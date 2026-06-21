@@ -1,11 +1,12 @@
 name: Windows
 
-# Validates that the converter — including the Windows-only vendor-SDK readers
-# (Agilent MHDAC / SciEX Clearcore2 / Bruker BAF) and the C# interop glues —
-# builds, links, and runs on the real Windows target. Runtime conversion of
-# actual Agilent/SciEX/BAF data needs the proprietary vendor DLLs + vendor data
-# and is out of scope for CI; the core convert path is smoke-tested on a tiny
-# bundled mzML.
+# Validates the converter on the real Windows target:
+#  - `windows` job: builds default + all Windows-only vendor-SDK features
+#    (Agilent MHDAC / SciEX Clearcore2 / Bruker BAF FFI), the C# interop glues,
+#    runs the tests, and smoke-converts a tiny bundled mzML.
+#  - `msconvert` job: installs ProteoWizard and exercises the --via-msconvert lane.
+# Runtime conversion of actual Agilent/SciEX/BAF *data* via the native readers
+# still needs the proprietary vendor DLLs + vendor data and stays out of CI.
 
 on:
   push:
@@ -58,3 +59,43 @@ jobs:
           cargo run --release -- convert sample.wiff -o out.mzpeak --force
           if ($LASTEXITCODE -ne 3) { Write-Error "expected exit 3, got $LASTEXITCODE"; exit 1 }
           Write-Host "vendor guard returned exit 3 as expected"
+
+  # Installs ProteoWizard (msconvert) and exercises the cross-vendor --via-msconvert
+  # lane end-to-end on Windows. Uses the committed mzML (msconvert reads mzML and
+  # re-emits it → we re-ingest), so the full lane — exe resolution, subprocess,
+  # temp mzML handling, re-ingest — is tested without needing licensed vendor data.
+  # Separate job so a flaky pwiz install can't mask the core build validation.
+  msconvert:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install ProteoWizard (msconvert) via Chocolatey
+        shell: pwsh
+        run: choco install proteowizard -y --no-progress --ignore-checksums
+
+      - name: Locate msconvert.exe
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path 'C:\ProgramData\chocolatey','C:\Program Files','C:\Program Files (x86)' `
+                   -Recurse -Filter msconvert.exe -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $exe) { Write-Error "msconvert.exe not found after install"; exit 1 }
+          Write-Host "msconvert: $($exe.FullName)"
+          "MSCONVERT_PATH=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build
+        run: cargo build --release --verbose
+
+      - name: Convert via msconvert (mzML -> msconvert -> mzPeak)
+        shell: pwsh
+        run: |
+          cargo run --release -- convert tests/fixtures/tiny.pwiz.1.1.mzML --via-msconvert -o out_pwiz.mzpeak --force
+          if ($LASTEXITCODE -ne 0) { Write-Error "--via-msconvert failed: $LASTEXITCODE"; exit 1 }
+          if (-not (Test-Path out_pwiz.mzpeak)) { Write-Error "no output archive produced"; exit 1 }
+          Write-Host "--via-msconvert produced $((Get-Item out_pwiz.mzpeak).Length) bytes"
