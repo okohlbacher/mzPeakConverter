@@ -5,7 +5,8 @@
 # for files that fail (convert or validate). Override with KEEP_OUTPUTS=1.
 #
 # Usage: tests/run_data_sweep.sh [DATA_ROOT]   (default ~/Claude/mzML2mzPeak/data)
-# Env:   JOBS=N (parallel, default 4), MEM_CAP_GB=N (hard RAM ceiling, default 30),
+# Env:   JOBS=N (small-file parallelism, default 4), MEM_CAP_GB=N (hard RAM ceiling, default 30),
+#        SIZE_BIG_MB=N (>=this runs serially, one at a time; default 200),
 #        KEEP_OUTPUTS=1, MZPEAK_VALIDATE=/path
 set -uo pipefail
 
@@ -60,6 +61,8 @@ JOBS="${JOBS:-4}"
 # freeing its memory immediately (SIGSTOP would not). The reaped file is recorded as OOM-KILL. Keep
 # JOBS modest so this rarely triggers; the watchdog is the backstop that stops the machine crashing.
 MEM_CAP_GB="${MEM_CAP_GB:-30}"
+# Inputs at/above this size are converted one at a time (serially); smaller ones run JOBS-parallel.
+SIZE_BIG_MB="${SIZE_BIG_MB:-200}"
 BIN="$root/target/release/mzpeak-convert"
 [ -x "$BIN" ] || { echo "build first: cargo build --release"; exit 2; }
 
@@ -76,9 +79,23 @@ rm -rf "$OUT"; mkdir -p "$OUT/archives" "$OUT/logs"
 : >"$OUT/results.tsv"
 export DATA OUT BIN VALIDATE KEEP_OUTPUTS
 
-# Build NUL-delimited "<fmt>\x1f<path>" records.
-recs="$OUT/records"; : >"$recs"
-emit() { printf '%s\x1f%s\0' "$1" "$2" >>"$recs"; }
+# Build NUL-delimited "<fmt>\x1f<path>" records, ROUTED BY SIZE: inputs at/above SIZE_BIG_MB go to a
+# serial queue (one big file at a time — the memory-heavy ones), everything else to a parallel queue.
+recs_small="$OUT/records.small"; recs_big="$OUT/records.big"; : >"$recs_small"; : >"$recs_big"
+big_bytes=$(( SIZE_BIG_MB * 1024 * 1024 ))
+emit() {
+  local fmt="$1" path="$2" sz
+  if [ -d "$path" ]; then
+    sz=$(du -sk "$path" 2>/dev/null | awk '{print $1*1024}')   # .d directory total
+  else
+    sz=$(stat -f%z "$path" 2>/dev/null || echo 0)
+  fi
+  if [ "${sz:-0}" -ge "$big_bytes" ]; then
+    printf '%s\x1f%s\0' "$fmt" "$path" >>"$recs_big"
+  else
+    printf '%s\x1f%s\0' "$fmt" "$path" >>"$recs_small"
+  fi
+}
 while IFS= read -r -d '' f; do emit mzML   "$f"; done < <(find "$DATA" -type f -iname '*.mzML'  -print0)
 while IFS= read -r -d '' f; do emit imzML  "$f"; done < <(find "$DATA" -type f -iname '*.imzML' -print0)
 while IFS= read -r -d '' f; do emit raw    "$f"; done < <(find "$DATA" -type f -iname '*.raw'   -print0)
@@ -92,8 +109,10 @@ while IFS= read -r -d '' d; do
   fi
 done < <(find "$DATA" -type d -iname '*.d' -print0)
 
-total="$(tr -cd '\0' <"$recs" | wc -c | tr -d ' ')"
-echo "sweep: $total inputs from $DATA  (jobs=$JOBS, RAM cap ${MEM_CAP_GB}GB)"
+n_small="$(tr -cd '\0' <"$recs_small" | wc -c | tr -d ' ')"
+n_big="$(tr -cd '\0' <"$recs_big" | wc -c | tr -d ' ')"
+echo "sweep: $((n_small + n_big)) inputs from $DATA"
+echo "  small (<${SIZE_BIG_MB}MB): $n_small parallel x$JOBS    big (>=${SIZE_BIG_MB}MB): $n_big serial    RAM cap ${MEM_CAP_GB}GB"
 echo "output/logs: $OUT"
 
 # RAM-cap watchdog: every 2s, sum the RSS of the sweep's heavy processes (converter + validator);
@@ -126,7 +145,10 @@ disown "$watchdog_pid" 2>/dev/null || true  # keep job-control quiet when we kil
 trap 'kill "$watchdog_pid" 2>/dev/null' EXIT
 
 start=$(date +%s)
-xargs -0 -P "$JOBS" -n1 bash "$0" --worker <"$recs"
+# Small files: parallel. Big files: strictly one at a time (so a single huge conversion never shares
+# RAM with another). The watchdog still guards both passes against any single runaway.
+xargs -0 -P "$JOBS" -n1 bash "$0" --worker <"$recs_small"
+xargs -0 -P 1     -n1 bash "$0" --worker <"$recs_big"
 end=$(date +%s)
 kill "$watchdog_pid" 2>/dev/null; trap - EXIT
 
