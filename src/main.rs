@@ -1,14 +1,12 @@
-//! mzpeak-convert — unified converter: mzML/imzML, Bruker .d (TDF), Thermo .raw → mzPeak.
+//! mzpeak-convert — single-command converter: mzML/imzML, Bruker `.d` (TDF/TSF/BAF), Thermo `.raw`,
+//! and (Windows) Agilent/SciEX → mzPeak.
 //!
-//! MVP (Phase 0): the conversion core wraps mzpeak_prototyping's reference flow
-//! (`examples/convert.rs`) — `mzdata::MZReaderType` auto-detects the input format and the
-//! reference writer wiring (sampled data schema, metadata copy, imaging presets, TDF
-//! ion-mobility) is reused rather than reinvented. The differentiated features
-//! (native-TOF ims-compact, TOF-grid, vendor injection, YAML aux policy) layer onto this
-//! green baseline in later phases — see PLAN.md.
-//!
-//! CLI follows clig.dev: subcommands, kebab-case flags, `-v/-q`, `--json`, `--dry-run`,
-//! overwrite guard, stable exit codes.
+//! `mzpeak-convert <input> [-o output] [options]`. With `--output` it converts; without it the input
+//! is only inspected and reported. The conversion core wraps mzpeak_prototyping's reference writer
+//! (`mzdata::MZReaderType` auto-detects format; the writer wiring — sampled data schema, metadata
+//! copy, imaging presets, TDF ion-mobility — is reused), with native readers layered on for the
+//! formats mzdata can't read (TSF/BAF, the lossless integer-TOF ims-compact path, Agilent/SciEX).
+//! Vendor-SDK readers compile in per platform (see the cfg-gated modules below). See PLAN.md.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,15 +15,17 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
-// Vendor-SDK readers are untestable on macOS (no SDK/DLLs); keep forward-looking members without
-// dead-code warnings. All are Windows(/Linux)-runtime-only, verified only to compile here.
-#[cfg(feature = "bruker_sdk")]
+// Vendor-SDK readers compile in automatically on the platforms where the proprietary vendor
+// libraries exist — Windows for Agilent (MHDAC), SciEX (Clearcore2) and Bruker BAF; Linux also for
+// Bruker BAF. They load the vendor DLLs at runtime and report a clear error if absent. macOS has no
+// vendor SDKs, so none are built there. `allow(dead_code)` keeps accessors that only some paths use.
+#[cfg(any(windows, target_os = "linux"))]
 #[allow(dead_code)]
 mod bruker_baf;
-#[cfg(feature = "agilent")]
+#[cfg(windows)]
 #[allow(dead_code)]
 mod agilent;
-#[cfg(feature = "sciex")]
+#[cfg(windows)]
 #[allow(dead_code)]
 mod sciex;
 mod bruker_native;
@@ -44,14 +44,13 @@ use mzdata::spectrum::bindata::BinaryArrayMap3D;
 use mzdata::spectrum::{BinaryArrayMap, Chromatogram, ChromatogramDescription};
 use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzpeak_prototyping::{BufferContext, BufferName};
-use mzpeak_prototyping::archive::{ArchiveReader, DispatchArchiveSource, ZipArchiveWriter};
+use mzpeak_prototyping::archive::ZipArchiveWriter;
 use mzpeak_prototyping::buffer_descriptors::BufferOverrideTable;
 use mzpeak_prototyping::chunk_series::ChunkingStrategy;
 use mzpeak_prototyping::peak_series::{INTENSITY_ARRAY, array_map_to_schema_arrays};
 use mzpeak_prototyping::writer::{
     AbstractMzPeakWriter, ArrayBuffersBuilder, CustomBuilderFromParameter, MzPeakWriterType,
 };
-use mzpeak_prototyping::MzPeakReader;
 use mzdata::prelude::ByteArrayView;
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
@@ -119,10 +118,6 @@ struct Cli {
     #[arg(short, long)]
     force: bool,
 
-    /// Round-trip fidelity check: re-read source and archive, compare spectrum counts.
-    #[arg(long)]
-    verify: bool,
-
     /// Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and
     /// write standard f64 m/z instead.
     #[arg(long)]
@@ -174,7 +169,6 @@ struct FileConfig {
     chunk_size: Option<f64>,
     zstd_level: Option<i32>,
     force: Option<bool>,
-    verify: Option<bool>,
     no_ims_compact: Option<bool>,
     no_vendor: Option<bool>,
     aux: Option<Vec<String>>,
@@ -190,7 +184,6 @@ struct Settings {
     chunk_size: f64,
     zstd_level: i32,
     force: bool,
-    verify: bool,
     no_ims_compact: bool,
     no_vendor: bool,
     aux: Vec<String>,
@@ -219,7 +212,6 @@ impl Settings {
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
             zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(3),
             force: cli.force || fc.force.unwrap_or(false),
-            verify: cli.verify || fc.verify.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
             no_vendor: cli.no_vendor || fc.no_vendor.unwrap_or(false),
             aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
@@ -318,11 +310,6 @@ fn run(cli: &Cli) -> Result<i32> {
     }
 
     log::info!("wrote {}", output.display());
-
-    if cfg.verify {
-        round_trip_verify(&cli.input, &output, use_ims_compact).context("round-trip verify")?;
-        log::info!("verify passed (counts match source)");
-    }
     Ok(exit::OK)
 }
 
@@ -340,7 +327,7 @@ fn report_inspect(input: &Path) -> Result<()> {
         println!("spectra:       {}", bruker_tsf::TsfReader::open(input)?.len());
         return Ok(());
     }
-    #[cfg(feature = "bruker_sdk")]
+    #[cfg(any(windows, target_os = "linux"))]
     if is_baf_dir(input) {
         println!("format:        Bruker BAF (.d)");
         println!("spectra:       {}", bruker_baf::BafReader::open(input, None)?.len());
@@ -348,17 +335,17 @@ fn report_inspect(input: &Path) -> Result<()> {
     }
     if is_agilent_d(input) {
         println!("format:        Agilent .d");
-        #[cfg(feature = "agilent")]
+        #[cfg(windows)]
         println!("spectra:       {}", agilent::AgilentReader::open(input)?.len());
-        #[cfg(not(feature = "agilent"))]
+        #[cfg(not(windows))]
         println!("note:          native Agilent reading needs a `--features agilent` build (or use --via-msconvert)");
         return Ok(());
     }
     if is_wiff(input) {
         println!("format:        SciEX .wiff");
-        #[cfg(feature = "sciex")]
+        #[cfg(windows)]
         println!("spectra:       {}", sciex::SciexReader::open(input)?.len());
-        #[cfg(not(feature = "sciex"))]
+        #[cfg(not(windows))]
         println!("note:          native SciEX reading needs a `--features sciex` build (or use --via-msconvert)");
         return Ok(());
     }
@@ -386,25 +373,34 @@ fn is_wiff(input: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("wiff") || e.eq_ignore_ascii_case("wiff2"))
 }
 
-/// Reject Agilent/SciEX inputs on the native path with actionable guidance: native readers need a
-/// licensed-DLL Windows build (PLAN §3.7, not yet implemented); the `--via-msconvert` lane works now.
+/// Reject inputs that have no native reader on THIS platform, with actionable guidance. The native
+/// vendor readers are compiled in where the vendor libraries exist (Agilent/SciEX: Windows; Bruker
+/// BAF: Windows + Linux); elsewhere the `--via-msconvert` lane is the path.
 fn guard_unsupported_vendor(input: &Path) -> Result<()> {
-    // Each vendor is handled natively in convert_file when its feature is built in; only bail (with
-    // guidance to the msconvert lane) when the corresponding feature is OFF.
-    #[cfg(not(feature = "agilent"))]
+    #[cfg(not(windows))]
     if is_agilent_d(input) {
         return Err(UnsupportedVendor(
-            "Agilent .d native reading needs a Windows build with the vendor SDK \
-             (`cargo build --features agilent`). For now: `--via-msconvert`."
+            "Agilent .d native reading is available only on Windows (MHDAC vendor SDK). \
+             On this platform use `--via-msconvert`."
                 .to_string(),
         )
         .into());
     }
-    #[cfg(not(feature = "sciex"))]
+    #[cfg(not(windows))]
     if is_wiff(input) {
         return Err(UnsupportedVendor(
-            "SciEX .wiff native reading needs a Windows build with the vendor SDK \
-             (`cargo build --features sciex`). For now: `--via-msconvert`."
+            "SciEX .wiff native reading is available only on Windows (Clearcore2 vendor SDK). \
+             On this platform use `--via-msconvert`."
+                .to_string(),
+        )
+        .into());
+    }
+    // Bruker BAF has a native reader on Windows + Linux but not macOS.
+    #[cfg(not(any(windows, target_os = "linux")))]
+    if input.is_dir() && input.join("analysis.baf").exists() {
+        return Err(UnsupportedVendor(
+            "Bruker BAF .d native reading is available only on Windows/Linux (libbaf2sql_c). \
+             On this platform use `--via-msconvert`."
                 .to_string(),
         )
         .into());
@@ -474,7 +470,7 @@ fn is_tsf_dir(input: &Path) -> bool {
 }
 
 /// True for a Bruker BAF `.d` (Q-TOF; peak arrays behind the baf2sql_c SDK).
-#[cfg(feature = "bruker_sdk")]
+#[cfg(any(windows, target_os = "linux"))]
 fn is_baf_dir(input: &Path) -> bool {
     input.is_dir() && input.join("analysis.baf").exists()
 }
@@ -489,15 +485,15 @@ fn convert_file(
     if is_tsf_dir(input) {
         return convert_tsf(input, output, chunk, zstd_level, vendor);
     }
-    #[cfg(feature = "bruker_sdk")]
+    #[cfg(any(windows, target_os = "linux"))]
     if is_baf_dir(input) {
         return convert_baf(input, output, chunk, zstd_level, vendor);
     }
-    #[cfg(feature = "agilent")]
+    #[cfg(windows)]
     if is_agilent_d(input) {
         return convert_agilent(input, output, chunk, zstd_level, vendor);
     }
-    #[cfg(feature = "sciex")]
+    #[cfg(windows)]
     if is_wiff(input) {
         return convert_sciex(input, output, chunk, zstd_level, vendor);
     }
@@ -747,7 +743,7 @@ fn embed_thermo_trailers(zip: &mut ZipArchiveWriter<fs::File>, input: &Path) -> 
 
 /// Convert a Bruker BAF `.d` (Q-TOF) → mzPeak via the vendor SDK (feature `bruker_sdk`,
 /// Windows/Linux only). Mirrors `convert_tsf`. UNTESTED on macOS (no SDK) — verified to compile.
-#[cfg(feature = "bruker_sdk")]
+#[cfg(any(windows, target_os = "linux"))]
 fn convert_baf(
     input: &Path,
     output: &Path,
@@ -765,7 +761,7 @@ fn convert_baf(
 /// Convert a SciEX `.wiff`/`.wiff2` → mzPeak via the Clearcore2 .NET glue (feature `sciex`,
 /// Windows-runtime-only, UNTESTED here). Mirrors `convert_tsf`. Needs `$MZPC_SCIEX_GLUE` +
 /// `$MZPC_PWIZ_DIR` at runtime (see glue/sciex/README.md).
-#[cfg(feature = "sciex")]
+#[cfg(windows)]
 fn convert_sciex(
     input: &Path,
     output: &Path,
@@ -779,7 +775,7 @@ fn convert_sciex(
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak via the MHDAC .NET glue (feature `agilent`,
 /// Windows-runtime-only, UNTESTED here; IM-MS/MIDAC out of scope). Mirrors `convert_tsf`.
-#[cfg(feature = "agilent")]
+#[cfg(windows)]
 fn convert_agilent(
     input: &Path,
     output: &Path,
@@ -927,42 +923,6 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
             run.default_instrument_id = Some(first_instr);
         }
     }
-}
-
-/// Round-trip fidelity: re-read the SOURCE via mzdata and the OUTPUT archive via the mzPeak
-/// reader, and assert the **spectrum count** matches. This catches the main writer-side risk —
-/// dropped or duplicated spectra — and is invariant to encoding and to the writer's
-/// zero-intensity-run masking (which makes per-point counts legitimately differ from source).
-/// Value-level (m/z/intensity) fidelity is added for the lossless ims-compact path in P2, where
-/// zero-masking is off and exact comparison is meaningful.
-fn round_trip_verify(input: &Path, output: &Path, ims_compact: bool) -> Result<()> {
-    // ims-compact stores native TDF frames in the peaks facet, so the comparable source count is the
-    // peak-bearing frames (mzdata uses a different, all-frames spectrum model — not apples-to-apples).
-    let src_spectra = if ims_compact {
-        bruker_native::peak_bearing_frames(input)?
-    } else {
-        count_source(input)?
-    };
-    let arc_spectra = count_archive(output)?;
-    if src_spectra != arc_spectra {
-        bail!("spectrum count mismatch: source {src_spectra} vs archive {arc_spectra}");
-    }
-    log::debug!("verify: {src_spectra} spectra match");
-    Ok(())
-}
-
-fn count_source(input: &Path) -> Result<usize> {
-    if is_tsf_dir(input) {
-        return Ok(bruker_tsf::TsfReader::open(input)?.len());
-    }
-    let reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input)?;
-    Ok(reader.len())
-}
-
-fn count_archive(output: &Path) -> Result<usize> {
-    let archive = ArchiveReader::<DispatchArchiveSource>::from_path(output.to_path_buf())?;
-    let reader = MzPeakReader::from_archive_reader(archive, Some(output.to_path_buf()))?;
-    Ok(reader.into_iter().count())
 }
 
 fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {

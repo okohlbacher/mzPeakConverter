@@ -45,13 +45,14 @@ analysis-ready, preserving vendor metadata and ion-mobility structure.
 | Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default** |
 | Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
-| Bruker `.d` **BAF** | ✅ | ❌ | ✅ | build `--features bruker_sdk` (`libbaf2sql_c`) |
-| Agilent `.d` (native) | ❌ | ❌ | ✅ | build `--features agilent` (MHDAC) |
-| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | build `--features sciex` (Clearcore2) |
+| Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; `libbaf2sql_c` at runtime |
+| Agilent `.d` (native) | ❌ | ❌ | ✅ | auto-built; MHDAC DLLs at runtime |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | auto-built; Clearcore2 DLLs at runtime |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
 
-The default build (all OSes) covers the first five rows; the rest need the
-optional build features, or the cross-vendor `--via-msconvert` path.
+The native vendor readers are **compiled in automatically on the platforms where
+the vendor libraries exist** (no build flag) and load the vendor DLLs at runtime;
+everywhere else, the cross-vendor `--via-msconvert` path covers them.
 
 ## Install
 
@@ -75,7 +76,7 @@ A single command. Give an input and, optionally, an output:
 mzpeak-convert run.raw
 
 # Convert to mzPeak (-v also prints the inspection report)
-mzpeak-convert run.raw -o run.mzpeak --verify --force
+mzpeak-convert run.raw -o run.mzpeak --force
 
 # Bruker timsTOF (.d): lossless ims-compact is the DEFAULT (--no-ims-compact to disable)
 mzpeak-convert experiment.d -o experiment.mzpeak
@@ -98,7 +99,7 @@ the independent `mzpeak-validate` tool (the e2e harness in `tests/` calls it).
 
 ```sh
 cargo test                     # unit tests
-tests/run_corpus_e2e.sh        # convert + --verify + mzpeak-validate over tests/corpus.tsv
+tests/run_corpus_e2e.sh        # convert + mzpeak-validate over tests/corpus.tsv
 tests/run_data_sweep.sh DIR    # full-corpus convert+validate sweep (parallel)
 ```
 

@@ -19,6 +19,14 @@ All notable changes to this project are documented here. The format follows
   - `tof-grid`/`tof-grid-probe` (a measured no-go research spike) are removed.
 - **`--config` is now a general configuration file** holding *any* overridable
   option (not just vendor side-file policy). Precedence: CLI flag > config > default.
+- **Removed `--verify`** (round-trip count check). Fidelity/conformance checking is
+  out of the converter's scope.
+- **Vendor-SDK readers are on by default per platform.** The Agilent (MHDAC), SciEX
+  (Clearcore2), and Bruker BAF (libbaf2sql_c) readers now compile in automatically
+  where the vendor libraries exist (Windows for all three; Linux also for BAF) —
+  the `bruker_sdk`/`agilent`/`sciex` cargo features are gone. They load the vendor
+  DLLs at runtime; macOS builds none. Inputs with no native reader on the platform
+  exit 3 (use `--via-msconvert`).
 - SQLite is compiled from source (`rusqlite` `bundled`) — self-contained build on
   all platforms (no system libsqlite3).
 

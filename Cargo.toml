@@ -48,20 +48,15 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
-# Bruker BAF (Q-TOF) vendor SDK FFI — Windows/Linux only (libbaf2sql_c not on macOS). Optional so
-# the default build stays FFI-free and cross-platform; enable with `--features bruker_sdk`.
-libloading = { version = "0.8", optional = true }
-# In-process .NET hosting for the native Agilent/SciEX glue (same crate the Thermo reader uses).
-# Default features (nethost-download + net8_0) compile cross-platform; runtime needs .NET 8 + the
-# vendor glue.dll + vendor DLLs (Windows/pwiz). Optional → only built with `agilent`/`sciex`.
-netcorehost = { version = "0.18", optional = true }
 
-[features]
-# Vendor-SDK readers — all OFF by default (they need licensed vendor DLLs and restrict the build to
-# Windows/Linux). bruker_sdk: BAF via libbaf2sql_c (implemented). agilent/sciex: native in-process
-# .NET-glue readers (MHDAC / Clearcore2) — Windows-only, future (PLAN §3.7); reserved here so the
-# build is "configurable with agilent/sciex support". The cross-vendor `--via-msconvert` lane needs
-# NO feature (it shells out to ProteoWizard).
-bruker_sdk = ["dep:libloading"]
-agilent = ["dep:netcorehost"]
-sciex = ["dep:netcorehost"]
+# Vendor-SDK readers are compiled in automatically on the platforms where the proprietary vendor
+# libraries exist (see the cfg-gated modules in src/main.rs) — no opt-in feature, "on by default
+# where available". They load the vendor DLLs at runtime and report a clear error if absent.
+
+# Bruker BAF (Q-TOF) via libbaf2sql_c — Windows + Linux (not macOS).
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+libloading = "0.8"
+
+# In-process .NET hosting for the native Agilent (MHDAC) / SciEX (Clearcore2) glue — Windows only.
+[target.'cfg(windows)'.dependencies]
+netcorehost = "0.18"

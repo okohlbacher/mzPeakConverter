@@ -34,13 +34,12 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # SQLite is compiled from source (rusqlite `bundled`), and .NET hosting for
-      # the Thermo reader downloads nethost at build — no system deps to install.
-      - name: Build (default features)
+      # The default Windows build now compiles the native vendor readers (Agilent MHDAC, SciEX
+      # Clearcore2, Bruker BAF) automatically — they're on by default where the platform supports
+      # them. SQLite is compiled from source (rusqlite `bundled`); .NET hosting downloads nethost at
+      # build. No system deps to install.
+      - name: Build (includes native vendor readers)
         run: cargo build --release --verbose
-
-      - name: Build (all vendor features — Agilent + SciEX + Bruker BAF FFI)
-        run: cargo build --release --features "agilent sciex bruker_sdk" --verbose
 
       - name: Test
         run: cargo test --release --verbose
@@ -51,20 +50,8 @@ jobs:
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
 
       # Core convert path, end-to-end on Windows, against a tiny committed mzML.
-      - name: Smoke test — convert + round-trip verify
-        run: cargo run --release -- tests/fixtures/tiny.pwiz.1.1.mzML -o out.mzpeak --verify --force
-
-      # SciEX .wiff with the feature OFF (default `cargo run`) must report the
-      # unsupported-vendor contract — exit 3, a clean refusal, not a crash.
-      - name: Vendor-guard contract (SciEX .wiff without feature → exit 3)
-        shell: pwsh
-        run: |
-          New-Item -ItemType File -Force -Path sample.wiff > $null
-          cargo run --release -- sample.wiff -o out.mzpeak --force
-          $code = $LASTEXITCODE   # capture before it leaks into the step's own exit status
-          if ($code -ne 3) { Write-Error "expected exit 3, got $code"; exit 1 }
-          Write-Host "vendor guard returned exit 3 as expected"
-          exit 0
+      - name: Smoke test — convert a tiny mzML
+        run: cargo run --release -- tests/fixtures/tiny.pwiz.1.1.mzML -o out.mzpeak --force
 
   # Installs ProteoWizard (msconvert) and exercises the cross-vendor --via-msconvert
   # lane end-to-end on Windows. Uses the committed mzML (msconvert reads mzML and

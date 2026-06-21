@@ -171,18 +171,3 @@ impl NativeTofReader {
     }
 
 }
-
-/// Count TDF frames that carry at least one peak — the spectrum count an ims-compact archive
-/// actually contains (empty frames hold no peaks, so they don't appear in the peaks facet). Used by
-/// `--verify` to compare like-for-like with the native ims-compact representation, instead of
-/// against mzdata's different (all-frames) spectrum model.
-pub fn peak_bearing_frames(dot_d: &Path) -> Result<usize> {
-    let reader = NativeTofReader::open(dot_d)?;
-    let mut n = 0;
-    for i in 0..reader.len() {
-        if !reader.frame(i)?.tof.is_empty() {
-            n += 1;
-        }
-    }
-    Ok(n)
-}

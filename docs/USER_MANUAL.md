@@ -21,11 +21,10 @@ It is a **single command**: give it an input and, optionally, an output.
 - [7. The mzPeak output](#7-the-mzpeak-output)
 - [8. Vendor-specific metadata handling](#8-vendor-specific-metadata-handling)
 - [9. Compression, layout & ims-compact](#9-compression-layout--ims-compact)
-- [10. Verification](#10-verification)
-- [11. Exit codes & environment](#11-exit-codes--environment)
-- [12. Optional vendor-SDK builds](#12-optional-vendor-sdk-builds)
-- [13. Dependencies](#13-dependencies)
-- [14. Troubleshooting](#14-troubleshooting)
+- [10. Exit codes & environment](#10-exit-codes--environment)
+- [11. Native vendor-SDK readers](#11-native-vendor-sdk-readers)
+- [12. Dependencies](#12-dependencies)
+- [13. Troubleshooting](#13-troubleshooting)
 
 ---
 
@@ -55,7 +54,7 @@ cd mzPeakConverter
 cargo build --release          # binary at target/release/mzpeak-convert
 ```
 
-Non-Thermo conversions need no .NET. See §12 for the optional vendor-SDK builds.
+Non-Thermo conversions need no .NET. See §11 for the native vendor-SDK readers.
 
 ## 3. Quick start
 
@@ -66,8 +65,8 @@ mzpeak-convert run.raw
 # Convert to mzPeak
 mzpeak-convert run.raw -o run.mzpeak
 
-# Convert, print the inspection report too, and round-trip verify
-mzpeak-convert run.raw -o run.mzpeak -v --verify --force
+# Convert and print the inspection report too
+mzpeak-convert run.raw -o run.mzpeak -v --force
 
 # Bruker timsTOF (.d): lossless ims-compact integer-TOF is the DEFAULT
 mzpeak-convert experiment.d -o experiment.mzpeak              # ims-compact
@@ -95,7 +94,6 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 | `--aux <glob=embed\|drop>` | — | Vendor side-file rule (repeatable, highest precedence) |
 | `--via-msconvert` | off | Read via ProteoWizard `msconvert` → mzML → mzPeak |
 | `--msconvert-path <PATH>` | `$MSCONVERT_PATH` / PATH | Location of `msconvert` |
-| `--verify` | off | Round-trip fidelity check (re-read source + archive, compare counts) |
 | `-f, --force` | off | Overwrite an existing output |
 | `-v, --verbose` | off | Print the inspection report (repeat `-vv` for trace logs) |
 | `-q, --quiet` | off | Silence all logs except errors |
@@ -126,7 +124,6 @@ aux:                       # vendor side-file rules (see §8)
 via_msconvert: false
 msconvert_path: /opt/pwiz/msconvert
 force: true
-verify: true
 ```
 
 ```sh
@@ -145,15 +142,16 @@ Unknown keys are rejected with a clear error.
 | Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default** |
 | Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; otofControl m/z correction |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
-| Bruker `.d` **BAF** | ✅¹ | ❌ | ✅¹ | ¹ build `--features bruker_sdk`; needs `libbaf2sql_c` |
-| Agilent `.d` (native) | ❌ | ❌ | ✅¹ | ¹ build `--features agilent`; MHDAC DLLs (Windows only) |
-| SciEX `.wiff` (native) | ❌ | ❌ | ✅¹ | ¹ build `--features sciex`; Clearcore2 DLLs (Windows only) |
-| Agilent / SciEX / … via msconvert | ✅² | ✅² | ✅ | ² `--via-msconvert`; needs ProteoWizard (Windows, or Wine elsewhere) |
+| Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; needs `libbaf2sql_c` at runtime |
+| Agilent `.d` (native) | ❌ | ❌ | ✅ | auto-built; MHDAC DLLs at runtime |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | auto-built; Clearcore2 DLLs at runtime |
+| Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Windows, or Wine elsewhere) |
 
-The default build (all OSes) covers the first five rows. Vendor-native rows need
-the optional build features in §12; everywhere else, `--via-msconvert` is the
-cross-vendor path. Inputs that the current build cannot read natively exit with
-code **3** and actionable guidance.
+The native vendor readers are **compiled in automatically on the platforms where
+the vendor libraries exist** — no build flag (see §11). They load the proprietary
+DLLs at runtime and report a clear error if those are absent. Inputs with no native
+reader on the current platform exit with code **3** and actionable guidance
+(usually: use `--via-msconvert`).
 
 ## 7. The mzPeak output
 
@@ -220,24 +218,13 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
   `--no-ims-compact` to write standard f64 m/z. m/z is reconstructed by readers as
   `m/z = (a + b·tof)²`.
 
-## 10. Verification
-
-`--verify` performs an in-process **round-trip fidelity** check: it re-reads both
-the source and the freshly written archive and asserts the spectrum counts match
-(for ims-compact, against the native peak-bearing frame count). This checks the
-conversion did not lose data — it does **not** check spec conformance.
-
-**Conformance validation is a separate concern**, handled by the independent
-`mzpeak-validate` tool (not part of this converter): `mzpeak-validate run.mzpeak`.
-The e2e harness in `tests/` invokes it automatically.
-
-## 11. Exit codes & environment
+## 10. Exit codes & environment
 
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | generic error (includes `--verify` mismatch) |
-| 3 | unsupported input/format in this build |
+| 1 | generic error |
+| 3 | unsupported input/format on this platform |
 
 | Variable | Effect |
 |---|---|
@@ -245,26 +232,24 @@ The e2e harness in `tests/` invokes it automatically.
 | `DOTNET_ROLL_FORWARD` | set automatically to `LatestMajor` if unset (Thermo) |
 | `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` | set automatically to `ignore` if unset |
 | `MSCONVERT_PATH` | `msconvert` location for `--via-msconvert` |
-| `MZPC_PWIZ_DIR`, `MZPC_SCIEX_GLUE`, `MZPC_AGILENT_GLUE` | native vendor-SDK builds (§12) |
+| `MZPC_PWIZ_DIR`, `MZPC_SCIEX_GLUE`, `MZPC_AGILENT_GLUE` | native vendor-SDK runtime (§11) |
 
-## 12. Optional vendor-SDK builds
+## 11. Native vendor-SDK readers
 
-Off by default (they need licensed vendor DLLs and are platform-restricted):
+The Agilent (MHDAC), SciEX (Clearcore2), and Bruker BAF (libbaf2sql_c) readers are
+**compiled in automatically** on the platforms where those vendor libraries exist —
+Windows for all three, Linux also for Bruker BAF. There is **no build flag** and no
+opt-in; macOS gets none (no vendor SDKs exist there).
 
-```sh
-cargo build --release --features bruker_sdk   # Bruker BAF via libbaf2sql_c (Windows/Linux)
-cargo build --release --features agilent      # Agilent MHDAC native .NET glue (Windows)
-cargo build --release --features sciex        # SciEX Clearcore2 native .NET glue (Windows)
-```
+They load the proprietary vendor DLLs at **runtime**, sourced from a ProteoWizard
+install: point `$MZPC_PWIZ_DIR` at it (MHDAC under `vendor_api/Agilent`, Clearcore2
+under `vendor_api/ABI`), and for the .NET glues set `$MZPC_AGILENT_GLUE` /
+`$MZPC_SCIEX_GLUE` to the built C# glue dir (`dotnet build glue/agilent/AgilentGlue.csproj`).
+Without the DLLs the reader reports a clear error. Where no native reader exists for
+a format on the current platform (e.g. Agilent/SciEX on macOS or Linux), use
+`--via-msconvert` — it needs no special build.
 
-The Agilent/SciEX readers are **Windows-runtime-only**. They need a .NET 8 runtime,
-the built C# glue (`glue/{agilent,sciex}/`, pointed to by `$MZPC_{AGILENT,SCIEX}_GLUE`),
-and vendor DLLs from a ProteoWizard install (`$MZPC_PWIZ_DIR`). The C# glues are
-reflection-only and build anywhere (`dotnet build glue/sciex/SciexGlue.csproj`).
-
-For everyday cross-vendor needs, prefer `--via-msconvert` — it needs no special build.
-
-## 13. Dependencies
+## 12. Dependencies
 
 Pure Rust plus a small C# interop layer for Thermo/native vendor readers. Core
 crates: `mzdata`, `mzpeaks`, `arrow`/`parquet`, `zip`, `timsrust`,
@@ -273,7 +258,7 @@ reference writer `mzpeak_prototyping` is vendored under `vendor/`. A complete
 inventory of all transitive dependencies (with licenses) is in
 [`sbom.cdx.json`](../sbom.cdx.json); see [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 
-## 14. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Fix |
 |---|---|

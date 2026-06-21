@@ -26,7 +26,7 @@ COPY . .
 # network for crates (or vendor them); the glues are reflection-only so they build without the DLLs.
 RUN dotnet build glue\sciex\SciexGlue.csproj -c Release; `
     dotnet build glue\agilent\AgilentGlue.csproj -c Release
-RUN cargo build --release --features "agilent sciex"
+RUN cargo build --release
 
 # Default: run the verification script (expects datasets + pwiz DLLs mounted; see build-and-test.ps1).
 ENTRYPOINT ["powershell", "-NoProfile", "-File", "C:\\mzpc\\docker\\windows\\build-and-test.ps1"]

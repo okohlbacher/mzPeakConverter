@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Full-corpus sweep: discover EVERY convertible input under a data root, convert each to mzPeak
-# (with --verify), validate the output with mzpeak-validate, and tabulate. Runs conversions in
+# validate the output with mzpeak-validate, and tabulate. Runs conversions in
 # parallel. Archives are deleted right after a passing validation to bound disk; logs are kept only
 # for files that fail (convert or validate). Override with KEEP_OUTPUTS=1.
 #
 # Usage: tests/run_data_sweep.sh [DATA_ROOT]   (default ~/Claude/mzML2mzPeak/data)
-# Env:   JOBS=N (parallel, default 6), KEEP_OUTPUTS=1, MZPEAK_VALIDATE=/path, NO_VERIFY=1
+# Env:   JOBS=N (parallel, default 6), KEEP_OUTPUTS=1, MZPEAK_VALIDATE=/path
 set -uo pipefail
 
 # ---- worker mode: one input record "<fmt>\x1f<path>" --------------------------------------------
@@ -18,9 +18,8 @@ if [ "${1:-}" = "--worker" ]; then
   id="$(printf '%s' "$rel" | tr -c 'A-Za-z0-9._-' '_')"
   archive="$OUT/archives/$id.mzpeak"
   clog="$OUT/logs/$id.convert.log"; vlog="$OUT/logs/$id.val.log"
-  verify=(--verify); [ -n "${NO_VERIFY:-}" ] && verify=()
 
-  "$BIN" "$path" -o "$archive" --force "${verify[@]}" >"$clog" 2>&1
+  "$BIN" "$path" -o "$archive" --force >"$clog" 2>&1
   rc=$?
   if [ "$rc" -eq 3 ]; then
     printf '%s\t%s\tSKIP\tunsupported (vendor feature off)\t\n' "$fmt" "$rel" >>"$OUT/results.tsv"
@@ -64,7 +63,7 @@ done
 
 rm -rf "$OUT"; mkdir -p "$OUT/archives" "$OUT/logs"
 : >"$OUT/results.tsv"
-export DATA OUT BIN VALIDATE KEEP_OUTPUTS NO_VERIFY
+export DATA OUT BIN VALIDATE KEEP_OUTPUTS
 
 # Build NUL-delimited "<fmt>\x1f<path>" records.
 recs="$OUT/records"; : >"$recs"
@@ -83,7 +82,7 @@ while IFS= read -r -d '' d; do
 done < <(find "$DATA" -type d -iname '*.d' -print0)
 
 total="$(tr -cd '\0' <"$recs" | wc -c | tr -d ' ')"
-echo "sweep: $total inputs from $DATA  (jobs=$JOBS, verify=$([ -n "${NO_VERIFY:-}" ] && echo off || echo on))"
+echo "sweep: $total inputs from $DATA  (jobs=$JOBS)"
 echo "output/logs: $OUT"
 start=$(date +%s)
 xargs -0 -P "$JOBS" -n1 bash "$0" --worker <"$recs"
