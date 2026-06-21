@@ -577,8 +577,15 @@ fn convert_file(
                 }
             }
         }
-        // Tag each spectrum with the concrete MS:1000294 child so the registered column populates.
-        entry.description_mut().add_param(mass_spectrum.clone());
+        // Tag mass spectra with the concrete MS:1000294 child so the registered column populates —
+        // but NOT UV/PDA (wavelength) spectra, which the writer routes to the wavelength facet.
+        let is_wavelength = entry
+            .arrays
+            .as_ref()
+            .is_some_and(|a| a.has_array(&ArrayType::WavelengthArray));
+        if !is_wavelength {
+            entry.description_mut().add_param(mass_spectrum.clone());
+        }
         if synth_chroms {
             ms1.observe(&entry);
         }
