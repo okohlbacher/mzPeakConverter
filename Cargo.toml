@@ -29,7 +29,11 @@ timsrust = "=0.4.1"
 # Bruker TSF (line-spectra timsTOF/MALDI): mzdata can't read TSF, and timsrust-tsf 0.1.4 pulls a
 # rusqlite/libsqlite3-sys that conflicts with mzdata's. So we read the TSF SQLite + zstd-chunked
 # tsf_bin directly (ported from BRFP), reusing the versions mzdata already links (one native lib).
-rusqlite = "0.31"
+# `bundled` compiles SQLite from source (no system libsqlite3) so the build is self-contained on
+# every platform — required on Windows runners, and removes the libsqlite3-dev dep on Linux. There is
+# exactly one rusqlite/libsqlite3-sys in the tree (shared with mzdata + timsrust), so the feature
+# unifies cleanly with no duplicate-symbol risk.
+rusqlite = { version = "0.31", features = ["bundled"] }
 zstd = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,0 +1,60 @@
+name: Windows
+
+# Validates that the converter — including the Windows-only vendor-SDK readers
+# (Agilent MHDAC / SciEX Clearcore2 / Bruker BAF) and the C# interop glues —
+# builds, links, and runs on the real Windows target. Runtime conversion of
+# actual Agilent/SciEX/BAF data needs the proprietary vendor DLLs + vendor data
+# and is out of scope for CI; the core convert path is smoke-tested on a tiny
+# bundled mzML.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # SQLite is compiled from source (rusqlite `bundled`), and .NET hosting for
+      # the Thermo reader downloads nethost at build — no system deps to install.
+      - name: Build (default features)
+        run: cargo build --release --verbose
+
+      - name: Build (all vendor features — Agilent + SciEX + Bruker BAF FFI)
+        run: cargo build --release --features "agilent sciex bruker_sdk" --verbose
+
+      - name: Test
+        run: cargo test --release --verbose
+
+      - name: Build C# interop glues (reflection-only, no vendor DLLs)
+        run: |
+          dotnet build glue/sciex/SciexGlue.csproj -c Release
+          dotnet build glue/agilent/AgilentGlue.csproj -c Release
+
+      # Core convert path, end-to-end on Windows, against a tiny committed mzML.
+      - name: Smoke test — convert + round-trip verify
+        run: cargo run --release -- convert tests/fixtures/tiny.pwiz.1.1.mzML -o out.mzpeak --verify --force
+
+      # SciEX .wiff with the feature OFF (default `cargo run`) must report the
+      # unsupported-vendor contract — exit 3, a clean refusal, not a crash.
+      - name: Vendor-guard contract (SciEX .wiff without feature → exit 3)
+        shell: pwsh
+        run: |
+          New-Item -ItemType File -Force -Path sample.wiff > $null
+          cargo run --release -- convert sample.wiff -o out.mzpeak --force
+          if ($LASTEXITCODE -ne 3) { Write-Error "expected exit 3, got $LASTEXITCODE"; exit 1 }
+          Write-Host "vendor guard returned exit 3 as expected"
