@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
-[![Release](https://img.shields.io/badge/release-v0.1.0-green.svg)](https://github.com/okohlbacher/mzPeakConverter/releases)
+[![Release](https://img.shields.io/badge/release-v0.2.0-green.svg)](https://github.com/okohlbacher/mzPeakConverter/releases)
 
 > [!IMPORTANT]
 > The **mzPeak format is still going through the HUPO-PSI specification process**

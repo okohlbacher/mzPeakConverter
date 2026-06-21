@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-06-21
+
+### Changed
+
+- **Removed the built-in conformance validation** (`validate` subcommand and
+  `convert --validate`). Validation is delegated to the independent
+  `mzpeak-validate` tool; `--verify` (round-trip fidelity) stays. Exit codes are
+  now `0`/`1`/`3` (the old `5` is gone). **Breaking** for anyone scripting the
+  `validate` subcommand.
+- Documentation now states prominently that the mzPeak format is still in the
+  HUPO-PSI specification process (draft v0.9) and this converter is a technical
+  demonstrator, not a production tool. Added references to mzpeak.org, the
+  HUPO-PSI/mzPeak-specification repo, and the in-browser viewer at mzpeak.org/view.
+
+### Added
+
+- Bare `ims-compact` encoder now streams one frame at a time (constant memory)
+  with an independent streaming lossless re-read.
+- Unsupported vendor inputs now exit `3` (typed `UnsupportedVendor` error).
+
+### Fixed
+
+- Collapsed three byte-identical `convert_*` writer bodies into one shared path.
+- Guard the archive ims-compact TOF cast against i32 overflow.
+- Agilent glue export used a non-blittable `char*` across the FFI boundary
+  (would mis-marshal on Windows); switched to `ushort*` like the SciEX glue.
+- `gen_sbom.py` null-root crash + legacy `/` SPDX normalization; sweep-script id
+  sanitization.
+
 ## [0.1.0] — 2026-06-21
 
 First public release.
@@ -52,4 +81,5 @@ First public release.
 - Thermo instrument error-log facet and the registered tof→m/z column transform
   are deferred pending upstream API support (see [HANDOFF.md](HANDOFF.md)).
 
+[0.2.0]: https://github.com/okohlbacher/mzPeakConverter/releases/tag/v0.2.0
 [0.1.0]: https://github.com/okohlbacher/mzPeakConverter/releases/tag/v0.1.0
