@@ -344,10 +344,10 @@ impl GenericDataArrayWriter {
         &mut self,
         writer: &mut ArrowWriter<W>,
     ) -> io::Result<()> {
-        let use_chunks = self.use_chunked_encoding().is_some();
         for batch in self.data_buffers.drain() {
             writer.write(&batch)?;
-            if writer.in_progress_size() > 16_000_000 && use_chunks {
+            // Bound the in-progress row group by size for EVERY layout (not just chunked).
+            if writer.in_progress_size() > 16_000_000 {
                 log::debug!(
                     "Flushing row group buffer with approximately {} bytes",
                     writer.in_progress_size()

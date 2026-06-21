@@ -98,7 +98,10 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
     }
 
     fn check_data_buffer(&mut self) -> io::Result<()> {
-        if self.spectrum_counter() % (self.buffer_size as u64) == 0 {
+        // Count threshold OR a ~4M-point ceiling (adaptive to spectrum size — see the default writer).
+        if self.spectrum_counter() % (self.buffer_size as u64) == 0
+            || self.spectrum_data_buffer_mut().len() >= 4_000_000
+        {
             self.flush_spectrum_data_arrays()?;
         }
         Ok(())

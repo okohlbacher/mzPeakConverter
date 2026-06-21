@@ -519,12 +519,12 @@ impl<
     }
 
     fn check_data_buffer(&mut self) -> io::Result<()> {
-        if self.spectrum_counter() % (self.buffer_size as u64) == 0 {
-            log::debug!(
-                "Flushing data buffer. {} spectra written so far. {} rows in the buffer",
-                self.spectrum_counter(),
-                self.buffered_spectrum_data()
-            );
+        // Flush on EITHER the spectrum-count threshold OR a buffered-point ceiling (~4M points), so a
+        // few very large profile / ion-mobility spectra can't pin gigabytes of RAM before the count
+        // threshold is reached.
+        if self.spectrum_counter() % (self.buffer_size as u64) == 0
+            || self.spectrum_data_buffer_mut().len() >= 4_000_000
+        {
             self.flush_data_arrays()?;
         }
         Ok(())
@@ -791,11 +791,12 @@ impl<
     }
 
     fn flush_data_arrays(&mut self) -> io::Result<()> {
-        let use_chunks = self.use_chunked_encoding().is_some();
         for batch in self.spectrum_data_buffers.drain() {
             if let Some(writer) = self.archive_writer.as_mut() {
                 writer.write(&batch)?;
-                if writer.in_progress_size() > 16_000_000 && use_chunks {
+                // Bound the in-progress row group by size for EVERY layout (not just chunked) so a
+                // point/non-chunked file can't grow an unbounded row group in RAM.
+                if writer.in_progress_size() > 16_000_000 {
                     log::debug!(
                         "Flushing row group buffer with approximately {} bytes",
                         writer.in_progress_size()

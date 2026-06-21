@@ -58,6 +58,20 @@ use mzdata::prelude::ByteArrayView;
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
 
+/// How many spectra the writer buffers before flushing a batch to Parquet. The vendored default is
+/// 5000, which is fine for small spectra but pins gigabytes for large profile / ion-mobility spectra
+/// (5000 × 100k points × ~16 B ≈ 8 GB) — the cause of the sweep OOMs. A few hundred keeps the
+/// in-RAM buffer to a few hundred MB while the writer still streams row groups to disk. Override with
+/// `$MZPC_BUFFER_SPECTRA`. (The ims-compact peak writer is separately point-bounded, so this only
+/// governs the standard f64 paths.)
+fn buffer_spectra() -> usize {
+    std::env::var("MZPC_BUFFER_SPECTRA")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(256)
+}
+
 /// Exit codes (shared contract, mirrors mzML2mzPeak).
 mod exit {
     pub const OK: i32 = 0;
@@ -529,6 +543,7 @@ fn convert_file(
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
         .chromatogram_chunked_encoding(chunk)
+        .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level));
 
     // Derive the data schema from the data actually present (one m/z + one intensity column at
@@ -866,6 +881,7 @@ fn convert_vendor_reader(
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
         .chromatogram_chunked_encoding(chunk)
+        .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level));
     for field in data_facet_fields_from_samples(&[&sample]) {
         builder = builder.add_spectrum_field(field);
