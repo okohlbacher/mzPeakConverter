@@ -949,12 +949,12 @@ impl ArrayBuffersBuilder {
                     log::debug!("Setting {buff} {buff:?} to be primary");
                     buff = buff.with_priority(Some(BufferPriority::Primary));
                     has_priority.push(buff.clone());
-                    *f = Arc::new(
-                        f.as_ref()
-                            .clone()
-                            .with_metadata(buff.as_field_metadata())
-                            .with_name(buff.to_string()),
-                    );
+                    // Merge (not replace) so caller-supplied custom field metadata — e.g. a
+                    // `mzpeak:transform_params` coefficient list — survives alongside the
+                    // BufferName-derived keys.
+                    let mut md = f.metadata().clone();
+                    md.extend(buff.as_field_metadata());
+                    *f = Arc::new(f.as_ref().clone().with_metadata(md).with_name(buff.to_string()));
                 }
             }
         }

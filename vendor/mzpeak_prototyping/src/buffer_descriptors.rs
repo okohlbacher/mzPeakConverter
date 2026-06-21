@@ -503,10 +503,18 @@ pub enum BufferTransform {
     NumpressPIC,
     NullInterpolate,
     NullZero,
+    /// Reconstruct m/z from an integer TOF column as `m/z = (a + b·tof)²`. The `[a, b]` coefficients
+    /// travel in the array index entry's `transform_params`, so a reader recovers m/z generically
+    /// without bespoke ims-compact handling. NOTE: the CURIE is PROVISIONAL (converter-local), to be
+    /// replaced by the assigned PSI term once the mzPeak specification defines it.
+    SqrtMzFromTof,
 }
 
 const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
 const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
+// PROVISIONAL accession (follows the writer's local null-transform numbering 1003901/1003902); not
+// yet an official PSI term — see BufferTransform::SqrtMzFromTof.
+const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003903);
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -516,6 +524,7 @@ impl BufferTransform {
             x if x == Self::NumpressLinear.curie() => Some(Self::NumpressLinear),
             x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
             x if x == NULL_ZERO => Some(Self::NullZero),
+            x if x == SQRT_MZ_FROM_TOF => Some(Self::SqrtMzFromTof),
             _ => None,
         }
     }
@@ -527,6 +536,9 @@ impl BufferTransform {
             BufferTransform::NumpressPIC => Some("numpress_pic"),
             BufferTransform::NullInterpolate => None,
             BufferTransform::NullZero => None,
+            // The stored column is the raw integer TOF; the transform is a reconstruction formula, not
+            // a re-encoding, so it does not rename the column.
+            BufferTransform::SqrtMzFromTof => None,
         }
     }
 
@@ -549,6 +561,7 @@ impl BufferTransform {
                 .unwrap(),
             BufferTransform::NullInterpolate => NULL_INTERPOLATE,
             BufferTransform::NullZero => NULL_ZERO,
+            BufferTransform::SqrtMzFromTof => SQRT_MZ_FROM_TOF,
         }
     }
 }
@@ -1038,6 +1051,9 @@ pub struct SerializedArrayIndexEntry {
         default
     )]
     pub transform: Option<CURIE>,
+    /// Numeric parameters for `transform` (e.g. the `[a, b]` of a `SqrtMzFromTof` reconstruction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_params: Option<Vec<f64>>,
     pub data_processing_id: Option<Box<str>>,
     pub buffer_priority: Option<BufferPriority>,
     pub sorting_rank: Option<u32>,
@@ -1080,6 +1096,7 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
             unit: value.unit.to_curie(),
             buffer_format: value.buffer_format.to_string(),
             transform: value.transform.map(|t| t.curie()),
+            transform_params: value.transform_params,
             data_processing_id: value.data_processing_id,
             buffer_priority: value.buffer_priority,
             sorting_rank: value.sorting_rank,
@@ -1112,7 +1129,7 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
             })
         });
 
-        Self::new(
+        let mut entry = Self::new(
             context,
             value.path,
             name,
@@ -1124,7 +1141,9 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
             value.data_processing_id,
             value.buffer_priority,
             value.sorting_rank,
-        )
+        );
+        entry.transform_params = value.transform_params;
+        entry
     }
 }
 
@@ -1150,6 +1169,8 @@ pub struct ArrayIndexEntry {
     pub buffer_format: BufferFormat,
     /// Any transformations applied to this array
     pub transform: Option<BufferTransform>,
+    /// Numeric parameters for `transform` (e.g. the `[a, b]` of a `SqrtMzFromTof` reconstruction).
+    pub transform_params: Option<Vec<f64>>,
     /// The default data processing method's ID applied to this array. Alternatives may
     /// be specified in the metadata table.
     pub data_processing_id: Option<Box<str>>,
@@ -1187,6 +1208,7 @@ impl ArrayIndexEntry {
             unit,
             buffer_format,
             transform,
+            transform_params: None,
             data_processing_id,
             buffer_priority,
             sorting_rank,
@@ -1212,6 +1234,13 @@ impl ArrayIndexEntry {
         ]
         .join(".");
 
+        // Numeric transform parameters (e.g. SqrtMzFromTof's `[a, b]`) ride in the arrow field's
+        // metadata under `mzpeak:transform_params` as a comma-separated f64 list, since they cannot
+        // live on the `Copy`/`Hash` `BufferName`.
+        let transform_params = field
+            .and_then(|f| f.metadata().get("mzpeak:transform_params"))
+            .and_then(|s| s.split(',').map(|x| x.trim().parse::<f64>().ok()).collect::<Option<Vec<f64>>>());
+
         Self {
             context: buffer_name.context,
             path,
@@ -1221,6 +1250,7 @@ impl ArrayIndexEntry {
             unit: buffer_name.unit,
             buffer_format: buffer_name.buffer_format,
             transform: buffer_name.transform,
+            transform_params,
             data_processing_id: buffer_name.data_processing_id,
             buffer_priority: buffer_name.buffer_priority,
             sorting_rank: buffer_name.sorting_rank,

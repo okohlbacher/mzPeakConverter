@@ -387,9 +387,9 @@ impl TryFrom<BufferTransform> for BufferTransformEncoder {
             BufferTransform::NumpressLinear
             | BufferTransform::NumpressSLOF
             | BufferTransform::NumpressPIC => Ok(Self(value)),
-            BufferTransform::NullInterpolate | BufferTransform::NullZero => {
-                Err(format!("{value:?} does not have an encoder"))
-            }
+            BufferTransform::NullInterpolate
+            | BufferTransform::NullZero
+            | BufferTransform::SqrtMzFromTof => Err(format!("{value:?} does not have an encoder")),
         }
     }
 }
@@ -571,9 +571,9 @@ impl TryFrom<BufferTransform> for BufferTransformDecoder {
             BufferTransform::NumpressLinear
             | BufferTransform::NumpressSLOF
             | BufferTransform::NumpressPIC => Ok(Self(value)),
-            BufferTransform::NullInterpolate | BufferTransform::NullZero => {
-                Err(format!("{value:?} does not have a decoder"))
-            }
+            BufferTransform::NullInterpolate
+            | BufferTransform::NullZero
+            | BufferTransform::SqrtMzFromTof => Err(format!("{value:?} does not have a decoder")),
         }
     }
 }

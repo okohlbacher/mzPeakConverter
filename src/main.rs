@@ -629,12 +629,25 @@ fn convert_ims_compact_archive(
     // installs it so the spectra' tof arrays land in the peaks facet instead of defaulting to a
     // (null) m/z column. BufferNames here must exactly match the arrays built in
     // `ims_compact_spectrum` (array_type + dtype + unit) or they'd spill to auxiliary_arrays.
-    let tof_field = BufferName::new(
-        BufferContext::Spectrum,
-        ArrayType::nonstandard("tof"),
-        BinaryDataArrayType::Int32,
-    )
-    .to_field();
+    // Register the TOF→m/z reconstruction on the `tof` column itself: the transform CURIE
+    // (SqrtMzFromTof) rides via the BufferName, and the [a, b] coefficients via the field metadata
+    // (`mzpeak:transform_params`), so a conformant reader recovers m/z = (a + b·tof)² generically
+    // from the column metadata — not only from the index `ims_calibration` block (still written).
+    let tof_field = {
+        let base = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::nonstandard("tof"),
+            BinaryDataArrayType::Int32,
+        )
+        .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+        .to_field();
+        let mut md = base.metadata().clone();
+        md.insert(
+            "mzpeak:transform_params".to_string(),
+            format!("{},{}", reader.model.a, reader.model.b),
+        );
+        std::sync::Arc::new((*base).clone().with_metadata(md))
+    };
     let mob_field = BufferName::new(
         BufferContext::Spectrum,
         ArrayType::MeanInverseReducedIonMobilityArray,
