@@ -1,10 +1,20 @@
 # mzPeakConverter — User Manual
 
+> [!IMPORTANT]
+> The **mzPeak format is still going through the HUPO-PSI specification process**
+> (currently draft v0.9). This converter is a **technical demonstrator, not a
+> production tool yet** — output layout and semantics may change as the spec evolves.
+
 `mzpeak-convert` converts mass-spectrometry raw and exchange formats into the
 **mzPeak** format (HUPO-PSI, v0.9). It reads through
 [`mzdata`](https://github.com/mobiusklein/mzdata) (plus native readers for
 formats mzdata does not cover) and writes through the reference
 `mzpeak_prototyping` writer.
+
+**Learn more about the format:** the [mzpeak.org](https://mzpeak.org) website and
+the specification repository [HUPO-PSI/mzPeak-specification](https://github.com/HUPO-PSI/mzPeak-specification).
+You can inspect and analyze any `.mzpeak` file directly in your browser (no upload,
+no backend) at **[mzpeak.org/view](https://mzpeak.org/view)**.
 
 - [1. What it does](#1-what-it-does)
 - [2. Installation & requirements](#2-installation--requirements)

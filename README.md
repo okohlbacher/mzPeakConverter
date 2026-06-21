@@ -4,10 +4,23 @@
 [![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
 [![Release](https://img.shields.io/badge/release-v0.1.0-green.svg)](https://github.com/okohlbacher/mzPeakConverter/releases)
 
+> [!IMPORTANT]
+> The **mzPeak format is still going through the HUPO-PSI specification process**
+> (currently draft v0.9). This converter is a **technical demonstrator, not a
+> production tool yet** — the output layout and semantics may change as the
+> specification evolves.
+
 A unified converter from mass-spectrometry formats to the **mzPeak** format
 (HUPO-PSI, v0.9). It reads via [`mzdata`](https://github.com/mobiusklein/mzdata)
 (plus native readers for formats mzdata does not cover) and writes via the
 reference `mzpeak_prototyping` writer (vendored under `vendor/`).
+
+## The mzPeak format
+
+- 🌐 Website: **[mzpeak.org](https://mzpeak.org)** — overview, rationale, and the draft specification.
+- 📑 Specification repository: **[HUPO-PSI/mzPeak-specification](https://github.com/HUPO-PSI/mzPeak-specification)**.
+- 🔬 Inspect & analyze any `.mzpeak` file in your browser — no upload, no backend —
+  at **[mzpeak.org/view](https://mzpeak.org/view)**.
 
 `mzpeak-convert` turns one acquisition into a single `.mzpeak` archive — a STORED
 ZIP of Apache Parquet facets + a JSON index — that is lossless, columnar, and
