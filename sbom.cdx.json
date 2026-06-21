@@ -1,0 +1,7113 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "mzpeak-convert",
+      "version": "0.1.0",
+      "purl": "pkg:cargo/mzpeak-convert@0.1.0"
+    },
+    "tools": [
+      {
+        "name": "gen_sbom.py",
+        "vendor": "mzPeakConverter"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "adler2",
+      "version": "2.0.1",
+      "purl": "pkg:cargo/adler2@2.0.1",
+      "description": "A simple clean-room implementation of the Adler-32 checksum",
+      "licenses": [
+        {
+          "expression": "0BSD OR MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/oyvindln/adler2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "aes",
+      "version": "0.8.4",
+      "purl": "pkg:cargo/aes@0.8.4",
+      "description": "Pure Rust implementation of the Advanced Encryption Standard (a.k.a. Rijndael)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/block-ciphers"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ahash",
+      "version": "0.8.12",
+      "purl": "pkg:cargo/ahash@0.8.12",
+      "description": "A non-cryptographic hash function using AES-NI for high performance",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tkaitchuck/ahash"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "aho-corasick",
+      "version": "1.1.4",
+      "purl": "pkg:cargo/aho-corasick@1.1.4",
+      "description": "Fast multiple substring searching.",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/aho-corasick"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alloc-no-stdlib",
+      "version": "2.0.4",
+      "purl": "pkg:cargo/alloc-no-stdlib@2.0.4",
+      "description": "A dynamic allocator that may be used with or without the stdlib. This allows a package with nostd to allocate memory dynamically and be used either with a custom allocator, items on the stack, or by a package that wishes to simply use Box<>. It also provides options to use calloc or a mutable global variable for pre-zeroed memory",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-alloc-no-stdlib"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alloc-stdlib",
+      "version": "0.2.4",
+      "purl": "pkg:cargo/alloc-stdlib@0.2.4",
+      "description": "A dynamic allocator example that may be used with the stdlib",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-alloc-no-stdlib"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "android_system_properties",
+      "version": "0.1.5",
+      "purl": "pkg:cargo/android_system_properties@0.1.5",
+      "description": "Minimal Android system properties wrapper",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nical/android_system_properties"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "anstream",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/anstream@1.0.0",
+      "description": "IO stream adapters for writing colored text that will gracefully degrade according to your terminal's capabilities.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "anstyle",
+      "version": "1.0.14",
+      "purl": "pkg:cargo/anstyle@1.0.14",
+      "description": "ANSI text styling",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "anstyle-parse",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/anstyle-parse@1.0.0",
+      "description": "Parse ANSI Style Escapes",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "anstyle-query",
+      "version": "1.1.5",
+      "purl": "pkg:cargo/anstyle-query@1.1.5",
+      "description": "Look up colored console capabilities",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "anstyle-wincon",
+      "version": "3.0.11",
+      "purl": "pkg:cargo/anstyle-wincon@3.0.11",
+      "description": "Styling legacy Windows terminals",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "anyhow",
+      "version": "1.0.102",
+      "purl": "pkg:cargo/anyhow@1.0.102",
+      "description": "Flexible concrete Error type built on std::error::Error",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/anyhow"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "approx",
+      "version": "0.5.1",
+      "purl": "pkg:cargo/approx@0.5.1",
+      "description": "Approximate floating point equality comparisons and assertions.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/brendanzab/approx"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arbitrary",
+      "version": "1.4.2",
+      "purl": "pkg:cargo/arbitrary@1.4.2",
+      "description": "The trait for generating structured data from unstructured data",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-fuzz/arbitrary/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow",
+      "version": "57.0.0",
+      "purl": "pkg:cargo/arrow@57.0.0",
+      "description": "Rust implementation of Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-arith",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-arith@57.3.1",
+      "description": "Arrow arithmetic kernels",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-array",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/arrow-array@42.0.0",
+      "description": "Array abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-array",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-array@57.3.1",
+      "description": "Array abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-buffer",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/arrow-buffer@42.0.0",
+      "description": "Buffer abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-buffer",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-buffer@57.3.1",
+      "description": "Buffer abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-cast",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/arrow-cast@42.0.0",
+      "description": "Cast kernel and utilities for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-cast",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-cast@57.3.1",
+      "description": "Cast kernel and utilities for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-csv",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-csv@57.3.1",
+      "description": "Support for parsing CSV format to and from the Arrow format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-data",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/arrow-data@42.0.0",
+      "description": "Array data abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-data",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-data@57.3.1",
+      "description": "Array data abstractions for Apache Arrow",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-ipc",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/arrow-ipc@42.0.0",
+      "description": "Support for the Arrow IPC format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-ipc",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-ipc@57.3.1",
+      "description": "Support for the Arrow IPC format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-json",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-json@57.3.1",
+      "description": "Support for parsing JSON format to and from the Arrow format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-ord",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-ord@57.3.1",
+      "description": "Ordering kernels for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-row",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-row@57.3.1",
+      "description": "Arrow row format",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-schema",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/arrow-schema@42.0.0",
+      "description": "Defines the logical types for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-schema",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-schema@57.3.1",
+      "description": "Defines the logical types for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-select",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/arrow-select@42.0.0",
+      "description": "Selection kernels for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-select",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-select@57.3.1",
+      "description": "Selection kernels for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "arrow-string",
+      "version": "57.3.1",
+      "purl": "pkg:cargo/arrow-string@57.3.1",
+      "description": "String kernels for arrow arrays",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "atoi",
+      "version": "2.0.0",
+      "purl": "pkg:cargo/atoi@2.0.0",
+      "description": "Parse integers directly from `[u8]` slices in safe code",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/pacman82/atoi-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "autocfg",
+      "version": "1.5.1",
+      "purl": "pkg:cargo/autocfg@1.5.1",
+      "description": "Automatic cfg for Rust compiler features",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/cuviper/autocfg"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "base16ct",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/base16ct@0.2.0",
+      "description": "Pure Rust implementation of Base16 a.k.a hexadecimal (RFC 4648) which avoids\nany usages of data-dependent branches/LUTs and thereby provides portable\n\"best effort\" constant-time operation and embedded-friendly no_std support\n",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/base16ct"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "base64",
+      "version": "0.21.7",
+      "purl": "pkg:cargo/base64@0.21.7",
+      "description": "encodes and decodes base64 as bytes or utf8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/marshallpierce/rust-base64"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "base64",
+      "version": "0.22.1",
+      "purl": "pkg:cargo/base64@0.22.1",
+      "description": "encodes and decodes base64 as bytes or utf8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/marshallpierce/rust-base64"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "base64-simd",
+      "version": "0.8.0",
+      "purl": "pkg:cargo/base64-simd@0.8.0",
+      "description": "SIMD-accelerated base64 encoding and decoding",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/simd"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bitflags",
+      "version": "1.3.2",
+      "purl": "pkg:cargo/bitflags@1.3.2",
+      "description": "A macro to generate structures which behave like bitflags.\n",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bitflags/bitflags"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bitflags",
+      "version": "2.13.0",
+      "purl": "pkg:cargo/bitflags@2.13.0",
+      "description": "A macro to generate structures which behave like bitflags.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bitflags/bitflags"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "block-buffer",
+      "version": "0.10.4",
+      "purl": "pkg:cargo/block-buffer@0.10.4",
+      "description": "Buffer type for block processing of data",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "brotli",
+      "version": "3.5.0",
+      "purl": "pkg:cargo/brotli@3.5.0",
+      "description": "A brotli compressor and decompressor that with an interface avoiding the rust stdlib. This makes it suitable for embedded devices and kernels. It is designed with a pluggable allocator so that the standard lib's allocator may be employed. The default build also includes a stdlib allocator and stream interface. Disable this with --features=no-stdlib. All included code is safe.",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-brotli"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "brotli",
+      "version": "8.0.4",
+      "purl": "pkg:cargo/brotli@8.0.4",
+      "description": "A brotli compressor and decompressor that with an interface avoiding the rust stdlib. This makes it suitable for embedded devices and kernels. It is designed with a pluggable allocator so that the standard lib's allocator may be employed. The default build also includes a stdlib allocator and stream interface. Disable this with --features=no-stdlib. All included code is safe.",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause AND MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-brotli"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "brotli-decompressor",
+      "version": "2.5.1",
+      "purl": "pkg:cargo/brotli-decompressor@2.5.1",
+      "description": "A brotli decompressor that with an interface avoiding the rust stdlib. This makes it suitable for embedded devices and kernels. It is designed with a pluggable allocator so that the standard lib's allocator may be employed. The default build also includes a stdlib allocator and stream interface. Disable this with --features=no-stdlib. Alternatively, --features=unsafe turns off array bounds checks and memory initialization but provides a safe interface for the caller.  Without adding the --features=unsafe argument, all included code is safe. For compression in addition to this library, download https://github.com/dropbox/rust-brotli ",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-brotli-decompressor"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "brotli-decompressor",
+      "version": "5.0.3",
+      "purl": "pkg:cargo/brotli-decompressor@5.0.3",
+      "description": "A brotli decompressor that with an interface avoiding the rust stdlib. This makes it suitable for embedded devices and kernels. It is designed with a pluggable allocator so that the standard lib's allocator may be employed. The default build also includes a stdlib allocator and stream interface. Disable this with --features=no-stdlib. Alternatively, --features=unsafe turns off array bounds checks and memory initialization but provides a safe interface for the caller.  Without adding the --features=unsafe argument, all included code is safe. For compression in addition to this library, download https://github.com/dropbox/rust-brotli ",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dropbox/rust-brotli-decompressor"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "build-target",
+      "version": "0.8.0",
+      "purl": "pkg:cargo/build-target@0.8.0",
+      "description": "A crate that provides programmatic access to information about the current build target.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/build-target"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bumpalo",
+      "version": "3.20.3",
+      "purl": "pkg:cargo/bumpalo@3.20.3",
+      "description": "A fast bump allocation arena for Rust.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/fitzgen/bumpalo"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bytemuck",
+      "version": "1.25.0",
+      "purl": "pkg:cargo/bytemuck@1.25.0",
+      "description": "A crate for mucking around with piles of bytes.",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Lokathor/bytemuck"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "byteorder",
+      "version": "1.5.0",
+      "purl": "pkg:cargo/byteorder@1.5.0",
+      "description": "Library for reading/writing numbers in big-endian and little-endian.",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/byteorder"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bytes",
+      "version": "1.12.0",
+      "purl": "pkg:cargo/bytes@1.12.0",
+      "description": "Types and traits for working with bytes",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/bytes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bzip2",
+      "version": "0.5.2",
+      "purl": "pkg:cargo/bzip2@0.5.2",
+      "description": "Bindings to libbzip2 for bzip2 compression and decompression exposed as\nReader/Writer streams.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/trifectatechfoundation/bzip2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bzip2",
+      "version": "0.6.1",
+      "purl": "pkg:cargo/bzip2@0.6.1",
+      "description": "Bindings to libbzip2 for bzip2 compression and decompression exposed as\nReader/Writer streams.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/trifectatechfoundation/bzip2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "bzip2-sys",
+      "version": "0.1.13+1.0.8",
+      "purl": "pkg:cargo/bzip2-sys@0.1.13+1.0.8",
+      "description": "Bindings to libbzip2 for bzip2 compression and decompression exposed as\nReader/Writer streams.\n",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/alexcrichton/bzip2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cargo-emit",
+      "version": "0.2.1",
+      "purl": "pkg:cargo/cargo-emit@0.2.1",
+      "description": "Talk to Cargo easily at build time.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nvzqz/cargo-emit"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cc",
+      "version": "1.2.65",
+      "purl": "pkg:cargo/cc@1.2.65",
+      "description": "A build-time dependency for Cargo build scripts to assist in invoking the native\nC compiler to compile native C code into a static archive to be linked into Rust\ncode.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cc-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cfg-if",
+      "version": "1.0.4",
+      "purl": "pkg:cargo/cfg-if@1.0.4",
+      "description": "A macro to ergonomically define an item depending on a large number of #[cfg]\nparameters. Structured like an if-else chain, the first matching branch is the\nitem that gets emitted.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cfg-if"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "chrono",
+      "version": "0.4.45",
+      "purl": "pkg:cargo/chrono@0.4.45",
+      "description": "Date and time library for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/chronotope/chrono"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cipher",
+      "version": "0.4.4",
+      "purl": "pkg:cargo/cipher@0.4.4",
+      "description": "Traits for describing block ciphers and stream ciphers",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "clap",
+      "version": "4.6.1",
+      "purl": "pkg:cargo/clap@4.6.1",
+      "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "clap_builder",
+      "version": "4.6.0",
+      "purl": "pkg:cargo/clap_builder@4.6.0",
+      "description": "A simple to use, efficient, and full-featured Command Line Argument Parser",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "clap_derive",
+      "version": "4.6.1",
+      "purl": "pkg:cargo/clap_derive@4.6.1",
+      "description": "Parse command line argument by defining a struct, derive crate.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "clap_lex",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/clap_lex@1.1.0",
+      "description": "Minimal, flexible command line parser",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/clap-rs/clap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cmake",
+      "version": "0.1.58",
+      "purl": "pkg:cargo/cmake@0.1.58",
+      "description": "A build dependency for running `cmake` to build a native library\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cmake-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "colorchoice",
+      "version": "1.0.5",
+      "purl": "pkg:cargo/colorchoice@1.0.5",
+      "description": "Global override of color control",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/anstyle.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "console",
+      "version": "0.15.11",
+      "purl": "pkg:cargo/console@0.15.11",
+      "description": "A terminal and console abstraction for Rust",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/console-rs/console"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "const-random",
+      "version": "0.1.18",
+      "purl": "pkg:cargo/const-random@0.1.18",
+      "description": "Provides compile time random number generation.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tkaitchuck/constrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "const-random-macro",
+      "version": "0.1.16",
+      "purl": "pkg:cargo/const-random-macro@0.1.16",
+      "description": "Provides the procedural macro used by const-random",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tkaitchuck/constrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "constant_time_eq",
+      "version": "0.3.1",
+      "purl": "pkg:cargo/constant_time_eq@0.3.1",
+      "description": "Compares two equal-sized byte strings in constant time.",
+      "licenses": [
+        {
+          "expression": "CC0-1.0 OR MIT-0 OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/cesarb/constant_time_eq"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "convert_case",
+      "version": "0.10.0",
+      "purl": "pkg:cargo/convert_case@0.10.0",
+      "description": "Convert strings into any case",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rutrum/convert-case"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cookie",
+      "version": "0.18.1",
+      "purl": "pkg:cargo/cookie@0.18.1",
+      "description": "HTTP cookie parsing and cookie jar management. Supports signed and private\n(encrypted, authenticated) jars.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/SergioBenitez/cookie-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cookie_store",
+      "version": "0.22.0",
+      "purl": "pkg:cargo/cookie_store@0.22.0",
+      "description": "Implementation of Cookie storage and retrieval",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/pfernie/cookie_store"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "core-foundation-sys",
+      "version": "0.8.7",
+      "purl": "pkg:cargo/core-foundation-sys@0.8.7",
+      "description": "Bindings to Core Foundation for macOS",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/core-foundation-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "coreclr-hosting-shared",
+      "version": "0.1.4",
+      "purl": "pkg:cargo/coreclr-hosting-shared@0.1.4",
+      "description": "Shared bindings for the coreclr hosting components.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/coreclr-hosting-shared"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cpufeatures",
+      "version": "0.2.17",
+      "purl": "pkg:cargo/cpufeatures@0.2.17",
+      "description": "Lightweight runtime CPU feature detection for aarch64, loongarch64, and x86/x86_64 targets, \nwith no_std support and support for mobile targets including Android and iOS\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crc",
+      "version": "3.4.0",
+      "purl": "pkg:cargo/crc@3.4.0",
+      "description": "Rust implementation of CRC with support of various standards",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mrhooray/crc-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crc-catalog",
+      "version": "2.5.0",
+      "purl": "pkg:cargo/crc-catalog@2.5.0",
+      "description": "Catalog of CRC algorithms (generated from http://reveng.sourceforge.net/crc-catalogue) expressed as simple Rust structs.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/akhilles/crc-catalog.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crc32fast",
+      "version": "1.5.0",
+      "purl": "pkg:cargo/crc32fast@1.5.0",
+      "description": "Fast, SIMD-accelerated CRC32 (IEEE) checksum computation",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/srijs/rust-crc32fast"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crossbeam-deque",
+      "version": "0.8.6",
+      "purl": "pkg:cargo/crossbeam-deque@0.8.6",
+      "description": "Concurrent work-stealing deque",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crossbeam-epoch",
+      "version": "0.9.18",
+      "purl": "pkg:cargo/crossbeam-epoch@0.9.18",
+      "description": "Epoch-based garbage collection",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crossbeam-utils",
+      "version": "0.8.21",
+      "purl": "pkg:cargo/crossbeam-utils@0.8.21",
+      "description": "Utilities for concurrent programming",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crunchy",
+      "version": "0.2.4",
+      "purl": "pkg:cargo/crunchy@0.2.4",
+      "description": "Crunchy unroller: deterministically unroll constant loops",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/eira-fransham/crunchy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "crypto-common",
+      "version": "0.1.7",
+      "purl": "pkg:cargo/crypto-common@0.1.7",
+      "description": "Common cryptographic traits",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cstr",
+      "version": "0.2.12",
+      "purl": "pkg:cargo/cstr@0.2.12",
+      "description": "Macro for building static CStr reference",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/upsuper/cstr"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "csv",
+      "version": "1.4.0",
+      "purl": "pkg:cargo/csv@1.4.0",
+      "description": "Fast CSV parsing with support for serde.",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/rust-csv"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "csv-core",
+      "version": "0.1.13",
+      "purl": "pkg:cargo/csv-core@0.1.13",
+      "description": "Bare bones CSV parsing with no_std support.",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/rust-csv"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "cty",
+      "version": "0.2.2",
+      "purl": "pkg:cargo/cty@0.2.2",
+      "description": "Type aliases to C types like c_int for use with bindgen",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/japaric/cty"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "darling",
+      "version": "0.21.3",
+      "purl": "pkg:cargo/darling@0.21.3",
+      "description": "A proc-macro library for reading attributes into structs when\nimplementing custom derives.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/TedDriggs/darling"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "darling_core",
+      "version": "0.21.3",
+      "purl": "pkg:cargo/darling_core@0.21.3",
+      "description": "Helper crate for proc-macro library for reading attributes into structs when\nimplementing custom derives. Use https://crates.io/crates/darling in your code.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/TedDriggs/darling"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "darling_macro",
+      "version": "0.21.3",
+      "purl": "pkg:cargo/darling_macro@0.21.3",
+      "description": "Internal support for a proc-macro library for reading attributes into structs when\nimplementing custom derives. Use https://crates.io/crates/darling in your code.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/TedDriggs/darling"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "deflate64",
+      "version": "0.1.12",
+      "purl": "pkg:cargo/deflate64@0.1.12",
+      "description": "Deflate64 implementation based on .NET's implementation",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/anatawa12/deflate64-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "defmt",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/defmt@1.1.0",
+      "description": "A highly efficient logging framework that targets resource-constrained devices, like microcontrollers",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/knurling-rs/defmt"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "defmt-macros",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/defmt-macros@1.1.0",
+      "description": "defmt macros",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/knurling-rs/defmt"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "defmt-parser",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/defmt-parser@1.0.0",
+      "description": "Parsing library for defmt format strings",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/knurling-rs/defmt"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "deranged",
+      "version": "0.5.8",
+      "purl": "pkg:cargo/deranged@0.5.8",
+      "description": "Ranged integers",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jhpratt/deranged"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "derive_arbitrary",
+      "version": "1.4.2",
+      "purl": "pkg:cargo/derive_arbitrary@1.4.2",
+      "description": "Derives arbitrary traits",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-fuzz/arbitrary"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "derive_more",
+      "version": "2.1.1",
+      "purl": "pkg:cargo/derive_more@2.1.1",
+      "description": "Adds #[derive(x)] macros for more traits",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/JelteF/derive_more"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "derive_more-impl",
+      "version": "2.1.1",
+      "purl": "pkg:cargo/derive_more-impl@2.1.1",
+      "description": "Internal implementation of `derive_more` crate",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/JelteF/derive_more"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "destruct-drop",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/destruct-drop@0.2.0",
+      "description": "Macro for dropping the fields of a struct or enum without dropping the container.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/destruct-drop"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "destruct-drop-derive",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/destruct-drop-derive@0.2.0",
+      "description": "Actual derive macro for destruct-drop.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/destruct-drop-derive"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "digest",
+      "version": "0.10.7",
+      "purl": "pkg:cargo/digest@0.10.7",
+      "description": "Traits for cryptographic hash functions and message authentication codes",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "displaydoc",
+      "version": "0.1.7",
+      "purl": "pkg:cargo/displaydoc@0.1.7",
+      "description": "A derive macro for implementing the display Trait via a doc comment and string interpolation\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/yaahc/displaydoc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "displaydoc",
+      "version": "0.2.6",
+      "purl": "pkg:cargo/displaydoc@0.2.6",
+      "description": "A derive macro for implementing the display Trait via a doc comment and string interpolation\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/yaahc/displaydoc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "dlopen2",
+      "version": "0.8.2",
+      "purl": "pkg:cargo/dlopen2@0.8.2",
+      "description": "Library for opening and operating on dynamic link libraries (also known as shared objects or shared libraries).",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/dlopen2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "dlopen2_derive",
+      "version": "0.4.3",
+      "purl": "pkg:cargo/dlopen2_derive@0.4.3",
+      "description": "Derive macros for the dlopen2 crate.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/dlopen2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "document-features",
+      "version": "0.2.12",
+      "purl": "pkg:cargo/document-features@0.2.12",
+      "description": "Extract documentation for the feature flags from comments in Cargo.toml",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/slint-ui/document-features"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "dotnetrawfilereader-sys",
+      "version": "0.7.0",
+      "purl": "pkg:cargo/dotnetrawfilereader-sys@0.7.0",
+      "description": "A low-level interface to a in-process dotnet runtime for Thermo Fisher's RawFileReader library",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/thermorawfilereader.rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "dyn-clone",
+      "version": "1.0.20",
+      "purl": "pkg:cargo/dyn-clone@1.0.20",
+      "description": "Clone trait that is dyn-compatible",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/dyn-clone"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "either",
+      "version": "1.16.0",
+      "purl": "pkg:cargo/either@1.16.0",
+      "description": "The enum `Either` with variants `Left` and `Right` is a general purpose sum type with two cases.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rayon-rs/either"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "encode_unicode",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/encode_unicode@1.0.0",
+      "description": "UTF-8 and UTF-16 character types, iterators and related methods for char, u8 and u16.\n",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tormol/encode_unicode"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "encoding_rs",
+      "version": "0.8.35",
+      "purl": "pkg:cargo/encoding_rs@0.8.35",
+      "description": "A Gecko-oriented implementation of the Encoding Standard",
+      "licenses": [
+        {
+          "expression": "(Apache-2.0 OR MIT) AND BSD-3-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hsivonen/encoding_rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "enum-map",
+      "version": "2.7.3",
+      "purl": "pkg:cargo/enum-map@2.7.3",
+      "description": "A map with C-like enum keys represented internally as an array",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://codeberg.org/xfix/enum-map"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "enum-map-derive",
+      "version": "0.17.0",
+      "purl": "pkg:cargo/enum-map-derive@0.17.0",
+      "description": "Macros 1.1 implementation of #[derive(Enum)]",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://codeberg.org/xfix/enum-map"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "env_filter",
+      "version": "1.0.1",
+      "purl": "pkg:cargo/env_filter@1.0.1",
+      "description": "Filter log events using environment variables\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/env_logger"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "env_logger",
+      "version": "0.11.10",
+      "purl": "pkg:cargo/env_logger@0.11.10",
+      "description": "A logging implementation for `log` which is configured via an environment\nvariable.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-cli/env_logger"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "equivalent",
+      "version": "1.0.2",
+      "purl": "pkg:cargo/equivalent@1.0.2",
+      "description": "Traits for key comparison in maps.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/indexmap-rs/equivalent"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "errno",
+      "version": "0.3.14",
+      "purl": "pkg:cargo/errno@0.3.14",
+      "description": "Cross-platform interface to the `errno` variable.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/lambda-fairy/rust-errno"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "fallible-iterator",
+      "version": "0.3.0",
+      "purl": "pkg:cargo/fallible-iterator@0.3.0",
+      "description": "Fallible iterator traits",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sfackler/rust-fallible-iterator"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "fallible-streaming-iterator",
+      "version": "0.1.9",
+      "purl": "pkg:cargo/fallible-streaming-iterator@0.1.9",
+      "description": "Fallible streaming iteration",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sfackler/fallible-streaming-iterator"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "fastrand",
+      "version": "2.4.1",
+      "purl": "pkg:cargo/fastrand@2.4.1",
+      "description": "A simple and fast random number generator",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/smol-rs/fastrand"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ffi-opaque",
+      "version": "2.0.1",
+      "purl": "pkg:cargo/ffi-opaque@2.0.1",
+      "description": "A simple macro to create correct opaque pointers.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "find-msvc-tools",
+      "version": "0.1.9",
+      "purl": "pkg:cargo/find-msvc-tools@0.1.9",
+      "description": "Find windows-specific tools, read MSVC versions from the registry and from COM interfaces",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/cc-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "flatbuffers",
+      "version": "23.5.26",
+      "purl": "pkg:cargo/flatbuffers@23.5.26",
+      "description": "Official FlatBuffers Rust runtime library.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/flatbuffers"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "flatbuffers",
+      "version": "25.12.19",
+      "purl": "pkg:cargo/flatbuffers@25.12.19",
+      "description": "Official FlatBuffers Rust runtime library.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/flatbuffers"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "flate2",
+      "version": "1.1.9",
+      "purl": "pkg:cargo/flate2@1.1.9",
+      "description": "DEFLATE compression and decompression exposed as Read/BufRead/Write streams.\nSupports miniz_oxide and multiple zlib implementations. Supports zlib, gzip,\nand raw deflate streams.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/flate2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "fnv",
+      "version": "1.0.7",
+      "purl": "pkg:cargo/fnv@1.0.7",
+      "description": "Fowler–Noll–Vo hash function",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 / MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-fnv"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "form_urlencoded",
+      "version": "1.2.2",
+      "purl": "pkg:cargo/form_urlencoded@1.2.2",
+      "description": "Parser and serializer for the application/x-www-form-urlencoded syntax, as used by HTML forms.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "futures-core",
+      "version": "0.3.32",
+      "purl": "pkg:cargo/futures-core@0.3.32",
+      "description": "The core traits and types in for the `futures` library.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/futures-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "futures-task",
+      "version": "0.3.32",
+      "purl": "pkg:cargo/futures-task@0.3.32",
+      "description": "Tools for working with tasks.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/futures-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "futures-util",
+      "version": "0.3.32",
+      "purl": "pkg:cargo/futures-util@0.3.32",
+      "description": "Common utilities and extension traits for the futures-rs library.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/futures-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "generic-array",
+      "version": "0.14.7",
+      "purl": "pkg:cargo/generic-array@0.14.7",
+      "description": "Generic types implementing functionality of arrays",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/fizyk20/generic-array.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "getrandom",
+      "version": "0.2.17",
+      "purl": "pkg:cargo/getrandom@0.2.17",
+      "description": "A small cross-platform library for retrieving random data from system source",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/getrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "getrandom",
+      "version": "0.3.4",
+      "purl": "pkg:cargo/getrandom@0.3.4",
+      "description": "A small cross-platform library for retrieving random data from system source",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/getrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "getrandom",
+      "version": "0.4.3",
+      "purl": "pkg:cargo/getrandom@0.4.3",
+      "description": "A small cross-platform library for retrieving random data from system source",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/getrandom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "half",
+      "version": "2.7.1",
+      "purl": "pkg:cargo/half@2.7.1",
+      "description": "Half-precision floating point f16 and bf16 types for Rust implementing the IEEE 754-2008 standard binary16 and bfloat16 types.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/VoidStarKat/half-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hashbrown",
+      "version": "0.12.3",
+      "purl": "pkg:cargo/hashbrown@0.12.3",
+      "description": "A Rust port of Google's SwissTable hash map",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/hashbrown"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hashbrown",
+      "version": "0.14.5",
+      "purl": "pkg:cargo/hashbrown@0.14.5",
+      "description": "A Rust port of Google's SwissTable hash map",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/hashbrown"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hashbrown",
+      "version": "0.16.1",
+      "purl": "pkg:cargo/hashbrown@0.16.1",
+      "description": "A Rust port of Google's SwissTable hash map",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/hashbrown"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hashbrown",
+      "version": "0.17.1",
+      "purl": "pkg:cargo/hashbrown@0.17.1",
+      "description": "A Rust port of Google's SwissTable hash map",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/hashbrown"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hashlink",
+      "version": "0.9.1",
+      "purl": "pkg:cargo/hashlink@0.9.1",
+      "description": "HashMap-like containers that hold their key-value pairs in a user controllable order",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/kyren/hashlink"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "heck",
+      "version": "0.5.0",
+      "purl": "pkg:cargo/heck@0.5.0",
+      "description": "heck is a case conversion library.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/withoutboats/heck"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hex",
+      "version": "0.4.3",
+      "purl": "pkg:cargo/hex@0.4.3",
+      "description": "Encoding and decoding data into/from hexadecimal representation.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/KokaKiwi/rust-hex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hmac",
+      "version": "0.12.1",
+      "purl": "pkg:cargo/hmac@0.12.1",
+      "description": "Generic implementation of Hash-based Message Authentication Code (HMAC)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/MACs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hostfxr-sys",
+      "version": "0.12.0",
+      "purl": "pkg:cargo/hostfxr-sys@0.12.0",
+      "description": "FFI bindings for hostfxr.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/hostfxr-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "http",
+      "version": "1.4.2",
+      "purl": "pkg:cargo/http@1.4.2",
+      "description": "A set of types for representing HTTP requests and responses.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hyperium/http"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "httparse",
+      "version": "1.10.1",
+      "purl": "pkg:cargo/httparse@1.10.1",
+      "description": "A tiny, safe, speedy, zero-copy HTTP/1.x parser.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/seanmonstar/httparse"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "iana-time-zone",
+      "version": "0.1.65",
+      "purl": "pkg:cargo/iana-time-zone@0.1.65",
+      "description": "get the IANA time zone for the current system",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/strawlab/iana-time-zone"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "iana-time-zone-haiku",
+      "version": "0.1.2",
+      "purl": "pkg:cargo/iana-time-zone-haiku@0.1.2",
+      "description": "iana-time-zone support crate for Haiku OS",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/strawlab/iana-time-zone"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "icu_collections",
+      "version": "2.2.0",
+      "purl": "pkg:cargo/icu_collections@2.2.0",
+      "description": "Collection of API for use in ICU libraries.",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "icu_locale_core",
+      "version": "2.2.0",
+      "purl": "pkg:cargo/icu_locale_core@2.2.0",
+      "description": "API for managing Unicode Language and Locale Identifiers",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "icu_normalizer",
+      "version": "2.2.0",
+      "purl": "pkg:cargo/icu_normalizer@2.2.0",
+      "description": "API for normalizing text into Unicode Normalization Forms",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "icu_normalizer_data",
+      "version": "2.2.0",
+      "purl": "pkg:cargo/icu_normalizer_data@2.2.0",
+      "description": "Data for the icu_normalizer crate",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "icu_properties",
+      "version": "2.2.0",
+      "purl": "pkg:cargo/icu_properties@2.2.0",
+      "description": "Definitions for Unicode properties",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "icu_properties_data",
+      "version": "2.2.0",
+      "purl": "pkg:cargo/icu_properties_data@2.2.0",
+      "description": "Data for the icu_properties crate",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "icu_provider",
+      "version": "2.2.0",
+      "purl": "pkg:cargo/icu_provider@2.2.0",
+      "description": "Trait and struct definitions for the ICU data provider",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ident_case",
+      "version": "1.0.1",
+      "purl": "pkg:cargo/ident_case@1.0.1",
+      "description": "Utility for applying case rules to Rust identifiers.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/TedDriggs/ident_case"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "identity-hash",
+      "version": "0.1.0",
+      "purl": "pkg:cargo/identity-hash@0.1.0",
+      "description": "An implementation of `std::hash::Hasher` which does not hash at all.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/offsetting/identity-hash"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "idna",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/idna@1.1.0",
+      "description": "IDNA (Internationalizing Domain Names in Applications) and Punycode.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "idna_adapter",
+      "version": "1.2.2",
+      "purl": "pkg:cargo/idna_adapter@1.2.2",
+      "description": "Back end adapter for idna",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hsivonen/idna_adapter"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "include_dir",
+      "version": "0.7.4",
+      "purl": "pkg:cargo/include_dir@0.7.4",
+      "description": "Embed the contents of a directory in your binary",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Michael-F-Bryan/include_dir"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "include_dir_macros",
+      "version": "0.7.4",
+      "purl": "pkg:cargo/include_dir_macros@0.7.4",
+      "description": "The procedural macro used by include_dir",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Michael-F-Bryan/include_dir"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "indexmap",
+      "version": "1.9.3",
+      "purl": "pkg:cargo/indexmap@1.9.3",
+      "description": "A hash table with consistent order and fast iteration.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bluss/indexmap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "indexmap",
+      "version": "2.14.0",
+      "purl": "pkg:cargo/indexmap@2.14.0",
+      "description": "A hash table with consistent order and fast iteration.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/indexmap-rs/indexmap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "indicatif",
+      "version": "0.17.11",
+      "purl": "pkg:cargo/indicatif@0.17.11",
+      "description": "A progress bar and cli reporting library for Rust",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/console-rs/indicatif"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "inout",
+      "version": "0.1.4",
+      "purl": "pkg:cargo/inout@0.1.4",
+      "description": "Custom reference types for code generic over in-place and buffer-to-buffer modes of operation.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "integer-encoding",
+      "version": "3.0.4",
+      "purl": "pkg:cargo/integer-encoding@3.0.4",
+      "description": "varint+zigzag and fixedint integer encoding/decoding (https://developers.google.com/protocol-buffers/docs/encoding)",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dermesser/integer-encoding-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "is_terminal_polyfill",
+      "version": "1.70.2",
+      "purl": "pkg:cargo/is_terminal_polyfill@1.70.2",
+      "description": "Polyfill for `is_terminal` stdlib feature for use with older MSRVs",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/polyfill-rs/is_terminal_polyfill"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "itertools",
+      "version": "0.14.0",
+      "purl": "pkg:cargo/itertools@0.14.0",
+      "description": "Extra iterator adaptors, iterator methods, free functions, and macros.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-itertools/itertools"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "itoa",
+      "version": "1.0.18",
+      "purl": "pkg:cargo/itoa@1.0.18",
+      "description": "Fast integer primitive to string conversion",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/itoa"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "jiff",
+      "version": "0.2.29",
+      "purl": "pkg:cargo/jiff@0.2.29",
+      "description": "A date-time library that encourages you to jump into the pit of success.\n\nThis library is heavily inspired by the Temporal project.\n",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/jiff"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "jiff-static",
+      "version": "0.2.29",
+      "purl": "pkg:cargo/jiff-static@0.2.29",
+      "description": "Create static TimeZone values for Jiff (useful in core-only environments).",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/jiff"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "jobserver",
+      "version": "0.1.34",
+      "purl": "pkg:cargo/jobserver@0.1.34",
+      "description": "An implementation of the GNU Make jobserver for Rust.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/jobserver-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "js-sys",
+      "version": "0.3.102",
+      "purl": "pkg:cargo/js-sys@0.3.102",
+      "description": "Bindings for all JS global objects and functions in all JS environments like\nNode.js and browsers, built on `#[wasm_bindgen]` using the `wasm-bindgen` crate.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-core",
+      "version": "0.8.5",
+      "purl": "pkg:cargo/lexical-core@0.8.5",
+      "description": "Lexical, to- and from-string conversion routines.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-core",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-core@1.0.6",
+      "description": "Lexical, to- and from-string conversion routines.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-parse-float",
+      "version": "0.8.5",
+      "purl": "pkg:cargo/lexical-parse-float@0.8.5",
+      "description": "Efficient parsing of floats from strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-parse-float",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-parse-float@1.0.6",
+      "description": "Efficient parsing of floats from strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-parse-integer",
+      "version": "0.8.6",
+      "purl": "pkg:cargo/lexical-parse-integer@0.8.6",
+      "description": "Efficient parsing of integers from strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-parse-integer",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-parse-integer@1.0.6",
+      "description": "Efficient parsing of integers from strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-util",
+      "version": "0.8.5",
+      "purl": "pkg:cargo/lexical-util@0.8.5",
+      "description": "Shared utilities for lexical creates.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-util",
+      "version": "1.0.7",
+      "purl": "pkg:cargo/lexical-util@1.0.7",
+      "description": "Shared utilities for lexical creates.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-write-float",
+      "version": "0.8.5",
+      "purl": "pkg:cargo/lexical-write-float@0.8.5",
+      "description": "Efficient formatting of floats to strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-write-float",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-write-float@1.0.6",
+      "description": "Efficient formatting of floats to strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-write-integer",
+      "version": "0.8.5",
+      "purl": "pkg:cargo/lexical-write-integer@0.8.5",
+      "description": "Efficient formatting of integers to strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lexical-write-integer",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/lexical-write-integer@1.0.6",
+      "description": "Efficient formatting of integers to strings.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/rust-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "libbz2-rs-sys",
+      "version": "0.2.5",
+      "purl": "pkg:cargo/libbz2-rs-sys@0.2.5",
+      "description": "a drop-in compatible rust bzip2 implementation",
+      "licenses": [
+        {
+          "expression": "bzip2-1.0.6"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/trifectatechfoundation/libbzip2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "libc",
+      "version": "0.2.186",
+      "purl": "pkg:cargo/libc@0.2.186",
+      "description": "Raw FFI bindings to platform libraries like libc.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "libloading",
+      "version": "0.8.9",
+      "purl": "pkg:cargo/libloading@0.8.9",
+      "description": "Bindings around the platform's dynamic library loading primitives with greatly improved memory safety.",
+      "licenses": [
+        {
+          "expression": "ISC"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nagisa/rust_libloading/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "liblzma",
+      "version": "0.4.6",
+      "purl": "pkg:cargo/liblzma@0.4.6",
+      "description": "Rust bindings to liblzma providing Read/Write streams as well as low-level\nin-memory encoding/decoding. forked from xz2.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/portable-network-archive/liblzma-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "liblzma-sys",
+      "version": "0.4.6",
+      "purl": "pkg:cargo/liblzma-sys@0.4.6",
+      "description": "Raw bindings to liblzma which contains an implementation of LZMA and xz stream\nencoding/decoding.\n\nHigh level Rust bindings are available in the `liblzma` crate.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/portable-network-archive/liblzma-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "libm",
+      "version": "0.2.16",
+      "purl": "pkg:cargo/libm@0.2.16",
+      "description": "libm in pure Rust",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/compiler-builtins"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "libsqlite3-sys",
+      "version": "0.28.0",
+      "purl": "pkg:cargo/libsqlite3-sys@0.28.0",
+      "description": "Native bindings to the libsqlite3 library",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusqlite/rusqlite"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "libz-sys",
+      "version": "1.1.29",
+      "purl": "pkg:cargo/libz-sys@1.1.29",
+      "description": "Low-level bindings to the system libz library (also known as zlib).",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/libz-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "linreg",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/linreg@0.2.0",
+      "description": "Calculates linear regresssions of two-dimensional data. Does not use stdlib, only depends on numeric traits.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/49nord/linreg-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "linux-raw-sys",
+      "version": "0.12.1",
+      "purl": "pkg:cargo/linux-raw-sys@0.12.1",
+      "description": "Generated bindings for Linux's userspace API",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/sunfishcode/linux-raw-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "litemap",
+      "version": "0.8.2",
+      "purl": "pkg:cargo/litemap@0.8.2",
+      "description": "A key-value Map implementation based on a flat, sorted Vec.",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "litrs",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/litrs@1.0.0",
+      "description": "Parse and inspect Rust literals (i.e. tokens in the Rust programming language\nrepresenting fixed values). Particularly useful for proc macros, but can also\nbe used outside of a proc-macro context.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/LukasKalbertodt/litrs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lock_api",
+      "version": "0.4.14",
+      "purl": "pkg:cargo/lock_api@0.4.14",
+      "description": "Wrappers to create fully-featured Mutex and RwLock types. Compatible with no_std.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Amanieu/parking_lot"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "log",
+      "version": "0.4.33",
+      "purl": "pkg:cargo/log@0.4.33",
+      "description": "A lightweight logging facade for Rust\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/log"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lz4",
+      "version": "1.28.1",
+      "purl": "pkg:cargo/lz4@1.28.1",
+      "description": "Rust LZ4 bindings library.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/10xGenomics/lz4-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lz4-sys",
+      "version": "1.11.1+lz4-1.10.0",
+      "purl": "pkg:cargo/lz4-sys@1.11.1+lz4-1.10.0",
+      "description": "Rust LZ4 sys package.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/10xGenomics/lz4-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lz4_flex",
+      "version": "0.11.6",
+      "purl": "pkg:cargo/lz4_flex@0.11.6",
+      "description": "Fastest LZ4 implementation in Rust, no unsafe by default.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/pseitz/lz4_flex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "lzma-rust2",
+      "version": "0.13.0",
+      "purl": "pkg:cargo/lzma-rust2@0.13.0",
+      "description": "LZMA / LZMA2 / LZIP / XZ compression ported from 'tukaani xz for java'",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hasenbanck/lzma-rust2/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "matrixmultiply",
+      "version": "0.3.10",
+      "purl": "pkg:cargo/matrixmultiply@0.3.10",
+      "description": "General matrix multiplication for f32 and f64 matrices. Operates on matrices with general layout (they can use arbitrary row and column stride). Detects and uses AVX or SSE2 on x86 platforms transparently for higher performance. Uses a microkernel strategy, so that the implementation is easy to parallelize and optimize.\n\nSupports multithreading.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bluss/matrixmultiply/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "md5",
+      "version": "0.7.0",
+      "purl": "pkg:cargo/md5@0.7.0",
+      "description": "The package provides the MD5 hash function.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/stainless-steel/md5"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "memchr",
+      "version": "2.8.2",
+      "purl": "pkg:cargo/memchr@2.8.2",
+      "description": "Provides extremely fast (uses SIMD on x86_64, aarch64 and wasm32) routines for\n1, 2 or 3 byte search and single substring search.\n",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/memchr"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "memmap2",
+      "version": "0.9.10",
+      "purl": "pkg:cargo/memmap2@0.9.10",
+      "description": "Cross-platform Rust API for memory-mapped file IO",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RazrFalcon/memmap2-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "miniz_oxide",
+      "version": "0.8.9",
+      "purl": "pkg:cargo/miniz_oxide@0.8.9",
+      "description": "DEFLATE compression and decompression library rewritten in Rust based on miniz",
+      "licenses": [
+        {
+          "expression": "MIT OR Zlib OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "mzdata",
+      "version": "0.64.1",
+      "purl": "pkg:cargo/mzdata@0.64.1",
+      "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzdata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "mzpeak_prototyping",
+      "version": "0.1.0",
+      "purl": "pkg:cargo/mzpeak_prototyping@0.1.0",
+      "properties": [
+        {
+          "name": "cdx:cargo:source",
+          "value": "local/vendored (path)"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "mzpeaks",
+      "version": "1.0.9",
+      "purl": "pkg:cargo/mzpeaks@1.0.9",
+      "description": "A library representing peaks in mass spectrometry data",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzpeaks"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "mzsignal",
+      "version": "1.1.12",
+      "purl": "pkg:cargo/mzsignal@1.1.12",
+      "description": "A library for mass spectrometry signal processing",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/mzsignal"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "nalgebra",
+      "version": "0.33.3",
+      "purl": "pkg:cargo/nalgebra@0.33.3",
+      "description": "General-purpose linear algebra library with transformations and statically-sized or dynamically-sized matrices.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dimforge/nalgebra"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "nalgebra-macros",
+      "version": "0.2.2",
+      "purl": "pkg:cargo/nalgebra-macros@0.2.2",
+      "description": "Procedural macros for nalgebra",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dimforge/nalgebra"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "netcorehost",
+      "version": "0.18.0",
+      "purl": "pkg:cargo/netcorehost@0.18.0",
+      "description": "A Rust library for hosting the .NET Core runtime.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/netcorehost"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "nethost-sys",
+      "version": "0.7.3",
+      "purl": "pkg:cargo/nethost-sys@0.7.3",
+      "description": "FFI bindings for nethost.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/OpenByteDev/nethost-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num",
+      "version": "0.4.3",
+      "purl": "pkg:cargo/num@0.4.3",
+      "description": "A collection of numeric types and traits for Rust, including bigint,\ncomplex, rational, range iterators, generic integers, and more!\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num-bigint",
+      "version": "0.4.6",
+      "purl": "pkg:cargo/num-bigint@0.4.6",
+      "description": "Big integer implementation for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-bigint"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num-complex",
+      "version": "0.4.6",
+      "purl": "pkg:cargo/num-complex@0.4.6",
+      "description": "Complex numbers implementation for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-complex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num-conv",
+      "version": "0.1.0",
+      "purl": "pkg:cargo/num-conv@0.1.0",
+      "description": "`num_conv` is a crate to convert between integer types without using `as` casts. This provides\nbetter certainty when refactoring, makes the exact behavior of code more explicit, and allows using\nturbofish syntax.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jhpratt/num-conv"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num-integer",
+      "version": "0.1.46",
+      "purl": "pkg:cargo/num-integer@0.1.46",
+      "description": "Integer traits and functions",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-integer"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num-iter",
+      "version": "0.1.45",
+      "purl": "pkg:cargo/num-iter@0.1.45",
+      "description": "External iterators for generic mathematics",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-iter"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num-rational",
+      "version": "0.4.2",
+      "purl": "pkg:cargo/num-rational@0.4.2",
+      "description": "Rational numbers implementation for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-rational"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num-traits",
+      "version": "0.2.19",
+      "purl": "pkg:cargo/num-traits@0.2.19",
+      "description": "Numeric traits for generic mathematics",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-num/num-traits"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num_enum",
+      "version": "0.7.6",
+      "purl": "pkg:cargo/num_enum@0.7.6",
+      "description": "Procedural macros to make inter-operation between primitives and enums easier.",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/illicitonion/num_enum"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "num_enum_derive",
+      "version": "0.7.6",
+      "purl": "pkg:cargo/num_enum_derive@0.7.6",
+      "description": "Internal implementation details for ::num_enum (Procedural macros to make inter-operation between primitives and enums easier)",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/illicitonion/num_enum"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "number_prefix",
+      "version": "0.4.0",
+      "purl": "pkg:cargo/number_prefix@0.4.0",
+      "description": "Library for numeric prefixes (kilo, giga, kibi).",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/ogham/rust-number-prefix"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "numpress-rs",
+      "version": "1.1.1",
+      "purl": "pkg:cargo/numpress-rs@1.1.1",
+      "description": "A pure rust implementation of ms-numpress, a fast, minimally lossy compression algorithm for mass spectrometry data.",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause-Clear/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/numpress-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "once_cell",
+      "version": "1.21.4",
+      "purl": "pkg:cargo/once_cell@1.21.4",
+      "description": "Single assignment cells and lazy values.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/matklad/once_cell"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "once_cell_polyfill",
+      "version": "1.70.2",
+      "purl": "pkg:cargo/once_cell_polyfill@1.70.2",
+      "description": "Polyfill for `OnceCell` stdlib feature for use with older MSRVs",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/polyfill-rs/once_cell_polyfill"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ordered-float",
+      "version": "2.10.1",
+      "purl": "pkg:cargo/ordered-float@2.10.1",
+      "description": "Wrappers for total ordering on floats",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/reem/rust-ordered-float"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "outref",
+      "version": "0.5.2",
+      "purl": "pkg:cargo/outref@0.5.2",
+      "description": "Out reference",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/outref"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "parking_lot",
+      "version": "0.12.5",
+      "purl": "pkg:cargo/parking_lot@0.12.5",
+      "description": "More compact and efficient implementations of the standard synchronization primitives.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Amanieu/parking_lot"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "parking_lot_core",
+      "version": "0.9.12",
+      "purl": "pkg:cargo/parking_lot_core@0.9.12",
+      "description": "An advanced API for creating custom synchronization primitives.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Amanieu/parking_lot"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "parquet",
+      "version": "42.0.0",
+      "purl": "pkg:cargo/parquet@42.0.0",
+      "description": "Apache Parquet implementation in Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "parquet",
+      "version": "57.0.0",
+      "purl": "pkg:cargo/parquet@57.0.0",
+      "description": "Apache Parquet implementation in Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/arrow-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "paste",
+      "version": "1.0.15",
+      "purl": "pkg:cargo/paste@1.0.15",
+      "description": "Macros for all your token pasting needs",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/paste"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "pbkdf2",
+      "version": "0.12.2",
+      "purl": "pkg:cargo/pbkdf2@0.12.2",
+      "description": "Generic implementation of PBKDF2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/password-hashes/tree/master/pbkdf2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "percent-encoding",
+      "version": "2.3.2",
+      "purl": "pkg:cargo/percent-encoding@2.3.2",
+      "description": "Percent encoding and decoding",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "pin-project-lite",
+      "version": "0.2.17",
+      "purl": "pkg:cargo/pin-project-lite@0.2.17",
+      "description": "A lightweight version of pin-project written with declarative macros.\n",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/taiki-e/pin-project-lite"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "pkg-config",
+      "version": "0.3.33",
+      "purl": "pkg:cargo/pkg-config@0.3.33",
+      "description": "A library to run the pkg-config system tool at build time in order to be used in\nCargo build scripts.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/pkg-config-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "portable-atomic",
+      "version": "1.13.1",
+      "purl": "pkg:cargo/portable-atomic@1.13.1",
+      "description": "Portable atomic types including support for 128-bit atomics, atomic float, etc.\n",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/taiki-e/portable-atomic"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "portable-atomic-util",
+      "version": "0.2.7",
+      "purl": "pkg:cargo/portable-atomic-util@0.2.7",
+      "description": "Synchronization primitives built with portable-atomic.\n",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/taiki-e/portable-atomic-util"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "potential_utf",
+      "version": "0.1.5",
+      "purl": "pkg:cargo/potential_utf@0.1.5",
+      "description": "Unvalidated string and character types",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "powerfmt",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/powerfmt@0.2.0",
+      "description": "    `powerfmt` is a library that provides utilities for formatting values. This crate makes it\n    significantly easier to support filling to a minimum width with alignment, avoid heap\n    allocation, and avoid repetitive calculations.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jhpratt/powerfmt"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ppmd-rust",
+      "version": "1.4.0",
+      "purl": "pkg:cargo/ppmd-rust@1.4.0",
+      "description": "PPMd compression / decompression",
+      "licenses": [
+        {
+          "expression": "CC0-1.0 OR MIT-0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hasenbanck/ppmd-rust"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "proc-macro-error-attr2",
+      "version": "2.0.0",
+      "purl": "pkg:cargo/proc-macro-error-attr2@2.0.0",
+      "description": "Attribute macro for the proc-macro-error2 crate",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/GnomedDev/proc-macro-error-2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "proc-macro-error2",
+      "version": "2.0.1",
+      "purl": "pkg:cargo/proc-macro-error2@2.0.1",
+      "description": "Almost drop-in replacement to panics in proc-macros",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/GnomedDev/proc-macro-error-2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "proc-macro2",
+      "version": "1.0.106",
+      "purl": "pkg:cargo/proc-macro2@1.0.106",
+      "description": "A substitute implementation of the compiler's `proc_macro` API to decouple token-based libraries from the procedural macro use case.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/proc-macro2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "quick-xml",
+      "version": "0.30.0",
+      "purl": "pkg:cargo/quick-xml@0.30.0",
+      "description": "High performance xml reader and writer",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tafia/quick-xml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "quote",
+      "version": "1.0.45",
+      "purl": "pkg:cargo/quote@1.0.45",
+      "description": "Quasi-quoting macro quote!(...)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/quote"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "r-efi",
+      "version": "5.3.0",
+      "purl": "pkg:cargo/r-efi@5.3.0",
+      "description": "UEFI Reference Specification Protocol Constants and Definitions",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0 OR LGPL-2.1-or-later"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/r-efi/r-efi"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "r-efi",
+      "version": "6.0.0",
+      "purl": "pkg:cargo/r-efi@6.0.0",
+      "description": "UEFI Reference Specification Protocol Constants and Definitions",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0 OR LGPL-2.1-or-later"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/r-efi/r-efi"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rawpointer",
+      "version": "0.2.1",
+      "purl": "pkg:cargo/rawpointer@0.2.1",
+      "description": "Extra methods for raw pointers and `NonNull<T>`.\n\nFor example `.post_inc()` and `.pre_dec()` (c.f. `ptr++` and `--ptr`),\n`offset` and `add` for `NonNull<T>`, and the function `ptrdistance`.\n",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bluss/rawpointer/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rayon",
+      "version": "1.12.0",
+      "purl": "pkg:cargo/rayon@1.12.0",
+      "description": "Simple work-stealing parallelism for Rust",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rayon-rs/rayon"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rayon-core",
+      "version": "1.13.0",
+      "purl": "pkg:cargo/rayon-core@1.13.0",
+      "description": "Core APIs for Rayon",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rayon-rs/rayon"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "redox_syscall",
+      "version": "0.5.18",
+      "purl": "pkg:cargo/redox_syscall@0.5.18",
+      "description": "A Rust library to access raw Redox system calls",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://gitlab.redox-os.org/redox-os/syscall"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ref-cast",
+      "version": "1.0.25",
+      "purl": "pkg:cargo/ref-cast@1.0.25",
+      "description": "Safely cast &T to &U where the struct U contains a single field of type T.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/ref-cast"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ref-cast-impl",
+      "version": "1.0.25",
+      "purl": "pkg:cargo/ref-cast-impl@1.0.25",
+      "description": "Derive implementation for ref_cast::RefCast.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/ref-cast"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "regex",
+      "version": "1.12.4",
+      "purl": "pkg:cargo/regex@1.12.4",
+      "description": "An implementation of regular expressions for Rust. This implementation uses\nfinite automata and guarantees linear time matching on all inputs.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/regex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "regex-automata",
+      "version": "0.4.14",
+      "purl": "pkg:cargo/regex-automata@0.4.14",
+      "description": "Automata construction and matching using regular expressions.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/regex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "regex-syntax",
+      "version": "0.8.11",
+      "purl": "pkg:cargo/regex-syntax@0.8.11",
+      "description": "A regular expression parser.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-lang/regex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ring",
+      "version": "0.17.14",
+      "purl": "pkg:cargo/ring@0.17.14",
+      "description": "An experiment.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 AND ISC"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/briansmith/ring"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rusqlite",
+      "version": "0.31.0",
+      "purl": "pkg:cargo/rusqlite@0.31.0",
+      "description": "Ergonomic wrapper for SQLite",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusqlite/rusqlite"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rustc_version",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/rustc_version@0.4.1",
+      "description": "A library for querying the version of a installed rustc compiler",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/djc/rustc-version-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rustix",
+      "version": "1.1.4",
+      "purl": "pkg:cargo/rustix@1.1.4",
+      "description": "Safe Rust bindings to POSIX/Unix/Linux/Winsock-like syscalls",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/rustix"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rustls",
+      "version": "0.23.40",
+      "purl": "pkg:cargo/rustls@0.23.40",
+      "description": "Rustls is a modern TLS library written in Rust.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR ISC OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/rustls"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rustls-pki-types",
+      "version": "1.14.1",
+      "purl": "pkg:cargo/rustls-pki-types@1.14.1",
+      "description": "Shared types for the rustls PKI ecosystem",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/pki-types"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rustls-webpki",
+      "version": "0.103.13",
+      "purl": "pkg:cargo/rustls-webpki@0.103.13",
+      "description": "Web PKI X.509 Certificate Verification.",
+      "licenses": [
+        {
+          "expression": "ISC"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/webpki"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "rustversion",
+      "version": "1.0.22",
+      "purl": "pkg:cargo/rustversion@1.0.22",
+      "description": "Conditional compilation according to rustc compiler version",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/rustversion"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ryu",
+      "version": "1.0.23",
+      "purl": "pkg:cargo/ryu@1.0.23",
+      "description": "Fast floating point to string conversion",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR BSL-1.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/ryu"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "safe_arch",
+      "version": "0.7.4",
+      "purl": "pkg:cargo/safe_arch@0.7.4",
+      "description": "Crate that exposes `core::arch` safely via `#[cfg()]`.",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Lokathor/safe_arch"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "same-file",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/same-file@1.0.6",
+      "description": "A simple crate for determining whether two file paths point to the same file.\n",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/same-file"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "schemars",
+      "version": "0.9.0",
+      "purl": "pkg:cargo/schemars@0.9.0",
+      "description": "Generate JSON Schemas from Rust code",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/GREsau/schemars"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "schemars",
+      "version": "1.2.1",
+      "purl": "pkg:cargo/schemars@1.2.1",
+      "description": "Generate JSON Schemas from Rust code",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/GREsau/schemars"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "scopeguard",
+      "version": "1.2.0",
+      "purl": "pkg:cargo/scopeguard@1.2.0",
+      "description": "A RAII scope guard that will run a given closure when it goes out of scope,\neven if the code between panics (assuming unwinding panic).\n\nDefines the macros `defer!`, `defer_on_unwind!`, `defer_on_success!` as\nshorthands for guards with one of the implemented strategies.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bluss/scopeguard"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "semver",
+      "version": "1.0.28",
+      "purl": "pkg:cargo/semver@1.0.28",
+      "description": "Parser and evaluator for Cargo's flavor of Semantic Versioning",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/semver"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "seq-macro",
+      "version": "0.3.6",
+      "purl": "pkg:cargo/seq-macro@0.3.6",
+      "description": "Macro to repeat sequentially indexed copies of a fragment of code.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/seq-macro"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde",
+      "version": "1.0.228",
+      "purl": "pkg:cargo/serde@1.0.228",
+      "description": "A generic serialization/deserialization framework",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/serde"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde-big-array",
+      "version": "0.5.1",
+      "purl": "pkg:cargo/serde-big-array@0.5.1",
+      "description": "Big array helper for serde.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/est31/serde-big-array"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde_core",
+      "version": "1.0.228",
+      "purl": "pkg:cargo/serde_core@1.0.228",
+      "description": "Serde traits only, with no support for derive -- use the `serde` crate instead",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/serde"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde_derive",
+      "version": "1.0.228",
+      "purl": "pkg:cargo/serde_derive@1.0.228",
+      "description": "Macros 1.1 implementation of #[derive(Serialize, Deserialize)]",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/serde"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde_json",
+      "version": "1.0.150",
+      "purl": "pkg:cargo/serde_json@1.0.150",
+      "description": "A JSON serialization file format",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/serde-rs/json"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde_with",
+      "version": "3.17.0",
+      "purl": "pkg:cargo/serde_with@3.17.0",
+      "description": "Custom de/serialization functions for Rust's serde",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jonasbb/serde_with/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde_with_macros",
+      "version": "3.17.0",
+      "purl": "pkg:cargo/serde_with_macros@3.17.0",
+      "description": "proc-macro library for serde_with",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jonasbb/serde_with/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "serde_yaml",
+      "version": "0.9.34+deprecated",
+      "purl": "pkg:cargo/serde_yaml@0.9.34+deprecated",
+      "description": "YAML data format for Serde",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/serde-yaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "sha1",
+      "version": "0.10.6",
+      "purl": "pkg:cargo/sha1@0.10.6",
+      "description": "SHA-1 hash function",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "sha2",
+      "version": "0.10.9",
+      "purl": "pkg:cargo/sha2@0.10.9",
+      "description": "Pure Rust implementation of the SHA-2 hash function family\nincluding SHA-224, SHA-256, SHA-384, and SHA-512.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/hashes"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "shlex",
+      "version": "2.0.1",
+      "purl": "pkg:cargo/shlex@2.0.1",
+      "description": "Split a string into shell words, like Python's shlex.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/comex/rust-shlex"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "simba",
+      "version": "0.9.1",
+      "purl": "pkg:cargo/simba@0.9.1",
+      "description": "SIMD algebra for Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dimforge/simba"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "simd-adler32",
+      "version": "0.3.9",
+      "purl": "pkg:cargo/simd-adler32@0.3.9",
+      "description": "A SIMD-accelerated Adler-32 hash algorithm implementation.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mcountryman/simd-adler32"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "simdutf8",
+      "version": "0.1.5",
+      "purl": "pkg:cargo/simdutf8@0.1.5",
+      "description": "SIMD-accelerated UTF-8 validation.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticstuff/simdutf8"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "slab",
+      "version": "0.4.12",
+      "purl": "pkg:cargo/slab@0.4.12",
+      "description": "Pre-allocated storage for a uniform data type",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/slab"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "smallvec",
+      "version": "1.15.2",
+      "purl": "pkg:cargo/smallvec@1.15.2",
+      "description": "'Small vector' optimization: store up to a small number of items on the stack",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-smallvec"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "snap",
+      "version": "1.1.1",
+      "purl": "pkg:cargo/snap@1.1.1",
+      "description": "A pure Rust implementation of the Snappy compression algorithm. Includes\nstreaming compression and decompression.\n",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/rust-snappy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "stable_deref_trait",
+      "version": "1.2.1",
+      "purl": "pkg:cargo/stable_deref_trait@1.2.1",
+      "description": "An unsafe marker trait for types like Box and Rc that dereference to a stable address even when moved, and hence can be used with libraries such as owning_ref and rental.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/storyyeller/stable_deref_trait"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "static_assertions",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/static_assertions@1.1.0",
+      "description": "Compile-time assertions to ensure that invariants are met.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nvzqz/static-assertions-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "strsim",
+      "version": "0.11.1",
+      "purl": "pkg:cargo/strsim@0.11.1",
+      "description": "Implementations of string similarity metrics. Includes Hamming, Levenshtein,\nOSA, Damerau-Levenshtein, Jaro, Jaro-Winkler, and Sørensen-Dice.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rapidfuzz/strsim-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "subtle",
+      "version": "2.6.1",
+      "purl": "pkg:cargo/subtle@2.6.1",
+      "description": "Pure-Rust traits and utilities for constant-time cryptographic implementations.",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dalek-cryptography/subtle"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "syn",
+      "version": "1.0.109",
+      "purl": "pkg:cargo/syn@1.0.109",
+      "description": "Parser for Rust source code",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/syn"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "syn",
+      "version": "2.0.118",
+      "purl": "pkg:cargo/syn@2.0.118",
+      "description": "Parser for Rust source code",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/syn"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "synstructure",
+      "version": "0.13.2",
+      "purl": "pkg:cargo/synstructure@0.13.2",
+      "description": "Helper methods and macros for custom derives",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mystor/synstructure"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "tempfile",
+      "version": "3.27.0",
+      "purl": "pkg:cargo/tempfile@3.27.0",
+      "description": "A library for managing temporary files and directories.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Stebalien/tempfile"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "thermorawfilereader",
+      "version": "0.7.0",
+      "purl": "pkg:cargo/thermorawfilereader@0.7.0",
+      "description": "A (relatively) high level interface to Thermo Fisher's RawFileReader library",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mobiusklein/thermorawfilereader.rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "thiserror",
+      "version": "1.0.69",
+      "purl": "pkg:cargo/thiserror@1.0.69",
+      "description": "derive(Error)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "thiserror",
+      "version": "2.0.18",
+      "purl": "pkg:cargo/thiserror@2.0.18",
+      "description": "derive(Error)",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "thiserror-impl",
+      "version": "1.0.69",
+      "purl": "pkg:cargo/thiserror-impl@1.0.69",
+      "description": "Implementation detail of the `thiserror` crate",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "thiserror-impl",
+      "version": "2.0.18",
+      "purl": "pkg:cargo/thiserror-impl@2.0.18",
+      "description": "Implementation detail of the `thiserror` crate",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/thiserror"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "thrift",
+      "version": "0.17.0",
+      "purl": "pkg:cargo/thrift@0.17.0",
+      "description": "Rust bindings for the Apache Thrift RPC system",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/apache/thrift/tree/master/lib/rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "time",
+      "version": "0.3.45",
+      "purl": "pkg:cargo/time@0.3.45",
+      "description": "Date and time library. Fully interoperable with the standard library. Mostly compatible with #![no_std].",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/time-rs/time"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "time-core",
+      "version": "0.1.7",
+      "purl": "pkg:cargo/time-core@0.1.7",
+      "description": "This crate is an implementation detail and should not be relied upon directly.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/time-rs/time"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "time-macros",
+      "version": "0.2.25",
+      "purl": "pkg:cargo/time-macros@0.2.25",
+      "description": "    Procedural macros for the time crate.\n    This crate is an implementation detail and should not be relied upon directly.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/time-rs/time"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "timsrust",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/timsrust@0.4.1",
+      "description": "A crate to read Bruker timsTOF data",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mannlabs/timsrust"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "tiny-keccak",
+      "version": "2.0.2",
+      "purl": "pkg:cargo/tiny-keccak@2.0.2",
+      "description": "An implementation of Keccak derived functions.",
+      "licenses": [
+        {
+          "expression": "CC0-1.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "tinystr",
+      "version": "0.8.3",
+      "purl": "pkg:cargo/tinystr@0.8.3",
+      "description": "A small ASCII-only bounded length string representation.",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "tokio",
+      "version": "1.52.3",
+      "purl": "pkg:cargo/tokio@1.52.3",
+      "description": "An event-driven, non-blocking I/O platform for writing asynchronous I/O\nbacked applications.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tokio"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "tokio-stream",
+      "version": "0.1.18",
+      "purl": "pkg:cargo/tokio-stream@0.1.18",
+      "description": "Utilities to work with `Stream` and `tokio`.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tokio"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "twox-hash",
+      "version": "1.6.3",
+      "purl": "pkg:cargo/twox-hash@1.6.3",
+      "description": "A Rust implementation of the XXHash and XXH3 algorithms",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/shepmaster/twox-hash"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "twox-hash",
+      "version": "2.1.2",
+      "purl": "pkg:cargo/twox-hash@2.1.2",
+      "description": "A Rust implementation of the XXHash and XXH3 algorithms",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/shepmaster/twox-hash"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "typenum",
+      "version": "1.20.1",
+      "purl": "pkg:cargo/typenum@1.20.1",
+      "description": "Typenum is a Rust library for type-level numbers evaluated at\n    compile time. It currently supports bits, unsigned integers, and signed\n    integers. It also provides a type-level array of type-level numbers, but its\n    implementation is incomplete.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/paholg/typenum"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "unicode-ident",
+      "version": "1.0.24",
+      "purl": "pkg:cargo/unicode-ident@1.0.24",
+      "description": "Determine whether characters have the XID_Start or XID_Continue properties according to Unicode Standard Annex #31",
+      "licenses": [
+        {
+          "expression": "(MIT OR Apache-2.0) AND Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/unicode-ident"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "unicode-segmentation",
+      "version": "1.13.3",
+      "purl": "pkg:cargo/unicode-segmentation@1.13.3",
+      "description": "This crate provides Grapheme Cluster, Word and Sentence boundaries\naccording to Unicode Standard Annex #29 rules.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-rs/unicode-segmentation"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "unicode-width",
+      "version": "0.2.2",
+      "purl": "pkg:cargo/unicode-width@0.2.2",
+      "description": "Determine displayed width of `char` and `str` types\naccording to Unicode Standard Annex #11 rules.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-rs/unicode-width"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "unicode-xid",
+      "version": "0.2.6",
+      "purl": "pkg:cargo/unicode-xid@0.2.6",
+      "description": "Determine whether characters have the XID_Start\nor XID_Continue properties according to\nUnicode Standard Annex #31.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-rs/unicode-xid"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "unsafe-libyaml",
+      "version": "0.2.11",
+      "purl": "pkg:cargo/unsafe-libyaml@0.2.11",
+      "description": "libyaml transpiled to rust by c2rust",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/unsafe-libyaml"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "untrusted",
+      "version": "0.9.0",
+      "purl": "pkg:cargo/untrusted@0.9.0",
+      "description": "Safe, fast, zero-panic, zero-crashing, zero-allocation parsing of untrusted inputs in Rust.",
+      "licenses": [
+        {
+          "expression": "ISC"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/briansmith/untrusted"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ureq",
+      "version": "3.3.0",
+      "purl": "pkg:cargo/ureq@3.3.0",
+      "description": "Simple, safe HTTP client",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/algesten/ureq"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ureq-proto",
+      "version": "0.6.0",
+      "purl": "pkg:cargo/ureq-proto@0.6.0",
+      "description": "ureq support crate",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/algesten/ureq-proto"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "url",
+      "version": "2.5.8",
+      "purl": "pkg:cargo/url@2.5.8",
+      "description": "URL library for Rust, based on the WHATWG URL Standard",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "utf8-zero",
+      "version": "0.8.1",
+      "purl": "pkg:cargo/utf8-zero@0.8.1",
+      "description": "Zero-copy, incremental UTF-8 decoding with error handling",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/algesten/utf8-zero"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "utf8_iter",
+      "version": "1.0.4",
+      "purl": "pkg:cargo/utf8_iter@1.0.4",
+      "description": "Iterator by char over potentially-invalid UTF-8 in &[u8]",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hsivonen/utf8_iter"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "utf8parse",
+      "version": "0.2.2",
+      "purl": "pkg:cargo/utf8parse@0.2.2",
+      "description": "Table-driven UTF-8 parser",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/alacritty/vte"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "uuid",
+      "version": "1.23.3",
+      "purl": "pkg:cargo/uuid@1.23.3",
+      "description": "A library to generate and parse UUIDs.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/uuid-rs/uuid"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "vcpkg",
+      "version": "0.2.15",
+      "purl": "pkg:cargo/vcpkg@0.2.15",
+      "description": "A library to find native dependencies in a vcpkg tree at build\ntime in order to be used in Cargo build scripts.\n",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mcgoo/vcpkg-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "version_check",
+      "version": "0.9.5",
+      "purl": "pkg:cargo/version_check@0.9.5",
+      "description": "Tiny crate to check the version of the installed/running rustc.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/SergioBenitez/version_check"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "vsimd",
+      "version": "0.8.0",
+      "purl": "pkg:cargo/vsimd@0.8.0",
+      "description": "SIMD utilities",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Nugine/simd"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "walkdir",
+      "version": "2.5.0",
+      "purl": "pkg:cargo/walkdir@2.5.0",
+      "description": "Recursively walk a directory.",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/walkdir"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wasi",
+      "version": "0.11.1+wasi-snapshot-preview1",
+      "purl": "pkg:cargo/wasi@0.11.1+wasi-snapshot-preview1",
+      "description": "Experimental WASI API bindings for Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasi"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wasip2",
+      "version": "1.0.4+wasi-0.2.12",
+      "purl": "pkg:cargo/wasip2@1.0.4+wasi-0.2.12",
+      "description": "WASIp2 API bindings for Rust",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wasi-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wasm-bindgen",
+      "version": "0.2.125",
+      "purl": "pkg:cargo/wasm-bindgen@0.2.125",
+      "description": "Easy support for interacting between JS and Rust.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wasm-bindgen-macro",
+      "version": "0.2.125",
+      "purl": "pkg:cargo/wasm-bindgen-macro@0.2.125",
+      "description": "Definition of the `#[wasm_bindgen]` attribute, an internal dependency\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wasm-bindgen-macro-support",
+      "version": "0.2.125",
+      "purl": "pkg:cargo/wasm-bindgen-macro-support@0.2.125",
+      "description": "Implementation APIs for the `#[wasm_bindgen]` attribute",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wasm-bindgen-shared",
+      "version": "0.2.125",
+      "purl": "pkg:cargo/wasm-bindgen-shared@0.2.125",
+      "description": "Shared support between wasm-bindgen and wasm-bindgen cli, an internal\ndependency.\n",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "web-time",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/web-time@1.1.0",
+      "description": "Drop-in replacement for std::time for Wasm in browsers",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/daxpedda/web-time"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "webpki-roots",
+      "version": "1.0.7",
+      "purl": "pkg:cargo/webpki-roots@1.0.7",
+      "description": "Mozilla's CA root certificates for use with webpki",
+      "licenses": [
+        {
+          "expression": "CDLA-Permissive-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/webpki-roots"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wide",
+      "version": "0.7.33",
+      "purl": "pkg:cargo/wide@0.7.33",
+      "description": "A crate to help you go wide.",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Lokathor/wide"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "widestring",
+      "version": "1.2.1",
+      "purl": "pkg:cargo/widestring@1.2.1",
+      "description": "A wide string Rust library for converting to and from wide strings, such as those often used in Windows API or other FFI libaries. Both `u16` and `u32` string types are provided, including support for UTF-16 and UTF-32, malformed encoding, C-style strings, etc.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/VoidStarKat/widestring-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "winapi",
+      "version": "0.3.9",
+      "purl": "pkg:cargo/winapi@0.3.9",
+      "description": "Raw FFI bindings for all of Windows API.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/retep998/winapi-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "winapi-i686-pc-windows-gnu",
+      "version": "0.4.0",
+      "purl": "pkg:cargo/winapi-i686-pc-windows-gnu@0.4.0",
+      "description": "Import libraries for the i686-pc-windows-gnu target. Please don't use this crate directly, depend on winapi instead.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/retep998/winapi-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "winapi-util",
+      "version": "0.1.11",
+      "purl": "pkg:cargo/winapi-util@0.1.11",
+      "description": "A dumping ground for high level safe wrappers over windows-sys.",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/winapi-util"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "winapi-x86_64-pc-windows-gnu",
+      "version": "0.4.0",
+      "purl": "pkg:cargo/winapi-x86_64-pc-windows-gnu@0.4.0",
+      "description": "Import libraries for the x86_64-pc-windows-gnu target. Please don't use this crate directly, depend on winapi instead.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/retep998/winapi-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-core",
+      "version": "0.62.2",
+      "purl": "pkg:cargo/windows-core@0.62.2",
+      "description": "Core type support for COM and Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-implement",
+      "version": "0.60.2",
+      "purl": "pkg:cargo/windows-implement@0.60.2",
+      "description": "The implement macro for the Windows crates",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-interface",
+      "version": "0.59.3",
+      "purl": "pkg:cargo/windows-interface@0.59.3",
+      "description": "The interface macro for the Windows crates",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-link",
+      "version": "0.2.1",
+      "purl": "pkg:cargo/windows-link@0.2.1",
+      "description": "Linking for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-result",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/windows-result@0.4.1",
+      "description": "Windows error handling",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-strings",
+      "version": "0.5.1",
+      "purl": "pkg:cargo/windows-strings@0.5.1",
+      "description": "Windows string types",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-sys",
+      "version": "0.52.0",
+      "purl": "pkg:cargo/windows-sys@0.52.0",
+      "description": "Rust for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-sys",
+      "version": "0.59.0",
+      "purl": "pkg:cargo/windows-sys@0.59.0",
+      "description": "Rust for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-sys",
+      "version": "0.61.2",
+      "purl": "pkg:cargo/windows-sys@0.61.2",
+      "description": "Rust for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows-targets",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows-targets@0.52.6",
+      "description": "Import libs for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_aarch64_gnullvm",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_aarch64_gnullvm@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_aarch64_msvc",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_aarch64_msvc@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_i686_gnu",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_i686_gnu@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_i686_gnullvm",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_i686_gnullvm@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_i686_msvc",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_i686_msvc@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_x86_64_gnu",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_x86_64_gnu@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_x86_64_gnullvm",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_x86_64_gnullvm@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "windows_x86_64_msvc",
+      "version": "0.52.6",
+      "purl": "pkg:cargo/windows_x86_64_msvc@0.52.6",
+      "description": "Import lib for Windows",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "wit-bindgen",
+      "version": "0.57.1",
+      "purl": "pkg:cargo/wit-bindgen@0.57.1",
+      "description": "Rust bindings generator and runtime support for WIT and the component model.\nUsed when compiling Rust programs to the component model.\n",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/bytecodealliance/wit-bindgen"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "writeable",
+      "version": "0.6.3",
+      "purl": "pkg:cargo/writeable@0.6.3",
+      "description": "A more efficient alternative to fmt::Display",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "yoke",
+      "version": "0.8.3",
+      "purl": "pkg:cargo/yoke@0.8.3",
+      "description": "Abstraction allowing borrowed data to be carried along with the backing data it borrows from",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "yoke-derive",
+      "version": "0.8.2",
+      "purl": "pkg:cargo/yoke-derive@0.8.2",
+      "description": "Custom derive for the yoke crate",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zerocopy",
+      "version": "0.8.52",
+      "purl": "pkg:cargo/zerocopy@0.8.52",
+      "description": "Zerocopy makes zero-cost memory manipulation effortless. We write \"unsafe\" so you don't have to.",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/zerocopy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zerocopy-derive",
+      "version": "0.8.52",
+      "purl": "pkg:cargo/zerocopy-derive@0.8.52",
+      "description": "Custom derive for traits from the zerocopy crate",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause OR Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/zerocopy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zerofrom",
+      "version": "0.1.8",
+      "purl": "pkg:cargo/zerofrom@0.1.8",
+      "description": "ZeroFrom trait for constructing",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zerofrom-derive",
+      "version": "0.1.7",
+      "purl": "pkg:cargo/zerofrom-derive@0.1.7",
+      "description": "Custom derive for the zerofrom crate",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zeroize",
+      "version": "1.9.0",
+      "purl": "pkg:cargo/zeroize@1.9.0",
+      "description": "Securely clear secrets from memory with a simple trait built on\nstable Rust primitives which guarantee memory is zeroed using an\noperation will not be 'optimized away' by the compiler.\nUses a portable pure Rust implementation that works everywhere,\neven WASM!\n",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zeroize_derive",
+      "version": "1.5.0",
+      "purl": "pkg:cargo/zeroize_derive@1.5.0",
+      "description": "Custom derive support for zeroize",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zerotrie",
+      "version": "0.2.4",
+      "purl": "pkg:cargo/zerotrie@0.2.4",
+      "description": "A data structure that efficiently maps strings to integers",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zerovec",
+      "version": "0.11.6",
+      "purl": "pkg:cargo/zerovec@0.11.6",
+      "description": "Zero-copy vector backed by a byte array",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zerovec-derive",
+      "version": "0.11.3",
+      "purl": "pkg:cargo/zerovec-derive@0.11.3",
+      "description": "Custom derive for the zerovec crate",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zip",
+      "version": "4.1.0",
+      "purl": "pkg:cargo/zip@4.1.0",
+      "description": "Library to support the reading and writing of zip files.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zip-rs/zip2.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zip",
+      "version": "6.0.0",
+      "purl": "pkg:cargo/zip@6.0.0",
+      "description": "Library to support the reading and writing of zip files.\n",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zip-rs/zip2.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zlib-rs",
+      "version": "0.6.3",
+      "purl": "pkg:cargo/zlib-rs@0.6.3",
+      "description": "A memory-safe zlib implementation written in rust",
+      "licenses": [
+        {
+          "expression": "Zlib"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/trifectatechfoundation/zlib-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zmij",
+      "version": "1.0.21",
+      "purl": "pkg:cargo/zmij@1.0.21",
+      "description": "A double-to-string conversion algorithm based on Schubfach and yy",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/dtolnay/zmij"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zopfli",
+      "version": "0.8.3",
+      "purl": "pkg:cargo/zopfli@0.8.3",
+      "description": "A Rust implementation of the Zopfli compression algorithm.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zopfli-rs/zopfli"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zstd",
+      "version": "0.12.4",
+      "purl": "pkg:cargo/zstd@0.12.4",
+      "description": "Binding for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zstd",
+      "version": "0.13.3",
+      "purl": "pkg:cargo/zstd@0.13.3",
+      "description": "Binding for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zstd-safe",
+      "version": "6.0.6",
+      "purl": "pkg:cargo/zstd-safe@6.0.6",
+      "description": "Safe low-level bindings for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zstd-safe",
+      "version": "7.2.4",
+      "purl": "pkg:cargo/zstd-safe@7.2.4",
+      "description": "Safe low-level bindings for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "zstd-sys",
+      "version": "2.0.16+zstd.1.5.7",
+      "purl": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "description": "Low-level bindings for the zstd compression library.",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gyscos/zstd-rs"
+        }
+      ]
+    }
+  ]
+}

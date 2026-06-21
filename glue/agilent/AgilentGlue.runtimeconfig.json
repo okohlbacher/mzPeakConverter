@@ -1,0 +1,13 @@
+{
+  "//": "Runtime config for the AgilentGlue assembly hosted in-process by the Rust `agilent` feature via netcorehost. `dotnet build` regenerates this next to AgilentGlue.dll (GenerateRuntimeConfigurationFiles=true); this checked-in copy documents the expected shape and lets the Rust loader find AgilentGlue.runtimeconfig.json even from a non-standard layout. Requires the .NET 8 desktop/runtime. MHDAC is x64 Windows only, so the hosting process must be x64 Windows at run time.",
+  "runtimeOptions": {
+    "tfm": "net8.0",
+    "framework": {
+      "name": "Microsoft.NETCore.App",
+      "version": "8.0.0"
+    },
+    "configProperties": {
+      "System.Reflection.Metadata.MetadataUpdater.IsSupported": false
+    }
+  }
+}

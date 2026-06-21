@@ -1,0 +1,9 @@
+# Keep the Docker build context small + reproducible.
+target/
+**/bin/
+**/obj/
+*.mzpeak
+*.parquet
+out/
+tmp/
+.git/

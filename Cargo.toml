@@ -1,0 +1,63 @@
+[package]
+name = "mzpeak-convert"
+version = "0.1.0"
+edition = "2024"
+# MSRV floor inherited from mzpeak_prototyping (stdlib APIs stabilized in 1.87).
+rust-version = "1.87"
+
+[[bin]]
+name = "mzpeak-convert"
+path = "src/main.rs"
+
+[dependencies]
+# Core compatibility crates pinned EXACTLY — these fracture the arrow/mzdata type graph if
+# they drift. Versions mirror mzpeak_prototyping's own Cargo.toml (one unified copy).
+arrow = "=57.0.0"
+parquet = { version = "=57.0.0", features = ["encryption"] }
+zip = "=4.1.0"
+mzdata = { version = "=0.64.1", features = ["imzml", "serde", "bruker_tdf", "thermo", "nalgebra", "zstd", "numpress"] }
+mzpeaks = "=1.0.9"
+
+# Reference mzPeak writer, vendored locally (default-features=false drops the async/tokio/
+# object_store stack — local-file-only). This is also the seam we will extend for the native
+# integer-TOF reader (see NATIVE-TOF-DESIGN.md).
+mzpeak_prototyping = { path = "vendor/mzpeak_prototyping", default-features = false }
+
+# Native Bruker TDF integer-TOF reads for the lossless ims-compact path (same crate mzdata wraps,
+# so we read the raw u32 TOF bins mzdata's API discards). Pinned to mzdata's transitive version.
+timsrust = "=0.4.1"
+# Bruker TSF (line-spectra timsTOF/MALDI): mzdata can't read TSF, and timsrust-tsf 0.1.4 pulls a
+# rusqlite/libsqlite3-sys that conflicts with mzdata's. So we read the TSF SQLite + zstd-chunked
+# tsf_bin directly (ported from BRFP), reusing the versions mzdata already links (one native lib).
+rusqlite = "0.31"
+zstd = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# gzip for stream-embedded vendor blobs (miniz_oxide backend — pure Rust, no native lib conflict).
+flate2 = "1"
+# Direct access to Thermo scan-trailer bags (FAIMS CV, injection time, charge, …) which mzdata's
+# spectrum API doesn't surface. Same crate (+ features) mzdata wraps, so it unifies to one copy.
+thermorawfilereader = { version = "=0.7.0", features = ["net8_0", "nethost-download"] }
+
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+# Bruker BAF (Q-TOF) vendor SDK FFI — Windows/Linux only (libbaf2sql_c not on macOS). Optional so
+# the default build stays FFI-free and cross-platform; enable with `--features bruker_sdk`.
+libloading = { version = "0.8", optional = true }
+# In-process .NET hosting for the native Agilent/SciEX glue (same crate the Thermo reader uses).
+# Default features (nethost-download + net8_0) compile cross-platform; runtime needs .NET 8 + the
+# vendor glue.dll + vendor DLLs (Windows/pwiz). Optional → only built with `agilent`/`sciex`.
+netcorehost = { version = "0.18", optional = true }
+
+[features]
+# Vendor-SDK readers — all OFF by default (they need licensed vendor DLLs and restrict the build to
+# Windows/Linux). bruker_sdk: BAF via libbaf2sql_c (implemented). agilent/sciex: native in-process
+# .NET-glue readers (MHDAC / Clearcore2) — Windows-only, future (PLAN §3.7); reserved here so the
+# build is "configurable with agilent/sciex support". The cross-vendor `--via-msconvert` lane needs
+# NO feature (it shells out to ProteoWizard).
+bruker_sdk = ["dep:libloading"]
+agilent = ["dep:netcorehost"]
+sciex = ["dep:netcorehost"]

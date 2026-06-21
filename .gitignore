@@ -1,0 +1,25 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# C# glue build output
+glue/**/bin/
+glue/**/obj/
+
+# Converter outputs / scratch
+*.mzpeak
+*.parquet
+out/
+tmp/
+
+# Local agent state and editor backups
+.claude/
+*~
+\#*\#
+
+# SECRETS — never commit. Holds Windows build-server credentials.
+mzpeak-win-build.txt
+*mzpeak-win-build.txt*
+
+# OS cruft
+.DS_Store

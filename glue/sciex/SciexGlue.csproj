@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    SciexGlue — a thin C# shim that the Rust `sciex` feature hosts in-process (via
+    netcorehost) to read SciEX .wiff/.wiff2 files through the vendor Clearcore2 .NET API.
+
+    KEY DESIGN POINT: there is NO <Reference> / <PackageReference> to any Clearcore2
+    assembly. The vendor DLLs are loaded at RUNTIME via System.Reflection
+    (Assembly.LoadFrom + late-bound member invocation). That means this project
+    `dotnet build`s on any platform (including macOS) WITHOUT the vendor DLLs present —
+    which is the whole point: the build host has no Clearcore2, the runtime host (Windows,
+    possibly Linux) supplies them out of a ProteoWizard install.
+
+    ⚠️ The produced DLL only *runs* where the Clearcore2 stack + a compatible .NET runtime
+    exist. It is Windows-runtime-only in practice and currently UNTESTED.
+
+    Build:  dotnet build -c Release
+    Output: bin/Release/net8.0/SciexGlue.dll  (+ SciexGlue.runtimeconfig.json)
+    Then point the Rust env var MZPC_SCIEX_GLUE at that directory.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- We export [UnmanagedCallersOnly] entry points; allow the unsafe blocks used for
+         pinning/marshalling raw pointers across the FFI boundary. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>SciexGlue</AssemblyName>
+    <RootNamespace>SciexGlue</RootNamespace>
+    <!-- A library, not an app. netcorehost loads it via initialize_for_runtime_config +
+         a delegate loader, so no managed entry point is needed. -->
+    <OutputType>Library</OutputType>
+    <!-- 64-bit only: the Clearcore2 native bits are x64. -->
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+</Project>

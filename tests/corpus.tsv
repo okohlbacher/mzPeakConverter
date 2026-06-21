@@ -1,0 +1,23 @@
+# Joint test corpus for mzpeak-convert — REFERENCES files in sibling projects (not copied).
+# Columns: id <TAB> format <TAB> status <TAB> path <TAB> note
+#   status: e2e  = convert + validate in run_corpus_e2e.sh
+#           skip = format not yet supported by the mzdata-only MVP (porting tracked in PLAN.md)
+# Paths may contain spaces; the runner reads tab-delimited fields.
+#
+# --- mzML / imzML (mzML2mzPeak corpus) ------------------------------------------------------
+mtbls18_lc	mzML	e2e	/Users/kohlbach/Claude/mzML2mzPeak/out/mtbls18/LTI225-03-1neg_1-A__7_01_24298.mzML	real LC-MS run (has TIC chromatogram)
+fixture_f32	mzML	e2e	/Users/kohlbach/Claude/mzML2mzPeak/tests/fixtures/mzml/profile_intensity_f32.mzML	profile, f32 intensity, no chromatograms
+fixture_f64	mzML	e2e	/Users/kohlbach/Claude/mzML2mzPeak/tests/fixtures/mzml/profile_intensity_f64.mzML	profile, f64 intensity
+tiny_pwiz	mzML	e2e	/Users/kohlbach/Claude/mzML2mzPeak/tests/fixtures/mzml/tiny.pwiz.1.1.mzML	pwiz reference tiny mzML
+imzml_processed	imzML	e2e	/Users/kohlbach/Claude/mzML2mzPeak/tests/fixtures/imaging/Example_Processed.imzML	MSI processed-mode imaging
+imzml_continuous	imzML	e2e	/Users/kohlbach/Claude/mzML2mzPeak/tests/fixtures/imaging/Example_Continuous.imzML	MSI continuous-mode imaging (has .ibd)
+#
+# --- Thermo .raw (needs .NET runtime; binary sets DOTNET_ROLL_FORWARD) ----------------------
+thermo_small	raw	e2e	/Users/kohlbach/Claude/mzPeak OpenMS/mzdata/test/data/small.RAW	Thermo .raw (mzdata test, 48 spectra)
+#
+# --- Bruker .d (BRFP corpus + nearby TDF test data) -----------------------------------------
+tdf_opentims	TDF	e2e	/Users/kohlbach/Claude/OpenMS/OpenMS-build/_deps/opentims-src/pytest/test.d	timsTOF TDF (opentims test, 919 spectra)
+tdf_diapasef	TDF	e2e	/Users/kohlbach/Claude/mzPeak OpenMS/mzdata/test/data/diaPASEF.d	timsTOF diaPASEF TDF (mzdata test)
+tsf_urine_pos	TSF	e2e	/Users/kohlbach/Claude/mzPeak/BRFP/fixtures/private/timsTOF_autoMSMS_Urine_6min_pos.d	TSF via ported BRFP reader (rusqlite + zstd tsf_bin)
+tsf_urine_neg	TSF	e2e	/Users/kohlbach/Claude/mzPeak/BRFP/fixtures/private/timsTOF_autoMSMS_Urine_6min_neg.d	TSF negative-mode
+baf_lti_neg	BAF	skip	/Users/kohlbach/Claude/mzPeak/BRFP/tmp/baf-e2e/LTI225-41-3neg_1-D,5_01_24321.d	BAF needs vendor SDK FFI; port BRFP baf reader (PLAN P3)

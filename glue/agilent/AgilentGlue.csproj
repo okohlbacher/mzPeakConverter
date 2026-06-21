@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    AgilentGlue — a .NET 8 shim that lets the Rust `agilent` feature read Agilent MassHunter
+    (.d) data via the vendor MHDAC DLLs WITHOUT a compile-time reference to them.
+
+    Design constraint (so this builds on macOS/Linux, no Agilent DLLs present):
+      * NO <Reference> / <PackageReference> to any MHDAC assembly.
+      * All MHDAC access is done at RUNTIME through System.Reflection (see Glue.cs).
+    Therefore `dotnet build` succeeds anywhere a .NET 8 SDK is installed. The MHDAC DLLs are only
+    needed when the produced AgilentGlue.dll is actually invoked at run time (Windows only).
+
+    Output: a class library producing AgilentGlue.dll. The Rust side hosts it in-process via
+    netcorehost and calls its [UnmanagedCallersOnly] exports. UnmanagedCallersOnly entry points
+    require an unmanaged-callable assembly; a normal class library is fine because netcorehost
+    loads it through hostfxr's delegate loader.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AgilentGlue</AssemblyName>
+    <RootNamespace>AgilentGlue</RootNamespace>
+
+    <!-- Required for [UnmanagedCallersOnly] function-pointer exports. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!--
+      MHDAC is a Windows x86/x64 native+managed mixed assembly. At RUN time the process must be
+      x64 Windows. We don't force a RID here (so the library still builds cross-platform); the
+      Rust host process supplies the actual x64 Windows runtime. If you want a self-contained
+      publish for deployment, do: `dotnet publish -r win-x64`.
+    -->
+    <Platforms>AnyCPU;x64</Platforms>
+
+    <!-- Emit a runtimeconfig.json next to the dll; netcorehost initializes against it. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+</Project>
