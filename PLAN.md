@@ -13,8 +13,9 @@ self-hosts a .NET runtime; the binary sets `DOTNET_ROLL_FORWARD=LatestMajor` (Ra
 targets net8.0) so it runs on installed .NET 9/10. Metadata
 fixups ported from mzML2mzPeak to reach validator-clean: empty-chromatogram facet (so the
 writer finalizes index metadata + archive opens), `MS:1000294` spectrum-type column, IMS
-cv-list for imzML, and `ms_run` required-field defaults. CLI: `convert`/`inspect`/`validate`,
-clig.dev-aligned.
+cv-list for imzML, and `ms_run` required-field defaults. CLI: `convert`/`inspect`,
+clig.dev-aligned. (Conformance validation is out of scope — left to the independent
+`mzpeak-validate` tool.)
 
 ## 1. Goal & scope
 
@@ -105,7 +106,8 @@ binary). Parquet facets get zstd internally, not gzip. → Research Q3 confirms 
 
 ## 4. CLI harmonization (clig.dev)
 
-Subcommands: `convert` (default), `inspect`, `validate`. (`query`/`xic` deferred.)
+Subcommands: `convert` (default), `inspect`. (Conformance validation is delegated to the
+standalone `mzpeak-validate`; `query`/`xic` deferred.)
 Principles (clig.dev): human-first output, `--json` for machines, `--help`/`-h`,
 `--version`, sensible defaults, `--dry-run`, `--quiet`/`-v`, confirm destructive, stable
 exit codes.
@@ -120,7 +122,7 @@ Unified surface (proposed):
 - `--ims-compact`, `--consolidate-ms2`, `--tof-grid` (experimental, off).
 - `--ms-level 1,2|1-3`, `--peak-mode`, `--no-peak-picking`.
 - `--vendor-metadata {tall,wide,both}`, `--config <yaml>`, `--aux glob=action`, `--dump-policy`.
-- `--validate`, `--verify`, `--conformance {l1,l2}`, `--json <report>`.
+- `--verify` (round-trip fidelity). Conformance validation is external (`mzpeak-validate`).
 - `--log-level {error..trace}`, `--log-file`, `--quiet`, `-v/--verbose`.
 - Exit codes (from mzML2mzPeak): 0 ok, 1 generic, 2 integrity, 3 unsupported, 4 coord, 5 verify-fail.
 

@@ -30,11 +30,11 @@ First public release.
   via `--aux`, opt-out via `--no-vendor`.
 - **`--via-msconvert`** — cross-vendor interim path through ProteoWizard
   `msconvert` (Agilent `.d`, SciEX `.wiff`, and anything msconvert reads).
-- **`inspect`** (with `--json`), **`validate`** (wraps `mzpeak-validate`),
-  **`tof-grid-probe`** / **`tof-grid`** (P5 TOF-grid feasibility spike).
-- **`--verify`** round-trip check and **`--validate`** hook.
-- Stable exit codes: `0` ok, `1` generic, `3` unsupported, `5` verify/validate
-  failure.
+- **`inspect`** (with `--json`) and **`tof-grid-probe`** / **`tof-grid`** (P5
+  TOF-grid feasibility spike).
+- **`--verify`** round-trip fidelity check (conformance validation is left to the
+  independent `mzpeak-validate` tool).
+- Stable exit codes: `0` ok, `1` generic, `3` unsupported.
 - Optional, off-by-default build features for native vendor SDK readers:
   `bruker_sdk` (BAF), `agilent` (MHDAC), `sciex` (Clearcore2) — Windows-runtime,
   compile-verified.

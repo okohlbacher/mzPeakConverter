@@ -12,9 +12,8 @@ formats mzdata does not cover) and writes through the reference
 - [4. Commands](#4-commands)
   - [4.1 convert](#41-convert)
   - [4.2 inspect](#42-inspect)
-  - [4.3 validate](#43-validate)
-  - [4.4 ims-compact](#44-ims-compact)
-  - [4.5 tof-grid-probe / tof-grid](#45-tof-grid-probe--tof-grid)
+  - [4.3 ims-compact](#43-ims-compact)
+  - [4.4 tof-grid-probe / tof-grid](#44-tof-grid-probe--tof-grid)
 - [5. Input formats](#5-input-formats)
 - [6. The mzPeak output](#6-the-mzpeak-output)
 - [7. Vendor side-files](#7-vendor-side-files)
@@ -77,8 +76,8 @@ Non-Thermo conversions need no .NET.
 # Convert an mzML file (output path inferred: sample.mzpeak)
 mzpeak-convert convert sample.mzML
 
-# Convert a Thermo .raw, verify the round trip, and validate the result
-mzpeak-convert convert run.raw -o run.mzpeak --verify --validate --force
+# Convert a Thermo .raw and verify the round trip
+mzpeak-convert convert run.raw -o run.mzpeak --verify --force
 
 # See what a reader makes of an input without converting
 mzpeak-convert inspect run.raw
@@ -108,7 +107,6 @@ Convert an input file/directory to an mzPeak archive.
 | `-f, --force` | off | Overwrite an existing output |
 | `-n, --dry-run` | off | Plan and report; write nothing |
 | `--verify` | off | Round-trip check (re-read source + archive; compare spectrum & point counts) |
-| `--validate` | off | Run `mzpeak-validate` on the output |
 | `--ims-compact` | off | Bruker TDF: store lossless integer-`tof` in `spectra_peaks` (§5) |
 | `--config <YAML>` | built-in | Vendor side-file embedding policy (§7) |
 | `--aux <glob=embed\|drop>` | — | Override one embedding rule (repeatable, highest precedence) |
@@ -123,15 +121,10 @@ Convert an input file/directory to an mzPeak archive.
 Report what the reader sees — detected format, spectrum count, MS levels,
 chromatograms — without converting. `--json` emits a machine-readable summary.
 
-### 4.3 validate
+> **Conformance validation is not part of this tool.** Validate `.mzpeak`
+> archives with the independent `mzpeak-validate` program (see §9).
 
-`mzpeak-convert validate [--json <PATH>] <ARCHIVE>`
-
-Validate an existing `.mzpeak` archive (or unpacked directory) against the mzPeak
-schema/conformance rules by invoking `mzpeak-validate`. `--json <PATH>` writes the
-validator's full JSON report.
-
-### 4.4 ims-compact
+### 4.3 ims-compact
 
 `mzpeak-convert ims-compact -o <OUT.parquet> <INPUT.d>`
 
@@ -141,7 +134,7 @@ and verifies losslessness with an independent native re-read before finalizing.
 Use this to inspect or benchmark the encoding in isolation; for a full archive,
 use `convert --ims-compact`.
 
-### 4.5 tof-grid-probe / tof-grid
+### 4.4 tof-grid-probe / tof-grid
 
 Research/feasibility tools for profile-TOF m/z grid encoding (PSI P5 spike):
 
@@ -208,23 +201,22 @@ captured into dedicated `vendor_scan_trailers` facets (tall + wide) and a
 
 ## 9. Verification & validation
 
-- `--verify` performs an in-process **round-trip**: it re-reads both the source
-  and the freshly written archive and asserts spectrum (and point) counts match.
-  A mismatch fails the conversion (exit 5).
-- `--validate` (or the `validate` command) runs **`mzpeak-validate`** for schema
-  and conformance checking.
-
-These are independent: `--verify` checks fidelity to the source; `--validate`
-checks conformance to the mzPeak spec.
+- **`--verify`** performs an in-process **round-trip fidelity** check: it re-reads
+  both the source and the freshly written archive and asserts spectrum (and point)
+  counts match. A mismatch fails the conversion. This checks that the conversion
+  did not lose data — it does *not* check spec conformance.
+- **Conformance validation is a separate concern**, handled by the independent
+  **`mzpeak-validate`** tool (not part of this converter). Run it on the produced
+  archive: `mzpeak-validate run.mzpeak`. The e2e harness in `tests/` invokes it
+  automatically (selecting a `pyarrow ≥ 14` environment via `$MZPEAK_VALIDATE`).
 
 ## 10. Exit codes & environment
 
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | generic error |
+| 1 | generic error (includes `--verify` mismatch) |
 | 3 | unsupported input/format in this build |
-| 5 | verify or validate failure |
 
 Environment variables:
 
@@ -234,8 +226,10 @@ Environment variables:
 | `DOTNET_ROLL_FORWARD` | set automatically to `LatestMajor` if unset (Thermo) |
 | `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` | set automatically to `ignore` if unset |
 | `MSCONVERT_PATH` | `msconvert` location for `--via-msconvert` |
-| `MZPEAK_VALIDATE` | path to the `mzpeak-validate` to use |
 | `MZPC_PWIZ_DIR`, `MZPC_SCIEX_GLUE`, `MZPC_AGILENT_GLUE` | native vendor-SDK builds (§11) |
+
+(`$MZPEAK_VALIDATE` is read by the `tests/` harness to pick a `mzpeak-validate`
+binary; the converter itself does not invoke a validator.)
 
 ## 11. Optional vendor-SDK builds
 
@@ -270,7 +264,6 @@ all 395 transitive dependencies (with licenses) is in
 | Symptom | Fix |
 |---|---|
 | Thermo `.raw` fails to open | install a .NET 8+ runtime |
-| `validate` uses the wrong pyarrow | point `MZPEAK_VALIDATE` at a `pyarrow ≥ 14` env |
 | `--via-msconvert` not found | install ProteoWizard or set `--msconvert-path`/`$MSCONVERT_PATH` |
 | Agilent/SciEX exits with code 3 | expected without `--features`; use `--via-msconvert` |
 | UV/PDA spectra missing | non-MS spectra are not yet carried (known limitation) |

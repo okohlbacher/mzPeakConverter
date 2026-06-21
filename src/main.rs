@@ -62,7 +62,6 @@ mod exit {
     pub const OK: i32 = 0;
     pub const GENERIC: i32 = 1;
     pub const UNSUPPORTED: i32 = 3;
-    pub const VALIDATE_FAIL: i32 = 5;
 }
 
 /// Marker error for "this input/format isn't supported in this build" — main maps it to exit 3
@@ -108,14 +107,6 @@ enum Cmd {
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
-    },
-    /// Validate an mzPeak archive with mzpeak-validate.
-    Validate {
-        /// mzPeak archive or unpacked directory.
-        archive: PathBuf,
-        /// Write the validator's JSON report to this path.
-        #[arg(long)]
-        json: Option<PathBuf>,
     },
     /// [P2] Encode a Bruker TDF .d to a lossless ims-compact Parquet (native integer-TOF).
     ImsCompact {
@@ -188,10 +179,6 @@ struct ConvertArgs {
     /// Plan the conversion and report without writing.
     #[arg(short = 'n', long)]
     dry_run: bool,
-
-    /// Run mzpeak-validate (schema/conformance) on the output after writing.
-    #[arg(long)]
-    validate: bool,
 
     /// Round-trip fidelity check: re-read source and archive, compare spectrum + point counts.
     #[arg(long)]
@@ -272,7 +259,6 @@ fn run(cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Convert(args) => cmd_convert(args),
         Cmd::Inspect { input, json } => cmd_inspect(&input, json),
-        Cmd::Validate { archive, json } => cmd_validate(&archive, json.as_deref()),
         Cmd::ImsCompact { input, output } => cmd_ims_compact(&input, output),
         Cmd::TofGridProbe { input, fit_tolerance_ppm } => {
             tof_grid::probe(&input, fit_tolerance_ppm)?;
@@ -375,15 +361,6 @@ fn cmd_convert(args: ConvertArgs) -> Result<i32> {
     if args.verify {
         round_trip_verify(&args.input, &output).context("round-trip verify")?;
         log::info!("verify passed (counts match source)");
-    }
-
-    if args.validate {
-        let code = run_validator(&output, None)?;
-        if code != 0 {
-            log::error!("validation reported problems (exit {code})");
-            return Ok(exit::VALIDATE_FAIL);
-        }
-        log::info!("validation passed");
     }
     Ok(exit::OK)
 }
@@ -1097,20 +1074,3 @@ fn reader_format<R: std::io::Read + std::io::Seek>(reader: &MZReaderType<R>) -> 
     }
 }
 
-fn cmd_validate(archive: &Path, json: Option<&Path>) -> Result<i32> {
-    let code = run_validator(archive, json)?;
-    Ok(if code == 0 { exit::OK } else { exit::VALIDATE_FAIL })
-}
-
-/// Shell out to `mzpeak-validate`. Inherits stdio so the user sees the report directly.
-fn run_validator(archive: &Path, json: Option<&Path>) -> Result<i32> {
-    let mut cmd = Command::new("mzpeak-validate");
-    cmd.arg(archive);
-    if let Some(j) = json {
-        cmd.arg("--json").arg(j);
-    }
-    let status = cmd
-        .status()
-        .context("running mzpeak-validate (is it on PATH?)")?;
-    Ok(status.code().unwrap_or(exit::UNSUPPORTED))
-}

@@ -48,22 +48,24 @@ for mzML/imzML/Bruker.
 ## Usage
 
 ```sh
-# Convert (output path inferred), then verify + validate
+# Convert (output path inferred), then round-trip verify
 mzpeak-convert convert sample.mzML
-mzpeak-convert convert run.raw -o run.mzpeak --verify --validate --force
+mzpeak-convert convert run.raw -o run.mzpeak --verify --force
 
 # Bruker timsTOF with lossless integer-TOF storage
 mzpeak-convert convert experiment.d -o experiment.mzpeak --ims-compact
 
-# Inspect / validate / cross-vendor fallback
+# Inspect / cross-vendor fallback
 mzpeak-convert inspect run.raw
-mzpeak-convert validate run.mzpeak
 mzpeak-convert convert agilent.d -o out.mzpeak --via-msconvert
 ```
 
 See the **[User Manual](docs/USER_MANUAL.md)** for the complete option reference.
 
-Exit codes: `0` ok · `1` generic error · `3` unsupported · `5` verify/validate failure.
+Exit codes: `0` ok · `1` generic error · `3` unsupported.
+
+Conformance validation is intentionally **not** built in — validate archives with
+the independent `mzpeak-validate` tool (the e2e harness in `tests/` calls it).
 
 ## Tests
 
