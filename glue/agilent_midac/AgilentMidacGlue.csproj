@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    AgilentMidacGlue — a .NET 8 shim that lets the Rust Agilent IM-MS path read Agilent ion-mobility
+    (.d) data via the vendor MIDAC DLLs WITHOUT a compile-time reference to them. Sibling of
+    glue/agilent (MHDAC). All MIDAC access is at RUNTIME through System.Reflection (see Glue.cs), so
+    `dotnet build` succeeds anywhere a .NET 8 SDK is installed; the MIDAC DLLs are only needed when
+    the produced AgilentMidacGlue.dll is actually invoked (x64 Windows only).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AgilentMidacGlue</AssemblyName>
+    <RootNamespace>AgilentMidacGlue</RootNamespace>
+
+    <!-- Required for [UnmanagedCallersOnly] function-pointer exports. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>AnyCPU;x64</Platforms>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+</Project>

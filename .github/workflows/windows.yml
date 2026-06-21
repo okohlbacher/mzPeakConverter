@@ -48,6 +48,7 @@ jobs:
         run: |
           dotnet build glue/sciex/SciexGlue.csproj -c Release
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
+          dotnet build glue/agilent_midac/AgilentMidacGlue.csproj -c Release
 
       # Core convert path, end-to-end on Windows, against a tiny committed mzML.
       - name: Smoke test — convert a tiny mzML

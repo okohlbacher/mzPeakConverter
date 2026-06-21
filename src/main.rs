@@ -27,6 +27,9 @@ mod bruker_baf;
 mod agilent;
 #[cfg(windows)]
 #[allow(dead_code)]
+mod agilent_midac;
+#[cfg(windows)]
+#[allow(dead_code)]
 mod sciex;
 mod bruker_native;
 mod bruker_tsf;
@@ -500,6 +503,11 @@ fn convert_file(
     }
     #[cfg(windows)]
     if is_agilent_d(input) {
+        // Agilent ion-mobility (6560 IM-QTOF) needs the MIDAC SDK to read the drift dimension;
+        // non-IM Agilent uses MHDAC. Probe via MIDAC; fall back to MHDAC when there's no IM data.
+        if agilent_midac::file_has_ims_data(input) {
+            return convert_agilent_midac(input, output, chunk, zstd_level, vendor, synth_chroms);
+        }
         return convert_agilent(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
     #[cfg(windows)]
@@ -815,6 +823,22 @@ fn convert_agilent(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent::AgilentReader::open(input)?;
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+}
+
+/// Convert a native Agilent **IM-MS** `.d` → mzPeak via the MIDAC .NET glue (Windows-runtime-only,
+/// UNTESTED SCAFFOLD). Each IM frame becomes one spectrum with a mean-inverse-reduced-ion-mobility
+/// array; mirrors `convert_agilent` but through `agilent_midac`.
+#[cfg(windows)]
+fn convert_agilent_midac(
+    input: &Path,
+    output: &Path,
+    chunk: Option<ChunkingStrategy>,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+) -> Result<()> {
+    let reader = agilent_midac::AgilentMidacReader::open(input)?;
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 

@@ -1,0 +1,13 @@
+{
+  "//": "Runtime config for the AgilentMidacGlue assembly hosted in-process by the Rust Agilent IM-MS path via netcorehost. `dotnet build` regenerates this next to AgilentMidacGlue.dll; this checked-in copy documents the expected shape. Requires the .NET 8 runtime. MIDAC is x64 Windows only, so the hosting process must be x64 Windows at run time.",
+  "runtimeOptions": {
+    "tfm": "net8.0",
+    "framework": {
+      "name": "Microsoft.NETCore.App",
+      "version": "8.0.0"
+    },
+    "configProperties": {
+      "System.Reflection.Metadata.MetadataUpdater.IsSupported": false
+    }
+  }
+}
