@@ -519,11 +519,13 @@ impl<
     }
 
     fn check_data_buffer(&mut self) -> io::Result<()> {
-        // Flush on EITHER the spectrum-count threshold OR a buffered-point ceiling (~4M points), so a
-        // few very large profile / ion-mobility spectra can't pin gigabytes of RAM before the count
-        // threshold is reached.
+        // Flush on the spectrum-count threshold, OR a buffered-point ceiling, OR the measured
+        // byte size of the buffered arrays — whichever trips first. (A pure byte trigger is not
+        // reliable alone: arrow's get_array_memory_size under-reports compressed/chunked buffers, so
+        // the count/point thresholds remain the load-bearing bound.)
         if self.spectrum_counter() % (self.buffer_size as u64) == 0
             || self.spectrum_data_buffer_mut().len() >= 4_000_000
+            || self.spectrum_data_buffer_mut().memory_size() >= *crate::writer::array_buffer::FLUSH_MEM_BYTES
         {
             self.flush_data_arrays()?;
         }

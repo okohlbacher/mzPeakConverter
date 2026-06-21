@@ -98,9 +98,11 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
     }
 
     fn check_data_buffer(&mut self) -> io::Result<()> {
-        // Count threshold OR a ~4M-point ceiling (adaptive to spectrum size — see the default writer).
+        // Count threshold OR point ceiling OR measured byte size — whichever first (see the default
+        // writer for why the byte size is not the sole trigger).
         if self.spectrum_counter() % (self.buffer_size as u64) == 0
             || self.spectrum_data_buffer_mut().len() >= 4_000_000
+            || self.spectrum_data_buffer_mut().memory_size() >= *crate::writer::array_buffer::FLUSH_MEM_BYTES
         {
             self.flush_spectrum_data_arrays()?;
         }

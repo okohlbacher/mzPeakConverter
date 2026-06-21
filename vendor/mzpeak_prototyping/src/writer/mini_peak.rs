@@ -93,7 +93,10 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
         self.n_points += n as u64;
         self.n_entries += 1;
 
-        if self.buffers.len() >= self.buffer_size {
+        // Flush on the point count OR the measured byte size, whichever trips first.
+        if self.buffers.len() >= self.buffer_size
+            || self.buffers.memory_size() >= *crate::writer::array_buffer::FLUSH_MEM_BYTES
+        {
             self.flush()?;
         }
         Ok(EntryMetadataDerivedFromData::new(

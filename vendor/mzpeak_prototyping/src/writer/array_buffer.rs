@@ -10,6 +10,19 @@ use arrow::{
 };
 use mzdata::{prelude::BuildArrayMapFrom, spectrum::ArrayType};
 
+/// General memory safeguard: flush a writer's in-RAM array buffers once their approximate byte size
+/// crosses this threshold — independent of spectrum or point counts, so it adapts to any dtype or
+/// spectrum size. Tunable via `$MZPC_FLUSH_MEM_MB` (default 128 MB).
+pub(crate) static FLUSH_MEM_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("MZPC_FLUSH_MEM_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(128)
+        * 1024
+        * 1024
+});
+
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries, buffer_descriptors::{BufferOverrideTable, BufferPriority, BufferTransform}, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, filter::{drop_where_column_is_zero_run_arrays, nullify_at_zero_pair_arrays}, peak_series::{
         ArrayIndex, ArrayIndexEntry, INTENSITY_ARRAY, MZ_ARRAY, TIME_ARRAY, WAVELENGTH_ARRAY,
@@ -203,6 +216,16 @@ impl PointBuffers {
             .map(|v| v.iter().map(|s| s.len()).sum::<usize>())
             .max()
             .unwrap_or_default()
+    }
+
+    /// Approximate in-RAM byte size of all currently-buffered arrays. The general,
+    /// dtype-agnostic flush trigger (independent of spectrum/point counts).
+    pub fn memory_size(&self) -> usize {
+        self.array_chunks
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|a| a.get_array_memory_size())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -497,6 +520,11 @@ impl ChunkBuffers {
         self.chunk_buffer.iter().map(|c| c.len()).sum()
     }
 
+    /// Approximate in-RAM byte size of all currently-buffered chunk arrays.
+    pub fn memory_size(&self) -> usize {
+        self.chunk_buffer.iter().map(|c| c.get_array_memory_size()).sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chunk_buffer.is_empty()
     }
@@ -608,6 +636,14 @@ impl ArrayBufferWriterVariants {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.len(),
             ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.len(),
+        }
+    }
+
+    /// Approximate in-RAM byte size of the buffered arrays — the memory-based flush trigger.
+    pub fn memory_size(&self) -> usize {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.memory_size(),
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.memory_size(),
         }
     }
 
