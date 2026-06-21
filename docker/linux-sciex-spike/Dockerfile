@@ -21,4 +21,4 @@ RUN cargo build --release --features sciex
 
 ENV MZPC_SCIEX_GLUE=/mzpc/glue/sciex/bin/Release/net8.0
 # Usage: docker run --rm -v /pwiz:/pwiz -v /data:/data -e MZPC_PWIZ_DIR=/pwiz IMG /data/x.wiff
-ENTRYPOINT ["/bin/sh", "-c", "exec /mzpc/target/release/mzpeak-convert convert \"$0\" -o /tmp/out.mzpeak --force --verify"]
+ENTRYPOINT ["/bin/sh", "-c", "exec /mzpc/target/release/mzpeak-convert \"$0\" -o /tmp/out.mzpeak --force --verify"]

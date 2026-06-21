@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 
 // Vendor-SDK readers are untestable on macOS (no SDK/DLLs); keep forward-looking members without
 // dead-code warnings. All are Windows(/Linux)-runtime-only, verified only to compile here.
@@ -32,7 +32,6 @@ mod bruker_native;
 mod bruker_tsf;
 mod thermo_status;
 mod thermo_trailers;
-mod tof_grid;
 mod vendor;
 
 use arrow::datatypes::DataType;
@@ -76,70 +75,87 @@ impl std::fmt::Display for UnsupportedVendor {
 }
 impl std::error::Error for UnsupportedVendor {}
 
+/// mzPeak converter — a single command. Give an input and (optionally) an output:
+///   * with `-o/--output`  → convert and write the `.mzpeak` archive
+///   * without `--output`  → write nothing; just inspect the input and print a report
+/// `-v` prints the inspection report even during a real conversion.
 #[derive(Parser, Debug)]
 #[command(
     name = "mzpeak-convert",
     version,
-    about = "Convert mzML/imzML, Bruker .d, Thermo .raw to mzPeak",
+    about = "Convert MS data (mzML/imzML, Bruker, Thermo, ...) to the mzPeak format",
     propagate_version = true
 )]
 struct Cli {
-    #[command(subcommand)]
-    command: Cmd,
+    /// Input file or vendor directory (mzML/.mzML.gz/imzML, Bruker .d, Thermo .raw).
+    input: PathBuf,
 
-    /// Increase log verbosity (-v debug, -vv trace). Overrides RUST_LOG.
-    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    /// Output .mzpeak path. If omitted, NOTHING is written — the input is only inspected and a
+    /// report (format, spectra, chromatograms) is printed.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Config file (YAML) setting defaults for any option below; explicit command-line flags win.
+    #[arg(short = 'c', long)]
+    config: Option<PathBuf>,
+
+    /// Signal layout [default: chunked].
+    #[arg(long, value_enum)]
+    layout: Option<Layout>,
+
+    /// Lossless delta m/z chunking instead of the default lossy numpress-linear.
+    #[arg(long)]
+    no_numpress: bool,
+
+    /// m/z chunk width (Th) for the chunked layout [default: 50].
+    #[arg(long)]
+    chunk_size: Option<f64>,
+
+    /// Zstd compression level (1–22) [default: 3].
+    #[arg(long)]
+    zstd_level: Option<i32>,
+
+    /// Overwrite the output if it already exists.
+    #[arg(short, long)]
+    force: bool,
+
+    /// Round-trip fidelity check: re-read source and archive, compare spectrum counts.
+    #[arg(long)]
+    verify: bool,
+
+    /// Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and
+    /// write standard f64 m/z instead.
+    #[arg(long)]
+    no_ims_compact: bool,
+
+    /// Do not embed vendor side-files into the archive.
+    #[arg(long)]
+    no_vendor: bool,
+
+    /// Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`. Highest precedence.
+    #[arg(long)]
+    aux: Vec<String>,
+
+    /// Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor path for formats
+    /// without a native reader in this build (Agilent `.d`, SciEX `.wiff`, ...).
+    #[arg(long)]
+    via_msconvert: bool,
+
+    /// Path to the `msconvert` executable (else `$MSCONVERT_PATH`, else `msconvert` on PATH).
+    #[arg(long)]
+    msconvert_path: Option<PathBuf>,
+
+    /// Verbose: print the inspection report (repeat `-vv` for trace logs). Overrides RUST_LOG.
+    #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
     /// Silence all logs except errors.
-    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    #[arg(short, long, conflicts_with = "verbose")]
     quiet: bool,
 }
 
-#[derive(Subcommand, Debug)]
-enum Cmd {
-    /// Convert an input file to mzPeak.
-    Convert(ConvertArgs),
-    /// Report what a reader sees in an input file (format, spectra, chromatograms).
-    Inspect {
-        /// Input file (mzML/.mzML.gz/imzML, Bruker .d, Thermo .raw).
-        input: PathBuf,
-        /// Emit machine-readable JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// [P2] Encode a Bruker TDF .d to a lossless ims-compact Parquet (native integer-TOF).
-    ImsCompact {
-        /// Input Bruker .d directory (TDF).
-        input: PathBuf,
-        /// Output .parquet path.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-    /// [P5 spike] Measure how well a profile-TOF file fits a single √(m/z) lattice (go/no-go for a
-    /// fit-from-m/z TOF-grid encoder). Read-only; writes nothing.
-    TofGridProbe {
-        /// Input file (a profile-TOF mzML / .raw / .d).
-        input: PathBuf,
-        /// Max per-point residual (ppm) for a spectrum to count as "fits the grid".
-        #[arg(long, default_value_t = 5.0)]
-        fit_tolerance_ppm: f64,
-    },
-    /// [P5] Encode profile-TOF m/z as the √(m/z) grid (k + per-spectrum α,β) and benchmark the m/z
-    /// storage vs raw-f64 and delta+zstd. Lossy within a reported ppm bound.
-    TofGrid {
-        /// Input profile-TOF file.
-        input: PathBuf,
-        /// Output grid .parquet (a sidecar `.grid.sidecar.parquet` is written alongside).
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        /// Max acceptable m/z error (ppm) for the GO verdict.
-        #[arg(long, default_value_t = 5.0)]
-        tolerance_ppm: f64,
-    },
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
+#[derive(ValueEnum, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
 enum Layout {
     /// Chunked m/z layout (default; numpress-linear or delta).
     Chunked,
@@ -147,68 +163,70 @@ enum Layout {
     Point,
 }
 
-#[derive(Args, Debug)]
-struct ConvertArgs {
-    /// Input file (mzML/.mzML.gz/imzML, Bruker .d, Thermo .raw).
-    input: PathBuf,
-
-    /// Output .mzpeak path (default: input with .mzpeak extension).
-    #[arg(short, long)]
+/// Config-file schema: every overridable option, all optional. Loaded from `--config`. Precedence:
+/// explicit command-line flag > config-file value > built-in default.
+#[derive(serde::Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+struct FileConfig {
     output: Option<PathBuf>,
-
-    /// Signal layout.
-    #[arg(long, value_enum, default_value_t = Layout::Chunked)]
-    layout: Layout,
-
-    /// Use lossless delta m/z chunking instead of the default lossy numpress-linear.
-    #[arg(long)]
-    no_numpress: bool,
-
-    /// m/z chunk width (Th) for the chunked layout.
-    #[arg(long, default_value_t = 50.0)]
-    chunk_size: f64,
-
-    /// Zstd compression level (1–22). Default 3 (size/speed sweet spot).
-    #[arg(long, default_value_t = 3)]
-    zstd_level: i32,
-
-    /// Overwrite the output if it already exists.
-    #[arg(short, long)]
-    force: bool,
-
-    /// Plan the conversion and report without writing.
-    #[arg(short = 'n', long)]
-    dry_run: bool,
-
-    /// Round-trip fidelity check: re-read source and archive, compare spectrum + point counts.
-    #[arg(long)]
-    verify: bool,
-
-    /// YAML aux-file policy for embedding Bruker `.d` vendor files (default: built-in policy).
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// Override an aux-file rule (repeatable): `glob=embed` or `glob=drop`. Highest precedence.
-    #[arg(long)]
-    aux: Vec<String>,
-
-    /// Do not embed any vendor side-files (Bruker `.d` only carries the converted facets).
-    #[arg(long)]
-    no_vendor: bool,
-
-    /// Bruker TDF only: store the lossless ims-compact signal IN-ARCHIVE — the spectra_peaks facet
-    /// carries integer `tof` (+ `ims_calibration` in the index) instead of f64 m/z.
-    #[arg(long)]
-    ims_compact: bool,
-
-    /// Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor interim path for
-    /// Agilent `.d` / SciEX `.wiff` (and any format msconvert reads). Needs msconvert on PATH/Windows.
-    #[arg(long)]
-    via_msconvert: bool,
-
-    /// Path to the `msconvert` executable (else `$MSCONVERT_PATH`, else `msconvert` on PATH).
-    #[arg(long)]
+    layout: Option<Layout>,
+    no_numpress: Option<bool>,
+    chunk_size: Option<f64>,
+    zstd_level: Option<i32>,
+    force: Option<bool>,
+    verify: Option<bool>,
+    no_ims_compact: Option<bool>,
+    no_vendor: Option<bool>,
+    aux: Option<Vec<String>>,
+    via_msconvert: Option<bool>,
     msconvert_path: Option<PathBuf>,
+}
+
+/// Effective settings after merging CLI over config-file over defaults.
+struct Settings {
+    output: Option<PathBuf>,
+    layout: Layout,
+    no_numpress: bool,
+    chunk_size: f64,
+    zstd_level: i32,
+    force: bool,
+    verify: bool,
+    no_ims_compact: bool,
+    no_vendor: bool,
+    aux: Vec<String>,
+    via_msconvert: bool,
+    msconvert_path: Option<PathBuf>,
+}
+
+impl Settings {
+    fn resolve(cli: &Cli) -> Result<Self> {
+        let fc: FileConfig = match &cli.config {
+            Some(p) => {
+                let text = fs::read_to_string(p)
+                    .with_context(|| format!("reading config {}", p.display()))?;
+                serde_yaml::from_str(&text)
+                    .with_context(|| format!("parsing config {}", p.display()))?
+            }
+            None => FileConfig::default(),
+        };
+        // CLI bool flags are "enable" switches, so they OR with the config value (the CLI can only
+        // turn a switch on, matching its own expressiveness); typed options take the CLI value when
+        // given, else the config value, else the built-in default.
+        Ok(Settings {
+            output: cli.output.clone().or(fc.output),
+            layout: cli.layout.or(fc.layout).unwrap_or(Layout::Chunked),
+            no_numpress: cli.no_numpress || fc.no_numpress.unwrap_or(false),
+            chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
+            zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(3),
+            force: cli.force || fc.force.unwrap_or(false),
+            verify: cli.verify || fc.verify.unwrap_or(false),
+            no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
+            no_vendor: cli.no_vendor || fc.no_vendor.unwrap_or(false),
+            aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
+            via_msconvert: cli.via_msconvert || fc.via_msconvert.unwrap_or(false),
+            msconvert_path: cli.msconvert_path.clone().or(fc.msconvert_path),
+        })
+    }
 }
 
 fn main() {
@@ -227,7 +245,7 @@ fn main() {
     let cli = Cli::parse();
     init_logging(cli.verbose, cli.quiet);
 
-    let code = match run(cli.command) {
+    let code = match run(&cli) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -255,114 +273,104 @@ fn init_logging(verbose: u8, quiet: bool) {
     env_logger::Builder::from_env(env).format_timestamp(None).init();
 }
 
-fn run(cmd: Cmd) -> Result<i32> {
-    match cmd {
-        Cmd::Convert(args) => cmd_convert(args),
-        Cmd::Inspect { input, json } => cmd_inspect(&input, json),
-        Cmd::ImsCompact { input, output } => cmd_ims_compact(&input, output),
-        Cmd::TofGridProbe { input, fit_tolerance_ppm } => {
-            tof_grid::probe(&input, fit_tolerance_ppm)?;
-            Ok(exit::OK)
-        }
-        Cmd::TofGrid { input, output, tolerance_ppm } => {
-            let out = output.unwrap_or_else(|| input.with_extension("grid.parquet"));
-            tof_grid::encode(&input, &out, tolerance_ppm)?;
-            Ok(exit::OK)
-        }
-    }
-}
+fn run(cli: &Cli) -> Result<i32> {
+    let cfg = Settings::resolve(cli)?;
+    let verbose = cli.verbose > 0;
 
-fn cmd_ims_compact(input: &Path, output: Option<PathBuf>) -> Result<i32> {
-    let out = output.unwrap_or_else(|| input.with_extension("ims-compact.parquet"));
-    let (rows, bytes) = bruker_native::encode_ims_compact(input, &out)
-        .with_context(|| format!("ims-compact encoding {}", input.display()))?;
-    let (back_rows, calib) = bruker_native::read_back_calibration(&out)?;
-    if back_rows != rows {
-        bail!("read-back row mismatch: wrote {rows}, read {back_rows}");
+    // Inspection report: always when there is no output (the whole job is "inspect"), and also as a
+    // verbose extra during a real conversion.
+    if verbose || cfg.output.is_none() {
+        report_inspect(&cli.input)?;
     }
-    let src = dir_size(input).unwrap_or(0);
-    println!("ims-compact: {} -> {}", input.display(), out.display());
-    println!("  peaks:       {rows}");
-    println!("  output:      {:.2} MB", bytes as f64 / 1e6);
-    if src > 0 {
-        println!("  source .d:   {:.2} MB  ({:.0}% of source)", src as f64 / 1e6, bytes as f64 / src as f64 * 100.0);
-    }
-    println!("  calibration: {calib}");
-    println!("  lossless (TOF-exact): PASS — independent re-read, TOF+intensity match native bins");
-    Ok(exit::OK)
-}
-
-fn dir_size(p: &Path) -> Result<u64> {
-    let mut total = 0u64;
-    for entry in fs::read_dir(p)? {
-        let entry = entry?;
-        let md = entry.metadata()?;
-        total += if md.is_dir() { dir_size(&entry.path()).unwrap_or(0) } else { md.len() };
-    }
-    Ok(total)
-}
-
-fn cmd_convert(args: ConvertArgs) -> Result<i32> {
-    let output = args
-        .output
-        .clone()
-        .unwrap_or_else(|| args.input.with_extension("mzpeak"));
-
-    let chunk = match args.layout {
-        Layout::Point => None,
-        Layout::Chunked if args.no_numpress => Some(ChunkingStrategy::Delta {
-            chunk_size: args.chunk_size,
-        }),
-        Layout::Chunked => Some(ChunkingStrategy::NumpressLinear {
-            chunk_size: args.chunk_size,
-        }),
+    let Some(output) = cfg.output.clone() else {
+        return Ok(exit::OK); // no --output: nothing written, just the report above
     };
 
-    if args.dry_run {
-        println!("would convert {} -> {}", args.input.display(), output.display());
-        println!(
-            "  layout={:?} chunk={:?} zstd={}",
-            args.layout, chunk, args.zstd_level
-        );
-        return Ok(exit::OK);
+    let chunk = match cfg.layout {
+        Layout::Point => None,
+        Layout::Chunked if cfg.no_numpress => Some(ChunkingStrategy::Delta { chunk_size: cfg.chunk_size }),
+        Layout::Chunked => Some(ChunkingStrategy::NumpressLinear { chunk_size: cfg.chunk_size }),
+    };
+
+    if output.exists() && !cfg.force {
+        bail!("output {} exists (use --force to overwrite)", output.display());
     }
 
-    if output.exists() && !args.force {
-        bail!(
-            "output {} exists (use --force to overwrite)",
-            output.display()
-        );
-    }
-
-    let vendor = if args.no_vendor {
+    let vendor = if cfg.no_vendor {
         None
     } else {
-        Some(vendor::VendorPolicy::load(args.config.as_deref(), &args.aux)?)
+        Some(vendor::VendorPolicy::load(None, &cfg.aux)?)
     };
 
-    if args.via_msconvert {
-        convert_via_msconvert(&args.input, &output, chunk, args.zstd_level, args.msconvert_path.as_deref())
-            .with_context(|| format!("converting {} via msconvert", args.input.display()))?;
-    } else if args.ims_compact {
-        let is_tdf = args.input.is_dir() && args.input.join("analysis.tdf").exists();
-        if !is_tdf {
-            bail!("--ims-compact requires a Bruker TDF .d (with analysis.tdf)");
-        }
-        convert_ims_compact_archive(&args.input, &output, args.zstd_level, vendor.as_ref())
-            .with_context(|| format!("ims-compact converting {}", args.input.display()))?;
+    // ims-compact is the DEFAULT for Bruker timsTOF (TDF); --no-ims-compact falls back to f64 m/z.
+    let use_ims_compact = is_tdf_dir(&cli.input) && !cfg.no_ims_compact;
+
+    if cfg.via_msconvert {
+        convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref())
+            .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
+    } else if use_ims_compact {
+        convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref())
+            .with_context(|| format!("ims-compact converting {}", cli.input.display()))?;
     } else {
-        guard_unsupported_vendor(&args.input)?;
-        convert_file(&args.input, &output, chunk, args.zstd_level, vendor.as_ref())
-            .with_context(|| format!("converting {}", args.input.display()))?;
+        guard_unsupported_vendor(&cli.input)?;
+        convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref())
+            .with_context(|| format!("converting {}", cli.input.display()))?;
     }
 
     log::info!("wrote {}", output.display());
 
-    if args.verify {
-        round_trip_verify(&args.input, &output).context("round-trip verify")?;
+    if cfg.verify {
+        round_trip_verify(&cli.input, &output, use_ims_compact).context("round-trip verify")?;
         log::info!("verify passed (counts match source)");
     }
     Ok(exit::OK)
+}
+
+/// True for a Bruker timsTOF TDF `.d` (folder with `analysis.tdf`).
+fn is_tdf_dir(input: &Path) -> bool {
+    input.is_dir() && input.join("analysis.tdf").exists()
+}
+
+/// Print a human report of what a reader sees (format, spectra, chromatograms) without converting —
+/// the behaviour of a no-output run, and the `-v` extra during a conversion.
+fn report_inspect(input: &Path) -> Result<()> {
+    println!("input:         {}", input.display());
+    if is_tsf_dir(input) {
+        println!("format:        Bruker TSF (.d)");
+        println!("spectra:       {}", bruker_tsf::TsfReader::open(input)?.len());
+        return Ok(());
+    }
+    #[cfg(feature = "bruker_sdk")]
+    if is_baf_dir(input) {
+        println!("format:        Bruker BAF (.d)");
+        println!("spectra:       {}", bruker_baf::BafReader::open(input, None)?.len());
+        return Ok(());
+    }
+    if is_agilent_d(input) {
+        println!("format:        Agilent .d");
+        #[cfg(feature = "agilent")]
+        println!("spectra:       {}", agilent::AgilentReader::open(input)?.len());
+        #[cfg(not(feature = "agilent"))]
+        println!("note:          native Agilent reading needs a `--features agilent` build (or use --via-msconvert)");
+        return Ok(());
+    }
+    if is_wiff(input) {
+        println!("format:        SciEX .wiff");
+        #[cfg(feature = "sciex")]
+        println!("spectra:       {}", sciex::SciexReader::open(input)?.len());
+        #[cfg(not(feature = "sciex"))]
+        println!("note:          native SciEX reading needs a `--features sciex` build (or use --via-msconvert)");
+        return Ok(());
+    }
+    let reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input)
+        .with_context(|| format!("opening {}", input.display()))?;
+    println!("format:        {}", reader_format(&reader));
+    println!("spectra:       {}", reader.len());
+    println!("chromatograms: {}", reader.count_chromatograms());
+    if is_tdf_dir(input) {
+        println!("ims-compact:   on by default for TDF (pass --no-ims-compact to write f64 m/z instead)");
+    }
+    Ok(())
 }
 
 /// True for an Agilent `.d` (folder with an `AcqData/` subdir).
@@ -927,8 +935,14 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
 /// zero-intensity-run masking (which makes per-point counts legitimately differ from source).
 /// Value-level (m/z/intensity) fidelity is added for the lossless ims-compact path in P2, where
 /// zero-masking is off and exact comparison is meaningful.
-fn round_trip_verify(input: &Path, output: &Path) -> Result<()> {
-    let src_spectra = count_source(input)?;
+fn round_trip_verify(input: &Path, output: &Path, ims_compact: bool) -> Result<()> {
+    // ims-compact stores native TDF frames in the peaks facet, so the comparable source count is the
+    // peak-bearing frames (mzdata uses a different, all-frames spectrum model — not apples-to-apples).
+    let src_spectra = if ims_compact {
+        bruker_native::peak_bearing_frames(input)?
+    } else {
+        count_source(input)?
+    };
     let arc_spectra = count_archive(output)?;
     if src_spectra != arc_spectra {
         bail!("spectrum count mismatch: source {src_spectra} vs archive {arc_spectra}");
@@ -968,41 +982,6 @@ fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
             )],
         }],
     });
-}
-
-fn cmd_inspect(input: &Path, json: bool) -> Result<i32> {
-    if is_tsf_dir(input) {
-        let n = bruker_tsf::TsfReader::open(input)?.len();
-        if json {
-            println!(r#"{{"input":{:?},"format":"Bruker TSF (.d)","spectra":{},"chromatograms":0}}"#, input.display().to_string(), n);
-        } else {
-            println!("input:        {}", input.display());
-            println!("format:       Bruker TSF (.d)");
-            println!("spectra:      {n}");
-        }
-        return Ok(exit::OK);
-    }
-    let reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input)
-        .with_context(|| format!("opening {}", input.display()))?;
-    let format = reader_format(&reader);
-    let n_spectra = reader.len();
-    let n_chrom = reader.count_chromatograms();
-
-    if json {
-        println!(
-            r#"{{"input":{:?},"format":{:?},"spectra":{},"chromatograms":{}}}"#,
-            input.display().to_string(),
-            format,
-            n_spectra,
-            n_chrom
-        );
-    } else {
-        println!("input:        {}", input.display());
-        println!("format:       {format}");
-        println!("spectra:      {n_spectra}");
-        println!("chromatograms:{n_chrom}");
-    }
-    Ok(exit::OK)
 }
 
 fn reader_format<R: std::io::Read + std::io::Seek>(reader: &MZReaderType<R>) -> &'static str {

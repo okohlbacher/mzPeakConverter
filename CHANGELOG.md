@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed — single-command CLI (breaking)
+
+- The tool is now **one command** — `mzpeak-convert <input> [-o <output>] [options]`.
+  The `convert`, `inspect`, `ims-compact`, `tof-grid-probe`, and `tof-grid`
+  subcommands are removed.
+  - **No `--output`** → nothing is written; the input is inspected and a report
+    is printed (the former `inspect`).
+  - **`-v`** prints that inspection report *and* still converts.
+  - **ims-compact** is now an option, **on by default for Bruker timsTOF (TDF)**;
+    disable with `--no-ims-compact`. The standalone bare-Parquet encoder is gone.
+  - `tof-grid`/`tof-grid-probe` (a measured no-go research spike) are removed.
+- **`--config` is now a general configuration file** holding *any* overridable
+  option (not just vendor side-file policy). Precedence: CLI flag > config > default.
+- SQLite is compiled from source (`rusqlite` `bundled`) — self-contained build on
+  all platforms (no system libsqlite3).
+
+### Added
+
+- Windows CI: builds default + all vendor-SDK features, the C# glues, smoke-converts,
+  and (separately) installs ProteoWizard from TeamCity to exercise `--via-msconvert`.
+
 ## [0.2.0] — 2026-06-21
 
 ### Changed

@@ -18,7 +18,7 @@ $validate = Get-Command mzpeak-validate -ErrorAction SilentlyContinue
 
 function Convert-And-Check($input, $tag) {
   Write-Host "==> $tag : $input"
-  & $bin convert "$input" -o "$out\$tag.mzpeak" --force --verify
+  & $bin "$input" -o "$out\$tag.mzpeak" --force --verify
   if ($LASTEXITCODE -ne 0) { Write-Host "  CONVERT FAILED ($LASTEXITCODE)"; return $false }
   if ($validate) {
     & $validate.Source "$out\$tag.mzpeak"

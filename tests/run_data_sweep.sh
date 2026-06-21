@@ -20,7 +20,7 @@ if [ "${1:-}" = "--worker" ]; then
   clog="$OUT/logs/$id.convert.log"; vlog="$OUT/logs/$id.val.log"
   verify=(--verify); [ -n "${NO_VERIFY:-}" ] && verify=()
 
-  "$BIN" convert "$path" -o "$archive" --force "${verify[@]}" >"$clog" 2>&1
+  "$BIN" "$path" -o "$archive" --force "${verify[@]}" >"$clog" 2>&1
   rc=$?
   if [ "$rc" -eq 3 ]; then
     printf '%s\t%s\tSKIP\tunsupported (vendor feature off)\t\n' "$fmt" "$rel" >>"$OUT/results.tsv"

@@ -49,7 +49,7 @@ while IFS=$'\t' read -r id format status path note; do
     missing=$((missing+1)); continue
   fi
   archive="$out/$id.mzpeak"
-  if ! "$bin" convert "$path" -o "$archive" --force --verify >"$out/$id.convert.log" 2>&1; then
+  if ! "$bin" "$path" -o "$archive" --force --verify >"$out/$id.convert.log" 2>&1; then
     printf "%-16s %-6s %-8s %s\n" "$id" "$format" "CONV-ERR" "see $out/$id.convert.log"
     fail=$((fail+1)); continue
   fi

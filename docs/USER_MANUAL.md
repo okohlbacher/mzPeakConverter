@@ -6,170 +6,156 @@
 > production tool yet** — output layout and semantics may change as the spec evolves.
 
 `mzpeak-convert` converts mass-spectrometry raw and exchange formats into the
-**mzPeak** format (HUPO-PSI, v0.9). It reads through
-[`mzdata`](https://github.com/mobiusklein/mzdata) (plus native readers for
-formats mzdata does not cover) and writes through the reference
-`mzpeak_prototyping` writer.
+**mzPeak** format. It reads through [`mzdata`](https://github.com/mobiusklein/mzdata)
+(plus native readers for formats mzdata does not cover) and writes through the
+reference `mzpeak_prototyping` writer.
 
-**Learn more about the format:** the [mzpeak.org](https://mzpeak.org) website and
-the specification repository [HUPO-PSI/mzPeak-specification](https://github.com/HUPO-PSI/mzPeak-specification).
-You can inspect and analyze any `.mzpeak` file directly in your browser (no upload,
-no backend) at **[mzpeak.org/view](https://mzpeak.org/view)**.
+It is a **single command**: give it an input and, optionally, an output.
 
 - [1. What it does](#1-what-it-does)
 - [2. Installation & requirements](#2-installation--requirements)
 - [3. Quick start](#3-quick-start)
-- [4. Commands](#4-commands)
-  - [4.1 convert](#41-convert)
-  - [4.2 inspect](#42-inspect)
-  - [4.3 ims-compact](#43-ims-compact)
-  - [4.4 tof-grid-probe / tof-grid](#44-tof-grid-probe--tof-grid)
-- [5. Input formats](#5-input-formats)
-- [6. The mzPeak output](#6-the-mzpeak-output)
-- [7. Vendor side-files](#7-vendor-side-files)
-- [8. Compression & layout](#8-compression--layout)
-- [9. Verification & validation](#9-verification--validation)
-- [10. Exit codes & environment](#10-exit-codes--environment)
-- [11. Optional vendor-SDK builds](#11-optional-vendor-sdk-builds)
-- [12. Dependencies](#12-dependencies)
-- [13. Troubleshooting](#13-troubleshooting)
+- [4. Command-line options](#4-command-line-options)
+- [5. Configuration file](#5-configuration-file)
+- [6. Supported formats & operating systems](#6-supported-formats--operating-systems)
+- [7. The mzPeak output](#7-the-mzpeak-output)
+- [8. Vendor-specific metadata handling](#8-vendor-specific-metadata-handling)
+- [9. Compression, layout & ims-compact](#9-compression-layout--ims-compact)
+- [10. Verification](#10-verification)
+- [11. Exit codes & environment](#11-exit-codes--environment)
+- [12. Optional vendor-SDK builds](#12-optional-vendor-sdk-builds)
+- [13. Dependencies](#13-dependencies)
+- [14. Troubleshooting](#14-troubleshooting)
 
 ---
 
 ## 1. What it does
 
-mzPeakConverter takes one input acquisition (a file or a vendor directory) and
-produces a single `.mzpeak` archive — a STORED ZIP holding Apache Parquet facets
-(`spectra_metadata`, `spectra_data`, `spectra_peaks`, `chromatograms`) plus an
-`mzpeak_index.json`. The goal is a **lossless, columnar, analysis-ready**
-representation that preserves vendor metadata and ion-mobility structure.
+`mzpeak-convert <input> [-o <output>] [options]` does one of two things:
 
-Highlights:
+- **With `--output`** — converts the input acquisition to a single `.mzpeak`
+  archive (a STORED ZIP of Apache Parquet facets + a JSON index) that is lossless,
+  columnar, and analysis-ready, preserving vendor metadata and ion-mobility structure.
+- **Without `--output`** — writes nothing; it just **inspects** the input and prints
+  a report (format, spectrum count, chromatogram count).
 
-- One binary for mzML/imzML, Bruker `.d` (TDF/TSF), and Thermo `.raw`.
-- Lossless **ims-compact** encoding for Bruker timsTOF integer-TOF data.
-- Verbatim Thermo scan-trailer capture (FAIMS CV, injection time, charge, …).
-- Vendor side-file embedding so the original metadata travels with the data.
-- A cross-vendor fallback through ProteoWizard `msconvert`.
+Passing `-v` prints that same inspection report *and still performs the conversion*.
 
 ## 2. Installation & requirements
-
-### Build requirements
 
 | Requirement | Notes |
 |---|---|
 | Rust ≥ 1.87 | edition 2024; install via <https://rustup.rs> |
-| C toolchain | for the bundled native libs (sqlite, zstd) |
+| C toolchain | for the bundled native libs (SQLite is compiled from source) |
 | .NET 8+ runtime | **only for Thermo `.raw`**; auto-rolls-forward to 9/10 |
 
 ```sh
 git clone https://github.com/okohlbacher/mzPeakConverter.git
 cd mzPeakConverter
-cargo build --release
-# binary at target/release/mzpeak-convert
+cargo build --release          # binary at target/release/mzpeak-convert
 ```
 
-The first build downloads the `nethost` loader for the Thermo interop layer.
-Non-Thermo conversions need no .NET.
-
-### Runtime requirements
-
-- Nothing beyond the binary for mzML/imzML/Bruker conversions.
-- A .NET 8+ runtime for Thermo `.raw` (<https://dotnet.microsoft.com/download>).
-- `mzpeak-validate` (from the mzPeak tooling) for `--validate` / the `validate`
-  command. Use a `pyarrow ≥ 14` environment for ims-compact archives.
-- `msconvert` (ProteoWizard) for `--via-msconvert`.
+Non-Thermo conversions need no .NET. See §12 for the optional vendor-SDK builds.
 
 ## 3. Quick start
 
 ```sh
-# Convert an mzML file (output path inferred: sample.mzpeak)
-mzpeak-convert convert sample.mzML
+# Inspect only — prints a report, writes nothing
+mzpeak-convert run.raw
 
-# Convert a Thermo .raw and verify the round trip
-mzpeak-convert convert run.raw -o run.mzpeak --verify --force
+# Convert to mzPeak
+mzpeak-convert run.raw -o run.mzpeak
 
-# See what a reader makes of an input without converting
-mzpeak-convert inspect run.raw
+# Convert, print the inspection report too, and round-trip verify
+mzpeak-convert run.raw -o run.mzpeak -v --verify --force
 
-# Convert a Bruker timsTOF .d with lossless integer-TOF storage
-mzpeak-convert convert experiment.d -o experiment.mzpeak --ims-compact
+# Bruker timsTOF (.d): lossless ims-compact integer-TOF is the DEFAULT
+mzpeak-convert experiment.d -o experiment.mzpeak              # ims-compact
+mzpeak-convert experiment.d -o experiment.mzpeak --no-ims-compact   # standard f64 m/z
+
+# A format without a native reader in this build, via ProteoWizard
+mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 ```
 
-## 4. Commands
+## 4. Command-line options
 
-Global options (accepted by every subcommand): `-v`/`--verbose` (repeat for more
-detail; overrides `RUST_LOG`), `-q`/`--quiet`, `-h`/`--help`, `-V`/`--version`.
-
-### 4.1 convert
-
-`mzpeak-convert convert [OPTIONS] <INPUT>`
-
-Convert an input file/directory to an mzPeak archive.
+`mzpeak-convert [OPTIONS] <INPUT>`
 
 | Option | Default | Description |
 |---|---|---|
-| `-o, --output <PATH>` | `<input>.mzpeak` | Output archive path |
-| `--layout <chunked\|point>` | `chunked` | Signal layout (see §8) |
+| `<INPUT>` | — | Input file or vendor directory (positional, required) |
+| `-o, --output <PATH>` | *(none → inspect only)* | Output `.mzpeak` archive; if omitted, nothing is written |
+| `-c, --config <FILE>` | — | YAML config file setting defaults for any option (see §5) |
+| `--layout <chunked\|point>` | `chunked` | Signal layout (see §9) |
 | `--no-numpress` | off | Lossless delta m/z chunking instead of lossy numpress-linear |
 | `--chunk-size <Th>` | `50` | m/z chunk width for the chunked layout |
 | `--zstd-level <1–22>` | `3` | Parquet zstd level |
+| `--no-ims-compact` | off | Bruker TDF: write standard f64 m/z instead of the default ims-compact |
+| `--no-vendor` | off | Do not embed vendor side-files (see §8) |
+| `--aux <glob=embed\|drop>` | — | Vendor side-file rule (repeatable, highest precedence) |
+| `--via-msconvert` | off | Read via ProteoWizard `msconvert` → mzML → mzPeak |
+| `--msconvert-path <PATH>` | `$MSCONVERT_PATH` / PATH | Location of `msconvert` |
+| `--verify` | off | Round-trip fidelity check (re-read source + archive, compare counts) |
 | `-f, --force` | off | Overwrite an existing output |
-| `-n, --dry-run` | off | Plan and report; write nothing |
-| `--verify` | off | Round-trip check (re-read source + archive; compare spectrum & point counts) |
-| `--ims-compact` | off | Bruker TDF: store lossless integer-`tof` in `spectra_peaks` (§5) |
-| `--config <YAML>` | built-in | Vendor side-file embedding policy (§7) |
-| `--aux <glob=embed\|drop>` | — | Override one embedding rule (repeatable, highest precedence) |
-| `--no-vendor` | off | Do not embed any vendor side-files |
-| `--via-msconvert` | off | Read via ProteoWizard `msconvert` → mzML → mzPeak (§5) |
-| `--msconvert-path <PATH>` | `$MSCONVERT_PATH` / PATH | Location of the `msconvert` executable |
+| `-v, --verbose` | off | Print the inspection report (repeat `-vv` for trace logs) |
+| `-q, --quiet` | off | Silence all logs except errors |
 
-### 4.2 inspect
+## 5. Configuration file
 
-`mzpeak-convert inspect [--json] <INPUT>`
+`--config <file.yaml>` loads a configuration file that can set **any** of the
+options above — it is a general configuration, not a vendor-only concern. Every
+key is optional. Precedence is:
 
-Report what the reader sees — detected format, spectrum count, MS levels,
-chromatograms — without converting. `--json` emits a machine-readable summary.
+> **explicit command-line flag → config-file value → built-in default**
 
-> **Conformance validation is not part of this tool.** Validate `.mzpeak`
-> archives with the independent `mzpeak-validate` program (see §9).
+(Boolean switches such as `no_numpress` are enable-only: a config value of `true`
+or the corresponding flag turns them on.)
 
-### 4.3 ims-compact
+```yaml
+# mzpeak-convert.yaml — every overridable option, all optional
+output: out.mzpeak
+layout: chunked            # or: point
+no_numpress: false
+chunk_size: 50
+zstd_level: 9
+no_ims_compact: false      # TDF: keep the lossless ims-compact default
+no_vendor: false
+aux:                       # vendor side-file rules (see §8)
+  - "*.tdf_bin=drop"
+  - "*.method=embed"
+via_msconvert: false
+msconvert_path: /opt/pwiz/msconvert
+force: true
+verify: true
+```
 
-`mzpeak-convert ims-compact -o <OUT.parquet> <INPUT.d>`
+```sh
+mzpeak-convert run.d -c mzpeak-convert.yaml          # uses the file's settings
+mzpeak-convert run.d -c mzpeak-convert.yaml --zstd-level 3   # CLI overrides zstd_level
+```
 
-Encode a Bruker **TDF** `.d` to a standalone lossless **ims-compact** Parquet
-(native integer-TOF). The encoder streams one frame at a time (constant memory)
-and verifies losslessness with an independent native re-read before finalizing.
-Use this to inspect or benchmark the encoding in isolation; for a full archive,
-use `convert --ims-compact`.
+Unknown keys are rejected with a clear error.
 
-### 4.4 tof-grid-probe / tof-grid
+## 6. Supported formats & operating systems
 
-Research/feasibility tools for profile-TOF m/z grid encoding (PSI P5 spike):
+| Format | Linux | macOS | Windows | Notes |
+|---|:---:|:---:|:---:|---|
+| mzML, `.mzML.gz` | ✅ | ✅ | ✅ | full metadata + chromatograms |
+| imzML | ✅ | ✅ | ✅ | imaging coordinate columns; IMS CV promoted |
+| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default** |
+| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; otofControl m/z correction |
+| Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
+| Bruker `.d` **BAF** | ✅¹ | ❌ | ✅¹ | ¹ build `--features bruker_sdk`; needs `libbaf2sql_c` |
+| Agilent `.d` (native) | ❌ | ❌ | ✅¹ | ¹ build `--features agilent`; MHDAC DLLs (Windows only) |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅¹ | ¹ build `--features sciex`; Clearcore2 DLLs (Windows only) |
+| Agilent / SciEX / … via msconvert | ✅² | ✅² | ✅ | ² `--via-msconvert`; needs ProteoWizard (Windows, or Wine elsewhere) |
 
-- `tof-grid-probe [--fit-tolerance-ppm N] <INPUT>` — read-only; measures how well
-  a profile-TOF acquisition fits a single √(m/z) lattice (a go/no-go signal).
-- `tof-grid [-o OUT] [--tolerance-ppm N] <INPUT>` — encodes m/z as the √(m/z)
-  grid and benchmarks storage vs raw-f64 and delta+zstd. **Lossy** within the
-  reported ppm bound.
+The default build (all OSes) covers the first five rows. Vendor-native rows need
+the optional build features in §12; everywhere else, `--via-msconvert` is the
+cross-vendor path. Inputs that the current build cannot read natively exit with
+code **3** and actionable guidance.
 
-## 5. Input formats
-
-| Format | Reader | Notes |
-|---|---|---|
-| mzML, `.mzML.gz` | mzdata | full metadata + chromatograms |
-| imzML | mzdata | imaging x/y(/z) coordinate columns; IMS CV promoted |
-| Bruker `.d` (TDF) | mzdata `bruker_tdf` + native `timsrust` | ion mobility preserved; `--ims-compact` for lossless integer-TOF |
-| Bruker `.d` (TSF) | ported reader (rusqlite + zstd) | MALDI / line spectra; otofControl m/z correction |
-| Thermo `.raw` | mzdata `thermo` (.NET) | verbatim scan-trailer facets |
-| Bruker `.d` (BAF) | `bruker_sdk` feature | needs `libbaf2sql_c` (Windows/Linux) |
-| Agilent `.d`, SciEX `.wiff` | `--via-msconvert`, or `agilent`/`sciex` features | native readers Windows-only (§11) |
-
-Inputs for unsupported vendors exit with code **3** and actionable guidance
-(usually: use `--via-msconvert`).
-
-## 6. The mzPeak output
+## 7. The mzPeak output
 
 A `.mzpeak` file is a **STORED** (uncompressed-container) ZIP. Compression lives
 *inside* the Parquet facets, not in the ZIP, so readers can range-read columns.
@@ -179,48 +165,73 @@ Contents:
   `ims_calibration` (for ims-compact), declared file entries.
 - `spectra_metadata.parquet` — per-spectrum descriptors (id, index, MS level,
   polarity, scan time, precursor info, …).
-- `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked or
-  point layout).
+- `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point).
 - `chromatograms.parquet` — TIC/BPC/SRM and other chromatograms.
-- `vendor/…` — embedded original side-files (optional, see §7).
+- `vendor/…` — embedded original side-files (optional, see §8).
 
-## 7. Vendor side-files
+**The format itself** — rationale, the draft specification, and the controlled
+vocabulary — is documented at:
 
-For Bruker `.d`, the original side-files are **embedded by default** under
-`vendor/` in the archive (preserve-by-default), gzip-compressed, and declared as
-`proprietary` entries in the index. Control this with:
+- 🌐 **[mzpeak.org](https://mzpeak.org)** — overview and specification.
+- 📑 **[HUPO-PSI/mzPeak-specification](https://github.com/HUPO-PSI/mzPeak-specification)** — the spec repository.
+- 🔬 **[mzpeak.org/view](https://mzpeak.org/view)** — open and analyze any `.mzpeak`
+  produced by this tool directly in your browser (streamed over HTTP, no upload,
+  no backend).
 
-- `--no-vendor` — embed nothing.
-- `--config policy.yaml` — a YAML glob→action policy (`embed` / `drop`).
-- `--aux 'glob=drop'` / `--aux 'glob=embed'` — per-glob override, highest
-  precedence, repeatable.
+## 8. Vendor-specific metadata handling
 
-For Thermo `.raw`, vendor scan trailers (FAIMS CV, injection time, charge, …) are
-captured into dedicated `vendor_scan_trailers` facets (tall + wide) and a
-`vendor_status_log` facet.
+Vendor acquisitions carry rich, format-specific metadata. mzPeakConverter
+preserves it along two routes:
 
-## 8. Compression & layout
+**Mapped metadata (into the archive's typed columns).** Where a vendor value has a
+PSI controlled-vocabulary meaning, it is mapped onto the standard
+`spectra_metadata` columns — MS level, polarity, scan start time, precursor m/z /
+charge / isolation window, ion-mobility (`mean inverse reduced ion mobility` for
+TDF), and the `MS:1000294` spectrum-type. Bruker TSF/BAF m/z is produced from the
+vendor calibration (TSF applies the otofControl ±Th correction); Bruker TDF stores
+the native integer TOF grid plus the `a,b` calibration in `ims_calibration` so a
+reader reconstructs `m/z = (a + b·tof)²` exactly.
 
-- **Layout** — `chunked` (default) groups m/z into chunks (`--chunk-size`, Th)
-  and encodes each with numpress-linear (lossy, compact) or, with
-  `--no-numpress`, lossless delta. `point` writes one row per (m/z, intensity).
+**Verbatim vendor side-files (preserved, not interpreted).** For Bruker `.d`, the
+original side-files (methods, calibration, acquisition databases, …) are
+**embedded by default** under `vendor/` in the archive — gzip-compressed and
+declared `proprietary` in the index — so nothing the converter does not yet model
+is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
+…) and status log are captured verbatim into dedicated `vendor_scan_trailers`
+(tall + wide) and `vendor_status_log` facets.
+
+**Including / excluding.** The embedding is policy-driven (preserve-by-default):
+
+- `--no-vendor` (or `no_vendor: true`) — embed nothing.
+- `--aux 'glob=drop'` / `--aux 'glob=embed'` — per-glob rule, highest precedence,
+  repeatable. The same rules can be given as the `aux:` list in the config file
+  (§5). For example, drop the bulk binaries but keep the method:
+  `--aux '*.tdf_bin=drop' --aux '*.method=embed'`.
+
+## 9. Compression, layout & ims-compact
+
+- **Layout** — `chunked` (default) groups m/z into chunks (`--chunk-size`, Th) and
+  encodes each with numpress-linear (lossy, compact) or, with `--no-numpress`,
+  lossless delta. `point` writes one row per (m/z, intensity).
 - **zstd** — applied inside Parquet, `--zstd-level` 1–22 (default 3).
-- **ims-compact** — Bruker TDF integer-TOF stored bit-exact with delta-reset +
-  BYTE_STREAM_SPLIT; ~50 % smaller than f64 m/z. m/z is reconstructed by readers
-  as `m/z = (a + b·tof)²` from the `ims_calibration` index entry.
+- **ims-compact** — for Bruker timsTOF (**TDF**) this is the **default**: the
+  native integer `tof` is stored bit-exact (Int32 + `ims_calibration`) instead of
+  f64 m/z, roughly halving the m/z bytes with an exact grid. Disable with
+  `--no-ims-compact` to write standard f64 m/z. m/z is reconstructed by readers as
+  `m/z = (a + b·tof)²`.
 
-## 9. Verification & validation
+## 10. Verification
 
-- **`--verify`** performs an in-process **round-trip fidelity** check: it re-reads
-  both the source and the freshly written archive and asserts spectrum (and point)
-  counts match. A mismatch fails the conversion. This checks that the conversion
-  did not lose data — it does *not* check spec conformance.
-- **Conformance validation is a separate concern**, handled by the independent
-  **`mzpeak-validate`** tool (not part of this converter). Run it on the produced
-  archive: `mzpeak-validate run.mzpeak`. The e2e harness in `tests/` invokes it
-  automatically (selecting a `pyarrow ≥ 14` environment via `$MZPEAK_VALIDATE`).
+`--verify` performs an in-process **round-trip fidelity** check: it re-reads both
+the source and the freshly written archive and asserts the spectrum counts match
+(for ims-compact, against the native peak-bearing frame count). This checks the
+conversion did not lose data — it does **not** check spec conformance.
 
-## 10. Exit codes & environment
+**Conformance validation is a separate concern**, handled by the independent
+`mzpeak-validate` tool (not part of this converter): `mzpeak-validate run.mzpeak`.
+The e2e harness in `tests/` invokes it automatically.
+
+## 11. Exit codes & environment
 
 | Code | Meaning |
 |---|---|
@@ -228,53 +239,47 @@ captured into dedicated `vendor_scan_trailers` facets (tall + wide) and a
 | 1 | generic error (includes `--verify` mismatch) |
 | 3 | unsupported input/format in this build |
 
-Environment variables:
-
 | Variable | Effect |
 |---|---|
 | `RUST_LOG` | log filter (overridden by `-v`/`-q`) |
 | `DOTNET_ROLL_FORWARD` | set automatically to `LatestMajor` if unset (Thermo) |
 | `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` | set automatically to `ignore` if unset |
 | `MSCONVERT_PATH` | `msconvert` location for `--via-msconvert` |
-| `MZPC_PWIZ_DIR`, `MZPC_SCIEX_GLUE`, `MZPC_AGILENT_GLUE` | native vendor-SDK builds (§11) |
+| `MZPC_PWIZ_DIR`, `MZPC_SCIEX_GLUE`, `MZPC_AGILENT_GLUE` | native vendor-SDK builds (§12) |
 
-(`$MZPEAK_VALIDATE` is read by the `tests/` harness to pick a `mzpeak-validate`
-binary; the converter itself does not invoke a validator.)
-
-## 11. Optional vendor-SDK builds
+## 12. Optional vendor-SDK builds
 
 Off by default (they need licensed vendor DLLs and are platform-restricted):
 
 ```sh
-cargo build --release --features bruker_sdk   # Bruker BAF via libbaf2sql_c
-cargo build --release --features agilent      # Agilent MHDAC (native .NET glue)
-cargo build --release --features sciex        # SciEX Clearcore2 (native .NET glue)
+cargo build --release --features bruker_sdk   # Bruker BAF via libbaf2sql_c (Windows/Linux)
+cargo build --release --features agilent      # Agilent MHDAC native .NET glue (Windows)
+cargo build --release --features sciex        # SciEX Clearcore2 native .NET glue (Windows)
 ```
 
-The Agilent/SciEX readers are **Windows-runtime-only** and currently
-compile-verified but not runtime-tested. They need a .NET 8 runtime, the built
-C# glue (`glue/{agilent,sciex}/`, pointed to by `$MZPC_{AGILENT,SCIEX}_GLUE`),
+The Agilent/SciEX readers are **Windows-runtime-only**. They need a .NET 8 runtime,
+the built C# glue (`glue/{agilent,sciex}/`, pointed to by `$MZPC_{AGILENT,SCIEX}_GLUE`),
 and vendor DLLs from a ProteoWizard install (`$MZPC_PWIZ_DIR`). The C# glues are
 reflection-only and build anywhere (`dotnet build glue/sciex/SciexGlue.csproj`).
 
-For everyday cross-vendor needs, prefer `--via-msconvert` — it needs no special
-build.
+For everyday cross-vendor needs, prefer `--via-msconvert` — it needs no special build.
 
-## 12. Dependencies
+## 13. Dependencies
 
-mzPeakConverter is pure Rust plus a small C# interop layer for Thermo/native
-vendor readers. Core crates: `mzdata`, `mzpeaks`, `arrow`/`parquet`, `zip`,
-`timsrust`, `rusqlite`/`zstd`, `flate2`, `clap`, `serde`, `anyhow`. The reference
-writer `mzpeak_prototyping` is vendored under `vendor/`. A complete inventory of
-all 395 transitive dependencies (with licenses) is in
+Pure Rust plus a small C# interop layer for Thermo/native vendor readers. Core
+crates: `mzdata`, `mzpeaks`, `arrow`/`parquet`, `zip`, `timsrust`,
+`rusqlite`(bundled SQLite)/`zstd`, `flate2`, `clap`, `serde`, `anyhow`. The
+reference writer `mzpeak_prototyping` is vendored under `vendor/`. A complete
+inventory of all transitive dependencies (with licenses) is in
 [`sbom.cdx.json`](../sbom.cdx.json); see [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Thermo `.raw` fails to open | install a .NET 8+ runtime |
 | `--via-msconvert` not found | install ProteoWizard or set `--msconvert-path`/`$MSCONVERT_PATH` |
-| Agilent/SciEX exits with code 3 | expected without `--features`; use `--via-msconvert` |
-| UV/PDA spectra missing | non-MS spectra are not yet carried (known limitation) |
+| Agilent/SciEX exits with code 3 | expected without the build feature; use `--via-msconvert` |
+| Nothing was written | give `-o/--output`; without it the run only inspects |
 | Output exists error | pass `--force` to overwrite |
+| UV/PDA spectra missing | non-MS spectra are not yet carried (known limitation) |

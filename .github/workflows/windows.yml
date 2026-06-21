@@ -52,7 +52,7 @@ jobs:
 
       # Core convert path, end-to-end on Windows, against a tiny committed mzML.
       - name: Smoke test — convert + round-trip verify
-        run: cargo run --release -- convert tests/fixtures/tiny.pwiz.1.1.mzML -o out.mzpeak --verify --force
+        run: cargo run --release -- tests/fixtures/tiny.pwiz.1.1.mzML -o out.mzpeak --verify --force
 
       # SciEX .wiff with the feature OFF (default `cargo run`) must report the
       # unsupported-vendor contract — exit 3, a clean refusal, not a crash.
@@ -60,7 +60,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType File -Force -Path sample.wiff > $null
-          cargo run --release -- convert sample.wiff -o out.mzpeak --force
+          cargo run --release -- sample.wiff -o out.mzpeak --force
           $code = $LASTEXITCODE   # capture before it leaks into the step's own exit status
           if ($code -ne 3) { Write-Error "expected exit 3, got $code"; exit 1 }
           Write-Host "vendor guard returned exit 3 as expected"
@@ -115,7 +115,7 @@ jobs:
       - name: Convert via msconvert (mzML -> msconvert -> mzPeak)
         shell: pwsh
         run: |
-          cargo run --release -- convert tests/fixtures/tiny.pwiz.1.1.mzML --via-msconvert -o out_pwiz.mzpeak --force
+          cargo run --release -- tests/fixtures/tiny.pwiz.1.1.mzML --via-msconvert -o out_pwiz.mzpeak --force
           $code = $LASTEXITCODE
           if ($code -ne 0) { Write-Error "--via-msconvert failed: $code"; exit 1 }
           if (-not (Test-Path out_pwiz.mzpeak)) { Write-Error "no output archive produced"; exit 1 }

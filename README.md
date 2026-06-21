@@ -28,22 +28,30 @@ analysis-ready, preserving vendor metadata and ion-mobility structure.
 
 ## Documentation
 
-- 📘 **[User Manual](docs/USER_MANUAL.md)** — full functionality, every command
-  and option, formats, output layout, requirements, troubleshooting.
+- 📘 **[User Manual](docs/USER_MANUAL.md)** — every option, the config file,
+  output layout, vendor metadata handling, requirements, troubleshooting.
+- 🌐 The **mzPeak format**: [mzpeak.org](https://mzpeak.org) · spec repo
+  [HUPO-PSI/mzPeak-specification](https://github.com/HUPO-PSI/mzPeak-specification)
+  · inspect `.mzpeak` files in your browser at [mzpeak.org/view](https://mzpeak.org/view)
 - 🏗 [Architecture & roadmap](PLAN.md) · [Native-TOF design](NATIVE-TOF-DESIGN.md) · [Handoff notes](HANDOFF.md)
 - 📦 [SBOM](sbom.cdx.json) (CycloneDX) · [Third-party notices](THIRD-PARTY-NOTICES.md) · [Changelog](CHANGELOG.md)
 
-## Supported inputs
+## Supported formats & operating systems
 
-| Format | Reader | Notes |
-|---|---|---|
-| mzML / `.mzML.gz` | mzdata | full metadata + chromatograms |
-| imzML | mzdata | imaging coordinate columns + IMS CV promoted |
-| Bruker `.d` (**TDF**, timsTOF) | mzdata `bruker_tdf` + native `timsrust` | ion mobility preserved; `--ims-compact` for lossless integer-TOF |
-| Bruker `.d` (**TSF**, line spectra) | ported reader (rusqlite + zstd) | MALDI / TOF line spectra |
-| Thermo `.raw` | mzdata `thermo` (.NET) | verbatim scan-trailer facet |
-| Bruker `.d` (BAF) | `--features bruker_sdk` | needs `libbaf2sql_c` (Windows/Linux) |
-| Agilent `.d`, SciEX `.wiff` | `--via-msconvert` (or `--features agilent`/`sciex`) | native readers Windows-only |
+| Format | Linux | macOS | Windows | Notes |
+|---|:---:|:---:|:---:|---|
+| mzML, `.mzML.gz` | ✅ | ✅ | ✅ | |
+| imzML | ✅ | ✅ | ✅ | imaging coords + IMS CV |
+| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default** |
+| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF |
+| Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
+| Bruker `.d` **BAF** | ✅ | ❌ | ✅ | build `--features bruker_sdk` (`libbaf2sql_c`) |
+| Agilent `.d` (native) | ❌ | ❌ | ✅ | build `--features agilent` (MHDAC) |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | build `--features sciex` (Clearcore2) |
+| Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
+
+The default build (all OSes) covers the first five rows; the rest need the
+optional build features, or the cross-vendor `--via-msconvert` path.
 
 ## Install
 
@@ -60,20 +68,26 @@ for mzML/imzML/Bruker.
 
 ## Usage
 
+A single command. Give an input and, optionally, an output:
+
 ```sh
-# Convert (output path inferred), then round-trip verify
-mzpeak-convert convert sample.mzML
-mzpeak-convert convert run.raw -o run.mzpeak --verify --force
+# No --output → inspect only (prints a report, writes nothing)
+mzpeak-convert run.raw
 
-# Bruker timsTOF with lossless integer-TOF storage
-mzpeak-convert convert experiment.d -o experiment.mzpeak --ims-compact
+# Convert to mzPeak (-v also prints the inspection report)
+mzpeak-convert run.raw -o run.mzpeak --verify --force
 
-# Inspect / cross-vendor fallback
-mzpeak-convert inspect run.raw
-mzpeak-convert convert agilent.d -o out.mzpeak --via-msconvert
+# Bruker timsTOF (.d): lossless ims-compact is the DEFAULT (--no-ims-compact to disable)
+mzpeak-convert experiment.d -o experiment.mzpeak
+
+# A format without a native reader in this build, via ProteoWizard
+mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
+
+# Drive any option from a config file (CLI flags override it)
+mzpeak-convert run.d -c mzpeak-convert.yaml
 ```
 
-See the **[User Manual](docs/USER_MANUAL.md)** for the complete option reference.
+See the **[User Manual](docs/USER_MANUAL.md)** for every option and the config-file schema.
 
 Exit codes: `0` ok · `1` generic error · `3` unsupported.
 
