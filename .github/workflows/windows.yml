@@ -17,6 +17,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -57,8 +61,10 @@ jobs:
         run: |
           New-Item -ItemType File -Force -Path sample.wiff > $null
           cargo run --release -- convert sample.wiff -o out.mzpeak --force
-          if ($LASTEXITCODE -ne 3) { Write-Error "expected exit 3, got $LASTEXITCODE"; exit 1 }
+          $code = $LASTEXITCODE   # capture before it leaks into the step's own exit status
+          if ($code -ne 3) { Write-Error "expected exit 3, got $code"; exit 1 }
           Write-Host "vendor guard returned exit 3 as expected"
+          exit 0
 
   # Installs ProteoWizard (msconvert) and exercises the cross-vendor --via-msconvert
   # lane end-to-end on Windows. Uses the committed mzML (msconvert reads mzML and
@@ -96,6 +102,8 @@ jobs:
         shell: pwsh
         run: |
           cargo run --release -- convert tests/fixtures/tiny.pwiz.1.1.mzML --via-msconvert -o out_pwiz.mzpeak --force
-          if ($LASTEXITCODE -ne 0) { Write-Error "--via-msconvert failed: $LASTEXITCODE"; exit 1 }
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { Write-Error "--via-msconvert failed: $code"; exit 1 }
           if (-not (Test-Path out_pwiz.mzpeak)) { Write-Error "no output archive produced"; exit 1 }
           Write-Host "--via-msconvert produced $((Get-Item out_pwiz.mzpeak).Length) bytes"
+          exit 0
