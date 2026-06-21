@@ -38,10 +38,10 @@ use arrow::datatypes::DataType;
 use mzdata::curie;
 use mzdata::io::MZReaderType;
 use mzdata::meta::{DataProcessing, ProcessingMethod, Software, SourceFile, custom_software_name};
-use mzdata::params::{ControlledVocabulary, Param};
+use mzdata::params::{ControlledVocabulary, Param, Unit};
 use mzdata::prelude::*;
 use mzdata::spectrum::bindata::BinaryArrayMap3D;
-use mzdata::spectrum::{BinaryArrayMap, Chromatogram, ChromatogramDescription};
+use mzdata::spectrum::{BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType, MultiLayerSpectrum};
 use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzpeak_prototyping::{BufferContext, BufferName};
 use mzpeak_prototyping::archive::ZipArchiveWriter;
@@ -127,6 +127,10 @@ struct Cli {
     #[arg(long)]
     no_vendor: bool,
 
+    /// Do not synthesize TIC + base-peak chromatograms from the MS1 spectra (synthesis is on by default).
+    #[arg(long)]
+    no_chromatograms: bool,
+
     /// Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`. Highest precedence.
     #[arg(long)]
     aux: Vec<String>,
@@ -171,6 +175,7 @@ struct FileConfig {
     force: Option<bool>,
     no_ims_compact: Option<bool>,
     no_vendor: Option<bool>,
+    no_chromatograms: Option<bool>,
     aux: Option<Vec<String>>,
     via_msconvert: Option<bool>,
     msconvert_path: Option<PathBuf>,
@@ -186,6 +191,7 @@ struct Settings {
     force: bool,
     no_ims_compact: bool,
     no_vendor: bool,
+    chromatograms: bool,
     aux: Vec<String>,
     via_msconvert: bool,
     msconvert_path: Option<PathBuf>,
@@ -214,6 +220,7 @@ impl Settings {
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
             no_vendor: cli.no_vendor || fc.no_vendor.unwrap_or(false),
+            chromatograms: !(cli.no_chromatograms || fc.no_chromatograms.unwrap_or(false)),
             aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
             via_msconvert: cli.via_msconvert || fc.via_msconvert.unwrap_or(false),
             msconvert_path: cli.msconvert_path.clone().or(fc.msconvert_path),
@@ -298,14 +305,14 @@ fn run(cli: &Cli) -> Result<i32> {
     let use_ims_compact = is_tdf_dir(&cli.input) && !cfg.no_ims_compact;
 
     if cfg.via_msconvert {
-        convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref())
+        convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms)
             .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
     } else if use_ims_compact {
-        convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref())
+        convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("ims-compact converting {}", cli.input.display()))?;
     } else {
         guard_unsupported_vendor(&cli.input)?;
-        convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref())
+        convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("converting {}", cli.input.display()))?;
     }
 
@@ -418,6 +425,7 @@ fn convert_via_msconvert(
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     msconvert_path: Option<&Path>,
+    synth_chroms: bool,
 ) -> Result<()> {
     let exe: std::ffi::OsString = msconvert_path
         .map(|p| p.as_os_str().to_os_string())
@@ -456,7 +464,7 @@ fn convert_via_msconvert(
         bail!("msconvert reported success but produced no mzML at {}", mzml.display());
     }
 
-    let result = convert_file(&mzml, output, chunk, zstd_level, None);
+    let result = convert_file(&mzml, output, chunk, zstd_level, None, synth_chroms);
     let _ = fs::remove_dir_all(&tmpdir);
     result
 }
@@ -481,21 +489,22 @@ fn convert_file(
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
 ) -> Result<()> {
     if is_tsf_dir(input) {
-        return convert_tsf(input, output, chunk, zstd_level, vendor);
+        return convert_tsf(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
     #[cfg(any(windows, target_os = "linux"))]
     if is_baf_dir(input) {
-        return convert_baf(input, output, chunk, zstd_level, vendor);
+        return convert_baf(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
     #[cfg(windows)]
     if is_agilent_d(input) {
-        return convert_agilent(input, output, chunk, zstd_level, vendor);
+        return convert_agilent(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
     #[cfg(windows)]
     if is_wiff(input) {
-        return convert_sciex(input, output, chunk, zstd_level, vendor);
+        return convert_sciex(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input)
         .with_context(|| format!("opening {}", input.display()))?;
@@ -556,6 +565,7 @@ fn convert_file(
         .build();
 
     let mut n = 0usize;
+    let mut ms1 = Ms1Chroms::default();
     for mut entry in reader.iter() {
         // If there's ion mobility, ensure m/z is sorted (the writer expects sorted m/z).
         if entry.has_ion_mobility_dimension() {
@@ -569,22 +579,15 @@ fn convert_file(
         }
         // Tag each spectrum with the concrete MS:1000294 child so the registered column populates.
         entry.description_mut().add_param(mass_spectrum.clone());
+        if synth_chroms {
+            ms1.observe(&entry);
+        }
         writer.write_spectrum(&entry)?;
         n += 1;
     }
     log::debug!("wrote {n} spectra");
 
-    let mut n_chrom = 0usize;
-    for chrom in reader.iter_chromatograms() {
-        writer.write_chromatogram(&chrom)?;
-        n_chrom += 1;
-    }
-    // The reference reader requires a chromatogram facet to open the archive, and the writer only
-    // finalizes index metadata (version, cv_list, ms_run) on the chromatogram-writing path
-    // (writer.rs:1086). Emit one empty chromatogram (no fabricated TIC) when the source had none.
-    if n_chrom == 0 {
-        write_empty_chromatogram(&mut writer)?;
-    }
+    finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     fixup_run_metadata(&mut writer, input);
@@ -603,6 +606,7 @@ fn convert_ims_compact_archive(
     output: &Path,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_native::NativeTofReader::open(input)?;
     if reader.len() == 0 {
@@ -649,11 +653,15 @@ fn convert_ims_compact_archive(
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
 
+    let mut ms1 = Ms1Chroms::default();
     for i in 0..reader.len() {
         let spec = reader.ims_compact_spectrum(i)?;
+        if synth_chroms {
+            ms1.observe(&spec);
+        }
         writer.write_spectrum(&spec)?;
     }
-    write_empty_chromatogram(&mut writer)?;
+    finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
 
     // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename.
@@ -750,10 +758,11 @@ fn convert_baf(
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_baf::BafReader::open(input, None)?;
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor,
+        input, output, chunk, zstd_level, vendor, synth_chroms,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
 }
@@ -768,9 +777,10 @@ fn convert_sciex(
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
 ) -> Result<()> {
     let reader = sciex::SciexReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak via the MHDAC .NET glue (feature `agilent`,
@@ -782,9 +792,10 @@ fn convert_agilent(
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent::AgilentReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
 /// Shared writer wiring for a custom (non-mzdata) reader: sample-derived schema + MS:1000294 column
@@ -796,6 +807,7 @@ fn convert_vendor_reader(
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
     len: usize,
     sample: mzdata::spectrum::bindata::BinaryArrayMap,
     mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
@@ -821,11 +833,15 @@ fn convert_vendor_reader(
     ));
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
+    let mut ms1 = Ms1Chroms::default();
     for i in 0..len {
         let spec = spectrum(i)?;
+        if synth_chroms {
+            ms1.observe(&spec);
+        }
         writer.write_spectrum(&spec)?;
     }
-    write_empty_chromatogram(&mut writer)?;
+    finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
     finish_with_vendor(writer, input, vendor)?;
     fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
@@ -841,10 +857,11 @@ fn convert_tsf(
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_tsf::TsfReader::open(input)?;
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor,
+        input, output, chunk, zstd_level, vendor, synth_chroms,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
 }
@@ -883,6 +900,98 @@ fn write_empty_chromatogram(writer: &mut MzPeakWriterType<fs::File>) -> Result<(
     arrays.add(DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new()));
     let empty = Chromatogram::new(ChromatogramDescription::default(), arrays);
     writer.write_chromatogram(&empty)?;
+    Ok(())
+}
+
+/// Accumulates the per-MS1-spectrum TIC (summed intensity) and base-peak intensity vs. retention
+/// time, so the converter can synthesize standard TIC + base-peak chromatograms. Populated during the
+/// spectrum write loop (one pass, no re-read); MS2+ spectra are ignored.
+#[derive(Default)]
+struct Ms1Chroms {
+    time: Vec<f64>,
+    tic: Vec<f64>,
+    bpc: Vec<f64>,
+}
+
+impl Ms1Chroms {
+    fn observe(&mut self, spec: &MultiLayerSpectrum) {
+        if spec.ms_level() != 1 {
+            return;
+        }
+        let peaks = spec.peaks();
+        self.time.push(spec.start_time());
+        self.tic.push(peaks.tic() as f64);
+        self.bpc.push(peaks.base_peak().intensity as f64);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.time.is_empty()
+    }
+
+    /// Write the synthesized TIC + base-peak chromatograms. Returns how many were written (0 or 2).
+    fn write(&self, writer: &mut MzPeakWriterType<fs::File>) -> Result<usize> {
+        if self.is_empty() {
+            return Ok(0);
+        }
+        let tic = synth_chromatogram(
+            "TIC",
+            Param::builder().name("total ion current chromatogram").curie(curie!(MS:1000235)).build(),
+            &self.time,
+            &self.tic,
+        )?;
+        let bpc = synth_chromatogram(
+            "BPC",
+            Param::builder().name("basepeak chromatogram").curie(curie!(MS:1000628)).build(),
+            &self.time,
+            &self.bpc,
+        )?;
+        writer.write_chromatogram(&tic)?;
+        writer.write_chromatogram(&bpc)?;
+        Ok(2)
+    }
+}
+
+fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f64]) -> Result<Chromatogram> {
+    let mut arrays = BinaryArrayMap::new();
+    let mut t = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new());
+    t.update_buffer(time).map_err(|e| anyhow::anyhow!("encoding chromatogram time: {e}"))?;
+    t.unit = Unit::Minute;
+    arrays.add(t);
+    let mut i = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new());
+    i.update_buffer(intensity).map_err(|e| anyhow::anyhow!("encoding chromatogram intensity: {e}"))?;
+    arrays.add(i);
+    let mut descr = ChromatogramDescription { id: id.to_string(), ..Default::default() };
+    descr.add_param(type_param);
+    Ok(Chromatogram::new(descr, arrays))
+}
+
+/// Write the chromatogram facet: synthesized MS1 TIC + base-peak (when `synth` and there were MS1
+/// spectra), plus any source chromatograms — skipping a source TIC/base-peak when we synthesized our
+/// own so they don't duplicate. Falls back to one empty chromatogram if nothing else was written
+/// (the reference reader requires the facet to open, and the writer finalizes index metadata here).
+fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
+    writer: &mut MzPeakWriterType<fs::File>,
+    ms1: &Ms1Chroms,
+    source: I,
+    synth: bool,
+) -> Result<()> {
+    let synthesized = if synth { ms1.write(writer)? } else { 0 };
+    let mut n = synthesized;
+    for chrom in source {
+        if synthesized > 0
+            && matches!(
+                chrom.chromatogram_type(),
+                ChromatogramType::TotalIonCurrentChromatogram | ChromatogramType::BasePeakChromatogram
+            )
+        {
+            continue; // superseded by our MS1-synthesized version
+        }
+        writer.write_chromatogram(&chrom)?;
+        n += 1;
+    }
+    if n == 0 {
+        write_empty_chromatogram(writer)?;
+    }
     Ok(())
 }
 
