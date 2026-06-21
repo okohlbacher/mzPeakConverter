@@ -81,19 +81,33 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Install ProteoWizard (msconvert) via Chocolatey
-        shell: pwsh
-        run: choco install proteowizard -y --no-progress --ignore-checksums
-
-      - name: Locate msconvert.exe
+      # No Chocolatey/winget package for ProteoWizard, so fetch the portable Windows
+      # x86_64 bundle straight from the official TeamCity guestAuth artifact feed,
+      # resolving the latest successful build dynamically via the REST API.
+      - name: Install ProteoWizard (msconvert) from TeamCity
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path 'C:\ProgramData\chocolatey','C:\Program Files','C:\Program Files (x86)' `
-                   -Recurse -Filter msconvert.exe -ErrorAction SilentlyContinue |
-                 Select-Object -First 1
-          if (-not $exe) { Write-Error "msconvert.exe not found after install"; exit 1 }
+          $ErrorActionPreference = "Stop"
+          $base = "https://teamcity.labkey.org/guestAuth/app/rest"
+          $h = @{ Accept = "application/json" }
+          $bts = Invoke-RestMethod -Headers $h -Uri "$base/buildTypes?locator=affectedProject:(id:ProteoWizard)"
+          $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" -and $_.name -match "x86_64" } | Select-Object -First 1
+          if (-not $bt) { $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" } | Select-Object -First 1 }
+          if (-not $bt) { Write-Error "no Windows ProteoWizard build type found"; exit 1 }
+          Write-Host "build type: $($bt.id) - $($bt.name)"
+          $arts = Invoke-RestMethod -Headers $h -Uri "$base/builds/buildType:$($bt.id),status:SUCCESS,state:finished/artifacts/children"
+          $f = $arts.file | Where-Object { $_.name -match "pwiz-bin-windows-x86_64.*\.tar\.bz2$" } | Select-Object -First 1
+          if (-not $f) { Write-Error "no pwiz windows x86_64 artifact found"; exit 1 }
+          $url = "https://teamcity.labkey.org" + $f.content.href
+          Write-Host "downloading $($f.name)"
+          Invoke-WebRequest -Uri $url -OutFile pwiz.tar.bz2
+          New-Item -ItemType Directory -Force -Path pwiz | Out-Null
+          tar -xjf pwiz.tar.bz2 -C pwiz
+          $exe = Get-ChildItem -Path pwiz -Recurse -Filter msconvert.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "msconvert.exe not found in artifact"; exit 1 }
           Write-Host "msconvert: $($exe.FullName)"
           "MSCONVERT_PATH=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          exit 0
 
       - name: Build
         run: cargo build --release --verbose
