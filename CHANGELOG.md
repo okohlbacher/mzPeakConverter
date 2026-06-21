@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — data features
+
+- **TIC + base-peak chromatograms synthesized from MS1** (on by default;
+  `--no-chromatograms` / `no_chromatograms` to disable), across every convert path.
+- **UV/PDA spectra carried** into a dedicated `wavelength_spectra` facet (Waters /
+  Agilent mzML and any wavelength-bearing input); no longer dropped or mislabeled
+  as mass spectra.
+- **Registered TOF→m/z transform** on the ims-compact `tof` column: the column
+  metadata carries the transform CURIE + `[a, b]` coefficients (`transform_params`)
+  so readers reconstruct `m/z = (a + b·tof)²` generically (ims_calibration kept too).
+  Provisional CURIE pending the PSI term.
+- **Native Agilent IM-MS (MIDAC) reader** — Windows-only scaffold, compile-verified
+  (untested at runtime; needs MIDAC DLLs + IM-MS data). An Agilent `.d` with ion
+  mobility routes to MIDAC, else MHDAC.
+
 ### Changed — single-command CLI (breaking)
 
 - The tool is now **one command** — `mzpeak-convert <input> [-o <output>] [options]`.
