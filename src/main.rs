@@ -748,38 +748,10 @@ fn convert_baf(
     vendor: Option<&vendor::VendorPolicy>,
 ) -> Result<()> {
     let reader = bruker_baf::BafReader::open(input, None)?;
-    if reader.len() == 0 {
-        bail!("no spectra in {}", input.display());
-    }
-    let tmp = output.with_extension("mzpeak.tmp");
-    let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    let level = ZstdLevel::try_new(zstd_level)
-        .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
-
-    let sample = reader.sample_arrays()?;
-    let mut builder = MzPeakWriterType::<fs::File>::builder()
-        .chunked_encoding(chunk)
-        .chromatogram_chunked_encoding(chunk)
-        .compression(Compression::ZSTD(level));
-    for field in data_facet_fields_from_samples(&[&sample]) {
-        builder = builder.add_spectrum_field(field);
-    }
-    builder = builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-        curie!(MS:1000294),
-        "mass spectrum",
-        DataType::Boolean,
-    ));
-    let mut writer = builder.build(handle, true);
-    add_processing_metadata(&mut writer);
-    for i in 0..reader.len() {
-        let spec = reader.spectrum(i)?;
-        writer.write_spectrum(&spec)?;
-    }
-    write_empty_chromatogram(&mut writer)?;
-    fixup_run_metadata(&mut writer, input);
-    finish_with_vendor(writer, input, vendor)?;
-    fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
-    Ok(())
+    convert_vendor_reader(
+        input, output, chunk, zstd_level, vendor,
+        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+    )
 }
 
 /// Convert a SciEX `.wiff`/`.wiff2` → mzPeak via the Clearcore2 .NET glue (feature `sciex`,
@@ -811,10 +783,9 @@ fn convert_agilent(
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
-/// Shared writer wiring for a custom vendor reader (sample-derived schema + MS:1000294 column +
-/// write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename). Used by
-/// the SciEX/Agilent native paths so they don't duplicate `convert_tsf`'s body.
-#[cfg(any(feature = "sciex", feature = "agilent"))]
+/// Shared writer wiring for a custom (non-mzdata) reader: sample-derived schema + MS:1000294 column
+/// + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by
+/// every custom-reader path (Bruker TSF/BAF, SciEX, Agilent) so they don't each duplicate the body.
 fn convert_vendor_reader(
     input: &Path,
     output: &Path,
@@ -868,40 +839,10 @@ fn convert_tsf(
     vendor: Option<&vendor::VendorPolicy>,
 ) -> Result<()> {
     let reader = bruker_tsf::TsfReader::open(input)?;
-    if reader.len() == 0 {
-        bail!("no frames in {}", input.display());
-    }
-    let tmp = output.with_extension("mzpeak.tmp");
-    let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    let level = ZstdLevel::try_new(zstd_level)
-        .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
-
-    let sample = reader.sample_arrays()?;
-    let mut builder = MzPeakWriterType::<fs::File>::builder()
-        .chunked_encoding(chunk)
-        .chromatogram_chunked_encoding(chunk)
-        .compression(Compression::ZSTD(level));
-    for field in data_facet_fields_from_samples(&[&sample]) {
-        builder = builder.add_spectrum_field(field);
-    }
-    builder = builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-        curie!(MS:1000294),
-        "mass spectrum",
-        DataType::Boolean,
-    ));
-
-    let mut writer = builder.build(handle, true);
-    add_processing_metadata(&mut writer);
-
-    for i in 0..reader.len() {
-        let spec = reader.spectrum(i)?;
-        writer.write_spectrum(&spec)?;
-    }
-    write_empty_chromatogram(&mut writer)?;
-    fixup_run_metadata(&mut writer, input);
-    finish_with_vendor(writer, input, vendor)?;
-    fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
-    Ok(())
+    convert_vendor_reader(
+        input, output, chunk, zstd_level, vendor,
+        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+    )
 }
 
 /// Derive spectra_data POINT-column fields from sample array maps (ported from mzML2mzPeak): runs

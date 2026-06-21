@@ -53,13 +53,6 @@ impl TofMzModel {
         let b = c.convert(1u32).sqrt() - a;
         Self { a, b }
     }
-    /// Reference m/z reconstruction `(a+b·tof)²` (decoder-side; kept as the canonical formula).
-    #[inline]
-    #[allow(dead_code)]
-    pub fn mz(&self, tof: u32) -> f64 {
-        let v = self.a + self.b * tof as f64;
-        v * v
-    }
 }
 
 /// One native TIMS frame == one mzPeak spectrum. `scan_offsets[s]..scan_offsets[s+1]` indexes the
@@ -150,7 +143,11 @@ impl NativeTofReader {
             }
             let m = self.mobility_for_scan(s);
             for k in lo..hi {
-                tof.push(frame.tof[k] as i32); // TOF bins fit i32 (digitizer ~4e5)
+                // TOF bins fit i32 in practice (digitizer ~4e5), but the column type is Int32 — guard
+                // the cast so an out-of-range bin is a hard error, never a silent wrap to garbage m/z.
+                let bin = i32::try_from(frame.tof[k])
+                    .map_err(|_| anyhow::anyhow!("TOF bin {} exceeds i32 range", frame.tof[k]))?;
+                tof.push(bin);
                 intensity.push(frame.intensity[k] as f32);
                 mobility.push(m);
             }

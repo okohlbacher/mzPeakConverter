@@ -10,6 +10,15 @@ import json
 import sys
 
 
+def _license(expr: str) -> dict:
+    """CycloneDX license object. Cargo allows the legacy `/` OR-separator (e.g. `MIT/Apache-2.0`),
+    which is not valid SPDX — normalize it to ` OR `. Emit a single ID as a `license.id`, anything
+    compound (OR/AND/WITH/parens) as an `expression`."""
+    norm = expr.replace("/", " OR ")
+    compound = any(op in f" {norm} " for op in (" OR ", " AND ", " WITH ")) or "(" in norm
+    return {"expression": norm} if compound else {"license": {"id": norm.strip()}}
+
+
 def main() -> None:
     md = json.load(sys.stdin)
     root = md.get("resolve", {}).get("root")
@@ -26,7 +35,7 @@ def main() -> None:
         if pkg.get("description"):
             comp["description"] = pkg["description"]
         if pkg.get("license"):
-            comp["licenses"] = [{"expression": pkg["license"]}]
+            comp["licenses"] = [_license(pkg["license"])]
         refs = []
         if pkg.get("repository"):
             refs.append({"type": "vcs", "url": pkg["repository"]})
@@ -38,20 +47,20 @@ def main() -> None:
             comp["externalReferences"] = refs
         components.append(comp)
 
-    root_pkg = next(p for p in md["packages"] if p["id"] == root)
+    metadata = {"tools": [{"name": "gen_sbom.py", "vendor": "mzPeakConverter"}]}
+    root_pkg = next((p for p in md["packages"] if p["id"] == root), None)
+    if root_pkg is not None:  # None for a virtual workspace / --no-deps with no root
+        metadata["component"] = {
+            "type": "application",
+            "name": root_pkg["name"],
+            "version": root_pkg["version"],
+            "purl": f"pkg:cargo/{root_pkg['name']}@{root_pkg['version']}",
+        }
     bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "version": 1,
-        "metadata": {
-            "component": {
-                "type": "application",
-                "name": root_pkg["name"],
-                "version": root_pkg["version"],
-                "purl": f"pkg:cargo/{root_pkg['name']}@{root_pkg['version']}",
-            },
-            "tools": [{"name": "gen_sbom.py", "vendor": "mzPeakConverter"}],
-        },
+        "metadata": metadata,
         "components": components,
     }
     json.dump(bom, sys.stdout, indent=2, ensure_ascii=False)

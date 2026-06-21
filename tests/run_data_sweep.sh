@@ -13,7 +13,9 @@ if [ "${1:-}" = "--worker" ]; then
   rec="$2"; us=$'\x1f'
   fmt="${rec%%${us}*}"; path="${rec#*${us}}"
   rel="${path#"$DATA"/}"
-  id="$(printf '%s' "$rel" | tr '/ ,()' '_____')"
+  # Sanitize ALL non-portable chars (incl. newlines/tabs/commas/spaces) so the id is a safe single
+  # filename AND a tab/newline can never sneak into a result-TSV row.
+  id="$(printf '%s' "$rel" | tr -c 'A-Za-z0-9._-' '_')"
   archive="$OUT/archives/$id.mzpeak"
   clog="$OUT/logs/$id.convert.log"; vlog="$OUT/logs/$id.val.log"
   verify=(--verify); [ -n "${NO_VERIFY:-}" ] && verify=()

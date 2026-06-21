@@ -116,12 +116,14 @@ public static class Exports
     // ==================================================================
 
     [UnmanagedCallersOnly(EntryPoint = "Open")]
-    public static unsafe long Open(char* pathUtf16, char* mhdacDirUtf16)
+    public static unsafe long Open(ushort* pathUtf16, ushort* mhdacDirUtf16)
     {
+        // NOTE: `ushort*` (not `char*`) — `char` is non-blittable under [UnmanagedCallersOnly], which
+        // would make the runtime reject/mis-marshal the export. Rust passes `*const u16` (UTF-16).
         try
         {
-            string path = new string(pathUtf16);
-            string mhdacDir = new string(mhdacDirUtf16);
+            string path = Marshal.PtrToStringUni((IntPtr)pathUtf16) ?? "";
+            string mhdacDir = Marshal.PtrToStringUni((IntPtr)mhdacDirUtf16) ?? "";
 
             EnsureMhdacLoaded(mhdacDir);
             MhdacApi api = ResolveApi(_mhdac!);

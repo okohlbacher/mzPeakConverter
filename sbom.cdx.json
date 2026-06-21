@@ -3,18 +3,18 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "component": {
-      "type": "application",
-      "name": "mzpeak-convert",
-      "version": "0.1.0",
-      "purl": "pkg:cargo/mzpeak-convert@0.1.0"
-    },
     "tools": [
       {
         "name": "gen_sbom.py",
         "vendor": "mzPeakConverter"
       }
-    ]
+    ],
+    "component": {
+      "type": "application",
+      "name": "mzpeak-convert",
+      "version": "0.1.0",
+      "purl": "pkg:cargo/mzpeak-convert@0.1.0"
+    }
   },
   "components": [
     {
@@ -97,7 +97,9 @@
       "description": "A dynamic allocator that may be used with or without the stdlib. This allows a package with nostd to allocate memory dynamically and be used either with a custom allocator, items on the stack, or by a package that wishes to simply use Box<>. It also provides options to use calloc or a mutable global variable for pre-zeroed memory",
       "licenses": [
         {
-          "expression": "BSD-3-Clause"
+          "license": {
+            "id": "BSD-3-Clause"
+          }
         }
       ],
       "externalReferences": [
@@ -115,7 +117,9 @@
       "description": "A dynamic allocator example that may be used with the stdlib",
       "licenses": [
         {
-          "expression": "BSD-3-Clause"
+          "license": {
+            "id": "BSD-3-Clause"
+          }
         }
       ],
       "externalReferences": [
@@ -133,7 +137,7 @@
       "description": "Minimal Android system properties wrapper",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -259,7 +263,9 @@
       "description": "Approximate floating point equality comparisons and assertions.",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -295,7 +301,9 @@
       "description": "Rust implementation of Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -313,7 +321,9 @@
       "description": "Arrow arithmetic kernels",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -331,7 +341,9 @@
       "description": "Array abstractions for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -349,7 +361,9 @@
       "description": "Array abstractions for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -367,7 +381,9 @@
       "description": "Buffer abstractions for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -385,7 +401,9 @@
       "description": "Buffer abstractions for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -403,7 +421,9 @@
       "description": "Cast kernel and utilities for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -421,7 +441,9 @@
       "description": "Cast kernel and utilities for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -439,7 +461,9 @@
       "description": "Support for parsing CSV format to and from the Arrow format",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -457,7 +481,9 @@
       "description": "Array data abstractions for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -475,7 +501,9 @@
       "description": "Array data abstractions for Apache Arrow",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -493,7 +521,9 @@
       "description": "Support for the Arrow IPC format",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -511,7 +541,9 @@
       "description": "Support for the Arrow IPC format",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -529,7 +561,9 @@
       "description": "Support for parsing JSON format to and from the Arrow format",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -547,7 +581,9 @@
       "description": "Ordering kernels for arrow arrays",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -565,7 +601,9 @@
       "description": "Arrow row format",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -583,7 +621,9 @@
       "description": "Defines the logical types for arrow arrays",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -601,7 +641,9 @@
       "description": "Defines the logical types for arrow arrays",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -619,7 +661,9 @@
       "description": "Selection kernels for arrow arrays",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -637,7 +681,9 @@
       "description": "Selection kernels for arrow arrays",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -655,7 +701,9 @@
       "description": "String kernels for arrow arrays",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -673,7 +721,9 @@
       "description": "Parse integers directly from `[u8]` slices in safe code",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -763,7 +813,9 @@
       "description": "SIMD-accelerated base64 encoding and decoding",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -781,7 +833,7 @@
       "description": "A macro to generate structures which behave like bitflags.\n",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -871,7 +923,7 @@
       "description": "A brotli decompressor that with an interface avoiding the rust stdlib. This makes it suitable for embedded devices and kernels. It is designed with a pluggable allocator so that the standard lib's allocator may be employed. The default build also includes a stdlib allocator and stream interface. Disable this with --features=no-stdlib. Alternatively, --features=unsafe turns off array bounds checks and memory initialization but provides a safe interface for the caller.  Without adding the --features=unsafe argument, all included code is safe. For compression in addition to this library, download https://github.com/dropbox/rust-brotli ",
       "licenses": [
         {
-          "expression": "BSD-3-Clause/MIT"
+          "expression": "BSD-3-Clause OR MIT"
         }
       ],
       "externalReferences": [
@@ -889,7 +941,7 @@
       "description": "A brotli decompressor that with an interface avoiding the rust stdlib. This makes it suitable for embedded devices and kernels. It is designed with a pluggable allocator so that the standard lib's allocator may be employed. The default build also includes a stdlib allocator and stream interface. Disable this with --features=no-stdlib. Alternatively, --features=unsafe turns off array bounds checks and memory initialization but provides a safe interface for the caller.  Without adding the --features=unsafe argument, all included code is safe. For compression in addition to this library, download https://github.com/dropbox/rust-brotli ",
       "licenses": [
         {
-          "expression": "BSD-3-Clause/MIT"
+          "expression": "BSD-3-Clause OR MIT"
         }
       ],
       "externalReferences": [
@@ -907,7 +959,9 @@
       "description": "A crate that provides programmatic access to information about the current build target.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -979,7 +1033,9 @@
       "description": "Types and traits for working with bytes",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1033,7 +1089,7 @@
       "description": "Bindings to libbzip2 for bzip2 compression and decompression exposed as\nReader/Writer streams.\n",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -1249,7 +1305,9 @@
       "description": "A terminal and console abstraction for Rust",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1321,7 +1379,9 @@
       "description": "Convert strings into any case",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1393,7 +1453,9 @@
       "description": "Shared bindings for the coreclr hosting components.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1537,7 +1599,9 @@
       "description": "Crunchy unroller: deterministically unroll constant loops",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1573,7 +1637,9 @@
       "description": "Macro for building static CStr reference",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1591,7 +1657,7 @@
       "description": "Fast CSV parsing with support for serde.",
       "licenses": [
         {
-          "expression": "Unlicense/MIT"
+          "expression": "Unlicense OR MIT"
         }
       ],
       "externalReferences": [
@@ -1609,7 +1675,7 @@
       "description": "Bare bones CSV parsing with no_std support.",
       "licenses": [
         {
-          "expression": "Unlicense/MIT"
+          "expression": "Unlicense OR MIT"
         }
       ],
       "externalReferences": [
@@ -1645,7 +1711,9 @@
       "description": "A proc-macro library for reading attributes into structs when\nimplementing custom derives.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1663,7 +1731,9 @@
       "description": "Helper crate for proc-macro library for reading attributes into structs when\nimplementing custom derives. Use https://crates.io/crates/darling in your code.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1681,7 +1751,9 @@
       "description": "Internal support for a proc-macro library for reading attributes into structs when\nimplementing custom derives. Use https://crates.io/crates/darling in your code.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1699,7 +1771,9 @@
       "description": "Deflate64 implementation based on .NET's implementation",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1807,7 +1881,9 @@
       "description": "Adds #[derive(x)] macros for more traits",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1825,7 +1901,9 @@
       "description": "Internal implementation of `derive_more` crate",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1843,7 +1921,9 @@
       "description": "Macro for dropping the fields of a struct or enum without dropping the container.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1861,7 +1941,9 @@
       "description": "Actual derive macro for destruct-drop.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1933,7 +2015,9 @@
       "description": "Library for opening and operating on dynamic link libraries (also known as shared objects or shared libraries).",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1951,7 +2035,9 @@
       "description": "Derive macros for the dlopen2 crate.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -1987,7 +2073,9 @@
       "description": "A low-level interface to a in-process dotnet runtime for Thermo Fisher's RawFileReader library",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2185,7 +2273,7 @@
       "description": "Fallible iterator traits",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -2203,7 +2291,7 @@
       "description": "Fallible streaming iteration",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -2239,7 +2327,9 @@
       "description": "A simple macro to create correct opaque pointers.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ]
     },
@@ -2269,7 +2359,9 @@
       "description": "Official FlatBuffers Rust runtime library.",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2287,7 +2379,9 @@
       "description": "Official FlatBuffers Rust runtime library.",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2323,7 +2417,7 @@
       "description": "Fowler–Noll–Vo hash function",
       "licenses": [
         {
-          "expression": "Apache-2.0 / MIT"
+          "expression": "Apache-2.0  OR  MIT"
         }
       ],
       "externalReferences": [
@@ -2413,7 +2507,9 @@
       "description": "Generic types implementing functionality of arrays",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -2647,7 +2743,9 @@
       "description": "FFI bindings for hostfxr.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -2737,7 +2835,9 @@
       "description": "Collection of API for use in ICU libraries.",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2755,7 +2855,9 @@
       "description": "API for managing Unicode Language and Locale Identifiers",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2773,7 +2875,9 @@
       "description": "API for normalizing text into Unicode Normalization Forms",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2791,7 +2895,9 @@
       "description": "Data for the icu_normalizer crate",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2809,7 +2915,9 @@
       "description": "Definitions for Unicode properties",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2827,7 +2935,9 @@
       "description": "Data for the icu_properties crate",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2845,7 +2955,9 @@
       "description": "Trait and struct definitions for the ICU data provider",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -2863,7 +2975,7 @@
       "description": "Utility for applying case rules to Rust identifiers.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -2935,7 +3047,9 @@
       "description": "Embed the contents of a directory in your binary",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -2953,7 +3067,9 @@
       "description": "The procedural macro used by include_dir",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3007,7 +3123,9 @@
       "description": "A progress bar and cli reporting library for Rust",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3043,7 +3161,9 @@
       "description": "varint+zigzag and fixedint integer encoding/decoding (https://developers.google.com/protocol-buffers/docs/encoding)",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3187,7 +3307,7 @@
       "description": "Lexical, to- and from-string conversion routines.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3205,7 +3325,7 @@
       "description": "Lexical, to- and from-string conversion routines.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3223,7 +3343,7 @@
       "description": "Efficient parsing of floats from strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3241,7 +3361,7 @@
       "description": "Efficient parsing of floats from strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3259,7 +3379,7 @@
       "description": "Efficient parsing of integers from strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3277,7 +3397,7 @@
       "description": "Efficient parsing of integers from strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3295,7 +3415,7 @@
       "description": "Shared utilities for lexical creates.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3313,7 +3433,7 @@
       "description": "Shared utilities for lexical creates.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3331,7 +3451,7 @@
       "description": "Efficient formatting of floats to strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3349,7 +3469,7 @@
       "description": "Efficient formatting of floats to strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3367,7 +3487,7 @@
       "description": "Efficient formatting of integers to strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3385,7 +3505,7 @@
       "description": "Efficient formatting of integers to strings.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3403,7 +3523,9 @@
       "description": "a drop-in compatible rust bzip2 implementation",
       "licenses": [
         {
-          "expression": "bzip2-1.0.6"
+          "license": {
+            "id": "bzip2-1.0.6"
+          }
         }
       ],
       "externalReferences": [
@@ -3439,7 +3561,9 @@
       "description": "Bindings around the platform's dynamic library loading primitives with greatly improved memory safety.",
       "licenses": [
         {
-          "expression": "ISC"
+          "license": {
+            "id": "ISC"
+          }
         }
       ],
       "externalReferences": [
@@ -3493,7 +3617,9 @@
       "description": "libm in pure Rust",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3511,7 +3637,9 @@
       "description": "Native bindings to the libsqlite3 library",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3547,7 +3675,9 @@
       "description": "Calculates linear regresssions of two-dimensional data. Does not use stdlib, only depends on numeric traits.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3583,7 +3713,9 @@
       "description": "A key-value Map implementation based on a flat, sorted Vec.",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -3655,7 +3787,9 @@
       "description": "Rust LZ4 bindings library.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3673,7 +3807,9 @@
       "description": "Rust LZ4 sys package.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3691,7 +3827,9 @@
       "description": "Fastest LZ4 implementation in Rust, no unsafe by default.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3709,7 +3847,9 @@
       "description": "LZMA / LZMA2 / LZIP / XZ compression ported from 'tukaani xz for java'",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -3727,7 +3867,7 @@
       "description": "General matrix multiplication for f32 and f64 matrices. Operates on matrices with general layout (they can use arbitrary row and column stride). Detects and uses AVX or SSE2 on x86 platforms transparently for higher performance. Uses a microkernel strategy, so that the implementation is easy to parallelize and optimize.\n\nSupports multithreading.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -3745,7 +3885,7 @@
       "description": "The package provides the MD5 hash function.",
       "licenses": [
         {
-          "expression": "Apache-2.0/MIT"
+          "expression": "Apache-2.0 OR MIT"
         }
       ],
       "externalReferences": [
@@ -3817,7 +3957,9 @@
       "description": "A library to read mass spectrometry data formats and a data model for mass spectra",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -3847,7 +3989,9 @@
       "description": "A library representing peaks in mass spectrometry data",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -3865,7 +4009,9 @@
       "description": "A library for mass spectrometry signal processing",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -3883,7 +4029,9 @@
       "description": "General-purpose linear algebra library with transformations and statically-sized or dynamically-sized matrices.",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -3901,7 +4049,9 @@
       "description": "Procedural macros for nalgebra",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -3919,7 +4069,9 @@
       "description": "A Rust library for hosting the .NET Core runtime.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -3937,7 +4089,9 @@
       "description": "FFI bindings for nethost.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4135,7 +4289,9 @@
       "description": "Library for numeric prefixes (kilo, giga, kibi).",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4153,7 +4309,7 @@
       "description": "A pure rust implementation of ms-numpress, a fast, minimally lossy compression algorithm for mass spectrometry data.",
       "licenses": [
         {
-          "expression": "BSD-3-Clause-Clear/Apache-2.0"
+          "expression": "BSD-3-Clause-Clear OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -4207,7 +4363,9 @@
       "description": "Wrappers for total ordering on floats",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4225,7 +4383,9 @@
       "description": "Out reference",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4279,7 +4439,9 @@
       "description": "Apache Parquet implementation in Rust",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -4297,7 +4459,9 @@
       "description": "Apache Parquet implementation in Rust",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -4441,7 +4605,9 @@
       "description": "Unvalidated string and character types",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -4549,7 +4715,9 @@
       "description": "High performance xml reader and writer",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4621,7 +4789,7 @@
       "description": "Extra methods for raw pointers and `NonNull<T>`.\n\nFor example `.post_inc()` and `.pre_dec()` (c.f. `ptr++` and `--ptr`),\n`offset` and `add` for `NonNull<T>`, and the function `ptrdistance`.\n",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -4675,7 +4843,9 @@
       "description": "A Rust library to access raw Redox system calls",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4801,7 +4971,9 @@
       "description": "Ergonomic wrapper for SQLite",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4891,7 +5063,9 @@
       "description": "Web PKI X.509 Certificate Verification.",
       "licenses": [
         {
-          "expression": "ISC"
+          "license": {
+            "id": "ISC"
+          }
         }
       ],
       "externalReferences": [
@@ -4963,7 +5137,7 @@
       "description": "A simple crate for determining whether two file paths point to the same file.\n",
       "licenses": [
         {
-          "expression": "Unlicense/MIT"
+          "expression": "Unlicense OR MIT"
         }
       ],
       "externalReferences": [
@@ -4981,7 +5155,9 @@
       "description": "Generate JSON Schemas from Rust code",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -4999,7 +5175,9 @@
       "description": "Generate JSON Schemas from Rust code",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5269,7 +5447,9 @@
       "description": "SIMD algebra for Rust",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -5287,7 +5467,9 @@
       "description": "A SIMD-accelerated Adler-32 hash algorithm implementation.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5323,7 +5505,9 @@
       "description": "Pre-allocated storage for a uniform data type",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5359,7 +5543,9 @@
       "description": "A pure Rust implementation of the Snappy compression algorithm. Includes\nstreaming compression and decompression.\n",
       "licenses": [
         {
-          "expression": "BSD-3-Clause"
+          "license": {
+            "id": "BSD-3-Clause"
+          }
         }
       ],
       "externalReferences": [
@@ -5413,7 +5599,9 @@
       "description": "Implementations of string similarity metrics. Includes Hamming, Levenshtein,\nOSA, Damerau-Levenshtein, Jaro, Jaro-Winkler, and Sørensen-Dice.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5431,7 +5619,9 @@
       "description": "Pure-Rust traits and utilities for constant-time cryptographic implementations.",
       "licenses": [
         {
-          "expression": "BSD-3-Clause"
+          "license": {
+            "id": "BSD-3-Clause"
+          }
         }
       ],
       "externalReferences": [
@@ -5485,7 +5675,9 @@
       "description": "Helper methods and macros for custom derives",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5521,7 +5713,9 @@
       "description": "A (relatively) high level interface to Thermo Fisher's RawFileReader library",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -5611,7 +5805,9 @@
       "description": "Rust bindings for the Apache Thrift RPC system",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -5683,7 +5879,9 @@
       "description": "A crate to read Bruker timsTOF data",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -5701,7 +5899,9 @@
       "description": "An implementation of Keccak derived functions.",
       "licenses": [
         {
-          "expression": "CC0-1.0"
+          "license": {
+            "id": "CC0-1.0"
+          }
         }
       ]
     },
@@ -5713,7 +5913,9 @@
       "description": "A small ASCII-only bounded length string representation.",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -5731,7 +5933,9 @@
       "description": "An event-driven, non-blocking I/O platform for writing asynchronous I/O\nbacked applications.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5749,7 +5953,9 @@
       "description": "Utilities to work with `Stream` and `tokio`.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5767,7 +5973,9 @@
       "description": "A Rust implementation of the XXHash and XXH3 algorithms",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5785,7 +5993,9 @@
       "description": "A Rust implementation of the XXHash and XXH3 algorithms",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5893,7 +6103,9 @@
       "description": "libyaml transpiled to rust by c2rust",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -5911,7 +6123,9 @@
       "description": "Safe, fast, zero-panic, zero-crashing, zero-allocation parsing of untrusted inputs in Rust.",
       "licenses": [
         {
-          "expression": "ISC"
+          "license": {
+            "id": "ISC"
+          }
         }
       ],
       "externalReferences": [
@@ -6055,7 +6269,7 @@
       "description": "A library to find native dependencies in a vcpkg tree at build\ntime in order to be used in Cargo build scripts.\n",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -6073,7 +6287,7 @@
       "description": "Tiny crate to check the version of the installed/running rustc.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -6091,7 +6305,9 @@
       "description": "SIMD utilities",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -6109,7 +6325,7 @@
       "description": "Recursively walk a directory.",
       "licenses": [
         {
-          "expression": "Unlicense/MIT"
+          "expression": "Unlicense OR MIT"
         }
       ],
       "externalReferences": [
@@ -6253,7 +6469,9 @@
       "description": "Mozilla's CA root certificates for use with webpki",
       "licenses": [
         {
-          "expression": "CDLA-Permissive-2.0"
+          "license": {
+            "id": "CDLA-Permissive-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6307,7 +6525,7 @@
       "description": "Raw FFI bindings for all of Windows API.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -6325,7 +6543,7 @@
       "description": "Import libraries for the i686-pc-windows-gnu target. Please don't use this crate directly, depend on winapi instead.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -6361,7 +6579,7 @@
       "description": "Import libraries for the x86_64-pc-windows-gnu target. Please don't use this crate directly, depend on winapi instead.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -6721,7 +6939,9 @@
       "description": "A more efficient alternative to fmt::Display",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6739,7 +6959,9 @@
       "description": "Abstraction allowing borrowed data to be carried along with the backing data it borrows from",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6757,7 +6979,9 @@
       "description": "Custom derive for the yoke crate",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6811,7 +7035,9 @@
       "description": "ZeroFrom trait for constructing",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6829,7 +7055,9 @@
       "description": "Custom derive for the zerofrom crate",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6883,7 +7111,9 @@
       "description": "A data structure that efficiently maps strings to integers",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6901,7 +7131,9 @@
       "description": "Zero-copy vector backed by a byte array",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6919,7 +7151,9 @@
       "description": "Custom derive for the zerovec crate",
       "licenses": [
         {
-          "expression": "Unicode-3.0"
+          "license": {
+            "id": "Unicode-3.0"
+          }
         }
       ],
       "externalReferences": [
@@ -6937,7 +7171,9 @@
       "description": "Library to support the reading and writing of zip files.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -6955,7 +7191,9 @@
       "description": "Library to support the reading and writing of zip files.\n",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -6973,7 +7211,9 @@
       "description": "A memory-safe zlib implementation written in rust",
       "licenses": [
         {
-          "expression": "Zlib"
+          "license": {
+            "id": "Zlib"
+          }
         }
       ],
       "externalReferences": [
@@ -6991,7 +7231,9 @@
       "description": "A double-to-string conversion algorithm based on Schubfach and yy",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -7009,7 +7251,9 @@
       "description": "A Rust implementation of the Zopfli compression algorithm.",
       "licenses": [
         {
-          "expression": "Apache-2.0"
+          "license": {
+            "id": "Apache-2.0"
+          }
         }
       ],
       "externalReferences": [
@@ -7027,7 +7271,9 @@
       "description": "Binding for the zstd compression library.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -7045,7 +7291,9 @@
       "description": "Binding for the zstd compression library.",
       "licenses": [
         {
-          "expression": "MIT"
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "externalReferences": [
@@ -7063,7 +7311,7 @@
       "description": "Safe low-level bindings for the zstd compression library.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
@@ -7099,7 +7347,7 @@
       "description": "Low-level bindings for the zstd compression library.",
       "licenses": [
         {
-          "expression": "MIT/Apache-2.0"
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "externalReferences": [
