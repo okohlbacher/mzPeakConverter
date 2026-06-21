@@ -5,7 +5,8 @@
 # for files that fail (convert or validate). Override with KEEP_OUTPUTS=1.
 #
 # Usage: tests/run_data_sweep.sh [DATA_ROOT]   (default ~/Claude/mzML2mzPeak/data)
-# Env:   JOBS=N (parallel, default 6), KEEP_OUTPUTS=1, MZPEAK_VALIDATE=/path
+# Env:   JOBS=N (parallel, default 4), MEM_CAP_GB=N (hard RAM ceiling, default 30),
+#        KEEP_OUTPUTS=1, MZPEAK_VALIDATE=/path
 set -uo pipefail
 
 # ---- worker mode: one input record "<fmt>\x1f<path>" --------------------------------------------
@@ -26,7 +27,12 @@ if [ "${1:-}" = "--worker" ]; then
     rm -f "$clog" "$archive"; exit 0
   fi
   if [ "$rc" -ne 0 ]; then
-    printf '%s\t%s\tCONV-ERR\trc=%s; see logs/%s.convert.log\t\n' "$fmt" "$rel" "$rc" "$id" >>"$OUT/results.tsv"
+    # rc 137 = SIGKILL (128+9): the memory watchdog reaped this conversion to stay under the RAM cap.
+    if [ "$rc" -eq 137 ]; then
+      printf '%s\t%s\tOOM-KILL\tkilled by RAM-cap watchdog (rerun this file alone or raise MEM_CAP_GB)\t\n' "$fmt" "$rel" >>"$OUT/results.tsv"
+    else
+      printf '%s\t%s\tCONV-ERR\trc=%s; see logs/%s.convert.log\t\n' "$fmt" "$rel" "$rc" "$id" >>"$OUT/results.tsv"
+    fi
     rm -f "$archive"; exit 0
   fi
   size="$(stat -f%z "$archive" 2>/dev/null || echo 0)"
@@ -48,7 +54,12 @@ here="$(cd "$(dirname "$0")" && pwd)"; root="$(dirname "$here")"
 DATA="${1:-$HOME/Claude/mzML2mzPeak/data}"
 DATA="$(cd "$DATA" && pwd)"
 OUT="${TMPDIR:-/tmp}/mzpc-sweep"
-JOBS="${JOBS:-6}"
+JOBS="${JOBS:-4}"
+# Hard RAM ceiling for the whole sweep (converter + validator processes). macOS has no cgroups, so a
+# background watchdog SIGKILLs the largest conversion whenever the aggregate RSS exceeds the cap —
+# freeing its memory immediately (SIGSTOP would not). The reaped file is recorded as OOM-KILL. Keep
+# JOBS modest so this rarely triggers; the watchdog is the backstop that stops the machine crashing.
+MEM_CAP_GB="${MEM_CAP_GB:-30}"
 BIN="$root/target/release/mzpeak-convert"
 [ -x "$BIN" ] || { echo "build first: cargo build --release"; exit 2; }
 
@@ -82,11 +93,42 @@ while IFS= read -r -d '' d; do
 done < <(find "$DATA" -type d -iname '*.d' -print0)
 
 total="$(tr -cd '\0' <"$recs" | wc -c | tr -d ' ')"
-echo "sweep: $total inputs from $DATA  (jobs=$JOBS)"
+echo "sweep: $total inputs from $DATA  (jobs=$JOBS, RAM cap ${MEM_CAP_GB}GB)"
 echo "output/logs: $OUT"
+
+# RAM-cap watchdog: every 2s, sum the RSS of the sweep's heavy processes (converter + validator);
+# while it exceeds the cap, SIGKILL the single largest one (freeing its RAM) until back under. Runs
+# in the background; trapped so it dies with the driver.
+mem_watchdog() {
+  local cap_kb=$(( MEM_CAP_GB * 1024 * 1024 ))
+  while :; do
+    sleep 2
+    local pids
+    pids="$({ pgrep -f "$BIN"; pgrep -f mzpeak-validate; } 2>/dev/null | sort -u | tr '\n' ' ')"
+    [ -z "${pids// /}" ] && continue
+    local total
+    total="$(ps -o rss= -p "${pids// /,}" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    while [ "${total:-0}" -gt "$cap_kb" ]; do
+      local victim
+      victim="$(ps -o pid=,rss= -p "${pids// /,}" 2>/dev/null | sort -k2 -rn | awk 'NR==1{print $1}')"
+      [ -z "$victim" ] && break
+      kill -9 "$victim" 2>/dev/null
+      echo "[mem-watchdog] RSS $((total/1024/1024))GB > ${MEM_CAP_GB}GB cap — killed pid $victim" >&2
+      sleep 1
+      pids="$({ pgrep -f "$BIN"; pgrep -f mzpeak-validate; } 2>/dev/null | sort -u | tr '\n' ' ')"
+      [ -z "${pids// /}" ] && break
+      total="$(ps -o rss= -p "${pids// /,}" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    done
+  done
+}
+mem_watchdog & watchdog_pid=$!
+disown "$watchdog_pid" 2>/dev/null || true  # keep job-control quiet when we kill it at the end
+trap 'kill "$watchdog_pid" 2>/dev/null' EXIT
+
 start=$(date +%s)
 xargs -0 -P "$JOBS" -n1 bash "$0" --worker <"$recs"
 end=$(date +%s)
+kill "$watchdog_pid" 2>/dev/null; trap - EXIT
 
 echo; echo "==== SWEEP SUMMARY ($((end-start))s) ===="
 awk -F'\t' '
@@ -96,12 +138,12 @@ awk -F'\t' '
     for (k in by) print "  "k": "by[k] | "sort";
     close("sort");
     print "----";
-    printf "TOTAL=%d  PASS=%d  CONV-ERR=%d  VAL-FAIL=%d  SKIP=%d\n",
-           total, st["PASS"], st["CONV-ERR"], st["VAL-FAIL"], st["SKIP"];
+    printf "TOTAL=%d  PASS=%d  CONV-ERR=%d  VAL-FAIL=%d  OOM-KILL=%d  SKIP=%d\n",
+           total, st["PASS"], st["CONV-ERR"], st["VAL-FAIL"], st["OOM-KILL"], st["SKIP"];
   }' "$OUT/results.tsv"
 
-echo; echo "failures (CONV-ERR / VAL-FAIL):"
-awk -F'\t' '$3=="CONV-ERR"||$3=="VAL-FAIL"{printf "  [%s] %s — %s\n",$3,$2,$4}' "$OUT/results.tsv" | sort | head -100
-fails="$(awk -F'\t' '$3=="CONV-ERR"||$3=="VAL-FAIL"' "$OUT/results.tsv" | wc -l | tr -d ' ')"
+echo; echo "failures (CONV-ERR / VAL-FAIL / OOM-KILL):"
+awk -F'\t' '$3=="CONV-ERR"||$3=="VAL-FAIL"||$3=="OOM-KILL"{printf "  [%s] %s — %s\n",$3,$2,$4}' "$OUT/results.tsv" | sort | head -100
+fails="$(awk -F'\t' '$3=="CONV-ERR"||$3=="VAL-FAIL"||$3=="OOM-KILL"' "$OUT/results.tsv" | wc -l | tr -d ' ')"
 echo "(full results: $OUT/results.tsv)"
 [ "$fails" -eq 0 ]
