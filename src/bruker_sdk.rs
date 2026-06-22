@@ -756,6 +756,32 @@ pub fn scannum_to_oneoverk0_table(input: &Path, frame_id: i64, n: usize) -> Resu
     Ok(out)
 }
 
+/// Diagnostic: the SDK's m/z `(min, max, n)` for one frame, via `tims_index_to_mz`. A garbage/huge
+/// m/z here would explode the chunked layout into millions of empty m/z chunks — the suspected cause
+/// of the 21 GB allocation.
+pub fn frame_mz_minmax(input: &Path, frame_idx: usize) -> Result<(f64, f64, usize)> {
+    let r = TdfSdkReader::open(input)?;
+    let frame = &r.frames[frame_idx.min(r.frames.len().saturating_sub(1))];
+    let peaks = r.read_frame_peaks(frame)?;
+    let indices: Vec<f64> = peaks.iter().map(|p| p.index as f64).collect();
+    let mz = r.convert(r.api.tims_index_to_mz, frame.id, &indices, "tims_index_to_mz")?;
+    let mn = mz.iter().copied().fold(f64::INFINITY, f64::min);
+    let mx = mz.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Ok((mn, mx, mz.len()))
+}
+
+/// Diagnostic: number of points the SDK's `tims_read_scans_v2` returns for the first `n_frames`
+/// frames — to compare against timsrust's raw frame read (do both decode the same stored peaks?).
+pub fn frame_point_counts(input: &Path, n_frames: usize) -> Result<Vec<usize>> {
+    let r = TdfSdkReader::open(input)?;
+    let k = n_frames.min(r.frames.len());
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        out.push(r.read_frame_peaks(&r.frames[i])?.len());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -410,6 +410,45 @@ fn dump_im_table(input: &Path) -> Result<()> {
             None => println!("{s},{:.8},,", timsrust[s]),
         }
     }
+
+    // Per-frame point counts: does the SDK's tims_read_scans_v2 decode the same number of stored
+    // peaks as timsrust's raw frame read? Printed to stderr so it stays out of the CSV on stdout.
+    let k = 10.min(native.len());
+    let timsrust_pts: Vec<usize> = (0..k)
+        .map(|i| native.frame(i).map(|f| f.tof.len()).unwrap_or(0))
+        .collect();
+    #[cfg(any(windows, target_os = "linux"))]
+    let sdk_pts: Option<Vec<usize>> = bruker_sdk::frame_point_counts(input, k).ok();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let sdk_pts: Option<Vec<usize>> = None;
+    eprintln!("frame,timsrust_points,sdk_points,diff");
+    for i in 0..k {
+        match &sdk_pts {
+            Some(v) => {
+                let s = v.get(i).copied().unwrap_or(0);
+                eprintln!("{i},{},{s},{}", timsrust_pts[i], timsrust_pts[i] as i64 - s as i64);
+            }
+            None => eprintln!("{i},{},,", timsrust_pts[i]),
+        }
+    }
+
+    // m/z range sanity for frame 0: timsrust m/z = (a + b·tof)²; a garbage SDK m/z would blow the
+    // chunked layout into millions of empty m/z chunks (the suspected 21 GB allocation).
+    if let Ok(f0) = native.frame(0) {
+        let (a, b) = (native.model.a, native.model.b);
+        let mz = |tof: u32| {
+            let v = a + b * tof as f64;
+            v * v
+        };
+        let tr_mn = f0.tof.iter().map(|&t| mz(t)).fold(f64::INFINITY, f64::min);
+        let tr_mx = f0.tof.iter().map(|&t| mz(t)).fold(f64::NEG_INFINITY, f64::max);
+        eprint!("frame0 m/z: timsrust [{tr_mn:.3}, {tr_mx:.3}]");
+        #[cfg(any(windows, target_os = "linux"))]
+        if let Ok((mn, mx, _)) = bruker_sdk::frame_mz_minmax(input, 0) {
+            eprint!("   sdk [{mn:.3}, {mx:.3}]");
+        }
+        eprintln!();
+    }
     Ok(())
 }
 
