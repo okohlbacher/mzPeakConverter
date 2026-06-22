@@ -110,33 +110,57 @@ jobs:
           Write-Host "--via-msconvert produced $((Get-Item out_pwiz.mzpeak).Length) bytes"
           exit 0
 
-  # SELF-HOSTED ONLY. The proprietary Bruker timsdata SDK can't live on a github-hosted runner, so
-  # the real SDK conversion + 1/K0 cross-check runs on the build box registered as a self-hosted
-  # Windows runner. Converts the SAME timsTOF .d three ways — SDK (vendor calibration), mzdata
-  # (--no-ims-compact), native ims-compact — diffs their 1/K0 mobility axes, and uploads the overlay
-  # plot. Gated on the repo variable TIMSDATA_LIB_DIR so it only schedules once the box is provisioned
-  # (set TIMSDATA_LIB_DIR = dir holding timsdata.dll, and BRUKER_SDK_SAMPLE_D = a TDF .d directory).
-  # Triggered manually (workflow_dispatch) so it runs on demand once the runner is online.
-  bruker-sdk-compare:
-    if: vars.TIMSDATA_LIB_DIR != '' && vars.BRUKER_SDK_SAMPLE_D != ''
-    runs-on: [self-hosted, Windows]
+  # Bruker SDK 1/K0 cross-check on a FREE github-hosted Windows runner, pulling the timsTOF data +
+  # the timsdata SDK from S3 (no self-hosted box needed). Converts the SAME .d three ways — SDK
+  # (vendor calibration), mzdata (--no-ims-compact), native ims-compact — diffs their 1/K0 mobility
+  # axes, and uploads the overlay plot. Each ~5GB output is deleted right after its tiny 1/K0 axis is
+  # extracted, so it fits the runner's ~14GB disk (use a small/representative .d).
+  #
+  # Provide on the repo:
+  #   secrets:   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   (least-privilege, read-only to the bucket)
+  #   variables: BRUKER_SAMPLE_S3 = s3://bucket/prefix/sample.d   (the .d, stored as a prefix)
+  #              BRUKER_SDK_S3    = s3://bucket/.../timsdata.dll  (the SDK; + any sibling DLLs it needs)
+  #              AWS_REGION       = e.g. eu-central-1   (optional; defaults below)
+  # Trigger with: gh workflow run Windows   (workflow_dispatch).
+  bruker-sdk-s3:
+    if: vars.BRUKER_SAMPLE_S3 != ''
+    runs-on: windows-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --verbose
-      - name: Convert three ways + compare 1/K0
+      - name: Pull timsTOF data + SDK from S3
+        shell: pwsh
+        run: |
+          aws s3 cp "${{ vars.BRUKER_SAMPLE_S3 }}" sample.d --recursive --quiet
+          aws s3 cp "${{ vars.BRUKER_SDK_S3 }}" sdklib/timsdata.dll --quiet
+          if (-not (Test-Path sample.d/analysis.tdf) -and -not (Test-Path sample.d/analysis.tsf)) {
+            throw "pulled .d has no analysis.tdf/.tsf — check BRUKER_SAMPLE_S3 points at the .d prefix"
+          }
+      - name: Convert three ways, extract 1/K0, delete each large output
         shell: pwsh
         env:
-          TIMSDATA_LIB_DIR: ${{ vars.TIMSDATA_LIB_DIR }}
+          TIMSDATA_LIB_DIR: ${{ github.workspace }}\sdklib
         run: |
-          $d = "${{ vars.BRUKER_SDK_SAMPLE_D }}"
-          cargo run --release -- "$d" -o sdk.mzpeak        --bruker-sdk     --force
-          cargo run --release -- "$d" -o mzdata.mzpeak     --no-ims-compact --force
-          cargo run --release -- "$d" -o imscompact.mzpeak                  --force
           python -m pip install --quiet pyarrow matplotlib
-          python tools/compare_ion_mobility.py sdk.mzpeak=SDK mzdata.mzpeak=mzdata `
-            imscompact.mzpeak=ims-compact --plot im_compare.png | Tee-Object im_compare.txt
+          $bin = "target/release/mzpeak-convert.exe"
+          function conv($flags, $label) {
+            & $bin sample.d -o out.mzpeak @flags --force
+            if ($LASTEXITCODE -ne 0) { throw "$label conversion failed ($LASTEXITCODE)" }
+            python tools/compare_ion_mobility.py --dump out.mzpeak "$label.json"
+            Remove-Item out.mzpeak -Force -ErrorAction SilentlyContinue
+          }
+          conv @('--bruker-sdk')     'SDK'
+          conv @('--no-ims-compact') 'mzdata'
+          conv @()                   'ims-compact'
+          python tools/compare_ion_mobility.py SDK.json=SDK mzdata.json=mzdata `
+            ims-compact.json=ims-compact --plot im_compare.png | Tee-Object im_compare.txt
       - name: Upload ion-mobility comparison
         if: always()
         uses: actions/upload-artifact@v4
@@ -145,3 +169,6 @@ jobs:
           path: |
             im_compare.png
             im_compare.txt
+            SDK.json
+            mzdata.json
+            ims-compact.json

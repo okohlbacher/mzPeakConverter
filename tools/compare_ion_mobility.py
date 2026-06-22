@@ -13,10 +13,15 @@ Handles both storage layouts:
 
 Usage:
   compare_ion_mobility.py A.mzpeak[=label] B.mzpeak[=label] ... [--plot out.png] [--tol 1e-6]
+  compare_ion_mobility.py --dump IN.mzpeak OUT.json   # extract just the 1/K0 axis (tiny)
+
+Inputs may be `.mzpeak` archives OR `.json` axis dumps from --dump (so a disk-limited CI runner can
+convert one file at a time, dump its axis, delete the big output, then compare the small JSONs).
 
 Exit 0 if every axis matches the first (reference) within tolerance, 1 otherwise.
 """
 import io
+import json
 import sys
 import zipfile
 
@@ -63,6 +68,9 @@ def _axis_from_meta_aux(z, sample_frames=400):
 
 
 def load_axis(path):
+    if path.endswith(".json"):
+        d = json.load(open(path))
+        return np.asarray(d["axis"], dtype=np.float64), d.get("src", "json")
     z = zipfile.ZipFile(path)
     ax = _axis_from_peaks(z)
     src = "spectra_peaks"
@@ -82,6 +90,11 @@ def nn_diff(ref, other):
 
 def main():
     args = [a for a in sys.argv[1:]]
+    if args[:1] == ["--dump"]:
+        ax, src = load_axis(args[1])
+        json.dump({"axis": ax.tolist(), "src": src}, open(args[2], "w"))
+        print(f"dumped {ax.size} distinct 1/K0 ({src}) -> {args[2]}")
+        return 0
     plot_path, tol = None, 1e-6
     paths = []
     i = 0
