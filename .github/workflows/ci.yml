@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,3 +34,22 @@ jobs:
           cargo run --release -- "${{ vars.BRUKER_SDK_SAMPLE_D }}" -o sdk_out.mzpeak --bruker-sdk --force
           test -f sdk_out.mzpeak || { echo "no output produced by --bruker-sdk"; exit 1; }
           echo "Bruker SDK conversion OK: $(stat -c%s sdk_out.mzpeak) bytes"
+
+  # Mine TimsCalibration.ModelType across many PRIDE timsTOF runs (pulls only analysis.tdf via HTTP
+  # range requests; no SDK, no binaries) to confirm whether any non-ModelType-2 calibration exists —
+  # our scan->1/K0 recalibration is ModelType-2-only. Manual-trigger only.
+  tims-modeltype-mine:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet remotezip
+      - name: Mine ModelTypes
+        run: python tools/mine_modeltypes.py | tee out_log.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tims-modeltypes
+          path: |
+            out/modeltypes.json
+            out_log.txt

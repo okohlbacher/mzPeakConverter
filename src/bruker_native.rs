@@ -80,11 +80,21 @@ impl MobilityCal {
 pub struct NativeTofReader {
     frames: FrameReader,
     im: Scan2ImConverter,
+    /// Vendor-grade ModelType-2 scan→1/K0 recalibration; `None` = use timsrust's linear approx
+    /// (when recalibration is disabled, or the calibration isn't ModelType 2).
+    recal: Option<crate::tims_mobility::TimsMobilityCalibration>,
     pub model: TofMzModel,
 }
 
 impl NativeTofReader {
+    /// Open with vendor mobility recalibration ON (the default).
     pub fn open(dot_d: &Path) -> Result<Self> {
+        Self::open_with(dot_d, true)
+    }
+
+    /// Open, choosing whether to recalibrate scan→1/K0 against the Bruker `TimsCalibration` model
+    /// (ModelType 2) instead of timsrust's linear approximation.
+    pub fn open_with(dot_d: &Path, recalibrate: bool) -> Result<Self> {
         let tdf = dot_d.join("analysis.tdf");
         if !tdf.exists() {
             bail!("{} is not a TDF .d (no analysis.tdf)", dot_d.display());
@@ -94,7 +104,13 @@ impl NativeTofReader {
         let frames = FrameReader::new(dot_d)
             .map_err(|e| anyhow::anyhow!("opening TDF frames: {e}"))?;
         let model = TofMzModel::from_converter(&meta.mz_converter);
-        Ok(Self { frames, im: meta.im_converter, model })
+        // Best-effort: a missing/other-ModelType calibration just leaves us on the linear path.
+        let recal = if recalibrate {
+            crate::tims_mobility::TimsMobilityCalibration::from_tdf_path(&tdf).unwrap_or(None)
+        } else {
+            None
+        };
+        Ok(Self { frames, im: meta.im_converter, recal, model })
     }
 
     pub fn len(&self) -> usize {
@@ -122,7 +138,10 @@ impl NativeTofReader {
 
     #[inline]
     pub fn mobility_for_scan(&self, scan: usize) -> f64 {
-        self.im.convert(scan as u32)
+        match &self.recal {
+            Some(c) => c.one_over_k0(scan as f64), // vendor ModelType-2 rational
+            None => self.im.convert(scan as u32),  // timsrust linear
+        }
     }
 
     /// The `ims_calibration` JSON for the archive index. Archive variant stores ABSOLUTE tof (no

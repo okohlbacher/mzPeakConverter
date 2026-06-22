@@ -91,6 +91,7 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 | `--zstd-level <1–22>` | `3` | Parquet zstd level |
 | `--no-ims-compact` | off | Bruker TDF: write standard f64 m/z instead of the default ims-compact |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF via the official `timsdata` SDK (Win/Linux only; needs `TIMSDATA_LIB_DIR`). Parallel path to the default pure-Rust readers; implies f64 m/z |
+| `--no-tims-recalibration` | off | Bruker TDF: disable vendor-grade scan→1/K0 recalibration (`TimsCalibration` ModelType-2 model) and use timsrust's linear approximation. Recalibration is **on by default** (~22× closer to the SDK) |
 | `--no-vendor` | off | Do not embed vendor side-files (see §8) |
 | `--aux <glob=embed\|drop>` | — | Vendor side-file rule (repeatable, highest precedence) |
 | `--via-msconvert` | off | Read via ProteoWizard `msconvert` → mzML → mzPeak |

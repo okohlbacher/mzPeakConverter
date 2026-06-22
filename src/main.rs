@@ -38,6 +38,7 @@ mod agilent_midac;
 mod sciex;
 mod bruker_native;
 mod bruker_tsf;
+mod tims_mobility;
 mod thermo_status;
 mod thermo_trailers;
 mod vendor;
@@ -160,6 +161,11 @@ struct Cli {
     #[arg(long)]
     bruker_sdk: bool,
 
+    /// Bruker timsTOF (TDF): disable vendor-grade scan→1/K0 recalibration (the `TimsCalibration`
+    /// ModelType-2 model) and use timsrust's linear approximation. Recalibration is ON by default.
+    #[arg(long)]
+    no_tims_recalibration: bool,
+
     /// Do not embed vendor side-files into the archive.
     #[arg(long)]
     no_vendor: bool,
@@ -212,6 +218,7 @@ struct FileConfig {
     force: Option<bool>,
     no_ims_compact: Option<bool>,
     bruker_sdk: Option<bool>,
+    no_tims_recalibration: Option<bool>,
     no_vendor: Option<bool>,
     no_chromatograms: Option<bool>,
     aux: Option<Vec<String>>,
@@ -229,6 +236,7 @@ struct Settings {
     force: bool,
     no_ims_compact: bool,
     bruker_sdk: bool,
+    tims_recalibration: bool,
     no_vendor: bool,
     chromatograms: bool,
     aux: Vec<String>,
@@ -259,6 +267,8 @@ impl Settings {
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
+            tims_recalibration: !(cli.no_tims_recalibration
+                || fc.no_tims_recalibration.unwrap_or(false)),
             no_vendor: cli.no_vendor || fc.no_vendor.unwrap_or(false),
             chromatograms: !(cli.no_chromatograms || fc.no_chromatograms.unwrap_or(false)),
             aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
@@ -362,7 +372,7 @@ fn run(cli: &Cli) -> Result<i32> {
         convert_bruker_sdk(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("converting {} via the Bruker timsdata SDK", cli.input.display()))?;
     } else if use_ims_compact {
-        convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
+        convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration)
             .with_context(|| format!("ims-compact converting {}", cli.input.display()))?;
     } else {
         guard_unsupported_vendor(&cli.input)?;
@@ -860,8 +870,9 @@ fn convert_ims_compact_archive(
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
+    tims_recalibration: bool,
 ) -> Result<()> {
-    let reader = bruker_native::NativeTofReader::open(input)?;
+    let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
     if reader.len() == 0 {
         bail!("no frames in {}", input.display());
     }
