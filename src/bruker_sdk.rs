@@ -733,6 +733,29 @@ impl BrukerSdkReader {
     }
 }
 
+/// Diagnostic: the vendor SDK's 1/K0 for scan numbers `[0, n)` of `frame_id`, via
+/// `tims_scannum_to_oneoverk0`. Used to compare the SDK's mobility calibration against timsrust's
+/// `Scan2ImConverter` scan-by-scan (isolating calibration from peak coverage).
+pub fn scannum_to_oneoverk0_table(input: &Path, frame_id: i64, n: usize) -> Result<Vec<f64>> {
+    let dir = analysis_dir(input, "analysis.tdf")?;
+    let api = TimsDataApi::load(None)?;
+    let handle = open_handle(api.tims_open, &dir)
+        .map_err(|e| anyhow!("tims_open failed: {e} ({})", api.last_error_tims()))?;
+    let scans: Vec<f64> = (0..n).map(|s| s as f64).collect();
+    let mut out = vec![0f64; n.max(1)];
+    let count = u32::try_from(n).unwrap_or(u32::MAX);
+    // SAFETY: scans + out both hold `n` f64; handle is valid until tims_close below.
+    let ok = unsafe {
+        (api.tims_scannum_to_oneoverk0)(handle, frame_id, scans.as_ptr(), out.as_mut_ptr(), count)
+    };
+    unsafe { (api.tims_close)(handle) };
+    if ok == 0 {
+        bail!("tims_scannum_to_oneoverk0 failed: {}", api.last_error_tims());
+    }
+    out.truncate(n);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -313,6 +313,13 @@ fn init_logging(verbose: u8, quiet: bool) {
 }
 
 fn run(cli: &Cli) -> Result<i32> {
+    // Diagnostic: dump the scan→1/K0 table from timsrust (and the Bruker SDK where available) so the
+    // two mobility calibrations can be compared scan-by-scan. Bypasses normal conversion.
+    if std::env::var_os("MZPC_DUMP_IM_TABLE").is_some() {
+        dump_im_table(&cli.input)?;
+        return Ok(exit::OK);
+    }
+
     let cfg = Settings::resolve(cli)?;
     let verbose = cli.verbose > 0;
 
@@ -370,6 +377,40 @@ fn run(cli: &Cli) -> Result<i32> {
 /// True for a Bruker timsTOF TDF `.d` (folder with `analysis.tdf`).
 fn is_tdf_dir(input: &Path) -> bool {
     input.is_dir() && input.join("analysis.tdf").exists()
+}
+
+/// Print `scan,timsrust_1overk0,sdk_1overk0,abs_diff` for every mobility scan of a TDF `.d`, so the
+/// timsrust `Scan2ImConverter` calibration can be compared scan-by-scan against the vendor SDK's
+/// `tims_scannum_to_oneoverk0`. The SDK column is blank on platforms without the SDK (e.g. macOS).
+fn dump_im_table(input: &Path) -> Result<()> {
+    let native = bruker_native::NativeTofReader::open(input)?;
+    let n = native.frame(0)?.scan_offsets.len().saturating_sub(1);
+    let timsrust: Vec<f64> = (0..n).map(|s| native.mobility_for_scan(s)).collect();
+
+    #[cfg(any(windows, target_os = "linux"))]
+    let sdk: Option<Vec<f64>> = match bruker_sdk::scannum_to_oneoverk0_table(input, 1, n) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("SDK scan→1/K0 table unavailable: {e}");
+            None
+        }
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let sdk: Option<Vec<f64>> = None;
+
+    println!("scan,timsrust_1overk0,sdk_1overk0,abs_diff");
+    for s in 0..n {
+        match &sdk {
+            Some(v) => println!(
+                "{s},{:.8},{:.8},{:.3e}",
+                timsrust[s],
+                v[s],
+                (timsrust[s] - v[s]).abs()
+            ),
+            None => println!("{s},{:.8},,", timsrust[s]),
+        }
+    }
+    Ok(())
 }
 
 /// Print a human report of what a reader sees (format, spectra, chromatograms) without converting —

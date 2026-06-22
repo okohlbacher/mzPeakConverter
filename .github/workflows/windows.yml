@@ -168,6 +168,15 @@ jobs:
           conv @()                   'ims-compact'
           python tools/compare_ion_mobility.py SDK.json=SDK mzdata.json=mzdata `
             ims-compact.json=ims-compact --plot im_compare.png | Tee-Object im_compare.txt
+      # Scan-by-scan calibration: timsrust (linear interpolation) vs the vendor SDK
+      # (tims_scannum_to_oneoverk0, exact). Isolates the calibration question from peak coverage.
+      - name: Dump scan->1/K0 table (timsrust vs SDK)
+        shell: pwsh
+        env:
+          MZPC_DUMP_IM_TABLE: '1'
+        run: |
+          target/release/mzpeak-convert.exe sample.d | Out-File -Encoding utf8 im_table.csv
+          python -c "import csv; r=list(csv.DictReader(open('im_table.csv'))); d=[abs(float(x['abs_diff'])) for x in r if x['abs_diff']]; print('rows',len(r),'max|timsrust-sdk|',max(d) if d else 'n/a','mean',sum(d)/len(d) if d else 'n/a')"
       - name: Upload ion-mobility comparison
         if: always()
         uses: actions/upload-artifact@v4
@@ -176,6 +185,7 @@ jobs:
           path: |
             im_compare.png
             im_compare.txt
+            im_table.csv
             SDK.json
             mzdata.json
             ims-compact.json
