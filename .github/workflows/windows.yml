@@ -145,10 +145,18 @@ jobs:
           Write-Host "timsdata SDK: $dll"
       - name: Convert three ways, extract 1/K0, delete each large output
         shell: pwsh
+        env:
+          RUST_BACKTRACE: '1'
+          # The 1/K0 axis is covered by a handful of frames; cap the conversion so the SDK's raw
+          # profile (every TOF bin) stays small + fast and never balloons the runner's RAM/disk.
+          MZPC_MAX_SPECTRA: '100'
+          MZPC_BUFFER_SPECTRA: '16'
         run: |
           $bin = "target/release/mzpeak-convert.exe"
+          # Point layout (no numpress chunking) — fair for a 1/K0 comparison and avoids the
+          # numpress allocation blow-up on the SDK's dense profile spectra.
           function conv($flags, $label) {
-            & $bin sample.d -o out.mzpeak @flags --no-vendor --force
+            & $bin sample.d -o out.mzpeak @flags --layout point --no-vendor --force
             if ($LASTEXITCODE -ne 0) { throw "$label conversion failed ($LASTEXITCODE)" }
             python tools/compare_ion_mobility.py --dump out.mzpeak "$label.json"
             Remove-Item out.mzpeak -Force -ErrorAction SilentlyContinue

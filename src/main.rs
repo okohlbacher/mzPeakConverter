@@ -77,6 +77,16 @@ fn buffer_spectra() -> usize {
         .unwrap_or(256)
 }
 
+/// Optional hard cap on how many spectra to convert (`$MZPC_MAX_SPECTRA`). Mainly for diagnostics /
+/// quick cross-checks (e.g. the ion-mobility comparison only needs a handful of frames to cover the
+/// full mobility axis), so a multi-GB run becomes seconds. `None` = convert everything.
+fn max_spectra() -> Option<usize> {
+    std::env::var("MZPC_MAX_SPECTRA")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
 /// Exit codes (shared contract, mirrors mzML2mzPeak).
 mod exit {
     pub const OK: i32 = 0;
@@ -612,8 +622,12 @@ fn convert_file(
         .build();
 
     let mut n = 0usize;
+    let cap = max_spectra();
     let mut ms1 = Ms1Chroms::default();
     for mut entry in reader.iter() {
+        if cap.is_some_and(|m| n >= m) {
+            break;
+        }
         // The mzPeak peaks facet requires non-decreasing m/z within a spectrum.
         if entry.has_ion_mobility_dimension() {
             // Ion mobility: re-sort via the 3D stack/unstack (keeps the mobility dimension aligned).
@@ -825,7 +839,8 @@ fn convert_ims_compact_archive(
     add_processing_metadata(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
-    for i in 0..reader.len() {
+    let n_frames = max_spectra().map_or(reader.len(), |m| m.min(reader.len()));
+    for i in 0..n_frames {
         let spec = reader.ims_compact_spectrum(i)?;
         if synth_chroms {
             ms1.observe(&spec);
@@ -1057,6 +1072,7 @@ fn convert_vendor_reader(
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
     let mut ms1 = Ms1Chroms::default();
+    let len = max_spectra().map_or(len, |m| m.min(len));
     for i in 0..len {
         let spec = spectrum(i)?;
         if synth_chroms {
