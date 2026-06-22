@@ -55,6 +55,26 @@ pub struct RawFrame {
     pub intensity: Vec<u32>,
 }
 
+/// Lean scan→1/K0 calibrator: timsrust's `Scan2ImConverter` built from `analysis.tdf` ALONE — no
+/// frame / `analysis.tdf_bin` read. Lets the mobility calibration be dumped from just the metadata
+/// DB (so CI can pull only the small `analysis.tdf` from a remote `.d.zip`, not the GB-scale binary).
+pub struct MobilityCal {
+    im: Scan2ImConverter,
+}
+
+impl MobilityCal {
+    pub fn open(tdf: &Path) -> Result<Self> {
+        let meta = MetadataReader::new(tdf)
+            .map_err(|e| anyhow::anyhow!("reading TDF metadata {}: {e}", tdf.display()))?;
+        Ok(Self { im: meta.im_converter })
+    }
+
+    #[inline]
+    pub fn for_scan(&self, scan: usize) -> f64 {
+        self.im.convert(scan as u32)
+    }
+}
+
 /// Native integer-TOF reader over a Bruker `.d` (TDF). The mzdata-integration seam: a future
 /// upstream native-TOF API would back this same surface.
 pub struct NativeTofReader {

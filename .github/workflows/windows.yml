@@ -193,3 +193,35 @@ jobs:
             SDK.json
             mzdata.json
             ims-compact.json
+
+  # Harvest Bruker TDF mobility calibrations across many PRIDE timsTOF runs to reverse-engineer the
+  # exact ModelType-2 scan→1/K0 formula. Pulls ONLY analysis.tdf from each remote .d.zip (HTTP range
+  # requests), evaluates timsrust vs the vendor SDK per scan, and records C0..C9 + reference points.
+  # Manual-trigger only. SDK comes from opentims_bruker_bridge (no licensed download needed).
+  tims-cal-harvest:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Provision SDK (opentims_bruker_bridge)
+        shell: pwsh
+        run: |
+          python -m pip install --quiet remotezip opentims_bruker_bridge
+          $dll = python -c "import opentims_bruker_bridge as o; print(o.get_appropriate_so_path())"
+          "TIMSDATA_LIB_DIR=$(Split-Path $dll)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "timsdata SDK: $dll"
+      - name: Harvest calibrations
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tools/harvest_calibrations.py target/release/mzpeak-convert.exe
+      - name: Upload calibrations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tims-calibrations
+          path: out/calibrations.json

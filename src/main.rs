@@ -381,14 +381,33 @@ fn is_tdf_dir(input: &Path) -> bool {
 
 /// Print `scan,timsrust_1overk0,sdk_1overk0,abs_diff` for every mobility scan of a TDF `.d`, so the
 /// timsrust `Scan2ImConverter` calibration can be compared scan-by-scan against the vendor SDK's
-/// `tims_scannum_to_oneoverk0`. The SDK column is blank on platforms without the SDK (e.g. macOS).
+/// `tims_scannum_to_oneoverk0`. Reads ONLY `analysis.tdf` (no frame/`.tdf_bin` read) so it can run on
+/// a `.d` where only the metadata DB was fetched. The SDK column is blank without the SDK (e.g.
+/// macOS). The optional per-frame point-count / m/z diagnostics run only if the binary is present.
 fn dump_im_table(input: &Path) -> Result<()> {
-    let native = bruker_native::NativeTofReader::open(input)?;
-    let n = native.frame(0)?.scan_offsets.len().saturating_sub(1);
-    let timsrust: Vec<f64> = (0..n).map(|s| native.mobility_for_scan(s)).collect();
+    let dir = if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input.parent().unwrap_or(input).to_path_buf()
+    };
+    let tdf = dir.join("analysis.tdf");
+
+    // num_scans straight from the SQLite Frames table — no binary needed.
+    let conn = rusqlite::Connection::open_with_flags(
+        &tdf,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", tdf.display()))?;
+    let n: i64 = conn
+        .query_row("SELECT MAX(NumScans) FROM Frames", [], |r| r.get(0))
+        .context("reading MAX(NumScans)")?;
+    let n = n.max(0) as usize;
+
+    let cal = bruker_native::MobilityCal::open(&tdf)?;
+    let timsrust: Vec<f64> = (0..n).map(|s| cal.for_scan(s)).collect();
 
     #[cfg(any(windows, target_os = "linux"))]
-    let sdk: Option<Vec<f64>> = match bruker_sdk::scannum_to_oneoverk0_table(input, 1, n) {
+    let sdk: Option<Vec<f64>> = match bruker_sdk::scannum_to_oneoverk0_table(&dir, 1, n) {
         Ok(v) => Some(v),
         Err(e) => {
             eprintln!("SDK scan→1/K0 table unavailable: {e}");
@@ -411,43 +430,25 @@ fn dump_im_table(input: &Path) -> Result<()> {
         }
     }
 
-    // Per-frame point counts: does the SDK's tims_read_scans_v2 decode the same number of stored
-    // peaks as timsrust's raw frame read? Printed to stderr so it stays out of the CSV on stdout.
-    let k = 10.min(native.len());
-    let timsrust_pts: Vec<usize> = (0..k)
-        .map(|i| native.frame(i).map(|f| f.tof.len()).unwrap_or(0))
-        .collect();
-    #[cfg(any(windows, target_os = "linux"))]
-    let sdk_pts: Option<Vec<usize>> = bruker_sdk::frame_point_counts(input, k).ok();
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let sdk_pts: Option<Vec<usize>> = None;
-    eprintln!("frame,timsrust_points,sdk_points,diff");
-    for i in 0..k {
-        match &sdk_pts {
-            Some(v) => {
-                let s = v.get(i).copied().unwrap_or(0);
-                eprintln!("{i},{},{s},{}", timsrust_pts[i], timsrust_pts[i] as i64 - s as i64);
-            }
-            None => eprintln!("{i},{},,", timsrust_pts[i]),
-        }
-    }
-
-    // m/z range sanity for frame 0: timsrust m/z = (a + b·tof)²; a garbage SDK m/z would blow the
-    // chunked layout into millions of empty m/z chunks (the suspected 21 GB allocation).
-    if let Ok(f0) = native.frame(0) {
-        let (a, b) = (native.model.a, native.model.b);
-        let mz = |tof: u32| {
-            let v = a + b * tof as f64;
-            v * v
-        };
-        let tr_mn = f0.tof.iter().map(|&t| mz(t)).fold(f64::INFINITY, f64::min);
-        let tr_mx = f0.tof.iter().map(|&t| mz(t)).fold(f64::NEG_INFINITY, f64::max);
-        eprint!("frame0 m/z: timsrust [{tr_mn:.3}, {tr_mx:.3}]");
+    // Optional: per-frame point counts (needs analysis.tdf_bin). Skip silently if the binary is
+    // absent/empty (the lean metadata-only mode).
+    if let Ok(native) = bruker_native::NativeTofReader::open(&dir) {
+        let k = 10.min(native.len());
+        eprintln!("frame,timsrust_points,sdk_points,diff");
         #[cfg(any(windows, target_os = "linux"))]
-        if let Ok((mn, mx, _)) = bruker_sdk::frame_mz_minmax(input, 0) {
-            eprint!("   sdk [{mn:.3}, {mx:.3}]");
+        let sdk_pts: Option<Vec<usize>> = bruker_sdk::frame_point_counts(&dir, k).ok();
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let sdk_pts: Option<Vec<usize>> = None;
+        for i in 0..k {
+            let t = native.frame(i).map(|f| f.tof.len()).unwrap_or(0);
+            match &sdk_pts {
+                Some(v) => {
+                    let s = v.get(i).copied().unwrap_or(0);
+                    eprintln!("{i},{t},{s},{}", t as i64 - s as i64);
+                }
+                None => eprintln!("{i},{t},,"),
+            }
         }
-        eprintln!();
     }
     Ok(())
 }
