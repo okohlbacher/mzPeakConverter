@@ -110,41 +110,35 @@ jobs:
           Write-Host "--via-msconvert produced $((Get-Item out_pwiz.mzpeak).Length) bytes"
           exit 0
 
-  # Bruker SDK 1/K0 cross-check on a FREE github-hosted Windows runner. Pulls the timsTOF .d from the
-  # (S3-compatible) object store, auto-downloads the Bruker timsdata SDK via the opentims_bruker_bridge
-  # pip package (which bundles timsdata.dll / libtimsdata.so), then converts the SAME .d three ways —
-  # SDK (vendor calibration), mzdata (--no-ims-compact), native ims-compact — diffs their 1/K0 mobility
-  # axes, and uploads the overlay plot. Each ~5GB output is deleted right after its tiny 1/K0 axis is
-  # extracted, so it fits the runner's disk. Manual-trigger only (so it never fires on a normal push).
+  # Bruker SDK 1/K0 cross-check on a FREE github-hosted Windows runner. The timsTOF data is in a
+  # PUBLIC-READ object store, so it just HTTPS-downloads the two files a TDF conversion needs
+  # (analysis.tdf + analysis.tdf_bin) — no credentials. The Bruker timsdata SDK is auto-fetched via
+  # the opentims_bruker_bridge pip package (bundles timsdata.dll / libtimsdata.so). Then it converts
+  # the SAME .d three ways — SDK (vendor calibration), mzdata (--no-ims-compact), native ims-compact —
+  # diffs their 1/K0 mobility axes, and uploads the overlay plot. Each large output is deleted right
+  # after its tiny 1/K0 axis is extracted, so it fits the runner's disk. Manual-trigger only.
   #
   # Provide on the repo:
-  #   secrets:   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   (the object-store key id + secret)
-  #   variables: BRUKER_SAMPLE_S3 = s3://bucket/prefix/sample.d   (the .d, stored as a prefix)
-  #              S3_ENDPOINT      = https://object.storage.eu01.onstackit.cloud   (S3-compatible endpoint)
-  #              AWS_REGION       = EU-01
+  #   variable BRUKER_SAMPLE_URL = public base URL of the .d (url-encoded), no trailing slash, e.g.
+  #     https://object.storage.eu01.onstackit.cloud/v09/.../SBA415%281%29%20Try_Slot1-2_1_8271.d
   # Trigger with: gh workflow run Windows
   bruker-sdk-s3:
-    if: github.event_name == 'workflow_dispatch' && vars.BRUKER_SAMPLE_S3 != ''
+    if: github.event_name == 'workflow_dispatch' && vars.BRUKER_SAMPLE_URL != ''
     runs-on: windows-latest
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION || 'EU-01' }}
-      S3_ENDPOINT: ${{ vars.S3_ENDPOINT }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --verbose
-      - name: Pull timsTOF data + fetch SDK
+      - name: Download timsTOF .d (public HTTPS) + fetch SDK
         shell: pwsh
         run: |
-          $ep = if ($env:S3_ENDPOINT) { "--endpoint-url", $env:S3_ENDPOINT } else { @() }
-          aws s3 cp "${{ vars.BRUKER_SAMPLE_S3 }}" sample.d --recursive --quiet @ep
-          if (-not (Test-Path sample.d/analysis.tdf) -and -not (Test-Path sample.d/analysis.tsf)) {
-            throw "pulled .d has no analysis.tdf/.tsf — check BRUKER_SAMPLE_S3 points at the .d prefix"
-          }
+          $base = "${{ vars.BRUKER_SAMPLE_URL }}".TrimEnd('/')
+          New-Item -ItemType Directory -Force sample.d | Out-Null
+          curl.exe -sSL "$base/analysis.tdf"     -o sample.d/analysis.tdf
+          curl.exe -sSL "$base/analysis.tdf_bin" -o sample.d/analysis.tdf_bin
+          if (-not (Test-Path sample.d/analysis.tdf)) { throw "analysis.tdf download failed" }
           python -m pip install --quiet pyarrow matplotlib opentims_bruker_bridge
           $dll = python -c "import opentims_bruker_bridge as o; print(o.get_appropriate_so_path())"
           "TIMSDATA_LIB_DIR=$(Split-Path $dll)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
@@ -154,7 +148,7 @@ jobs:
         run: |
           $bin = "target/release/mzpeak-convert.exe"
           function conv($flags, $label) {
-            & $bin sample.d -o out.mzpeak @flags --force
+            & $bin sample.d -o out.mzpeak @flags --no-vendor --force
             if ($LASTEXITCODE -ne 0) { throw "$label conversion failed ($LASTEXITCODE)" }
             python tools/compare_ion_mobility.py --dump out.mzpeak "$label.json"
             Remove-Item out.mzpeak -Force -ErrorAction SilentlyContinue
