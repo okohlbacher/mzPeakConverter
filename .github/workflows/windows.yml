@@ -147,6 +147,8 @@ jobs:
         shell: pwsh
         env:
           RUST_BACKTRACE: '1'
+          # The comparison tool prints a 'Δ' — force UTF-8 so it doesn't trip Windows' cp1252 stdout.
+          PYTHONIOENCODING: 'utf-8'
           # The 1/K0 axis is covered by a handful of frames; cap the conversion so the SDK's raw
           # profile (every TOF bin) stays small + fast and never balloons the runner's RAM/disk.
           MZPC_MAX_SPECTRA: '100'
