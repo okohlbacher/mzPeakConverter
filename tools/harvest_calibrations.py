@@ -39,9 +39,11 @@ def f64s(blob):
 results = []
 for i, url in enumerate(URLS):
     d = "sample.d"
+    con = None
     try:
         shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d)
+        shutil.rmtree("rz", ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
         with RemoteZip(url) as z:
             tdf = [n for n in z.namelist() if n.lower().endswith("analysis.tdf")]
             if not tdf:
@@ -64,9 +66,16 @@ for i, url in enumerate(URLS):
         cal = dict(zip(cols, c.execute("SELECT * FROM TimsCalibration").fetchone()))
         ns = c.execute("SELECT MAX(NumScans) FROM Frames").fetchone()[0]
 
-        def blob(k):
+        def blob(k):  # binary f64 array values
             x = c.execute("SELECT Value FROM CalibrationInfo WHERE KeyName=?", (k,)).fetchone()
             return f64s(x[0]) if x else None
+
+        def textf(k):  # numeric TEXT values (e.g. pressure)
+            x = c.execute("SELECT Value FROM CalibrationInfo WHERE KeyName=?", (k,)).fetchone()
+            try:
+                return float(x[0]) if x else None
+            except (TypeError, ValueError):
+                return None
 
         ok = len(sdk) == len(timsrust) and len(sdk) > 0
         results.append(dict(
@@ -74,15 +83,17 @@ for i, url in enumerate(URLS):
             coeffs={k: str(cal[k]) for k in cal},
             Vref=blob("MeasuredTimsVoltages"),
             Mref=blob("MobilitiesCorrectedCalibration"),
-            pressure=blob("MobilitiyReferencePressure"),
+            pressure=textf("MobilitiyReferencePressure"),
+            pressure_comp=textf("MobilitiyPressureCompensationFactor"),
             timsrust=timsrust, sdk=sdk, sdk_ok=ok,
             stderr=(p.stderr or "")[-300:],
         ))
         print(f"[{i}] {url.split('/')[-1][:34]:34s} ns={ns} sdk_ok={ok}")
-        con.close()
     except Exception as e:
         print(f"[{i}] ERR {type(e).__name__}: {e}")
     finally:
+        if con is not None:
+            con.close()  # release the SQLite handle so Windows can delete the dir
         shutil.rmtree(d, ignore_errors=True)
 
 json.dump(results, open("out/calibrations.json", "w"))
