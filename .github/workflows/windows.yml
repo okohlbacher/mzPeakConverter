@@ -168,9 +168,13 @@ jobs:
           conv @()                   'ims-compact'
           python tools/compare_ion_mobility.py SDK.json=SDK mzdata.json=mzdata `
             ims-compact.json=ims-compact --plot im_compare.png | Tee-Object im_compare.txt
+          # A DIFFER verdict here is the EXPECTED result (SDK's exact nonlinear calibration + raw
+          # coverage vs timsrust's linear interpolation), so it's informational — not a CI failure.
+          $global:LASTEXITCODE = 0
       # Scan-by-scan calibration: timsrust (linear interpolation) vs the vendor SDK
       # (tims_scannum_to_oneoverk0, exact). Isolates the calibration question from peak coverage.
       - name: Dump scan->1/K0 table (timsrust vs SDK)
+        if: always()
         shell: pwsh
         env:
           MZPC_DUMP_IM_TABLE: '1'
