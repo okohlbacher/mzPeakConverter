@@ -9,6 +9,7 @@
 //! Vendor-SDK readers compile in per platform (see the cfg-gated modules below). See PLAN.md.
 
 use std::fs;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,6 +23,10 @@ use clap::{Parser, ValueEnum};
 #[cfg(any(windows, target_os = "linux"))]
 #[allow(dead_code)]
 mod bruker_baf;
+// Bruker timsdata SDK reader (TDF + TSF) — same OS envelope as baf2sql (Win + Linux, no macOS).
+#[cfg(any(windows, target_os = "linux"))]
+#[allow(dead_code)]
+mod bruker_sdk;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod agilent;
@@ -140,6 +145,11 @@ struct Cli {
     #[arg(long)]
     no_ims_compact: bool,
 
+    /// Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default
+    /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). Implies f64 m/z.
+    #[arg(long)]
+    bruker_sdk: bool,
+
     /// Do not embed vendor side-files into the archive.
     #[arg(long)]
     no_vendor: bool,
@@ -191,6 +201,7 @@ struct FileConfig {
     zstd_level: Option<i32>,
     force: Option<bool>,
     no_ims_compact: Option<bool>,
+    bruker_sdk: Option<bool>,
     no_vendor: Option<bool>,
     no_chromatograms: Option<bool>,
     aux: Option<Vec<String>>,
@@ -207,6 +218,7 @@ struct Settings {
     zstd_level: i32,
     force: bool,
     no_ims_compact: bool,
+    bruker_sdk: bool,
     no_vendor: bool,
     chromatograms: bool,
     aux: Vec<String>,
@@ -236,6 +248,7 @@ impl Settings {
             zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(3),
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
+            bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             no_vendor: cli.no_vendor || fc.no_vendor.unwrap_or(false),
             chromatograms: !(cli.no_chromatograms || fc.no_chromatograms.unwrap_or(false)),
             aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
@@ -318,12 +331,19 @@ fn run(cli: &Cli) -> Result<i32> {
         Some(vendor::VendorPolicy::load(None, &cfg.aux)?)
     };
 
-    // ims-compact is the DEFAULT for Bruker timsTOF (TDF); --no-ims-compact falls back to f64 m/z.
-    let use_ims_compact = is_tdf_dir(&cli.input) && !cfg.no_ims_compact;
+    // The Bruker SDK path (opt-in) reads TDF/TSF via timsdata and supersedes both ims-compact and the
+    // pure-Rust readers for those inputs.
+    let use_bruker_sdk = cfg.bruker_sdk && (is_tdf_dir(&cli.input) || is_tsf_dir(&cli.input));
+    // ims-compact is the DEFAULT for Bruker timsTOF (TDF); --no-ims-compact (or --bruker-sdk) falls
+    // back to f64 m/z.
+    let use_ims_compact = is_tdf_dir(&cli.input) && !cfg.no_ims_compact && !use_bruker_sdk;
 
     if cfg.via_msconvert {
         convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms)
             .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
+    } else if use_bruker_sdk {
+        convert_bruker_sdk(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
+            .with_context(|| format!("converting {} via the Bruker timsdata SDK", cli.input.display()))?;
     } else if use_ims_compact {
         convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("ims-compact converting {}", cli.input.display()))?;
@@ -528,7 +548,11 @@ fn convert_file(
     if is_wiff(input) {
         return convert_sciex(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
-    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input)
+    // mzdata panics on an empty self-closing <referenceableParamGroup/> that is later referenced
+    // (ProteomeDiscoverer emits these). If present, convert from a sanitized copy instead.
+    let sanitized = sanitize_param_groups(input)?;
+    let read_path: &Path = sanitized.as_deref().unwrap_or(input);
+    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
 
     let tmp = output.with_extension("mzpeak.tmp");
@@ -590,13 +614,30 @@ fn convert_file(
     let mut n = 0usize;
     let mut ms1 = Ms1Chroms::default();
     for mut entry in reader.iter() {
-        // If there's ion mobility, ensure m/z is sorted (the writer expects sorted m/z).
+        // The mzPeak peaks facet requires non-decreasing m/z within a spectrum.
         if entry.has_ion_mobility_dimension() {
+            // Ion mobility: re-sort via the 3D stack/unstack (keeps the mobility dimension aligned).
             if let Some(arrays) = entry.arrays.as_mut() {
                 if arrays.mzs().is_ok_and(|v| !v.is_sorted()) {
                     if let Ok(sorted) = BinaryArrayMap3D::stack(arrays).and_then(|v| v.unstack()) {
                         *arrays = sorted;
                     }
+                }
+            }
+        } else {
+            // Non-IM: SRM/SIM (and some vendor) spectra list values out of m/z order, but the mzPeak
+            // peaks facet requires non-decreasing m/z. mzdata may carry the same spectrum as a
+            // centroid peak set, a deconvoluted set, and/or raw arrays; the writer prefers
+            // peaks > deconvoluted > arrays, so re-sort whichever is present (no-op when ordered).
+            if let Some(peaks) = entry.peaks.as_mut() {
+                peaks.sort();
+            }
+            if let Some(peaks) = entry.deconvoluted_peaks.as_mut() {
+                peaks.sort();
+            }
+            if let Some(arrays) = entry.arrays.as_mut() {
+                if arrays.mzs().is_ok_and(|v| !v.is_sorted()) {
+                    let _ = arrays.sort_by_array(&ArrayType::MZArray);
                 }
             }
         }
@@ -624,7 +665,94 @@ fn convert_file(
 
     finish_with_vendor(writer, input, vendor)?;
     fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
+    if let Some(s) = &sanitized {
+        let _ = fs::remove_file(s);
+    }
     Ok(())
+}
+
+/// Work around an mzdata defect: it `panic!`s when a `<referenceableParamGroupRef>` points at an
+/// empty self-closing `<referenceableParamGroup id="…"/>` (which it never registers). Such groups
+/// are valid mzML and ProteomeDiscoverer emits them. If the input's header contains that pattern,
+/// write a sanitized copy where each empty group is rewritten as an explicit open/close pair and
+/// return its path; otherwise return None (convert the original in place). Only the small pre-
+/// `<spectrumList>` header is rewritten; the bulk of the file is streamed through verbatim.
+fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !ext.eq_ignore_ascii_case("mzml") {
+        return Ok(None);
+    }
+    let mut f = BufReader::new(fs::File::open(input)?);
+    // Read the header (everything before <spectrumList); the empty group + its list live here.
+    let marker = b"<spectrumList";
+    let mut head: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let nread = f.read(&mut buf)?;
+        if nread == 0 {
+            break;
+        }
+        head.extend_from_slice(&buf[..nread]);
+        if find_subslice(&head, marker).is_some() || head.len() > 32 * 1024 * 1024 {
+            break;
+        }
+    }
+    let split = find_subslice(&head, marker).unwrap_or(head.len());
+    let header = match std::str::from_utf8(&head[..split]) {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // binary in header region: leave it alone
+    };
+    if !header.contains("<referenceableParamGroup id=") {
+        return Ok(None);
+    }
+    let fixed = expand_empty_param_groups(header);
+    if fixed == header {
+        return Ok(None);
+    }
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
+    let temp =
+        std::env::temp_dir().join(format!("mzpc-san-{}-{}.mzML", std::process::id(), stem));
+    let mut out = BufWriter::new(fs::File::create(&temp)?);
+    out.write_all(fixed.as_bytes())?;
+    out.write_all(&head[split..])?; // bytes already read past the header
+    io::copy(&mut f, &mut out)?; // the rest of the file, verbatim
+    out.flush()?;
+    log::debug!("sanitized empty referenceableParamGroup(s) into {}", temp.display());
+    Ok(Some(temp))
+}
+
+/// Rewrite every empty self-closing `<referenceableParamGroup id="…"/>` as `<… ></…>`. Leaves
+/// `<referenceableParamGroupRef …/>` (a different element) and non-empty groups untouched.
+fn expand_empty_param_groups(header: &str) -> String {
+    const NEEDLE: &str = "<referenceableParamGroup id=";
+    let mut out = String::with_capacity(header.len() + 64);
+    let mut rest = header;
+    while let Some(pos) = rest.find(NEEDLE) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        match after.find('>') {
+            Some(end) => {
+                let tag = &after[..=end];
+                if tag.ends_with("/>") {
+                    out.push_str(&tag[..tag.len() - 2]);
+                    out.push_str("></referenceableParamGroup>");
+                } else {
+                    out.push_str(tag);
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(after);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Convert a Bruker TDF `.d` to an IN-ARCHIVE ims-compact mzPeak (Track 1): spectra_peaks carries
@@ -808,6 +936,41 @@ fn convert_baf(
         input, output, chunk, zstd_level, vendor, synth_chroms,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
+}
+
+/// Convert a Bruker TDF/TSF `.d` → mzPeak via the official Bruker **timsdata** SDK (opt-in
+/// `--bruker-sdk`), a parallel path to the default pure-Rust readers. Windows/Linux only — there is
+/// no macOS timsdata build, so the non-(win|linux) stub returns the typed unsupported error (exit 3).
+/// Hooks into the same `MultiLayerSpectrum` seam every native reader uses.
+#[cfg(any(windows, target_os = "linux"))]
+fn convert_bruker_sdk(
+    input: &Path,
+    output: &Path,
+    chunk: Option<ChunkingStrategy>,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+) -> Result<()> {
+    let reader = bruker_sdk::BrukerSdkReader::open(input)?;
+    convert_vendor_reader(
+        input, output, chunk, zstd_level, vendor, synth_chroms,
+        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+    )
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn convert_bruker_sdk(
+    _input: &Path,
+    _output: &Path,
+    _chunk: Option<ChunkingStrategy>,
+    _zstd_level: i32,
+    _vendor: Option<&vendor::VendorPolicy>,
+    _synth_chroms: bool,
+) -> Result<()> {
+    Err(UnsupportedVendor(
+        "the Bruker timsdata SDK path (--bruker-sdk) is only available on Windows and Linux".into(),
+    )
+    .into())
 }
 
 /// Convert a SciEX `.wiff`/`.wiff2` → mzPeak via the Clearcore2 .NET glue (feature `sciex`,
@@ -1123,3 +1286,24 @@ fn reader_format<R: std::io::Read + std::io::Seek>(reader: &MZReaderType<R>) -> 
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::expand_empty_param_groups;
+
+    #[test]
+    fn expands_only_empty_referenceable_param_groups() {
+        // empty self-closing def -> explicit open/close
+        let h = r#"<list><referenceableParamGroup id="G" /></list>"#;
+        // the space before '>' is preserved (valid XML); only the empty close is rewritten
+        assert_eq!(
+            expand_empty_param_groups(h),
+            r#"<list><referenceableParamGroup id="G" ></referenceableParamGroup></list>"#
+        );
+        // a Ref (different element) and a non-empty group must be left untouched
+        let keep = r#"<referenceableParamGroup id="G"><cvParam/></referenceableParamGroup><referenceableParamGroupRef ref="G"/>"#;
+        assert_eq!(expand_empty_param_groups(keep), keep);
+        // no group at all -> unchanged
+        assert_eq!(expand_empty_param_groups("<run/>"), "<run/>");
+    }
+}

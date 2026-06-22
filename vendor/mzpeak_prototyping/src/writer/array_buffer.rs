@@ -258,6 +258,47 @@ impl PointBuffers {
         RecordBatch::try_new(schema, arrays).unwrap()
     }
 
+    /// Find an existing schema column whose array type + data type match `f`, ignoring unit. A
+    /// source may emit the same logical array (e.g. intensity) with a unit label that drifts between
+    /// spectra ("number of counts" vs "number of detector counts"), producing a BufferName that the
+    /// schema sampler — which only inspects a handful of control-point spectra — never saw. Rather
+    /// than crash, route such a field into its canonical facet column (the facet has one column per
+    /// array type + dtype). Returns the target column key, or None if nothing matches.
+    fn fallback_field(&self, f: &Field) -> Option<(String, DataType)> {
+        let want_acc = f.metadata().get("array_accession");
+        let want_name = f.metadata().get("array_name");
+        self.peak_array_fields
+            .iter()
+            .find(|cand| {
+                self.array_chunks.contains_key(cand.name())
+                    && if want_acc.is_some() {
+                        cand.metadata().get("array_accession") == want_acc
+                    } else {
+                        cand.metadata().get("array_name") == want_name
+                    }
+            })
+            .map(|cand| (cand.name().to_string(), cand.data_type().clone()))
+    }
+
+    /// Route `arr`/`f` to its canonical schema column when the exact BufferName is absent, casting
+    /// the array to the column's dtype if needed (numeric casts: a later spectrum encoding intensity
+    /// as f32 lands in an f64 column, or vice versa). Returns `(key, possibly-cast array)`, or panics
+    /// when no array of the same type exists at all (a genuinely unexpected field).
+    fn route_unexpected(&self, f: &Field, arr: ArrayRef, label: &str) -> (String, ArrayRef) {
+        match self.fallback_field(f) {
+            Some((key, dt)) => {
+                let arr = if arr.data_type() == &dt {
+                    arr
+                } else {
+                    arrow::compute::cast(&arr, &dt).unwrap_or(arr)
+                };
+                log::debug!("Routing variant field {label} to canonical column {key}");
+                (key, arr)
+            }
+            None => panic!("Unexpected field {f:?}"),
+        }
+    }
+
     pub fn add<T: ToMzPeakDataSeries>(
         &mut self,
         series_index: u64,
@@ -271,11 +312,13 @@ impl PointBuffers {
             let name = BufferName::from_field(self.buffer_context, f.clone())
                 .map(|b| b.to_string())
                 .unwrap_or(f.name().to_string());
-            self.array_chunks
-                .get_mut(&name)
-                .unwrap_or_else(|| panic!("Unexpected field {f:?}"))
-                .push(arr);
-            visited.insert(name);
+            let (key, arr) = if self.array_chunks.contains_key(&name) {
+                (name, arr)
+            } else {
+                self.route_unexpected(f, arr, &name)
+            };
+            self.array_chunks.get_mut(&key).unwrap().push(arr);
+            visited.insert(key);
         }
 
         for (f, chunk) in self.array_chunks.iter_mut() {
@@ -332,23 +375,23 @@ impl PointBuffers {
         let index_of_insertion = arrays.first().and_then(|arr| arr.as_primitive::<UInt64Type>().iter().next()?);
         let n = arrays.iter().map(|v| v.len()).next().unwrap_or_default();
 
-        let mut visited = HashSet::new();
+        let mut visited: HashSet<String> = HashSet::new();
         for (f, arr) in fields.iter().zip(arrays) {
             if arr.len() != n {
                 log::error!("{} is length {}, expected {n}", f.name(), arr.len());
             }
-            self.array_chunks
-                .get_mut(f.name())
-                .unwrap_or_else(|| {
-                    panic!("Unexpected field {f:?}\nfor\n{:#?}", self.peak_array_fields)
-                })
-                .push(arr);
-            visited.insert(f.name());
+            let (key, arr) = if self.array_chunks.contains_key(f.name()) {
+                (f.name().to_string(), arr)
+            } else {
+                self.route_unexpected(f, arr, f.name())
+            };
+            self.array_chunks.get_mut(&key).unwrap().push(arr);
+            visited.insert(key);
         }
 
         let mut filled = 0;
         for (f, chunk) in self.array_chunks.iter_mut() {
-            if !visited.contains(&f) {
+            if !visited.contains(f) {
                 if let Some(t) = chunk.first().map(|a| a.data_type()).or_else(|| {
                     self.peak_array_fields
                         .iter()

@@ -109,3 +109,39 @@ jobs:
           if (-not (Test-Path out_pwiz.mzpeak)) { Write-Error "no output archive produced"; exit 1 }
           Write-Host "--via-msconvert produced $((Get-Item out_pwiz.mzpeak).Length) bytes"
           exit 0
+
+  # SELF-HOSTED ONLY. The proprietary Bruker timsdata SDK can't live on a github-hosted runner, so
+  # the real SDK conversion + 1/K0 cross-check runs on the build box registered as a self-hosted
+  # Windows runner. Converts the SAME timsTOF .d three ways — SDK (vendor calibration), mzdata
+  # (--no-ims-compact), native ims-compact — diffs their 1/K0 mobility axes, and uploads the overlay
+  # plot. Gated on the repo variable TIMSDATA_LIB_DIR so it only schedules once the box is provisioned
+  # (set TIMSDATA_LIB_DIR = dir holding timsdata.dll, and BRUKER_SDK_SAMPLE_D = a TDF .d directory).
+  # Triggered manually (workflow_dispatch) so it runs on demand once the runner is online.
+  bruker-sdk-compare:
+    if: vars.TIMSDATA_LIB_DIR != '' && vars.BRUKER_SDK_SAMPLE_D != ''
+    runs-on: [self-hosted, Windows]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Convert three ways + compare 1/K0
+        shell: pwsh
+        env:
+          TIMSDATA_LIB_DIR: ${{ vars.TIMSDATA_LIB_DIR }}
+        run: |
+          $d = "${{ vars.BRUKER_SDK_SAMPLE_D }}"
+          cargo run --release -- "$d" -o sdk.mzpeak        --bruker-sdk     --force
+          cargo run --release -- "$d" -o mzdata.mzpeak     --no-ims-compact --force
+          cargo run --release -- "$d" -o imscompact.mzpeak                  --force
+          python -m pip install --quiet pyarrow matplotlib
+          python tools/compare_ion_mobility.py sdk.mzpeak=SDK mzdata.mzpeak=mzdata `
+            imscompact.mzpeak=ims-compact --plot im_compare.png | Tee-Object im_compare.txt
+      - name: Upload ion-mobility comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ion-mobility-comparison
+          path: |
+            im_compare.png
+            im_compare.txt

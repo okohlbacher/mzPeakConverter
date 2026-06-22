@@ -20,6 +20,20 @@ All notable changes to this project are documented here. The format follows
 - **Native Agilent IM-MS (MIDAC) reader** — Windows-only scaffold, compile-verified
   (untested at runtime; needs MIDAC DLLs + IM-MS data). An Agilent `.d` with ion
   mobility routes to MIDAC, else MHDAC.
+- **Bruker timsdata SDK reader (`--bruker-sdk`)** — an opt-in parallel path that reads
+  TDF *and* TSF `.d` through Bruker's official `timsdata` library (vendor index→m/z
+  calibration; per-peak 1/K0 mobility for TDF), emitting the same `MultiLayerSpectrum`
+  structures as the default pure-Rust readers. Windows/Linux only (no macOS SDK);
+  loads `timsdata.dll`/`libtimsdata.so` via `TIMSDATA_LIB_DIR`. Implies f64 m/z (not
+  ims-compact). BAF is unaffected — it uses the separate `baf2sql` library. Pure
+  decode/mapping logic is unit-tested; CI runs a real `.d` e2e when the SDK is
+  provisioned on the runner.
+
+### Changed — dependencies
+
+- **mzdata `0.64.1` → `0.65.2`** — pulls upstream TDF/ion-mobility correctness fixes
+  (`process_3d_slice` per-frame peak inflation; ion-mobility off-by-one labeling) that
+  affect the standard `--no-ims-compact` TDF path. No arrow/parquet/mzpeaks churn.
 
 ### Changed — single-command CLI (breaking)
 

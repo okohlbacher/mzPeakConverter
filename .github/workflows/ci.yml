@@ -21,3 +21,15 @@ jobs:
         run: cargo build --release --verbose
       - name: Test
         run: cargo test --verbose
+      # Real end-to-end test of the Bruker timsdata SDK path (--bruker-sdk) on Linux. Runs ONLY when
+      # the runner exposes libtimsdata.so + a sample .d via repo variables (github-hosted runners lack
+      # the licensed SDK, so it is skipped there). Set repo variables TIMSDATA_LIB_DIR (dir holding
+      # libtimsdata.so) and BRUKER_SDK_SAMPLE_D (a TDF or TSF .d directory).
+      - name: Bruker SDK e2e — convert a real TDF/TSF via --bruker-sdk
+        if: vars.TIMSDATA_LIB_DIR != '' && vars.BRUKER_SDK_SAMPLE_D != ''
+        env:
+          TIMSDATA_LIB_DIR: ${{ vars.TIMSDATA_LIB_DIR }}
+        run: |
+          cargo run --release -- "${{ vars.BRUKER_SDK_SAMPLE_D }}" -o sdk_out.mzpeak --bruker-sdk --force
+          test -f sdk_out.mzpeak || { echo "no output produced by --bruker-sdk"; exit 1; }
+          echo "Bruker SDK conversion OK: $(stat -c%s sdk_out.mzpeak) bytes"

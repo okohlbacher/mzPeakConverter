@@ -90,6 +90,7 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 | `--chunk-size <Th>` | `50` | m/z chunk width for the chunked layout |
 | `--zstd-level <1–22>` | `3` | Parquet zstd level |
 | `--no-ims-compact` | off | Bruker TDF: write standard f64 m/z instead of the default ims-compact |
+| `--bruker-sdk` | off | Read Bruker TDF/TSF via the official `timsdata` SDK (Win/Linux only; needs `TIMSDATA_LIB_DIR`). Parallel path to the default pure-Rust readers; implies f64 m/z |
 | `--no-vendor` | off | Do not embed vendor side-files (see §8) |
 | `--aux <glob=embed\|drop>` | — | Vendor side-file rule (repeatable, highest precedence) |
 | `--via-msconvert` | off | Read via ProteoWizard `msconvert` → mzML → mzPeak |
