@@ -88,18 +88,33 @@ pub fn array_map_to_schema_arrays_and_excess(
             .with_sorting_rank((*v.name() == context.default_sorted_array()).then(|| 0));
         let buffer_name = overrides.map(&buffer_name);
 
-        let fieldref = buffer_name.to_field();
+        let mut fieldref = buffer_name.to_field();
         if let Some(schema) = schema {
-            if schema
+            // The schema's main-axis field is named by its PRIMARY variant (no dtype suffix, e.g.
+            // `tof_index`), while a freshly derived BufferName carries the suffix (`tof_index_i32`).
+            // Try the direct name first, then the primary-stripped name, so a nonstandard main-axis
+            // column (m/z replaced by an integer `tof`/`tof_index`) matches its schema field instead
+            // of spilling to auxiliary.
+            let primary_name = buffer_name
+                .clone()
+                .with_priority(Some(crate::buffer_descriptors::BufferPriority::Primary))
+                .to_string();
+            let matched = schema
                 .iter()
-                .find(|c| c.name() == fieldref.name())
-                .is_none()
-            {
-                log::trace!(
-                    "{fieldref:?} |\n{buffer_name:?}\ndid not map to schema\n{schema:#?}\nwith overrides\n{overrides:#?}"
-                );
-                auxiliary.push(AuxiliaryArray::from_data_array(v)?);
-                continue;
+                .find(|c| c.name() == fieldref.name() || *c.name() == primary_name);
+            match matched {
+                Some(field) => {
+                    // Adopt the schema field (carries the primary name + any custom metadata such as
+                    // `mzpeak:transform_params`) so the written column name matches the declared one.
+                    fieldref = field.clone();
+                }
+                None => {
+                    log::trace!(
+                        "{fieldref:?} |\n{buffer_name:?}\ndid not map to schema\n{schema:#?}\nwith overrides\n{overrides:#?}"
+                    );
+                    auxiliary.push(AuxiliaryArray::from_data_array(v)?);
+                    continue;
+                }
             }
         }
 

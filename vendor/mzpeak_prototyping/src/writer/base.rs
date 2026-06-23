@@ -1126,8 +1126,14 @@ pub trait AbstractMzPeakWriter {
             }
             if c.name().ends_with("_index") {
                 log::debug!("{}: delta binary packing", c.path());
-                data_props =
-                    data_props.set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
+                // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
+                // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF
+                // grid with ~10^6 distinct values) would silently fall back to a useless dictionary
+                // (~2.3 B/value) instead of delta-packing (~0.2 B/value). Disable the dictionary for
+                // `_index` columns so the requested DELTA_BINARY_PACKED actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
             }
         }
 
@@ -1254,8 +1260,14 @@ pub trait AbstractMzPeakWriter {
             }
             if c.name().ends_with("_index") {
                 log::debug!("{}: delta binary packing", c.path());
-                data_props =
-                    data_props.set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
+                // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
+                // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF
+                // grid with ~10^6 distinct values) would silently fall back to a useless dictionary
+                // (~2.3 B/value) instead of delta-packing (~0.2 B/value). Disable the dictionary for
+                // `_index` columns so the requested DELTA_BINARY_PACKED actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
             }
         }
 

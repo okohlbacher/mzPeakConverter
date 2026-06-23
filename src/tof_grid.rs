@@ -20,14 +20,25 @@ pub struct TofGrid {
     pub c1: f64,
 }
 
-/// Acceptance tolerance for the lossless grid fit. SCIEX TOF reconstructs to ~0.05–0.1 ppm with a
-/// fine enough grid; Orbitrap/QqQ-SRM miss by orders of magnitude. 0.2 ppm is the gate from the
-/// research spike (`WATERS_SCIEX_COMPACT.md`): SCIEX passes, non-TOF fails. We also require the
-/// resulting `tof_index` to fit comfortably in Int32.
-pub const PPM_TOL: f64 = 0.2;
+/// Acceptance tolerance for the grid fit at the NATURAL lattice (the compression-optimal grid where
+/// stored samples are one step apart). At that grid the residual is pure grid-snap quantization,
+/// bounded at SCIEX TOF instrument accuracy (~1–2 ppm measured) — NOT instrument jitter, and it
+/// halves with each grid refinement, the signature of a true flight-time lattice. 3 ppm comfortably
+/// admits SCIEX TripleTOF/ZenoTOF while the `median_dk == 1` density gate rejects non-TOF data
+/// (Orbitrap/QqQ-SRM), which is off by tens to hundreds of ppm at any dense grid. The reconstruction
+/// is lossless *within instrument accuracy*; for a stricter bound, a finer grid (smaller ppm, larger
+/// `tof_index`) is selected automatically by the refinement fallback.
+pub const PPM_TOL: f64 = 3.0;
 /// Keep k within signed-31-bit range with a safety margin (DELTA_BINARY_PACKED makes the absolute
 /// magnitude almost free, but the column is Int32 so k MUST fit).
 pub const MAX_K: i64 = 1_900_000_000;
+/// A genuine flight-time lattice is DENSE: within a spectrum, adjacent points sit a small integer
+/// number of grid steps apart (median `dk` ≈ 1–8 for SCIEX profile). A non-lattice (Orbitrap/SRM,
+/// or smoothly-varying m/z) can be made to *reconstruct* within `PPM_TOL` only by refining the grid
+/// arbitrarily fine, which blows the median `dk` up into the hundreds (every point lands on a
+/// distant fractional node). This is the decisive discriminator: refine-to-fit cannot fake a dense
+/// lattice. Reject if the per-spectrum median `dk` exceeds this.
+pub const MAX_MEDIAN_DK: i64 = 32;
 
 /// Result of attempting to fit a run-wide TOF grid over sampled m/z arrays.
 pub struct FitOutcome {
@@ -38,6 +49,9 @@ pub struct FitOutcome {
     pub median_ppm: f64,
     /// Largest `tof_index` produced over the sampled points (for the Int32-range check).
     pub max_k: i64,
+    /// Median integer step between adjacent points within a representative spectrum (lattice density
+    /// check — see `MAX_MEDIAN_DK`).
+    pub median_dk: i64,
 }
 
 impl TofGrid {
@@ -56,7 +70,9 @@ impl TofGrid {
             return None;
         }
         let k = ((mz.sqrt() - self.c0) / self.c1).round();
-        if !k.is_finite() || k < 0.0 || k > MAX_K as f64 {
+        // k may be negative — valid lattice points below the c0 reference (e.g. low-m/z MS2 fragment
+        // peaks). Int32 + DELTA_BINARY_PACKED store signed values fine; only require it to fit Int32.
+        if !k.is_finite() || k.abs() > MAX_K as f64 {
             return None;
         }
         Some(k as i32)
@@ -130,20 +146,57 @@ fn evaluate(grid: &TofGrid, mzs: &[f64]) -> (f64, f64, i64) {
     (max, median, max_k)
 }
 
+/// Median integer step `dk` between adjacent points of one spectrum under `grid`. Sort the
+/// spectrum's m/z, map each to its grid index, and take the median of consecutive index gaps.
+/// Small (≈1–8) for a dense flight-time lattice; large for a refine-to-fit non-lattice.
+fn median_dk(grid: &TofGrid, spec: &[f64]) -> i64 {
+    let mut ks: Vec<i64> = spec
+        .iter()
+        .filter(|&&m| m > 0.0)
+        .map(|&m| ((m.sqrt() - grid.c0) / grid.c1).round() as i64)
+        .collect();
+    if ks.len() < 2 {
+        return i64::MAX;
+    }
+    ks.sort_unstable();
+    let mut dks: Vec<i64> = ks.windows(2).map(|w| w[1] - w[0]).filter(|&d| d > 0).collect();
+    if dks.is_empty() {
+        return i64::MAX;
+    }
+    dks.sort_unstable();
+    dks[dks.len() / 2]
+}
+
 /// Try to fit a run-wide TOF grid over the pooled sampled m/z from several spectra.
 ///
-/// Strategy: estimate a coarse single-step from the first usable spectrum, then refine the step by
-/// successive halving (the lattice is finer than the densest observed gap — each halving roughly
-/// halves the reconstruction error, which is the signature of a perfect grid vs. instrument jitter).
-/// Accept the finest grid that (a) reconstructs every pooled point within `PPM_TOL` and (b) keeps k
-/// within Int32. Return `None` if no refinement meets the tolerance (non-TOF / jittered data).
+/// Strategy — target the NATURAL lattice, not the finest one:
+///
+/// The fundamental flight-time clock is far finer than the spacing of the stored samples. Sampling
+/// at the clock would reconstruct m/z to ~0 ppm but make `tof_index` huge and its deltas large
+/// (poor compression). Sampling at the *data spacing* (the coarsest grid where adjacent dense points
+/// are one step apart, `median_dk == 1`) is the sweet spot: `tof_index` deltas are tiny
+/// (DELTA_BINARY_PACKED shrinks the column to ~0.2 B/peak — the whole point) while the residual is
+/// pure grid-snap quantization, bounded at SCIEX TOF instrument accuracy (~1–2 ppm). Each refinement
+/// halves the ppm but inflates the column; the natural lattice is the right trade-off and matches
+/// the measured 0.21 B/peak in the research spike.
+///
+/// We scan coarse→fine. The natural lattice is the first grid whose per-spectrum `median_dk` is 1.
+/// Accept it iff its max reconstruction error is within `PPM_TOL` (a generous SCIEX-accuracy bound)
+/// AND `tof_index` fits Int32. A non-TOF input (Orbitrap/QqQ-SRM) never produces a `median_dk == 1`
+/// grid within `PPM_TOL` — its points aren't on any flight-time lattice — so it is rejected (the
+/// `median_dk` gate is the decisive discriminator: refine-to-fit cannot fake a dense lattice).
 pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
-    // Pool all sampled m/z (different spectra share the per-run lattice).
+    // Pool all sampled m/z (different spectra share the per-run lattice). The base single-step is
+    // estimated from ONE spectrum (pooling interleaves spectra and corrupts the step estimate).
     let mut pooled: Vec<f64> = Vec::new();
     let mut first_step: Option<f64> = None;
+    let mut probe: &[f64] = &[];
     for spec in sample_spectra {
         if first_step.is_none() {
-            first_step = base_step(spec);
+            if let Some(s) = base_step(spec) {
+                first_step = Some(s);
+                probe = spec; // representative in-order spectrum for the lattice-density check
+            }
         }
         pooled.extend(spec.iter().copied().filter(|&m| m > 0.0));
     }
@@ -154,9 +207,30 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
     let sqrt_mz: Vec<f64> = pooled.iter().map(|&m| m.sqrt()).collect();
     let s_min = sqrt_mz.iter().cloned().fold(f64::INFINITY, f64::min);
 
+    // The natural lattice (compression-optimal) is the COARSEST grid in the scan — start there. We
+    // also try a couple of coarser-than-detected steps in case the 30th-percentile estimate slightly
+    // under-shot the true single step (which would give median_dk > 1).
     let mut best: Option<FitOutcome> = None;
-    // Refine the step by halving. Stop once k would overflow Int32 or we've gone deep enough.
-    for shift in 0..12u32 {
+    for mult in [4.0, 2.0, 1.0] {
+        let step = base * mult;
+        let (c0, c1) = fit_with_step(&sqrt_mz, s_min, step);
+        if !(c1 > 0.0) || !c0.is_finite() {
+            continue;
+        }
+        let grid = TofGrid { c0, c1 };
+        let mdk = median_dk(&grid, probe);
+        let (max_ppm, median_ppm, max_k) = evaluate(&grid, &pooled);
+        // The natural lattice: dense adjacency (median dk == 1) AND lossless within instrument
+        // accuracy AND fits Int32. This is the compression sweet spot.
+        if mdk == 1 && max_ppm <= PPM_TOL && max_k <= MAX_K {
+            return Some(FitOutcome { grid, max_ppm, median_ppm, max_k, median_dk: mdk });
+        }
+    }
+
+    // No clean dk==1 lattice at the detected step. Fall back to refinement: accept the COARSEST grid
+    // (best compression) that meets the ppm gate while remaining dense (median_dk <= MAX_MEDIAN_DK).
+    // This still rejects non-TOF data — its dk explodes long before ppm is met.
+    for shift in 0..14u32 {
         let step = base / (1u64 << shift) as f64;
         let (c0, c1) = fit_with_step(&sqrt_mz, s_min, step);
         if !(c1 > 0.0) || !c0.is_finite() {
@@ -165,28 +239,17 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
         let grid = TofGrid { c0, c1 };
         let (max_ppm, median_ppm, max_k) = evaluate(&grid, &pooled);
         if max_k > MAX_K {
-            break; // finer grids only push k higher
+            break;
         }
-        let outcome = FitOutcome { grid, max_ppm, median_ppm, max_k };
-        // Keep refining while it helps; record the best (finest passing) grid.
-        let improved = match &best {
-            None => true,
-            Some(b) => max_ppm < b.max_ppm,
-        };
-        if improved {
-            best = Some(outcome);
-        }
+        let mdk = median_dk(&grid, probe);
         if max_ppm <= PPM_TOL {
-            // Good enough and lossless within tolerance; one more refinement only tightens it, but
-            // we already meet the gate — take the first passing fine grid to keep k smaller.
+            if mdk <= MAX_MEDIAN_DK {
+                best = Some(FitOutcome { grid, max_ppm, median_ppm, max_k, median_dk: mdk });
+            }
             break;
         }
     }
-
-    match best {
-        Some(b) if b.max_ppm <= PPM_TOL && b.max_k <= MAX_K => Some(b),
-        _ => None,
-    }
+    best
 }
 
 #[cfg(test)]

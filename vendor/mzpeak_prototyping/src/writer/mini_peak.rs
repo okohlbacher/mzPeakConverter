@@ -1,5 +1,6 @@
 use std::io::{self, prelude::*};
 
+use mzdata::prelude::*; // ByteArrayView for `DataArray::data_len`
 use mzdata::spectrum::RefPeakDataLevel;
 use mzpeaks::{CentroidLike, DeconvolutedCentroidLike};
 use parquet::{arrow::ArrowWriter, file::metadata::KeyValue};
@@ -76,21 +77,37 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
             }
             RefPeakDataLevel::Missing => unimplemented!(),
             RefPeakDataLevel::RawData(arrays) => {
+                // `RefPeakDataLevel::len()` derives the point count from the m/z array, which is 0
+                // for a custom peak facet that REPLACES m/z with a nonstandard main axis (e.g. an
+                // integer `tof`/`tof_index` flight-time column). Fall back to the longest data array
+                // so the primary length is correct and the columns land as typed columns instead of
+                // spilling to auxiliary (the `primary_array_len == 0` aux path).
+                let primary_len = if n == 0 {
+                    arrays
+                        .iter()
+                        .filter_map(|(_, v)| v.data_len().ok())
+                        .max()
+                        .unwrap_or(0)
+                } else {
+                    n
+                };
                 let (fields, cols, aux) = array_map_to_schema_arrays_and_excess(
                     crate::BufferContext::Spectrum,
                     arrays,
-                    n,
+                    primary_len,
                     spectrum_count,
                     spectrum_time,
                     Some(self.buffers.fields()),
                     self.buffers.overrides(),
                 )?;
-                let pts_written = self.buffers.add_arrays(fields, cols, n, false);
+                let pts_written = self.buffers.add_arrays(fields, cols, primary_len, false);
                 (aux, pts_written)
             }
         };
 
-        self.n_points += n as u64;
+        // `n_peaks` is the count actually written (equals `n` for peak lists, or the recovered
+        // primary length when m/z was replaced by a nonstandard main axis).
+        self.n_points += n_peaks as u64;
         self.n_entries += 1;
 
         // Flush on the point count OR the measured byte size, whichever trips first.

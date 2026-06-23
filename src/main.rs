@@ -726,9 +726,19 @@ fn convert_file_tof_grid(
         .with_context(BufferContext::Spectrum)
         .add_field(BufferContext::Spectrum.index_field())
         .add_field(tof_field)
-        .add_field(INTENSITY_ARRAY.to_field());
+        // Intensity at Float64 to match f64-intensity sources (SCIEX mzML) and the writer's
+        // intensity buffer dtype; f32 sources upcast cleanly.
+        .add_field(
+            BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::IntensityArray,
+                BinaryDataArrayType::Float64,
+            )
+            .with_unit(Unit::DetectorCounts)
+            .to_field(),
+        );
 
-    let builder = MzPeakWriterType::<fs::File>::builder()
+    let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
@@ -737,6 +747,10 @@ fn convert_file_tof_grid(
             DataType::Boolean,
         ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
+    // Derive the chromatogram schema (intensity/time dtypes) from the source chromatograms so the
+    // facet matches what we write (the synthesized TIC/base-peak are f64 — sampling f64 source
+    // chromatograms keeps the schema f64 and avoids an f32/f64 record-batch mismatch).
+    builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
     let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);
     add_processing_metadata(&mut writer);
@@ -772,7 +786,11 @@ fn convert_file_tof_grid(
     });
     zip.add_index_metadata("tof_calibration", &cal)
         .context("writing tof_calibration index")?;
-    if let Some(policy) = vendor {
+    // The TOF-grid path handles mzML inputs (no vendor `.d` to embed). Only embed when the input is
+    // actually a Bruker `.d` directory (mirrors `finish_with_vendor`); skip for plain mzML files.
+    let is_bruker_d = input.is_dir()
+        && (input.join("analysis.tsf").exists() || input.join("analysis.tdf").exists());
+    if let (Some(policy), true) = (vendor, is_bruker_d) {
         vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
     }
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
@@ -783,6 +801,20 @@ fn convert_file_tof_grid(
 /// Build one TOF-grid spectrum: convert the source f64 m/z array to `tof_index` (Int32) via `grid`,
 /// keep intensity, DROP f64 m/z. The grid maps each m/z to its nearest flight-time lattice index;
 /// readers reconstruct `m/z = (c0 + c1·tof_index)²`. Preserves the source spectrum description.
+/// A point in some spectrum did not reconstruct from the run-wide TOF grid within tolerance — the
+/// grid is not lossless for the whole file. In `auto` mode the caller falls back to f64 m/z.
+#[derive(Debug)]
+struct TofGridNotLossless {
+    mz: f64,
+    spectrum: usize,
+}
+impl std::fmt::Display for TofGridNotLossless {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "m/z {} in spectrum {} is not on the accepted TOF grid", self.mz, self.spectrum)
+    }
+}
+impl std::error::Error for TofGridNotLossless {}
+
 fn tof_grid_spectrum(
     entry: &MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
     grid: &tof_grid::TofGrid,
@@ -796,18 +828,24 @@ fn tof_grid_spectrum(
     let intens = arrays.intensities().map_err(|e| anyhow::anyhow!("reading intensity: {e}"))?;
 
     let mut tof: Vec<i32> = Vec::with_capacity(mzs.len());
-    let mut intensity: Vec<f32> = Vec::with_capacity(mzs.len());
+    let mut intensity: Vec<f64> = Vec::with_capacity(mzs.len());
     for (&mz, &inten) in mzs.iter().zip(intens.iter()) {
-        // A point off the lattice (negative / overflow) would corrupt m/z silently — hard error. The
-        // run-wide fit was already accepted lossless, so this should never trigger in practice.
-        let k = grid.tof_index(mz).ok_or_else(|| {
-            anyhow::anyhow!(
-                "m/z {mz} in spectrum {} does not map onto the accepted TOF grid",
-                entry.description().index
-            )
-        })?;
+        // The run-wide grid was fit on SAMPLED spectra; a point in a non-sampled spectrum could be
+        // off the lattice. Verify EVERY point reconstructs within tolerance — otherwise storing
+        // `tof_index` would corrupt m/z silently. On any miss, raise the typed `TofGridNotLossless`
+        // so `auto` mode falls back to f64 m/z (and `on` mode surfaces a hard error).
+        let k = match grid.tof_index(mz) {
+            Some(k) if (grid.mz(k) - mz).abs() <= mz * tof_grid::PPM_TOL * 1e-6 => k,
+            _ => {
+                return Err(TofGridNotLossless {
+                    mz,
+                    spectrum: entry.description().index,
+                }
+                .into())
+            }
+        };
         tof.push(k);
-        intensity.push(inten);
+        intensity.push(inten as f64);
     }
 
     let mut out = BinaryArrayMap::new();
@@ -816,14 +854,21 @@ fn tof_grid_spectrum(
     tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
     out.add(tof_da);
     let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new());
     int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+    int_da.unit = Unit::DetectorCounts; // match INTENSITY_ARRAY's unit so it maps to point.intensity
     out.add(int_da);
 
     let mut descr = entry.description().clone();
     if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
         descr.add_param(mass_spectrum.clone());
     }
+    // Route the arrays through the custom peak facet (spectra_peaks) instead of the profile-array
+    // facet: the writer sends RawData+Profile to `write_spectrum_binary_array_map` (standard m/z
+    // schema → our tof_index would spill to auxiliary), but RawData+Centroid to the separate peak
+    // writer that honours our custom `tof_index` peak schema. We are storing a discretized point
+    // list (tof_index, intensity), so Centroid continuity is the correct routing.
+    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
     Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
 }
 
@@ -871,14 +916,29 @@ fn convert_file(
         match try_fit_tof_grid(&mut reader) {
             Some(fit) => {
                 log::info!(
-                    "TOF-grid: lossless fit accepted (c0={:.6} c1={:.6e}, max {:.4} ppm, median {:.4} ppm, k≤{}); storing tof_index instead of f64 m/z",
-                    fit.grid.c0, fit.grid.c1, fit.max_ppm, fit.median_ppm, fit.max_k
+                    "TOF-grid: lossless fit accepted (c0={:.6} c1={:.6e}, max {:.4} ppm, median {:.4} ppm, k≤{}, median dk={}); storing tof_index instead of f64 m/z",
+                    fit.grid.c0, fit.grid.c1, fit.max_ppm, fit.median_ppm, fit.max_k, fit.median_dk
                 );
                 let r = convert_file_tof_grid(input, output, zstd_level, vendor, synth_chroms, reader, fit.grid);
-                if let Some(s) = &sanitized {
-                    let _ = fs::remove_file(s);
+                match r {
+                    // A per-point lossless violation in a non-sampled spectrum → in `auto`, redo the
+                    // whole file with standard f64 m/z (re-open a fresh reader; the prior was consumed).
+                    Err(e)
+                        if tof_grid == TofGridMode::Auto
+                            && e.downcast_ref::<TofGridNotLossless>().is_some() =>
+                    {
+                        log::warn!("TOF-grid not lossless over the full run ({e}); falling back to f64 m/z");
+                        reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
+                            .with_context(|| format!("opening {}", input.display()))?;
+                        // fall through to the standard f64 path below
+                    }
+                    other => {
+                        if let Some(s) = &sanitized {
+                            let _ = fs::remove_file(s);
+                        }
+                        return other;
+                    }
                 }
-                return r;
             }
             None => {
                 if tof_grid == TofGridMode::On {
@@ -1525,8 +1585,13 @@ fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f6
     t.update_buffer(time).map_err(|e| anyhow::anyhow!("encoding chromatogram time: {e}"))?;
     t.unit = Unit::Minute;
     arrays.add(t);
-    let mut i = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new());
-    i.update_buffer(intensity).map_err(|e| anyhow::anyhow!("encoding chromatogram intensity: {e}"))?;
+    // Intensity as f32: the mzPeak chromatogram facet stores intensity as Float32 (chunked and point
+    // paths alike), so emit f32 to match the schema directly. On the chunked path the writer would
+    // coerce f64→f32 anyway; on the point path (custom-schema converters) it would NOT, so emitting
+    // f32 here keeps both paths consistent. TIC/base-peak magnitudes fit f32 without loss of meaning.
+    let intensity_f32: Vec<f32> = intensity.iter().map(|&v| v as f32).collect();
+    let mut i = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    i.update_buffer(intensity_f32.as_slice()).map_err(|e| anyhow::anyhow!("encoding chromatogram intensity: {e}"))?;
     arrays.add(i);
     let mut descr = ChromatogramDescription { id: id.to_string(), ..Default::default() };
     descr.add_param(type_param);
