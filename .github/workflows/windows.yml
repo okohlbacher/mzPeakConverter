@@ -278,6 +278,57 @@ jobs:
             vendor-mzpeak-out/vendor_layouts.tsv
             vendor-mzpeak-out/logs/**
 
+  # Extract the ProteoWizard-bundled VENDOR SDK libraries (SCIEX Clearcore2, Agilent MHDAC/MIDAC,
+  # Waters MassLynxRaw/cdt, Bruker timsdata/baf2sql, + pwiz CLI bindings) and upload them as an
+  # artifact, so they can be mirrored to a PRIVATE store for dissection / the native-reader path.
+  # The pwiz bundle is fetched from TeamCity ON THE RUNNER (it is HTTP 403 from some networks).
+  # NOTE: these are PROPRIETARY vendor libraries — the mirror MUST stay private. Manual-trigger only.
+  pwiz-vendor-extract:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ProteoWizard from TeamCity (extracts to pwiz/)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://teamcity.labkey.org/guestAuth/app/rest"
+          $h = @{ Accept = "application/json" }
+          $bts = Invoke-RestMethod -Headers $h -Uri "$base/buildTypes?locator=affectedProject:(id:ProteoWizard)"
+          $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" -and $_.name -match "x86_64" } | Select-Object -First 1
+          if (-not $bt) { $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" } | Select-Object -First 1 }
+          if (-not $bt) { Write-Error "no Windows ProteoWizard build type found"; exit 1 }
+          $arts = Invoke-RestMethod -Headers $h -Uri "$base/builds/buildType:$($bt.id),status:SUCCESS,state:finished/artifacts/children"
+          $f = $arts.file | Where-Object { $_.name -match "pwiz-bin-windows-x86_64.*\.tar\.bz2$" } | Select-Object -First 1
+          if (-not $f) { Write-Error "no pwiz windows x86_64 artifact found"; exit 1 }
+          $url = "https://teamcity.labkey.org" + $f.content.href
+          Write-Host "downloading $($f.name)"
+          Invoke-WebRequest -Uri $url -OutFile pwiz.tar.bz2
+          New-Item -ItemType Directory -Force -Path pwiz | Out-Null
+          tar -xjf pwiz.tar.bz2 -C pwiz
+          Write-Host "extracted $((Get-ChildItem pwiz -Recurse -File | Measure-Object).Count) files"
+      - name: Collect vendor SDK libraries + SHA-256 manifest
+        shell: bash
+        run: |
+          mkdir -p sdk
+          # Vendor reader libraries (+ pwiz CLI bindings needed by the native path). Case-insensitive.
+          pat='clearcore2|sciex|wiffreader|massspecdatareader|basecommon|basedataaccess|baseerror|baseprocessing|midac|agilent|agt|masslynx|cdt|waters|timsdata|baf2sql|bruker|unifi|pwiz_bindings|pwiz_data'
+          find pwiz -type f \( -iname '*.dll' -o -iname '*.so' -o -iname '*.dylib' -o -iname '*.config' \) \
+            | grep -iE "$pat" | while read -r f; do
+                rel="${f#pwiz/}"; mkdir -p "sdk/$(dirname "$rel")"; cp "$f" "sdk/$rel"
+              done
+          ( cd sdk && find . -type f ! -name 'MANIFEST*' | sort | while read -r f; do
+              printf '%s  %10s  %s\n' "$(sha256sum "$f" | cut -d" " -f1)" "$(stat -c%s "$f")" "${f#./}"
+            done ) > sdk/MANIFEST.sha256.txt
+          echo "collected $(grep -c . sdk/MANIFEST.sha256.txt) files, total $(du -sh sdk | cut -f1)"
+          sed -n '1,60p' sdk/MANIFEST.sha256.txt
+      - name: Upload vendor SDK artifact (PRIVATE — proprietary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pwiz-vendor-sdk
+          path: sdk/**
+          retention-days: 5
+
   # Harvest Bruker TDF mobility calibrations across many PRIDE timsTOF runs to reverse-engineer the
   # exact ModelType-2 scan→1/K0 formula. Pulls ONLY analysis.tdf from each remote .d.zip (HTTP range
   # requests), evaluates timsrust vs the vendor SDK per scan, and records C0..C9 + reference points.
