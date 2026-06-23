@@ -21,14 +21,14 @@ pub struct TofGrid {
 }
 
 /// Acceptance tolerance for the grid fit at the NATURAL lattice (the compression-optimal grid where
-/// stored samples are one step apart). At that grid the residual is pure grid-snap quantization,
-/// bounded at SCIEX TOF instrument accuracy (~1–2 ppm measured) — NOT instrument jitter, and it
-/// halves with each grid refinement, the signature of a true flight-time lattice. 3 ppm comfortably
-/// admits SCIEX TripleTOF/ZenoTOF while the `median_dk == 1` density gate rejects non-TOF data
-/// (Orbitrap/QqQ-SRM), which is off by tens to hundreds of ppm at any dense grid. The reconstruction
-/// is lossless *within instrument accuracy*; for a stricter bound, a finer grid (smaller ppm, larger
-/// `tof_index`) is selected automatically by the refinement fallback.
-pub const PPM_TOL: f64 = 3.0;
+/// stored samples are one step apart). At that grid the residual is pure grid-snap quantization — NOT
+/// instrument jitter — and it halves with each grid refinement, the signature of a true flight-time
+/// lattice. The natural-grid quantization depends on the instrument's flight-time step: measured
+/// **TripleTOF ≈ 1.75 ppm, ZenoTOF 7600 ≈ 3.94 ppm** (its step is coarser). 5 ppm admits both — and
+/// is well within TOF mass accuracy — while the `median_dk == 1` density gate rejects non-TOF data
+/// (Orbitrap/QqQ-SRM, off by tens to hundreds of ppm at any dense grid). For a tighter bound a finer
+/// grid (smaller ppm, larger `tof_index`) is selected automatically by the refinement fallback.
+pub const PPM_TOL: f64 = 5.0;
 /// Keep k within signed-31-bit range with a safety margin (DELTA_BINARY_PACKED makes the absolute
 /// magnitude almost free, but the column is Int32 so k MUST fit).
 pub const MAX_K: i64 = 1_900_000_000;
