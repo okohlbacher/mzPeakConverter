@@ -194,6 +194,87 @@ jobs:
             mzdata.json
             ims-compact.json
 
+  # Convert the Windows-only vendor datasets (Sciex .wiff, Agilent .d, Waters .raw) of the reference
+  # corpus to mzPeak on the runner via the ProteoWizard lane, and TRANSFER THE .mzpeak BACK as a
+  # build artifact (plus a raw-vs-mzpeak size table). Pure-Rust/Thermo/Bruker formats are converted
+  # on the host (tools/convert_corpus.sh); this job covers only what macOS/Linux can't read.
+  #
+  # The vendor inputs aren't in git (proprietary + large), so each file is fetched per-URL from a
+  # public object store, listed in tools/vendor_ci_manifest.tsv (public bucket listing is denied, so
+  # explicit URLs are required). Add rows to the manifest as more datasets get mirrored.
+  # Trigger with: gh workflow run Windows
+  vendor-corpus:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install ProteoWizard (msconvert) from TeamCity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://teamcity.labkey.org/guestAuth/app/rest"
+          $h = @{ Accept = "application/json" }
+          $bts = Invoke-RestMethod -Headers $h -Uri "$base/buildTypes?locator=affectedProject:(id:ProteoWizard)"
+          $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" -and $_.name -match "x86_64" } | Select-Object -First 1
+          if (-not $bt) { $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" } | Select-Object -First 1 }
+          if (-not $bt) { Write-Error "no Windows ProteoWizard build type found"; exit 1 }
+          $arts = Invoke-RestMethod -Headers $h -Uri "$base/builds/buildType:$($bt.id),status:SUCCESS,state:finished/artifacts/children"
+          $f = $arts.file | Where-Object { $_.name -match "pwiz-bin-windows-x86_64.*\.tar\.bz2$" } | Select-Object -First 1
+          if (-not $f) { Write-Error "no pwiz windows x86_64 artifact found"; exit 1 }
+          $url = "https://teamcity.labkey.org" + $f.content.href
+          Invoke-WebRequest -Uri $url -OutFile pwiz.tar.bz2
+          New-Item -ItemType Directory -Force -Path pwiz | Out-Null
+          tar -xjf pwiz.tar.bz2 -C pwiz
+          $exe = Get-ChildItem -Path pwiz -Recurse -Filter msconvert.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "msconvert.exe not found in artifact"; exit 1 }
+          "MSCONVERT_PATH=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$(Split-Path $exe.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build
+        run: cargo build --release --verbose
+      # pyarrow lets the layout step count peaks-facet rows for a bytes/peak figure (best-effort).
+      - name: Provision pyarrow (bytes/peak rowcount, best-effort)
+        shell: pwsh
+        run: python -m pip install --quiet pyarrow || Write-Host "pyarrow unavailable; bytes/peak will be blank"
+      - name: Fetch vendor corpus files (per-URL manifest)
+        shell: bash
+        run: |
+          mkdir -p vendor-in
+          while IFS=$'\t' read -r dest url flag; do
+            case "$dest" in ''|\#*) continue ;; esac
+            [ -z "$url" ] && continue
+            mkdir -p "vendor-in/$(dirname "$dest")"
+            echo "downloading $dest"
+            curl -sSL "$url" -o "vendor-in/$dest" || { echo "FETCH FAILED: $dest"; exit 1; }
+            if [ "${flag:-}" = "unzip" ]; then
+              d="vendor-in/$(dirname "$dest")"
+              echo "extracting $dest into $d"
+              if command -v unzip >/dev/null 2>&1; then unzip -q -o "vendor-in/$dest" -d "$d";
+              elif command -v 7z   >/dev/null 2>&1; then 7z x -y -o"$d" "vendor-in/$dest" >/dev/null;
+              else tar -xf "vendor-in/$dest" -C "$d"; fi || { echo "UNZIP FAILED: $dest"; exit 1; }
+              rm -f "vendor-in/$dest"   # reclaim disk: keep only the extracted vendor dir
+            fi
+          done < tools/vendor_ci_manifest.tsv
+          echo "--- fetched ---"; find vendor-in -maxdepth 3 \( -type f -o -name '*.d' -o -name '*.raw' \) -exec ls -ld {} + | head -50
+      - name: Convert vendor datasets -> mzPeak (via msconvert) + capture layouts
+        shell: bash
+        run: tools/convert_vendor_ci.sh vendor-in vendor-mzpeak-out
+      - name: Upload mzPeak archives + size table + layout exploration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-corpus-mzpeak
+          path: |
+            vendor-mzpeak-out/archives/**
+            vendor-mzpeak-out/results.tsv
+            vendor-mzpeak-out/vendor_layouts.md
+            vendor-mzpeak-out/vendor_layouts.tsv
+            vendor-mzpeak-out/logs/**
+
   # Harvest Bruker TDF mobility calibrations across many PRIDE timsTOF runs to reverse-engineer the
   # exact ModelType-2 scan→1/K0 formula. Pulls ONLY analysis.tdf from each remote .d.zip (HTTP range
   # requests), evaluates timsrust vs the vendor SDK per scan, and records C0..C9 + reference points.
