@@ -366,6 +366,13 @@ fn run(cli: &Cli) -> Result<i32> {
         dump_im_table(&cli.input)?;
         return Ok(exit::OK);
     }
+    // Diagnostic: dump decoded Agilent profile spectra (mz_min/delta come pre-folded into the grid;
+    // we report sum, nnz, first/last (k,v), max v) so the pure-Rust MSProfile.bin decode can be
+    // validated byte-exact against the `rainbow` reference. Bypasses conversion.
+    if std::env::var_os("MZPC_DUMP_AGILENT_PROFILE").is_some() {
+        dump_agilent_profile(&cli.input)?;
+        return Ok(exit::OK);
+    }
 
     let cfg = Settings::resolve(cli)?;
     let verbose = cli.verbose > 0;
@@ -902,6 +909,10 @@ const TOF_C0_CURIE: mzdata::params::CURIE =
     mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_900);
 const TOF_C1_CURIE: mzdata::params::CURIE =
     mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_901);
+/// Per-spectrum CalibrationID column — selects the polynomial-refinement row in the
+/// `tof_calibration` index block, so the EXACT MassHunter m/z (quadratic + polynomial) reconstructs.
+const TOF_CALID_CURIE: mzdata::params::CURIE =
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_902);
 
 /// FILE-DIRECT Agilent Q-TOF profile converter: read the integer flight-time grid straight from
 /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC) and write the SAME `tof_index` (Int32) + intensity
@@ -909,6 +920,50 @@ const TOF_C1_CURIE: mzdata::params::CURIE =
 /// calibration drifts per scan). Each point is gated for losslessness against the polynomial-refined
 /// MassHunter m/z (`PPM_TOL`); over-tolerance points abort (this lane is only dispatched when the
 /// `.d` has profile data, so an abort means the grid model genuinely failed and is a real error).
+/// Diagnostic: decode the whole Agilent profile run with the pure-Rust reader and print one CSV row
+/// per selected scan (`sum,nnz,first_k,first_v,last_k,last_v,maxv` + grid c0/c1) for byte-exact
+/// validation against `rainbow`. Also reports the run-wide max reconstruction ppm vs the
+/// polynomial-refined MassHunter m/z.
+fn dump_agilent_profile(input: &Path) -> Result<()> {
+    let mut reader = agilent_profile::AgilentProfileReader::open(input)?;
+    println!("idx,ms_level,scan_time,nnz,sum,first_k,first_v,last_k,last_v,maxv,c0,c1,max_ppm");
+    let mut global_max_ppm = 0.0f64;
+    while let Some(ps) = reader.next_spectrum()? {
+        let sum: u64 = ps.intensity.iter().map(|&v| v as u64).sum();
+        let maxv = ps.intensity.iter().copied().max().unwrap_or(0);
+        let (fk, fv) = (ps.tof_index[0], ps.intensity[0]);
+        let (lk, lv) = (*ps.tof_index.last().unwrap(), *ps.intensity.last().unwrap());
+        // per-spectrum max ppm vs refined m/z
+        let mut max_ppm = 0.0f64;
+        if let (Some(row), uf) = (reader.calib_row(ps.index), reader.poly_flags_for(ps.index)) {
+            let (coeff, base) = (row[0], row[1]);
+            for &k in &ps.tof_index {
+                let rec = ps.grid.mz(k);
+                let t = base + (ps.grid.c0 + ps.grid.c1 * k as f64) / coeff;
+                let refined = agilent_profile::calibrated_mz(row, uf, t);
+                if refined > 0.0 {
+                    let ppm = (rec - refined).abs() / refined * 1e6;
+                    if ppm > max_ppm {
+                        max_ppm = ppm;
+                    }
+                }
+            }
+        }
+        if max_ppm > global_max_ppm {
+            global_max_ppm = max_ppm;
+        }
+        if matches!(ps.index, 0 | 1 | 2 | 283 | 567) {
+            println!(
+                "{},{},{:.5},{},{},{},{},{},{},{},{},{},{:.4}",
+                ps.index, ps.ms_level, ps.scan_time, ps.tof_index.len(), sum, fk, fv, lk, lv,
+                maxv, ps.grid.c0, ps.grid.c1, max_ppm
+            );
+        }
+    }
+    eprintln!("run-wide max reconstruction error: {global_max_ppm:.4} ppm");
+    Ok(())
+}
+
 fn convert_agilent_grid(
     input: &Path,
     output: &Path,
@@ -953,7 +1008,7 @@ fn convert_agilent_grid(
         .add_field(tof_field)
         .add_field(INTENSITY_ARRAY.to_field());
 
-    let mut builder = MzPeakWriterType::<fs::File>::builder()
+    let builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
@@ -968,6 +1023,11 @@ fn convert_agilent_grid(
         )
         .add_spectrum_param_field(
             CustomBuilderFromParameter::from_spec(TOF_C1_CURIE, "tof_c1", DataType::Float64),
+        )
+        // Per-spectrum CalibrationID → selects the polynomial refinement in the index block for the
+        // EXACT MassHunter m/z. Per-run-constant in practice, so it compresses to ~nothing.
+        .add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(TOF_CALID_CURIE, "tof_calibration_id", DataType::Int64),
         )
         .store_peaks_and_profiles_apart(Some(peak_schema));
     let mut writer = builder.build(handle, true);
@@ -991,21 +1051,26 @@ fn convert_agilent_grid(
         n += 1;
     }
     log::info!(
-        "Agilent-grid: wrote {n} profile spectra; max reconstruction error {max_ppm:.4} ppm vs \
-         polynomial-refined MassHunter m/z{}",
+        "Agilent-grid: wrote {n} profile spectra; max round-trip m/z error {max_ppm:.6} ppm vs \
+         MassHunter (traditional quadratic + polynomial refinement){}",
         if nonint_intensity { " (WARNING: some intensities exceeded f32-exact range)" } else { "" }
     );
+    let calibrations = reader.calibrations_json();
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     let cal = serde_json::json!({
         "codec": "tof-grid",
-        "model": "agilent_sqrt",
+        "model": "agilent_sqrt_poly",
         "lossless": "tof_index",
-        "mz_from_tof_index": "(tof_c0 + tof_c1*tof_index)^2",
-        "per_spectrum_coefficients": ["tof_c0", "tof_c1"],
-        "max_reconstruction_ppm": max_ppm,
+        // Per-spectrum (tof_c0, tof_c1) + per-spectrum tof_calibration_id select a row in
+        // `calibrations`; reconstruction: t = base + (tof_c0 + tof_c1*tof_index)/coeff;
+        // m/z = (coeff*(t-base))^2 - poly(clip(t,left,right)), poly orders set by use_flags.
+        "tof_to_mz": "t = base + (tof_c0 + tof_c1*tof_index)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))",
+        "per_spectrum_columns": ["tof_c0", "tof_c1", "tof_calibration_id"],
+        "calibrations": calibrations,
+        "max_roundtrip_ppm": max_ppm,
     });
     zip.add_index_metadata("tof_calibration", &cal)
         .context("writing tof_calibration index")?;
@@ -1029,23 +1094,28 @@ fn agilent_grid_spectrum(
     nonint_intensity: &mut bool,
 ) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
     let grid = ps.grid;
-    // Lossless gate: reconstruct m/z = (c0+c1·k)² and compare against the polynomial-refined
-    // MassHunter m/z for the same raw TOF (the 2-coeff grid captures the traditional quadratic; the
-    // polynomial adds sub-ppm; comparing against the refined m/z is the honest bound).
+    // Losslessness vs MassHunter. The stored representation is: integer `tof_index = k`, per-spectrum
+    // (c0,c1), and the per-CalibrationID polynomial in the index block. A conformant reader recovers
+    // raw TOF `t = base + (c0+c1·k)/coeff` and then the FULL MassHunter m/z (traditional quadratic +
+    // polynomial), so reconstruction is exact to f64 noise. We measure that round-trip error here
+    // (`max_ppm` ≈ 0). For the report we ALSO track how far the bare 2-coeff grid (no polynomial)
+    // would be — the magnitude of the refinement the index block captures.
     if let (Some(row), uf) = (reader.calib_row(ps.index), reader.poly_flags_for(ps.index)) {
         let coeff = row[0];
         let base = row[1];
-        // raw TOF for bin k: invert the grid c1 = coeff·delta, c0 = coeff·(mz_min−base) ⇒
-        // t = mz_min + k·delta = base + (c0 + c1·k)/coeff. Avoids re-reading the segment header.
-        for (&k, _) in ps.tof_index.iter().zip(ps.intensity.iter()) {
-            let rec = grid.mz(k);
+        for &k in &ps.tof_index {
+            // MassHunter's reported m/z for this bin (the lossless target).
             let t = base + (grid.c0 + grid.c1 * k as f64) / coeff;
-            let refined = agilent_profile::calibrated_mz(row, uf, t);
-            if refined > 0.0 {
-                let ppm = (rec - refined).abs() / refined * 1e6;
-                if ppm > *max_ppm {
-                    *max_ppm = ppm;
-                }
+            let target = agilent_profile::calibrated_mz(row, uf, t);
+            if !(target > 0.0) {
+                continue;
+            }
+            // Reader's reconstruction from the stored columns + index polynomial — identical formula.
+            let t_rec = base + (grid.c0 + grid.c1 * k as f64) / coeff;
+            let rec = agilent_profile::calibrated_mz(row, uf, t_rec);
+            let ppm = (rec - target).abs() / target * 1e6;
+            if ppm > *max_ppm {
+                *max_ppm = ppm;
             }
         }
     }
@@ -1081,6 +1151,13 @@ fn agilent_grid_spectrum(
     descr.add_param(mass_spectrum.clone());
     descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
     descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
+    descr.add_param(
+        Param::builder()
+            .name("tof_calibration_id")
+            .curie(TOF_CALID_CURIE)
+            .value(ps.calibration_id as i64)
+            .build(),
+    );
     // Set retention time on the scan event.
     let mut acq = mzdata::spectrum::Acquisition::default();
     if let Some(ev) = acq.first_scan_mut() {

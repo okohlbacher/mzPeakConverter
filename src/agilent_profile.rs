@@ -55,6 +55,8 @@ pub struct ProfileSpectrum {
     pub index: usize,
     /// MS level (1 for survey, 2 for product-ion scans); read from MSScan.bin when present.
     pub ms_level: u8,
+    /// CalibrationID for this scan (selects the polynomial-refinement row in the calibration block).
+    pub calibration_id: i32,
 }
 
 /// A parsed Agilent profile `.d`, ready to iterate spectra. Holds the open `MSProfile.bin` handle
@@ -113,6 +115,7 @@ impl AgilentProfileReader {
 
     /// Number of scan records (an upper bound on the spectra yielded — truncated/empty segments are
     /// skipped during iteration).
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.scans.len()
     }
@@ -168,6 +171,7 @@ impl AgilentProfileReader {
                 scan_time: info.scan_time,
                 index: i,
                 ms_level: info.ms_level,
+                calibration_id: info.calibration_id,
             }));
         }
         Ok(None)
@@ -187,6 +191,40 @@ impl AgilentProfileReader {
     /// reference m/z used in the lossless check).
     pub fn calib_row(&self, i: usize) -> Option<&[f64; 10]> {
         self.calib.get(i)
+    }
+
+    /// The distinct per-scan calibrations as a JSON map `calibration_id → {coeff, base, left, right,
+    /// poly_coeffs, use_flags}`, for the `tof_calibration` index block. A reader reconstructs the
+    /// EXACT MassHunter m/z (traditional quadratic + polynomial refinement) from a point's
+    /// `tof_index` and its scan's `calibration_id`:
+    ///   `t = base + (c0 + c1·tof_index)/coeff`; `m/z = (coeff·(t−base))² − poly(clip(t,left,right))`
+    /// where the polynomial fills the orders set in `use_flags` (ascending) from `poly_coeffs`.
+    pub fn calibrations_json(&self) -> serde_json::Value {
+        // Map each distinct CalibrationID to its (row, use_flags), in first-seen order.
+        let mut seen: Vec<(i32, [f64; 10], u32)> = Vec::new();
+        for (i, info) in self.scans.iter().enumerate() {
+            let cid = info.calibration_id;
+            if !seen.iter().any(|(c, _, _)| *c == cid) {
+                let row = self.calib.get(i).copied().unwrap_or([0.0; 10]);
+                let uf = self.poly_flags.get(&cid).copied().unwrap_or(0);
+                seen.push((cid, row, uf));
+            }
+        }
+        let mut map = serde_json::Map::new();
+        for (cid, row, uf) in seen {
+            map.insert(
+                cid.to_string(),
+                serde_json::json!({
+                    "coeff": row[0],
+                    "base": row[1],
+                    "left": row[2],
+                    "right": row[3],
+                    "poly_coeffs": &row[4..10],
+                    "use_flags": uf,
+                }),
+            );
+        }
+        serde_json::Value::Object(map)
     }
 }
 
@@ -506,10 +544,14 @@ fn step_values(block: &str, formula: &str) -> Vec<f64> {
     let tail = &block[fpos..];
     let stop = tail.find("</Step>").unwrap_or(tail.len());
     let scope = &tail[..stop];
+    // `<Value Number="1">0.000…</Value>` — the element carries attributes, so split on `<Value`
+    // and skip past the closing `>` of the opening tag before reading the numeric text.
     let mut vals = Vec::new();
-    for chunk in scope.split("<Value>").skip(1) {
-        if let Some(end) = chunk.find("</Value>") {
-            if let Ok(v) = chunk[..end].trim().parse::<f64>() {
+    for chunk in scope.split("<Value").skip(1) {
+        let Some(gt) = chunk.find('>') else { continue };
+        let after = &chunk[gt + 1..];
+        if let Some(end) = after.find("</Value>") {
+            if let Ok(v) = after[..end].trim().parse::<f64>() {
                 vals.push(v);
             }
         }
