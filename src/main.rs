@@ -1718,6 +1718,61 @@ fn reader_format<R: std::io::Read + std::io::Seek>(reader: &MZReaderType<R>) -> 
 #[cfg(test)]
 mod tests {
     use super::expand_empty_param_groups;
+    use super::{tof_grid, tof_grid_spectrum, TofRoute};
+    use mzdata::params::Param;
+    use mzdata::prelude::*;
+    use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
+    use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum, SpectrumDescription};
+    use mzpeaks::{CentroidPeak, DeconvolutedPeak};
+
+    fn spec_from(mzs: &[f64], intens: &[f32], index: usize)
+        -> MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>
+    {
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz.update_buffer(mzs).unwrap();
+        arrays.add(mz);
+        let mut it = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        it.update_buffer(intens).unwrap();
+        arrays.add(it);
+        let mut descr = SpectrumDescription::default();
+        descr.index = index;
+        descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
+        MultiLayerSpectrum::new(descr, Some(arrays), None, None)
+    }
+
+    /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);
+    /// a spectrum with any off-lattice point → exact f64 m/z (F64). Both in one run.
+    #[test]
+    fn tof_grid_routes_per_spectrum() {
+        let grid = tof_grid::TofGrid { c0: 14.0, c1: 3.6e-5 };
+        let mass_spectrum = Param::builder().name("mass spectrum").build();
+
+        // on-lattice spectrum: build from exact grid points → must route Gridded.
+        let on: Vec<f64> = (200_000i32..200_400).map(|k| grid.mz(k)).collect();
+        let on_int = vec![1.0f32; on.len()];
+        match tof_grid_spectrum(&spec_from(&on, &on_int, 0), &grid, &mass_spectrum).unwrap() {
+            TofRoute::Gridded(s) => {
+                assert_eq!(s.signal_continuity(), mzdata::spectrum::SignalContinuity::Centroid);
+                // the gridded facet carries tof_index, NOT f64 m/z
+                assert!(s.arrays.as_ref().unwrap().get(&ArrayType::nonstandard("tof_index")).is_some());
+            }
+            TofRoute::F64(_) => panic!("on-lattice spectrum should grid"),
+        }
+
+        // off-lattice spectrum: arbitrary m/z not on the lattice → must route F64 with EXACT m/z.
+        let off: Vec<f64> = (0..50).map(|i| 137.0 + 0.131 * i as f64 + 0.017 * (i as f64).sin()).collect();
+        let off_int = vec![2.0f32; off.len()];
+        match tof_grid_spectrum(&spec_from(&off, &off_int, 1), &grid, &mass_spectrum).unwrap() {
+            TofRoute::F64(s) => {
+                assert_eq!(s.signal_continuity(), mzdata::spectrum::SignalContinuity::Profile);
+                // exact f64 m/z preserved bit-for-bit
+                let back = s.arrays.as_ref().unwrap().mzs().unwrap();
+                assert_eq!(back.as_ref(), off.as_slice());
+            }
+            TofRoute::Gridded(_) => panic!("off-lattice spectrum must keep f64 m/z"),
+        }
+    }
 
     #[test]
     fn expands_only_empty_referenceable_param_groups() {
