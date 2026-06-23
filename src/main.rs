@@ -744,6 +744,11 @@ fn convert_file_tof_grid(
             DataType::Boolean,
         ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
+    // PER-SPECTRUM ROUTING: griddable spectra go to the custom `tof_index` peak facet (above);
+    // off-grid spectra (MS2, sparse, off-lattice) keep EXACT f64 m/z and are routed to the standard
+    // `spectra_data` (profile) facet. Sample the source so that facet's f64 m/z schema is configured
+    // — without this the f64 m/z column would spill to auxiliary_arrays and read back wrong.
+    builder = builder.sample_array_types_from_spectrum_source(&mut reader);
     // Derive the chromatogram schema (intensity/time dtypes) from the source chromatograms so the
     // facet matches what we write (the synthesized TIC/base-peak are f64 — sampling f64 source
     // chromatograms keeps the schema f64 and avoids an f32/f64 record-batch mismatch).
@@ -756,18 +761,31 @@ fn convert_file_tof_grid(
     let mut ms1 = Ms1Chroms::default();
     let cap = max_spectra();
     let mut n = 0usize;
+    let mut n_gridded = 0usize;
+    let mut n_f64 = 0usize;
     for entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
         }
-        let spec = tof_grid_spectrum(&entry, &grid, &mass_spectrum)?;
+        let spec = match tof_grid_spectrum(&entry, &grid, &mass_spectrum)? {
+            TofRoute::Gridded(s) => {
+                n_gridded += 1;
+                s
+            }
+            TofRoute::F64(s) => {
+                n_f64 += 1;
+                s
+            }
+        };
         if synth_chroms {
             ms1.observe(&spec);
         }
         writer.write_spectrum(&spec)?;
         n += 1;
     }
-    log::debug!("TOF-grid wrote {n} spectra");
+    log::info!(
+        "TOF-grid wrote {n} spectra: {n_gridded} gridded (tof_index facet), {n_f64} kept f64 m/z (data facet)"
+    );
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
 
@@ -795,28 +813,31 @@ fn convert_file_tof_grid(
     Ok(())
 }
 
-/// Build one TOF-grid spectrum: convert the source f64 m/z array to `tof_index` (Int32) via `grid`,
-/// keep intensity, DROP f64 m/z. The grid maps each m/z to its nearest flight-time lattice index;
-/// readers reconstruct `m/z = (c0 + c1·tof_index)²`. Preserves the source spectrum description.
-/// A point in some spectrum did not reconstruct from the run-wide TOF grid within tolerance — the
-/// grid is not lossless for the whole file. In `auto` mode the caller falls back to f64 m/z.
-#[derive(Debug)]
-struct TofGridNotLossless {
-    mz: f64,
-    spectrum: usize,
+/// Per-spectrum routing decision for the TOF-grid path.
+enum TofRoute {
+    /// Every point reconstructed from the run-wide grid within tolerance: a Centroid spectrum
+    /// carrying `tof_index` (Int32), routed to the custom `spectra_peaks` facet.
+    Gridded(MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>),
+    /// At least one point is off-lattice (MS2, sparse, off-lattice): the spectrum is kept verbatim
+    /// with EXACT f64 m/z and routed to the standard `spectra_data` (profile) facet.
+    F64(MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>),
 }
-impl std::fmt::Display for TofGridNotLossless {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "m/z {} in spectrum {} is not on the accepted TOF grid", self.mz, self.spectrum)
-    }
-}
-impl std::error::Error for TofGridNotLossless {}
 
+/// Decide and build the representation for one spectrum (PER-SPECTRUM, not all-or-nothing).
+///
+/// Try to map every f64 m/z to a grid `tof_index` and reconstruct within `PPM_TOL`. If ALL points
+/// pass, return [`TofRoute::Gridded`] — a Centroid spectrum carrying `tof_index`, which the writer
+/// routes to the custom `spectra_peaks` facet (`m/z = (c0 + c1·tof_index)²` on read). If ANY point
+/// is off-grid, return [`TofRoute::F64`] — the original spectrum, unchanged, with exact f64 m/z,
+/// which the writer routes to the standard `spectra_data` (profile) facet. A reader distinguishes
+/// the two per spectrum by facet membership (peak_count>0 vs data_point_count>0, keyed on
+/// spectrum_index), so one archive losslessly holds both. This replaces the former whole-run
+/// `TofGridNotLossless` fallback.
 fn tof_grid_spectrum(
     entry: &MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
     grid: &tof_grid::TofGrid,
     mass_spectrum: &Param,
-) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
+) -> Result<TofRoute> {
     let arrays = entry
         .arrays
         .as_ref()
@@ -826,19 +847,35 @@ fn tof_grid_spectrum(
 
     let mut tof: Vec<i32> = Vec::with_capacity(mzs.len());
     let mut intensity: Vec<f32> = Vec::with_capacity(mzs.len());
+    let mut all_on_grid = true;
     for (&mz, &inten) in mzs.iter().zip(intens.iter()) {
         // The run-wide grid was fit on SAMPLED spectra; a point in a non-sampled spectrum could be
         // off the lattice. Verify EVERY point reconstructs within tolerance — otherwise storing
-        // `tof_index` would corrupt m/z silently. On any miss, raise the typed `TofGridNotLossless`
-        // so `auto` mode falls back to f64 m/z (and `on` mode surfaces a hard error).
-        let k = match grid.tof_index(mz) {
-            Some(k) if (grid.mz(k) - mz).abs() <= mz * tof_grid::PPM_TOL * 1e-6 => k,
+        // `tof_index` would corrupt m/z silently. On ANY miss, this spectrum is routed to f64 m/z
+        // instead (per-spectrum), so the off-lattice MS2 / sparse spectra stay exact while the dense
+        // MS1 profile (99%+ of the data) still grids.
+        match grid.tof_index(mz) {
+            Some(k) if (grid.mz(k) - mz).abs() <= mz * tof_grid::PPM_TOL * 1e-6 => tof.push(k),
             _ => {
-                return Err(TofGridNotLossless { mz, spectrum: entry.description().index }.into())
+                all_on_grid = false;
+                break;
             }
-        };
-        tof.push(k);
+        }
         intensity.push(inten);
+    }
+
+    if !all_on_grid {
+        // Keep the source spectrum verbatim (exact f64 m/z, original signal continuity). The writer
+        // routes its RawData+Profile arrays to `write_spectrum_binary_array_map` → `spectra_data`.
+        let mut descr = entry.description().clone();
+        if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
+            descr.add_param(mass_spectrum.clone());
+        }
+        let mut out = MultiLayerSpectrum::new(descr, entry.arrays.clone(), None, None);
+        // Force Profile continuity so the f64 m/z arrays land in the standard data facet (an input
+        // marked Centroid with raw arrays would otherwise hit the peak writer's tof_index schema).
+        out.description_mut().signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
+        return Ok(TofRoute::F64(out));
     }
 
     let mut out = BinaryArrayMap::new();
@@ -862,7 +899,7 @@ fn tof_grid_spectrum(
     // writer that honours our custom `tof_index` peak schema. We are storing a discretized point
     // list (tof_index, intensity), so Centroid continuity is the correct routing.
     descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
-    Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
+    Ok(TofRoute::Gridded(MultiLayerSpectrum::new(descr, Some(out), None, None)))
 }
 
 fn convert_file(
@@ -912,26 +949,14 @@ fn convert_file(
                     "TOF-grid: lossless fit accepted (c0={:.6} c1={:.6e}, max {:.4} ppm, median {:.4} ppm, k≤{}, median dk={}); storing tof_index instead of f64 m/z",
                     fit.grid.c0, fit.grid.c1, fit.max_ppm, fit.median_ppm, fit.max_k, fit.median_dk
                 );
+                // PER-SPECTRUM routing: off-grid spectra (MS2 / sparse / off-lattice) are stored as
+                // exact f64 m/z in the `spectra_data` facet, while griddable spectra use `tof_index`.
+                // There is no longer a whole-run fallback — a single archive holds both facets.
                 let r = convert_file_tof_grid(input, output, zstd_level, vendor, synth_chroms, reader, fit.grid);
-                match r {
-                    // A per-point lossless violation in a non-sampled spectrum → in `auto`, redo the
-                    // whole file with standard f64 m/z (re-open a fresh reader; the prior was consumed).
-                    Err(e)
-                        if tof_grid == TofGridMode::Auto
-                            && e.downcast_ref::<TofGridNotLossless>().is_some() =>
-                    {
-                        log::warn!("TOF-grid not lossless over the full run ({e}); falling back to f64 m/z");
-                        reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
-                            .with_context(|| format!("opening {}", input.display()))?;
-                        // fall through to the standard f64 path below
-                    }
-                    other => {
-                        if let Some(s) = &sanitized {
-                            let _ = fs::remove_file(s);
-                        }
-                        return other;
-                    }
+                if let Some(s) = &sanitized {
+                    let _ = fs::remove_file(s);
                 }
+                return r;
             }
             None => {
                 if tof_grid == TofGridMode::On {
