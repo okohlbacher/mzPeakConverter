@@ -726,18 +726,10 @@ fn convert_file_tof_grid(
         .with_context(BufferContext::Spectrum)
         .add_field(BufferContext::Spectrum.index_field())
         .add_field(tof_field)
-        // Intensity as Int32: SCIEX (and TOF) detector counts are integers, so this is exact and
-        // compresses far better than f32/f64 (dictionary/RLE). The per-point encoder verifies each
-        // value is a non-negative integer in i32 range and otherwise falls back to the f64-m/z path.
-        .add_field(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Int32,
-            )
-            .with_unit(Unit::DetectorCounts)
-            .to_field(),
-        );
+        // Intensity matches the baseline f32 (SCIEX detector counts; f32 is exact for them and equal
+        // to the standard path, so only the m/z axis changes). The writer's `_index` delta fix lands
+        // tof_index as a tiny column; intensity stays at baseline size.
+        .add_field(INTENSITY_ARRAY.to_field());
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
@@ -829,7 +821,7 @@ fn tof_grid_spectrum(
     let intens = arrays.intensities().map_err(|e| anyhow::anyhow!("reading intensity: {e}"))?;
 
     let mut tof: Vec<i32> = Vec::with_capacity(mzs.len());
-    let mut intensity: Vec<i32> = Vec::with_capacity(mzs.len());
+    let mut intensity: Vec<f32> = Vec::with_capacity(mzs.len());
     for (&mz, &inten) in mzs.iter().zip(intens.iter()) {
         // The run-wide grid was fit on SAMPLED spectra; a point in a non-sampled spectrum could be
         // off the lattice. Verify EVERY point reconstructs within tolerance — otherwise storing
@@ -841,14 +833,8 @@ fn tof_grid_spectrum(
                 return Err(TofGridNotLossless { mz, spectrum: entry.description().index }.into())
             }
         };
-        // Intensity must be a non-negative integer in i32 range to store exactly as Int32; otherwise
-        // fall back (same typed error → f64-m/z path, which keeps the source intensity dtype).
-        let iv = inten as f64;
-        if iv.fract() != 0.0 || !(0.0..=2_147_483_647.0).contains(&iv) {
-            return Err(TofGridNotLossless { mz, spectrum: entry.description().index }.into());
-        }
         tof.push(k);
-        intensity.push(iv as i32);
+        intensity.push(inten);
     }
 
     let mut out = BinaryArrayMap::new();
@@ -857,7 +843,7 @@ fn tof_grid_spectrum(
     tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
     out.add(tof_da);
     let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
     int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
     int_da.unit = Unit::DetectorCounts; // match INTENSITY_ARRAY's unit so it maps to point.intensity
     out.add(int_da);
