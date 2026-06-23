@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added — data features
 
+- **FILE-DIRECT Agilent Q-TOF *profile* reader** (`--agilent-grid`, off by default;
+  pure Rust, no MHDAC/msconvert). Reads the integer flight-time grid straight from
+  `AcqData/MSProfile.bin` (0x90-RLE + LZF decoders, MSScan.xsd/.bin parser,
+  MSMassCal.bin / DefaultMassCal.xml calibration) and stores `tof_index` (Int32,
+  delta-packed) + integer intensity + per-spectrum `tof_c0`/`tof_c1`/
+  `tof_calibration_id` and a per-`CalibrationID` polynomial in the `tof_calibration`
+  index block. Reconstructs MassHunter m/z exactly (`t = base + (c0+c1·k)/coeff`,
+  `m/z = (coeff·(t−base))² − poly(clip(t,left,right))`). Measured on a real profile
+  `.d` (MTBLS1334): **0.141× the vendor `.d`, 0.225× the msconvert lane**, m/z lossless
+  to 7.8e-10 ppm, integer intensities exact. Only dispatched when `MSProfile.bin` is
+  non-empty (centroid-only `.d` fall through unchanged).
 - **TIC + base-peak chromatograms synthesized from MS1** (on by default;
   `--no-chromatograms` / `no_chromatograms` to disable), across every convert path.
 - **UV/PDA spectra carried** into a dedicated `wavelength_spectra` facet (Waters /
