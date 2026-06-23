@@ -165,13 +165,25 @@ while IFS= read -r f; do
   rm -f "$f.scan" "${f}2" 2>/dev/null || true
 done < <(find "$input" -type f -iname '*.wiff' | sort)
 
-# Agilent .d (directories without Bruker analysis.tdf/tsf)
-while IFS= read -r d; do
-  [ -d "$d" ] || continue
-  if [ -z "$(find "$d" -name analysis.tdf -o -name analysis.tsf 2>/dev/null | head -1)" ]; then
-    id="$(slug "$d")"; convert "$id" "agilent-d" "$d" "$(sizeof "$d")"
-  fi
-done < <(find "$input" -type d -iname '*.d' | sort)
+# Agilent .d (directories without Bruker analysis.tdf/tsf).
+#
+# Discovery by the canonical Agilent marker `AcqData/` rather than by an `*.d` name suffix:
+# PRIDE/MassIVE archives are frequently zipped on Windows from a "20190423_Alex7.d - Copy"
+# duplicate, so the extracted top-level dir is e.g. `<run>.d - Copy` (a trailing " - Copy"
+# breaks `find -iname '*.d'` and the dataset is silently skipped). Every Agilent .d holds an
+# `AcqData` subdir (MSProfile.bin / MSScan.bin etc.); a Bruker .d does not — it has analysis.tdf/
+# tsf. We therefore locate each `AcqData` dir and treat its PARENT as the Agilent .d, dedup-ing
+# parents and excluding any that also contain Bruker analysis.tdf/tsf.
+agilent_seen=""
+while IFS= read -r acq; do
+  [ -d "$acq" ] || continue
+  d="$(dirname "$acq")"
+  case " $agilent_seen " in *" $d "*) continue ;; esac   # dedup parents
+  agilent_seen="$agilent_seen $d"
+  # skip Bruker (timsTOF) .d — those carry analysis.tdf/tsf, not an Agilent AcqData MS store
+  [ -n "$(find "$d" -maxdepth 2 \( -name analysis.tdf -o -name analysis.tsf \) 2>/dev/null | head -1)" ] && continue
+  id="$(slug "$d")"; convert "$id" "agilent-d" "$d" "$(sizeof "$d")"
+done < <(find "$input" -type d -iname 'AcqData' | sort)
 
 # Waters .raw (a DIRECTORY; Thermo .raw is a file and is handled on the host, not here)
 while IFS= read -r d; do

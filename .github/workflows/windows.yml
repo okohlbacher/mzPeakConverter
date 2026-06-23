@@ -262,7 +262,7 @@ jobs:
               rm -f "vendor-in/$dest"   # reclaim disk: keep only the extracted vendor dir
             fi
           done < tools/vendor_ci_manifest.tsv
-          echo "--- fetched ---"; find vendor-in -maxdepth 3 \( -type f -o -name '*.d' -o -name '*.raw' \) -exec ls -ld {} + | head -50
+          echo "--- fetched ---"; find vendor-in -maxdepth 3 \( -type f -o -name '*.d' -o -name '*.d - Copy' -o -name 'AcqData' -o -name '*.raw' \) -exec ls -ld {} + | head -50
       - name: Convert vendor datasets -> mzPeak (via msconvert) + capture layouts
         shell: bash
         run: tools/convert_vendor_ci.sh vendor-in vendor-mzpeak-out
