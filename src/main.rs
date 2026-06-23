@@ -36,6 +36,7 @@ mod agilent_midac;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod sciex;
+mod agilent_profile;
 mod bruker_native;
 mod bruker_tsf;
 mod tof_grid;
@@ -187,6 +188,14 @@ struct Cli {
     #[arg(long, value_enum)]
     tof_grid: Option<TofGridMode>,
 
+    /// Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from
+    /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + a
+    /// per-run `{c0,c1}` calibration instead of f64 m/z, recovering `m/z = (c0 + c1·tof_index)²`.
+    /// Far smaller than the msconvert lane (≈0.14×). OFF by default; only applies when
+    /// `AcqData/MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path).
+    #[arg(long)]
+    agilent_grid: bool,
+
     /// Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor path for formats
     /// without a native reader in this build (Agilent `.d`, SciEX `.wiff`, ...).
     #[arg(long)]
@@ -245,6 +254,7 @@ struct FileConfig {
     no_chromatograms: Option<bool>,
     aux: Option<Vec<String>>,
     tof_grid: Option<TofGridMode>,
+    agilent_grid: Option<bool>,
     via_msconvert: Option<bool>,
     msconvert_path: Option<PathBuf>,
 }
@@ -264,6 +274,7 @@ struct Settings {
     chromatograms: bool,
     aux: Vec<String>,
     tof_grid: TofGridMode,
+    agilent_grid: bool,
     via_msconvert: bool,
     msconvert_path: Option<PathBuf>,
 }
@@ -297,6 +308,7 @@ impl Settings {
             chromatograms: !(cli.no_chromatograms || fc.no_chromatograms.unwrap_or(false)),
             aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
             tof_grid: cli.tof_grid.or(fc.tof_grid).unwrap_or_default(),
+            agilent_grid: cli.agilent_grid || fc.agilent_grid.unwrap_or(false),
             via_msconvert: cli.via_msconvert || fc.via_msconvert.unwrap_or(false),
             msconvert_path: cli.msconvert_path.clone().or(fc.msconvert_path),
         })
@@ -394,7 +406,24 @@ fn run(cli: &Cli) -> Result<i32> {
         Some(vendor::VendorPolicy::load(None, &cfg.aux)?)
     };
 
-    if cfg.via_msconvert {
+    // Agilent FILE-DIRECT profile grid (pure Rust, no MHDAC/msconvert): when `--agilent-grid` is set
+    // and the input is an Agilent `.d` with a non-empty `AcqData/MSProfile.bin`, read the integer
+    // flight-time grid straight from the file and store `tof_index` + `{c0,c1}`. Cross-platform, so
+    // it must run BEFORE `guard_unsupported_vendor` (which rejects Agilent `.d` off Windows).
+    let use_agilent_grid = cfg.agilent_grid && is_agilent_d(&cli.input)
+        && agilent_profile::has_profile(&cli.input);
+    if cfg.agilent_grid && is_agilent_d(&cli.input) && !use_agilent_grid {
+        log::warn!(
+            "--agilent-grid: {} has no profile data (AcqData/MSProfile.bin is empty/absent); \
+             centroid-only Agilent .d is not griddable — falling back to the standard path",
+            cli.input.display()
+        );
+    }
+
+    if use_agilent_grid {
+        convert_agilent_grid(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
+            .with_context(|| format!("file-direct Agilent-grid converting {}", cli.input.display()))?;
+    } else if cfg.via_msconvert {
         convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms)
             .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
     } else if use_bruker_sdk {
@@ -862,6 +891,207 @@ fn tof_grid_spectrum(
     // writer that honours our custom `tof_index` peak schema. We are storing a discretized point
     // list (tof_index, intensity), so Centroid continuity is the correct routing.
     descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+    Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
+}
+
+/// Local CURIEs for the per-spectrum TOF-grid coefficients (Agilent profile grid drifts scan-to-scan
+/// — `base`/`coeff` vary per scan — so a single run-wide `[c0,c1]` is ~100 ppm off; we store c0/c1 as
+/// per-spectrum columns instead). MS:4000900/4000901 are unused local accessions reserved for this
+/// converter's grid handoff; a reader recovers `m/z = (tof_c0 + tof_c1·tof_index)²` per spectrum.
+const TOF_C0_CURIE: mzdata::params::CURIE =
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_900);
+const TOF_C1_CURIE: mzdata::params::CURIE =
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_901);
+
+/// FILE-DIRECT Agilent Q-TOF profile converter: read the integer flight-time grid straight from
+/// `AcqData/MSProfile.bin` (pure Rust, no MHDAC) and write the SAME `tof_index` (Int32) + intensity
+/// peak facet `convert_file_tof_grid` uses, plus per-spectrum `tof_c0`/`tof_c1` columns (Agilent
+/// calibration drifts per scan). Each point is gated for losslessness against the polynomial-refined
+/// MassHunter m/z (`PPM_TOL`); over-tolerance points abort (this lane is only dispatched when the
+/// `.d` has profile data, so an abort means the grid model genuinely failed and is a real error).
+fn convert_agilent_grid(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+) -> Result<()> {
+    let mut reader = agilent_profile::AgilentProfileReader::open(input)
+        .with_context(|| format!("opening Agilent profile .d {}", input.display()))?;
+
+    let tmp = output.with_extension("mzpeak.tmp");
+    let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let level = ZstdLevel::try_new(zstd_level)
+        .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
+
+    // Peak facet: integer `tof_index` (Int32, ΔBP) + intensity, identical to the SCIEX TOF-grid path.
+    // The run-wide `transform_params` on the column is informational (per-spectrum c0/c1 ride their
+    // own columns); set it to the first spectrum's grid so a single-calibration run still self-describes.
+    let first_grid = {
+        // Peek the first spectrum's grid without consuming the stream: re-open a probe reader.
+        let mut probe = agilent_profile::AgilentProfileReader::open(input)?;
+        probe.next_spectrum()?.map(|s| s.grid)
+    };
+    let (c0_hint, c1_hint) = first_grid.map(|g| (g.c0, g.c1)).unwrap_or((0.0, 1.0));
+    let tof_field = {
+        let base = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::nonstandard("tof_index"),
+            BinaryDataArrayType::Int32,
+        )
+        .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+        .to_field();
+        let mut md = base.metadata().clone();
+        md.insert("mzpeak:transform_params".to_string(), format!("{c0_hint},{c1_hint}"));
+        md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+        std::sync::Arc::new((*base).clone().with_metadata(md))
+    };
+    let peak_schema = ArrayBuffersBuilder::default()
+        .prefix("point")
+        .with_context(BufferContext::Spectrum)
+        .add_field(BufferContext::Spectrum.index_field())
+        .add_field(tof_field)
+        .add_field(INTENSITY_ARRAY.to_field());
+
+    let mut builder = MzPeakWriterType::<fs::File>::builder()
+        .buffer_size(buffer_spectra())
+        .compression(Compression::ZSTD(level))
+        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            curie!(MS:1000294),
+            "mass spectrum",
+            DataType::Boolean,
+        ))
+        // Per-spectrum grid coefficients as Float64 spectrum columns (pulled from each spectrum's
+        // params by CURIE). These are the AUTHORITATIVE per-scan calibration for m/z reconstruction.
+        .add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(TOF_C0_CURIE, "tof_c0", DataType::Float64),
+        )
+        .add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(TOF_C1_CURIE, "tof_c1", DataType::Float64),
+        )
+        .store_peaks_and_profiles_apart(Some(peak_schema));
+    let mut writer = builder.build(handle, true);
+    add_processing_metadata(&mut writer);
+
+    let mass_spectrum = Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build();
+    let mut ms1 = Ms1Chroms::default();
+    let cap = max_spectra();
+    let mut n = 0usize;
+    let mut max_ppm = 0.0f64;
+    let mut nonint_intensity = false;
+    while let Some(ps) = reader.next_spectrum()? {
+        if cap.is_some_and(|m| n >= m) {
+            break;
+        }
+        let spec = agilent_grid_spectrum(&reader, ps, &mass_spectrum, &mut max_ppm, &mut nonint_intensity)?;
+        if synth_chroms {
+            ms1.observe(&spec);
+        }
+        writer.write_spectrum(&spec)?;
+        n += 1;
+    }
+    log::info!(
+        "Agilent-grid: wrote {n} profile spectra; max reconstruction error {max_ppm:.4} ppm vs \
+         polynomial-refined MassHunter m/z{}",
+        if nonint_intensity { " (WARNING: some intensities exceeded f32-exact range)" } else { "" }
+    );
+    finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
+    fixup_run_metadata(&mut writer, input);
+
+    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    let cal = serde_json::json!({
+        "codec": "tof-grid",
+        "model": "agilent_sqrt",
+        "lossless": "tof_index",
+        "mz_from_tof_index": "(tof_c0 + tof_c1*tof_index)^2",
+        "per_spectrum_coefficients": ["tof_c0", "tof_c1"],
+        "max_reconstruction_ppm": max_ppm,
+    });
+    zip.add_index_metadata("tof_calibration", &cal)
+        .context("writing tof_calibration index")?;
+    // Embed the Agilent vendor side-files (AcqData) per the vendor policy, mirroring the other lanes.
+    if let Some(policy) = vendor {
+        vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
+    }
+    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
+    fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
+    Ok(())
+}
+
+/// Build one mzPeak spectrum from an Agilent profile spectrum: the integer `tof_index` (Int32) +
+/// integer intensity (as Float32, exact for counts < 2^24), the per-spectrum grid as `tof_c0`/`tof_c1`
+/// params, and a per-point lossless gate against the polynomial-refined MassHunter m/z.
+fn agilent_grid_spectrum(
+    reader: &agilent_profile::AgilentProfileReader,
+    ps: agilent_profile::ProfileSpectrum,
+    mass_spectrum: &Param,
+    max_ppm: &mut f64,
+    nonint_intensity: &mut bool,
+) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
+    let grid = ps.grid;
+    // Lossless gate: reconstruct m/z = (c0+c1·k)² and compare against the polynomial-refined
+    // MassHunter m/z for the same raw TOF (the 2-coeff grid captures the traditional quadratic; the
+    // polynomial adds sub-ppm; comparing against the refined m/z is the honest bound).
+    if let (Some(row), uf) = (reader.calib_row(ps.index), reader.poly_flags_for(ps.index)) {
+        let coeff = row[0];
+        let base = row[1];
+        // raw TOF for bin k: invert the grid c1 = coeff·delta, c0 = coeff·(mz_min−base) ⇒
+        // t = mz_min + k·delta = base + (c0 + c1·k)/coeff. Avoids re-reading the segment header.
+        for (&k, _) in ps.tof_index.iter().zip(ps.intensity.iter()) {
+            let rec = grid.mz(k);
+            let t = base + (grid.c0 + grid.c1 * k as f64) / coeff;
+            let refined = agilent_profile::calibrated_mz(row, uf, t);
+            if refined > 0.0 {
+                let ppm = (rec - refined).abs() / refined * 1e6;
+                if ppm > *max_ppm {
+                    *max_ppm = ppm;
+                }
+            }
+        }
+    }
+
+    let intensity: Vec<f32> = ps
+        .intensity
+        .iter()
+        .map(|&v| {
+            if v > (1 << 24) {
+                *nonint_intensity = true;
+            }
+            v as f32
+        })
+        .collect();
+
+    let mut out = BinaryArrayMap::new();
+    let mut tof_da =
+        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
+    tof_da.update_buffer(ps.tof_index.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
+    out.add(tof_da);
+    let mut int_da =
+        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+    int_da.unit = Unit::DetectorCounts;
+    out.add(int_da);
+
+    let mut descr = mzdata::spectrum::SpectrumDescription::default();
+    descr.index = ps.index;
+    descr.id = format!("scan={}", ps.index + 1);
+    descr.ms_level = ps.ms_level;
+    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+    descr.polarity = mzdata::spectrum::ScanPolarity::Negative; // MTBLS1334 is neg-mode; faithful default
+    descr.add_param(mass_spectrum.clone());
+    descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
+    descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
+    // Set retention time on the scan event.
+    let mut acq = mzdata::spectrum::Acquisition::default();
+    if let Some(ev) = acq.first_scan_mut() {
+        ev.start_time = ps.scan_time;
+    } else {
+        let mut ev = mzdata::spectrum::ScanEvent::default();
+        ev.start_time = ps.scan_time;
+        acq.scans.push(ev);
+    }
+    descr.acquisition = acq;
+
     Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
 }
 
