@@ -167,6 +167,25 @@ fn median_dk(grid: &TofGrid, spec: &[f64]) -> i64 {
     dks[dks.len() / 2]
 }
 
+/// Robust lattice-density across SEVERAL probe spectra: the MEDIAN of per-spectrum `median_dk`.
+/// A genuine per-run flight-time lattice gives a small `median_dk` in EVERY dense spectrum; a
+/// non-lattice that a refined grid happens to fit in one spectrum does not hold across spectra.
+/// Taking the median over probes prevents a single coincidentally-dense spectrum from passing the
+/// density gate (the single-spectrum false-accept that this guards against).
+fn robust_median_dk(grid: &TofGrid, probes: &[&[f64]]) -> i64 {
+    let mut per: Vec<i64> = probes.iter().map(|p| median_dk(grid, p)).collect();
+    if per.is_empty() {
+        return i64::MAX;
+    }
+    per.sort_unstable();
+    per[per.len() / 2]
+}
+
+/// A per-run lattice claim needs corroboration across spectra. One dense spectrum can be made to
+/// refine-fit by coincidence (its `median_dk` is then unreliable — see the single-FT-scan Orbitrap
+/// false-accept). Require at least this many distinct dense probe spectra before accepting a grid.
+pub const MIN_PROBES: usize = 2;
+
 /// Try to fit a run-wide TOF grid over the pooled sampled m/z from several spectra.
 ///
 /// Strategy — target the NATURAL lattice, not the finest one:
@@ -190,18 +209,26 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
     // estimated from ONE spectrum (pooling interleaves spectra and corrupts the step estimate).
     let mut pooled: Vec<f64> = Vec::new();
     let mut first_step: Option<f64> = None;
-    let mut probe: &[f64] = &[];
+    // ALL dense spectra are probes for the cross-spectrum density check (not just the first): a true
+    // per-run flight-time lattice is dense in EVERY spectrum. base_step succeeding is the "dense
+    // enough" criterion (>= 8 usable points with a measurable single step).
+    let mut probes: Vec<&[f64]> = Vec::new();
     for spec in sample_spectra {
-        if first_step.is_none() {
-            if let Some(s) = base_step(spec) {
-                first_step = Some(s);
-                probe = spec; // representative in-order spectrum for the lattice-density check
+        if let Some(s) = base_step(spec) {
+            if first_step.is_none() {
+                first_step = Some(s); // step estimated from one spectrum (pooling corrupts it)
             }
+            probes.push(spec.as_slice());
         }
         pooled.extend(spec.iter().copied().filter(|&m| m > 0.0));
     }
     let base = first_step?;
     if pooled.len() < 16 {
+        return None;
+    }
+    // Need corroboration across spectra: a single dense spectrum is insufficient evidence of a
+    // per-run lattice (its refined-grid median_dk is unreliable). Reject if too few dense probes.
+    if probes.len() < MIN_PROBES {
         return None;
     }
     let sqrt_mz: Vec<f64> = pooled.iter().map(|&m| m.sqrt()).collect();
@@ -218,7 +245,7 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
             continue;
         }
         let grid = TofGrid { c0, c1 };
-        let mdk = median_dk(&grid, probe);
+        let mdk = robust_median_dk(&grid, &probes);
         let (max_ppm, median_ppm, max_k) = evaluate(&grid, &pooled);
         // The natural lattice: dense adjacency (median dk == 1) AND lossless within instrument
         // accuracy AND fits Int32. This is the compression sweet spot.
@@ -241,7 +268,7 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
         if max_k > MAX_K {
             break;
         }
-        let mdk = median_dk(&grid, probe);
+        let mdk = robust_median_dk(&grid, &probes);
         if max_ppm <= PPM_TOL {
             if mdk <= MAX_MEDIAN_DK {
                 best = Some(FitOutcome { grid, max_ppm, median_ppm, max_k, median_dk: mdk });
@@ -279,6 +306,22 @@ mod tests {
             let ppm = (rec - mz).abs() / mz * 1e6;
             assert!(ppm <= PPM_TOL, "roundtrip ppm {ppm} for mz {mz}");
         }
+    }
+
+    /// A SINGLE dense spectrum is insufficient evidence of a per-run lattice (its refined-grid
+    /// density can be coincidental — the single-FT-scan Orbitrap false-accept). Require >= MIN_PROBES.
+    #[test]
+    fn single_probe_rejected() {
+        let truth = TofGrid { c0: 17.32, c1: 1.6e-5 };
+        let mut spec = Vec::new();
+        let mut k = 100_000i32;
+        while k < 1_200_000 {
+            spec.push(truth.mz(k));
+            k += if k % 7 == 0 { 3 } else { 1 };
+        }
+        // One probe spectrum only → reject (even though it IS a perfect lattice). Two → accept.
+        assert!(fit(&[spec.clone()]).is_none(), "single probe must be rejected");
+        assert!(fit(&[spec.clone(), spec]).is_some(), "two probes of a real lattice must fit");
     }
 
     /// Non-TOF data (random-ish m/z not on any lattice, e.g. Orbitrap/QqQ-SRM) must be rejected.
