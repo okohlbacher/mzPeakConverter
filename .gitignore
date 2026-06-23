@@ -27,3 +27,6 @@ mzpeak-win-build.txt
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Windows workstation credentials — NEVER commit
+flash-workstation.txt

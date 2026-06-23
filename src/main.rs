@@ -352,18 +352,22 @@ fn run(cli: &Cli) -> Result<i32> {
         bail!("output {} exists (use --force to overwrite)", output.display());
     }
 
-    let vendor = if cfg.no_vendor {
-        None
-    } else {
-        Some(vendor::VendorPolicy::load(None, &cfg.aux)?)
-    };
-
     // The Bruker SDK path (opt-in) reads TDF/TSF via timsdata and supersedes both ims-compact and the
     // pure-Rust readers for those inputs.
     let use_bruker_sdk = cfg.bruker_sdk && (is_tdf_dir(&cli.input) || is_tsf_dir(&cli.input));
     // ims-compact is the DEFAULT for Bruker timsTOF (TDF); --no-ims-compact (or --bruker-sdk) falls
     // back to f64 m/z.
     let use_ims_compact = is_tdf_dir(&cli.input) && !cfg.no_ims_compact && !use_bruker_sdk;
+
+    let vendor = if cfg.no_vendor {
+        None
+    } else if use_ims_compact {
+        // The lossless ims-compact facet already encodes the exact signal, so drop the redundant raw
+        // `*_bin` bulk binary by default (was ~39% of the TDF archive, a verbatim copy).
+        Some(vendor::VendorPolicy::load_lossless(None, &cfg.aux)?)
+    } else {
+        Some(vendor::VendorPolicy::load(None, &cfg.aux)?)
+    };
 
     if cfg.via_msconvert {
         convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms)
