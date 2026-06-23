@@ -245,6 +245,9 @@ jobs:
         run: |
           mkdir -p vendor-in
           while IFS=$'\t' read -r dest url flag; do
+            # strip any trailing CR (manifest may be checked out with CRLF on Windows) — a stray
+            # \r on the URL makes curl reject it ("Malformed input to a URL function").
+            dest="${dest%$'\r'}"; url="${url%$'\r'}"; flag="${flag%$'\r'}"
             case "$dest" in ''|\#*) continue ;; esac
             [ -z "$url" ] && continue
             mkdir -p "vendor-in/$(dirname "$dest")"

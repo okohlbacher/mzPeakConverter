@@ -1,0 +1,4 @@
+# Keep shell scripts and data manifests LF on all platforms (the Windows CI runs them under
+# git-bash; CRLF would break the scripts and corrupt manifest URLs read by curl).
+*.sh text eol=lf
+tools/*.tsv text eol=lf
