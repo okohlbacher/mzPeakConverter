@@ -59,13 +59,11 @@ use mzdata::spectrum::{BinaryArrayMap, Chromatogram, ChromatogramDescription, Ch
 use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzpeak_prototyping::{BufferContext, BufferName};
 use mzpeak_prototyping::archive::ZipArchiveWriter;
-use mzpeak_prototyping::buffer_descriptors::BufferOverrideTable;
 use mzpeak_prototyping::chunk_series::ChunkingStrategy;
-use mzpeak_prototyping::peak_series::{INTENSITY_ARRAY, array_map_to_schema_arrays};
+use mzpeak_prototyping::peak_series::INTENSITY_ARRAY;
 use mzpeak_prototyping::writer::{
     AbstractMzPeakWriter, ArrayBuffersBuilder, CustomBuilderFromParameter, MzPeakWriterType,
 };
-use mzdata::prelude::ByteArrayView;
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
 
@@ -1928,35 +1926,6 @@ fn convert_tsf(
         input, output, chunk, zstd_level, vendor, synth_chroms,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
-}
-
-/// Derive spectra_data POINT-column fields from sample array maps (ported from mzML2mzPeak): runs
-/// the reference `array_map_to_schema_arrays` so each array yields one column at its SOURCE dtype,
-/// de-duplicated by name. Used when the reader is not an mzdata `SpectrumSource`.
-///
-/// NOTE: superseded for the data-facet schema by the chunk-aware `sample_array_types_from_spectra`
-/// (this produces SCALAR fields and mismatches the writer's chunked LargeList batches on dense
-/// profile data). Retained for non-chunked / diagnostic use.
-#[allow(dead_code)]
-fn data_facet_fields_from_samples(samples: &[&BinaryArrayMap]) -> Vec<arrow::datatypes::FieldRef> {
-    let overrides = BufferOverrideTable::default();
-    let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::new();
-    for map in samples {
-        let primary_len = map
-            .get(&BufferContext::Spectrum.default_sorted_array())
-            .and_then(|a| a.data_len().ok())
-            .unwrap_or_default();
-        if let Ok((derived, _arrays)) =
-            array_map_to_schema_arrays(BufferContext::Spectrum, map, primary_len, 0, None, &overrides)
-        {
-            for f in derived.iter() {
-                if !fields.iter().any(|g| g.name() == f.name()) {
-                    fields.push(f.clone());
-                }
-            }
-        }
-    }
-    fields
 }
 
 /// Write one empty chromatogram (zero data points, no fabricated TIC). Mirrors mzML2mzPeak's
