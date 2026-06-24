@@ -8,15 +8,15 @@
 //! The C API (verified empirically on the workstation + cross-checked against the public MassLynx
 //! SDK ctypes binding):
 //!   * `createRawReaderFromPath(path, &reader, type)` — `type`: SCAN=1, INFO=2 (CHROM=3, ANALOG=4).
-//!   * `getFunctionCount(infoReader, &n)` / `getScanCount(infoReader, func, &n)`.
-//!   * `getScan(scanReader, func, scan, &masses, &intensities, &n)` — allocates two `float[n]`
+//!   * `getFunctionCount(infoReader, &n)` / `readScanCount(infoReader, func, &n)`.
+//!   * `readScan(scanReader, func, scan, &masses, &intensities, &n)` — allocates two `float[n]`
 //!     arrays the caller frees with `releaseMemory`.
 //!   * `destroyRawReader(reader)`. All return `int` (0 = OK).
 //!
 //! RUNTIME: Windows + the MassLynx DLLs (`MassLynxRaw.dll` + deps `cdt.dll`, … — bundled in a
 //! ProteoWizard install). Point `MZPC_MASSLYNX_DIR` (or `MZPC_PWIZ_DIR`) at that directory. We
 //! prepend it to `PATH` before loading so `MassLynxRaw.dll`'s *dependency* DLLs (notably `cdt.dll`,
-//! the compressed-scan decoder that `getScan` needs) resolve — otherwise data reads access-violate
+//! the compressed-scan decoder that `readScan` needs) resolve — otherwise data reads access-violate
 //! even though the reader opens fine.
 
 use std::ffi::{CString, OsString, c_char, c_int, c_void};
@@ -47,7 +47,7 @@ type CreateFromPathFn = unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_
 type DestroyReaderFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type GetFunctionCountFn = unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int;
 type GetScanCountFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int) -> c_int;
-type GetScanFn =
+type ReadScanFn =
     unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *mut f32, *mut *mut f32, *mut c_int)
         -> c_int;
 type ReleaseMemoryFn = unsafe extern "C" fn(*mut c_void) -> c_int;
@@ -57,7 +57,7 @@ type ReleaseMemoryFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 pub struct WatersReader {
     // `_lib` MUST outlive the function pointers + handles below (dropped together with this struct).
     _lib: Library,
-    get_scan: GetScanFn,
+    read_scan: ReadScanFn,
     release_memory: ReleaseMemoryFn,
     destroy: DestroyReaderFn,
     info_reader: *mut c_void,
@@ -92,10 +92,10 @@ impl WatersReader {
             .context("resolving MassLynx export destroyRawReader")?;
         let get_function_count: GetFunctionCountFn = *unsafe { lib.get(b"getFunctionCount\0") }
             .context("resolving MassLynx export getFunctionCount")?;
-        let get_scan_count: GetScanCountFn = *unsafe { lib.get(b"getScanCount\0") }
-            .context("resolving MassLynx export getScanCount")?;
-        let get_scan: GetScanFn =
-            *unsafe { lib.get(b"getScan\0") }.context("resolving MassLynx export getScan")?;
+        let read_scan_count: GetScanCountFn = *unsafe { lib.get(b"readScanCount\0") }
+            .context("resolving MassLynx export readScanCount")?;
+        let read_scan: ReadScanFn =
+            *unsafe { lib.get(b"readScan\0") }.context("resolving MassLynx export readScan")?;
         let release_memory: ReleaseMemoryFn = *unsafe { lib.get(b"releaseMemory\0") }
             .context("resolving MassLynx export releaseMemory")?;
 
@@ -137,7 +137,7 @@ impl WatersReader {
         let mut index = Vec::new();
         for f in 0..n_functions {
             let mut n_scans: c_int = 0;
-            let rc = unsafe { get_scan_count(info_reader, f, &mut n_scans) };
+            let rc = unsafe { read_scan_count(info_reader, f, &mut n_scans) };
             if rc != 0 || n_scans < 0 {
                 continue; // skip a function we can't enumerate rather than abort the whole run
             }
@@ -155,7 +155,7 @@ impl WatersReader {
 
         Ok(WatersReader {
             _lib: lib,
-            get_scan,
+            read_scan,
             release_memory,
             destroy,
             info_reader,
@@ -168,7 +168,7 @@ impl WatersReader {
         self.index.len()
     }
 
-    /// Read one spectrum: `getScan` → m/z (f64, widened from the vendor's f32) + intensity (f32).
+    /// Read one spectrum: `readScan` → m/z (f64, widened from the vendor's f32) + intensity (f32).
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
         let (func, scan) = *self
             .index
@@ -179,7 +179,7 @@ impl WatersReader {
         let mut p_intensities: *mut f32 = ptr::null_mut();
         let mut n: c_int = 0;
         let rc = unsafe {
-            (self.get_scan)(
+            (self.read_scan)(
                 self.scan_reader,
                 func,
                 scan,
@@ -189,11 +189,11 @@ impl WatersReader {
             )
         };
         if rc != 0 {
-            bail!("MassLynx getScan(func={func}, scan={scan}) failed (rc={rc})");
+            bail!("MassLynx readScan(func={func}, scan={scan}) failed (rc={rc})");
         }
         if n < 0 || n > MAX_WATERS_SPECTRUM_POINTS {
             unsafe { self.free_pair(p_masses, p_intensities) };
-            bail!("MassLynx getScan returned implausible point count {n}");
+            bail!("MassLynx readScan returned implausible point count {n}");
         }
         let n = n as usize;
 
@@ -247,7 +247,7 @@ impl WatersReader {
                 .curie(curie!(MS:1000294))
                 .build(),
         );
-        // RT is available via getScanItemValue (TODO); leave a default scan event for now.
+        // RT is available via readScanItemValue (TODO); leave a default scan event for now.
         descr.acquisition.scans.push(ScanEvent::default());
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
@@ -269,7 +269,7 @@ impl WatersReader {
         Ok(self.spectrum(0)?.arrays.unwrap_or_default())
     }
 
-    /// Free a (masses, intensities) pair returned by `getScan`. MassLynx allocates each separately.
+    /// Free a (masses, intensities) pair returned by `readScan`. MassLynx allocates each separately.
     unsafe fn free_pair(&self, masses: *mut f32, intensities: *mut f32) {
         if !masses.is_null() {
             unsafe { (self.release_memory)(masses as *mut c_void) };
