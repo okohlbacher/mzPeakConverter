@@ -1798,8 +1798,7 @@ fn convert_sciex(
     // {c0,c1}. Per-spectrum coefficients absorb per-scan c0 drift (which defeats a run-wide grid —
     // the ZenoTOF case). Off-lattice spectra (sparse/MS2) stay f64. `chunk` is unused (the grid uses
     // the point facet, not chunked m/z).
-    let _ = chunk;
-    convert_sciex_grid(input, output, zstd_level, vendor, synth_chroms)
+    convert_sciex_grid(input, output, chunk, zstd_level, vendor, synth_chroms)
 }
 
 /// Native SCIEX `.wiff` → mzPeak with a PER-SPECTRUM TOF grid (recycles the Agilent grid writer's
@@ -1811,6 +1810,7 @@ fn convert_sciex(
 fn convert_sciex_grid(
     input: &Path,
     output: &Path,
+    chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
@@ -1861,6 +1861,10 @@ fn convert_sciex_grid(
     let builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
+        // Off-lattice (f64) spectra route to spectra_data — chunk that facet (numpress) so SWATH/DIA
+        // runs, where most MS2 windows DON'T grid, don't bloat by storing f64 m/z flat.
+        .chunked_encoding(chunk)
+        .chromatogram_chunked_encoding(chunk)
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
             curie!(MS:1000294),
             "mass spectrum",
