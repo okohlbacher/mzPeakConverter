@@ -2052,7 +2052,10 @@ mod tests {
     /// a spectrum with any off-lattice point → exact f64 m/z (F64). Both in one run.
     #[test]
     fn tof_grid_routes_per_spectrum() {
-        let grid = tof_grid::TofGrid { c0: 14.0, c1: 3.6e-5 };
+        // Coarse-enough step that the half-step quantization at low m/z exceeds PPM_TOL, so a genuinely
+        // off-lattice spectrum has points beyond tolerance and must route F64 (at a very fine grid the
+        // 5 ppm tolerance would snap any m/z onto a node, which is correct but wouldn't test routing).
+        let grid = tof_grid::TofGrid { c0: 14.0, c1: 1.0e-4 };
         let mass_spectrum = Param::builder().name("mass spectrum").build();
 
         // on-lattice spectrum: build from exact grid points → must route Gridded.

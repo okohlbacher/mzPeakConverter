@@ -28,7 +28,7 @@ pub struct TofGrid {
 /// is well within TOF mass accuracy — while the `median_dk == 1` density gate rejects non-TOF data
 /// (Orbitrap/QqQ-SRM, off by tens to hundreds of ppm at any dense grid). For a tighter bound a finer
 /// grid (smaller ppm, larger `tof_index`) is selected automatically by the refinement fallback.
-pub const PPM_TOL: f64 = 3.0;
+pub const PPM_TOL: f64 = 5.0;
 /// Keep k within signed-31-bit range with a safety margin (DELTA_BINARY_PACKED makes the absolute
 /// magnitude almost free, but the column is Int32 so k MUST fit).
 pub const MAX_K: i64 = 1_900_000_000;
@@ -38,7 +38,7 @@ pub const MAX_K: i64 = 1_900_000_000;
 /// arbitrarily fine, which blows the median `dk` up into the hundreds (every point lands on a
 /// distant fractional node). This is the decisive discriminator: refine-to-fit cannot fake a dense
 /// lattice. Reject if the per-spectrum median `dk` exceeds this.
-pub const MAX_MEDIAN_DK: i64 = 32;
+pub const MAX_MEDIAN_DK: i64 = 4;
 
 /// Result of attempting to fit a run-wide TOF grid over sampled m/z arrays.
 pub struct FitOutcome {
