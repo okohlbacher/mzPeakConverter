@@ -329,6 +329,82 @@ jobs:
           path: sdk/**
           retention-days: 5
 
+  # Convert the ZenoTOF .wiff DIRECTLY through the native SCIEX (Clearcore2) reader and compare to
+  # the msconvert→mzML lane on the SAME file — to see what the raw vendor read produces (point
+  # counts / m/z / size) vs the mzML path that has been bloating. Manual dispatch only. The native
+  # reader needs pwiz's Clearcore2 DLLs (MZPC_PWIZ_DIR) + the built SciexGlue (MZPC_SCIEX_GLUE).
+  sciex-native-zeno:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install ProteoWizard (Clearcore2 + msconvert) from TeamCity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://teamcity.labkey.org/guestAuth/app/rest"
+          $h = @{ Accept = "application/json" }
+          $bts = Invoke-RestMethod -Headers $h -Uri "$base/buildTypes?locator=affectedProject:(id:ProteoWizard)"
+          $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" -and $_.name -match "x86_64" } | Select-Object -First 1
+          if (-not $bt) { $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" } | Select-Object -First 1 }
+          if (-not $bt) { Write-Error "no Windows ProteoWizard build type found"; exit 1 }
+          $arts = Invoke-RestMethod -Headers $h -Uri "$base/builds/buildType:$($bt.id),status:SUCCESS,state:finished/artifacts/children"
+          $f = $arts.file | Where-Object { $_.name -match "pwiz-bin-windows-x86_64.*\.tar\.bz2$" } | Select-Object -First 1
+          if (-not $f) { Write-Error "no pwiz windows x86_64 artifact found"; exit 1 }
+          $url = "https://teamcity.labkey.org" + $f.content.href
+          Invoke-WebRequest -Uri $url -OutFile pwiz.tar.bz2
+          New-Item -ItemType Directory -Force -Path pwiz | Out-Null
+          tar -xjf pwiz.tar.bz2 -C pwiz
+          $exe = Get-ChildItem -Path pwiz -Recurse -Filter msconvert.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "msconvert.exe not found"; exit 1 }
+          "MSCONVERT_PATH=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build converter + SCIEX glue
+        run: |
+          cargo build --release --verbose
+          dotnet build glue/sciex/SciexGlue.csproj -c Release
+      - name: Fetch ZenoTOF .wiff (+ .scan + .wiff2)
+        shell: bash
+        run: |
+          base="https://object.storage.eu01.onstackit.cloud/v09/mzML-examples/sciex-zenotof-7600"
+          f="20240826_RNAseB_Reduced_50ngul_1ul_MRM_03"
+          mkdir -p wiff
+          for ext in wiff wiff.scan wiff2; do curl -fsSL "$base/$f.$ext" -o "wiff/$f.$ext"; done
+          ls -l wiff
+      - name: Convert NATIVE (.wiff direct) vs msconvert lane, compare
+        shell: pwsh
+        env:
+          RUST_LOG: info
+        run: |
+          $exe  = "target\release\mzpeak-convert.exe"
+          $wiff = (Get-ChildItem wiff -Filter *.wiff | Select-Object -First 1).FullName
+          $glue = (Get-ChildItem glue\sciex -Recurse -Filter SciexGlue.dll | Select-Object -First 1).Directory.FullName
+          $abi  = (Get-ChildItem pwiz -Recurse -Filter Clearcore2.Data.dll | Select-Object -First 1).Directory.FullName
+          $env:MZPC_SCIEX_GLUE = $glue
+          $env:MZPC_PWIZ_DIR   = $abi
+          Write-Host "glue=$glue"
+          Write-Host "abi=$abi"
+          Write-Host "=== NATIVE .wiff -> mzpeak (Clearcore2 reader, no msconvert) ==="
+          & $exe $wiff -o native.mzpeak --force 2>&1 | Select-String -Pattern 'TOF-grid|gridded|spectra|points|error|panic|Clearcore|glue'
+          if (Test-Path native.mzpeak) { Write-Host "native bytes: $((Get-Item native.mzpeak).Length)" } else { Write-Host "NATIVE PRODUCED NO ARCHIVE" }
+          Write-Host "=== msconvert .wiff -> mzML -> mzpeak (the lane under review) ==="
+          & $exe $wiff --via-msconvert -o msconvert.mzpeak --force 2>&1 | Select-String -Pattern 'TOF-grid|gridded|spectra|points|error|panic'
+          if (Test-Path msconvert.mzpeak) { Write-Host "msconvert bytes: $((Get-Item msconvert.mzpeak).Length)" }
+      - name: Upload archives
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sciex-native-zeno
+          path: |
+            native.mzpeak
+            msconvert.mzpeak
+          retention-days: 5
+          if-no-files-found: warn
+
   # Harvest Bruker TDF mobility calibrations across many PRIDE timsTOF runs to reverse-engineer the
   # exact ModelType-2 scan→1/K0 formula. Pulls ONLY analysis.tdf from each remote .d.zip (HTTP range
   # requests), evaluates timsrust vs the vendor SDK per scan, and records C0..C9 + reference points.
