@@ -50,7 +50,6 @@ type GetScanCountFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int) -> c_
 type ReadScanFn =
     unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *mut f32, *mut *mut f32, *mut c_int)
         -> c_int;
-type ReleaseMemoryFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 /// A native Waters `.raw` reader. Holds the loaded library, the resolved C function pointers, the
 /// info + scan reader handles, and the flattened `(function, scan)` spectrum index.
@@ -58,7 +57,6 @@ pub struct WatersReader {
     // `_lib` MUST outlive the function pointers + handles below (dropped together with this struct).
     _lib: Library,
     read_scan: ReadScanFn,
-    release_memory: ReleaseMemoryFn,
     destroy: DestroyReaderFn,
     info_reader: *mut c_void,
     scan_reader: *mut c_void,
@@ -96,8 +94,6 @@ impl WatersReader {
             .context("resolving MassLynx export getScanCount")?;
         let read_scan: ReadScanFn =
             *unsafe { lib.get(b"readScan\0") }.context("resolving MassLynx export readScan")?;
-        let release_memory: ReleaseMemoryFn = *unsafe { lib.get(b"releaseMemory\0") }
-            .context("resolving MassLynx export releaseMemory")?;
 
         let path_str = input
             .to_str()
@@ -156,7 +152,6 @@ impl WatersReader {
         Ok(WatersReader {
             _lib: lib,
             read_scan,
-            release_memory,
             destroy,
             info_reader,
             scan_reader,
@@ -192,12 +187,13 @@ impl WatersReader {
             bail!("MassLynx readScan(func={func}, scan={scan}) failed (rc={rc})");
         }
         if n < 0 || n > MAX_WATERS_SPECTRUM_POINTS {
-            unsafe { self.free_pair(p_masses, p_intensities) };
             bail!("MassLynx readScan returned implausible point count {n}");
         }
         let n = n as usize;
 
-        // Copy out before freeing the vendor buffers. m/z widened f32→f64 (mzdata MZArray is f64).
+        // The masses/intensities arrays are READER-OWNED — internal buffers valid until the next
+        // readScan (or reader destroy), NOT caller-allocated. Copy out immediately; do NOT free them
+        // (calling releaseMemory on them corrupts the heap — 0xC0000374). m/z widened f32→f64.
         let mz: Vec<f64> = if n > 0 && !p_masses.is_null() {
             unsafe { std::slice::from_raw_parts(p_masses, n) }
                 .iter()
@@ -211,7 +207,6 @@ impl WatersReader {
         } else {
             Vec::new()
         };
-        unsafe { self.free_pair(p_masses, p_intensities) };
 
         let mut arrays = BinaryArrayMap::new();
         let mut mz_da =
@@ -267,16 +262,6 @@ impl WatersReader {
             }
         }
         Ok(self.spectrum(0)?.arrays.unwrap_or_default())
-    }
-
-    /// Free a (masses, intensities) pair returned by `readScan`. MassLynx allocates each separately.
-    unsafe fn free_pair(&self, masses: *mut f32, intensities: *mut f32) {
-        if !masses.is_null() {
-            unsafe { (self.release_memory)(masses as *mut c_void) };
-        }
-        if !intensities.is_null() {
-            unsafe { (self.release_memory)(intensities as *mut c_void) };
-        }
     }
 }
 
