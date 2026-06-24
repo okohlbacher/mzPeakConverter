@@ -396,6 +396,19 @@ jobs:
           $env:MZPC_SCIEX_GLUE = $glue
           $env:MZPC_PWIZ_DIR   = $abi
           Write-Host "glue=$glue"; Write-Host "abi=$abi"
+          # DIAGNOSTIC: dump the REAL Clearcore2 API surface so the glue's reflection binds correctly
+          # (the glue is end-to-end untested; the first runtime call hit MissingMethodException). Loads
+          # every Clearcore2*.dll and lists ctors+static methods of the factory + the WIFF provider type.
+          Write-Host "===== Clearcore2 API DUMP ====="
+          Get-ChildItem $abi -Filter 'Clearcore2*.dll' | ForEach-Object { try { [Reflection.Assembly]::LoadFrom($_.FullName) | Out-Null } catch {} }
+          foreach ($tn in @('Clearcore2.Data.DataAccess.SampleData.AnalystDataProviderFactory','Clearcore2.Data.AnalystFR.AnalystWiffDataProvider')) {
+            $t = [AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object { try { $_.GetType($tn) } catch {} } | Where-Object { $_ } | Select-Object -First 1
+            if (-not $t) { Write-Host "TYPE NOT FOUND: $tn"; continue }
+            Write-Host "--- $($t.FullName)  [$($t.Assembly.GetName().Name)]"
+            $t.GetConstructors() | ForEach-Object { Write-Host "  ctor($(( $_.GetParameters() | ForEach-Object { $_.ParameterType.Name } ) -join ', '))" }
+            $t.GetMethods('Public,Static,Instance,DeclaredOnly') | Where-Object { $_.Name -match 'Create|Provider|Batch|Wiff|Sample|Open' } | ForEach-Object { Write-Host "  $(if($_.IsStatic){'static '})$($_.ReturnType.Name) $($_.Name)($(( $_.GetParameters() | ForEach-Object { $_.ParameterType.Name } ) -join ', '))" }
+          }
+          Write-Host "===== END DUMP ====="
           # DIRECT only (strategy B): native Clearcore2 read, no msconvert/mzML. Stores exact f64 m/z
           # until the glue surfaces SCIEX's mass calibration (then it grids losslessly from the format).
           # raw = .wiff + all sidecars (.scan/.wiff2); mzPeak = --no-vendor (data representation).
