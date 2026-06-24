@@ -8,7 +8,7 @@
 //! The C API (verified empirically on the workstation + cross-checked against the public MassLynx
 //! SDK ctypes binding):
 //!   * `createRawReaderFromPath(path, &reader, type)` — `type`: SCAN=1, INFO=2 (CHROM=3, ANALOG=4).
-//!   * `getFunctionCount(infoReader, &n)` / `readScanCount(infoReader, func, &n)`.
+//!   * `getFunctionCount(infoReader, &n)` / `getScanCount(infoReader, func, &n)`.
 //!   * `readScan(scanReader, func, scan, &masses, &intensities, &n)` — allocates two `float[n]`
 //!     arrays the caller frees with `releaseMemory`.
 //!   * `destroyRawReader(reader)`. All return `int` (0 = OK).
@@ -92,8 +92,8 @@ impl WatersReader {
             .context("resolving MassLynx export destroyRawReader")?;
         let get_function_count: GetFunctionCountFn = *unsafe { lib.get(b"getFunctionCount\0") }
             .context("resolving MassLynx export getFunctionCount")?;
-        let read_scan_count: GetScanCountFn = *unsafe { lib.get(b"readScanCount\0") }
-            .context("resolving MassLynx export readScanCount")?;
+        let read_scan_count: GetScanCountFn = *unsafe { lib.get(b"getScanCount\0") }
+            .context("resolving MassLynx export getScanCount")?;
         let read_scan: ReadScanFn =
             *unsafe { lib.get(b"readScan\0") }.context("resolving MassLynx export readScan")?;
         let release_memory: ReleaseMemoryFn = *unsafe { lib.get(b"releaseMemory\0") }
