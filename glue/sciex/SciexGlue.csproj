@@ -31,6 +31,11 @@
     <!-- A library, not an app. netcorehost loads it via initialize_for_runtime_config +
          a delegate loader, so no managed entry point is needed. -->
     <OutputType>Library</OutputType>
+    <!-- A plain class library does NOT emit a .runtimeconfig.json, but netcorehost REQUIRES one to
+         boot the runtime (initialize_for_runtime_config) — without it SciexReader::open fails with
+         "SciexGlue.runtimeconfig.json not found". EnableDynamicLoading makes the build generate it
+         next to the DLL (the canonical setting for a hostfxr-loaded class library). -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
     <!-- 64-bit only: the Clearcore2 native bits are x64. -->
     <Platforms>x64</Platforms>
   </PropertyGroup>
