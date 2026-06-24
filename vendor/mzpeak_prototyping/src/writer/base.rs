@@ -1124,7 +1124,7 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if c.name().ends_with("_index") {
+            if c.name().ends_with("_index") || c.name() == "tof" {
                 log::debug!("{}: delta binary packing", c.path());
                 // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
                 // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF
@@ -1258,7 +1258,7 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if c.name().ends_with("_index") {
+            if c.name().ends_with("_index") || c.name() == "tof" {
                 log::debug!("{}: delta binary packing", c.path());
                 // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
                 // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF
