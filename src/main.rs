@@ -1860,7 +1860,7 @@ fn convert_vendor_reader(
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
     len: usize,
-    sample: mzdata::spectrum::bindata::BinaryArrayMap,
+    _sample: mzdata::spectrum::bindata::BinaryArrayMap,
     mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
 ) -> Result<()> {
     if len == 0 {
@@ -1870,14 +1870,25 @@ fn convert_vendor_reader(
     let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let level = ZstdLevel::try_new(zstd_level)
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
+    // Derive the data-facet schema from a few REAL sample spectra, CHUNK-AWARELY. The writer chunks
+    // dense profile arrays into `LargeList`; a scalar schema from a single BinaryArrayMap mismatches
+    // and panics the writer on SCIEX/Waters profile data. Probes spread across the run.
+    const N_PROBE: usize = 6;
+    let step = (len / N_PROBE).max(1);
+    let mut probes: Vec<mzdata::spectrum::MultiLayerSpectrum> = Vec::new();
+    let mut pi = 0usize;
+    while pi < len && probes.len() < N_PROBE {
+        if let Ok(s) = spectrum(pi) {
+            probes.push(s);
+        }
+        pi += step;
+    }
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
         .chromatogram_chunked_encoding(chunk)
         .buffer_size(buffer_spectra())
-        .compression(Compression::ZSTD(level));
-    for field in data_facet_fields_from_samples(&[&sample]) {
-        builder = builder.add_spectrum_field(field);
-    }
+        .compression(Compression::ZSTD(level))
+        .sample_array_types_from_spectra(probes.into_iter());
     builder = builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
         curie!(MS:1000294),
         "mass spectrum",
@@ -1922,6 +1933,11 @@ fn convert_tsf(
 /// Derive spectra_data POINT-column fields from sample array maps (ported from mzML2mzPeak): runs
 /// the reference `array_map_to_schema_arrays` so each array yields one column at its SOURCE dtype,
 /// de-duplicated by name. Used when the reader is not an mzdata `SpectrumSource`.
+///
+/// NOTE: superseded for the data-facet schema by the chunk-aware `sample_array_types_from_spectra`
+/// (this produces SCALAR fields and mismatches the writer's chunked LargeList batches on dense
+/// profile data). Retained for non-chunked / diagnostic use.
+#[allow(dead_code)]
 fn data_facet_fields_from_samples(samples: &[&BinaryArrayMap]) -> Vec<arrow::datatypes::FieldRef> {
     let overrides = BufferOverrideTable::default();
     let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::new();
