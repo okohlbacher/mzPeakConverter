@@ -223,6 +223,55 @@ pub fn fit_one(mzs: &[f64]) -> Option<(TofGrid, Vec<i32>, f64)> {
     None
 }
 
+/// Like [`fit_one`] but with a FIXED run-wide `c1` (the SCIEX digitizer clock is global; only the
+/// per-scan offset `c0` drifts). Fits just `c0` for the given `c1`, so even SPARSE spectra (SWATH/DIA
+/// MS2 windows) that can't self-estimate the step still grid against the shared clock. Returns
+/// `(grid, tof_index, max ppm)` iff every point reconstructs within `PPM_TOL`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn fit_one_c1(mzs: &[f64], c1: f64) -> Option<(TofGrid, Vec<i32>, f64)> {
+    if !(c1 > 0.0) {
+        return None;
+    }
+    let s_min = mzs
+        .iter()
+        .filter(|&&m| m > 0.0)
+        .map(|&m| m.sqrt())
+        .fold(f64::INFINITY, f64::min);
+    if !s_min.is_finite() {
+        return None;
+    }
+    // c0 = mean(√mz − c1·k) with k = round((√mz − s_min)/c1): the best-fit offset for the fixed step.
+    let (mut sum, mut cnt) = (0.0f64, 0.0f64);
+    for &m in mzs {
+        if m > 0.0 {
+            let y = m.sqrt();
+            let k = ((y - s_min) / c1).round();
+            sum += y - c1 * k;
+            cnt += 1.0;
+        }
+    }
+    if cnt < 4.0 {
+        return None;
+    }
+    let grid = TofGrid { c0: sum / cnt, c1 };
+    let mut idx = Vec::with_capacity(mzs.len());
+    let mut max_ppm = 0.0f64;
+    for &m in mzs {
+        let k = grid.tof_index(m)?;
+        let rec = grid.mz(k);
+        let ppm = (rec - m).abs() / m * 1e6;
+        if ppm > max_ppm {
+            max_ppm = ppm;
+        }
+        idx.push(k);
+    }
+    if max_ppm <= PPM_TOL {
+        Some((grid, idx, max_ppm))
+    } else {
+        None
+    }
+}
+
 /// Try to fit a run-wide TOF grid over the pooled sampled m/z from several spectra.
 ///
 /// Strategy — target the NATURAL lattice, not the finest one:

@@ -1847,16 +1847,25 @@ fn convert_sciex_grid(
         .add_field(tof_field)
         .add_field(INTENSITY_ARRAY.to_field());
 
-    // Probe a few spectra for the f64 data-facet schema (off-lattice spectra), chunk-aware.
-    let probe_step = (total / 6).max(1);
+    // Probe spectra spread across the run: feed the f64 data-facet schema (chunk-aware) AND fit the
+    // run-wide digitizer clock c1. The SCIEX clock is GLOBAL (only c0 drifts per scan), so a single c1
+    // lets even sparse SWATH/DIA MS2 windows grid against the shared lattice (per-spectrum c1
+    // estimation fails on them).
+    let probe_step = (total / 16).max(1);
     let mut probes: Vec<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> = Vec::new();
     let mut pi = 0usize;
-    while pi < total && probes.len() < 6 {
+    while pi < total && probes.len() < 16 {
         if let Ok(s) = reader.spectrum(pi) {
             probes.push(s);
         }
         pi += probe_step;
     }
+    let samples: Vec<Vec<f64>> = probes
+        .iter()
+        .filter_map(|s| s.arrays.as_ref().and_then(|a| a.mzs().ok()).map(|c| c.into_owned()))
+        .filter(|v| v.len() >= 64)
+        .collect();
+    let c1_global = tof_grid::fit(&samples).map(|f| f.grid.c1);
 
     let builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
@@ -1898,7 +1907,11 @@ fn convert_sciex_grid(
             .and_then(|a| a.mzs().ok())
             .map(|c| c.into_owned())
             .unwrap_or_default();
-        let out = match tof_grid::fit_one(&mz) {
+        // Prefer the global-c1 fit (grids sparse MS2 windows too); fall back to a per-spectrum fit.
+        let fit = c1_global
+            .and_then(|c1| tof_grid::fit_one_c1(&mz, c1))
+            .or_else(|| tof_grid::fit_one(&mz));
+        let out = match fit {
             Some((grid, tof_index, ppm)) => {
                 max_ppm = max_ppm.max(ppm);
                 n_grid += 1;
