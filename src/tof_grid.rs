@@ -186,6 +186,43 @@ fn robust_median_dk(grid: &TofGrid, probes: &[&[f64]]) -> i64 {
 /// false-accept). Require at least this many distinct dense probe spectra before accepting a grid.
 pub const MIN_PROBES: usize = 2;
 
+/// Fit a grid to ONE spectrum's recalibrated f64 m/z, for native vendor readers that expose only
+/// decoded f64 (SCIEX Clearcore2). Inverts `sqrt(m/z)=c0+c1·k` PER SPECTRUM, so per-scan c0 drift —
+/// which defeats a single run-wide grid (the ZenoTOF failure) — is absorbed into each spectrum's own
+/// coefficients. Returns `(grid, tof_index per input point in order, max ppm)` iff every point
+/// reconstructs within `PPM_TOL` and fits Int32; `None` otherwise (caller keeps that spectrum f64).
+/// No non-TOF rejection here — the caller already knows the instrument is TOF; this is just the
+/// lossless gate.
+#[cfg_attr(not(windows), allow(dead_code))] // only the cfg(windows) SCIEX grid path calls it
+pub fn fit_one(mzs: &[f64]) -> Option<(TofGrid, Vec<i32>, f64)> {
+    let base = base_step(mzs)?;
+    let sqrt_mz: Vec<f64> = mzs.iter().filter(|&&m| m > 0.0).map(|&m| m.sqrt()).collect();
+    if sqrt_mz.len() < 8 {
+        return None;
+    }
+    let s_min = sqrt_mz.iter().cloned().fold(f64::INFINITY, f64::min);
+    // The natural digitizer step is ~`base`; accept the COARSEST grid (smallest k → best compression)
+    // whose every point reconstructs within PPM_TOL, falling to finer multiples only if the natural
+    // quantization is too coarse.
+    for mult in [1.0, 0.5, 0.25, 0.125] {
+        let step = base * mult;
+        let (c0, c1) = fit_with_step(&sqrt_mz, s_min, step);
+        if !(c1 > 0.0) || !c0.is_finite() {
+            continue;
+        }
+        let grid = TofGrid { c0, c1 };
+        let (max_ppm, _median, max_k) = evaluate(&grid, mzs);
+        if max_ppm <= PPM_TOL && max_k <= MAX_K {
+            let mut idx = Vec::with_capacity(mzs.len());
+            for &m in mzs {
+                idx.push(grid.tof_index(m)?);
+            }
+            return Some((grid, idx, max_ppm));
+        }
+    }
+    None
+}
+
 /// Try to fit a run-wide TOF grid over the pooled sampled m/z from several spectra.
 ///
 /// Strategy — target the NATURAL lattice, not the finest one:

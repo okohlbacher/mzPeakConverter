@@ -1793,9 +1793,200 @@ fn convert_sciex(
     // the flight-time index or the mass-calibration coefficients. Strategy (B) (always grid, lossless,
     // straight from the vendor calibration — like the Agilent `MSProfile.bin` reader) therefore needs
     // a glue extension to surface SCIEX's calibration. Until then `.wiff` stores exact f64 m/z. The
-    // statistical detector (strategy A) is deliberately NOT used here — it is gated to the mzML path.
+    // Clearcore2 returns only DECODED f64 m/z (not the flight-time integers), so we INVERT it
+    // per-spectrum into the TOF grid (`sqrt(m/z)=c0+c1·k`), storing `tof_index` + per-spectrum
+    // {c0,c1}. Per-spectrum coefficients absorb per-scan c0 drift (which defeats a run-wide grid —
+    // the ZenoTOF case). Off-lattice spectra (sparse/MS2) stay f64. `chunk` is unused (the grid uses
+    // the point facet, not chunked m/z).
+    let _ = chunk;
+    convert_sciex_grid(input, output, zstd_level, vendor, synth_chroms)
+}
+
+/// Native SCIEX `.wiff` → mzPeak with a PER-SPECTRUM TOF grid (recycles the Agilent grid writer's
+/// per-spectrum `tof_c0`/`tof_c1` columns + `tof_index` peak facet). For each spectrum we fit
+/// `sqrt(m/z)=c0+c1·k` from the Clearcore2 f64 m/z and store the integer `tof_index`; a reader
+/// recovers `m/z=(tof_c0+tof_c1·tof_index)²` per spectrum. Griddable spectra route to the `tof_index`
+/// peak facet; off-lattice ones keep exact f64 m/z in the `spectra_data` facet.
+#[cfg(windows)]
+fn convert_sciex_grid(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+) -> Result<()> {
     let reader = sciex::SciexReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    let total = reader.len();
+    if total == 0 {
+        bail!("no spectra in {}", input.display());
+    }
+    let tmp = output.with_extension("mzpeak.tmp");
+    let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let level = ZstdLevel::try_new(zstd_level)
+        .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
+
+    // Peak facet: tof_index (Int32) + intensity (f32) + per-spectrum tof_c0/tof_c1 (the run-wide
+    // transform_params are placeholders; the authoritative coefficients ride the per-spectrum columns).
+    let tof_field = {
+        let base = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::nonstandard("tof_index"),
+            BinaryDataArrayType::Int32,
+        )
+        .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+        .to_field();
+        let mut md = base.metadata().clone();
+        md.insert("mzpeak:transform_params".to_string(), "0,1".to_string());
+        md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+        std::sync::Arc::new((*base).clone().with_metadata(md))
+    };
+    let peak_schema = ArrayBuffersBuilder::default()
+        .prefix("point")
+        .with_context(BufferContext::Spectrum)
+        .add_field(BufferContext::Spectrum.index_field())
+        .add_field(tof_field)
+        .add_field(INTENSITY_ARRAY.to_field());
+
+    // Probe a few spectra for the f64 data-facet schema (off-lattice spectra), chunk-aware.
+    let probe_step = (total / 6).max(1);
+    let mut probes: Vec<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> = Vec::new();
+    let mut pi = 0usize;
+    while pi < total && probes.len() < 6 {
+        if let Ok(s) = reader.spectrum(pi) {
+            probes.push(s);
+        }
+        pi += probe_step;
+    }
+
+    let builder = MzPeakWriterType::<fs::File>::builder()
+        .buffer_size(buffer_spectra())
+        .compression(Compression::ZSTD(level))
+        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            curie!(MS:1000294),
+            "mass spectrum",
+            DataType::Boolean,
+        ))
+        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            TOF_C0_CURIE,
+            "tof_c0",
+            DataType::Float64,
+        ))
+        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            TOF_C1_CURIE,
+            "tof_c1",
+            DataType::Float64,
+        ))
+        .store_peaks_and_profiles_apart(Some(peak_schema))
+        .sample_array_types_from_spectra(probes.into_iter());
+    let mut writer = builder.build(handle, true);
+    add_processing_metadata(&mut writer);
+
+    let mass_spectrum = Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build();
+    let mut ms1 = Ms1Chroms::default();
+    let len = max_spectra().map_or(total, |m| m.min(total));
+    let (mut n_grid, mut n_f64) = (0usize, 0usize);
+    let mut max_ppm = 0.0f64;
+    for i in 0..len {
+        let spec = reader.spectrum(i)?;
+        let mz: Vec<f64> = spec
+            .arrays
+            .as_ref()
+            .and_then(|a| a.mzs().ok())
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
+        let out = match tof_grid::fit_one(&mz) {
+            Some((grid, tof_index, ppm)) => {
+                max_ppm = max_ppm.max(ppm);
+                n_grid += 1;
+                sciex_grid_spectrum(&spec, &tof_index, grid, &mass_spectrum)?
+            }
+            None => {
+                n_f64 += 1;
+                sciex_f64_spectrum(spec, &mass_spectrum)
+            }
+        };
+        if synth_chroms {
+            ms1.observe(&out);
+        }
+        writer.write_spectrum(&out)?;
+    }
+    log::info!(
+        "SCIEX per-spectrum grid: wrote {len} spectra ({n_grid} gridded tof_index, {n_f64} kept f64); \
+         max round-trip {max_ppm:.4} ppm"
+    );
+    finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
+    fixup_run_metadata(&mut writer, input);
+
+    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    let cal = serde_json::json!({
+        "codec": "tof-grid",
+        "model": "sciex_sqrt_per_spectrum",
+        "lossless": "tof_index",
+        "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
+        "per_spectrum_columns": ["tof_c0", "tof_c1"],
+        "max_roundtrip_ppm": max_ppm,
+    });
+    zip.add_index_metadata("tof_calibration", &cal)
+        .context("writing tof_calibration index")?;
+    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
+    fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
+    Ok(())
+}
+
+/// Build a gridded SCIEX spectrum: `tof_index` (Int32) + intensity (f32) + per-spectrum tof_c0/tof_c1,
+/// Centroid continuity (routes to the `tof_index` peak facet). Keeps the source description (RT, MS
+/// level, polarity).
+#[cfg(windows)]
+fn sciex_grid_spectrum(
+    spec: &MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
+    tof_index: &[i32],
+    grid: tof_grid::TofGrid,
+    mass_spectrum: &Param,
+) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
+    let intensity: Vec<f32> = spec
+        .arrays
+        .as_ref()
+        .and_then(|a| a.intensities().ok())
+        .map(|c| c.into_owned())
+        .unwrap_or_default();
+
+    let mut out = BinaryArrayMap::new();
+    let mut tof_da =
+        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
+    tof_da.update_buffer(tof_index).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
+    out.add(tof_da);
+    let mut int_da =
+        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+    int_da.unit = Unit::DetectorCounts;
+    out.add(int_da);
+
+    let mut descr = spec.description().clone();
+    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+    if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
+        descr.add_param(mass_spectrum.clone());
+    }
+    descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
+    descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
+    Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
+}
+
+/// Keep an off-lattice SCIEX spectrum as exact f64 m/z (Profile continuity → `spectra_data` facet).
+#[cfg(windows)]
+fn sciex_f64_spectrum(
+    mut spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
+    mass_spectrum: &Param,
+) -> MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> {
+    spec.description_mut().signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
+    if !spec
+        .description()
+        .params()
+        .iter()
+        .any(|p| p.curie() == Some(curie!(MS:1000294)))
+    {
+        spec.description_mut().add_param(mass_spectrum.clone());
+    }
+    spec
 }
 
 /// Convert a Waters MassLynx `.raw` → mzPeak via the MassLynx .NET glue (Windows-runtime-only,
