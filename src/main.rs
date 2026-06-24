@@ -180,11 +180,13 @@ struct Cli {
     #[arg(long)]
     aux: Vec<String>,
 
-    /// TOF-grid m/z encoding for SCIEX (and other exact-lattice TOF) mzML: store an integer
-    /// `tof_index` (Int32) + a per-run `{c0,c1}` calibration instead of f64 m/z, recovering
-    /// `m/z = (c0 + c1·tof_index)²`. `auto` (default) applies it only when a strict lossless grid
-    /// fit passes (SCIEX TOF passes; Orbitrap/QqQ fall back to f64 m/z); `on` requires the fit and
-    /// errors if it fails; `off` never applies it.
+    /// **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by
+    /// DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) +
+    /// a per-run `{c0,c1}` instead, recovering `m/z = (c0 + c1·tof_index)²`. **Off by default** and
+    /// bounded-lossy (reconstruction within `PPM_TOL`) — it reverse-engineers the grid msconvert
+    /// discarded. `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise);
+    /// `off` keeps exact f64. Native vendor readers ignore this — they read the true grid from the
+    /// vendor calibration losslessly (strategy B) and always do so.
     #[arg(long, value_enum)]
     tof_grid: Option<TofGridMode>,
 
@@ -223,17 +225,20 @@ enum Layout {
     Point,
 }
 
-/// When to apply the SCIEX/exact-lattice TOF-grid m/z encoding (`tof_index` Int32 + per-run grid).
+/// When to apply the statistically-DETECTED TOF-grid m/z encoding (strategy A) on the **mzML path
+/// only**. This reverse-engineers an integer flight-time grid from already-decoded f64 m/z, so it is
+/// bounded-lossy (reconstruction within `PPM_TOL`). Native vendor readers do NOT use this — they
+/// read the true grid from the vendor calibration (strategy B) and are lossless by construction.
 #[derive(ValueEnum, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 enum TofGridMode {
-    /// Apply only when a strict lossless grid fit passes; otherwise keep f64 m/z. (default)
+    /// Never apply the detected grid; keep exact f64 m/z. (default — exact is the safe choice)
     #[default]
-    Auto,
-    /// Require the grid fit; error if the input is not losslessly griddable.
-    On,
-    /// Never apply the grid; always keep f64 m/z.
     Off,
+    /// Apply only when a strict grid fit passes (within `PPM_TOL`); otherwise keep f64 m/z.
+    Auto,
+    /// Require the grid fit; error if the input is not griddable.
+    On,
 }
 
 /// Config-file schema: every overridable option, all optional. Loaded from `--config`. Precedence:
@@ -431,7 +436,7 @@ fn run(cli: &Cli) -> Result<i32> {
         convert_agilent_grid(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("file-direct Agilent-grid converting {}", cli.input.display()))?;
     } else if cfg.via_msconvert {
-        convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms)
+        convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms, cfg.tof_grid)
             .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
     } else if use_bruker_sdk {
         convert_bruker_sdk(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
@@ -629,6 +634,7 @@ fn convert_via_msconvert(
     zstd_level: i32,
     msconvert_path: Option<&Path>,
     synth_chroms: bool,
+    tof_grid: TofGridMode,
 ) -> Result<()> {
     let exe: std::ffi::OsString = msconvert_path
         .map(|p| p.as_os_str().to_os_string())
@@ -667,8 +673,9 @@ fn convert_via_msconvert(
         bail!("msconvert reported success but produced no mzML at {}", mzml.display());
     }
 
-    // msconvert produces SCIEX/Agilent mzML — apply TOF-grid in auto mode (lossless when griddable).
-    let result = convert_file(&mzml, output, chunk, zstd_level, None, synth_chroms, TofGridMode::Auto);
+    // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
+    // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
+    let result = convert_file(&mzml, output, chunk, zstd_level, None, synth_chroms, tof_grid);
     let _ = fs::remove_dir_all(&tmpdir);
     result
 }
@@ -1726,122 +1733,13 @@ fn convert_sciex(
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
 ) -> Result<()> {
+    // Native `.wiff` is read through Clearcore2, which currently exposes only decoded f64 m/z — not
+    // the flight-time index or the mass-calibration coefficients. Strategy (B) (always grid, lossless,
+    // straight from the vendor calibration — like the Agilent `MSProfile.bin` reader) therefore needs
+    // a glue extension to surface SCIEX's calibration. Until then `.wiff` stores exact f64 m/z. The
+    // statistical detector (strategy A) is deliberately NOT used here — it is gated to the mzML path.
     let reader = sciex::SciexReader::open(input)?;
-    let len = reader.len();
-    // Grid encoding is the DEFAULT for `.wiff` TOF data: try to fit a per-run integer flight-time
-    // grid `sqrt(m/z)=c0+c1·k` and store `tof_index` instead of f64 m/z (per-spectrum routing keeps
-    // off-lattice spectra as exact f64). `fit()` returns None for non-lattice data, so non-TOF
-    // `.wiff` falls back to the standard f64 path automatically.
-    if let Some(fit) = try_fit_tof_grid_closure(len, |i| reader.spectrum(i)) {
-        log::info!(
-            "TOF-grid: lossless fit accepted (c0={:.6} c1={:.6e}, max {:.4} ppm, median {:.4} ppm, k≤{}, median dk={}); storing tof_index instead of f64 m/z",
-            fit.grid.c0, fit.grid.c1, fit.max_ppm, fit.median_ppm, fit.max_k, fit.median_dk
-        );
-        return convert_vendor_reader_tof_grid(
-            input, output, zstd_level, vendor, synth_chroms,
-            len, &reader.sample_arrays()?, |i| reader.spectrum(i), fit.grid,
-        );
-    }
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, len, reader.sample_arrays()?, |i| reader.spectrum(i))
-}
-
-/// Like [`try_fit_tof_grid`] but driven by a vendor reader's `(len, spectrum closure)` rather than an
-/// mzdata `SpectrumSource`. Samples up to 16 non-IM spectra (≥64 points) and fits the run-wide grid.
-#[cfg(windows)]
-fn try_fit_tof_grid_closure(
-    len: usize,
-    mut spectrum: impl FnMut(usize) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>>,
-) -> Option<tof_grid::FitOutcome> {
-    if len == 0 {
-        return None;
-    }
-    const N_SAMPLE: usize = 16;
-    let step = (len / N_SAMPLE).max(1);
-    let mut samples: Vec<Vec<f64>> = Vec::new();
-    let mut idx = 0usize;
-    while idx < len && samples.len() < N_SAMPLE {
-        if let Ok(spec) = spectrum(idx) {
-            let mz = spec
-                .arrays
-                .as_ref()
-                .filter(|a| !a.has_ion_mobility())
-                .and_then(|a| a.mzs().ok())
-                .map(|c| c.into_owned());
-            if let Some(v) = mz {
-                if v.len() >= 64 {
-                    samples.push(v);
-                }
-            }
-        }
-        idx += step;
-    }
-    tof_grid::fit(&samples)
-}
-
-/// Native-vendor TOF-grid writer: like [`convert_file_tof_grid`] but driven by a vendor reader's
-/// `(len, sample arrays, spectrum closure)` instead of an mzdata `SpectrumSource`. The f64 data
-/// facet schema (for off-lattice spectra) comes from the sample arrays; chromatograms are
-/// synthesized. Used by [`convert_sciex`] so `.wiff` TOF profile grids by default.
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn convert_vendor_reader_tof_grid(
-    input: &Path,
-    output: &Path,
-    zstd_level: i32,
-    vendor: Option<&vendor::VendorPolicy>,
-    synth_chroms: bool,
-    len: usize,
-    sample: &BinaryArrayMap,
-    mut spectrum: impl FnMut(usize) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>>,
-    grid: tof_grid::TofGrid,
-) -> Result<()> {
-    let tmp = output.with_extension("mzpeak.tmp");
-    let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    let level = ZstdLevel::try_new(zstd_level)
-        .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
-    let mut builder = MzPeakWriterType::<fs::File>::builder()
-        .buffer_size(buffer_spectra())
-        .compression(Compression::ZSTD(level))
-        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            curie!(MS:1000294),
-            "mass spectrum",
-            DataType::Boolean,
-        ))
-        .store_peaks_and_profiles_apart(Some(tof_index_peak_schema(&grid)));
-    // f64 data facet (off-lattice spectra) schema from the sample arrays — mirrors convert_vendor_reader.
-    for field in data_facet_fields_from_samples(&[sample]) {
-        builder = builder.add_spectrum_field(field);
-    }
-    let mut writer = builder.build(handle, true);
-    add_processing_metadata(&mut writer);
-
-    let mass_spectrum = Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build();
-    let mut ms1 = Ms1Chroms::default();
-    let len = max_spectra().map_or(len, |m| m.min(len));
-    let (mut n_gridded, mut n_f64) = (0usize, 0usize);
-    for i in 0..len {
-        let spec = spectrum(i)?;
-        let out = match tof_grid_spectrum(&spec, &grid, &mass_spectrum)? {
-            TofRoute::Gridded(s) => {
-                n_gridded += 1;
-                s
-            }
-            TofRoute::F64(s) => {
-                n_f64 += 1;
-                s
-            }
-        };
-        if synth_chroms {
-            ms1.observe(&out);
-        }
-        writer.write_spectrum(&out)?;
-    }
-    log::info!(
-        "TOF-grid wrote {len} spectra: {n_gridded} gridded (tof_index facet), {n_f64} kept f64 m/z (data facet)"
-    );
-    finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
-    fixup_run_metadata(&mut writer, input);
-    finish_tof_grid_archive(writer, &tmp, output, input, &grid, vendor)
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak via the MHDAC .NET glue (feature `agilent`,

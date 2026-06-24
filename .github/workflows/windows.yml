@@ -388,11 +388,14 @@ jobs:
           $env:MZPC_PWIZ_DIR   = $abi
           Write-Host "glue=$glue"
           Write-Host "abi=$abi"
-          Write-Host "=== NATIVE .wiff -> mzpeak (Clearcore2 reader, no msconvert) ==="
+          # Strategy B (native): Clearcore2 read. Stores exact f64 m/z until the glue surfaces SCIEX's
+          # mass calibration (then it grids losslessly from the format). No statistical detection here.
+          Write-Host "=== NATIVE .wiff -> mzpeak (strategy B: exact f64, grid-from-cal pending glue) ==="
           & $exe $wiff -o native.mzpeak --force 2>&1 | Select-String -Pattern 'TOF-grid|gridded|spectra|points|error|panic|Clearcore|glue'
           if (Test-Path native.mzpeak) { Write-Host "native bytes: $((Get-Item native.mzpeak).Length)" } else { Write-Host "NATIVE PRODUCED NO ARCHIVE" }
-          Write-Host "=== msconvert .wiff -> mzML -> mzpeak (the lane under review) ==="
-          & $exe $wiff --via-msconvert -o msconvert.mzpeak --force 2>&1 | Select-String -Pattern 'TOF-grid|gridded|spectra|points|error|panic'
+          # Strategy A (mzML detection): opt-in, bounded-lossy. Off by default, so request it explicitly.
+          Write-Host "=== msconvert .wiff -> mzML -> mzpeak, --tof-grid auto (strategy A, opt-in) ==="
+          & $exe $wiff --via-msconvert --tof-grid auto -o msconvert.mzpeak --force 2>&1 | Select-String -Pattern 'TOF-grid|gridded|spectra|points|error|panic'
           if (Test-Path msconvert.mzpeak) { Write-Host "msconvert bytes: $((Get-Item msconvert.mzpeak).Length)" }
       - name: Upload archives
         if: always()
