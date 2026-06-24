@@ -133,13 +133,13 @@ internal sealed class Clearcore2Api
     private static readonly object _gate = new();
 
     private readonly Type _factoryType;
-    private readonly MethodInfo _createDataProvider;
+    private readonly Type _providerType;
     private readonly MethodInfo _createBatch;
 
-    private Clearcore2Api(Type factoryType, MethodInfo createDataProvider, MethodInfo createBatch)
+    private Clearcore2Api(Type factoryType, Type providerType, MethodInfo createBatch)
     {
         _factoryType = factoryType;
-        _createDataProvider = createDataProvider;
+        _providerType = providerType;
         _createBatch = createBatch;
     }
 
@@ -181,22 +181,26 @@ internal sealed class Clearcore2Api
                 try { Assembly.LoadFrom(dll); } catch { /* skip unloadable */ }
             }
 
+            // Real Clearcore2 (Analyst/SCIEX) API (verified by reflection against the pwiz Clearcore2
+            // build): the factory lives in `Clearcore2.Data.AnalystDataProvider` (NOT the assumed
+            // `...DataAccess.SampleData`), there is NO `CreateDataProvider`, and the WIFF provider is
+            // constructed directly: `new AnalystWiffDataProvider()` → `CreateBatch(path, provider)`.
             var factoryType =
-                FindType("Clearcore2.Data.DataAccess.SampleData.AnalystDataProviderFactory")
+                FindType("Clearcore2.Data.AnalystDataProvider.AnalystDataProviderFactory")
                 ?? throw new TypeLoadException(
                     "AnalystDataProviderFactory not found among the loaded Clearcore2 assemblies");
 
-            var createDataProvider =
-                FindStaticMethod(factoryType, "CreateDataProvider")
-                ?? throw new MissingMethodException(
-                    "AnalystDataProviderFactory.CreateDataProvider not found");
+            var providerType =
+                FindType("Clearcore2.Data.AnalystDataProvider.AnalystWiffDataProvider")
+                ?? throw new TypeLoadException(
+                    "AnalystWiffDataProvider not found among the loaded Clearcore2 assemblies");
 
             var createBatch =
                 FindStaticMethod(factoryType, "CreateBatch")
                 ?? throw new MissingMethodException(
                     "AnalystDataProviderFactory.CreateBatch not found");
 
-            _instance = new Clearcore2Api(factoryType, createDataProvider, createBatch);
+            _instance = new Clearcore2Api(factoryType, providerType, createBatch);
             return _instance;
         }
     }
@@ -204,8 +208,10 @@ internal sealed class Clearcore2Api
     /// <summary>Open a WIFF and build the flattened spectrum index.</summary>
     public WiffSession Open(string wiffPath)
     {
-        // provider = CreateDataProvider("", true)  (the empty-string/true args mirror WiffFile.cpp)
-        var provider = InvokeCreateDataProvider();
+        // provider = new AnalystWiffDataProvider()  (parameterless ctor; the real Clearcore2 API has
+        // no factory CreateDataProvider — you construct the provider and pass it to CreateBatch).
+        var provider = Activator.CreateInstance(_providerType)
+            ?? throw new InvalidOperationException("AnalystWiffDataProvider construction returned null");
         // batch = CreateBatch(wiffPath, provider)
         var batch = _createBatch.Invoke(null, new object?[] { wiffPath, provider })
             ?? throw new InvalidOperationException("CreateBatch returned null");
@@ -213,21 +219,6 @@ internal sealed class Clearcore2Api
         var session = new WiffSession { Provider = provider, Batch = batch };
         BuildIndex(session);
         return session;
-    }
-
-    private object InvokeCreateDataProvider()
-    {
-        // CreateDataProvider has had a few overloads across versions: (string,bool), (string),
-        // and (). Try them in decreasing specificity.
-        var ps = _createDataProvider.GetParameters();
-        object?[] args = ps.Length switch
-        {
-            2 => new object?[] { "", true },
-            1 => new object?[] { "" },
-            _ => Array.Empty<object?>(),
-        };
-        return _createDataProvider.Invoke(null, args)
-            ?? throw new InvalidOperationException("CreateDataProvider returned null");
     }
 
     /// <summary>
