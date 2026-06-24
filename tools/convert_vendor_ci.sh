@@ -125,8 +125,18 @@ convert() {  # id format input raw_bytes
   # 1) INSPECT (proposal "explore" half) — format, #spectra, #chromatograms
   local spectra; spectra="$(inspect "$id" "$in")"
 
-  # 2) CONVERT (measured baseline)
-  if "$bin" "$in" --via-msconvert -o "$a" --force >"$logs/$id.log" 2>&1 && [ -f "$a" ]; then
+  # 2) CONVERT with the best-shippable per-vendor encoding (strategy-locked 2026-06-24), --no-vendor
+  #    so the ratio reflects the DATA representation (not raw blobs re-embedded):
+  #      - Agilent .d  → file-direct flight-time grid (strategy B, lossless): --agilent-grid
+  #      - SCIEX .wiff → msconvert→mzML + DETECTED grid (strategy A, opt-in, bounded-lossy): --tof-grid auto
+  #      - Waters .raw → msconvert→mzML + DETECTED grid (strategy A): --tof-grid auto
+  local flags
+  case "$fmt" in
+    agilent-d)  flags="--agilent-grid --no-vendor" ;;
+    sciex-wiff) flags="--via-msconvert --tof-grid auto --no-vendor" ;;
+    *)          flags="--via-msconvert --tof-grid auto --no-vendor" ;;
+  esac
+  if "$bin" "$in" $flags -o "$a" --force >"$logs/$id.log" 2>&1 && [ -f "$a" ]; then
     local mp; mp="$(sizeof "$a")"
     local r; r="$(awk -v m="$mp" -v w="$raw" 'BEGIN{ if(w>0) printf "%.4f", m/w; else print "NA"}')"
     printf '%s\t%s\tOK\t%s\t%s\t%s\t%s\n' "$id" "$fmt" "$raw" "$mp" "$r" "$(basename "$in")" >> "$tsv"
