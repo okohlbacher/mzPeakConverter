@@ -15,6 +15,7 @@ path = "src/main.rs"
 arrow = "=57.0.0"
 parquet = { version = "=57.0.0", features = ["encryption"] }
 zip = "=4.1.0"
+libloading = "0.8"   # vendor native-DLL loading (Bruker BAF, Waters MassLynx); cross-platform compile
 mzdata = { version = "=0.65.2", features = ["imzml", "serde", "bruker_tdf", "thermo", "nalgebra", "zstd", "numpress"] }
 mzpeaks = "=1.0.9"
 
@@ -52,10 +53,6 @@ env_logger = "0.11"
 # Vendor-SDK readers are compiled in automatically on the platforms where the proprietary vendor
 # libraries exist (see the cfg-gated modules in src/main.rs) — no opt-in feature, "on by default
 # where available". They load the vendor DLLs at runtime and report a clear error if absent.
-
-# Bruker BAF (Q-TOF) via libbaf2sql_c — Windows + Linux (not macOS).
-[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
-libloading = "0.8"
 
 # In-process .NET hosting for the native Agilent (MHDAC) / SciEX (Clearcore2) glue — Windows only.
 [target.'cfg(windows)'.dependencies]

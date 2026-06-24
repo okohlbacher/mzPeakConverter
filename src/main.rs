@@ -36,7 +36,8 @@ mod agilent_midac;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod sciex;
-#[cfg(windows)]
+// libloading-based (cross-platform compile); only *runs* on Windows with the MassLynx DLLs, so the
+// `convert_waters` dispatch stays `#[cfg(windows)]` and the reader is dead code off-Windows.
 #[allow(dead_code)]
 mod waters;
 mod agilent_profile;
