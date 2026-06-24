@@ -54,6 +54,7 @@ jobs:
       - name: Build C# interop glues (reflection-only, no vendor DLLs)
         run: |
           dotnet build glue/sciex/SciexGlue.csproj -c Release
+          dotnet build glue/waters/WatersGlue.csproj -c Release
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
           dotnet build glue/agilent_midac/AgilentMidacGlue.csproj -c Release
 

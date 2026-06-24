@@ -36,6 +36,9 @@ mod agilent_midac;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod sciex;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod waters;
 mod agilent_profile;
 mod bruker_native;
 mod bruker_tsf;
@@ -564,6 +567,14 @@ fn report_inspect(input: &Path) -> Result<()> {
         println!("note:          native SciEX reading needs a `--features sciex` build (or use --via-msconvert)");
         return Ok(());
     }
+    if is_waters_raw(input) {
+        println!("format:        Waters MassLynx .raw");
+        #[cfg(windows)]
+        println!("spectra:       {}", waters::WatersReader::open(input)?.len());
+        #[cfg(not(windows))]
+        println!("note:          native Waters reading needs the waters feature on Windows (or use --via-msconvert)");
+        return Ok(());
+    }
     let reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input)
         .with_context(|| format!("opening {}", input.display()))?;
     println!("format:        {}", reader_format(&reader));
@@ -588,6 +599,39 @@ fn is_wiff(input: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("wiff") || e.eq_ignore_ascii_case("wiff2"))
 }
 
+/// True for a Waters MassLynx `.raw`. Unlike a Thermo `.raw` (a single FILE), a Waters `.raw` is
+/// a DIRECTORY with a `.raw` extension that holds `_HEADER.TXT` and per-function `_FUNCnnn.DAT`
+/// files. Requiring `is_dir()` keeps it from colliding with the Thermo `.raw` file; the
+/// `_HEADER.TXT` / `_FUNC*.DAT` marker keeps it from colliding with Bruker/Agilent `.d` dirs.
+fn is_waters_raw(input: &Path) -> bool {
+    if !input.is_dir() {
+        return false;
+    }
+    let is_dot_raw = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("raw"));
+    if !is_dot_raw {
+        return false;
+    }
+    if input.join("_HEADER.TXT").exists() {
+        return true;
+    }
+    // Otherwise accept any `_FUNC*.DAT` (case-insensitive) inside the directory.
+    let Ok(entries) = std::fs::read_dir(input) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            let upper = name.to_ascii_uppercase();
+            if upper.starts_with("_FUNC") && upper.ends_with(".DAT") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Reject inputs that have no native reader on THIS platform, with actionable guidance. The native
 /// vendor readers are compiled in where the vendor libraries exist (Agilent/SciEX: Windows; Bruker
 /// BAF: Windows + Linux); elsewhere the `--via-msconvert` lane is the path.
@@ -605,6 +649,15 @@ fn guard_unsupported_vendor(input: &Path) -> Result<()> {
     if is_wiff(input) {
         return Err(UnsupportedVendor(
             "SciEX .wiff native reading is available only on Windows (Clearcore2 vendor SDK). \
+             On this platform use `--via-msconvert`."
+                .to_string(),
+        )
+        .into());
+    }
+    #[cfg(not(windows))]
+    if is_waters_raw(input) {
+        return Err(UnsupportedVendor(
+            "Waters MassLynx .raw native reading is available only on Windows (MassLynx vendor SDK). \
              On this platform use `--via-msconvert`."
                 .to_string(),
         )
@@ -1257,6 +1310,10 @@ fn convert_file(
     if is_wiff(input) {
         return convert_sciex(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
+    #[cfg(windows)]
+    if is_waters_raw(input) {
+        return convert_waters(input, output, chunk, zstd_level, vendor, synth_chroms);
+    }
     // mzdata panics on an empty self-closing <referenceableParamGroup/> that is later referenced
     // (ProteomeDiscoverer emits these). If present, convert from a sanitized copy instead.
     let sanitized = sanitize_param_groups(input)?;
@@ -1739,6 +1796,25 @@ fn convert_sciex(
     // a glue extension to surface SCIEX's calibration. Until then `.wiff` stores exact f64 m/z. The
     // statistical detector (strategy A) is deliberately NOT used here — it is gated to the mzML path.
     let reader = sciex::SciexReader::open(input)?;
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+}
+
+/// Convert a Waters MassLynx `.raw` → mzPeak via the MassLynx .NET glue (Windows-runtime-only,
+/// UNTESTED here). Mirrors `convert_sciex`. Needs `$MZPC_WATERS_GLUE` + `$MZPC_MASSLYNX_DIR` at
+/// runtime (see glue/waters/README.md).
+#[cfg(windows)]
+fn convert_waters(
+    input: &Path,
+    output: &Path,
+    chunk: Option<ChunkingStrategy>,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+) -> Result<()> {
+    // Native `.raw` is read through MassLynx, which exposes decoded f64 m/z (not the raw flight-time
+    // index or the mass-calibration coefficients). The statistical TOF-grid detector (strategy A) is
+    // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
+    let reader = waters::WatersReader::open(input)?;
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
