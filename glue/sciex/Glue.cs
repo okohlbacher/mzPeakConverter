@@ -401,10 +401,47 @@ internal sealed class Clearcore2Api
             BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy);
     }
 
+    // Resolve an instance method by name AND arity/argument types. Clearcore2 overloads several
+    // members (e.g. GetMassSpectrum has Int32/(Int32,Int32)/Double/(Double,Double) variants), so a
+    // bare GetMethod(name) throws AmbiguousMatchException — pick the overload whose parameters accept
+    // the supplied args.
+    private static MethodInfo? ResolveMethod(Type t, string method, object?[] args)
+    {
+        MethodInfo? fallback = null;
+        foreach (var m in t.GetMethods(
+                     BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy))
+        {
+            if (m.Name != method)
+            {
+                continue;
+            }
+            var ps = m.GetParameters();
+            if (ps.Length != args.Length)
+            {
+                continue;
+            }
+            bool ok = true;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (args[i] != null && !ps[i].ParameterType.IsAssignableFrom(args[i]!.GetType()))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok)
+            {
+                return m;
+            }
+            fallback ??= m; // same name + arity but a type mismatch — last resort
+        }
+        return fallback;
+    }
+
     private static object? Invoke(object target, string method, params object?[] args)
     {
         var t = target.GetType();
-        var m = t.GetMethod(method, BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+        var m = ResolveMethod(t, method, args)
             ?? throw new MissingMethodException(t.FullName, method);
         return m.Invoke(target, args.Length == 0 ? null : args);
     }
@@ -413,8 +450,7 @@ internal sealed class Clearcore2Api
     {
         try
         {
-            var m = target.GetType().GetMethod(
-                method, BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+            var m = ResolveMethod(target.GetType(), method, args);
             return m?.Invoke(target, args.Length == 0 ? null : args);
         }
         catch
