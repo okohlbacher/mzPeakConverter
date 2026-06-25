@@ -54,7 +54,15 @@ print(pts, sig)
 PY
 }
 
-sizeof() { du -sk "$1" 2>/dev/null | awk '{print $1*1024}'; }
+# raw footprint: a directory (.d/.raw) counts everything; a FILE counts its vendor sidecars too
+# (imzML binary data lives in the .ibd; SCIEX .wiff carries .wiff.scan/.wiff2 — handled on the box).
+sizeof() {
+  local p="$1" t; t=$(du -sk "$p" 2>/dev/null | awk '{print $1*1024}')
+  case "$p" in
+    *.imzML) local ibd="${p%.imzML}.ibd"; [ -f "$ibd" ] && t=$((t + $(du -sk "$ibd" | awk '{print $1*1024}'))) ;;
+  esac
+  echo "$t"
+}
 ratio()  { awk -v m="$1" -v r="$2" 'BEGIN{if(r>0) printf "%.3f", m/r; else print "NA"}'; }
 bpp()    { awk -v b="$1" -v p="$2" 'BEGIN{if(p>0) printf "%.2f", b/p; else print "NA"}'; }
 
