@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use mzdata::prelude::*;
+use mzdata::spectrum::SpectrumDescription;
 use mzpeak_prototyping::MzPeakReader;
 
 #[derive(Parser)]
@@ -48,6 +49,21 @@ fn meta_of<R: SpectrumLike>(s: &R) -> Meta {
         key: (
             s.ms_level(),
             (s.start_time() * 60000.0).round() as i64, // rt in ms (start_time is minutes)
+            (pmz * 100.0).round() as i64,
+        ),
+    }
+}
+
+// SpectrumDescription (returned by metadata-only reads) doesn't implement SpectrumLike.
+fn meta_from_descr(d: &SpectrumDescription) -> Meta {
+    let pmz = d.precursor.as_ref().and_then(|p| p.ion()).map(|i| i.mz).unwrap_or(0.0);
+    let rt = d.acquisition.first_scan().map(|s| s.start_time).unwrap_or(0.0);
+    Meta {
+        index: d.index,
+        id: d.id.clone(),
+        key: (
+            d.ms_level,
+            (rt * 60000.0).round() as i64,
             (pmz * 100.0).round() as i64,
         ),
     }
@@ -106,7 +122,7 @@ fn main() -> std::io::Result<()> {
     let mut b_by_key: HashMap<(u8, i64, i64), VecDeque<usize>> = HashMap::new();
     for idx in 0..nb {
         if let Some(d) = breader.get_spectrum_metadata(idx as u64)? {
-            let m = meta_of(&d);
+            let m = meta_from_descr(&d);
             b_by_id.insert(m.id.clone(), idx);
             b_by_key.entry(m.key).or_default().push_back(idx);
         }
