@@ -561,7 +561,15 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_wiff(input) {
         println!("format:        SciEX .wiff");
         #[cfg(windows)]
-        println!("spectra:       {}", sciex::SciexReader::open(input)?.len());
+        {
+            let r = sciex::SciexReader::open(input)?;
+            // MZPC_SCIEX_RAW_STATS: dump per-MS-level SDK raw point counts (pre-grid ground truth)
+            if std::env::var_os("MZPC_SCIEX_RAW_STATS").is_some() {
+                r.raw_stats()?;
+            } else {
+                println!("spectra:       {}", r.len());
+            }
+        }
         #[cfg(not(windows))]
         println!("note:          native SciEX reading needs a `--features sciex` build (or use --via-msconvert)");
         return Ok(());
@@ -894,14 +902,25 @@ fn tof_index_peak_schema(grid: &tof_grid::TofGrid) -> ArrayBuffersBuilder {
 /// Finalize a TOF-grid archive: write the `tof_calibration` index block (so readers recover
 /// `m/z = (c0 + c1·tof_index)²`), embed vendor files when the input is a Bruker `.d`, finish the
 /// ZIP, and rename the temp into place. Shared by the mzML and native-vendor TOF-grid paths.
+/// Declare the converter-owned MZP CV (`cv/mzpeak.obo`) in the archive's `cv_list`. The grid paths
+/// emit MZP transform/coefficient terms; the writer otherwise seeds only MS+UO. Call before
+/// `finish_parquet()` (which writes the cv_list). `ControlledVocabulary::Unknown.into()` resolves to
+/// the MZP entry via the `From<ControlledVocabulary>` impl in `mzpeak_prototyping::param`.
+fn register_mzp_cv(writer: &mut MzPeakWriterType<fs::File>) {
+    writer
+        .controlled_vocabularies_mut()
+        .push(ControlledVocabulary::Unknown.into());
+}
+
 fn finish_tof_grid_archive(
-    writer: MzPeakWriterType<fs::File>,
+    mut writer: MzPeakWriterType<fs::File>,
     tmp: &Path,
     output: &Path,
     input: &Path,
     grid: &tof_grid::TofGrid,
     vendor: Option<&vendor::VendorPolicy>,
 ) -> Result<()> {
+    register_mzp_cv(&mut writer);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     let cal = serde_json::json!({
         "codec": "tof-grid",
@@ -1012,18 +1031,20 @@ fn tof_grid_spectrum(
     Ok(TofRoute::Gridded(MultiLayerSpectrum::new(descr, Some(out), None, None)))
 }
 
-/// Local CURIEs for the per-spectrum TOF-grid coefficients (Agilent profile grid drifts scan-to-scan
-/// — `base`/`coeff` vary per scan — so a single run-wide `[c0,c1]` is ~100 ppm off; we store c0/c1 as
-/// per-spectrum columns instead). MS:4000900/4000901 are unused local accessions reserved for this
-/// converter's grid handoff; a reader recovers `m/z = (tof_c0 + tof_c1·tof_index)²` per spectrum.
+/// Converter-owned MZP CV terms for the per-spectrum TOF-grid coefficients (Agilent profile grid
+/// drifts scan-to-scan — `base`/`coeff` vary per scan — so a single run-wide `[c0,c1]` is ~100 ppm
+/// off; we store c0/c1 as per-spectrum columns instead). Represented as `Unknown`-CV CURIEs that the
+/// writer renders with the `MZP:` prefix (see `cv/mzpeak.obo` + `param::curie_to_string`); a reader
+/// recovers `m/z = (tof_c0 + tof_c1·tof_index)²` per spectrum. Provisional pending PSI-MS terms
+/// (BACKLOG.md #1). MZP:1000003 = c0, MZP:1000004 = c1, MZP:1000005 = calibration id.
 const TOF_C0_CURIE: mzdata::params::CURIE =
-    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_900);
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_003);
 const TOF_C1_CURIE: mzdata::params::CURIE =
-    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_901);
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_004);
 /// Per-spectrum CalibrationID column — selects the polynomial-refinement row in the
 /// `tof_calibration` index block, so the EXACT MassHunter m/z (quadratic + polynomial) reconstructs.
 const TOF_CALID_CURIE: mzdata::params::CURIE =
-    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_902);
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_005);
 
 /// FILE-DIRECT Agilent Q-TOF profile converter: read the integer flight-time grid straight from
 /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC) and write the SAME `tof_index` (Int32) + intensity
@@ -1170,6 +1191,7 @@ fn convert_agilent_grid(
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
 
+    register_mzp_cv(&mut writer);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     let cal = serde_json::json!({
         "codec": "tof-grid",
@@ -1643,6 +1665,7 @@ fn convert_ims_compact_archive(
     fixup_run_metadata(&mut writer, input);
 
     // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename.
+    register_mzp_cv(&mut writer);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     zip.add_index_metadata("ims_calibration", &reader.calibration_json())
         .context("writing ims_calibration index")?;
@@ -1973,6 +1996,7 @@ fn convert_sciex_grid(
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
 
+    register_mzp_cv(&mut writer);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     let cal = if use_sqrt {
         serde_json::json!({

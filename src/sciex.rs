@@ -367,6 +367,31 @@ impl SciexReader {
         &self.wiff_path
     }
 
+    /// SDK ground-truth diagnostic: sum the raw `NumDataPoints` (the SDK m/z array length, BEFORE
+    /// any TOF-grid binning) per MS level, with the profile/centroid split. Lets us see exactly
+    /// what the Clearcore2 reader yields, independent of pwiz and of our writer. Diagnostic only.
+    pub fn raw_stats(&self) -> Result<()> {
+        use std::collections::BTreeMap;
+        // ms_level -> (n_spectra, raw_points, n_profile, n_centroid)
+        let mut by: BTreeMap<i32, (u64, u64, u64, u64)> = BTreeMap::new();
+        for i in 0..self.len() {
+            let m = self.meta(i)?;
+            let (mz, _intensity) = self.peaks(i)?;
+            let e = by.entry(m.ms_level).or_insert((0, 0, 0, 0));
+            e.0 += 1;
+            e.1 += mz.len() as u64;
+            if m.signal_continuity == 1 { e.3 += 1 } else { e.2 += 1 }
+        }
+        let (mut ts, mut tp) = (0u64, 0u64);
+        for (ms, (n, p, prof, cen)) in &by {
+            println!("MS{ms}: spectra={n} raw_points={p} profile={prof} centroid={cen}");
+            ts += n;
+            tp += p;
+        }
+        println!("TOTAL: spectra={ts} raw_points={tp}");
+        Ok(())
+    }
+
     /// Fetch one spectrum's scalar metadata via the glue.
     fn meta(&self, i: usize) -> Result<SciexSpectrumMeta> {
         let index = i64::try_from(i).map_err(|_| anyhow!("SciEX index {i} does not fit in i64"))?;
