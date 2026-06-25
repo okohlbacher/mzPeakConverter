@@ -11,9 +11,7 @@ thermo_velos	Thermo	LTQ Orbitrap Velos	raw	host	/Users/kohlbach/Claude/mzML2mzPe
 thermo_ltqft	Thermo	LTQ-FT Ultra	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-ltq-ft-ultra-MTBLS3512/mtab_BIOS_CRAM1620_1_072617_34.RAW	--no-vendor	MTBLS3512
 thermo_lumos	Thermo	Fusion Lumos	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-fusion-lumos-PXD008952/01_CPTAC_TMTS1-NCI7_P_JHUZ_20170509_LUMOS.raw	--no-vendor	PXD008952
 thermo_astral	Thermo	Astral	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-astral-MSV000100943/20240912_WFB_exp01_magnet_5_0.raw	--no-vendor	MSV000100943
-bruker_urine_tsf	Bruker	timsTOF TSF (line)	d	host	/Users/kohlbach/Claude/mzPeak/BRFP/fixtures/private/timsTOF_autoMSMS_Urine_6min_pos.d	--no-vendor	BRFP-fixture
 bruker_sba415_tdf	Bruker	timsTOF TDF (IMS)	d	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/bruker-timstof-MSV000101607/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d	--no-vendor	MSV000101607
-bruker_diapasef_tdf	Bruker	timsTOF TDF (IMS)	d	host	/Users/kohlbach/Claude/mzPeak OpenMS/mzdata/test/data/diaPASEF.d	--no-vendor	mzdata-test
 agilent_qtof	Agilent	Q-TOF profile	d	host	/Users/kohlbach/Claude/mzML2mzPeak/data/vendor-agilent-sciex/agilent/PXD041315/LMVCS24HC.d	--agilent-grid --no-vendor	PXD041315
 sciex_zenotof	SCIEX	ZenoTOF 7600	wiff	box	C:/Users/User/vendor-data/zenotof/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff	--no-vendor	v09-objstore
 sciex_swath	SCIEX	TripleTOF SWATH	wiff	box	C:/Users/User/vendor-data/swath/SW_F2_2-2.wiff	--no-vendor	PXD078909
