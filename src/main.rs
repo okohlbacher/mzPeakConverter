@@ -1940,7 +1940,11 @@ fn convert_sciex_grid(
             .and_then(|a| a.mzs().ok())
             .map(|c| c.into_owned())
             .unwrap_or_default();
-        let out = if use_sqrt {
+        let out = if mz.is_empty() {
+            // Empty spectrum (no peaks to grid): route to the (always-present) data facet. This is a
+            // structural degenerate case, NOT statistical per-spectrum routing of real data.
+            sciex_f64_spectrum(spec, &mass_spectrum)
+        } else if use_sqrt {
             // Profile run: every spectrum onto the shared global-c1 lattice (per-spectrum c0). The run
             // was chosen sqrt because all probes grid, so this always fits; force as a last resort.
             let (grid, tof_index, ppm) = c1_global
