@@ -14,7 +14,8 @@ out="${TMPDIR:-/tmp}/rerun_tests"
 passthru=()
 while [ $# -gt 0 ]; do case "$1" in
   --out) out="$2"; shift 2;;
-  --box|--only) passthru+=("$1" "$2"); [ "$1" = --box ] && shift || shift 2;;
+  --box) passthru+=("$1"); shift;;
+  --only) passthru+=("$1" "$2"); shift 2;;
   *) passthru+=("$1"); shift;;
 esac; done
 
