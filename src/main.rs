@@ -1855,10 +1855,11 @@ fn convert_sciex_grid(
     // sqrt flight-time grid (`tof_index`, m/z = (c0+c1·k)²). Otherwise (centroid / mixed, e.g. SWATH
     // whose MS2 windows are centroided OFF the lattice) store a UNIFORM m/z grid (m/z = k/scale). BOTH
     // are integer-grid representations — there is NO f64 fallback facet, so a run is one or the other.
-    let use_sqrt = c1_global.is_some()
-        && probes
-            .iter()
-            .all(|s| s.description().signal_continuity != mzdata::spectrum::SignalContinuity::Centroid);
+    // Decide by LATTICE FIT, not the (unreliable) continuity flag: sqrt iff every dense probe grids
+    // against the global clock. SWATH's centroid MS2 probes fail this → uniform; ZenoTOF's all pass.
+    let use_sqrt = c1_global.is_some_and(|c1| {
+        !samples.is_empty() && samples.iter().all(|s| tof_grid::fit_one_c1(s, c1).is_some())
+    });
     let transform = if use_sqrt {
         mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof
     } else {
