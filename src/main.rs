@@ -701,6 +701,9 @@ fn convert_via_msconvert(
     let mut cmd = Command::new(&exe);
     cmd.arg(input)
         .arg("--mzML")
+        // Newer instruments (e.g. SCIEX ZenoTOF 7600) fail the pwiz instrument-model lookup and
+        // abort the whole conversion; ignore that non-fatal check so the mzML still gets written.
+        .arg("--ignoreUnknownInstrumentError")
         .arg("--outdir")
         .arg(&tmpdir)
         .arg("--outfile")
