@@ -1855,10 +1855,13 @@ fn convert_sciex_grid(
     // sqrt flight-time grid (`tof_index`, m/z = (c0+c1·k)²). Otherwise (centroid / mixed, e.g. SWATH
     // whose MS2 windows are centroided OFF the lattice) store a UNIFORM m/z grid (m/z = k/scale). BOTH
     // are integer-grid representations — there is NO f64 fallback facet, so a run is one or the other.
-    // Decide by LATTICE FIT, not the (unreliable) continuity flag: sqrt iff every dense probe grids
-    // against the global clock. SWATH's centroid MS2 probes fail this → uniform; ZenoTOF's all pass.
+    // Decide by LATTICE FIT, not the (unreliable) continuity flag: sqrt iff MOST dense probes grid
+    // against the global clock (≥80%). ZenoTOF (profile, a few stragglers) passes → sqrt; SWATH (its
+    // probes are mostly centroid MS2) fails → uniform m/z grid.
     let use_sqrt = c1_global.is_some_and(|c1| {
-        !samples.is_empty() && samples.iter().all(|s| tof_grid::fit_one_c1(s, c1).is_some())
+        let n = samples.len();
+        let g = samples.iter().filter(|s| tof_grid::fit_one_c1(s, c1).is_some()).count();
+        n > 0 && g * 5 >= n * 4
     });
     let transform = if use_sqrt {
         mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof
@@ -1991,12 +1994,13 @@ fn sciex_grid_spectrum(
     grid: tof_grid::TofGrid,
     mass_spectrum: &Param,
 ) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
-    let intensity: Vec<f32> = spec
+    let mut intensity: Vec<f32> = spec
         .arrays
         .as_ref()
         .and_then(|a| a.intensities().ok())
         .map(|c| c.into_owned())
         .unwrap_or_default();
+    intensity.resize(tof_index.len(), 0.0); // one intensity per peak (writer requires equal lengths)
 
     let mut out = BinaryArrayMap::new();
     let mut tof_da =
@@ -2028,12 +2032,13 @@ fn sciex_linear_spectrum(
     mz_index: &[i32],
     mass_spectrum: &Param,
 ) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
-    let intensity: Vec<f32> = spec
+    let mut intensity: Vec<f32> = spec
         .arrays
         .as_ref()
         .and_then(|a| a.intensities().ok())
         .map(|c| c.into_owned())
         .unwrap_or_default();
+    intensity.resize(mz_index.len(), 0.0); // guarantee one intensity per peak (writer requires equal lengths)
     let mut out = BinaryArrayMap::new();
     let mut tof_da =
         DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
