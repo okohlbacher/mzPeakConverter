@@ -508,13 +508,19 @@ pub enum BufferTransform {
     /// without bespoke ims-compact handling. NOTE: the CURIE is PROVISIONAL (converter-local), to be
     /// replaced by the assigned PSI term once the mzPeak specification defines it.
     SqrtMzFromTof,
+    /// Reconstruct m/z from an integer column as `m/z = scale·k` (a UNIFORM m/z grid, vs the sqrt
+    /// flight-time grid). `scale` rides in `transform_params`. Used for centroid/mixed TOF runs
+    /// (e.g. SWATH MS2) whose peaks are off the flight-time lattice but pack tightly as
+    /// delta-encoded scaled integers. PROVISIONAL converter-local CURIE.
+    LinearMz,
 }
 
 const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
 const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
-// PROVISIONAL accession (follows the writer's local null-transform numbering 1003901/1003902); not
-// yet an official PSI term — see BufferTransform::SqrtMzFromTof.
+// PROVISIONAL accessions (follow the writer's local null-transform numbering 1003901/1003902); not
+// yet official PSI terms — see BufferTransform::SqrtMzFromTof.
 const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003903);
+const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003904);
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -525,6 +531,7 @@ impl BufferTransform {
             x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
             x if x == NULL_ZERO => Some(Self::NullZero),
             x if x == SQRT_MZ_FROM_TOF => Some(Self::SqrtMzFromTof),
+            x if x == LINEAR_MZ => Some(Self::LinearMz),
             _ => None,
         }
     }
@@ -539,6 +546,7 @@ impl BufferTransform {
             // The stored column is the raw integer TOF; the transform is a reconstruction formula, not
             // a re-encoding, so it does not rename the column.
             BufferTransform::SqrtMzFromTof => None,
+            BufferTransform::LinearMz => None,
         }
     }
 
@@ -562,6 +570,7 @@ impl BufferTransform {
             BufferTransform::NullInterpolate => NULL_INTERPOLATE,
             BufferTransform::NullZero => NULL_ZERO,
             BufferTransform::SqrtMzFromTof => SQRT_MZ_FROM_TOF,
+            BufferTransform::LinearMz => LINEAR_MZ,
         }
     }
 }

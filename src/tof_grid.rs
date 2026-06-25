@@ -272,6 +272,43 @@ pub fn fit_one_c1(mzs: &[f64], c1: f64) -> Option<(TofGrid, Vec<i32>, f64)> {
     }
 }
 
+/// Like [`fit_one_c1`] but ALWAYS returns a grid (no ppm gate) — for the all-or-nothing sqrt path
+/// where the run was already chosen as profile-on-lattice, so a stray spectrum must still grid.
+/// `c1` must be > 0 (the caller passes the run-wide global clock).
+pub fn force_grid_c1(mzs: &[f64], c1: f64) -> (TofGrid, Vec<i32>, f64) {
+    let s_min = mzs
+        .iter()
+        .filter(|&&m| m > 0.0)
+        .map(|&m| m.sqrt())
+        .fold(f64::INFINITY, f64::min);
+    let s_min = if s_min.is_finite() { s_min } else { 0.0 };
+    let (mut sum, mut cnt) = (0.0f64, 0.0f64);
+    for &m in mzs {
+        if m > 0.0 {
+            let y = m.sqrt();
+            sum += y - c1 * ((y - s_min) / c1).round();
+            cnt += 1.0;
+        }
+    }
+    let c0 = if cnt > 0.0 { sum / cnt } else { s_min };
+    let grid = TofGrid { c0, c1 };
+    let mut idx = Vec::with_capacity(mzs.len());
+    let mut max_ppm = 0.0f64;
+    for &m in mzs {
+        let k = if m > 0.0 {
+            (((m.sqrt() - c0) / c1).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        } else {
+            0
+        };
+        if m > 0.0 {
+            let rec = grid.mz(k);
+            max_ppm = max_ppm.max((rec - m).abs() / m * 1e6);
+        }
+        idx.push(k);
+    }
+    (grid, idx, max_ppm)
+}
+
 /// Try to fit a run-wide TOF grid over the pooled sampled m/z from several spectra.
 ///
 /// Strategy — target the NATURAL lattice, not the finest one:
