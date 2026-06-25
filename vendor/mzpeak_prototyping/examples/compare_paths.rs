@@ -126,6 +126,12 @@ fn main() -> std::io::Result<()> {
     let (mut gmax_ppm, mut gmax_int) = (0f64, 0f64);
     let mut peak_perfect = 0u64; // matched spectra with zero a_only+b_only peaks
     let mut worst: Vec<(String, u64, u64, f64)> = Vec::new(); // id, a_only, b_only, max_ppm
+    // C: per-MS-level breakdown [spectra, peaks_matched, peaks_a_only, peaks_b_only].
+    let mut per_level: std::collections::BTreeMap<u8, [u64; 4]> = std::collections::BTreeMap::new();
+    // C: decode-gap guard — A spectra that decoded to ZERO points (neither profile m/z nor peaks).
+    // A future decode regression (e.g. an unapplied grid transform) would spike this instead of being
+    // silently mis-counted as "peaks lost".
+    let mut a_empty_decode = 0u64;
 
     for aidx in 0..na {
         let aspec = match areader.get_spectrum(aidx) {
@@ -133,6 +139,16 @@ fn main() -> std::io::Result<()> {
             None => continue,
         };
         let am = meta_of(&aspec);
+
+        // C: flag a fully-empty decode (no profile m/z and no peaks) — a potential decode gap.
+        let a_pts = aspec
+            .raw_arrays()
+            .and_then(|m| m.mzs().ok().map(|v| v.len()))
+            .unwrap_or(0)
+            + aspec.peaks().len();
+        if a_pts == 0 {
+            a_empty_decode += 1;
+        }
 
         // find a B match: id first, else an unused entry under the same key
         let bidx = if let Some(&bi) = b_by_id.get(&am.id).filter(|&&bi| !b_used[bi]) {
@@ -169,6 +185,11 @@ fn main() -> std::io::Result<()> {
         };
         if let (Ok(amz), Ok(ai), Ok(bmz), Ok(bi)) = (amz, ai, bmz, bi) {
             let (m, ao, bo, mp, mi) = diff_peaks(&amz, &ai, &bmz, &bi, args.ppm);
+            let lvl = per_level.entry(am.key.0).or_insert([0u64; 4]);
+            lvl[0] += 1;
+            lvl[1] += m;
+            lvl[2] += ao;
+            lvl[3] += bo;
             tot_match += m;
             tot_aonly += ao;
             tot_bonly += bo;
@@ -186,6 +207,16 @@ fn main() -> std::io::Result<()> {
         }
     }
     let b_only_spectra = b_used.iter().filter(|&&u| !u).count() as u64;
+
+    let per_level_json: Vec<String> = per_level
+        .iter()
+        .map(|(lvl, v)| {
+            format!(
+                "{{\"ms_level\":{},\"spectra\":{},\"peaks_matched\":{},\"peaks_a_only\":{},\"peaks_b_only\":{}}}",
+                lvl, v[0], v[1], v[2], v[3]
+            )
+        })
+        .collect();
 
     worst.sort_by(|x, y| (y.1 + y.2).cmp(&(x.1 + x.2)));
     let worst_json: Vec<String> = worst
@@ -207,6 +238,7 @@ fn main() -> std::io::Result<()> {
 \"peak_perfect_spectra\":{},\
 \"peaks_matched\":{},\"peaks_a_only\":{},\"peaks_b_only\":{},\
 \"max_abs_ppm\":{:.4},\"max_rel_intensity_diff\":{:.4},\
+\"a_empty_decode\":{},\"per_ms_level\":[{}],\
 \"worst\":[{}]}}",
         args.label,
         args.a.display(),
@@ -225,6 +257,8 @@ fn main() -> std::io::Result<()> {
         tot_bonly,
         gmax_ppm,
         gmax_int,
+        a_empty_decode,
+        per_level_json.join(","),
         worst_json.join(",")
     );
     Ok(())

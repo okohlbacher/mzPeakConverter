@@ -517,12 +517,15 @@ pub enum BufferTransform {
 
 const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
 const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
-// Converter-owned MZP CV terms (see `cv/mzpeak.obo`), represented as `Unknown`-CV CURIEs so mzdata
-// can carry them; the `MZP:` prefix is supplied at the (de)serialisation boundary by
-// `crate::param::curie_to_string`. MZP:1000001 = sqrt-from-TOF transform, MZP:1000002 = linear-m/z
-// grid transform. Provisional pending assigned PSI-MS terms (see BACKLOG.md #1).
-const SQRT_MZ_FROM_TOF: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
-const LINEAR_MZ: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
+// Grid reconstruction transforms, now using their ASSIGNED PSI-MS terms (BACKLOG.md #1):
+//   MS:1003903 = square-root m/z from TOF index, MS:1003904 = linear m/z grid.
+// The provisional converter-owned `MZP:1000001`/`MZP:1000002` (Unknown-CV) CURIEs are still
+// recognized on read (`from_curie`) so archives written before the assignment keep decoding.
+const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003903);
+const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003904);
+// Legacy provisional terms — read-side back-compat only.
+const SQRT_MZ_FROM_TOF_LEGACY: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
+const LINEAR_MZ_LEGACY: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -532,8 +535,8 @@ impl BufferTransform {
             x if x == Self::NumpressLinear.curie() => Some(Self::NumpressLinear),
             x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
             x if x == NULL_ZERO => Some(Self::NullZero),
-            x if x == SQRT_MZ_FROM_TOF => Some(Self::SqrtMzFromTof),
-            x if x == LINEAR_MZ => Some(Self::LinearMz),
+            x if x == SQRT_MZ_FROM_TOF || x == SQRT_MZ_FROM_TOF_LEGACY => Some(Self::SqrtMzFromTof),
+            x if x == LINEAR_MZ || x == LINEAR_MZ_LEGACY => Some(Self::LinearMz),
             _ => None,
         }
     }

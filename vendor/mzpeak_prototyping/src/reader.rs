@@ -1301,6 +1301,46 @@ impl<
             }
         }
 
+        // Per-spectrum TOF-grid refinement (3c): when the description carries per-spectrum sqrt-grid
+        // coefficients (MZP:1000003/1000004 = tof_c0/tof_c1), reconstruct m/z EXACTLY from the stored
+        // `tof_index` using those. The column-level `transform_params` applied during array decode are
+        // only a run-wide hint (and for SCIEX a "0,1" placeholder), so per-spectrum coefficients — when
+        // present — take precedence here.
+        {
+            let pc0 = mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_003);
+            let pc1 = mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_004);
+            let (c0, c1) = {
+                let params = spectrum.description().params();
+                let coeff = |acc: mzdata::params::CURIE| {
+                    params
+                        .iter()
+                        .find(|p| p.curie() == Some(acc))
+                        .and_then(|p| p.to_f64().ok())
+                };
+                (coeff(pc0), coeff(pc1))
+            };
+            if let (Some(c0), Some(c1)) = (c0, c1) {
+                if let Some(arrays) = spectrum.arrays.as_mut() {
+                    if let Some(ks) = arrays
+                        .get(&ArrayType::nonstandard("tof_index"))
+                        .and_then(|tof| tof.to_i32().ok())
+                    {
+                        let mzs: Vec<f64> =
+                            ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect();
+                        let mut mz_da = DataArray::wrap(
+                            &ArrayType::MZArray,
+                            mzdata::spectrum::BinaryDataArrayType::Float64,
+                            Vec::new(),
+                        );
+                        if mz_da.update_buffer(mzs.as_slice()).is_ok() {
+                            mz_da.unit = Unit::MZ;
+                            arrays.add(mz_da);
+                        }
+                    }
+                }
+            }
+        }
+
         Some(spectrum)
     }
 
