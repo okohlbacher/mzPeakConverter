@@ -1858,11 +1858,17 @@ fn convert_sciex_grid(
     // Decide by LATTICE FIT, not the (unreliable) continuity flag: sqrt iff MOST dense probes grid
     // against the global clock (≥80%). ZenoTOF (profile, a few stragglers) passes → sqrt; SWATH (its
     // probes are mostly centroid MS2) fails → uniform m/z grid.
-    let use_sqrt = c1_global.is_some_and(|c1| {
+    let grids = |s: &Vec<f64>| {
+        c1_global
+            .and_then(|c1| tof_grid::fit_one_c1(s, c1))
+            .or_else(|| tof_grid::fit_one(s))
+            .is_some()
+    };
+    let use_sqrt = {
         let n = samples.len();
-        let g = samples.iter().filter(|s| tof_grid::fit_one_c1(s, c1).is_some()).count();
+        let g = samples.iter().filter(|s| grids(s)).count();
         n > 0 && g * 5 >= n * 4
-    });
+    };
     let transform = if use_sqrt {
         mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof
     } else {
@@ -1940,7 +1946,10 @@ fn convert_sciex_grid(
             let (grid, tof_index, ppm) = c1_global
                 .and_then(|c1| tof_grid::fit_one_c1(&mz, c1))
                 .or_else(|| tof_grid::fit_one(&mz))
-                .unwrap_or_else(|| tof_grid::force_grid_c1(&mz, c1_global.unwrap()));
+                .unwrap_or_else(|| match c1_global {
+                    Some(c1) => tof_grid::force_grid_c1(&mz, c1),
+                    None => tof_grid::force_grid(&mz),
+                });
             max_ppm = max_ppm.max(ppm);
             sciex_grid_spectrum(&spec, &tof_index, grid, &mass_spectrum)?
         } else {

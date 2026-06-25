@@ -82,7 +82,7 @@ impl TofGrid {
 /// Estimate the single-step grid spacing in sqrt-m/z space from one spectrum's (unsorted) m/z.
 /// Profile TOF spectra are dense and monotone, so the typical small consecutive gap is one grid
 /// step. Returns `None` if there aren't enough usable points.
-fn base_step(mzs: &[f64]) -> Option<f64> {
+pub(crate) fn base_step(mzs: &[f64]) -> Option<f64> {
     let mut s: Vec<f64> = mzs.iter().filter(|&&m| m > 0.0).map(|&m| m.sqrt()).collect();
     if s.len() < 8 {
         return None;
@@ -307,6 +307,13 @@ pub fn force_grid_c1(mzs: &[f64], c1: f64) -> (TofGrid, Vec<i32>, f64) {
         idx.push(k);
     }
     (grid, idx, max_ppm)
+}
+
+/// Force a per-spectrum grid when no run-wide c1 is available (estimate the step from this
+/// spectrum's √(m/z) gaps, then force). Always returns.
+pub fn force_grid(mzs: &[f64]) -> (TofGrid, Vec<i32>, f64) {
+    let c1 = base_step(mzs).filter(|c| *c > 0.0).unwrap_or(1.0e-4);
+    force_grid_c1(mzs, c1)
 }
 
 /// Try to fit a run-wide TOF grid over the pooled sampled m/z from several spectra.
