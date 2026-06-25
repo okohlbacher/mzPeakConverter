@@ -36,36 +36,23 @@ struct App {
 
 #[derive(Clone)]
 struct Meta {
-    index: usize,
     id: String,
-    key: (u8, i64, i64), // (ms_level, rt_milli, precursor_centi)
+    key: (u8, i64), // (ms_level, rt_milli); precursor windows disambiguated by FIFO order within bucket
 }
 
 fn meta_of<R: SpectrumLike>(s: &R) -> Meta {
-    let pmz = s.precursor().and_then(|p| p.ion()).map(|i| i.mz).unwrap_or(0.0);
     Meta {
-        index: s.index(),
         id: s.id().to_string(),
-        key: (
-            s.ms_level(),
-            (s.start_time() * 60000.0).round() as i64, // rt in ms (start_time is minutes)
-            (pmz * 100.0).round() as i64,
-        ),
+        key: (s.ms_level(), (s.start_time() * 60000.0).round() as i64), // start_time is minutes
     }
 }
 
 // SpectrumDescription (returned by metadata-only reads) doesn't implement SpectrumLike.
 fn meta_from_descr(d: &SpectrumDescription) -> Meta {
-    let pmz = d.precursor.as_ref().and_then(|p| p.ion()).map(|i| i.mz).unwrap_or(0.0);
     let rt = d.acquisition.first_scan().map(|s| s.start_time).unwrap_or(0.0);
     Meta {
-        index: d.index,
         id: d.id.clone(),
-        key: (
-            d.ms_level,
-            (rt * 60000.0).round() as i64,
-            (pmz * 100.0).round() as i64,
-        ),
+        key: (d.ms_level, (rt * 60000.0).round() as i64),
     }
 }
 
@@ -119,7 +106,7 @@ fn main() -> std::io::Result<()> {
     let mut breader = MzPeakReader::new(&args.b)?;
     let nb = breader.len();
     let mut b_by_id: HashMap<String, usize> = HashMap::with_capacity(nb);
-    let mut b_by_key: HashMap<(u8, i64, i64), VecDeque<usize>> = HashMap::new();
+    let mut b_by_key: HashMap<(u8, i64), VecDeque<usize>> = HashMap::new();
     for idx in 0..nb {
         if let Some(d) = breader.get_spectrum_metadata(idx as u64)? {
             let m = meta_from_descr(&d);
