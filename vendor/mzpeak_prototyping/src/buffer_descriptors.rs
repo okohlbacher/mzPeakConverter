@@ -517,10 +517,12 @@ pub enum BufferTransform {
 
 const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
 const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
-// PROVISIONAL accessions (follow the writer's local null-transform numbering 1003901/1003902); not
-// yet official PSI terms — see BufferTransform::SqrtMzFromTof.
-const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003903);
-const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003904);
+// Converter-owned MZP CV terms (see `cv/mzpeak.obo`), represented as `Unknown`-CV CURIEs so mzdata
+// can carry them; the `MZP:` prefix is supplied at the (de)serialisation boundary by
+// `crate::param::curie_to_string`. MZP:1000001 = sqrt-from-TOF transform, MZP:1000002 = linear-m/z
+// grid transform. Provisional pending assigned PSI-MS terms (see BACKLOG.md #1).
+const SQRT_MZ_FROM_TOF: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
+const LINEAR_MZ: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -754,7 +756,7 @@ impl BufferName {
         .into_iter()
         .collect();
         if let Some(trfm) = self.transform.as_ref() {
-            meta.insert("transform".to_string(), trfm.curie().to_string());
+            meta.insert("transform".to_string(), crate::param::curie_to_string(&trfm.curie()));
         }
         if let Some(dp_id) = self.data_processing_id.as_ref() {
             meta.insert("data_processing_id".to_string(), dp_id.to_string());

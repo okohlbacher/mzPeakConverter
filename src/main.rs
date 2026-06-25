@@ -1133,12 +1133,6 @@ fn convert_agilent_grid(
         md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
         std::sync::Arc::new((*base).clone().with_metadata(md))
     };
-    let peak_schema = ArrayBuffersBuilder::default()
-        .prefix("point")
-        .with_context(BufferContext::Spectrum)
-        .add_field(BufferContext::Spectrum.index_field())
-        .add_field(tof_field)
-        .add_field(INTENSITY_ARRAY.to_field());
 
     let builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
@@ -1161,7 +1155,11 @@ fn convert_agilent_grid(
         .add_spectrum_param_field(
             CustomBuilderFromParameter::from_spec(TOF_CALID_CURIE, "tof_calibration_id", DataType::Int64),
         )
-        .store_peaks_and_profiles_apart(Some(peak_schema));
+        // 3a/3b/3c fix: profile grid → DATA facet (point layout) carrying the transform annotation,
+        // so the point reader reconstructs m/z and the spectrum is labeled profile / data_points.
+        .add_spectrum_field(BufferContext::Spectrum.index_field())
+        .add_spectrum_field(tof_field)
+        .add_spectrum_field(INTENSITY_ARRAY.to_field());
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
 
@@ -1279,7 +1277,9 @@ fn agilent_grid_spectrum(
     descr.index = ps.index;
     descr.id = format!("scan={}", ps.index + 1);
     descr.ms_level = ps.ms_level;
-    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+    // PROFILE source (MassHunter), stored compactly as tof_index in the DATA facet; the reader
+    // reconstructs m/z = (tof_c0 + tof_c1·k)² from the registered transform (3a/3b/3c fix).
+    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
     descr.polarity = mzdata::spectrum::ScanPolarity::Negative; // MTBLS1334 is neg-mode; faithful default
     descr.add_param(mass_spectrum.clone());
     descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
@@ -1915,12 +1915,6 @@ fn convert_sciex_grid(
         }
         std::sync::Arc::new((*base).clone().with_metadata(md))
     };
-    let peak_schema = ArrayBuffersBuilder::default()
-        .prefix("point")
-        .with_context(BufferContext::Spectrum)
-        .add_field(BufferContext::Spectrum.index_field())
-        .add_field(tof_field)
-        .add_field(INTENSITY_ARRAY.to_field());
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
@@ -1931,9 +1925,15 @@ fn convert_sciex_grid(
             "mass spectrum",
             DataType::Boolean,
         ))
-        .store_peaks_and_profiles_apart(Some(peak_schema))
-        // Empty data facet (everything grids); sample a valid schema from the probes anyway.
-        .sample_array_types_from_spectra(probes.into_iter());
+        // 3a/3b fix: grid spectra are PROFILE data (SDK source), stored compactly as `tof_index` in
+        // the DATA facet (point layout) rather than mislabeled into the centroid peaks facet. Pin the
+        // transform-annotated schema onto the data facet so RawData+Profile routes there carrying the
+        // SqrtMzFromTof/LinearMz annotation; representation=profile + number_of_data_points then follow
+        // automatically. The point reader reconstructs m/z from the annotation (see reader/point.rs).
+        .add_spectrum_field(BufferContext::Spectrum.index_field())
+        .add_spectrum_field(tof_field)
+        .add_spectrum_field(INTENSITY_ARRAY.to_field());
+    let _ = &probes; // probes no longer needed to seed an empty data facet
     // Per-spectrum sqrt-grid coefficients only exist in sqrt mode (linear m/z grid uses one global scale).
     if use_sqrt {
         builder = builder
@@ -2051,7 +2051,9 @@ fn sciex_grid_spectrum(
     out.add(int_da);
 
     let mut descr = spec.description().clone();
-    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+    // PROFILE source (SDK), stored compactly as tof_index in the DATA facet; the reader reconstructs
+    // m/z = (tof_c0 + tof_c1·k)² from the registered transform (3a/3b/3c fix).
+    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
     if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
         descr.add_param(mass_spectrum.clone());
     }
@@ -2087,7 +2089,8 @@ fn sciex_linear_spectrum(
     int_da.unit = Unit::DetectorCounts;
     out.add(int_da);
     let mut descr = spec.description().clone();
-    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+    // PROFILE source, stored as a uniform-m/z grid in the DATA facet (3a/3b/3c fix).
+    descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
     if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
         descr.add_param(mass_spectrum.clone());
     }

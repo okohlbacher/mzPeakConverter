@@ -181,8 +181,10 @@ pub fn embed_into_archive(
         let encoding = if do_gzip { "gzip" } else { "identity" };
         // Declared as a `proprietary` FileEntry so it lands in the index `files[]` — the viewer
         // surfaces proprietary members in its Structure inspector and the validator skips them
-        // (they are not parsed as Parquet).
-        let fe = FileEntry::new(member.clone(), EntityType::Other("vendor".into()), DataKind::Proprietary);
+        // (they are not parsed as Parquet). entity_type is the spec's controlled `other` (the
+        // `vendor/` path prefix + `proprietary` data_kind already mark it as vendor-private; a
+        // non-controlled "vendor" value would just be folded to `other` by conformant readers).
+        let fe = FileEntry::new(member.clone(), EntityType::Other("other".into()), DataKind::Proprietary);
         if do_gzip {
             let mut enc = GzEncoder::new(BufReader::new(f), Compression::default());
             zip.add_file_from_read(&mut enc, None::<&String>, Some(fe))

@@ -691,7 +691,15 @@ pub trait AbstractMzPeakWriter {
         let (_had_mzs, n_points) = if let Ok(mzs) = mzs.as_ref() {
             (true, mzs.len())
         } else {
-            (false, 0)
+            // No m/z array: grid spectra store an integer index axis (e.g. `tof_index`) that the
+            // reader reconstructs m/z from. Count the stored points from the widest parallel array so
+            // the data-point count — and the reader's profile-load gating — are correct (not 0).
+            let n = binary_array_map
+                .iter()
+                .filter_map(|(_, a)| a.data_len().ok())
+                .max()
+                .unwrap_or(0);
+            (false, n)
         };
 
         let is_profile = spectrum.signal_continuity() == SignalContinuity::Profile;

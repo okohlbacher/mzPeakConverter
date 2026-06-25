@@ -14,8 +14,9 @@ use arrow::{
     error::ArrowError,
 };
 use mzdata::{
-    prelude::BuildFromArrayMap,
-    spectrum::{ArrayType, BinaryArrayMap, DataArray, PeakDataLevel},
+    params::Unit,
+    prelude::*,
+    spectrum::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray, PeakDataLevel},
 };
 use mzpeaks::{CentroidLike, DeconvolutedCentroidLike, coordinate::SimpleInterval};
 use parquet::{
@@ -358,6 +359,43 @@ impl PointDataCacheBlock {
         let mut out = BinaryArrayMap::new();
         for v in bin_map.into_values() {
             out.add(v);
+        }
+
+        // 3c: reconstruct m/z when an integer grid column carries a registered grid transform and no
+        // m/z array is materialized (TOF-grid / ims-compact spectra). Without this a generic reader
+        // sees raw flight-time indices. `transform_params` are the run-wide coefficients ([c0,c1] for
+        // sqrt-from-TOF, [scale] for the linear m/z grid); per-spectrum tof_c0/tof_c1 refinement, when
+        // present, is layered on by the caller.
+        if out.get(&ArrayType::MZArray).is_none() {
+            let mut reconstructed: Vec<DataArray> = Vec::new();
+            for v in self.spectrum_array_indices.iter() {
+                let is_sqrt =
+                    matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof));
+                let is_linear =
+                    matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::LinearMz));
+                if !is_sqrt && !is_linear {
+                    continue;
+                }
+                let Some(src) = out.get(&v.array_type) else { continue };
+                let Ok(ks) = src.to_i32() else { continue };
+                let p = v.transform_params.clone().unwrap_or_default();
+                let mzs: Vec<f64> = if is_sqrt {
+                    let c0 = p.first().copied().unwrap_or(0.0);
+                    let c1 = p.get(1).copied().unwrap_or(1.0);
+                    ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect()
+                } else {
+                    let s = p.first().copied().unwrap_or(1.0);
+                    ks.iter().map(|&k| s * k as f64).collect()
+                };
+                let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+                if mz_da.update_buffer(mzs.as_slice()).is_ok() {
+                    mz_da.unit = Unit::MZ;
+                    reconstructed.push(mz_da);
+                }
+            }
+            for mz_da in reconstructed {
+                out.add(mz_da);
+            }
         }
         Ok(Some(out))
     }
