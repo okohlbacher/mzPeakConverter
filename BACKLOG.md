@@ -7,40 +7,40 @@ Status legend: 🔴 blocker · 🟡 deferred · ✅ done this round.
 
 ---
 
-## #1 — Provisional accessions squatted the PSI-owned `MS:` namespace ✅ (de-squatted to MZP)
+## #1 — Grid encoding CV terms ✅ (adopted Josh's seeded PSI-MS terms)
 
-**Done.** The five grid terms moved out of `MS:` into a converter-owned CV with prefix
-`MZP` (`cv/mzpeak.obo`, declared in the archive `cv_list`). On the wire they now read
-`MZP:1000001` (transform) and `MZP_1000003_tof_c0` (column), never `MS:…`.
+**Done.** Josh Klein had already seeded a coherent "coordinate spacing model" tree in PSI-MS
+for grid encoding, which covers both our transforms exactly. The converter now emits the
+**assigned** terms (no more `MS:1003903/1003904` placeholders, no more `MZP` for transforms):
 
-Implementation (the mzdata blocker was sidestepped, not by vendoring): MZP terms are
-represented as `ControlledVocabulary::Unknown` CURIEs, and the `MZP:` prefix is supplied
-at the single (de)serialisation boundary in `mzpeak_prototyping::param`
-(`curie_to_string` / `parse_curie`), which every CURIE string already funnels through.
-Grid paths call `register_mzp_cv()` before `finish_parquet()` so `cv_list` declares MZP.
+| We emit (write) | PSI-MS term | Maps our | Reconstruction |
+|---|---|---|---|
+| `MS:1003825` | square root grid interpolation | sqrt-from-TOF | `mz = f((b + a·k)²)`, `f`=identity |
+| `MS:1003824` | linear grid interpolation | linear m/z | `mz = f(b + a·k)`, `f`=identity |
+| `MS:1003826` | coordinate grid encoding | grid-index marker | array stores indices; value = grid id |
 
-MZP → suggested-PSI-MS mapping (for the eventual #4 swap):
-`MZP:1000001`→sqrt-from-TOF transform, `MZP:1000002`→linear-m/z transform,
-`MZP:1000003/4/5`→tof_c0 / tof_c1 / tof_calibration_id.
+Parent tree: `MS:1003820` coordinate spacing model → `MS:1003822` grid coordinate interpolation
+→ {`MS:1003824` linear, `MS:1003825` sqrt}. Legacy codings (`MS:1003903/1003904`, `MZP:1000001/2`)
+are still recognized on READ (`buffer_descriptors::from_curie`) so older archives decode.
 
-### Suggested PSI-MS terms to request (for #4)
+**Are any MZP terms still needed? No.** The coefficients (`tof_c0`/`tof_c1`/`tof_calibration_id`)
+are **values**, not CV terms — in PSI's model they ride in the spacing model's value list. We keep
+them as per-spectrum columns (Agilent drift) tagged with a converter-owned `MZP:` accession purely
+as a column-naming artifact; this can move to the value-list / plain names to drop `MZP` entirely.
 
-Submit these to the PSI-MS CV (HUPO-PSI/psi-ms-CV) and replace the provisional accessions
-once assigned. Accession numbers are **to be assigned by PSI**; the current placeholders
-are listed for traceability.
+### Two PSI terms still to request (NOT MZP — these are real gaps for full fidelity)
 
-| Provisional | Suggested name | Value / params | Definition | Suggested parent |
-|---|---|---|---|---|
-| `MS:1003903` | square-root m/z from TOF index transformation | params `[c0, c1]` (double) | A reconstruction transform recovering an m/z array from a stored integer time-of-flight index `k` as `m/z = (c0 + c1·k)²`, with `c0`,`c1` carried as the array's transform parameters. | sibling of the null-marking transforms `MS:1003901` / `MS:1003902` (binary data / array transformation) |
-| `MS:1003904` | linear m/z grid transformation | param `[s]` (double) | A reconstruction transform recovering an m/z array from a stored integer index `k` as `m/z = s·k`, with bin width `s` carried as a transform parameter. Used for centroided TOF data off the flight-time lattice. | same parent as `MS:1003903` |
-| `MS:4000900` | time-of-flight grid coefficient c0 | value: double | The constant term `c0` of the per-spectrum sqrt-TOF reconstruction `m/z = (c0 + c1·k)²`. | spectrum / scan attribute (value-type term) |
-| `MS:4000901` | time-of-flight grid coefficient c1 | value: double | The linear term `c1` of the per-spectrum sqrt-TOF reconstruction. | spectrum / scan attribute (value-type term) |
-| `MS:4000902` | time-of-flight calibration identifier | value: nonNegativeInteger | Selects the per-spectrum polynomial-refinement row in the `tof_calibration` index block, so the exact vendor m/z reconstructs. | spectrum / scan attribute (value-type term) |
+1. **recalibration function** — the non-identity `f` referenced by `MS:1003822`/`1003824`/`1003825`
+   but not yet instantiated. Needed for Agilent's per-CalibrationID polynomial refinement
+   (`mz = (c0+c1·k)² − poly(...)`). The reserved `MS:1003823`/`1003827` slots look intended for this.
+2. **polynomial / mobility grid model** — a spacing model for the **TIMS ion-mobility axis**
+   (scan index → 1/K0), which is nonlinear (Bruker TimsCalibration ModelType 2) and fits neither
+   linear nor sqrt. Lets us encode the mobility grid exactly instead of timsrust's ~0.038 linear approx.
 
-Definition sites (single source of truth for the #4 swap to assigned MS terms):
-- `vendor/mzpeak_prototyping/src/buffer_descriptors.rs` — `SQRT_MZ_FROM_TOF`, `LINEAR_MZ`
-- `src/main.rs` — `TOF_C0_CURIE`, `TOF_C1_CURIE`, `TOF_CALID_CURIE`
-- `cv/mzpeak.obo` — the term definitions; `mzpeak_prototyping::param` — prefix (de)serialisation
+Definition sites:
+- `vendor/mzpeak_prototyping/src/buffer_descriptors.rs` — `SQRT_MZ_FROM_TOF`(=MS:1003825),
+  `LINEAR_MZ`(=MS:1003824), `COORD_GRID_ENCODING`(=MS:1003826) + legacy-read consts
+- `src/main.rs` — `TOF_C0_CURIE` / `TOF_C1_CURIE` / `TOF_CALID_CURIE` (coefficient value columns)
 
 ## #2 — `cv_list` must declare the grid CV ✅ (done)
 

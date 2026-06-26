@@ -503,29 +503,36 @@ pub enum BufferTransform {
     NumpressPIC,
     NullInterpolate,
     NullZero,
-    /// Reconstruct m/z from an integer TOF column as `m/z = (a + b·tof)²`. The `[a, b]` coefficients
-    /// travel in the array index entry's `transform_params`, so a reader recovers m/z generically
-    /// without bespoke ims-compact handling. NOTE: the CURIE is PROVISIONAL (converter-local), to be
-    /// replaced by the assigned PSI term once the mzPeak specification defines it.
+    /// Reconstruct m/z from an integer grid index as `m/z = (b + a·k)²` — PSI-MS "square root grid
+    /// interpolation" (MS:1003825), `x = f((b + i·a)²)` with the recalibration `f` = identity here.
+    /// The `[b, a]` (= `[c0, c1]`) coefficients travel in the array index entry's `transform_params`.
+    /// Used for sqrt flight-time grids: Bruker ims-compact, Agilent/SCIEX file-direct profile.
     SqrtMzFromTof,
-    /// Reconstruct m/z from an integer column as `m/z = scale·k` (a UNIFORM m/z grid, vs the sqrt
-    /// flight-time grid). `scale` rides in `transform_params`. Used for centroid/mixed TOF runs
-    /// (e.g. SWATH MS2) whose peaks are off the flight-time lattice but pack tightly as
-    /// delta-encoded scaled integers. PROVISIONAL converter-local CURIE.
+    /// Reconstruct m/z from an integer grid index as `m/z = b + a·k` — PSI-MS "linear grid
+    /// interpolation" (MS:1003824), `x = f(b + i·a)` with `f` = identity, `b` = 0, `a` = scale.
+    /// Used for uniform m/z grids (e.g. SWATH MS2) off the flight-time lattice.
     LinearMz,
 }
 
 const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
 const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
-// Grid reconstruction transforms, now using their ASSIGNED PSI-MS terms (BACKLOG.md #1):
-//   MS:1003903 = square-root m/z from TOF index, MS:1003904 = linear m/z grid.
-// The provisional converter-owned `MZP:1000001`/`MZP:1000002` (Unknown-CV) CURIEs are still
-// recognized on read (`from_curie`) so archives written before the assignment keep decoding.
-const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003903);
-const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003904);
-// Legacy provisional terms — read-side back-compat only.
-const SQRT_MZ_FROM_TOF_LEGACY: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
-const LINEAR_MZ_LEGACY: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
+// Grid reconstruction transforms, using the ASSIGNED PSI-MS "coordinate spacing model" terms seeded
+// for grid encoding (children of MS:1003820 / MS:1003822 "grid coordinate interpolation"):
+//   MS:1003825 = square root grid interpolation   x = f((b + i·a)²)
+//   MS:1003824 = linear grid interpolation        x = f(b + i·a)
+// `f` (recalibration) is identity for these; a non-identity `f` (e.g. Agilent's per-CalibrationID
+// polynomial, the TIMS mobility model) awaits a PSI recalibration-function term (BACKLOG.md #1).
+const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003825);
+const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003824);
+// MS:1003826 "coordinate grid encoding" — marks an array as storing grid INDICES into an external
+// grid (value = grid id); emitted alongside the spacing model on the grid-index column.
+pub const COORD_GRID_ENCODING: CURIE = mzdata::curie!(MS:1003826);
+// Legacy codings recognized on READ only, so archives written before the assignment keep decoding:
+// our earlier made-up MS:1003903/1003904 and the converter-owned MZP:1000001/1000002 (Unknown-CV).
+const SQRT_LEGACY_MS: CURIE = mzdata::curie!(MS:1003903);
+const LINEAR_LEGACY_MS: CURIE = mzdata::curie!(MS:1003904);
+const SQRT_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
+const LINEAR_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -535,8 +542,12 @@ impl BufferTransform {
             x if x == Self::NumpressLinear.curie() => Some(Self::NumpressLinear),
             x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
             x if x == NULL_ZERO => Some(Self::NullZero),
-            x if x == SQRT_MZ_FROM_TOF || x == SQRT_MZ_FROM_TOF_LEGACY => Some(Self::SqrtMzFromTof),
-            x if x == LINEAR_MZ || x == LINEAR_MZ_LEGACY => Some(Self::LinearMz),
+            x if x == SQRT_MZ_FROM_TOF || x == SQRT_LEGACY_MS || x == SQRT_LEGACY_MZP => {
+                Some(Self::SqrtMzFromTof)
+            }
+            x if x == LINEAR_MZ || x == LINEAR_LEGACY_MS || x == LINEAR_LEGACY_MZP => {
+                Some(Self::LinearMz)
+            }
             _ => None,
         }
     }

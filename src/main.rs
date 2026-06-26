@@ -1031,12 +1031,13 @@ fn tof_grid_spectrum(
     Ok(TofRoute::Gridded(MultiLayerSpectrum::new(descr, Some(out), None, None)))
 }
 
-/// Converter-owned MZP CV terms for the per-spectrum TOF-grid coefficients (Agilent profile grid
-/// drifts scan-to-scan — `base`/`coeff` vary per scan — so a single run-wide `[c0,c1]` is ~100 ppm
-/// off; we store c0/c1 as per-spectrum columns instead). Represented as `Unknown`-CV CURIEs that the
-/// writer renders with the `MZP:` prefix (see `cv/mzpeak.obo` + `param::curie_to_string`); a reader
-/// recovers `m/z = (tof_c0 + tof_c1·tof_index)²` per spectrum. Provisional pending PSI-MS terms
-/// (BACKLOG.md #1). MZP:1000003 = c0, MZP:1000004 = c1, MZP:1000005 = calibration id.
+/// Per-spectrum coefficients of the `MS:1003825` square-root grid spacing model (Agilent profile grid
+/// drifts scan-to-scan — `base`/`coeff` vary per scan — so a single run-wide `[b,a]` is ~100 ppm off;
+/// we store c0/c1 as per-spectrum columns instead). In PSI's model these are the spacing model's
+/// *value list* (values, NOT CV terms — no per-coefficient PSI term exists or is needed); we still tag
+/// the carrier columns with a converter-owned `Unknown`-CV (`MZP:`) accession purely as a column-name
+/// artifact. A reader recovers `m/z = (tof_c0 + tof_c1·tof_index)²` per spectrum. The non-identity
+/// recalibration (CalibrationID polynomial) still awaits a PSI recalibration-function term — BACKLOG.md #1.
 const TOF_C0_CURIE: mzdata::params::CURIE =
     mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_003);
 const TOF_C1_CURIE: mzdata::params::CURIE =
