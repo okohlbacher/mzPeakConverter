@@ -24,6 +24,8 @@ conv(){ # tier format flags input outpath
   local tier="$1" fmt="$2" flags="$3" in="$4" o="$5"
   [ -n "$only" ] && case "$only" in *",$tier,"*) :;; *) return;; esac
   local id; id="$(slug "$in")"; local raw; raw="$(sizeof "$in")"
+  # imzML signal lives in the .ibd sidecar — count it in the raw footprint or ratios are inflated.
+  if [ "$fmt" = imzml ]; then local ibd="${in%.*}.ibd"; [ -f "$ibd" ] && raw=$((raw + $(sizeof "$ibd"))); fi
   echo ">> [$tier/$fmt] $id"
   if "$bin" "$in" $flags -o "$o" --force > "$out/logs/$id.log" 2>&1; then
     local mp; mp="$(sizeof "$o")"
