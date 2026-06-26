@@ -1132,6 +1132,21 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
+            if c.name() == "intensity"
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
+                log::debug!("{}: byte-stream-split intensity", c.path());
+                // MS intensities (detector counts / peak areas) are integer-valued or similar-
+                // magnitude floats whose byte planes are highly redundant, so byte-stream-split +
+                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). Disable the
+                // dictionary for this column so the BSS encoding actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
             if c.name().ends_with("_index") || c.name() == "tof" {
                 log::debug!("{}: delta binary packing", c.path());
                 // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
@@ -1265,6 +1280,21 @@ pub trait AbstractMzPeakWriter {
                 );
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
+            }
+            if c.name() == "intensity"
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
+                log::debug!("{}: byte-stream-split intensity", c.path());
+                // MS intensities (detector counts / peak areas) are integer-valued or similar-
+                // magnitude floats whose byte planes are highly redundant, so byte-stream-split +
+                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). Disable the
+                // dictionary for this column so the BSS encoding actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
             }
             if c.name().ends_with("_index") || c.name() == "tof" {
                 log::debug!("{}: delta binary packing", c.path());
