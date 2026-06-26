@@ -131,9 +131,13 @@ impl AgilentProfileReader {
             if info.point_count <= 0 || info.byte_count <= 0 {
                 continue;
             }
-            if info.offset + info.byte_count as u64 > self.profile_size {
-                // An interrupted acquisition: the rest of the run is unwritten — stop.
-                break;
+            // Checked add: a corrupt `offset`/`byte_count` could overflow and wrap past the EOF
+            // guard, then drive an arbitrary `vec![0u8; byte_count]` allocation below. On overflow
+            // or past-EOF, treat as an interrupted acquisition and stop. This also bounds the
+            // allocation: byte_count is now guaranteed ≤ profile_size (the real file length).
+            match info.offset.checked_add(info.byte_count as u64) {
+                Some(end) if end <= self.profile_size => {}
+                _ => break,
             }
             let n = info.point_count as usize;
             let mut seg = vec![0u8; info.byte_count as usize];
@@ -474,6 +478,19 @@ fn load_calibration(
             );
         }
         let fallback = *default_rows.values().next().unwrap();
+        // An unknown CalibrationID falls back to an arbitrary row → plausible-but-wrong m/z. Surface
+        // it loudly (once, with the offending IDs) rather than mis-calibrating those scans silently.
+        let unknown: std::collections::BTreeSet<i32> = calibration_ids
+            .iter()
+            .copied()
+            .filter(|c| !default_rows.contains_key(c))
+            .collect();
+        if !unknown.is_empty() {
+            log::warn!(
+                "CalibrationID(s) {unknown:?} absent from DefaultMassCal.xml; those scans use a \
+                 fallback calibration and their m/z may be off"
+            );
+        }
         calibration_ids
             .iter()
             .map(|cid| *default_rows.get(cid).unwrap_or(&fallback))

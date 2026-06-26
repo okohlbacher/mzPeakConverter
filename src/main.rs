@@ -871,6 +871,22 @@ fn convert_file_tof_grid(
     finish_tof_grid_archive(writer, &tmp, output, input, &grid, vendor)
 }
 
+/// Build the custom peak-facet array map shared by every TOF-grid / ims-compact peaks facet: an
+/// Int32 `tof_index` axis column (replaces m/z) + an f32 intensity column in DetectorCounts.
+fn tof_index_intensity_map(tof_index: &[i32], intensity: &[f32]) -> Result<BinaryArrayMap> {
+    let mut out = BinaryArrayMap::new();
+    let mut tof_da =
+        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
+    tof_da.update_buffer(tof_index).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
+    out.add(tof_da);
+    let mut int_da =
+        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    int_da.update_buffer(intensity).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+    int_da.unit = Unit::DetectorCounts; // match INTENSITY_ARRAY's unit so it maps to point.intensity
+    out.add(int_da);
+    Ok(out)
+}
+
 /// Custom peaks-facet schema: the `point` facet carries integer `tof_index` (nonstandard, replaces
 /// m/z) + intensity. The `SqrtMzFromTof` transform CURIE rides on the column, and the [c0,c1]
 /// coefficients ride via field metadata (`mzpeak:transform_params`), so a conformant reader
@@ -976,7 +992,9 @@ fn tof_grid_spectrum(
 
     let mut tof: Vec<i32> = Vec::with_capacity(mzs.len());
     let mut intensity: Vec<f32> = Vec::with_capacity(mzs.len());
-    let mut all_on_grid = true;
+    // A length mismatch would let the zip below silently drop the tail; route such a (corrupt)
+    // spectrum to the exact f64 facet instead, which keeps both arrays as-is.
+    let mut all_on_grid = mzs.len() == intens.len();
     for (&mz, &inten) in mzs.iter().zip(intens.iter()) {
         // The run-wide grid was fit on SAMPLED spectra; a point in a non-sampled spectrum could be
         // off the lattice. Verify EVERY point reconstructs within tolerance — otherwise storing
@@ -1007,16 +1025,7 @@ fn tof_grid_spectrum(
         return Ok(TofRoute::F64(out));
     }
 
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-    int_da.unit = Unit::DetectorCounts; // match INTENSITY_ARRAY's unit so it maps to point.intensity
-    out.add(int_da);
+    let out = tof_index_intensity_map(&tof, &intensity)?;
 
     let mut descr = entry.description().clone();
     if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
@@ -1263,16 +1272,7 @@ fn agilent_grid_spectrum(
         })
         .collect();
 
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(ps.tof_index.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-    int_da.unit = Unit::DetectorCounts;
-    out.add(int_da);
+    let out = tof_index_intensity_map(&ps.tof_index, &intensity)?;
 
     let mut descr = mzdata::spectrum::SpectrumDescription::default();
     descr.index = ps.index;
@@ -1983,7 +1983,18 @@ fn convert_sciex_grid(
             sciex_grid_spectrum(&spec, &tof_index, grid, &mass_spectrum)?
         } else {
             // Uniform m/z grid: every peak → round(m/z · scale) as i32 (m/z ≤ ~2^31/scale).
-            let idx: Vec<i32> = mz.iter().map(|&m| (m * LINEAR_MZ_SCALE).round() as i32).collect();
+            // `as i32` SATURATES silently for m/z > ~214748 — there is no f64 fallback on this path,
+            // so bail loudly rather than corrupt those peaks to i32::MAX.
+            let idx: Vec<i32> = mz
+                .iter()
+                .map(|&m| {
+                    let scaled = (m * LINEAR_MZ_SCALE).round();
+                    if scaled < i32::MIN as f64 || scaled > i32::MAX as f64 {
+                        bail!("m/z {m} out of range for the uniform i32 grid (would saturate)");
+                    }
+                    Ok(scaled as i32)
+                })
+                .collect::<Result<Vec<i32>>>()?;
             sciex_linear_spectrum(&spec, &idx, &mass_spectrum)?
         };
         if synth_chroms {
@@ -2044,16 +2055,7 @@ fn sciex_grid_spectrum(
         .unwrap_or_default();
     intensity.resize(tof_index.len(), 0.0); // one intensity per peak (writer requires equal lengths)
 
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(tof_index).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-    int_da.unit = Unit::DetectorCounts;
-    out.add(int_da);
+    let out = tof_index_intensity_map(tof_index, &intensity)?;
 
     let mut descr = spec.description().clone();
     // PROFILE source (SDK), stored compactly as tof_index in the DATA facet; the reader reconstructs
@@ -2083,16 +2085,7 @@ fn sciex_linear_spectrum(
         .map(|c| c.into_owned())
         .unwrap_or_default();
     intensity.resize(mz_index.len(), 0.0); // guarantee one intensity per peak (writer requires equal lengths)
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(mz_index).map_err(|e| anyhow::anyhow!("encoding mz_index: {e}"))?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-    int_da.unit = Unit::DetectorCounts;
-    out.add(int_da);
+    let out = tof_index_intensity_map(mz_index, &intensity)?;
     let mut descr = spec.description().clone();
     // PROFILE source, stored as a uniform-m/z grid in the DATA facet (3a/3b/3c fix).
     descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
