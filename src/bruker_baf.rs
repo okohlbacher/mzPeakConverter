@@ -848,23 +848,6 @@ impl BafReader {
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    /// A sample spectrum's array map, for deriving the writer's data-facet
-    /// schema (mirrors `TsfReader::sample_arrays`).
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let i = (0..self.len())
-            .find(|&i| {
-                matches!(
-                    Self::select_pair(&self.rows[i], self.prefer_profile),
-                    (Some(_), Some(_), _)
-                )
-            })
-            .unwrap_or(0);
-        self.spectrum(i)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 #[cfg(test)]

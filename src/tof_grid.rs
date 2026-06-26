@@ -275,6 +275,7 @@ pub fn fit_one_c1(mzs: &[f64], c1: f64) -> Option<(TofGrid, Vec<i32>, f64)> {
 /// Like [`fit_one_c1`] but ALWAYS returns a grid (no ppm gate) — for the all-or-nothing sqrt path
 /// where the run was already chosen as profile-on-lattice, so a stray spectrum must still grid.
 /// `c1` must be > 0 (the caller passes the run-wide global clock).
+#[cfg_attr(not(windows), allow(dead_code))] // only reached from the #[cfg(windows)] SCIEX grid path
 pub fn force_grid_c1(mzs: &[f64], c1: f64) -> (TofGrid, Vec<i32>, f64) {
     let s_min = mzs
         .iter()
@@ -311,6 +312,7 @@ pub fn force_grid_c1(mzs: &[f64], c1: f64) -> (TofGrid, Vec<i32>, f64) {
 
 /// Force a per-spectrum grid when no run-wide c1 is available (estimate the step from this
 /// spectrum's √(m/z) gaps, then force). Always returns.
+#[cfg_attr(not(windows), allow(dead_code))] // only reached from the #[cfg(windows)] SCIEX grid path
 pub fn force_grid(mzs: &[f64]) -> (TofGrid, Vec<i32>, f64) {
     let c1 = base_step(mzs).filter(|c| *c > 0.0).unwrap_or(1.0e-4);
     force_grid_c1(mzs, c1)

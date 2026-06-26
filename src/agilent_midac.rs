@@ -404,23 +404,6 @@ impl AgilentMidacReader {
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let mut idx = 0usize;
-        for i in 0..self.count {
-            if let Ok((mz, _, _, _)) = self.fetch(i) {
-                if !mz.is_empty() {
-                    idx = i;
-                    break;
-                }
-            }
-        }
-        self.spectrum(idx)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample frame has no arrays"))
-    }
 }
 
 impl Drop for AgilentMidacReader {

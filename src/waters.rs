@@ -247,22 +247,6 @@ impl WatersReader {
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema. Uses the first
-    /// non-empty spectrum so both m/z and intensity columns are present.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        for i in 0..self.len() {
-            if let Ok(spec) = self.spectrum(i) {
-                if let Some(arrays) = spec.arrays {
-                    let non_empty = arrays.mzs().map(|m| !m.is_empty()).unwrap_or(false);
-                    if non_empty {
-                        return Ok(arrays);
-                    }
-                }
-            }
-        }
-        Ok(self.spectrum(0)?.arrays.unwrap_or_default())
-    }
 }
 
 impl Drop for WatersReader {

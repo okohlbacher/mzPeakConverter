@@ -561,26 +561,6 @@ impl SciexReader {
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema (mirrors
-    /// `TsfReader::sample_arrays` / `BafReader::sample_arrays`). Uses the first non-empty
-    /// spectrum so both columns are actually present.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let mut chosen = 0usize;
-        for i in 0..self.count {
-            // A non-empty spectrum is preferable so the m/z + intensity columns are present.
-            if let Ok((mz, _)) = self.peaks(i) {
-                if !mz.is_empty() {
-                    chosen = i;
-                    break;
-                }
-            }
-        }
-        self.spectrum(chosen)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 impl Drop for SciexReader {

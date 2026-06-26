@@ -490,26 +490,6 @@ impl AgilentReader {
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema. Mirrors
-    /// `TsfReader::sample_arrays`: prefer the first non-empty spectrum so both columns are present.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let mut idx = 0usize;
-        for i in 0..self.count {
-            // Cheap probe: a spectrum with points. fetch() is the only way to know the length, so
-            // we accept the first that yields a non-empty m/z array, falling back to index 0.
-            if let Ok((mz, _, _)) = self.fetch(i) {
-                if !mz.is_empty() {
-                    idx = i;
-                    break;
-                }
-            }
-        }
-        self.spectrum(idx)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 impl Drop for AgilentReader {

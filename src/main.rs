@@ -1765,7 +1765,7 @@ fn convert_baf(
     let reader = bruker_baf::BafReader::open(input, None)?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms,
-        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+        reader.len(), |i| reader.spectrum(i),
     )
 }
 
@@ -1785,7 +1785,7 @@ fn convert_bruker_sdk(
     let reader = bruker_sdk::BrukerSdkReader::open(input)?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms,
-        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+        reader.len(), |i| reader.spectrum(i),
     )
 }
 
@@ -1830,6 +1830,7 @@ fn convert_sciex(
 
 /// Uniform-m/z-grid scale: centroid/mixed runs store `round(m/z · 1e4)` as Int32 (m/z = k/1e4,
 /// ≤1 ppm — far below centroid uncertainty), delta-packed. `1e4` keeps m/z up to ~2e5 within i32.
+#[cfg_attr(not(windows), allow(dead_code))] // only the #[cfg(windows)] SCIEX uniform-grid path uses it
 const LINEAR_MZ_SCALE: f64 = 1.0e4;
 
 /// Native SCIEX `.wiff` → mzPeak as an integer-grid archive, decided ONCE per run (no per-spectrum
@@ -2015,8 +2016,11 @@ fn convert_sciex_grid(
             "scale": LINEAR_MZ_SCALE,
         })
     };
-    zip.add_index_metadata("tof_calibration", &cal)
-        .context("writing tof_calibration index")?;
+    // The schema pins `tof_calibration.codec` to "tof-grid"; the uniform-m/z grid uses its own
+    // `mz_calibration` block (codec "mz-grid") so neither violates the index schema.
+    let cal_key = if use_sqrt { "tof_calibration" } else { "mz_calibration" };
+    zip.add_index_metadata(cal_key, &cal)
+        .context("writing calibration index")?;
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
     Ok(())
@@ -2133,7 +2137,7 @@ fn convert_waters(
     // index or the mass-calibration coefficients). The statistical TOF-grid detector (strategy A) is
     // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
     let reader = waters::WatersReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak via the MHDAC .NET glue (feature `agilent`,
@@ -2148,7 +2152,7 @@ fn convert_agilent(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent::AgilentReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent **IM-MS** `.d` → mzPeak via the MIDAC .NET glue (Windows-runtime-only,
@@ -2164,7 +2168,7 @@ fn convert_agilent_midac(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent_midac::AgilentMidacReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Shared writer wiring for a custom (non-mzdata) reader: sample-derived schema + MS:1000294 column
@@ -2178,7 +2182,6 @@ fn convert_vendor_reader(
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
     len: usize,
-    _sample: mzdata::spectrum::bindata::BinaryArrayMap,
     mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
 ) -> Result<()> {
     if len == 0 {
@@ -2244,7 +2247,7 @@ fn convert_tsf(
     let reader = bruker_tsf::TsfReader::open(input)?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms,
-        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+        reader.len(), |i| reader.spectrum(i),
     )
 }
 
