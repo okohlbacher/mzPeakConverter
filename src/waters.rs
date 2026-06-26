@@ -19,7 +19,7 @@
 //! the compressed-scan decoder that `readScan` needs) resolve — otherwise data reads access-violate
 //! even though the reader opens fine.
 
-use std::ffi::{CString, OsString, c_char, c_int, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -68,7 +68,7 @@ impl WatersReader {
     /// Open a Waters `.raw` directory and build the flattened spectrum index.
     pub fn open(input: &Path) -> Result<Self> {
         let dir = resolve_masslynx_dir()?;
-        prepend_dir_to_path(&dir);
+        add_dll_directory(&dir)?;
         let dll = dir.join("MassLynxRaw.dll");
         if !dll.is_file() {
             bail!(
@@ -79,7 +79,7 @@ impl WatersReader {
         }
 
         // SAFETY: loading the vendor DLL + resolving its documented C exports. The DLL's own deps
-        // (cdt.dll, …) resolve via the PATH we just prepended.
+        // (cdt.dll, …) resolve via the DLL directory we just set.
         let lib =
             unsafe { Library::new(&dll) }.with_context(|| format!("loading {}", dll.display()))?;
         // Copy the raw function pointers out of the borrowed Symbols; they stay valid as long as
@@ -274,13 +274,26 @@ fn resolve_masslynx_dir() -> Result<PathBuf> {
     )
 }
 
-/// Prepend `dir` to the process `PATH` so the vendor DLL's dependency DLLs resolve at load time.
-fn prepend_dir_to_path(dir: &Path) {
-    let mut new_path = OsString::from(dir);
-    if let Some(old) = std::env::var_os("PATH") {
-        new_path.push(if cfg!(windows) { ";" } else { ":" });
-        new_path.push(old);
+/// Add `dir` to the DLL search path so the vendor DLL's dependency DLLs (cdt.dll, …) resolve at load
+/// time, WITHOUT mutating the process-global `PATH` — `std::env::set_var` is a data race under
+/// current Rust. `SetDllDirectoryW` is the documented Windows mechanism and is idempotent (it
+/// replaces any single prior extra directory, so repeated opens don't accumulate state).
+#[cfg(windows)]
+fn add_dll_directory(dir: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn SetDllDirectoryW(lp_path_name: *const u16) -> i32;
     }
-    // SAFETY: set during conversion startup, before any worker threads read PATH.
-    unsafe { std::env::set_var("PATH", new_path) };
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: FFI to a documented kernel32 export with a valid NUL-terminated wide string.
+    if unsafe { SetDllDirectoryW(wide.as_ptr()) } == 0 {
+        bail!("SetDllDirectoryW({}) failed", dir.display());
+    }
+    Ok(())
+}
+
+/// Non-Windows builds compile the reader but never load the (Windows-only) vendor DLL.
+#[cfg(not(windows))]
+fn add_dll_directory(_dir: &Path) -> Result<()> {
+    Ok(())
 }

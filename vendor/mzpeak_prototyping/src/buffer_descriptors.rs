@@ -524,9 +524,9 @@ const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
 // polynomial, the TIMS mobility model) awaits a PSI recalibration-function term (BACKLOG.md #1).
 const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003825);
 const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003824);
-// MS:1003826 "coordinate grid encoding" — marks an array as storing grid INDICES into an external
-// grid (value = grid id); emitted alongside the spacing model on the grid-index column.
-pub const COORD_GRID_ENCODING: CURIE = mzdata::curie!(MS:1003826);
+// (MS:1003826 "coordinate grid encoding" would additionally mark the grid-index column, but the
+// array index `transform` field holds a single CURIE — already the spacing model — so there is no
+// slot for it; revisit if the spec adds a dedicated grid-encoding marker field.)
 // Legacy codings recognized on READ only, so archives written before the assignment keep decoding:
 // our earlier made-up MS:1003903/1003904 and the converter-owned MZP:1000001/1000002 (Unknown-CV).
 const SQRT_LEGACY_MS: CURIE = mzdata::curie!(MS:1003903);

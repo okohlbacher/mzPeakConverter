@@ -1177,13 +1177,12 @@ fn convert_agilent_grid(
     let mut ms1 = Ms1Chroms::default();
     let cap = max_spectra();
     let mut n = 0usize;
-    let mut max_ppm = 0.0f64;
     let mut nonint_intensity = false;
     while let Some(ps) = reader.next_spectrum()? {
         if cap.is_some_and(|m| n >= m) {
             break;
         }
-        let spec = agilent_grid_spectrum(&reader, ps, &mass_spectrum, &mut max_ppm, &mut nonint_intensity)?;
+        let spec = agilent_grid_spectrum(ps, &mass_spectrum, &mut nonint_intensity)?;
         if synth_chroms {
             ms1.observe(&spec);
         }
@@ -1191,8 +1190,8 @@ fn convert_agilent_grid(
         n += 1;
     }
     log::info!(
-        "Agilent-grid: wrote {n} profile spectra; max round-trip m/z error {max_ppm:.6} ppm vs \
-         MassHunter (traditional quadratic + polynomial refinement){}",
+        "Agilent-grid: wrote {n} profile spectra; lossless vs MassHunter — tof_index is the native \
+         integer flight-time, so the quadratic + polynomial reconstruction is exact{}",
         if nonint_intensity { " (WARNING: some intensities exceeded f32-exact range)" } else { "" }
     );
     let calibrations = reader.calibrations_json();
@@ -1211,7 +1210,7 @@ fn convert_agilent_grid(
         "tof_to_mz": "t = base + (tof_c0 + tof_c1*tof_index)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))",
         "per_spectrum_columns": ["tof_c0", "tof_c1", "tof_calibration_id"],
         "calibrations": calibrations,
-        "max_roundtrip_ppm": max_ppm,
+        "max_roundtrip_ppm": 0.0, // lossless by construction (tof_index is the native integer bin)
     });
     zip.add_index_metadata("tof_calibration", &cal)
         .context("writing tof_calibration index")?;
@@ -1228,39 +1227,15 @@ fn convert_agilent_grid(
 /// integer intensity (as Float32, exact for counts < 2^24), the per-spectrum grid as `tof_c0`/`tof_c1`
 /// params, and a per-point lossless gate against the polynomial-refined MassHunter m/z.
 fn agilent_grid_spectrum(
-    reader: &agilent_profile::AgilentProfileReader,
     ps: agilent_profile::ProfileSpectrum,
     mass_spectrum: &Param,
-    max_ppm: &mut f64,
     nonint_intensity: &mut bool,
 ) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
     let grid = ps.grid;
-    // Losslessness vs MassHunter. The stored representation is: integer `tof_index = k`, per-spectrum
-    // (c0,c1), and the per-CalibrationID polynomial in the index block. A conformant reader recovers
-    // raw TOF `t = base + (c0+c1·k)/coeff` and then the FULL MassHunter m/z (traditional quadratic +
-    // polynomial), so reconstruction is exact to f64 noise. We measure that round-trip error here
-    // (`max_ppm` ≈ 0). For the report we ALSO track how far the bare 2-coeff grid (no polynomial)
-    // would be — the magnitude of the refinement the index block captures.
-    if let (Some(row), uf) = (reader.calib_row(ps.index), reader.poly_flags_for(ps.index)) {
-        let coeff = row[0];
-        let base = row[1];
-        for &k in &ps.tof_index {
-            // MassHunter's reported m/z for this bin (the lossless target).
-            let t = base + (grid.c0 + grid.c1 * k as f64) / coeff;
-            let target = agilent_profile::calibrated_mz(row, uf, t);
-            if !(target > 0.0) {
-                continue;
-            }
-            // Reader's reconstruction from the stored columns + index polynomial — identical formula.
-            let t_rec = base + (grid.c0 + grid.c1 * k as f64) / coeff;
-            let rec = agilent_profile::calibrated_mz(row, uf, t_rec);
-            let ppm = (rec - target).abs() / target * 1e6;
-            if ppm > *max_ppm {
-                *max_ppm = ppm;
-            }
-        }
-    }
-
+    // Lossless vs MassHunter by construction: `tof_index = k` is the NATIVE integer flight-time bin
+    // (no rounding); per-spectrum (c0,c1) + the per-CalibrationID polynomial ride in the index block,
+    // so a conformant reader recovers `t = base + (c0+c1·k)/coeff` then the full MassHunter m/z
+    // (quadratic + polynomial) exactly.
     let intensity: Vec<f32> = ps
         .intensity
         .iter()
