@@ -114,6 +114,11 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
         let mzs: Vec<f64> = if is_sqrt {
             let c0 = p.first().copied().unwrap_or(0.0);
             let c1 = p.get(1).copied().unwrap_or(1.0);
+            // R3 guard: the run-wide `(0,1)` sqrt params are an IDENTITY PLACEHOLDER (native-SCIEX).
+            // Computing `(0 + 1·k)² = k²` here installs confident garbage m/z. The real grid is the
+            // per-spectrum `(tof_c0 + tof_c1·k)²` applied once the description is read (see the
+            // per-spectrum fixup in reader.rs). Skip so corruption surfaces as missing m/z, not k².
+            if c0 == 0.0 && c1 == 1.0 { continue; }
             ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect()
         } else {
             let s = p.first().copied().unwrap_or(1.0);
@@ -127,6 +132,39 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
     }
     for mz_da in reconstructed {
         out.add(mz_da);
+    }
+}
+
+/// Per-spectrum sqrt TOF-grid reconstruction (native-SCIEX): overwrite m/z with
+/// `(tof_c0 + tof_c1·k)²` using the spectrum's PER-SPECTRUM coefficients, which override the run-wide
+/// `(0,1)` placeholder that [`reconstruct_grid_mz`] deliberately skips. Coefficients are looked up by
+/// NAME (`tof_c0`/`tof_c1`) so it is accession-independent (`MZP:1000003/4` today, legacy
+/// `MS:4000900/1`); the grid array is located via the run-wide index's `ArrayType` because the decoded
+/// `tof_index` is a `NonStandardDataArray` whose name may be empty. No-op when there are no per-spectrum
+/// coefficients (non-grid data) or no grid array. Shared by the sync and async readers.
+pub(crate) fn reconstruct_per_spectrum_grid_mz(
+    out: &mut BinaryArrayMap,
+    params: &[mzdata::params::Param],
+    array_indices: &ArrayIndex,
+) {
+    let Some(gt) = array_indices
+        .iter()
+        .find(|v| matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof)))
+        .map(|v| v.array_type.clone())
+    else {
+        return;
+    };
+    let coeff = |needle: &str| {
+        params.iter().find(|p| p.name.contains(needle)).and_then(|p| p.to_f64().ok())
+    };
+    let (Some(c0), Some(c1)) = (coeff("tof_c0"), coeff("tof_c1")) else { return };
+    if let Some(ks) = out.get(&gt).and_then(|t| t.to_i32().ok()).map(|c| c.into_owned()) {
+        let mzs: Vec<f64> = ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect();
+        let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        if mz_da.update_buffer(mzs.as_slice()).is_ok() {
+            mz_da.unit = Unit::MZ;
+            out.add(mz_da);
+        }
     }
 }
 
