@@ -77,7 +77,21 @@ the controlled sets; (c) a `transform` that needs params carries `mzpeak:transfo
 `…_per_spectrum`. Each is a net-new `p_*` primitive + rule entry + fixture in
 `~/Claude/mzPeakValidator`. Makes #1–#3 regressions impossible to reintroduce silently.
 
-## #7 — Centroid → naive-encoding fallback 🟡 (robustness; motivated by the chromatogram drain panic)
+## #7 — Centroid → naive-encoding fallback 🟢 (root cause fixed; #2 hardening optional)
+
+**Root cause fixed (`142b9ac`).** The drain panic was not really a centroid-encoding gap — it was a
+flag bug in the *packed* `MzPeakWriterType`: it built the chromatogram buffer's schema off
+`use_chunked_encoding` (the **spectrum** flag) while `write_chromatogram_arrays` branches on
+`use_chromatogram_chunked_encoding` (the **chromatogram** flag). Whenever they disagreed —
+`convert_sciex_grid`: point spectra + chunked-chromatogram flag — construction was point but the
+write was chunked, panicking `drain()` into a 0-byte archive once a real TIC was written. Now both
+sides key on the chromatogram flag (the split writer already did), so sub-item 3 is closed and the
+`6ae92d1` point-only pin was dropped — SCIEX-grid chromatograms are chunked + consistent again.
+Verified: MSV000090136 (the original crash) reconverts clean.
+
+Sub-item 2 below is still worth doing as defense-in-depth but is no longer urgent:
+
+(original framing kept for the remaining optional hardening —)
 
 The SCIEX-grid chromatogram panic fixed point-wise in `6ae92d1` was one instance of a general
 fragility: a facet whose **write** path is chunked/grid while its Arrow **schema** was built point
@@ -92,15 +106,16 @@ do not fit and must use naive point `(m/z, intensity)` encoding. Today that fall
 per-path (the grid path special-cases empty spectra to the data facet; chromatograms are now
 hard-pinned point), so the next path that enables chunked write without a matching schema reopens it.
 
-What to build (any one closes the hole; ideally all three):
-1. **One detection point** — centroid/won't-grid ⇒ route to naive point encoding, instead of each
-   converter re-deciding ad hoc. `src/main.rs` (`convert_sciex_grid` profile-vs-centroid routing).
-2. **Fail loud, not fatal** — `drain()`'s `unwrap_or_else(|e| panic!(…))`
+What to build:
+1. ~~One detection point — centroid/won't-grid ⇒ naive point encoding.~~ **Moot** — the panic was a
+   writer flag bug, not a routing gap; the existing profile/centroid/empty routing was already correct.
+2. **Fail loud, not fatal** 🟡 (optional, still open) — `drain()`'s `unwrap_or_else(|e| panic!(…))`
    (`vendor/mzpeak_prototyping/src/writer/array_buffer.rs:437`) should `bail!` with the facet +
-   column names so a schema/data mismatch is a recoverable CONV-ERR, never a silent 0-byte file.
-3. **Self-consistent flag** — make `chromatogram_chunked_encoding(Some)` actually build the chunked
-   chromatogram schema (`base.rs:537` write path vs the buffer's point fields), so the flag can't be
-   set on one side only. Then the point-only pin in `convert_sciex_grid` can drop.
+   column names so any *future* schema/data mismatch is a recoverable CONV-ERR, not a panic. Lower
+   priority now that the one known trigger is gone; the trait returns `impl Iterator<Item=RecordBatch>`
+   so this needs threading `Result` through ~10 call sites.
+3. ~~Self-consistent flag.~~ **Done (`142b9ac`)** — packed writer now builds the chromatogram buffer
+   off `use_chromatogram_chunked_encoding`; the `convert_sciex_grid` point-only pin was dropped.
 
 ---
 
