@@ -1582,11 +1582,14 @@ fn transcode_legacy_encoding(input: &Path) -> Result<Option<PathBuf>> {
     if is_imzml {
         let ibd = input.with_extension("ibd");
         if ibd.exists() {
+            // Absolute target — the symlink lives in the temp dir, so a relative input path would
+            // otherwise resolve the .ibd against the temp dir and dangle.
+            let ibd_abs = fs::canonicalize(&ibd)?;
             let dst = dir.join(format!("{stem}.ibd"));
             #[cfg(unix)]
-            std::os::unix::fs::symlink(&ibd, &dst)?;
+            std::os::unix::fs::symlink(&ibd_abs, &dst)?;
             #[cfg(not(unix))]
-            fs::copy(&ibd, &dst)?;
+            fs::copy(&ibd_abs, &dst)?;
         }
     }
     log::info!(
