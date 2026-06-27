@@ -1816,7 +1816,7 @@ const LINEAR_MZ_SCALE: f64 = 1.0e4;
 fn convert_sciex_grid(
     input: &Path,
     output: &Path,
-    _chunk: Option<ChunkingStrategy>, // chromatograms are point on this path; see builder below
+    chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
@@ -1896,11 +1896,7 @@ fn convert_sciex_grid(
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
-        // ponytail: no chromatogram_chunked_encoding here. This path uses a custom POINT spectrum
-        // schema and never samples chromatogram array types, so the chromatogram facet schema stays
-        // point. Setting chunked encoding flips only the WRITE path to LargeList (base.rs), leaving a
-        // point schema → the drain panics ("1 column vs 3 fields") the moment a real synthesized TIC
-        // is written (i.e. any run with MS1 spectra). TIC/BPC are tiny; point matches convert_file.
+        .chromatogram_chunked_encoding(chunk)
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
             curie!(MS:1000294),
             "mass spectrum",

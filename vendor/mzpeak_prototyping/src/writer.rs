@@ -690,7 +690,12 @@ impl<
             spectrum_buffers.into()
         };
 
-        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
+        // The chromatogram buffer's schema must follow the CHROMATOGRAM chunking flag, not the
+        // spectrum one. write_chromatogram_arrays() (base.rs) branches on
+        // use_chromatogram_chunked_encoding; building the buffer off use_chunked_encoding instead
+        // lets the two disagree (point spectra + chunked-chromatogram flag → point buffer, chunked
+        // write → drain panics "N columns vs M fields"). The split writer already uses this flag.
+        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chromatogram_chunked_encoding.is_some() {
             chromatogram_buffers_builder
                 .build_chunked(
                     Arc::new(Schema::empty()),
