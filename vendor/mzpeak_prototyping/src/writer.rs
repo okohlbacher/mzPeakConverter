@@ -892,7 +892,19 @@ impl<
                     .map_err(io::Error::other)?;
             for batch in reader {
                 let batch = batch.map_err(io::Error::other)?;
-                self.archive_writer.as_mut().unwrap().write(&batch)?;
+                let writer = self.archive_writer.as_mut().unwrap();
+                writer.write(&batch)?;
+                // Bound the metadata row group by bytes (same threshold as the data facet) so a
+                // very large run (100k+ spectra) is split into several row groups a reader can
+                // decode incrementally, instead of one monolithic row group it must materialize
+                // whole on open.
+                if writer.in_progress_size() > 16_000_000 {
+                    log::debug!(
+                        "Flushing metadata row group buffer with approximately {} bytes",
+                        writer.in_progress_size()
+                    );
+                    writer.flush()?;
+                }
             }
         } else {
             let arrays = self.spectrum_metadata_buffer.finish();

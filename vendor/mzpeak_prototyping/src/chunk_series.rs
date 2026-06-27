@@ -959,6 +959,16 @@ impl ArrowArrayChunk {
                     if f.transform.is_some() {
                         fields_of.insert(f.clone().with_transform(None), f.clone());
                     }
+                    // Physical arrays frequently arrive with no unit annotation (e.g. mzML
+                    // intensity carries Unit::Unknown) while the schema field declares the
+                    // canonical unit. BufferName equality/hash include the unit, so without a
+                    // unit-stripped alias the lookup misses, the schema field's Primary priority
+                    // never propagates, and the array is wrongly spilled to a huge *uncompressed*
+                    // auxiliary array in spectra_metadata instead of its own data-facet column.
+                    if !matches!(f.unit, mzdata::params::Unit::Unknown) {
+                        fields_of
+                            .insert(f.clone().with_unit(mzdata::params::Unit::Unknown), f.clone());
+                    }
                 }
             }
         }
