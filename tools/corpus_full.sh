@@ -19,6 +19,9 @@ echo "reconvert -> $out"
 sizeof(){ if [ -d "$1" ]; then du -sk "$1" | awk '{print $1*1024}'; else stat -f %z "$1" 2>/dev/null || echo 0; fi; }
 slug(){ echo "${1#$root/}" | sed 's#[^A-Za-z0-9._-]#_#g; s#__*#_#g'; }
 ratio(){ awk -v m="$1" -v w="$2" 'BEGIN{if(w>0) printf "%.4f", m/w; else print "NA"}'; }
+# A Thermo RAW file starts with 01 A1 followed by "Finnigan" in UTF-16LE. Peek the first bytes,
+# drop the interleaved NULs, and look for the magic — robust to corpus dirs mislabeled by vendor.
+raw_is_thermo(){ LC_ALL=C head -c 64 "$1" 2>/dev/null | LC_ALL=C tr -d '\000' | LC_ALL=C grep -qa 'Finnigan'; }
 
 conv(){ # tier format flags input outpath
   local tier="$1" fmt="$2" flags="$3" in="$4" o="$5"
@@ -42,15 +45,39 @@ mz_of(){ local p="$1"; case "$p" in *.*) echo "${p%.*}.mzpeak";; *) echo "$p.mzp
 
 walk_tier(){ # tier dir  — dispatch every unit in a tile by type
   local tier="$1" dir="$root/$2"; [ -d "$dir" ] || return
-  # Agilent .d (no analysis.tdf/tsf) -> grid; Bruker .d (has tdf/tsf) -> native
+  # .d dispatch by CONTENT, not by absence-of-Bruker-markers:
+  #  - a .d holding a nested *.d is a container/wrapper (e.g. Bruker SBA415_Try.d wrapping the real
+  #    acquisition .d) — skip it; the inner .d is walked on its own and classified correctly.
+  #  - analysis.tdf/tsf  -> Bruker, host-native.
+  #  - AcqData/ with a non-empty MSProfile.bin -> Agilent profile, host-griddable.
+  #  - AcqData/ without profile data -> centroid-only Agilent, needs the Windows MHDAC SDK -> box.
+  #  - anything else -> unrecognized, skip loudly (don't feed it to --agilent-grid and crash).
   while IFS= read -r d; do
-    if find "$d" -maxdepth 1 \( -name analysis.tdf -o -name analysis.tsf \) | grep -q .; then
+    if find "$d" -mindepth 1 -maxdepth 1 -type d -iname '*.d' 2>/dev/null | grep -q .; then
+      echo "  skip wrapper .d (holds a nested .d): ${d#$root/}" >&2
+    elif find "$d" -maxdepth 1 \( -name analysis.tdf -o -name analysis.tsf \) | grep -q .; then
       conv "$tier" bruker "" "$d" "$(mz_of "$d")"
+    elif [ -d "$d/AcqData" ]; then
+      if [ -s "$d/AcqData/MSProfile.bin" ]; then
+        conv "$tier" agilent "--agilent-grid" "$d" "$(mz_of "$d")"
+      else
+        defer "$tier" agilent-d "$d"   # centroid-only Agilent .d -> Windows MHDAC on the box
+      fi
     else
-      conv "$tier" agilent "--agilent-grid" "$d" "$(mz_of "$d")"
+      echo "  skip unrecognized .d (no tdf/tsf/AcqData): ${d#$root/}" >&2
     fi
   done < <(find "$dir" -type d -iname '*.d' 2>/dev/null | sort)
-  while IFS= read -r f; do conv "$tier" thermo "" "$f" "$(mz_of "$f")"; done < <(find "$dir" -type f -iname '*.raw' 2>/dev/null | sort)
+  # .raw FILES are Thermo only if they carry the Finnigan magic (01 A1 "Finnigan" in UTF-16). A .raw
+  # without it is not Thermo (mislabeled corpus dir, or another vendor) — record it instead of
+  # crashing the Thermo reader on it. (Waters .raw is a DIRECTORY, deferred just below.)
+  while IFS= read -r f; do
+    if raw_is_thermo "$f"; then
+      conv "$tier" thermo "" "$f" "$(mz_of "$f")"
+    else
+      echo "  skip non-Thermo .raw (no Finnigan magic): ${f#$root/}" >&2
+      printf '%s\t%s\tUNSUPPORTED\t%s\t\t\t%s\n' "$tier" raw-unknown "$(sizeof "$f")" "${f#$root/}" >> "$tsv"
+    fi
+  done < <(find "$dir" -type f -iname '*.raw' 2>/dev/null | sort)
   # Waters .raw is a DIRECTORY (MassLynx) — host-unconvertible on macOS, box-deferred.
   while IFS= read -r d; do defer "$tier" waters-raw "$d"; done < <(find "$dir" -type d -iname '*.raw' 2>/dev/null | sort)
   while IFS= read -r f; do
