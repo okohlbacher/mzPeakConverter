@@ -438,6 +438,24 @@ fn ensure_cv_term(params: &mut Vec<MetaParam>, accession: CURIE, name: &str) {
     });
 }
 
+/// Like [`ensure_cv_term`] but only injects when the list carries NO CV-accession param at all.
+/// Used for `instrumentconfiguration_must` (MS:1000031 instrument model), `detector_must`
+/// (MS:1000026 detector type) and `software_must` (MS:1000799 custom software): the specific value
+/// can't be fabricated, so we supply the rule-valid term ONLY for entries that declare no CV term —
+/// never adding a second term to an entry that already has one (detector/software are not
+/// repeatable, so a blind add would create a "too many" violation).
+fn ensure_cv_term_if_bare(params: &mut Vec<MetaParam>, accession: CURIE, name: &str) {
+    if params.iter().any(|p| p.accession.is_some()) {
+        return;
+    }
+    params.push(MetaParam {
+        name: Some(name.to_string()),
+        accession: Some(accession),
+        value: serde_json::Value::Null,
+        unit: None,
+    });
+}
+
 /// An adaptation of [`mzdata::meta::SourceFile`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SourceFile {
@@ -610,10 +628,14 @@ impl From<Software> for mzdata::meta::Software {
 
 impl From<&mzdata::meta::Software> for Software {
     fn from(value: &mzdata::meta::Software) -> Self {
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `software_must`: each software entry needs a child of MS:1000531 "software".
+        ensure_cv_term_if_bare(&mut parameters, mzdata::curie!(MS:1000799), "custom unreleased software tool");
         Self {
             id: value.id.clone(),
             version: value.version.clone(),
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+            parameters,
         }
     }
 }
@@ -722,16 +744,20 @@ impl From<Component> for mzdata::meta::Component {
 
 impl From<&mzdata::meta::Component> for Component {
     fn from(value: &mzdata::meta::Component) -> Self {
-        Self {
-            component_type: match value.component_type {
-                mzdata::meta::ComponentType::Analyzer => ComponentType::Analyzer,
-                mzdata::meta::ComponentType::IonSource => ComponentType::IonSource,
-                mzdata::meta::ComponentType::Detector => ComponentType::Detector,
-                mzdata::meta::ComponentType::Unknown => ComponentType::Unknown,
-            },
-            order: value.order,
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+        let component_type = match value.component_type {
+            mzdata::meta::ComponentType::Analyzer => ComponentType::Analyzer,
+            mzdata::meta::ComponentType::IonSource => ComponentType::IonSource,
+            mzdata::meta::ComponentType::Detector => ComponentType::Detector,
+            mzdata::meta::ComponentType::Unknown => ComponentType::Unknown,
+        };
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `detector_must`: a detector component needs a detector-type term (MS:1000026,
+        // use_term=true so the parent is valid; not repeatable, hence the `_if_bare` guard).
+        if matches!(component_type, ComponentType::Detector) {
+            ensure_cv_term_if_bare(&mut parameters, mzdata::curie!(MS:1000026), "detector type");
         }
+        Self { component_type, order: value.order, parameters }
     }
 }
 
@@ -761,9 +787,14 @@ impl From<InstrumentConfiguration> for mzdata::meta::InstrumentConfiguration {
 
 impl From<&mzdata::meta::InstrumentConfiguration> for InstrumentConfiguration {
     fn from(value: &mzdata::meta::InstrumentConfiguration) -> Self {
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `instrumentconfiguration_must`: needs an instrument-model term (MS:1000031,
+        // use_term=true so the parent is valid). `_if_bare` so we never overwrite a real model.
+        ensure_cv_term_if_bare(&mut parameters, mzdata::curie!(MS:1000031), "instrument model");
         Self {
             components: value.components.iter().map(Component::from).collect(),
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+            parameters,
             software_reference: value.software_reference.clone(),
             id: value.id,
         }

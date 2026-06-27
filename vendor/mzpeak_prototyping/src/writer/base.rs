@@ -409,6 +409,9 @@ pub trait AbstractMzPeakWriter {
             .collect();
         self.add_index_metadata(DATA_PROCESSING_METHOD_LIST_KEY, &tmp)?;
 
+        // NOTE: the converter already registers itself (id "mzpeak-convert", MS:1000799) + a
+        // referencing data-processing method in src/main.rs — that IS the provenance entry ("M3"),
+        // so we don't add another here.
         let tmp: Vec<_> = self
             .mz_metadata()
             .softwares()
