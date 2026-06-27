@@ -9,11 +9,12 @@
 # Usage: tools/corpus_full.sh [DATA_ROOT] [--only TIER[,TIER...]]
 set -uo pipefail
 root="${1:-$HOME/Claude/mzPeak/data}"; shift || true
-only=""; box=""; box_jobs=4
+only=""; box=""; box_jobs=4; skip_ok=""
 while [ $# -gt 0 ]; do case "$1" in
   --only) only=",$2,"; shift 2;;
   --box) box=1; shift;;                       # convert vendor units on the flash-workstation via box_convert
   --box-jobs) box_jobs="$2"; shift 2;;
+  --skip-ok) skip_ok="$2"; shift 2;;          # resume: skip units already OK in a prior results.tsv
   *) shift;; esac; done
 here="$(cd "$(dirname "$0")" && pwd)"; bin="$(dirname "$here")/target/release/mzpeak-convert"
 [ -x "$bin" ] || { echo "build first: cargo build --release" >&2; exit 2; }
@@ -28,10 +29,18 @@ ratio(){ awk -v m="$1" -v w="$2" 'BEGIN{if(w>0) printf "%.4f", m/w; else print "
 # A Thermo RAW file starts with 01 A1 followed by "Finnigan" in UTF-16LE. Peek the first bytes,
 # drop the interleaved NULs, and look for the magic — robust to corpus dirs mislabeled by vendor.
 raw_is_thermo(){ LC_ALL=C head -c 64 "$1" 2>/dev/null | LC_ALL=C tr -d '\000' | LC_ALL=C grep -qa 'Finnigan'; }
+# --skip-ok: a unit (path relative to root) is "done" if it was OK in the prior results.tsv.
+okset=""
+if [ -n "$skip_ok" ] && [ -f "$skip_ok" ]; then
+  okset="$out/.skip-ok"; awk -F'\t' '$3=="OK"{print $7}' "$skip_ok" | sort -u > "$okset"
+  echo "resume: skipping $(wc -l < "$okset" | tr -d ' ') units already OK in $skip_ok"
+fi
+is_done(){ [ -n "$okset" ] && grep -Fxq "$1" "$okset"; }
 
 conv(){ # tier format flags input outpath
   local tier="$1" fmt="$2" flags="$3" in="$4" o="$5"
   [ -n "$only" ] && case "$only" in *",$tier,"*) :;; *) return;; esac
+  is_done "${in#$root/}" && return            # --skip-ok: already OK in the prior run
   local id; id="$(slug "$in")"; local raw; raw="$(sizeof "$in")"
   # imzML signal lives in the .ibd sidecar — count it in the raw footprint or ratios are inflated.
   if [ "$fmt" = imzml ]; then local ibd="${in%.*}.ibd"; [ -f "$ibd" ] && raw=$((raw + $(sizeof "$ibd"))); fi
@@ -45,6 +54,7 @@ conv(){ # tier format flags input outpath
   fi
 }
 defer(){ # tier fmt path — enqueue for box conversion (--box) else record BOX-DEFERRED
+  is_done "${3#$root/}" && return              # --skip-ok: already OK in the prior run
   if [ -n "$box" ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(mz_of "$3")" "$(box_opts "$2")" >> "$boxtrack"
   else
