@@ -1314,10 +1314,13 @@ fn convert_file(
     if is_waters_raw(input) {
         return convert_waters(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
-    // mzdata panics on an empty self-closing <referenceableParamGroup/> that is later referenced
-    // (ProteomeDiscoverer emits these). If present, convert from a sanitized copy instead.
-    let sanitized = sanitize_param_groups(input)?;
-    let read_path: &Path = sanitized.as_deref().unwrap_or(input);
+    // mzdata panics on a legacy (ISO-8859-1) XML declaration via its sourceFile handler; transcode
+    // to UTF-8 first (imzML carries its .ibd along). Then the empty-<referenceableParamGroup/>
+    // panic that ProteomeDiscoverer triggers — sanitize that too. Each may produce a temp copy.
+    let transcoded = transcode_legacy_encoding(input)?;
+    let base_path: &Path = transcoded.as_deref().unwrap_or(input);
+    let sanitized = sanitize_param_groups(base_path)?;
+    let read_path: &Path = sanitized.as_deref().unwrap_or(base_path);
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
 
@@ -1338,6 +1341,9 @@ fn convert_file(
                 let r = convert_file_tof_grid(input, output, zstd_level, vendor, synth_chroms, reader, fit.grid);
                 if let Some(s) = &sanitized {
                     let _ = fs::remove_file(s);
+                }
+                if let Some(p) = transcoded.as_deref().and_then(Path::parent) {
+                    let _ = fs::remove_dir_all(p);
                 }
                 return r;
             }
@@ -1471,6 +1477,9 @@ fn convert_file(
     if let Some(s) = &sanitized {
         let _ = fs::remove_file(s);
     }
+    if let Some(p) = transcoded.as_deref().and_then(Path::parent) {
+        let _ = fs::remove_dir_all(p);
+    }
     Ok(())
 }
 
@@ -1522,6 +1531,69 @@ fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
     out.flush()?;
     log::debug!("sanitized empty referenceableParamGroup(s) into {}", temp.display());
     Ok(Some(temp))
+}
+
+/// mzdata 0.65.2 assumes UTF-8 for mzML/imzML, but its `sourceFile` attribute handler
+/// (`io/mzml/reading_shared.rs:649`) decodes with `unescape_value().expect(...)` — a hard panic on
+/// non-UTF-8 — instead of the `decode_latin1_escape` it uses for every *other* attribute. Real
+/// imzML are declared `ISO-8859-1` (e.g. DESI exports carry `<sourceFile name="à">`, one 0xE0
+/// byte), so that lone Latin-1 byte panics the whole conversion. When the XML declaration names a
+/// legacy encoding, transcode Latin-1→UTF-8 into a temp the reader can open and rewrite the
+/// declaration to UTF-8; imzML's `.ibd` sidecar is symlinked alongside since mzdata finds it by the
+/// `.imzML` stem. The temp lives in its own dir — the caller drops it with `remove_dir_all`.
+///
+/// Caveat: a Latin-1 byte in a *param* value would double-decode through mzdata's own
+/// `decode_latin1_escape` after this (cosmetic mojibake, never a crash). Legacy-encoded imzML in
+/// practice only carry non-ASCII in sourceFile/operator metadata, so trading a crash for at-worst
+/// rare mojibake is the right call. Upstream fix: make mzdata's sourceFile handler use
+/// `decode_latin1_escape` like the rest of the file (reported separately).
+fn transcode_legacy_encoding(input: &Path) -> Result<Option<PathBuf>> {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_imzml = ext.eq_ignore_ascii_case("imzml");
+    if !is_imzml && !ext.eq_ignore_ascii_case("mzml") {
+        return Ok(None);
+    }
+    // Peek only the XML declaration — skip the overwhelming UTF-8 case without reading the file.
+    let mut head = [0u8; 256];
+    let n = fs::File::open(input)?.read(&mut head)?;
+    let decl = String::from_utf8_lossy(&head[..n]);
+    let decl = decl.split("?>").next().unwrap_or("").to_ascii_lowercase();
+    if !(decl.contains("iso-8859") || decl.contains("windows-125") || decl.contains("latin")) {
+        return Ok(None); // UTF-8 or unspecified: mzdata reads it directly
+    }
+    // ISO-8859-1 (Latin-1): every byte maps 1:1 to U+0000..=U+00FF, so `b as char` is exact.
+    let bytes = fs::read(input)?;
+    let mut text: String = bytes.iter().map(|&b| b as char).collect();
+    // Rewrite encoding="…" inside the declaration to UTF-8 (mzdata ignores it, but keep it honest).
+    if let Some(decl_end) = text.find("?>") {
+        if let Some(es) = text[..decl_end].find("encoding=\"") {
+            let vstart = es + "encoding=\"".len();
+            if let Some(rel) = text[vstart..decl_end].find('"') {
+                text.replace_range(vstart..vstart + rel, "UTF-8");
+            }
+        }
+    }
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
+    let name = input.file_name().unwrap_or(input.as_os_str());
+    let dir = std::env::temp_dir().join(format!("mzpc-xlat-{}-{}", std::process::id(), stem));
+    fs::create_dir_all(&dir)?;
+    let out = dir.join(name);
+    fs::write(&out, text.as_bytes())?;
+    if is_imzml {
+        let ibd = input.with_extension("ibd");
+        if ibd.exists() {
+            let dst = dir.join(format!("{stem}.ibd"));
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&ibd, &dst)?;
+            #[cfg(not(unix))]
+            fs::copy(&ibd, &dst)?;
+        }
+    }
+    log::info!(
+        "transcoded legacy-encoded {} → UTF-8 (works around mzdata's sourceFile UTF-8 panic)",
+        input.display()
+    );
+    Ok(Some(out))
 }
 
 /// Rewrite every empty self-closing `<referenceableParamGroup id="…"/>` as `<… ></…>`. Leaves
