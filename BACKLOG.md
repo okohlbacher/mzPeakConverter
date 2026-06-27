@@ -140,6 +140,30 @@ Once (1) ships upstream and the pin moves, drop `transcode_legacy_encoding`.
 
 ---
 
+## #9 — Agilent `.d`: MHDAC needs .NET Framework, not .NET 8 ✅ (re-hosted out-of-process)
+
+**Done.** MHDAC cannot run in an in-process .NET 8 runtime: `MassSpecDataReader.OpenDataFile`
+internally calls `Delegate.BeginInvoke` (`DataFileMgr.ReadNonMSInfoDelegate`), permanently
+unsupported on .NET Core/5+ (`PlatformNotSupportedException`, no opt-in flag). Re-hosted as an
+**out-of-process .NET Framework 4.8 console EXE** `AgilentGlueHost.exe` (`glue/agilent/`, retargeted
+net8 lib → net48 exe via `Microsoft.NETFramework.ReferenceAssemblies` so it still cross-builds with
+the `dotnet` SDK). `src/agilent.rs` now spawns it per `.d` and reads back a little-endian binary file
+(replacing the `netcorehost`/UnmanagedCallersOnly FFI). On the box: `box_convert_remote.ps1` points
+`MZPC_AGILENT_GLUE` at `bin/Release/net48`, and a `pwiz-bin/vendor_api/Agilent → pwiz-bin` junction
+supplies the flattened MHDAC DLLs.
+
+Verified: MHDAC now executes under .NET FW (the `BeginInvoke` wall is gone) and returns real vendor
+verdicts. Reflection resolution validated against MHDAC `10.0.1.10305` (types across
+`MassSpecDataReader`/`BaseDataAccess`/`BaseCommon`; reader API via the `IMsdrDataReader` interface).
+
+**Corpus note (separate annotation issue):** `Alexander_023_B_30x_pos_121820_136.d` carries **no MS
+data** — its `AcqData` holds only LC device traces (`BinPump1.cg` pump pressure, `HiP-ALS1.cg`
+autosampler), no `MSScan/MSPeak/MSProfile`. MHDAC correctly reports "does not contain any data"; it
+should be excluded from MS conversion, not recorded as a failure. The only MS-bearing Agilent `.d` in
+the corpus is the profile `LMVCS24HC.d` (host `--agilent-grid` path). Full design: `glue/agilent/README.md`.
+
+---
+
 ## Done ✅
 
 - **#5** — the four index blocks are typed optional schema properties in the spec + validator
