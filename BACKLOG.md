@@ -178,3 +178,31 @@ the corpus is the profile `LMVCS24HC.d` (host `--agilent-grid` path). Full desig
 - **#3** — embedded vendor side-files now use the controlled `entity_type: other`
   (was the non-conformant `"vendor"`); `data_kind: proprietary` + the `vendor/` path
   prefix still mark them vendor-private. `src/vendor.rs`; spec examples updated to match.
+
+---
+
+## #10 — Adversarial-review follow-ups (deferred from v0.3.0) 🟡
+
+Lower-severity hardening surfaced by the v0.3.0 release review; none affect the
+example corpus (which validates 0/0). Fix opportunistically.
+
+**Box tooling (`tools/`):**
+- `box_convert_scp.sh` word-splits `src out` pairs and `$members` on whitespace, so it
+  can't handle paths with spaces/parens (the corpus has `SBA415(1) Try_…`). The SCP
+  path is a fallback (URL-pull supersedes it); to lift the limitation, feed NUL/tab-
+  delimited records + bash arrays like `box_convert.sh` does. Header already documents it.
+- No trap/`finally` on the SCP path → orphaned `scpconv/<uid>` box temp dirs on kill.
+  Mirror `box_convert.sh`'s `trap cleanup EXIT INT TERM` + self-cleaning box-side temp.
+
+**Agilent host (`glue/agilent/Glue.cs`):**
+- Missing-RT is silently 0.0 (indistinguishable from a real RT 0); use a NaN sentinel so
+  the Rust side can tell "no RT" from "RT 0". Also assert `GetScanRecord`/`GetSpectrum`
+  share a row-index space.
+- No endianness sentinel — the LE assumption is correct on x64 Windows but unguarded;
+  a u64 magic-2 after `AGL1` would catch a future BE/ARM host.
+- `MapMsLevel` demotes MS3+/MSn to MS1 (fine for QTOF; wrong for deeper-level instruments).
+- X/Y length mismatch is silently clamped to the shorter array rather than flagged.
+
+**Metadata (`vendor/mzpeak_prototyping/src/param.rs`):** `ensure_cv_term_if_bare` keys on
+"no accession at all", not "no accession from the rule's branch" — an entry carrying an
+unrelated CV term still warns. Needs CV-hierarchy awareness to close fully.

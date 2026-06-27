@@ -6,6 +6,46 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-27
+
+### Fixed — validator spec-compliance (mzpeak-0.9 profile)
+
+- **Array-index `unit` is always a CURIE.** Arrays arriving with `Unit::Unknown`
+  (mzML intensity, the integer `tof_index` grid column, ion-mobility / charge columns)
+  get a conventional fallback unit (intensity → `MS:1000131`, tof_index → `UO:0000189`,
+  1/K0 → `MS:1002814`, drift time → ms, charge → `UO:0000186`) instead of an empty /
+  `null` unit, in both the Parquet field-metadata and the JSON index. `buffer_priority`
+  is now omitted when absent rather than serialized as `null`.
+- **Mandatory CV terms injected** where the source omits them: a child of `data
+  transformation` (`MS:1000530`) per processing method, `data file content`
+  (`MS:1000294`) in `file_description`, `software` (`MS:1000799`), `instrument model`
+  (`MS:1000031`), `detector type` (`MS:1000026`) — only when the entry declares no CV
+  term, so no duplicate / "too-many" violations.
+- **`tof_calibration.lossless`** (`"tof_index"`) is now written on the SciEX-sqrt grid
+  path too (it was only on the TSF / Agilent builders).
+- Net effect: the example corpus validates **0 errors / 0 warnings** (was 126 FAIL).
+
+### Changed — Agilent native moved out-of-process (.NET Framework 4.8)
+
+- MHDAC's `OpenDataFile` internally calls `Delegate.BeginInvoke`, permanently
+  unsupported on .NET Core / 5+. The Agilent native reader is therefore **re-hosted as
+  a standalone net48 EXE** (`AgilentGlueHost.exe`, built from `glue/agilent/` via
+  `Microsoft.NETFramework.ReferenceAssemblies` so it cross-builds with the dotnet SDK).
+  `src/agilent.rs` spawns it per `.d` and reads back a little-endian binary file,
+  replacing the in-process `netcorehost` / `UnmanagedCallersOnly` FFI. The host writes
+  its output atomically (`.part` + rename); the Rust reader bound-checks declared
+  sizes against the on-disk file.
+
+### Added — no-S3 box conversion tooling
+
+- `tools/box_convert_scp.sh` + `box_local_convert.ps1` — convert vendor formats on a
+  Windows box via **direct SCP** (raw up, `.mzpeak` back), no S3 round-trip, with ssh
+  keepalive for large transfers.
+- `tools/box_url_convert.ps1` — the box pulls the raw **straight from its public source**
+  (PRIDE / MassIVE) into a local cache (atomic `.part` download), converts, and the
+  caller retrieves the result; `-Names` handles sources whose filename is in the query
+  string (e.g. MassIVE `DownloadResultFile`).
+
 ### Added — data features
 
 - **FILE-DIRECT Agilent Q-TOF *profile* reader** (`--agilent-grid`, off by default;

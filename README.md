@@ -46,13 +46,16 @@ analysis-ready, preserving vendor metadata and ion-mobility structure.
 | Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; `libbaf2sql_c` at runtime |
-| Agilent `.d` (native) | ❌ | ❌ | ✅ | auto-built; MHDAC DLLs at runtime |
-| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | auto-built; Clearcore2 DLLs at runtime |
+| Agilent `.d` (native) | ❌ | ❌ | ✅ | out-of-process **.NET FW 4.8** host (`glue/agilent`); MHDAC at runtime |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
 
-The native vendor readers are **compiled in automatically on the platforms where
-the vendor libraries exist** (no build flag) and load the vendor DLLs at runtime;
-everywhere else, the cross-vendor `--via-msconvert` path covers them.
+Thermo `.raw` and Bruker `.d` link their readers in automatically (no build flag).
+The SciEX/Waters/Agilent native readers use a small .NET **glue** under `glue/`
+(built once with `dotnet build`, pointed at via `MZPC_*_GLUE` + a ProteoWizard
+install for the vendor DLLs — see each `glue/*/README.md`). MHDAC needs .NET
+Framework, so Agilent runs as a separate net48 EXE rather than in-process.
+Everywhere else, the cross-vendor `--via-msconvert` path covers them.
 
 ## Install
 
