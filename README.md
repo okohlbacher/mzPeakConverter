@@ -57,6 +57,10 @@ install for the vendor DLLs — see each `glue/*/README.md`). MHDAC needs .NET
 Framework, so Agilent runs as a separate net48 EXE rather than in-process.
 Everywhere else, the cross-vendor `--via-msconvert` path covers them.
 
+**Full matrix** — every format × OS, the runtime requirements (.NET 8 for Thermo,
+.NET Framework 4.8 for Agilent, the vendor DLLs), and how to build/point at each glue
+executable: **[docs/PLATFORM_SUPPORT.md](docs/PLATFORM_SUPPORT.md)**.
+
 ## Install
 
 ```sh

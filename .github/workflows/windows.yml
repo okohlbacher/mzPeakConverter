@@ -58,6 +58,23 @@ jobs:
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
           dotnet build glue/agilent_midac/AgilentMidacGlue.csproj -c Release
 
+      # Each native vendor reader needs its glue executable/assembly at runtime — fail the build if
+      # any artifact is missing (e.g. a TFM rename or a glue that silently stopped emitting an exe).
+      # Agilent is the net48 AgilentGlueHost.exe (out-of-process); the other three are net8 DLLs.
+      - name: Verify produced executables (converter + 4 glue artifacts)
+        shell: pwsh
+        run: |
+          $need = @(
+            "target/release/mzpeak-convert.exe",
+            "glue/agilent/bin/Release/net48/AgilentGlueHost.exe",
+            "glue/sciex/bin/Release/net8.0/SciexGlue.dll",
+            "glue/waters/bin/Release/net8.0/WatersGlue.dll",
+            "glue/agilent_midac/bin/Release/net8.0/AgilentMidacGlue.dll"
+          )
+          $missing = $need | Where-Object { -not (Test-Path $_) }
+          if ($missing) { Write-Error "missing build artifacts:`n$($missing -join "`n")"; exit 1 }
+          $need | ForEach-Object { Write-Host "OK $_ ($((Get-Item $_).Length) bytes)" }
+
       # Core convert path, end-to-end on Windows, against a tiny committed mzML.
       - name: Smoke test — convert a tiny mzML
         run: cargo run --release -- tests/fixtures/tiny.pwiz.1.1.mzML -o out.mzpeak --force
