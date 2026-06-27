@@ -30,3 +30,4 @@ __pycache__/
 
 # Windows workstation credentials — NEVER commit
 flash-workstation.txt
+tools/box.env
