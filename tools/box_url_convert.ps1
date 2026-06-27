@@ -2,20 +2,26 @@
 # LOCAL CACHE, convert to .mzpeak, NO S3. The mac scp's the result back. Cached raws are kept so a
 # re-convert skips the (large) download.
 #   powershell -NoProfile -ExecutionPolicy Bypass -File box_url_convert.ps1 \
-#       -Urls "<url1>,<url2>,..." -RawName <file-to-convert> -OutPath <box out.mzpeak> -CacheKey <subdir>
+#       -Urls "<url1>,<url2>,..." -RawName <file-to-convert> -OutPath <box out.mzpeak> -CacheKey <subdir> [-Names "n1,n2"]
+# -Names: explicit cache filenames parallel to -Urls (needed when the filename is in the query string,
+#   not the URL path — e.g. MassIVE ProteoSAFe DownloadResultFile endpoints).
 param(
   [Parameter(Mandatory=$true)][string]$Urls,
   [Parameter(Mandatory=$true)][string]$RawName,
   [Parameter(Mandatory=$true)][string]$OutPath,
-  [Parameter(Mandatory=$true)][string]$CacheKey
+  [Parameter(Mandatory=$true)][string]$CacheKey,
+  [string]$Names = ""
 )
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 $cache = Join-Path 'C:\Users\User\rawcache' $CacheKey
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
-foreach ($u in ($Urls -split ',')) {
-  if (-not $u.Trim()) { continue }
-  $name = [IO.Path]::GetFileName(([Uri]$u).AbsolutePath)
+$urlArr  = @($Urls  -split ',' | Where-Object { $_.Trim() })
+$nameArr = @($Names -split ',' | Where-Object { $_.Trim() })
+for ($i = 0; $i -lt $urlArr.Count; $i++) {
+  $u    = $urlArr[$i].Trim()
+  $name = if ($i -lt $nameArr.Count -and $nameArr[$i].Trim()) { $nameArr[$i].Trim() }
+          else { [IO.Path]::GetFileName(([Uri]$u).AbsolutePath) }
   $dst  = Join-Path $cache $name
   if ((Test-Path $dst) -and ((Get-Item $dst).Length -gt 0)) { "CACHED=$name"; continue }   # cache hit
   & curl.exe -fSL --retry 3 --retry-delay 5 -o $dst $u

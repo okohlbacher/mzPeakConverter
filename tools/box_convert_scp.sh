@@ -7,8 +7,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 set -a; . "$here/box.env" 2>/dev/null; set +a
 : "${BOX_SSH:?}" "${BOX_JUMP:?}" "${BOX_SSH_KEY:?}"
 JOBS="${JOBS:-2}"
-SSHOPT=(-i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
-PROXY="ProxyCommand=ssh -i $BOX_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -W %h:%p $BOX_JUMP"
+SSHOPT=(-i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o TCPKeepAlive=yes)
+PROXY="ProxyCommand=ssh -i $BOX_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -W %h:%p $BOX_JUMP"
 
 # stage the box-side helper once
 scp "${SSHOPT[@]}" -o "$PROXY" "$here/box_local_convert.ps1" "$BOX_SSH:C:/Users/User/box_local_convert.ps1" >/dev/null 2>&1 \
