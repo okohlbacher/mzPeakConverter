@@ -55,6 +55,9 @@ conv(){ # tier format flags input outpath
 }
 defer(){ # tier fmt path — enqueue for box conversion (--box) else record BOX-DEFERRED
   is_done "${3#$root/}" && return              # --skip-ok: already OK in the prior run
+  # In resume mode the box phase has no prior results.tsv rows, so treat a box unit as done when its
+  # output already exists (no output-changing writer fix since) — only missing ones get reconverted.
+  [ -n "$skip_ok" ] && [ -f "$(mz_of "$3")" ] && return
   if [ -n "$box" ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(mz_of "$3")" "$(box_opts "$2")" >> "$boxtrack"
   else
