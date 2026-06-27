@@ -117,6 +117,27 @@ What to build:
 3. ~~Self-consistent flag.~~ **Done (`142b9ac`)** — packed writer now builds the chromatogram buffer
    off `use_chromatogram_chunked_encoding`; the `convert_sciex_grid` point-only pin was dropped.
 
+## #8 — Upstream mzdata: graceful decode in the sourceFile handler 🟡 (report upstream)
+
+We work around it converter-side (`transcode_legacy_encoding`, `1cf067c`/`4bd8eb7`), but the real bug
+is in mzdata 0.65.2 `io/mzml/reading_shared.rs:649`: the `sourceFile` `id`/`name`/`location`
+attributes are decoded with `attr.unescape_value().expect("Error decoding …")` — a UTF-8 decode that
+**panics** — while every other attribute in the same file uses the Latin-1-aware `decode_latin1_escape`
+(lines 191/199/234/284/296/333/500). So one Latin-1 byte in a `sourceFile` attribute panics the whole
+reader (DESI imzML declared ISO-8859-1, `<sourceFile name="à">`). Three graceful options, in order:
+
+1. **Consistency one-liner** — use the decoder already in the file:
+   `source_file.name = decode_latin1_escape(&attr.value).to_string();` (same for id/location). Never
+   panics, matches the rest of the codebase.
+2. **No-panic principle** — a parser must never `.expect()` on external input. Audit the mzML/imzML
+   readers for decode `.expect(`/`unwrap(` and route them through the existing `handle_xml_error`, or
+   `…unwrap_or_else(|_| decode_latin1_escape(&attr.value))`.
+3. **Honor the declaration** — quick-xml's `encoding` feature auto-transcodes a declared
+   `encoding="ISO-8859-1"`/`Windows-1252`/UTF-16; enabling it makes legacy files Just Work and retires
+   the per-attribute Latin-1 dance (and our converter-side transcode) entirely.
+
+Once (1) ships upstream and the pin moves, drop `transcode_legacy_encoding`.
+
 ---
 
 ## Done ✅
