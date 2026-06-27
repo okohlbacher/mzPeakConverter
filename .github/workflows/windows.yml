@@ -13,6 +13,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Which heavy manual job to run (blank = sciex-native only)"
+        required: false
+        default: ""
+        type: choice
+        options: ["", "sciex-native", "vendor-corpus", "pwiz-vendor-extract", "tims-cal-harvest"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,6 +54,7 @@ jobs:
       - name: Build C# interop glues (reflection-only, no vendor DLLs)
         run: |
           dotnet build glue/sciex/SciexGlue.csproj -c Release
+          dotnet build glue/waters/WatersGlue.csproj -c Release
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
           dotnet build glue/agilent_midac/AgilentMidacGlue.csproj -c Release
 
@@ -194,12 +202,249 @@ jobs:
             mzdata.json
             ims-compact.json
 
+  # Convert the Windows-only vendor datasets (Sciex .wiff, Agilent .d, Waters .raw) of the reference
+  # corpus to mzPeak on the runner via the ProteoWizard lane, and TRANSFER THE .mzpeak BACK as a
+  # build artifact (plus a raw-vs-mzpeak size table). Pure-Rust/Thermo/Bruker formats are converted
+  # on the host (tools/convert_corpus.sh); this job covers only what macOS/Linux can't read.
+  #
+  # The vendor inputs aren't in git (proprietary + large), so each file is fetched per-URL from a
+  # public object store, listed in tools/vendor_ci_manifest.tsv (public bucket listing is denied, so
+  # explicit URLs are required). Add rows to the manifest as more datasets get mirrored.
+  # Trigger with: gh workflow run Windows
+  vendor-corpus:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'vendor-corpus'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install ProteoWizard (msconvert) from TeamCity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://teamcity.labkey.org/guestAuth/app/rest"
+          $h = @{ Accept = "application/json" }
+          $bts = Invoke-RestMethod -Headers $h -Uri "$base/buildTypes?locator=affectedProject:(id:ProteoWizard)"
+          $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" -and $_.name -match "x86_64" } | Select-Object -First 1
+          if (-not $bt) { $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" } | Select-Object -First 1 }
+          if (-not $bt) { Write-Error "no Windows ProteoWizard build type found"; exit 1 }
+          $arts = Invoke-RestMethod -Headers $h -Uri "$base/builds/buildType:$($bt.id),status:SUCCESS,state:finished/artifacts/children"
+          $f = $arts.file | Where-Object { $_.name -match "pwiz-bin-windows-x86_64.*\.tar\.bz2$" } | Select-Object -First 1
+          if (-not $f) { Write-Error "no pwiz windows x86_64 artifact found"; exit 1 }
+          $url = "https://teamcity.labkey.org" + $f.content.href
+          Invoke-WebRequest -Uri $url -OutFile pwiz.tar.bz2
+          New-Item -ItemType Directory -Force -Path pwiz | Out-Null
+          tar -xjf pwiz.tar.bz2 -C pwiz
+          $exe = Get-ChildItem -Path pwiz -Recurse -Filter msconvert.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "msconvert.exe not found in artifact"; exit 1 }
+          "MSCONVERT_PATH=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$(Split-Path $exe.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build
+        run: cargo build --release --verbose
+      # pyarrow lets the layout step count peaks-facet rows for a bytes/peak figure (best-effort).
+      - name: Provision pyarrow (bytes/peak rowcount, best-effort)
+        shell: pwsh
+        run: python -m pip install --quiet pyarrow || Write-Host "pyarrow unavailable; bytes/peak will be blank"
+      - name: Fetch vendor corpus files (per-URL manifest)
+        shell: bash
+        run: |
+          mkdir -p vendor-in
+          while IFS=$'\t' read -r dest url flag; do
+            # strip any trailing CR (manifest may be checked out with CRLF on Windows) — a stray
+            # \r on the URL makes curl reject it ("Malformed input to a URL function").
+            dest="${dest%$'\r'}"; url="${url%$'\r'}"; flag="${flag%$'\r'}"
+            case "$dest" in ''|\#*) continue ;; esac
+            [ -z "$url" ] && continue
+            mkdir -p "vendor-in/$(dirname "$dest")"
+            echo "downloading $dest"
+            curl -sSL "$url" -o "vendor-in/$dest" || { echo "FETCH FAILED: $dest"; exit 1; }
+            if [ "${flag:-}" = "unzip" ]; then
+              d="vendor-in/$(dirname "$dest")"
+              echo "extracting $dest into $d"
+              if command -v unzip >/dev/null 2>&1; then unzip -q -o "vendor-in/$dest" -d "$d";
+              elif command -v 7z   >/dev/null 2>&1; then 7z x -y -o"$d" "vendor-in/$dest" >/dev/null;
+              else tar -xf "vendor-in/$dest" -C "$d"; fi || { echo "UNZIP FAILED: $dest"; exit 1; }
+              rm -f "vendor-in/$dest"   # reclaim disk: keep only the extracted vendor dir
+            fi
+          done < tools/vendor_ci_manifest.tsv
+          echo "--- fetched ---"; find vendor-in -maxdepth 3 \( -type f -o -name '*.d' -o -name '*.d - Copy' -o -name 'AcqData' -o -name '*.raw' \) -exec ls -ld {} + | head -50
+      - name: Convert vendor datasets -> mzPeak (via msconvert) + capture layouts
+        shell: bash
+        run: tools/convert_vendor_ci.sh vendor-in vendor-mzpeak-out
+      - name: Upload mzPeak archives + size table + layout exploration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-corpus-mzpeak
+          path: |
+            vendor-mzpeak-out/archives/**
+            vendor-mzpeak-out/results.tsv
+            vendor-mzpeak-out/vendor_layouts.md
+            vendor-mzpeak-out/vendor_layouts.tsv
+            vendor-mzpeak-out/logs/**
+
+  # Extract the ProteoWizard-bundled VENDOR SDK libraries (SCIEX Clearcore2, Agilent MHDAC/MIDAC,
+  # Waters MassLynxRaw/cdt, Bruker timsdata/baf2sql, + pwiz CLI bindings) and upload them as an
+  # artifact, so they can be mirrored to a PRIVATE store for dissection / the native-reader path.
+  # The pwiz bundle is fetched from TeamCity ON THE RUNNER (it is HTTP 403 from some networks).
+  # NOTE: these are PROPRIETARY vendor libraries — the mirror MUST stay private. Manual-trigger only.
+  pwiz-vendor-extract:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'pwiz-vendor-extract'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ProteoWizard from TeamCity (extracts to pwiz/)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://teamcity.labkey.org/guestAuth/app/rest"
+          $h = @{ Accept = "application/json" }
+          $bts = Invoke-RestMethod -Headers $h -Uri "$base/buildTypes?locator=affectedProject:(id:ProteoWizard)"
+          $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" -and $_.name -match "x86_64" } | Select-Object -First 1
+          if (-not $bt) { $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" } | Select-Object -First 1 }
+          if (-not $bt) { Write-Error "no Windows ProteoWizard build type found"; exit 1 }
+          $arts = Invoke-RestMethod -Headers $h -Uri "$base/builds/buildType:$($bt.id),status:SUCCESS,state:finished/artifacts/children"
+          $f = $arts.file | Where-Object { $_.name -match "pwiz-bin-windows-x86_64.*\.tar\.bz2$" } | Select-Object -First 1
+          if (-not $f) { Write-Error "no pwiz windows x86_64 artifact found"; exit 1 }
+          $url = "https://teamcity.labkey.org" + $f.content.href
+          Write-Host "downloading $($f.name)"
+          Invoke-WebRequest -Uri $url -OutFile pwiz.tar.bz2
+          New-Item -ItemType Directory -Force -Path pwiz | Out-Null
+          tar -xjf pwiz.tar.bz2 -C pwiz
+          Write-Host "extracted $((Get-ChildItem pwiz -Recurse -File | Measure-Object).Count) files"
+      - name: Collect vendor SDK libraries + SHA-256 manifest
+        shell: bash
+        run: |
+          mkdir -p sdk
+          # Vendor reader libraries (+ pwiz CLI bindings needed by the native path). Case-insensitive.
+          pat='clearcore2|sciex|wiffreader|massspecdatareader|basecommon|basedataaccess|baseerror|baseprocessing|midac|agilent|agt|masslynx|cdt|waters|timsdata|baf2sql|bruker|unifi|pwiz_bindings|pwiz_data'
+          find pwiz -type f \( -iname '*.dll' -o -iname '*.so' -o -iname '*.dylib' -o -iname '*.config' \) \
+            | grep -iE "$pat" | while read -r f; do
+                rel="${f#pwiz/}"; mkdir -p "sdk/$(dirname "$rel")"; cp "$f" "sdk/$rel"
+              done
+          ( cd sdk && find . -type f ! -name 'MANIFEST*' | sort | while read -r f; do
+              printf '%s  %10s  %s\n' "$(sha256sum "$f" | cut -d" " -f1)" "$(stat -c%s "$f")" "${f#./}"
+            done ) > sdk/MANIFEST.sha256.txt
+          echo "collected $(grep -c . sdk/MANIFEST.sha256.txt) files, total $(du -sh sdk | cut -f1)"
+          sed -n '1,60p' sdk/MANIFEST.sha256.txt
+      - name: Upload vendor SDK artifact (PRIVATE — proprietary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pwiz-vendor-sdk
+          path: sdk/**
+          retention-days: 5
+
+  # Convert the ZenoTOF .wiff DIRECTLY through the native SCIEX (Clearcore2) reader and compare to
+  # the msconvert→mzML lane on the SAME file — to see what the raw vendor read produces (point
+  # counts / m/z / size) vs the mzML path that has been bloating. Manual dispatch only. The native
+  # reader needs pwiz's Clearcore2 DLLs (MZPC_PWIZ_DIR) + the built SciexGlue (MZPC_SCIEX_GLUE).
+  sciex-native-zeno:
+    if: github.event_name == 'workflow_dispatch' && (inputs.target == '' || inputs.target == 'sciex-native')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install ProteoWizard (Clearcore2 + msconvert) from TeamCity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "https://teamcity.labkey.org/guestAuth/app/rest"
+          $h = @{ Accept = "application/json" }
+          $bts = Invoke-RestMethod -Headers $h -Uri "$base/buildTypes?locator=affectedProject:(id:ProteoWizard)"
+          $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" -and $_.name -match "x86_64" } | Select-Object -First 1
+          if (-not $bt) { $bt = $bts.buildType | Where-Object { $_.name -match "(?i)windows" } | Select-Object -First 1 }
+          if (-not $bt) { Write-Error "no Windows ProteoWizard build type found"; exit 1 }
+          $arts = Invoke-RestMethod -Headers $h -Uri "$base/builds/buildType:$($bt.id),status:SUCCESS,state:finished/artifacts/children"
+          $f = $arts.file | Where-Object { $_.name -match "pwiz-bin-windows-x86_64.*\.tar\.bz2$" } | Select-Object -First 1
+          if (-not $f) { Write-Error "no pwiz windows x86_64 artifact found"; exit 1 }
+          $url = "https://teamcity.labkey.org" + $f.content.href
+          Invoke-WebRequest -Uri $url -OutFile pwiz.tar.bz2
+          New-Item -ItemType Directory -Force -Path pwiz | Out-Null
+          tar -xjf pwiz.tar.bz2 -C pwiz
+          $exe = Get-ChildItem -Path pwiz -Recurse -Filter msconvert.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "msconvert.exe not found"; exit 1 }
+          "MSCONVERT_PATH=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build converter + SCIEX glue
+        run: |
+          cargo build --release --verbose
+          dotnet build glue/sciex/SciexGlue.csproj -c Release
+      - name: Fetch SCIEX .wiff (ZenoTOF + TripleTOF SWATH, with sidecars)
+        shell: bash
+        run: |
+          mkdir -p wiff
+          zb="https://object.storage.eu01.onstackit.cloud/v09/mzML-examples/sciex-zenotof-7600"
+          z="20240826_RNAseB_Reduced_50ngul_1ul_MRM_03"
+          for ext in wiff wiff.scan wiff2; do curl -fsSL "$zb/$z.$ext" -o "wiff/$z.$ext"; done
+          sb="https://ftp.pride.ebi.ac.uk/pride/data/archive/2026/05/PXD078909"
+          s="SW_F2_2-2"
+          for ext in wiff wiff.scan; do curl -fsSL "$sb/$s.$ext" -o "wiff/$s.$ext"; done
+          ls -l wiff
+      - name: Convert each .wiff DIRECT (native Clearcore2), compute raw-vs-mzPeak ratio
+        shell: pwsh
+        env:
+          RUST_LOG: info
+        run: |
+          $exe  = "target\release\mzpeak-convert.exe"
+          $glue = (Get-ChildItem glue\sciex -Recurse -Filter SciexGlue.dll | Select-Object -First 1).Directory.FullName
+          $abi  = (Get-ChildItem pwiz -Recurse -Filter Clearcore2.Data.dll | Select-Object -First 1).Directory.FullName
+          $env:MZPC_SCIEX_GLUE = $glue
+          $env:MZPC_PWIZ_DIR   = $abi
+          Write-Host "glue=$glue"; Write-Host "abi=$abi"
+          # DIAGNOSTIC: dump the REAL Clearcore2 API surface so the glue's reflection binds correctly
+          # (the glue is end-to-end untested; the first runtime call hit MissingMethodException). Loads
+          # every Clearcore2*.dll and lists ctors+static methods of the factory + the WIFF provider type.
+          Write-Host "===== Clearcore2 API DUMP ====="
+          Get-ChildItem $abi -Filter 'Clearcore2*.dll' | ForEach-Object { try { [Reflection.Assembly]::LoadFrom($_.FullName) | Out-Null } catch {} }
+          foreach ($tn in @('Clearcore2.Data.DataAccess.SampleData.AnalystDataProviderFactory','Clearcore2.Data.AnalystFR.AnalystWiffDataProvider')) {
+            $t = [AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object { try { $_.GetType($tn) } catch {} } | Where-Object { $_ } | Select-Object -First 1
+            if (-not $t) { Write-Host "TYPE NOT FOUND: $tn"; continue }
+            Write-Host "--- $($t.FullName)  [$($t.Assembly.GetName().Name)]"
+            $t.GetConstructors() | ForEach-Object { Write-Host "  ctor($(( $_.GetParameters() | ForEach-Object { $_.ParameterType.Name } ) -join ', '))" }
+            $t.GetMethods('Public,Static,Instance,DeclaredOnly') | Where-Object { $_.Name -match 'Create|Provider|Batch|Wiff|Sample|Open' } | ForEach-Object { Write-Host "  $(if($_.IsStatic){'static '})$($_.ReturnType.Name) $($_.Name)($(( $_.GetParameters() | ForEach-Object { $_.ParameterType.Name } ) -join ', '))" }
+          }
+          Write-Host "===== END DUMP ====="
+          # DIRECT only (strategy B): native Clearcore2 read, no msconvert/mzML. Stores exact f64 m/z
+          # until the glue surfaces SCIEX's mass calibration (then it grids losslessly from the format).
+          # raw = .wiff + all sidecars (.scan/.wiff2); mzPeak = --no-vendor (data representation).
+          "kind`tdataset`traw`tmzpeak`tratio" | Out-File -FilePath ratios.tsv -Encoding utf8
+          foreach ($w in (Get-ChildItem wiff -Filter *.wiff)) {
+            $stem = $w.BaseName
+            $raw = (Get-ChildItem wiff -Filter "$stem.*" | Measure-Object -Property Length -Sum).Sum
+            $out = "native_$stem.mzpeak"
+            Write-Host "=== DIRECT native: $($w.Name) ==="
+            & $exe $w.FullName --no-vendor -o $out --force 2>&1 | Select-String -Pattern 'TOF-grid|gridded|spectra|points|error|panic|Clearcore|glue'
+            if (Test-Path $out) {
+              $mp = (Get-Item $out).Length
+              $r = [math]::Round($mp / $raw, 3)
+              Write-Host "RATIO  $stem : raw=$raw mzpeak=$mp ratio=$r"
+              "TOF`t$stem`t$raw`t$mp`t$r" | Out-File -FilePath ratios.tsv -Append -Encoding utf8
+            } else { Write-Host "NO ARCHIVE for $stem"; "TOF`t$stem`t$raw`tFAIL`t-" | Out-File -FilePath ratios.tsv -Append -Encoding utf8 }
+          }
+          Write-Host "=== ratios.tsv ==="; Get-Content ratios.tsv
+      - name: Upload archives + ratios
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sciex-native-direct
+          path: |
+            native_*.mzpeak
+            ratios.tsv
+          retention-days: 5
+          if-no-files-found: warn
+
   # Harvest Bruker TDF mobility calibrations across many PRIDE timsTOF runs to reverse-engineer the
   # exact ModelType-2 scan→1/K0 formula. Pulls ONLY analysis.tdf from each remote .d.zip (HTTP range
   # requests), evaluates timsrust vs the vendor SDK per scan, and records C0..C9 + reference points.
   # Manual-trigger only. SDK comes from opentims_bruker_bridge (no licensed download needed).
   tims-cal-harvest:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'tims-cal-harvest'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

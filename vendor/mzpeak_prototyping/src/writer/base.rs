@@ -691,7 +691,15 @@ pub trait AbstractMzPeakWriter {
         let (_had_mzs, n_points) = if let Ok(mzs) = mzs.as_ref() {
             (true, mzs.len())
         } else {
-            (false, 0)
+            // No m/z array: grid spectra store an integer index axis (e.g. `tof_index`) that the
+            // reader reconstructs m/z from. Count the stored points from the widest parallel array so
+            // the data-point count — and the reader's profile-load gating — are correct (not 0).
+            let n = binary_array_map
+                .iter()
+                .filter_map(|(_, a)| a.data_len().ok())
+                .max()
+                .unwrap_or(0);
+            (false, n)
         };
 
         let is_profile = spectrum.signal_continuity() == SignalContinuity::Profile;
@@ -1124,10 +1132,31 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if c.name().ends_with("_index") {
+            if c.name() == "intensity"
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
+                log::debug!("{}: byte-stream-split intensity", c.path());
+                // MS intensities (detector counts / peak areas) are integer-valued or similar-
+                // magnitude floats whose byte planes are highly redundant, so byte-stream-split +
+                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). Disable the
+                // dictionary for this column so the BSS encoding actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
+            if c.name().ends_with("_index") || c.name() == "tof" {
                 log::debug!("{}: delta binary packing", c.path());
-                data_props =
-                    data_props.set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
+                // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
+                // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF
+                // grid with ~10^6 distinct values) would silently fall back to a useless dictionary
+                // (~2.3 B/value) instead of delta-packing (~0.2 B/value). Disable the dictionary for
+                // `_index` columns so the requested DELTA_BINARY_PACKED actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
             }
         }
 
@@ -1252,10 +1281,31 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if c.name().ends_with("_index") {
+            if c.name() == "intensity"
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
+                log::debug!("{}: byte-stream-split intensity", c.path());
+                // MS intensities (detector counts / peak areas) are integer-valued or similar-
+                // magnitude floats whose byte planes are highly redundant, so byte-stream-split +
+                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). Disable the
+                // dictionary for this column so the BSS encoding actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
+            if c.name().ends_with("_index") || c.name() == "tof" {
                 log::debug!("{}: delta binary packing", c.path());
-                data_props =
-                    data_props.set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
+                // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
+                // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF
+                // grid with ~10^6 distinct values) would silently fall back to a useless dictionary
+                // (~2.3 B/value) instead of delta-packing (~0.2 B/value). Disable the dictionary for
+                // `_index` columns so the requested DELTA_BINARY_PACKED actually applies.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
             }
         }
 

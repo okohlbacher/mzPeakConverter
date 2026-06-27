@@ -369,6 +369,27 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    /// Like [`Self::sample_array_types_from_spectrum_source`] but driven by an explicit iterator of
+    /// sample spectra, for vendor readers that are NOT a [`RandomAccessSpectrumSource`] (SciEX,
+    /// Waters, Bruker TSF). Honors the configured chunking strategy so the derived data-facet schema
+    /// matches the chunked record batches — without this, dense profile spectra chunk into
+    /// `LargeList(Float32)` while a scalar-derived schema expects `Float32`, panicking the writer.
+    pub fn sample_array_types_from_spectra<
+        C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+        D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+        I: Iterator<Item = MultiLayerSpectrum<C, D>>,
+    >(
+        mut self,
+        spectra: I,
+    ) -> Self {
+        let fields = ArrayTypesSampler::new(&self.spectrum_overrides(), self.chunked_encoding)
+            .sample_spectrum_array_types(spectra, false);
+        for f in fields {
+            self = self.add_spectrum_field(f);
+        }
+        self
+    }
+
     fn take_or_initialize_peak_builder(&mut self) -> ArrayBuffersBuilder {
         let mut point_builder = self
             .store_peaks_and_profiles_apart
@@ -669,7 +690,12 @@ impl<
             spectrum_buffers.into()
         };
 
-        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
+        // The chromatogram buffer's schema must follow the CHROMATOGRAM chunking flag, not the
+        // spectrum one. write_chromatogram_arrays() (base.rs) branches on
+        // use_chromatogram_chunked_encoding; building the buffer off use_chunked_encoding instead
+        // lets the two disagree (point spectra + chunked-chromatogram flag → point buffer, chunked
+        // write → drain panics "N columns vs M fields"). The split writer already uses this flag.
+        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chromatogram_chunked_encoding.is_some() {
             chromatogram_buffers_builder
                 .build_chunked(
                     Arc::new(Schema::empty()),

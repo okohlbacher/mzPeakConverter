@@ -814,13 +814,16 @@ impl BafReader {
             .map_err(|e| anyhow!("encoding m/z: {e}"))?;
         mz_da.unit = Unit::MZ;
         arrays.add(mz_da);
+        // Intensity is stored as f32 (MS:1000521) to match the mzPeak writer's
+        // standardized intensity schema; baf2sql hands back f64, so narrow it.
+        let intensity_f32: Vec<f32> = intensity.iter().map(|&v| v as f32).collect();
         let mut int_da = DataArray::wrap(
             &ArrayType::IntensityArray,
-            BinaryDataArrayType::Float64,
+            BinaryDataArrayType::Float32,
             Vec::new(),
         );
         int_da
-            .update_buffer(intensity.as_slice())
+            .update_buffer(intensity_f32.as_slice())
             .map_err(|e| anyhow!("encoding intensity: {e}"))?;
         int_da.unit = Unit::DetectorCounts;
         arrays.add(int_da);
@@ -844,23 +847,6 @@ impl BafReader {
         descr.acquisition.scans.push(scan);
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
-    }
-
-    /// A sample spectrum's array map, for deriving the writer's data-facet
-    /// schema (mirrors `TsfReader::sample_arrays`).
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let i = (0..self.len())
-            .find(|&i| {
-                matches!(
-                    Self::select_pair(&self.rows[i], self.prefer_profile),
-                    (Some(_), Some(_), _)
-                )
-            })
-            .unwrap_or(0);
-        self.spectrum(i)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
     }
 }
 

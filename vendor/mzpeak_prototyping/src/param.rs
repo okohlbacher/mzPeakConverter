@@ -19,6 +19,48 @@ pub type CURIE = mzdata::params::CURIE;
 
 pub use mzdata::curie;
 
+/// Converter-owned CV prefix for the provisional mzPeak grid/calibration terms (see `cv/mzpeak.obo`).
+/// mzdata's [`CURIE`] cannot carry a non-standard prefix, so MZP terms are represented as
+/// `ControlledVocabulary::Unknown` CURIEs (the accession is the MZP term number) and the prefix is
+/// supplied here at the (de)serialisation boundary. Every CURIE string crosses through
+/// [`curie_to_string`] / [`parse_curie`], so MZP is the only place a non-mzdata prefix appears.
+pub const MZP_CV_PREFIX: &str = "MZP";
+
+/// True for a converter-owned MZP term (an `Unknown`-CV CURIE). mzdata maps every unrecognised CV
+/// prefix to `Unknown` and discards the prefix string, so within this converter — which only ever
+/// constructs `Unknown` CURIEs for MZP terms — `Unknown` is synonymous with MZP.
+#[inline]
+pub(crate) fn is_mzp(c: &CURIE) -> bool {
+    matches!(
+        c.controlled_vocabulary,
+        mzdata::params::ControlledVocabulary::Unknown
+    )
+}
+
+/// Render a CURIE to its wire string. MZP terms get the converter-owned `MZP:` prefix; everything
+/// else uses mzdata's standard rendering. (mzdata's own `Display` *panics* on `Unknown`, so all
+/// CURIE stringification in this crate MUST go through here.)
+pub(crate) fn curie_to_string(c: &CURIE) -> String {
+    if is_mzp(c) {
+        format!("{}:{:07}", MZP_CV_PREFIX, c.accession)
+    } else {
+        mzdata::params::CURIE::from(*c).to_string()
+    }
+}
+
+/// Parse a wire CURIE string, recognising the converter-owned `MZP:` prefix (which mzdata cannot
+/// parse to a usable CV) and falling back to mzdata for standard prefixes.
+pub(crate) fn parse_curie(v: &str) -> Result<CURIE, String> {
+    if let Some(rest) = v.strip_prefix("MZP:").or_else(|| v.strip_prefix("MZP_")) {
+        rest.trim()
+            .parse::<u32>()
+            .map(|acc| CURIE::new(mzdata::params::ControlledVocabulary::Unknown, acc))
+            .map_err(|e| format!("invalid MZP accession '{rest}': {e}"))
+    } else {
+        v.parse::<CURIE>().map_err(|e| e.to_string())
+    }
+}
+
 // Provide a way to JSON-serialize CURIEs as nullable string
 pub(crate) fn opt_curie_serialize<S>(
     curie: &Option<CURIE>,
@@ -28,7 +70,7 @@ where
     S: serde::Serializer,
 {
     match curie {
-        Some(curie) => serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string()),
+        Some(curie) => serializer.serialize_str(&curie_to_string(curie)),
         None => serializer.serialize_none(),
     }
 }
@@ -48,9 +90,7 @@ where
             }
             s.end()
         }
-        PathOrCURIE::CURIE(curie) => {
-            serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string())
-        }
+        PathOrCURIE::CURIE(curie) => serializer.serialize_str(&curie_to_string(curie)),
         PathOrCURIE::None => serializer.serialize_none(),
     }
 }
@@ -75,8 +115,8 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            match v.parse::<mzdata::params::CURIE>() {
-                Ok(v) => Ok(PathOrCURIE::CURIE(v.into())),
+            match parse_curie(v) {
+                Ok(v) => Ok(PathOrCURIE::CURIE(v)),
                 Err(e) => Err(E::custom(e)),
             }
         }
@@ -108,7 +148,7 @@ pub(crate) fn curie_serialize<S>(curie: &CURIE, serializer: S) -> Result<S::Ok, 
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string())
+    serializer.serialize_str(&curie_to_string(curie))
 }
 
 // Provide a way to JSON-deserialize CURIEs from a nullable string
@@ -132,8 +172,8 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            match v.parse::<mzdata::params::CURIE>() {
-                Ok(v) => Ok(Some(v.into())),
+            match parse_curie(v) {
+                Ok(v) => Ok(Some(v)),
                 Err(e) => Err(E::custom(e)),
             }
         }
@@ -163,8 +203,8 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            match v.parse::<mzdata::params::CURIE>() {
-                Ok(v) => Ok(v.into()),
+            match parse_curie(v) {
+                Ok(v) => Ok(v),
                 Err(e) => Err(E::custom(e)),
             }
         }
@@ -318,7 +358,14 @@ impl From<mzdata::params::ControlledVocabulary> for ControlledVocabularyEntry {
                 "https://raw.githubusercontent.com/imzML/imzML/refs/heads/master/imagingMS.obo",
                 Some("1.1.0"),
             ),
-            mzdata::params::ControlledVocabulary::Unknown => todo!(),
+            // The converter represents its provisional MZP terms as `Unknown`-CV CURIEs (see
+            // `is_mzp` / `cv/mzpeak.obo`), so an `Unknown` CV here means the converter-owned MZP CV.
+            mzdata::params::ControlledVocabulary::Unknown => ControlledVocabularyEntry::new(
+                MZP_CV_PREFIX,
+                "mzPeak converter provisional controlled vocabulary",
+                "https://raw.githubusercontent.com/okohlbacher/mzPeakConverter/main/cv/mzpeak.obo",
+                Some("0.1.0"),
+            ),
         }
     }
 }

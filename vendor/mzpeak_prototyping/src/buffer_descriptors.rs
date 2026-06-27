@@ -503,18 +503,36 @@ pub enum BufferTransform {
     NumpressPIC,
     NullInterpolate,
     NullZero,
-    /// Reconstruct m/z from an integer TOF column as `m/z = (a + b·tof)²`. The `[a, b]` coefficients
-    /// travel in the array index entry's `transform_params`, so a reader recovers m/z generically
-    /// without bespoke ims-compact handling. NOTE: the CURIE is PROVISIONAL (converter-local), to be
-    /// replaced by the assigned PSI term once the mzPeak specification defines it.
+    /// Reconstruct m/z from an integer grid index as `m/z = (b + a·k)²` — PSI-MS "square root grid
+    /// interpolation" (MS:1003825), `x = f((b + i·a)²)` with the recalibration `f` = identity here.
+    /// The `[b, a]` (= `[c0, c1]`) coefficients travel in the array index entry's `transform_params`.
+    /// Used for sqrt flight-time grids: Bruker ims-compact, Agilent/SCIEX file-direct profile.
     SqrtMzFromTof,
+    /// Reconstruct m/z from an integer grid index as `m/z = b + a·k` — PSI-MS "linear grid
+    /// interpolation" (MS:1003824), `x = f(b + i·a)` with `f` = identity, `b` = 0, `a` = scale.
+    /// Used for uniform m/z grids (e.g. SWATH MS2) off the flight-time lattice.
+    LinearMz,
 }
 
 const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
 const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
-// PROVISIONAL accession (follows the writer's local null-transform numbering 1003901/1003902); not
-// yet an official PSI term — see BufferTransform::SqrtMzFromTof.
-const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003903);
+// Grid reconstruction transforms, using the ASSIGNED PSI-MS "coordinate spacing model" terms seeded
+// for grid encoding (children of MS:1003820 / MS:1003822 "grid coordinate interpolation"):
+//   MS:1003825 = square root grid interpolation   x = f((b + i·a)²)
+//   MS:1003824 = linear grid interpolation        x = f(b + i·a)
+// `f` (recalibration) is identity for these; a non-identity `f` (e.g. Agilent's per-CalibrationID
+// polynomial, the TIMS mobility model) awaits a PSI recalibration-function term (BACKLOG.md #1).
+const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003825);
+const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003824);
+// (MS:1003826 "coordinate grid encoding" would additionally mark the grid-index column, but the
+// array index `transform` field holds a single CURIE — already the spacing model — so there is no
+// slot for it; revisit if the spec adds a dedicated grid-encoding marker field.)
+// Legacy codings recognized on READ only, so archives written before the assignment keep decoding:
+// our earlier made-up MS:1003903/1003904 and the converter-owned MZP:1000001/1000002 (Unknown-CV).
+const SQRT_LEGACY_MS: CURIE = mzdata::curie!(MS:1003903);
+const LINEAR_LEGACY_MS: CURIE = mzdata::curie!(MS:1003904);
+const SQRT_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
+const LINEAR_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -524,7 +542,12 @@ impl BufferTransform {
             x if x == Self::NumpressLinear.curie() => Some(Self::NumpressLinear),
             x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
             x if x == NULL_ZERO => Some(Self::NullZero),
-            x if x == SQRT_MZ_FROM_TOF => Some(Self::SqrtMzFromTof),
+            x if x == SQRT_MZ_FROM_TOF || x == SQRT_LEGACY_MS || x == SQRT_LEGACY_MZP => {
+                Some(Self::SqrtMzFromTof)
+            }
+            x if x == LINEAR_MZ || x == LINEAR_LEGACY_MS || x == LINEAR_LEGACY_MZP => {
+                Some(Self::LinearMz)
+            }
             _ => None,
         }
     }
@@ -539,6 +562,7 @@ impl BufferTransform {
             // The stored column is the raw integer TOF; the transform is a reconstruction formula, not
             // a re-encoding, so it does not rename the column.
             BufferTransform::SqrtMzFromTof => None,
+            BufferTransform::LinearMz => None,
         }
     }
 
@@ -562,6 +586,7 @@ impl BufferTransform {
             BufferTransform::NullInterpolate => NULL_INTERPOLATE,
             BufferTransform::NullZero => NULL_ZERO,
             BufferTransform::SqrtMzFromTof => SQRT_MZ_FROM_TOF,
+            BufferTransform::LinearMz => LINEAR_MZ,
         }
     }
 }
@@ -745,7 +770,7 @@ impl BufferName {
         .into_iter()
         .collect();
         if let Some(trfm) = self.transform.as_ref() {
-            meta.insert("transform".to_string(), trfm.curie().to_string());
+            meta.insert("transform".to_string(), crate::param::curie_to_string(&trfm.curie()));
         }
         if let Some(dp_id) = self.data_processing_id.as_ref() {
             meta.insert("data_processing_id".to_string(), dp_id.to_string());

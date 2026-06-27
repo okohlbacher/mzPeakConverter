@@ -1,22 +1,23 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    SciexGlue — a thin C# shim that the Rust `sciex` feature hosts in-process (via
-    netcorehost) to read SciEX .wiff/.wiff2 files through the vendor Clearcore2 .NET API.
+    WatersGlue — a thin C# shim that the Rust `waters` path hosts in-process (via
+    netcorehost) to read Waters MassLynx `.raw` directories through the vendor MassLynx SDK
+    managed API.
 
-    KEY DESIGN POINT: there is NO <Reference> / <PackageReference> to any Clearcore2
+    KEY DESIGN POINT: there is NO <Reference> / <PackageReference> to any MassLynx
     assembly. The vendor DLLs are loaded at RUNTIME via System.Reflection
     (Assembly.LoadFrom + late-bound member invocation). That means this project
     `dotnet build`s on any platform (including macOS) WITHOUT the vendor DLLs present —
-    which is the whole point: the build host has no Clearcore2, the runtime host (Windows,
-    possibly Linux) supplies them out of a ProteoWizard install.
+    which is the whole point: the build host has no MassLynx SDK, the runtime host (Windows)
+    supplies them out of the MassLynx SDK (or a ProteoWizard install's vendor_api/Waters).
 
-    ⚠️ The produced DLL only *runs* where the Clearcore2 stack + a compatible .NET runtime
-    exist. It is Windows-runtime-only in practice and currently UNTESTED.
+    ⚠️ The produced DLL only *runs* where the MassLynx managed stack + a compatible .NET
+    runtime exist. It is Windows-runtime-only in practice and currently UNTESTED.
 
     Build:  dotnet build -c Release
-    Output: bin/Release/net8.0/SciexGlue.dll  (+ SciexGlue.runtimeconfig.json)
-    Then point the Rust env var MZPC_SCIEX_GLUE at that directory.
+    Output: bin/Release/net8.0/WatersGlue.dll  (+ WatersGlue.runtimeconfig.json)
+    Then point the Rust env var MZPC_WATERS_GLUE at that directory.
   -->
 
   <PropertyGroup>
@@ -26,17 +27,17 @@
     <!-- We export [UnmanagedCallersOnly] entry points; allow the unsafe blocks used for
          pinning/marshalling raw pointers across the FFI boundary. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <AssemblyName>SciexGlue</AssemblyName>
-    <RootNamespace>SciexGlue</RootNamespace>
+    <AssemblyName>WatersGlue</AssemblyName>
+    <RootNamespace>WatersGlue</RootNamespace>
     <!-- A library, not an app. netcorehost loads it via initialize_for_runtime_config +
          a delegate loader, so no managed entry point is needed. -->
     <OutputType>Library</OutputType>
     <!-- A plain class library does NOT emit a .runtimeconfig.json, but netcorehost REQUIRES one to
-         boot the runtime (initialize_for_runtime_config) — without it SciexReader::open fails with
-         "SciexGlue.runtimeconfig.json not found". EnableDynamicLoading makes the build generate it
+         boot the runtime (initialize_for_runtime_config) — without it WatersReader::open fails with
+         "WatersGlue.runtimeconfig.json not found". EnableDynamicLoading makes the build generate it
          next to the DLL (the canonical setting for a hostfxr-loaded class library). -->
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <!-- 64-bit only: the Clearcore2 native bits are x64. -->
+    <!-- 64-bit only: the MassLynx native bits are x64. -->
     <Platforms>x64</Platforms>
   </PropertyGroup>
 

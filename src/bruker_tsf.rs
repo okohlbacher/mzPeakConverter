@@ -221,16 +221,4 @@ impl TsfReader {
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        // Use the first non-empty frame so the m/z + intensity columns are actually present.
-        let i = (0..self.len())
-            .find(|&i| self.frames[i].num_peaks > 0)
-            .unwrap_or(0);
-        self.spectrum(i)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("sample spectrum has no arrays"))
-    }
 }

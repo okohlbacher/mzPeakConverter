@@ -58,7 +58,13 @@ impl TimsMobilityCalibration {
     #[inline]
     pub fn one_over_k0(&self, scan: f64) -> f64 {
         let v = self.voltage(scan);
-        (v + self.delta) / (self.c7 + self.c6 * v)
+        let denom = self.c7 + self.c6 * v;
+        // A malformed ModelType-2 row could drive the denominator to 0; return NaN rather than
+        // writing ±inf mobility into the archive.
+        if denom.abs() < f64::EPSILON {
+            return f64::NAN;
+        }
+        (v + self.delta) / denom
     }
 
     /// Load from an open `analysis.tdf` connection. `Ok(None)` when there is no `ModelType = 2` row

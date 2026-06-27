@@ -1083,6 +1083,30 @@ impl<
 
     /// Read the complete data arrays for the spectrum at `index`
     pub async fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<Option<BinaryArrayMap>> {
+        let mut out = self.get_spectrum_arrays_raw(index).await?;
+        // native-SCIEX per-spectrum sqrt-grid m/z — only when there is a grid array to reconstruct
+        if let Some(arrays) = out.as_mut() {
+            if self.metadata.spectrum_array_indices().iter().any(|v| {
+                matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+            }) {
+                let params: Vec<_> = self
+                    .get_spectrum_metadata(index)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|d| d.params().to_vec())
+                    .unwrap_or_default();
+                crate::reader::point::reconstruct_per_spectrum_grid_mz(
+                    arrays,
+                    &params,
+                    self.metadata.spectrum_array_indices(),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_spectrum_arrays_raw(&mut self, index: u64) -> io::Result<Option<BinaryArrayMap>> {
         let delta_model = self.metadata.model_deltas_for(index as usize);
         let builder = self.handle.spectra_data().await?;
 

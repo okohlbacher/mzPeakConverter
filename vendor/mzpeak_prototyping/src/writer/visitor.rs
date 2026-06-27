@@ -134,7 +134,7 @@ macro_rules! anyways {
 /// is the name of the term with all non alphanumeric characters are replaced
 /// with '_'.
 pub fn inflect_cv_term_to_column_name(curie: CURIE, name: &str, unit: Option<CURIE>) -> String {
-    let cv_part = curie.to_string().replace(":", "_");
+    let cv_part = crate::param::curie_to_string(&curie).replace(":", "_");
     let mut buffer = String::with_capacity(name.len() + cv_part.len() + 1);
     buffer.push_str(&cv_part);
     buffer.push('_');

@@ -412,10 +412,6 @@ impl TsfSdkReader {
         let descr = make_description(i, frame, SignalContinuity::Centroid);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        sample_first_nonempty(self.len(), |i| self.spectrum(i))
-    }
 }
 
 impl Drop for TsfSdkReader {
@@ -561,10 +557,6 @@ impl TdfSdkReader {
         }
         Ok(out)
     }
-
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        sample_first_nonempty(self.len(), |i| self.spectrum(i))
-    }
 }
 
 impl Drop for TdfSdkReader {
@@ -669,28 +661,6 @@ fn mz_intensity_arrays(mz: &[f64], intensity: &[f32], mobility: Option<&[f64]>) 
     Ok(arrays)
 }
 
-/// Find the first spectrum with non-empty arrays for schema sampling (mirrors the other readers).
-fn sample_first_nonempty(
-    len: usize,
-    mut spectrum: impl FnMut(usize) -> Result<MultiLayerSpectrum>,
-) -> Result<BinaryArrayMap> {
-    if len == 0 {
-        bail!("no frames to sample");
-    }
-    for i in 0..len {
-        let spec = spectrum(i)?;
-        if let Some(arrays) = spec.arrays {
-            if !arrays.is_empty() {
-                return Ok(arrays);
-            }
-        }
-    }
-    // All empty: fall back to the first spectrum's (empty) arrays so the schema still has the columns.
-    spectrum(0)?
-        .arrays
-        .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-}
-
 // --- unified entry point ---------------------------------------------------
 
 /// A Bruker `.d` reader over the timsdata SDK, dispatching to TDF or TSF by the marker file present.
@@ -715,13 +685,6 @@ impl BrukerSdkReader {
         match self {
             Self::Tsf(r) => r.len(),
             Self::Tdf(r) => r.len(),
-        }
-    }
-
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        match self {
-            Self::Tsf(r) => r.sample_arrays(),
-            Self::Tdf(r) => r.sample_arrays(),
         }
     }
 

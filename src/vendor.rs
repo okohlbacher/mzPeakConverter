@@ -58,11 +58,15 @@ pub struct VendorPolicy {
 impl VendorPolicy {
     /// Built-in **preserve-by-default** policy: embed every side-file (gzip compressible types).
     /// Nothing is dropped by default — dropping is opt-in via `--aux glob=drop` or a YAML policy.
-    /// Rationale (codex review): the TDF path still reads via mzdata (lossy m/z/intensity) until
-    /// ims-compact is the in-archive facet, so silently dropping `analysis.tdf_bin` would lose the
-    /// only exact signal; and SQLite rollback journals can be needed to recover a DB snapshot. The
-    /// converter's job is to ADD the mzPeak facets, not to decide the raw data is disposable.
-    /// (To shrink archives once a path is proven lossless: `--aux 'analysis.tsf_bin=drop'`.)
+    /// Rationale: for the LOSSY paths (mzdata f64 m/z, or the Bruker SDK) `analysis.tdf_bin` is the
+    /// only exact copy of the signal, so it must be preserved; and SQLite rollback journals can be
+    /// needed to recover a DB snapshot. The converter's job is to ADD the mzPeak facets, not to
+    /// decide the raw data is disposable.
+    ///
+    /// The LOSSLESS ims-compact path is different: it encodes the exact integer-TOF + intensity
+    /// signal into the Parquet peak facet, so the raw `*_bin` bulk file is fully redundant (it was
+    /// ~39% of the archive, a verbatim copy). That path uses [`load_lossless`](Self::load_lossless),
+    /// which drops `*_bin` by default. To force-keep it: `--aux 'analysis.tdf_bin=embed'`.
     pub fn builtin() -> Self {
         VendorPolicy { rules: vec![Rule { pat: "*".to_string(), action: Action::Embed, gzip: Gzip::Auto }] }
     }
@@ -90,6 +94,21 @@ impl VendorPolicy {
         }
         front.extend(policy.rules);
         policy.rules = front;
+        Ok(policy)
+    }
+
+    /// Like [`load`](Self::load), but for the **lossless** ims-compact facet: the exact integer-TOF
+    /// signal already lives in the Parquet peak facet, so the raw `*_bin` bulk binary
+    /// (`analysis.tdf_bin` / `analysis.tsf_bin`) is redundant and defaults to DROP. The drop rule is
+    /// inserted right after the user `--aux` overrides (which `load` prepends) and before the base
+    /// policy, so an explicit `--aux 'analysis.tdf_bin=embed'` still wins. The drop is recorded in
+    /// the `vendor_files` manifest, so it is visible, never silent.
+    pub fn load_lossless(path: Option<&Path>, overrides: &[String]) -> Result<Self> {
+        let mut policy = Self::load(path, overrides)?;
+        let drop_bin = Rule { pat: "*_bin".to_string(), action: Action::Drop, gzip: Gzip::Auto };
+        // `load` prepends exactly one rule per override, so index == overrides.len() lands the drop
+        // immediately after them and ahead of the base catch-all.
+        policy.rules.insert(overrides.len(), drop_bin);
         Ok(policy)
     }
 
@@ -162,8 +181,10 @@ pub fn embed_into_archive(
         let encoding = if do_gzip { "gzip" } else { "identity" };
         // Declared as a `proprietary` FileEntry so it lands in the index `files[]` — the viewer
         // surfaces proprietary members in its Structure inspector and the validator skips them
-        // (they are not parsed as Parquet).
-        let fe = FileEntry::new(member.clone(), EntityType::Other("vendor".into()), DataKind::Proprietary);
+        // (they are not parsed as Parquet). entity_type is the spec's controlled `other` (the
+        // `vendor/` path prefix + `proprietary` data_kind already mark it as vendor-private; a
+        // non-controlled "vendor" value would just be folded to `other` by conformant readers).
+        let fe = FileEntry::new(member.clone(), EntityType::Other("other".into()), DataKind::Proprietary);
         if do_gzip {
             let mut enc = GzEncoder::new(BufReader::new(f), Compression::default());
             zip.add_file_from_read(&mut enc, None::<&String>, Some(fe))
@@ -305,6 +326,20 @@ mod tests {
         let pol = VendorPolicy::load(None, &["*_bin=drop".to_string()]).unwrap();
         assert_eq!(pol.resolve("analysis.tsf_bin").0, Action::Drop);
         assert_eq!(pol.resolve("analysis.tsf").0, Action::Embed);
+    }
+
+    #[test]
+    fn lossless_drops_bulk_bin_by_default() {
+        // ims-compact path: the raw `*_bin` is redundant with the Parquet facet → DROP by default,
+        // but the SQLite metadata and other side-files are still embedded.
+        let pol = VendorPolicy::load_lossless(None, &[]).unwrap();
+        assert_eq!(pol.resolve("analysis.tdf_bin").0, Action::Drop);
+        assert_eq!(pol.resolve("analysis.tsf_bin").0, Action::Drop);
+        assert_eq!(pol.resolve("analysis.tdf").0, Action::Embed);
+        assert_eq!(pol.resolve("Hystar.Method").0, Action::Embed);
+        // explicit user override to keep the bulk binary still wins over the lossless default
+        let pol = VendorPolicy::load_lossless(None, &["analysis.tdf_bin=embed".to_string()]).unwrap();
+        assert_eq!(pol.resolve("analysis.tdf_bin").0, Action::Embed);
     }
 
     #[test]

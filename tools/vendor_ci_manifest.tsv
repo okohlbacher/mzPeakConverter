@@ -1,0 +1,31 @@
+# Vendor datasets to fetch onto the CI runner for the `vendor-corpus` job.
+# Columns: dest_relpath <TAB> public_url [<TAB> unzip]
+#   dest_relpath  path under vendor-in/ on the runner.
+#   public_url    a PUBLIC http(s) URL (no credentials). PRIDE FTP paths are mirrored at
+#                 https://ftp.pride.ebi.ac.uk/... — use that, not ftp://.
+#   unzip         optional 3rd column literally "unzip": after download, extract the archive
+#                 in place (into dest's directory) and delete the .zip. Used for Agilent .d.zip
+#                 and Waters .raw.zip, which deposit a vendor DIRECTORY inside a single zip.
+# convert_vendor_ci.sh then discovers *.wiff / Agilent .d / Waters .raw under vendor-in/ and
+# converts+measures+DELETES one dataset at a time (disk-safe for multi-GB inputs).
+#
+# Coverage: SCIEX (.wiff/.wiff2, QTOF SWATH + ZenoTOF), Agilent QTOF (.d profile grid),
+# Waters Synapt (.raw TWIMS ion-mobility). Smallest public file per dataset is chosen.
+#
+# --- SCIEX ZenoTOF 7600 (RNAseB MRM) — .wiff + .wiff.scan + .wiff2 — object store ------------
+sciex-zenotof-7600/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff	https://object.storage.eu01.onstackit.cloud/v09/mzML-examples/sciex-zenotof-7600/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff
+sciex-zenotof-7600/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff.scan	https://object.storage.eu01.onstackit.cloud/v09/mzML-examples/sciex-zenotof-7600/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff.scan
+sciex-zenotof-7600/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff2	https://object.storage.eu01.onstackit.cloud/v09/mzML-examples/sciex-zenotof-7600/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff2
+#
+# --- SCIEX TripleTOF 6600 SWATH/DIA (grid-TOF candidate) — PXD078909, smallest .wiff pair ----
+#     SW_F2_2-2.wiff (15 MB) + .wiff.scan (347 MB); zebrafish SWATH-MS.
+sciex-tripletof-swath/SW_F2_2-2.wiff	https://ftp.pride.ebi.ac.uk/pride/data/archive/2026/05/PXD078909/SW_F2_2-2.wiff
+sciex-tripletof-swath/SW_F2_2-2.wiff.scan	https://ftp.pride.ebi.ac.uk/pride/data/archive/2026/05/PXD078909/SW_F2_2-2.wiff.scan
+#
+# --- Agilent QTOF .d (profile MSProfile.bin grid) — PXD041903, smallest .d.zip (442 MB) ------
+#     20190423_Alex7.d.zip extracts to 20190423_Alex7.d/ (AcqData/MSProfile.bin etc.).
+agilent-qtof/20190423_Alex7.d.zip	https://ftp.pride.ebi.ac.uk/pride/data/archive/2025/05/PXD041903/20190423_Alex7.d.zip	unzip
+#
+# --- Waters Synapt (TWIMS ion-mobility) .raw — PXD073666, smallest per-run .raw.zip (290 MB) -
+#     20250628_cpB_100000ms_03.raw.zip extracts to ...raw/ (a Waters _FUNC*.DAT directory).
+waters-synapt/20250628_cpB_100000ms_03.raw.zip	https://ftp.pride.ebi.ac.uk/pride/data/archive/2026/04/PXD073666/20250628_cpB_100000ms_03.raw.zip	unzip
