@@ -77,6 +77,31 @@ the controlled sets; (c) a `transform` that needs params carries `mzpeak:transfo
 `…_per_spectrum`. Each is a net-new `p_*` primitive + rule entry + fixture in
 `~/Claude/mzPeakValidator`. Makes #1–#3 regressions impossible to reintroduce silently.
 
+## #7 — Centroid → naive-encoding fallback 🟡 (robustness; motivated by the chromatogram drain panic)
+
+The SCIEX-grid chromatogram panic fixed point-wise in `6ae92d1` was one instance of a general
+fragility: a facet whose **write** path is chunked/grid while its Arrow **schema** was built point
+(or vice versa) blows up at `drain()` — `RecordBatch::try_new` fails "number of columns(N) must
+match number of fields(M)" and the writer `panic!`s, producing a **0-byte archive** with no clean
+error. It only fires when real data lands in that facet (the bug hid until a SWATH run carried MS1
+spectra → a synthesized TIC was written), so it passes most fixtures and dies on production data.
+
+Grid encodings (sqrt/linear `tof_index`, `MS:1003824/1003825`) are valid **only** for profile data
+on a regular flight-time/m-z lattice. Centroid peak lists and small auxiliary facets (chromatograms)
+do not fit and must use naive point `(m/z, intensity)` encoding. Today that fallback is implicit and
+per-path (the grid path special-cases empty spectra to the data facet; chromatograms are now
+hard-pinned point), so the next path that enables chunked write without a matching schema reopens it.
+
+What to build (any one closes the hole; ideally all three):
+1. **One detection point** — centroid/won't-grid ⇒ route to naive point encoding, instead of each
+   converter re-deciding ad hoc. `src/main.rs` (`convert_sciex_grid` profile-vs-centroid routing).
+2. **Fail loud, not fatal** — `drain()`'s `unwrap_or_else(|e| panic!(…))`
+   (`vendor/mzpeak_prototyping/src/writer/array_buffer.rs:437`) should `bail!` with the facet +
+   column names so a schema/data mismatch is a recoverable CONV-ERR, never a silent 0-byte file.
+3. **Self-consistent flag** — make `chromatogram_chunked_encoding(Some)` actually build the chunked
+   chromatogram schema (`base.rs:537` write path vs the buffer's point fields), so the flag can't be
+   set on one side only. Then the point-only pin in `convert_sciex_grid` can drop.
+
 ---
 
 ## Done ✅
