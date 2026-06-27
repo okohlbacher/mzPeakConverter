@@ -2065,6 +2065,9 @@ fn convert_sciex_grid(
         serde_json::json!({
             "codec": "tof-grid",
             "model": "sciex_sqrt",
+            // `lossless` names the exactly-preserved stored column (spec: mzpeak_index.json /
+            // tof_calibration), required + consistent with the tsf/agilent grid builders.
+            "lossless": "tof_index",
             "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
             "per_spectrum_columns": ["tof_c0", "tof_c1"],
             "max_roundtrip_ppm": max_ppm,

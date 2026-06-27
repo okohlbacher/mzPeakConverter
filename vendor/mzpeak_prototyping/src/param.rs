@@ -420,6 +420,24 @@ impl From<mzdata::Param> for MetaParam {
     }
 }
 
+/// Ensure a CV-param list carries a mandatory term, pushing it as a value-less flag if absent.
+/// The mzPeak spec's CvMapping rules require terms that source mzML frequently omits: every
+/// `data_processing` method needs a child of MS:1000452 "data transformation", and
+/// `file_description.contents` needs a child of MS:1000524 "data file content" (both rules are
+/// `use_term:false`, so the abstract parent itself does not satisfy them — a child does). Dedup by
+/// exact accession so we never duplicate a term the source already supplied.
+fn ensure_cv_term(params: &mut Vec<MetaParam>, accession: CURIE, name: &str) {
+    if params.iter().any(|p| p.accession == Some(accession)) {
+        return;
+    }
+    params.push(MetaParam {
+        name: Some(name.to_string()),
+        accession: Some(accession),
+        value: serde_json::Value::Null,
+        unit: None,
+    });
+}
+
 /// An adaptation of [`mzdata::meta::SourceFile`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SourceFile {
@@ -551,12 +569,16 @@ impl From<FileDescription> for mzdata::meta::FileDescription {
 
 impl From<&mzdata::meta::FileDescription> for FileDescription {
     fn from(value: &mzdata::meta::FileDescription) -> Self {
-        let contents = value
+        let mut contents: Vec<MetaParam> = value
             .contents
             .iter()
             .cloned()
             .map(MetaParam::from)
             .collect();
+        // CvMapping `filecontent_must` requires a CHILD of MS:1000524 "data file content"
+        // (use_term:false → the abstract parent itself is not valid). MS:1000294 "mass spectrum"
+        // is the safe generic child present in any MS file.
+        ensure_cv_term(&mut contents, mzdata::curie!(MS:1000294), "mass spectrum");
         let source_files = value.source_files.iter().map(SourceFile::from).collect();
         Self {
             contents,
@@ -616,10 +638,16 @@ impl From<ProcessingMethod> for mzdata::meta::ProcessingMethod {
 
 impl From<&mzdata::meta::ProcessingMethod> for ProcessingMethod {
     fn from(value: &mzdata::meta::ProcessingMethod) -> Self {
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `processingmethod_must` requires a CHILD of MS:1000452 "data transformation"
+        // (use_term:false → not the abstract parent itself). MS:1000530 "file format conversion"
+        // is the honest child for a format converter.
+        ensure_cv_term(&mut parameters, mzdata::curie!(MS:1000530), "file format conversion");
         Self {
             order: value.order,
             software_reference: value.software_reference.clone(),
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+            parameters,
         }
     }
 }

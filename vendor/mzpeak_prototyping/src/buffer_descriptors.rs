@@ -534,6 +534,32 @@ const LINEAR_LEGACY_MS: CURIE = mzdata::curie!(MS:1003904);
 const SQRT_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
 const LINEAR_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
 
+/// A fallback `unit` CURIE for arrays that arrive with `Unit::Unknown`. The mzPeak array-index
+/// schema (`array_index.json`) makes `unit` REQUIRED with `pattern \S+:\S+`, but some arrays have no
+/// unit on the source side: mzML intensity arrays rarely declare one, and the integer `tof_index`
+/// grid column is a dimensionless hardware counter. Supply the conventional CURIE so the writer
+/// never emits a null/empty unit. Intensity → `MS:1000131` (number of detector counts, the term the
+/// spec's own examples use); a non-standard array (e.g. `tof_index`) → `UO:0000189` (count unit).
+fn default_unit_curie(array_type: &ArrayType) -> Option<CURIE> {
+    use mzdata::params::Unit;
+    match array_type {
+        ArrayType::IntensityArray => Some(mzdata::curie!(MS:1000131)),
+        ArrayType::NonStandardDataArray { .. } => Some(mzdata::curie!(UO:0000189)),
+        // Ion-mobility arrays reach the writer with Unit::Unknown from some readers (e.g. the Bruker
+        // timsTOF path); supply the conventional unit via mzdata's own Unit→CURIE map. Inverse
+        // reduced mobility (1/K0) → MS:1002814 (volt-second per square centimeter); drift time → ms.
+        ArrayType::MeanInverseReducedIonMobilityArray
+        | ArrayType::RawInverseReducedIonMobilityArray
+        | ArrayType::DeconvolutedInverseReducedIonMobilityArray => {
+            Unit::VoltSecondPerSquareCentimeter.to_curie()
+        }
+        ArrayType::MeanDriftTimeArray
+        | ArrayType::RawDriftTimeArray
+        | ArrayType::DeconvolutedDriftTimeArray => Unit::Millisecond.to_curie(),
+        _ => None,
+    }
+}
+
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
         match accession {
@@ -746,6 +772,7 @@ impl BufferName {
                 "unit".to_string(),
                 self.unit
                     .to_curie()
+                    .or_else(|| default_unit_curie(&self.array_type))
                     .map(|c| c.to_string())
                     .unwrap_or_default(),
             ),
@@ -1080,6 +1107,9 @@ pub struct SerializedArrayIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform_params: Option<Vec<f64>>,
     pub data_processing_id: Option<Box<str>>,
+    // `buffer_priority` is an enum (primary|secondary) with no null member in array_index.json, so a
+    // `null` fails validation — but the field is NOT required, so omitting it when absent is valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_priority: Option<BufferPriority>,
     pub sorting_rank: Option<u32>,
 }
@@ -1118,7 +1148,7 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
                 ArrayType::NonStandardDataArray { name } => name.to_string(),
                 _ => value.array_type.as_param_const().name().to_string(),
             },
-            unit: value.unit.to_curie(),
+            unit: value.unit.to_curie().or_else(|| default_unit_curie(&value.array_type)),
             buffer_format: value.buffer_format.to_string(),
             transform: value.transform.map(|t| t.curie()),
             transform_params: value.transform_params,
