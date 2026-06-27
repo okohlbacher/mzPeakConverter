@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-27
+
+### Added — docs & CI
+
+- **`docs/PLATFORM_SUPPORT.md`** — authoritative per-platform vendor-format
+  support matrix (format × OS, reader mechanism, runtime requirement), the
+  why-the-split rationale, the four `.NET` glue executables + their env vars,
+  and the CI-coverage summary. Linked from the README.
+- **macOS CI** — `ci.yml`'s `build-test` is now a `[ubuntu, macos]` matrix;
+  each builds that platform's `mzpeak-convert`, runs the tests, and
+  smoke-converts the committed fixture. Linux-only deps and the Bruker-SDK
+  e2e are gated on the runner OS.
+- **Glue-executable verification (Windows CI)** — after the C# glue build,
+  `windows.yml` asserts all five produced artifacts exist (`mzpeak-convert.exe`,
+  the net48 `AgilentGlueHost.exe`, and the three net8 glue DLLs).
+
 ## [0.3.0] — 2026-06-27
 
 ### Fixed — validator spec-compliance (mzpeak-0.9 profile)
@@ -192,5 +208,7 @@ First public release.
 - Thermo instrument error-log facet and the registered tof→m/z column transform
   are deferred pending upstream API support (see [HANDOFF.md](HANDOFF.md)).
 
+[0.3.1]: https://github.com/okohlbacher/mzPeakConverter/releases/tag/v0.3.1
+[0.3.0]: https://github.com/okohlbacher/mzPeakConverter/releases/tag/v0.3.0
 [0.2.0]: https://github.com/okohlbacher/mzPeakConverter/releases/tag/v0.2.0
 [0.1.0]: https://github.com/okohlbacher/mzPeakConverter/releases/tag/v0.1.0
