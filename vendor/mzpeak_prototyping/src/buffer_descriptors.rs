@@ -556,6 +556,17 @@ fn default_unit_curie(array_type: &ArrayType) -> Option<CURIE> {
         ArrayType::MeanDriftTimeArray
         | ArrayType::RawDriftTimeArray
         | ArrayType::DeconvolutedDriftTimeArray => Unit::Millisecond.to_curie(),
+        // Generic ion-mobility arrays carry no fixed unit on the mzdata side; mzML's convention is
+        // drift time, so default to millisecond. Charge is dimensionless. Both still need a CURIE to
+        // satisfy the required `unit` pattern. m/z and time normally arrive with a real unit, but
+        // default them defensively too so NO required array can ever serialize an empty unit.
+        ArrayType::IonMobilityArray
+        | ArrayType::MeanIonMobilityArray
+        | ArrayType::RawIonMobilityArray
+        | ArrayType::DeconvolutedIonMobilityArray => Unit::Millisecond.to_curie(),
+        ArrayType::ChargeArray => Some(mzdata::curie!(UO:0000186)), // dimensionless unit
+        ArrayType::MZArray => Some(mzdata::curie!(MS:1000040)),
+        ArrayType::TimeArray => Unit::Minute.to_curie(),
         _ => None,
     }
 }

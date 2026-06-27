@@ -16,16 +16,26 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 $cache = Join-Path 'C:\Users\User\rawcache' $CacheKey
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
-$urlArr  = @($Urls  -split ',' | Where-Object { $_.Trim() })
-$nameArr = @($Names -split ',' | Where-Object { $_.Trim() })
+# Do NOT filter empties — -Names is index-parallel to -Urls; a blank slot means "derive from URL".
+$urlArr  = @($Urls  -split ',')
+$nameArr = @($Names -split ',')
 for ($i = 0; $i -lt $urlArr.Count; $i++) {
-  $u    = $urlArr[$i].Trim()
-  $name = if ($i -lt $nameArr.Count -and $nameArr[$i].Trim()) { $nameArr[$i].Trim() }
-          else { [IO.Path]::GetFileName(([Uri]$u).AbsolutePath) }
+  $u = $urlArr[$i].Trim()
+  if (-not $u) { continue }
+  if ($i -lt $nameArr.Count -and $nameArr[$i].Trim()) { $name = $nameArr[$i].Trim() }
+  else {
+    $name = [IO.Path]::GetFileName(([Uri]$u).AbsolutePath)
+    if (-not $name) { "DL_FAIL=no filename for url (pass -Names): $u"; exit 1 }   # guard empty basename
+  }
   $dst  = Join-Path $cache $name
+  $part = "$dst.part"
   if ((Test-Path $dst) -and ((Get-Item $dst).Length -gt 0)) { "CACHED=$name"; continue }   # cache hit
-  & curl.exe -fSL --retry 3 --retry-delay 5 -o $dst $u
-  if ($LASTEXITCODE -ne 0) { "DL_FAIL=$name (curl $LASTEXITCODE)"; exit 1 }
+  Remove-Item -LiteralPath $part -ErrorAction SilentlyContinue                  # drop any stale partial
+  # download to .part, publish on success only — a killed/interrupted curl must never be cached as
+  # complete (which would later be CACHED= and converted as a truncated raw).
+  & curl.exe -fSL --retry 3 --retry-delay 5 -o $part $u
+  if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $part -ErrorAction SilentlyContinue; "DL_FAIL=$name (curl $LASTEXITCODE)"; exit 1 }
+  Move-Item -LiteralPath $part -Destination $dst -Force
   "DOWNLOADED=$name"
 }
 # vendor SDK env (mirrors box_convert_remote.ps1 / box_local_convert.ps1)

@@ -77,6 +77,7 @@ struct RecordHeader {
 pub struct AgilentReader {
     file: RefCell<File>,
     offsets: Vec<u64>,
+    file_len: u64,
     tmp_path: PathBuf,
 }
 
@@ -162,12 +163,22 @@ impl AgilentReader {
             let _ = std::fs::remove_file(&tmp_path);
             bail!("Agilent host output {} has bad magic {magic:?}", tmp_path.display());
         }
+        let file_len = file.metadata().context("stat host output")?.len();
         let count = read_u64(&mut file).context("reading count")? as usize;
-        let offsets_bytes = read_exact_vec(&mut file, count * 8).context("reading offset table")?;
+        // Guard a corrupt/truncated host file: the offset table (count×8) must fit, and count×8 must
+        // not overflow. (With the host's atomic .part publish this should never trip, but never
+        // allocate or index off an unchecked on-disk length.)
+        let table_bytes = count
+            .checked_mul(8)
+            .filter(|b| *b as u64 <= file_len.saturating_sub(12))
+            .ok_or_else(|| {
+                anyhow!("Agilent host output declares {count} records, too many for its {file_len} bytes")
+            })?;
+        let offsets_bytes = read_exact_vec(&mut file, table_bytes).context("reading offset table")?;
         let offsets: Vec<u64> =
             offsets_bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
 
-        Ok(Self { file: RefCell::new(file), offsets, tmp_path })
+        Ok(Self { file: RefCell::new(file), offsets, file_len, tmp_path })
     }
 
     pub fn len(&self) -> usize {
@@ -196,6 +207,11 @@ impl AgilentReader {
             n_points: read_u64(&mut *f)?,
         };
         let n = hdr.n_points as usize;
+        // Bound the two n×8 arrays against the file so a corrupt n_points can't drive a huge alloc.
+        // The 32-byte record header (rt8 + 4×i32 + n8) precedes the arrays at `off`.
+        n.checked_mul(16)
+            .filter(|b| *b as u64 <= self.file_len.saturating_sub(off + 32))
+            .ok_or_else(|| anyhow!("Agilent record {i}: n_points {n} exceeds the host file bounds"))?;
         let mz_bytes = read_exact_vec(&mut *f, n * 8)?;
         let int_bytes = read_exact_vec(&mut *f, n * 8)?;
         let mz: Vec<f64> =

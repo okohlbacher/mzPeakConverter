@@ -42,7 +42,12 @@ namespace AgilentGlue
             try
             {
                 int count = reader.Open(dPath, mhdacDir);
-                using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.ReadWrite))
+                // Write to a .part file and atomically publish only after a fully-successful write +
+                // close. The offset table is back-filled at the end, so a host killed/crashed mid-write
+                // (e.g. a native MHDAC AccessViolation that bypasses catch/finally) would otherwise
+                // leave an out.bin with a zeroed offset table that the Rust reader treats as valid.
+                string partPath = outPath + ".part";
+                using (var fs = new FileStream(partPath, FileMode.Create, FileAccess.ReadWrite))
                 using (var bw = new BinaryWriter(fs))
                 {
                     bw.Write((byte)'A'); bw.Write((byte)'G'); bw.Write((byte)'L'); bw.Write((byte)'1');
@@ -70,12 +75,15 @@ namespace AgilentGlue
                     for (int i = 0; i < count; i++) bw.Write((ulong)offsets[i]);
                     bw.Flush();
                 }
+                if (File.Exists(outPath)) File.Delete(outPath);
+                File.Move(partPath, outPath);                              // atomic publish
                 return 0;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("AgilentGlueHost error: " + MhdacReader.Flatten(ex));
                 try { if (File.Exists(outPath)) File.Delete(outPath); } catch { /* best effort */ }
+                try { if (File.Exists(outPath + ".part")) File.Delete(outPath + ".part"); } catch { }
                 return 1;
             }
             finally
@@ -179,7 +187,10 @@ namespace AgilentGlue
             s.MsLevel = MapMsLevel(_api.SpecMsLevelInfo.GetValue(spec));
             s.Polarity = MapPolarity(_api.SpecIonPolarity.GetValue(spec));
             s.IsCentroid = MapStorageMode(_api.SpecMsStorageMode.GetValue(spec));
-            s.ScanId = Convert.ToInt32(_api.SpecScanId.GetValue(spec));
+            // ScanId is i32 on the wire; MHDAC may type it wider. Don't let a >int.MaxValue id abort
+            // the whole .d — fall back to the row index (it only labels the spectrum id string).
+            try { s.ScanId = Convert.ToInt32(_api.SpecScanId.GetValue(spec)); }
+            catch (OverflowException) { s.ScanId = index; }
             return s;
         }
 
@@ -275,9 +286,14 @@ namespace AgilentGlue
             api.TotalScansPresent = FindProp(scanFileInfoType, "TotalScansPresent");
 
             // The 4-arg int overload: GetSpectrum(int, IMsdrPeakFilter, IMsdrPeakFilter, DesiredMSStorageType).
-            api.GetSpectrumByRow = readerIface.GetMethods().First(m =>
+            // Constrain the FULL signature (first param int, last param the storage-type enum) so we
+            // can't bind a different 4-arg overload, and raise a descriptive error if it's gone.
+            api.GetSpectrumByRow = readerIface.GetMethods().FirstOrDefault(m =>
                 m.Name == "GetSpectrum" && m.GetParameters().Length == 4
-                && m.GetParameters()[0].ParameterType == typeof(int));
+                && m.GetParameters()[0].ParameterType == typeof(int)
+                && m.GetParameters()[3].ParameterType == desiredStorageType)
+                ?? throw new MissingMethodException("IMsdrDataReader",
+                    "GetSpectrum(int, IMsdrPeakFilter, IMsdrPeakFilter, DesiredMSStorageType)");
             api.GetScanRecord = FindMethod(readerIface, "GetScanRecord", new[] { typeof(int) });
 
             api.SpecXArray = FindProp(specType, "XArray");

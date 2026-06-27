@@ -39,17 +39,22 @@ convert_one(){
     scp $SSHOPT_STR -o "$PROXY" "$d/$m" "$BOX_SSH:$boxdir/$m" >/dev/null 2>&1 \
       || { echo "[$tag] FAIL: scp up $m"; ssh $SSHOPT_STR -J "$BOX_JUMP" "$BOX_SSH" "powershell -NoProfile -Command \"Remove-Item -Recurse -Force '$boxdir'\"" >/dev/null 2>&1; return 1; }
   done
-  local res
-  res="$(ssh $SSHOPT_STR -J "$BOX_JUMP" "$BOX_SSH" "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/User/box_local_convert.ps1 -InPath '$boxdir/$b' -OutPath '$boxdir/out.mzpeak'" 2>/dev/null)"
-  if echo "$res" | grep -q 'EXIT=0' && echo "$res" | grep -q 'SIZE='; then
+  local res err
+  # keep stderr so an ssh/auth/ProxyCommand failure surfaces instead of an empty "FAIL: convert ()".
+  res="$(ssh $SSHOPT_STR -J "$BOX_JUMP" "$BOX_SSH" "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/User/box_local_convert.ps1 -InPath '$boxdir/$b' -OutPath '$boxdir/out.mzpeak'" 2>/tmp/bxc-$uid.err)"
+  err="$(tr '\n' ' ' < /tmp/bxc-$uid.err 2>/dev/null | tail -c 200)"; rm -f /tmp/bxc-$uid.err
+  local boxsz; boxsz="$(echo "$res" | grep -oE 'SIZE=[0-9]+' | cut -d= -f2)"
+  if echo "$res" | grep -q 'EXIT=0' && [ -n "$boxsz" ] && [ "$boxsz" -gt 0 ] 2>/dev/null; then
     mkdir -p "$(dirname "$out")"
     if scp $SSHOPT_STR -o "$PROXY" "$BOX_SSH:$boxdir/out.mzpeak" "$out" >/dev/null 2>&1; then
-      echo "[$tag] OK ($(echo "$res" | grep -oE 'SIZE=[0-9]+'))"
+      local locsz; locsz="$(stat -f %z "$out" 2>/dev/null || stat -c %s "$out" 2>/dev/null)"
+      if [ "$locsz" = "$boxsz" ]; then echo "[$tag] OK (SIZE=$boxsz)"
+      else echo "[$tag] FAIL: result size mismatch (box=$boxsz mac=$locsz) — truncated transfer"; rm -f "$out"; fi
     else
       echo "[$tag] FAIL: scp down result"
     fi
   else
-    echo "[$tag] FAIL: convert ($(echo "$res" | tr '\n' ' '))"
+    echo "[$tag] FAIL: convert (${res:+$res }${err:+stderr: $err})"
   fi
   ssh $SSHOPT_STR -J "$BOX_JUMP" "$BOX_SSH" "powershell -NoProfile -Command \"Remove-Item -Recurse -Force '$boxdir'\"" >/dev/null 2>&1
 }
