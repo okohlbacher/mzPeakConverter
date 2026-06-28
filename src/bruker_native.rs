@@ -144,19 +144,6 @@ impl NativeTofReader {
         }
     }
 
-    /// The `ims_calibration` JSON for the archive index. Archive variant stores ABSOLUTE tof (no
-    /// delta), so readers reconstruct `m/z = (a + b·tof)²` directly.
-    pub fn calibration_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "codec": "ims-compact",
-            "lossless": "tof",
-            "mz_from_tof": "(a + b*tof)^2",
-            "tof_encoding": "absolute",
-            "a": self.model.a,
-            "b": self.model.b,
-        })
-    }
-
     /// Build the IN-ARCHIVE ims-compact spectrum for frame `i`: the signal arrays are
     /// `nonstandard("tof")` (Int32, replaces `m/z array`) + `IntensityArray` (f32) +
     /// `MeanInverseReducedIonMobilityArray` (f64). m/z is reconstructed by readers from the index

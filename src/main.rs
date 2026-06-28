@@ -409,6 +409,10 @@ fn run(cli: &Cli) -> Result<i32> {
     // ims-compact is the DEFAULT for Bruker timsTOF (TDF); --no-ims-compact (or --bruker-sdk) falls
     // back to f64 m/z.
     let use_ims_compact = is_tdf_dir(&cli.input) && !cfg.no_ims_compact && !use_bruker_sdk;
+    // The SDK decoder ALSO has the raw tof index, so it can emit the same ims-compact integer-tof
+    // layout — use it for TDF (unless --no-ims-compact) so newer timsTOF (5.1.x) that timsrust can't
+    // decompress still gets the compact lossless format (+ byte-plane) instead of f64 m/z.
+    let use_sdk_ims_compact = use_bruker_sdk && is_tdf_dir(&cli.input) && !cfg.no_ims_compact;
 
     let vendor = if cfg.no_vendor {
         None
@@ -440,6 +444,9 @@ fn run(cli: &Cli) -> Result<i32> {
     } else if cfg.via_msconvert {
         convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms, cfg.tof_grid)
             .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
+    } else if use_sdk_ims_compact {
+        convert_ims_compact_sdk(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
+            .with_context(|| format!("SDK ims-compact converting {}", cli.input.display()))?;
     } else if use_bruker_sdk {
         convert_bruker_sdk(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("converting {} via the Bruker timsdata SDK", cli.input.display()))?;
@@ -1561,16 +1568,26 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// integer `tof` instead of f64 m/z, with the TOF→m/z calibration in the index `ims_calibration`
 /// block. Half the m/z bytes (i32 vs f64) + exact integer grid; readers reconstruct
 /// `(a+b·tof)²`. Vendor embedding still applies.
-fn convert_ims_compact_archive(
+/// Shared ims-compact archive writer: builds the `point` peaks-facet schema (integer `tof` +
+/// intensity + ion mobility), streams `n_total` frames through the `spectrum` closure, and writes
+/// the `ims_calibration` index. Used by BOTH the native timsrust path and the Bruker-SDK path —
+/// they yield the same integer-tof `MultiLayerSpectrum`, just from different decoders. `model_a/b`
+/// are the `m/z = (a + b·tof)²` coefficients.
+fn write_ims_compact_archive<F>(
     input: &Path,
     output: &Path,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
-    tims_recalibration: bool,
-) -> Result<()> {
-    let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
-    if reader.len() == 0 {
+    model_a: f64,
+    model_b: f64,
+    n_total: usize,
+    mut spectrum: F,
+) -> Result<()>
+where
+    F: FnMut(usize, bool) -> Result<MultiLayerSpectrum>,
+{
+    if n_total == 0 {
         bail!("no frames in {}", input.display());
     }
     let tmp = output.with_extension("mzpeak.tmp");
@@ -1598,7 +1615,7 @@ fn convert_ims_compact_archive(
         let mut md = base.metadata().clone();
         md.insert(
             "mzpeak:transform_params".to_string(),
-            format!("{},{}", reader.model.a, reader.model.b),
+            format!("{},{}", model_a, model_b),
         );
         std::sync::Arc::new((*base).clone().with_metadata(md))
     };
@@ -1643,9 +1660,9 @@ fn convert_ims_compact_archive(
     add_processing_metadata(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
-    let n_frames = max_spectra().map_or(reader.len(), |m| m.min(reader.len()));
+    let n_frames = max_spectra().map_or(n_total, |m| m.min(n_total));
     for i in 0..n_frames {
-        let spec = reader.ims_compact_spectrum(i, int_intensity)?;
+        let spec = spectrum(i, int_intensity)?;
         if synth_chroms {
             ms1.observe(&spec);
         }
@@ -1655,8 +1672,16 @@ fn convert_ims_compact_archive(
     fixup_run_metadata(&mut writer, input);
 
     // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename.
+    let cal = serde_json::json!({
+        "codec": "ims-compact",
+        "lossless": "tof",
+        "mz_from_tof": "(a + b*tof)^2",
+        "tof_encoding": "absolute",
+        "a": model_a,
+        "b": model_b,
+    });
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    zip.add_index_metadata("ims_calibration", &reader.calibration_json())
+    zip.add_index_metadata("ims_calibration", &cal)
         .context("writing ims_calibration index")?;
     if let Some(policy) = vendor {
         vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
@@ -1664,6 +1689,54 @@ fn convert_ims_compact_archive(
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
     Ok(())
+}
+
+/// Native (timsrust) ims-compact: pure-Rust decoder, default for Bruker TDF.
+fn convert_ims_compact_archive(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+    tims_recalibration: bool,
+) -> Result<()> {
+    let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
+    let (a, b, n) = (reader.model.a, reader.model.b, reader.len());
+    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, n, |i, int| {
+        reader.ims_compact_spectrum(i, int)
+    })
+}
+
+/// Bruker-SDK ims-compact: same integer-tof layout, but decoded via the official `timsdata` library
+/// (handles newer timsTOF, e.g. 5.1.x, that the vendored timsrust can't). Windows/Linux only.
+#[cfg(any(windows, target_os = "linux"))]
+fn convert_ims_compact_sdk(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+) -> Result<()> {
+    let reader = bruker_sdk::TdfSdkReader::open(input)?;
+    let (a, b) = reader.tof_mz_model();
+    let n = reader.len();
+    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, n, |i, int| {
+        reader.ims_compact_spectrum(i, int)
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn convert_ims_compact_sdk(
+    _input: &Path,
+    _output: &Path,
+    _zstd_level: i32,
+    _vendor: Option<&vendor::VendorPolicy>,
+    _synth_chroms: bool,
+) -> Result<()> {
+    Err(UnsupportedVendor(
+        "the Bruker timsdata SDK path (--bruker-sdk) is only available on Windows and Linux".into(),
+    )
+    .into())
 }
 
 /// Flush Parquet, then (for a Bruker `.d` with a vendor policy) stream-embed vendor side-files +

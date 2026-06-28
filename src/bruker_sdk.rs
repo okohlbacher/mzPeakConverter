@@ -539,6 +539,77 @@ impl TdfSdkReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
+    /// `m/z = (a + b·tof)²` coefficients, recovered from the SDK's run-constant index→m/z calibration
+    /// (`a = √(index_to_mz(0))`, `b = √(index_to_mz(1)) − a`) — mirrors `bruker_native::TofMzModel`.
+    /// Falls back to the (0,1) identity placeholder (which readers guard) if the SDK call fails.
+    pub fn tof_mz_model(&self) -> (f64, f64) {
+        let fid = self.frames.first().map(|f| f.id).unwrap_or(0);
+        match self.convert(self.api.tims_index_to_mz, fid, &[0.0_f64, 1.0_f64], "tims_index_to_mz") {
+            Ok(v) if v.len() == 2 => {
+                let a = v[0].max(0.0).sqrt();
+                let b = v[1].max(0.0).sqrt() - a;
+                (a, b)
+            }
+            _ => (0.0, 1.0),
+        }
+    }
+
+    /// Build the ims-compact spectrum for frame `i`: integer `tof` (raw index) + intensity + per-peak
+    /// 1/K0, in the SDK's native mobility-major order (NO m/z sort — the ims-compact reader recovers
+    /// m/z from the tof grid). Same layout as `bruker_native::ims_compact_spectrum`, so it flows
+    /// through `write_ims_compact_archive`. `int_intensity` stores counts as Int32 for byte-plane.
+    pub fn ims_compact_spectrum(&self, i: usize, int_intensity: bool) -> Result<MultiLayerSpectrum> {
+        let frame = self
+            .frames
+            .get(i)
+            .with_context(|| format!("TDF frame index {i} out of range"))?;
+        let peaks = self.read_frame_peaks(frame)?;
+        let scans: Vec<f64> = peaks.iter().map(|p| p.scan as f64).collect();
+        let mobility = self.convert(
+            self.api.tims_scannum_to_oneoverk0,
+            frame.id,
+            &scans,
+            "tims_scannum_to_oneoverk0",
+        )?;
+
+        let mut tof: Vec<i32> = Vec::with_capacity(peaks.len());
+        let (mut int_f32, mut int_i32): (Vec<f32>, Vec<i32>) = (Vec::new(), Vec::new());
+        for p in &peaks {
+            tof.push(i32::try_from(p.index).map_err(|_| anyhow!("TOF index {} exceeds i32", p.index))?);
+            if int_intensity {
+                int_i32.push(i32::try_from(p.intensity).map_err(|_| anyhow!("intensity {} exceeds i32", p.intensity))?);
+            } else {
+                int_f32.push(p.intensity as f32);
+            }
+        }
+
+        let mut arrays = BinaryArrayMap::new();
+        let mut tof_da = DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
+        tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow!("encoding tof: {e}"))?;
+        arrays.add(tof_da);
+        let mut int_da = if int_intensity {
+            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+            da.update_buffer(int_i32.as_slice()).map_err(|e| anyhow!("encoding intensity: {e}"))?;
+            da
+        } else {
+            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+            da.update_buffer(int_f32.as_slice()).map_err(|e| anyhow!("encoding intensity: {e}"))?;
+            da
+        };
+        int_da.unit = Unit::DetectorCounts;
+        arrays.add(int_da);
+        let mut mob_da = DataArray::wrap(
+            &ArrayType::MeanInverseReducedIonMobilityArray,
+            BinaryDataArrayType::Float64,
+            Vec::new(),
+        );
+        mob_da.update_buffer(mobility.as_slice()).map_err(|e| anyhow!("encoding mobility: {e}"))?;
+        arrays.add(mob_da);
+
+        let descr = make_description(i, frame, SignalContinuity::Centroid);
+        Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
+    }
+
     /// Shared wrapper for the two per-peak conversion calls (index→m/z, scan→1/K0): both take a
     /// `*const f64` in and a `*mut f64` out with the same count, returning 0 on error.
     fn convert(
