@@ -14,8 +14,9 @@ use arrow::{
     error::ArrowError,
 };
 use mzdata::{
-    prelude::BuildFromArrayMap,
-    spectrum::{ArrayType, BinaryArrayMap, DataArray, PeakDataLevel},
+    params::Unit,
+    prelude::*,
+    spectrum::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray, PeakDataLevel},
 };
 use mzpeaks::{CentroidLike, DeconvolutedCentroidLike, coordinate::SimpleInterval};
 use parquet::{
@@ -89,6 +90,82 @@ pub(crate) fn binary_search_arrow_index(
     }
 
     None
+}
+
+/// 3c: reconstruct m/z from an integer grid column carrying a registered grid transform
+/// (`SqrtMzFromTof` / `LinearMz`) when no m/z array was materialized — TOF-grid / ims-compact
+/// spectra store raw flight-time indices. Shared by every point-read path so generic readers
+/// (`get_spectrum_arrays` → `raw_arrays`/`mzs`) see m/z, not integer indices. `transform_params`
+/// are the run-wide coefficients ([c0,c1] for sqrt-from-TOF, [scale] for the linear m/z grid).
+pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &ArrayIndex) {
+    if out.get(&ArrayType::MZArray).is_some() {
+        return;
+    }
+    let mut reconstructed: Vec<DataArray> = Vec::new();
+    for v in array_indices.iter() {
+        let is_sqrt = matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof));
+        let is_linear = matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::LinearMz));
+        if !is_sqrt && !is_linear {
+            continue;
+        }
+        let Some(src) = out.get(&v.array_type) else { continue };
+        let Ok(ks) = src.to_i32() else { continue };
+        let p = v.transform_params.clone().unwrap_or_default();
+        let mzs: Vec<f64> = if is_sqrt {
+            let c0 = p.first().copied().unwrap_or(0.0);
+            let c1 = p.get(1).copied().unwrap_or(1.0);
+            // R3 guard: the run-wide `(0,1)` sqrt params are an IDENTITY PLACEHOLDER (native-SCIEX).
+            // Computing `(0 + 1·k)² = k²` here installs confident garbage m/z. The real grid is the
+            // per-spectrum `(tof_c0 + tof_c1·k)²` applied once the description is read (see the
+            // per-spectrum fixup in reader.rs). Skip so corruption surfaces as missing m/z, not k².
+            if c0 == 0.0 && c1 == 1.0 { continue; }
+            ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect()
+        } else {
+            let s = p.first().copied().unwrap_or(1.0);
+            ks.iter().map(|&k| s * k as f64).collect()
+        };
+        let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        if mz_da.update_buffer(mzs.as_slice()).is_ok() {
+            mz_da.unit = Unit::MZ;
+            reconstructed.push(mz_da);
+        }
+    }
+    for mz_da in reconstructed {
+        out.add(mz_da);
+    }
+}
+
+/// Per-spectrum sqrt TOF-grid reconstruction (native-SCIEX): overwrite m/z with
+/// `(tof_c0 + tof_c1·k)²` using the spectrum's PER-SPECTRUM coefficients, which override the run-wide
+/// `(0,1)` placeholder that [`reconstruct_grid_mz`] deliberately skips. Coefficients are looked up by
+/// NAME (`tof_c0`/`tof_c1`) so it is accession-independent (`MZP:1000003/4` today, legacy
+/// `MS:4000900/1`); the grid array is located via the run-wide index's `ArrayType` because the decoded
+/// `tof_index` is a `NonStandardDataArray` whose name may be empty. No-op when there are no per-spectrum
+/// coefficients (non-grid data) or no grid array. Shared by the sync and async readers.
+pub(crate) fn reconstruct_per_spectrum_grid_mz(
+    out: &mut BinaryArrayMap,
+    params: &[mzdata::params::Param],
+    array_indices: &ArrayIndex,
+) {
+    let Some(gt) = array_indices
+        .iter()
+        .find(|v| matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof)))
+        .map(|v| v.array_type.clone())
+    else {
+        return;
+    };
+    let coeff = |needle: &str| {
+        params.iter().find(|p| p.name.contains(needle)).and_then(|p| p.to_f64().ok())
+    };
+    let (Some(c0), Some(c1)) = (coeff("tof_c0"), coeff("tof_c1")) else { return };
+    if let Some(ks) = out.get(&gt).and_then(|t| t.to_i32().ok()).map(|c| c.into_owned()) {
+        let mzs: Vec<f64> = ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect();
+        let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        if mz_da.update_buffer(mzs.as_slice()).is_ok() {
+            mz_da.unit = Unit::MZ;
+            out.add(mz_da);
+        }
+    }
 }
 
 /// An internal shared behavior set for reading point-layout data
@@ -359,6 +436,9 @@ impl PointDataCacheBlock {
         for v in bin_map.into_values() {
             out.add(v);
         }
+
+        // 3c: reconstruct m/z for grid-encoded (TOF / ims-compact) spectra; see reconstruct_grid_mz.
+        reconstruct_grid_mz(&mut out, &self.spectrum_array_indices);
         Ok(Some(out))
     }
 }
@@ -649,6 +729,8 @@ mod async_impl {
             for v in bin_map.into_values() {
                 out.add(v);
             }
+            // 3c: reconstruct m/z for grid-encoded (TOF / ims-compact) spectra (see slice_to_arrays_of).
+            super::reconstruct_grid_mz(&mut out, array_indices);
             Ok(Some(out))
         }
 
@@ -1061,6 +1143,8 @@ mod sync_impl {
             for v in bin_map.into_values() {
                 out.add(v);
             }
+            // 3c: reconstruct m/z for grid-encoded (TOF / ims-compact) spectra (see slice_to_arrays_of).
+            super::reconstruct_grid_mz(&mut out, array_indices);
             Ok(Some(out))
         }
 

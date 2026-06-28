@@ -503,18 +503,73 @@ pub enum BufferTransform {
     NumpressPIC,
     NullInterpolate,
     NullZero,
-    /// Reconstruct m/z from an integer TOF column as `m/z = (a + b·tof)²`. The `[a, b]` coefficients
-    /// travel in the array index entry's `transform_params`, so a reader recovers m/z generically
-    /// without bespoke ims-compact handling. NOTE: the CURIE is PROVISIONAL (converter-local), to be
-    /// replaced by the assigned PSI term once the mzPeak specification defines it.
+    /// Reconstruct m/z from an integer grid index as `m/z = (b + a·k)²` — PSI-MS "square root grid
+    /// interpolation" (MS:1003825), `x = f((b + i·a)²)` with the recalibration `f` = identity here.
+    /// The `[b, a]` (= `[c0, c1]`) coefficients travel in the array index entry's `transform_params`.
+    /// Used for sqrt flight-time grids: Bruker ims-compact, Agilent/SCIEX file-direct profile.
     SqrtMzFromTof,
+    /// Reconstruct m/z from an integer grid index as `m/z = b + a·k` — PSI-MS "linear grid
+    /// interpolation" (MS:1003824), `x = f(b + i·a)` with `f` = identity, `b` = 0, `a` = scale.
+    /// Used for uniform m/z grids (e.g. SWATH MS2) off the flight-time lattice.
+    LinearMz,
 }
 
 const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
 const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
-// PROVISIONAL accession (follows the writer's local null-transform numbering 1003901/1003902); not
-// yet an official PSI term — see BufferTransform::SqrtMzFromTof.
-const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003903);
+// Grid reconstruction transforms, using the ASSIGNED PSI-MS "coordinate spacing model" terms seeded
+// for grid encoding (children of MS:1003820 / MS:1003822 "grid coordinate interpolation"):
+//   MS:1003825 = square root grid interpolation   x = f((b + i·a)²)
+//   MS:1003824 = linear grid interpolation        x = f(b + i·a)
+// `f` (recalibration) is identity for these; a non-identity `f` (e.g. Agilent's per-CalibrationID
+// polynomial, the TIMS mobility model) awaits a PSI recalibration-function term (BACKLOG.md #1).
+const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003825);
+const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003824);
+// (MS:1003826 "coordinate grid encoding" would additionally mark the grid-index column, but the
+// array index `transform` field holds a single CURIE — already the spacing model — so there is no
+// slot for it; revisit if the spec adds a dedicated grid-encoding marker field.)
+// Legacy codings recognized on READ only, so archives written before the assignment keep decoding:
+// our earlier made-up MS:1003903/1003904 and the converter-owned MZP:1000001/1000002 (Unknown-CV).
+const SQRT_LEGACY_MS: CURIE = mzdata::curie!(MS:1003903);
+const LINEAR_LEGACY_MS: CURIE = mzdata::curie!(MS:1003904);
+const SQRT_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
+const LINEAR_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_002);
+
+/// A fallback `unit` CURIE for arrays that arrive with `Unit::Unknown`. The mzPeak array-index
+/// schema (`array_index.json`) makes `unit` REQUIRED with `pattern \S+:\S+`, but some arrays have no
+/// unit on the source side: mzML intensity arrays rarely declare one, and the integer `tof_index`
+/// grid column is a dimensionless hardware counter. Supply the conventional CURIE so the writer
+/// never emits a null/empty unit. Intensity → `MS:1000131` (number of detector counts, the term the
+/// spec's own examples use); a non-standard array (e.g. `tof_index`) → `UO:0000189` (count unit).
+fn default_unit_curie(array_type: &ArrayType) -> Option<CURIE> {
+    use mzdata::params::Unit;
+    match array_type {
+        ArrayType::IntensityArray => Some(mzdata::curie!(MS:1000131)),
+        ArrayType::NonStandardDataArray { .. } => Some(mzdata::curie!(UO:0000189)),
+        // Ion-mobility arrays reach the writer with Unit::Unknown from some readers (e.g. the Bruker
+        // timsTOF path); supply the conventional unit via mzdata's own Unit→CURIE map. Inverse
+        // reduced mobility (1/K0) → MS:1002814 (volt-second per square centimeter); drift time → ms.
+        ArrayType::MeanInverseReducedIonMobilityArray
+        | ArrayType::RawInverseReducedIonMobilityArray
+        | ArrayType::DeconvolutedInverseReducedIonMobilityArray => {
+            Unit::VoltSecondPerSquareCentimeter.to_curie()
+        }
+        ArrayType::MeanDriftTimeArray
+        | ArrayType::RawDriftTimeArray
+        | ArrayType::DeconvolutedDriftTimeArray => Unit::Millisecond.to_curie(),
+        // Generic ion-mobility arrays carry no fixed unit on the mzdata side; mzML's convention is
+        // drift time, so default to millisecond. Charge is dimensionless. Both still need a CURIE to
+        // satisfy the required `unit` pattern. m/z and time normally arrive with a real unit, but
+        // default them defensively too so NO required array can ever serialize an empty unit.
+        ArrayType::IonMobilityArray
+        | ArrayType::MeanIonMobilityArray
+        | ArrayType::RawIonMobilityArray
+        | ArrayType::DeconvolutedIonMobilityArray => Unit::Millisecond.to_curie(),
+        ArrayType::ChargeArray => Some(mzdata::curie!(UO:0000186)), // dimensionless unit
+        ArrayType::MZArray => Some(mzdata::curie!(MS:1000040)),
+        ArrayType::TimeArray => Unit::Minute.to_curie(),
+        _ => None,
+    }
+}
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -524,7 +579,12 @@ impl BufferTransform {
             x if x == Self::NumpressLinear.curie() => Some(Self::NumpressLinear),
             x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
             x if x == NULL_ZERO => Some(Self::NullZero),
-            x if x == SQRT_MZ_FROM_TOF => Some(Self::SqrtMzFromTof),
+            x if x == SQRT_MZ_FROM_TOF || x == SQRT_LEGACY_MS || x == SQRT_LEGACY_MZP => {
+                Some(Self::SqrtMzFromTof)
+            }
+            x if x == LINEAR_MZ || x == LINEAR_LEGACY_MS || x == LINEAR_LEGACY_MZP => {
+                Some(Self::LinearMz)
+            }
             _ => None,
         }
     }
@@ -539,6 +599,7 @@ impl BufferTransform {
             // The stored column is the raw integer TOF; the transform is a reconstruction formula, not
             // a re-encoding, so it does not rename the column.
             BufferTransform::SqrtMzFromTof => None,
+            BufferTransform::LinearMz => None,
         }
     }
 
@@ -562,6 +623,7 @@ impl BufferTransform {
             BufferTransform::NullInterpolate => NULL_INTERPOLATE,
             BufferTransform::NullZero => NULL_ZERO,
             BufferTransform::SqrtMzFromTof => SQRT_MZ_FROM_TOF,
+            BufferTransform::LinearMz => LINEAR_MZ,
         }
     }
 }
@@ -721,6 +783,7 @@ impl BufferName {
                 "unit".to_string(),
                 self.unit
                     .to_curie()
+                    .or_else(|| default_unit_curie(&self.array_type))
                     .map(|c| c.to_string())
                     .unwrap_or_default(),
             ),
@@ -745,7 +808,7 @@ impl BufferName {
         .into_iter()
         .collect();
         if let Some(trfm) = self.transform.as_ref() {
-            meta.insert("transform".to_string(), trfm.curie().to_string());
+            meta.insert("transform".to_string(), crate::param::curie_to_string(&trfm.curie()));
         }
         if let Some(dp_id) = self.data_processing_id.as_ref() {
             meta.insert("data_processing_id".to_string(), dp_id.to_string());
@@ -1055,6 +1118,9 @@ pub struct SerializedArrayIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform_params: Option<Vec<f64>>,
     pub data_processing_id: Option<Box<str>>,
+    // `buffer_priority` is an enum (primary|secondary) with no null member in array_index.json, so a
+    // `null` fails validation — but the field is NOT required, so omitting it when absent is valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_priority: Option<BufferPriority>,
     pub sorting_rank: Option<u32>,
 }
@@ -1093,7 +1159,7 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
                 ArrayType::NonStandardDataArray { name } => name.to_string(),
                 _ => value.array_type.as_param_const().name().to_string(),
             },
-            unit: value.unit.to_curie(),
+            unit: value.unit.to_curie().or_else(|| default_unit_curie(&value.array_type)),
             buffer_format: value.buffer_format.to_string(),
             transform: value.transform.map(|t| t.curie()),
             transform_params: value.transform_params,

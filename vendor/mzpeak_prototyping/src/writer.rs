@@ -492,6 +492,12 @@ pub struct MzPeakWriterType<
     wavelength_spectrum_data_buffers: Option<GenericDataArrayWriter>,
 
     spectrum_metadata_buffer: SpectrumBuilder,
+    /// Temp-parquet spool for spectrum metadata. The metadata facet can't be written into the
+    /// single-stream zip until finish, so for high-spectrum-count files its builder would otherwise
+    /// hold every spectrum in RAM (~7 GB at 307k spectra). Lazily created once the builder is first
+    /// drained on the buffer_size cadence; streamed back batch-by-batch into the metadata entry at
+    /// finish. Small files (< buffer_size spectra) never spool and keep the single in-RAM batch path.
+    spectrum_metadata_spool: Option<ArrowWriter<fs::File>>,
     chromatogram_metadata_buffer: ChromatogramBuilder,
     wavelength_spectrum_metadata_buffer: WavelengthSpectrumBuilder,
 
@@ -549,6 +555,12 @@ impl<
             || self.spectrum_data_buffer_mut().memory_size() >= *crate::writer::array_buffer::FLUSH_MEM_BYTES
         {
             self.flush_data_arrays()?;
+        }
+        // Bound the spectrum-METADATA builder on the same count cadence. It can't stream into the
+        // single-stream zip (the metadata entry opens only at finish), so drain it to a side parquet
+        // spool. Small files (< buffer_size spectra) never trip this and keep the in-RAM finish path.
+        if self.spectrum_counter() % (self.buffer_size as u64) == 0 {
+            self.spool_spectrum_metadata()?;
         }
         Ok(())
     }
@@ -690,7 +702,12 @@ impl<
             spectrum_buffers.into()
         };
 
-        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
+        // The chromatogram buffer's schema must follow the CHROMATOGRAM chunking flag, not the
+        // spectrum one. write_chromatogram_arrays() (base.rs) branches on
+        // use_chromatogram_chunked_encoding; building the buffer off use_chunked_encoding instead
+        // lets the two disagree (point spectra + chunked-chromatogram flag → point buffer, chunked
+        // write → drain panics "N columns vs M fields"). The split writer already uses this flag.
+        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chromatogram_chunked_encoding.is_some() {
             chromatogram_buffers_builder
                 .build_chunked(
                     Arc::new(Schema::empty()),
@@ -759,6 +776,7 @@ impl<
             use_chunked_encoding,
             use_chromatogram_chunked_encoding,
             spectrum_metadata_buffer,
+            spectrum_metadata_spool: None,
             spectrum_data_buffers: spectrum_buffers,
             chromatogram_data_buffers: chromatogram_buffers,
             chromatogram_metadata_buffer: Default::default(),
@@ -833,10 +851,66 @@ impl<
         Ok(())
     }
 
-    fn flush_spectrum_metadata_records(&mut self) -> io::Result<()> {
+    /// Drain the in-RAM spectrum-metadata builder into the temp-parquet spool (lazily created on
+    /// first use). No-op when the builder holds no rows. `finish()` resets the builder but leaves the
+    /// `id_to_index` map intact, so cross-batch precursor->spectrum references still resolve.
+    fn spool_spectrum_metadata(&mut self) -> io::Result<()> {
         let arrays = self.spectrum_metadata_buffer.finish();
         let batch = RecordBatch::from(arrays.as_struct());
-        self.archive_writer.as_mut().unwrap().write(&batch)?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        if self.spectrum_metadata_spool.is_none() {
+            let f = tempfile::tempfile()?;
+            self.spectrum_metadata_spool =
+                Some(ArrowWriter::try_new(f, batch.schema(), None).map_err(io::Error::other)?);
+        }
+        self.spectrum_metadata_spool
+            .as_mut()
+            .unwrap()
+            .write(&batch)
+            .map_err(io::Error::other)
+    }
+
+    fn flush_spectrum_metadata_records(&mut self) -> io::Result<()> {
+        // Spooled (high-spectrum-count file): flush the tail, then stream the spool back into the
+        // metadata entry ONE batch at a time so RAM stays bounded. Otherwise write the lone in-RAM
+        // batch directly — no temp-file round-trip for small files.
+        if self.spectrum_metadata_spool.is_some() {
+            self.spool_spectrum_metadata()?;
+            let mut tmp = self
+                .spectrum_metadata_spool
+                .take()
+                .unwrap()
+                .into_inner()
+                .map_err(io::Error::other)?;
+            tmp.rewind()?;
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(tmp)
+                    .map_err(io::Error::other)?
+                    .build()
+                    .map_err(io::Error::other)?;
+            for batch in reader {
+                let batch = batch.map_err(io::Error::other)?;
+                let writer = self.archive_writer.as_mut().unwrap();
+                writer.write(&batch)?;
+                // Bound the metadata row group by bytes (same threshold as the data facet) so a
+                // very large run (100k+ spectra) is split into several row groups a reader can
+                // decode incrementally, instead of one monolithic row group it must materialize
+                // whole on open.
+                if writer.in_progress_size() > 16_000_000 {
+                    log::debug!(
+                        "Flushing metadata row group buffer with approximately {} bytes",
+                        writer.in_progress_size()
+                    );
+                    writer.flush()?;
+                }
+            }
+        } else {
+            let arrays = self.spectrum_metadata_buffer.finish();
+            let batch = RecordBatch::from(arrays.as_struct());
+            self.archive_writer.as_mut().unwrap().write(&batch)?;
+        }
         Ok(())
     }
 

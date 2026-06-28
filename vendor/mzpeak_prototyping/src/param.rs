@@ -19,6 +19,48 @@ pub type CURIE = mzdata::params::CURIE;
 
 pub use mzdata::curie;
 
+/// Converter-owned CV prefix for the provisional mzPeak grid/calibration terms (see `cv/mzpeak.obo`).
+/// mzdata's [`CURIE`] cannot carry a non-standard prefix, so MZP terms are represented as
+/// `ControlledVocabulary::Unknown` CURIEs (the accession is the MZP term number) and the prefix is
+/// supplied here at the (de)serialisation boundary. Every CURIE string crosses through
+/// [`curie_to_string`] / [`parse_curie`], so MZP is the only place a non-mzdata prefix appears.
+pub const MZP_CV_PREFIX: &str = "MZP";
+
+/// True for a converter-owned MZP term (an `Unknown`-CV CURIE). mzdata maps every unrecognised CV
+/// prefix to `Unknown` and discards the prefix string, so within this converter — which only ever
+/// constructs `Unknown` CURIEs for MZP terms — `Unknown` is synonymous with MZP.
+#[inline]
+pub(crate) fn is_mzp(c: &CURIE) -> bool {
+    matches!(
+        c.controlled_vocabulary,
+        mzdata::params::ControlledVocabulary::Unknown
+    )
+}
+
+/// Render a CURIE to its wire string. MZP terms get the converter-owned `MZP:` prefix; everything
+/// else uses mzdata's standard rendering. (mzdata's own `Display` *panics* on `Unknown`, so all
+/// CURIE stringification in this crate MUST go through here.)
+pub(crate) fn curie_to_string(c: &CURIE) -> String {
+    if is_mzp(c) {
+        format!("{}:{:07}", MZP_CV_PREFIX, c.accession)
+    } else {
+        mzdata::params::CURIE::from(*c).to_string()
+    }
+}
+
+/// Parse a wire CURIE string, recognising the converter-owned `MZP:` prefix (which mzdata cannot
+/// parse to a usable CV) and falling back to mzdata for standard prefixes.
+pub(crate) fn parse_curie(v: &str) -> Result<CURIE, String> {
+    if let Some(rest) = v.strip_prefix("MZP:").or_else(|| v.strip_prefix("MZP_")) {
+        rest.trim()
+            .parse::<u32>()
+            .map(|acc| CURIE::new(mzdata::params::ControlledVocabulary::Unknown, acc))
+            .map_err(|e| format!("invalid MZP accession '{rest}': {e}"))
+    } else {
+        v.parse::<CURIE>().map_err(|e| e.to_string())
+    }
+}
+
 // Provide a way to JSON-serialize CURIEs as nullable string
 pub(crate) fn opt_curie_serialize<S>(
     curie: &Option<CURIE>,
@@ -28,7 +70,7 @@ where
     S: serde::Serializer,
 {
     match curie {
-        Some(curie) => serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string()),
+        Some(curie) => serializer.serialize_str(&curie_to_string(curie)),
         None => serializer.serialize_none(),
     }
 }
@@ -48,9 +90,7 @@ where
             }
             s.end()
         }
-        PathOrCURIE::CURIE(curie) => {
-            serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string())
-        }
+        PathOrCURIE::CURIE(curie) => serializer.serialize_str(&curie_to_string(curie)),
         PathOrCURIE::None => serializer.serialize_none(),
     }
 }
@@ -75,8 +115,8 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            match v.parse::<mzdata::params::CURIE>() {
-                Ok(v) => Ok(PathOrCURIE::CURIE(v.into())),
+            match parse_curie(v) {
+                Ok(v) => Ok(PathOrCURIE::CURIE(v)),
                 Err(e) => Err(E::custom(e)),
             }
         }
@@ -108,7 +148,7 @@ pub(crate) fn curie_serialize<S>(curie: &CURIE, serializer: S) -> Result<S::Ok, 
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string())
+    serializer.serialize_str(&curie_to_string(curie))
 }
 
 // Provide a way to JSON-deserialize CURIEs from a nullable string
@@ -132,8 +172,8 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            match v.parse::<mzdata::params::CURIE>() {
-                Ok(v) => Ok(Some(v.into())),
+            match parse_curie(v) {
+                Ok(v) => Ok(Some(v)),
                 Err(e) => Err(E::custom(e)),
             }
         }
@@ -163,8 +203,8 @@ where
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            match v.parse::<mzdata::params::CURIE>() {
-                Ok(v) => Ok(v.into()),
+            match parse_curie(v) {
+                Ok(v) => Ok(v),
                 Err(e) => Err(E::custom(e)),
             }
         }
@@ -318,7 +358,14 @@ impl From<mzdata::params::ControlledVocabulary> for ControlledVocabularyEntry {
                 "https://raw.githubusercontent.com/imzML/imzML/refs/heads/master/imagingMS.obo",
                 Some("1.1.0"),
             ),
-            mzdata::params::ControlledVocabulary::Unknown => todo!(),
+            // The converter represents its provisional MZP terms as `Unknown`-CV CURIEs (see
+            // `is_mzp` / `cv/mzpeak.obo`), so an `Unknown` CV here means the converter-owned MZP CV.
+            mzdata::params::ControlledVocabulary::Unknown => ControlledVocabularyEntry::new(
+                MZP_CV_PREFIX,
+                "mzPeak converter provisional controlled vocabulary",
+                "https://raw.githubusercontent.com/okohlbacher/mzPeakConverter/main/cv/mzpeak.obo",
+                Some("0.1.0"),
+            ),
         }
     }
 }
@@ -371,6 +418,42 @@ impl From<mzdata::Param> for MetaParam {
             unit: value.unit.to_curie().map(CURIE::from),
         }
     }
+}
+
+/// Ensure a CV-param list carries a mandatory term, pushing it as a value-less flag if absent.
+/// The mzPeak spec's CvMapping rules require terms that source mzML frequently omits: every
+/// `data_processing` method needs a child of MS:1000452 "data transformation", and
+/// `file_description.contents` needs a child of MS:1000524 "data file content" (both rules are
+/// `use_term:false`, so the abstract parent itself does not satisfy them — a child does). Dedup by
+/// exact accession so we never duplicate a term the source already supplied.
+fn ensure_cv_term(params: &mut Vec<MetaParam>, accession: CURIE, name: &str) {
+    if params.iter().any(|p| p.accession == Some(accession)) {
+        return;
+    }
+    params.push(MetaParam {
+        name: Some(name.to_string()),
+        accession: Some(accession),
+        value: serde_json::Value::Null,
+        unit: None,
+    });
+}
+
+/// Like [`ensure_cv_term`] but only injects when the list carries NO CV-accession param at all.
+/// Used for `instrumentconfiguration_must` (MS:1000031 instrument model), `detector_must`
+/// (MS:1000026 detector type) and `software_must` (MS:1000799 custom software): the specific value
+/// can't be fabricated, so we supply the rule-valid term ONLY for entries that declare no CV term —
+/// never adding a second term to an entry that already has one (detector/software are not
+/// repeatable, so a blind add would create a "too many" violation).
+fn ensure_cv_term_if_bare(params: &mut Vec<MetaParam>, accession: CURIE, name: &str) {
+    if params.iter().any(|p| p.accession.is_some()) {
+        return;
+    }
+    params.push(MetaParam {
+        name: Some(name.to_string()),
+        accession: Some(accession),
+        value: serde_json::Value::Null,
+        unit: None,
+    });
 }
 
 /// An adaptation of [`mzdata::meta::SourceFile`]
@@ -504,12 +587,16 @@ impl From<FileDescription> for mzdata::meta::FileDescription {
 
 impl From<&mzdata::meta::FileDescription> for FileDescription {
     fn from(value: &mzdata::meta::FileDescription) -> Self {
-        let contents = value
+        let mut contents: Vec<MetaParam> = value
             .contents
             .iter()
             .cloned()
             .map(MetaParam::from)
             .collect();
+        // CvMapping `filecontent_must` requires a CHILD of MS:1000524 "data file content"
+        // (use_term:false → the abstract parent itself is not valid). MS:1000294 "mass spectrum"
+        // is the safe generic child present in any MS file.
+        ensure_cv_term(&mut contents, mzdata::curie!(MS:1000294), "mass spectrum");
         let source_files = value.source_files.iter().map(SourceFile::from).collect();
         Self {
             contents,
@@ -541,10 +628,14 @@ impl From<Software> for mzdata::meta::Software {
 
 impl From<&mzdata::meta::Software> for Software {
     fn from(value: &mzdata::meta::Software) -> Self {
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `software_must`: each software entry needs a child of MS:1000531 "software".
+        ensure_cv_term_if_bare(&mut parameters, mzdata::curie!(MS:1000799), "custom unreleased software tool");
         Self {
             id: value.id.clone(),
             version: value.version.clone(),
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+            parameters,
         }
     }
 }
@@ -569,10 +660,16 @@ impl From<ProcessingMethod> for mzdata::meta::ProcessingMethod {
 
 impl From<&mzdata::meta::ProcessingMethod> for ProcessingMethod {
     fn from(value: &mzdata::meta::ProcessingMethod) -> Self {
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `processingmethod_must` requires a CHILD of MS:1000452 "data transformation"
+        // (use_term:false → not the abstract parent itself). MS:1000530 "file format conversion"
+        // is the honest child for a format converter.
+        ensure_cv_term(&mut parameters, mzdata::curie!(MS:1000530), "file format conversion");
         Self {
             order: value.order,
             software_reference: value.software_reference.clone(),
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+            parameters,
         }
     }
 }
@@ -647,16 +744,20 @@ impl From<Component> for mzdata::meta::Component {
 
 impl From<&mzdata::meta::Component> for Component {
     fn from(value: &mzdata::meta::Component) -> Self {
-        Self {
-            component_type: match value.component_type {
-                mzdata::meta::ComponentType::Analyzer => ComponentType::Analyzer,
-                mzdata::meta::ComponentType::IonSource => ComponentType::IonSource,
-                mzdata::meta::ComponentType::Detector => ComponentType::Detector,
-                mzdata::meta::ComponentType::Unknown => ComponentType::Unknown,
-            },
-            order: value.order,
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+        let component_type = match value.component_type {
+            mzdata::meta::ComponentType::Analyzer => ComponentType::Analyzer,
+            mzdata::meta::ComponentType::IonSource => ComponentType::IonSource,
+            mzdata::meta::ComponentType::Detector => ComponentType::Detector,
+            mzdata::meta::ComponentType::Unknown => ComponentType::Unknown,
+        };
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `detector_must`: a detector component needs a detector-type term (MS:1000026,
+        // use_term=true so the parent is valid; not repeatable, hence the `_if_bare` guard).
+        if matches!(component_type, ComponentType::Detector) {
+            ensure_cv_term_if_bare(&mut parameters, mzdata::curie!(MS:1000026), "detector type");
         }
+        Self { component_type, order: value.order, parameters }
     }
 }
 
@@ -686,9 +787,14 @@ impl From<InstrumentConfiguration> for mzdata::meta::InstrumentConfiguration {
 
 impl From<&mzdata::meta::InstrumentConfiguration> for InstrumentConfiguration {
     fn from(value: &mzdata::meta::InstrumentConfiguration) -> Self {
+        let mut parameters: Vec<MetaParam> =
+            value.iter_params().cloned().map(MetaParam::from).collect();
+        // CvMapping `instrumentconfiguration_must`: needs an instrument-model term (MS:1000031,
+        // use_term=true so the parent is valid). `_if_bare` so we never overwrite a real model.
+        ensure_cv_term_if_bare(&mut parameters, mzdata::curie!(MS:1000031), "instrument model");
         Self {
             components: value.components.iter().map(Component::from).collect(),
-            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+            parameters,
             software_reference: value.software_reference.clone(),
             id: value.id,
         }
