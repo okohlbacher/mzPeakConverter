@@ -358,14 +358,15 @@ BRFP's **per-(frame,scan) delta-reset** would drop `tof` from ~1.36 GB to ~0.3�
   bins." It doesn't — scans are **sparse (~34 peaks across a ~400k-bin flight-time axis;
   intra-scan delta median 189, max 353k)**, so per-scan deltas are large and pack worse than
   the absolute values. The premise is false; the fix regresses `tof`.
-- **The real (modest) lever the handoff missed is point *sort order*, not delta encoding.**
-  `tof` and `mobility` cost trade against each other: the point list has one order.
-  - current **scan-major**: `tof` 1.633 + `mobility` 0.071 = 1.704 B/pt (coords)
-  - **tof-sorted within spectrum**: `tof` 0.341 + `mobility` 1.227 = 1.568 B/pt (coords)
-  - Net **−0.136 B/pt (~5% of the peaks facet)** — tof-sorting cheapens `tof` exactly as the
-    handoff wanted, but balloons `mobility` (RLE_DICTIONARY runs scramble), and reorders
-    points away from mobility-major (breaks per-peak ion-mobility locality readers may rely
-    on). Modest win, real semantic cost — **not recommended without a consumer-side reason.**
+- **Point sort order (tof-major) is a WASH — do not pursue.** `tof` and `mobility` trade off
+  (one point order), but the trade nets ~zero. On a representative 167 M-point sample (pyarrow
+  zstd-3): scan-major `tof` 1.424 + `mobility` 0.037 = 1.461 B/pt; tof-major `tof` 0.278 +
+  `mobility` 1.239 = 1.517 B/pt → tof-major is **+0.06 B/pt WORSE**. (An earlier 42 M-sample
+  reading showed −0.136; the larger, representative sample reverses it — the mobility balloon
+  slightly exceeds the tof saving.) 4-variant comparison confirms: byte-plane −6.9% vs baseline,
+  tof-major **+0.7% worse**, both = worse than byte-plane alone. Plus tof-major breaks per-peak
+  ion-mobility locality. **Net: no size benefit + a locality cost → drop it. Byte-plane intensity
+  is the only real lever.**
 - **Intensity** (handoff dismissed it as fine — but it's the real slack): f32 BYTE_STREAM_SPLIT
   1.17 B/pt, yet its order-0 **symbol entropy is 0.94 B/pt** (4,865 distinct values, median 65).
   No stock Parquet codec reaches it (int32 dict 1.21, dict+gzip-9 1.21, raw zlib uint16 1.22) —
@@ -373,17 +374,18 @@ BRFP's **per-(frame,scan) delta-reset** would drop `tof` from ~1.36 GB to ~0.3�
   recoverable only with a symbol-level entropy coder (FSE/range), which Parquet doesn't expose.
 - **"Larger than the raw `.d`" — correction: ~1.10× is NOT a fundamental floor**, it's the
   floor of Parquet's *stock byte codecs*. The data's order-0 entropy is ~2.5 B/pt ≈ **2.05 GB,
-  *below* raw (2.21 GB)** — Bruker's `.d` isn't even optimal. Two ways to approach raw:
-  - **Pure-Parquet: tof-major sort → ~2.31 GB (≈1.04× raw), essentially matching** — `tof`
-    deltas go tiny (1.63→0.34) but `mobility` balloons (0.07→1.23) and point order leaves
-    mobility-major (breaks per-peak IM locality). Nearly matches, real semantic cost.
-  - **Match/beat raw (≤2.21 GB, down to ~2.05 GB):** needs a custom symbol-entropy-coded
+  *below* raw (2.21 GB)** — Bruker's `.d` isn't even optimal. But the practical levers are narrow:
+  - **byte-plane intensity (measured above): −6.3% → 102.7% of raw.** The real, lossless,
+    no-dependency win.
+  - **tof-major sort: a WASH (see the sort-order bullet) — drop it.** It does NOT meaningfully
+    approach raw and costs IM locality.
+  - **Match/beat raw (≤2.21 GB, down to ~2.05 GB):** would need a custom symbol-entropy-coded
     intensity column (FSE/range) or Bruker's 2D nested-frame layout — engineering, not a flag.
 
 **Decision: keep the current `tof` encoding (absolute + DELTA) as the default.** It's the best
 of the stock options *and* preserves mobility-major locality. The handoff's per-scan-delta fix
-is refuted. The size levers (tof-major sort; custom-entropy intensity) are real but each carries
-a cost (IM locality / a bespoke codec) — revisit only if matching/beating raw becomes a goal.
+is refuted; tof-major is a wash. The one worthwhile size lever is **byte-plane intensity** (−6.3%,
+lossless, stock Parquet); beating raw outright would need a bespoke entropy codec.
 Lesson logged twice: (1) measure encodings on the full file, not a subset; (2) "Parquet
 can't go lower" ≠ "the data can't go lower" — check the symbol entropy.
 
@@ -415,8 +417,8 @@ zstd. Reproduced and measured on the full SBA415:
   B/pt). Scan-major layout kept; integer-intensity path only (ims-compact / native counts), generic
   f32 unaffected; zstd needed for the full win (snappy 1.10, none 1.21) but is already the default.
   (An earlier *projection* of ~2.22 GB/~1.00× omitted Parquet/zip + spectrum_index overhead; the real
-  number is 102.7%, ~60 MB over raw. Closing the last ~3% also needs the tof-major sort — IM-locality
-  cost — since tof is already at its entropy floor.)
+  number is 102.7%, ~60 MB over raw. The remaining ~3% is NOT recoverable by tof-major — that's a
+  measured wash, see the sort-order bullet — so 102.7% is the practical floor with stock Parquet.)
 
 Implementation: in the integer-intensity writer path, emit `intensity` as byte-plane uint8 columns
 (tag it in the schema/metadata); reader recombines `Σ byte[k]<<8k`. Reader-portable (standard Parquet
