@@ -403,14 +403,18 @@ zstd. Reproduced and measured on the full SBA415:
   range, no zero planes — already near entropy).
 - **Projected file: ~2.26 GB ≈ the raw `.d` (2.21 GB, ~1.02×)**, down from 2.42 GB (1.10×) —
   scan-major layout kept (no IM-locality cost). Just the intensity column changes.
-- **What it needs:** intensity stored as an **integer** (lossless for native counts) + BYTE_STREAM_SPLIT.
-  BSS on a *float* column (what we ship) gives only 1.17 — the 4-byte float carries mantissa noise;
-  the win requires the 2-byte integer dtype. The vendored **parquet crate is 42.0.0**, which only
-  does BSS on FLOAT/DOUBLE; int-BSS (Parquet format v2.10) needs arrow-rs ≈ v53+. So shipping this
-  is either **(a) bump parquet/arrow-rs to ≥53** and store integer intensity + BSS (clean, standard,
-  reader-portable), or **(b) a manual byte-shuffle codec** (works on crate 42 but makes the column
-  non-standard). Bruker-/integer-intensity path only (generic f32 intensity is unaffected).
+- **What it needs (NO crate upgrade):** the byte-plane split *is* the transform — store integer
+  intensity as **N uint8 byte-plane columns** (`intensity_b0..b3` for u32; lossless for any count,
+  round-trip verified) and let Parquet's standard dict + the **existing zstd** do the rest. Measured
+  **0.998 B/pt** (byte2/byte3 are 100% zero → ~free; zstd entropy-codes the low bytes). This works on
+  the current **parquet crate 42.0.0** — no BSS-on-int, no new codec. (BSS on a *float* column, what
+  we ship, only reaches 1.17 — the 4-byte float carries mantissa noise; and a plain u32 column
+  interleaves the zero high-bytes → 1.26. Grouping the zeros via byte planes is the key.)
+- **Projected file: ~2.22 GB ≈ the raw `.d` (2.21 GB, ~1.00×)**, down from 2.42 GB — scan-major
+  layout kept. Integer-intensity path only (ims-compact / native counts); generic f32 intensity
+  unaffected. zstd is needed for the full win (snappy → 1.10, none → 1.21) but is already the default.
 
-Net: matching the raw `.d` *is* reproducible, entirely via the intensity column. Gated on the
-arrow-rs upgrade (or a bespoke codec); ~6% file size for a dependency bump — pursue if size parity
-with vendor `.d` is a goal.
+Implementation: in the integer-intensity writer path, emit `intensity` as byte-plane uint8 columns
+(tag it in the schema/metadata); reader recombines `Σ byte[k]<<8k`. Reader-portable (standard Parquet
+types), lossless. Net: **matching the raw `.d` is reproducible with stock Parquet** — purely a
+writer/reader change on the intensity column, no dependency bump.
