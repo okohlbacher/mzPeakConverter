@@ -211,6 +211,11 @@ unrelated CV term still warns. Needs CV-hierarchy awareness to close fully.
 
 ## #11 — Converge grid **storage** onto the upstream generic grid facet 🟡
 
+> **Design proposal: [GRID-FACET-DESIGN.md](GRID-FACET-DESIGN.md)** (DRAFT v0.1) — facet
+> schema, `grid_id` referencing, parametric + materialized forms, worked Agilent-dedup
+> migration, and open questions to settle with upstream before any code. Per the chosen
+> approach (design-first, no code), this is the current state of #11/#12.
+
 Prompted by the upstream `mzpeak_prototyping` author's note on grid storage (the person
 who designed the polynomial recalibration / null-filling model). Two halves: what's
 settled, and what changes.
