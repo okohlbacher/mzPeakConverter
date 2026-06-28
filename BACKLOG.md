@@ -366,13 +366,23 @@ BRFP's **per-(frame,scan) delta-reset** would drop `tof` from ~1.36 GB to ~0.3�
     handoff wanted, but balloons `mobility` (RLE_DICTIONARY runs scramble), and reorders
     points away from mobility-major (breaks per-peak ion-mobility locality readers may rely
     on). Modest win, real semantic cost — **not recommended without a consumer-side reason.**
-- **Intensity** (handoff dismissed it, correctly): f32 BYTE_STREAM_SPLIT 1.221 B/pt vs int32
-  1.262 — integer encoding is marginally *worse*. Leave as f32.
-- **"Larger than the raw `.d`" is not a clear regression.** Even the best encoding
-  (~2.29 GB) stays at/above the raw `.d` (2.21 GB): losslessly storing native tof + integer
-  intensity + per-point mobility in a general columnar format is inherently ~raw-sized next
-  to Bruker's bespoke-compressed `.d`. No simple encoding change gets dramatically below raw.
+- **Intensity** (handoff dismissed it as fine — but it's the real slack): f32 BYTE_STREAM_SPLIT
+  1.17 B/pt, yet its order-0 **symbol entropy is 0.94 B/pt** (4,865 distinct values, median 65).
+  No stock Parquet codec reaches it (int32 dict 1.21, dict+gzip-9 1.21, raw zlib uint16 1.22) —
+  byte-oriented coders can't capture a 16-bit symbol histogram. ~0.23 B/pt (~190 MB) sits here,
+  recoverable only with a symbol-level entropy coder (FSE/range), which Parquet doesn't expose.
+- **"Larger than the raw `.d`" — correction: ~1.10× is NOT a fundamental floor**, it's the
+  floor of Parquet's *stock byte codecs*. The data's order-0 entropy is ~2.5 B/pt ≈ **2.05 GB,
+  *below* raw (2.21 GB)** — Bruker's `.d` isn't even optimal. Two ways to approach raw:
+  - **Pure-Parquet: tof-major sort → ~2.31 GB (≈1.04× raw), essentially matching** — `tof`
+    deltas go tiny (1.63→0.34) but `mobility` balloons (0.07→1.23) and point order leaves
+    mobility-major (breaks per-peak IM locality). Nearly matches, real semantic cost.
+  - **Match/beat raw (≤2.21 GB, down to ~2.05 GB):** needs a custom symbol-entropy-coded
+    intensity column (FSE/range) or Bruker's 2D nested-frame layout — engineering, not a flag.
 
-**Decision: keep the current `tof` encoding (absolute + DELTA).** It is the best of the
-tested options at scale. The handoff's fix is refuted; the sort-order lever is modest and
-carries a semantic cost. Lesson logged: measure encodings on the full file, not a subset.
+**Decision: keep the current `tof` encoding (absolute + DELTA) as the default.** It's the best
+of the stock options *and* preserves mobility-major locality. The handoff's per-scan-delta fix
+is refuted. The size levers (tof-major sort; custom-entropy intensity) are real but each carries
+a cost (IM locality / a bespoke codec) — revisit only if matching/beating raw becomes a goal.
+Lesson logged twice: (1) measure encodings on the full file, not a subset; (2) "Parquet
+can't go lower" ≠ "the data can't go lower" — check the symbol entropy.
