@@ -1450,10 +1450,18 @@ fn convert_file(
     if is_waters_raw(input) {
         return convert_waters(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
+    // mzdata's quick-xml reader assumes UTF-8 and panics on Latin-1/windows-1252 high bytes
+    // (e.g. zenodo DESI imzML declare ISO-8859-1). If the input declares a non-UTF-8 encoding,
+    // transcode it to a throwaway UTF-8 temp first and read from there. `_utf8` is an RAII guard:
+    // it deletes the temp dir (transcoded file + hardlinked .ibd sidecar) on every exit path.
+    let _utf8 = transcode_to_utf8(input)?;
+    let utf8_path: &Path = _utf8.as_ref().map(|g| g.file.as_path()).unwrap_or(input);
+
     // mzdata panics on an empty self-closing <referenceableParamGroup/> that is later referenced
-    // (ProteomeDiscoverer emits these). If present, convert from a sanitized copy instead.
-    let sanitized = sanitize_param_groups(input)?;
-    let read_path: &Path = sanitized.as_deref().unwrap_or(input);
+    // (ProteomeDiscoverer emits these). If present, convert from a sanitized copy instead. Sanitize
+    // the already-UTF-8 file so both workarounds compose.
+    let sanitized = sanitize_param_groups(utf8_path)?;
+    let read_path: &Path = sanitized.as_deref().unwrap_or(utf8_path);
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
 
@@ -1608,6 +1616,154 @@ fn convert_file(
         let _ = fs::remove_file(s);
     }
     Ok(())
+}
+
+/// RAII cleanup for a transcoded-to-UTF-8 input. Holds the temp *directory* we created (for imzML
+/// we also place a hardlinked/copied `.ibd` sidecar beside the temp file, so the whole dir must go)
+/// and removes it on drop — covering success, conversion error, and panic-unwind exit paths alike.
+struct TranscodeGuard {
+    dir: PathBuf,
+    /// The transcoded UTF-8 file to hand to mzdata, inside `dir`.
+    file: PathBuf,
+}
+
+impl Drop for TranscodeGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Sniff the XML encoding declared in the first ~200 bytes. Returns the lowercased charset name from
+/// `<?xml ... encoding="X"?>`, or `None` when there is no declaration. ASCII/UTF-8 inputs need no
+/// transcode, so callers treat `None`/`"utf-8"`/`"ascii"` as "leave it alone".
+fn sniff_xml_encoding(head: &[u8]) -> Option<String> {
+    let n = head.len().min(256);
+    let s = String::from_utf8_lossy(&head[..n]);
+    let decl_start = s.find("<?xml")?;
+    let decl = &s[decl_start..];
+    let decl_end = decl.find("?>").map(|e| e + 2).unwrap_or(decl.len());
+    let decl = &decl[..decl_end];
+    let key = decl.find("encoding")?;
+    let after = &decl[key + "encoding".len()..];
+    let eq = after.find('=')?;
+    let after = after[eq + 1..].trim_start();
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &after[1..];
+    let close = rest.find(quote)?;
+    Some(rest[..close].trim().to_ascii_lowercase())
+}
+
+/// True for an encoding mzdata's UTF-8-only quick-xml reader can already handle untouched.
+fn is_utf8ish(enc: &str) -> bool {
+    matches!(enc, "utf-8" | "utf8" | "us-ascii" | "ascii")
+}
+
+/// Decode a single-byte legacy charset to a UTF-8 `String`. ISO-8859-1/latin1 is the identity
+/// codepoint map (byte 0xNN → U+00NN) and needs no table. windows-1252 differs only in 0x80–0x9F;
+/// we map that block via the standard table and fall through to latin1 for everything else. Unknown
+/// single-byte charsets are treated as latin1 (the common MS-imzML case), which never panics.
+fn decode_single_byte(bytes: &[u8], enc: &str) -> String {
+    let windows_1252_high = |b: u8| -> char {
+        // 0x80..=0x9F mapping for windows-1252; 0x81/0x8D/0x8F/0x90/0x9D are undefined → U+FFFD.
+        const T: [char; 32] = [
+            '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+            '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
+            '\u{017D}', '\u{FFFD}', '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+            '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+            '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+        ];
+        T[(b - 0x80) as usize]
+    };
+    let is_1252 = enc == "windows-1252" || enc == "cp1252";
+    bytes
+        .iter()
+        .map(|&b| {
+            if is_1252 && (0x80..=0x9F).contains(&b) {
+                windows_1252_high(b)
+            } else {
+                // latin1 (and the 0xA0..=0xFF tail of windows-1252): identity codepoint map.
+                b as char
+            }
+        })
+        .collect()
+}
+
+/// Rewrite the `encoding="X"` value in the XML declaration (first ~256 bytes of `s`) to `UTF-8`,
+/// so the transcoded file is self-consistent. No-op if no declaration/encoding attr is present.
+fn rewrite_encoding_decl_to_utf8(s: &str) -> String {
+    let Some(decl_start) = s.find("<?xml") else { return s.to_string() };
+    let head_end = s[decl_start..].find("?>").map(|e| decl_start + e + 2).unwrap_or(s.len());
+    let (decl, tail) = s.split_at(head_end);
+    let Some(key) = decl.find("encoding") else { return s.to_string() };
+    let after = &decl[key + "encoding".len()..];
+    let Some(eq_rel) = after.find('=') else { return s.to_string() };
+    let val_start_rel = {
+        let a = &after[eq_rel + 1..];
+        let trimmed = a.trim_start();
+        eq_rel + 1 + (a.len() - trimmed.len())
+    };
+    let val = &after[val_start_rel..];
+    let Some(quote) = val.chars().next() else { return s.to_string() };
+    if quote != '"' && quote != '\'' {
+        return s.to_string();
+    }
+    let Some(close_rel) = val[1..].find(quote) else { return s.to_string() };
+    // Absolute byte offsets within `decl` of the quoted value (excluding quotes).
+    let abs_val = key + "encoding".len() + val_start_rel + 1;
+    let abs_close = abs_val + close_rel;
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&decl[..abs_val]);
+    out.push_str("UTF-8");
+    out.push_str(&decl[abs_close..]);
+    out.push_str(tail);
+    out
+}
+
+/// If `input` declares a non-UTF-8 XML encoding (ISO-8859-1, latin1, windows-1252, …), transcode it
+/// to UTF-8 in a throwaway temp dir and return a [`TranscodeGuard`] whose `file` is the path to hand
+/// to mzdata. Returns `Ok(None)` (zero overhead) for UTF-8/ASCII inputs or inputs with no XML
+/// declaration. For an imzML, the binary sidecar `<stem>.ibd` is hardlinked (or copied across
+/// filesystems) beside the temp under the SAME basename so mzdata finds it and the UUID matches.
+fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
+    // Sniff only the first chunk — enough for the XML declaration, no full read for the common case.
+    let mut f = fs::File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let mut head = [0u8; 256];
+    let n = f.read(&mut head)?;
+    let enc = match sniff_xml_encoding(&head[..n]) {
+        Some(e) if !is_utf8ish(&e) => e,
+        _ => return Ok(None), // UTF-8/ASCII or no declaration: leave it alone, zero overhead.
+    };
+    log::info!("input declares {enc} XML encoding; transcoding to UTF-8 for the reader");
+
+    // Read the whole file and transcode. Legacy MS XML files are single-byte charsets.
+    let raw = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let utf8 = decode_single_byte(&raw, &enc);
+    let utf8 = rewrite_encoding_decl_to_utf8(&utf8);
+
+    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
+    let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("xml");
+    let dir = std::env::temp_dir().join(format!(".mzpc-utf8-{}-{}", std::process::id(), stem));
+    fs::create_dir_all(&dir).with_context(|| format!("creating temp dir {}", dir.display()))?;
+    let guard = TranscodeGuard { dir: dir.clone(), file: dir.join(format!("{stem}.{ext}")) };
+    fs::write(&guard.file, utf8.as_bytes())
+        .with_context(|| format!("writing transcoded {}", guard.file.display()))?;
+
+    // imzML needs its `.ibd` sidecar next to the file under the same basename (and matching UUID).
+    if ext.eq_ignore_ascii_case("imzml") {
+        let ibd_src = input.with_extension("ibd");
+        if ibd_src.exists() {
+            let ibd_dst = dir.join(format!("{stem}.ibd"));
+            // Same filesystem → hardlink is free; fall back to a copy across filesystems.
+            if fs::hard_link(&ibd_src, &ibd_dst).is_err() {
+                fs::copy(&ibd_src, &ibd_dst)
+                    .with_context(|| format!("copying sidecar {}", ibd_src.display()))?;
+            }
+        }
+    }
+    Ok(Some(guard))
 }
 
 /// Work around an mzdata defect: it `panic!`s when a `<referenceableParamGroupRef>` points at an
@@ -2577,6 +2733,7 @@ fn reader_format<R: std::io::Read + std::io::Seek>(reader: &MZReaderType<R>) -> 
 #[cfg(test)]
 mod tests {
     use super::expand_empty_param_groups;
+    use super::{decode_single_byte, rewrite_encoding_decl_to_utf8, sniff_xml_encoding};
     use super::{tof_grid, tof_grid_spectrum, TofRoute};
     use mzdata::params::Param;
     use mzdata::prelude::*;
@@ -2598,6 +2755,61 @@ mod tests {
         descr.index = index;
         descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
         MultiLayerSpectrum::new(descr, Some(arrays), None, None)
+    }
+
+    /// Latin-1 sniff + transcode: an ISO-8859-1 imzML header with a 0xE9 'é' high byte must sniff as
+    /// iso-8859-1, decode to valid UTF-8 (é → U+00E9), and have its declaration rewritten to UTF-8.
+    #[test]
+    fn latin1_imzml_sniff_and_transcode() {
+        // Synthetic Latin-1 imzML fragment: 0xE9 is 'é' in ISO-8859-1.
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n");
+        raw.extend_from_slice(b"<mzML><cvParam name=\"Caf");
+        raw.push(0xE9); // 'é'
+        raw.extend_from_slice(b"\"/></mzML>");
+
+        // Sniff: declared charset is the non-UTF-8 iso-8859-1.
+        let enc = sniff_xml_encoding(&raw).expect("declaration present");
+        assert_eq!(enc, "iso-8859-1");
+        assert!(!super::is_utf8ish(&enc), "iso-8859-1 must trigger the transcode branch");
+
+        // Decode: 0xE9 → U+00E9 'é', and the result is valid UTF-8.
+        let utf8 = decode_single_byte(&raw, &enc);
+        assert!(utf8.contains("Caf\u{00E9}"), "0xE9 must decode to 'é'");
+        // (a String is UTF-8 by construction; assert the bytes round-trip cleanly.)
+        assert!(std::str::from_utf8(utf8.as_bytes()).is_ok());
+
+        // Rewrite: the declaration now says UTF-8 (self-consistent), old charset gone.
+        let fixed = rewrite_encoding_decl_to_utf8(&utf8);
+        assert!(fixed.contains("encoding=\"UTF-8\""), "declaration must be rewritten: {fixed}");
+        assert!(!fixed.to_ascii_lowercase().contains("iso-8859-1"));
+    }
+
+    /// UTF-8 / no-declaration inputs must NOT trigger transcoding (zero overhead for the common case).
+    #[test]
+    fn utf8_inputs_are_left_untouched() {
+        let utf8_decl = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><mzML/>";
+        let enc = sniff_xml_encoding(utf8_decl).expect("declaration present");
+        assert!(super::is_utf8ish(&enc), "utf-8 must be left untouched");
+
+        // No declaration at all → no charset → no transcode.
+        assert!(sniff_xml_encoding(b"<mzML>plain ascii</mzML>").is_none());
+
+        // ASCII declaration is also a pass-through.
+        let ascii = b"<?xml version='1.0' encoding='US-ASCII'?><mzML/>";
+        assert!(super::is_utf8ish(&sniff_xml_encoding(ascii).unwrap()));
+    }
+
+    /// windows-1252 0x80 → U+20AC (Euro), proving the 0x80–0x9F block uses the cp1252 table while
+    /// the 0xA0–0xFF tail stays latin1-identity.
+    #[test]
+    fn windows_1252_high_block() {
+        let raw = [0x80u8, 0xE9]; // € then é
+        let out = decode_single_byte(&raw, "windows-1252");
+        assert_eq!(out, "\u{20AC}\u{00E9}");
+        // Same bytes under latin1: 0x80 is a C1 control (identity), 0xE9 is é.
+        let lat = decode_single_byte(&raw, "iso-8859-1");
+        assert_eq!(lat, "\u{0080}\u{00E9}");
     }
 
     /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);

@@ -42,8 +42,8 @@ if [ -n "$skip_ok" ] && [ -f "$skip_ok" ]; then
 fi
 is_done(){ [ -n "$okset" ] && grep -Fxq "$1" "$okset"; }
 
-conv(){ # tier format flags input outpath
-  local tier="$1" fmt="$2" flags="$3" in="$4" o="$5"
+conv(){ # tier format input outpath [extra converter args...]
+  local tier="$1" fmt="$2" in="$3" o="$4"; shift 4; local xargs=("$@")
   [ -n "$only" ] && case "$only" in *",$tier,"*) :;; *) return;; esac
   is_done "${in#$root/}" && return            # --skip-ok: already OK in the prior run
   local id; id="$(slug "$in")"; local raw; raw="$(sizeof "$in")"
@@ -52,7 +52,7 @@ conv(){ # tier format flags input outpath
   echo ">> [$tier/$fmt] $id"
   # The actual convert+record. Backgrounded when JOBS>1; big inputs forced serial (gate at JOBS=1).
   _conv_run(){
-    if "$bin" "$in" $flags -o "$o" --force > "$out/logs/$id.log" 2>&1; then
+    if "$bin" "$in" ${xargs[@]+"${xargs[@]}"} -o "$o" --force > "$out/logs/$id.log" 2>&1; then
       local mp; mp="$(sizeof "$o")"
       printf '%s\t%s\tOK\t%s\t%s\t%s\t%s\n' "$tier" "$fmt" "$raw" "$mp" "$(ratio "$mp" "$raw")" "${in#$root/}" >> "$tsv"
     else
@@ -84,6 +84,15 @@ box_opts(){ case "$1" in *) echo "--no-vendor";; esac; }   # vendor units: skip 
 # in-place target: replace the unit's extension with .mzpeak (deterministic, 1:1 with the unit)
 mz_of(){ local p="$1"; case "$p" in *.*) echo "${p%.*}.mzpeak";; *) echo "$p.mzpeak";; esac; }
 
+# Study SDRF for a unit: the first *.sdrf.tsv in its dir or up to two parents (the corpus study
+# root, e.g. sdrf-examples/PXD009465/mzml/X.mzML -> PXD009465/PXD009465.sdrf.tsv). Empty if none.
+sdrf_for(){ local d cand s; d="$(dirname "$1")"
+  for cand in "$d" "$(dirname "$d")" "$(dirname "$(dirname "$d")")"; do
+    s="$(find "$cand" -maxdepth 1 -name '*.sdrf.tsv' 2>/dev/null | head -1)"
+    [ -n "$s" ] && { echo "$s"; return; }
+  done
+}
+
 walk_tier(){ # tier dir  — dispatch every unit in a tile by type
   local tier="$1" dir="$root/$2"; [ -d "$dir" ] || return
   # .d dispatch by CONTENT, not by absence-of-Bruker-markers:
@@ -97,10 +106,10 @@ walk_tier(){ # tier dir  — dispatch every unit in a tile by type
     if find "$d" -mindepth 1 -maxdepth 1 -type d -iname '*.d' 2>/dev/null | grep -q .; then
       echo "  skip wrapper .d (holds a nested .d): ${d#$root/}" >&2
     elif find "$d" -maxdepth 1 \( -name analysis.tdf -o -name analysis.tsf \) | grep -q .; then
-      conv "$tier" bruker "" "$d" "$(mz_of "$d")"
+      conv "$tier" bruker "$d" "$(mz_of "$d")"
     elif [ -d "$d/AcqData" ]; then
       if [ -s "$d/AcqData/MSProfile.bin" ]; then
-        conv "$tier" agilent "--agilent-grid" "$d" "$(mz_of "$d")"
+        conv "$tier" agilent "$d" "$(mz_of "$d")" --agilent-grid
       else
         defer "$tier" agilent-d "$d"   # centroid-only Agilent .d -> Windows MHDAC on the box
       fi
@@ -113,7 +122,9 @@ walk_tier(){ # tier dir  — dispatch every unit in a tile by type
   # crashing the Thermo reader on it. (Waters .raw is a DIRECTORY, deferred just below.)
   while IFS= read -r f; do
     if raw_is_thermo "$f"; then
-      conv "$tier" thermo "" "$f" "$(mz_of "$f")"
+      local rsdrf; rsdrf="$(sdrf_for "$f")"
+      if [ -n "$rsdrf" ]; then conv "$tier" thermo "$f" "$(mz_of "$f")" --sdrf "$rsdrf"
+      else conv "$tier" thermo "$f" "$(mz_of "$f")"; fi
     else
       echo "  skip non-Thermo .raw (no Finnigan magic): ${f#$root/}" >&2
       printf '%s\t%s\tUNSUPPORTED\t%s\t\t\t%s\n' "$tier" raw-unknown "$(sizeof "$f")" "${f#$root/}" >> "$tsv"
@@ -122,14 +133,23 @@ walk_tier(){ # tier dir  — dispatch every unit in a tile by type
   # Waters .raw is a DIRECTORY (MassLynx) — host-unconvertible on macOS, box-deferred.
   while IFS= read -r d; do defer "$tier" waters-raw "$d"; done < <(find "$dir" -type d -iname '*.raw' 2>/dev/null | sort)
   while IFS= read -r f; do
-    local ibd="${f%.*}.ibd"; conv "$tier" imzml "" "$f" "$(mz_of "$f")"
+    # MSI: embed every sibling optical image (--image, repeatable). Latin-1 imzML (e.g. DESI) is
+    # transcoded to UTF-8 inside the converter, so no special-casing here.
+    local imgs=()
+    while IFS= read -r img; do imgs+=(--image "$img"); done < <(find "$(dirname "$f")" -maxdepth 1 -type f \
+      \( -iname '*.tif' -o -iname '*.tiff' -o -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) 2>/dev/null | sort)
+    conv "$tier" imzml "$f" "$(mz_of "$f")" ${imgs[@]+"${imgs[@]}"}
   done < <(find "$dir" -type f -iname '*.imzML' 2>/dev/null | sort)
-  while IFS= read -r f; do conv "$tier" mzml "" "$f" "$(mz_of "$f")"; done < <(find "$dir" -type f -iname '*.mzML' ! -iname '*.imzML' 2>/dev/null | sort)
+  while IFS= read -r f; do
+    local msdrf; msdrf="$(sdrf_for "$f")"
+    if [ -n "$msdrf" ]; then conv "$tier" mzml "$f" "$(mz_of "$f")" --sdrf "$msdrf"
+    else conv "$tier" mzml "$f" "$(mz_of "$f")"; fi
+  done < <(find "$dir" -type f -iname '*.mzML' ! -iname '*.imzML' 2>/dev/null | sort)
   while IFS= read -r f; do defer "$tier" sciex-wiff "$f"; done < <(find "$dir" -type f -iname '*.wiff' 2>/dev/null | sort)
 }
 
 # TIERS — most relevant (grid/vendor changes in this build) first, bulk mzML last.
-for t in tof-grid-examples vendor-agilent-sciex vendor-flash-data vendor-waters vendor-bruker-baf \
+for t in tof-grid-examples ims-examples vendor-agilent-sciex vendor-flash-data vendor-waters vendor-bruker-baf \
          raw-bench raw-examples raw-replacements imzml-examples mzML-examples pwiz-examples sdrf-examples demo; do
   echo "============ TILE $t ============"
   walk_tier "$t" "$t"
