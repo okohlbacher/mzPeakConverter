@@ -84,6 +84,12 @@ pub struct NativeTofReader {
     /// (when recalibration is disabled, or the calibration isn't ModelType 2).
     recal: Option<crate::tims_mobility::TimsMobilityCalibration>,
     pub model: TofMzModel,
+    /// Per-frame `NumPeaks` (from `analysis.tdf`, ordered by Id to match timsrust's frame index).
+    /// Newer timsTOF (acq software 5.1.x) emits empty frames (`NumPeaks=0`) stored as a header-only
+    /// blob with no zstd payload; `timsrust` errors decoding the empty payload. We short-circuit
+    /// those to an empty frame so a real decode error on a *non-empty* frame still surfaces, instead
+    /// of mzdata's blanket `.ok().unwrap_or_default()` that masks genuine corruption too.
+    num_peaks: Vec<u32>,
 }
 
 impl NativeTofReader {
@@ -110,7 +116,19 @@ impl NativeTofReader {
         } else {
             None
         };
-        Ok(Self { frames, im: meta.im_converter, recal, model })
+        let mut num_peaks = read_frame_num_peaks(&tdf)?;
+        // Guard the position-based indexing: if timsrust's frame count disagrees with the Frames
+        // row count, drop the fast-path rather than risk nulling a real frame (a misread empty frame
+        // just errors → mzdata fallback; silently dropping a populated one would lose data).
+        if num_peaks.len() != frames.len() {
+            log::warn!(
+                "TDF NumPeaks rows ({}) != timsrust frames ({}); disabling empty-frame fast path",
+                num_peaks.len(),
+                frames.len()
+            );
+            num_peaks.clear();
+        }
+        Ok(Self { frames, im: meta.im_converter, recal, model, num_peaks })
     }
 
     pub fn len(&self) -> usize {
@@ -118,6 +136,17 @@ impl NativeTofReader {
     }
 
     pub fn frame(&self, i: usize) -> Result<RawFrame> {
+        // Empty frame (NumPeaks=0): timsrust can't decode the header-only blob, so build an empty
+        // frame directly rather than letting it error the whole run. scan_offsets=[0] => 0 scans.
+        if self.num_peaks.get(i).copied() == Some(0) {
+            return Ok(RawFrame {
+                index: i,
+                ms_level: 0,
+                scan_offsets: vec![0],
+                tof: Vec::new(),
+                intensity: Vec::new(),
+            });
+        }
         let f = self
             .frames
             .get(i)
@@ -213,4 +242,19 @@ impl NativeTofReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
+}
+
+/// `NumPeaks` for every frame, ordered by `Id` so position `i` matches timsrust's frame index.
+/// Lets [`NativeTofReader::frame`] recognize empty frames without reading the binary.
+fn read_frame_num_peaks(tdf: &Path) -> Result<Vec<u32>> {
+    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| anyhow::anyhow!("opening {} for NumPeaks: {e}", tdf.display()))?;
+    let mut stmt = conn
+        .prepare("SELECT NumPeaks FROM Frames ORDER BY Id")
+        .map_err(|e| anyhow::anyhow!("querying NumPeaks: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, i64>(0).map(|n| n.max(0) as u32))
+        .map_err(|e| anyhow::anyhow!("reading NumPeaks: {e}"))?;
+    rows.collect::<rusqlite::Result<Vec<u32>>>()
+        .map_err(|e| anyhow::anyhow!("collecting NumPeaks: {e}"))
 }
