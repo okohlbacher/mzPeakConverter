@@ -386,3 +386,31 @@ is refuted. The size levers (tof-major sort; custom-entropy intensity) are real 
 a cost (IM locality / a bespoke codec) — revisit only if matching/beating raw becomes a goal.
 Lesson logged twice: (1) measure encodings on the full file, not a subset; (2) "Parquet
 can't go lower" ≠ "the data can't go lower" — check the symbol entropy.
+
+### Reproducing Bruker's byte-order encoding (how to ~match the raw `.d`)
+
+Bruker's TDF compactness comes from a **byte-plane shuffle** (decompose the integer array into
+byte planes — all byte-0s, then byte-1s, … — so the mostly-zero high bytes form long runs) then
+zstd. Reproduced and measured on the full SBA415:
+
+| column | current Parquet | byte-shuffle + zstd | entropy |
+|---|---|---|---|
+| `intensity` (as **uint16**) | 1.169 | **0.984** ✓ (hits floor) | 0.94 |
+| `tof` (uint32) | 1.633 | 1.643 (no help) | 1.54 |
+
+- **Intensity is the whole win.** Stored as a uint16 with byte-shuffle it drops to the 0.94 B/pt
+  floor (median count 65 → high byte plane ≈ all zeros). `tof` doesn't benefit (full ~18-bit
+  range, no zero planes — already near entropy).
+- **Projected file: ~2.26 GB ≈ the raw `.d` (2.21 GB, ~1.02×)**, down from 2.42 GB (1.10×) —
+  scan-major layout kept (no IM-locality cost). Just the intensity column changes.
+- **What it needs:** intensity stored as an **integer** (lossless for native counts) + BYTE_STREAM_SPLIT.
+  BSS on a *float* column (what we ship) gives only 1.17 — the 4-byte float carries mantissa noise;
+  the win requires the 2-byte integer dtype. The vendored **parquet crate is 42.0.0**, which only
+  does BSS on FLOAT/DOUBLE; int-BSS (Parquet format v2.10) needs arrow-rs ≈ v53+. So shipping this
+  is either **(a) bump parquet/arrow-rs to ≥53** and store integer intensity + BSS (clean, standard,
+  reader-portable), or **(b) a manual byte-shuffle codec** (works on crate 42 but makes the column
+  non-standard). Bruker-/integer-intensity path only (generic f32 intensity is unaffected).
+
+Net: matching the raw `.d` *is* reproducible, entirely via the intensity column. Gated on the
+arrow-rs upgrade (or a bespoke codec); ~6% file size for a dependency bump — pursue if size parity
+with vendor `.d` is a goal.
