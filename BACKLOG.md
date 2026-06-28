@@ -448,7 +448,18 @@ encodings, the TileDB/sparse-array angle). Deliver a recommendation: pursue, or 
 list + byte-plane intensity is the right tradeoff. Likely **confirms flat-list** — but the entropy
 gap says it's worth one rigorous look. Pairs with #11 (generic grid facet) and #14.
 
-## #16 — timsrust can't decompress newer timsTOF (5.1.x); route ims-compact through mzdata 🟡
+## #16 — timsrust can't decompress newer timsTOF (5.1.x); route ims-compact through mzdata 🟢 (decided: ignore — mzdata fallback is enough)
+
+> **Decision (2026-06-28): don't chase this.** Root cause is fully understood and benign —
+> newer timsTOF emits **empty frames (`NumPeaks=0`)** stored as a header-only blob with no zstd
+> payload; `zstd::decode_all` can't decode an empty slice. The shipped **mzdata fallback** decodes
+> these files (f64 m/z), so conversion succeeds — the warning is expected, not a bug. The native
+> fix is known (2-line: empty payload → empty blob; empty blob → empty frame) and a ready
+> PR-draft commit exists (`fix/empty-frame-decode`, enabling upstream's own commented-out
+> `EmptyData → FrameIons::default()`; validated end-to-end, SCP all 20,873 frames, 1.128× raw).
+> timsrust 0.4.2 does NOT fix it. Revisit only if a *native* ims-compact row for newer timsTOF
+> is needed; until then the fallback covers it. See [[timsrust-empty-frame-harmless]]. Details:
+
 
 Two linked items surfaced by the IM benchmark (timsTOF SCP, PXD078573, acq software 5.1.8):
 
