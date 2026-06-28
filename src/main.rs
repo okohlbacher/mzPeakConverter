@@ -1642,11 +1642,12 @@ where
         BinaryDataArrayType::Float64,
     )
     .to_field();
-    // Byte-plane intensity (MZPC_BYTE_PLANE_INTENSITY): store native counts as Int32 so the writer
-    // BYTE_STREAM_SPLITs the column (~ -16% on intensity, lossless; cf. BACKLOG #14). Off by default.
+    // Byte-plane intensity: store native counts as Int32 so the writer BYTE_STREAM_SPLITs the column
+    // (~ -16% on intensity, lossless; cf. BACKLOG #14). On by default for timsTOF ims-compact; set
+    // MZPC_BYTE_PLANE_INTENSITY=0 to opt back out to f32 intensity.
     let int_intensity = std::env::var("MZPC_BYTE_PLANE_INTENSITY")
         .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
+        .unwrap_or(true);
     let intensity_field = if int_intensity {
         BufferName::new(
             BufferContext::Spectrum,
