@@ -606,7 +606,19 @@ impl TdfSdkReader {
         mob_da.update_buffer(mobility.as_slice()).map_err(|e| anyhow!("encoding mobility: {e}"))?;
         arrays.add(mob_da);
 
-        let descr = make_description(i, frame, SignalContinuity::Centroid);
+        let mut descr = make_description(i, frame, SignalContinuity::Centroid);
+        // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (a + b·tof)²
+        // (monotonic in tof) over the min/max TOF index present. Without this the viewer shows
+        // "m/z 0–0".
+        if let (Some(&tmin), Some(&tmax)) = (tof.iter().min(), tof.iter().max()) {
+            let (a, b) = self.tof_mz_model();
+            let mz = |t: i32| -> f64 {
+                let v = a + b * t as f64;
+                v * v
+            };
+            let (mz_a, mz_b) = (mz(tmin), mz(tmax));
+            crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
+        }
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 

@@ -127,6 +127,18 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
     pub fn flush(&mut self) -> io::Result<()> {
         for batch in self.buffers.drain() {
             self.writer.write(&batch)?;
+            // Bound the in-progress row group by its real Parquet byte size. The peak/data facet
+            // can accumulate a very large signal row group (timsTOF ims-compact, TOF-grid) under the
+            // row-count cap alone, so mirror the main facet's reliable byte cap here. Use
+            // `in_progress_size()` (the writer's true accounting), NOT arrow `memory_size()` which
+            // under-reports. 64 MB target for the data facet.
+            if self.writer.in_progress_size() > 64_000_000 {
+                log::debug!(
+                    "Flushing peak row group buffer with approximately {} bytes",
+                    self.writer.in_progress_size()
+                );
+                self.writer.flush()?;
+            }
         }
         Ok(())
     }

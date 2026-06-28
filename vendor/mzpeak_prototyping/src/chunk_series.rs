@@ -599,6 +599,38 @@ pub struct ArrowArrayChunk {
     pub arrays: HashMap<BufferName, ArrayRef>,
 }
 
+/// Returns `true` if `array_type` denotes a SIGNAL array — m/z (MS:1000514),
+/// intensity (MS:1000515), or a `tof` flight-time array (carried as the generic
+/// non-standard data array MS:1000786 with the value `"tof"`).
+///
+/// Signal arrays MUST live in the spectra_data / spectra_peaks facet, never spilled
+/// into `auxiliary_arrays` (which lands in spectra_metadata). Spilling one is a bug;
+/// [`guard_not_signal_array`] catches it.
+pub(crate) fn is_signal_array_type(array_type: &ArrayType) -> bool {
+    match array_type {
+        ArrayType::MZArray | ArrayType::IntensityArray => true,
+        ArrayType::NonStandardDataArray { name } => name.as_ref().eq_ignore_ascii_case("tof"),
+        _ => false,
+    }
+}
+
+/// Structural guard for the auxiliary-array spill path: a signal array (m/z, intensity,
+/// or `tof`) must never reach `auxiliary_arrays`. If it does, loudly log and trip a
+/// `debug_assert!` so the bug is caught in tests/CI, but do NOT panic in release — we
+/// don't want to abort an otherwise-good conversion in the field.
+pub(crate) fn guard_not_signal_array(array_type: &ArrayType) {
+    if is_signal_array_type(array_type) {
+        log::error!(
+            "BUG: signal array {array_type:?} is being spilled to auxiliary_arrays \
+             (metadata facet); signal arrays must live in spectra_data/spectra_peaks"
+        );
+        debug_assert!(
+            false,
+            "signal array {array_type:?} must not be spilled to auxiliary_arrays"
+        );
+    }
+}
+
 impl ArrowArrayChunk {
     /// A wrapper around [`Self::from_arrays`] and [`Self::to_struct_array`]
     ///
@@ -983,6 +1015,7 @@ impl ArrowArrayChunk {
                 .iter()
                 .filter_map(|(_, arr)| (arr.raw_len() > 0).then(|| arr))
             {
+                guard_not_signal_array(&arr.name);
                 auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
             }
             return Ok((Vec::new(), auxiliary_arrays, 0));
@@ -1010,6 +1043,7 @@ impl ArrowArrayChunk {
                 // If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
                 if !fields.find(&field_name).is_some() && buffer_name != main_axis {
                     log::debug!("Skipping {field_name} from {arr:?}, not in schema: {fields:?}",);
+                    guard_not_signal_array(&arr.name);
                     auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
                     continue;
                 }
@@ -1175,6 +1209,32 @@ mod test {
     use super::*;
     use arrow::array::RecordBatch;
     use mzdata::{MZReader, params::Unit, prelude::*};
+
+    /// B.1 structural guard: the signal-array classifier flags m/z, intensity, and `tof`
+    /// (a non-standard array), but not benign columns like time or a mobility array.
+    #[test]
+    fn signal_array_classifier() {
+        assert!(is_signal_array_type(&ArrayType::MZArray));
+        assert!(is_signal_array_type(&ArrayType::IntensityArray));
+        assert!(is_signal_array_type(&ArrayType::nonstandard("tof".to_string())));
+        assert!(is_signal_array_type(&ArrayType::nonstandard("TOF".to_string())));
+        // Not signal: a different non-standard array, time, mobility.
+        assert!(!is_signal_array_type(&ArrayType::nonstandard("noise".to_string())));
+        assert!(!is_signal_array_type(&ArrayType::TimeArray));
+        assert!(!is_signal_array_type(&ArrayType::MeanIonMobilityArray));
+    }
+
+    /// The guard must trip (via its `debug_assert!`) when a signal array would be spilled
+    /// to auxiliary_arrays. The `debug_assert!` is compiled out in `--release` (where
+    /// `debug-assertions = false`), so this test only runs in debug builds; in release the
+    /// guard degrades to a loud `log::error!` (intentionally non-fatal). `signal_array_classifier`
+    /// above is the profile-independent contract test.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must not be spilled to auxiliary_arrays")]
+    fn guard_fires_on_intensity() {
+        guard_not_signal_array(&ArrayType::IntensityArray);
+    }
 
     fn load_chunking_data() -> io::Result<Vec<f64>> {
         let reader = io::BufReader::new(fs::File::open("test/data/chunking_mzs.txt")?);

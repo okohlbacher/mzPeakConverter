@@ -1856,8 +1856,26 @@ impl SpectrumDetailsBuilder {
 
         self.spectrum_type.append_value(&spectrum_type);
 
-        self.lowest_observed_mz.append_value(summaries.mz_range.0);
-        self.highest_observed_mz.append_value(summaries.mz_range.1);
+        // Observed-m/z range. Normally derived from the m/z data array, but grid / ims-compact
+        // spectra REPLACE the m/z array with an integer tof/tof_index axis, so the data-derived
+        // range collapses to (0,0). In that case, fall back to the explicit MS:1000528 / MS:1000527
+        // params the converter set on the description from the reconstructed m/z (B.3). Without this
+        // the viewer shows "m/z 0–0" for those files.
+        let (mut lo_mz, mut hi_mz) = summaries.mz_range;
+        if !(lo_mz > 0.0) || !(hi_mz > 0.0) {
+            if let Some(p) = item.get_param_by_curie(&curie!(MS:1000528)) {
+                if let Ok(v) = p.to_f64() {
+                    lo_mz = v;
+                }
+            }
+            if let Some(p) = item.get_param_by_curie(&curie!(MS:1000527)) {
+                if let Ok(v) = p.to_f64() {
+                    hi_mz = v;
+                }
+            }
+        }
+        self.lowest_observed_mz.append_value(lo_mz);
+        self.highest_observed_mz.append_value(hi_mz);
 
         self.base_peak_mz.append_option(base_peak_mz);
         self.base_peak_intensity.append_option(base_peak_intensity);

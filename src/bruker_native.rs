@@ -43,6 +43,13 @@ impl TofMzModel {
         let b = c.convert(1u32).sqrt() - a;
         Self { a, b }
     }
+
+    /// Reconstruct m/z from a TOF bin: `m/z = (a + b·tof)²`. Monotonic in `tof` (a,b ≥ 0), so the
+    /// min/max m/z of a spectrum come from the min/max TOF bin present.
+    pub fn mz(&self, tof: i32) -> f64 {
+        let v = self.a + self.b * tof as f64;
+        v * v
+    }
 }
 
 /// One native TIMS frame == one mzPeak spectrum. `scan_offsets[s]..scan_offsets[s+1]` indexes the
@@ -239,6 +246,13 @@ impl NativeTofReader {
             ..Default::default()
         };
         descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z via the model
+        // (m/z = (a + b·tof)², monotonic in tof) over the min/max TOF bin present. Without this the
+        // viewer reports "m/z 0–0".
+        if let (Some(&tmin), Some(&tmax)) = (tof.iter().min(), tof.iter().max()) {
+            let (mz_a, mz_b) = (self.model.mz(tmin), self.model.mz(tmax));
+            crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
+        }
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 

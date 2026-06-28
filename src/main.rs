@@ -989,6 +989,50 @@ enum TofRoute {
 /// the two per spectrum by facet membership (peak_count>0 vs data_point_count>0, keyed on
 /// spectrum_index), so one archive losslessly holds both. This replaces the former whole-run
 /// `TofGridNotLossless` fallback.
+/// Set the observed-m/z CV terms (MS:1000528 lowest, MS:1000527 highest) on a spectrum
+/// description, from a reconstructed/source m/z min and max. Grid and ims-compact outputs
+/// store integer `tof_index`/`tof` rather than m/z, so without this the viewer reports
+/// "m/z 0–0". These terms mean *observed* m/z (NOT the scan window). If the description
+/// already carries either term, it is left untouched (don't duplicate).
+fn set_observed_mz_range(descr: &mut mzdata::spectrum::SpectrumDescription, mz_min: f64, mz_max: f64) {
+    if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000528))) {
+        descr.add_param(
+            Param::builder()
+                .name("lowest observed m/z")
+                .curie(curie!(MS:1000528))
+                .value(mz_min)
+                .unit(Unit::MZ)
+                .build(),
+        );
+    }
+    if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000527))) {
+        descr.add_param(
+            Param::builder()
+                .name("highest observed m/z")
+                .curie(curie!(MS:1000527))
+                .value(mz_max)
+                .unit(Unit::MZ)
+                .build(),
+        );
+    }
+}
+
+/// Min/max over an m/z slice, guarding empty and unsorted input. Returns `None` if empty.
+fn mz_min_max(mzs: &[f64]) -> Option<(f64, f64)> {
+    let mut it = mzs.iter().copied().filter(|v| v.is_finite());
+    let first = it.next()?;
+    let (mut lo, mut hi) = (first, first);
+    for v in it {
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+    }
+    Some((lo, hi))
+}
+
 fn tof_grid_spectrum(
     entry: &MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
     grid: &tof_grid::TofGrid,
@@ -1027,6 +1071,11 @@ fn tof_grid_spectrum(
         if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
             descr.add_param(mass_spectrum.clone());
         }
+        // Observed-m/z range from the source f64 m/z array (this route keeps the f64 m/z, but the
+        // CV terms may still be absent on the source description).
+        if let Some((lo, hi)) = mz_min_max(&mzs) {
+            set_observed_mz_range(&mut descr, lo, hi);
+        }
         let mut out = MultiLayerSpectrum::new(descr, entry.arrays.clone(), None, None);
         // Force Profile continuity so the f64 m/z arrays land in the standard data facet (an input
         // marked Centroid with raw arrays would otherwise hit the peak writer's tof_index schema).
@@ -1048,6 +1097,11 @@ fn tof_grid_spectrum(
     let mut descr = entry.description().clone();
     if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
         descr.add_param(mass_spectrum.clone());
+    }
+    // Observed-m/z range from the source f64 m/z array (the output stores integer tof_index, so
+    // these CV terms would otherwise be absent and the viewer would show "m/z 0–0").
+    if let Some((lo, hi)) = mz_min_max(&mzs) {
+        set_observed_mz_range(&mut descr, lo, hi);
     }
     // Route the arrays through the custom peak facet (spectra_peaks) instead of the profile-array
     // facet: the writer sends RawData+Profile to `write_spectrum_binary_array_map` (standard m/z
@@ -1315,6 +1369,16 @@ fn agilent_grid_spectrum(
             .value(ps.calibration_id as i64)
             .build(),
     );
+    // Observed-m/z range: the output stores integer tof_index, so reconstruct m/z = grid.mz(k) for
+    // the min/max tof_index actually present (grid m/z is monotonic in tof_index, so the extremes
+    // of the index range give the extremes of m/z). Without this the viewer shows "m/z 0–0".
+    if let (Some(&kmin), Some(&kmax)) = (
+        ps.tof_index.iter().min(),
+        ps.tof_index.iter().max(),
+    ) {
+        let (mz_a, mz_b) = (grid.mz(kmin), grid.mz(kmax));
+        set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
+    }
     // Set retention time on the scan event.
     let mut acq = mzdata::spectrum::Acquisition::default();
     if let Some(ev) = acq.first_scan_mut() {
@@ -2570,6 +2634,235 @@ mod tests {
             }
             TofRoute::Gridded(_) => panic!("off-lattice spectrum must keep f64 m/z"),
         }
+    }
+
+    /// TASK 1 (B.3): a gridded TOF spectrum must carry the observed-m/z CV terms (MS:1000528 lowest,
+    /// MS:1000527 highest) computed from the source f64 m/z, so the viewer doesn't show "m/z 0–0".
+    #[test]
+    fn gridded_spectrum_carries_observed_mz_range() {
+        let grid = tof_grid::TofGrid { c0: 14.0, c1: 1.0e-4 };
+        let mass_spectrum = Param::builder().name("mass spectrum").build();
+        let on: Vec<f64> = (200_000i32..200_400).map(|k| grid.mz(k)).collect();
+        let on_int = vec![1.0f32; on.len()];
+        let (want_lo, want_hi) = (on[0], on[on.len() - 1]);
+        match tof_grid_spectrum(&spec_from(&on, &on_int, 0), &grid, &mass_spectrum).unwrap() {
+            TofRoute::Gridded(s) => {
+                let lo = s
+                    .description()
+                    .params()
+                    .iter()
+                    .find(|p| p.curie() == Some(mzdata::curie!(MS:1000528)))
+                    .expect("lowest observed m/z (MS:1000528) present");
+                let hi = s
+                    .description()
+                    .params()
+                    .iter()
+                    .find(|p| p.curie() == Some(mzdata::curie!(MS:1000527)))
+                    .expect("highest observed m/z (MS:1000527) present");
+                let lo_v = lo.to_f64().unwrap();
+                let hi_v = hi.to_f64().unwrap();
+                assert!((lo_v - want_lo).abs() < 1e-6, "lo {lo_v} vs {want_lo}");
+                assert!((hi_v - want_hi).abs() < 1e-6, "hi {hi_v} vs {want_hi}");
+                assert!(lo_v > 0.0 && hi_v > lo_v, "observed m/z must be a non-zero range");
+            }
+            TofRoute::F64(_) => panic!("on-lattice spectrum should grid"),
+        }
+    }
+
+    /// B.4 regression (frame-preserving ims-compact). Corpus-gated: needs the smallest timsTOF `.d`
+    /// (~2 GB), too large to vendor. Convert it and assert the peak facet carries
+    /// `mean_inverse_reduced_ion_mobility` (MS:1003006) and that #spectra == #TDF frames
+    /// (one spectrum per FRAME, not per mobility scan). `#[ignore]` by default; run with:
+    ///   `cargo test --release ims_compact_is_frame_preserving -- --ignored --nocapture`
+    /// Corpus path (see MEMORY: smallest timsTOF):
+    ///   /Users/kohlbach/Claude/mzPeak/data/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d
+    #[test]
+    #[ignore = "needs the ~2GB SBA415 timsTOF .d corpus fixture; run with --ignored"]
+    fn ims_compact_is_frame_preserving() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs;
+
+        let input = std::path::Path::new(
+            "/Users/kohlbach/Claude/mzPeak/data/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d",
+        );
+        assert!(input.exists(), "corpus fixture missing: {}", input.display());
+
+        let scratch = std::path::Path::new(
+            "/private/tmp/claude-501/-Users-kohlbach-Claude-mzPeak-mzPeakConverter/b893364b-bab9-4ecd-b671-4ff71e9db809/scratchpad",
+        );
+        fs::create_dir_all(scratch).unwrap();
+        let output = scratch.join("sba415_ims_compact.mzpeak");
+        let _ = fs::remove_file(&output);
+
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false)
+            .expect("ims-compact conversion");
+
+        // Crack the zip archive and extract facets to scratch files (File: ChunkReader).
+        let f = fs::File::open(&output).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+
+        // (a) the peak facet has the mean 1/K0 mobility column (MS:1003006).
+        let peaks_path = extract_zip_entry(&mut zip, "spectra_peaks.parquet", scratch);
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&peaks_path).unwrap()).unwrap();
+        let schema = builder.schema().clone();
+        assert!(
+            schema.field_with_name("mean_inverse_reduced_ion_mobility").is_ok(),
+            "spectra_peaks must carry mean_inverse_reduced_ion_mobility (MS:1003006); got {:?}",
+            schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+        );
+        // The peak facet stores integer `tof`, not m/z.
+        assert!(schema.field_with_name("tof").is_ok(), "peak facet must have a `tof` column");
+
+        // (b) #spectra == #TDF frames (one spectrum per frame).
+        let n_frames = {
+            let conn = rusqlite::Connection::open_with_flags(
+                input.join("analysis.tdf"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            conn.query_row("SELECT COUNT(*) FROM Frames", [], |r| r.get::<_, i64>(0))
+                .unwrap() as u64
+        };
+        // One row per spectrum in spectra_metadata.parquet; compare its row count to the frame count.
+        let meta_path = extract_zip_entry(&mut zip, "spectra_metadata.parquet", scratch);
+        let meta_builder =
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&meta_path).unwrap()).unwrap();
+        let n_spectra: i64 = meta_builder.metadata().file_metadata().num_rows();
+        assert_eq!(
+            n_spectra as u64, n_frames,
+            "expected one spectrum per TDF frame: {n_spectra} spectra vs {n_frames} frames"
+        );
+    }
+
+    /// A-contract lock-in. Asserts the calibration index keys + peak/grid column names don't get
+    /// renamed out from under readers. Corpus-gated (`#[ignore]`) because it converts real `.d`
+    /// inputs. Run with `cargo test --release contract_ -- --ignored`.
+    #[test]
+    #[ignore = "needs the SBA415 timsTOF .d corpus fixture; run with --ignored"]
+    fn contract_ims_compact_calibration_keys() {
+        use std::fs;
+        use std::io::Read;
+
+        let input = std::path::Path::new(
+            "/Users/kohlbach/Claude/mzPeak/data/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d",
+        );
+        assert!(input.exists(), "corpus fixture missing: {}", input.display());
+        let scratch = std::path::Path::new(
+            "/private/tmp/claude-501/-Users-kohlbach-Claude-mzPeak-mzPeakConverter/b893364b-bab9-4ecd-b671-4ff71e9db809/scratchpad",
+        );
+        fs::create_dir_all(scratch).unwrap();
+        let output = scratch.join("sba415_contract.mzpeak");
+        let _ = fs::remove_file(&output);
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false)
+            .expect("ims-compact conversion");
+
+        let f = fs::File::open(&output).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        let mut idx_bytes = Vec::new();
+        zip.by_name("mzpeak_index.json")
+            .expect("mzpeak_index.json present")
+            .read_to_end(&mut idx_bytes)
+            .unwrap();
+        let idx: serde_json::Value = serde_json::from_slice(&idx_bytes).unwrap();
+        let cal = idx
+            .get("metadata")
+            .and_then(|m| m.get("ims_calibration"))
+            .expect("metadata.ims_calibration present");
+        for key in ["codec", "mz_from_tof", "tof_encoding", "a", "b"] {
+            assert!(cal.get(key).is_some(), "ims_calibration missing key `{key}`: {cal}");
+        }
+        assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("ims-compact"));
+
+        // peaks schema has a `tof` column.
+        let peaks_path = extract_zip_entry(&mut zip, "spectra_peaks.parquet", scratch);
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            fs::File::open(&peaks_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            builder.schema().field_with_name("tof").is_ok(),
+            "ims-compact peaks schema must have a `tof` column"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a SciEX/Agilent TOF-grid .d or .wiff corpus source; run with --ignored"]
+    fn contract_tof_grid_calibration_keys() {
+        // Lock-in for the tof-grid archive contract: metadata.tof_calibration with codec:"tof-grid"
+        // and a `tof_index` column in the peak facet. Point CORPUS at a readable grid SOURCE.
+        use std::fs;
+        use std::io::Read;
+
+        let corpus = std::env::var("MZPEAK_TOF_GRID_SOURCE").unwrap_or_default();
+        assert!(
+            !corpus.is_empty(),
+            "set MZPEAK_TOF_GRID_SOURCE=/path/to/grid/source (.d or .mzML) to run this test"
+        );
+        let input = std::path::Path::new(&corpus);
+        assert!(input.exists(), "MZPEAK_TOF_GRID_SOURCE not found: {corpus}");
+        let scratch = std::path::Path::new(
+            "/private/tmp/claude-501/-Users-kohlbach-Claude-mzPeak-mzPeakConverter/b893364b-bab9-4ecd-b671-4ff71e9db809/scratchpad",
+        );
+        fs::create_dir_all(scratch).unwrap();
+        let output = scratch.join("tof_grid_contract.mzpeak");
+        let _ = fs::remove_file(&output);
+
+        // Drive the full converter binary so the path matches production. The bin lives under the
+        // crate's target/release dir (unit tests don't get CARGO_BIN_EXE_*, so resolve it manually).
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/release/mzpeak-convert");
+        assert!(bin.exists(), "build the release binary first: {}", bin.display());
+        let status = std::process::Command::new(&bin)
+            .arg(input)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .expect("running mzpeak-convert");
+        assert!(status.success(), "conversion failed");
+
+        let f = fs::File::open(&output).unwrap();
+        let mut zip = zip::ZipArchive::new(f).unwrap();
+        let mut idx_bytes = Vec::new();
+        zip.by_name("mzpeak_index.json")
+            .unwrap()
+            .read_to_end(&mut idx_bytes)
+            .unwrap();
+        let idx: serde_json::Value = serde_json::from_slice(&idx_bytes).unwrap();
+        let cal = idx
+            .get("metadata")
+            .and_then(|m| m.get("tof_calibration"))
+            .expect("metadata.tof_calibration present");
+        assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("tof-grid"));
+
+        let peaks_path = extract_zip_entry(&mut zip, "spectra_peaks.parquet", scratch);
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            fs::File::open(&peaks_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            builder.schema().field_with_name("tof_index").is_ok(),
+            "tof-grid peaks schema must have a `tof_index` column"
+        );
+    }
+
+    /// Extract a named entry from an open zip archive to a scratch file and return its path.
+    /// Lets the corpus tests open parquet facets as `File` (which implements `ChunkReader`) without
+    /// pulling in the `bytes` crate as a direct dependency.
+    fn extract_zip_entry(
+        zip: &mut zip::ZipArchive<std::fs::File>,
+        name: &str,
+        scratch: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        zip.by_name(name)
+            .unwrap_or_else(|_| panic!("{name} present in archive"))
+            .read_to_end(&mut buf)
+            .unwrap();
+        let out = scratch.join(name.replace('/', "_"));
+        std::fs::write(&out, &buf).unwrap();
+        out
     }
 
     #[test]
