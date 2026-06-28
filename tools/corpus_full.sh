@@ -26,6 +26,11 @@ echo "reconvert -> $out${box:+  (vendor units via box_convert, --box-jobs $box_j
 sizeof(){ if [ -d "$1" ]; then du -sk "$1" | awk '{print $1*1024}'; else stat -f %z "$1" 2>/dev/null || echo 0; fi; }
 slug(){ echo "${1#$root/}" | sed 's#[^A-Za-z0-9._-]#_#g; s#__*#_#g'; }
 ratio(){ awk -v m="$1" -v w="$2" 'BEGIN{if(w>0) printf "%.4f", m/w; else print "NA"}'; }
+# JOBS>1 runs host conversions in parallel (independent output files; each appends one short line to
+# the TSV, which is atomic under PIPE_BUF). Big inputs (>=BIG_MB) still run one-at-a-time so a cluster
+# of multi-GB DIA runs can't blow the RAM ceiling. Portable throttle (no `wait -n`: macOS bash is 3.2).
+JOBS="${JOBS:-1}"; BIG_MB="${BIG_MB:-1500}"
+throttle(){ local n="$1"; while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$n" ]; do sleep 0.3; done; }
 # A Thermo RAW file starts with 01 A1 followed by "Finnigan" in UTF-16LE. Peek the first bytes,
 # drop the interleaved NULs, and look for the magic — robust to corpus dirs mislabeled by vendor.
 raw_is_thermo(){ LC_ALL=C head -c 64 "$1" 2>/dev/null | LC_ALL=C tr -d '\000' | LC_ALL=C grep -qa 'Finnigan'; }
@@ -45,12 +50,22 @@ conv(){ # tier format flags input outpath
   # imzML signal lives in the .ibd sidecar — count it in the raw footprint or ratios are inflated.
   if [ "$fmt" = imzml ]; then local ibd="${in%.*}.ibd"; [ -f "$ibd" ] && raw=$((raw + $(sizeof "$ibd"))); fi
   echo ">> [$tier/$fmt] $id"
-  if "$bin" "$in" $flags -o "$o" --force > "$out/logs/$id.log" 2>&1; then
-    local mp; mp="$(sizeof "$o")"
-    printf '%s\t%s\tOK\t%s\t%s\t%s\t%s\n' "$tier" "$fmt" "$raw" "$mp" "$(ratio "$mp" "$raw")" "${in#$root/}" >> "$tsv"
+  # The actual convert+record. Backgrounded when JOBS>1; big inputs forced serial (gate at JOBS=1).
+  _conv_run(){
+    if "$bin" "$in" $flags -o "$o" --force > "$out/logs/$id.log" 2>&1; then
+      local mp; mp="$(sizeof "$o")"
+      printf '%s\t%s\tOK\t%s\t%s\t%s\t%s\n' "$tier" "$fmt" "$raw" "$mp" "$(ratio "$mp" "$raw")" "${in#$root/}" >> "$tsv"
+    else
+      local rc=$?; local st="CONV-ERR"; [ "$rc" = 3 ] && st="UNSUPPORTED"
+      printf '%s\t%s\t%s\t%s\t\t\tsee logs/%s.log\n' "$tier" "$fmt" "$st" "$raw" "$id" >> "$tsv"
+    fi
+  }
+  if [ "$JOBS" -le 1 ]; then
+    _conv_run
+  elif [ "$raw" -ge $((BIG_MB*1024*1024)) ]; then
+    wait; _conv_run            # big file: drain the pool, then run it alone
   else
-    local rc=$?; local st="CONV-ERR"; [ "$rc" = 3 ] && st="UNSUPPORTED"
-    printf '%s\t%s\t%s\t%s\t\t\tsee logs/%s.log\n' "$tier" "$fmt" "$st" "$raw" "$id" >> "$tsv"
+    throttle "$JOBS"; _conv_run &
   fi
 }
 defer(){ # tier fmt path — enqueue for box conversion (--box) else record BOX-DEFERRED
@@ -119,6 +134,7 @@ for t in tof-grid-examples vendor-agilent-sciex vendor-flash-data vendor-waters 
   echo "============ TILE $t ============"
   walk_tier "$t" "$t"
 done
+wait   # drain any in-flight parallel (JOBS>1) host conversions before the box phase / summary
 
 # --box: convert the enqueued vendor units on the flash-workstation via box_convert (S3-relayed,
 # parallel), then record each outcome by whether the sibling .mzpeak now exists.
