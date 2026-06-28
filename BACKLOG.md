@@ -424,3 +424,26 @@ Implementation: in the integer-intensity writer path, emit `intensity` as byte-p
 (tag it in the schema/metadata); reader recombines `Σ byte[k]<<8k`. Reader-portable (standard Parquet
 types), lossless. Net: **matching the raw `.d` is reproducible with stock Parquet** — purely a
 writer/reader change on the intensity column, no dependency bump.
+
+## #15 — Research: Bruker 2D frame layout in mzPeak/Parquet 🔬 (deep adversarial research; bg)
+
+Deep research project — **kick off in the background when there's spare time** (a Workflow /
+multi-agent adversarial research run is appropriate). Question: would Bruker's TDF **2D
+per-frame layout** (a frame = scan × tof, with scan offsets + intra-frame structure) map onto
+mzPeak/Parquet, and would it beat the flat point-list?
+
+Context (measured, #14): on timsTOF the flat point list + byte-plane intensity reaches ~102.7%
+of the raw `.d`; the data's order-0 entropy (~2.05 GB) is *below* raw, so there's headroom a
+better *structure* (not just a better codec) could capture. Bruker's `.d` exploits the 2D frame
+structure; mzPeak currently flattens it to points (`spectrum_index, tof, intensity, mobility`),
+which forces one sort order and pays the tof-vs-mobility tradeoff (#14: tof-major is a wash).
+
+Investigate, adversarially: (a) representations — nested Parquet (list-per-scan of tof/intensity),
+or a frame-blob column, or run-length over the (scan,tof) grid; (b) whether Parquet's columnar
+model can express the 2D locality Bruker's bespoke format gets, or whether it fights it; (c)
+projected size vs the 2.05 GB entropy floor and vs raw; (d) the cost — random-access /
+predicate-pushdown / streaming-decode regressions, reader complexity, and whether it breaks the
+"one schema for all instruments" goal; (e) prior art (OpenTIMS/AlphaTims on-disk, Parquet nested
+encodings, the TileDB/sparse-array angle). Deliver a recommendation: pursue, or confirm the flat
+list + byte-plane intensity is the right tradeoff. Likely **confirms flat-list** — but the entropy
+gap says it's worth one rigorous look. Pairs with #11 (generic grid facet) and #14.
