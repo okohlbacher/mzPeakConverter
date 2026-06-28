@@ -331,12 +331,48 @@ less than intuition suggests, and for the same reason:
   best f64 m/z (5.74 MB) is a **~3%** difference. The big wins (41% vs f64 PLAIN, 69% vs BSS)
   only exist against *un*-dictionaried float storage. **So ims-compact's real value is
   losslessness (bit-exact integer grid), not size — its size ≈ dictionary-encoded f64 m/z.**
-- **Side finding (actionable):** our `tof` column ships as DELTA_BINARY_PACKED (6.18 MB) but
-  plain dictionary on the same int32 is **5.56 MB (~10% smaller)** — cross-scan tof resets
-  make the deltas noisy; the 40k-value grid dictionaries better. `tof` is 58% of the peaks
-  facet, so letting Parquet choose (or forcing dictionary) on that column is ~6% off the
-  whole facet, on every timsTOF file. Low-risk encoding tweak in the vendored writer; verify
-  it doesn't regress non-IM datasets first.
+- **Side finding (RETRACTED — see #14):** the table above was measured on a **400-frame
+  subset**, where int32 dictionary looked ~10% smaller than the shipped DELTA. **This does
+  not hold at scale.** On the full SBA415 (821 M points) the shipped absolute+DELTA is
+  **1.633 B/pt** while dictionary is **2.195 B/pt (worse)**. Small-subset encoding
+  measurements don't predict full-file behavior here — always validate on the whole file.
 
-Net: ion-mobility grid work is unjustified; the only real lever here is the `tof` column
-encoding choice (DELTA → dictionary).
+Net: ion-mobility grid work is unjustified. The `tof` column is already near-optimally
+encoded (see #14, which also refutes an external "per-scan-delta" handoff).
+
+## #14 — `tof` column encoding: handoff refuted; current encoding is near-optimal ✅ (analysis)
+
+External handoff (`~/Downloads/mzpeak-timstof-tof-encoding-regression-handoff.md`) claimed the
+ims-compact `tof` column regressed by storing **absolute** flight-time bins, and that restoring
+BRFP's **per-(frame,scan) delta-reset** would drop `tof` from ~1.36 GB to ~0.3–0.5 GB (3–4×).
+**Measured on the full SBA415 (821 M points) — the fix is wrong and would make it worse.**
+
+| `tof` encoding (full file, ZSTD) | B/pt | |
+|---|---|---|
+| **absolute + DELTA_BINARY_PACKED (what we ship)** | **1.633** | best of the simple options |
+| absolute + dictionary (the retracted #13 idea) | 2.195 | worse |
+| per-(frame,scan) delta-reset + DELTA (the handoff's fix) | 2.056 | **worse** |
+| per-scan-delta + dictionary | 1.995 | worse |
+
+- **Why the handoff is wrong:** it assumes within a mobility scan `tof` rises in "a handful of
+  bins." It doesn't — scans are **sparse (~34 peaks across a ~400k-bin flight-time axis;
+  intra-scan delta median 189, max 353k)**, so per-scan deltas are large and pack worse than
+  the absolute values. The premise is false; the fix regresses `tof`.
+- **The real (modest) lever the handoff missed is point *sort order*, not delta encoding.**
+  `tof` and `mobility` cost trade against each other: the point list has one order.
+  - current **scan-major**: `tof` 1.633 + `mobility` 0.071 = 1.704 B/pt (coords)
+  - **tof-sorted within spectrum**: `tof` 0.341 + `mobility` 1.227 = 1.568 B/pt (coords)
+  - Net **−0.136 B/pt (~5% of the peaks facet)** — tof-sorting cheapens `tof` exactly as the
+    handoff wanted, but balloons `mobility` (RLE_DICTIONARY runs scramble), and reorders
+    points away from mobility-major (breaks per-peak ion-mobility locality readers may rely
+    on). Modest win, real semantic cost — **not recommended without a consumer-side reason.**
+- **Intensity** (handoff dismissed it, correctly): f32 BYTE_STREAM_SPLIT 1.221 B/pt vs int32
+  1.262 — integer encoding is marginally *worse*. Leave as f32.
+- **"Larger than the raw `.d`" is not a clear regression.** Even the best encoding
+  (~2.29 GB) stays at/above the raw `.d` (2.21 GB): losslessly storing native tof + integer
+  intensity + per-point mobility in a general columnar format is inherently ~raw-sized next
+  to Bruker's bespoke-compressed `.d`. No simple encoding change gets dramatically below raw.
+
+**Decision: keep the current `tof` encoding (absolute + DELTA).** It is the best of the
+tested options at scale. The handoff's fix is refuted; the sort-order lever is modest and
+carries a semantic cost. Lesson logged: measure encodings on the full file, not a subset.

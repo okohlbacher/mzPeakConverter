@@ -7,12 +7,17 @@
 //! [`NativeTofReader`] capability so it can later be re-pointed at an upstream mzdata accessor
 //! without touching the encoder (NATIVE-TOF-DESIGN.md).
 //!
-//! Encoding (ported from BRFP `write_tdf_to_ims_compact`): rows grouped by `spectrum_index`
-//! (frame), within a frame mobility-major (scan ascending) then TOF ascending; the TOF column is
-//! **delta-reset per (frame, scan)** — first peak of each scan holds the absolute bin, the rest
-//! hold non-negative increments. Lossless: `m/z = (a + b·tof)²` with `a,b` stored in file KV
-//! metadata; the decoder recovers the exact integer TOF and thus the exact m/z the instrument
-//! calibration produces.
+//! Encoding: rows grouped by `spectrum_index` (frame), within a frame mobility-major (scan
+//! ascending) then TOF ascending; the TOF column stores the **absolute** flight-time bin per
+//! point (`tof_encoding: "absolute"`), so the reader reconstructs `m/z = (a + b·tof)²` directly
+//! with no cumulative sum. `a,b` live in the file KV `ims_calibration`; the decoder recovers the
+//! exact integer TOF and thus the exact m/z the instrument calibration produces.
+//!
+//! NB: BRFP's `write_tdf_to_ims_compact` delta-reset TOF per (frame, scan). We measured that on
+//! the full SBA415 run (821 M points) and it packs **worse**, not better (2.06 vs 1.63 B/pt):
+//! a mobility scan is sparse — ~34 peaks spread across a ~400k-bin axis — so intra-scan deltas
+//! are large (median ~190), not "a handful of bins". Absolute + DELTA_BINARY_PACKED is the best
+//! of the simple encodings here; do not "restore" the per-scan delta (see BACKLOG #14).
 
 use std::path::Path;
 
