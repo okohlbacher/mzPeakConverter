@@ -451,8 +451,25 @@ fn run(cli: &Cli) -> Result<i32> {
         convert_bruker_sdk(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("converting {} via the Bruker timsdata SDK", cli.input.display()))?;
     } else if use_ims_compact {
-        convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration)
-            .with_context(|| format!("ims-compact converting {}", cli.input.display()))?;
+        // Native ims-compact (direct timsrust) is the lossless default. When timsrust can't
+        // decompress a frame — newer timsTOF (e.g. 5.1.x) writes a TDF binary it doesn't handle —
+        // fall back to the mzdata reader interface (f64 m/z), which decodes those files. mzdata may
+        // silently drop a truly-undecodable frame, so the fallback is loud. (Backlog: fix timsrust /
+        // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
+        match convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration) {
+            Ok(()) => {}
+            Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
+                log::warn!(
+                    "native ims-compact failed on {} ({e}); falling back to the mzdata reader \
+                     (f64 m/z, larger; may skip any frame even mzdata can't decode)",
+                    cli.input.display()
+                );
+                guard_unsupported_vendor(&cli.input)?;
+                convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid)
+                    .with_context(|| format!("mzdata-fallback converting {}", cli.input.display()))?;
+            }
+            Err(e) => return Err(e).with_context(|| format!("ims-compact converting {}", cli.input.display())),
+        }
     } else {
         guard_unsupported_vendor(&cli.input)?;
         convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid)

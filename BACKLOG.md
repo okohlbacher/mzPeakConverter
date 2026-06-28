@@ -447,3 +447,27 @@ predicate-pushdown / streaming-decode regressions, reader complexity, and whethe
 encodings, the TileDB/sparse-array angle). Deliver a recommendation: pursue, or confirm the flat
 list + byte-plane intensity is the right tradeoff. Likely **confirms flat-list** — but the entropy
 gap says it's worth one rigorous look. Pairs with #11 (generic grid facet) and #14.
+
+## #16 — timsrust can't decompress newer timsTOF (5.1.x); route ims-compact through mzdata 🟡
+
+Two linked items surfaced by the IM benchmark (timsTOF SCP, PXD078573, acq software 5.1.8):
+
+1. **timsrust 0.4.1 decode bug on 5.1.x TDF.** `FrameReader::get()` fails "Decompression fails"
+   on a frame (735 in PXD078573) that older (4.0.5) files don't have. Confirmed not corruption
+   (zip CRC clean, `TimsCompressionType=2` same as a working file). Hits the native ims-compact
+   path (direct timsrust). **Mitigation shipped:** the converter now falls back to the **mzdata
+   reader** on a decompress error (mzdata decodes these files) — but mzdata's output is f64 m/z
+   (not ims-compact, ~3.4× raw) AND mzdata *silently drops* any frame even it can't decode
+   (`get().ok().unwrap_or_default()`), so the fallback is loud. Real fix: bump timsrust when an
+   upstream fix lands, or use the official `--bruker-sdk` decoder (the SDK ims-compact path is
+   wired and box-compiles; its first runtime CONV-FAIL'd — debug separately).
+
+2. **Consolidate Bruker reading onto the mzdata *interface* (drop direct timsrust calls).** The
+   raw integer TOF ims-compact needs is `timsrust::Frame.tof_indices` — a *public* field mzdata
+   already reads in `process_3d_slice` and then discards during m/z conversion. So a small
+   **upstream mzdata PR** — emit a `RawTimeOfFlight` array (or expose the raw `timsrust::Frame`)
+   under a detail level — would let ims-compact run through mzdata's `TDFFrameReader` with no
+   direct timsrust dependency in `bruker_native`. `FrameToArraysMapper` is already `pub` and
+   takes `&timsrust::Frame`, so the data is in hand; it's a don't-throw-it-away change. (timsrust
+   stays transitively — mzdata depends on it — but our direct calls go away.) Pairs with the
+   `with_raw_tof` idea in NATIVE-TOF-DESIGN.md.
