@@ -410,9 +410,13 @@ zstd. Reproduced and measured on the full SBA415:
   the current **parquet crate 42.0.0** — no BSS-on-int, no new codec. (BSS on a *float* column, what
   we ship, only reaches 1.17 — the 4-byte float carries mantissa noise; and a plain u32 column
   interleaves the zero high-bytes → 1.26. Grouping the zeros via byte planes is the key.)
-- **Projected file: ~2.22 GB ≈ the raw `.d` (2.21 GB, ~1.00×)**, down from 2.42 GB — scan-major
-  layout kept. Integer-intensity path only (ims-compact / native counts); generic f32 intensity
-  unaffected. zstd is needed for the full win (snappy → 1.10, none → 1.21) but is already the default.
+- **MEASURED end-to-end (full SBA415, 821 M pts, lossless round-trip verified): 2.42 GB → 2.269 GB
+  (109.6% → 102.7% of raw `.d`), −152 MB / −6.3%.** Intensity 0.961 GB → 0.809 GB (1.169 → 0.984
+  B/pt). Scan-major layout kept; integer-intensity path only (ims-compact / native counts), generic
+  f32 unaffected; zstd needed for the full win (snappy 1.10, none 1.21) but is already the default.
+  (An earlier *projection* of ~2.22 GB/~1.00× omitted Parquet/zip + spectrum_index overhead; the real
+  number is 102.7%, ~60 MB over raw. Closing the last ~3% also needs the tof-major sort — IM-locality
+  cost — since tof is already at its entropy floor.)
 
 Implementation: in the integer-intensity writer path, emit `intensity` as byte-plane uint8 columns
 (tag it in the schema/metadata); reader recombines `Σ byte[k]<<8k`. Reader-portable (standard Parquet
