@@ -45,6 +45,13 @@ flate2 = "1"
 # spectrum API doesn't surface. Same crate (+ features) mzdata wraps, so it unifies to one copy.
 thermorawfilereader = { version = "=0.7.0", features = ["net8_0", "nethost-download"] }
 
+# Optical-image first-IFD dimension reads (dimensions-only, no codecs) for --image embedding.
+# Pinned to match the mzML2mzPeak prototype exactly.
+tiff = { version = "=0.11.3", default-features = false }
+# SHA-256 over embedded optical-image / SDRF bytes (bounded streamed pass). Already in the tree
+# transitively; declared explicitly here so the embed_aux module can depend on it directly.
+sha2 = "0.10"
+
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 log = "0.4"

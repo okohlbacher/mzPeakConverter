@@ -48,6 +48,7 @@ mod tims_mobility;
 mod thermo_status;
 mod thermo_trailers;
 mod vendor;
+mod embed_aux;
 
 use arrow::datatypes::DataType;
 use mzdata::curie;
@@ -182,6 +183,19 @@ struct Cli {
     #[arg(long)]
     aux: Vec<String>,
 
+    /// **mzML/imzML inputs only:** embed an optical image VERBATIM into the archive as
+    /// `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine. Repeatable. A bad/missing
+    /// path here ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}`
+    /// sibling is additionally auto-discovered (best-effort: warn + skip if unreadable).
+    #[arg(long)]
+    image: Vec<PathBuf>,
+
+    /// **mzML/imzML inputs only:** embed an SDRF (sample-metadata) TSV VERBATIM as
+    /// `sample_metadata/sdrf.tsv` with `metadata.study` + `metadata.sample_metadata` back-refs. A
+    /// missing/unreadable path ERRORS the conversion.
+    #[arg(long)]
+    sdrf: Option<PathBuf>,
+
     /// **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by
     /// DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) +
     /// a per-run `{c0,c1}` instead, recovering `m/z = (c0 + c1·tof_index)²`. **Off by default** and
@@ -260,6 +274,8 @@ struct FileConfig {
     no_vendor: Option<bool>,
     no_chromatograms: Option<bool>,
     aux: Option<Vec<String>>,
+    image: Option<Vec<PathBuf>>,
+    sdrf: Option<PathBuf>,
     tof_grid: Option<TofGridMode>,
     agilent_grid: Option<bool>,
     via_msconvert: Option<bool>,
@@ -284,6 +300,8 @@ struct Settings {
     no_vendor: bool,
     chromatograms: bool,
     aux: Vec<String>,
+    image: Vec<PathBuf>,
+    sdrf: Option<PathBuf>,
     tof_grid: TofGridMode,
     agilent_grid: bool,
     via_msconvert: bool,
@@ -319,6 +337,8 @@ impl Settings {
             no_vendor: cli.no_vendor || fc.no_vendor.unwrap_or(false),
             chromatograms: !(cli.no_chromatograms || fc.no_chromatograms.unwrap_or(false)),
             aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
+            image: if cli.image.is_empty() { fc.image.unwrap_or_default() } else { cli.image.clone() },
+            sdrf: cli.sdrf.clone().or(fc.sdrf),
             tof_grid: cli.tof_grid.or(fc.tof_grid).unwrap_or_default(),
             agilent_grid: cli.agilent_grid || fc.agilent_grid.unwrap_or(false),
             via_msconvert: cli.via_msconvert || fc.via_msconvert.unwrap_or(false),
@@ -470,14 +490,14 @@ fn run(cli: &Cli) -> Result<i32> {
                     cli.input.display()
                 );
                 guard_unsupported_vendor(&cli.input)?;
-                convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid)
+                convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref())
                     .with_context(|| format!("mzdata-fallback converting {}", cli.input.display()))?;
             }
             Err(e) => return Err(e).with_context(|| format!("ims-compact converting {}", cli.input.display())),
         }
     } else {
         guard_unsupported_vendor(&cli.input)?;
-        convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid)
+        convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref())
             .with_context(|| format!("converting {}", cli.input.display()))?;
     }
 
@@ -756,7 +776,7 @@ fn convert_via_msconvert(
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
-    let result = convert_file(&mzml, output, chunk, zstd_level, None, synth_chroms, tof_grid);
+    let result = convert_file(&mzml, output, chunk, zstd_level, None, synth_chroms, tof_grid, &[], None);
     let _ = fs::remove_dir_all(&tmpdir);
     result
 }
@@ -1309,6 +1329,7 @@ fn agilent_grid_spectrum(
     Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_file(
     input: &Path,
     output: &Path,
@@ -1317,7 +1338,30 @@ fn convert_file(
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
     tof_grid: TofGridMode,
+    images: &[PathBuf],
+    sdrf: Option<&Path>,
 ) -> Result<()> {
+    // --image / --sdrf are only honored on the mzML/imzML reader path below. A vendor-format input
+    // (TSF/BAF/Agilent/SciEX/Waters) routes to a dedicated converter that does not embed them — warn
+    // rather than silently dropping a user-supplied path.
+    #[allow(unused_mut)]
+    let mut routes_to_vendor = is_tsf_dir(input);
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        routes_to_vendor = routes_to_vendor || is_baf_dir(input);
+    }
+    #[cfg(windows)]
+    {
+        routes_to_vendor =
+            routes_to_vendor || is_agilent_d(input) || is_wiff(input) || is_waters_raw(input);
+    }
+    if routes_to_vendor && (!images.is_empty() || sdrf.is_some()) {
+        log::warn!(
+            "--image/--sdrf are only supported for mzML/imzML inputs; ignoring them for vendor input {}",
+            input.display()
+        );
+    }
+
     if is_tsf_dir(input) {
         return convert_tsf(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
@@ -1494,7 +1538,7 @@ fn convert_file(
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     fixup_run_metadata(&mut writer, input);
 
-    finish_with_vendor(writer, input, vendor)?;
+    finish_with_vendor_and_aux(writer, input, vendor, images, sdrf)?;
     fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
     if let Some(s) = &sanitized {
         let _ = fs::remove_file(s);
@@ -1781,17 +1825,46 @@ fn finish_with_vendor(
     vendor: Option<&vendor::VendorPolicy>,
 ) -> Result<()> {
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    embed_vendor_members(&mut zip, input, vendor)?;
+    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
+    Ok(())
+}
+
+/// Like [`finish_with_vendor`], but the mzML/imzML path also embeds optical images (`--image` +
+/// sibling discovery) and an SDRF (`--sdrf`) into the still-open archive BEFORE `zip.finish()`,
+/// adding the `metadata.imaging` / `metadata.study` / `metadata.sample_metadata` index blocks.
+fn finish_with_vendor_and_aux(
+    writer: MzPeakWriterType<fs::File>,
+    input: &Path,
+    vendor: Option<&vendor::VendorPolicy>,
+    images: &[PathBuf],
+    sdrf: Option<&Path>,
+) -> Result<()> {
+    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    embed_vendor_members(&mut zip, input, vendor)?;
+    embed_aux::embed_into_archive(&mut zip, input, images, sdrf)
+        .context("embedding optical images / SDRF")?;
+    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
+    Ok(())
+}
+
+/// Shared vendor-member embed step (Bruker side-files / Thermo trailers), factored out so both
+/// finish helpers stay in lockstep.
+fn embed_vendor_members(
+    zip: &mut ZipArchiveWriter<fs::File>,
+    input: &Path,
+    vendor: Option<&vendor::VendorPolicy>,
+) -> Result<()> {
     if let Some(policy) = vendor {
         let is_bruker_d = input.is_dir()
             && (input.join("analysis.tsf").exists() || input.join("analysis.tdf").exists());
         if is_bruker_d {
-            vendor::embed_into_archive(&mut zip, input, policy)
+            vendor::embed_into_archive(zip, input, policy)
                 .context("embedding vendor files")?;
         } else if is_thermo_raw(input) {
-            embed_thermo_trailers(&mut zip, input)?;
+            embed_thermo_trailers(zip, input)?;
         }
     }
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     Ok(())
 }
 
