@@ -1608,12 +1608,27 @@ fn convert_ims_compact_archive(
         BinaryDataArrayType::Float64,
     )
     .to_field();
+    // Byte-plane intensity (MZPC_BYTE_PLANE_INTENSITY): store native counts as Int32 so the writer
+    // BYTE_STREAM_SPLITs the column (~ -16% on intensity, lossless; cf. BACKLOG #14). Off by default.
+    let int_intensity = std::env::var("MZPC_BYTE_PLANE_INTENSITY")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    let intensity_field = if int_intensity {
+        BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::IntensityArray,
+            BinaryDataArrayType::Int32,
+        )
+        .to_field()
+    } else {
+        INTENSITY_ARRAY.to_field()
+    };
     let peak_schema = ArrayBuffersBuilder::default()
         .prefix("point")
         .with_context(BufferContext::Spectrum)
         .add_field(BufferContext::Spectrum.index_field())
         .add_field(tof_field)
-        .add_field(INTENSITY_ARRAY.to_field())
+        .add_field(intensity_field)
         .add_field(mob_field);
 
     let builder = MzPeakWriterType::<fs::File>::builder()
@@ -1630,7 +1645,7 @@ fn convert_ims_compact_archive(
     let mut ms1 = Ms1Chroms::default();
     let n_frames = max_spectra().map_or(reader.len(), |m| m.min(reader.len()));
     for i in 0..n_frames {
-        let spec = reader.ims_compact_spectrum(i)?;
+        let spec = reader.ims_compact_spectrum(i, int_intensity)?;
         if synth_chroms {
             ms1.observe(&spec);
         }

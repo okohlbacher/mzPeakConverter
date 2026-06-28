@@ -161,10 +161,14 @@ impl NativeTofReader {
     /// `nonstandard("tof")` (Int32, replaces `m/z array`) + `IntensityArray` (f32) +
     /// `MeanInverseReducedIonMobilityArray` (f64). m/z is reconstructed by readers from the index
     /// `ims_calibration` (per the mzPeakViewer handoff). Peaks are mobility-major then TOF order.
-    pub fn ims_compact_spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
+    pub fn ims_compact_spectrum(&self, i: usize, int_intensity: bool) -> Result<MultiLayerSpectrum> {
         let frame = self.frame(i)?;
         let n_scans = frame.scan_offsets.len().saturating_sub(1);
-        let (mut tof, mut intensity, mut mobility) = (Vec::new(), Vec::new(), Vec::new());
+        // Native counts are integers (u32). `int_intensity` stores them as Int32 so the writer can
+        // BYTE_STREAM_SPLIT the column (byte-plane layout, ~ -16% on the intensity column, lossless;
+        // f32 is also lossy for counts > 2^24). Default keeps f32 for format stability.
+        let (mut tof, mut intensity_f32, mut intensity_i32, mut mobility) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for s in 0..n_scans {
             let (lo, hi) = (frame.scan_offsets[s], frame.scan_offsets[s + 1]);
             if lo >= hi {
@@ -177,7 +181,13 @@ impl NativeTofReader {
                 let bin = i32::try_from(frame.tof[k])
                     .map_err(|_| anyhow::anyhow!("TOF bin {} exceeds i32 range", frame.tof[k]))?;
                 tof.push(bin);
-                intensity.push(frame.intensity[k] as f32);
+                if int_intensity {
+                    intensity_i32.push(i32::try_from(frame.intensity[k]).map_err(|_| {
+                        anyhow::anyhow!("intensity {} exceeds i32 range", frame.intensity[k])
+                    })?);
+                } else {
+                    intensity_f32.push(frame.intensity[k] as f32);
+                }
                 mobility.push(m);
             }
         }
@@ -186,8 +196,15 @@ impl NativeTofReader {
         let mut tof_da = DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
         tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof: {e}"))?;
         arrays.add(tof_da);
-        let mut int_da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+        let mut int_da = if int_intensity {
+            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+            da.update_buffer(intensity_i32.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+            da
+        } else {
+            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+            da.update_buffer(intensity_f32.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+            da
+        };
         int_da.unit = Unit::DetectorCounts;
         arrays.add(int_da);
         let mut mob_da = DataArray::wrap(

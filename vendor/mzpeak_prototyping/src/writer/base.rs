@@ -1138,7 +1138,10 @@ pub trait AbstractMzPeakWriter {
             if c.name() == "intensity"
                 && matches!(
                     c.physical_type(),
-                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                    parquet::basic::Type::DOUBLE
+                        | parquet::basic::Type::FLOAT
+                        | parquet::basic::Type::INT32
+                        | parquet::basic::Type::INT64
                 )
             {
                 log::debug!("{}: byte-stream-split intensity", c.path());
@@ -1287,7 +1290,10 @@ pub trait AbstractMzPeakWriter {
             if c.name() == "intensity"
                 && matches!(
                     c.physical_type(),
-                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                    parquet::basic::Type::DOUBLE
+                        | parquet::basic::Type::FLOAT
+                        | parquet::basic::Type::INT32
+                        | parquet::basic::Type::INT64
                 )
             {
                 log::debug!("{}: byte-stream-split intensity", c.path());
