@@ -18,6 +18,7 @@ if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE 
 if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
 $env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent loads from $pwiz/vendor_api/Agilent
+if (Test-Path "$pwiz/timsdata.dll") { $env:TIMSDATA_LIB_DIR = $pwiz }   # --bruker-sdk loads timsdata.dll from pwiz-bin
 if (Test-Path 'C:\Users\User\box_convert_env.ps1') { . 'C:\Users\User\box_convert_env.ps1' }
 
 $job = [Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -66,6 +67,12 @@ try {
     $log = Join-Path $work 'convert.log'
     $optList = @()
     if ($job.opts -and $job.opts.Trim()) { $optList = @([regex]::Split($job.opts.Trim(), '\s+') | Where-Object { $_ -ne '' }) }
+    # --byte-plane-intensity is a converter ENV toggle (MZPC_BYTE_PLANE_INTENSITY), not a CLI flag —
+    # lift it out of the opts so it can be driven per-job through box_convert.
+    if ($optList -contains '--byte-plane-intensity') {
+        $env:MZPC_BYTE_PLANE_INTENSITY = '1'
+        $optList = @($optList | Where-Object { $_ -ne '--byte-plane-intensity' })
+    }
     # Continue around the native call: the converter logs INFO to stderr on SUCCESS, which would
     # otherwise raise a NativeCommandError under 'Stop' and mask a clean run. Exit is read explicitly.
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
