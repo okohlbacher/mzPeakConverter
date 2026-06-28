@@ -206,3 +206,132 @@ example corpus (which validates 0/0). Fix opportunistically.
 **Metadata (`vendor/mzpeak_prototyping/src/param.rs`):** `ensure_cv_term_if_bare` keys on
 "no accession at all", not "no accession from the rule's branch" — an entry carrying an
 unrelated CV term still warns. Needs CV-hierarchy awareness to close fully.
+
+---
+
+## #11 — Converge grid **storage** onto the upstream generic grid facet 🟡
+
+Prompted by the upstream `mzpeak_prototyping` author's note on grid storage (the person
+who designed the polynomial recalibration / null-filling model). Two halves: what's
+settled, and what changes.
+
+**Settled — the math has converged, no action.** Our index-interpolating-grid math
+(SQRT transform + m/z deltas + polynomial recalibration) independently converged with
+both the upstream author's plan *and* TOFEE. So the calibration models we already ship
+are validated in spirit and we should keep them:
+- SCIEX run-wide `m/z = (c0 + c1·tof_index)²` (`sciex_sqrt`) — [main.rs:941](src/main.rs:941).
+- Agilent per-spectrum `(tof_c0 + tof_c1·k)²` + polynomial refine (`agilent_sqrt_poly`) —
+  [main.rs:1203](src/main.rs:1203), per-CalibrationID poly in `agilent_profile.rs`.
+- Bruker `(a + b·tof)²` (`ims_calibration`) — [bruker_native.rs:149](src/bruker_native.rs:149).
+
+**Changes — storage diverges.** The upstream plan is a *generic grid* stored in an
+**additional Parquet facet**, not the three ad-hoc forms we use today:
+- **Their model:** one extra Parquet file; rows chunked into segments per grid; an
+  **entity-index column = grid ID** (incremental per-grid decode); grid values possibly in
+  a **list column**; each grid defined *either* parametrically (index-space equation +
+  coefficients) *or* **materialized** (precomputed coordinate list, recalibratable with a
+  model). Generic across TOF (parametric) and low-res axes (materializable).
+- **Ours today (divergent, 3 inconsistent representations):**
+  1. SCIEX — column transform metadata (`mzpeak:transform_params`) + a `tof_calibration`
+     JSON block in `mzpeak_index.json`.
+  2. Agilent — **per-spectrum columns** `tof_c0`/`tof_c1`/`tof_calibration_id` in
+     `spectra_metadata.parquet` + a `calibrations` map in the index JSON.
+  3. Bruker — `ims_calibration` JSON block + column transform.
+  There is **no grid entity/facet**; nothing is referenced by a first-class grid ID.
+
+**Impact / why it matters:**
+- **Forward-compat risk.** If upstream lands the grid facet, our JSON-index blocks +
+  per-spectrum coefficient columns become a legacy dialect the reference reader /
+  `mzpeak.org/view` / validator won't interpret. Treat our current grid forms as
+  **provisional** and plan a migration once the upstream facet stabilizes.
+- **Continuation of the metadata-bloat fix ([[no-converted-mzpeak-to-s3]] sibling work).**
+  Agilent repeats `tof_c0`/`tof_c1` on *every* spectrum even though they are shared by all
+  spectra with the same `tof_calibration_id` (which we already emit). A grid facet keyed by
+  grid ID stores each distinct grid **once** and lets spectra reference it by ID. (Marginal
+  now — ~3×f64/spectrum, compressible — but it's exactly the per-spectrum-repetition smell
+  we just removed for intensity; the facet is the clean home.)
+- **New capability we lack:** the **materialized** grid mode (coordinate list + optional
+  recal model). All our grids are parametric today.
+
+Action: track the upstream design; keep our math; when the facet API exists, migrate the
+three representations onto it (grid-ID-referenced, parametric + materialized) and drop the
+per-spectrum coefficient columns. Pairs with #12.
+
+## #12 — Materialized low-res grids for **time** and **ion-mobility** axes 🟡
+
+Depends on the grid facet from #11. The upstream note calls out that a **materialized**
+grid (precomputed coordinates, recalibratable) "would work for any sufficiently low
+resolution measure like time or ion mobility … a time grid would be convenient for storing
+many, many chromatographic traces."
+
+We have no materialized-grid path today — both of these are stored **per-point, inline**:
+- **1/K0 (ion mobility):** one f64 per peak in `MeanInverseReducedIonMobilityArray`,
+  inline in `spectra_peaks` — [bruker_native.rs](src/bruker_native.rs) (`mobility.push`).
+  The 1/K0 ramp is largely shared across frames yet re-stored per point.
+- **Chromatogram time:** one f64 per point in `TimeArray` in `chromatograms_data.parquet` —
+  [main.rs:2361](src/main.rs:2361) (`synth_chromatogram`). A time axis shared by many
+  traces is re-stored per trace.
+
+Opportunity: once #11's grid facet exists, store a shared low-res axis **once** as a
+materialized grid and reference it by grid ID from many entities — compact storage for
+many chromatographic traces / XICs (and a natural home for SRM/MRM transitions if we add
+them), plus dedup of the 1/K0 ramp. New writer/reader paths for the materialized form.
+
+**But for ion mobility specifically, #13 measured this and the answer is: don't.**
+
+## #13 — Measured: a materialized grid for timsTOF ion mobility saves ~nothing ✅ (analysis)
+
+Josh's follow-up claim: "ion mobility is so low in resolution compared to m/z that we do
+not actually need to do anything special. Parquet's RLE_DICTIONARY effectively does this
+[a materialized grid] while adaptively selecting the smallest index size… DELTA_BINARY_PACKED
+could squeeze a little more from long monotonic runs [but] ion mobility lacks this when it
+is a tertiary sorting dimension." Measured on real timsTOF (SBA415 `.d`, 400 frames →
+3,008,870 peaks, ims-compact peaks facet). **He is right on every point.**
+
+**The 1/K0 column (`mean_inverse_reduced_ion_mobility`, f64):**
+
+| encoding of the SAME data (ZSTD) | size | note |
+|---|---|---|
+| f64 + dictionary (**what we ship — Parquet auto-picks RLE_DICTIONARY**) | **405 KB** | |
+| f64 PLAIN | 551 KB | dict already saves 27% over this, for free |
+| f64 BYTE_STREAM_SPLIT | 2,495 KB | wrong tool for low cardinality |
+| **materialized grid** (uint16 index + one 718-value table) | **406 KB** | **+0.3% — i.e. 1.2 KB *worse*** |
+| materialized grid, DELTA-packed index | 474 KB | worse (IM non-monotonic as tertiary dim — as Josh predicted) |
+
+- Cardinality is **718 distinct 1/K0 over 3.0M points (0.024%)** — the mobility scan count,
+  fixed by the instrument regardless of run length, so this ratio only gets more extreme on
+  bigger runs.
+- A materialized grid **is** RLE_DICTIONARY: the dictionary page already holds the 718
+  distinct values (the "grid"), the data page holds the indices. Building it by hand just
+  reimplements dictionary encoding and adds a read-time join, for **0% gain**.
+- Stakes are tiny anyway: the whole mobility column is **3.9% of the peaks facet**; deleting
+  it outright would shrink the file <4%.
+- **Decision: do nothing special for ion mobility.** Keep the plain f64 column; let Parquet
+  pick the encoding (it picks RLE_DICTIONARY). Scope #12's materialized-grid work to *time*
+  axes (many chromatographic traces), not IM.
+
+**"How much does our byte-packed (int `tof`) representation save on top of that?"** — also
+less than intuition suggests, and for the same reason:
+
+| `tof` axis representation (ZSTD) | size | |
+|---|---|---|
+| int32 dictionary | 5.56 MB | smallest |
+| **int32 DELTA_BINARY_PACKED (what we ship)** | **6.18 MB** | |
+| f64 m/z `(a+b·tof)²` dictionary | 5.74 MB | ≈ int32 dict (±3%) |
+| f64 m/z PLAIN | 9.45 MB | |
+| f64 m/z BYTE_STREAM_SPLIT | 17.75 MB | |
+
+- Real timsTOF m/z has only **~40k distinct values** (it *is* a tof grid), so under dictionary
+  encoding the int-vs-float width advantage nearly vanishes: byte-packed int32 (5.56 MB) vs
+  best f64 m/z (5.74 MB) is a **~3%** difference. The big wins (41% vs f64 PLAIN, 69% vs BSS)
+  only exist against *un*-dictionaried float storage. **So ims-compact's real value is
+  losslessness (bit-exact integer grid), not size — its size ≈ dictionary-encoded f64 m/z.**
+- **Side finding (actionable):** our `tof` column ships as DELTA_BINARY_PACKED (6.18 MB) but
+  plain dictionary on the same int32 is **5.56 MB (~10% smaller)** — cross-scan tof resets
+  make the deltas noisy; the 40k-value grid dictionaries better. `tof` is 58% of the peaks
+  facet, so letting Parquet choose (or forcing dictionary) on that column is ~6% off the
+  whole facet, on every timsTOF file. Low-risk encoding tweak in the vendored writer; verify
+  it doesn't regress non-IM datasets first.
+
+Net: ion-mobility grid work is unjustified; the only real lever here is the `tof` column
+encoding choice (DELTA → dictionary).
