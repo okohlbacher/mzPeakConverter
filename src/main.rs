@@ -273,6 +273,10 @@ struct Settings {
     no_numpress: bool,
     chunk_size: f64,
     zstd_level: i32,
+    /// zstd level for the byte-plane timsTOF ims-compact path. Defaults to 5 (the measured plateau —
+    /// higher levels add time, not compression) rather than the general default of 3; an explicit
+    /// `--zstd-level` still wins.
+    ims_zstd_level: i32,
     force: bool,
     no_ims_compact: bool,
     bruker_sdk: bool,
@@ -306,6 +310,7 @@ impl Settings {
             no_numpress: cli.no_numpress || fc.no_numpress.unwrap_or(false),
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
             zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(3),
+            ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(5),
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
@@ -445,7 +450,7 @@ fn run(cli: &Cli) -> Result<i32> {
         convert_via_msconvert(&cli.input, &output, chunk, cfg.zstd_level, cfg.msconvert_path.as_deref(), cfg.chromatograms, cfg.tof_grid)
             .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
     } else if use_sdk_ims_compact {
-        convert_ims_compact_sdk(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
+        convert_ims_compact_sdk(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms)
             .with_context(|| format!("SDK ims-compact converting {}", cli.input.display()))?;
     } else if use_bruker_sdk {
         convert_bruker_sdk(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms)
@@ -456,7 +461,7 @@ fn run(cli: &Cli) -> Result<i32> {
         // fall back to the mzdata reader interface (f64 m/z), which decodes those files. mzdata may
         // silently drop a truly-undecodable frame, so the fallback is loud. (Backlog: fix timsrust /
         // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
-        match convert_ims_compact_archive(&cli.input, &output, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration) {
+        match convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration) {
             Ok(()) => {}
             Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
                 log::warn!(
@@ -1666,7 +1671,7 @@ where
         .add_field(intensity_field)
         .add_field(mob_field);
 
-    let builder = MzPeakWriterType::<fs::File>::builder()
+    let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
             curie!(MS:1000294),
@@ -1674,6 +1679,16 @@ where
             DataType::Boolean,
         ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
+    // Peak-facet row-group size (rows) = the per-chunk zstd granularity. Smaller = finer random
+    // access (fewer peaks to decompress per frame) but worse compression; default is parquet's 2^20.
+    // Tunable via $MZPC_ROW_GROUP_ROWS for benchmarking the size/random-access tradeoff.
+    if let Some(n) = std::env::var("MZPC_ROW_GROUP_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        builder = builder.row_group_size(Some(n));
+    }
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
 
