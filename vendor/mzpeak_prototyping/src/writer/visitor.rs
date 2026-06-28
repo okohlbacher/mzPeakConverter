@@ -1859,23 +1859,23 @@ impl SpectrumDetailsBuilder {
         // Observed-m/z range. Normally derived from the m/z data array, but grid / ims-compact
         // spectra REPLACE the m/z array with an integer tof/tof_index axis, so the data-derived
         // range collapses to (0,0). In that case, fall back to the explicit MS:1000528 / MS:1000527
-        // params the converter set on the description from the reconstructed m/z (B.3). Without this
-        // the viewer shows "m/z 0–0" for those files.
-        let (mut lo_mz, mut hi_mz) = summaries.mz_range;
-        if !(lo_mz > 0.0) || !(hi_mz > 0.0) {
-            if let Some(p) = item.get_param_by_curie(&curie!(MS:1000528)) {
-                if let Ok(v) = p.to_f64() {
-                    lo_mz = v;
-                }
-            }
-            if let Some(p) = item.get_param_by_curie(&curie!(MS:1000527)) {
-                if let Ok(v) = p.to_f64() {
-                    hi_mz = v;
-                }
-            }
-        }
-        self.lowest_observed_mz.append_value(lo_mz);
-        self.highest_observed_mz.append_value(hi_mz);
+        // params the converter set on the description from the reconstructed m/z (B.3). An EMPTY
+        // spectrum (no peaks — e.g. newer-timsTOF blank frames) has NEITHER, so write NULL rather
+        // than 0.0: a literal observed m/z of 0 would drag the file-level lowest-observed-m/z to 0
+        // and mislabel a non-observation as a measurement.
+        let (data_lo, data_hi) = summaries.mz_range;
+        let lo_mz = if data_lo > 0.0 {
+            Some(data_lo)
+        } else {
+            item.get_param_by_curie(&curie!(MS:1000528)).and_then(|p| p.to_f64().ok()).filter(|v| *v > 0.0)
+        };
+        let hi_mz = if data_hi > 0.0 {
+            Some(data_hi)
+        } else {
+            item.get_param_by_curie(&curie!(MS:1000527)).and_then(|p| p.to_f64().ok()).filter(|v| *v > 0.0)
+        };
+        self.lowest_observed_mz.append_option(lo_mz);
+        self.highest_observed_mz.append_option(hi_mz);
 
         self.base_peak_mz.append_option(base_peak_mz);
         self.base_peak_intensity.append_option(base_peak_intensity);
