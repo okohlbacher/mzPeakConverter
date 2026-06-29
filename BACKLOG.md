@@ -485,3 +485,56 @@ Two linked items surfaced by the IM benchmark (timsTOF SCP, PXD078573, acq softw
    takes `&timsrust::Frame`, so the data is in hand; it's a don't-throw-it-away change. (timsrust
    stays transitively — mzdata depends on it — but our direct calls go away.) Pairs with the
    `with_raw_tof` idea in NATIVE-TOF-DESIGN.md.
+
+---
+
+# Performance (from deep perf research, 2026-06-29)
+
+Converter is **single-threaded end-to-end within a unit** (read → encode → zstd → write on one
+thread). `JOBS=N` parallelizes across units but does nothing for the big-file tail (a 3 GB Astral
+`.raw` ~8–15 min / a 10 GB `.d`, each pinning one core). No `thread::`/`rayon`/parallel-parquet
+anywhere. Ranked by impact × 1/effort:
+
+## #17 — Add release `[profile]` (LTO + codegen-units=1 + panic=abort) 🟢 quick win
+`Cargo.toml` has NO `[profile.release]`; vendored crate sets `debug=true` (bloats binary, no speed).
+Add `lto="thin"`, `codegen-units=1`, `panic="abort"` to `Cargo.toml`; drop `debug=true` from
+`vendor/mzpeak_prototyping/Cargo.toml`. Also `RUSTFLAGS=-C target-cpu=native` for self-built corpus
+runs (AVX2 for zstd/BSS/delta loops). **Impact: medium (5–20%, all formats) · Effort: trivial · Risk: none.**
+
+## #18 — Pipeline-parallelize convert via a bounded channel (reader → encode/compress thread)
+Split the `write_spectrum` loop (`main.rs:1560`, `:1961`) into a `Send` producer + single consumer
+thread owning the writer, bounded channel for backpressure, so read overlaps encode+zstd. Scope to
+native-TDF + mzML first (Bruker-SDK reader is `!Send` `bruker_sdk.rs:325`; Thermo is interop-bound).
+**Impact: high (1.4–1.8× on TDF/mzML) · Effort: medium · Risk: low (single consumer = deterministic order).**
+
+## #19 — Data-parallel timsTOF frame decode (rayon)
+Frames are independent zstd blobs (`bruker_native.rs:187`); decode+transform on a rayon pool with a
+bounded reorder window, feeding the writer in index order. Kills the single-core `.d` tail. timsrust
+already pulls rayon; `FrameReader::get(i)` is thread-safe random access.
+**Impact: high (3–6× on read/transform for big `.d`) · Effort: medium · Risk: memory+ordering (bounded by window).**
+
+## #20 — Parallel parquet row-group encoding in the vendored writer
+Replace single `ArrowWriter::write` with `ArrowColumnWriter`/`get_column_writers` to encode+compress
+row groups concurrently, then `append_row_group` in order — moves zstd off the critical path, stacks
+with #18/#19. Touches the locked vendored writer (`writer.rs`, `base.rs`); do AFTER #18 proves out.
+**Impact: high (compress-bound paths) · Effort: high · Risk: writer-contract + determinism.**
+(Note: multithreaded zstd via `with_workers` is NOT reachable through `parquet::Compression::ZSTD` —
+skip it; the level knob `--zstd-level` is the only zstd lever, and L5 already plateaus per
+[[zstd-level-5-timstof]]. Lowering level trades a few % size for compress speed on CPU-bound runs.)
+
+## #21 — Collapse Thermo's 3 extra metadata passes into one shared handle
+Trailers/status/wide-trailer each re-`open()` the `.raw` (`main.rs:2098-2129`) and loop
+`get_raw_trailers_for(i)` per spectrum (`thermo_trailers.rs:33`). Share one `RawFileReader` across
+facets (ideally fold trailers into the main spectrum pass). The only easy Thermo win — the main read
+is .NET-interop-locked and can't be parallelized across the boundary.
+**Impact: low-medium (Thermo tail) · Effort: low · Risk: low (metadata-only).**
+
+## #22 — Avoid the full-file Latin-1 transcode rewrite
+`transcode_to_utf8` does `fs::read` whole file → decode → `fs::write` temp (`main.rs:1742`) before
+conversion — extra read+write pass for Latin-1 imzML (DESI set). Replace with a streaming
+transcoding `Read` adapter handed to mzdata instead of materializing a temp file.
+**Impact: low (DESI set only, ~2× I/O for those) · Effort: medium · Risk: low.**
+
+## #23 — Agilent MHDAC glue: loader/project architecture mismatch (Agilent .d blocked)
+`src/agilent.rs` loads the glue via `netcorehost` → `initialize_for_runtime_config(AgilentGlue.runtimeconfig.json)`, i.e. it expects a **.NET-core** `AgilentGlue.dll` + `AgilentGlue.runtimeconfig.json` in `$MZPC_AGILENT_GLUE`. But `glue/agilent/AgilentGlue.csproj` is `OutputType=Exe`, `TargetFramework=net48`, `AssemblyName=AgilentGlueHost` → it builds a **net48 `AgilentGlueHost.exe`** (subprocess host, no runtimeconfig). The two halves are different designs, so MHDAC Agilent `.d` fails with "Agilent glue runtimeconfig not found" no matter how the box is built (confirmed 2026-06-29 on the flash box after installing the .NET SDK + a clean `dotnet build` that produced only `AgilentGlueHost.exe`). MHDAC is .NET-Framework-only, so the net48 host is the realistic target — the FIX is to reconcile `agilent.rs` to the subprocess model (spawn `AgilentGlueHost.exe` over its stdio/IPC) OR add a net-core `AgilentGlue` shim project that netcorehost can host and which in turn drives the net48 host. Until then, Agilent `.d` units (corpus: `tof-grid-examples/MSV000094882`, `vendor-agilent-sciex/agilent`, `ims-examples/agilent-6560-dtims`) are BOX-DEFERRED-but-failing; `--via-msconvert` is the only working path. (Box now HAS the .NET SDK 8 installed, so once the project is fixed it builds cleanly.)
+*Impact: medium (unblocks all Agilent .d) · Effort: medium (IPC/host reconciliation) · Risk: medium*
