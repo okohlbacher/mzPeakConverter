@@ -538,3 +538,15 @@ transcoding `Read` adapter handed to mzdata instead of materializing a temp file
 ## #23 — Agilent MHDAC glue: loader/project architecture mismatch (Agilent .d blocked)
 `src/agilent.rs` loads the glue via `netcorehost` → `initialize_for_runtime_config(AgilentGlue.runtimeconfig.json)`, i.e. it expects a **.NET-core** `AgilentGlue.dll` + `AgilentGlue.runtimeconfig.json` in `$MZPC_AGILENT_GLUE`. But `glue/agilent/AgilentGlue.csproj` is `OutputType=Exe`, `TargetFramework=net48`, `AssemblyName=AgilentGlueHost` → it builds a **net48 `AgilentGlueHost.exe`** (subprocess host, no runtimeconfig). The two halves are different designs, so MHDAC Agilent `.d` fails with "Agilent glue runtimeconfig not found" no matter how the box is built (confirmed 2026-06-29 on the flash box after installing the .NET SDK + a clean `dotnet build` that produced only `AgilentGlueHost.exe`). MHDAC is .NET-Framework-only, so the net48 host is the realistic target — the FIX is to reconcile `agilent.rs` to the subprocess model (spawn `AgilentGlueHost.exe` over its stdio/IPC) OR add a net-core `AgilentGlue` shim project that netcorehost can host and which in turn drives the net48 host. Until then, Agilent `.d` units (corpus: `tof-grid-examples/MSV000094882`, `vendor-agilent-sciex/agilent`, `ims-examples/agilent-6560-dtims`) are BOX-DEFERRED-but-failing. **`--via-msconvert` does NOT work either** — the box's ProteoWizard fails with `[ReaderFail]` (no working Agilent MHDAC reader in that pwiz build), confirmed 2026-06-29. So BOTH paths are dead on the box; the real fix is reconciling the glue OR installing a pwiz with MHDAC. (Box now HAS the .NET SDK 8 installed, so once the project is fixed it builds cleanly.)
 *Impact: medium (unblocks all Agilent .d) · Effort: medium (IPC/host reconciliation) · Risk: medium*
+
+## #23 update (2026-06-29): the corpus Alexander_023 .d is INCOMPLETE — orthogonal to the glue
+Investigated the one failing Agilent unit (`tof-grid-examples/MSV000094882/Alexander_023…d`). Root
+cause is NOT the glue mismatch and NOT the box: the `.d` is **metadata-only (1.4 MB)** — `AcqData/`
+has the LC method / pump traces / instrument config (`AcqMethod.xml`, `BinPump1.cg`, …) but **no MS
+data** (`MSProfile.bin`/`MSScan.bin`/`MSPeak.bin` absent). msconvert `[ReaderFail]` is correct —
+nothing to read. **Fix = re-download the complete `.d` from MassIVE MSV000094882**, then convert.
+Confirmed the box DOES have the Agilent MHDAC reader (FLASHApp pwiz `vendor_api/Agilent/MassSpecDataReader.dll`).
+Also fixed `tools/box_convert_remote.ps1` to pin `$MSCONVERT_PATH` to that pwiz's `msconvert.exe` so
+`--via-msconvert` uses the vendor-enabled build (else it grabbed a no-vendor msconvert on PATH →
+`[ReaderFail]` for ALL vendor formats). The #23 glue loader/project mismatch remains a real latent bug
+for *complete* Agilent `.d` via the native path, but it is not what blocks this corpus unit.

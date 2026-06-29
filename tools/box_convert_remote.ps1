@@ -18,6 +18,9 @@ if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE 
 if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
 $env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent loads from $pwiz/vendor_api/Agilent
+# --via-msconvert resolves msconvert via $MSCONVERT_PATH; pin it to THIS pwiz so it has the bundled
+# vendor readers (vendor_api/Agilent etc.) — else it grabs a msconvert on PATH that lacks them ([ReaderFail]).
+if (Test-Path "$pwiz/msconvert.exe") { $env:MSCONVERT_PATH = (Join-Path $pwiz 'msconvert.exe') }
 if (Test-Path "$pwiz/timsdata.dll") { $env:TIMSDATA_LIB_DIR = $pwiz }   # --bruker-sdk loads timsdata.dll from pwiz-bin
 if (Test-Path 'C:\Users\User\box_convert_env.ps1') { . 'C:\Users\User\box_convert_env.ps1' }
 
