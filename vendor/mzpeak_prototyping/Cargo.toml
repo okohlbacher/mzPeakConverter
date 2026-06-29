@@ -103,4 +103,5 @@ serde_arrow = { version = "0.13.7", features = ["arrow-57"] }
 rstest = "0.26.1"
 
 [profile.release]
-debug = true
+# (Profiles only take effect from the root manifest; this is here for standalone builds of the
+# vendored crate. debug symbols dropped — see the converter's root [profile.release].)

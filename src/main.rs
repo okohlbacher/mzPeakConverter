@@ -1859,6 +1859,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// the `ims_calibration` index. Used by BOTH the native timsrust path and the Bruker-SDK path —
 /// they yield the same integer-tof `MultiLayerSpectrum`, just from different decoders. `model_a/b`
 /// are the `m/z = (a + b·tof)²` coefficients.
+// Live on Windows/Linux (the SDK reader path); dead on macOS where that path is cfg'd out.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 fn write_ims_compact_archive<F>(
     input: &Path,
     output: &Path,
@@ -1868,10 +1870,68 @@ fn write_ims_compact_archive<F>(
     model_a: f64,
     model_b: f64,
     n_total: usize,
-    mut spectrum: F,
+    spectrum: F,
 ) -> Result<()>
 where
     F: FnMut(usize, bool) -> Result<MultiLayerSpectrum>,
+{
+    // Serial driver: SDK reader is !Send/!Sync, so its decode must stay single-threaded. The unused
+    // `Parallel` arm is pinned to a fn-pointer type so inference has a concrete `P`.
+    type ParPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
+    write_ims_compact_archive_impl::<F, ParPlaceholder>(
+        input, output, zstd_level, vendor, synth_chroms, model_a, model_b, n_total,
+        Driver::Serial(spectrum),
+    )
+}
+
+/// #19: native (timsrust) ims-compact with PARALLEL frame decode. Identical output to the serial
+/// path (writes in strict index order); only the decode is fanned across cores. The closure must be
+/// `Fn + Sync` (timsrust's mmap-backed reader is thread-safe random access).
+fn write_ims_compact_archive_parallel<F>(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+    model_a: f64,
+    model_b: f64,
+    n_total: usize,
+    spectrum: F,
+) -> Result<()>
+where
+    F: Fn(usize, bool) -> Result<MultiLayerSpectrum> + Sync,
+{
+    type SerPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
+    write_ims_compact_archive_impl::<SerPlaceholder, F>(
+        input, output, zstd_level, vendor, synth_chroms, model_a, model_b, n_total,
+        Driver::Parallel(spectrum),
+    )
+}
+
+/// Decode strategy for the shared ims-compact writer: serial (`FnMut`, for the !Sync SDK reader) or
+/// parallel (`Fn + Sync`, for the thread-safe native timsrust reader). Both write spectra in strict
+/// index order, so the two produce byte-identical archives.
+enum Driver<S, P> {
+    // `Serial` is only constructed on the Windows/Linux SDK path.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+    Serial(S),
+    Parallel(P),
+}
+
+fn write_ims_compact_archive_impl<S, P>(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+    model_a: f64,
+    model_b: f64,
+    n_total: usize,
+    mut driver: Driver<S, P>,
+) -> Result<()>
+where
+    S: FnMut(usize, bool) -> Result<MultiLayerSpectrum>,
+    P: Fn(usize, bool) -> Result<MultiLayerSpectrum> + Sync,
 {
     if n_total == 0 {
         bail!("no frames in {}", input.display());
@@ -1958,12 +2018,77 @@ where
 
     let mut ms1 = Ms1Chroms::default();
     let n_frames = max_spectra().map_or(n_total, |m| m.min(n_total));
-    for i in 0..n_frames {
-        let spec = spectrum(i, int_intensity)?;
-        if synth_chroms {
-            ms1.observe(&spec);
+    match &mut driver {
+        Driver::Serial(spectrum) => {
+            for i in 0..n_frames {
+                let spec = spectrum(i, int_intensity)?;
+                if synth_chroms {
+                    ms1.observe(&spec);
+                }
+                writer.write_spectrum(&spec)?;
+            }
         }
-        writer.write_spectrum(&spec)?;
+        Driver::Parallel(spectrum) => {
+            // #19 + #18: decode frames in parallel (timsrust's mmap-backed `FrameReader::get` is
+            // thread-safe random access) AND overlap that decode with the single-threaded
+            // encode/compress/write. A dedicated WRITER THREAD owns `writer` + `ms1` and pulls
+            // spectra off a bounded channel in the exact order they are sent; the producer decodes a
+            // bounded reorder window of frames in parallel (`into_par_iter().collect::<Vec>()`
+            // preserves index order) and sends them in strict index order. Single consumer + ordered
+            // send => spectra are written in the same order as the serial path => byte-identical
+            // output. The bounded channel + window cap memory. Empty frames (NumPeaks=0) decode to an
+            // empty spectrum exactly as serial. MZPC_DECODE_WINDOW overrides the window
+            // (0/unset => default = 8× the rayon thread count, capped at 128 — past which the
+            // bounded channel/window stops helping and just costs memory).
+            use rayon::prelude::*;
+            let window = std::env::var("MZPC_DECODE_WINDOW")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&w| w > 0)
+                .unwrap_or_else(|| (rayon::current_num_threads() * 8).clamp(1, 128));
+            // Bounded channel: at most `window` decoded spectra buffered between decode and write, so
+            // a slow writer back-pressures the decoder (and vice versa) without unbounded memory.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<MultiLayerSpectrum>(window);
+            // The writer thread owns writer+ms1 and returns them (or the first write error) on join.
+            let writer_thread = std::thread::spawn(move || -> Result<(MzPeakWriterType<fs::File>, Ms1Chroms)> {
+                while let Ok(spec) = rx.recv() {
+                    if synth_chroms {
+                        ms1.observe(&spec);
+                    }
+                    writer.write_spectrum(&spec)?;
+                }
+                Ok((writer, ms1))
+            });
+            // Producer: parallel-decode each window, then send in strict index order. On any decode
+            // error, drop tx (closes the channel) and surface the error after joining the writer.
+            let produce = || -> Result<()> {
+                let mut i = 0usize;
+                while i < n_frames {
+                    let end = (i + window).min(n_frames);
+                    let batch: Vec<Result<MultiLayerSpectrum>> =
+                        (i..end).into_par_iter().map(|j| spectrum(j, int_intensity)).collect();
+                    for spec in batch {
+                        // A send error means the writer thread died (write error) — stop producing;
+                        // the real error comes back from the join below.
+                        if tx.send(spec?).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    i = end;
+                }
+                Ok(())
+            };
+            let produce_result = produce();
+            drop(tx); // close channel so the writer thread's recv loop ends
+            let joined = writer_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("ims-compact writer thread panicked"))?;
+            // Surface a decode error first (it may be why the writer stopped), then a write error.
+            produce_result?;
+            let (w, m) = joined?;
+            writer = w;
+            ms1 = m;
+        }
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
@@ -1999,7 +2124,8 @@ fn convert_ims_compact_archive(
 ) -> Result<()> {
     let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
     let (a, b, n) = (reader.model.a, reader.model.b, reader.len());
-    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, n, |i, int| {
+    // The native reader is Sync (mmap-backed timsrust FrameReader), so decode frames in parallel.
+    write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, n, |i, int| {
         reader.ims_compact_spectrum(i, int)
     })
 }
@@ -2096,7 +2222,17 @@ fn is_thermo_raw(input: &Path) -> bool {
 /// Build + embed the Thermo `vendor_scan_trailers.parquet` proprietary facet (Track 2). Best-effort:
 /// a trailer-read failure is logged but does not abort the (already-written) conversion.
 fn embed_thermo_trailers(zip: &mut ZipArchiveWriter<fs::File>, input: &Path) -> Result<()> {
-    match thermo_trailers::build_trailer_facet(input) {
+    // #21: open the Thermo RawFileReader ONCE and share it across all three metadata facets, instead
+    // of re-opening (re-spinning the .NET RawFileReader) three times. A failure to open is fatal for
+    // every facet, so report it once and skip them all (matching the prior per-facet warn behavior).
+    let handle = match thermorawfilereader::RawFileReader::open(input) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("skipping Thermo vendor metadata facets (open failed): {e}");
+            return Ok(());
+        }
+    };
+    match thermo_trailers::build_trailer_facet(&handle) {
         Ok(Some(bytes)) => {
             let fe = mzpeak_prototyping::archive::FileEntry::new(
                 "vendor_scan_trailers.parquet".to_string(),
@@ -2117,7 +2253,7 @@ fn embed_thermo_trailers(zip: &mut ZipArchiveWriter<fs::File>, input: &Path) -> 
             mzpeak_prototyping::archive::DataKind::Proprietary,
         )
     };
-    match thermo_status::build_status_log_facet(input) {
+    match thermo_status::build_status_log_facet(&handle) {
         Ok(Some(bytes)) => {
             zip.add_file_from_read(&mut std::io::Cursor::new(bytes), None::<&String>, Some(proprietary("vendor_status_log.parquet")))
                 .context("embedding vendor_status_log.parquet")?;
@@ -2126,7 +2262,7 @@ fn embed_thermo_trailers(zip: &mut ZipArchiveWriter<fs::File>, input: &Path) -> 
         Ok(None) => log::debug!("no Thermo status logs to embed"),
         Err(e) => log::warn!("skipping Thermo status-log facet: {e:#}"),
     }
-    match thermo_status::build_trailer_wide_facet(input) {
+    match thermo_status::build_trailer_wide_facet(&handle) {
         Ok(Some(bytes)) => {
             zip.add_file_from_read(&mut std::io::Cursor::new(bytes), None::<&String>, Some(proprietary("vendor_scan_trailers_wide.parquet")))
                 .context("embedding vendor_scan_trailers_wide.parquet")?;

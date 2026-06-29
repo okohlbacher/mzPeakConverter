@@ -14,7 +14,6 @@
 //! Values are captured verbatim; numeric coercion is a convenience, never a reinterpretation.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -45,9 +44,7 @@ fn write_parquet(schema: Arc<Schema>, batch: RecordBatch, ctx: &'static str) -> 
 /// status logs. Tall layout: one row per (status channel × sample). `position` is the sample index
 /// within its channel, `rt` the retention time, `label` the channel name, `value` the verbatim
 /// stringified reading, and `value_float` the numeric reading when the channel is numeric.
-pub fn build_status_log_facet(raw_path: &Path) -> Result<Option<Vec<u8>>> {
-    let handle = RawFileReader::open(raw_path)
-        .map_err(|e| anyhow::anyhow!("opening {} for status logs: {e}", raw_path.display()))?;
+pub fn build_status_log_facet(handle: &RawFileReader) -> Result<Option<Vec<u8>>> {
     let Some(logs) = handle.get_status_logs() else {
         return Ok(None);
     };
@@ -156,9 +153,7 @@ fn sanitize_label(label: &str) -> String {
 /// has no trailers. Wide layout: one row per spectrum ordinal, one TYPED column per distinct trailer
 /// label. A column is Float64 when every present value parses as f64, otherwise Utf8. Column names
 /// are the sanitized labels (collisions disambiguated with a numeric suffix).
-pub fn build_trailer_wide_facet(raw_path: &Path) -> Result<Option<Vec<u8>>> {
-    let handle = RawFileReader::open(raw_path)
-        .map_err(|e| anyhow::anyhow!("opening {} for wide trailers: {e}", raw_path.display()))?;
+pub fn build_trailer_wide_facet(handle: &RawFileReader) -> Result<Option<Vec<u8>>> {
     let n = handle.len();
 
     // Pass 1: collect, per spectrum, the verbatim value for each distinct label (first occurrence

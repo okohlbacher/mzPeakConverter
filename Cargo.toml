@@ -1,6 +1,6 @@
 [package]
 name = "mzpeak-convert"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 # MSRV floor inherited from mzpeak_prototyping (stdlib APIs stabilized in 1.87).
 rust-version = "1.87"
@@ -53,6 +53,9 @@ tiff = { version = "=0.11.3", default-features = false }
 sha2 = "0.10"
 
 clap = { version = "4", features = ["derive"] }
+# Parallel timsTOF frame decode (#19). Already in the tree transitively (timsrust pulls it); declared
+# here so the ims-compact writer can fan frame decode across cores. Pinned to the transitive version.
+rayon = "1"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
@@ -64,3 +67,13 @@ env_logger = "0.11"
 # In-process .NET hosting for the native Agilent (MHDAC) / SciEX (Clearcore2) glue — Windows only.
 [target.'cfg(windows)'.dependencies]
 netcorehost = "0.18"
+
+# Release profile tuned for the batch-CLI converter (#17). thin-LTO + a single codegen unit let the
+# optimizer inline across crate boundaries (mzdata/timsrust/parquet hot loops); panic=abort drops the
+# unwind tables (the converter is a fail-fast batch tool, nothing catches unwinds). Output is
+# byte-identical — these flags change codegen, not behavior. `cargo test` keeps unwind automatically
+# (Cargo forces panic=unwind for the test/bench profiles, so #[should_panic] still works).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

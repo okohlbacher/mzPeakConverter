@@ -7,7 +7,6 @@
 //! (tall: ordinal, label, value verbatim, value_float when numeric). This is the converter-side of
 //! the raw-verbatim-metadata model; values are captured verbatim, never reinterpreted.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -21,10 +20,9 @@ use parquet::file::properties::WriterProperties;
 use thermorawfilereader::RawFileReader;
 
 /// Build the `vendor_scan_trailers.parquet` bytes for a Thermo `.raw`, or `None` if the file has no
-/// trailers. Tall layout: one row per (spectrum ordinal × trailer label).
-pub fn build_trailer_facet(raw_path: &Path) -> Result<Option<Vec<u8>>> {
-    let handle = RawFileReader::open(raw_path)
-        .map_err(|e| anyhow::anyhow!("opening {} for trailers: {e}", raw_path.display()))?;
+/// trailers. Tall layout: one row per (spectrum ordinal × trailer label). Takes a shared, already-open
+/// reader (#21) so the three Thermo metadata facets don't each re-open (re-spin the .NET RawFileReader).
+pub fn build_trailer_facet(handle: &RawFileReader) -> Result<Option<Vec<u8>>> {
     let n = handle.len();
 
     let (mut ordinals, mut labels, mut values, mut floats) =
