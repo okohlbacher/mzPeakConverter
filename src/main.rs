@@ -747,13 +747,28 @@ fn convert_via_msconvert(
     fs::create_dir_all(&tmpdir).with_context(|| format!("creating {}", tmpdir.display()))?;
     let mzml = tmpdir.join("via_msconvert.mzML");
 
+    let mzcvt_log = tmpdir.join("msconvert.log");
     let mut cmd = Command::new(&exe);
     cmd.arg(input)
         .arg("--mzML")
+        // #1: newer SCIEX (ZenoTOF 7600, newer TripleTOF) report an instrument-model string that
+        // ProteoWizard's hand-curated `Reader_ABI` model map doesn't recognize yet; without this the
+        // reader THROWS on the run and no mzML is written (msconvert may still exit 0 → we'd bail
+        // "produced no mzML", or exit 1). msconvert itself recommends this exact flag ("use the
+        // ignoreUnknownInstrumentError flag"). Benign on recognized instruments (they don't hit the
+        // fallback), so it's safe to pass unconditionally.
+        .arg("--ignoreUnknownInstrumentError")
         .arg("--outdir")
         .arg(&tmpdir)
         .arg("--outfile")
         .arg("via_msconvert.mzML");
+    // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
+    // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
+    if let Ok(f) = fs::File::create(&mzcvt_log) {
+        if let Ok(f2) = f.try_clone() {
+            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
+        }
+    }
     let status = cmd.status().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             anyhow::anyhow!(
@@ -765,13 +780,27 @@ fn convert_via_msconvert(
             anyhow::anyhow!("running msconvert: {e}")
         }
     })?;
+    // #3: on any failure, include the tail of msconvert's own output so the error is self-diagnosing.
+    let msconvert_tail = || -> String {
+        fs::read_to_string(&mzcvt_log)
+            .ok()
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                lines[lines.len().saturating_sub(15)..].join("\n")
+            })
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
+            .unwrap_or_default()
+    };
     if !status.success() {
+        let t = msconvert_tail();
         let _ = fs::remove_dir_all(&tmpdir);
-        bail!("msconvert failed (exit {:?})", status.code());
+        bail!("msconvert failed (exit {:?}){}", status.code(), t);
     }
     if !mzml.exists() {
+        let t = msconvert_tail();
         let _ = fs::remove_dir_all(&tmpdir);
-        bail!("msconvert reported success but produced no mzML at {}", mzml.display());
+        bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), t);
     }
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
