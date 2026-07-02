@@ -134,7 +134,16 @@ pub fn array_map_to_schema_arrays_and_excess(
 
         fields.push(fieldref.clone());
 
-        let array: ArrayRef = data_array_to_arrow_array(&buffer_name, v)?;
+        let mut array: ArrayRef = data_array_to_arrow_array(&buffer_name, v)?;
+        // #2 (precision coercion): a source spectrum may encode a logical array at a different
+        // precision than the facet's single column for that array (e.g. f64 intensity from an
+        // undecoded raw-centroid spectrum, while the column is the f32 primary). Coerce the built
+        // array to the adopted column's dtype so it lands in the one canonical column instead of
+        // failing record-batch assembly. Widening (f32->f64 m/z) is lossless; narrowing to the
+        // format's convention precision (f64->f32 intensity) matches the declared column type.
+        if array.data_type() != fieldref.data_type() {
+            array = arrow::compute::cast(&array, fieldref.data_type()).unwrap_or(array);
+        }
 
         arrays.push(array);
     }

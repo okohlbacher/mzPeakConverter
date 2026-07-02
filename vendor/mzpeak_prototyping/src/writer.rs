@@ -338,6 +338,134 @@ pub fn sample_array_types_from_spectrum_source<
 
 }
 
+/// Backstop (Option E) for the spectra-peaks facet: drop any `point`-struct child column that is
+/// **100% null across the whole file** AND shares its `array_name` with another (populated) sibling.
+///
+/// The schema sampler can add an alternate-precision twin (e.g. an `intensity_f64` alongside the f32
+/// `intensity`, both `array_name = "intensity array"`) that the fixed-precision peak write path never
+/// fills. Such a null twin reusing a primary's `array_name` blanks the spectrum in readers that
+/// resolve arrays by `array_name` without honoring `buffer_priority`.
+///
+/// This runs AFTER the peak parquet is finished, so it never changes the write-time schema (which the
+/// point-layout write routing depends on) — it just rewrites the finished facet without the dead
+/// column. Detection is metadata-only (row-group null counts); the rewrite happens ONLY when a twin
+/// is actually present, so the common case pays nothing but a stats scan.
+fn prune_all_null_dup_point_columns(
+    mut peak_file: fs::File,
+) -> Result<fs::File, parquet::errors::ParquetError> {
+    use arrow::array::{Array, ArrayRef, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::io::Seek;
+
+    peak_file.rewind()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(peak_file.try_clone()?)?;
+    let arrow_schema = builder.schema().clone();
+    let pq_meta = builder.metadata().clone();
+
+    // The peak facet is a single top-level `point` struct; bail (leave untouched) on any other shape.
+    let Some((point_idx, point_field)) = arrow_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, f)| matches!(f.data_type(), DataType::Struct(_)))
+        .map(|(i, f)| (i, f.clone()))
+    else {
+        peak_file.rewind()?;
+        return Ok(peak_file);
+    };
+    let DataType::Struct(children) = point_field.data_type().clone() else { unreachable!() };
+    let n = children.len();
+    let total_rows = pq_meta.file_metadata().num_rows();
+
+    // Per-child null counts from row-group statistics (one struct => leaf columns align 1:1 with
+    // children, in order). If any stat is missing or the shape is unexpected, skip pruning entirely.
+    let mut null_counts = vec![0i64; n];
+    let mut have_stats = total_rows > 0;
+    'rg: for rg in pq_meta.row_groups() {
+        if rg.num_columns() != n {
+            have_stats = false;
+            break;
+        }
+        for (i, col) in rg.columns().iter().enumerate() {
+            match col.statistics().and_then(|s| s.null_count_opt()) {
+                Some(nc) => null_counts[i] += nc as i64,
+                None => {
+                    have_stats = false;
+                    break 'rg;
+                }
+            }
+        }
+    }
+
+    let array_name = |f: &Field| f.metadata().get("array_name").cloned();
+    let mut drop: Vec<usize> = Vec::new();
+    if have_stats {
+        for (i, ch) in children.iter().enumerate() {
+            if null_counts[i] != total_rows {
+                continue; // not all-null
+            }
+            let Some(an) = array_name(ch) else { continue };
+            // keep it unless a DIFFERENT, populated sibling already owns this array_name
+            let shadowed = children.iter().enumerate().any(|(j, o)| {
+                j != i && null_counts[j] != total_rows && array_name(o).as_deref() == Some(an.as_str())
+            });
+            if shadowed {
+                drop.push(i);
+            }
+        }
+    }
+    if drop.is_empty() {
+        peak_file.rewind()?;
+        return Ok(peak_file);
+    }
+    log::debug!(
+        "spectra_peaks: pruning {} all-null duplicate column(s): {:?}",
+        drop.len(),
+        drop.iter().map(|&i| children[i].name()).collect::<Vec<_>>()
+    );
+
+    // Rewrite the facet with the surviving children only.
+    let kept: Vec<usize> = (0..n).filter(|i| !drop.contains(i)).collect();
+    let kept_fields: Fields = kept.iter().map(|&i| children[i].clone()).collect();
+    let mut out_fields: Vec<_> = arrow_schema.fields().iter().cloned().collect();
+    out_fields[point_idx] = Arc::new(
+        Field::new(point_field.name(), DataType::Struct(kept_fields.clone()), point_field.is_nullable())
+            .with_metadata(point_field.metadata().clone()),
+    );
+    let out_schema = Arc::new(Schema::new_with_metadata(out_fields, arrow_schema.metadata().clone()));
+
+    let out = tempfile::tempfile()?;
+    let mut w = ArrowWriter::try_new(out.try_clone()?, out_schema.clone(), None)?;
+    if let Some(kvs) = pq_meta.file_metadata().key_value_metadata() {
+        for kv in kvs {
+            if kv.key != "ARROW:schema" {
+                w.append_key_value_metadata(kv.clone());
+            }
+        }
+    }
+    for batch in builder.build()? {
+        let batch = batch?;
+        let point = batch
+            .column(point_idx)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("point column is a struct");
+        let kept_arrays: Vec<ArrayRef> = kept.iter().map(|&i| point.column(i).clone()).collect();
+        let new_point = StructArray::new(kept_fields.clone(), kept_arrays, point.nulls().cloned());
+        let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+        cols[point_idx] = Arc::new(new_point);
+        let new_batch = arrow::record_batch::RecordBatch::try_new(out_schema.clone(), cols)
+            .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
+        w.write(&new_batch)?;
+    }
+    w.close()?;
+
+    let mut out = out;
+    out.rewind()?;
+    Ok(out)
+}
+
 /// Array type inference from inputs
 impl MzPeakWriterBuilder {
     /// Collect arrays fields from spectra in a [`RandomAccessSpectrumSource`] to prepare
@@ -967,7 +1095,10 @@ impl<
             let mut writer = self.archive_writer.take().unwrap().into_inner()?;
 
             if let Some(peak_file_writer) = self.spectrum_peaks_writer.take() {
-                let mut peak_file = peak_file_writer.finish()?;
+                let peak_file = peak_file_writer.finish()?;
+                // Option E backstop: drop any all-null column that duplicates a populated sibling's
+                // `array_name` (e.g. a spurious `intensity_f64` twin). No-op unless one is present.
+                let mut peak_file = prune_all_null_dup_point_columns(peak_file)?;
                 log::trace!("Copying peaks file into zip archive");
                 peak_file.rewind()?;
                 writer.add_file_from_read(

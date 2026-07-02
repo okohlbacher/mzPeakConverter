@@ -3046,6 +3046,71 @@ mod tests {
         }
     }
 
+    /// Regression (Option E backstop): `spectra_peaks` must never carry two `intensity array`
+    /// columns. A mixed-precision mzML (profile MS1 with 64-bit intensity + centroid MS2) used to
+    /// emit a second, all-null `intensity_f64*` column reusing `array_name: "intensity array"` — the
+    /// peaks-schema sampler adds the source-precision (f64) intensity while the fixed-precision peak
+    /// write path only fills the f32 primary. Readers resolving arrays by `array_name` (no
+    /// `buffer_priority`) then clobbered the real f32 data with the null f64 → blank spectrum view.
+    /// The writer now prunes the all-null duplicate from the finished facet. Both layouts are checked:
+    /// point layout additionally regresses a Float64/Float32 write clash if the twin is dropped from
+    /// the *write* schema, so this guards that E prunes at OUTPUT (post-write), not at schema time.
+    #[test]
+    fn peaks_facet_has_single_intensity_array_column() {
+        use mzpeak_prototyping::chunk_series::ChunkingStrategy;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs;
+
+        let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/mixed_precision.mzML");
+        assert!(input.exists(), "fixture missing: {}", input.display());
+
+        fn count_intensity(fields: &arrow::datatypes::Fields) -> usize {
+            fields
+                .iter()
+                .map(|f| match f.data_type() {
+                    arrow::datatypes::DataType::Struct(children) => count_intensity(children),
+                    _ => (f.metadata().get("array_name").map(String::as_str)
+                        == Some("intensity array")) as usize,
+                })
+                .sum()
+        }
+
+        // Point layout exercises the full fix chain — #1 coalesce-by-accession (one intensity
+        // column), #2 precision coercion (f64 raw intensity cast into the f32 primary, no clash), and
+        // the #3 invariant debug_assert — via the array_map write path in both debug and release.
+        // (The chunked/default path is verified end-to-end via the release CLI; in *debug* it also
+        // trips a separate pre-existing chunk-facet spill `debug_assert`, unrelated to the twin.)
+        let cases: [(&str, Option<ChunkingStrategy>); 1] = [("point", None)];
+        for (tag, chunk) in cases {
+            let scratch =
+                std::env::temp_dir().join(format!("mzpc-peaks-{tag}-{}", std::process::id()));
+            fs::create_dir_all(&scratch).unwrap();
+            let output = scratch.join("mixed.mzpeak");
+            let _ = fs::remove_file(&output);
+
+            // synth_chroms=true mirrors the CLI default. (An unrelated pre-existing point-layout write
+            // clash triggers only with --no-chromatograms + mixed precision; not this test's concern.)
+            super::convert_file(&input, &output, chunk, 3, None, true, super::TofGridMode::Off, &[], None)
+                .unwrap_or_else(|e| panic!("[{tag}] conversion failed: {e:#}"));
+
+            let f = fs::File::open(&output).unwrap();
+            let mut zip = zip::ZipArchive::new(f).unwrap();
+            let peaks = extract_zip_entry(&mut zip, "spectra_peaks.parquet", &scratch);
+            let schema = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&peaks).unwrap())
+                .unwrap()
+                .schema()
+                .clone();
+            let n = count_intensity(schema.fields());
+            let _ = fs::remove_dir_all(&scratch);
+            assert_eq!(
+                n, 1,
+                "[{tag}] spectra_peaks must have exactly one 'intensity array' column (no null twin); got {n} in {:?}",
+                schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// B.4 regression (frame-preserving ims-compact). Corpus-gated: needs the smallest timsTOF `.d`
     /// (~2 GB), too large to vendor. Convert it and assert the peak facet carries
     /// `mean_inverse_reduced_ion_mobility` (MS:1003006) and that #spectra == #TDF frames

@@ -29,6 +29,40 @@ use crate::{
     }, spectrum::AuxiliaryArray
 };
 
+/// The precision-twin identity of a field: `(array_accession, buffer_format)`. Two fields with the
+/// same key are the SAME logical column stored at different precisions (e.g. a sampled `intensity_f64`
+/// beside the f32 `intensity`, both `buffer_format=point`) — exactly one may survive. The
+/// `buffer_format` component is essential: a chunked array legitimately spreads ONE `array_accession`
+/// across several columns with DIFFERENT formats (`chunk_start`/`chunk_end`/`chunk_values`/
+/// `chunk_transform`), which must NOT be collapsed. `None` for structural columns (the index) with no
+/// accession — those keep name-based dedup.
+fn logical_array_key(f: &Field) -> Option<(&str, &str)> {
+    let acc = f.metadata().get("array_accession").map(String::as_str).filter(|s| !s.is_empty())?;
+    let fmt = f.metadata().get("buffer_format").map(String::as_str).unwrap_or("");
+    Some((acc, fmt))
+}
+
+/// Rank a field's `buffer_priority` (primary > secondary > unmarked) for coalescing.
+fn field_priority_rank(f: &Field) -> u8 {
+    match f.metadata().get("buffer_priority").map(String::as_str) {
+        Some("primary") => 2,
+        Some("secondary") => 1,
+        _ => 0,
+    }
+}
+
+/// Rank a dtype by width, used only as an equal-priority tiebreak so the surviving column is wide
+/// enough that any write-time coercion widens (lossless) rather than narrows.
+fn dtype_width_rank(dt: &DataType) -> u8 {
+    match dt {
+        DataType::Float64 | DataType::Int64 | DataType::UInt64 => 8,
+        DataType::Float32 | DataType::Int32 | DataType::UInt32 => 4,
+        DataType::Int16 | DataType::UInt16 => 2,
+        DataType::Int8 | DataType::UInt8 => 1,
+        _ => 0,
+    }
+}
+
 pub trait ArrayBufferWriter {
     /// Whether the buffer describes a spectrum or chromatogram
     fn buffer_context(&self) -> BufferContext;
@@ -412,6 +446,22 @@ impl PointBuffers {
     }
 
     pub fn drain(&mut self) -> impl Iterator<Item = RecordBatch> {
+        // #3 (invariant): the facet must carry at most one column per logical array (`array_accession`).
+        // Enforced in debug builds so a future regression in schema assembly is caught at the source.
+        #[cfg(debug_assertions)]
+        {
+            let mut seen = std::collections::HashSet::new();
+            for f in self.peak_array_fields.iter() {
+                if let Some(key) = logical_array_key(f) {
+                    debug_assert!(
+                        seen.insert((key.0.to_string(), key.1.to_string())),
+                        "one-column-per-array invariant violated: (accession {}, format {}) appears twice in facet columns {:?}",
+                        key.0, key.1,
+                        self.peak_array_fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
         let n_chunks = self.num_chunks();
         let mut chunks: Vec<Vec<ArrayRef>> = Vec::with_capacity(n_chunks);
         chunks.resize(n_chunks, Vec::new());
@@ -951,8 +1001,32 @@ impl ArrayBuffersBuilder {
         DataType::Struct(self.array_fields.clone().into())
     }
 
-    /// Register a new [`arrow::datatypes::FieldRef`] with the current schema
+    /// Register a new [`arrow::datatypes::FieldRef`] with the current schema.
+    ///
+    /// #1 (one column per logical array): a facet MUST hold at most one column per logical array,
+    /// keyed by `(array_accession, buffer_format)`. On a collision, keep the higher-priority column
+    /// (primary > secondary > unmarked); on a tie, keep the wider dtype so any write-time coercion
+    /// widens (lossless) rather than narrows. This deletes alternate-precision twins (e.g. a sampled
+    /// `intensity_f64` beside the f32 `intensity`, both `array_name="intensity array"`,
+    /// `buffer_format=point`) that would otherwise reuse one `array_name` and blank readers keyed on
+    /// it — while leaving a chunked array's distinct-format component columns (chunk_start/end/values/
+    /// transform) untouched. Fields with no `array_accession` (structural columns like the index)
+    /// fall back to name-based dedup.
     pub fn add_field(mut self, field: FieldRef) -> Self {
+        if let Some(key) = logical_array_key(&field) {
+            if let Some(pos) =
+                self.array_fields.iter().position(|f| logical_array_key(f) == Some(key))
+            {
+                let existing = &self.array_fields[pos];
+                let stronger = (field_priority_rank(&field), dtype_width_rank(field.data_type()))
+                    > (field_priority_rank(existing), dtype_width_rank(existing.data_type()));
+                if stronger {
+                    self.array_fields[pos] = field;
+                }
+                self.apply_overrides();
+                return self;
+            }
+        }
         if !self.array_fields.iter().any(|f| f.name() == field.name()) {
             self.array_fields.push(field);
         }
