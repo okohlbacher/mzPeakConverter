@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-07-02
+
+### Fixed — duplicate `intensity array` column blanked the spectrum view
+
+- **One column per logical array (`spectra_peaks` and all facets).** The schema
+  sampler could emit a second `intensity array` column at the source precision
+  (an `intensity_f64` beside the primary f32 `intensity`, both reusing
+  `array_name: "intensity array"`). Written centroid peaks only filled the f32
+  primary, leaving the f64 twin 100% null; a reader resolving arrays by
+  `array_name` without honoring `buffer_priority` clobbered the real data with
+  the null column, rendering MS2 spectra as a flat line at intensity 0
+  (`sdrf-examples/PXD011799`). The writer now **coalesces columns by
+  `(array_accession, buffer_format)`** so a facet holds at most one column per
+  logical array — while leaving a chunked array's distinct-format component
+  columns (`chunk_start`/`chunk_end`/`chunk_values`/`chunk_transform`) intact.
+- **Precision coercion at the write boundary.** A source encoding a logical
+  array at a different precision than its one canonical column is now cast into
+  that column (lossless widening for m/z; the format's convention precision for
+  intensity) instead of failing record-batch assembly — this also fixes a
+  pre-existing `--layout point --no-chromatograms` Float64/Float32 write clash.
+- **Invariant guard** (`debug_assert`) that no facet carries two columns with
+  the same `(array_accession, buffer_format)`, plus a finish-time backstop that
+  prunes any all-null column duplicating a populated sibling's `array_name`.
+- Verified byte-identical output on 12 real datasets across 8 vendors (only the
+  one twin-affected file changes: `PXD000001`, twin removed, data preserved,
+  +0.14 %).
+
+### Fixed — SCIEX `--via-msconvert` (v0.4.5 tip)
+
+- **`--ignoreUnknownInstrumentError`** is passed to the spawned `msconvert`, so
+  newer SCIEX acquisitions (ZenoTOF 7600, newer TripleTOF) whose instrument
+  model ProteoWizard doesn't recognize convert instead of writing no mzML.
+- The spawned `msconvert`'s stdout+stderr are captured and their tail surfaced
+  in the failure message, so a `--via-msconvert` error is self-diagnosing.
+
 ## [0.3.1] — 2026-06-27
 
 ### Added — docs & CI
