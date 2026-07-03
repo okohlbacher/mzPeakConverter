@@ -13,7 +13,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 
 // Vendor-SDK readers compile in automatically on the platforms where the proprietary vendor
@@ -125,14 +125,15 @@ impl std::error::Error for UnsupportedVendor {}
 #[command(
     name = "mzpeak-convert",
     version,
-    about = "Convert MS data (mzML/imzML, Bruker, Thermo, ...) to the mzPeak format",
+    about = "Convert MS data (mzML/imzML, Bruker, Thermo, SciEX, ...) to mzPeak — or to mzML with --to mzml",
     propagate_version = true
 )]
 struct Cli {
     /// Input file or vendor directory (mzML/.mzML.gz/imzML, Bruker .d, Thermo .raw).
     input: PathBuf,
 
-    /// Output .mzpeak path. If omitted, NOTHING is written — the input is only inspected and a
+    /// Output path. `.mzpeak` (default) or `.mzML` — the format is inferred from the extension (or
+    /// forced with `--to`). If omitted, NOTHING is written — the input is only inspected and a
     /// report (format, spectra, chromatograms) is printed.
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -144,6 +145,11 @@ struct Cli {
     /// Signal layout [default: chunked].
     #[arg(long, value_enum)]
     layout: Option<Layout>,
+
+    /// Output format [default: inferred from the -o extension — `.mzML`→mzml, else mzpeak]. `mzml`
+    /// writes a plain mzML (vendor→mzML) instead of mzPeak, bypassing the mzPeak-specific encoders.
+    #[arg(long, value_enum)]
+    to: Option<OutputFormat>,
 
     /// Lossless delta m/z chunking instead of the default lossy numpress-linear.
     #[arg(long)]
@@ -246,6 +252,26 @@ enum Layout {
     Point,
 }
 
+/// Output container. `mzpeak` is the default. `mzml` bypasses the mzPeak encoders entirely and
+/// writes a plain mzML through the mzdata writer — turning the tool into a cross-platform
+/// vendor→mzML converter for every format it can read natively (mzML/imzML, Thermo `.raw`, Bruker
+/// TDF/TSF/BAF, plus the Windows native vendor readers: SciEX/Waters/Agilent/Shimadzu).
+#[derive(ValueEnum, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum OutputFormat {
+    Mzpeak,
+    Mzml,
+}
+
+/// Infer the output format from the `-o` file extension: `.mzML`/`.mzml` → mzML, everything else
+/// (`.mzpeak`, no/unknown extension) → mzPeak.
+fn infer_output_format(output: &Path) -> OutputFormat {
+    match output.extension().and_then(|e| e.to_str()) {
+        Some(e) if e.eq_ignore_ascii_case("mzml") => OutputFormat::Mzml,
+        _ => OutputFormat::Mzpeak,
+    }
+}
+
 /// When to apply the statistically-DETECTED TOF-grid m/z encoding (strategy A) on the **mzML path
 /// only**. This reverse-engineers an integer flight-time grid from already-decoded f64 m/z, so it is
 /// bounded-lossy (reconstruction within `PPM_TOL`). Native vendor readers do NOT use this — they
@@ -268,6 +294,7 @@ enum TofGridMode {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     output: Option<PathBuf>,
+    to: Option<OutputFormat>,
     layout: Option<Layout>,
     no_numpress: Option<bool>,
     chunk_size: Option<f64>,
@@ -290,6 +317,7 @@ struct FileConfig {
 /// Effective settings after merging CLI over config-file over defaults.
 struct Settings {
     output: Option<PathBuf>,
+    output_format: OutputFormat,
     layout: Layout,
     no_numpress: bool,
     chunk_size: f64,
@@ -327,8 +355,15 @@ impl Settings {
         // CLI bool flags are "enable" switches, so they OR with the config value (the CLI can only
         // turn a switch on, matching its own expressiveness); typed options take the CLI value when
         // given, else the config value, else the built-in default.
+        let output = cli.output.clone().or(fc.output);
+        // Output format: explicit --to wins, else config, else infer from the -o extension
+        // (`.mzML`→mzml, else mzpeak).
+        let output_format = cli.to.or(fc.to).unwrap_or_else(|| {
+            output.as_deref().map(infer_output_format).unwrap_or(OutputFormat::Mzpeak)
+        });
         Ok(Settings {
-            output: cli.output.clone().or(fc.output),
+            output,
+            output_format,
             layout: cli.layout.or(fc.layout).unwrap_or(Layout::Chunked),
             no_numpress: cli.no_numpress || fc.no_numpress.unwrap_or(false),
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
@@ -431,6 +466,16 @@ fn run(cli: &Cli) -> Result<i32> {
 
     if output.exists() && !cfg.force {
         bail!("output {} exists (use --force to overwrite)", output.display());
+    }
+
+    // mzML output: a separate, simpler lane. It bypasses every mzPeak-specific encoder (ims-compact,
+    // TOF-grid, chunking, byte-plane, vendor side-file embedding) and just streams the read spectra
+    // into an mzML via the mzdata writer. `--via-msconvert` already yields mzML, so route it straight
+    // to the output path in that case.
+    if cfg.output_format == OutputFormat::Mzml {
+        convert_to_mzml(&cli.input, &output, cfg.via_msconvert, cfg.msconvert_path.as_deref())
+            .with_context(|| format!("converting {} to mzML", cli.input.display()))?;
+        return Ok(exit::OK);
     }
 
     // The Bruker SDK path (opt-in) reads TDF/TSF via timsdata and supersedes both ims-compact and the
@@ -839,6 +884,149 @@ fn convert_via_msconvert(
     let result = convert_file(&mzml, output, chunk, zstd_level, None, synth_chroms, tof_grid, &[], None);
     let _ = fs::remove_dir_all(&tmpdir);
     result
+}
+
+/// The `--to mzml` lane: convert `input` to a plain **mzML** via the mzdata writer, streaming the
+/// read spectra straight through — no mzPeak encoders (ims-compact / TOF-grid / chunking /
+/// byte-plane / side-file embedding all bypassed). Covers every format the tool reads: the
+/// Windows-native vendor readers (SciEX/Waters/Agilent/Shimadzu, Bruker TSF/BAF) plus everything
+/// mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF). `--via-msconvert` runs msconvert
+/// straight to the output mzML.
+fn convert_to_mzml(
+    input: &Path,
+    output: &Path,
+    via_msconvert: bool,
+    msconvert_path: Option<&Path>,
+) -> Result<()> {
+    if via_msconvert {
+        return msconvert_to_mzml(input, output, msconvert_path);
+    }
+    // Native-only vendor formats (mzdata can't read these) → native reader → mzML.
+    if is_tsf_dir(input) {
+        let r = bruker_tsf::TsfReader::open(input)?;
+        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    if is_baf_dir(input) {
+        let r = bruker_baf::BafReader::open(input, None)?;
+        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+    }
+    #[cfg(windows)]
+    if is_wiff(input) {
+        let r = sciex::SciexReader::open(input)?;
+        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+    }
+    #[cfg(windows)]
+    if is_waters_raw(input) {
+        let r = waters::WatersReader::open(input)?;
+        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+    }
+    #[cfg(windows)]
+    if is_agilent_d(input) {
+        let r = agilent::AgilentReader::open(input)?;
+        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+    }
+    #[cfg(windows)]
+    if is_lcd(input) {
+        let r = shimadzu::ShimadzuReader::open(input)?;
+        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+    }
+    // Off-Windows: the native-only vendor formats can't be read here (typed unsupported error).
+    guard_unsupported_vendor(input)?;
+
+    // mzdata-readable (mzML/imzML, Thermo `.raw`, Bruker TDF). Apply the same XML preprocessing the
+    // mzPeak path uses (Latin-1 transcode + empty-param-group sanitize) so odd mzML still reads.
+    let _utf8 = transcode_to_utf8(input)?;
+    let utf8_path: &Path = _utf8.as_ref().map(|g| g.file.as_path()).unwrap_or(input);
+    let sanitized = sanitize_param_groups(utf8_path)?;
+    let read_path: &Path = sanitized.as_deref().unwrap_or(utf8_path);
+    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
+        .with_context(|| format!("opening {}", input.display()))?;
+
+    use mzdata::prelude::{MSDataFileMetadata, SpectrumSource, SpectrumWriter};
+    let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut w = mzdata::io::mzml::MzMLWriter::new(file);
+    w.copy_metadata_from(&reader);
+    let cap = max_spectra();
+    for (i, spec) in reader.iter().enumerate() {
+        if cap.is_some_and(|m| i >= m) {
+            break;
+        }
+        SpectrumWriter::write(&mut w, &spec)
+            .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
+    }
+    SpectrumWriter::close(&mut w)
+        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
+    log::info!("wrote {}", output.display());
+    Ok(())
+}
+
+/// Write a native reader's spectra (via a `spectrum(i)` closure) to an mzML.
+fn write_native_mzml(
+    input: &Path,
+    output: &Path,
+    len: usize,
+    mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
+) -> Result<()> {
+    use mzdata::prelude::SpectrumWriter;
+    if len == 0 {
+        bail!("no spectra in {}", input.display());
+    }
+    let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut w = mzdata::io::mzml::MzMLWriter::new(file);
+    let len = max_spectra().map_or(len, |m| m.min(len));
+    for i in 0..len {
+        let spec = spectrum(i)?;
+        SpectrumWriter::write(&mut w, &spec)
+            .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
+    }
+    SpectrumWriter::close(&mut w)
+        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
+    log::info!("wrote {}", output.display());
+    Ok(())
+}
+
+/// Run ProteoWizard `msconvert` to produce the output mzML directly (`--via-msconvert --to mzml`).
+fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>) -> Result<()> {
+    let exe: std::ffi::OsString = msconvert_path
+        .map(|p| p.as_os_str().to_os_string())
+        .or_else(|| std::env::var_os("MSCONVERT_PATH"))
+        .unwrap_or_else(|| "msconvert".into());
+    let outdir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let outfile = output
+        .file_name()
+        .ok_or_else(|| anyhow!("output {} has no file name", output.display()))?;
+    let status = Command::new(&exe)
+        .arg(input)
+        .arg("--mzML")
+        .arg("--ignoreUnknownInstrumentError")
+        .arg("--outdir")
+        .arg(outdir)
+        .arg("--outfile")
+        .arg(outfile)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow!(
+                    "msconvert not found ({}); install ProteoWizard or set --msconvert-path / \
+                     $MSCONVERT_PATH",
+                    exe.to_string_lossy()
+                )
+            } else {
+                anyhow!("running msconvert: {e}")
+            }
+        })?;
+    if !status.success() {
+        bail!("msconvert failed (exit {:?})", status.code());
+    }
+    if !output.exists() {
+        bail!("msconvert reported success but produced no mzML at {}", output.display());
+    }
+    log::info!("wrote {}", output.display());
+    Ok(())
 }
 
 /// Core conversion: mzdata reader → mzpeak_prototyping writer. Single-threaded for the MVP
@@ -3178,6 +3366,35 @@ mod tests {
                 schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// `--to mzml` lane: converting an mzML input to mzML must preserve the spectra (count + data)
+    /// via the mzdata writer. Uses the committed mixed-precision fixture (3 profile MS1 + 3 centroid
+    /// MS2) and re-reads the output to confirm a faithful round-trip.
+    #[test]
+    fn mzml_output_preserves_spectra() {
+        use mzdata::prelude::SpectrumSource;
+        use std::fs;
+
+        let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/mixed_precision.mzML");
+        assert!(input.exists(), "fixture missing: {}", input.display());
+        let scratch = std::env::temp_dir().join(format!("mzpc-mzml-{}", std::process::id()));
+        fs::create_dir_all(&scratch).unwrap();
+        let out = scratch.join("out.mzML");
+
+        super::convert_to_mzml(&input, &out, false, None).expect("mzML conversion");
+
+        // Output is XML mzML (not a zip), and re-reads to the same spectrum count.
+        let head = fs::read(&out).unwrap();
+        let is_mzml = head.starts_with(b"<?xml") || head.windows(5).any(|w| w == b"<mzML");
+        let mut reader =
+            super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(&out)
+                .expect("reopen mzML output");
+        let n = reader.iter().count();
+        let _ = fs::remove_dir_all(&scratch);
+        assert!(is_mzml, "output is not mzML XML");
+        assert_eq!(n, 6, "expected 6 spectra in the mzML output, got {n}");
     }
 
     /// B.4 regression (frame-preserving ims-compact). Corpus-gated: needs the smallest timsTOF `.d`
