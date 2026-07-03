@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.9] — 2026-07-03
+
+### Fixed — mzML output correctness (adversarial review of the `--to mzml` path)
+
+- **Chromatograms are no longer dropped.** The initial `--to mzml` lane wrote only spectra, so a
+  chromatogram-only SRM/MRM mzML converted to an EMPTY file (all 720 SRM traces lost) and any
+  source TIC/SIM was discarded. The lane now passes the source's chromatograms through (collected
+  before the spectrum pass, since iterating spectra can leave the reader past the chromatogramList),
+  dropping only source TIC/base-peak because the mzML writer emits its own spectrum-derived TIC +
+  base-peak summary. raw→mzML and raw→mzPeak now carry the same chromatograms (verified: sciex-qtrap
+  SRM 722↔722, Agilent IM-QTOF 2↔2, timsTOF TSF 4819 spectra + 2 chromatograms).
+- **Zero-spectra crash fixed.** A chromatogram-only input hit `Attempted to transition from Run to
+  Run` in the mzML writer; the spectrumList is now opened explicitly so chromatograms have a valid
+  state to follow.
+- **Correct spectrum count + metadata.** `set_spectrum_count` is set (the `spectrumList` count
+  attribute was 0), and the native-reader lane now fills run/source-file metadata (`fixup_run_metadata`)
+  instead of emitting a metadata-less mzML.
+- **`--via-msconvert --to mzml` surfaces msconvert's stderr** on failure (unknown-instrument /
+  unsupported-format), matching the mzPeak `convert_via_msconvert` path.
+- Peak data is bit-exact between raw→mzPeak and raw→mzML (m/z & intensity diff = 0).
+
 ## [0.4.8] — 2026-07-03
 
 ### Added — mzML output (`--to mzml`)
