@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.7] — 2026-07-03
+
+### Added — native Shimadzu `.lcd` reader (Windows, no msconvert) — glue only, hosting UNVERIFIED
+
+- **`glue/shimadzu/` + `src/shimadzu.rs`** — a native Shimadzu LabSolutions `.lcd` reader that
+  drives the vendor `Shimadzu.LabSolutions.IO` managed API in-process (the same DLL ProteoWizard's
+  `Reader_Shimadzu` wraps), so `.lcd` can convert **without** shelling out to `msconvert`. Mirrors
+  the SciEX/Agilent pattern: a net8.0 C# glue reaches the vendor API purely by runtime reflection
+  (`Assembly.LoadFrom` from `MZPC_PWIZ_DIR`), and the Rust side hosts CoreCLR via `netcorehost`.
+  Wired into `is_lcd()` detection, `convert_shimadzu()`, inspect, and the off-Windows guard.
+- **The vendor DLL is never shipped.** No compile-time reference, no bundling; loaded at runtime
+  from an existing ProteoWizard install. `.gitignore` now excludes every EULA-restricted vendor
+  assembly by name and `glue/**/*.dll` as a hard backstop.
+- **⚠️ Status: the glue is verified correct (type + all `[UnmanagedCallersOnly]` exports load in a
+  net8 host), but the shared `netcorehost` hosting path is UNVERIFIED end-to-end** — resolving the
+  first export currently fails with hostfxr `0x8000211D`, a foundation-level issue affecting all
+  four `.NET`-glue vendors (SciEX/Waters/Agilent/Shimadzu, all previously untested), not the
+  Shimadzu logic. Until that's resolved, convert Shimadzu `.lcd` via `--via-msconvert` (9030-class;
+  the legacy IT-TOF `.lcd` is unsupported by ProteoWizard itself).
+
 ## [0.4.6] — 2026-07-02
 
 ### Fixed — duplicate `intensity array` column blanked the spectrum view
