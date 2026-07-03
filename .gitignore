@@ -6,6 +6,26 @@
 glue/**/bin/
 glue/**/obj/
 
+# Proprietary, EULA-restricted VENDOR DLLs must NEVER be committed. They are loaded at RUNTIME
+# from an existing ProteoWizard install (via MZPC_PWIZ_DIR) through reflection — never referenced
+# at compile time and never bundled here. Exclude every vendor assembly by name, anywhere in the
+# tree, as a hard backstop against an accidental `git add`.
+**/Shimadzu.LabSolutions.*.dll
+**/Clearcore2*.dll
+**/Clearcore.Data*.dll
+**/Sciex.Data*.dll
+**/MassLynxRaw.dll
+**/MassLynxSDK*.dll
+**/BaseCommon.dll
+**/BaseDataAccess.dll
+**/*MHDAC*.dll
+**/BaseTof*.dll
+**/agtsampleinforw.dll
+**/timsdata.dll
+**/baf2sql_c.dll
+# Any DLL dropped inside the glue source dirs (only source + .csproj belong there).
+glue/**/*.dll
+
 # Converter outputs / scratch
 *.mzpeak
 *.parquet

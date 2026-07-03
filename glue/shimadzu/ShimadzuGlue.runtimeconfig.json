@@ -1,0 +1,15 @@
+{
+  "//": "Standalone runtimeconfig consumed by netcorehost's initialize_for_runtime_config. dotnet build also emits one next to the DLL; this committed copy documents the expected shape and lets the Rust host boot even when pointed at a directory that only holds the DLL + this file. Targets the .NET 8 shared runtime (Microsoft.NETCore.App).",
+  "runtimeOptions": {
+    "tfm": "net8.0",
+    "framework": {
+      "name": "Microsoft.NETCore.App",
+      "version": "8.0.0"
+    },
+    "configProperties": {
+      "System.Reflection.Metadata.MetadataUpdater.IsSupported": false,
+      "System.Runtime.Loader.UseRidGraph": true
+    },
+    "rollForward": "LatestMinor"
+  }
+}

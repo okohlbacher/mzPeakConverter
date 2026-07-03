@@ -36,6 +36,11 @@ mod agilent_midac;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod sciex;
+// Native Shimadzu `.lcd` via the Shimadzu.LabSolutions.IO managed DLL (netcorehost glue, like
+// SciEX). Windows-runtime-only; the `convert_shimadzu` dispatch is `#[cfg(windows)]`.
+#[cfg(windows)]
+#[allow(dead_code)]
+mod shimadzu;
 // libloading-based (cross-platform compile); only *runs* on Windows with the MassLynx DLLs, so the
 // `convert_waters` dispatch stays `#[cfg(windows)]` and the reader is dead code off-Windows.
 #[allow(dead_code)]
@@ -623,6 +628,14 @@ fn report_inspect(input: &Path) -> Result<()> {
         println!("note:          native Waters reading needs the waters feature on Windows (or use --via-msconvert)");
         return Ok(());
     }
+    if is_lcd(input) {
+        println!("format:        Shimadzu LabSolutions .lcd");
+        #[cfg(windows)]
+        println!("spectra:       {}", shimadzu::ShimadzuReader::open(input)?.len());
+        #[cfg(not(windows))]
+        println!("note:          native Shimadzu reading is Windows-only (Shimadzu.LabSolutions.IO); or use --via-msconvert");
+        return Ok(());
+    }
     let reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input)
         .with_context(|| format!("opening {}", input.display()))?;
     println!("format:        {}", reader_format(&reader));
@@ -637,6 +650,15 @@ fn report_inspect(input: &Path) -> Result<()> {
 /// True for an Agilent `.d` (folder with an `AcqData/` subdir).
 fn is_agilent_d(input: &Path) -> bool {
     input.is_dir() && input.join("AcqData").is_dir()
+}
+
+/// True for a Shimadzu LabSolutions `.lcd` file.
+fn is_lcd(input: &Path) -> bool {
+    input.is_file()
+        && input
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("lcd"))
 }
 
 /// True for a SciEX wiff/wiff2 file.
@@ -698,6 +720,15 @@ fn guard_unsupported_vendor(input: &Path) -> Result<()> {
         return Err(UnsupportedVendor(
             "SciEX .wiff native reading is available only on Windows (Clearcore2 vendor SDK). \
              On this platform use `--via-msconvert`."
+                .to_string(),
+        )
+        .into());
+    }
+    #[cfg(not(windows))]
+    if is_lcd(input) {
+        return Err(UnsupportedVendor(
+            "Shimadzu .lcd native reading is available only on Windows (Shimadzu.LabSolutions.IO \
+             vendor DLL). On this platform use `--via-msconvert`."
                 .to_string(),
         )
         .into());
@@ -1478,6 +1509,10 @@ fn convert_file(
     #[cfg(windows)]
     if is_waters_raw(input) {
         return convert_waters(input, output, chunk, zstd_level, vendor, synth_chroms);
+    }
+    #[cfg(windows)]
+    if is_lcd(input) {
+        return convert_shimadzu(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
     // mzdata's quick-xml reader assumes UTF-8 and panics on Latin-1/windows-1252 high bytes
     // (e.g. zenodo DESI imzML declare ISO-8859-1). If the input declares a non-UTF-8 encoding,
@@ -2352,6 +2387,40 @@ fn convert_bruker_sdk(
 ) -> Result<()> {
     Err(UnsupportedVendor(
         "the Bruker timsdata SDK path (--bruker-sdk) is only available on Windows and Linux".into(),
+    )
+    .into())
+}
+
+/// Convert a Shimadzu `.lcd` → mzPeak via the Shimadzu.LabSolutions.IO .NET glue (Windows-only,
+/// UNTESTED here). Mirrors `convert_sciex`, but centroid/profile arrays feed the standard writer
+/// seam (no TOF-grid inversion). Needs `$MZPC_SHIMADZU_GLUE` + `$MZPC_PWIZ_DIR` at runtime.
+#[cfg(windows)]
+fn convert_shimadzu(
+    input: &Path,
+    output: &Path,
+    chunk: Option<ChunkingStrategy>,
+    zstd_level: i32,
+    vendor: Option<&vendor::VendorPolicy>,
+    synth_chroms: bool,
+) -> Result<()> {
+    let reader = shimadzu::ShimadzuReader::open(input)?;
+    convert_vendor_reader(
+        input, output, chunk, zstd_level, vendor, synth_chroms,
+        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+    )
+}
+
+#[cfg(not(windows))]
+fn convert_shimadzu(
+    _input: &Path,
+    _output: &Path,
+    _chunk: Option<ChunkingStrategy>,
+    _zstd_level: i32,
+    _vendor: Option<&vendor::VendorPolicy>,
+    _synth_chroms: bool,
+) -> Result<()> {
+    Err(UnsupportedVendor(
+        "Shimadzu .lcd native reading is only available on Windows (Shimadzu.LabSolutions.IO vendor DLL)".into(),
     )
     .into())
 }

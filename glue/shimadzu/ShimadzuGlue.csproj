@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ShimadzuGlue — a thin C# shim the Rust `shimadzu` path hosts in-process (via netcorehost)
+    to read Shimadzu LabSolutions .lcd files through the vendor Shimadzu.LabSolutions.IO managed
+    API (the same DLL ProteoWizard's Reader_Shimadzu wraps).
+
+    KEY DESIGN POINT: NO <Reference>/<PackageReference> to any Shimadzu assembly. The vendor DLL
+    (Shimadzu.LabSolutions.IO.IoModule.dll) is loaded at RUNTIME via System.Reflection
+    (Assembly.LoadFrom + late-bound member invocation), so this project `dotnet build`s on any
+    platform WITHOUT the vendor DLL — the build host has none; the runtime host (Windows) supplies
+    it out of a ProteoWizard install (flat in pwiz-bin, next to msconvert.exe).
+
+    ⚠️ WINDOWS-RUNTIME-ONLY. The Shimadzu DLL is managed .NET over native/COM: it only *runs* on
+       Windows with .NET. It also carries a restrictive Shimadzu EULA (ProteoWizard-branded scope,
+       no reverse-engineering) — see README.md.
+
+    Build:  dotnet build -c Release
+    Output: bin/Release/net8.0/ShimadzuGlue.dll (+ ShimadzuGlue.runtimeconfig.json)
+    Then point the Rust env var MZPC_SHIMADZU_GLUE at that directory.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>ShimadzuGlue</AssemblyName>
+    <RootNamespace>ShimadzuGlue</RootNamespace>
+    <OutputType>Library</OutputType>
+    <!-- netcorehost boots the runtime via initialize_for_runtime_config; EnableDynamicLoading
+         emits the required ShimadzuGlue.runtimeconfig.json next to the DLL. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <!-- 64-bit only: the Shimadzu native bits are x64. -->
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+</Project>
