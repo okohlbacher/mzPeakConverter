@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.8] — 2026-07-03
+
+### Added — mzML output (`--to mzml`)
+
+- **The converter can now write plain mzML as well as mzPeak.** Output format is chosen by the `-o`
+  extension (`.mzML` → mzML, else mzPeak) or forced with **`--to mzpeak|mzml`**. The mzML lane
+  bypasses every mzPeak-specific encoder and streams the read spectra through the mzdata writer, so
+  it works for every format the tool reads — mzML/imzML, Thermo `.raw`, Bruker TDF/TSF/BAF, and the
+  Windows-native vendor readers (SciEX/Waters/Agilent/Shimadzu) — making it a cross-platform
+  vendor→mzML converter. `--via-msconvert --to mzml` runs msconvert straight to the output mzML.
+  Verified round-trip (spectrum count + exact m/z) on a real Agilent IM-QTOF mzML.
+
 ## [0.4.7] — 2026-07-03
 
 ### Added — native Shimadzu `.lcd` reader (Windows, no msconvert) — glue only, hosting UNVERIFIED
