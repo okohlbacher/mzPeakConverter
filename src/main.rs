@@ -943,11 +943,25 @@ fn convert_to_mzml(
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
 
-    use mzdata::prelude::{MSDataFileMetadata, SpectrumSource, SpectrumWriter};
+    use mzdata::prelude::{ChromatogramSource, MSDataFileMetadata, SpectrumSource, SpectrumWriter};
+    // Collect chromatograms FIRST: iterating the spectra can leave the reader positioned past the
+    // chromatogramList (fatal for a chromatogram-only SRM/MRM file — the mzPeak path samples them
+    // early for the same reason). Then rewind for the spectrum pass.
+    let source_chroms: Vec<Chromatogram> = reader.iter_chromatograms().collect();
+    let _ = reader.reset();
+
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let mut w = mzdata::io::mzml::MzMLWriter::new(file);
     w.copy_metadata_from(&reader);
+    fixup_run_metadata(&mut w, input);
     let cap = max_spectra();
+    let n_spec = cap.map_or_else(|| reader.len(), |m| m.min(reader.len()));
+    w.set_spectrum_count(n_spec as u64);
+    // Open the spectrumList NOW so chromatograms (written after it) have a valid state even when the
+    // input has zero spectra (a chromatogram-only SRM/MRM file) — otherwise `write_chromatogram`
+    // fails to transition into the chromatogramList.
+    w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
+
     for (i, spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             break;
@@ -955,13 +969,20 @@ fn convert_to_mzml(
         SpectrumWriter::write(&mut w, &spec)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
     }
+    // Pass through the source's chromatograms (SRM/SIM/vendor traces — otherwise silently lost,
+    // fatal for MRM data). Drop source TIC/base-peak: the mzML writer emits its own spectrum-derived
+    // TIC + base-peak summary at close, so keeping the source ones would duplicate them.
+    write_source_chromatograms_mzml(&mut w, source_chroms.into_iter())?;
+
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
     log::info!("wrote {}", output.display());
     Ok(())
 }
 
-/// Write a native reader's spectra (via a `spectrum(i)` closure) to an mzML.
+/// Write a native reader's spectra (via a `spectrum(i)` closure) to an mzML. Native readers carry no
+/// vendor chromatograms; the mzML writer emits its own TIC + base-peak summary at close (matching the
+/// mzPeak path's synthesized TIC/BPC).
 fn write_native_mzml(
     input: &Path,
     output: &Path,
@@ -974,8 +995,10 @@ fn write_native_mzml(
     }
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let mut w = mzdata::io::mzml::MzMLWriter::new(file);
-    let len = max_spectra().map_or(len, |m| m.min(len));
-    for i in 0..len {
+    fixup_run_metadata(&mut w, input);
+    let n = max_spectra().map_or(len, |m| m.min(len));
+    w.set_spectrum_count(n as u64);
+    for i in 0..n {
         let spec = spectrum(i)?;
         SpectrumWriter::write(&mut w, &spec)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
@@ -983,6 +1006,25 @@ fn write_native_mzml(
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
     log::info!("wrote {}", output.display());
+    Ok(())
+}
+
+/// Pass a source's chromatograms through to an mzML, dropping TIC/base-peak (the mzML writer emits
+/// its own spectrum-derived TIC + base-peak summary at close, so those would duplicate). Everything
+/// else — SRM/SIM/vendor traces — is preserved. Must be called after all spectra (writer state).
+fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromatogram>>(
+    w: &mut mzdata::io::mzml::MzMLWriter<W>,
+    source: I,
+) -> Result<()> {
+    for chrom in source {
+        if matches!(
+            chrom.chromatogram_type(),
+            ChromatogramType::TotalIonCurrentChromatogram | ChromatogramType::BasePeakChromatogram
+        ) {
+            continue;
+        }
+        w.write_chromatogram(&chrom).map_err(|e| anyhow!("writing chromatogram to mzML: {e}"))?;
+    }
     Ok(())
 }
 
@@ -999,32 +1041,56 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
     let outfile = output
         .file_name()
         .ok_or_else(|| anyhow!("output {} has no file name", output.display()))?;
-    let status = Command::new(&exe)
-        .arg(input)
+    // Capture msconvert's stdout+stderr so a failure carries its real message (unknown-instrument /
+    // unsupported-format / missing-sidecar) instead of a bare exit code — same as the mzPeak
+    // `convert_via_msconvert` path (commit 57262aa).
+    let log_path = std::env::temp_dir().join(format!("mzpc-msconvert-mzml-{}.log", std::process::id()));
+    let mut cmd = Command::new(&exe);
+    cmd.arg(input)
         .arg("--mzML")
         .arg("--ignoreUnknownInstrumentError")
         .arg("--outdir")
         .arg(outdir)
         .arg("--outfile")
-        .arg(outfile)
-        .status()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow!(
-                    "msconvert not found ({}); install ProteoWizard or set --msconvert-path / \
-                     $MSCONVERT_PATH",
-                    exe.to_string_lossy()
-                )
-            } else {
-                anyhow!("running msconvert: {e}")
-            }
-        })?;
+        .arg(outfile);
+    if let Ok(f) = fs::File::create(&log_path) {
+        if let Ok(f2) = f.try_clone() {
+            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
+        }
+    }
+    let status = cmd.status().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "msconvert not found ({}); install ProteoWizard or set --msconvert-path / \
+                 $MSCONVERT_PATH",
+                exe.to_string_lossy()
+            )
+        } else {
+            anyhow!("running msconvert: {e}")
+        }
+    })?;
+    let tail = || -> String {
+        fs::read_to_string(&log_path)
+            .ok()
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                lines[lines.len().saturating_sub(15)..].join("\n")
+            })
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
+            .unwrap_or_default()
+    };
     if !status.success() {
-        bail!("msconvert failed (exit {:?})", status.code());
+        let t = tail();
+        let _ = fs::remove_file(&log_path);
+        bail!("msconvert failed (exit {:?}){}", status.code(), t);
     }
     if !output.exists() {
-        bail!("msconvert reported success but produced no mzML at {}", output.display());
+        let t = tail();
+        let _ = fs::remove_file(&log_path);
+        bail!("msconvert reported success but produced no mzML at {}{}", output.display(), t);
     }
+    let _ = fs::remove_file(&log_path);
     log::info!("wrote {}", output.display());
     Ok(())
 }
@@ -3395,6 +3461,38 @@ mod tests {
         let _ = fs::remove_dir_all(&scratch);
         assert!(is_mzml, "output is not mzML XML");
         assert_eq!(n, 6, "expected 6 spectra in the mzML output, got {n}");
+    }
+
+    /// `--to mzml` chromatogram regression (corpus-gated): a chromatogram-only SRM/MRM mzML (0
+    /// spectra) must convert to mzML with its SRM traces PRESERVED — not silently dropped, and
+    /// without the 0-spectra "Run to Run" writer crash. Uses the sciex-qtrap scheduled-MRM file (a
+    /// real msconvert SRM; synthetic mzML chromatograms aren't read back by mzdata). Run with:
+    ///   `cargo test --release mzml_output_preserves_srm -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the sciex-qtrap scheduled-MRM corpus file; run with --ignored"]
+    fn mzml_output_preserves_srm_chromatograms() {
+        use mzdata::prelude::{ChromatogramSource, SpectrumSource};
+        use std::fs;
+
+        let input = std::path::Path::new(
+            "/Users/kohlbach/Claude/mzpeak-example-data/data/general-ms/sciex-qtrap-6500/Drug_substance_3_scheduled_MRM.mzML",
+        );
+        assert!(input.exists(), "corpus SRM file missing: {}", input.display());
+        let scratch = std::env::temp_dir().join(format!("mzpc-srm-{}", std::process::id()));
+        fs::create_dir_all(&scratch).unwrap();
+        let out = scratch.join("out.mzML");
+
+        super::convert_to_mzml(input, &out, false, None).expect("SRM → mzML must not crash");
+
+        let mut reader =
+            super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(&out)
+                .expect("reopen SRM mzML");
+        let n_chrom = reader.iter_chromatograms().count();
+        let n_spec = reader.iter().count();
+        let _ = fs::remove_dir_all(&scratch);
+        assert_eq!(n_spec, 0, "SRM file has no spectra");
+        // 720 SRM transitions preserved + the writer's TIC/BIC summary.
+        assert!(n_chrom > 100, "SRM chromatograms must be preserved in mzML, got {n_chrom}");
     }
 
     /// B.4 regression (frame-preserving ims-compact). Corpus-gated: needs the smallest timsTOF `.d`
