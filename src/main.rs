@@ -2664,7 +2664,11 @@ fn convert_shimadzu(
     )
 }
 
+// Off-Windows a `.lcd` is routed straight to `guard_unsupported_vendor` (the native dispatch is
+// `#[cfg(windows)]`), so this stub is never called there — keep it for symmetry with the other
+// vendor converters without tripping dead-code.
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn convert_shimadzu(
     _input: &Path,
     _output: &Path,
