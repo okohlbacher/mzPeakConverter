@@ -1135,7 +1135,7 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if c.name() == "intensity"
+            if (c.name() == "intensity" || c.name() == "tof")
                 && matches!(
                     c.physical_type(),
                     parquet::basic::Type::DOUBLE
@@ -1144,16 +1144,18 @@ pub trait AbstractMzPeakWriter {
                         | parquet::basic::Type::INT64
                 )
             {
-                log::debug!("{}: byte-stream-split intensity", c.path());
+                log::debug!("{}: byte-stream-split", c.path());
                 // MS intensities (detector counts / peak areas) are integer-valued or similar-
                 // magnitude floats whose byte planes are highly redundant, so byte-stream-split +
-                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). Disable the
-                // dictionary for this column so the BSS encoding actually applies.
+                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). The integer TOF
+                // axis has the same byte-plane redundancy (its high bytes are near-constant across a
+                // frame), so byte-stream-split beats delta-packing there too. Disable the dictionary
+                // for these columns so the BSS encoding actually applies.
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
             }
-            if c.name().ends_with("_index") || c.name() == "tof" {
+            if c.name().ends_with("_index") {
                 log::debug!("{}: delta binary packing", c.path());
                 // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
                 // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF
@@ -1287,7 +1289,7 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if c.name() == "intensity"
+            if (c.name() == "intensity" || c.name() == "tof")
                 && matches!(
                     c.physical_type(),
                     parquet::basic::Type::DOUBLE
@@ -1296,16 +1298,18 @@ pub trait AbstractMzPeakWriter {
                         | parquet::basic::Type::INT64
                 )
             {
-                log::debug!("{}: byte-stream-split intensity", c.path());
+                log::debug!("{}: byte-stream-split", c.path());
                 // MS intensities (detector counts / peak areas) are integer-valued or similar-
                 // magnitude floats whose byte planes are highly redundant, so byte-stream-split +
-                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). Disable the
-                // dictionary for this column so the BSS encoding actually applies.
+                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). The integer TOF
+                // axis has the same byte-plane redundancy (its high bytes are near-constant across a
+                // frame), so byte-stream-split beats delta-packing there too. Disable the dictionary
+                // for these columns so the BSS encoding actually applies.
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
             }
-            if c.name().ends_with("_index") || c.name() == "tof" {
+            if c.name().ends_with("_index") {
                 log::debug!("{}: delta binary packing", c.path());
                 // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
                 // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF

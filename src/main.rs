@@ -172,6 +172,14 @@ struct Cli {
     #[arg(long)]
     no_ims_compact: bool,
 
+    /// Bruker timsTOF (TDF) ims-compact only, **EXPERIMENTAL**: the frame-compact layout — store the
+    /// integer TOF axis as per-scan deltas (byte-split) instead of absolute bins, for maximum
+    /// compactness (~-15% vs the default ims-compact on timsTOF). Lossless, but requires per-frame
+    /// random access on read: a reader cumsum's the deltas within each mobility scan before applying
+    /// the m/z model (marked per spectrum with `mzpeak:tof_delta_reset=scan`).
+    #[arg(long)]
+    frame_compact_ims: bool,
+
     /// Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default
     /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). Implies f64 m/z.
     #[arg(long)]
@@ -328,6 +336,7 @@ struct Settings {
     ims_zstd_level: i32,
     force: bool,
     no_ims_compact: bool,
+    frame_compact_ims: bool,
     bruker_sdk: bool,
     tims_recalibration: bool,
     no_vendor: bool,
@@ -371,6 +380,7 @@ impl Settings {
             ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(5),
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
+            frame_compact_ims: cli.frame_compact_ims,
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             tims_recalibration: !(cli.no_tims_recalibration
                 || fc.no_tims_recalibration.unwrap_or(false)),
@@ -531,7 +541,7 @@ fn run(cli: &Cli) -> Result<i32> {
         // fall back to the mzdata reader interface (f64 m/z), which decodes those files. mzdata may
         // silently drop a truly-undecodable frame, so the fallback is loud. (Backlog: fix timsrust /
         // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
-        match convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration) {
+        match convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.frame_compact_ims) {
             Ok(()) => {}
             Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
                 log::warn!(
@@ -2548,12 +2558,13 @@ fn convert_ims_compact_archive(
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
     tims_recalibration: bool,
+    frame_compact: bool,
 ) -> Result<()> {
     let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
     let (a, b, n) = (reader.model.a, reader.model.b, reader.len());
     // The native reader is Sync (mmap-backed timsrust FrameReader), so decode frames in parallel.
     write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, n, |i, int| {
-        reader.ims_compact_spectrum(i, int)
+        reader.ims_compact_spectrum(i, int, frame_compact)
     })
 }
 
@@ -3633,7 +3644,7 @@ mod tests {
         let output = scratch.join("sba415_ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
 
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false)
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false)
             .expect("ims-compact conversion");
 
         // Crack the zip archive and extract facets to scratch files (File: ChunkReader).
@@ -3693,7 +3704,7 @@ mod tests {
         fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_contract.mzpeak");
         let _ = fs::remove_file(&output);
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false)
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false)
             .expect("ims-compact conversion");
 
         let f = fs::File::open(&output).unwrap();
