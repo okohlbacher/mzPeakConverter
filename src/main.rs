@@ -931,6 +931,21 @@ fn convert_to_mzml(
         let r = shimadzu::ShimadzuReader::open(input)?;
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
+    // Agilent profile `.d` off Windows: the pure-Rust MSProfile.bin reader gives native mzML without
+    // msconvert (same reader the mzPeak grid lane uses). Must run BEFORE guard_unsupported_vendor,
+    // which rejects Agilent `.d`. If the reader can't open this `.d` (e.g. an ion-mobility / flat
+    // MSScan.xsd variant it doesn't model), fall through to the typed "use --via-msconvert" guidance
+    // rather than surfacing a raw schema-parse error.
+    #[cfg(not(windows))]
+    if is_agilent_d(input) && agilent_profile::has_profile(input) {
+        match agilent_profile::AgilentProfileReader::open(input) {
+            Ok(reader) => return write_agilent_profile_mzml(reader, input, output),
+            Err(e) => log::warn!(
+                "native Agilent profile→mzML unavailable for {}: {e:#}",
+                input.display()
+            ),
+        }
+    }
     // Off-Windows: the native-only vendor formats can't be read here (typed unsupported error).
     guard_unsupported_vendor(input)?;
 
@@ -1009,6 +1024,93 @@ fn write_native_mzml(
         let spec = spectrum(i)?;
         SpectrumWriter::write(&mut w, &spec)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
+    }
+    SpectrumWriter::close(&mut w)
+        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
+    log::info!("wrote {}", output.display());
+    Ok(())
+}
+
+/// Write an Agilent **profile** `.d` (`AcqData/MSProfile.bin`) to mzML on any platform, using the
+/// pure-Rust reader (no msconvert / vendor SDK). Each stored profile point's flight-time bin is mapped
+/// to m/z with the per-scan calibration, applying MassHunter's polynomial refinement when the scan
+/// carries a calibration row (the value msconvert would emit); the raw integer counts become the
+/// intensity array. The data is profile, so the spectra are marked as such.
+#[cfg(not(windows))]
+fn write_agilent_profile_mzml(
+    mut reader: agilent_profile::AgilentProfileReader,
+    input: &Path,
+    output: &Path,
+) -> Result<()> {
+    use mzdata::prelude::SpectrumWriter;
+    let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut w = mzdata::io::mzml::MzMLWriter::new(file);
+    fixup_run_metadata(&mut w, input);
+    // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
+    // (matches write_native_mzml, which also uses the reader's record count).
+    let cap = max_spectra();
+    w.set_spectrum_count(cap.map_or(reader.len(), |m| m.min(reader.len())) as u64);
+
+    let mut out_index = 0usize;
+    while let Some(ps) = reader.next_spectrum()? {
+        if cap.is_some_and(|m| out_index >= m) {
+            break;
+        }
+        // Flight-time bin → m/z, applying the polynomial refinement when a calibration row is present
+        // (identical math to the mzPeak grid lane's lossless gate).
+        let row = reader.calib_row(ps.index);
+        let uf = reader.poly_flags_for(ps.index);
+        let mut mz: Vec<f64> = Vec::with_capacity(ps.tof_index.len());
+        for &k in &ps.tof_index {
+            let m = match row {
+                Some(r) if r[0] != 0.0 => {
+                    let (coeff, base) = (r[0], r[1]);
+                    let t = base + (ps.grid.c0 + ps.grid.c1 * k as f64) / coeff;
+                    let refined = agilent_profile::calibrated_mz(r, uf, t);
+                    if refined > 0.0 { refined } else { ps.grid.mz(k) }
+                }
+                _ => ps.grid.mz(k),
+            };
+            mz.push(m);
+        }
+        let mut intensity: Vec<f32> = ps.intensity.iter().map(|&v| v as f32).collect();
+        // The TOF axis can descend (grid.c1 < 0); m/z is monotonic in k, so one reverse restores the
+        // ascending-m/z order mzML consumers expect.
+        if mz.len() > 1 && mz[0] > mz[mz.len() - 1] {
+            mz.reverse();
+            intensity.reverse();
+        }
+
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz_da.update_buffer(mz.as_slice()).map_err(|e| anyhow!("encoding m/z: {e}"))?;
+        mz_da.unit = Unit::MZ;
+        arrays.add(mz_da);
+        let mut int_da =
+            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow!("encoding intensity: {e}"))?;
+        int_da.unit = Unit::DetectorCounts;
+        arrays.add(int_da);
+
+        let mut descr = mzdata::spectrum::SpectrumDescription {
+            id: format!("scanId={}", ps.index),
+            index: out_index,
+            ms_level: ps.ms_level,
+            signal_continuity: mzdata::spectrum::SignalContinuity::Profile,
+            ..Default::default()
+        };
+        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        let mut scan = mzdata::spectrum::ScanEvent::default();
+        scan.start_time = ps.scan_time; // MSProfile scan_time is in minutes; mzdata wants minutes
+        descr.acquisition.scans.push(scan);
+
+        let spec = MultiLayerSpectrum::new(descr, Some(arrays), None, None);
+        SpectrumWriter::write(&mut w, &spec)
+            .map_err(|e| anyhow!("writing spectrum {out_index} to mzML: {e}"))?;
+        out_index += 1;
+    }
+    if out_index == 0 {
+        bail!("no profile spectra in {}", input.display());
     }
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
