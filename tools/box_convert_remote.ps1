@@ -65,6 +65,20 @@ try {
     }
 
     # 3. convert (capture every stream + the converter's own exit code)
+    # 2b. BENCH: measure raw footprint + msconvert->mzML size (reported via note; does not affect the mzpeak upload)
+    try {
+        $ri = Get-Item -LiteralPath $inputPath
+        $rawSize = if ($ri.PSIsContainer) { (Get-ChildItem -LiteralPath $inputPath -Recurse -File | Measure-Object Length -Sum).Sum } else { $ri.Length }
+        $mzmlSize = 0
+        if ($env:MSCONVERT_PATH -and (Test-Path $env:MSCONVERT_PATH)) {
+            $mzmlDir = Join-Path $work 'mzml'; New-Item -ItemType Directory -Force -Path $mzmlDir | Out-Null
+            & $env:MSCONVERT_PATH $inputPath --mzML -o $mzmlDir *> (Join-Path $work 'msconvert.log')
+            $mz = Get-ChildItem -Path $mzmlDir -Filter *.mzML -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1
+            if ($mz) { $mzmlSize = $mz.Length }
+        }
+        $res.note = ((@($res.note, "raw=$rawSize", "mzml=$mzmlSize") | Where-Object { $_ }) -join ' ')
+    } catch { $res.note = ((@($res.note, "benchmeas-fail") | Where-Object { $_ }) -join ' ') }
+
     $res.stage = 'convert'
     $out = Join-Path $work 'out.mzpeak'
     $log = Join-Path $work 'convert.log'
