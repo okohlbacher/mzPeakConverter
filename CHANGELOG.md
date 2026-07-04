@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.10] — 2026-07-04
+
+### Fixed — `--to mzml` on directory-based vendor formats
+
+- **Bruker TDF `.d` → mzML no longer crashes with `EISDIR` (os error 21).** The `--to mzml` lane
+  applied the mzML/imzML XML preprocessing (Latin-1 transcode + empty-param-group sanitize)
+  unconditionally, and those steps `read()` the input path as a file — which fails on a `.d`
+  *directory* before the reader is ever reached. The preprocessing is now gated on a file input, so a
+  `.d` goes straight to `open_path`, which reads Bruker TDF directly (verified: `test.d` → 919
+  spectra). As a side effect, any unhandled directory input now fails with a clear "unknown format"
+  error instead of a bare `EISDIR`.
+
 ## [0.4.9] — 2026-07-03
 
 ### Fixed — mzML output correctness (adversarial review of the `--to mzml` path)
