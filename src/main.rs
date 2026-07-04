@@ -934,13 +934,20 @@ fn convert_to_mzml(
     // Off-Windows: the native-only vendor formats can't be read here (typed unsupported error).
     guard_unsupported_vendor(input)?;
 
-    // mzdata-readable (mzML/imzML, Thermo `.raw`, Bruker TDF). Apply the same XML preprocessing the
-    // mzPeak path uses (Latin-1 transcode + empty-param-group sanitize) so odd mzML still reads.
-    let _utf8 = transcode_to_utf8(input)?;
-    let utf8_path: &Path = _utf8.as_ref().map(|g| g.file.as_path()).unwrap_or(input);
-    let sanitized = sanitize_param_groups(utf8_path)?;
-    let read_path: &Path = sanitized.as_deref().unwrap_or(utf8_path);
-    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
+    // mzdata-readable (mzML/imzML, Thermo `.raw`, Bruker TDF). The Latin-1 transcode +
+    // empty-param-group sanitize are XML-FILE-only workarounds — applying them to a directory
+    // vendor unit (a `.d`) would `read()` the directory fd and fail EISDIR before we ever reach the
+    // reader, so gate them on a file input.
+    let (_utf8, read_path): (Option<TranscodeGuard>, PathBuf) = if input.is_file() {
+        let utf8 = transcode_to_utf8(input)?;
+        let utf8_path: &Path = utf8.as_ref().map(|g| g.file.as_path()).unwrap_or(input);
+        let sanitized = sanitize_param_groups(utf8_path)?;
+        let rp = sanitized.unwrap_or_else(|| utf8_path.to_path_buf());
+        (utf8, rp)
+    } else {
+        (None, input.to_path_buf())
+    };
+    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&read_path)
         .with_context(|| format!("opening {}", input.display()))?;
 
     use mzdata::prelude::{ChromatogramSource, MSDataFileMetadata, SpectrumSource, SpectrumWriter};
