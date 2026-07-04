@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.11] — 2026-07-04
+
+### Added — native Agilent profile `.d` → mzML (all platforms)
+
+- **`--to mzml` now reads Agilent *profile* `.d` with the pure-Rust reader**, so a native
+  vendor→mzML conversion works off Windows without msconvert (previously the mzML lane guarded
+  Agilent `.d` out on non-Windows → `--via-msconvert`). Each `MSProfile.bin` flight-time bin is mapped
+  to m/z with the per-scan calibration, applying MassHunter's polynomial refinement when present (the
+  same math the mzPeak grid lane gates against), and emitted as profile spectra.
+- **Graceful fallback:** if the reader can't model a `.d` (e.g. the 6560 DTIMS / flat-`MSScan.xsd`
+  ion-mobility variant, which has no `SpectrumParamsType`), the lane logs a diagnostic and falls
+  through to the typed *"…use `--via-msconvert`"* guidance instead of surfacing a raw schema-parse
+  error — no crash, no partial output. (Native support for that IM variant is a separate follow-up.)
+
 ## [0.4.10] — 2026-07-04
 
 ### Fixed — `--to mzml` on directory-based vendor formats
