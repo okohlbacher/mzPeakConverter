@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.12] — 2026-07-06
+
+### Changed — timsTOF ims-compact: per-scan delta TOF is now the default
+
+- **The integer TOF (m/z) axis is now stored as per-scan deltas by default** (the first peak of each
+  mobility scan is the absolute bin, the rest are increments), byte-split + zstd. ~15% smaller than
+  absolute bins; on the reference diaPASEF run (PXD017703 HeLa 60 SPD) the file is **1682 MB = 0.91× the
+  vendor `.d`** — below the raw vendor file. Lossless: a reader reconstructs the absolute TOF by
+  cumulative-summing within each mobility scan. Round-trip verified end-to-end (291,531 peaks
+  reconstructed exactly, 98.6% via accumulated deltas).
+- **New `--no-tof-delta`** stores absolute TOF bins instead (byte-split; 1892 MB = 1.02× the `.d`).
+  Replaces the earlier experimental opt-in `--frame-compact-ims` flag with an opt-out.
+- The native/SDK `tof` column now uses `BYTE_STREAM_SPLIT` (was delta-packing) in both modes.
+- **Reader compatibility:** delta files carry `mzpeak:tof_delta_reset=scan` per spectrum; a reader MUST
+  cumulative-sum the `tof` column within each mobility-scan run before applying the m/z model, and access
+  is per-frame rather than per-point. Use `--no-tof-delta` for readers that don't understand the delta
+  layer.
+
 ## [0.4.11] — 2026-07-04
 
 ### Added — native Agilent profile `.d` → mzML (all platforms)
