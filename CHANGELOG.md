@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.13] — 2026-07-06
+
+### Released to main — per-scan delta TOF is the default
+
+- Merges the per-scan delta TOF encoding (0.4.12) into `main`: for timsTOF ims-compact conversion the
+  integer TOF axis is stored as per-scan deltas by default (byte-split; lossless — a reader cumulative-
+  sums within each mobility scan, keyed on `mzpeak:tof_delta_reset=scan`). ~15% smaller, 0.91× the
+  vendor `.d` on the reference diaPASEF run. Use **`--no-tof-delta`** for absolute bins (1.02×) when the
+  reader does not understand the delta layer.
+- Verified on merge: 27 unit + 3 contract tests green; e2e confirmed default = delta (marker present),
+  `--no-tof-delta` = absolute (marker absent), non-TDF conversion unaffected.
+
 ## [0.4.12] — 2026-07-06
 
 ### Changed — timsTOF ims-compact: per-scan delta TOF is now the default
