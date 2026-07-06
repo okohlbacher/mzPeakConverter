@@ -188,7 +188,7 @@ impl NativeTofReader {
         &self,
         i: usize,
         int_intensity: bool,
-        frame_compact: bool,
+        tof_delta: bool,
     ) -> Result<MultiLayerSpectrum> {
         let frame = self.frame(i)?;
         let n_scans = frame.scan_offsets.len().saturating_sub(1);
@@ -197,7 +197,7 @@ impl NativeTofReader {
         // f32 is also lossy for counts > 2^24). Default keeps f32 for format stability.
         let (mut tof, mut intensity_f32, mut intensity_i32, mut mobility) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        // Absolute TOF extent for the observed-m/z range — tracked separately because `frame_compact`
+        // Absolute TOF extent for the observed-m/z range — tracked separately because `tof_delta`
         // rewrites the `tof` column to per-scan deltas (so `tof.iter().min()` would be a delta, not a bin).
         let (mut tof_min, mut tof_max) = (i32::MAX, i32::MIN);
         for s in 0..n_scans {
@@ -214,11 +214,12 @@ impl NativeTofReader {
                     .map_err(|_| anyhow::anyhow!("TOF bin {} exceeds i32 range", frame.tof[k]))?;
                 tof_min = tof_min.min(bin);
                 tof_max = tof_max.max(bin);
-                // frame-compact: store the per-scan delta (first peak of a scan = absolute bin, the
-                // rest = non-negative increments; TOF is ascending within a scan). A reader cumsum's
+                // per-scan delta (the default; --no-tof-delta disables it): first peak of a scan =
+                // absolute bin, the rest = non-negative increments; TOF is ascending within a scan. A
+                // reader cumsum's
                 // within each mobility scan to recover the absolute bin before the m/z model. Smaller
                 // magnitudes ⇒ far more byte-plane redundancy ⇒ ~-20% on the TOF column.
-                let stored = if frame_compact {
+                let stored = if tof_delta {
                     let d = if k == lo { bin } else { bin - prev };
                     prev = bin;
                     d
@@ -268,8 +269,8 @@ impl NativeTofReader {
             ..Default::default()
         };
         descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
-        if frame_compact {
-            // Self-describing marker for the frame-compact TOF encoding: a reader must cumsum the
+        if tof_delta {
+            // Self-describing marker for the per-scan-delta TOF encoding: a reader must cumsum the
             // `tof` column within each mobility-scan run before applying the m/z model.
             descr.add_param(Param::builder().name("mzpeak:tof_delta_reset").value("scan").build());
         }
@@ -301,11 +302,11 @@ fn read_frame_num_peaks(tdf: &Path) -> Result<Vec<u32>> {
 }
 
 #[cfg(test)]
-mod frame_compact_tests {
-    /// `--frame-compact-ims` stores per-scan deltas (first peak of a scan = absolute bin, the rest =
-    /// increments, since TOF ascends within a scan); a reader recovers absolute TOF by cumulative sum
-    /// within each scan. That transform MUST be exactly invertible — this guards the losslessness the
-    /// flag promises. Mirrors the encode step in [`super::NativeTofReader::ims_compact_spectrum`].
+mod tof_delta_tests {
+    /// Per-scan delta TOF (the default; `--no-tof-delta` disables it) stores the first peak of a scan
+    /// as the absolute bin and the rest as increments (TOF ascends within a scan); a reader recovers
+    /// absolute TOF by cumulative sum within each scan. That transform MUST be exactly invertible —
+    /// this guards losslessness. Mirrors the encode step in [`super::NativeTofReader::ims_compact_spectrum`].
     #[test]
     fn per_scan_delta_is_lossless() {
         let scans: Vec<Vec<i32>> = vec![
