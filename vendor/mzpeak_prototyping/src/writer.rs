@@ -102,6 +102,7 @@ impl<'a> ArrayTypesSampler<'a> {
                 false,
                 false,
                 None,
+                None,
             )
             .ok()
             .and_then(|(chunks, _aux_arrays, _)| {

@@ -576,6 +576,8 @@ pub struct ChunkBuffers {
     is_profile_buffer: Vec<bool>,
     include_time: bool,
     chunking_strategy: ChunkingStrategy,
+    /// GATED ims-chunked: when set, raw-array writes chunk an integer `tof` axis on m/z bins.
+    mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
     point_count: u64,
 }
 
@@ -592,6 +594,7 @@ impl ChunkBuffers {
         is_profile_buffer: Vec<bool>,
         include_time: bool,
         chunking_strategy: ChunkingStrategy,
+        mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
     ) -> Self {
         Self {
             chunk_array_fields,
@@ -605,7 +608,53 @@ impl ChunkBuffers {
             is_profile_buffer,
             include_time,
             chunking_strategy,
+            mz_boundary,
             point_count: 0,
+        }
+    }
+
+    /// GATED ims-chunked raw-array write: chunk a spectrum's raw `tof`/intensity/mobility arrays on
+    /// m/z bins and buffer the resulting chunk struct. Returns `None` when this facet is not an
+    /// ims-chunked (m/z-boundary) buffer, so the caller falls back to the normal point path.
+    pub fn add_raw_mz_boundary(
+        &mut self,
+        series_index: u64,
+        series_time: Option<f32>,
+        arrays: &mzdata::spectrum::BinaryArrayMap,
+    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+        let boundary = self.mz_boundary?;
+        // The chunk main axis is the integer `tof` flight-time array (replaces m/z for this facet).
+        let main_axis = crate::BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::nonstandard("tof"),
+            mzdata::spectrum::BinaryDataArrayType::Int32,
+        );
+        let series_time = if self.include_time { series_time } else { None };
+        let res = ArrowArrayChunk::build_with_axis(
+            series_index,
+            series_time,
+            self.buffer_context,
+            arrays,
+            self.chunking_strategy,
+            &self.overrides,
+            false,
+            false,
+            &self.chunk_array_fields,
+            Some(main_axis),
+            Some(boundary),
+        );
+        match res {
+            Ok((chunks, _aux, n_pts)) => {
+                if let Some(chunks) = chunks {
+                    let (fields, cols, _) = chunks.into_parts();
+                    self.add_arrays(fields, cols, n_pts, false);
+                } else {
+                    // Empty frame (no points): nothing to buffer, but count the (zero) points.
+                    self.point_count += 0;
+                }
+                Some(Ok(n_pts))
+            }
+            Err(e) => Some(Err(e)),
         }
     }
 
@@ -751,6 +800,23 @@ impl ArrayBufferWriterVariants {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
                 Some(&chunk_buffers.chunking_strategy)
+            }
+            ArrayBufferWriterVariants::PointBuffers(_) => None,
+        }
+    }
+
+    /// GATED ims-chunked raw-array write. Delegates to [`ChunkBuffers::add_raw_mz_boundary`];
+    /// returns `None` for a point buffer or a chunk buffer without an m/z boundary configured, so
+    /// the caller falls back to the normal raw-array path.
+    pub fn add_raw_mz_boundary(
+        &mut self,
+        series_index: u64,
+        series_time: Option<f32>,
+        arrays: &mzdata::spectrum::BinaryArrayMap,
+    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
+                chunk_buffers.add_raw_mz_boundary(series_index, series_time, arrays)
             }
             ArrayBufferWriterVariants::PointBuffers(_) => None,
         }
@@ -914,6 +980,9 @@ pub struct ArrayBuffersBuilder {
     include_time: bool,
     buffer_context: BufferContext,
     chunking_strategy: Option<ChunkingStrategy>,
+    /// GATED (timsTOF `--ims-chunked`): when set, chunk an integer `tof` main axis on m/z bins.
+    /// `None` for every default/other-format path, so normal m/z-axis chunking is untouched.
+    mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
 }
 
 /// The builder will default to the `point` layout
@@ -927,6 +996,7 @@ impl Default for ArrayBuffersBuilder {
             include_time: false,
             buffer_context: BufferContext::Spectrum,
             chunking_strategy: None,
+            mz_boundary: None,
         }
     }
 }
@@ -974,6 +1044,21 @@ impl ArrayBuffersBuilder {
             self.array_fields.clear();
         }
         self
+    }
+
+    /// GATED ims-chunked: set the TOF→m/z boundary model so a chunked build splits an integer `tof`
+    /// axis on m/z bins. Leaves default m/z-axis chunking untouched (this is `None` elsewhere).
+    pub fn mz_boundary(
+        mut self,
+        mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
+    ) -> Self {
+        self.mz_boundary = mz_boundary;
+        self
+    }
+
+    /// Whether a chunked layout has been requested for this facet.
+    pub fn has_chunking(&self) -> bool {
+        self.chunking_strategy.is_some()
     }
 
     /// Register an new rule mapping from one [`BufferName`]-like to another [`BufferName`]-like
@@ -1253,6 +1338,7 @@ impl ArrayBuffersBuilder {
             Vec::new(),
             self.include_time,
             self.chunking_strategy.unwrap(),
+            self.mz_boundary,
         )
     }
 

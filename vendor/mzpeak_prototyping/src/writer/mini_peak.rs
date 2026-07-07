@@ -77,6 +77,28 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
             }
             RefPeakDataLevel::Missing => unimplemented!(),
             RefPeakDataLevel::RawData(arrays) => {
+                // GATED ims-chunked: if this facet is a ChunkBuffers with an m/z boundary, chunk the
+                // raw `tof`/intensity/mobility arrays on m/z bins instead of storing flat points.
+                // Returns `None` for every other facet, falling through to the normal point path.
+                if let Some(res) =
+                    self.buffers.add_raw_mz_boundary(spectrum_count, spectrum_time, arrays)
+                {
+                    let n_peaks = res.map_err(io::Error::other)?;
+                    self.n_points += n_peaks as u64;
+                    self.n_entries += 1;
+                    if self.buffers.len() >= self.buffer_size
+                        || self.buffers.memory_size()
+                            >= *crate::writer::array_buffer::FLUSH_MEM_BYTES
+                    {
+                        self.flush()?;
+                    }
+                    return Ok(EntryMetadataDerivedFromData::new(
+                        None,
+                        Some(Vec::new()),
+                        None,
+                        Some(n_peaks),
+                    ));
+                }
                 // `RefPeakDataLevel::len()` derives the point count from the m/z array, which is 0
                 // for a custom peak facet that REPLACES m/z with a nonstandard main axis (e.g. an
                 // integer `tof`/`tof_index` flight-time column). Fall back to the longest data array

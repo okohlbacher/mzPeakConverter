@@ -284,6 +284,108 @@ impl NativeTofReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
+    /// GATED `--ims-chunked` variant of [`Self::ims_compact_spectrum`]: emits ABSOLUTE integer `tof`
+    /// (no per-scan delta) with the WHOLE FRAME sorted by `tof` (== sorted by m/z, since m/z is
+    /// monotonic in tof). The writer then splits these points into true-m/z-bin chunks and
+    /// delta-encodes `tof` within each chunk. Sorting mixes mobility scans, which is lossless because
+    /// mobility is stored explicitly per point. Same three arrays (`tof`, intensity, mobility) as the
+    /// default path, minus the `mzpeak:tof_delta_reset` marker (delta is per-chunk, not per-scan).
+    pub fn ims_compact_spectrum_chunked(
+        &self,
+        i: usize,
+        int_intensity: bool,
+    ) -> Result<MultiLayerSpectrum> {
+        let frame = self.frame(i)?;
+        let n_scans = frame.scan_offsets.len().saturating_sub(1);
+        // Gather every point as (tof_bin, intensity, mobility) across all mobility scans.
+        // Sort by TOF (== by m/z): this puts m/z-adjacent points together so the per-chunk delta
+        // makes tof deltas near-zero (tof is the largest column, so this dominates). A secondary
+        // sort by mobility was tried to shrink the scattered 1/K0 column, but it scrambles tof
+        // within each chunk and inflates it more than it saves on mobility — a net loss (measured
+        // g99123: mobility −392 MB, tof +577 MB). So m/z order stays.
+        let mut pts: Vec<(i32, u32, f64)> = Vec::with_capacity(frame.tof.len());
+        let (mut tof_min, mut tof_max) = (i32::MAX, i32::MIN);
+        for s in 0..n_scans {
+            let (lo, hi) = (frame.scan_offsets[s], frame.scan_offsets[s + 1]);
+            if lo >= hi {
+                continue;
+            }
+            let m = self.mobility_for_scan(s);
+            for k in lo..hi {
+                let bin = i32::try_from(frame.tof[k])
+                    .map_err(|_| anyhow::anyhow!("TOF bin {} exceeds i32 range", frame.tof[k]))?;
+                tof_min = tof_min.min(bin);
+                tof_max = tof_max.max(bin);
+                pts.push((bin, frame.intensity[k], m));
+            }
+        }
+        pts.sort_by_key(|p| p.0);
+
+        let (mut tof, mut intensity_i32, mut intensity_f32, mut mobility) = (
+            Vec::with_capacity(pts.len()),
+            Vec::with_capacity(pts.len()),
+            Vec::with_capacity(pts.len()),
+            Vec::with_capacity(pts.len()),
+        );
+        for (bin, inten, m) in pts {
+            tof.push(bin);
+            if int_intensity {
+                intensity_i32.push(
+                    i32::try_from(inten)
+                        .map_err(|_| anyhow::anyhow!("intensity {} exceeds i32 range", inten))?,
+                );
+            } else {
+                intensity_f32.push(inten as f32);
+            }
+            mobility.push(m);
+        }
+
+        let mut arrays = BinaryArrayMap::new();
+        let mut tof_da =
+            DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
+        tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof: {e}"))?;
+        arrays.add(tof_da);
+        let mut int_da = if int_intensity {
+            let mut da =
+                DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+            da.update_buffer(intensity_i32.as_slice())
+                .map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+            da
+        } else {
+            let mut da = DataArray::wrap(
+                &ArrayType::IntensityArray,
+                BinaryDataArrayType::Float32,
+                Vec::new(),
+            );
+            da.update_buffer(intensity_f32.as_slice())
+                .map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+            da
+        };
+        int_da.unit = Unit::DetectorCounts;
+        arrays.add(int_da);
+        let mut mob_da = DataArray::wrap(
+            &ArrayType::MeanInverseReducedIonMobilityArray,
+            BinaryDataArrayType::Float64,
+            Vec::new(),
+        );
+        mob_da.update_buffer(mobility.as_slice())
+            .map_err(|e| anyhow::anyhow!("encoding mobility: {e}"))?;
+        arrays.add(mob_da);
+
+        let mut descr = SpectrumDescription {
+            id: format!("frame={}", frame.index),
+            index: i,
+            ms_level: frame.ms_level.max(1),
+            signal_continuity: SignalContinuity::Centroid,
+            ..Default::default()
+        };
+        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        if tof_min <= tof_max {
+            let (mz_a, mz_b) = (self.model.mz(tof_min), self.model.mz(tof_max));
+            crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
+        }
+        Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
+    }
 }
 
 /// `NumPeaks` for every frame, ordered by `Id` so position `i` matches timsrust's frame index.

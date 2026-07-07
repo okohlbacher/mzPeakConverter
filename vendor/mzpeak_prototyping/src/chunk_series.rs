@@ -631,6 +631,78 @@ pub(crate) fn guard_not_signal_array(array_type: &ArrayType) {
     }
 }
 
+/// GATED timsTOF ims-compact "chunked" layout (opt-in `--ims-chunked`). Carries the TOF→m/z model
+/// coefficients so the chunker can split an INTEGER `tof` main axis on TRUE m/z bin boundaries
+/// (`floor(mz / width)`, `mz = (a + b·tof)²`) and record each chunk's `chunk_start`/`chunk_end` as
+/// the tight min/max **m/z** of the points it holds — making the facet m/z-page-prunable while
+/// storing the lossless integer `tof` (delta-encoded within each chunk).
+///
+/// This is ONLY ever `Some` on the gated ims-chunked path; every other caller passes `None`, so the
+/// default float m/z-axis chunking (all other formats) is byte-for-byte unaffected.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TofMzBoundary {
+    pub a: f64,
+    pub b: f64,
+}
+
+impl TofMzBoundary {
+    /// m/z = (a + b·tof)² — the same monotonic model used by the ims-compact reader.
+    #[inline]
+    pub fn mz(&self, tof: f64) -> f64 {
+        let s = self.a + self.b * tof;
+        s * s
+    }
+}
+
+/// Split a sorted (ascending-`tof`) Int32 flight-time array into contiguous runs whose points fall
+/// in the same m/z bin (`floor(mz / width)`). Empty bins are skipped implicitly (a run is created
+/// only for the points actually present). Assumes a dense (non-null) `tof` array, which the
+/// ims-compact writer always produces.
+fn mz_boundary_steps(
+    tof: &Int32Array,
+    boundary: TofMzBoundary,
+    width: f64,
+) -> Vec<std::ops::Range<usize>> {
+    let n = tof.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let bin = |t: i32| -> i64 { (boundary.mz(t as f64) / width).floor() as i64 };
+    let mut steps = Vec::new();
+    let mut start = 0usize;
+    let mut cur = bin(tof.value(0));
+    for i in 1..n {
+        let bi = bin(tof.value(i));
+        if bi != cur {
+            steps.push(start..i);
+            start = i;
+            cur = bi;
+        }
+    }
+    steps.push(start..n);
+    steps
+}
+
+/// Encode a chunk's Int32 `tof` slice as [absolute_first, delta, delta, ...]: the first element is
+/// the absolute TOF bin, the rest are increments from the previous point. Reconstruction is a plain
+/// cumulative sum from element 0 (NOT from `chunk_start`, which holds m/z, not tof). Assumes dense
+/// (non-null) input.
+fn int32_chunk_delta(slice: &Int32Array) -> ArrayRef {
+    let n = slice.len();
+    let mut out: Vec<i32> = Vec::with_capacity(n);
+    let mut prev = 0i32;
+    for i in 0..n {
+        let v = slice.value(i);
+        if i == 0 {
+            out.push(v);
+        } else {
+            out.push(v - prev);
+        }
+        prev = v;
+    }
+    Arc::new(Int32Array::from(out))
+}
+
 impl ArrowArrayChunk {
     /// A wrapper around [`Self::from_arrays`] and [`Self::to_struct_array`]
     ///
@@ -646,17 +718,52 @@ impl ArrowArrayChunk {
         nullify_zero_intensity: bool,
         fields: &Fields,
     ) -> Result<(Option<StructArray>, Vec<AuxiliaryArray>, usize), ArrayRetrievalError> {
+        Self::build_with_axis(
+            series_index,
+            series_time,
+            buffer_context,
+            arrays,
+            encoding,
+            overrides,
+            drop_zero_intensity,
+            nullify_zero_intensity,
+            fields,
+            None,
+            None,
+        )
+    }
+
+    /// Like [`Self::build`], but allows overriding the chunk main axis (default:
+    /// `buffer_context.main_axis()`, i.e. m/z) and supplying a [`TofMzBoundary`] to chunk an
+    /// integer `tof` axis on m/z bins. Both extra arguments are `None` on every non-ims-chunked
+    /// caller, so default behavior is unchanged.
+    pub fn build_with_axis(
+        series_index: u64,
+        series_time: Option<f32>,
+        buffer_context: BufferContext,
+        arrays: &BinaryArrayMap,
+        encoding: ChunkingStrategy,
+        overrides: &BufferOverrideTable,
+        drop_zero_intensity: bool,
+        nullify_zero_intensity: bool,
+        fields: &Fields,
+        main_axis_override: Option<BufferName>,
+        mz_boundary: Option<TofMzBoundary>,
+    ) -> Result<(Option<StructArray>, Vec<AuxiliaryArray>, usize), ArrayRetrievalError> {
+        let main_axis = main_axis_override
+            .unwrap_or_else(|| buffer_context.main_axis())
+            .with_priority(Some(BufferPriority::Primary));
         let (chunks, auxiliary_arrays, n_pts) = ArrowArrayChunk::from_arrays(
             series_index,
             series_time,
-            buffer_context.main_axis()
-                .with_priority(Some(BufferPriority::Primary)),
+            main_axis,
             &arrays,
             encoding,
             overrides,
             drop_zero_intensity,
             nullify_zero_intensity,
             Some(fields),
+            mz_boundary,
         )?;
         let chunks = if !chunks.is_empty() {
             let chunks = ArrowArrayChunk::to_struct_array(
@@ -965,6 +1072,7 @@ impl ArrowArrayChunk {
         drop_zero_intensity: bool,
         nullify_zero_intensity: bool,
         fields: Option<&Fields>,
+        mz_boundary: Option<TofMzBoundary>,
     ) -> Result<(Vec<Self>, Vec<AuxiliaryArray>, usize), ArrayRetrievalError> {
         let mut chunks = Vec::new();
 
@@ -1139,6 +1247,54 @@ impl ArrowArrayChunk {
 
         let n_pts = main_axis_array.len();
 
+        let main_axis = main_axis.clone().with_format(BufferFormat::Chunk);
+
+        // GATED ims-chunked path: chunk an integer `tof` main axis on TRUE m/z bin boundaries and
+        // delta-encode `tof` within each chunk. Only taken when `mz_boundary` is `Some` (the
+        // opt-in timsTOF `--ims-chunked` layout); the default float m/z path is the `else` below.
+        if let Some(boundary) = mz_boundary {
+            let tof: &Int32Array = main_axis_array.as_primitive::<Int32Type>();
+            let width = chunk_encoding.chunk_size();
+            let steps = mz_boundary_steps(tof, boundary, width);
+            for step in steps {
+                let (s, e) = (step.start, step.end);
+                let slice_dyn = main_axis_array.slice(s, e - s);
+                let slice: &Int32Array = slice_dyn.as_primitive::<Int32Type>();
+                // Tight m/z bounds for the chunk: min/max m/z over its (tof-sorted) points.
+                let m0 = boundary.mz(slice.value(0) as f64);
+                let m1 = boundary.mz(slice.value(slice.len() - 1) as f64);
+                let (chunk_start, chunk_end) = (m0.min(m1), m0.max(m1));
+                let chunk_values = int32_chunk_delta(slice);
+
+                let mut chunk_arrays: HashMap<BufferName, ArrayRef> = Default::default();
+                for (k, v) in arrow_arrays
+                    .iter()
+                    .filter(|(k, _)| k.array_type != main_axis.array_type)
+                {
+                    let k = k.clone().with_format(BufferFormat::ChunkSecondary);
+                    let v = v.slice(s, e - s);
+                    if let Ok(transform) = BufferTransformEncoder::try_from(k.transform) {
+                        let vi = transform.encode_arrow(&k, &v);
+                        chunk_arrays.insert(k, vi);
+                    } else {
+                        chunk_arrays.insert(k, v);
+                    }
+                }
+
+                chunks.push(Self::new(
+                    series_index,
+                    series_time,
+                    chunk_start,
+                    chunk_end,
+                    main_axis.clone(),
+                    chunk_values,
+                    chunk_encoding,
+                    chunk_arrays,
+                ));
+            }
+            return Ok((chunks, auxiliary_arrays, n_pts));
+        }
+
         let steps = match array_to_arrow_type(main_axis.dtype) {
             DataType::Float32 => null_chunk_every_k(
                 main_axis_array.as_primitive::<Float32Type>(),
@@ -1150,8 +1306,6 @@ impl ArrowArrayChunk {
             ),
             _ => unimplemented!("{}", main_axis),
         };
-
-        let main_axis = main_axis.clone().with_format(BufferFormat::Chunk);
 
         for step in steps {
             let slice = main_axis_array.slice(step.start, step.end - step.start);
@@ -1315,6 +1469,7 @@ mod test {
             true,
             false,
             None,
+            None,
         )?;
 
         for chunk in chunks.iter() {
@@ -1402,6 +1557,7 @@ mod test {
             &BufferOverrideTable::default(),
             true,
             true,
+            None,
             None,
         )?;
 
@@ -1536,6 +1692,7 @@ mod test {
             false,
             false,
             None,
+            None,
         )?;
 
         let rendered = ArrowArrayChunk::to_struct_array(
@@ -1586,6 +1743,7 @@ mod test {
             &overrides,
             false,
             false,
+            None,
             None,
         )?;
 
@@ -1652,6 +1810,7 @@ mod test {
             &Default::default(),
             false,
             false,
+            None,
             None,
         )?;
 
@@ -1748,6 +1907,7 @@ mod test {
             &Default::default(),
             true,
             true,
+            None,
             None,
         )?;
 
@@ -1890,6 +2050,7 @@ mod test {
             &Default::default(),
             true,
             true,
+            None,
             None,
         )?;
 

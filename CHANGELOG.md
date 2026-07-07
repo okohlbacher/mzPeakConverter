@@ -6,6 +6,43 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.14] — 2026-07-07
+
+### Added — timsTOF `--ims-chunked` (opt-in, m/z-prunable layout for fast slicing)
+
+- **New `--ims-chunked`** (Bruker timsTOF ims-compact only, **OFF BY DEFAULT**) writes peaks in a
+  **chunked integer-TOF layout**: each frame's peaks are split into true m/z bins (default 50 Th,
+  override with `--chunk-size` in Th), and every chunk records its m/z min/max (`chunk_start`/
+  `chunk_end`) as Parquet columns with page statistics, so the m/z axis becomes page-prunable. XIC /
+  m/z-slice queries touch only the overlapping chunks (~2–4 % of the peaks) — a measured sweep on
+  MSV000099123 ran **~20–30× faster** than the archive layout. TOF is delta-encoded within each chunk
+  (cumulative-sum to reconstruct, lossless); the block carries `tof_encoding = m/z-chunked`,
+  `chunk_bounds = mz`, and `chunk_width_th`.
+- **The default is unchanged — the "archive" layout** (flat per-scan-delta table) stays the default for
+  timsTOF: maximum compression and fast whole-spectrum access. `--ims-chunked` is a separate,
+  mutually-exclusive opt-in; without it, output is byte-identical to 0.4.13.
+
+### Fixed
+
+- **`BYTE_STREAM_SPLIT` now applies to the chunked layout's nested value columns.** The writer matched
+  the leaf names `intensity`/`tof` only, so the chunked `chunk.intensity.list.item` /
+  `chunk.tof_chunk_values.list.item` columns silently fell back to dictionary encoding. Restoring BSS
+  cuts the chunked size overhead sharply (MSV000099123: **+19 % → +1.9 %** vs the archive layout;
+  chunked lands at ~parity with archive and **0.86× the vendor `.d`**). No effect on the default or any
+  other layout/format.
+- **`ims_calibration.tof_encoding` is now truthful** — emits `per-scan-delta` (default), `absolute`
+  (`--no-tof-delta` / SDK path), or `m/z-chunked` (`--ims-chunked`), replacing a hard-coded `"absolute"`
+  that mislabeled the default delta output.
+
+### Notes
+
+- Losslessness verified independently (pyarrow reconstruction, not the writer's own check) across the
+  reference timsTOF + HeLa diaPASEF sets: ≥1.2 billion peaks, 0 mismatches on tof/intensity/mobility/
+  spectrum_index.
+- Whole-spectrum random access equals the archive layout once chunk row groups are sized finely; the
+  shipped default (8192 chunks/row group) is coarse on very large files — set `MZPC_ROW_GROUP_ROWS` to
+  tune, or use the archive layout for whole-spectrum-heavy workloads. Points-based auto-sizing is planned.
+
 ## [0.4.13] — 2026-07-06
 
 ### Released to main — per-scan delta TOF is the default

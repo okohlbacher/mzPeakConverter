@@ -992,21 +992,30 @@ pub trait AbstractMzPeakWriter {
         buffer_size: usize,
         encryption_properties: &HashMap<String, Arc<FileEncryptionProperties>>,
     ) -> io::Result<MiniPeakWriterType<S>> {
-        let peak_buffer = peak_buffer_builder.include_time(include_time).build(
-            Arc::new(Schema::empty()),
-            BufferContext::Spectrum,
-            false,
-        );
+        // GATED ims-chunked: when the peak facet builder carries a chunking strategy (only set on
+        // the timsTOF `--ims-chunked` path), build a ChunkBuffers so raw arrays are stored as m/z
+        // chunks; otherwise the default point layout (all other facets/formats — unchanged).
+        let peak_buffer_builder = peak_buffer_builder.include_time(include_time);
+        let peak_buffer: ArrayBufferWriterVariants = if peak_buffer_builder.has_chunking() {
+            peak_buffer_builder
+                .build_chunked(Arc::new(Schema::empty()), BufferContext::Spectrum, false)
+                .into()
+        } else {
+            peak_buffer_builder
+                .build(Arc::new(Schema::empty()), BufferContext::Spectrum, false)
+                .into()
+        };
 
         let peak_encrytion_props = encryption_properties
             .get(&FileEntry::from(MzPeakArchiveType::SpectrumPeakDataArrays).name)
             .cloned();
 
+        let peak_chunk_encoding = peak_buffer.chunking_strategy().copied();
         let peak_data_props = Self::spectrum_data_writer_props(
             &peak_buffer,
             peak_buffer.index_path(),
             shuffle_mz,
-            &None,
+            &peak_chunk_encoding,
             compression,
             write_batch_config,
             peak_encrytion_props,
@@ -1020,7 +1029,7 @@ pub trait AbstractMzPeakWriter {
 
         Ok(MiniPeakWriterType::new(
             peak_writer,
-            peak_buffer.into(),
+            peak_buffer,
             buffer_size,
         ))
     }
@@ -1135,7 +1144,10 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if (c.name() == "intensity" || c.name() == "tof")
+            if (c.name() == "intensity"
+                || c.name() == "tof"
+                || c.path().string().ends_with("intensity.list.item")
+                || c.path().string().ends_with("tof_chunk_values.list.item"))
                 && matches!(
                     c.physical_type(),
                     parquet::basic::Type::DOUBLE
@@ -1289,7 +1301,10 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
-            if (c.name() == "intensity" || c.name() == "tof")
+            if (c.name() == "intensity"
+                || c.name() == "tof"
+                || c.path().string().ends_with("intensity.list.item")
+                || c.path().string().ends_with("tof_chunk_values.list.item"))
                 && matches!(
                     c.physical_type(),
                     parquet::basic::Type::DOUBLE

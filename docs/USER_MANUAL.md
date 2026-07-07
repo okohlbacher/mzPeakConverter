@@ -90,6 +90,8 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 | `--chunk-size <Th>` | `50` | m/z chunk width for the chunked layout |
 | `--zstd-level <1–22>` | `3` | Parquet zstd level |
 | `--no-ims-compact` | off | Bruker TDF: write standard f64 m/z instead of the default ims-compact |
+| `--no-tof-delta` | off | Bruker TDF ims-compact: store absolute integer TOF bins instead of the default per-scan delta (larger, but needs no reconstruction — max reader compatibility) |
+| `--ims-chunked` | off | Bruker TDF ims-compact: opt into the **chunked** layout (m/z-page-prunable, fast XIC/slice) instead of the default **archive** layout (see §9). Mutually exclusive with per-scan delta |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF via the official `timsdata` SDK (Win/Linux only; needs `TIMSDATA_LIB_DIR`). Parallel path to the default pure-Rust readers; implies f64 m/z |
 | `--no-tims-recalibration` | off | Bruker TDF: disable vendor-grade scan→1/K0 recalibration (`TimsCalibration` ModelType-2 model) and use timsrust's linear approximation. Recalibration is **on by default** (~22× closer to the SDK) |
 | `--no-vendor` | off | Do not embed vendor side-files (see §8) |
@@ -219,6 +221,19 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
   f64 m/z, roughly halving the m/z bytes with an exact grid. Disable with
   `--no-ims-compact` to write standard f64 m/z. m/z is reconstructed by readers as
   `m/z = (a + b·tof)²`.
+- **ims-compact TOF layout (two modes)** — the peak facet has two mutually-exclusive layouts,
+  recorded in `ims_calibration.tof_encoding`:
+  - **Archive** *(default)* — a flat table with the integer TOF stored as **per-scan deltas**
+    (`per-scan-delta`; `--no-tof-delta` stores `absolute` bins instead). Maximum compression and fast
+    whole-spectrum access; no m/z index (an m/z-range query is a full scan). Below the vendor `.d` on
+    every reference file.
+  - **Chunked** *(`--ims-chunked`)* — each frame's peaks are split into true m/z bins (`--chunk-size`,
+    default 50 Th); each chunk stores its m/z min/max (`chunk_start`/`chunk_end`, Parquet
+    page-prunable) and delta-encodes TOF within the chunk (`m/z-chunked`). **m/z-slice / XIC queries
+    are ~20–30× faster** (they touch only the overlapping chunks) at roughly parity size. Reconstruct
+    a chunk's absolute TOF by cumulative-summing its values. Whole-spectrum access matches archive when
+    row groups are sized finely (`MZPC_ROW_GROUP_ROWS`); the default (8192 chunks/row group) is coarse
+    on very large files.
 
 ## 10. Exit codes & environment
 
