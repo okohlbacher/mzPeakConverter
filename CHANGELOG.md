@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.15] — 2026-07-08
+
+### Changed — multi-core parallel peak encoding (≈9× faster timsTOF conversion)
+
+- **Parallel row-group encode for the peak facet** (`spectra_peaks.parquet`). timsTOF conversion was
+  measured to be **~97 % encode+zstd-bound in a single writer thread** (parallel frame decode was
+  already hidden at ~1.4 s); the Arrow column encode + zstd is now spread across a bounded worker
+  pool using parquet's low-level `ArrowColumnWriter` API, while a single collector appends row groups
+  in `spectrum_index` order. **Output is byte-identical** to the serial writer (verified sha256 on
+  507 M- and 636 M-point files, independent of thread count), so page-pruning and determinism are
+  preserved.
+  - **Measured speedups (16-core machine):** g99123 1.5 GB archive **23.1 s → 2.5 s (9.2×)**; HeLa
+    diaPASEF 60SPD 1.8 GB **33.6 s → 3.5 s (9.6×)**; `--ims-chunked` g99123 **26.4 s → 4.4 s (6.0×)**.
+    Both layouts flip from encode-bound to decode-bound — decode (already parallel) is now the floor.
+  - **Auto-detects cores** via `available_parallelism()` (no configuration needed). Override with
+    `MZPC_ENCODE_THREADS` (or `RAYON_NUM_THREADS`); disable with `MZPC_PARALLEL_ENCODE=0` (serial
+    path retained verbatim). In-flight memory is bounded **by bytes** (default `max(256 MB,
+    threads×48 MB)`, override `MZPC_ENCODE_INFLIGHT_BYTES`), so memory stays flat as cores scale.
+  - Encrypted facets fall back to the serial path.
+
+### Added — instrumentation & corpus-tooling
+
+- **`MZPC_TIMING=1`** prints a per-conversion decode-vs-encode split (`decode busy` / `encode+zstd
+  busy` / total, plus detected threads and in-flight budget) for the timsTOF pipeline — the basis for
+  the bottleneck diagnosis above.
+- **Box tooling:** per-stage box timings (`conv_s`/`msconv_s`/`dl_s`/`up_s`/`raw_bytes`, optional
+  `BENCH_TSV`); the size-bench msconvert is gated behind `MZPC_BENCH_MZML=1` (was unconditional,
+  doubling `--via-msconvert` work); `--jobs` defaults to 1 with a disk-safety clamp
+  (`MZPC_ALLOW_PARALLEL=1` to override) so concurrent multi-GB msconvert intermediates can't fill the
+  box disk.
+
+### Notes
+
+- zstd stays at the ims default (L5) — on the archive layout the size is level-insensitive from L1–L5
+  on most files, and encode is no longer the bottleneck, so lowering it is unnecessary.
+- The serial `convert_file` path (Thermo `.raw` / msconvert-mzML re-read / SCIEX/Waters glue) writes
+  the standard data facet, not the peak facet, and is unaffected by this change — parallelizing it is
+  future work.
+
 ## [0.4.14] — 2026-07-07
 
 ### Added — timsTOF `--ims-chunked` (opt-in, m/z-prunable layout for fast slicing)

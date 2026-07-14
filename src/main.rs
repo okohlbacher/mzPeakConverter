@@ -2603,13 +2603,23 @@ where
             // Bounded channel: at most `window` decoded spectra buffered between decode and write, so
             // a slow writer back-pressures the decoder (and vice versa) without unbounded memory.
             let (tx, rx) = std::sync::mpsc::sync_channel::<MultiLayerSpectrum>(window);
+            // Perf instrumentation (MZPC_TIMING=1): decode/encode are pipelined (parallel producer +
+            // single writer thread), so the wall ≈ max(decode_busy, writer_busy). Comparing the two
+            // busy-times against total tells us which stage is the critical path.
+            let timing = std::env::var("MZPC_TIMING").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+            let t_block = std::time::Instant::now();
+            let writer_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let decode_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let wns = writer_ns.clone();
             // The writer thread owns writer+ms1 and returns them (or the first write error) on join.
             let writer_thread = std::thread::spawn(move || -> Result<(MzPeakWriterType<fs::File>, Ms1Chroms)> {
                 while let Ok(spec) = rx.recv() {
                     if synth_chroms {
                         ms1.observe(&spec);
                     }
+                    let s = std::time::Instant::now();
                     writer.write_spectrum(&spec)?;
+                    if timing { wns.fetch_add(s.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                 }
                 Ok((writer, ms1))
             });
@@ -2619,8 +2629,10 @@ where
                 let mut i = 0usize;
                 while i < n_frames {
                     let end = (i + window).min(n_frames);
+                    let sd = std::time::Instant::now();
                     let batch: Vec<Result<MultiLayerSpectrum>> =
                         (i..end).into_par_iter().map(|j| spectrum(j, int_intensity)).collect();
+                    if timing { decode_ns.fetch_add(sd.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
                     for spec in batch {
                         // A send error means the writer thread died (write error) — stop producing;
                         // the real error comes back from the join below.
@@ -2642,6 +2654,16 @@ where
             let (w, m) = joined?;
             writer = w;
             ms1 = m;
+            if timing {
+                let total = t_block.elapsed().as_secs_f64();
+                let wsec = writer_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+                let dsec = decode_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+                let bound = if wsec > dsec { "ENCODE-bound (writer thread)" } else { "DECODE-bound" };
+                eprintln!(
+                    "[timing] frames={n_frames} total={total:.1}s | decode(parallel busy)={dsec:.1}s  encode+zstd(writer busy)={wsec:.1}s | {bound} | threads={}",
+                    rayon::current_num_threads()
+                );
+            }
         }
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;

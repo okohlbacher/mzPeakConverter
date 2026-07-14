@@ -26,7 +26,7 @@ REMOTE_PS='C:\Users\User\box_convert_remote.ps1'
 RELAY=(python3 "$here/s3_relay.py")
 PROXY="ProxyCommand=ssh -i $BOX_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -W %h:%p $BOX_JUMP"
 SSH=(ssh -i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
-     -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -o "$PROXY")
+     -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=30 -o "$PROXY")
 
 # --- always delete any S3 key we minted, even on Ctrl-C / SIGTERM / mid-job crash ---
 PENDING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bxc-pending.XXXXXX")"
@@ -78,12 +78,14 @@ try: r=json.loads(base64.b64decode(sys.stdin.read()))
 except Exception: print("ERR"); sys.exit()
 c=lambda s:str(s).replace("\t"," ").replace("\n"," ").replace("\r"," ")
 for v in [c(r.get("stage","")),str(r.get("exit","")),"1" if r.get("uploaded") else "0",
-          str(r.get("size","")),str(r.get("md5","")),c(r.get("error","")),c(r.get("note",""))]:
+          str(r.get("size","")),str(r.get("md5","")),c(r.get("error","")),c(r.get("note","")),
+          str(r.get("conv_s","")),str(r.get("msconv_s","")),str(r.get("dl_s","")),str(r.get("up_s","")),str(r.get("raw_bytes",""))]:
     print(v)')"
   [ "$fields" = "ERR" ] && { echo "[$tag] FAIL: unparseable result from box" >&2; return 1; }
-  local R_STAGE R_EXIT R_UP R_SIZE R_MD5 R_ERR R_NOTE
+  local R_STAGE R_EXIT R_UP R_SIZE R_MD5 R_ERR R_NOTE R_CONV R_MSCONV R_DL R_UPS R_RAW
   { IFS= read -r R_STAGE; IFS= read -r R_EXIT; IFS= read -r R_UP; IFS= read -r R_SIZE
-    IFS= read -r R_MD5;   IFS= read -r R_ERR;  IFS= read -r R_NOTE; } <<EOF
+    IFS= read -r R_MD5;   IFS= read -r R_ERR;  IFS= read -r R_NOTE
+    IFS= read -r R_CONV;  IFS= read -r R_MSCONV; IFS= read -r R_DL; IFS= read -r R_UPS; IFS= read -r R_RAW; } <<EOF
 $fields
 EOF
   [ -n "$R_NOTE" ] && echo "[$tag] note: $R_NOTE" >&2
@@ -100,6 +102,12 @@ EOF
       echo "[$tag] FAIL: md5 mismatch (box=$R_MD5 got=$gotmd5)" >&2; rm -f "$part"; return 1; fi
     mv -f "$part" "$out"
     echo "[$tag] OK exit=0 size=$R_SIZE -> $out"
+    if [ -n "${BENCH_TSV:-}" ]; then   # per-stage box timings for benchmark collection
+      [ -f "$BENCH_TSV" ] || printf 'iso_time\tunit\tconverter\topts\traw_bytes\tmzpeak_bytes\tconv_s\tmsconv_s\tdl_s\tup_s\thost\n' > "$BENCH_TSV"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tbox\n' \
+        "$(date -u +%FT%TZ)" "$(basename "$out")" "${BOX_CONVERTER:-}" "$opts" \
+        "${R_RAW:-}" "$R_SIZE" "${R_CONV:-}" "${R_MSCONV:-}" "${R_DL:-}" "${R_UPS:-}" >> "$BENCH_TSV"
+    fi
     return 0
   fi
   echo "[$tag] CONV-FAIL stage=$R_STAGE exit=$R_EXIT error=${R_ERR:-<none>}" >&2
@@ -176,8 +184,15 @@ stage_remote || exit 1
 mode="${1:-}"
 case "$mode" in
   --manifest|--local-manifest)
-    mf="${2:?manifest path}"; jobs=4
-    [ "${3:-}" = "--jobs" ] && jobs="${4:-4}"
+    mf="${2:?manifest path}"; jobs=1
+    [ "${3:-}" = "--jobs" ] && jobs="${4:-1}"
+    # DISK SAFETY — sequential by default. Each concurrent --via-msconvert job writes a full
+    # multi-GB (SWATH/DIA: tens-of-GB) mzML intermediate to the box temp disk; running several at
+    # once fills the disk and the jobs stall mid-convert. Clamp to 1 unless explicitly overridden.
+    if [ "$jobs" -gt 1 ] && [ "${MZPC_ALLOW_PARALLEL:-}" != "1" ]; then
+      echo "box_convert: --jobs $jobs clamped to 1 (box disk safety; set MZPC_ALLOW_PARALLEL=1 to override)" >&2
+      jobs=1
+    fi
     [ -f "$mf" ] || { echo "no such manifest: $mf" >&2; exit 2; }
     if [ "$mode" = "--local-manifest" ]; then run_pool "$mf" local_job "$jobs"
     else run_pool "$mf" one_job "$jobs"; fi

@@ -982,7 +982,7 @@ pub trait AbstractMzPeakWriter {
     fn set_spectrum_peak_writer(&mut self, writer: MiniPeakWriterType<fs::File>);
 
     /// Create a specrtum peak writer over the provided stream using the given configuration
-    fn make_peaks_writer<S: io::Write + Send + io::Seek>(
+    fn make_peaks_writer<S: io::Write + Send + io::Seek + 'static>(
         stream: S,
         peak_buffer_builder: ArrayBuffersBuilder,
         write_batch_config: WriteBatchConfig,
@@ -1009,6 +1009,7 @@ pub trait AbstractMzPeakWriter {
         let peak_encrytion_props = encryption_properties
             .get(&FileEntry::from(MzPeakArchiveType::SpectrumPeakDataArrays).name)
             .cloned();
+        let is_encrypted = peak_encrytion_props.is_some();
 
         let peak_chunk_encoding = peak_buffer.chunking_strategy().copied();
         let peak_data_props = Self::spectrum_data_writer_props(
@@ -1027,11 +1028,31 @@ pub trait AbstractMzPeakWriter {
             ArrowWriterOptions::new().with_properties(peak_data_props),
         )?;
 
-        Ok(MiniPeakWriterType::new(
-            peak_writer,
-            peak_buffer,
-            buffer_size,
-        ))
+        // The peak facet is ~95% of the output bytes; its Arrow-encode + zstd is single-threaded and,
+        // on the timsTOF ims-compact path, the entire conversion wall. Encode its row groups across
+        // cores by default (byte-identical to serial — same 1_048_576-row boundaries, same encodings;
+        // see `mini_peak`). Opt out with MZPC_PARALLEL_ENCODE=0. Encrypted facets stay serial: page
+        // nonces would defeat both determinism and the byte-identity guarantee.
+        let parallel = !is_encrypted
+            && std::env::var("MZPC_PARALLEL_ENCODE")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true);
+
+        if parallel {
+            let schema = peak_buffer.schema().clone();
+            let (file_writer, factory) = peak_writer.into_serialized_writer()?;
+            let max_rows = file_writer.properties().max_row_group_size();
+            Ok(MiniPeakWriterType::new_parallel(
+                file_writer,
+                factory,
+                schema,
+                max_rows,
+                peak_buffer,
+                buffer_size,
+            ))
+        } else {
+            Ok(MiniPeakWriterType::new(peak_writer, peak_buffer, buffer_size))
+        }
     }
 
     /// Generate the [`WriterProperties`] for the the spectrum metadata file, based upon

@@ -27,7 +27,8 @@ if (Test-Path 'C:\Users\User\box_convert_env.ps1') { . 'C:\Users\User\box_conver
 $job = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $work = Join-Path $env:TEMP ("bxc-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
-$res = [ordered]@{ stage='init'; exit=1; uploaded=$false; size=0; md5=''; log=''; error=''; note='' }
+$res = [ordered]@{ stage='init'; exit=1; uploaded=$false; size=0; md5=''; log=''; error=''; note='';
+                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0 }
 
 try {
     $converter = if ($job.converter) { $job.converter } else { 'C:\Users\User\src\mzPeakConverter\target\release\mzpeak-convert.exe' }
@@ -40,8 +41,10 @@ try {
     $rawPath = Join-Path $work $rawName
     $dlcfg = Join-Path $work 'dl.cfg'
     Set-Content -LiteralPath $dlcfg -Value ('url = "' + $job.raw_url + '"') -Encoding ASCII
+    $swdl = [Diagnostics.Stopwatch]::StartNew()
     & curl.exe -fSL --retry 3 --retry-delay 5 -K $dlcfg -o $rawPath
     if ($LASTEXITCODE -ne 0) { throw "raw download failed (curl exit $LASTEXITCODE)" }
+    $res.dl_s = [math]::Round($swdl.Elapsed.TotalSeconds, 1)
 
     # 2. archive (multi-file vendor formats) -> extract + pick the unit deterministically
     $isArchive = $job.archive -or ($rawName -match '\.(zip|tgz|tar\.gz)$')
@@ -69,14 +72,20 @@ try {
     try {
         $ri = Get-Item -LiteralPath $inputPath
         $rawSize = if ($ri.PSIsContainer) { (Get-ChildItem -LiteralPath $inputPath -Recurse -File | Measure-Object Length -Sum).Sum } else { $ri.Length }
+        $res.raw_bytes = $rawSize
         $mzmlSize = 0
-        if ($env:MSCONVERT_PATH -and (Test-Path $env:MSCONVERT_PATH)) {
+        # OPT-IN size-bench only: running msconvert here purely to MEASURE the mzML size doubles the
+        # work of every --via-msconvert job (a full multi-GB mzML write, then discarded). Gate it so
+        # production conversions never pay for it. Set MZPC_BENCH_MZML=1 for compression-bench runs.
+        if ($env:MZPC_BENCH_MZML -eq '1' -and $env:MSCONVERT_PATH -and (Test-Path $env:MSCONVERT_PATH)) {
             $mzmlDir = Join-Path $work 'mzml'; New-Item -ItemType Directory -Force -Path $mzmlDir | Out-Null
+            $swmz = [Diagnostics.Stopwatch]::StartNew()
             & $env:MSCONVERT_PATH $inputPath --mzML -o $mzmlDir *> (Join-Path $work 'msconvert.log')
+            $res.msconv_s = [math]::Round($swmz.Elapsed.TotalSeconds, 1)
             $mz = Get-ChildItem -Path $mzmlDir -Filter *.mzML -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1
             if ($mz) { $mzmlSize = $mz.Length }
         }
-        $res.note = ((@($res.note, "raw=$rawSize", "mzml=$mzmlSize") | Where-Object { $_ }) -join ' ')
+        $res.note = ((@($res.note, "raw=$rawSize", "mzml=$mzmlSize", "msconv_s=$($res.msconv_s)") | Where-Object { $_ }) -join ' ')
     } catch { $res.note = ((@($res.note, "benchmeas-fail") | Where-Object { $_ }) -join ' ') }
 
     $res.stage = 'convert'
@@ -93,8 +102,10 @@ try {
     # Continue around the native call: the converter logs INFO to stderr on SUCCESS, which would
     # otherwise raise a NativeCommandError under 'Stop' and mask a clean run. Exit is read explicitly.
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $swcv = [Diagnostics.Stopwatch]::StartNew()
     & $converter $inputPath @optList -o $out --force *> $log
     $res.exit = $LASTEXITCODE
+    $res.conv_s = [math]::Round($swcv.Elapsed.TotalSeconds, 1)
     $ErrorActionPreference = $prevEAP
     if (Test-Path $log) { $res.log = (Get-Content $log -Raw) }
 
@@ -106,8 +117,10 @@ try {
         $res.stage = 'upload'
         $upcfg = Join-Path $work 'up.cfg'
         Set-Content -LiteralPath $upcfg -Value ('url = "' + $job.put_url + '"') -Encoding ASCII
+        $swup = [Diagnostics.Stopwatch]::StartNew()
         & curl.exe -fS -X PUT --upload-file $out -K $upcfg
         if ($LASTEXITCODE -ne 0) { throw "upload failed (curl exit $LASTEXITCODE)" }
+        $res.up_s = [math]::Round($swup.Elapsed.TotalSeconds, 1)
         $res.uploaded = $true
         $res.stage = 'done'
     } elseif ($res.exit -eq 0) {
