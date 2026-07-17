@@ -97,6 +97,9 @@ pub struct NativeTofReader {
     /// those to an empty frame so a real decode error on a *non-empty* frame still surfaces, instead
     /// of mzdata's blanket `.ok().unwrap_or_default()` that masks genuine corruption too.
     num_peaks: Vec<u32>,
+    /// Frame retention time in SECONDS (TDF `Frames.Time`, ordered by Id → position = frame index).
+    /// Empty if unavailable or if the row count disagrees with timsrust's frame count (see `open_with`).
+    frame_rt: Vec<f64>,
 }
 
 impl NativeTofReader {
@@ -135,7 +138,13 @@ impl NativeTofReader {
             );
             num_peaks.clear();
         }
-        Ok(Self { frames, im: meta.im_converter, recal, model, num_peaks })
+        // Frame retention time (`Frames.Time`, seconds). Same position-based guard as NumPeaks:
+        // a misaligned RT is worse than none, so drop it if the row count disagrees with timsrust.
+        let mut frame_rt = read_frame_rt(&tdf).unwrap_or_default();
+        if frame_rt.len() != frames.len() {
+            frame_rt.clear();
+        }
+        Ok(Self { frames, im: meta.im_converter, recal, model, num_peaks, frame_rt })
     }
 
     pub fn len(&self) -> usize {
@@ -268,6 +277,11 @@ impl NativeTofReader {
             signal_continuity: SignalContinuity::Centroid,
             ..Default::default()
         };
+        // Retention time: TDF `Frames.Time` is seconds; mzPeak scan start time / `spectrum.time` are
+        // minutes (matching the mzML/Thermo path), so store rt/60. Enables `--rt` on timsTOF.
+        if let Some(&rt) = self.frame_rt.get(i) {
+            descr.acquisition.first_scan_mut().unwrap().start_time = rt / 60.0;
+        }
         descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
         if tof_delta {
             // Self-describing marker for the per-scan-delta TOF encoding: a reader must cumsum the
@@ -379,6 +393,11 @@ impl NativeTofReader {
             signal_continuity: SignalContinuity::Centroid,
             ..Default::default()
         };
+        // Retention time: TDF `Frames.Time` is seconds; mzPeak scan start time / `spectrum.time` are
+        // minutes (matching the mzML/Thermo path), so store rt/60. Enables `--rt` on timsTOF.
+        if let Some(&rt) = self.frame_rt.get(i) {
+            descr.acquisition.first_scan_mut().unwrap().start_time = rt / 60.0;
+        }
         descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
         if tof_min <= tof_max {
             let (mz_a, mz_b) = (self.model.mz(tof_min), self.model.mz(tof_max));
@@ -401,6 +420,22 @@ fn read_frame_num_peaks(tdf: &Path) -> Result<Vec<u32>> {
         .map_err(|e| anyhow::anyhow!("reading NumPeaks: {e}"))?;
     rows.collect::<rusqlite::Result<Vec<u32>>>()
         .map_err(|e| anyhow::anyhow!("collecting NumPeaks: {e}"))
+}
+
+/// Retention time (SECONDS) for every frame, ordered by `Id` so position `i` matches timsrust's
+/// frame index. Bruker stores RT in seconds in `Frames.Time`; the ims-compact spectra convert to
+/// minutes for the scan start time. Best-effort — a read failure just leaves timsTOF without RT.
+fn read_frame_rt(tdf: &Path) -> Result<Vec<f64>> {
+    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| anyhow::anyhow!("opening {} for Frame RT: {e}", tdf.display()))?;
+    let mut stmt = conn
+        .prepare("SELECT Time FROM Frames ORDER BY Id")
+        .map_err(|e| anyhow::anyhow!("querying Frame Time: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, f64>(0))
+        .map_err(|e| anyhow::anyhow!("reading Frame Time: {e}"))?;
+    rows.collect::<rusqlite::Result<Vec<f64>>>()
+        .map_err(|e| anyhow::anyhow!("collecting Frame Time: {e}"))
 }
 
 #[cfg(test)]

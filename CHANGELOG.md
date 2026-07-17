@@ -6,6 +6,44 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-09
+
+### Added — mzPeak → mzPeak filtering (Phase 1 + 2)
+
+- A `.mzpeak` input is now detected and routed to a **filter/repack** path (`src/filter.rs`) — no new
+  subcommand; `mzpeak-convert in.mzpeak -o out.mzpeak …` just works. `report_inspect` also summarizes
+  a `.mzpeak` (members + spectrum/chromatogram counts).
+- **Spectrum-level filters** (surgical, index-stable — spectra are never renumbered):
+  - `--rt MIN-MAX` — keep spectra whose `spectrum.time` is in range.
+  - `--ms-level N` (repeatable / comma-list) — keep only the given MS level(s).
+  Every per-spectrum facet (metadata, peaks/data, and vendor per-spectrum facets like
+  `vendor_scan_trailers`/`_wide`) is filtered to the same survivor set; peak values are row-selected,
+  never re-computed, so per-scan/per-chunk delta chains stay intact. Facet handling is
+  schema-registry-driven and **errors** on an unrecognized per-spectrum facet rather than emitting an
+  inconsistent file. Chromatograms are truncated to the RT window (point layout exact;
+  numpress-chunked at chunk granularity). `ims_calibration` and other run-global blocks are preserved;
+  index counts are refreshed and a `metadata.filter` provenance block is written. Dropped precursors
+  leave a one-line warning (fragments are kept).
+- **Aux remove/inject:** `--drop-aux '<glob>'` (repeatable) removes matching ZIP members and updates
+  `index.files`; `--aux/--image/--sdrf` inject side-files into an existing archive.
+- Verified content-preserving on real files (Thermo 8-facet incl. MS1+MS2+precursors+vendor trailers;
+  timsTOF point facet, 74.2 M peaks) with 0 cross-facet inconsistencies across no-op/RT/MS-level/aux.
+
+### Fixed — timsTOF retention time (enables `--rt` on timsTOF)
+
+- The native ims-compact path now records each frame's **retention time** in `spectrum.time` (read from
+  the TDF `Frames.Time`, seconds → minutes to match the mzML/Thermo convention). Previously
+  `spectrum.time` was 0 for every frame, which made `--rt` a no-op on timsTOF. Verified exact
+  (`spectrum.time == Frames.Time/60`), monotonic with frame index, and applied to both the archive and
+  `--ims-chunked` layouts. Peak data is unchanged (metadata-only). (The opt-in `--bruker-sdk` path is
+  not yet updated.)
+
+### Known limitations
+
+- **`--mz` (m/z-range filtering) is not yet implemented** (Phase 3) — it errors clearly.
+- A no-op repack is **not byte-identical** — facets are decoded and re-encoded (zstd + best-effort
+  encodings); peak content is preserved exactly.
+
 ## [0.4.15] — 2026-07-08
 
 ### Changed — multi-core parallel peak encoding (≈9× faster timsTOF conversion)

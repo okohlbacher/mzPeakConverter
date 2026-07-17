@@ -54,6 +54,7 @@ mod thermo_status;
 mod thermo_trailers;
 mod vendor;
 mod embed_aux;
+mod filter;
 
 use arrow::datatypes::DataType;
 use mzdata::curie;
@@ -226,6 +227,22 @@ struct Cli {
     /// missing/unreadable path ERRORS the conversion.
     #[arg(long)]
     sdrf: Option<PathBuf>,
+
+    /// mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches stored spectrum.time).
+    #[arg(long, value_name = "MIN-MAX")]
+    rt: Option<String>,
+
+    /// mzPeak input only: keep spectra with these MS levels (repeatable or comma-list).
+    #[arg(long = "ms-level", value_delimiter = ',')]
+    ms_level: Vec<u8>,
+
+    /// mzPeak input only: drop archive members matching this glob (repeatable).
+    #[arg(long = "drop-aux")]
+    drop_aux: Vec<String>,
+
+    /// mzPeak input only: m/z-range filter — NOT YET IMPLEMENTED (errors).
+    #[arg(long, value_name = "MIN-MAX")]
+    mz: Option<String>,
 
     /// **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by
     /// DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) +
@@ -487,6 +504,27 @@ fn run(cli: &Cli) -> Result<i32> {
         return Ok(exit::OK); // no --output: nothing written, just the report above
     };
 
+    // mzPeak input → filter path. A `.mzpeak` (or any ZIP with mzpeak_index.json) cannot be read by
+    // mzdata; instead of the convert lanes below, route to the mzPeak→mzPeak filter (RT / MS-level /
+    // aux drop+inject). This supersedes the old "mzdata can't read it" error.
+    if filter::is_mzpeak_input(&cli.input) {
+        if output.exists() && !cfg.force {
+            bail!("output {} exists (use --force to overwrite)", output.display());
+        }
+        let opts = filter::FilterOpts {
+            rt: cli.rt.as_deref().map(filter::parse_rt).transpose()?,
+            ms_levels: cli.ms_level.clone(),
+            drop_aux: cli.drop_aux.clone(),
+            images: cfg.image.clone(),
+            sdrf: cfg.sdrf.clone(),
+            mz_requested: cli.mz.is_some(),
+        };
+        filter::run(&cli.input, &output, &opts)
+            .with_context(|| format!("filtering {}", cli.input.display()))?;
+        log::info!("wrote {}", output.display());
+        return Ok(exit::OK);
+    }
+
     let chunk = match cfg.layout {
         Layout::Point => None,
         Layout::Chunked if cfg.no_numpress => Some(ChunkingStrategy::Delta { chunk_size: cfg.chunk_size }),
@@ -666,6 +704,10 @@ fn dump_im_table(input: &Path) -> Result<()> {
 /// Print a human report of what a reader sees (format, spectra, chromatograms) without converting —
 /// the behaviour of a no-output run, and the `-v` extra during a conversion.
 fn report_inspect(input: &Path) -> Result<()> {
+    // mzPeak archive: mzdata can't open it — report members + spectrum/chromatogram counts instead.
+    if filter::is_mzpeak_input(input) {
+        return filter::report_inspect(input);
+    }
     println!("input:         {}", input.display());
     if is_tsf_dir(input) {
         println!("format:        Bruker TSF (.d)");
