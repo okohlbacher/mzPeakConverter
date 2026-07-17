@@ -511,14 +511,30 @@ fn run(cli: &Cli) -> Result<i32> {
         if output.exists() && !cfg.force {
             bail!("output {} exists (use --force to overwrite)", output.display());
         }
+        // `--no-vendor` strips the embedded vendor data on the filter path too — same effect as
+        // `--drop-aux 'vendor*'` (the glob's `*` spans `/`, so it also catches `vendor/…` side-files).
+        // (It is moot for mzML output — vendor facets aren't carried into mzML at all.)
+        let mut drop_aux = cli.drop_aux.clone();
+        if cfg.no_vendor {
+            drop_aux.push("vendor*".to_string());
+        }
         let opts = filter::FilterOpts {
             rt: cli.rt.as_deref().map(filter::parse_rt).transpose()?,
             ms_levels: cli.ms_level.clone(),
-            drop_aux: cli.drop_aux.clone(),
+            drop_aux,
             images: cfg.image.clone(),
             sdrf: cfg.sdrf.clone(),
             mz_requested: cli.mz.is_some(),
         };
+        // mzML output: read the `.mzpeak` with the sync reader (which decodes every buffer transform,
+        // incl. the timsTOF tof→m/z) and write the RT / MS-level survivors to a real mzML — the "slice
+        // to a narrow RT window then hand the small mzML to a search engine" workflow. Otherwise the
+        // filter writes a new `.mzpeak` (aux drop/inject + spectrum-level filtering).
+        if cfg.output_format == OutputFormat::Mzml {
+            filter_mzpeak_to_mzml(&cli.input, &output, &opts)
+                .with_context(|| format!("filtering {} to mzML", cli.input.display()))?;
+            return Ok(exit::OK);
+        }
         filter::run(&cli.input, &output, &opts)
             .with_context(|| format!("filtering {}", cli.input.display()))?;
         log::info!("wrote {}", output.display());
@@ -1067,6 +1083,83 @@ fn convert_to_mzml(
     // TIC + base-peak summary at close, so keeping the source ones would duplicate them.
     write_source_chromatograms_mzml(&mut w, source_chroms.into_iter())?;
 
+    SpectrumWriter::close(&mut w)
+        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
+    log::info!("wrote {}", output.display());
+    Ok(())
+}
+
+/// The mzPeak-INPUT filter path with an mzML output. Reads the `.mzpeak` with the sync `MzPeakReader`
+/// — which decodes every buffer transform (delta chains, numpress, and the timsTOF `SqrtMzFromTof`
+/// tof→m/z), so iterated spectra carry real m/z (+ ion mobility), not raw tof — keeps the spectra
+/// passing the RT / MS-level predicate, and writes them to a real mzML via the mzdata writer. This is
+/// the "slice a mzPeak to a narrow RT window, then hand the small mzML to a search engine
+/// (Sage/MSFragger)" workflow. `--mz` is unimplemented (errors, mirroring the mzpeak filter path);
+/// aux/vendor embedding does not apply to an mzML output and is silently ignored.
+///
+/// The predicate matches `filter.rs`: keep iff `start_time()` (the mzPeak stores `spectrum.time` in
+/// **minutes**, which the reader surfaces directly) ∈ `--rt` AND `ms_level()` ∈ the `--ms-level` set.
+fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts) -> Result<()> {
+    use mzdata::io::DetailLevel;
+    use mzdata::prelude::{MSDataFileMetadata, SpectrumLike, SpectrumSource, SpectrumWriter};
+    use mzpeak_prototyping::MzPeakReader;
+
+    if opts.mz_requested {
+        bail!("--mz filtering not yet implemented");
+    }
+
+    let filtering = opts.rt.is_some() || !opts.ms_levels.is_empty();
+    let keep = |ms_level: u8, start_time_min: f64| -> bool {
+        let mut ok = true;
+        if let Some((lo, hi)) = opts.rt {
+            ok &= start_time_min >= lo && start_time_min <= hi;
+        }
+        if !opts.ms_levels.is_empty() {
+            ok &= opts.ms_levels.contains(&ms_level);
+        }
+        ok
+    };
+
+    let mut reader =
+        MzPeakReader::new(input).with_context(|| format!("opening {} as mzPeak", input.display()))?;
+    let total = reader.len();
+    let cap = max_spectra();
+
+    // Pass 1 (metadata-only): collect the surviving indices — no peak arrays decoded here, so the
+    // dropped spectra are never fully read. Gives an accurate spectrumList `count` attribute + the
+    // "keeping X/N" log up front.
+    reader.set_detail_level(DetailLevel::MetadataOnly);
+    let mut survivor_ids: Vec<usize> = Vec::new();
+    for i in 0..total {
+        if cap.is_some_and(|m| i >= m) {
+            break;
+        }
+        if let Some(spec) = reader.get_spectrum_by_index(i) {
+            if keep(spec.ms_level(), spec.start_time()) {
+                survivor_ids.push(i);
+            }
+        }
+    }
+    if filtering {
+        log::info!("filter: keeping {}/{} spectra", survivor_ids.len(), total);
+    }
+
+    // Pass 2 (full): decode + write only the survivors.
+    reader.set_detail_level(DetailLevel::Full);
+    reader.reset();
+    let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut w = mzdata::io::mzml::MzMLWriter::new(file);
+    w.copy_metadata_from(&reader);
+    fixup_run_metadata(&mut w, input);
+    w.set_spectrum_count(survivor_ids.len() as u64);
+    w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
+    for &i in &survivor_ids {
+        let spec = reader
+            .get_spectrum_by_index(i)
+            .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
+        SpectrumWriter::write(&mut w, &spec)
+            .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
+    }
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
     log::info!("wrote {}", output.display());

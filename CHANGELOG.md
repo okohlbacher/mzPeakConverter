@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-07-17
+
+### Added — filter a mzPeak straight to a searchable mzML
+
+- **`mzpeak-convert IN.mzpeak --rt A-B --ms-level N -o OUT.mzML`** now writes a **real mzML** of the
+  kept spectra (previously the filter only wrote mzPeak; a `.mzML`/`--to mzml` request silently
+  produced a mislabeled mzPeak archive). The sync `MzPeakReader` decodes every buffer transform —
+  including the timsTOF `tof → m/z` — so the mzML carries real m/z (verified 99.4–1292 on a timsTOF
+  slice, not raw tof bins) and MS² **precursors survive**. Unblocks "slice a run to a narrow RT
+  window, then hand the small mzML to Sage/MSFragger". Two-pass (metadata sweep → decode survivors);
+  ion-mobility is flattened (one m/z+intensity spectrum per frame — mzML has no place for it) and
+  vendor/aux facets are dropped (they don't map to mzML).
+
+### Fixed
+
+- **`--no-vendor` is now honored on the filter path** — it strips the embedded vendor side-files
+  (`vendor/*`, incl. the multi-GB timsTOF `linespectra`/`analysis.tdf` blobs) from the output, same as
+  `--drop-aux 'vendor*'`. Previously ignored, so a small RT slice still carried the whole-run vendor
+  blob (reported: a 1,126-spectrum slice was 4.9 GB).
+
 ## [0.5.0] — 2026-07-09
 
 ### Added — mzPeak → mzPeak filtering (Phase 1 + 2)
