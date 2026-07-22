@@ -3,16 +3,16 @@
 #   engine = host (convert locally) | box (convert on flash-workstation via tools/corpus_bench.sh --box)
 #   convert_flags are passed verbatim to mzpeak-convert; ratios are mzPeak/raw on the data representation.
 #   Datasets with raw < 20 MB are auto-EXCLUDED from the headline ratio (Parquet/ZIP floor dominates).
-mzml_mtbls18	mzML	LC-MS (Q-Exactive)	mzML	host	/Users/kohlbach/Claude/mzML2mzPeak/out/mtbls18/LTI225-03-1neg_1-A__7_01_24298.mzML	--no-vendor	MTBLS18
-imzml_thaliana	imzML	MSI LA-ESI	imzML	host	/Users/kohlbach/Claude/mzML2mzPeak/out/campaign/imzML_LA-ESI__180817_NEG_Thaliana_Leaf_bottom_1_.imzML	--no-vendor	campaign
-imzml_bladder	imzML	MSI AP-SMALDI	imzML	host	/Users/kohlbach/Claude/mzML2mzPeak/out/campaign/imzML_AP_SMALDI__HR2MSImouseurinarybladderS096.imzML	--no-vendor	HR2MSI
-thermo_ltqxl	Thermo	LTQ-XL ion trap	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-ltq-xl-PXD059878/2013_30_Amrutha_050713_1.raw	--no-vendor	PXD059878
-thermo_velos	Thermo	LTQ Orbitrap Velos	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-ltq-orbitrap-velos-PXD000001/TMT_Erwinia_01.raw	--no-vendor	PXD000001
-thermo_ltqft	Thermo	LTQ-FT Ultra	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-ltq-ft-ultra-MTBLS3512/mtab_BIOS_CRAM1620_1_072617_34.RAW	--no-vendor	MTBLS3512
-thermo_lumos	Thermo	Fusion Lumos	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-fusion-lumos-PXD008952/01_CPTAC_TMTS1-NCI7_P_JHUZ_20170509_LUMOS.raw	--no-vendor	PXD008952
-thermo_astral	Thermo	Astral	raw	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/thermo-astral-MSV000100943/20240912_WFB_exp01_magnet_5_0.raw	--no-vendor	MSV000100943
-bruker_sba415_tdf	Bruker	timsTOF TDF (IMS)	d	host	/Users/kohlbach/Claude/mzML2mzPeak/data/raw-examples/bruker-timstof-MSV000101607/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d	--no-vendor	MSV000101607
-agilent_qtof	Agilent	Q-TOF profile	d	host	/Users/kohlbach/Claude/mzML2mzPeak/data/vendor-agilent-sciex/agilent/PXD041315/LMVCS24HC.d	--agilent-grid --no-vendor	PXD041315
+mzml_mtbls18	mzML	LC-MS (Q-Exactive)	mzML	host	$HOME/Claude/mzML2mzPeak/out/mtbls18/LTI225-03-1neg_1-A__7_01_24298.mzML	--no-vendor	MTBLS18
+imzml_thaliana	imzML	MSI LA-ESI	imzML	host	$HOME/Claude/mzML2mzPeak/out/campaign/imzML_LA-ESI__180817_NEG_Thaliana_Leaf_bottom_1_.imzML	--no-vendor	campaign
+imzml_bladder	imzML	MSI AP-SMALDI	imzML	host	$HOME/Claude/mzML2mzPeak/out/campaign/imzML_AP_SMALDI__HR2MSImouseurinarybladderS096.imzML	--no-vendor	HR2MSI
+thermo_ltqxl	Thermo	LTQ-XL ion trap	raw	host	$HOME/Claude/mzML2mzPeak/data/raw-examples/thermo-ltq-xl-PXD059878/2013_30_Amrutha_050713_1.raw	--no-vendor	PXD059878
+thermo_velos	Thermo	LTQ Orbitrap Velos	raw	host	$HOME/Claude/mzML2mzPeak/data/raw-examples/thermo-ltq-orbitrap-velos-PXD000001/TMT_Erwinia_01.raw	--no-vendor	PXD000001
+thermo_ltqft	Thermo	LTQ-FT Ultra	raw	host	$HOME/Claude/mzML2mzPeak/data/raw-examples/thermo-ltq-ft-ultra-MTBLS3512/mtab_BIOS_CRAM1620_1_072617_34.RAW	--no-vendor	MTBLS3512
+thermo_lumos	Thermo	Fusion Lumos	raw	host	$HOME/Claude/mzML2mzPeak/data/raw-examples/thermo-fusion-lumos-PXD008952/01_CPTAC_TMTS1-NCI7_P_JHUZ_20170509_LUMOS.raw	--no-vendor	PXD008952
+thermo_astral	Thermo	Astral	raw	host	$HOME/Claude/mzML2mzPeak/data/raw-examples/thermo-astral-MSV000100943/20240912_WFB_exp01_magnet_5_0.raw	--no-vendor	MSV000100943
+bruker_sba415_tdf	Bruker	timsTOF TDF (IMS)	d	host	$HOME/Claude/mzML2mzPeak/data/raw-examples/bruker-timstof-MSV000101607/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d	--no-vendor	MSV000101607
+agilent_qtof	Agilent	Q-TOF profile	d	host	$HOME/Claude/mzML2mzPeak/data/vendor-agilent-sciex/agilent/PXD041315/LMVCS24HC.d	--agilent-grid --no-vendor	PXD041315
 sciex_zenotof	SCIEX	ZenoTOF 7600	wiff	box	C:/Users/User/vendor-data/zenotof/20240826_RNAseB_Reduced_50ngul_1ul_MRM_03.wiff	--no-vendor	v09-objstore
 sciex_swath	SCIEX	TripleTOF SWATH	wiff	box	C:/Users/User/vendor-data/swath/SW_F2_2-2.wiff	--no-vendor	PXD078909
 waters_synapt	Waters	Synapt G2-Si TWIMS	raw	box	C:/Users/User/vendor-data/waters/20250628_cpB_100000ms_03.raw	--no-vendor	PXD073666

@@ -3927,6 +3927,17 @@ mod tests {
     }
 
     /// `--to mzml` chromatogram regression (corpus-gated): a chromatogram-only SRM/MRM mzML (0
+    /// Corpus root for the `--ignored` fixture tests. Override with `MZPEAK_CORPUS`; defaults
+    /// under `$HOME` so the repository carries no absolute operator path.
+    fn corpus_root() -> std::path::PathBuf {
+        std::env::var("MZPEAK_CORPUS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                    .join("Claude/mzpeak-example-data/data")
+            })
+    }
+
     /// spectra) must convert to mzML with its SRM traces PRESERVED — not silently dropped, and
     /// without the 0-spectra "Run to Run" writer crash. Uses the sciex-qtrap scheduled-MRM file (a
     /// real msconvert SRM; synthetic mzML chromatograms aren't read back by mzdata). Run with:
@@ -3937,9 +3948,8 @@ mod tests {
         use mzdata::prelude::{ChromatogramSource, SpectrumSource};
         use std::fs;
 
-        let input = std::path::Path::new(
-            "/Users/kohlbach/Claude/mzpeak-example-data/data/general-ms/sciex-qtrap-6500/Drug_substance_3_scheduled_MRM.mzML",
-        );
+        let input = corpus_root().join("general-ms/sciex-qtrap-6500/Drug_substance_3_scheduled_MRM.mzML");
+        let input = input.as_path();
         assert!(input.exists(), "corpus SRM file missing: {}", input.display());
         let scratch = std::env::temp_dir().join(format!("mzpc-srm-{}", std::process::id()));
         fs::create_dir_all(&scratch).unwrap();
@@ -3964,16 +3974,16 @@ mod tests {
     /// (one spectrum per FRAME, not per mobility scan). `#[ignore]` by default; run with:
     ///   `cargo test --release ims_compact_is_frame_preserving -- --ignored --nocapture`
     /// Corpus path (see MEMORY: smallest timsTOF):
-    ///   /Users/kohlbach/Claude/mzPeak/data/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d
+    ///   $MZPEAK_CORPUS/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d
     #[test]
     #[ignore = "needs the ~2GB SBA415 timsTOF .d corpus fixture; run with --ignored"]
     fn ims_compact_is_frame_preserving() {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use std::fs;
 
-        let input = std::path::Path::new(
-            "/Users/kohlbach/Claude/mzPeak/data/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d",
-        );
+        let input =
+            corpus_root().join("ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d");
+        let input = input.as_path();
         assert!(input.exists(), "corpus fixture missing: {}", input.display());
 
         let scratch = std::path::Path::new(
@@ -4033,9 +4043,9 @@ mod tests {
         use std::fs;
         use std::io::Read;
 
-        let input = std::path::Path::new(
-            "/Users/kohlbach/Claude/mzPeak/data/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d",
-        );
+        let input =
+            corpus_root().join("ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d");
+        let input = input.as_path();
         assert!(input.exists(), "corpus fixture missing: {}", input.display());
         let scratch = std::path::Path::new(
             "/private/tmp/claude-501/-Users-kohlbach-Claude-mzPeak-mzPeakConverter/b893364b-bab9-4ecd-b671-4ff71e9db809/scratchpad",

@@ -39,6 +39,10 @@ printf "%-16s %-6s %-8s %s\n" "ID" "FORMAT" "RESULT" "DETAIL"
 printf -- "------------------------------------------------------------------\n"
 
 while IFS=$'\t' read -r id format status path note; do
+  # Manifest paths are $HOME/$MZPEAK_CORPUS-relative so the repo carries no operator path.
+  # Plain substitution, never eval: the manifest is data, not script.
+  path="${path//\$MZPEAK_CORPUS/${MZPEAK_CORPUS:-$HOME/Claude/mzpeak-example-data/data}}"
+  path="${path//\$HOME/$HOME}"
   case "$id" in ''|\#*) continue ;; esac          # skip blanks/comments
   if [ "$status" = "skip" ]; then
     printf "%-16s %-6s %-8s %s\n" "$id" "$format" "SKIP" "$note"

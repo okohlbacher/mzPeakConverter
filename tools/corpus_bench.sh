@@ -67,6 +67,9 @@ ratio()  { awk -v m="$1" -v r="$2" 'BEGIN{if(r>0) printf "%.3f", m/r; else print
 bpp()    { awk -v b="$1" -v p="$2" 'BEGIN{if(p>0) printf "%.2f", b/p; else print "NA"}'; }
 
 while IFS=$'\t' read -r id vendor instrument format engine raw flags accession; do
+  # See run_corpus_e2e.sh: manifest paths are $HOME-relative; substitute, never eval.
+  raw="${raw//\$MZPEAK_CORPUS/${MZPEAK_CORPUS:-$HOME/Claude/mzpeak-example-data/data}}"
+  raw="${raw//\$HOME/$HOME}"
   case "$id" in '#'*|'') continue;; esac
   [ -n "$only" ] && case "$only" in *",$id,"*) :;; *) continue;; esac
   echo ">> $id ($vendor / $instrument)"
