@@ -59,7 +59,10 @@ mod filter;
 use arrow::datatypes::DataType;
 use mzdata::curie;
 use mzdata::io::MZReaderType;
-use mzdata::meta::{DataProcessing, ProcessingMethod, Software, SourceFile, custom_software_name};
+use mzdata::meta::{
+    Component, ComponentType, DataProcessing, InstrumentConfiguration, ProcessingMethod, Software,
+    SourceFile, custom_software_name,
+};
 use mzdata::params::{ControlledVocabulary, Param, Unit};
 use mzdata::prelude::*;
 use mzdata::spectrum::bindata::BinaryArrayMap3D;
@@ -3560,6 +3563,47 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
             id: "sourceFile".to_string(),
             ..Default::default()
         });
+    }
+
+    // 1b. Ensure an instrument_configuration exists. Bruker leaves the list empty while `run`
+    // and every `scan` still reference configuration 0, which is a dangling foreign key — the
+    // spec's semantic invariants require every non-null FK to resolve. The instrument is described
+    // in the `.d`'s GlobalMetadata, so promote it into a real record rather than inventing one.
+    //
+    // Only what the vendor file actually states is asserted: model, serial and (for a timsTOF, where
+    // the analyzer is not in doubt) the TOF analyzer. The ion source and detector are NOT guessed —
+    // `InstrumentSourceType` is an opaque Bruker code, and a wrong `MS:1000008` child is worse than
+    // an absent one, since the CV-mapping rules only bind to components that exist.
+    if target.instrument_configurations().is_empty() {
+        if let Some(meta) = vendor::read_global_metadata(input) {
+            let get = |k: &str| meta.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+            if let Some(model) = get("InstrumentName") {
+                let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+                cfg.params.push(
+                    Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model).build(),
+                );
+                if let Some(serial) = get("InstrumentSerialNumber") {
+                    cfg.params.push(
+                        // Force String: a serial is an identifier, not a quantity. `Into<Value>`
+                        // on a &str auto-types numeric-looking text to Float, which would drop
+                        // leading zeros and re-render the value.
+                        Param::builder()
+                            .name("instrument serial number")
+                            .curie(curie!(MS:1000529))
+                            .value(mzdata::params::Value::String(serial))
+                            .build(),
+                    );
+                }
+                cfg.components.push(Component {
+                    component_type: ComponentType::Analyzer,
+                    order: 1,
+                    params: vec![
+                        Param::builder().name("time-of-flight").curie(curie!(MS:1000084)).build(),
+                    ],
+                });
+                target.instrument_configurations_mut().insert(0, cfg);
+            }
+        }
     }
 
     // 2. default_source_file_id / default_data_processing_id ← first list entry, when unset.
