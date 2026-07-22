@@ -1454,6 +1454,90 @@ mod test {
         assert!((s2 - 1171.8).abs() < 1e-9 && (e2 - s2).abs() < 1e-9, "null-padded single point: start={s2} end={e2}");
     }
 
+    /// `--ims-chunked` chunks an INTEGER TOF main axis on true m/z bin boundaries. The chunked
+    /// layout requires that `chunk_start`/`chunk_end` be the FIRST and LAST value of that main axis
+    /// — not a transformed quantity — and that the start point be EXCLUDED from the values array
+    /// (docs/layouts/chunked-layout.md). Both were once wrong: the bounds carried m/z while the
+    /// entry declared TOF bins (UO:0000189), and element 0 held the absolute start. Fixture-free on
+    /// purpose, so it runs without the corpus.
+    #[test]
+    fn ims_chunked_bounds_are_tof_and_exclude_start_point() {
+        use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
+
+        // m/z = (a + b·tof)²; these bins straddle several 50-Th bins, forcing multiple chunks.
+        let boundary = TofMzBoundary { a: 10.0, b: 5.0e-5 };
+        let tof: Vec<i32> = vec![100, 137, 4021, 4022, 90_000, 90_500, 300_000];
+
+        let mut arrays = BinaryArrayMap::new();
+        let mut tof_da = DataArray::wrap(
+            &ArrayType::nonstandard("tof"),
+            BinaryDataArrayType::Int32,
+            Vec::new(),
+        );
+        tof_da.update_buffer(tof.as_slice()).unwrap();
+        arrays.add(tof_da);
+        let mut int_da = DataArray::wrap(
+            &ArrayType::IntensityArray,
+            BinaryDataArrayType::Int32,
+            Vec::new(),
+        );
+        int_da.update_buffer(vec![7i32; tof.len()].as_slice()).unwrap();
+        int_da.unit = Unit::DetectorCounts;
+        arrays.add(int_da);
+
+        let main_axis = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::nonstandard("tof"),
+            BinaryDataArrayType::Int32,
+        );
+        let (chunks, _, _) = ArrowArrayChunk::from_arrays(
+            0,
+            None,
+            main_axis,
+            &arrays,
+            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &Default::default(),
+            false,
+            false,
+            None,
+            Some(boundary),
+        )
+        .unwrap();
+
+        assert!(
+            chunks.len() > 1,
+            "expected several m/z-bin chunks, got {}",
+            chunks.len()
+        );
+
+        let mut rebuilt: Vec<i32> = Vec::new();
+        for c in chunks.iter() {
+            let deltas = c.chunk_values.as_primitive::<Int32Type>();
+            // Reconstruct exactly as a conformant reader would: chunk_start, then a running sum.
+            let mut v = c.chunk_start as i32;
+            let mut got = vec![v];
+            for d in deltas.values().iter().copied() {
+                v += d;
+                got.push(v);
+            }
+            assert_eq!(
+                deltas.len() + 1,
+                got.len(),
+                "the start point must be excluded from chunk_values"
+            );
+            assert_eq!(
+                c.chunk_end as i32,
+                *got.last().unwrap(),
+                "chunk_end must be the LAST main-axis value, got {got:?}"
+            );
+            rebuilt.extend(got);
+        }
+        assert_eq!(
+            rebuilt, tof,
+            "the chunked round-trip must reconstruct the TOF axis exactly"
+        );
+    }
+
     #[test]
     fn test_chunking() -> io::Result<()> {
         let mzs = load_chunking_data()?;
