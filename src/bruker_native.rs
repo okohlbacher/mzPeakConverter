@@ -14,6 +14,7 @@
 //! metadata; the decoder recovers the exact integer TOF and thus the exact m/z the instrument
 //! calibration produces.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -21,7 +22,12 @@ use anyhow::{Result, bail};
 use mzdata::params::{Param, Unit};
 use mzdata::prelude::ParamDescribed;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
-use mzdata::spectrum::{MultiLayerSpectrum, ScanPolarity, SignalContinuity, SpectrumDescription};
+use mzdata::curie;
+use mzdata::meta::DissociationMethodTerm;
+use mzdata::spectrum::{
+    Activation, IsolationWindow, IsolationWindowState, MultiLayerSpectrum,
+    Precursor, ScanPolarity, SelectedIon, SignalContinuity, SpectrumDescription,
+};
 
 use timsrust::converters::{ConvertableDomain, Scan2ImConverter, Tof2MzConverter};
 use timsrust::readers::{FrameReader, MetadataReader};
@@ -93,6 +99,8 @@ pub struct NativeTofReader {
     /// Per-frame `Frames` columns from `analysis.tdf`. Empty if unavailable or if the row count
     /// disagrees with timsrust's frame count (see `open_with`).
     table: FrameTable,
+    /// MS2 isolation windows keyed by 1-based TDF frame Id. Empty for MS1-only runs.
+    windows: HashMap<i64, Vec<FrameWindow>>,
 }
 
 /// Per-frame `Frames` columns, ordered by `Id` so position `i` matches timsrust's frame index.
@@ -113,6 +121,26 @@ struct FrameTable {
     rt: Vec<f64>,
     ms_level: Vec<u8>,
     polarity: Vec<ScanPolarity>,
+}
+
+/// One quadrupole isolation window within an MS2 frame.
+///
+/// A TDF MS2 frame is a whole TIMS ramp (900–1600 scans), and the quadrupole retunes *during* the
+/// ramp: each `[scan_begin, scan_end)` sub-range gets its own isolation window and collision energy.
+/// So one frame carries N windows over disjoint mobility ranges — ~1.6 on average for DDA-PASEF,
+/// 5.0 for dia-PASEF. mzdata splits these into N mzML spectra because mzML has nowhere to put the
+/// mobility dimension; mzPeak does, so we keep the frame whole and attach N precursors to it.
+struct FrameWindow {
+    scan_begin: u32,
+    scan_end: u32,
+    isolation_mz: f64,
+    isolation_width: f64,
+    collision_energy: f64,
+    /// DDA-PASEF only — dia-PASEF has no `Precursors` table, so the window centre is all there is.
+    mono_mz: Option<f64>,
+    average_mz: Option<f64>,
+    charge: Option<i32>,
+    intensity: Option<f64>,
 }
 
 impl NativeTofReader {
@@ -152,7 +180,11 @@ impl NativeTofReader {
             );
             table = FrameTable::default();
         }
-        Ok(Self { frames, im: meta.im_converter, recal, model, table })
+        let windows = read_frame_windows(&tdf).unwrap_or_else(|e| {
+            log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
+            HashMap::new()
+        });
+        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows })
     }
 
     pub fn len(&self) -> usize {
@@ -193,6 +225,57 @@ impl NativeTofReader {
             tof: f.tof_indices,
             intensity: f.intensities,
         })
+    }
+
+    /// Build the mzdata precursors for frame `i` (0-based position; TDF Id is `i + 1`).
+    ///
+    /// Follows mzdata's TDF conventions so the two agree — isolation bounds are the window centre
+    /// +/- half the FULL width, activation is CID at the window's collision energy — with two
+    /// deliberate improvements: a NULL `MonoisotopicMz` falls back to `AverageMz`/`IsolationMz`
+    /// instead of mzdata's `0.0`, and the mobility of the window is recorded from its own scan
+    /// range rather than the precursor's parent-frame scan number.
+    fn precursors_at(&self, i: usize) -> Vec<Precursor> {
+        let Some(windows) = self.windows.get(&((i + 1) as i64)) else {
+            return Vec::new();
+        };
+        windows
+            .iter()
+            .map(|w| {
+                let half = (w.isolation_width / 2.0) as f32;
+                let mut ion = SelectedIon {
+                    mz: w.mono_mz.or(w.average_mz).unwrap_or(w.isolation_mz),
+                    intensity: w.intensity.unwrap_or(0.0) as f32,
+                    charge: w.charge.filter(|c| *c != 0),
+                    ..Default::default()
+                };
+                // Mobility of the isolation window: the midpoint of the scan range it occupies.
+                let mid = (w.scan_begin as f64 + w.scan_end as f64) / 2.0;
+                ion.add_param(
+                    Param::builder()
+                        .name("inverse reduced ion mobility")
+                        .curie(curie!(MS:1002815))
+                        .value(self.mobility_for_scan(mid as usize))
+                        .unit(Unit::VoltSecondPerSquareCentimeter)
+                        .build(),
+                );
+                let mut activation = Activation::default();
+                activation.energy = w.collision_energy as f32;
+                activation
+                    .methods_mut()
+                    .push(DissociationMethodTerm::CollisionInducedDissociation);
+                Precursor {
+                    ions: vec![ion],
+                    isolation_window: IsolationWindow {
+                        target: w.isolation_mz as f32,
+                        lower_bound: w.isolation_mz as f32 - half,
+                        upper_bound: w.isolation_mz as f32 + half,
+                        flags: IsolationWindowState::Complete,
+                    },
+                    activation,
+                    ..Default::default()
+                }
+            })
+            .collect()
     }
 
     /// MS level for frame `i` from the TDF `MsMsType`, defaulting to MS1 when the table is
@@ -305,6 +388,7 @@ impl NativeTofReader {
         }
         // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
         descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
+        descr.precursor = self.precursors_at(i);
         if tof_delta {
             // Self-describing marker for the per-scan-delta TOF encoding: a reader must cumsum the
             // `tof` column within each mobility-scan run before applying the m/z model.
@@ -422,12 +506,103 @@ impl NativeTofReader {
         }
         // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
         descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
+        descr.precursor = self.precursors_at(i);
         if tof_min <= tof_max {
             let (mz_a, mz_b) = (self.model.mz(tof_min), self.model.mz(tof_max));
             crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
         }
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
+}
+
+/// Read the MS2 isolation windows from `analysis.tdf`, keyed by 1-based frame Id.
+///
+/// The two acquisition modes store this completely differently, and a file has only one of them —
+/// dia-PASEF `.d` files have no `PasefFrameMsMsInfo`/`Precursors` tables AT ALL, so this probes
+/// `sqlite_master` rather than assuming. PRM (`PrmFrameMsMsInfo`) is not handled yet; such a run
+/// simply gets no precursors rather than a wrong one.
+fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWindow>>> {
+    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| anyhow::anyhow!("opening {} for MS2 info: {e}", tdf.display()))?;
+    let has = |name: &str| -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |_| Ok(()),
+        )
+        .is_ok()
+    };
+
+    let mut out: HashMap<i64, Vec<FrameWindow>> = HashMap::new();
+    if has("PasefFrameMsMsInfo") && has("Precursors") {
+        // DDA-PASEF. LEFT JOIN so a window with a dangling/NULL precursor still yields its
+        // isolation window rather than vanishing.
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.Frame, p.ScanNumBegin, p.ScanNumEnd, p.IsolationMz, p.IsolationWidth, \
+                        p.CollisionEnergy, pr.MonoisotopicMz, pr.AverageMz, pr.Charge, pr.Intensity \
+                 FROM PasefFrameMsMsInfo p LEFT JOIN Precursors pr ON pr.Id = p.Precursor \
+                 ORDER BY p.Frame, p.ScanNumBegin",
+            )
+            .map_err(|e| anyhow::anyhow!("querying PasefFrameMsMsInfo: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    FrameWindow {
+                        scan_begin: r.get::<_, i64>(1)?.max(0) as u32,
+                        scan_end: r.get::<_, i64>(2)?.max(0) as u32,
+                        isolation_mz: r.get(3)?,
+                        isolation_width: r.get(4)?,
+                        collision_energy: r.get(5)?,
+                        mono_mz: r.get(6)?,
+                        average_mz: r.get(7)?,
+                        charge: r.get(8)?,
+                        intensity: r.get(9)?,
+                    },
+                ))
+            })
+            .map_err(|e| anyhow::anyhow!("reading PasefFrameMsMsInfo: {e}"))?;
+        for row in rows {
+            let (frame, w) = row.map_err(|e| anyhow::anyhow!("collecting PasefFrameMsMsInfo: {e}"))?;
+            out.entry(frame).or_default().push(w);
+        }
+    } else if has("DiaFrameMsMsInfo") && has("DiaFrameMsMsWindows") {
+        // dia-PASEF: the frame maps to a window GROUP, and the group expands to its windows. There
+        // is no per-precursor detail — the window centre is the only m/z available.
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.Frame, w.ScanNumBegin, w.ScanNumEnd, w.IsolationMz, w.IsolationWidth, \
+                        w.CollisionEnergy \
+                 FROM DiaFrameMsMsInfo d JOIN DiaFrameMsMsWindows w ON w.WindowGroup = d.WindowGroup \
+                 ORDER BY d.Frame, w.ScanNumBegin",
+            )
+            .map_err(|e| anyhow::anyhow!("querying DiaFrameMsMsWindows: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    FrameWindow {
+                        scan_begin: r.get::<_, i64>(1)?.max(0) as u32,
+                        scan_end: r.get::<_, i64>(2)?.max(0) as u32,
+                        isolation_mz: r.get(3)?,
+                        isolation_width: r.get(4)?,
+                        collision_energy: r.get(5)?,
+                        mono_mz: None,
+                        average_mz: None,
+                        charge: None,
+                        intensity: None,
+                    },
+                ))
+            })
+            .map_err(|e| anyhow::anyhow!("reading DiaFrameMsMsWindows: {e}"))?;
+        for row in rows {
+            let (frame, w) = row.map_err(|e| anyhow::anyhow!("collecting DiaFrameMsMsWindows: {e}"))?;
+            out.entry(frame).or_default().push(w);
+        }
+    }
+    log::debug!("TDF MS2 windows: {} frames carry isolation windows", out.len());
+    Ok(out)
 }
 
 /// Read the per-frame [`FrameTable`] from `analysis.tdf`, ordered by `Id` so position `i` matches
