@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — dependency pins
+
+- **arrow / parquet 57.0.0 → 59.1.0**, **mzdata 0.65.2 → 0.65.4**, **thermorawfilereader 0.7.0 →
+  0.7.2** (forced by mzdata 0.65.4). `timsrust` (0.4.1) and `rusqlite` (0.31) stay put — mzdata pins
+  both transitively, so 0.6.3 / 0.40.1 are unreachable until mzdata moves. Output is unchanged:
+  parallel vs serial encoding stays byte-identical and the reconstructed peak fingerprint over
+  74,162,464 peaks matches the arrow-57 value exactly.
+
+### Fixed — conformance with mzPeak-specification HEAD (`9e61e32`)
+
+An adversarial review against the specification found these; all are verified against real output.
+
+- **`--ims-chunked` output was undecodable.** Every array-index entry carried `transform: null` and
+  no coefficients, so the TOF→m/z model lived only in the non-standard `ims_calibration` block. A
+  reader resolving transforms through the array index — as `docs/conformance.md` requires — could not
+  reach m/z at all. The transform CURIE and its `[a, b]` parameters are now declared on the chunk
+  axis, matching the archive path. Chunk payloads are unchanged.
+- **Empty dia-PASEF frames were written as MS1.** They are `MsMsType=8` (MS2) in the TDF; the
+  empty-frame path had no MS level to report and a downstream `.max(1)` clamp turned that into a
+  fabricated MS1. MS level now comes from `Frames.MsMsType`.
+- **Scan polarity was dropped for timsTOF** although `Frames.Polarity` carries it.
+- **`MS_1000559_spectrum_type` read `MS:1000294` for every spectrum**, including all MS2, because a
+  valueless per-spectrum param outranked the MS-level-derived value. Now correctly `MS:1000579` /
+  `MS:1000580`.
+- **The `MS_1000294_mass_spectrum` Boolean column asserted `false` on every mass spectrum.** Removed
+  from all six writer paths; the corrected `spectrum_type` column already satisfies the
+  `spectrum_must` placement rule it was added for.
+
 ### Fixed — duplicate spectrum ids on timsTOF runs containing empty frames
 
 - **Empty TDF frames were given the *previous* frame's spectrum id.** The empty-frame fast path
