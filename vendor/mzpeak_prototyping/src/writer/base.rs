@@ -1041,7 +1041,13 @@ pub trait AbstractMzPeakWriter {
         if parallel {
             let schema = peak_buffer.schema().clone();
             let (file_writer, factory) = peak_writer.into_serialized_writer()?;
-            let max_rows = file_writer.properties().max_row_group_size();
+            // parquet 59 made this `Option<usize>` (None = the default). The parallel peak
+            // encoder cuts row groups at exactly this count, so it must resolve to the same
+            // 1,048,576 the old `max_row_group_size()` returned or byte-identity breaks.
+            let max_rows = file_writer
+                .properties()
+                .max_row_group_row_count()
+                .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
             Ok(MiniPeakWriterType::new_parallel(
                 file_writer,
                 factory,
@@ -1142,7 +1148,7 @@ pub trait AbstractMzPeakWriter {
             .set_statistics_enabled(EnabledStatistics::Page);
 
         if use_chunked_encoding.is_some() {
-            data_props = data_props.set_max_row_group_size(1024 * 100)
+            data_props = data_props.set_max_row_group_row_count(Some(1024 * 100))
         }
 
         for c in parquet_schema.columns().iter() {
@@ -1273,7 +1279,10 @@ pub trait AbstractMzPeakWriter {
 
         let max_row_group_size = write_batch_config
             .row_group_size
-            .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_SIZE);
+            // parquet 59 renamed DEFAULT_MAX_ROW_GROUP_SIZE → DEFAULT_MAX_ROW_GROUP_ROW_COUNT
+            // (same value, 1024*1024). The parallel peak encoder cuts row groups at exactly this
+            // count, so the value must stay 1,048,576 for its byte-identity guarantee to hold.
+            .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
         let data_page_size = write_batch_config
             .page_size
             .unwrap_or(parquet::file::properties::DEFAULT_PAGE_SIZE);
@@ -1293,11 +1302,11 @@ pub trait AbstractMzPeakWriter {
 
         if use_chunked_encoding.is_some() {
             data_props = data_props
-                .set_max_row_group_size(max_row_group_size)
+                .set_max_row_group_row_count(Some(max_row_group_size))
                 .set_data_page_size_limit(data_page_size / 4);
         } else {
             data_props = data_props
-                .set_max_row_group_size(max_row_group_size)
+                .set_max_row_group_row_count(Some(max_row_group_size))
                 .set_data_page_row_count_limit(data_page_size);
         }
 

@@ -744,7 +744,7 @@ pub trait ArchiveSource: Sized + 'static {
     fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
         let handle = self.open_entry_by_index(index)?;
 
-        let mut opts = ArrowReaderOptions::new().with_page_index(true);
+        let mut opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
         if let Some(enc) = self.decryption_properties_for_index(index) {
             opts = opts.with_file_decryption_properties(enc);
         }
