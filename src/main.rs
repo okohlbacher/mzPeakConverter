@@ -2524,11 +2524,18 @@ fn ims_chunked_peak_schema(
     mob_da.update_buffer(&[1.0f64, 1.0f64]).expect("sample mobility");
     arrays.add(mob_da);
 
+    // Register the TOF→m/z reconstruction on the chunk axis, exactly as the archive path does for
+    // `point.tof`. Without it the chunked array index carries `transform: null` on every entry and
+    // the m/z model lives ONLY in the index `ims_calibration` block, so a reader that resolves
+    // transforms through the array index — as the spec requires — cannot reach m/z at all.
+    // `from_arrays` looks arrays up by `array_type`, not by full BufferName, so the added transform
+    // does not disturb the chunking itself.
     let main_axis = BufferName::new(
         BufferContext::Spectrum,
         ArrayType::nonstandard("tof"),
         BinaryDataArrayType::Int32,
-    );
+    )
+    .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof));
     let (chunks, _, _) = ArrowArrayChunk::from_arrays(
         0,
         None,
@@ -2555,6 +2562,16 @@ fn ims_chunked_peak_schema(
         .chunking_strategy(Some(strategy))
         .mz_boundary(Some(boundary));
     for f in schema.fields().iter().cloned() {
+        // The transform CURIE rides the BufferName into the field metadata, but the [a, b]
+        // coefficients cannot (BufferName is Copy/Hash), so attach them to every tof-derived
+        // column the same way the archive path does.
+        let f = if f.metadata().contains_key("transform") {
+            let mut md = f.metadata().clone();
+            md.insert("mzpeak:transform_params".to_string(), format!("{model_a},{model_b}"));
+            std::sync::Arc::new((*f).clone().with_metadata(md))
+        } else {
+            f
+        };
         builder = builder.add_field(f);
     }
     builder
