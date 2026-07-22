@@ -380,8 +380,15 @@ impl PeakMetadata {
             }
         }
         if has_arrays {
-            let index = SpectrumDataIndex::Point(SpectrumPointIndex::from_reader(reader, &this.array_indices));
-            this.query_index = index;
+            // Pick the index variant from the facet's OWN layout prefix, mirroring the data facet
+            // (`populate_spectrum_data_indices`). This used to hardcode Point, so a chunked peaks
+            // facet — what --ims-chunked writes — was indexed as if it were point data and decoded
+            // to nothing.
+            this.query_index = if crate::peak_series::BufferFormat::Chunk.prefix() == this.array_indices.prefix {
+                SpectrumDataIndex::Chunk(super::index::SpectrumChunkIndex::from_reader(reader, &this.array_indices))
+            } else {
+                SpectrumDataIndex::Point(SpectrumPointIndex::from_reader(reader, &this.array_indices))
+            };
             Some(this)
         } else {
             None

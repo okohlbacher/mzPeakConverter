@@ -860,9 +860,23 @@ impl<
             ))?;
 
         let PageQuery {
-            pages: _,
+            pages,
             row_group_indices,
         } = meta_index.query_index.query_pages(index);
+
+        // A CHUNKED peaks facet (timsTOF --ims-chunked) must go through the chunk reader. The peak
+        // cache below is point-layout only, so this dispatch has to come first — otherwise a chunked
+        // archive decodes to nothing and every consumer sees empty spectra.
+        if let SpectrumDataIndex::Chunk(query_index) = &meta_index.query_index {
+            let arrays = ChunkDataReader::new(builder, BufferContext::Spectrum).read_chunks_for(
+                index,
+                query_index,
+                &meta_index.array_indices,
+                None,
+                Some(PageQuery::new(row_group_indices, pages)),
+            )?;
+            return PeakDataLevel::try_from(&arrays).map(Some).map_err(io::Error::from);
+        }
 
         // If there is only one row group in the scan, take the fast path through the cache
         if row_group_indices.len() == 1 {
