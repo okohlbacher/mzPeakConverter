@@ -38,6 +38,21 @@ use crate::{
     writer::{CURIEBuilder, VisitorBase},
 };
 
+/// Integer counterpart of [`delta_decode`], for chunked layouts whose main axis is an integer array
+/// (the timsTOF `tof` axis). Kept separate because [`delta_decode`] is bound to `Float`.
+///
+/// Mirrors the same contract: `start_value` is the chunk's excluded first point (from `chunk_start`)
+/// and the returned count includes it.
+pub fn delta_decode_int(it: &[i32], start_value: i32, accumulator: &mut DataArray) -> usize {
+    let mut state = start_value;
+    accumulator.push(state).unwrap();
+    for val in it.iter().copied() {
+        state += val;
+        accumulator.push(state).unwrap();
+    }
+    it.len() + 1
+}
+
 pub fn delta_decode<T: Float + Pod + AddAssign>(
     it: &[T],
     start_value: T,
@@ -319,6 +334,12 @@ impl ChunkingStrategy {
                         f64,
                         "f64 delta decoding contained nulls but no delta model provided"
                     )
+                }
+                // Integer main axis (timsTOF ims-compact `tof`). This path writes no nulls, so the
+                // null-aware branch of `decode_delta!` has nothing to do here.
+                DataType::Int32 => {
+                    let it = array.as_primitive::<Int32Type>();
+                    delta_decode_int(it.values(), start_value as i32, accumulator)
                 }
                 _ => panic!(
                     "Data type {:?} is not supported by chunk decoding",
@@ -688,17 +709,13 @@ fn mz_boundary_steps(
 /// cumulative sum from element 0 (NOT from `chunk_start`, which holds m/z, not tof). Assumes dense
 /// (non-null) input.
 fn int32_chunk_delta(slice: &Int32Array) -> ArrayRef {
+    // The first value is the chunk's reference point and lives in `chunk_start`, NOT in this array
+    // (chunked-layout.md: "The start point is *excluded* from the chunk-values array"). So a chunk
+    // of n points yields n-1 deltas, and the parallel secondary arrays keep all n.
     let n = slice.len();
-    let mut out: Vec<i32> = Vec::with_capacity(n);
-    let mut prev = 0i32;
-    for i in 0..n {
-        let v = slice.value(i);
-        if i == 0 {
-            out.push(v);
-        } else {
-            out.push(v - prev);
-        }
-        prev = v;
+    let mut out: Vec<i32> = Vec::with_capacity(n.saturating_sub(1));
+    for i in 1..n {
+        out.push(slice.value(i) - slice.value(i - 1));
     }
     Arc::new(Int32Array::from(out))
 }
@@ -1260,10 +1277,22 @@ impl ArrowArrayChunk {
                 let (s, e) = (step.start, step.end);
                 let slice_dyn = main_axis_array.slice(s, e - s);
                 let slice: &Int32Array = slice_dyn.as_primitive::<Int32Type>();
-                // Tight m/z bounds for the chunk: min/max m/z over its (tof-sorted) points.
-                let m0 = boundary.mz(slice.value(0) as f64);
-                let m1 = boundary.mz(slice.value(slice.len() - 1) as f64);
-                let (chunk_start, chunk_end) = (m0.min(m1), m0.max(m1));
+                // `chunk_start`/`chunk_end` are the FIRST and LAST value of the MAIN AXIS
+                // (chunked-layout.md column naming rules 2 and 3). The main axis here is the integer
+                // `tof` array, so these carry TOF bins — matching the declared `array_type`
+                // (MS:1000786 "tof") and `unit` (UO:0000189). Points are TOF-ascending within a
+                // chunk, so first == min and last == max.
+                //
+                // m/z-range pruning is unaffected: the chunk cuts still fall on true m/z bin
+                // boundaries, and the declared MS:1003825 transform is monotonic, so a reader maps
+                // its m/z window through `(a + b·tof)²` and compares against these bounds. Keeping
+                // the bounds in TOF also keeps reconstruction exact — recovering the first TOF from
+                // an f64 m/z would require inverting a square root and could land on a different bin.
+                let t0 = slice.value(0);
+                let t1 = slice.value(slice.len() - 1);
+                let (chunk_start, chunk_end) = (t0.min(t1) as f64, t0.max(t1) as f64);
+                // The start point is EXCLUDED from the delta array (chunked-layout.md, "Delta
+                // encoding"): reconstruct as `chunk_start` followed by a cumulative sum of these.
                 let chunk_values = int32_chunk_delta(slice);
 
                 let mut chunk_arrays: HashMap<BufferName, ArrayRef> = Default::default();

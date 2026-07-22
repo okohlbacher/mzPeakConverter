@@ -173,14 +173,13 @@ struct Cli {
     #[arg(long)]
     no_ims_compact: bool,
 
-    /// Bruker timsTOF (TDF) ims-compact only: DISABLE the default per-scan delta encoding of the
-    /// integer TOF axis and store absolute TOF bins instead. Delta is ON by default (~15% smaller,
-    /// lossless), but the TOF must be cumulative-summed within each mobility scan on read — per-frame,
-    /// not per-point, random access (delta files are marked per spectrum with
-    /// `mzpeak:tof_delta_reset=scan`). Use `--no-tof-delta` for maximum reader compatibility: absolute
-    /// TOF needs no reconstruction.
+    /// Bruker timsTOF (TDF) ims-compact only: per-scan delta-encode the integer TOF axis (~3% smaller,
+    /// lossless). OFF BY DEFAULT and NON-CONFORMANT — the point layout requires values be stored
+    /// as-is so the Parquet page index stays meaningful, and delta encoding defeats that
+    /// (mzPeak-specification `docs/layouts/point-layout.md`). Delta files are marked per spectrum with
+    /// `mzpeak:tof_delta_reset=scan` and must be cumulative-summed within each mobility scan on read.
     #[arg(long)]
-    no_tof_delta: bool,
+    tof_delta: bool,
 
     /// Bruker timsTOF (TDF) ims-compact only — select the CHUNKED layout for rapid m/z-range access.
     /// OFF BY DEFAULT. When absent, timsTOF data is written in the ARCHIVE layout (the default): a flat
@@ -338,6 +337,7 @@ struct FileConfig {
     zstd_level: Option<i32>,
     force: Option<bool>,
     no_ims_compact: Option<bool>,
+    tof_delta: Option<bool>,
     ims_chunked: Option<bool>,
     bruker_sdk: Option<bool>,
     no_tims_recalibration: Option<bool>,
@@ -412,10 +412,11 @@ impl Settings {
             ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(5),
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
-            // Per-scan delta encoding of the integer TOF axis is ON by default; --no-tof-delta opts out.
-            // When --ims-chunked is set, the chunker does per-chunk delta, so the per-scan manual delta
-            // in ims_compact_spectrum is forced OFF (mutually exclusive).
-            tof_delta: !cli.no_tof_delta && !(cli.ims_chunked || fc.ims_chunked.unwrap_or(false)),
+            // Per-scan delta encoding of the integer TOF axis is OFF by default: it is forbidden in
+            // the point layout (see the --tof-delta help). When --ims-chunked is set, the chunker does
+            // its own per-chunk delta, so the per-scan manual delta is forced off (mutually exclusive).
+            tof_delta: (cli.tof_delta || fc.tof_delta.unwrap_or(false))
+                && !(cli.ims_chunked || fc.ims_chunked.unwrap_or(false)),
             ims_chunked: cli.ims_chunked || fc.ims_chunked.unwrap_or(false),
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             tims_recalibration: !(cli.no_tims_recalibration

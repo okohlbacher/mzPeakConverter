@@ -631,6 +631,11 @@ impl<'a> ChunkDecoder<'a> {
             }
             self.bin_map.add(store);
         }
+        // Reconstruct m/z from an integer main axis carrying a grid transform (the timsTOF
+        // ims-compact `tof` array). The point reader has always done this; without it here, a
+        // chunked ims-compact archive decodes to raw flight-time indices and every consumer that
+        // asks for m/z — including the mzML writer — sees an empty spectrum.
+        crate::reader::point::reconstruct_grid_mz(&mut self.bin_map, self.array_indices);
         Ok(self.bin_map)
     }
 
