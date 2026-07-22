@@ -156,7 +156,11 @@ impl NativeTofReader {
         // frame directly rather than letting it error the whole run. scan_offsets=[0] => 0 scans.
         if self.num_peaks.get(i).copied() == Some(0) {
             return Ok(RawFrame {
-                index: i,
+                // timsrust reports the 1-based TDF frame Id in `index` (position 0 => Id 1), and
+                // `index` only ever becomes the `frame=N` spectrum id. Using the 0-based position
+                // here handed every empty frame its predecessor's id — duplicate ids collapse the
+                // reader's id_index, which then sizes its per-spectrum vecs short and panics.
+                index: i + 1,
                 ms_level: 0,
                 scan_offsets: vec![0],
                 tof: Vec::new(),

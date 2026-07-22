@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — duplicate spectrum ids on timsTOF runs containing empty frames
+
+- **Empty TDF frames were given the *previous* frame's spectrum id.** The empty-frame fast path
+  (`NumPeaks=0`, where timsrust can't decode the header-only blob) filled `RawFrame.index` with the
+  0-based loop position, while timsrust reports the **1-based** TDF frame `Id` for every other frame
+  — so an empty frame at position *p* was written as `frame=p` instead of `frame=p+1`. On a 41,175
+  frame run with 32 empty frames this produced **26 duplicate ids**.
+- Duplicate ids collapse the reader's `id_index`, which sizes the per-spectrum metadata vectors by
+  the *unique* id count and then indexes them by the `index` column — so any full-metadata read
+  (notably `-o out.mzML`) **panicked** with `index out of bounds`.
+- Peak data was never affected (ids are metadata only); the fix is id-only and leaves the encoded
+  peaks byte-for-byte identical. **Files converted before this fix keep the duplicate ids and should
+  be reconverted** if they contain empty frames.
+
 ## [0.5.1] — 2026-07-17
 
 ### Added — filter a mzPeak straight to a searchable mzML
