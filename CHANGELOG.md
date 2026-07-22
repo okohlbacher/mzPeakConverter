@@ -6,6 +6,48 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — timsTOF MS2 precursors and isolation windows
+
+- **Precursor information is now extracted from the TDF.** It was previously discarded entirely:
+  `precursor` and `selected_ion` were null for every spectrum, including all MS2, which made DDA and
+  dia-PASEF output unusable for identification. A TDF MS2 frame is a full TIMS ramp and the
+  quadrupole retunes during it, so one frame carries N isolation windows over disjoint mobility
+  ranges (~1.6 per frame for DDA-PASEF, 5.0 for dia-PASEF). mzML has nowhere to put the mobility
+  dimension so mzdata splits these into N spectra; mzPeak does, so the frame stays whole and carries
+  N precursors. The two acquisition modes are stored in completely different tables and a file has
+  only one set, so the loader probes `sqlite_master` rather than assuming. Verified against ground
+  truth: 23,818 precursor rows vs 23,818 TDF windows (DDA), 15,977 vs 15,977 (dia-PASEF).
+
+### Fixed — more conformance with mzPeak-specification HEAD (`9e61e32`)
+
+- **`--ims-chunked` archives read back as empty spectra.** `PeakMetadata::from_metadata` hardcoded
+  the Point index variant regardless of the facet's actual layout, and `get_spectrum_peaks_for` had
+  no chunk branch. Both now select on the facet's own array-index prefix. Verified: the same input
+  converted archive-vs-chunked decodes to identical content — 18/18 spectra agree on the m/z
+  multiset and on (m/z, intensity) pairs, differing only in ordering.
+- **Per-scan TOF delta encoding is now opt-in (`--tof-delta`), default off.** The point layout
+  requires values be stored as-is so the Parquet page index stays meaningful, and delta encoding
+  defeats that. Retained as a flag because it is genuinely useful (~3% smaller) and is a proposed
+  spec change; the help text says plainly that it is non-conformant.
+- **`--ims-chunked` chunk bounds** now hold the first/last value of the main axis (TOF bins), matching
+  the declared `MS:1000786` / `UO:0000189`, and the delta **start point is excluded** from
+  `chunk_values` as the chunked layout requires.
+- **A dangling instrument-configuration foreign key** — `run.default_instrument_id` and every
+  `scan.instrument_configuration_ref` pointed at configuration 0 while the list was empty. The model,
+  serial and TOF analyzer are now promoted from the `.d`'s GlobalMetadata. The ion source and detector
+  are deliberately not guessed from Bruker's opaque `InstrumentSourceType` code.
+- **`run.start_time`** is filled from the vendor acquisition timestamp.
+
+### Fixed — no operator paths in archives or the repository
+
+- Archives embedded the operator's filesystem twice: the verbatim command line as the "conversion
+  options" param, and an absolute `file://` directory as the source file's `location`. Conversion
+  options now keep the flags but reduce path-shaped arguments to basenames, and `location` records
+  the bare `file://` authority — the source is already identified by `name`.
+- 26 hardcoded `/Users/...` paths in tracked files (test constants and the two corpus manifests) are
+  gone; the corpus root resolves through `MZPEAK_CORPUS`, defaulting under `$HOME`.
+- `.gitignore` now covers `tools/box.env*`, so a `.bak` of the credentials file cannot be staged.
+
 ### Changed — dependency pins
 
 - **arrow / parquet 57.0.0 → 59.1.0**, **mzdata 0.65.2 → 0.65.4**, **thermorawfilereader 0.7.0 →
