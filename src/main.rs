@@ -1443,11 +1443,6 @@ fn convert_file_tof_grid(
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
-        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            curie!(MS:1000294),
-            "mass spectrum",
-            DataType::Boolean,
-        ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
     // PER-SPECTRUM ROUTING: griddable spectra go to the custom `tof_index` peak facet (above);
     // off-grid spectra (MS2, sparse, off-lattice) keep EXACT f64 m/z and are routed to the standard
@@ -1809,11 +1804,6 @@ fn convert_agilent_grid(
     let builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
-        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            curie!(MS:1000294),
-            "mass spectrum",
-            DataType::Boolean,
-        ))
         // Per-spectrum grid coefficients as Float64 spectrum columns (pulled from each spectrum's
         // params by CURIE). These are the AUTHORITATIVE per-scan calibration for m/z reconstruction.
         .add_spectrum_param_field(
@@ -2111,15 +2101,6 @@ fn convert_file(
         .sample_array_types_for_peaks_from_spectrum_source(&mut reader)
         .sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
 
-    // Register the explicit spectrum-TYPE column MS:1000294 (mass spectrum) — a concrete child of
-    // MS:1000559 the validator's `spectrum_must` placement rule requires (the writer's fixed
-    // spectrum_type column carries only the abstract parent accession).
-    builder = builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-        curie!(MS:1000294),
-        "mass spectrum",
-        DataType::Boolean,
-    ));
-
     let mut writer = builder.build(handle, true);
 
     // imzML carries imaging coordinate cvParams that must be promoted to columns; the archive then
@@ -2139,11 +2120,6 @@ fn convert_file(
     if let MZReaderType::BrukerTDF(tdf) = &mut reader {
         tdf.set_consolidate_peaks(false);
     }
-
-    let mass_spectrum = Param::builder()
-        .name("mass spectrum")
-        .curie(curie!(MS:1000294))
-        .build();
 
     let mut n = 0usize;
     let cap = max_spectra();
@@ -2178,15 +2154,6 @@ fn convert_file(
                     let _ = arrays.sort_by_array(&ArrayType::MZArray);
                 }
             }
-        }
-        // Tag mass spectra with the concrete MS:1000294 child so the registered column populates —
-        // but NOT UV/PDA (wavelength) spectra, which the writer routes to the wavelength facet.
-        let is_wavelength = entry
-            .arrays
-            .as_ref()
-            .is_some_and(|a| a.has_array(&ArrayType::WavelengthArray));
-        if !is_wavelength {
-            entry.description_mut().add_param(mass_spectrum.clone());
         }
         if synth_chroms {
             ms1.observe(&entry);
@@ -2681,11 +2648,6 @@ where
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
-        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            curie!(MS:1000294),
-            "mass spectrum",
-            DataType::Boolean,
-        ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
     // Peak-facet row-group size (rows) = the per-chunk zstd granularity. Smaller = finer random
     // access (fewer peaks to decompress per frame) but worse compression; default is parquet's 2^20.
@@ -3201,11 +3163,6 @@ fn convert_sciex_grid(
         .chunked_encoding(chunk)
         .chromatogram_chunked_encoding(chunk)
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            curie!(MS:1000294),
-            "mass spectrum",
-            DataType::Boolean,
-        ))
-        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
             TOF_C0_CURIE,
             "tof_c0",
             DataType::Float64,
@@ -3382,8 +3339,7 @@ fn convert_agilent_midac(
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
-/// Shared writer wiring for a custom (non-mzdata) reader: sample-derived schema + MS:1000294 column
-/// + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by
+/// Shared writer wiring for a custom (non-mzdata) reader: sample-derived schema + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by
 /// every custom-reader path (Bruker TSF/BAF, SciEX, Agilent) so they don't each duplicate the body.
 fn convert_vendor_reader(
     input: &Path,
@@ -3416,17 +3372,12 @@ fn convert_vendor_reader(
         }
         pi += step;
     }
-    let mut builder = MzPeakWriterType::<fs::File>::builder()
+    let builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
         .chromatogram_chunked_encoding(chunk)
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
         .sample_array_types_from_spectra(probes.into_iter());
-    builder = builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-        curie!(MS:1000294),
-        "mass spectrum",
-        DataType::Boolean,
-    ));
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
     let mut ms1 = Ms1Chroms::default();

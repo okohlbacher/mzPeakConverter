@@ -18,11 +18,10 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use mzdata::curie;
 use mzdata::params::{Param, Unit};
 use mzdata::prelude::ParamDescribed;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
-use mzdata::spectrum::{MultiLayerSpectrum, SignalContinuity, SpectrumDescription};
+use mzdata::spectrum::{MultiLayerSpectrum, ScanPolarity, SignalContinuity, SpectrumDescription};
 
 use timsrust::converters::{ConvertableDomain, Scan2ImConverter, Tof2MzConverter};
 use timsrust::readers::{FrameReader, MetadataReader};
@@ -91,15 +90,29 @@ pub struct NativeTofReader {
     /// (when recalibration is disabled, or the calibration isn't ModelType 2).
     recal: Option<crate::tims_mobility::TimsMobilityCalibration>,
     pub model: TofMzModel,
-    /// Per-frame `NumPeaks` (from `analysis.tdf`, ordered by Id to match timsrust's frame index).
-    /// Newer timsTOF (acq software 5.1.x) emits empty frames (`NumPeaks=0`) stored as a header-only
-    /// blob with no zstd payload; `timsrust` errors decoding the empty payload. We short-circuit
-    /// those to an empty frame so a real decode error on a *non-empty* frame still surfaces, instead
-    /// of mzdata's blanket `.ok().unwrap_or_default()` that masks genuine corruption too.
+    /// Per-frame `Frames` columns from `analysis.tdf`. Empty if unavailable or if the row count
+    /// disagrees with timsrust's frame count (see `open_with`).
+    table: FrameTable,
+}
+
+/// Per-frame `Frames` columns, ordered by `Id` so position `i` matches timsrust's frame index.
+///
+/// One query for all four, because they share the same position↔Id assumption and so must stand or
+/// fall together:
+/// * `NumPeaks` — newer timsTOF (acq software 5.1.x) emits empty frames (`NumPeaks=0`) stored as a
+///   header-only blob with no zstd payload, which `timsrust` errors on. Recognising them here lets a
+///   real decode error on a *non-empty* frame still surface, instead of mzdata's blanket
+///   `.ok().unwrap_or_default()` that masks genuine corruption too.
+/// * `Time` — retention time in SECONDS.
+/// * `MsMsType` — the MS level. This is the ONLY source for empty frames: timsrust cannot decode
+///   them, so without it a dia-PASEF MS2 frame with no peaks gets silently written as MS1.
+/// * `Polarity` — `+`/`-`; timsrust does not expose it.
+#[derive(Default)]
+struct FrameTable {
     num_peaks: Vec<u32>,
-    /// Frame retention time in SECONDS (TDF `Frames.Time`, ordered by Id → position = frame index).
-    /// Empty if unavailable or if the row count disagrees with timsrust's frame count (see `open_with`).
-    frame_rt: Vec<f64>,
+    rt: Vec<f64>,
+    ms_level: Vec<u8>,
+    polarity: Vec<ScanPolarity>,
 }
 
 impl NativeTofReader {
@@ -126,25 +139,20 @@ impl NativeTofReader {
         } else {
             None
         };
-        let mut num_peaks = read_frame_num_peaks(&tdf)?;
+        let mut table = read_frame_table(&tdf)?;
         // Guard the position-based indexing: if timsrust's frame count disagrees with the Frames
-        // row count, drop the fast-path rather than risk nulling a real frame (a misread empty frame
-        // just errors → mzdata fallback; silently dropping a populated one would lose data).
-        if num_peaks.len() != frames.len() {
+        // row count, drop the whole table rather than risk misattributing a row (a misread empty
+        // frame just errors → mzdata fallback; a misaligned RT/MS level silently corrupts).
+        if table.num_peaks.len() != frames.len() {
             log::warn!(
-                "TDF NumPeaks rows ({}) != timsrust frames ({}); disabling empty-frame fast path",
-                num_peaks.len(),
+                "TDF Frames rows ({}) != timsrust frames ({}); disabling empty-frame fast path, \
+                 retention time, MS level and polarity",
+                table.num_peaks.len(),
                 frames.len()
             );
-            num_peaks.clear();
+            table = FrameTable::default();
         }
-        // Frame retention time (`Frames.Time`, seconds). Same position-based guard as NumPeaks:
-        // a misaligned RT is worse than none, so drop it if the row count disagrees with timsrust.
-        let mut frame_rt = read_frame_rt(&tdf).unwrap_or_default();
-        if frame_rt.len() != frames.len() {
-            frame_rt.clear();
-        }
-        Ok(Self { frames, im: meta.im_converter, recal, model, num_peaks, frame_rt })
+        Ok(Self { frames, im: meta.im_converter, recal, model, table })
     }
 
     pub fn len(&self) -> usize {
@@ -154,14 +162,14 @@ impl NativeTofReader {
     pub fn frame(&self, i: usize) -> Result<RawFrame> {
         // Empty frame (NumPeaks=0): timsrust can't decode the header-only blob, so build an empty
         // frame directly rather than letting it error the whole run. scan_offsets=[0] => 0 scans.
-        if self.num_peaks.get(i).copied() == Some(0) {
+        if self.table.num_peaks.get(i).copied() == Some(0) {
             return Ok(RawFrame {
                 // timsrust reports the 1-based TDF frame Id in `index` (position 0 => Id 1), and
                 // `index` only ever becomes the `frame=N` spectrum id. Using the 0-based position
                 // here handed every empty frame its predecessor's id — duplicate ids collapse the
                 // reader's id_index, which then sizes its per-spectrum vecs short and panics.
                 index: i + 1,
-                ms_level: 0,
+                ms_level: self.ms_level_at(i),
                 scan_offsets: vec![0],
                 tof: Vec::new(),
                 intensity: Vec::new(),
@@ -174,7 +182,9 @@ impl NativeTofReader {
         let ms_level = match f.ms_level {
             MSLevel::MS1 => 1,
             MSLevel::MS2 => 2,
-            _ => 0,
+            // timsrust only models MS1/MS2; anything else (MRM, dia-PASEF variants) falls back to
+            // the TDF's own MsMsType rather than being fabricated as MS1.
+            _ => self.ms_level_at(i),
         };
         Ok(RawFrame {
             index: f.index,
@@ -183,6 +193,13 @@ impl NativeTofReader {
             tof: f.tof_indices,
             intensity: f.intensities,
         })
+    }
+
+    /// MS level for frame `i` from the TDF `MsMsType`, defaulting to MS1 when the table is
+    /// unavailable. Never returns 0 — `ms_level` 0 is not a legal MS stage under `MS:1000511`.
+    #[inline]
+    fn ms_level_at(&self, i: usize) -> u8 {
+        self.table.ms_level.get(i).copied().unwrap_or(1)
     }
 
     #[inline]
@@ -277,16 +294,17 @@ impl NativeTofReader {
         let mut descr = SpectrumDescription {
             id: format!("frame={}", frame.index),
             index: i,
-            ms_level: frame.ms_level.max(1),
+            ms_level: frame.ms_level,
             signal_continuity: SignalContinuity::Centroid,
             ..Default::default()
         };
         // Retention time: TDF `Frames.Time` is seconds; mzPeak scan start time / `spectrum.time` are
         // minutes (matching the mzML/Thermo path), so store rt/60. Enables `--rt` on timsTOF.
-        if let Some(&rt) = self.frame_rt.get(i) {
+        if let Some(&rt) = self.table.rt.get(i) {
             descr.acquisition.first_scan_mut().unwrap().start_time = rt / 60.0;
         }
-        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
+        descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
         if tof_delta {
             // Self-describing marker for the per-scan-delta TOF encoding: a reader must cumsum the
             // `tof` column within each mobility-scan run before applying the m/z model.
@@ -393,16 +411,17 @@ impl NativeTofReader {
         let mut descr = SpectrumDescription {
             id: format!("frame={}", frame.index),
             index: i,
-            ms_level: frame.ms_level.max(1),
+            ms_level: frame.ms_level,
             signal_continuity: SignalContinuity::Centroid,
             ..Default::default()
         };
         // Retention time: TDF `Frames.Time` is seconds; mzPeak scan start time / `spectrum.time` are
         // minutes (matching the mzML/Thermo path), so store rt/60. Enables `--rt` on timsTOF.
-        if let Some(&rt) = self.frame_rt.get(i) {
+        if let Some(&rt) = self.table.rt.get(i) {
             descr.acquisition.first_scan_mut().unwrap().start_time = rt / 60.0;
         }
-        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
+        descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
         if tof_min <= tof_max {
             let (mz_a, mz_b) = (self.model.mz(tof_min), self.model.mz(tof_max));
             crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
@@ -411,37 +430,40 @@ impl NativeTofReader {
     }
 }
 
-/// `NumPeaks` for every frame, ordered by `Id` so position `i` matches timsrust's frame index.
-/// Lets [`NativeTofReader::frame`] recognize empty frames without reading the binary.
-fn read_frame_num_peaks(tdf: &Path) -> Result<Vec<u32>> {
+/// Read the per-frame [`FrameTable`] from `analysis.tdf`, ordered by `Id` so position `i` matches
+/// timsrust's frame index.
+fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
     let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| anyhow::anyhow!("opening {} for NumPeaks: {e}", tdf.display()))?;
+        .map_err(|e| anyhow::anyhow!("opening {} for Frames: {e}", tdf.display()))?;
     let mut stmt = conn
-        .prepare("SELECT NumPeaks FROM Frames ORDER BY Id")
-        .map_err(|e| anyhow::anyhow!("querying NumPeaks: {e}"))?;
+        .prepare("SELECT NumPeaks, Time, MsMsType, Polarity FROM Frames ORDER BY Id")
+        .map_err(|e| anyhow::anyhow!("querying Frames: {e}"))?;
     let rows = stmt
-        .query_map([], |r| r.get::<_, i64>(0).map(|n| n.max(0) as u32))
-        .map_err(|e| anyhow::anyhow!("reading NumPeaks: {e}"))?;
-    rows.collect::<rusqlite::Result<Vec<u32>>>()
-        .map_err(|e| anyhow::anyhow!("collecting NumPeaks: {e}"))
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?.max(0) as u32,
+                r.get::<_, f64>(1)?,
+                // TDF MsMsType: 0 is full-scan MS1; every other value (2 MRM, 8 PASEF, 9 dia-PASEF)
+                // is a fragmentation frame, i.e. MS2.
+                if r.get::<_, i64>(2)? == 0 { 1u8 } else { 2u8 },
+                match r.get::<_, String>(3)?.trim() {
+                    "+" => ScanPolarity::Positive,
+                    "-" => ScanPolarity::Negative,
+                    _ => ScanPolarity::Unknown,
+                },
+            ))
+        })
+        .map_err(|e| anyhow::anyhow!("reading Frames: {e}"))?;
+    let mut t = FrameTable::default();
+    for row in rows {
+        let (n, rt, lvl, pol) = row.map_err(|e| anyhow::anyhow!("collecting Frames: {e}"))?;
+        t.num_peaks.push(n);
+        t.rt.push(rt);
+        t.ms_level.push(lvl);
+        t.polarity.push(pol);
+    }
+    Ok(t)
 }
-
-/// Retention time (SECONDS) for every frame, ordered by `Id` so position `i` matches timsrust's
-/// frame index. Bruker stores RT in seconds in `Frames.Time`; the ims-compact spectra convert to
-/// minutes for the scan start time. Best-effort — a read failure just leaves timsTOF without RT.
-fn read_frame_rt(tdf: &Path) -> Result<Vec<f64>> {
-    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| anyhow::anyhow!("opening {} for Frame RT: {e}", tdf.display()))?;
-    let mut stmt = conn
-        .prepare("SELECT Time FROM Frames ORDER BY Id")
-        .map_err(|e| anyhow::anyhow!("querying Frame Time: {e}"))?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, f64>(0))
-        .map_err(|e| anyhow::anyhow!("reading Frame Time: {e}"))?;
-    rows.collect::<rusqlite::Result<Vec<f64>>>()
-        .map_err(|e| anyhow::anyhow!("collecting Frame Time: {e}"))
-}
-
 #[cfg(test)]
 mod tof_delta_tests {
     /// Per-scan delta TOF (the default; `--no-tof-delta` disables it) stores the first peak of a scan
