@@ -55,6 +55,9 @@ tiff = { version = "=0.11.3", default-features = false }
 # transitively; declared explicitly here so the embed_aux module can depend on it directly.
 sha2 = "0.10"
 
+# RFC 3339 parsing for the Bruker acquisition timestamp -> run.start_time. Already in the tree via
+# mzdata; declared here so main.rs can use it directly.
+chrono = "0.4.45"
 clap = { version = "4", features = ["derive"] }
 # Parallel timsTOF frame decode (#19). Already in the tree transitively (timsrust pulls it); declared
 # here so the ims-compact writer can fan frame decode across cores. Pinned to the transitive version.

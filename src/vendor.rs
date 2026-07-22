@@ -205,7 +205,7 @@ pub fn embed_into_archive(
 }
 
 /// Read run-level `GlobalMetadata` (key/value) from a TSF or TDF SQLite, as a JSON object.
-fn read_global_metadata(dot_d: &Path) -> Option<serde_json::Value> {
+pub(crate) fn read_global_metadata(dot_d: &Path) -> Option<serde_json::Value> {
     let sql = ["analysis.tsf", "analysis.tdf"]
         .iter()
         .map(|n| dot_d.join(n))

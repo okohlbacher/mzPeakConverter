@@ -3549,8 +3549,10 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
 fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     // 1. Ensure at least one source_file (the input itself) so default_source_file_id can resolve.
     if target.file_description().source_files.is_empty() {
-        let parent = input.parent().filter(|p| !p.as_os_str().is_empty());
-        let location = parent.map_or_else(|| "file://".to_string(), |p| format!("file://{}", p.display()));
+        // `name` identifies the source; the directory it happened to sit in on the converting
+        // machine is not provenance, it is the operator's filesystem — and it would travel with
+        // every distributed archive. Record the bare `file://` authority instead of an absolute path.
+        let location = "file://".to_string();
         let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         target.file_description_mut().source_files.push(SourceFile {
             name,
@@ -3566,6 +3568,13 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     let first_instr = target.instrument_configurations().keys().copied().min().unwrap_or(0);
     let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty());
     if let Some(run) = target.run_description_mut() {
+        // Bruker leaves `run.start_time` unset, but the `.d` records the acquisition timestamp in
+        // GlobalMetadata as RFC 3339 already.
+        if run.start_time.is_none() {
+            run.start_time = vendor::read_global_metadata(input)
+                .and_then(|m| m.get("AcquisitionDateTime")?.as_str().map(str::to_owned))
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok());
+        }
         if run.default_source_file_id.is_none() {
             run.default_source_file_id = first_sf;
         }
@@ -3594,7 +3603,24 @@ fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
             software_reference: "mzpeak-convert".to_string(),
             params: vec![Param::new_key_value(
                 "conversion options",
-                std::env::args().skip(1).collect::<Vec<String>>().join(" "),
+                // Provenance without leaking the operator's filesystem: flags are kept verbatim, but
+                // any path-shaped argument is reduced to its basename. The raw command line would
+                // otherwise embed absolute input/output paths — home directory, scratch dirs — in
+                // every distributed archive.
+                std::env::args()
+                    .skip(1)
+                    .map(|a| {
+                        if a.contains(std::path::MAIN_SEPARATOR) {
+                            Path::new(&a)
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or(a)
+                        } else {
+                            a
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(" "),
             )],
         }],
     });
