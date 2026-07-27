@@ -514,8 +514,11 @@ pub enum BufferTransform {
     LinearMz,
 }
 
-const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
-const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
+// NOTE: upstream (and docs/layouts/signal-data.md) assign MS:1003901 = zero intensity point
+// trimming, MS:1003902 = ...interpolation. Our vendored copy had these two swapped; adopting
+// upstream's mapping fixes the read path for spec-conformant third-party files.
+const NULL_ZERO: CURIE = mzdata::curie!(MS:1003901);
+const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003902);
 // Grid reconstruction transforms, using the ASSIGNED PSI-MS "coordinate spacing model" terms seeded
 // for grid encoding (children of MS:1003820 / MS:1003822 "grid coordinate interpolation"):
 //   MS:1003825 = square root grid interpolation   x = f((b + i·a)²)

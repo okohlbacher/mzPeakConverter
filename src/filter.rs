@@ -288,13 +288,15 @@ fn compute_survivors(
 
     for batch in reader {
         let batch = batch?;
-        let spectrum = struct_col(&batch, "spectrum")
-            .ok_or_else(|| anyhow!("spectra_metadata has no `spectrum` struct column"))?;
+        let spectrum = facet_view(&batch, "spectrum")
+            .ok_or_else(|| anyhow!("spectra_metadata has neither a `spectrum` struct nor an `index` column"))?;
+        let spectrum = &spectrum;
         let index = u64_child(spectrum, "index")
             .ok_or_else(|| anyhow!("spectrum.index missing/!uint64"))?;
         let ids = lstr_child(spectrum, "id");
         let time = f64_child(spectrum, "time");
-        let ms = u8_child(spectrum, "MS_1000511_ms_level");
+        let ms = cv_child(spectrum, "ms_level", "MS_1000511_ms_level")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::UInt8Array>());
         let precursor = struct_col(&batch, "precursor");
         let pids = precursor.and_then(|p| lstr_child(p, "precursor_id"));
 
@@ -1022,6 +1024,32 @@ fn parquet_schema(bytes: &[u8]) -> Result<SchemaRef> {
 fn parquet_row_count(bytes: &[u8]) -> Result<i64> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))?;
     Ok(builder.metadata().file_metadata().num_rows())
+}
+
+/// A facet view that works across BOTH metadata layouts.
+///
+/// Up to v0.6.0 a metadata facet was a nested struct column inside one packed table
+/// (`spectrum`, `scan`, `precursor`, `selected_ion`). From v0.7.0 each facet is its own Parquet
+/// file whose columns sit at the top level. Existing archives stay readable until they are
+/// reconverted, so every read path resolves through here: nested struct if present, otherwise the
+/// batch itself viewed as a struct. Arrow arrays are Arc-backed, so the clone is a refcount bump.
+fn facet_view(batch: &RecordBatch, name: &str) -> Option<StructArray> {
+    if let Some(s) = struct_col(batch, name) {
+        return Some(s.clone());
+    }
+    // Split layout: the facet IS the file. Only treat it as such when the expected key column is
+    // present, so a genuinely absent facet still reports absent rather than yielding a bogus view.
+    let key = if name == "spectrum" || name == "chromatogram" { "index" } else { "source_index" };
+    if batch.column_by_name(key).is_some() {
+        return Some(StructArray::from(batch.clone()));
+    }
+    None
+}
+
+/// Read a CV-mapped column under either naming scheme: the v0.7.0 bare name (`ms_level`) or the
+/// pre-0.7.0 inflected name (`MS_1000511_ms_level`).
+fn cv_child<'a>(s: &'a StructArray, bare: &str, inflected: &str) -> Option<&'a arrow::array::ArrayRef> {
+    s.column_by_name(bare).or_else(|| s.column_by_name(inflected))
 }
 
 fn struct_col<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StructArray> {

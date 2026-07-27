@@ -450,8 +450,11 @@ pub trait AbstractMzPeakWriter {
         Ok(())
     }
 
-    /// Whether or not a chunking strategy is being used for spectra
+    /// Whether or not a chunking strategy is being used for spectra data
     fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy>;
+
+    /// Whether or not a chunking strategy is being used for spectra peaks
+    fn use_chunked_encoding_for_peaks(&self) -> Option<&ChunkingStrategy>;
 
     /// Whether or not a chunking strategy is being used for chromatograms
     fn use_chromatogram_chunked_encoding(&self) -> Option<&ChunkingStrategy>;
@@ -1098,6 +1101,15 @@ pub trait AbstractMzPeakWriter {
             .set_column_bloom_filter_enabled("spectrum.id".into(), true)
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_statistics_enabled(EnabledStatistics::Page);
+
+        for c in parquet_schema.columns().iter() {
+            if c.name().ends_with("index") {
+                builder = builder.set_column_encoding(
+                    c.path().clone(),
+                    Encoding::DELTA_BINARY_PACKED
+                );
+            }
+        }
 
         if let Some(encryption_props) = encryption_properties {
             builder = builder.with_file_encryption_properties(encryption_props);

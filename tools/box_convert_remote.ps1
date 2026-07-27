@@ -17,6 +17,7 @@ $pwiz = 'C:/Program Files (x86)/FLASHApp-1.0.0/FLASHApp-1.0.0/share/OpenMS/THIRD
 if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE  = (Resolve-Path "$cvtRoot\glue\sciex\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
+if (Test-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0") { $env:MZPC_SHIMADZU_GLUE = (Resolve-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0").Path }  # native Shimadzu .lcd (LabSolutions.IO)
 $env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent loads from $pwiz/vendor_api/Agilent
 # --via-msconvert resolves msconvert via $MSCONVERT_PATH; pin it to THIS pwiz so it has the bundled
 # vendor readers (vendor_api/Agilent etc.) — else it grabs a msconvert on PATH that lacks them ([ReaderFail]).
@@ -99,12 +100,42 @@ try {
         $env:MZPC_BYTE_PLANE_INTENSITY = '1'
         $optList = @($optList | Where-Object { $_ -ne '--byte-plane-intensity' })
     }
+    # mzML intermediate -> RAMDISK when configured. The converter writes any msconvert mzML to
+    # $env:TEMP (Rust std::env::temp_dir), so pointing TEMP/TMP at a RAM-backed volume keeps the giant
+    # intermediate off disk. Set MZPC_MZML_TMPDIR to a ramdisk in C:\Users\User\box_convert_env.ps1.
+    if ($env:MZPC_MZML_TMPDIR -and (Test-Path $env:MZPC_MZML_TMPDIR)) {
+        $env:TMP = $env:MZPC_MZML_TMPDIR; $env:TEMP = $env:MZPC_MZML_TMPDIR
+        $res.note = ((@($res.note, 'mzmltmp=ram') | Where-Object { $_ }) -join ' ')
+    }
     # Continue around the native call: the converter logs INFO to stderr on SUCCESS, which would
     # otherwise raise a NativeCommandError under 'Stop' and mask a clean run. Exit is read explicitly.
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    # msconvert is FALLBACK-ONLY, never the primary path. Windows has a native reader for every vendor
+    # (Thermo/.NET, Bruker TDF+BAF, Agilent MHDAC/grid, SciEX Clearcore2, Waters MassLynx, Shimadzu
+    # LabSolutions) and native is both faster and smaller (measured: Waters 946->163 MB, SciEX SWATH
+    # 1242->495 s and 2891->2040 MB; msconvert inflates the mzML round-trip). So the PRIMARY attempt is
+    # ALWAYS native: strip the mzML-lane flags (--via-msconvert, --tof-grid <mode>) so even a job that
+    # still asks for --via-msconvert is tried native first. msconvert runs ONLY if the native read fails.
+    $nativeOpts = @(); $skipNext = $false
+    foreach ($o in $optList) {
+        if ($skipNext) { $skipNext = $false; continue }
+        if ($o -eq '--via-msconvert') { continue }
+        if ($o -eq '--tof-grid') { $skipNext = $true; continue }   # drop the flag AND its mode arg
+        $nativeOpts += $o
+    }
     $swcv = [Diagnostics.Stopwatch]::StartNew()
-    & $converter $inputPath @optList -o $out --force *> $log
+    & $converter $inputPath @nativeOpts -o $out --force *> $log
     $res.exit = $LASTEXITCODE
+    if ($res.exit -eq 0) {
+        $res.note = ((@($res.note, 'path=native') | Where-Object { $_ }) -join ' ')
+    } else {
+        # native failed on this file/model -> msconvert FALLBACK (the ONLY place msconvert ever runs)
+        $res.note = ((@($res.note, 'path=native-fail->msconvert') | Where-Object { $_ }) -join ' ')
+        $native_only = @('--agilent-grid', '--bruker-sdk')   # conflict with / ignored by the mzML lane
+        $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', 'auto')
+        & $converter $inputPath @fbOpts -o $out --force *>> $log
+        $res.exit = $LASTEXITCODE
+    }
     $res.conv_s = [math]::Round($swcv.Elapsed.TotalSeconds, 1)
     $ErrorActionPreference = $prevEAP
     if (Test-Path $log) { $res.log = (Get-Content $log -Raw) }

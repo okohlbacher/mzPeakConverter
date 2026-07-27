@@ -185,6 +185,10 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
     fn controlled_vocabularies_mut(&mut self) -> &mut Vec<crate::param::ControlledVocabularyEntry> {
         &mut self.controlled_vocabularies
     }
+
+    fn use_chunked_encoding_for_peaks(&self) -> Option<&ChunkingStrategy> {
+        self.separate_peak_writer.as_ref().and_then(|v| v.buffers().chunking_strategy())
+    }
 }
 
 impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPeakDataSeries>
@@ -200,7 +204,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
         use_chunked_encoding: Option<ChunkingStrategy>,
         use_chromatogram_chunked_encoding: Option<ChunkingStrategy>,
         compression: Compression,
-        store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
+        spectrum_peak_buffers_builder: ArrayBuffersBuilder,
         write_batch_config: WriteBatchConfig,
         spectrum_fields: SpectrumFieldVisitors,
     ) -> Self {
@@ -258,27 +262,22 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
 
         let encryption_properties = Default::default();
 
-        let separate_peak_writer = if let Some(peak_buffer_builder) = store_peaks_and_profiles_apart
-        {
-            let peak_buffer_file = fs::File::create(
-                path.join(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()),
-            )
-            .unwrap();
-
-            let peak_writer = Self::make_peaks_writer(
-                peak_buffer_file,
-                peak_buffer_builder,
-                write_batch_config,
-                compression,
-                spectrum_buffers.include_time(),
-                shuffle_mz,
-                buffer_size,
-                &encryption_properties,
-            );
-            peak_writer.ok()
-        } else {
-            None
-        };
+        let peak_buffer_file = fs::File::create(
+            path.join(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()),
+        )
+        .unwrap();
+        let separate_peak_writer = Self::make_peaks_writer(
+            peak_buffer_file,
+            spectrum_peak_buffers_builder,
+            write_batch_config,
+            compression,
+            spectrum_buffers.include_time(),
+            shuffle_mz,
+            buffer_size,
+            &encryption_properties,
+        )
+        .map_err(|e| log::error!("Failed to open peak writer: {e}"))
+        .ok();
 
         let metadata_props = Self::spectrum_metadata_writer_props(&metadata_fields, None);
 
