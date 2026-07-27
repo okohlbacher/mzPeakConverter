@@ -3511,6 +3511,16 @@ fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f6
     i.update_buffer(intensity_f32.as_slice()).map_err(|e| anyhow::anyhow!("encoding chromatogram intensity: {e}"))?;
     arrays.add(i);
     let mut descr = ChromatogramDescription { id: id.to_string(), ..Default::default() };
+    // Set the typed field, not just the param: the `chromatogram_type` COLUMN is populated from
+    // `chromatogram_type()`, and leaving it Unknown makes the writer emit null (previously the
+    // abstract MS:1000626 parent) even though we know exactly which chromatogram this is.
+    if let Some(curie) = type_param.curie() {
+        descr.chromatogram_type = match curie {
+            c if c == mzdata::curie!(MS:1000235) => ChromatogramType::TotalIonCurrentChromatogram,
+            c if c == mzdata::curie!(MS:1000628) => ChromatogramType::BasePeakChromatogram,
+            _ => descr.chromatogram_type,
+        };
+    }
     descr.add_param(type_param);
     Ok(Chromatogram::new(descr, arrays))
 }

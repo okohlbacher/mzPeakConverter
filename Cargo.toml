@@ -19,7 +19,7 @@ zip = "=4.1.0"
 # bytes). Already in the tree transitively (parquet/arrow); declared here so filter.rs can use it.
 bytes = "1"
 libloading = "0.8"   # vendor native-DLL loading (Bruker BAF, Waters MassLynx); cross-platform compile
-mzdata = { version = "=0.65.4", features = ["imzml", "serde", "bruker_tdf", "thermo", "nalgebra", "zstd", "numpress"] }
+mzdata = { version = "=0.65.5", features = ["imzml", "serde", "bruker_tdf", "thermo", "nalgebra", "zstd", "numpress"] }
 mzpeaks = "=1.0.9"
 
 # Reference mzPeak writer, vendored locally (default-features=false drops the async/tokio/

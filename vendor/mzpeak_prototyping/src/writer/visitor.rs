@@ -2497,13 +2497,22 @@ impl ChromatogramDetailsBuilder {
     ) -> bool {
         self.index.append_value(index);
         self.id.append_value(item.id());
-        self.polarity.append_value(match item.polarity() {
-            ScanPolarity::Positive => 1,
-            ScanPolarity::Negative => -1,
-            ScanPolarity::Unknown => 0,
+        // `scan_polarity` is defined as 1, -1 or null — 0 is not a legal value (see
+        // docs/schemas/chromatograms.md). Mirror the spectrum path, which already appends an option.
+        self.polarity.append_option(match item.polarity() {
+            ScanPolarity::Positive => Some(1),
+            ScanPolarity::Negative => Some(-1),
+            ScanPolarity::Unknown => None,
         });
-        self.chromatogram_type
-            .append_value(&item.chromatogram_type().to_curie());
+        // The column must hold a CHILD of MS:1000626, never the abstract parent itself. mzdata maps
+        // an unknown chromatogram type onto the parent term, so write null rather than a value the
+        // `chromatogram_must` placement rule rejects.
+        let ctype = item.chromatogram_type().to_curie();
+        if ctype == mzdata::curie!(MS:1000626) {
+            self.chromatogram_type.append_null();
+        } else {
+            self.chromatogram_type.append_value(&ctype);
+        }
         self.data_processing_ref.append_null();
 
         if let Some(aux_arrays) = auxiliary_arrays {
