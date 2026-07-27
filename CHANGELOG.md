@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-07-23
+
+### Changed — BREAKING: split-facet metadata, bare column names
+
+Re-vendors `mzpeak_prototyping` from upstream `d0fdb0b` → `474a7c2`, adopting the metadata-storage
+refactor the reference implementation made to track the specification's revised metadata-table model
+(HUPO-PSI/mzPeak-specification `e7f3447`).
+
+- **Metadata facets are now separate Parquet files** joined by `source_index` —
+  `spectra_metadata_scans/_precursors/_selected_ions` and the chromatogram equivalents — instead of
+  nested struct columns in one packed table.
+- **Columns use bare names** (`ms_level`, not `MS_1000511_ms_level`), with the CV binding carried in
+  the index's `column_mapping`, which the converter now emits.
+- **`data_kind`** uses the new controlled values (`data_arrays`, `scans`, `precursors`,
+  `selected_ions`), written as `data_arrays` with a `data arrays` read alias.
+- **Reading pre-0.7.0 packed archives is no longer supported** — upstream removed that path. Such
+  files now fail with a clear message telling you to reconvert, rather than panicking deep in the
+  reader. The mzPeak→mzPeak **filter still reads both layouts**, so existing archives stay filterable
+  until the corpus is reconverted.
+
+### Fixed
+
+- **`MS:1003901` / `MS:1003902` were swapped** in the vendored copy (`MS:1003901` is zero-intensity
+  trimming, `MS:1003902` the interpolation variant). Upstream has it right; this corrects reading
+  spec-conformant third-party files.
+- **Chromatogram `scan_polarity`** wrote `0`, which is not a legal value (`1`, `-1` or null).
+- **Chromatogram `chromatogram_type`** wrote the abstract parent `MS:1000626`; it now carries the
+  real children `MS:1000235` (TIC) / `MS:1000628` (base peak).
+- The spectrum-metadata RAM spool is dropped as **obsolete, not regressed** — it existed because the
+  packed metadata entry could only open at finish, and each facet now has its own streaming writer.
+
+### Dependencies
+
+- **mzdata 0.65.4 → 0.65.5**; `serde_arrow` stays at 0.14.2 / arrow-59. Incoming upstream code was
+  ported from arrow 57 to our arrow 59 pin.
+
 ## [0.6.0] — 2026-07-22
 
 ### Added — timsTOF MS2 precursors and isolation windows
