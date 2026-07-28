@@ -168,6 +168,102 @@ def convert(unit: Path, binary: str, version: str, dry: bool) -> tuple[Path, str
     return unit, "converted", ""
 
 
+TOOLS = Path(__file__).resolve().parent
+
+
+def box_ssh(command: str, timeout: int = 3600) -> str:
+    """Run a PowerShell command on the flash workstation through the jump host."""
+    env = {}
+    envfile = TOOLS / "box.env"
+    if envfile.exists():
+        for line in envfile.read_text().splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    for k in ("BOX_SSH", "BOX_JUMP", "BOX_SSH_KEY"):
+        env.setdefault(k, os.environ.get(k, ""))
+        if not env[k]:
+            sys.exit(f"box: {k} not set (env or tools/box.env)")
+    proxy = (f"ProxyCommand=ssh -i {env['BOX_SSH_KEY']} -o IdentitiesOnly=yes "
+             f"-o StrictHostKeyChecking=accept-new -W %h:%p {env['BOX_JUMP']}")
+    proc = subprocess.run(
+        ["ssh", "-i", env["BOX_SSH_KEY"], "-o", "IdentitiesOnly=yes",
+         "-o", "StrictHostKeyChecking=accept-new", "-o", proxy,
+         "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=30",
+         env["BOX_SSH"], f"powershell -NoProfile -Command \"{command}\""],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    return (proc.stdout or "").replace("\r", "").strip()
+
+
+def sync_box(version: str, repo: str = r"C:\Users\User\src\mzPeakConverter") -> bool:
+    """Ensure the box's converter matches `version`, fast-forwarding and rebuilding if not.
+
+    Without this the box silently converts with whatever binary it last built — the same stale-binary
+    trap that PATH resolution creates on the host. Per the box-follows-repo rule we only ever check
+    out a canonical tag; nothing is committed on the box.
+    """
+    want = version.split()[-1]  # "mzpeak-convert 0.7.0" -> "0.7.0"
+    have = box_ssh(f"cd {repo}; (& .\\target\\release\\mzpeak-convert.exe --version)")
+    print(f"box       : has {have or '(no binary)'}, want {version}")
+    if have.split()[-1:] == [want]:
+        return True
+    dirty = box_ssh(f"cd {repo}; ((git status --porcelain) | Measure-Object -Line).Lines")
+    if dirty.strip() not in ("0", ""):
+        print(f"box       : REFUSING to update — working tree has {dirty} modified file(s)")
+        return False
+    print(f"box       : updating to v{want} and rebuilding (several minutes)...")
+    box_ssh(f"cd {repo}; git fetch origin --tags 2>&1 | Select-Object -Last 1; "
+            f"git checkout --detach v{want} 2>&1 | Select-Object -Last 1", timeout=900)
+    box_ssh(f"cd {repo}; cargo build --release 2>&1 | Select-Object -Last 2", timeout=7200)
+    have = box_ssh(f"cd {repo}; (& .\\target\\release\\mzpeak-convert.exe --version)")
+    ok = have.split()[-1:] == [want]
+    print(f"box       : now {have} — {'ok' if ok else 'MISMATCH, aborting box phase'}")
+    return ok
+
+
+def run_box(units: list[Path], root: Path, version: str, jobs: int) -> None:
+    """Convert host-unsupported units on the box, relaying the archives back.
+
+    Delegates the transfer to tools/box_convert.sh --local-manifest, which already stages the raw
+    through S3, converts in an isolated temp dir on the box, and pulls the .mzpeak back with a
+    size+md5 check. Reimplementing that here would fork a second, less-tested transfer path.
+    """
+    if not units:
+        print("box       : nothing to do")
+        return
+    if not sync_box(version):
+        print("box       : skipped (converter could not be brought up to date)")
+        return
+    manifest = root.parent / "validator_logs" / "box-jobs.tsv"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    with manifest.open("w") as fh:
+        for u in units:
+            fh.write(f"{u}\t{target_for(u)}\t--no-vendor\n")
+    print(f"box       : {len(units)} unit(s) -> {manifest}")
+    # box_convert.sh shells out to `python3` for the S3 relay, which needs boto3. The system python3
+    # doesn't have it; the anaconda one does. Prepend it rather than patching the shared script.
+    env = dict(os.environ)
+    for cand in (Path.home() / "anaconda3/bin", Path.home() / "miniconda3/bin"):
+        if (cand / "python3").exists():
+            env["PATH"] = f"{cand}:{env.get('PATH', '')}"
+            break
+    proc = subprocess.run(
+        ["bash", str(TOOLS / "box_convert.sh"), "--local-manifest", str(manifest), "--jobs", str(jobs)],
+        text=True, env=env,
+    )
+    print(f"box       : box_convert exited {proc.returncode}")
+    for u in units:  # stamp whatever came back so the next run sees it as current
+        out = target_for(u)
+        if out.exists():
+            try:
+                with zipfile.ZipFile(out) as z:
+                    if any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
+                        stamp_for(out).write_text(version + "\n")
+            except Exception:
+                pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", nargs="?", default=os.path.expanduser("~/Claude/mzpeak-example-data/data"))
@@ -175,6 +271,9 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--report-only", action="store_true", help="audit completeness, convert nothing")
+    ap.add_argument("--box", action="store_true",
+                    help="also convert host-unsupported vendor units on the flash workstation")
+    ap.add_argument("--box-jobs", type=int, default=1, help="box concurrency (disk-bound; default 1)")
     args = ap.parse_args()
 
     root = Path(args.root).expanduser()
@@ -215,6 +314,14 @@ def main() -> int:
                 print(f"  [{i}/{len(todo)}] {mark:4} {unit.relative_to(root)}"
                       + (f"  ({detail})" if detail else ""), flush=True)
         print(f"\nelapsed   : {time.time() - started:.0f}s")
+
+    # ---- box phase ----------------------------------------------------------
+    # Units the host cannot convert (Windows-only vendor SDKs, missing msconvert) go to the flash
+    # workstation. Payload-missing units are excluded: no binary can convert data that isn't there.
+    if args.box and not (args.report_only or args.dry_run):
+        print()
+        deferred = [u for u, d in results["skipped"] if "payload missing" not in d]
+        run_box(deferred, root, version, args.box_jobs)
 
     # ---- report -------------------------------------------------------------
     have = [u for u in units if is_current(target_for(u), version)]
