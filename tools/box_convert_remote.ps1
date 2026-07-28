@@ -56,8 +56,33 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "extract failed (tar exit $LASTEXITCODE)" }
         $order = @('.d','.wiff','.raw','.imzml','.mzml')   # preference order
         $units = @()
-        # vendor dirs: Bruker/Agilent .d AND Waters .raw (a directory, not a file)
-        $units += Get-ChildItem -Path $ex -Recurse -Directory | Where-Object { @('.d','.raw') -contains $_.Extension.ToLower() }
+        # vendor dirs: Bruker/Agilent .d AND Waters .raw (a directory, not a file).
+        # A vendor dir counts as a unit ONLY if it holds the vendor payload. Some archives nest the
+        # real unit inside a WRAPPER dir that also ends in .d (e.g. MSV000101607:
+        # `Blank_Try.d/Blank(1) Try_Slot1-1_1_8270.d/analysis.tdf`). Without this check the wrapper
+        # wins the FullName sort below (it is a path prefix of the nested unit) and the converter is
+        # handed a directory with no vendor data -> native read fails, msconvert fails, job lost.
+        $hasPayload = {
+            param($dir)
+            $markers = @('analysis.tdf','analysis.tsf','analysis.baf','_HEADER.TXT','MSScan.bin','msprofile.bin')
+            foreach ($mk in $markers) { if (Test-Path -LiteralPath (Join-Path $dir.FullName $mk)) { return $true } }
+            # Agilent keeps its payload under AcqData\; Waters uses _FUNC*.DAT
+            if (Test-Path -LiteralPath (Join-Path $dir.FullName 'AcqData')) { return $true }
+            if (Get-ChildItem -LiteralPath $dir.FullName -Filter '_FUNC*.DAT' -File -ea SilentlyContinue | Select-Object -First 1) { return $true }
+            return $false
+        }
+        $vendorDirs = @(Get-ChildItem -Path $ex -Recurse -Directory | Where-Object { @('.d','.raw') -contains $_.Extension.ToLower() })
+        $withPayload = @($vendorDirs | Where-Object { & $hasPayload $_ })
+        # Prefer dirs that actually hold vendor data; fall back to the old behaviour if none matched
+        # (unknown vendor layout) so this can never make a previously-working archive unconvertible.
+        if ($withPayload.Count -gt 0) {
+            if ($withPayload.Count -lt $vendorDirs.Count) {
+                $res.note = ((@($res.note, "skipped $($vendorDirs.Count - $withPayload.Count) wrapper dir(s) w/o vendor payload") | Where-Object { $_ }) -join ' ')
+            }
+            $units += $withPayload
+        } else {
+            $units += $vendorDirs
+        }
         $units += Get-ChildItem -Path $ex -Recurse -File | Where-Object { $order -contains $_.Extension.ToLower() }
         $units = $units | Where-Object { $_.Name -notlike '._*' }   # drop macOS AppleDouble junk
         if (-not $units -or $units.Count -eq 0) { throw "no convertible unit (.d/.wiff/.raw/.imzML/.mzML) in archive" }

@@ -2167,6 +2167,25 @@ fn convert_file(
     }
     log::debug!("wrote {n} spectra");
 
+    // Cross-check against the source's own declared count. A reader that stops early — a truncated
+    // imzML `.ibd`, a half-downloaded mzML — otherwise yields a structurally valid archive that is
+    // silently missing most of its spectra, with exit code 0. Fail loudly instead: the archive is
+    // not written, so a partial conversion can never be mistaken for a complete one.
+    if cap.is_none() {
+        if let Some(declared) = declared_spectrum_count(input) {
+            if declared != n as u64 {
+                bail!(
+                    "{}: source declares {declared} spectra but only {n} were read \
+                     ({:.1}%). The input is incomplete — for imzML check that the `.ibd` sidecar is \
+                     fully downloaded (it holds all the signal; the .imzML is only metadata). \
+                     Refusing to write a partial archive.",
+                    input.display(),
+                    100.0 * n as f64 / declared.max(1) as f64,
+                );
+            }
+        }
+    }
+
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
@@ -2333,6 +2352,32 @@ fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
 /// are valid mzML and ProteomeDiscoverer emits them. If the input's header contains that pattern,
 /// write a sanitized copy where each empty group is rewritten as an explicit open/close pair and
 /// return its path; otherwise return None (convert the original in place). Only the small pre-
+/// The spectrum count an XML source declares in `<spectrumList count="N">`.
+///
+/// Only meaningful for mzML/imzML, where the count is authoritative. Returns `None` when the input
+/// is another format, the attribute is absent, or the header cannot be read — callers treat that as
+/// "no cross-check available" rather than as a failure.
+fn declared_spectrum_count(input: &Path) -> Option<u64> {
+    let ext = input.extension()?.to_string_lossy().to_ascii_lowercase();
+    if ext != "mzml" && ext != "imzml" {
+        return None;
+    }
+    // The attribute lives in the header; read a bounded prefix rather than the whole file (these
+    // run to hundreds of MB).
+    let mut f = fs::File::open(input).ok()?;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let n = std::io::Read::read(&mut f, &mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let at = head.find("<spectrumList")?;
+    let rest = &head[at..];
+    let c = rest.find("count=")? + "count=".len();
+    let rest = &rest[c..];
+    let q = rest.chars().next()?;
+    let rest = &rest[q.len_utf8()..];
+    let end = rest.find(q)?;
+    rest[..end].trim().parse().ok()
+}
+
 /// `<spectrumList>` header is rewritten; the bulk of the file is streamed through verbatim.
 fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
     let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
