@@ -258,6 +258,34 @@ impl NativeTofReader {
                         .unit(Unit::VoltSecondPerSquareCentimeter)
                         .build(),
                 );
+                // The midpoint ALONE is not enough to reconstruct the split: a frame's windows
+                // cover generally ASYMMETRIC scan ranges (e.g. [34,602) and [602,944)), so a
+                // reader splitting at the midpoint between adjacent centres misplaces the
+                // boundary — measured 3.5% of the mobility axis on average, up to 10.3%, on a
+                // real dia-PASEF run. Emit the true bounds so readers never have to guess.
+                let (mob_a, mob_b) = (
+                    self.mobility_for_scan(w.scan_begin as usize),
+                    self.mobility_for_scan(w.scan_end as usize),
+                );
+                // 1/K0 DECREASES as the scan index increases, so order the bounds explicitly
+                // rather than assuming begin<end maps to lower<upper.
+                let (mob_lo, mob_hi) = if mob_a <= mob_b { (mob_a, mob_b) } else { (mob_b, mob_a) };
+                // Emitted WITHOUT a CURIE: mzdata panics ("Cannot encode unknown CV") when a
+                // non-standard accession reaches its param encoder, and PSI-MS has no term for
+                // an isolation window's mobility bounds. Readers match on the name, as they
+                // already do for the nonstandard "tof" / mobility array names.
+                for (name, value) in [
+                    ("isolation window inverse reduced ion mobility lower limit", mob_lo),
+                    ("isolation window inverse reduced ion mobility upper limit", mob_hi),
+                ] {
+                    ion.add_param(
+                        Param::builder()
+                            .name(name)
+                            .value(value)
+                            .unit(Unit::VoltSecondPerSquareCentimeter)
+                            .build(),
+                    );
+                }
                 let mut activation = Activation::default();
                 activation.energy = w.collision_energy as f32;
                 activation

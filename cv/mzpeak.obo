@@ -38,3 +38,15 @@ id: MZP:1000005
 name: time-of-flight calibration identifier
 def: "Selects the per-spectrum polynomial-refinement row in the tof_calibration index block, so the exact vendor m/z reconstructs. Stored as a per-spectrum non-negative integer." []
 comment: Provisional spectrum/scan attribute.
+
+[Term]
+id: MZP:1000006
+name: isolation window inverse reduced ion mobility lower limit
+def: "Lower 1/K0 bound of the mobility range this isolation window occupies within its frame. A dia-PASEF frame carries several isolation windows over disjoint, generally ASYMMETRIC mobility ranges; without explicit bounds a reader can only guess the split from window midpoints, which on real data misassigns several percent of the mobility axis. Stored as a per-isolation-window value of type double, in V*s/cm^2." []
+comment: Provisional isolation-window attribute.
+
+[Term]
+id: MZP:1000007
+name: isolation window inverse reduced ion mobility upper limit
+def: "Upper 1/K0 bound of the mobility range this isolation window occupies within its frame. See MZP:1000006. Stored as a per-isolation-window value of type double, in V*s/cm^2." []
+comment: Provisional isolation-window attribute.
