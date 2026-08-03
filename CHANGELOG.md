@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] — 2026-07-28
+
+### Fixed
+
+- **Truncated XML sources no longer produce a silently partial archive.** An imzML whose `.ibd`
+  sidecar was an incomplete download converted to a structurally valid archive containing 4,550 of
+  its 34,840 spectra, with exit code 0 and nothing naming the loss. mzML/imzML conversions now compare
+  the written spectrum count against the source's own `<spectrumList count=>` and abort without
+  writing when they differ. Skipped when `MZPC_MAX_SPECTRA` caps the run, and for non-XML formats,
+  which declare no authoritative count.
+
+### Added
+
+- **`tools/corpus_reconvert.py`** — idempotent raw→mzPeak harness for the example-data corpus.
+  Currency is judged from the archive (zip opens, split-facet marker present, `.built` stamp matches
+  the converter version) rather than timestamps, so re-running converges instead of redoing work.
+  `--box` sends host-unsupported vendor formats to the flash workstation, verifying and if necessary
+  rebuilding its converter first — the box had no version guard, so it could silently convert with a
+  stale binary. Reports completeness, host-unconvertible units, stale pre-0.7.0 archives, and dates
+  the set by its oldest member.
+
 ## [0.7.0] — 2026-07-23
 
 ### Changed — BREAKING: split-facet metadata, bare column names
