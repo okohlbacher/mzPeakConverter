@@ -1073,7 +1073,10 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
         );
         self.filter_string
             .append_option(item.filter_string().as_deref());
-        self.ion_injection_time.append_value(item.injection_time);
+        // Same reasoning as SelectedIon::intensity: 0.0 here is "not reported" for backends that
+        // do not record it (timsTOF, imzML), not an injection time of zero milliseconds.
+        self.ion_injection_time
+            .append_option((item.injection_time != 0.0).then_some(item.injection_time));
         self.ion_mobility_value.append_option(item.ion_mobility());
         self.ion_mobility_type
             .append_option(item.ion_mobility_type().and_then(|v| v.curie()).as_ref());
@@ -1532,7 +1535,12 @@ impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::SelectedIon)> for Selec
         self.precursor_index.append_option(*j);
         self.selected_ion_mz.append_value(item.mz);
         self.charge_state.append_option(item.charge());
-        self.intensity.append_value(item.intensity);
+        // `null` means "absent" (metadata-tables.md); 0.0 would assert a measured zero. mzdata's
+        // SelectedIon.intensity is a plain f32, so a backend that does not report it (dia-PASEF has
+        // no Precursors table; Thermo does not surface it) is indistinguishable from a real zero —
+        // and a selected ion of zero intensity is not a meaningful measurement, so treat it as absent.
+        self.intensity
+            .append_option((item.intensity != 0.0).then_some(item.intensity));
 
         if let Some(im_val) = item.ion_mobility_type() {
             self.ion_mobility.append_value(im_val.to_f64().unwrap());
@@ -1902,6 +1910,9 @@ impl VisitorBase for SpectrumDetailsBuilder {
         let fields = self.fields();
         cols.extend([
             metacol!("ms level", [fields[2].name()], curie!(MS:1000511)),
+            // `time` was previously unmapped, so its unit — which spectra.md makes a MUST — was not
+            // discoverable from the index at all.
+            metacol!("scan start time", [fields[3].name()], curie!(MS:1000016), Unit::Minute),
             metacol!("scan polarity", [fields[4].name()], curie!(MS:1000465)),
             metacol!("spectrum representation", [fields[5].name()], curie!(MS:1000525)),
             metacol!("spectrum type", [fields[6].name()], curie!(MS:1000559)),
