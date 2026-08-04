@@ -120,6 +120,28 @@ def target_for(unit: Path) -> Path:
     return unit.with_suffix(".mzpeak")
 
 
+# Vendor-native formats first: several datasets ship the SAME acquisition as both a vendor raw and a
+# converted mzML sharing one stem, so both units resolve to one `.mzpeak`. Converting both is
+# meaningless and, run concurrently, they race on the output path. Pick one per target — the native
+# format, which carries more (vendor trailers, true profile/centroid state) — and fall back to the
+# next candidate only if the preferred one cannot be converted on this host.
+_FORMAT_RANK = {".d": 0, ".raw": 1, ".wiff": 2, ".lcd": 3, ".baf": 4, ".tdf": 5, ".imzml": 6, ".mzml": 7}
+
+
+def preference(unit: Path) -> tuple[int, str]:
+    return (_FORMAT_RANK.get(unit.suffix.lower(), 99), unit.name)
+
+
+def group_by_target(units: list[Path]) -> dict[Path, list[Path]]:
+    """Map each output archive to its candidate units, best-first."""
+    groups: dict[Path, list[Path]] = {}
+    for u in units:
+        groups.setdefault(target_for(u), []).append(u)
+    for t in groups:
+        groups[t].sort(key=preference)
+    return groups
+
+
 def stamp_for(archive: Path) -> Path:
     return archive.with_suffix(archive.suffix + ".built")
 
@@ -264,6 +286,23 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int) -> None:
                 pass
 
 
+def convert_target(cands: list[Path], binary: str, version: str, dry: bool) -> tuple[Path, str, str]:
+    """Convert the best candidate for one output archive; fall back on the next if it cannot run.
+
+    Only a `skipped` outcome falls through — a genuine `failed` is reported as-is rather than being
+    masked by silently converting a lesser source.
+    """
+    last = None
+    for i, u in enumerate(cands):
+        unit, status, detail = convert(u, binary, version, dry)
+        if status != "skipped":
+            if i:
+                detail = (detail + " " if detail else "") + f"(fallback from {cands[0].name})"
+            return unit, status, detail
+        last = (unit, status, detail)
+    return last
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", nargs="?", default=os.path.expanduser("~/Claude/mzpeak-example-data/data"))
@@ -294,19 +333,26 @@ def main() -> int:
             removed += 1
         print(f"cleaned   : {removed} existing archives/stamps removed")
 
-    todo = [u for u in units if not is_current(target_for(u), version)]
-    fresh = len(units) - len(todo)
-    print(f"already ok: {fresh}\nto convert: {len(todo)}\n")
+    groups = group_by_target(units)
+    dup = {t: c for t, c in groups.items() if len(c) > 1}
+    if dup:
+        print(f"note      : {len(dup)} target(s) have several source formats; converting the "
+              f"native one and skipping the duplicate(s)")
+        for t, c in dup.items():
+            print(f"            {t.name}  <- {', '.join(x.name for x in c)}")
+    todo = [t for t in groups if not is_current(t, version)]
+    fresh = len(groups) - len(todo)
+    print(f"archives  : {len(groups)} (from {len(units)} units)\nalready ok: {fresh}\nto convert: {len(todo)}\n")
 
     results: dict[str, list] = {"converted": [], "skipped": [], "failed": [], "would-convert": []}
-    for u in units:
-        if u not in todo:
-            results["converted"].append((u, ""))
+    for t in groups:
+        if t not in todo:
+            results["converted"].append((groups[t][0], ""))
 
     if not args.report_only and todo:
         started = time.time()
         with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futs = {pool.submit(convert, u, binary, version, args.dry_run): u for u in todo}
+            futs = {pool.submit(convert_target, groups[t], binary, version, args.dry_run): t for t in todo}
             for i, fut in enumerate(cf.as_completed(futs), 1):
                 unit, status, detail = fut.result()
                 results[status].append((unit, detail))
@@ -324,10 +370,10 @@ def main() -> int:
         run_box(deferred, root, version, args.box_jobs)
 
     # ---- report -------------------------------------------------------------
-    have = [u for u in units if is_current(target_for(u), version)]
+    have = [t for t in groups if is_current(t, version)]
     print("\n" + "=" * 72)
-    print(f"COMPLETENESS  {len(have)}/{len(units)} raw units have a current .mzpeak"
-          f"  ({100.0 * len(have) / max(1, len(units)):.1f}%)")
+    print(f"COMPLETENESS  {len(have)}/{len(groups)} archives current"
+          f"  ({100.0 * len(have) / max(1, len(groups)):.1f}%)   [from {len(units)} raw units]")
     for key, label in (("skipped", "SKIPPED (host cannot convert)"), ("failed", "FAILED")):
         rows = results[key]
         if rows:
@@ -351,7 +397,7 @@ def main() -> int:
     if have:
         # "Last update" of the SET is governed by its oldest member: the set is only as fresh as
         # the staleast archive in it.
-        pairs = [(target_for(u).stat().st_mtime, target_for(u)) for u in have]
+        pairs = [(t.stat().st_mtime, t) for t in have]
         oldest_ts, oldest_p = min(pairs)
         newest_ts, _ = max(pairs)
         fmt = lambda t: datetime.fromtimestamp(t, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
