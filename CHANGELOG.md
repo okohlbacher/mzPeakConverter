@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] — 2026-08-04
+
+### Changed
+
+- **Vendored `mzpeak_prototyping` `474a7c2` → `589d6e3`.** `column_mapping.path` is now a
+  dot-delimited string rather than an array of segments, matching the array index and the
+  specification's normative form. Also brings upstream's layout-aware cache load, its own chunk
+  dispatch in `get_spectrum_peaks_for`, and split (threaded) point queries.
+
+### Fixed
+
+- **Absent values are written as `null`, not `0.0`.** `peak_intensity` and `ion_injection_time` were
+  0.0 on backends that do not report them (dia-PASEF has no `Precursors` table; neither timsTOF nor
+  imzML records an injection time), which asserted a measured zero and round-tripped into literal
+  `peak intensity = 0` cvParams. Real values are untouched.
+- **The `time` column is now mapped** (`MS:1000016`, `UO:0000031`), so its minute unit — a MUST in
+  `docs/schemas/spectra.md` — is discoverable from the index.
+
+### Known
+
+- `isolation_window_target` remains float32 against metadata-tables.md's "prefer 64-bit doubles".
+  Widening it would imply precision we do not have: mzdata's `IsolationWindow.target` is itself f32,
+  so the f64 TDF value is downcast before reaching the writer. Needs an upstream mzdata change.
+- `--ims-chunked` still declares a `point` array index on its empty `spectra_data` facet beside the
+  chunked peaks facet, against the new layout-family purity rule in `conformance.md`. The index is
+  emitted at writer construction, before row counts are known, so suppressing it needs restructuring.
+
 ## [0.7.1] — 2026-07-28
 
 ### Fixed
