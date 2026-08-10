@@ -716,8 +716,19 @@ fn run(cli: &Cli) -> Result<i32> {
 }
 
 /// True for a Bruker timsTOF TDF `.d` (folder with `analysis.tdf`).
+/// True when `dir/<name>` exists AND is a non-empty file.
+///
+/// Existence alone is not enough to claim a vendor format. Real corpora carry **zero-byte** stubs
+/// left by partial downloads or archive extraction: an Agilent `.d` with a 0-byte `analysis.tdf`
+/// beside its `AcqData/` was routed to the Bruker TDF lane and hard-failed with
+/// "no such table: GlobalMetadata", so its actual format was never attempted. 7 of 358 corpus units
+/// failed this way.
+fn has_nonempty(dir: &Path, name: &str) -> bool {
+    std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
 fn is_tdf_dir(input: &Path) -> bool {
-    input.is_dir() && input.join("analysis.tdf").exists()
+    input.is_dir() && has_nonempty(input, "analysis.tdf")
 }
 
 /// Print `scan,timsrust_1overk0,sdk_1overk0,abs_diff` for every mobility scan of a TDF `.d`, so the
@@ -1460,13 +1471,13 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
 /// requirement). Mirrors the proven wiring in mzpeak_prototyping/examples/convert.rs.
 /// True for a Bruker TSF `.d` (line spectra; mzdata can't read it, we use the timsrust-tsf path).
 fn is_tsf_dir(input: &Path) -> bool {
-    input.is_dir() && input.join("analysis.tsf").exists() && !input.join("analysis.tdf").exists()
+    input.is_dir() && has_nonempty(input, "analysis.tsf") && !has_nonempty(input, "analysis.tdf")
 }
 
 /// True for a Bruker BAF `.d` (Q-TOF; peak arrays behind the baf2sql_c SDK).
 #[cfg(any(windows, target_os = "linux"))]
 fn is_baf_dir(input: &Path) -> bool {
-    input.is_dir() && input.join("analysis.baf").exists()
+    input.is_dir() && has_nonempty(input, "analysis.baf")
 }
 
 /// Sample m/z arrays across the run and try to fit a per-run integer TOF grid (`sqrt(m/z)=c0+c1·k`).

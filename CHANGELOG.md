@@ -104,6 +104,12 @@ All notable changes to this project are documented here. The format follows
   versioned OBO purl that 404s for every release. CURIEs actually resolve against the CV bundled in
   the mzdata we link, which is `4.1.249`; the declaration now states that version behind a tagged
   URL that returns 200.
+- **A zero-byte vendor marker misrouted the input to the wrong reader.** `is_tdf_dir` / `is_tsf_dir` /
+  `is_baf_dir` tested only that `analysis.tdf` / `.tsf` / `.baf` *existed*. Real corpora carry
+  zero-byte stubs from partial downloads or archive extraction: an Agilent `.d` with a 0-byte
+  `analysis.tdf` beside its `AcqData/` was sent to the Bruker TDF lane and died with "no such table:
+  GlobalMetadata", so its real format was never attempted. 7 of 358 corpus units failed this way;
+  they now report their actual format correctly.
 - **Corpus-gated tests had silently rotted.** All four pinned corpus paths that no longer exist and
   looked up signal columns at the schema root, where the v0.7 layout nests them inside the
   `point`/`chunk` struct — so they failed for reasons unrelated to the code. Fixtures are now located
