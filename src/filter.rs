@@ -164,6 +164,27 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
         .unwrap_or_else(|| "spectra_metadata.parquet".to_string());
     let meta_bytes =
         read_member(&mut zip, &meta_name).with_context(|| format!("reading {meta_name}"))?;
+
+    // A pre-0.7 PACKED archive cannot be spectrum-filtered correctly. Its `spectrum`, `scan`,
+    // `precursor` and `selected_ion` columns are parallel but INDEPENDENTLY packed — precursor slot
+    // j holds the j-th precursor in the run, not the precursor of spectrum j, with the tail
+    // null-padded. Masking rows by `spectrum.index` therefore keeps the wrong slots: measured on a
+    // real 4,880-spectrum packed archive, `--ms-level 2` left 3,904 MS2 spectra of which 782 lost
+    // their precursor entirely and 3,082 got SOMEONE ELSE'S — only 40 were right, silently.
+    //
+    // Repacking each nested column against its own `source_index` is possible but untestable going
+    // forward (nothing writes this layout any more), so refuse, matching what the mzPeak→mzML lane
+    // already does. A pure aux drop/inject is still allowed: it copies facets verbatim.
+    if filtering_spectra && parquet_schema(&meta_bytes)?.column_with_name("spectrum").is_some() {
+        bail!(
+            "{} uses the pre-0.7.0 packed metadata layout, whose spectrum/scan/precursor columns are \
+             packed independently; filtering it by RT or MS level would silently attach the wrong \
+             precursors to surviving spectra. Reconvert from the source with this version, then \
+             filter. (Aux drop/inject without --rt/--ms-level still works on this archive.)",
+            input.display()
+        );
+    }
+
     let (survivors, total_spectra, dangling) =
         compute_survivors(&meta_bytes, opts).context("computing surviving spectra")?;
     if filtering_spectra {

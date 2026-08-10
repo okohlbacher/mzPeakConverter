@@ -311,8 +311,12 @@ impl From<mzdata::params::ControlledVocabulary> for ControlledVocabularyEntry {
             mzdata::params::ControlledVocabulary::MS => ControlledVocabularyEntry::new(
                 "MS",
                 "Proteomics Standards Initiative Mass Spectrometry Ontology",
-                "http://purl.obolibrary.org/obo/ms/4.1.248/ms.obo",
-                Some("4.1.248"),
+                // The version CURIEs actually resolve against is the psi-ms CV bundled in the
+                // mzdata we link (4.1.249) — declaring anything else makes the archive's own
+                // provenance wrong. The versioned OBO purl form (obo/ms/<v>/ms.obo) 404s for every
+                // release, so pin the tagged GitHub raw URL, which does resolve.
+                "https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/v4.1.249/psi-ms.obo",
+                Some("4.1.249"),
             ),
             mzdata::params::ControlledVocabulary::UO => ControlledVocabularyEntry::new(
                 "UO",

@@ -17,6 +17,7 @@
 //! vendor library only exists on those platforms.
 
 use std::env;
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -434,6 +435,10 @@ pub struct TdfSdkReader {
     api: TimsDataApi,
     handle: u64,
     frames: Vec<FrameMeta>,
+    /// MS2 isolation windows keyed by 1-based TDF frame Id, shared with the native lane. Without
+    /// these the SDK lane wrote every MS2 frame with NO precursor at all — the whole precursor facet
+    /// silently absent on the lane that exists precisely for files the native reader cannot decode.
+    windows: HashMap<i64, Vec<crate::bruker_native::FrameWindow>>,
     _not_thread_safe: PhantomData<*const ()>,
 }
 
@@ -446,11 +451,37 @@ impl TdfSdkReader {
         })?;
         let conn = open_sqlite(&dir, "analysis.tdf")?;
         let frames = read_frames(&conn, true)?;
-        Ok(Self { api, handle, frames, _not_thread_safe: PhantomData })
+        let windows = crate::bruker_native::read_frame_windows(&dir.join("analysis.tdf"))
+            .unwrap_or_else(|e| {
+                log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
+                HashMap::new()
+            });
+        Ok(Self { api, handle, frames, windows, _not_thread_safe: PhantomData })
     }
 
     pub fn len(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Attach this frame's MS2 precursors, using the VENDOR's own scan→1/K0 conversion
+    /// (`tims_scannum_to_oneoverk0`) for the mobility — the SDK is the authority the native lane's
+    /// recalibration is measured against, so on this lane we can use it directly.
+    fn attach_precursors(&self, descr: &mut SpectrumDescription, frame: &FrameMeta) {
+        let Some(windows) = self.windows.get(&frame.id) else { return };
+        let precursors = crate::bruker_native::build_precursors(windows, |scan| {
+            self.convert(
+                self.api.tims_scannum_to_oneoverk0,
+                frame.id,
+                &[scan],
+                "tims_scannum_to_oneoverk0",
+            )
+            .ok()
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0.0)
+        });
+        // ALL of them: a timsTOF MS2 frame carries one precursor per isolation window (~1.6 for
+        // DDA-PASEF, 5.0 for dia-PASEF), and the native lane keeps every one.
+        descr.precursor = precursors;
     }
 
     /// Read one PASEF frame as flat `(index, intensity, scan_number)` peaks across all its mobility
@@ -535,7 +566,8 @@ impl TdfSdkReader {
         let mob: Vec<f64> = triples.iter().map(|t| t.2).collect();
 
         let arrays = mz_intensity_arrays(&mz, &intensity, Some(&mob))?;
-        let descr = make_description(i, frame, SignalContinuity::Centroid);
+        let mut descr = make_description(i, frame, SignalContinuity::Centroid);
+        self.attach_precursors(&mut descr, frame);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
@@ -607,6 +639,7 @@ impl TdfSdkReader {
         arrays.add(mob_da);
 
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
+        self.attach_precursors(&mut descr, frame);
         // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (a + b·tof)²
         // (monotonic in tof) over the min/max TOF index present. Without this the viewer shows
         // "m/z 0–0".

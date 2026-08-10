@@ -129,7 +129,7 @@ struct FrameTable {
 /// So one frame carries N windows over disjoint mobility ranges — ~1.6 on average for DDA-PASEF,
 /// 5.0 for dia-PASEF. mzdata splits these into N mzML spectra because mzML has nowhere to put the
 /// mobility dimension; mzPeak does, so we keep the frame whole and attach N precursors to it.
-struct FrameWindow {
+pub(crate) struct FrameWindow {
     scan_begin: u32,
     scan_end: u32,
     isolation_mz: f64,
@@ -244,6 +244,21 @@ impl NativeTofReader {
         let Some(windows) = self.windows.get(&((i + 1) as i64)) else {
             return Vec::new();
         };
+        build_precursors(windows, |scan| self.mobility_for_scan_f(scan))
+    }
+}
+
+/// Build the mzdata precursors for one frame's isolation windows.
+///
+/// Free-standing so BOTH timsTOF lanes share it: the native (timsrust) reader and the `--bruker-sdk`
+/// reader, which previously wrote every MS2 frame with no precursor at all. `mobility` maps a
+/// (fractional) TIMS scan position to 1/K0 — the native lane passes its ModelType-2 recalibration,
+/// the SDK lane passes the vendor's own `tims_scannum_to_oneoverk0`.
+pub(crate) fn build_precursors(
+    windows: &[FrameWindow],
+    mobility: impl Fn(f64) -> f64,
+) -> Vec<Precursor> {
+    {
         windows
             .iter()
             .map(|w| {
@@ -265,7 +280,7 @@ impl NativeTofReader {
                     Param::builder()
                         .name("inverse reduced ion mobility")
                         .curie(curie!(MS:1002815))
-                        .value(self.mobility_for_scan_f(scan))
+                        .value(mobility(scan))
                         .unit(Unit::VoltSecondPerSquareCentimeter)
                         .build(),
                 );
@@ -275,8 +290,8 @@ impl NativeTofReader {
                 // boundary — measured 3.5% of the mobility axis on average, up to 10.3%, on a
                 // real dia-PASEF run. Emit the true bounds so readers never have to guess.
                 let (mob_a, mob_b) = (
-                    self.mobility_for_scan(w.scan_begin as usize),
-                    self.mobility_for_scan(w.scan_end as usize),
+                    mobility(w.scan_begin as f64),
+                    mobility(w.scan_end as f64),
                 );
                 // 1/K0 DECREASES as the scan index increases, so order the bounds explicitly
                 // rather than assuming begin<end maps to lower<upper.
@@ -321,7 +336,9 @@ impl NativeTofReader {
             })
             .collect()
     }
+}
 
+impl NativeTofReader {
     /// MS level for frame `i` from the TDF `MsMsType`, defaulting to MS1 when the table is
     /// unavailable. Never returns 0 — `ms_level` 0 is not a legal MS stage under `MS:1000511`.
     #[inline]
@@ -564,7 +581,7 @@ impl NativeTofReader {
 /// dia-PASEF `.d` files have no `PasefFrameMsMsInfo`/`Precursors` tables AT ALL, so this probes
 /// `sqlite_master` rather than assuming. PRM (`PrmFrameMsMsInfo`) is not handled yet; such a run
 /// simply gets no precursors rather than a wrong one.
-fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWindow>>> {
+pub(crate) fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWindow>>> {
     let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| anyhow::anyhow!("opening {} for MS2 info: {e}", tdf.display()))?;
     let has = |name: &str| -> bool {

@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.3] — 2026-08-10
 
 ### Removed
 
@@ -87,6 +87,23 @@ All notable changes to this project are documented here. The format follows
   foreign key resolves. Those columns are now nulled when the parent does not survive (survivors keep
   their original `index`, so no remapping is needed). Verified: 0 dangling refs, 0 orphans in every
   facet.
+- **Filtering a pre-0.7 packed archive silently attached the wrong precursors.** Its `spectrum` /
+  `scan` / `precursor` / `selected_ion` columns are parallel but independently packed — precursor
+  slot *j* holds the *j*-th precursor in the run, not the precursor of spectrum *j* — so masking rows
+  by `spectrum.index` keeps the wrong slots. Measured on a real 4,880-spectrum packed archive built
+  with v0.6.0: `--ms-level 2` left 3,904 MS2 spectra of which **782 lost their precursor entirely and
+  3,082 got someone else's — only 40 were correct**, with no warning. Spectrum filtering on that
+  layout is now refused with a reconvert message (matching the mzPeak→mzML lane, which already
+  refused it); a pure aux drop/inject still works, since it copies facets verbatim.
+- **The `--bruker-sdk` lane wrote every MS2 frame with no precursor at all.** It never set
+  `descr.precursor`, so the lane that exists specifically for files the native reader cannot decode
+  silently dropped the entire precursor facet. Both lanes now share one `build_precursors`, with the
+  SDK lane using the vendor's own `tims_scannum_to_oneoverk0` for the mobility. *(Compiles here but
+  runtime-unverified — the SDK lane needs Windows/Linux and the timsdata library.)*
+- **`cv_list` declared a psi-ms version that does not resolve.** It claimed `4.1.248` behind a
+  versioned OBO purl that 404s for every release. CURIEs actually resolve against the CV bundled in
+  the mzdata we link, which is `4.1.249`; the declaration now states that version behind a tagged
+  URL that returns 200.
 - **Corpus-gated tests had silently rotted.** All four pinned corpus paths that no longer exist and
   looked up signal columns at the schema root, where the v0.7 layout nests them inside the
   `point`/`chunk` struct — so they failed for reasons unrelated to the code. Fixtures are now located
