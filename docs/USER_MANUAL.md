@@ -91,7 +91,7 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 | `--zstd-level <1–22>` | `3` | Parquet zstd level |
 | `--no-ims-compact` | off | Bruker TDF: write standard f64 m/z instead of the default ims-compact |
 | `--ims-chunked` | off | Bruker TDF ims-compact: opt into the **chunked** layout (m/z-page-prunable, fast XIC/slice) instead of the default **archive** layout (see §9) |
-| `--bruker-sdk` | off | Read Bruker TDF/TSF via the official `timsdata` SDK (Win/Linux only; needs `TIMSDATA_LIB_DIR`). Parallel path to the default pure-Rust readers; implies f64 m/z |
+| `--bruker-sdk` | off | Read Bruker TDF/TSF via the official `timsdata` SDK (Win/Linux only; needs `TIMSDATA_LIB_DIR`). Parallel path to the default pure-Rust readers; on TDF still writes ims-compact — add `--no-ims-compact` for f64 m/z |
 | `--no-tims-recalibration` | off | Bruker TDF: disable vendor-grade scan→1/K0 recalibration (`TimsCalibration` ModelType-2 model) and use timsrust's linear approximation. Recalibration is **on by default** (~22× closer to the SDK) |
 | `--no-vendor` | off | Do not embed vendor side-files (see §8) |
 | `--aux <glob=embed\|drop>` | — | Vendor side-file rule (repeatable, highest precedence) |
@@ -227,7 +227,7 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
     Below the vendor `.d` on every reference file. (A per-scan delta variant existed up to v0.7.2 and
     was removed in v0.7.3 — no reader decoded it correctly; reconvert any such archive.)
   - **Chunked** *(`--ims-chunked`)* — each frame's peaks are split into true m/z bins (`--chunk-size`,
-    default 50 Th); each chunk stores its m/z min/max (`chunk_start`/`chunk_end`, Parquet
+    default 50 Th); each chunk stores its main-axis (TOF) bounds (`chunk_start`/`chunk_end`, Parquet
     page-prunable) and delta-encodes TOF within the chunk (`m/z-chunked`). **m/z-slice / XIC queries
     are ~20–30× faster** (they touch only the overlapping chunks) at roughly parity size. Reconstruct
     a chunk's absolute TOF by cumulative-summing its values. Whole-spectrum access matches archive when

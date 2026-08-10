@@ -190,7 +190,9 @@ struct Cli {
     ims_chunked: bool,
 
     /// Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default
-    /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). Implies f64 m/z.
+    /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). On a TDF `.d` this
+    /// still writes the lossless integer-TOF ims-compact layout — the SDK exposes the raw TOF index
+    /// too. Add `--no-ims-compact` for f64 m/z.
     #[arg(long)]
     bruker_sdk: bool,
 
@@ -582,6 +584,38 @@ fn run(cli: &Cli) -> Result<i32> {
             .with_context(|| format!("filtering {}", cli.input.display()))?;
         log::info!("wrote {}", output.display());
         return Ok(exit::OK);
+    }
+
+    // Past this point the input is a RAW/exchange format, not a `.mzpeak` — and the spectrum filters
+    // are implemented only on the mzPeak-input lane above. They used to be parsed and then silently
+    // ignored: `mzpeak-convert run.mzML --ms-level 2 --rt 5-6` wrote the COMPLETE 3574-spectrum
+    // archive and exited 0, so a user slicing a file got the whole thing and no indication. Refuse
+    // instead — convert first, then filter the resulting archive.
+    {
+        let mut ignored: Vec<&str> = Vec::new();
+        if cli.rt.is_some() {
+            ignored.push("--rt");
+        }
+        if !cli.ms_level.is_empty() {
+            ignored.push("--ms-level");
+        }
+        if cli.mz.is_some() {
+            ignored.push("--mz");
+        }
+        if !cli.drop_aux.is_empty() {
+            ignored.push("--drop-aux");
+        }
+        if !ignored.is_empty() {
+            bail!(
+                "{} apply only to a `.mzpeak` input (they filter an existing archive), but {} is a \
+                 raw/exchange format. Convert it first, then filter the archive:\n  \
+                 mzpeak-convert {} -o out.mzpeak\n  mzpeak-convert out.mzpeak -o filtered.mzpeak {}",
+                ignored.join(", "),
+                cli.input.display(),
+                cli.input.display(),
+                ignored.join(" …  ")
+            );
+        }
     }
 
     let chunk = match cfg.layout {
@@ -2089,14 +2123,27 @@ fn convert_file(
     // (e.g. zenodo DESI imzML declare ISO-8859-1). If the input declares a non-UTF-8 encoding,
     // transcode it to a throwaway UTF-8 temp first and read from there. `_utf8` is an RAII guard:
     // it deletes the temp dir (transcoded file + hardlinked .ibd sidecar) on every exit path.
-    let _utf8 = transcode_to_utf8(input)?;
-    let utf8_path: &Path = _utf8.as_ref().map(|g| g.file.as_path()).unwrap_or(input);
-
-    // mzdata panics on an empty self-closing <referenceableParamGroup/> that is later referenced
-    // (ProteomeDiscoverer emits these). If present, convert from a sanitized copy instead. Sanitize
-    // the already-UTF-8 file so both workarounds compose.
-    let sanitized = sanitize_param_groups(utf8_path)?;
-    let read_path: &Path = sanitized.as_deref().unwrap_or(utf8_path);
+    // Both workarounds are XML-FILE-only. A directory vendor unit still reaching here — a TDF `.d`
+    // under `--no-ims-compact`, or the ims-compact decompress fallback — would have its directory fd
+    // `read()` and fail EISDIR ("Is a directory") before the reader ever opened it. `convert_to_mzml`
+    // has always gated these on `is_file()`; this lane did not.
+    let (_utf8, sanitized, read_path): (Option<TranscodeGuard>, Option<PathBuf>, PathBuf) =
+        if input.is_file() {
+            let utf8 = transcode_to_utf8(input)?;
+            let utf8_path: PathBuf = utf8
+                .as_ref()
+                .map(|g| g.file.clone())
+                .unwrap_or_else(|| input.to_path_buf());
+            // mzdata panics on an empty self-closing <referenceableParamGroup/> that is later
+            // referenced (ProteomeDiscoverer emits these). If present, convert from a sanitized copy
+            // instead. Sanitize the already-UTF-8 file so both workarounds compose.
+            let sanitized = sanitize_param_groups(&utf8_path)?;
+            let read = sanitized.clone().unwrap_or(utf8_path);
+            (utf8, sanitized, read)
+        } else {
+            (None, None, input.to_path_buf())
+        };
+    let read_path: &Path = read_path.as_path();
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
 
@@ -2144,7 +2191,13 @@ fn convert_file(
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
-        .chromatogram_chunked_encoding(chunk)
+        // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
+        // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
+        // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
+        // intensity array into an uncompressed `auxiliary_arrays` blob in chromatograms_metadata —
+        // losing the time axis outright. 99 of 330 reference archives are affected. A chromatogram
+        // is a few thousand points; chunking bought nothing.
+        .chromatogram_chunked_encoding(None)
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level));
 
@@ -3329,7 +3382,13 @@ fn convert_sciex_grid(
         // Off-lattice (f64) spectra route to spectra_data — chunk that facet (numpress) so SWATH/DIA
         // runs, where most MS2 windows DON'T grid, don't bloat by storing f64 m/z flat.
         .chunked_encoding(chunk)
-        .chromatogram_chunked_encoding(chunk)
+        // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
+        // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
+        // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
+        // intensity array into an uncompressed `auxiliary_arrays` blob in chromatograms_metadata —
+        // losing the time axis outright. 99 of 330 reference archives are affected. A chromatogram
+        // is a few thousand points; chunking bought nothing.
+        .chromatogram_chunked_encoding(None)
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
             TOF_C0_CURIE,
             "tof_c0",
@@ -3542,7 +3601,13 @@ fn convert_vendor_reader(
     }
     let builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
-        .chromatogram_chunked_encoding(chunk)
+        // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
+        // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
+        // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
+        // intensity array into an uncompressed `auxiliary_arrays` blob in chromatograms_metadata —
+        // losing the time axis outright. 99 of 330 reference archives are affected. A chromatogram
+        // is a few thousand points; chunking bought nothing.
+        .chromatogram_chunked_encoding(None)
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
         .sample_array_types_from_spectra(probes.into_iter());

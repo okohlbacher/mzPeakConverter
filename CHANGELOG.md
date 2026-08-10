@@ -54,6 +54,32 @@ All notable changes to this project are documented here. The format follows
   facet whose entity the index does not identify, or an entry whose `entity_type` contradicts the
   member name, is now an error. The primary metadata member is read from the index rather than
   assumed to be `spectra_metadata.parquet`.
+- **Chromatogram signal was being written into the metadata facet as an opaque blob.** The spectrum
+  chunking strategy was passed through to chromatograms, producing a `chunk` struct with no
+  `chunk_start`/`chunk_end` columns; the chunk builder then saw an empty main axis, wrote **0 time
+  and 0 intensity points** into `chromatograms_data.parquet`, and spilled the whole intensity array
+  into an uncompressed `auxiliary_arrays` blob in `chromatograms_metadata.parquet` — losing the time
+  axis outright. The writer's own guard was logging `BUG: signal array IntensityArray is being
+  spilled`. **99 of 330 reference-corpus archives are affected and need reconversion.** Chromatograms
+  now always use the point layout (a chromatogram is a few thousand points; chunking bought nothing).
+  Verified: TIC/BPC restored to 3,574 points each with a correct 0.008–20.019 min time range, and a
+  300-chromatogram SRM file round-trips 1,011,900 points with zero spilled arrays.
+- **Filter flags on a raw input were silently ignored.** `mzpeak-convert run.mzML --ms-level 2
+  --rt 5-6` wrote the complete 3,574-spectrum archive and exited 0 — `--rt` / `--ms-level` / `--mz` /
+  `--drop-aux` are implemented only on the mzPeak-input lane. They are now a hard error naming the
+  convert-then-filter sequence instead of quietly producing an unfiltered result.
+- **`--no-ims-compact` on a Bruker `.d` failed outright** with "Is a directory (os error 21)": the
+  Latin-1 transcode and param-group sanitize workarounds are XML-file-only and were applied to the
+  directory. `convert_to_mzml` had always gated them on `is_file()`; this lane did not. The same gap
+  hit the ims-compact decompress fallback.
+- **`--ims-chunked` scan/range queries mis-attributed points.** The scan decoder's single-point-chunk
+  branch recovered the point but never extended the entity-index accumulator, leaving it one short
+  per single-point chunk — a length mismatch at assembly, or points attributed to the wrong spectrum
+  if that validation were bypassed. (Found by review; the per-spectrum decoder was unaffected, which
+  is why the round-trip check passed.)
+- **`--bruker-sdk` help and manual claimed it "implies f64 m/z".** On a TDF `.d` it writes the
+  integer-TOF ims-compact layout like the native path; f64 needs `--no-ims-compact` as well.
+- **Manual §9 still described `--ims-chunked` bounds as m/z min/max**; they hold main-axis TOF values.
 - **Filtering no longer leaves dangling parent references.** With the new precursor linkage in place,
   an `--ms-level 2` filter drops exactly the survey spectra the precursors point at, so all 289
   precursor and selected-ion rows on the reference run kept a `precursor_id` / `precursor_index`

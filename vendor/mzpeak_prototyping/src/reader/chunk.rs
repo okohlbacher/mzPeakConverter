@@ -1127,32 +1127,33 @@ impl<'a> ChunkScanDecoder<'a> {
                     .as_ref()
                     .map(|a| crate::peak_series::array_to_arrow_type(a.dtype()))
                     .unwrap_or(DataType::Float64);
-                match encoding {
-                    NO_COMPRESSION => {
-                        (ChunkingStrategy::Basic { chunk_size: 50.0 }).decode_arrow(
-                            &arrow::array::new_empty_array(&empty_dtype),
-                            start as f64,
-                            end as f64,
-                            self.main_axis.as_mut().unwrap(),
-                            None,
-                        );
-                    }
-                    DELTA_ENCODE => {
-                        (ChunkingStrategy::Delta { chunk_size: 50.0 }).decode_arrow(
-                            &arrow::array::new_empty_array(&empty_dtype),
-                            start as f64,
-                            end as f64,
-                            self.main_axis.as_mut().unwrap(),
-                            None,
-                        );
-                    }
-                    NUMPRESS_LINEAR => {
-                        // This chunk is never empty if it is valid
-                    }
+                // The recovered start point is a REAL point and must be attributed to its entity,
+                // exactly as the decoded branches above do. Dropping it here left `entity_idx_acc`
+                // one short per single-point chunk while the axis and secondary columns stayed
+                // full-length — a StructArray length mismatch at assembly, or, if that validation
+                // were bypassed, every later point silently attributed to the wrong spectrum.
+                let n_points_added = match encoding {
+                    NO_COMPRESSION => (ChunkingStrategy::Basic { chunk_size: 50.0 }).decode_arrow(
+                        &arrow::array::new_empty_array(&empty_dtype),
+                        start as f64,
+                        end as f64,
+                        self.main_axis.as_mut().unwrap(),
+                        None,
+                    ),
+                    DELTA_ENCODE => (ChunkingStrategy::Delta { chunk_size: 50.0 }).decode_arrow(
+                        &arrow::array::new_empty_array(&empty_dtype),
+                        start as f64,
+                        end as f64,
+                        self.main_axis.as_mut().unwrap(),
+                        None,
+                    ),
+                    // Never legitimately empty.
+                    NUMPRESS_LINEAR => 0,
                     _ => {
                         unimplemented!("{encoding}")
                     }
-                }
+                };
+                entity_idx_acc.extend(std::iter::repeat_n(entity_index, n_points_added));
             }
         }
 
