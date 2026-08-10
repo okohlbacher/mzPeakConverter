@@ -713,6 +713,27 @@ mod single_point_chunk_tests {
     use mzdata::spectrum::{ArrayType, BinaryDataArrayType, DataArray};
     use mzpeak_prototyping::chunk_series::ChunkingStrategy;
 
+    /// A chunk whose only point sits at coordinate ZERO must still decode to that point.
+    ///
+    /// `decode_arrow` used to open with `if start == 0.0 && end == 0.0 { return 0 }`, standing in for
+    /// "this chunk row is absent" — but null bounds and a real bound of 0.0 were indistinguishable
+    /// because the bounds were read past their null mask. TOF bin 0 occurs in real timsTOF data
+    /// (`min(tof) == 0` on the reference DDA run), so with a small `--chunk-size` a genuine chunk at
+    /// zero decoded to nothing while its intensity/mobility arrays kept their entries: one point
+    /// silently lost, and a length desync. Absence is now taken from the null mask instead.
+    #[test]
+    fn zero_bounded_chunk_still_decodes_its_point() {
+        let empty = arrow::array::new_empty_array(&arrow::datatypes::DataType::Int32);
+        let mut acc = DataArray::from_name_and_type(
+            &ArrayType::nonstandard("tof"),
+            BinaryDataArrayType::Int32,
+        );
+        let n = (ChunkingStrategy::Delta { chunk_size: 50.0 })
+            .decode_arrow(&empty, 0.0, 0.0, &mut acc, None);
+        assert_eq!(n, 1, "a single-point chunk at coordinate 0 must decode to one point");
+        assert_eq!(acc.to_i32().unwrap().to_vec(), vec![0]);
+    }
+
     /// A single-point chunk stores an EMPTY values list (the start point lives in `chunk_start`).
     /// The reader used to feed a hard-coded empty **Float64** array into the decoder for that case,
     /// which pushed an f64 into the Int32 `tof` accumulator and panicked with `DataTypeSizeMismatch`

@@ -495,11 +495,18 @@ trait ChunkQuerySource {
     }
 }
 
-fn coerce_bounds_array(arr: &ArrayRef) -> Vec<f64> {
+/// Chunk bounds with ABSENCE PRESERVED.
+///
+/// `arr.values()` ignores the null mask, so a null bound arrived as `0.0` and was indistinguishable
+/// from a real bound of zero. `decode_arrow` then treated `start == end == 0.0` as "absent chunk" and
+/// returned no points — which silently DROPPED a legitimate single-point chunk sitting at coordinate
+/// zero. TOF bin 0 occurs in real timsTOF data, and with a small `--chunk-size` such a chunk exists.
+/// Returning `Option` lets absence be checked as absence.
+fn coerce_bounds_array(arr: &ArrayRef) -> Vec<Option<f64>> {
     if let Some(arr) = arr.as_primitive_opt::<Float64Type>() {
-        arr.values().to_vec()
+        arr.iter().collect()
     } else if let Some(arr) = arr.as_primitive_opt::<Float32Type>() {
-        arr.values().into_iter().map(|v| *v as f64).collect()
+        arr.iter().map(|v| v.map(|v| v as f64)).collect()
     } else {
         unimplemented!("Bounds array of type {:?} not implemented", arr.data_type());
     }
@@ -825,6 +832,10 @@ impl<'a> ChunkDecoder<'a> {
 
         // For each chunk row
         for (row, ((encoding, start), end)) in chunk_iter {
+            // A chunk row with NULL bounds carries no chunk; skip it. This used to be inferred from
+            // `start == end == 0.0` inside `decode_arrow`, which also swallowed real chunks at
+            // coordinate zero.
+            let (Some(start), Some(end)) = (start, end) else { continue };
             // For each possible main axis array (e.g. BufferFormat::Chunked)
             let mut did_decode = false;
             for (name, chunk_vals) in row {
@@ -1050,6 +1061,8 @@ impl<'a> ChunkScanDecoder<'a> {
 
         // For each chunk row
         for (rows, (((encoding, start), end), entity_index)) in chunk_iter {
+            // See the note in `ChunkDecoder::decode_batch`: null bounds mean "no chunk here".
+            let (Some(start), Some(end)) = (start, end) else { continue };
             // For each possible main axis array (e.g. BufferFormat::Chunked)
             let mut did_decode = false;
             for (name, chunk_vals) in rows {

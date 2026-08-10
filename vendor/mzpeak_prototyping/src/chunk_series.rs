@@ -254,9 +254,11 @@ impl ChunkingStrategy {
         accumulator: &mut DataArray,
         delta_model: Option<&RegressionDeltaModel<f64>>,
     ) -> usize {
-        if start_value == 0.0 && end_value == 0.0 {
-            return 0;
-        }
+        // NOTE: there used to be an early `return 0` here when `start_value == end_value == 0.0`,
+        // standing in for "this chunk row is absent". It also discarded any REAL chunk whose single
+        // point sits at coordinate zero — TOF bin 0 exists in timsTOF data, so a small `--chunk-size`
+        // produced a chunk that decoded to nothing while its intensity/mobility arrays kept their
+        // entries. Absence is now detected from the bounds' null mask by the caller.
         macro_rules! decode_delta {
             ($array:ident, $dtype:ty, $native:ty, $debug:literal) => {{
                 let it = $array.as_primitive::<$dtype>();

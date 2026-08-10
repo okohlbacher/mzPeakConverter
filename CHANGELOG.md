@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A chunk sitting at coordinate zero was silently dropped.** `decode_arrow` opened with
+  `if start == 0.0 && end == 0.0 { return 0 }`, standing in for "this chunk row is absent" — but the
+  bounds were read past their null mask, so a null bound and a real bound of `0.0` were
+  indistinguishable. TOF bin 0 occurs in real timsTOF data (`min(tof) == 0` on the reference DDA
+  run), so a chunk whose only point sits there decoded to nothing while its intensity and mobility
+  arrays kept their entries: one point silently lost plus a length desync. Absence now comes from the
+  null mask. Reachable with a small `--chunk-size` (measured: exactly one point recovered on a
+  0.01 Th run, 993,975 → 993,976); the default 50 Th is unaffected and byte-identical (354,690 peaks
+  compared, zero differences).
+
 ## [0.7.3] — 2026-08-10
 
 ### Removed
