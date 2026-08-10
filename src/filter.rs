@@ -825,7 +825,70 @@ fn filter_by_top_key(
     let mask: BooleanArray = (0..idx.len())
         .map(|r| Some(!idx.is_null(r) && survivors.contains(&idx.value(r))))
         .collect();
-    Ok(Some(filter_record_batch(batch, &mask)?))
+    let kept = filter_record_batch(batch, &mask)?;
+    Ok(Some(null_dangling_parent_refs(&kept, survivors)?))
+}
+
+/// Null `precursor_index` / `precursor_id` on rows whose PARENT spectrum did not survive.
+///
+/// These point at the survey spectrum an MS2 was selected from. Filtering by MS level drops exactly
+/// those parents, so without this every surviving precursor row keeps a reference to a spectrum that
+/// is no longer in the archive — breaking the spec's "every non-null foreign key resolves to an
+/// existing key/id" MUST. Surviving spectra keep their ORIGINAL `index`, so nulling is sufficient;
+/// no remapping is needed. A facet without these columns passes through untouched.
+fn null_dangling_parent_refs(
+    batch: &RecordBatch,
+    survivors: &BTreeSet<u64>,
+) -> Result<RecordBatch> {
+    let Some(pidx) = batch.column_by_name("precursor_index").and_then(to_u64) else {
+        return Ok(batch.clone());
+    };
+    let keep: Vec<bool> = (0..pidx.len())
+        .map(|r| !pidx.is_null(r) && survivors.contains(&pidx.value(r)))
+        .collect();
+    if keep.iter().all(|k| *k) {
+        return Ok(batch.clone());
+    }
+    let n_dropped = keep.iter().filter(|k| !**k).count();
+    log::warn!(
+        "{n_dropped} precursor rows referenced a filtered-out parent spectrum; \
+         nulling their precursor_index/precursor_id"
+    );
+    let cols: Vec<ArrayRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(f, c)| -> Result<ArrayRef> {
+            match f.name().as_str() {
+                "precursor_index" => {
+                    let src = to_u64(c).unwrap();
+                    let mut b = arrow::array::UInt64Builder::with_capacity(src.len());
+                    for (r, k) in keep.iter().enumerate() {
+                        b.append_option((*k && !src.is_null(r)).then(|| src.value(r)));
+                    }
+                    Ok(Arc::new(b.finish()) as ArrayRef)
+                }
+                "precursor_id" => {
+                    let src = c
+                        .as_any()
+                        .downcast_ref::<arrow::array::LargeStringArray>()
+                        .ok_or_else(|| anyhow!("precursor_id is not a LargeUtf8 column"))?;
+                    let mut b = arrow::array::LargeStringBuilder::new();
+                    for (r, k) in keep.iter().enumerate() {
+                        if *k && !src.is_null(r) {
+                            b.append_value(src.value(r));
+                        } else {
+                            b.append_null();
+                        }
+                    }
+                    Ok(Arc::new(b.finish()) as ArrayRef)
+                }
+                _ => Ok(c.clone()),
+            }
+        })
+        .collect::<Result<_>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), cols)?)
 }
 
 /// Truncate chromatogram data to the RT window [lo, hi]. Two layouts:

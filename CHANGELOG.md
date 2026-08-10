@@ -54,6 +54,13 @@ All notable changes to this project are documented here. The format follows
   facet whose entity the index does not identify, or an entry whose `entity_type` contradicts the
   member name, is now an error. The primary metadata member is read from the index rather than
   assumed to be `spectra_metadata.parquet`.
+- **Filtering no longer leaves dangling parent references.** With the new precursor linkage in place,
+  an `--ms-level 2` filter drops exactly the survey spectra the precursors point at, so all 289
+  precursor and selected-ion rows on the reference run kept a `precursor_id` / `precursor_index`
+  naming a spectrum no longer in the archive — breaking the conformance MUST that every non-null
+  foreign key resolves. Those columns are now nulled when the parent does not survive (survivors keep
+  their original `index`, so no remapping is needed). Verified: 0 dangling refs, 0 orphans in every
+  facet.
 - **Corpus-gated tests had silently rotted.** All four pinned corpus paths that no longer exist and
   looked up signal columns at the schema root, where the v0.7 layout nests them inside the
   `point`/`chunk` struct — so they failed for reasons unrelated to the code. Fixtures are now located
