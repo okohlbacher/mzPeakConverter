@@ -193,6 +193,16 @@ vendor calibration (TSF applies the otofControl ±Th correction); Bruker TDF sto
 the native integer TOF grid plus the `a,b` calibration in `ims_calibration` so a
 reader reconstructs `m/z = (a + b·tof)²` exactly.
 
+**Profile zero-run compaction (the one transform that is not byte-for-byte).** In **profile**
+spectra, a run of two or more *consecutive* zero-intensity points is collapsed to a single zero at
+each peak boundary — `[0,0,0,0,0, 900, 500, 0,0,0, 300, 0]` (12 points) is stored as
+`[0, 900, 500, 0, 0, 300, 0]` (7). The baseline extent of every peak is preserved, so the profile
+shape is unchanged, but `number_of_data_points` reflects the stored count rather than the source's.
+**Centroid spectra are never touched** — isolated and interior zero-intensity centroids round-trip
+exactly. Everything else (m/z at full f64 precision, intensity, retention time, precursor m/z and
+charge) round-trips bit-for-bit; verified against mzdata's own mzML output on a 4,880-spectrum DDA
+run with zero differences.
+
 **Verbatim vendor side-files (preserved, not interpreted).** For Bruker `.d`, the
 original side-files (methods, calibration, acquisition databases, …) are
 **embedded by default** under `vendor/` in the archive — gzip-compressed and
