@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **mzPeak→mzML dropped every source chromatogram.** `filter_mzpeak_to_mzml` never read the
+  archive's chromatogram facet, so the export carried only the writer's synthesized TIC/base-peak
+  summary. On a 300-chromatogram SIM/SRM run, **299 quantitative traces vanished** on export while
+  sitting intact in `chromatograms_data.parquet` — any MRM/SRM/SIM experiment round-tripped through
+  mzPeak lost its quantitation. The convert lane has always carried them across; this lane never did.
+  Verified: 2 → 301 chromatograms, ids identical to a direct mzdata export, 2,017,054 chromatogram
+  points compared with zero mismatches. *(This corrects an earlier report in this session that said
+  the defect was not reproducible — that check only saw the synthesized TIC/BPC.)*
+- **A collision energy of `0.0 eV` was fabricated on every MS2 whose source declared none.**
+  `Activation::energy` is a plain f32 defaulting to `0.0`, and the writer appended `MS:1000045` from
+  it unconditionally — asserting a measured value that was never measured, indistinguishable from a
+  real one. It is now emitted only when non-zero, matching how `peak_intensity` and
+  `ion_injection_time` already treat absent-vs-zero. Verified: a source declaring 35.0 eV keeps
+  `35.0` with its `UO:0000266` unit; the same file with its CE params stripped now yields none
+  (previously 21 fabricated `0.0 eV`).
 - **A chunk sitting at coordinate zero was silently dropped.** `decode_arrow` opened with
   `if start == 0.0 && end == 0.0 { return 0 }`, standing in for "this chunk row is absent" — but the
   bounds were read past their null mask, so a null bound and a real bound of `0.0` were

@@ -199,6 +199,15 @@ impl ChunkingStrategy {
         // one non-null value the iterator was already empty after `next()`, so `end` fell through to
         // 0.0 — yielding `chunk_start > chunk_end (= 0)` and the validator's "chunk start > end".
         // Read start and end from two INDEPENDENT iterators so a single-point chunk gives end == start.
+        // The reader now distinguishes "absent chunk" from "chunk at coordinate zero" by the bounds'
+        // NULL MASK, not by their value, so this encoder must never be handed an empty or all-null
+        // array: it would emit non-null 0.0/0.0 bounds that the reader would materialise as a
+        // phantom point at zero. Callers only ever pass non-empty ranges (the chunk step generators
+        // never emit an empty range), so this is a contract check, not a runtime branch.
+        debug_assert!(
+            array.iter().flatten().next().is_some(),
+            "encode_arrow requires at least one non-null value; an empty chunk must not be emitted"
+        );
         let start: f64 = array
             .iter()
             .flatten()
@@ -254,6 +263,14 @@ impl ChunkingStrategy {
         accumulator: &mut DataArray,
         delta_model: Option<&RegressionDeltaModel<f64>>,
     ) -> usize {
+        // A chunk's bounds must be ordered. A violation means a corrupt or mis-encoded archive; warn
+        // rather than silently decoding from a nonsense start.
+        if start_value > end_value {
+            log::error!(
+                "chunk bounds are inverted (start {start_value} > end {end_value}); \
+                 the archive is malformed and this chunk will decode incorrectly"
+            );
+        }
         // NOTE: there used to be an early `return 0` here when `start_value == end_value == 0.0`,
         // standing in for "this chunk row is absent". It also discarded any REAL chunk whose single
         // point sits at coordinate zero — TOF bin 0 exists in timsTOF data, so a small `--chunk-size`

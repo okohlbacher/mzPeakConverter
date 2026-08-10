@@ -1258,6 +1258,18 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         SpectrumWriter::write(&mut w, &spec)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
     }
+
+    // Carry the archive's chromatograms across. Without this the lane emitted ONLY the writer's
+    // synthesized TIC/base-peak summary: on a 300-chromatogram SIM/SRM run, 299 quantitative traces
+    // vanished on export even though they were stored intact in `chromatograms_data.parquet`. The
+    // convert lane has always done this (`write_source_chromatograms_mzml`); this one never did.
+    // TIC/base-peak are skipped there because the writer regenerates them at close.
+    let n_chrom = mzdata::prelude::ChromatogramSource::count_chromatograms(&reader);
+    let chroms: Vec<Chromatogram> = (0..n_chrom)
+        .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
+        .collect();
+    write_source_chromatograms_mzml(&mut w, chroms.into_iter())?;
+
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
     log::info!("wrote {}", output.display());

@@ -1311,12 +1311,19 @@ impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
             params.append_value(&par);
         }
 
-        let energy = mzdata::Param::builder()
-            .name("collision energy")
-            .curie(mzdata::curie!(MS:1000045))
-            .value(item.energy)
-            .unit(Unit::Electronvolt)
-            .build();
+        // Only when the source actually declared one. `Activation::energy` is a plain f32 that
+        // DEFAULTS to 0.0, so emitting unconditionally stamped `MS:1000045 = 0.0 eV` onto every MS2
+        // of every file that reports no collision energy — a fabricated measurement indistinguishable
+        // from a real one. 0 eV is not a meaningful dissociation energy, so absent and zero are
+        // treated alike, as they already are for `peak_intensity` and `ion_injection_time`.
+        let energy = (item.energy != 0.0).then(|| {
+            mzdata::Param::builder()
+                .name("collision energy")
+                .curie(mzdata::curie!(MS:1000045))
+                .value(item.energy)
+                .unit(Unit::Electronvolt)
+                .build()
+        });
 
         for e in self.extra.iter_mut() {
             if e.append_value(item) {
@@ -1325,7 +1332,7 @@ impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
         }
 
         self.parameters
-            .append_iter(item.params().iter().chain([&energy]).filter(|p| {
+            .append_iter(item.params().iter().chain(energy.iter()).filter(|p| {
                 if let Some(c) = p.curie() {
                     !self.curies_to_mask.contains(&c)
                 } else {
