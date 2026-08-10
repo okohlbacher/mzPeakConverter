@@ -82,7 +82,10 @@ def is_vendor_dir_unit(path: Path) -> bool:
         names = {p.name for p in path.iterdir()}
     except OSError:
         return False
-    if any(m in names for m in markers):
+    # NON-EMPTY: a wrapper can carry a zero-byte `analysis.tdf` stub left by a partial download or
+    # archive extraction, which made the wrapper look like an acquisition and fail every run. The
+    # converter's own format probes were fixed the same way in v0.7.3.
+    if any((path / m).is_file() and (path / m).stat().st_size > 0 for m in markers if m in names):
         return True
     # Thermo/Waters `.raw` directories and method-only dirs: accept when there is no nested unit.
     return not any(Path(n).suffix.lower() in DIR_UNIT_SUFFIXES for n in names)
@@ -112,6 +115,14 @@ def find_units(root: Path) -> list[Path]:
             p = here / f
             if p.suffix.lower() in FILE_UNIT_SUFFIXES:
                 # A Thermo `.raw` FILE is a unit; a Waters `.raw` DIRECTORY was caught above.
+                # Zero-byte files are never acquisitions — corpora carry stubs left by partial
+                # downloads (a 0-byte `analysis.tdf` inside a wrapper `.d` was counted as a unit and
+                # failed every run).
+                try:
+                    if p.stat().st_size == 0:
+                        continue
+                except OSError:
+                    continue
                 units.append(p)
     return sorted(set(units))
 
