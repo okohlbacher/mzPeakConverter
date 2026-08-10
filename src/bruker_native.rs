@@ -8,11 +8,10 @@
 //! without touching the encoder (NATIVE-TOF-DESIGN.md).
 //!
 //! Encoding (ported from BRFP `write_tdf_to_ims_compact`): rows grouped by `spectrum_index`
-//! (frame), within a frame mobility-major (scan ascending) then TOF ascending; the TOF column is
-//! **delta-reset per (frame, scan)** — first peak of each scan holds the absolute bin, the rest
-//! hold non-negative increments. Lossless: `m/z = (a + b·tof)²` with `a,b` stored in file KV
-//! metadata; the decoder recovers the exact integer TOF and thus the exact m/z the instrument
-//! calibration produces.
+//! (frame), within a frame mobility-major (scan ascending) then TOF ascending. The TOF column holds
+//! ABSOLUTE bins — the point layout requires values be stored as-is so the Parquet page index stays
+//! meaningful. Lossless: `m/z = (a + b·tof)²` with `a,b` in the array index's transform parameters,
+//! so a reader recovers the exact integer TOF and thus the exact vendor m/z.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -329,7 +328,6 @@ impl NativeTofReader {
         &self,
         i: usize,
         int_intensity: bool,
-        tof_delta: bool,
     ) -> Result<MultiLayerSpectrum> {
         let frame = self.frame(i)?;
         let n_scans = frame.scan_offsets.len().saturating_sub(1);
@@ -347,7 +345,6 @@ impl NativeTofReader {
                 continue;
             }
             let m = self.mobility_for_scan(s);
-            let mut prev = 0i32;
             for k in lo..hi {
                 // TOF bins fit i32 in practice (digitizer ~4e5), but the column type is Int32 — guard
                 // the cast so an out-of-range bin is a hard error, never a silent wrap to garbage m/z.
@@ -355,19 +352,7 @@ impl NativeTofReader {
                     .map_err(|_| anyhow::anyhow!("TOF bin {} exceeds i32 range", frame.tof[k]))?;
                 tof_min = tof_min.min(bin);
                 tof_max = tof_max.max(bin);
-                // per-scan delta (the default; --no-tof-delta disables it): first peak of a scan =
-                // absolute bin, the rest = non-negative increments; TOF is ascending within a scan. A
-                // reader cumsum's
-                // within each mobility scan to recover the absolute bin before the m/z model. Smaller
-                // magnitudes ⇒ far more byte-plane redundancy ⇒ ~-20% on the TOF column.
-                let stored = if tof_delta {
-                    let d = if k == lo { bin } else { bin - prev };
-                    prev = bin;
-                    d
-                } else {
-                    bin
-                };
-                tof.push(stored);
+                tof.push(bin);
                 if int_intensity {
                     intensity_i32.push(i32::try_from(frame.intensity[k]).map_err(|_| {
                         anyhow::anyhow!("intensity {} exceeds i32 range", frame.intensity[k])
@@ -417,11 +402,6 @@ impl NativeTofReader {
         // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
         descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
         descr.precursor = self.precursors_at(i);
-        if tof_delta {
-            // Self-describing marker for the per-scan-delta TOF encoding: a reader must cumsum the
-            // `tof` column within each mobility-scan run before applying the m/z model.
-            descr.add_param(Param::builder().name("mzpeak:tof_delta_reset").value("scan").build());
-        }
         // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z via the model
         // (m/z = (a + b·tof)², monotonic in tof) over the min/max ABSOLUTE TOF bin present. Without
         // this the viewer reports "m/z 0–0".
@@ -666,35 +646,4 @@ fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
         t.polarity.push(pol);
     }
     Ok(t)
-}
-#[cfg(test)]
-mod tof_delta_tests {
-    /// Per-scan delta TOF (the default; `--no-tof-delta` disables it) stores the first peak of a scan
-    /// as the absolute bin and the rest as increments (TOF ascends within a scan); a reader recovers
-    /// absolute TOF by cumulative sum within each scan. That transform MUST be exactly invertible —
-    /// this guards losslessness. Mirrors the encode step in [`super::NativeTofReader::ims_compact_spectrum`].
-    #[test]
-    fn per_scan_delta_is_lossless() {
-        let scans: Vec<Vec<i32>> = vec![
-            vec![10, 12, 500, 501, 402_000],
-            vec![3, 400_000],
-            vec![7],
-            vec![],
-        ];
-        for scan in &scans {
-            let mut enc = Vec::new();
-            let mut prev = 0i32;
-            for (k, &bin) in scan.iter().enumerate() {
-                enc.push(if k == 0 { bin } else { bin - prev });
-                prev = bin;
-            }
-            let mut dec = Vec::with_capacity(enc.len());
-            let mut acc = 0i32;
-            for (k, &d) in enc.iter().enumerate() {
-                acc = if k == 0 { d } else { acc + d };
-                dec.push(acc);
-            }
-            assert_eq!(&dec, scan, "per-scan delta round-trip must reconstruct absolute TOF");
-        }
-    }
 }

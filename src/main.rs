@@ -176,13 +176,6 @@ struct Cli {
     #[arg(long)]
     no_ims_compact: bool,
 
-    /// Bruker timsTOF (TDF) ims-compact only: per-scan delta-encode the integer TOF axis (~3% smaller,
-    /// lossless). OFF BY DEFAULT and NON-CONFORMANT — the point layout requires values be stored
-    /// as-is so the Parquet page index stays meaningful, and delta encoding defeats that
-    /// (mzPeak-specification `docs/layouts/point-layout.md`). Delta files are marked per spectrum with
-    /// `mzpeak:tof_delta_reset=scan` and must be cumulative-summed within each mobility scan on read.
-    #[arg(long)]
-    tof_delta: bool,
 
     /// Bruker timsTOF (TDF) ims-compact only — select the CHUNKED layout for rapid m/z-range access.
     /// OFF BY DEFAULT. When absent, timsTOF data is written in the ARCHIVE layout (the default): a flat
@@ -340,7 +333,6 @@ struct FileConfig {
     zstd_level: Option<i32>,
     force: Option<bool>,
     no_ims_compact: Option<bool>,
-    tof_delta: Option<bool>,
     ims_chunked: Option<bool>,
     bruker_sdk: Option<bool>,
     no_tims_recalibration: Option<bool>,
@@ -369,7 +361,6 @@ struct Settings {
     ims_zstd_level: i32,
     force: bool,
     no_ims_compact: bool,
-    tof_delta: bool,
     /// OPT-IN chunked integer-TOF ims-compact layout (m/z-boundary chunks). Default false.
     ims_chunked: bool,
     bruker_sdk: bool,
@@ -415,11 +406,6 @@ impl Settings {
             ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(5),
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
-            // Per-scan delta encoding of the integer TOF axis is OFF by default: it is forbidden in
-            // the point layout (see the --tof-delta help). When --ims-chunked is set, the chunker does
-            // its own per-chunk delta, so the per-scan manual delta is forced off (mutually exclusive).
-            tof_delta: (cli.tof_delta || fc.tof_delta.unwrap_or(false))
-                && !(cli.ims_chunked || fc.ims_chunked.unwrap_or(false)),
             ims_chunked: cli.ims_chunked || fc.ims_chunked.unwrap_or(false),
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             tims_recalibration: !(cli.no_tims_recalibration
@@ -507,6 +493,28 @@ fn run(cli: &Cli) -> Result<i32> {
     let Some(output) = cfg.output.clone() else {
         return Ok(exit::OK); // no --output: nothing written, just the report above
     };
+
+    // REFUSE to write over the input. Every lane opens the source and then truncates the output, so
+    // `-o` pointing back at the input destroys it — with `--force` this silently ate a 120 MB archive
+    // and still failed the conversion, leaving nothing. Compare device+inode rather than the path
+    // text so a symlink, a hardlink, or `./x` vs `x` cannot slip past.
+    if output.exists() {
+        let same = match (fs::metadata(&cli.input), fs::metadata(&output)) {
+            (Ok(a), Ok(b)) => {
+                use std::os::unix::fs::MetadataExt;
+                a.dev() == b.dev() && a.ino() == b.ino()
+            }
+            _ => false,
+        };
+        if same {
+            bail!(
+                "output {} is the same file as the input — refusing to overwrite the source \
+                 (conversion reads the input while writing the output, so this destroys it). \
+                 Write to a different path, then replace the original.",
+                output.display()
+            );
+        }
+    }
 
     // mzPeak input → filter path. A `.mzpeak` (or any ZIP with mzpeak_index.json) cannot be read by
     // mzdata; instead of the convert lanes below, route to the mzPeak→mzPeak filter (RT / MS-level /
@@ -618,7 +626,7 @@ fn run(cli: &Cli) -> Result<i32> {
         // fall back to the mzdata reader interface (f64 m/z), which decodes those files. mzdata may
         // silently drop a truly-undecodable frame, so the fallback is loud. (Backlog: fix timsrust /
         // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
-        match convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.tof_delta, cfg.ims_chunked, cfg.chunk_size) {
+        match convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size) {
             Ok(()) => {}
             Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
                 log::warn!(
@@ -2869,7 +2877,6 @@ fn convert_ims_compact_archive(
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
     tims_recalibration: bool,
-    tof_delta: bool,
     ims_chunked: bool,
     chunk_size_th: f64,
 ) -> Result<()> {
@@ -2878,8 +2885,6 @@ fn convert_ims_compact_archive(
     // Truthful self-describing tof_encoding label for the ims_calibration index block.
     let (tof_encoding, chunk_cfg) = if ims_chunked {
         ("m/z-chunked", Some(chunk_size_th))
-    } else if tof_delta {
-        ("per-scan-delta", None)
     } else {
         ("absolute", None)
     };
@@ -2890,7 +2895,7 @@ fn convert_ims_compact_archive(
             // chunker's m/z bins are contiguous. Per-scan delta OFF (chunker deltas per chunk).
             reader.ims_compact_spectrum_chunked(i, int)
         } else {
-            reader.ims_compact_spectrum(i, int, tof_delta)
+            reader.ims_compact_spectrum(i, int)
         }
     })
 }
@@ -4048,7 +4053,7 @@ mod tests {
         let output = scratch.join("sba415_ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
 
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, false, 50.0)
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
             .expect("ims-compact conversion");
 
         // Crack the zip archive and extract facets to scratch files (File: ChunkReader).
@@ -4108,7 +4113,7 @@ mod tests {
         fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_contract.mzpeak");
         let _ = fs::remove_file(&output);
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, false, 50.0)
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
             .expect("ims-compact conversion");
 
         let f = fs::File::open(&output).unwrap();

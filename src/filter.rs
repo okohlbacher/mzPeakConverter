@@ -209,7 +209,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
 
         if name.ends_with(".parquet") {
             let bytes = read_member(&mut zip, name)?;
-            let class = classify_facet(&bytes)
+            let class = classify_facet(&bytes, &fe)
                 .with_context(|| format!("classifying facet {name}"))?;
             let out_bytes = process_parquet(
                 &bytes,
@@ -364,13 +364,42 @@ enum Facet {
     ChromatogramData(String),
     /// Per-spectrum vendor facet keyed by a top-level `ordinal` column (scan trailers / wide).
     VendorOrdinal,
+    /// v0.7 split layout: `spectra_metadata.parquet`, keyed by a TOP-LEVEL `index`.
+    SpectrumMetaFlat,
+    /// v0.7 split layout: a per-spectrum secondary facet (scans / precursors / selected_ions),
+    /// keyed by a TOP-LEVEL `source_index` referencing `spectra_metadata.index`.
+    SpectrumSecondary,
     /// No spectrum linkage — copy verbatim (run-global vendor status log, etc.).
     RunGlobal,
 }
 
 /// Classify a Parquet facet by its arrow schema. Errors when a facet LOOKS per-spectrum-shaped (a
 /// top-level `point`/`chunk`/`peak` struct) but has no key we can map to survivors.
-fn classify_facet(bytes: &[u8]) -> Result<Facet> {
+fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
+    // v0.7 split layout: trust the index. Schema sniffing cannot distinguish a spectrum's
+    // `precursors` facet from a chromatogram's — they have the same columns — and getting it wrong
+    // filters the wrong table.
+    match (&fe.entity_type, &fe.data_kind) {
+        (EntityType::Spectrum, DataKind::Metadata) if has_top_level(bytes, "index")? => {
+            return Ok(Facet::SpectrumMetaFlat);
+        }
+        (EntityType::Spectrum, DataKind::Scans | DataKind::Precursors | DataKind::SelectedIons | DataKind::Products)
+            if has_top_level(bytes, "source_index")? =>
+        {
+            return Ok(Facet::SpectrumSecondary);
+        }
+        _ => {}
+    }
+    classify_facet_by_schema(bytes)
+}
+
+/// True when the Parquet schema has `name` as a TOP-LEVEL column (the v0.7 split layout puts a
+/// facet's columns at the root; pre-0.7 nested them inside a struct).
+fn has_top_level(bytes: &[u8], name: &str) -> Result<bool> {
+    Ok(parquet_schema(bytes)?.column_with_name(name).is_some())
+}
+
+fn classify_facet_by_schema(bytes: &[u8]) -> Result<Facet> {
     let schema = parquet_schema(bytes)?;
     // Peaks/data: a struct field with a `spectrum_index` child.
     for f in schema.fields() {
@@ -458,6 +487,30 @@ fn process_parquet(
                     bytes,
                     move |b| filter_by_struct_key(b, &f2, "spectrum_index", &surv, false),
                     CountMode::SpectrumData(field),
+                )
+            }
+        }
+        Facet::SpectrumMetaFlat => {
+            if !filtering_spectra {
+                reencode(bytes, |b| Ok(Some(b.clone())), CountMode::SpectrumMeta)
+            } else {
+                let surv = survivors.clone();
+                reencode(
+                    bytes,
+                    move |b| filter_by_top_key(b, "index", &surv),
+                    CountMode::SpectrumMeta,
+                )
+            }
+        }
+        Facet::SpectrumSecondary => {
+            if !filtering_spectra {
+                reencode(bytes, |b| Ok(Some(b.clone())), CountMode::Vendor)
+            } else {
+                let surv = survivors.clone();
+                reencode(
+                    bytes,
+                    move |b| filter_by_top_key(b, "source_index", &surv),
+                    CountMode::Vendor,
                 )
             }
         }
