@@ -873,10 +873,20 @@ impl<'a> ChunkDecoder<'a> {
             }
 
             if !did_decode {
+                // An EMPTY chunk-values list means a SINGLE-POINT chunk: the start point is excluded
+                // from the values array, so a 1-point chunk stores nothing. The empty placeholder
+                // below must match the MAIN AXIS dtype — hard-coding Float64 pushed an f64 into the
+                // Int32 `tof` accumulator and panicked with DataTypeSizeMismatch, which made EVERY
+                // ims-chunked archive unreadable (105 of 415 chunks are single-point at 50 Th).
+                let empty_dtype = self
+                    .main_axis
+                    .as_ref()
+                    .map(|a| crate::peak_series::array_to_arrow_type(a.dtype()))
+                    .unwrap_or(DataType::Float64);
                 match encoding {
                     NO_COMPRESSION => {
                         (ChunkingStrategy::Basic { chunk_size: 50.0 }).decode_arrow(
-                            &arrow::array::new_empty_array(&DataType::Float64),
+                            &arrow::array::new_empty_array(&empty_dtype),
                             start as f64,
                             end as f64,
                             self.main_axis.as_mut().unwrap(),
@@ -885,7 +895,7 @@ impl<'a> ChunkDecoder<'a> {
                     }
                     DELTA_ENCODE => {
                         (ChunkingStrategy::Delta { chunk_size: 50.0 }).decode_arrow(
-                            &arrow::array::new_empty_array(&DataType::Float64),
+                            &arrow::array::new_empty_array(&empty_dtype),
                             start as f64,
                             end as f64,
                             self.main_axis.as_mut().unwrap(),
@@ -1107,10 +1117,20 @@ impl<'a> ChunkScanDecoder<'a> {
                 }
             }
             if !did_decode {
+                // An EMPTY chunk-values list means a SINGLE-POINT chunk: the start point is excluded
+                // from the values array, so a 1-point chunk stores nothing. The empty placeholder
+                // below must match the MAIN AXIS dtype — hard-coding Float64 pushed an f64 into the
+                // Int32 `tof` accumulator and panicked with DataTypeSizeMismatch, which made EVERY
+                // ims-chunked archive unreadable (105 of 415 chunks are single-point at 50 Th).
+                let empty_dtype = self
+                    .main_axis
+                    .as_ref()
+                    .map(|a| crate::peak_series::array_to_arrow_type(a.dtype()))
+                    .unwrap_or(DataType::Float64);
                 match encoding {
                     NO_COMPRESSION => {
                         (ChunkingStrategy::Basic { chunk_size: 50.0 }).decode_arrow(
-                            &arrow::array::new_empty_array(&DataType::Float64),
+                            &arrow::array::new_empty_array(&empty_dtype),
                             start as f64,
                             end as f64,
                             self.main_axis.as_mut().unwrap(),
@@ -1119,7 +1139,7 @@ impl<'a> ChunkScanDecoder<'a> {
                     }
                     DELTA_ENCODE => {
                         (ChunkingStrategy::Delta { chunk_size: 50.0 }).decode_arrow(
-                            &arrow::array::new_empty_array(&DataType::Float64),
+                            &arrow::array::new_empty_array(&empty_dtype),
                             start as f64,
                             end as f64,
                             self.main_axis.as_mut().unwrap(),

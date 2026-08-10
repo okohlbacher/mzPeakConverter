@@ -31,6 +31,43 @@ All notable changes to this project are documented here. The format follows
   `source_index` values no longer present. Classification is now driven by the index's
   `entity_type`/`data_kind`, with the pre-0.7 schema guess retained as the fallback.
 - **Portability:** the in-place guard no longer breaks the `x86_64-pc-windows-msvc` build.
+- **Every `--ims-chunked` archive was unreadable.** A single-point chunk stores an empty
+  chunk-values list (the start point lives in `chunk_start`), and the reader fed a hard-coded empty
+  **Float64** array into the decoder for that case — pushing an `f64` into the `Int32` `tof`
+  accumulator and panicking with `DataTypeSizeMismatch`. Single-point chunks are not exotic: 105 of
+  415 chunks at the default 50 Th width. The placeholder now takes the main axis's own dtype.
+  Verified by decoding 354,690 peaks bit-identically against the archive layout, plus a pathological
+  0.01 Th run with 389,345 single-point chunks. Default (non-chunked) output is unaffected.
+- **DDA-PASEF precursors now carry their parent survey frame.** `precursor_id` / `precursor_index`
+  were null on every row (0 of 232,203 on the reference run), so an MS2 could not be traced to the
+  MS1 it was selected from. `Precursors.Parent` is now emitted as `frame=<Id>`, which the writer
+  resolves into `precursor_index` — 232,203 of 232,203 populated.
+- **DDA precursor mobility uses the true fractional scan position.** We recorded the isolation
+  window's integer scan midpoint instead of `Precursors.ScanNumber`, a systematic error of up to a
+  full scan (747 vs 747.519 on frame 2 of the reference run, 2.8e-4 in 1/K0). dia-PASEF has no such
+  value and still uses the window midpoint.
+- **The truncated-source cross-check now covers the TOF-grid and `--to mzml` lanes**, which could
+  previously write a silently short output with exit code 0. A refused conversion also removes its
+  partial `.tmp` / output rather than leaving it beside the intended one.
+- **The filter fails loudly on a malformed index instead of guessing.** An unknown spectrum
+  `data_kind` used to fall through and be copied unfiltered (leaving orphans); a `source_index`-keyed
+  facet whose entity the index does not identify, or an entry whose `entity_type` contradicts the
+  member name, is now an error. The primary metadata member is read from the index rather than
+  assumed to be `spectra_metadata.parquet`.
+- **Corpus-gated tests had silently rotted.** All four pinned corpus paths that no longer exist and
+  looked up signal columns at the schema root, where the v0.7 layout nests them inside the
+  `point`/`chunk` struct — so they failed for reasons unrelated to the code. Fixtures are now located
+  by search (missing ⇒ skip, not fail) and column checks flatten the struct. Three
+  machine-specific absolute scratch paths were also removed from the committed source.
+
+### Known issues
+
+- **Layout-family purity conflicts with the split peaks/profiles layout** (see
+  `mzPeak-spec-issue-layout-family-purity.md`). The reference writer routes chunked profile arrays to
+  `spectra_data.parquet` and point-format centroids to `spectra_peaks.parquet`, both
+  `entity_type: spectrum`, which the conformance MUST forbids. 140 of 330 corpus archives declare two
+  families; 6 have both populated with real data. Raised with the specification rather than patched
+  unilaterally, since the reference layout design and the rule disagree.
 
 ## [0.7.2] — 2026-08-04
 

@@ -113,3 +113,32 @@ mod tests {
         assert!(cal.one_over_k0(100.0) > cal.one_over_k0(800.0)); // monotonic
     }
 }
+
+#[cfg(test)]
+mod scan_number_precision_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The isolation window's integer midpoint is NOT the precursor's mobility: `Precursors.
+    /// ScanNumber` is fractional. Pin the size of the error we were making on a real DDA frame.
+    #[test]
+    #[ignore = "needs the reference corpus (MZPEAK_CORPUS)"]
+    fn fractional_scan_number_moves_mobility() {
+        let Ok(root) = std::env::var("MZPEAK_CORPUS") else { return };
+        let tdf = Path::new(&root)
+            .join("ims-examples/PXD078573/20250305_AI_Rui_Xlink_F19_Slot1-28_1_9629.d/analysis.tdf");
+        if !tdf.exists() {
+            return;
+        }
+        let cal = TimsMobilityCalibration::from_tdf_path(&tdf).unwrap().unwrap();
+        // Frame 2, first window: ScanNumBegin=735, ScanNumEnd=759 -> old midpoint 747.
+        // Precursors.ScanNumber for that precursor = 747.5194174757281.
+        let old = cal.one_over_k0(747.0);
+        let new = cal.one_over_k0(747.5194174757281);
+        assert!(
+            (new - old).abs() > 1e-5,
+            "fractional scan number must move 1/K0 measurably: {old} vs {new}"
+        );
+        eprintln!("1/K0 midpoint {old} vs ScanNumber {new} (delta {})", new - old);
+    }
+}

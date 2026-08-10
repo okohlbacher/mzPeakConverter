@@ -153,8 +153,17 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     // Read spectra_metadata once: compute the surviving spectrum-index set + the dangling-precursor
     // count. Metadata is one row per spectrum, so it is small relative to the peak facets.
     let filtering_spectra = opts.rt.is_some() || !opts.ms_levels.is_empty();
-    let meta_bytes = read_member(&mut zip, "spectra_metadata.parquet")
-        .context("reading spectra_metadata.parquet")?;
+    // The primary spectrum metadata member, taken from the index rather than assumed: the name is
+    // conventional, not normative, and an archive is free to call it something else.
+    let meta_name = orig_files
+        .values()
+        .find(|fe| {
+            matches!(fe.entity_type, EntityType::Spectrum) && matches!(fe.data_kind, DataKind::Metadata)
+        })
+        .map(|fe| fe.name.clone())
+        .unwrap_or_else(|| "spectra_metadata.parquet".to_string());
+    let meta_bytes =
+        read_member(&mut zip, &meta_name).with_context(|| format!("reading {meta_name}"))?;
     let (survivors, total_spectra, dangling) =
         compute_survivors(&meta_bytes, opts).context("computing surviving spectra")?;
     if filtering_spectra {
@@ -379,16 +388,40 @@ fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
     // v0.7 split layout: trust the index. Schema sniffing cannot distinguish a spectrum's
     // `precursors` facet from a chromatogram's — they have the same columns — and getting it wrong
     // filters the wrong table.
-    match (&fe.entity_type, &fe.data_kind) {
-        (EntityType::Spectrum, DataKind::Metadata) if has_top_level(bytes, "index")? => {
+    //
+    // "Trust" is bounded: an index entry that contradicts the member name is a malformed manifest,
+    // and acting on it would filter a chromatogram table against spectrum survivors. Refuse instead.
+    let named_chromatogram = fe.name.rsplit('/').next().unwrap_or(&fe.name).starts_with("chromatogram");
+    if matches!(fe.entity_type, EntityType::Spectrum) && named_chromatogram {
+        bail!(
+            "index entry for {} claims entity_type=spectrum but the member is named as a \
+             chromatogram facet — the archive's index is inconsistent, refusing to filter it",
+            fe.name
+        );
+    }
+    if matches!(fe.entity_type, EntityType::Spectrum) {
+        if has_top_level(bytes, "index")? && matches!(fe.data_kind, DataKind::Metadata) {
             return Ok(Facet::SpectrumMetaFlat);
         }
-        (EntityType::Spectrum, DataKind::Scans | DataKind::Precursors | DataKind::SelectedIons | DataKind::Products)
-            if has_top_level(bytes, "source_index")? =>
-        {
+        // Any per-spectrum secondary, INCLUDING a `data_kind` this build does not know. Keying on
+        // the known kinds alone let a future/unknown kind fall through to `RunGlobal` and be copied
+        // unfiltered, leaving rows pointing at spectra that no longer exist.
+        if has_top_level(bytes, "source_index")? {
             return Ok(Facet::SpectrumSecondary);
         }
-        _ => {}
+    }
+    // A facet keyed by `source_index` whose index entry does not say which entity owns it cannot be
+    // filtered safely: spectrum and chromatogram secondaries are schema-identical. Copying it
+    // verbatim silently leaves orphans, so fail loudly and let the user repair the index.
+    if !matches!(fe.entity_type, EntityType::Chromatogram) && has_top_level(bytes, "source_index")? {
+        bail!(
+            "{} is keyed by `source_index` but the index does not identify its entity \
+             (entity_type={:?}, data_kind={:?}); spectrum and chromatogram secondaries are \
+             indistinguishable by schema, so filtering it could drop the wrong rows",
+            fe.name,
+            fe.entity_type,
+            fe.data_kind
+        );
     }
     classify_facet_by_schema(bytes)
 }

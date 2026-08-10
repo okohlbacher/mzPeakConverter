@@ -1114,12 +1114,22 @@ fn convert_to_mzml(
     // fails to transition into the chromatogramList.
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
 
+    let mut written = 0usize;
     for (i, spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             break;
         }
         SpectrumWriter::write(&mut w, &spec)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
+        written += 1;
+    }
+    // Same truncated-source cross-check the mzPeak lanes make. This lane writes `output` directly
+    // rather than a temp, so remove the partial file before propagating — otherwise a truncated
+    // source leaves a half mzML on disk that looks like a successful conversion.
+    if let Err(e) = assert_source_complete(input, written, cap) {
+        drop(w);
+        let _ = fs::remove_file(output);
+        return Err(e);
     }
     // Pass through the source's chromatograms (SRM/SIM/vendor traces — otherwise silently lost,
     // fatal for MRM data). Drop source TIC/base-peak: the mzML writer emits its own spectrum-derived
@@ -1529,6 +1539,7 @@ fn convert_file_tof_grid(
     log::info!(
         "TOF-grid wrote {n} spectra: {n_gridded} gridded (tof_index facet), {n_f64} kept f64 m/z (data facet)"
     );
+    assert_source_complete_tmp(input, n, max_spectra(), &tmp)?;
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
     finish_tof_grid_archive(writer, &tmp, output, input, &grid, vendor)
@@ -2210,20 +2221,7 @@ fn convert_file(
     // imzML `.ibd`, a half-downloaded mzML — otherwise yields a structurally valid archive that is
     // silently missing most of its spectra, with exit code 0. Fail loudly instead: the archive is
     // not written, so a partial conversion can never be mistaken for a complete one.
-    if cap.is_none() {
-        if let Some(declared) = declared_spectrum_count(input) {
-            if declared != n as u64 {
-                bail!(
-                    "{}: source declares {declared} spectra but only {n} were read \
-                     ({:.1}%). The input is incomplete — for imzML check that the `.ibd` sidecar is \
-                     fully downloaded (it holds all the signal; the .imzML is only metadata). \
-                     Refusing to write a partial archive.",
-                    input.display(),
-                    100.0 * n as f64 / declared.max(1) as f64,
-                );
-            }
-        }
-    }
+    assert_source_complete_tmp(input, n, cap, &tmp)?;
 
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
@@ -2391,6 +2389,47 @@ fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
 /// are valid mzML and ProteomeDiscoverer emits them. If the input's header contains that pattern,
 /// write a sanitized copy where each empty group is rewritten as an explicit open/close pair and
 /// return its path; otherwise return None (convert the original in place). Only the small pre-
+/// Cross-check spectra written against the source's own declared count.
+///
+/// A reader that stops early — a truncated imzML `.ibd`, a half-downloaded mzML — otherwise yields a
+/// structurally valid archive that is silently missing most of its spectra, with exit code 0. Fail
+/// loudly instead: the caller has not renamed its temp file yet, so a partial conversion can never
+/// be mistaken for a complete one. `cap` is `MZPC_MAX_SPECTRA`, which deliberately truncates, so a
+/// capped run skips the check.
+fn assert_source_complete_tmp(
+    input: &Path,
+    written: usize,
+    cap: Option<usize>,
+    tmp: &Path,
+) -> Result<()> {
+    let r = assert_source_complete(input, written, cap);
+    if r.is_err() {
+        // The half-written archive is worthless and confusing sitting next to the intended output.
+        let _ = fs::remove_file(tmp);
+    }
+    r
+}
+
+fn assert_source_complete(input: &Path, written: usize, cap: Option<usize>) -> Result<()> {
+    if cap.is_some() {
+        return Ok(());
+    }
+    let Some(declared) = declared_spectrum_count(input) else {
+        return Ok(());
+    };
+    if declared != written as u64 {
+        bail!(
+            "{}: source declares {declared} spectra but only {written} were read ({:.1}%). \
+             The input is incomplete — for imzML check that the `.ibd` sidecar is fully downloaded \
+             (it holds all the signal; the .imzML is only metadata). Refusing to write a partial \
+             output.",
+            input.display(),
+            100.0 * written as f64 / declared.max(1) as f64,
+        );
+    }
+    Ok(())
+}
+
 /// Refuse to read an archive written with the removed per-scan TOF delta encoding.
 ///
 /// Releases up to v0.7.2 could emit `ims_calibration.tof_encoding = "per-scan-delta"`, but no reader
@@ -4066,12 +4105,32 @@ mod tests {
         use mzdata::prelude::{ChromatogramSource, SpectrumSource};
         use std::fs;
 
-        let input = corpus_root().join("general-ms/sciex-qtrap-6500/Drug_substance_3_scheduled_MRM.mzML");
+        let Some(input) = corpus_find(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mzML"))
+                && p.file_name().is_some_and(|n| n.to_string_lossy().to_uppercase().contains("MRM"))
+        }) else {
+            eprintln!("skipping: no *MRM*.mzML under {}", corpus_root().display());
+            return;
+        };
         let input = input.as_path();
-        assert!(input.exists(), "corpus SRM file missing: {}", input.display());
         let scratch = std::env::temp_dir().join(format!("mzpc-srm-{}", std::process::id()));
         fs::create_dir_all(&scratch).unwrap();
         let out = scratch.join("out.mzML");
+
+        // Baseline from the SOURCE rather than a pinned number: the invariant under test is that
+        // conversion does not silently DROP chromatograms (fatal for MRM/SRM), not that a particular
+        // corpus file has a particular transition count.
+        let n_src = {
+            let mut r = super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(input)
+                .expect("open source");
+            r.iter_chromatograms().count()
+        };
+        if n_src == 0 {
+            eprintln!("skipping: {} carries no chromatograms", input.display());
+            let _ = fs::remove_dir_all(&scratch);
+            return;
+        }
 
         super::convert_to_mzml(input, &out, false, None).expect("SRM → mzML must not crash");
 
@@ -4079,11 +4138,60 @@ mod tests {
             super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(&out)
                 .expect("reopen SRM mzML");
         let n_chrom = reader.iter_chromatograms().count();
-        let n_spec = reader.iter().count();
         let _ = fs::remove_dir_all(&scratch);
-        assert_eq!(n_spec, 0, "SRM file has no spectra");
-        // 720 SRM transitions preserved + the writer's TIC/BIC summary.
-        assert!(n_chrom > 100, "SRM chromatograms must be preserved in mzML, got {n_chrom}");
+        assert!(
+            n_chrom >= n_src,
+            "source chromatograms must survive conversion: {n_src} in {}, {n_chrom} out",
+            input.display()
+        );
+    }
+
+    /// Flatten a peaks/data schema to the leaf column names — the v0.7 layout nests the signal
+    /// columns inside a top-level `point`/`chunk` struct, so a root-level lookup finds nothing.
+    fn leaf_column_names(schema: &arrow::datatypes::Schema) -> Vec<String> {
+        schema
+            .fields()
+            .iter()
+            .flat_map(|f| match f.data_type() {
+                arrow::datatypes::DataType::Struct(kids) => {
+                    kids.iter().map(|k| k.name().clone()).collect::<Vec<_>>()
+                }
+                _ => vec![f.name().clone()],
+            })
+            .collect()
+    }
+
+    /// First file/dir under the corpus matching `pred`, or `None`.
+    ///
+    /// The reference corpus is reorganised from time to time, so these fixtures are located by
+    /// SEARCH rather than by a pinned path — a moved file should skip the test, not fail it with a
+    /// stale path that says nothing about the code.
+    fn corpus_find(pred: impl Fn(&std::path::Path) -> bool) -> Option<std::path::PathBuf> {
+        fn walk(
+            dir: &std::path::Path,
+            depth: usize,
+            pred: &impl Fn(&std::path::Path) -> bool,
+            out: &mut Option<std::path::PathBuf>,
+        ) {
+            if out.is_some() || depth == 0 {
+                return;
+            }
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            entries.sort();
+            for p in entries {
+                if pred(&p) {
+                    *out = Some(p);
+                    return;
+                }
+                if p.is_dir() {
+                    walk(&p, depth - 1, pred, out);
+                }
+            }
+        }
+        let mut out = None;
+        walk(&corpus_root(), 6, &pred, &mut out);
+        out
     }
 
     /// B.4 regression (frame-preserving ims-compact). Corpus-gated: needs the smallest timsTOF `.d`
@@ -4099,14 +4207,21 @@ mod tests {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use std::fs;
 
-        let input =
-            corpus_root().join("ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d");
+        let Some(input) = corpus_find(|p| {
+            p.is_dir()
+                && p.extension().is_some_and(|e| e == "d")
+                // Non-empty: the corpus keeps zero-byte `analysis.tdf` stubs in the OUTER `.d`
+                // wrapper directories, whose real acquisition lives one level down.
+                && std::fs::metadata(p.join("analysis.tdf")).is_ok_and(|m| m.len() > 0)
+        }) else {
+            eprintln!("skipping: no TDF .d under {}", corpus_root().display());
+            return;
+        };
         let input = input.as_path();
-        assert!(input.exists(), "corpus fixture missing: {}", input.display());
 
-        let scratch = std::path::Path::new(
-            "/private/tmp/claude-501/-Users-kohlbach-Claude-mzPeak-mzPeakConverter/b893364b-bab9-4ecd-b671-4ff71e9db809/scratchpad",
-        );
+        // Never a machine-specific absolute path: this file is committed.
+        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        let scratch = scratch.as_path();
         fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
@@ -4123,13 +4238,13 @@ mod tests {
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&peaks_path).unwrap()).unwrap();
         let schema = builder.schema().clone();
+        let cols = leaf_column_names(&schema);
         assert!(
-            schema.field_with_name("mean_inverse_reduced_ion_mobility").is_ok(),
-            "spectra_peaks must carry mean_inverse_reduced_ion_mobility (MS:1003006); got {:?}",
-            schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+            cols.iter().any(|n| n == "mean_inverse_reduced_ion_mobility"),
+            "spectra_peaks must carry mean_inverse_reduced_ion_mobility (MS:1003006); got {cols:?}"
         );
         // The peak facet stores integer `tof`, not m/z.
-        assert!(schema.field_with_name("tof").is_ok(), "peak facet must have a `tof` column");
+        assert!(cols.iter().any(|n| n == "tof"), "peak facet must have a `tof` column; got {cols:?}");
 
         // (b) #spectra == #TDF frames (one spectrum per frame).
         let n_frames = {
@@ -4161,13 +4276,20 @@ mod tests {
         use std::fs;
         use std::io::Read;
 
-        let input =
-            corpus_root().join("ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d");
+        let Some(input) = corpus_find(|p| {
+            p.is_dir()
+                && p.extension().is_some_and(|e| e == "d")
+                // Non-empty: the corpus keeps zero-byte `analysis.tdf` stubs in the OUTER `.d`
+                // wrapper directories, whose real acquisition lives one level down.
+                && std::fs::metadata(p.join("analysis.tdf")).is_ok_and(|m| m.len() > 0)
+        }) else {
+            eprintln!("skipping: no TDF .d under {}", corpus_root().display());
+            return;
+        };
         let input = input.as_path();
-        assert!(input.exists(), "corpus fixture missing: {}", input.display());
-        let scratch = std::path::Path::new(
-            "/private/tmp/claude-501/-Users-kohlbach-Claude-mzPeak-mzPeakConverter/b893364b-bab9-4ecd-b671-4ff71e9db809/scratchpad",
-        );
+        // Never a machine-specific absolute path: this file is committed.
+        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        let scratch = scratch.as_path();
         fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_contract.mzpeak");
         let _ = fs::remove_file(&output);
@@ -4197,9 +4319,10 @@ mod tests {
             fs::File::open(&peaks_path).unwrap(),
         )
         .unwrap();
+        let cols = leaf_column_names(builder.schema());
         assert!(
-            builder.schema().field_with_name("tof").is_ok(),
-            "ims-compact peaks schema must have a `tof` column"
+            cols.iter().any(|n| n == "tof"),
+            "ims-compact peaks schema must have a `tof` column; got {cols:?}"
         );
     }
 
@@ -4212,15 +4335,15 @@ mod tests {
         use std::io::Read;
 
         let corpus = std::env::var("MZPEAK_TOF_GRID_SOURCE").unwrap_or_default();
-        assert!(
-            !corpus.is_empty(),
-            "set MZPEAK_TOF_GRID_SOURCE=/path/to/grid/source (.d or .mzML) to run this test"
-        );
+        if corpus.is_empty() {
+            eprintln!("skipping: set MZPEAK_TOF_GRID_SOURCE=/path/to/grid/source (.d or .mzML)");
+            return;
+        }
         let input = std::path::Path::new(&corpus);
         assert!(input.exists(), "MZPEAK_TOF_GRID_SOURCE not found: {corpus}");
-        let scratch = std::path::Path::new(
-            "/private/tmp/claude-501/-Users-kohlbach-Claude-mzPeak-mzPeakConverter/b893364b-bab9-4ecd-b671-4ff71e9db809/scratchpad",
-        );
+        // Never a machine-specific absolute path: this file is committed.
+        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        let scratch = scratch.as_path();
         fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("tof_grid_contract.mzpeak");
         let _ = fs::remove_file(&output);

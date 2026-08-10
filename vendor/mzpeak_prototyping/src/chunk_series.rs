@@ -704,10 +704,10 @@ fn mz_boundary_steps(
     steps
 }
 
-/// Encode a chunk's Int32 `tof` slice as [absolute_first, delta, delta, ...]: the first element is
-/// the absolute TOF bin, the rest are increments from the previous point. Reconstruction is a plain
-/// cumulative sum from element 0 (NOT from `chunk_start`, which holds m/z, not tof). Assumes dense
-/// (non-null) input.
+/// Encode a chunk's Int32 `tof` slice as increments from the previous point, with the FIRST point
+/// excluded — it lives in `chunk_start`, which holds a main-axis (TOF) value. Reconstruction is a
+/// cumulative sum seeded from `chunk_start`. A single-point chunk therefore yields an EMPTY values
+/// list, which the reader must still decode into that one point. Assumes dense (non-null) input.
 fn int32_chunk_delta(slice: &Int32Array) -> ArrayRef {
     // The first value is the chunk's reference point and lives in `chunk_start`, NOT in this array
     // (chunked-layout.md: "The start point is *excluded* from the chunk-values array"). So a chunk

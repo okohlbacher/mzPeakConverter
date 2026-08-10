@@ -140,6 +140,13 @@ struct FrameWindow {
     average_mz: Option<f64>,
     charge: Option<i32>,
     intensity: Option<f64>,
+    /// `Precursors.Parent` — the TDF Id of the survey (MS1) frame this precursor was detected in.
+    /// Becomes the `precursor_id` (`frame=N`), which the writer resolves into `precursor_index`.
+    parent: Option<i64>,
+    /// `Precursors.ScanNumber` — the FRACTIONAL scan position of the precursor's mobility peak.
+    /// Strictly better than the isolation window's integer midpoint, which is off by up to a full
+    /// scan (measured 0.882 on frame 2 of the reference DDA run).
+    scan_number: Option<f64>,
 }
 
 impl NativeTofReader {
@@ -247,13 +254,18 @@ impl NativeTofReader {
                     charge: w.charge.filter(|c| *c != 0),
                     ..Default::default()
                 };
-                // Mobility of the isolation window: the midpoint of the scan range it occupies.
-                let mid = (w.scan_begin as f64 + w.scan_end as f64) / 2.0;
+                // Mobility of the precursor. DDA-PASEF records the FRACTIONAL scan position of the
+                // detected mobility peak in `Precursors.ScanNumber` — use it. Only when it is
+                // absent (dia-PASEF, or a dangling precursor) fall back to the isolation window's
+                // midpoint, which is off by up to a full scan.
+                let scan = w
+                    .scan_number
+                    .unwrap_or_else(|| (w.scan_begin as f64 + w.scan_end as f64) / 2.0);
                 ion.add_param(
                     Param::builder()
                         .name("inverse reduced ion mobility")
                         .curie(curie!(MS:1002815))
-                        .value(self.mobility_for_scan(mid as usize))
+                        .value(self.mobility_for_scan_f(scan))
                         .unit(Unit::VoltSecondPerSquareCentimeter)
                         .build(),
                 );
@@ -299,6 +311,11 @@ impl NativeTofReader {
                         flags: IsolationWindowState::Complete,
                     },
                     activation,
+                    // Parent survey frame. Spectrum ids are `frame=<TDF Id>` and the writer resolves
+                    // `precursor_id` against its id→index map to fill `precursor_index`, so naming
+                    // the parent here is the whole linkage — without it an MS2 cannot be traced back
+                    // to the MS1 it was selected from.
+                    precursor_id: w.parent.map(|p| format!("frame={p}")),
                     ..Default::default()
                 }
             })
@@ -314,9 +331,27 @@ impl NativeTofReader {
 
     #[inline]
     pub fn mobility_for_scan(&self, scan: usize) -> f64 {
+        self.mobility_for_scan_f(scan as f64)
+    }
+
+    /// 1/K0 at a FRACTIONAL scan position. `Precursors.ScanNumber` is fractional (the mobility peak
+    /// apex, not a scan boundary), so rounding it to an integer throws away up to a full scan of
+    /// precision. The vendor model is continuous and takes the value directly; timsrust's linear
+    /// converter is integer-only, so interpolate between the neighbouring scans — exact for a linear
+    /// model, which is what that path is.
+    pub fn mobility_for_scan_f(&self, scan: f64) -> f64 {
         match &self.recal {
-            Some(c) => c.one_over_k0(scan as f64), // vendor ModelType-2 rational
-            None => self.im.convert(scan as u32),  // timsrust linear
+            Some(c) => c.one_over_k0(scan), // vendor ModelType-2 rational
+            None => {
+                let lo = scan.floor().max(0.0);
+                let frac = scan - lo;
+                let a = self.im.convert(lo as u32);
+                if frac == 0.0 {
+                    a
+                } else {
+                    a + frac * (self.im.convert(lo as u32 + 1) - a)
+                }
+            }
         }
     }
 
@@ -548,7 +583,8 @@ fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWindow>>> {
         let mut stmt = conn
             .prepare(
                 "SELECT p.Frame, p.ScanNumBegin, p.ScanNumEnd, p.IsolationMz, p.IsolationWidth, \
-                        p.CollisionEnergy, pr.MonoisotopicMz, pr.AverageMz, pr.Charge, pr.Intensity \
+                        p.CollisionEnergy, pr.MonoisotopicMz, pr.AverageMz, pr.Charge, pr.Intensity, \
+                        pr.Parent, pr.ScanNumber \
                  FROM PasefFrameMsMsInfo p LEFT JOIN Precursors pr ON pr.Id = p.Precursor \
                  ORDER BY p.Frame, p.ScanNumBegin",
             )
@@ -567,6 +603,8 @@ fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWindow>>> {
                         average_mz: r.get(7)?,
                         charge: r.get(8)?,
                         intensity: r.get(9)?,
+                        parent: r.get(10)?,
+                        scan_number: r.get(11)?,
                     },
                 ))
             })
@@ -600,6 +638,10 @@ fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWindow>>> {
                         average_mz: None,
                         charge: None,
                         intensity: None,
+                        // dia-PASEF windows are scheduled, not detected: there is no parent survey
+                        // frame and no precursor mobility peak to record.
+                        parent: None,
+                        scan_number: None,
                     },
                 ))
             })
@@ -646,4 +688,29 @@ fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
         t.polarity.push(pol);
     }
     Ok(t)
+}
+
+#[cfg(test)]
+mod single_point_chunk_tests {
+    use mzdata::prelude::*;
+    use mzdata::spectrum::{ArrayType, BinaryDataArrayType, DataArray};
+    use mzpeak_prototyping::chunk_series::ChunkingStrategy;
+
+    /// A single-point chunk stores an EMPTY values list (the start point lives in `chunk_start`).
+    /// The reader used to feed a hard-coded empty **Float64** array into the decoder for that case,
+    /// which pushed an f64 into the Int32 `tof` accumulator and panicked with `DataTypeSizeMismatch`
+    /// — making every `--ims-chunked` archive unreadable, since 105 of 415 chunks are single-point
+    /// at the default 50 Th width. Decoding an empty Int32 chunk must yield exactly the start point.
+    #[test]
+    fn empty_int32_chunk_decodes_to_its_start_point() {
+        let empty = arrow::array::new_empty_array(&arrow::datatypes::DataType::Int32);
+        let mut acc = DataArray::from_name_and_type(
+            &ArrayType::nonstandard("tof"),
+            BinaryDataArrayType::Int32,
+        );
+        let n = (ChunkingStrategy::Delta { chunk_size: 50.0 })
+            .decode_arrow(&empty, 123_456.0, 123_456.0, &mut acc, None);
+        assert_eq!(n, 1, "a single-point chunk decodes to exactly one point");
+        assert_eq!(acc.to_i32().unwrap().to_vec(), vec![123_456]);
+    }
 }
