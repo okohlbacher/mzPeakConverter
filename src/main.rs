@@ -179,12 +179,13 @@ struct Cli {
 
     /// Bruker timsTOF (TDF) ims-compact only — select the CHUNKED layout for rapid m/z-range access.
     /// OFF BY DEFAULT. When absent, timsTOF data is written in the ARCHIVE layout (the default): a flat
-    /// per-scan-delta table — maximum compression and fast whole-spectrum access, but no m/z index.
-    /// `--ims-chunked` instead splits each frame's peaks into true m/z 50-Th bins (override width with
-    /// `--chunk-size`, in Th); every chunk records its m/z min/max (`chunk_start`/`chunk_end`) as
-    /// Parquet columns WITH page statistics, so the m/z axis becomes page-prunable — XIC / m/z-slice
-    /// queries are ~20x faster — at roughly parity-to-+8% file size. TOF is delta-encoded within each
-    /// chunk (cumulative-sum to reconstruct, lossless). Mutually exclusive with per-scan delta.
+    /// table of absolute integer TOF bins — maximum compression and fast whole-spectrum access, but no
+    /// m/z index. `--ims-chunked` instead splits each frame's peaks into true m/z 50-Th bins (override
+    /// width with `--chunk-size`, in Th); every chunk records its main-axis (TOF) bounds
+    /// (`chunk_start`/`chunk_end`) as Parquet columns WITH page statistics, so the m/z axis becomes
+    /// page-prunable — XIC / m/z-slice queries are ~20x faster — at roughly parity-to-+8% file size.
+    /// TOF is delta-encoded within each chunk (start point excluded; cumulative-sum from
+    /// `chunk_start` to reconstruct, lossless).
     #[arg(long)]
     ims_chunked: bool,
 
@@ -498,12 +499,38 @@ fn run(cli: &Cli) -> Result<i32> {
     // `-o` pointing back at the input destroys it — with `--force` this silently ate a 120 MB archive
     // and still failed the conversion, leaving nothing. Compare device+inode rather than the path
     // text so a symlink, a hardlink, or `./x` vs `x` cannot slip past.
+    // A `.d` / `.raw` input is a DIRECTORY: an output inside it overwrites a vendor member
+    // (`-o Run.d/analysis.tsf`) or gets swept up by vendor preservation while it is still being
+    // written (`-o Run.d/out.mzpeak` → the archive streams itself in until the disk fills). Checked
+    // before the exists() test below because the self-embedding case starts from a fresh path.
+    if cli.input.is_dir() {
+        let out_dir = output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        if let (Ok(root), Ok(dir)) = (fs::canonicalize(&cli.input), fs::canonicalize(out_dir)) {
+            if dir.starts_with(&root) {
+                bail!(
+                    "output {} is inside the input directory {} — refusing (it would overwrite a \
+                     vendor file, or be embedded into itself by vendor preservation). Write outside \
+                     the input.",
+                    output.display(),
+                    cli.input.display()
+                );
+            }
+        }
+    }
+
     if output.exists() {
+        #[cfg(unix)]
         let same = match (fs::metadata(&cli.input), fs::metadata(&output)) {
             (Ok(a), Ok(b)) => {
                 use std::os::unix::fs::MetadataExt;
                 a.dev() == b.dev() && a.ino() == b.ino()
             }
+            _ => false,
+        };
+        // ponytail: no inode on Windows — canonicalized paths catch symlinks/`./x` but not hardlinks.
+        #[cfg(not(unix))]
+        let same = match (fs::canonicalize(&cli.input), fs::canonicalize(&output)) {
+            (Ok(a), Ok(b)) => a == b,
             _ => false,
         };
         if same {
@@ -523,6 +550,10 @@ fn run(cli: &Cli) -> Result<i32> {
         if output.exists() && !cfg.force {
             bail!("output {} exists (use --force to overwrite)", output.display());
         }
+        // Releases up to v0.7.2 could write `tof_encoding: per-scan-delta`, but no reader ever
+        // cumulatively summed it — every TOF bin after the first in a scan decodes as a tiny bin and
+        // squares to a nonsense m/z. Refuse rather than emit silently wrong masses.
+        reject_legacy_tof_delta(&cli.input)?;
         // `--no-vendor` strips the embedded vendor data on the filter path too — same effect as
         // `--drop-aux 'vendor*'` (the glob's `*` spans `/`, so it also catches `vendor/…` side-files).
         // (It is moot for mzML output — vendor facets aren't carried into mzML at all.)
@@ -2360,6 +2391,33 @@ fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
 /// are valid mzML and ProteomeDiscoverer emits them. If the input's header contains that pattern,
 /// write a sanitized copy where each empty group is rewritten as an explicit open/close pair and
 /// return its path; otherwise return None (convert the original in place). Only the small pre-
+/// Refuse to read an archive written with the removed per-scan TOF delta encoding.
+///
+/// Releases up to v0.7.2 could emit `ims_calibration.tof_encoding = "per-scan-delta"`, but no reader
+/// (ours or the reference one) ever cumulatively summed those deltas — only the first bin of each
+/// mobility scan decodes correctly and the rest square to nonsense m/z. The encoding is gone from the
+/// writer; this stops an old archive from silently producing wrong masses. Reconvert from the `.d`.
+fn reject_legacy_tof_delta(input: &Path) -> Result<()> {
+    let Ok(file) = fs::File::open(input) else { return Ok(()) };
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else { return Ok(()) };
+    let Ok(entry) = zip.by_name("mzpeak_index.json") else { return Ok(()) };
+    let Ok(idx) = serde_json::from_reader::<_, serde_json::Value>(entry) else { return Ok(()) };
+    let enc = idx
+        .get("metadata")
+        .and_then(|m| m.get("ims_calibration"))
+        .and_then(|c| c.get("tof_encoding"))
+        .and_then(|e| e.as_str());
+    if enc == Some("per-scan-delta") {
+        bail!(
+            "{} was written with the removed `per-scan-delta` TOF encoding, which no reader decodes \
+             correctly (deltas were never cumulatively summed, so every m/z after the first in a \
+             mobility scan is wrong). Reconvert from the original Bruker `.d` with this version.",
+            input.display()
+        );
+    }
+    Ok(())
+}
+
 /// The spectrum count an XML source declares in `<spectrumList count="N">`.
 ///
 /// Only meaningful for mzML/imzML, where the count is authoritative. Returns `None` when the input
@@ -2841,10 +2899,10 @@ where
     fixup_run_metadata(&mut writer, input);
 
     // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename.
-    // `tof_encoding` is now TRUTHFUL: "per-scan-delta" (default), "absolute" (--no-tof-delta / SDK),
-    // or "m/z-chunked" (--ims-chunked). For the chunked layout, `chunk_start`/`chunk_end` are the
-    // per-chunk m/z min/max (Parquet-page-prunable) and `tof` is delta-encoded within each chunk
-    // (first element absolute, cumsum from element 0 to reconstruct — NOT from chunk_start).
+    // `tof_encoding` is TRUTHFUL: "absolute" (archive layout + SDK) or "m/z-chunked"
+    // (--ims-chunked). For the chunked layout, `chunk_start`/`chunk_end` are the per-chunk main-axis
+    // (TOF) bounds and `tof` is delta-encoded within each chunk with the start point EXCLUDED
+    // (cumsum from `chunk_start` to reconstruct), per the spec's chunked-layout rules.
     let mut cal = serde_json::json!({
         "codec": "ims-compact",
         "lossless": "tof",

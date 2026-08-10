@@ -669,8 +669,12 @@ fn accumulate_counts(
             }
         }
         CountMode::Vendor => {
+            // `ordinal` on legacy/vendor facets; `source_index` on the v0.7 split secondaries
+            // (spectra_metadata_scans/_precursors/_selected_ions). Counting only `ordinal` wrote
+            // `spectrum_count = 0` into every filtered secondary facet.
             if let Some(idx) = batch
                 .column_by_name("ordinal")
+                .or_else(|| batch.column_by_name("source_index"))
                 .and_then(|a| to_u64(a))
             {
                 for r in 0..idx.len() {

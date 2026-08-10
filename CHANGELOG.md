@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Removed
+
+- **`--tof-delta` (per-scan TOF delta encoding) is gone, and archives that used it are rejected.**
+  The writer stored per-scan deltas, but no reader — ours or the reference one — ever cumulatively
+  summed them, so every TOF bin after the first in a mobility scan decoded as a tiny bin and squared
+  to a nonsense m/z. Its unit test only checked a hypothetical inverse in isolation and never
+  exercised the real reader, which is why round-trip checks passed. The flag, the
+  `mzpeak:tof_delta_reset` marker, and the `per-scan-delta` `tof_encoding` label are all removed; the
+  archive layout writes absolute bins. Reading a `.mzpeak` whose index still declares
+  `tof_encoding: per-scan-delta` (anything written by ≤ 0.7.2 with the flag on) now **fails with a
+  reconvert-from-`.d` message** rather than emitting silently wrong masses. No file in the reference
+  corpus is affected — all ims archives there are `absolute`.
+
+### Fixed
+
+- **Refuse to write the output over the input.** `-o` pointing back at the source (via any path
+  spelling, a symlink, or a hardlink) truncated it while the conversion was still reading — with
+  `--force` this destroyed a 120 MB archive and then failed, leaving nothing. Identity is compared by
+  device+inode on Unix and by canonicalized path elsewhere.
+- **The filter now removes secondary metadata rows for dropped spectra.** On the v0.7 split layout,
+  `classify_facet` fell through to a schema guess and copied `spectra_metadata_scans` /
+  `_precursors` / `_selected_ions` wholesale, so an `--ms-level` filter left orphaned rows pointing at
+  `source_index` values no longer present. Classification is now driven by the index's
+  `entity_type`/`data_kind`, with the pre-0.7 schema guess retained as the fallback.
+- **Portability:** the in-place guard no longer breaks the `x86_64-pc-windows-msvc` build.
+
 ## [0.7.2] — 2026-08-04
 
 ### Changed

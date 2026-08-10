@@ -86,7 +86,7 @@ mzpeak-convert run.raw
 mzpeak-convert run.raw -o run.mzpeak --force
 
 # Bruker timsTOF (.d): lossless ims-compact is the DEFAULT (--no-ims-compact to disable)
-# Layout defaults to "archive" (per-scan-delta, max compression, fast whole-spectrum access)
+# Layout defaults to "archive" (absolute TOF bins, max compression, fast whole-spectrum access)
 mzpeak-convert experiment.d -o experiment.mzpeak
 
 # Opt into the "chunked" layout for fast m/z-range / XIC queries (m/z-page-prunable, ~parity size)

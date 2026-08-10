@@ -336,8 +336,8 @@ impl NativeTofReader {
         // f32 is also lossy for counts > 2^24). Default keeps f32 for format stability.
         let (mut tof, mut intensity_f32, mut intensity_i32, mut mobility) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        // Absolute TOF extent for the observed-m/z range — tracked separately because `tof_delta`
-        // rewrites the `tof` column to per-scan deltas (so `tof.iter().min()` would be a delta, not a bin).
+        // Absolute TOF extent for the observed-m/z range, tracked as we go so the summary reflects
+        // real bins regardless of how the writer later encodes the column.
         let (mut tof_min, mut tof_max) = (i32::MAX, i32::MIN);
         for s in 0..n_scans {
             let (lo, hi) = (frame.scan_offsets[s], frame.scan_offsets[s + 1]);
@@ -417,7 +417,7 @@ impl NativeTofReader {
     /// monotonic in tof). The writer then splits these points into true-m/z-bin chunks and
     /// delta-encodes `tof` within each chunk. Sorting mixes mobility scans, which is lossless because
     /// mobility is stored explicitly per point. Same three arrays (`tof`, intensity, mobility) as the
-    /// default path, minus the `mzpeak:tof_delta_reset` marker (delta is per-chunk, not per-scan).
+    /// default path; the delta encoding lives entirely in the writer, per chunk.
     pub fn ims_compact_spectrum_chunked(
         &self,
         i: usize,

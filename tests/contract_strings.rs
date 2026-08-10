@@ -25,11 +25,10 @@ fn pinned(needle: &str) {
 fn ims_compact_calibration_pinned() {
     pinned("\"codec\": \"ims-compact\"");
     pinned("\"mz_from_tof\": \"(a + b*tof)^2\"");
-    // `tof_encoding` is now emitted from a variable with three TRUTHFUL values (was hard-coded
-    // "absolute", which lied when the native path wrote per-scan delta). The viewer must accept all
-    // three verbatim: "per-scan-delta" (default), "absolute" (--no-tof-delta / SDK), "m/z-chunked"
-    // (--ims-chunked). Each literal is emitted verbatim from src/main.rs.
-    pinned("\"per-scan-delta\"");
+    // `tof_encoding` is emitted from a variable with two TRUTHFUL values the viewer must accept
+    // verbatim: "absolute" (archive layout + SDK path) and "m/z-chunked" (--ims-chunked). The third,
+    // "per-scan-delta", was REMOVED in v0.7.3 — no reader ever cumsummed it, so it produced wrong
+    // m/z. Do not re-add the pin: the label must not reappear in emitted output.
     pinned("\"absolute\"");
     pinned("\"m/z-chunked\"");
 }
