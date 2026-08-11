@@ -1077,9 +1077,22 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
         // do not record it (timsTOF, imzML), not an injection time of zero milliseconds.
         self.ion_injection_time
             .append_option((item.injection_time != 0.0).then_some(item.injection_time));
-        self.ion_mobility_value.append_option(item.ion_mobility());
-        self.ion_mobility_type
-            .append_option(item.ion_mobility_type().and_then(|v| v.curie()).as_ref());
+        // A NaN mobility means "not measured", and `null` is how that is spelled in a numeric
+        // column — writing NaN puts a value in the column that no consumer can use and that
+        // silently poisons any min/max or arithmetic over it. Some sources really do carry it:
+        // an Agilent 6560 DTIMS mzML in the reference corpus declares
+        // `MS:1002476 ion mobility drift time` with `value="nan"` on all 982 scans.
+        //
+        // Drop the TYPE too when there is no value: declaring a mobility dimension the file cannot
+        // populate makes a reader plot an axis with nothing on it.
+        let mobility = item.ion_mobility().filter(|v| !v.is_nan());
+        self.ion_mobility_value.append_option(mobility);
+        self.ion_mobility_type.append_option(
+            mobility
+                .and(item.ion_mobility_type())
+                .and_then(|v| v.curie())
+                .as_ref(),
+        );
         self.instrument_configuration_ref
             .append_value(item.instrument_configuration_id);
         self.spectrum_reference
@@ -2056,16 +2069,27 @@ impl SpectrumDetailsBuilder {
         // spectrum (no peaks — e.g. newer-timsTOF blank frames) has NEITHER, so write NULL rather
         // than 0.0: a literal observed m/z of 0 would drag the file-level lowest-observed-m/z to 0
         // and mislabel a non-observation as a measurement.
+        // `> 0.0` alone is NOT enough: a min over an EMPTY peak list folds to `f64::INFINITY`, and
+        // `inf > 0.0` is true, so the +inf sailed through the very check this comment describes.
+        // 546 empty centroid spectra across 4 reference archives were written with
+        // `lowest_observed_mz = +inf` while `highest_observed_mz` on the same rows was null — the two
+        // bounds disagreeing about how to say "absent", and poisoning any reader that computes a
+        // file-level m/z range by aggregation. Require a FINITE positive value on both sides.
+        let finite_pos = |v: f64| v.is_finite() && v > 0.0;
         let (data_lo, data_hi) = summaries.mz_range;
-        let lo_mz = if data_lo > 0.0 {
+        let lo_mz = if finite_pos(data_lo) {
             Some(data_lo)
         } else {
-            item.get_param_by_curie(&curie!(MS:1000528)).and_then(|p| p.to_f64().ok()).filter(|v| *v > 0.0)
+            item.get_param_by_curie(&curie!(MS:1000528))
+                .and_then(|p| p.to_f64().ok())
+                .filter(|v| finite_pos(*v))
         };
-        let hi_mz = if data_hi > 0.0 {
+        let hi_mz = if finite_pos(data_hi) {
             Some(data_hi)
         } else {
-            item.get_param_by_curie(&curie!(MS:1000527)).and_then(|p| p.to_f64().ok()).filter(|v| *v > 0.0)
+            item.get_param_by_curie(&curie!(MS:1000527))
+                .and_then(|p| p.to_f64().ok())
+                .filter(|v| finite_pos(*v))
         };
         self.lowest_observed_mz.append_option(lo_mz);
         self.highest_observed_mz.append_option(hi_mz);

@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.6] — 2026-08-11
+
+### Fixed
+
+- **Non-finite values were written into numeric metadata columns instead of `null`.** Two paths:
+  - **`lowest_observed_mz` was `+inf` on empty spectra.** A min over an empty peak list folds to
+    `f64::INFINITY`, and the `> 0.0` guard meant to write null for empty spectra let it through
+    because `inf > 0.0` is true. **546 empty centroid spectra across 4 reference archives** carried
+    `+inf` while `highest_observed_mz` on the same rows was null — the two bounds disagreeing about
+    how to express "absent", and poisoning any reader computing a file-level m/z range by
+    aggregation. Both bounds now require a finite positive value.
+  - **`ion_mobility_value` was `NaN`.** An Agilent 6560 DTIMS mzML in the corpus declares
+    `MS:1002476 ion mobility drift time` with `value="nan"` on all 982 scans (the real drift times
+    were lost upstream, before this converter ever saw the file). We propagated the NaN verbatim, so
+    readers gating on `isnull()` saw 982 present-but-unusable values. Non-finite mobility is now
+    `null`, and `ion_mobility_type` is only declared when a usable value exists — a declared mobility
+    dimension with nothing in it makes a reader draw an empty axis.
+
+  Found by an adversarial review of a downstream viewer's bug report; the `+inf` case was in neither
+  the report nor my own triage.
+
 ## [0.7.5] — 2026-08-11
 
 ### Fixed
