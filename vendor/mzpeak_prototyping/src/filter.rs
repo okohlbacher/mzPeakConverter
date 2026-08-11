@@ -648,6 +648,17 @@ where
             was_zero = false;
         }
     }
+    // An ALL-ZERO array satisfies the skip condition at every index, so the loop above discards it
+    // entirely: a blank profile scan was stored with zero points, erasing its m/z extent, and the
+    // reader gates on count > 0 so it read back with no profile at all. Keep the first and last
+    // point — the same boundary zeros this filter preserves around any other run — so the spectrum
+    // survives with its extent intact.
+    if acc.is_empty() && n > 0 {
+        acc.push(0);
+        if n > 1 {
+            acc.push((n - 1) as u64);
+        }
+    }
     acc
 }
 

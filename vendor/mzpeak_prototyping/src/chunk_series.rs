@@ -1145,6 +1145,26 @@ impl ArrowArrayChunk {
                         fields_of
                             .insert(f.clone().with_unit(mzdata::params::Unit::Unknown), f.clone());
                     }
+                    // Same idea for the DTYPE. The schema is fixed by sampling a few spectra, and a
+                    // secondary array whose decoded width differs from the sampled one (Waters/Agilent
+                    // ion mobility arrives as f64 while the sampler declared f32) hashed to a
+                    // different BufferName, missed the schema lookup, and was spilled into
+                    // `auxiliary_arrays`. The declared column then stayed EMPTY next to a full
+                    // intensity list — a parallel-length violation with the mobility only reachable as
+                    // an opaque blob. Measured: 4,136 such chunk rows across 18 corpus archives.
+                    // Alias the other float widths onto the schema's field so the array lands in its
+                    // own column; the builder casts to the declared width.
+                    for alt in [BinaryDataArrayType::Float32, BinaryDataArrayType::Float64] {
+                        if alt != f.dtype {
+                            let mut a = f.clone();
+                            a.dtype = alt;
+                            fields_of.insert(a.clone(), f.clone());
+                            if !matches!(f.unit, mzdata::params::Unit::Unknown) {
+                                fields_of
+                                    .insert(a.with_unit(mzdata::params::Unit::Unknown), f.clone());
+                            }
+                        }
+                    }
                 }
             }
         }

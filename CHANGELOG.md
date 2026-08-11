@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.5] — 2026-08-11
+
+### Fixed
+
+- **A blank profile spectrum was stored with zero points.** An all-zero intensity array satisfies the
+  zero-run skip condition at *every* index, so the whole spectrum was discarded: its m/z extent was
+  erased and, because the reader gates on `count > 0`, it read back with no profile at all. The first
+  and last points are now kept — the same boundary zeros the filter preserves around any other run.
+  Verified: a 10-point all-zero profile scan now stores 2 points and round-trips with its extent
+  (m/z 200.00–200.09) intact.
+- **Random access to an empty spectrum aborted the process.** `PointDataReader::slice_to_arrays_of`
+  called `panic!("Could not find start and end in binary search")` when the binary search found no
+  span — which is exactly what an empty spectrum looks like. Under this crate's `panic = "abort"`
+  profile that terminates the host on an ordinary read, and newer timsTOF (5.1.x) emits precisely
+  such frames, which this build converts. It now returns the empty array map callers already handle.
+  Verified end to end on a point-layout archive containing two zero-length spectra.
+- **Ion mobility was declared as a column but written as an empty list.** The chunk schema is fixed
+  by sampling a few spectra; a secondary array whose decoded width differs from the sampled one
+  (Waters and Agilent ion mobility arrives as f64 where the sampler declared f32) hashed to a
+  different `BufferName`, missed the schema lookup, and was spilled into `auxiliary_arrays`. The
+  declared column then sat EMPTY beside a full intensity list — a parallel-length violation, with the
+  mobility reachable only as an opaque blob. **4,136 chunk rows across 18 corpus archives.** The
+  other float widths are now aliased onto the schema's field. Verified: mobility 0 → 468,914 points,
+  exactly matching intensity, with no auxiliary spill.
+
 ## [0.7.4] — 2026-08-10
 
 ### Fixed

@@ -394,17 +394,18 @@ impl PointDataCacheBlock {
 
         let (start, end) = self.find_span_for_query(index);
 
-        if !(start.is_some() && end.is_some()) {
-            panic!("Could not find start and end in binary search");
-            // for (i, idx) in indices.iter().enumerate() {
-            //     if idx.unwrap() == index {
-            //         if start.is_some() {
-            //             end = Some(i + 1)
-            //         } else {
-            //             start = Some(i)
-            //         }
-            //     }
-            // }
+        // A spectrum with NO points is a legitimate query target, not a bug: newer timsTOF (acq
+        // software 5.1.x) writes empty frames (`NumPeaks = 0`), and this build converts them. The
+        // binary search finds no span for such an index and used to `panic!` — under this crate's
+        // `panic = "abort"` profile that terminates the host process on an ordinary random-access
+        // read. Return the empty array map the caller already handles instead.
+        if start.is_none() || end.is_none() {
+            log::debug!("no point span for spectrum {index}; returning empty arrays (empty spectrum)");
+            let mut empty = BinaryArrayMap::new();
+            for (_, arr) in bin_map {
+                empty.add(arr);
+            }
+            return Ok(Some(empty));
         }
 
         let points = self.row_group.column(0).as_struct();

@@ -752,3 +752,66 @@ mod single_point_chunk_tests {
         assert_eq!(acc.to_i32().unwrap().to_vec(), vec![123_456]);
     }
 }
+
+#[cfg(test)]
+mod empty_frame_read_tests {
+    /// Random access to an EMPTY spectrum must not abort the process.
+    ///
+    /// Newer timsTOF (5.1.x) writes frames with `NumPeaks = 0`, which this build converts. The point
+    /// reader's binary search finds no span for such an index and used to `panic!`; with this crate's
+    /// `panic = "abort"` profile that kills the host on an ordinary read. Exercised end to end: build
+    /// an archive containing an empty spectrum and read every spectrum back by index.
+    #[test]
+    #[ignore = "needs the reference corpus (MZPEAK_CORPUS)"]
+    fn random_access_to_empty_spectrum_does_not_abort() {
+        use mzpeak_prototyping::MzPeakReader;
+        let Ok(root) = std::env::var("MZPEAK_CORPUS") else { return };
+        let archive = match std::env::var("MZPEAK_EMPTY_ARCHIVE") {
+            Ok(v) => std::path::PathBuf::from(v),
+            Err(_) => match walk(std::path::Path::new(&root), 6) {
+                Some(p) => p,
+                None => {
+                    eprintln!("skipping: no .mzpeak with an empty spectrum under {root}");
+                    return;
+                }
+            },
+        };
+        let mut r = match MzPeakReader::new(&archive) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("skipping: {}: {e}", archive.display()); return }
+        };
+        let n = r.len().min(500);
+        let mut empties = 0usize;
+        for i in 0..n {
+            match r.get_spectrum_peaks_for(i as u64) {
+                Ok(peaks) => {
+                    if peaks.map(|p| p.is_empty()).unwrap_or(true) { empties += 1 }
+                }
+                Err(e) => panic!("read of spectrum {i} failed: {e}"),
+            }
+        }
+        eprintln!("read {n} spectra from {}; {empties} empty", archive.display());
+    }
+
+    /// First archive under `dir` that reports at least one zero-point spectrum.
+    fn walk(dir: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {
+        if depth == 0 { return None }
+        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for p in &entries {
+            if p.extension().is_some_and(|e| e == "mzpeak") && p.is_file() && has_empty_spectrum(p) {
+                return Some(p.clone());
+            }
+        }
+        entries.into_iter().filter(|p| p.is_dir()).find_map(|p| walk(&p, depth - 1))
+    }
+
+    fn has_empty_spectrum(archive: &std::path::Path) -> bool {
+        let Ok(mut r) = mzpeak_prototyping::MzPeakReader::new(archive) else { return false };
+        use mzdata::prelude::SpectrumLike;
+        (0..r.len().min(4000)).any(|i| {
+            mzdata::prelude::SpectrumSource::get_spectrum_by_index(&mut r, i)
+                .is_some_and(|s| s.peaks().len() == 0)
+        })
+    }
+}
