@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.7] — 2026-08-12
+
+### Fixed
+
+- **The corpus harness's `--box` phase crashed on an undefined name.** `run_box()` referenced
+  `box_recipes`, which does not exist in its scope, so `--box` died with a `NameError` the moment it
+  had any unit to defer — after the host pass had run, and before a single unit reached the
+  workstation. The recipes are now threaded through as a parameter, which also fixes what the name
+  was reaching for: a box-built archive uses its descriptor's own `convert.flags`, so it matches the
+  recipe a host-built one would use (an SDRF demonstrator keeps `--sdrf` and its embedded
+  `sample_metadata/sdrf.tsv`). `--no-vendor` remains the fallback only where no flags are described.
+
+### Note
+
+  Completeness is measured against the **descriptors** (`data/<tile>/<id>/<id>.yaml`), not a walk of
+  the tree — the corpus publishes one representative per multi-run deposit. The harness falls back to
+  the walk when PyYAML is unavailable, which inflates the denominator; run it with an interpreter
+  that has PyYAML. Corpus at this release: **201/201 described archives current (100.0%)**, all
+  passing mzPeakValidator 0.9.16.
+
 ## [0.7.6] — 2026-08-11
 
 ### Fixed
