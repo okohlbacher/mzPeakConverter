@@ -347,7 +347,8 @@ def sync_box(version: str, repo: str = r"C:\Users\User\src\mzPeakConverter") -> 
     return ok
 
 
-def run_box(units: list[Path], root: Path, version: str, jobs: int) -> None:
+def run_box(units: list[Path], root: Path, version: str, jobs: int,
+            recipes: dict[Path, list[str]] | None = None) -> None:
     """Convert host-unsupported units on the box, relaying the archives back.
 
     Delegates the transfer to tools/box_convert.sh --local-manifest, which already stages the raw
@@ -364,7 +365,10 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int) -> None:
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("w") as fh:
         for u in units:
-            fh.write(f"{u}\t{target_for(u)}\t{' '.join(box_recipes.get(u) or ['--no-vendor'])}\n")
+            # The descriptor's own flags, so a box-built archive matches its host-built recipe
+            # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
+            flags = (recipes or {}).get(u) or ['--no-vendor']
+            fh.write(f"{u}\t{target_for(u)}\t{' '.join(flags)}\n")
     print(f"box       : {len(units)} unit(s) -> {manifest}")
     # box_convert.sh shells out to `python3` for the S3 relay, which needs boto3. The system python3
     # doesn't have it; the anaconda one does. Prepend it rather than patching the shared script.
@@ -480,7 +484,7 @@ def main() -> int:
     if args.box and not (args.report_only or args.dry_run):
         print()
         deferred = [u for u, d in results["skipped"] if "payload missing" not in d]
-        run_box(deferred, root, version, args.box_jobs)
+        run_box(deferred, root, version, args.box_jobs, recipe_flags)
 
     # ---- report -------------------------------------------------------------
     have = [t for t in groups if is_current(t, version)]
