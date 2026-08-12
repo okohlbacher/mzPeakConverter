@@ -244,8 +244,29 @@ def stamp_for(archive: Path) -> Path:
     return archive.with_suffix(archive.suffix + ".built")
 
 
+# Releases that produce BYTE-IDENTICAL archives, newest first within each group. The stamp records
+# which converter built an archive, and currency was an exact string match against the installed
+# one -- so a release that changed only tooling invalidated the entire corpus and demanded a
+# multi-hour rebuild to reproduce the same bytes. Only add a pair here when the release genuinely
+# cannot change output (e.g. 0.7.7 touched nothing but this harness); when in doubt, leave it out
+# and let the corpus rebuild.
+OUTPUT_COMPATIBLE: list[set[str]] = [
+    {"mzpeak-convert 0.7.6", "mzpeak-convert 0.7.7"},
+]
+
+
+def compatible_versions(version: str) -> set[str]:
+    """`version` plus any release known to produce identical output."""
+    out = {version}
+    for group in OUTPUT_COMPATIBLE:
+        if version in group:
+            out |= group
+    return out
+
+
 def is_current(archive: Path, version: str) -> bool:
-    """True when `archive` was produced by `version` AND uses the split-facet layout."""
+    """True when `archive` was produced by `version` (or an output-identical release) AND uses the
+    split-facet layout."""
     if not archive.exists():
         return False
     try:
@@ -255,7 +276,7 @@ def is_current(archive: Path, version: str) -> bool:
     except Exception:
         return False  # unreadable/truncated -> rebuild
     stamp = stamp_for(archive)
-    return stamp.exists() and stamp.read_text().strip() == version
+    return stamp.exists() and stamp.read_text().strip() in compatible_versions(version)
 
 
 def convert(unit: Path, binary: str, version: str, dry: bool,
