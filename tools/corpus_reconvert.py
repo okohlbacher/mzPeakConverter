@@ -131,6 +131,93 @@ def target_for(unit: Path) -> Path:
     return unit.with_suffix(".mzpeak")
 
 
+# ── descriptor awareness ────────────────────────────────────────────────────────────────────────
+# The corpus is DESCRIBED by `data/<tile>/<id>/<id>.yaml`: each descriptor names the one unit it
+# publishes (`convert.input`) and the recipe to build it with (`convert.flags`). Walking the tree for
+# raw units alone gets both wrong:
+#   * a multi-run deposit (PXD018751 ships 122 runs in one archive) yields 122 targets where the
+#     corpus publishes ONE representative, so a full pass recreates 100+ unpublished archives; and
+#   * flags are lost — an SDRF demonstrator built with `--sdrf` gets silently rebuilt WITHOUT its
+#     embedded `sample_metadata/sdrf.tsv`, i.e. the run loses its sample metadata.
+# So: honour the descriptor where there is one. Tiles in MULTI_UNIT_TILES keep every-unit behaviour
+# because they are deliberately multi-file (the ProteoWizard reader-regression corpus).
+MULTI_UNIT_TILES = {"pwiz-examples"}
+
+
+def load_recipes(root: Path) -> tuple[dict[Path, list[str]], dict[Path, Path], set[Path], set[Path]]:
+    """-> (extra flags by unit, pinned unit by dataset dir, skipped dataset dirs, all governed dirs).
+
+    Missing PyYAML is not fatal: without it we cannot read descriptors, so the caller falls back to
+    the every-unit walk rather than silently publishing the wrong set.
+    """
+    try:
+        import yaml  # noqa: PLC0415
+    except ImportError:
+        print("warn      : PyYAML unavailable — descriptors not read, falling back to every-unit walk")
+        return {}, {}, set(), set()
+    import shlex  # noqa: PLC0415
+    flags: dict[Path, list[str]] = {}
+    pinned: dict[Path, Path] = {}
+    skipped: set[Path] = set()
+    governed: set[Path] = set()
+    for desc in sorted(root.glob("*/*/*.yaml")):
+        if desc.name in {"_tile.yaml", "TEMPLATE.yaml"}:
+            continue
+        if desc.parent.parent.name in MULTI_UNIT_TILES:
+            continue
+        try:
+            doc = yaml.safe_load(desc.read_text()) or {}
+        except Exception:
+            continue
+        cv, dd = (doc.get("convert") or {}), desc.parent
+        governed.add(dd)
+        if cv.get("skip"):
+            skipped.add(dd)
+            continue
+        spec = cv.get("input")
+        if spec and spec != "auto":
+            unit = dd / spec
+            pinned[dd] = unit
+            if cv.get("flags"):
+                flags[unit] = shlex.split(str(cv["flags"]))
+    return flags, pinned, skipped, governed
+
+
+def apply_recipes(units: list[Path], pinned: dict[Path, Path], skipped: set[Path],
+                  governed: set[Path]) -> list[Path]:
+    """Narrow the walked units to what the descriptors actually publish.
+
+    For a dataset whose descriptor pins `convert.input`, keep only that unit (or units inside it,
+    for a vendor directory). A dataset with no pin is untouched, so auto-detection still applies —
+    this only ever narrows where the corpus has stated explicitly what it publishes.
+    """
+    kept: list[Path] = []
+    unpinned: dict[Path, list[Path]] = {}
+    for u in units:
+        ds = next((d for d in (*pinned, *skipped, *governed) if d in u.parents), None)
+        if ds is None:
+            kept.append(u)                      # outside a described dataset -> unchanged behaviour
+        elif ds in skipped:
+            continue                            # convert.skip -> not ours to build
+        elif ds in pinned:
+            pin = pinned[ds]
+            if u == pin or pin in u.parents:
+                kept.append(u)                  # the described unit (or a unit inside a vendor dir)
+        else:
+            unpinned.setdefault(ds, []).append(u)
+    # A described dataset with no explicit `convert.input` still publishes ONE archive: a multi-run
+    # deposit (PXD018751: 122 runs in one zip) must not yield 122 unpublished archives. Pick one
+    # representative deterministically — pin `convert.input` in the descriptor to choose a different
+    # one. Single-unit datasets are unaffected.
+    for ds, us in sorted(unpinned.items()):
+        us = sorted(us)
+        kept.append(us[0])
+        if len(us) > 1:
+            print(f"note      : {ds.name} has {len(us)} units and no convert.input — building only "
+                  f"{us[0].name} (one per described set)")
+    return kept
+
+
 # Vendor-native formats first: several datasets ship the SAME acquisition as both a vendor raw and a
 # converted mzML sharing one stem, so both units resolve to one `.mzpeak`. Converting both is
 # meaningless and, run concurrently, they race on the output path. Pick one per target — the native
@@ -171,8 +258,13 @@ def is_current(archive: Path, version: str) -> bool:
     return stamp.exists() and stamp.read_text().strip() == version
 
 
-def convert(unit: Path, binary: str, version: str, dry: bool) -> tuple[Path, str, str]:
-    """-> (unit, status, detail). status in {converted, skipped, failed}."""
+def convert(unit: Path, binary: str, version: str, dry: bool,
+            extra: list[str] | None = None) -> tuple[Path, str, str]:
+    """-> (unit, status, detail). status in {converted, skipped, failed}.
+
+    `extra` carries the descriptor's `convert.flags` (e.g. `--sdrf study.sdrf.tsv`, `--zstd-level 12`)
+    so a rebuild reproduces the published archive instead of a bare default conversion.
+    """
     out = target_for(unit)
     if dry:
         return unit, "would-convert", ""
@@ -184,7 +276,7 @@ def convert(unit: Path, binary: str, version: str, dry: bool) -> tuple[Path, str
     if unit.is_dir() and not any((unit / m).exists() for m in VENDOR_PAYLOAD_MARKERS):
         return unit, "skipped", "vendor payload missing (incomplete download)"
     proc = subprocess.run(
-        [binary, str(unit), "-o", str(out), "-f"],
+        [binary, str(unit), "-o", str(out), "-f", *(extra or [])],
         capture_output=True,
         text=True,
     )
@@ -272,7 +364,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int) -> None:
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("w") as fh:
         for u in units:
-            fh.write(f"{u}\t{target_for(u)}\t--no-vendor\n")
+            fh.write(f"{u}\t{target_for(u)}\t{' '.join(box_recipes.get(u) or ['--no-vendor'])}\n")
     print(f"box       : {len(units)} unit(s) -> {manifest}")
     # box_convert.sh shells out to `python3` for the S3 relay, which needs boto3. The system python3
     # doesn't have it; the anaconda one does. Prepend it rather than patching the shared script.
@@ -297,7 +389,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int) -> None:
                 pass
 
 
-def convert_target(cands: list[Path], binary: str, version: str, dry: bool) -> tuple[Path, str, str]:
+def convert_target(cands: list[Path], binary: str, version: str, dry: bool, recipes: dict | None = None) -> tuple[Path, str, str]:
     """Convert the best candidate for one output archive; fall back on the next if it cannot run.
 
     Only a `skipped` outcome falls through — a genuine `failed` is reported as-is rather than being
@@ -305,7 +397,7 @@ def convert_target(cands: list[Path], binary: str, version: str, dry: bool) -> t
     """
     last = None
     for i, u in enumerate(cands):
-        unit, status, detail = convert(u, binary, version, dry)
+        unit, status, detail = convert(u, binary, version, dry, (recipes or {}).get(u))
         if status != "skipped":
             if i:
                 detail = (detail + " " if detail else "") + f"(fallback from {cands[0].name})"
@@ -337,6 +429,16 @@ def main() -> int:
     units = find_units(root)
     print(f"raw units : {len(units)}")
 
+    # Honour the descriptors: build what the corpus PUBLISHES, with the recipe it publishes it under.
+    recipe_flags, pinned, desc_skipped, governed = load_recipes(root)
+    if governed:
+        before = len(units)
+        units = apply_recipes(units, pinned, desc_skipped, governed)
+        dropped = before - len(units)
+        print(f"descriptors: {len(pinned)} pinned, {len(desc_skipped)} skipped"
+              + (f" -> {dropped} undescribed unit(s) not built" if dropped else "")
+              + (f"; {len(recipe_flags)} carry convert.flags" if recipe_flags else ""))
+
     if args.clean and not (args.dry_run or args.report_only):
         removed = 0
         for p in list(root.rglob("*.mzpeak")) + list(root.rglob("*.mzpeak.built")):
@@ -363,7 +465,7 @@ def main() -> int:
     if not args.report_only and todo:
         started = time.time()
         with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futs = {pool.submit(convert_target, groups[t], binary, version, args.dry_run): t for t in todo}
+            futs = {pool.submit(convert_target, groups[t], binary, version, args.dry_run, recipe_flags): t for t in todo}
             for i, fut in enumerate(cf.as_completed(futs), 1):
                 unit, status, detail = fut.result()
                 results[status].append((unit, detail))
