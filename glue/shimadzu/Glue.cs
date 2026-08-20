@@ -4,11 +4,14 @@
 // Shimadzu.LabSolutions.IO managed API and exposes a tiny C ABI (matching src/shimadzu.rs) of
 // [UnmanagedCallersOnly] static methods to the Rust host (which boots CoreCLR via netcorehost).
 //
-// ⚠️ WINDOWS-RUNTIME-ONLY AND UNTESTED. This compiles anywhere (no compile-time reference to the
-//    Shimadzu DLLs — everything vendor-specific is reached through reflection at runtime), but only
-//    *runs* where Shimadzu.LabSolutions.IO.IoModule.dll (sourced from a ProteoWizard install, flat
-//    in pwiz-bin) and a compatible .NET 8 runtime are present. It also carries the restrictive
-//    Shimadzu EULA — see README.md.
+// ⚠️ WINDOWS-RUNTIME-ONLY. This compiles anywhere (no compile-time reference to the Shimadzu DLLs
+//    — everything vendor-specific is reached through reflection at runtime), but only *runs* where
+//    Shimadzu.LabSolutions.IO.IoModule.dll (sourced from a ProteoWizard install, flat in pwiz-bin)
+//    and a compatible .NET 8 runtime are present. It also carries the restrictive Shimadzu EULA —
+//    see README.md.
+//
+//    Verified against real data on 2026-08-20 (LCMS-9030 QTOF). Set MZPC_SHIMADZU_DEBUG=1 to trace
+//    scan-count discovery and the mass-unit resolution on stderr; both fail silently otherwise.
 //
 // SHIMADZU.LABSOLUTIONS.IO API SHAPE (from ProteoWizard ShimadzuReader.cpp), all reached by
 // reflection here:
@@ -77,6 +80,19 @@ internal sealed class ShimadzuData
     public required MethodInfo GetSpectrumByScan;
 }
 
+/// <summary>Diagnostics for the scan-count discovery, which otherwise swallows every failure and
+/// reports 0 spectra with no clue why. Set MZPC_SHIMADZU_DEBUG=1 to trace it on stderr.</summary>
+internal static class Dbg
+{
+    private static readonly bool On =
+        Environment.GetEnvironmentVariable("MZPC_SHIMADZU_DEBUG") is string v && v != "0" && v != "";
+
+    internal static void Say(string msg)
+    {
+        if (On) Console.Error.WriteLine("[shimadzu-glue] " + msg);
+    }
+}
+
 internal static class Reflect
 {
     public static PropertyInfo? Prop(object o, params string[] names)
@@ -97,6 +113,45 @@ internal static class Reflect
         => t.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)
             .FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)
                                  && m.GetParameters().Length == argCount);
+
+    /// <summary>Invoke `m` after coercing each argument to the parameter type the method actually
+    /// declares.</summary>
+    ///
+    /// <remarks>
+    /// Reflection `Invoke` demands EXACT value types: a boxed `int` will not bind to a `short`,
+    /// `uint` or enum parameter, it throws ArgumentException. The Shimadzu signatures use a mix
+    /// (`GetMSSpectrumInfo(uint scan, ...)`, `GetEventNo(short, short)`), and the widths drift
+    /// between LabSolutions releases, so hardcoding them here would break on the next one. Both the
+    /// segment/event scan-count path and its probe fallback were failing on exactly this and being
+    /// swallowed by a bare `catch`, so every `.lcd` reported 0 spectra whatever the file contained.
+    /// `out`/`ref` parameters are coerced through their element type and written back by the caller.
+    /// </remarks>
+    public static object? InvokeCoerced(MethodInfo m, object target, object?[] args)
+    {
+        var ps = m.GetParameters();
+        for (int i = 0; i < ps.Length && i < args.Length; i++)
+        {
+            var want = ps[i].ParameterType;
+            if (want.IsByRef) want = want.GetElementType()!;
+            args[i] = Coerce(args[i], want);
+        }
+        return m.Invoke(target, args);
+    }
+
+    /// <summary>Best-effort conversion of a boxed value to `want` (enums and numeric widths).</summary>
+    public static object? Coerce(object? value, Type want)
+    {
+        if (value == null) return null;
+        if (want.IsInstanceOfType(value)) return value;
+        try
+        {
+            if (want.IsEnum) return Enum.ToObject(want, Convert.ToInt64(value, CultureInfo.InvariantCulture));
+            if (want.IsPrimitive || want == typeof(decimal))
+                return Convert.ChangeType(value, want, CultureInfo.InvariantCulture);
+        }
+        catch { /* fall through: hand the original back and let Invoke report it */ }
+        return value;
+    }
 
     /// <summary>A status enum (or int) is "success" iff its integer value is 0 or its name is a
     /// known OK synonym. Shimadzu's IDataIO/ISpectrum methods return such a status.</summary>
@@ -170,12 +225,47 @@ public static class Api
                 }
             }
         }
-        return 20.0; // fallback hypothesis
+        // Nothing found. Dump the candidates so the constant can be identified rather than guessed:
+        // getting this wrong does not fail, it silently writes a WRONG m/z axis.
+        if (true)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()
+                         .Where(a => (a.GetName().Name ?? "").StartsWith("Shimadzu", StringComparison.OrdinalIgnoreCase)))
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); } catch { continue; }
+                foreach (var t in types)
+                    foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+                    {
+                        var n = f.Name.ToUpperInvariant();
+                        if (!n.Contains("UNIT") && !n.Contains("MASS") && !n.Contains("SCALE")) continue;
+                        object? v = null;
+                        try { v = f.GetValue(null); } catch { }
+                        Dbg.Say($"candidate constant {t.FullName}.{f.Name} = {v}");
+                    }
+            }
+        }
+        // The vendor assembly exposes NO such constant (verified by dumping every static field whose
+        // name mentions UNIT/MASS/SCALE on an LCMS-9030 install: none). ProteoWizard carries it as a
+        // C++ constant in ShimadzuReader.cpp, not in the managed DLL, so it cannot be reflected and
+        // must be pinned here.
+        //
+        // 10000 = masses stored as integers with 4 decimal places. Established against a known-good
+        // msconvert conversion of the same file (MTBLS5861 HEK_PosOAD1.lcd, LCMS-9030 QTOF):
+        // msconvert reports m/z 70.0-1250.0, the raw integers are 700000-12500000, ratio 10000
+        // exactly on both bounds. The previous fallback of 20 was a guess and was wrong by 500x.
+        Dbg.Say("MASSNUMBER_UNIT not exposed by the vendor assembly; using the pinned 10000");
+        return 10000.0;
     }
 
     // --- open / scan-count -------------------------------------------------------------------
 
-    internal static ShimadzuData Open(string path, string pwizDir)
+    // NOT named `Open`: the exported [UnmanagedCallersOnly] `Open(ushort*, ushort*)` lives in this
+    // same class, and the Rust host resolves exports by NAME through reflection. An overload made
+    // that lookup ambiguous, so every native `.lcd` conversion died at startup with
+    // AmbiguousMatchException (HRESULT 0x8000211D) -- before touching the file, which is why it
+    // looked like an unsupported .lcd variant. Keep exported entry-point names unique in `Api`.
+    internal static ShimadzuData OpenData(string path, string pwizDir)
     {
         var asm = LoadIoModule(pwizDir);
         var dataType = asm.GetType("Shimadzu.LabSolutions.IO.Data.DataObject")
@@ -196,7 +286,9 @@ public static class Api
         var parameters = Reflect.GetProp(ms, "Parameters");
         var chromatogram = Reflect.GetProp(ms, "Chromatogram");
 
-        var massMul = 1.0 / ResolveMassNumberUnit();
+        var unit = ResolveMassNumberUnit();
+        var massMul = 1.0 / unit;
+        Dbg.Say($"MASSNUMBER_UNIT resolved to {unit} (massMul={massMul})");
         int scanCount = ComputeScanCount(spectrum, parameters, chromatogram);
 
         var getInfo = Reflect.Method(spectrum.GetType(), "GetMSSpectrumInfo", 8)
@@ -232,11 +324,12 @@ public static class Api
                 if (gat != null)
                 {
                     var args = new object?[] { 0, 0, 0 };
-                    gat.Invoke(parameters, args);
+                    Reflect.InvokeCoerced(gat, parameters, args);
                     endTime = Convert.ToInt32(args[1] ?? 0);
                 }
             }
             var retTimeToScan = Reflect.Method(spectrum.GetType(), "RetTimeToScan", 3);
+            Dbg.Say($"endTime={endTime} chromatogram={(chromatogram != null)} retTimeToScan={(retTimeToScan != null)} parameters={(parameters != null)}");
 
             if (chromatogram != null && retTimeToScan != null && endTime > 0)
             {
@@ -245,14 +338,14 @@ public static class Api
                 var getEventNoM = Reflect.Method(chromatogram.GetType(), "GetEventNo", 2);
                 for (int seg = 1; seg <= segCount; seg++)
                 {
-                    int evCount = eventCountM != null ? Convert.ToInt32(eventCountM.Invoke(chromatogram, new object[] { seg })) : 1;
+                    int evCount = eventCountM != null ? Convert.ToInt32(Reflect.InvokeCoerced(eventCountM, chromatogram, new object?[] { seg })) : 1;
                     for (int ei = 1; ei <= evCount; ei++)
                     {
                         short eventNo = getEventNoM != null
-                            ? Convert.ToInt16(getEventNoM.Invoke(chromatogram, new object[] { seg, ei }))
+                            ? Convert.ToInt16(Reflect.InvokeCoerced(getEventNoM, chromatogram, new object?[] { seg, ei }))
                             : (short)ei;
                         var args = new object?[] { (uint)0, endTime, eventNo };
-                        var st = retTimeToScan.Invoke(spectrum, args);
+                        var st = Reflect.InvokeCoerced(retTimeToScan, spectrum, args);
                         if (Reflect.Ok(st))
                         {
                             int last = Convert.ToInt32(args[0] ?? 0);
@@ -262,8 +355,9 @@ public static class Api
                 }
             }
         }
-        catch { lastScan = 0; }
+        catch (Exception e) { Dbg.Say($"segment/event scan-count path threw: {e.GetType().Name}: {e.Message}"); lastScan = 0; }
 
+        Dbg.Say($"segment/event scan-count path -> lastScan={lastScan}");
         if (lastScan > 0) return lastScan;
 
         // Fallback: probe upward with GetMSSpectrumInfo until failure (bounded).
@@ -278,13 +372,21 @@ public static class Api
                 {
                     var args = new object?[] { scan, 0, 0, 0, 0, null, 0, (short)0 };
                     object? st;
-                    try { st = getInfo.Invoke(spectrum, args); } catch { break; }
-                    if (!Reflect.Ok(st)) break;
+                    try { st = Reflect.InvokeCoerced(getInfo, spectrum, args); }
+                    catch (Exception e)
+                    {
+                        Dbg.Say($"probe GetMSSpectrumInfo(scan={scan}) threw: " +
+                                $"{(e.InnerException ?? e).GetType().Name}: {(e.InnerException ?? e).Message}");
+                        break;
+                    }
+                    if (!Reflect.Ok(st)) { Dbg.Say($"probe GetMSSpectrumInfo(scan={scan}) status={st}"); break; }
                 }
                 lastScan = scan - 1;
+                Dbg.Say($"probe fallback -> lastScan={lastScan}");
             }
+            else Dbg.Say("probe fallback: GetMSSpectrumInfo(8 args) not found");
         }
-        catch { }
+        catch (Exception e) { Dbg.Say($"probe fallback threw: {e.GetType().Name}: {e.Message}"); }
         return lastScan;
     }
 
@@ -294,7 +396,7 @@ public static class Api
     {
         var m = new ShimadzuSpectrumMeta { ScanNumber = scan, MsLevel = 1, Polarity = 2, SignalContinuity = 0 };
         var args = new object?[] { scan, 0, 0, 0, 0, null, 0, (short)0 };
-        var st = d.GetSpectrumInfo.Invoke(d.SpectrumObj, args);
+        var st = Reflect.InvokeCoerced(d.GetSpectrumInfo, d.SpectrumObj, args);
         if (Reflect.Ok(st))
         {
             int retTime = Convert.ToInt32(args[1] ?? 0);
@@ -323,7 +425,7 @@ public static class Api
     {
         object? specObj = null;
         var args = new object?[] { null, scan, true }; // out spectrum, scan, profileDesired
-        var st = d.GetSpectrumByScan.Invoke(d.SpectrumObj, args);
+        var st = Reflect.InvokeCoerced(d.GetSpectrumByScan, d.SpectrumObj, args);
         if (Reflect.Ok(st)) specObj = args[0];
         if (specObj == null) throw new Exception($"GetMSSpectrumByScan failed for scan {scan}: {st}");
 
@@ -374,7 +476,7 @@ public static class Api
         {
             string path = new string((char*)pathUtf16);
             string pwiz = new string((char*)pwizDirUtf16);
-            var d = Open(path, pwiz);
+            var d = OpenData(path, pwiz);
             lock (Gate)
             {
                 long h = _nextHandle++;

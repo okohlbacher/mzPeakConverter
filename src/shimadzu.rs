@@ -1,9 +1,14 @@
 //! Native Shimadzu LabSolutions `.lcd` reader → mzdata spectra (native lane, no msconvert).
 //!
-//! ⚠️ WINDOWS-RUNTIME-ONLY AND UNTESTED. Verified to *compile* behind `#[cfg(windows)]` on any
-//! host, but it only *runs* where `Shimadzu.LabSolutions.IO.IoModule.dll` (from a ProteoWizard
-//! install, flat in pwiz-bin) and a .NET 8 runtime exist. There is no macOS/Linux build of the
-//! Shimadzu stack. The DLL also carries a restrictive Shimadzu EULA — see `glue/shimadzu/README.md`.
+//! ⚠️ WINDOWS-RUNTIME-ONLY. It only *runs* where `Shimadzu.LabSolutions.IO.IoModule.dll` (from a
+//! ProteoWizard install, flat in pwiz-bin) and a .NET 8 runtime exist. There is no macOS/Linux build
+//! of the Shimadzu stack. The DLL also carries a restrictive Shimadzu EULA — see
+//! `glue/shimadzu/README.md`.
+//!
+//! **Verified on real data (2026-08-20)**, LCMS-9030 QTOF `HEK_PosOAD1.lcd`: 2,101 spectra, MS1+MS2,
+//! m/z 70–1250, RT 0–16.99 min. Against a msconvert conversion of the same file the intensities are
+//! bit-identical and m/z agrees to < 2 ppm; msconvert additionally pads each profile spectrum with
+//! two zero-intensity points at the scan-window bounds, which this lane does not emit.
 //!
 //! ## How it works (mirrors `src/sciex.rs`)
 //!
@@ -25,7 +30,7 @@
 use std::ffi::OsStr;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -88,7 +93,30 @@ struct GlueApi {
     last_error: ShimLastError,
 }
 
+/// The CoreCLR runtime, booted ONCE per process.
+///
+/// `hostfxr` refuses a second `initialize_for_runtime_config` in the same process
+/// ("Initialization request is expected to be non-null for requests other than the first one",
+/// 0x80008081). `-v` opens the reader once for the inspection report and again for the conversion,
+/// so a per-open init made the two paths mutually exclusive: verbose conversion always failed.
+/// The delegate loader is cheap to share and the glue is internally locked, so cache it.
+static GLUE: OnceLock<Mutex<Option<GlueApi>>> = OnceLock::new();
+
 impl GlueApi {
+    /// Process-wide, initialized on first use. Later calls hand back a clone of the same exports.
+    fn shared(glue_dir: &Path) -> Result<Self> {
+        let cell = GLUE.get_or_init(|| Mutex::new(None));
+        let mut slot = cell
+            .lock()
+            .map_err(|_| anyhow!("Shimadzu glue lock poisoned by an earlier panic"))?;
+        if let Some(api) = slot.as_ref() {
+            return Ok(api.clone());
+        }
+        let api = Self::load(glue_dir)?;
+        *slot = Some(api.clone());
+        Ok(api)
+    }
+
     fn load(glue_dir: &Path) -> Result<Self> {
         let runtime_config = glue_dir.join("ShimadzuGlue.runtimeconfig.json");
         let assembly = glue_dir.join("ShimadzuGlue.dll");
@@ -190,7 +218,7 @@ impl ShimadzuReader {
                 )
             })?;
         let pwiz_dir = resolve_shimadzu_dll_dir()?;
-        let api = GlueApi::load(&glue_dir)?;
+        let api = GlueApi::shared(&glue_dir)?;
 
         let path_utf16 = to_utf16_nul(path.as_os_str())
             .with_context(|| format!("encoding .lcd path {}", path.display()))?;
