@@ -251,7 +251,10 @@ def stamp_for(archive: Path) -> Path:
 # cannot change output (e.g. 0.7.7 touched nothing but this harness); when in doubt, leave it out
 # and let the corpus rebuild.
 OUTPUT_COMPATIBLE: list[set[str]] = [
-    {"mzpeak-convert 0.7.6", "mzpeak-convert 0.7.7"},
+    # 0.7.7 changed only this harness. 0.7.8 changed only src/shimadzu.rs and glue/shimadzu/Glue.cs,
+    # both reachable solely through the #[cfg(windows)] native `.lcd` lane -- which errored on every
+    # file before 0.7.8, so no archive in existence was produced by it. Every other lane is untouched.
+    {"mzpeak-convert 0.7.6", "mzpeak-convert 0.7.7", "mzpeak-convert 0.7.8"},
 ]
 
 

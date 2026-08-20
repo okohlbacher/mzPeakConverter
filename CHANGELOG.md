@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.8] — 2026-08-20
+
+### Fixed
+
+- **The native Shimadzu `.lcd` lane now works — it never had.** Three defects, each fatal on its own,
+  none of which could surface as more than "0 spectra" or a bare HRESULT:
+  - **`Api.Open` was overloaded.** The exported `[UnmanagedCallersOnly] Open(ushort*, ushort*)` sat
+    beside an internal `Open(string, string)` in the same class, and the Rust host resolves exports
+    **by name** through reflection. The lookup was ambiguous, so every conversion died at startup
+    with `AmbiguousMatchException` (`0x8000211D`) before touching the file.
+  - **CoreCLR was initialized per reader-open.** `hostfxr` refuses a second
+    `initialize_for_runtime_config` in one process (`0x80008081`), so `-v` — which opens the reader
+    for the inspection report and again for the conversion — could never convert. The delegate loader
+    is now a process-wide singleton.
+  - **Reflected calls passed boxed `int` where the vendor API declares `short`, `uint` or an enum.**
+    `Invoke` demands exact value types, so the scan-count path and its probe fallback both threw
+    `ArgumentException` into bare `catch` blocks and reported 0 spectra for *every* file. Arguments
+    are now coerced to each method's declared parameter types, which also absorbs the signature drift
+    between LabSolutions releases.
+- **The m/z axis was wrong by 500×.** `MASSNUMBER_UNIT` is not exposed by the vendor assembly at all
+  (verified by dumping every static field mentioning UNIT/MASS/SCALE — none), so the reflection
+  lookup always fell through to a guessed `20.0`. Pinned to `10000` (masses as integers with four
+  decimals), established against a msconvert conversion of the same file: raw 700000–12500000 against
+  m/z 70–1250, exactly 10000 on both bounds.
+
+### Added
+
+- `MZPC_SHIMADZU_DEBUG=1` traces scan-count discovery and mass-unit resolution to stderr. Both failed
+  silently before, which is why broken glue looked like an unsupported `.lcd` variant.
+
+### Verification
+
+  `MTBLS5861/HEK_PosOAD1.lcd` (LCMS-9030 QTOF) converted natively on the Windows box: **2,101
+  spectra, MS1+MS2, m/z 70–1250, RT 0–16.99 min** — identical to msconvert on all four. Point-for-point
+  over 16,075 points: **intensities bit-identical**, m/z within **7.9e-4 (< 2 ppm)**. msconvert
+  additionally pads each profile spectrum with two zero-intensity points at the scan-window bounds;
+  the native lane emits only real vendor points.
+
+  Note for `REMOVED.md`: MTBLS432's *native* failure was attributed to an unsupported `.lcd` variant,
+  but that error was `0x8000211D` — the overload bug above, which hit every file. Its msconvert
+  failure (`E_UNSUPPORTEDFILE`) was genuine, so the removal stands, but that file is worth retrying.
+
 ## [0.7.7] — 2026-08-12
 
 ### Fixed
