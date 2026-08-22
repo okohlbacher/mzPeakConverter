@@ -28,7 +28,28 @@ pub struct TofGrid {
 /// is well within TOF mass accuracy — while the `median_dk == 1` density gate rejects non-TOF data
 /// (Orbitrap/QqQ-SRM, off by tens to hundreds of ppm at any dense grid). For a tighter bound a finer
 /// grid (smaller ppm, larger `tof_index`) is selected automatically by the refinement fallback.
-pub const PPM_TOL: f64 = 5.0;
+pub const PPM_TOL_DEFAULT: f64 = 5.0;
+
+/// Reconstruction tolerance for the grid fit, in ppm.
+///
+/// 5 ppm is the SCIEX-accuracy bound this lane was built for. It is overridable through
+/// `MZPC_TOF_GRID_PPM` because whether a vendor's m/z is "on a lattice" is a property of the DATA,
+/// not of this code: Shimadzu `.lcd` rounds m/z to four decimals, which perturbs the underlying
+/// flight-time lattice by a few ppm (measured on a QTOF DIA run: median ~5 ppm, max ~25 ppm), so a
+/// fit that is real is nonetheless rejected at 5. Raising it trades exactness for size — the lane is
+/// bounded-lossy by construction and the bound is exactly this number, so anything above the
+/// instrument's own mass accuracy is not defensible.
+pub fn ppm_tol() -> f64 {
+    static TOL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *TOL.get_or_init(|| {
+        std::env::var("MZPC_TOF_GRID_PPM")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0 && v.is_finite())
+            .inspect(|v| log::warn!("TOF-grid tolerance overridden to {v} ppm (default {PPM_TOL_DEFAULT})"))
+            .unwrap_or(PPM_TOL_DEFAULT)
+    })
+}
 /// Keep k within signed-31-bit range with a safety margin (DELTA_BINARY_PACKED makes the absolute
 /// magnitude almost free, but the column is Int32 so k MUST fit).
 pub const MAX_K: i64 = 1_900_000_000;
@@ -202,7 +223,7 @@ pub fn fit_one(mzs: &[f64]) -> Option<(TofGrid, Vec<i32>, f64)> {
     }
     let s_min = sqrt_mz.iter().cloned().fold(f64::INFINITY, f64::min);
     // The natural digitizer step is ~`base`; accept the COARSEST grid (smallest k → best compression)
-    // whose every point reconstructs within PPM_TOL, falling to finer multiples only if the natural
+    // whose every point reconstructs within ppm_tol(), falling to finer multiples only if the natural
     // quantization is too coarse.
     for mult in [1.0, 0.5, 0.25, 0.125] {
         let step = base * mult;
@@ -212,7 +233,7 @@ pub fn fit_one(mzs: &[f64]) -> Option<(TofGrid, Vec<i32>, f64)> {
         }
         let grid = TofGrid { c0, c1 };
         let (max_ppm, _median, max_k) = evaluate(&grid, mzs);
-        if max_ppm <= PPM_TOL && max_k <= MAX_K {
+        if max_ppm <= ppm_tol() && max_k <= MAX_K {
             let mut idx = Vec::with_capacity(mzs.len());
             for &m in mzs {
                 idx.push(grid.tof_index(m)?);
@@ -265,7 +286,7 @@ pub fn fit_one_c1(mzs: &[f64], c1: f64) -> Option<(TofGrid, Vec<i32>, f64)> {
         }
         idx.push(k);
     }
-    if max_ppm <= PPM_TOL {
+    if max_ppm <= ppm_tol() {
         Some((grid, idx, max_ppm))
     } else {
         None
@@ -308,6 +329,59 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
         }
         pooled.extend(spec.iter().copied().filter(|&m| m > 0.0));
     }
+    // `base_step` infers the lattice step from the spacing between ADJACENT points, which is only
+    // the detector step for DENSE profile data. Vendors that peak-detect and then round m/z (Shimadzu
+    // `.lcd` rounds to 1e-4) present sparse points whose median gap is ~0.35 m/z — thousands of times
+    // coarser than the lattice they actually lie on. The fit then "succeeds" onto a grid so coarse
+    // that ~300 distinct m/z collapse onto one index: measured on a QTOF DIA run, 490,646 distinct
+    // m/z mapped to 42,817 indices with 72.8 ppm error, which is pure quantization, not misfit.
+    //
+    // `MZPC_TOF_GRID_C1` forces the sqrt-space step instead of inferring it. Choose it so the grid
+    // step at the TOP of the m/z range resolves the vendor's quantum: c1 = quantum / (2*sqrt(mz_max)).
+    // For a 1e-4 lattice topping out at m/z 1700 that is ~1.2e-6, giving 0.12 ppm with k <= 26M —
+    // comfortably Int32.
+    let forced_c1 = std::env::var("MZPC_TOF_GRID_C1")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && v.is_finite());
+    if let Some(c1) = forced_c1 {
+        log::warn!("TOF-grid c1 forced to {c1:e} (skipping step inference)");
+        let mut worst = 0.0f64;
+        let mut all_ppm: Vec<f64> = Vec::new();
+        let mut max_k: i64 = 0;
+        for spec in sample_spectra {
+            if let Some((g, ks, mp)) = fit_one_c1(spec, c1) {
+                worst = worst.max(mp);
+                max_k = max_k.max(ks.iter().copied().max().unwrap_or(0) as i64);
+                for (&k, &m) in ks.iter().zip(spec.iter()) {
+                    if m > 0.0 {
+                        all_ppm.push((g.mz(k) - m).abs() / m * 1e6);
+                    }
+                }
+            }
+        }
+        if all_ppm.is_empty() || worst > ppm_tol() || max_k > MAX_K {
+            log::warn!(
+                "TOF-grid forced c1 rejected: max {worst:.3} ppm (tol {:.2}), k_max {max_k}",
+                ppm_tol()
+            );
+            return None;
+        }
+        all_ppm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = all_ppm[all_ppm.len() / 2];
+        let c0 = {
+            let s_min = pooled.iter().cloned().fold(f64::INFINITY, |a, b| a.min(b.sqrt()));
+            s_min - 1e-9
+        };
+        return Some(FitOutcome {
+            grid: TofGrid { c0, c1 },
+            max_ppm: worst,
+            median_ppm: median,
+            max_k,
+            median_dk: 1,
+        });
+    }
+
     let base = first_step?;
     if pooled.len() < 16 {
         return None;
@@ -335,7 +409,7 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
         let (max_ppm, median_ppm, max_k) = evaluate(&grid, &pooled);
         // The natural lattice: dense adjacency (median dk == 1) AND lossless within instrument
         // accuracy AND fits Int32. This is the compression sweet spot.
-        if mdk == 1 && max_ppm <= PPM_TOL && max_k <= MAX_K {
+        if mdk == 1 && max_ppm <= ppm_tol() && max_k <= MAX_K {
             return Some(FitOutcome { grid, max_ppm, median_ppm, max_k, median_dk: mdk });
         }
     }
@@ -355,7 +429,7 @@ pub fn fit(sample_spectra: &[Vec<f64>]) -> Option<FitOutcome> {
             break;
         }
         let mdk = robust_median_dk(&grid, &probes);
-        if max_ppm <= PPM_TOL {
+        if max_ppm <= ppm_tol() {
             if mdk <= MAX_MEDIAN_DK {
                 best = Some(FitOutcome { grid, max_ppm, median_ppm, max_k, median_dk: mdk });
             }
@@ -384,13 +458,13 @@ mod tests {
             k += if k % 7 == 0 { 3 } else { 1 };
         }
         let out = fit(&[spec.clone(), spec.clone()]).expect("should fit exact lattice");
-        assert!(out.max_ppm <= PPM_TOL, "max_ppm {} over tol", out.max_ppm);
+        assert!(out.max_ppm <= ppm_tol(), "max_ppm {} over tol", out.max_ppm);
         // Round-trip every point losslessly within tolerance.
         for &mz in &spec {
             let k = out.grid.tof_index(mz).expect("index");
             let rec = out.grid.mz(k);
             let ppm = (rec - mz).abs() / mz * 1e6;
-            assert!(ppm <= PPM_TOL, "roundtrip ppm {ppm} for mz {mz}");
+            assert!(ppm <= ppm_tol(), "roundtrip ppm {ppm} for mz {mz}");
         }
     }
 

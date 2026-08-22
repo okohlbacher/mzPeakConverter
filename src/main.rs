@@ -1748,7 +1748,7 @@ fn tof_grid_spectrum(
         // instead (per-spectrum), so the off-lattice MS2 / sparse spectra stay exact while the dense
         // MS1 profile (99%+ of the data) still grids.
         match grid.tof_index(mz) {
-            Some(k) if (grid.mz(k) - mz).abs() <= mz * tof_grid::PPM_TOL * 1e-6 => tof.push(k),
+            Some(k) if (grid.mz(k) - mz).abs() <= mz * tof_grid::ppm_tol() * 1e-6 => tof.push(k),
             _ => {
                 all_on_grid = false;
                 break;
@@ -2195,7 +2195,7 @@ fn convert_file(
                     bail!(
                         "--tof-grid on: input {} is not losslessly griddable (no per-run integer TOF \
                          lattice within {:.2} ppm); use --tof-grid auto to fall back to f64 m/z",
-                        input.display(), tof_grid::PPM_TOL
+                        input.display(), tof_grid::ppm_tol()
                     );
                 }
                 log::info!("TOF-grid auto: no lossless grid fit — keeping standard f64 m/z");

@@ -55,3 +55,7 @@ tools/box.env*
 # Python build artifacts in the vendored mzpeak_prototyping/python bindings
 **/*.egg-info/
 **/__pycache__/
+
+# Vendor-supplied example acquisitions and their conversions (tens of GB, often EULA-bound).
+# Kept locally for benchmarking; never committed.
+vendor-examples/

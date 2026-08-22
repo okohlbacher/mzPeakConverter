@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.9] — 2026-08-22
+
+### Added
+
+- **`MZPC_TOF_GRID_PPM`** overrides the TOF-grid reconstruction tolerance (default 5 ppm). Whether a
+  vendor's m/z lies on a flight-time lattice is a property of the *data*, not of this code, so the
+  bound needs to be adjustable to measure a candidate before committing to it. The lane is
+  bounded-lossy by construction and this number IS the bound, so anything above the instrument's own
+  mass accuracy is not defensible.
+- **`MZPC_TOF_GRID_C1`** forces the sqrt-space grid step instead of inferring it.
+
+  `base_step` infers the step from the spacing between *adjacent* points, which is the detector step
+  only for dense profile data. A vendor that peak-detects and then rounds m/z presents sparse points
+  whose spacing is orders of magnitude coarser than the lattice they actually lie on — so the fit
+  "succeeds" onto a grid far too coarse and the error is pure quantization, not misfit. Measured on a
+  Shimadzu QTOF DIA run: the inferred grid mapped **490,646 distinct m/z onto 42,817 indices** with
+  **72.8 ppm** error, while forcing `c1 = 1.2e-6` (the step that resolves that vendor's 1e-4 m/z
+  quantum at the top of its range) gives **0.12 ppm max, 0.024 ppm median**, with `k ≤ 26,023,743` —
+  comfortably Int32.
+
+  The principled choice is `c1 = quantum / (2·sqrt(mz_max))`. Deriving it automatically from the data
+  is the obvious follow-up; this exposes the knob so the effect can be measured first.
+
+### Note
+
+  Conversion fidelity for the mzML → mzPeak path was verified exhaustively on Shimadzu QTOF DIA data:
+  **21,500 spectra and 279,707,903 points compared against the source mzML with zero difference** in
+  m/z, intensity, retention time, precursor m/z, spectrum id, MS level and peak counts — including
+  through chunked storage and numpress-linear m/z.
+
 ## [0.7.8] — 2026-08-20
 
 ### Fixed
