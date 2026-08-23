@@ -10,9 +10,8 @@ All notable changes to this project are documented here. The format follows
 
 - **Shimadzu `.lcd` now defaults to lossless delta m/z chunking instead of numpress-linear.**
   This vendor stores m/z as scaled integers (fixed-point, 1e-4), so consecutive values are
-  near-constant integer deltas — which delta + `DELTA_BINARY_PACKED` encodes far better than
-  numpress-linear's floating-point prediction. Measured on two QTOF DIA runs (21,500 and 22,113
-  spectra):
+  near-constant deltas, whose byte patterns zstd compresses far better than numpress-linear's
+  floating-point prediction residual. Measured on two QTOF DIA runs (21,500 and 22,113 spectra):
 
   | | archive | time | m/z fidelity |
   |---|---:|---:|---|
@@ -27,6 +26,15 @@ All notable changes to this project are documented here. The format follows
   acquisition (verified: 279,707,903 points, zero difference) and lossy on the profile data the native
   `.lcd` lane reads. So this is defaulted per vendor rather than globally. `--no-numpress` continues
   to work everywhere and is now a no-op for `.lcd`.
+
+  **Correction (2026-08-22):** the original wording of this entry said the delta path uses
+  `DELTA_BINARY_PACKED`. It does not. `null_delta_encode` is generic over `Float` and emits a
+  **Float64** array (`vendor/mzpeak_prototyping/src/filter.rs:799`), and `DELTA_BINARY_PACKED` is
+  assigned only to columns whose name ends in `_index`
+  (`vendor/mzpeak_prototyping/src/writer/base.rs:1369`). The m/z delta column is Float64 stored PLAIN
+  and compressed by zstd. The measured 27.3% win is unaffected — only the stated mechanism was wrong.
+  Found by two independent adversarial reviews (Codex and Kimi), which flagged it separately with the
+  same citations.
 
   Also measured and rejected: chunk width is already optimal at the default 50 Th (5 Th costs +15%,
   200 Th costs more too), `--layout point` is +38%, and `--zstd-level 19` buys a further 1.6% for
