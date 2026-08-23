@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.10] — 2026-08-22
+
+### Changed
+
+- **Shimadzu `.lcd` now defaults to lossless delta m/z chunking instead of numpress-linear.**
+  This vendor stores m/z as scaled integers (fixed-point, 1e-4), so consecutive values are
+  near-constant integer deltas — which delta + `DELTA_BINARY_PACKED` encodes far better than
+  numpress-linear's floating-point prediction. Measured on two QTOF DIA runs (21,500 and 22,113
+  spectra):
+
+  | | archive | time | m/z fidelity |
+  |---|---:|---:|---|
+  | numpress-linear (old default) | 1,125 MB | 102 s | off the vendor lattice by up to 3.8e-3 |
+  | **delta (new default)** | **818 MB** | **92 s** | **on the lattice to 3.7e-9** |
+
+  **Smaller (−27.3%), faster, and exact** — numpress was losing on all three. The loss it introduced
+  is ~1 ppb, far below any instrument's mass accuracy, so archives already written are not
+  scientifically compromised; they are simply 27% larger than they needed to be.
+
+  Numpress fidelity is **data-dependent** — it is exact on the centroid mzML export of the same
+  acquisition (verified: 279,707,903 points, zero difference) and lossy on the profile data the native
+  `.lcd` lane reads. So this is defaulted per vendor rather than globally. `--no-numpress` continues
+  to work everywhere and is now a no-op for `.lcd`.
+
+  Also measured and rejected: chunk width is already optimal at the default 50 Th (5 Th costs +15%,
+  200 Th costs more too), `--layout point` is +38%, and `--zstd-level 19` buys a further 1.6% for
+  2.1× the runtime — worth it for archival, not for bulk conversion.
+
 ## [0.7.9] — 2026-08-22
 
 ### Added

@@ -618,11 +618,31 @@ fn run(cli: &Cli) -> Result<i32> {
         }
     }
 
+    // Shimadzu `.lcd` stores m/z as scaled integers (fixed-point, 1e-4), so consecutive values are
+    // near-constant integer deltas. Lossless delta chunking is therefore strictly better than
+    // numpress-linear on this vendor -- SMALLER, FASTER *and* exact, measured on two QTOF DIA runs:
+    //
+    //     default (numpress)  1,125 MB   102 s   m/z off the vendor lattice by up to 3.8e-3
+    //     delta               818 MB      92 s   on the lattice to 3.7e-9
+    //
+    // Numpress-linear's floating-point prediction fights a fixed-point lattice: it both compresses
+    // worse and fails to reproduce the vendor's integers (~1 ppb, below any instrument's accuracy,
+    // but paid for with 27% more space). Its fidelity is data-dependent -- it IS exact on the
+    // centroid mzML export of the same acquisition -- so this defaults per vendor, not globally.
+    let numpress_hurts = is_lcd(&cli.input);
     let chunk = match cfg.layout {
         Layout::Point => None,
-        Layout::Chunked if cfg.no_numpress => Some(ChunkingStrategy::Delta { chunk_size: cfg.chunk_size }),
+        Layout::Chunked if cfg.no_numpress || numpress_hurts => {
+            Some(ChunkingStrategy::Delta { chunk_size: cfg.chunk_size })
+        }
         Layout::Chunked => Some(ChunkingStrategy::NumpressLinear { chunk_size: cfg.chunk_size }),
     };
+    if numpress_hurts && !cfg.no_numpress {
+        log::info!(
+            "Shimadzu .lcd: using lossless delta m/z chunking (numpress-linear is larger AND lossy \
+             on this vendor's fixed-point m/z)"
+        );
+    }
 
     if output.exists() && !cfg.force {
         bail!("output {} exists (use --force to overwrite)", output.display());
