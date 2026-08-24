@@ -159,6 +159,23 @@ impl WatersReader {
             }));
         }
 
+        // Log what the vendor actually said. Without this, a working `isContinuum` and a silently
+        // failing one are indistinguishable from the output whenever the run happens to be all
+        // continuum -- which is the common case, and exactly how an unverified binding hides.
+        log::info!(
+            "MassLynx continuum flags by function: {}",
+            continuum
+                .iter()
+                .enumerate()
+                .map(|(f, c)| match c {
+                    Some(true) => format!("{f}=continuum"),
+                    Some(false) => format!("{f}=centroid"),
+                    None => format!("{f}=unknown"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
         let mut index = Vec::new();
         for f in 0..n_functions {
             let mut n_scans: c_int = 0;
