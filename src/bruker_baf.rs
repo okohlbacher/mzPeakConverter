@@ -39,6 +39,10 @@ use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
 };
 
+// The CLI enum rather than `shimadzu::Representation`: that module is `cfg(windows)` while this
+// one also builds on Linux, so importing it there would break the Linux build.
+use crate::RepresentationArg;
+
 /// Hard cap on how many doubles a single BAF array may report. Guards against a
 /// corrupt cache / hostile library returning an enormous count that would
 /// exhaust memory before we ever read it.
