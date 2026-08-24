@@ -95,6 +95,20 @@ All notable changes to this project are documented here. The format follows
 - `tools/lcd_streams.py` — report whether a Shimadzu `.lcd` stores profile, centroid, or both, by
   reading the OLE2 stream sizes directly. No Windows, vendor DLL, or conversion needed.
 
+- **mzML export of a dual spectrum no longer mislabels the data.** mzML holds one representation per
+  spectrum. Under the faithful `both` default the reader hands the writer profile arrays *plus* a
+  centroid peak list, and mzdata then serialises the typed peaks while taking continuity from the
+  description — writing centroid data labelled `profile spectrum`. `.lcd → mzML` now collapses to
+  the profile (less-processed) view up front, so the bytes and the label agree; an explicit
+  `--representation centroid` still exports the peak lists. Because `Representation::Profile` falls
+  back to whatever the file actually stores, a centroid-only `.lcd` still exports correctly-labelled
+  centroids.
+
+- **`mzPeak → mzML` says what it drops.** The reader's default preference is profile, so a
+  dual-facet archive silently exported half its content. It now warns with the count
+  (`2101/2101 spectra carry both a profile and a peak facet; …the peak lists are dropped`).
+  Required making `ReaderMetadata::spectra` public so a caller can see the two facet counts.
+
 ### Notes
 
 - **The dual-facet path is now demonstrated on real data.** Of the four `.lcd` files available, two

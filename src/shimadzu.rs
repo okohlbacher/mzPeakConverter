@@ -408,9 +408,12 @@ impl ShimadzuReader {
             if (!profile.0.is_empty() || !centroid.0.is_empty())
                 && !self.fallback_warned.swap(true, Ordering::Relaxed)
             {
+                // Neutral wording on purpose: the mzML export path maps the `both` DEFAULT onto
+                // `Profile` to collapse to one representation, so naming the requested variant here
+                // would report a choice the user never made.
                 log::warn!(
-                    "--representation {:?} was requested but this file stores the other \
-                     representation; writing what it actually contains, correctly labelled",
+                    "this file does not store the requested representation ({:?}); writing the one \
+                     it does contain, correctly labelled",
                     self.representation
                 );
             }

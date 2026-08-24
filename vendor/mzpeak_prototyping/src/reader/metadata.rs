@@ -247,7 +247,9 @@ impl ReaderFacetMetadataLike for ChromatogramMetadataFacet {
 #[derive(Debug, Clone)]
 pub struct ReaderMetadata {
     pub(crate) mz_metadata: mzdata::meta::FileMetadataConfig,
-    pub(crate) spectra: SpectrumMetadataFacet,
+    /// Per-spectrum metadata columns, including the two facet counts a caller needs to
+    /// tell whether a spectrum carries profile data, peak data, or both.
+    pub spectra: SpectrumMetadataFacet,
     pub(crate) chromatograms: ChromatogramMetadataFacet,
     pub(crate) wavelength_spectra: Option<Box<WavelengthSpectrumMetadataFacet>>,
 }

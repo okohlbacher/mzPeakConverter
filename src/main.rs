@@ -1190,14 +1190,24 @@ fn convert_to_mzml(
         // default `both` still has to collapse to one on export; but an explicit `profile` /
         // `centroid` must pick which, and previously did not reach this path at all -- the two
         // exports came out byte-identical.
-        let r = shimadzu::ShimadzuReader::open_with(
-            input,
-            match representation() {
-                RepresentationArg::Both => shimadzu::Representation::Both,
-                RepresentationArg::Profile => shimadzu::Representation::Profile,
-                RepresentationArg::Centroid => shimadzu::Representation::Centroid,
-            },
-        )?;
+        // mzML holds ONE representation per spectrum. Under the faithful `both` default the reader
+        // hands the writer profile arrays PLUS a centroid peak list, and mzdata then serialises the
+        // typed peaks while taking continuity from the description -- writing centroid data labelled
+        // `profile spectrum`. Collapse here instead, to the profile (less-processed) view, so the
+        // bytes and the label agree. `Representation::Profile` already falls back to whatever the
+        // file actually stores, so a centroid-only `.lcd` still exports correctly-labelled centroids.
+        let rep = match representation() {
+            RepresentationArg::Both => {
+                log::info!(
+                    "--to mzml: mzML carries one representation per spectrum; exporting the profile \
+                     view where present (pass --representation centroid for the peak lists)"
+                );
+                shimadzu::Representation::Profile
+            }
+            RepresentationArg::Profile => shimadzu::Representation::Profile,
+            RepresentationArg::Centroid => shimadzu::Representation::Centroid,
+        };
+        let r = shimadzu::ShimadzuReader::open_with(input, rep)?;
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
     // Agilent profile `.d` off Windows: the pure-Rust MSProfile.bin reader gives native mzML without
@@ -1315,6 +1325,25 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let mut reader =
         MzPeakReader::new(input).with_context(|| format!("opening {} as mzPeak", input.display()))?;
     let total = reader.len();
+    // An mzPeak spectrum may carry BOTH facets; an mzML spectrum cannot. The reader's default
+    // preference is profile, so the peak lists are dropped — correct, but it used to be silent.
+    // Say so, once, with the count, rather than quietly halving what the archive holds.
+    {
+        let dp = reader.metadata.spectra.data_point_counts();
+        let pk = reader.metadata.spectra.peak_counts();
+        let dual = dp
+            .iter()
+            .zip(pk.iter())
+            .filter(|(d, p)| **d > 0 && **p > 0)
+            .count();
+        if dual > 0 {
+            log::warn!(
+                "{dual}/{total} spectra carry both a profile and a peak facet; mzML holds one \
+                 representation per spectrum, so the profile view is exported and the peak lists \
+                 are dropped"
+            );
+        }
+    }
     let cap = max_spectra();
 
     // Pass 1 (metadata-only): collect the surviving indices — no peak arrays decoded here, so the
