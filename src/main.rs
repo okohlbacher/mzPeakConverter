@@ -1186,7 +1186,18 @@ fn convert_to_mzml(
     }
     #[cfg(windows)]
     if is_lcd(input) {
-        let r = shimadzu::ShimadzuReader::open(input)?;
+        // Honour --representation here too. mzML carries ONE representation per spectrum, so the
+        // default `both` still has to collapse to one on export; but an explicit `profile` /
+        // `centroid` must pick which, and previously did not reach this path at all -- the two
+        // exports came out byte-identical.
+        let r = shimadzu::ShimadzuReader::open_with(
+            input,
+            match representation() {
+                RepresentationArg::Both => shimadzu::Representation::Both,
+                RepresentationArg::Profile => shimadzu::Representation::Profile,
+                RepresentationArg::Centroid => shimadzu::Representation::Centroid,
+            },
+        )?;
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
     // Agilent profile `.d` off Windows: the pure-Rust MSProfile.bin reader gives native mzML without

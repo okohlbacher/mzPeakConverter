@@ -87,12 +87,43 @@ All notable changes to this project are documented here. The format follows
 - One-entry memo in the glue for `Api.Data`, since the reader asks for profile then centroid on the
   same scan — without it every spectrum cost two `GetMSSpectrumByScan` round-trips.
 
+- `--representation` now reaches the `--to mzml` export path too. It previously did not: that path
+  called `ShimadzuReader::open` rather than `open_with`, so `--representation profile` and
+  `--representation centroid` produced byte-identical mzML. mzML carries one representation per
+  spectrum, so the default `both` still collapses on export, but an explicit choice is now honoured.
+
+- `tools/lcd_streams.py` — report whether a Shimadzu `.lcd` stores profile, centroid, or both, by
+  reading the OLE2 stream sizes directly. No Windows, vendor DLL, or conversion needed.
+
 ### Notes
 
-- **The measured `.lcd` files store centroids only.** `ProfileList` is empty on every scan and does
-  not fill when the vendor's `profileDesired` flag is flipped; msconvert reads the same three files
-  as 100% `MS:1000127` (21,501 / 22,114 / 193 spectra, zero profile). So the dual-facet path is
-  implemented and exercised but not yet demonstrated on data that carries both.
+- **The dual-facet path is now demonstrated on real data.** Of the four `.lcd` files available, two
+  store BOTH representations and two store centroids only — settled at the container level rather
+  than inferred from the reader. A `.lcd` is an OLE2 compound file carrying a symmetric pair of raw
+  streams, and the unused one is present at ZERO length:
+
+  | file | `QTFL RawData/Profile Data` | `QTFL RawData/Centroid Data` | stores |
+  |---|---:|---:|---|
+  | `Blind_P1_pos_012` | 48,503,000 B (87.4%) | 3,016,418 B (5.4%) | **profile + centroid** |
+  | `HEK_PosOAD1` | 42,156,216 B (66.7%) | 18,511,430 B (29.3%) | **profile + centroid** |
+  | `DIA_Hela_20ng` | **0 B** | 2,803,102,880 B (99.8%) | centroid only |
+  | `DIA_Hela_100ng` | **0 B** | 2,828,715,992 B (99.8%) | centroid only |
+
+  So the DIA runs were acquired with profile saving off — not a reader limitation. `tools/lcd_streams.py`
+  reports this for any `.lcd` without Windows, the vendor DLL, or a conversion. Corroborated by
+  enumerating all 1,280 types in `Shimadzu.LabSolutions.IO.IoModule` v3.8.4.6016: the only
+  spectrum-level profile accessor is `MassSpectrumObject.ProfileList`, which is what the glue reads.
+
+  Converting the two dual files writes both facets, every row carrying both counts:
+
+  | | spectra | `spectra_data` | `spectra_peaks` | rows with both counts |
+  |---|---:|---:|---:|---:|
+  | `Blind_P1_pos_012` | 13,200 | 1,225,829 pts | 216,742 peaks | **13,200 / 13,200** |
+  | `HEK_PosOAD1` | 2,101 | 11,119,571 pts | 1,543,961 peaks | **2,101 / 2,101** |
+
+  Both PASS mzPeakValidator 0.9.1 with 0 errors and 0 warnings. The profile is genuinely dense
+  (median m/z spacing 0.0044, ~6.3 points per peak, a third of them flanking zeros) and the centroid
+  intensity is peak AREA rather than apex — centroid/Σprofile ≈ 0.86–0.93 versus centroid/apex ≈ 4.4–7.1.
 
 - **The correctness fix initially cost 89% in size (818 MB → 1,547 MB), now recovered.** Chunked
   encoding was applied by `write_spectrum_binary_array_map` on the data facet only; the peaks facet
