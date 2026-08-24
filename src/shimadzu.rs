@@ -30,6 +30,7 @@
 use std::ffi::OsStr;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -39,6 +40,7 @@ use netcorehost::pdcstring::PdCString;
 use netcorehost::{nethost, pdcstr};
 
 use mzdata::curie;
+use mzpeaks::{CentroidPeak, PeakSet};
 use mzdata::params::{Param, Unit};
 use mzdata::prelude::ParamDescribed;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
@@ -76,8 +78,10 @@ type ShimOpen = extern "system" fn(*const u16, *const u16) -> i64;
 type ShimClose = extern "system" fn(i64);
 type ShimSpectrumCount = extern "system" fn(i64) -> i64;
 type ShimSpectrumMetaFn = extern "system" fn(i64, i64, *mut ShimadzuSpectrumMeta) -> i32;
+/// `which`: 0 = profile, 1 = centroid. Both exist for the same scan; each is fetched separately so
+/// an archive can carry both facets (see `Representation`).
 type ShimSpectrumData =
-    extern "system" fn(i64, i64, *mut *const f64, *mut *const f32, *mut i64) -> i32;
+    extern "system" fn(i64, i64, i32, *mut *const f64, *mut *const f32, *mut i64) -> i32;
 type ShimDataFree = extern "system" fn(i64, *const f64, *const f32);
 type ShimLastError = extern "system" fn(*mut u16, i32) -> i32;
 
@@ -199,16 +203,38 @@ impl GlueApi {
 
 /// A native Shimadzu `.lcd` reader yielding one [`MultiLayerSpectrum`] per scan (1-based on the
 /// vendor side, 0-based here). ⚠️ Windows-runtime-only and untested.
+/// Which representation(s) to read from a `.lcd`.
+///
+/// Shimadzu exposes `ProfileList` and `CentroidList` for the SAME scan, and mzPeak carries both by
+/// design (`spectra_data` + `spectra_peaks`). `Both` is the faithful default; the others force one
+/// view when that is what a caller wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Representation {
+    #[default]
+    Both,
+    Profile,
+    Centroid,
+}
+
 pub struct ShimadzuReader {
     api: GlueApi,
     handle: i64,
     count: usize,
     lcd_path: PathBuf,
+    representation: Representation,
+    /// One-shot latch so the "you asked for X, the file has Y" warning is emitted once per file
+    /// rather than once per spectrum.
+    fallback_warned: AtomicBool,
     _not_thread_safe: PhantomData<*const ()>,
 }
 
 impl ShimadzuReader {
+    /// Open with the faithful default: read whichever representations the file actually has.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, Representation::default())
+    }
+
+    pub fn open_with(path: &Path, representation: Representation) -> Result<Self> {
         let glue_dir = std::env::var_os("MZPC_SHIMADZU_GLUE")
             .map(PathBuf::from)
             .ok_or_else(|| {
@@ -256,6 +282,8 @@ impl ShimadzuReader {
             handle,
             count,
             lcd_path: path.to_path_buf(),
+            representation,
+            fallback_warned: AtomicBool::new(false),
             _not_thread_safe: PhantomData,
         })
     }
@@ -283,7 +311,8 @@ impl ShimadzuReader {
         Ok(meta)
     }
 
-    fn peaks(&self, i: usize) -> Result<(Vec<f64>, Vec<f32>)> {
+    /// Fetch one representation of spectrum `i`. `which`: 0 = profile, 1 = centroid.
+    fn peaks(&self, i: usize, which: i32) -> Result<(Vec<f64>, Vec<f32>)> {
         let index = i64::try_from(i).map_err(|_| anyhow!("Shimadzu index {i} does not fit in i64"))?;
         let mut mz_ptr: *const f64 = std::ptr::null();
         let mut int_ptr: *const f32 = std::ptr::null();
@@ -292,6 +321,7 @@ impl ShimadzuReader {
         let rc = (self.api.spectrum_data)(
             self.handle,
             index,
+            which,
             &mut mz_ptr as *mut _,
             &mut int_ptr as *mut _,
             &mut len as *mut _,
@@ -357,7 +387,63 @@ impl ShimadzuReader {
             bail!("Shimadzu spectrum index {i} out of range (len {})", self.count);
         }
         let meta = self.meta(i)?;
-        let (mz, intensity) = self.peaks(i)?;
+        // Shimadzu exposes profile AND centroid for the same scan. Fetch what was asked for and
+        // report which one actually carried data, so the spectrum can be LABELLED correctly --
+        // previously the continuity flag was dropped at the ABI boundary and every spectrum was
+        // written as "profile" whatever it held.
+        let want_profile = self.representation != Representation::Centroid;
+        let want_centroid = self.representation != Representation::Profile;
+        let mut profile = if want_profile { self.peaks(i, 0)? } else { (Vec::new(), Vec::new()) };
+        let mut centroid = if want_centroid { self.peaks(i, 1)? } else { (Vec::new(), Vec::new()) };
+        // An explicit `--representation profile` on a file that stores only centroids (which is what
+        // these Shimadzu `.lcd` runs are) would otherwise leave both arrays empty and then LABEL that
+        // emptiness -- writing a zero-point spectrum tagged as the representation that is absent.
+        // Fall back to the representation the file does have, keep its true label, and say so once.
+        if profile.0.is_empty() && centroid.0.is_empty() {
+            match self.representation {
+                Representation::Profile => centroid = self.peaks(i, 1)?,
+                Representation::Centroid => profile = self.peaks(i, 0)?,
+                Representation::Both => {}
+            }
+            if (!profile.0.is_empty() || !centroid.0.is_empty())
+                && !self.fallback_warned.swap(true, Ordering::Relaxed)
+            {
+                log::warn!(
+                    "--representation {:?} was requested but this file stores the other \
+                     representation; writing what it actually contains, correctly labelled",
+                    self.representation
+                );
+            }
+        }
+
+        // Which facets does this spectrum actually carry? When BOTH are present the raw profile goes
+        // into the data facet and the centroid list travels alongside it as a peak list -- the writer
+        // emits `spectra_data` + `spectra_peaks` and fills both `number_of_data_points` and
+        // `number_of_peaks` (base.rs `write_spectrum_data`, the "Writing both profile signal and
+        // peaks" branch). With only one present, that one is written and labelled for what it is.
+        let has_profile = !profile.0.is_empty();
+        let has_centroid = !centroid.0.is_empty();
+        // The centroid list rides along as a peak list only when a profile occupies the data facet;
+        // otherwise it IS the data facet (moved into `mz`/`intensity` below) and the writer derives
+        // the peaks itself. Built before the move so it can consume `centroid` in place.
+        let peak_set = if has_profile && has_centroid {
+            Some(PeakSet::new(
+                centroid
+                    .0
+                    .iter()
+                    .zip(centroid.1.iter())
+                    .enumerate()
+                    .map(|(k, (m, it))| CentroidPeak::new(*m, *it, k as u32))
+                    .collect(),
+            ))
+        } else {
+            None
+        };
+        let (mz, intensity, is_profile) = if has_profile {
+            (profile.0, profile.1, true)
+        } else {
+            (centroid.0, centroid.1, false)
+        };
 
         let mut arrays = BinaryArrayMap::new();
         let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
@@ -378,9 +464,14 @@ impl ShimadzuReader {
             1 => ScanPolarity::Negative,
             _ => ScanPolarity::Unknown,
         };
-        let signal_continuity = match meta.signal_continuity {
-            1 => SignalContinuity::Centroid,
-            _ => SignalContinuity::Profile,
+        // From the DATA, not from `meta.signal_continuity` -- the glue hardcodes that field to 0
+        // (profile), so trusting it labelled centroid data as profile on every Shimadzu spectrum,
+        // routing it into the profile facet and populating number_of_data_points instead of
+        // number_of_peaks.
+        let signal_continuity = if is_profile {
+            SignalContinuity::Profile
+        } else {
+            SignalContinuity::Centroid
         };
 
         let mut descr = SpectrumDescription {
@@ -400,17 +491,21 @@ impl ShimadzuReader {
         // NOTE: precursor m/z for MSn is available on `meta.precursor_mz` but the precursor linkage
         // is not yet threaded into the SpectrumDescription — parity item vs. msconvert (see e2e).
 
-        Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
+        Ok(MultiLayerSpectrum::new(descr, Some(arrays), peak_set, None))
     }
 
     /// A sample spectrum's array map, for deriving the writer's data-facet schema.
     pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
+        // Look through BOTH representations: on a centroid-only file every `which = 0` fetch comes
+        // back empty, and settling for spectrum 0 would hand the writer an empty schema sample.
         let mut chosen = 0usize;
-        for i in 0..self.count {
-            if let Ok((mz, _)) = self.peaks(i) {
-                if !mz.is_empty() {
-                    chosen = i;
-                    break;
+        'outer: for i in 0..self.count {
+            for which in [0, 1] {
+                if let Ok((mz, _)) = self.peaks(i, which) {
+                    if !mz.is_empty() {
+                        chosen = i;
+                        break 'outer;
+                    }
                 }
             }
         }

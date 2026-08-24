@@ -102,6 +102,26 @@ fn max_spectra() -> Option<usize> {
         .filter(|&n| n > 0)
 }
 
+/// The `--representation` choice, published once after CLI parsing. `convert_file` already carries
+/// nine parameters and this one matters to exactly one vendor lane, so it travels out-of-band rather
+/// than as a tenth argument threaded through every caller. Single-process, set-once, read-only after.
+static REPRESENTATION: std::sync::OnceLock<RepresentationArg> = std::sync::OnceLock::new();
+
+fn representation() -> RepresentationArg {
+    *REPRESENTATION.get().unwrap_or(&RepresentationArg::Both)
+}
+
+/// CLI spelling of the signal representation to read. Mirrors `shimadzu::Representation`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
+enum RepresentationArg {
+    /// Read every representation the file contains (faithful default).
+    Both,
+    /// Read only profile data.
+    Profile,
+    /// Read only centroided data.
+    Centroid,
+}
+
 /// Exit codes (shared contract, mirrors mzML2mzPeak).
 mod exit {
     pub const OK: i32 = 0;
@@ -176,6 +196,15 @@ struct Cli {
     #[arg(long)]
     no_ims_compact: bool,
 
+
+    /// Which signal representation to read when a vendor supplies BOTH profile and centroid for the
+    /// same spectrum (Shimadzu `.lcd` does). `both` (the DEFAULT) is faithful to the raw data: profile
+    /// goes to the `spectra_data` facet, centroid to `spectra_peaks`, and the metadata row carries
+    /// both `number_of_data_points` and `number_of_peaks` so a reader knows which to read. `profile`
+    /// / `centroid` force one view. A requested representation the file does not contain is a
+    /// warning, not an error — the other one is written instead of producing an empty archive.
+    #[arg(long, value_enum, default_value_t = RepresentationArg::Both)]
+    representation: RepresentationArg,
 
     /// Bruker timsTOF (TDF) ims-compact only — select the CHUNKED layout for rapid m/z-range access.
     /// OFF BY DEFAULT. When absent, timsTOF data is written in the ARCHIVE layout (the default): a flat
@@ -440,6 +469,16 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    let _ = REPRESENTATION.set(cli.representation);
+    // Only the Shimadzu lane reads a representation choice today: every other vendor ABI hands back
+    // one array pair per scan, and the mzML/imzML reader takes whatever the file declares. Setting
+    // the flag anywhere else would otherwise look effective and do nothing.
+    if cli.representation != RepresentationArg::Both && !is_lcd(&cli.input) {
+        log::warn!(
+            "--representation is only honored for Shimadzu .lcd input; ignoring it for {}",
+            cli.input.display()
+        );
+    }
     init_logging(cli.verbose, cli.quiet);
 
     let code = match run(&cli) {
@@ -2160,7 +2199,7 @@ fn convert_file(
     }
     #[cfg(windows)]
     if is_lcd(input) {
-        return convert_shimadzu(input, output, chunk, zstd_level, vendor, synth_chroms);
+        return convert_shimadzu(input, output, chunk, zstd_level, vendor, synth_chroms, representation());
     }
     // mzdata's quick-xml reader assumes UTF-8 and panics on Latin-1/windows-1252 high bytes
     // (e.g. zenodo DESI imzML declare ISO-8859-1). If the input declares a non-UTF-8 encoding,
@@ -3302,8 +3341,14 @@ fn convert_shimadzu(
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
+    representation: RepresentationArg,
 ) -> Result<()> {
-    let reader = shimadzu::ShimadzuReader::open(input)?;
+    let rep = match representation {
+        RepresentationArg::Both => shimadzu::Representation::Both,
+        RepresentationArg::Profile => shimadzu::Representation::Profile,
+        RepresentationArg::Centroid => shimadzu::Representation::Centroid,
+    };
+    let reader = shimadzu::ShimadzuReader::open_with(input, rep)?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
@@ -3322,6 +3367,7 @@ fn convert_shimadzu(
     _zstd_level: i32,
     _vendor: Option<&vendor::VendorPolicy>,
     _synth_chroms: bool,
+    _representation: RepresentationArg,
 ) -> Result<()> {
     Err(UnsupportedVendor(
         "Shimadzu .lcd native reading is only available on Windows (Shimadzu.LabSolutions.IO vendor DLL)".into(),

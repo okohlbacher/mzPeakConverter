@@ -78,6 +78,10 @@ internal sealed class ShimadzuData
     // Reflection method handles (resolved once at open).
     public required MethodInfo GetSpectrumInfo;
     public required MethodInfo GetSpectrumByScan;
+
+    // One-entry memo for Api.Data: the caller fetches profile then centroid for the same scan.
+    public int CachedScan = -1;
+    public ((double[] mz, float[] intensity) profile, (double[] mz, float[] intensity) centroid)? CachedData;
 }
 
 /// <summary>Diagnostics for the scan-count discovery, which otherwise swallows every failure and
@@ -419,38 +423,57 @@ public static class Api
         catch { return 2; }
     }
 
-    /// <summary>Return (mz[], intensity[]) for a scan. Prefers profile; falls back to centroid when
+    /// <summary>Return BOTH representations for a scan: (profile, centroid), either possibly empty.
+    ///
+    /// It used to return one or the other -- profile preferred, centroid as fallback -- and drop a
+    /// `bool centroid` on the floor at the ABI boundary while Meta() hardcoded "profile". So centroid
+    /// data was written into the profile facet and labelled profile. mzPeak carries both
+    /// representations for one spectrum by design (spectra_data + spectra_peaks), so return both and
+    /// let the caller decide.
+    /// <para>Original note: prefers profile; falls back to centroid when
     /// the profile list is empty (SpectrumList_Shimadzu does the same).</summary>
-    internal static (double[] mz, float[] intensity, bool centroid) Data(ShimadzuData d, int scan)
+    internal static ((double[] mz, float[] intensity) profile, (double[] mz, float[] intensity) centroid) Data(ShimadzuData d, int scan)
     {
+        // The Rust side asks for `which = 0` then `which = 1` on the SAME scan, so without a memo
+        // every spectrum costs two GetMSSpectrumByScan round-trips into the vendor assembly. A
+        // one-entry cache halves that. Keyed by scan; the reader is single-threaded per handle
+        // (`_not_thread_safe` in src/shimadzu.rs) so no locking is needed.
+        if (d.CachedScan == scan && d.CachedData != null) return d.CachedData.Value;
+
         object? specObj = null;
-        var args = new object?[] { null, scan, true }; // out spectrum, scan, profileDesired
+        // MZPC_SHIMADZU_PROFILE_DESIRED=0 flips the vendor's profileDesired flag, to establish whether
+        // the API actually has profile data for a run or is returning centroids either way.
+        bool wantProfile = Environment.GetEnvironmentVariable("MZPC_SHIMADZU_PROFILE_DESIRED") != "0";
+        var args = new object?[] { null, scan, wantProfile }; // out spectrum, scan, profileDesired
         var st = Reflect.InvokeCoerced(d.GetSpectrumByScan, d.SpectrumObj, args);
         if (Reflect.Ok(st)) specObj = args[0];
         if (specObj == null) throw new Exception($"GetMSSpectrumByScan failed for scan {scan}: {st}");
 
         var profile = Reflect.GetProp(specObj, "ProfileList") as IList;
-        bool centroid = false;
-        IList? list = profile;
-        if (list == null || list.Count == 0)
-        {
-            list = Reflect.GetProp(specObj, "CentroidList") as IList;
-            centroid = true;
-        }
-        if (list == null) return (Array.Empty<double>(), Array.Empty<float>(), centroid);
+        var centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
+        Dbg.Say($"scan {scan}: ProfileList={(profile == null ? "null" : profile.Count.ToString())} " +
+                $"CentroidList={(centroidList == null ? "null" : centroidList.Count.ToString())}");
+        var both = (ToArrays(profile, d), ToArrays(centroidList, d));
+        d.CachedScan = scan;
+        d.CachedData = both;
+        return both;
+    }
 
-        int n = list.Count;
+    /// <summary>Vendor point list -> (m/z, intensity). Empty arrays when the list is absent.</summary>
+    private static (double[] mz, float[] intensity) ToArrays(IList? list, ShimadzuData d)
+    {
+        int n = list?.Count ?? 0;
         var mz = new double[n];
         var inten = new float[n];
         for (int i = 0; i < n; i++)
         {
-            var pt = list[i]!;
-            long massInt = Convert.ToInt64(Reflect.GetProp(pt, "Mass") ?? 0L);
-            double intensity = Convert.ToDouble(Reflect.GetProp(pt, "Intensity") ?? 0.0);
+            var pt = list![i]!;
+            long massInt = System.Convert.ToInt64(Reflect.GetProp(pt, "Mass") ?? 0L);
+            double intensity = System.Convert.ToDouble(Reflect.GetProp(pt, "Intensity") ?? 0.0);
             mz[i] = massInt * d.MassMultiplier;
             inten[i] = (float)intensity;
         }
-        return (mz, inten, centroid);
+        return (mz, inten);
     }
 
     // --- C ABI (matches src/shimadzu.rs) -----------------------------------------------------
@@ -527,8 +550,10 @@ public static class Api
         catch (Exception e) { _lastError = e.ToString(); return 1; }
     }
 
+    /// <summary>`which`: 0 = profile, 1 = centroid. Both are available for the same scan; the caller
+    /// asks for each separately so an archive can carry both facets.</summary>
     [UnmanagedCallersOnly(EntryPoint = "SpectrumData")]
-    public static unsafe int SpectrumData(long handle, long index, double** mzOut, float** intOut, long* nOut)
+    public static unsafe int SpectrumData(long handle, long index, int which, double** mzOut, float** intOut, long* nOut)
     {
         try
         {
@@ -536,7 +561,8 @@ public static class Api
             lock (Gate) { Readers.TryGetValue(handle, out d); }
             if (d == null) { _lastError = "unknown handle"; return 1; }
             int scan = (int)index + 1;
-            var (mz, inten, _) = Data(d, scan);
+            var both = Data(d, scan);
+            var (mz, inten) = which == 1 ? both.centroid : both.profile;
             var mzH = GCHandle.Alloc(mz, GCHandleType.Pinned);
             var inH = GCHandle.Alloc(inten, GCHandleType.Pinned);
             var mzP = mz.Length > 0 ? (double*)mzH.AddrOfPinnedObject() : null;

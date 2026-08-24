@@ -4,6 +4,74 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Shimadzu `.lcd` spectra were labelled `profile` regardless of what they actually contained.**
+  The glue's `Data()` computed a correct `centroid` flag; `SpectrumData` destructured it into a
+  discard, and `Meta()` hardcoded `SignalContinuity = 0`. So `src/shimadzu.rs` labelled every
+  spectrum profile, which routed centroid data into `spectra_data.parquet`, stamped `MS:1000128`,
+  populated `number_of_data_points`, and left `number_of_peaks` null. mzPeak requires the opposite
+  on all four counts for centroid data, so every native-lane Shimadzu archive written before this
+  was **non-conformant**, not merely suboptimal. Continuity is now derived from which list the
+  vendor API actually returned.
+
+  Verified on `DIA_Hela_20ng` (21,500 spectra) before → after:
+
+  | | before | after |
+  |---|---|---|
+  | `spectrum_representation` | `MS:1000128` × 21,500 | `MS:1000127` × 21,500 |
+  | `number_of_peaks` | null × 21,500 | populated × 21,500 (279,686,550 points) |
+  | `number_of_data_points` | populated × 21,500 | null × 21,500 |
+  | signal facet | `spectra_data.parquet` | `spectra_peaks.parquet` (1.546 GB) |
+  | mzPeakValidator 0.9.1 | — | **PASS, 0 errors, 0 warnings** |
+
+### Added
+
+- **The reader now carries every representation a vendor stores for one spectrum, not just one.**
+  When a scan has both, the profile goes to `spectra_data` and the centroid list rides along as a
+  peak list in `spectra_peaks`, and the metadata row carries both counts — the shape the writer
+  already supported (`writer/base.rs` "Writing both profile signal and peaks") but which no vendor
+  lane ever produced, since all of them passed `None` for peaks.
+
+- **`--representation both|profile|centroid`** (default `both`). `both` means "everything the source
+  has" — a single-representation scan is normal and silent. An explicit `profile` / `centroid` on a
+  file that stores only the other one warns once and writes what the file actually contains with its
+  true label, rather than emitting an empty facet tagged as the absent representation. The flag is
+  read only by the Shimadzu lane today; setting it elsewhere warns that it is inert.
+
+- One-entry memo in the glue for `Api.Data`, since the reader asks for profile then centroid on the
+  same scan — without it every spectrum cost two `GetMSSpectrumByScan` round-trips.
+
+### Notes
+
+- **The measured `.lcd` files store centroids only.** `ProfileList` is empty on every scan and does
+  not fill when the vendor's `profileDesired` flag is flipped; msconvert reads the same three files
+  as 100% `MS:1000127` (21,501 / 22,114 / 193 spectra, zero profile). So the dual-facet path is
+  implemented and exercised but not yet demonstrated on data that carries both.
+
+- **The correctness fix costs 89% in size: 818 MB → 1,547 MB.** Chunked delta/numpress encoding is
+  applied by `write_spectrum_binary_array_map` on the data facet; the peaks facet stores flat points
+  (`mini_peak.rs`), with chunking gated to the ims/tof-grid path. So correctly routing this data to
+  `spectra_peaks` also takes it out of the delta encoding that produced the 0.7.10 win — that
+  default is now **inert for `.lcd`**. Extending chunked encoding to the peaks facet would recover
+  most of it and is the obvious follow-up.
+
+  **This corrects the 0.7.10 entry below**, which described its 818 MB measurement as being on "the
+  profile data the native `.lcd` lane reads". That data was centroid data mislabelled as profile.
+  The delta-vs-numpress comparison itself stands — both were measured on the same bytes — but it no
+  longer describes the output of the shipped default, because those bytes no longer travel through
+  the chunked encoder.
+
+- Found by two independent adversarial reviews (Codex, Kimi), both of which confirmed the diagnosis
+  line-by-line and independently identified the same systemic pattern: **every** vendor lane passes
+  `None` for peaks, `src/waters.rs` hardcodes `Profile` while its own glue already computes
+  `IsContinuum`, `src/bruker_baf.rs` has `prefer_profile` pinned to `false` with no flag reaching it,
+  and the `--tof-grid` lanes deliberately overwrite continuity to steer data into a facet. Codex also
+  caught a real bug in the first draft of this change (an explicit `profile` request on a
+  centroid-only file emitted an empty centroid-labelled spectrum), fixed before this entry.
+
 ## [0.7.10] — 2026-08-22
 
 ### Changed
