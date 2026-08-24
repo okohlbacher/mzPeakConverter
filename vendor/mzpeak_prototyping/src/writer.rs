@@ -533,6 +533,29 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    /// Populate the PEAK facet schema from an iterator of sample spectra, chunk-awarely.
+    ///
+    /// The sibling `sample_array_types_for_peaks_from_spectrum_source` needs a
+    /// `RandomAccessSpectrumSource`, which the vendor lanes do not have — they hand the writer
+    /// spectra through a closure. Without this the peak facet schema stays empty, and a CHUNKED
+    /// peak facet then panics in `add_arrays` ("expected Float32 but found LargeList(Float32)")
+    /// because the buffer's declared schema is scalar while the chunked data is list-typed.
+    pub fn sample_array_types_for_peaks_from_spectra<
+        C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+        D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+        I: Iterator<Item = MultiLayerSpectrum<C, D>>,
+    >(
+        mut self,
+        spectra: I,
+    ) -> Self {
+        let fields = ArrayTypesSampler::new(&self.spectrum_overrides(), self.peaks_chunked_encoding)
+            .sample_spectrum_array_types(spectra, true);
+        for f in fields {
+            self.spectrum_peak_arrays = self.spectrum_peak_arrays.add_field(f);
+        }
+        self
+    }
+
     pub fn sample_array_types_for_peaks_from_spectrum_source<
         C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
         D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,

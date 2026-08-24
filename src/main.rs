@@ -931,6 +931,30 @@ fn is_agilent_d(input: &Path) -> bool {
     input.is_dir() && input.join("AcqData").is_dir()
 }
 
+/// Should the PEAK facet use the chunked layout, and with which strategy?
+///
+/// A centroid peak list is just a sorted m/z array, so it chunks exactly like profile signal does.
+/// Without this the peaks facet is the point layout, where the spec requires values be stored as-is
+/// -- so `point.mz` lands as PLAIN `f64` and zstd alone recovers only ~43% of it. Measured on a
+/// centroid-only Shimadzu archive, that one column was 82% of the file at 1.82x compression, while
+/// `spectrum_index` beside it got 42.9x from DELTA_BINARY_PACKED.
+///
+/// Defaulted per vendor rather than globally, exactly as the 0.7.10 numpress decision was: this
+/// changes the on-disk layout of the peaks facet, so every other format's output stays as it was
+/// until it has been measured too. `MZPC_PEAKS_CHUNKED=1`/`=0` forces it either way.
+///
+/// Note the spec constraint this satisfies: transforms are legal in the chunked layout (declared
+/// via `chunk_encoding`) and forbidden in the point layout, which is why storing a transformed m/z
+/// as flat points would NOT be conformant even though it compresses just as well.
+fn peaks_chunk_strategy(input: &Path, chunk: Option<ChunkingStrategy>) -> Option<ChunkingStrategy> {
+    let on = match std::env::var("MZPC_PEAKS_CHUNKED").ok().as_deref() {
+        Some("0") => false,
+        Some(v) if !v.is_empty() => true,
+        _ => is_lcd(input),
+    };
+    if on { chunk } else { None }
+}
+
 /// True for a Shimadzu LabSolutions `.lcd` file.
 fn is_lcd(input: &Path) -> bool {
     input.is_file()
@@ -2273,6 +2297,8 @@ fn convert_file(
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
+        // Off for mzML/imzML unless MZPC_PEAKS_CHUNKED forces it -- see `peaks_chunk_strategy`.
+        .peaks_chunked_encoding(peaks_chunk_strategy(input, chunk))
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -3690,6 +3716,7 @@ fn convert_vendor_reader(
     }
     let builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
+        .peaks_chunked_encoding(peaks_chunk_strategy(input, chunk))
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -3699,7 +3726,11 @@ fn convert_vendor_reader(
         .chromatogram_chunked_encoding(None)
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
-        .sample_array_types_from_spectra(probes.into_iter());
+        // Both facets need their schema sampled: the data facet from the probes, and — when the
+        // peak facet is chunked — the peak facet too, or its buffer declares scalar columns while
+        // the chunked writer hands it list-typed ones.
+        .sample_array_types_from_spectra(probes.clone().into_iter())
+        .sample_array_types_for_peaks_from_spectra(probes.into_iter());
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
     let mut ms1 = Ms1Chroms::default();

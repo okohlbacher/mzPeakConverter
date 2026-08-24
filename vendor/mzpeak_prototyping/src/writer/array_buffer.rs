@@ -658,6 +658,42 @@ impl ChunkBuffers {
         }
     }
 
+    /// Chunk raw `(m/z, intensity)` arrays on the DEFAULT m/z main axis, for a peak facet that is
+    /// in the chunked layout without an ims `tof` boundary. This is what a centroid spectrum takes:
+    /// its peak list is a plain sorted m/z array, so it chunks exactly like profile signal does,
+    /// and the m/z column then gets the configured [`ChunkingStrategy`] instead of being stored as
+    /// PLAIN `f64` points. Returns `None` when no chunking is configured, so the caller falls back
+    /// to the flat point path.
+    pub fn add_raw_chunked(
+        &mut self,
+        series_index: u64,
+        series_time: Option<f32>,
+        arrays: &mzdata::spectrum::BinaryArrayMap,
+    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+        let series_time = if self.include_time { series_time } else { None };
+        let res = ArrowArrayChunk::build(
+            series_index,
+            series_time,
+            self.buffer_context,
+            arrays,
+            self.chunking_strategy,
+            &self.overrides,
+            false,
+            false,
+            &self.chunk_array_fields,
+        );
+        match res {
+            Ok((chunks, _aux, n_pts)) => {
+                if let Some(chunks) = chunks {
+                    let (fields, cols, _) = chunks.into_parts();
+                    self.add_arrays(fields, cols, n_pts, false);
+                }
+                Some(Ok(n_pts))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.chunk_buffer.iter().map(|c| c.len()).sum()
     }
@@ -817,6 +853,23 @@ impl ArrayBufferWriterVariants {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
                 chunk_buffers.add_raw_mz_boundary(series_index, series_time, arrays)
+            }
+            ArrayBufferWriterVariants::PointBuffers(_) => None,
+        }
+    }
+
+    /// Chunked raw-array write on the default m/z axis. Delegates to
+    /// [`ChunkBuffers::add_raw_chunked`]; returns `None` for a point buffer, so the caller falls
+    /// back to the flat point path.
+    pub fn add_raw_chunked(
+        &mut self,
+        series_index: u64,
+        series_time: Option<f32>,
+        arrays: &mzdata::spectrum::BinaryArrayMap,
+    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
+                chunk_buffers.add_raw_chunked(series_index, series_time, arrays)
             }
             ArrayBufferWriterVariants::PointBuffers(_) => None,
         }

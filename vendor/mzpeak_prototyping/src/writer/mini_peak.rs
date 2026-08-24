@@ -151,8 +151,16 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
                 // GATED ims-chunked: if this facet is a ChunkBuffers with an m/z boundary, chunk the
                 // raw `tof`/intensity/mobility arrays on m/z bins instead of storing flat points.
                 // Returns `None` for every other facet, falling through to the normal point path.
-                if let Some(res) =
-                    self.buffers.add_raw_mz_boundary(spectrum_count, spectrum_time, arrays)
+                // Then, for a chunked peak facet WITHOUT an ims boundary: a centroid peak list is a
+                // plain sorted m/z array, so it chunks on the default m/z axis exactly like profile
+                // signal. This is what keeps `point.mz` out of PLAIN f64 -- the encoding that made
+                // it 82% of a centroid-only archive at only 1.8x compression.
+                if let Some(res) = self
+                    .buffers
+                    .add_raw_mz_boundary(spectrum_count, spectrum_time, arrays)
+                    .or_else(|| {
+                        self.buffers.add_raw_chunked(spectrum_count, spectrum_time, arrays)
+                    })
                 {
                     let n_peaks = res.map_err(io::Error::other)?;
                     self.n_points += n_peaks as u64;

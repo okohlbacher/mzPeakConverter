@@ -29,6 +29,49 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The peaks facet can now use the chunked layout — 46% smaller on centroid data, losslessly.**
+  Default ON for Shimadzu `.lcd`; `MZPC_PEAKS_CHUNKED=1`/`=0` forces it either way on any format.
+
+  A centroid peak list is just a sorted m/z array, so it chunks exactly like profile signal. Without
+  this the peaks facet is the point layout, where the spec requires values be stored as-is, so
+  `point.mz` lands as PLAIN `f64`. Measured on the centroid-only Shimadzu archive, that one column
+  was **82% of the file at 1.82× compression**, while `spectrum_index` beside it got 42.9× from
+  `DELTA_BINARY_PACKED`.
+
+  | | point layout | chunked peaks | |
+  |---|---:|---:|---:|
+  | `DIA_Hela_20ng` | 1,547,389,638 | **839,156,909** | −45.8% |
+  | `DIA_Hela_100ng` | 1,554,759,745 | **857,062,254** | −44.9% |
+  | `blank-centroid` (mzML, forced on) | 21,387,267 | **10,889,211** | −49.1% |
+
+  **Lossless on `.lcd`**: the chunks carry `chunk_encoding = MS:1003089` (delta) with no numpress
+  transform, and a round-trip over 2,584,247 points differs in **zero** m/z and **zero** intensity
+  values, bit-for-bit. On mzML input the default strategy is numpress-linear instead, which is what
+  the data facet already used there — measured at 0.0002 ppm max m/z deviation, intensities exact.
+  mzPeakValidator 0.9.1 PASS, 0 errors, 0 warnings, on every archive above.
+
+  **Why the chunked layout rather than just encoding m/z as a scaled integer in place:** the point
+  layout requires values be stored as-is precisely so the page index stays meaningful, and it has
+  nowhere to declare a transform — its array-index entries pin `transform: null`. A reader would
+  have no way to learn the scale factor. The chunked layout carries exactly that declaration, and
+  the emitted index shows it: `chunk_start`, `chunk_end`, `chunk_values`, `chunk_encoding`,
+  `chunk_secondary`, plus a `chunk_transform` entry when a transform is used. Same compression,
+  declared rather than implied.
+
+  Two bugs fixed on the way in, both only reachable from the vendor lanes:
+
+  - `ChunkBuffers` could chunk raw arrays only on the ims `tof` axis with an m/z boundary
+    (`add_raw_mz_boundary`, gated to timsTOF). Ordinary centroid m/z arrays fell through to flat
+    points. Added `add_raw_chunked` for the default m/z axis; the ims path is untouched.
+  - The vendor lanes never sampled the **peak** facet schema — only the data facet — so a chunked
+    peak facet panicked in `add_arrays` with `expected Float32 but found LargeList(Float32)`. The
+    mzML lane escaped this because it calls `sample_array_types_for_peaks_from_spectrum_source`,
+    which needs a `RandomAccessSpectrumSource` the vendor lanes do not have. Added
+    `sample_array_types_for_peaks_from_spectra`, the iterator equivalent.
+
+  Cost: conversion time went from ~80 s to ~200 s per file, since the m/z column is now encoded
+  rather than dumped.
+
 - **The reader now carries every representation a vendor stores for one spectrum, not just one.**
   When a scan has both, the profile goes to `spectra_data` and the centroid list rides along as a
   peak list in `spectra_peaks`, and the metadata row carries both counts — the shape the writer
@@ -51,12 +94,12 @@ All notable changes to this project are documented here. The format follows
   as 100% `MS:1000127` (21,501 / 22,114 / 193 spectra, zero profile). So the dual-facet path is
   implemented and exercised but not yet demonstrated on data that carries both.
 
-- **The correctness fix costs 89% in size: 818 MB → 1,547 MB.** Chunked delta/numpress encoding is
-  applied by `write_spectrum_binary_array_map` on the data facet; the peaks facet stores flat points
-  (`mini_peak.rs`), with chunking gated to the ims/tof-grid path. So correctly routing this data to
-  `spectra_peaks` also takes it out of the delta encoding that produced the 0.7.10 win — that
-  default is now **inert for `.lcd`**. Extending chunked encoding to the peaks facet would recover
-  most of it and is the obvious follow-up.
+- **The correctness fix initially cost 89% in size (818 MB → 1,547 MB), now recovered.** Chunked
+  encoding was applied by `write_spectrum_binary_array_map` on the data facet only; the peaks facet
+  stored flat points, with chunking gated to the ims/tof-grid path. Correctly routing this data to
+  `spectra_peaks` therefore took it out of the encoding that produced the 0.7.10 win. Extending the
+  chunked layout to the peaks facet (see Added) brings it to **839 MB** — within 3% of the old
+  mislabelled archive, and losslessly.
 
   **This corrects the 0.7.10 entry below**, which described its 818 MB measurement as being on "the
   profile data the native `.lcd` lane reads". That data was centroid data mislabelled as profile.
