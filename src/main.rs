@@ -668,20 +668,17 @@ fn run(cli: &Cli) -> Result<i32> {
     // worse and fails to reproduce the vendor's integers (~1 ppb, below any instrument's accuracy,
     // but paid for with 27% more space). Its fidelity is data-dependent -- it IS exact on the
     // centroid mzML export of the same acquisition -- so this defaults per vendor, not globally.
-    let numpress_hurts = is_lcd(&cli.input);
+    // The strategy requested here is provisional. `refine_chunking` swaps numpress-linear for
+    // lossless delta once real m/z has been sampled and found to sit on a fixed-point lattice --
+    // superseding the `is_lcd()` guess this used to make, which was right about Shimadzu's NATIVE
+    // lane and wrong about msconvert's mzML of the very same acquisition.
     let chunk = match cfg.layout {
         Layout::Point => None,
-        Layout::Chunked if cfg.no_numpress || numpress_hurts => {
+        Layout::Chunked if cfg.no_numpress => {
             Some(ChunkingStrategy::Delta { chunk_size: cfg.chunk_size })
         }
         Layout::Chunked => Some(ChunkingStrategy::NumpressLinear { chunk_size: cfg.chunk_size }),
     };
-    if numpress_hurts && !cfg.no_numpress {
-        log::info!(
-            "Shimadzu .lcd: using lossless delta m/z chunking (numpress-linear is larger AND lossy \
-             on this vendor's fixed-point m/z)"
-        );
-    }
 
     if output.exists() && !cfg.force {
         bail!("output {} exists (use --force to overwrite)", output.display());
@@ -931,6 +928,60 @@ fn is_agilent_d(input: &Path) -> bool {
     input.is_dir() && input.join("AcqData").is_dir()
 }
 
+/// Does this m/z axis sit on a fixed-point lattice — i.e. are the values vendor-stored scaled
+/// integers?
+///
+/// This decides delta-vs-numpress from the DATA rather than from the file extension, which is a bad
+/// proxy and was measurably wrong. A Shimadzu `.lcd` read natively is on an exact 1e-4 lattice
+/// (residual 9.3e-10) where delta chunking is ~3x smaller than numpress-linear AND bit-exact. But
+/// msconvert's mzML **of the same acquisition** is off that lattice (residual ~0.5, uniform), and
+/// there delta is 1.6x LARGER than numpress. Same instrument, same run, opposite answers — so the
+/// extension cannot decide this and the values have to be looked at.
+fn is_fixed_point_lattice(mzs: &[f64]) -> bool {
+    // Vendor fixed-point scales seen in the wild. 1e-4 is Shimadzu's MASSNUMBER_UNIT.
+    const SCALES: [f64; 3] = [10_000.0, 100_000.0, 1_000.0];
+    let sample: Vec<f64> = mzs.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
+    if sample.len() < 64 {
+        return false;
+    }
+    SCALES.iter().any(|scale| {
+        // Every value must land on the grid, not merely most: a genuine lattice has NO exceptions,
+        // while off-lattice data occasionally lands near an integer by chance.
+        sample.iter().all(|v| {
+            let scaled = v * scale;
+            (scaled - scaled.round()).abs() < 1e-6
+        })
+    })
+}
+
+/// Refine a requested chunking strategy against real m/z values: numpress-linear's floating-point
+/// prediction fights a fixed-point lattice, so swap it for lossless delta when the data is on one.
+/// An explicitly requested delta (`--no-numpress`) is left alone.
+fn refine_chunking(
+    sample_mz: &[f64],
+    requested: Option<ChunkingStrategy>,
+) -> Option<ChunkingStrategy> {
+    match requested {
+        Some(ChunkingStrategy::NumpressLinear { chunk_size }) if is_fixed_point_lattice(sample_mz) => {
+            log::info!(
+                "m/z is on a fixed-point lattice; using lossless delta chunking (numpress-linear \
+                 would be both larger and lossy on this data)"
+            );
+            Some(ChunkingStrategy::Delta { chunk_size })
+        }
+        other => other,
+    }
+}
+
+/// Collect m/z values from a few sample spectra, for `refine_chunking`.
+fn sample_mz_from(spectra: &[mzdata::spectrum::MultiLayerSpectrum]) -> Vec<f64> {
+    spectra
+        .iter()
+        .filter_map(|s| s.raw_arrays().and_then(|a| a.mzs().ok()).map(|v| v.to_vec()))
+        .flatten()
+        .collect()
+}
+
 /// Should the PEAK facet use the chunked layout, and with which strategy?
 ///
 /// A centroid peak list is just a sorted m/z array, so it chunks exactly like profile signal does.
@@ -939,20 +990,59 @@ fn is_agilent_d(input: &Path) -> bool {
 /// centroid-only Shimadzu archive, that one column was 82% of the file at 1.82x compression, while
 /// `spectrum_index` beside it got 42.9x from DELTA_BINARY_PACKED.
 ///
-/// Defaulted per vendor rather than globally, exactly as the 0.7.10 numpress decision was: this
-/// changes the on-disk layout of the peaks facet, so every other format's output stays as it was
-/// until it has been measured too. `MZPC_PEAKS_CHUNKED=1`/`=0` forces it either way.
+/// Chunked only when the PEAK facet actually dominates the run — measured, not assumed.
+///
+/// A blanket "always chunk" is wrong. Measured across formats, on the peaks facet alone:
+///
+/// | run | peaks facet | |
+/// |---|---|---|
+/// | Bruker microTOF-Q2 (centroid-only) | 38.0 MB -> 23.8 MB | **-37%** |
+/// | Shimadzu `.lcd` (centroid-only)    | 1,547 MB -> 839 MB | **-46%** |
+/// | Thermo LTQ Velos (profile + small peak sidecar) | 133 KB -> 178 KB | **+34%** |
+///
+/// The per-chunk `chunk_start`/`chunk_end`/index columns are a fixed cost per chunk. When the peak
+/// lists carry the run, that cost is repaid many times over; when they are a sidecar beside profile
+/// data, it is not. Which of the two facets holds more points separates the cases cleanly across
+/// every file tested. `MZPC_PEAKS_CHUNKED=1`/`=0` overrides either way.
 ///
 /// Note the spec constraint this satisfies: transforms are legal in the chunked layout (declared
 /// via `chunk_encoding`) and forbidden in the point layout, which is why storing a transformed m/z
 /// as flat points would NOT be conformant even though it compresses just as well.
-fn peaks_chunk_strategy(input: &Path, chunk: Option<ChunkingStrategy>) -> Option<ChunkingStrategy> {
+fn peaks_chunk_strategy(
+    chunk: Option<ChunkingStrategy>,
+    profile_points: usize,
+    peak_points: usize,
+) -> Option<ChunkingStrategy> {
+    let dominant = peak_points > profile_points;
     let on = match std::env::var("MZPC_PEAKS_CHUNKED").ok().as_deref() {
         Some("0") => false,
         Some(v) if !v.is_empty() => true,
-        _ => is_lcd(input),
+        _ => dominant,
     };
+    if on && chunk.is_some() {
+        log::info!(
+            "peaks facet: chunked layout ({peak_points} peak vs {profile_points} profile points in \
+             the sample)"
+        );
+    }
     if on { chunk } else { None }
+}
+
+/// Profile-facet and peak-facet point counts over sample spectra, for `peaks_chunk_strategy`.
+/// A profile spectrum's own arrays are profile points and its attached peak list (if any) is peak
+/// points; a centroid spectrum's arrays ARE peak points, since that is the facet they land in.
+fn facet_point_counts(spectra: &[mzdata::spectrum::MultiLayerSpectrum]) -> (usize, usize) {
+    let (mut profile, mut peaks) = (0usize, 0usize);
+    for s in spectra {
+        let n = s.raw_arrays().and_then(|a| a.mzs().ok()).map(|v| v.len()).unwrap_or(0);
+        if s.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
+            profile += n;
+            peaks += s.peaks.as_ref().map(|p| p.len()).unwrap_or(0);
+        } else {
+            peaks += n;
+        }
+    }
+    (profile, peaks)
 }
 
 /// True for a Shimadzu LabSolutions `.lcd` file.
@@ -2335,10 +2425,26 @@ fn convert_file(
 
     let is_imzml = matches!(reader, MZReaderType::IMzML(_));
 
+    // Sample real m/z before choosing an encoding: numpress-linear and delta win on opposite kinds
+    // of data, and which one this file holds cannot be told from its name. Spread the probes across
+    // the run rather than taking the first few, which on a DIA file would be all one window.
+    let probes: Vec<mzdata::spectrum::MultiLayerSpectrum> = {
+        let n = reader.len();
+        let step = (n / 6).max(1);
+        let v: Vec<_> = (0..n)
+            .step_by(step)
+            .take(6)
+            .filter_map(|i| reader.get_spectrum_by_index(i))
+            .collect();
+        reader.reset();
+        v
+    };
+    let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
+    let (probe_profile_pts, probe_peak_pts) = facet_point_counts(&probes);
+
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
-        // Off for mzML/imzML unless MZPC_PEAKS_CHUNKED forces it -- see `peaks_chunk_strategy`.
-        .peaks_chunked_encoding(peaks_chunk_strategy(input, chunk))
+        .peaks_chunked_encoding(peaks_chunk_strategy(chunk, probe_profile_pts, probe_peak_pts))
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -3754,9 +3860,12 @@ fn convert_vendor_reader(
         }
         pi += step;
     }
+    // Pick delta-vs-numpress from the actual m/z values in the probes, not from the extension.
+    let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
+    let (probe_profile_pts, probe_peak_pts) = facet_point_counts(&probes);
     let builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
-        .peaks_chunked_encoding(peaks_chunk_strategy(input, chunk))
+        .peaks_chunked_encoding(peaks_chunk_strategy(chunk, probe_profile_pts, probe_peak_pts))
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
