@@ -30,7 +30,8 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - **The peaks facet can now use the chunked layout — 46% smaller on centroid data, losslessly.**
-  Default ON for Shimadzu `.lcd`; `MZPC_PEAKS_CHUNKED=1`/`=0` forces it either way on any format.
+  Enabled per file by measurement on every format — see "chosen from the data" below.
+  `MZPC_PEAKS_CHUNKED=1`/`=0` overrides either way.
 
   A centroid peak list is just a sorted m/z array, so it chunks exactly like profile signal. Without
   this the peaks facet is the point layout, where the spec requires values be stored as-is, so
@@ -108,6 +109,30 @@ All notable changes to this project are documented here. The format follows
   dual-facet archive silently exported half its content. It now warns with the count
   (`2101/2101 spectra carry both a profile and a peak facet; …the peak lists are dropped`).
   Required making `ReaderMetadata::spectra` public so a caller can see the two facet counts.
+
+- **Both chunk-encoding defaults are now chosen from the data, not the filename.** Two heuristics
+  keyed on the file extension; both were measurably wrong, and both are replaced by a probe of ~6
+  sample spectra spread across the run.
+
+  *Which m/z chunk encoding.* `is_lcd()` decided delta-vs-numpress. But a Shimadzu `.lcd` read
+  natively is on an exact 1e-4 lattice (residual 9.3e-10) where delta is ~3x smaller **and**
+  bit-exact, while msconvert's mzML **of the same acquisition** is off that lattice (residual ~0.5)
+  where delta is 1.6x **larger** than numpress. Same instrument, same run, opposite answers — the
+  extension cannot decide it. `is_fixed_point_lattice()` now tests the values, requiring *every*
+  sampled m/z to land on the grid rather than merely most.
+
+  *Whether to chunk the peaks facet.* A blanket "always chunk" regresses profile-dominated runs: the
+  per-chunk `chunk_start`/`chunk_end`/index columns are a fixed cost per chunk. On the peaks facet:
+
+  | run | peaks facet | |
+  |---|---|---|
+  | Bruker microTOF-Q2 (centroid-only) | 38.0 MB -> 23.8 MB | **-37%** |
+  | Shimadzu `.lcd` (centroid-only) | 1,547 MB -> 839 MB | **-46%** |
+  | Thermo LTQ Velos (profile + peak sidecar) | 133 KB -> 178 KB | **+34%** |
+
+  Which facet holds more points separates these cleanly on every file tested, so that is the rule.
+  Across a seven-format sample the wins are kept (-12.4% Thermo FT-ICR, -37.1% Bruker microTOF) and
+  every regression is gone (LTQ Velos, Waters, Agilent, Bruker CsI all unchanged). All PASS.
 
 ### Notes
 
