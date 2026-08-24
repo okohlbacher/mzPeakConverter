@@ -220,13 +220,19 @@ impl<
 
     fn get_spectrum_by_id(&mut self, id: &str) -> Option<MultiLayerSpectrum<C, D>> {
         let description = self.get_spectrum_metadata_by_id(id).ok()??;
-        let arrays = if self.detail_level == DetailLevel::Full {
-            self.get_spectrum_arrays(description.index as u64).ok()??
-        } else {
-            BinaryArrayMap::new()
-        };
+        // Delegate to the by-INDEX path once the index is known. This used to call
+        // `get_spectrum_arrays` unconditionally, which reads only the `spectra_data` facet -- so a
+        // centroid-only archive (every peak in `spectra_peaks`, `number_of_data_points` null)
+        // returned an EMPTY spectrum through this API while the same spectrum read fine by index.
+        // Going through the by-index path also picks up the loading preference and the per-spectrum
+        // TOF-grid reconstruction, which this branch never applied.
+        if self.detail_level == DetailLevel::Full {
+            if let Some(spec) = self.get_spectrum_by_index(description.index) {
+                return Some(spec);
+            }
+        }
         Some(MultiLayerSpectrum::from_arrays_and_description(
-            arrays,
+            BinaryArrayMap::new(),
             description,
         ))
     }

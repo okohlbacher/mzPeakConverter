@@ -697,7 +697,16 @@ impl BafReader {
     /// optionally points at the `baf2sql_c` library or an SDK root; otherwise
     /// `TIMSDATA_LIB_DIR` is consulted. Uses auto calibration (calibrated, with
     /// raw fallback).
+    /// Open with the historical line-first default.
     pub fn open(dot_d: &Path, sdk_lib: Option<&Path>) -> Result<Self> {
+        Self::open_with(dot_d, sdk_lib, RepresentationArg::Both)
+    }
+
+    pub fn open_with(
+        dot_d: &Path,
+        sdk_lib: Option<&Path>,
+        representation: RepresentationArg,
+    ) -> Result<Self> {
         let paths = BafPaths::resolve(dot_d)?;
         let api = Baf2SqlApi::load(sdk_lib)?;
         let sqlite_cache = api.sqlite_cache_path(&paths.baf_file)?;
@@ -709,8 +718,11 @@ impl BafReader {
         let rows = read_spectrum_rows(&connection)?;
         // The connection was only needed to read the metadata rows up front.
         drop(connection);
-        // Default to line-first (finding 2).
-        let prefer_profile = false;
+        // Line-first by default (finding 2), but no longer hardcoded: `--representation profile`
+        // reaches this lane now. `both` keeps the line-first default, since a BAF spectrum can only
+        // carry ONE array pair through this reader -- emitting both facets here would need the
+        // second pair read as a peak list, which is still open.
+        let prefer_profile = matches!(representation, RepresentationArg::Profile);
         let storage = open_storage_with_fallback(
             &api,
             &paths.baf_file,
@@ -755,18 +767,20 @@ impl BafReader {
         row: &BafSpectrumRow,
         prefer_profile: bool,
     ) -> (Option<u64>, Option<u64>, SignalContinuity) {
-        if prefer_profile && row.profile_mz_id.is_some() && row.profile_intensity_id.is_some() {
-            (
-                row.profile_mz_id,
-                row.profile_intensity_id,
-                SignalContinuity::Profile,
-            )
-        } else {
-            (
-                row.line_mz_id,
-                row.line_intensity_id,
-                SignalContinuity::Centroid,
-            )
+        let profile = (row.profile_mz_id, row.profile_intensity_id);
+        let line = (row.line_mz_id, row.line_intensity_id);
+        let has = |p: (Option<u64>, Option<u64>)| p.0.is_some() && p.1.is_some();
+
+        // Fall back in BOTH directions. The old code fell back only from profile to line, so a row
+        // that stores ONLY profile arrays returned the (None, None) line pair and was written as an
+        // EMPTY spectrum labelled centroid -- data silently lost, and mislabelled on the way out.
+        match (prefer_profile, has(profile), has(line)) {
+            (true, true, _) | (false, true, false) => {
+                (profile.0, profile.1, SignalContinuity::Profile)
+            }
+            (false, _, true) | (true, false, true) => (line.0, line.1, SignalContinuity::Centroid),
+            // Neither pair is readable: report it as such rather than inventing a label.
+            (_, false, false) => (None, None, SignalContinuity::Unknown),
         }
     }
 

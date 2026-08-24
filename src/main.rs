@@ -111,9 +111,11 @@ fn representation() -> RepresentationArg {
     *REPRESENTATION.get().unwrap_or(&RepresentationArg::Both)
 }
 
-/// CLI spelling of the signal representation to read. Mirrors `shimadzu::Representation`.
+/// CLI spelling of the signal representation to read. Mirrors `shimadzu::Representation`, and is
+/// also what the Bruker BAF lane consumes directly (that module builds on Linux too, where the
+/// `cfg(windows)` shimadzu enum does not exist).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
-enum RepresentationArg {
+pub enum RepresentationArg {
     /// Read every representation the file contains (faithful default).
     Both,
     /// Read only profile data.
@@ -3460,7 +3462,7 @@ fn convert_baf(
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
 ) -> Result<()> {
-    let reader = bruker_baf::BafReader::open(input, None)?;
+    let reader = bruker_baf::BafReader::open_with(input, None, representation())?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
@@ -4433,6 +4435,64 @@ mod tests {
     /// without the 0-spectra "Run to Run" writer crash. Uses the sciex-qtrap scheduled-MRM file (a
     /// real msconvert SRM; synthetic mzML chromatograms aren't read back by mzdata). Run with:
     ///   `cargo test --release mzml_output_preserves_srm -- --ignored --nocapture`
+    /// A CENTROID-ONLY archive must return its signal through `get_spectrum_by_id`, not just
+    /// `get_spectrum_by_index`. `get_spectrum_by_id` used to call `get_spectrum_arrays`
+    /// unconditionally, which reads only the `spectra_data` facet — so every peak living in
+    /// `spectra_peaks` was invisible by ID and the call returned an empty spectrum. Centroid-only
+    /// archives are the common case for several vendors, so this was a silent hole in the API.
+    /// Run with `cargo test --release by_id -- --ignored`.
+    #[test]
+    #[ignore = "needs a centroid mzML corpus fixture; run with --ignored"]
+    fn by_id_reads_the_peaks_facet_on_a_centroid_only_archive() {
+        use mzdata::io::DetailLevel;
+        use mzdata::prelude::SpectrumSource;
+        use mzpeak_prototyping::MzPeakReader;
+        use std::fs;
+
+        let Some(input) = corpus_find(|p| {
+            p.is_file()
+                && p.file_name().and_then(|n| n.to_str())
+                    == Some("neg_01_Fistax_1-A,2_01_5715.mzML")
+        }) else {
+            eprintln!("corpus fixture not found; skipping");
+            return;
+        };
+        // Unique per process: this test binary gets run more than once in a single `cargo test`
+        // invocation, and a shared fixed path made the two runs delete each other's output mid-write.
+        let tmp = std::env::temp_dir().join(format!("mzpc_by_id_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("out.mzpeak");
+        super::convert_file(
+            &input,
+            &out,
+            Some(super::ChunkingStrategy::NumpressLinear { chunk_size: 50.0 }),
+            3,
+            None,
+            true,
+            super::TofGridMode::Off,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let mut reader = MzPeakReader::new(&out).unwrap();
+        reader.set_detail_level(DetailLevel::Full);
+        let by_index = reader.get_spectrum_by_index(0).expect("spectrum 0 by index");
+        let id = by_index.id().to_string();
+        let n_index = by_index.peaks().len();
+        assert!(n_index > 0, "fixture is not carrying signal; test is vacuous");
+
+        let by_id = reader.get_spectrum_by_id(&id).expect("spectrum by id");
+        assert_eq!(
+            by_id.peaks().len(),
+            n_index,
+            "by-id returned {} points but by-index returned {n_index} for {id}",
+            by_id.peaks().len()
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     #[ignore = "needs the sciex-qtrap scheduled-MRM corpus file; run with --ignored"]
     fn mzml_output_preserves_srm_chromatograms() {

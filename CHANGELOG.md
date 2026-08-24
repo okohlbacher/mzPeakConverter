@@ -8,6 +8,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Waters: continuity read from the vendor, not assumed.** [src/waters.rs](src/waters.rs)
+  hardcoded `SignalContinuity::Profile`, so every centroided MassLynx function was mislabelled and
+  its peaks written to the profile facet — the same non-conformance as the Shimadzu defect above.
+  `MassLynxRaw.dll` exports `isContinuum` (confirmed by reading the DLL's PE export table, alongside
+  `getFunctionType`), so it is now bound and resolved once per FUNCTION, which is the granularity
+  MassLynx stores it at. The binding is optional: an older DLL without the export keeps the previous
+  behaviour and warns, rather than failing the conversion.
+
+- **Bruker BAF: no longer silently drops a representation, and honours `--representation`.**
+  `select_pair` fell back only from profile to line, so a row storing ONLY profile arrays returned
+  the empty line pair and was written as an **empty spectrum labelled centroid** — data lost and
+  mislabelled on the way out. It now falls back in both directions, reports `Unknown` when neither
+  pair is readable instead of inventing a label, and takes its preference from `--representation`
+  rather than a hardcoded `prefer_profile = false`. Emitting BOTH facets for a BAF row is still
+  open: that needs the second pair read as a peak list.
+
+- **`get_spectrum_by_id` could not see the peaks facet.** It called `get_spectrum_arrays`
+  unconditionally, which reads only `spectra_data` — so a centroid-only archive returned an EMPTY
+  spectrum by ID while the same spectrum read fine by index. Measured on a Bruker microTOF-Q2
+  archive: **by-id 0 points, by-index 937**. It now delegates to the by-index path, which also picks
+  up the loading preference and the per-spectrum TOF-grid reconstruction this branch never applied.
+  Covered by `by_id_reads_the_peaks_facet_on_a_centroid_only_archive` (corpus-gated), verified to
+  fail against the old code.
+
+- **The peak writer no longer panics on a signal-free spectrum.** `mini_peak.rs` had
+  `RefPeakDataLevel::Missing => unimplemented!()`. Empty spectra are legitimate (newer-timsTOF blank
+  frames) and reach this writer whenever the metadata says peaks; it now records an empty entry.
+
 - **Shimadzu `.lcd` spectra were labelled `profile` regardless of what they actually contained.**
   The glue's `Data()` computed a correct `centroid` flag; `SpectrumData` destructured it into a
   discard, and `Meta()` hardcoded `SignalContinuity = 0`. So `src/shimadzu.rs` labelled every

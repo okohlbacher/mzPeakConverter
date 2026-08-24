@@ -47,6 +47,10 @@ type CreateFromPathFn = unsafe extern "C" fn(*const c_char, *mut *mut c_void, c_
 type DestroyReaderFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type GetFunctionCountFn = unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int;
 type GetScanCountFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int) -> c_int;
+/// `isContinuum(infoReader, function, *out bool)`. Same shape as `getScanCount`: handle, function
+/// index, out-param, non-zero return on failure. Exported by `MassLynxRaw.dll` (verified in its PE
+/// export table alongside `getFunctionType` / `getFunctionTypeString`).
+type IsContinuumFn = unsafe extern "C" fn(*mut c_void, c_int, *mut bool) -> c_int;
 type ReadScanFn =
     unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *mut f32, *mut *mut f32, *mut c_int)
         -> c_int;
@@ -57,6 +61,9 @@ pub struct WatersReader {
     // `_lib` MUST outlive the function pointers + handles below (dropped together with this struct).
     _lib: Library,
     read_scan: ReadScanFn,
+    is_continuum: Option<IsContinuumFn>,
+    /// Per-function continuum flag, resolved once at open. `None` when the export is unavailable.
+    continuum: Vec<Option<bool>>,
     destroy: DestroyReaderFn,
     info_reader: *mut c_void,
     scan_reader: *mut c_void,
@@ -94,6 +101,16 @@ impl WatersReader {
             .context("resolving MassLynx export getScanCount")?;
         let read_scan: ReadScanFn =
             *unsafe { lib.get(b"readScan\0") }.context("resolving MassLynx export readScan")?;
+        // OPTIONAL: older MassLynx builds may not export it. Absent, continuity falls back to the
+        // previous behaviour (profile) rather than failing the whole conversion.
+        let is_continuum: Option<IsContinuumFn> =
+            unsafe { lib.get::<IsContinuumFn>(b"isContinuum\0") }.ok().map(|f| *f);
+        if is_continuum.is_none() {
+            log::warn!(
+                "MassLynxRaw.dll does not export isContinuum; every function will be labelled \
+                 profile, which is wrong for centroided functions"
+            );
+        }
 
         let path_str = input
             .to_str()
@@ -130,6 +147,18 @@ impl WatersReader {
             }
             bail!("MassLynx getFunctionCount failed (rc={rc}, n={n_functions})");
         }
+        // Continuity is a per-FUNCTION property in MassLynx, so resolve it once per function rather
+        // than per spectrum. It used to be hardcoded to Profile, which mislabelled every centroided
+        // function -- the same defect that put Shimadzu centroid data in the profile facet.
+        let mut continuum: Vec<Option<bool>> = Vec::new();
+        for f in 0..n_functions {
+            continuum.push(is_continuum.and_then(|func| {
+                let mut flag = false;
+                let rc = unsafe { func(info_reader, f, &mut flag) };
+                (rc == 0).then_some(flag)
+            }));
+        }
+
         let mut index = Vec::new();
         for f in 0..n_functions {
             let mut n_scans: c_int = 0;
@@ -156,6 +185,8 @@ impl WatersReader {
             info_reader,
             scan_reader,
             index,
+            is_continuum,
+            continuum,
         })
     }
 
@@ -232,7 +263,13 @@ impl WatersReader {
             id: format!("function={} process=0 scan={}", func + 1, scan + 1),
             index: i,
             ms_level,
-            signal_continuity: SignalContinuity::Profile,
+            // From the vendor's per-function flag, not assumed. Unknown (export missing or the call
+            // failed) keeps the historical Profile default.
+            signal_continuity: match self.continuum.get(func as usize).copied().flatten() {
+                Some(true) => SignalContinuity::Profile,
+                Some(false) => SignalContinuity::Centroid,
+                None => SignalContinuity::Profile,
+            },
             polarity: ScanPolarity::Unknown,
             ..Default::default()
         };

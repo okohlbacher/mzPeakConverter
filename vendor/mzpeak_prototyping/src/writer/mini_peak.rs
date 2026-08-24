@@ -146,7 +146,10 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
                 self.buffers
                     .add(spectrum_count, spectrum_time, peaks.as_slice())
             }
-            RefPeakDataLevel::Missing => unimplemented!(),
+            // A spectrum with no signal at all is legitimate (newer-timsTOF blank frames), and it
+            // reaches this writer whenever the metadata says peaks. Record an empty entry rather
+            // than aborting the whole conversion on an `unimplemented!()`.
+            RefPeakDataLevel::Missing => (Vec::new(), 0),
             RefPeakDataLevel::RawData(arrays) => {
                 // GATED ims-chunked: if this facet is a ChunkBuffers with an m/z boundary, chunk the
                 // raw `tof`/intensity/mobility arrays on m/z bins instead of storing flat points.
