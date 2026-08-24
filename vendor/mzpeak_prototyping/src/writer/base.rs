@@ -942,7 +942,15 @@ pub trait AbstractMzPeakWriter {
                 }
                 mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => {
                     match spectrum.signal_continuity() {
-                        SignalContinuity::Profile => {
+                        // UNKNOWN routes here with Profile, not with Centroid below. The metadata
+                        // side already assumes profile for Unknown -- it logs "assuming profile",
+                        // writes `number_of_data_points`, and nulls `number_of_peaks`. Routing the
+                        // bytes to the PEAK facet contradicted that: `spectra_data` came out empty
+                        // while the counts told a reader to look there, so a reader doing the
+                        // spec's count-driven read planning found nothing and the signal was
+                        // unreachable. Reproduced on 600 spectra: 0 rows in `spectra_data`, 1,044
+                        // in `spectra_peaks`, `number_of_data_points` populated on all 600.
+                        SignalContinuity::Profile | SignalContinuity::Unknown => {
                             log::trace!(
                                 "Writing {} raw arrays for {spectrum_index}",
                                 binary_array_map.len()
@@ -953,7 +961,7 @@ pub trait AbstractMzPeakWriter {
                                 binary_array_map,
                             )?
                         }
-                        SignalContinuity::Centroid | SignalContinuity::Unknown => {
+                        SignalContinuity::Centroid => {
                             log::trace!(
                                 "Writing {} peaks from raw arrays for {spectrum_index}",
                                 peaks.len()

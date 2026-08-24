@@ -2613,6 +2613,13 @@ impl<'a> MzChromatogramBuilder<'a> {
             .copied()
             .zip(self.descriptions.iter_mut())
         {
+            // Null-guard, mirroring the SPECTRUM continuity visitor above. Without it a single
+            // chromatogram row with a null `chromatogram_type` aborts the whole process on an
+            // `Option::unwrap`, and the writer does emit such rows -- every Waters MRM archive
+            // carries one (id "", type null), so `--to mzml` on those crashed outright.
+            if spec_type_array.is_null(i) {
+                continue;
+            }
             let chromatogram_type_curie = spec_type_array.value(i).unwrap();
             let chromatogram_type =
                 ChromatogramType::from_accession(chromatogram_type_curie.accession);

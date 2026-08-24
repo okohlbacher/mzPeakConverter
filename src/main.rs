@@ -1047,6 +1047,26 @@ fn facet_point_counts(spectra: &[mzdata::spectrum::MultiLayerSpectrum]) -> (usiz
     (profile, peaks)
 }
 
+/// True when `path` is an mzML that does NOT carry the `<indexedmzML>` wrapper.
+///
+/// This is the discriminator for a real data-loss trap: mzdata can only enumerate chromatograms
+/// from an mzML's EMBEDDED index. On a plain (non-indexed) mzML `count_chromatograms()` reports 0
+/// and `get_chromatogram_by_index(0)` returns `None` even when the file declares a populated
+/// `<chromatogramList>` — and calling `build_index()` does not recover them, so the converter
+/// cannot read them at all. Measured: a Thermo LTQ Velos mzML declaring `TIC` + three
+/// `SIM SIC` traces yielded 0; the two synthesized MS1 chromatograms masked the loss of the three
+/// SIM SICs entirely. Only the first KB is read — the wrapper is the document element.
+fn is_unindexed_mzml(path: &Path) -> bool {
+    use std::io::Read;
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mzML")) {
+        return false;
+    }
+    let Ok(mut f) = fs::File::open(path) else { return false };
+    let mut head = [0u8; 1024];
+    let Ok(n) = f.read(&mut head) else { return false };
+    !String::from_utf8_lossy(&head[..n]).contains("indexedmzML")
+}
+
 /// True for a Shimadzu LabSolutions `.lcd` file.
 fn is_lcd(input: &Path) -> bool {
     input.is_file()
@@ -2532,6 +2552,17 @@ fn convert_file(
     // not written, so a partial conversion can never be mistaken for a complete one.
     assert_source_complete_tmp(input, n, cap, &tmp)?;
 
+    // Say so when the source's chromatograms are unreadable, rather than writing an archive that
+    // quietly lacks them. Synthesis regenerates TIC/BPC from MS1 and so hides the loss of anything
+    // else — SIM/SRM traces are exactly what does not come back.
+    if reader.count_chromatograms() == 0 && is_unindexed_mzml(read_path) {
+        log::warn!(
+            "{} is a non-indexed mzML: its chromatogramList cannot be enumerated by this reader, so \
+             any chromatograms it declares (SIM/SRM traces included) are NOT carried into the \
+             archive. Re-index it (msconvert, or `--via-msconvert`) if you need them.",
+            read_path.display()
+        );
+    }
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
@@ -4032,6 +4063,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
         writer.write_chromatogram(&chrom)?;
         n += 1;
     }
+    log::info!("chromatograms: {synthesized} synthesized + {} from source = {n}", n - synthesized);
     if n == 0 {
         write_empty_chromatogram(writer)?;
     }

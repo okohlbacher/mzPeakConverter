@@ -2055,7 +2055,12 @@ impl SpectrumDetailsBuilder {
         });
         self.spectrum_representation
             .append_option(match item.signal_continuity() {
-                mzdata::spectrum::SignalContinuity::Unknown => None,
+                // `spectrum representation` (a child of MS:1000525) is MUST-level for every
+                // spectrum -- `schema/table_rules.json` `spectrum_must`, requirement_level MUST.
+                // Emitting null made every Unknown-continuity spectrum non-conformant. We already
+                // assume profile for Unknown everywhere else (the warn below, and the counts), so
+                // say so rather than leaving a required term absent.
+                mzdata::spectrum::SignalContinuity::Unknown => Some(&curie!(MS:1000128)),
                 mzdata::spectrum::SignalContinuity::Centroid => Some(&curie!(MS:1000127)),
                 mzdata::spectrum::SignalContinuity::Profile => Some(&curie!(MS:1000128)),
             });

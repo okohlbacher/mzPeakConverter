@@ -8,6 +8,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Unknown signal continuity produced a self-contradictory archive, losing all the data.** The
+  metadata side assumed profile — logging "assuming profile", writing `number_of_data_points`, and
+  nulling `number_of_peaks` — while the writer routed the bytes to the PEAK facet. So `spectra_data`
+  came out empty while the counts told a reader to look there, and the spec's count-driven read
+  planning found nothing. Reproduced on a 600-spectrum mzML with the continuity cvParam stripped:
+  **17,965 points in, 0 out** of a round-trip. Routing now follows the same profile assumption the
+  counts already made, and the round-trip returns all 17,965.
+
+  The same spectra also had `spectrum_representation` = null, which violates a MUST
+  (`schema/table_rules.json` `spectrum_must`, requirement_level MUST, MS:1000525). Unknown now
+  writes `MS:1000128`, consistent with the assumption made everywhere else. **mzPeakValidator did
+  not flag either problem** — neither the missing MUST term nor the count/facet contradiction.
+
+- **`--to mzml` aborted on any archive with a null-typed chromatogram.** The chromatogram visitor
+  unwrapped `chromatogram_type` without the null guard its sibling spectrum-continuity visitor has,
+  so one such row killed the process (`Option::unwrap` on `None`). The writer emits exactly such a
+  row — `write_empty_chromatogram`'s placeholder, id `""`, type null — whenever a run ends up with
+  no chromatograms, which meant **every Waters MRM archive crashed on export**. Guarded.
+
+- **Non-indexed mzML silently loses its chromatograms.** mzdata can only enumerate an mzML's
+  chromatograms from the EMBEDDED index: on a plain mzML `count_chromatograms()` reports 0 and
+  `get_chromatogram_by_index(0)` returns `None` even with a populated `<chromatogramList>`, and
+  `build_index()` does not recover them. A Thermo LTQ Velos mzML declaring `TIC` + three `SIM SIC`
+  traces yielded **0 from source**; the two synthesized MS1 chromatograms masked it, so the three
+  SIM SICs vanished without a word. This is an upstream limitation the converter cannot fix, so it
+  now **warns**, naming the file and pointing at re-indexing. Indexed mzML (verified on a 300-
+  chromatogram Agilent file) is unaffected and stays silent.
+
 - **Waters: continuity read from the vendor, not assumed.** [src/waters.rs](src/waters.rs)
   hardcoded `SignalContinuity::Profile`, so every centroided MassLynx function was mislabelled and
   its peaks written to the profile facet — the same non-conformance as the Shimadzu defect above.
