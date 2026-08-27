@@ -20,12 +20,19 @@ All notable changes to this project are documented here. The format follows
   rather than an outcome. Affected: 3 archives on this machine (`HEK_PosOAD1`, `Blind_P1_pos_012`,
   `090701-LTQVelos-unittest-01`) — every dual archive written by v0.8.0.
 
-  Matching is also *cheaper* on the file that motivated the old heuristic: `HEK_PosOAD1` is
-  33,392,175 B chunked/chunked versus 35,018,328 B mixed — **4.6% smaller**. Centroid-only runs keep
-  the full chunked-peaks win unchanged (Bruker microTOF −37%, Shimadzu `.lcd` −46%), since their
-  data facet is chunked and the peaks facet simply follows. The cost falls on profile-dominated runs
-  with a small centroid sidecar: +3.2% on a Thermo LTQ Velos archive. That is the price of
-  conformance.
+  **Size impact on dual archives cuts both ways** — it depends on how large the centroid facet is,
+  since chunking repays its per-chunk columns only on a big peak list:
+
+  | archive | peaks | mixed (illegal) | matched | |
+  |---|---:|---:|---:|---:|
+  | `HEK_PosOAD1` | 1,543,961 | 35,018,382 | **33,392,223** | **−4.6%** |
+  | `Blind_P1_pos_012` | 216,742 | 3,268,711 | **3,533,168** | **+8.1%** |
+  | `090701-LTQVelos-unittest-01` | 16,047 | 1,419,533 | **1,464,868** | **+3.2%** |
+
+  So roughly −5% to +8%, and not a win on balance. Conformance is the reason for the change, not
+  size. Centroid-only runs are byte-for-byte unaffected and keep the full chunked-peaks win (Bruker
+  microTOF −37%, Shimadzu `.lcd` −46%), since their data facet is chunked and the peaks facet simply
+  follows.
 
   Corroborated by mzPeakViewer's own golden dual fixture (`packages/core/test/fixtures/dual.mzpeak`),
   which is `point`/`point` — family-consistent, as ours now are.
