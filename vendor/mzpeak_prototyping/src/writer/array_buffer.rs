@@ -1349,6 +1349,26 @@ impl ArrayBuffersBuilder {
         mask_zero_intensity_runs: bool,
     ) -> ChunkBuffers {
         if self.fields_empty() {
+            // `add_default_fields_for_context` is layout-blind: it installs POINT-shaped scalars
+            // (`mz: Float64`, `intensity: Float32`) regardless of `self.chunking_strategy`. Those
+            // cannot describe a chunked buffer, whose columns are `LargeList`. We deliberately do
+            // NOT synthesize chunk-shaped defaults here: the correct chunk field *names* encode the
+            // source dtype (`intensity_f32_dc` vs `intensity_f64_dc`) and the transform
+            // (`mz_numpress_linear_bytes`), neither of which is knowable without seeing data —
+            // guessing wrong swaps a loud panic for a silently all-null column.
+            //
+            // Reaching here with a chunking strategy set means schema sampling produced nothing.
+            // That is only benign when the source carries no signal at all (no chunk batch is ever
+            // built, so this schema stays inert). If any spectrum does have data, the writer will
+            // panic in `promote_record_batch_to_struct`. Sampling is where that must be fixed; see
+            // `sample_array_types_from_spectrum_source`.
+            if self.chunking_strategy.is_some() {
+                log::warn!(
+                    "chunked {buffer_context:?} buffer has an empty array schema; falling back to \
+                     point-shaped default fields, which cannot describe chunked data. This is \
+                     only safe if the source has no signal at all."
+                );
+            }
             self = self.add_default_fields_for_context(buffer_context);
         }
         if self.include_time {

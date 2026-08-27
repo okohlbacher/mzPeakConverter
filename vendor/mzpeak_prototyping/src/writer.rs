@@ -306,7 +306,12 @@ where
 /// Collect arrays fields from spectra in a [`RandomAccessSpectrumSource`] to prepare
 /// the data file schema.
 ///
-/// This examines the first, 100th, and middle spectrum from `reader`.
+/// For sources with more than 50 spectra this examines five fixed control points
+/// (first, 100th, quarter, half, three-quarter). If every one of them is empty -- routine
+/// for ion-mobility data, which is mostly zero-length ramp slots -- it falls back to scanning
+/// forward for the first few spectra that actually carry data, because an empty array schema
+/// silently degrades a chunked buffer to point-shaped defaults. Smaller sources are read in
+/// full.
 ///
 /// # Arguments
 /// `reader`: The stream of spectra to read from
@@ -335,8 +340,44 @@ pub fn sample_array_types_from_spectrum_source<
         let it = pts
             .into_iter()
             .flat_map(|i| reader.get_spectrum_by_index(i));
-        ArrayTypesSampler::new(overrides, use_chunked_encoding)
-            .sample_spectrum_array_types(it, prefer_peaks)
+        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding)
+            .sample_spectrum_array_types(it, prefer_peaks);
+        if !fields.is_empty() {
+            return fields;
+        }
+
+        // Every control point was a zero-length spectrum, so the sample described nothing.
+        //
+        // This is routine for ion-mobility data: a PASEF/IMS mzML is mostly empty ramp slots
+        // (~80% of `Hela_QC_PASEF_Slot1-first-6-frames.mzML` has `defaultArrayLength="0"`), and
+        // the control points are fixed positions that can all miss the data. An empty field set
+        // is NOT harmless: `ArrayBufferBuilder::build_chunked` then falls back to
+        // `add_default_fields_for_context`, which is layout-blind and installs the POINT-shaped
+        // scalars `mz: Float64` / `intensity: Float32` into a *chunked* buffer. The writer
+        // panics ("expected Float32 but found LargeList(Float32)") the moment a real spectrum
+        // produces list-typed chunk columns.
+        //
+        // Widening or reshuffling `pts` cannot fix this — a file whose only non-empty spectrum
+        // sits at an unprobed index still defeats any fixed probe set. Scan instead, and stop as
+        // soon as enough spectra with data have been seen to describe the arrays. This is lazy:
+        // on the happy path above we never get here, and here we read only up to the first few
+        // non-empty spectra.
+        log::debug!(
+            "control points {pts:?} yielded no array fields (all sampled spectra empty); \
+             scanning forward for spectra with data"
+        );
+        let it = (0..n)
+            .flat_map(|i| reader.get_spectrum_by_index(i))
+            .filter(|s| !s.peaks().is_empty())
+            .take(pts.len());
+        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding)
+            .sample_spectrum_array_types(it, prefer_peaks);
+        if fields.is_empty() {
+            // The file genuinely has no signal anywhere. No chunk batch is ever produced, so the
+            // point-shaped default schema is inert rather than wrong.
+            log::debug!("no spectrum in this source carries any data; array schema left empty");
+        }
+        fields
     } else {
         log::trace!("{n} spectra detected, sampling arrays from all entries");
         let it = reader.iter();
@@ -480,7 +521,12 @@ impl MzPeakWriterBuilder {
     /// Collect arrays fields from spectra in a [`RandomAccessSpectrumSource`] to prepare
     /// the data file schema.
     ///
-    /// This examines the first, 100th, and middle spectrum from `reader`.
+    /// For sources with more than 50 spectra this examines five fixed control points
+    /// (first, 100th, quarter, half, three-quarter). If every one of them is empty -- routine
+    /// for ion-mobility data, which is mostly zero-length ramp slots -- it falls back to scanning
+    /// forward for the first few spectra that actually carry data, because an empty array schema
+    /// silently degrades a chunked buffer to point-shaped defaults. Smaller sources are read in
+    /// full.
     ///
     /// # Arguments
     /// `reader`: The stream of spectra to read from
