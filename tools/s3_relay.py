@@ -57,6 +57,8 @@ def main():
     h = sub.add_parser("head"); h.add_argument("key")
     d = sub.add_parser("delete"); d.add_argument("key")
     m = sub.add_parser("md5"); m.add_argument("path")
+    l = sub.add_parser("ls"); l.add_argument("prefix"); l.add_argument("--count", action="store_true")
+    cp = sub.add_parser("copy"); cp.add_argument("src_key"); cp.add_argument("dst_key")
     a = ap.parse_args()
 
     if a.cmd == "md5":  # local-only, no network/boto3
@@ -77,6 +79,24 @@ def main():
         s3.download_file(b, a.key, a.dest)
     elif a.cmd == "head":
         print(s3.head_object(Bucket=b, Key=a.key)["ContentLength"])
+    elif a.cmd == "copy":
+        # Server-side: the bytes never touch this host. Used to publish a VERIFIED staging object to
+        # its durable corpus key, so a corrupt or truncated upload can never appear at the real key.
+        s3.copy_object(Bucket=b, Key=a.dst_key, CopySource={"Bucket": b, "Key": a.src_key})
+        print(s3.head_object(Bucket=b, Key=a.dst_key)["ContentLength"])
+    elif a.cmd == "ls":
+        # Paginated: a vendor .d unit is hundreds of objects and list_objects_v2 caps at 1000.
+        keys, tok = [], None
+        while True:
+            kw = {"Bucket": b, "Prefix": a.prefix}
+            if tok:
+                kw["ContinuationToken"] = tok
+            r = s3.list_objects_v2(**kw)
+            keys += [o["Key"] for o in r.get("Contents", [])]
+            if not r.get("IsTruncated"):
+                break
+            tok = r["NextContinuationToken"]
+        print(len(keys) if a.count else "\n".join(keys))
     elif a.cmd == "delete":
         s3.delete_object(Bucket=b, Key=a.key)  # idempotent: no error if absent
 

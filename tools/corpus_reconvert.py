@@ -55,12 +55,17 @@ def converter() -> str:
     env = os.environ.get("MZPEAK_CONVERT")
     if env and Path(env).exists():
         return env
-    found = shutil.which("mzpeak-convert")
-    if found:
-        return found
+    # target/release BEFORE $PATH: this repo's own build is the authority on "current". A stale
+    # ~/.cargo/bin/mzpeak-convert shadows it otherwise (seen in the wild: PATH 0.7.10 masking a
+    # target/release 0.8.0), which silently pins the corpus to an old converter — and would make a
+    # version-sync driven off this function DOWNGRADE the box. convert_corpus.sh:12 and
+    # corpus_full.sh:19 already resolve in this order; match them.
     local = Path(__file__).resolve().parent.parent / "target/release/mzpeak-convert"
     if local.exists():
         return str(local)
+    found = shutil.which("mzpeak-convert")
+    if found:
+        return found
     sys.exit("mzpeak-convert not found: set $MZPEAK_CONVERT or build target/release")
 
 
@@ -179,8 +184,36 @@ def load_recipes(root: Path) -> tuple[dict[Path, list[str]], dict[Path, Path], s
             unit = dd / spec
             pinned[dd] = unit
             if cv.get("flags"):
-                flags[unit] = shlex.split(str(cv["flags"]))
+                flags[unit] = resolve_flag_paths(shlex.split(str(cv["flags"])), dd, root.parent, root)
     return flags, pinned, skipped, governed
+
+
+# Flags that name a FILE. A descriptor writes them relative to its own directory
+# (`--sdrf PXD020187.sdrf.tsv` sits beside the descriptor, while the input is `mzml/D2_Nat_2.mzML`),
+# but the converter resolves a relative path against ITS cwd, not the descriptor's. Every SDRF
+# demonstrator therefore failed with "opening SDRF <name>: No such file or directory" even though
+# the file was present. Absolutise here, where the descriptor's directory is still known.
+PATH_FLAGS = {"--sdrf", "--image"}
+
+
+def resolve_flag_paths(tokens: list[str], *bases: Path) -> list[str]:
+    """Absolutise path-valued flags against the first `bases` entry that actually has the file.
+
+    Descriptors are inconsistent about what a relative path is relative to, and both spellings are
+    in use: sdrf-examples writes `--sdrf PXD020187.sdrf.tsv` (beside the descriptor), while
+    zenodo-DESI writes `--image "data/imzml-examples/.../90,100,110,120.jpg"` (from the CORPUS
+    ROOT'S PARENT, i.e. including the `data/` component). Try each base rather than pick one.
+    """
+    out, expect_path = [], False
+    for tok in tokens:
+        if expect_path and not tok.startswith("-"):
+            hit = next((b / tok for b in bases if (b / tok).exists()), None)
+            out.append(str(hit.resolve()) if hit else tok)
+            expect_path = False
+            continue
+        expect_path = tok in PATH_FLAGS
+        out.append(tok)
+    return out
 
 
 def apply_recipes(units: list[Path], pinned: dict[Path, Path], skipped: set[Path],
@@ -371,8 +404,18 @@ def sync_box(version: str, repo: str = r"C:\Users\User\src\mzPeakConverter") -> 
     return ok
 
 
+def s3_target(local: Path) -> str:
+    """Local archive path -> its s3:// corpus URI, via corpus_lib (the one mapping the sync uses)."""
+    import importlib.util
+    lib = Path(os.path.expanduser("~/Claude/mzpeak-example-data/scripts/corpus_lib.py"))
+    spec = importlib.util.spec_from_file_location("corpus_lib", lib)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.s3_uri(str(local))
+
+
 def run_box(units: list[Path], root: Path, version: str, jobs: int,
-            recipes: dict[Path, list[str]] | None = None) -> None:
+            recipes: dict[Path, list[str]] | None = None, s3_first: bool = True) -> None:
     """Convert host-unsupported units on the box, relaying the archives back.
 
     Delegates the transfer to tools/box_convert.sh --local-manifest, which already stages the raw
@@ -392,7 +435,13 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
             # The descriptor's own flags, so a box-built archive matches its host-built recipe
             # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
             flags = (recipes or {}).get(u) or ['--no-vendor']
-            fh.write(f"{u}\t{target_for(u)}\t{' '.join(flags)}\n")
+            # S3-FIRST (default): name the FINAL corpus key as the target, so the box PUTs the
+            # archive straight to where the corpus publishes it and the host only mirrors it down.
+            # Previously the archive came back to the host and needed a separate upload pass, which
+            # is where local and bucket drifted apart. corpus_lib owns the mapping so a conversion
+            # target and a sync destination can never disagree.
+            out = s3_target(target_for(u)) if s3_first else target_for(u)
+            fh.write(f"{u}\t{out}\t{' '.join(flags)}\n")
     print(f"box       : {len(units)} unit(s) -> {manifest}")
     # box_convert.sh shells out to `python3` for the S3 relay, which needs boto3. The system python3
     # doesn't have it; the anaconda one does. Prepend it rather than patching the shared script.
@@ -444,6 +493,8 @@ def main() -> int:
     ap.add_argument("--box", action="store_true",
                     help="also convert host-unsupported vendor units on the flash workstation")
     ap.add_argument("--box-jobs", type=int, default=1, help="box concurrency (disk-bound; default 1)")
+    ap.add_argument("--no-s3-first", action="store_true",
+                    help="box returns archives to the host instead of PUTting them to the corpus bucket")
     args = ap.parse_args()
 
     root = Path(args.root).expanduser()
@@ -508,7 +559,11 @@ def main() -> int:
     if args.box and not (args.report_only or args.dry_run):
         print()
         deferred = [u for u, d in results["skipped"] if "payload missing" not in d]
-        run_box(deferred, root, version, args.box_jobs, recipe_flags)
+        # BOX_REQUIRE_VERSION: this harness STAMPS archives with a version string, so converting
+        # with a stale box exe would mislabel them. Abort instead.
+        os.environ.setdefault("BOX_REQUIRE_VERSION", "1")
+        run_box(deferred, root, version, args.box_jobs, recipe_flags,
+                s3_first=not args.no_s3_first)
 
     # ---- report -------------------------------------------------------------
     have = [t for t in groups if is_current(t, version)]
