@@ -897,6 +897,7 @@ impl<
             tempfile::tempfile().expect("Failed to create temporary file to write peaks to");
         let separate_peak_writer = Self::make_peaks_writer(
             peak_buffer_file,
+            spectrum_buffers.prefix(),
             spectrum_peak_buffers_builder,
             write_batch_config,
             compression,

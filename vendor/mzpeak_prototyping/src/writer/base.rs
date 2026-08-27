@@ -882,8 +882,10 @@ pub trait AbstractMzPeakWriter {
                         .map(|(k, v)| (k.clone(), v.clone())),
                 )
                 .with_context(BufferContext::Spectrum);
+            let data_facet_prefix = self.spectrum_data_buffer_mut().prefix().to_string();
             let writer = Self::make_peaks_writer(
                 peak_buffer_file,
+                &data_facet_prefix,
                 builder,
                 self.write_batch_config(),
                 self.compression(),
@@ -893,6 +895,7 @@ pub trait AbstractMzPeakWriter {
                 self.encryption_properties(),
             )?;
             self.set_spectrum_peak_writer(writer);
+
         }
         self.spectrum_peak_writer()
             .ok_or_else(|| io::Error::other("Cannot create peak writer"))
@@ -995,6 +998,7 @@ pub trait AbstractMzPeakWriter {
     /// Create a specrtum peak writer over the provided stream using the given configuration
     fn make_peaks_writer<S: io::Write + Send + io::Seek + 'static>(
         stream: S,
+        data_facet_prefix: &str,
         peak_buffer_builder: ArrayBuffersBuilder,
         write_batch_config: WriteBatchConfig,
         compression: Compression,
@@ -1016,6 +1020,26 @@ pub trait AbstractMzPeakWriter {
                 .build(Arc::new(Schema::empty()), BufferContext::Spectrum, false)
                 .into()
         };
+
+        // ENFORCE the layout-family invariant, at the one choke point every peak writer is born
+        // through. `spectra_data` and `spectra_peaks` are both `entity_type: spectrum` and share one
+        // `spectrum_array_index`, so the spec requires a single layout family across them
+        // (mzPeak-specification docs/conformance.md, "Conformant archive" item 4 + the semantic
+        // invariants; scope clarified in HUPO-PSI/mzPeak-specification#21).
+        //
+        // The defect is conformance, not reachability: readers that resolve the layout PER SOURCE
+        // (mzpeakts does) read a mixed archive fine, and the centroids were never actually lost.
+        // But the guarantee a reader is entitled to is that one `entity_type` has one family, and
+        // an archive that breaks it is only readable by luck of implementation. No validator rule
+        // covers this, so nothing downstream would catch it. Fail at write time instead.
+        if peak_buffer.prefix() != data_facet_prefix {
+            return Err(io::Error::other(format!(
+                "layout family mismatch between spectrum facets: spectra_data is \
+                 '{data_facet_prefix}' but spectra_peaks would be '{}'. Both belong to the \
+                 `spectrum` entity and MUST share one layout family.",
+                peak_buffer.prefix()
+            )));
+        }
 
         let peak_encrytion_props = encryption_properties
             .get(&FileEntry::from(MzPeakArchiveType::SpectrumPeakDataArrays).name)

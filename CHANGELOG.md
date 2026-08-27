@@ -12,13 +12,33 @@ All notable changes to this project are documented here. The format follows
   `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, and `docs/conformance.md:68`
   is explicit: "within an entity, all `array_index` entries share one layout family — either every
   entry is `point` or every entry is one of the `chunk_*` formats; the two **MUST NOT** be mixed".
-  The v0.8.0 peaks-facet heuristic chose per facet, by whichever held more points, so every archive
-  carrying BOTH representations came out `chunk` data + `point` peaks — illegal, and unreadable:
-  mzPeakViewer showed `HEK_PosOAD1.native.mzpeak` as profile-only with no centroid data reachable.
+  The v0.8.0 peaks-facet heuristic chose per facet, by whichever held more points, so archives came
+  out `chunk` data + `point` peaks.
 
-  The peaks facet now always takes the data facet's strategy, so family consistency is structural
-  rather than an outcome. Affected: 3 archives on this machine (`HEK_PosOAD1`, `Blind_P1_pos_012`,
-  `090701-LTQVelos-unittest-01`) — every dual archive written by v0.8.0.
+  **Correction to the first version of this entry:** it said such archives were "unreadable" and
+  that mzPeakViewer could not reach their centroids. That is false, and was checked afterwards
+  rather than before writing it. The centroid data is present and readable — verified three ways on
+  `HEK_PosOAD1`: the vendored Rust reader (all 1,543,961 peaks), **mzpeakts, the viewer's own
+  engine** (`altAvailable = true` on every spectrum, forced-centroid read returns peaks), and
+  pyarrow directly. mzpeakts resolves the layout *per source*, so a mixed archive does not break it.
+  The viewer symptom that prompted this was a separate, already-fixed viewer bug (mzPeakViewer
+  `2c84ee3`, shipped in v0.9.1: parquet-wasm panicked on the second read of a facet over HTTP,
+  naming these two Shimadzu files). The defect fixed here is **conformance**, which stands on its
+  own: one `entity_type` must have one layout family, and an archive that breaks it is readable only
+  by luck of implementation.
+
+  The peaks facet now always takes the data facet's strategy, and `make_peaks_writer` **enforces**
+  it — a mismatch is an error at write time, not an archive. Verified by reintroducing the v0.8.0
+  behaviour and confirming the conversion fails.
+
+  **Blast radius, corrected and much larger than first reported.** A 0-row facet still ships a full
+  array index carrying its own prefix, so the mismatch is not confined to archives with both facets
+  populated: **191 of 207** archives in `mzpeak-example-data` (92.3%) are mismatched. It predates
+  the heuristic — before `6f0b39e` the peaks facet was `point` *always*, so anything chunked was
+  mismatched. Truly dual-representation archives (≥1 spectrum with both counts) machine-wide: 16
+  paths, 11 distinct, of which the 2 Shimadzu ones are fixed here and the rest were not written by
+  this converter. `090701-LTQVelos-unittest-01` is **not** dual — it is mixed-*mode* (some spectra
+  profile-only, some centroid-only, `both = 0`); the earlier entry mislabelled it.
 
   **Size impact on dual archives cuts both ways** — it depends on how large the centroid facet is,
   since chunking repays its per-chunk columns only on a big peak list:
