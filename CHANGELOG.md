@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Dual-representation archives mixed layout families, and readers could not see their centroids.**
+  `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, and `docs/conformance.md:68`
+  is explicit: "within an entity, all `array_index` entries share one layout family — either every
+  entry is `point` or every entry is one of the `chunk_*` formats; the two **MUST NOT** be mixed".
+  The v0.8.0 peaks-facet heuristic chose per facet, by whichever held more points, so every archive
+  carrying BOTH representations came out `chunk` data + `point` peaks — illegal, and unreadable:
+  mzPeakViewer showed `HEK_PosOAD1.native.mzpeak` as profile-only with no centroid data reachable.
+
+  The peaks facet now always takes the data facet's strategy, so family consistency is structural
+  rather than an outcome. Affected: 3 archives on this machine (`HEK_PosOAD1`, `Blind_P1_pos_012`,
+  `090701-LTQVelos-unittest-01`) — every dual archive written by v0.8.0.
+
+  Matching is also *cheaper* on the file that motivated the old heuristic: `HEK_PosOAD1` is
+  33,392,175 B chunked/chunked versus 35,018,328 B mixed — **4.6% smaller**. Centroid-only runs keep
+  the full chunked-peaks win unchanged (Bruker microTOF −37%, Shimadzu `.lcd` −46%), since their
+  data facet is chunked and the peaks facet simply follows. The cost falls on profile-dominated runs
+  with a small centroid sidecar: +3.2% on a Thermo LTQ Velos archive. That is the price of
+  conformance.
+
+  Corroborated by mzPeakViewer's own golden dual fixture (`packages/core/test/fixtures/dual.mzpeak`),
+  which is `point`/`point` — family-consistent, as ours now are.
+
+  **mzPeakValidator does not catch this** (it passes all three mixed archives); reported separately.
+
 ## [0.8.0] — 2026-08-25
 
 ### Fixed

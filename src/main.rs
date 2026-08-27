@@ -992,61 +992,27 @@ fn sample_mz_from(spectra: &[mzdata::spectrum::MultiLayerSpectrum]) -> Vec<f64> 
 /// centroid-only Shimadzu archive, that one column was 82% of the file at 1.82x compression, while
 /// `spectrum_index` beside it got 42.9x from DELTA_BINARY_PACKED.
 ///
-/// Chunked only when the PEAK facet actually dominates the run — measured, not assumed.
+/// The PEAK facet always uses the DATA facet's chunking strategy. Not a tuning choice — a spec
+/// requirement, and the reason this is a function rather than an inline argument.
 ///
-/// A blanket "always chunk" is wrong. Measured across formats, on the peaks facet alone:
+/// `docs/conformance.md:68`: "within an entity, all `array_index` entries share one layout family —
+/// either every entry is `point` or every entry is one of the `chunk_*` formats; the two **MUST
+/// NOT** be mixed". `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, so a
+/// chunked data facet beside a point peaks facet is non-conformant.
 ///
-/// | run | peaks facet | |
-/// |---|---|---|
-/// | Bruker microTOF-Q2 (centroid-only) | 38.0 MB -> 23.8 MB | **-37%** |
-/// | Shimadzu `.lcd` (centroid-only)    | 1,547 MB -> 839 MB | **-46%** |
-/// | Thermo LTQ Velos (profile + small peak sidecar) | 133 KB -> 178 KB | **+34%** |
+/// This previously chose per facet, by whichever held more points — which produced exactly that
+/// illegal mix on every DUAL-representation archive (profile in `spectra_data`, centroid in
+/// `spectra_peaks`). Measured: 3 archives, including a Shimadzu `.lcd` whose centroid facet
+/// mzPeakViewer could then not read at all, and whose Summary reported it as profile-only.
 ///
-/// The per-chunk `chunk_start`/`chunk_end`/index columns are a fixed cost per chunk. When the peak
-/// lists carry the run, that cost is repaid many times over; when they are a sidecar beside profile
-/// data, it is not. Which of the two facets holds more points separates the cases cleanly across
-/// every file tested. `MZPC_PEAKS_CHUNKED=1`/`=0` overrides either way.
+/// Matching is not merely the legal choice, it was also the cheaper one on the file that motivated
+/// the old heuristic: HEK_PosOAD1 is 33,392,175 B chunked/chunked versus 35,018,328 B mixed — 4.6%
+/// SMALLER. A centroid-only run still gets the full chunked-peaks win (−46% on Shimadzu `.lcd`),
+/// because its data facet is chunked too and the peaks facet simply follows.
 ///
-/// Note the spec constraint this satisfies: transforms are legal in the chunked layout (declared
-/// via `chunk_encoding`) and forbidden in the point layout, which is why storing a transformed m/z
-/// as flat points would NOT be conformant even though it compresses just as well.
-fn peaks_chunk_strategy(
-    chunk: Option<ChunkingStrategy>,
-    profile_points: usize,
-    peak_points: usize,
-) -> Option<ChunkingStrategy> {
-    let dominant = peak_points > profile_points;
-    let on = match std::env::var("MZPC_PEAKS_CHUNKED").ok().as_deref() {
-        Some("0") => false,
-        Some(v) if !v.is_empty() => true,
-        _ => dominant,
-    };
-    if on && chunk.is_some() {
-        log::info!(
-            "peaks facet: chunked layout ({peak_points} peak vs {profile_points} profile points in \
-             the sample)"
-        );
-    }
-    if on { chunk } else { None }
-}
-
-/// Profile-facet and peak-facet point counts over sample spectra, for `peaks_chunk_strategy`.
-/// A profile spectrum's own arrays are profile points and its attached peak list (if any) is peak
-/// points; a centroid spectrum's arrays ARE peak points, since that is the facet they land in.
-fn facet_point_counts(spectra: &[mzdata::spectrum::MultiLayerSpectrum]) -> (usize, usize) {
-    let (mut profile, mut peaks) = (0usize, 0usize);
-    for s in spectra {
-        let n = s.raw_arrays().and_then(|a| a.mzs().ok()).map(|v| v.len()).unwrap_or(0);
-        if s.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
-            profile += n;
-            peaks += s.peaks.as_ref().map(|p| p.len()).unwrap_or(0);
-        } else {
-            peaks += n;
-        }
-    }
-    (profile, peaks)
-}
-
+/// The cost lands on profile-dominated runs carrying a small centroid sidecar, where the per-chunk
+/// columns are not repaid (+34% on that facet for a Thermo LTQ Velos file, ~+3% of the archive).
+/// That is the price of conformance, and it is not optional.
 /// True when `path` is an mzML that does NOT carry the `<indexedmzML>` wrapper.
 ///
 /// This is the discriminator for a real data-loss trap: mzdata can only enumerate chromatograms
@@ -2462,11 +2428,10 @@ fn convert_file(
         v
     };
     let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
-    let (probe_profile_pts, probe_peak_pts) = facet_point_counts(&probes);
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
-        .peaks_chunked_encoding(peaks_chunk_strategy(chunk, probe_profile_pts, probe_peak_pts))
+        .peaks_chunked_encoding(chunk)
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -3895,10 +3860,10 @@ fn convert_vendor_reader(
     }
     // Pick delta-vs-numpress from the actual m/z values in the probes, not from the extension.
     let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
-    let (probe_profile_pts, probe_peak_pts) = facet_point_counts(&probes);
     let builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
-        .peaks_chunked_encoding(peaks_chunk_strategy(chunk, probe_profile_pts, probe_peak_pts))
+        // Same family as the data facet — see the note above `is_unindexed_mzml`'s neighbours.
+        .peaks_chunked_encoding(chunk)
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
