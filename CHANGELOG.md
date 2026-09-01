@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.0] — 2026-09-01
 
 ### Changed
 
@@ -12,7 +12,7 @@ All notable changes to this project are documented here. The format follows
   calibration — adopted as the default, deliberately.** Before the mzdata 0.66 bump this path
   carried timsrust's linear 1/K0 approximation (documented error ~0.03 Vs·s/cm² against the vendor
   model); mzdata 0.66.3 implemented the true `TimsCalibrationModel2` and applies it unconditionally
-  (`im_enabled` is hard-coded in its `CalibrationStore`), so the lossy path's mobility axis shifted
+  (`im_enabled` is hard-coded true in its `CalibrationParameters::from_sql`), so the lossy path's mobility axis shifted
   by ≤0.0318 toward vendor truth. Measured on `SBA415(1) Try`: m/z and intensity byte-identical,
   mobility residuals vs the exact vendor model 4.2e-4 → 1.3e-4 (median). This entry records that
   shift as the intended default, not an accident of the dependency bump.
@@ -24,7 +24,30 @@ All notable changes to this project are documented here. The format follows
   datasets. Lossy-path TDF archives written before and after mzdata 0.66 differ in their mobility
   axis; the corpus default is ims-compact, so no corpus reconvert is triggered.
 
+- **Box conversion is S3-first and self-updating.** `box_convert.sh` accepts `s3://` sources
+  (handed to the box as a presigned GET — bytes already in the corpus bucket never round-trip
+  through the host) and `s3://` targets (PUT straight to the final key, host mirrors down), and
+  brings the box's converter to the newest release tag before any job runs
+  (`BOX_AUTOUPDATE`/`BOX_REQUIRE_VERSION`). Fixed alongside: a failed upload no longer reports
+  SUCCESS, a cross-bucket `s3://` target is no longer discarded, and the INT/TERM trap now cleans
+  up minted relay keys.
+
+### Dependencies
+
+- **mzdata `=0.65.5` → `=0.66.6`** (mirrored in `vendor/mzpeak_prototyping`; the pins must move
+  together), plus 108 registry crates via `cargo update`. mzdata 0.66.0 split into sub-crates and
+  added `ArrayType::IndexArray`, fixed with an explicit match arm. **MSRV 1.87 → 1.88** (`time`
+  0.3.55 / `serde_with` 3.22 via mzdata 0.66).
+
 ### Fixed
+
+- **PASEF/IMS mzML aborted with "expected Float32 but found LargeList(Float32)".** The chunked
+  schema sampler can only learn field types from spectra that contain data, and its five fixed
+  probe positions all landed on empty ramp slots (~80% of a PASEF mzML is `defaultArrayLength="0"`),
+  so `build_chunked` fell back to layout-blind point-shaped defaults inside a chunked buffer and the
+  first real spectrum panicked the writer. The five-point sample is now a fast path with a lazy
+  forward scan for the first spectra that actually carry data. Corpus completeness 191/199 →
+  **199/199 (100%)**; point counts round-trip exactly (2073 → 2073, 682 → 682).
 
 - **The `--representation` inert-flag warning never actually printed.** It was emitted before
   `init_logging`, so `log::warn!` hit the uninitialized default logger and was silently dropped —

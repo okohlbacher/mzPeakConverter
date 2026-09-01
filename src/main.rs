@@ -493,7 +493,7 @@ fn main() {
     // Same inert-flag honesty for the TDF mobility knob: our ModelType-2 recalibration lives in the
     // ims-compact reader (`bruker_native`). The lossy `--no-ims-compact` path flows through mzdata's
     // TDF reader, whose own ModelType-2 tims calibration is unconditional (`im_enabled` is
-    // hard-coded true in mzdata 0.66's CalibrationStore::from_sql) — mzdata's mobility IS the
+    // hard-coded true in mzdata 0.66's CalibrationParameters::from_sql) — mzdata's mobility IS the
     // default there and cannot be toggled from here.
     if cli.no_tims_recalibration && cli.no_ims_compact {
         log::warn!(
