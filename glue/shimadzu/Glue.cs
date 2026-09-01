@@ -565,9 +565,35 @@ public static class Api
             catch { return 0L; }
         }
 
-        m.IsolationTargetMz = AsDouble("AcqModeMz", 1e-4);
+        m.IsolationTargetMz = AsDouble("AcqModeMz", d.MassMultiplier);
         m.IsolationWidthMz = AsDouble("QTransmissionWidthMz", 1e-1);
         m.CollisionEnergy = AsDouble("CollisionEnergy", 1.0);
+        // The precursor m/z, from the vendor's own selection record and on the SAME fixed-point
+        // scale as the m/z axis (`Mass` 1002162 -> 100.2162), which is proven bit-exact against the
+        // LabSolutions export. Do NOT use the scalar `GetSpectrumInfo` returns in `args[3]`: on
+        // HEK_PosOAD1 scan 18 that is 2241279, which is exactly the spectrum's own `BPMass` (base
+        // peak), not its precursor — msconvert reads the same field and publishes it as an m/z of
+        // 2.24e07. `AcqModeMz` is preferred where the vendor sets it because DIA validates it
+        // directly (4525000 -> 452.5, matching the mzML lane's isolation target); OAD/DDA runs
+        // leave it 0 and carry the selection in `PrecursorMzList` instead.
+        m.PrecursorMz = 0.0; // discard the V1 value unconditionally — see above, it is BPMass
+        if (m.IsolationTargetMz > 0.0)
+        {
+            m.PrecursorMz = m.IsolationTargetMz;
+        }
+        else if (Reflect.GetProp(spec, "PrecursorMzList") is IList pl && pl.Count > 0)
+        {
+            try
+            {
+                double first = Convert.ToDouble(pl[0], CultureInfo.InvariantCulture) * d.MassMultiplier;
+                if (first > 0.0) m.PrecursorMz = first;
+            }
+            catch { /* leave 0: better no precursor than an invented one */ }
+        }
+        else
+        {
+            m.PrecursorMz = 0.0;
+        }
         m.PrecursorScanNumber = AsLong("PrecursorScanNo");
         m.SegmentNo = (int)AsLong("SegmentNo");
         m.EventNo = (int)AsLong("EventNo");
@@ -580,9 +606,6 @@ public static class Api
             m.IsolationWidthMz = 0.0;
             m.CollisionEnergy = 0.0;
         }
-        // The vendor reports the precursor as `AcqModeMz` for DIA (a window, not a picked ion);
-        // fall back to it when GetSpectrumInfo had no precursor mass.
-        if (m.PrecursorMz == 0.0) m.PrecursorMz = m.IsolationTargetMz;
         return m;
     }
 
