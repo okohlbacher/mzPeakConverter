@@ -171,6 +171,15 @@ internal static class Exp
         DumpObject($"scan {scan} MassSpectrumObject", specObj);
         DumpObject($"scan {scan} ProfileList[0]", profile != null && profile.Count > 0 ? profile[0] : null);
         DumpObject($"scan {scan} CentroidList[0]", centroid != null && centroid.Count > 0 ? centroid[0] : null);
+        // The precursor list is the vendor's own answer for "what was selected"; the scalar that
+        // GetSpectrumInfo hands back has no documented scale and lands outside the instrument's
+        // m/z range under every obvious one, so read this instead of guessing a divisor.
+        if (Reflect.GetProp(specObj!, "PrecursorMzList") is IList pl)
+        {
+            Console.Error.WriteLine($"[shimadzu-dump] scan {scan} PrecursorMzList: {pl.Count} entries");
+            for (int i = 0; i < Math.Min(pl.Count, 3); i++)
+                DumpObject($"scan {scan} PrecursorMzList[{i}]", pl[i]);
+        }
     }
 
     private static void DumpObject(string label, object? o)
