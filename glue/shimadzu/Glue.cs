@@ -64,6 +64,33 @@ public struct ShimadzuSpectrumMeta
     public long NPoints;
 }
 
+/// <summary>V2 metadata: the V1 layout VERBATIM as a prefix, plus the precursor/acquisition fields
+/// the native lane was missing against the mzML lane. Never reorder or resize the prefix — old
+/// callers reach V1 through the unchanged `SpectrumMeta` export and must keep working.
+///
+/// Sources on `MassSpectrumObject` (confirmed by reflective dump of DIA_Hela_20ng scan 2):
+/// `AcqModeMz` 4525000 -> isolation target m/z 452.5; `QTransmissionWidthMz` 170 -> 17.0 Th window;
+/// `CollisionEnergy` 18.4; `PrecursorScanNo`; `PrecursorChargeState`; `SegmentNo`; `EventNo`.</summary>
+public struct ShimadzuSpectrumMetaV2
+{
+    // --- V1 prefix, byte-for-byte (48 B) ---
+    public long ScanNumber;
+    public int MsLevel;
+    public int Polarity;
+    public int SignalContinuity;
+    public int PrecursorCharge;
+    public double RetentionTimeSeconds;
+    public double PrecursorMz;
+    public long NPoints;
+    // --- V2 additions (40 B) ---
+    public double IsolationTargetMz;   // 0 = none
+    public double IsolationWidthMz;    // 0 = unknown; full width, so the offsets are half each side
+    public double CollisionEnergy;     // 0 = none
+    public long PrecursorScanNumber;   // 0 = none
+    public int SegmentNo;
+    public int EventNo;
+}
+
 /// <summary>One opened .lcd reader: the managed DataObject tree + resolved reflection handles.</summary>
 internal sealed class ShimadzuData
 {
@@ -82,6 +109,12 @@ internal sealed class ShimadzuData
     // One-entry memo for Api.Data: the caller fetches profile then centroid for the same scan.
     public int CachedScan = -1;
     public ((double[] mz, float[] intensity) profile, (double[] mz, float[] intensity) centroid)? CachedData;
+
+    // One-entry memo for the decoded MassSpectrumObject. SpectrumMetaV2 needs the same object
+    // Data() decodes (the precursor/acquisition scalars live on it), and the caller asks for meta
+    // and data on the same scan back to back — without this each spectrum costs two full decodes.
+    public int CachedSpecScan = -1;
+    public object? CachedSpecObj;
 }
 
 /// <summary>Diagnostics for the scan-count discovery, which otherwise swallows every failure and
@@ -479,6 +512,64 @@ public static class Api
         return m;
     }
 
+    /// <summary>V1 metadata plus the precursor/acquisition scalars, which live on the decoded
+    /// `MassSpectrumObject` rather than on `GetSpectrumInfo`'s out-params. Vendor units: `AcqModeMz`
+    /// and `QTransmissionWidthMz` are fixed-point (1e4 and 1e1 respectively), matching what the
+    /// LabSolutions mzML records as isolation target 452.5 and a 17.0 Th window.</summary>
+    internal static ShimadzuSpectrumMetaV2 MetaV2(ShimadzuData d, int scan)
+    {
+        var v1 = Meta(d, scan);
+        var m = new ShimadzuSpectrumMetaV2
+        {
+            ScanNumber = v1.ScanNumber,
+            MsLevel = v1.MsLevel,
+            Polarity = v1.Polarity,
+            SignalContinuity = v1.SignalContinuity,
+            PrecursorCharge = v1.PrecursorCharge,
+            RetentionTimeSeconds = v1.RetentionTimeSeconds,
+            PrecursorMz = v1.PrecursorMz,
+            NPoints = v1.NPoints,
+        };
+        object spec;
+        try { spec = SpecFor(d, scan, Exp.ProfileDesired); }
+        catch (Exception e) { Dbg.Say($"MetaV2 scan {scan}: no spectrum object ({e.Message})"); return m; }
+
+        double AsDouble(string name, double scale)
+        {
+            var v = Reflect.GetProp(spec, name);
+            if (v == null) return 0.0;
+            try { return Convert.ToDouble(v, CultureInfo.InvariantCulture) * scale; }
+            catch { return 0.0; }
+        }
+        long AsLong(string name)
+        {
+            var v = Reflect.GetProp(spec, name);
+            if (v == null) return 0L;
+            try { return Convert.ToInt64(v, CultureInfo.InvariantCulture); }
+            catch { return 0L; }
+        }
+
+        m.IsolationTargetMz = AsDouble("AcqModeMz", 1e-4);
+        m.IsolationWidthMz = AsDouble("QTransmissionWidthMz", 1e-1);
+        m.CollisionEnergy = AsDouble("CollisionEnergy", 1.0);
+        m.PrecursorScanNumber = AsLong("PrecursorScanNo");
+        m.SegmentNo = (int)AsLong("SegmentNo");
+        m.EventNo = (int)AsLong("EventNo");
+        if (m.PrecursorCharge == 0) m.PrecursorCharge = (int)AsLong("PrecursorChargeState");
+        // MS1 spectra carry an AcqModeMz too (the acquisition range centre); an isolation target is
+        // only meaningful for MSn, and emitting one for MS1 would invent a precursor.
+        if (m.MsLevel < 2)
+        {
+            m.IsolationTargetMz = 0.0;
+            m.IsolationWidthMz = 0.0;
+            m.CollisionEnergy = 0.0;
+        }
+        // The vendor reports the precursor as `AcqModeMz` for DIA (a window, not a picked ion);
+        // fall back to it when GetSpectrumInfo had no precursor mass.
+        if (m.PrecursorMz == 0.0) m.PrecursorMz = m.IsolationTargetMz;
+        return m;
+    }
+
     private static int PolarityCode(object? polarity)
     {
         if (polarity == null) return 2;
@@ -525,7 +616,7 @@ public static class Api
         }
         else
         {
-            var specObj = FetchSpectrum(d, scan, Exp.ProfileDesired);
+            var specObj = SpecFor(d, scan, Exp.ProfileDesired);
             IList? profile = null, centroidList = null;
             switch (Exp.Fetch)
             {
@@ -563,6 +654,16 @@ public static class Api
         d.CachedScan = scan;
         d.CachedData = both;
         return both;
+    }
+
+    /// <summary>The decoded spectrum object for `scan`, memoised so that a meta call and a data
+    /// call on the same scan share one decode. Bypassed whenever a Stage-B lever is set.</summary>
+    internal static object SpecFor(ShimadzuData d, int scan, bool profileDesired)
+    {
+        if (!Exp.Active && d.CachedSpecScan == scan && d.CachedSpecObj != null) return d.CachedSpecObj;
+        var o = FetchSpectrum(d, scan, profileDesired);
+        if (!Exp.Active) { d.CachedSpecScan = scan; d.CachedSpecObj = o; }
+        return o;
     }
 
     /// <summary>One `GetMSSpectrumByScan(out spectrum, scan, profileDesired)` round trip.</summary>
@@ -604,9 +705,21 @@ public static class Api
 
     static Api()
     {
-        // Fail fast on ABI drift.
+        // Fail fast on ABI drift. These check THIS build's own layout only — cross-binary safety
+        // comes from `ShimadzuAbiVersion` plus the versioned entry points.
         if (Marshal.SizeOf<ShimadzuSpectrumMeta>() != 48)
             throw new Exception($"ShimadzuSpectrumMeta must be 48 bytes, is {Marshal.SizeOf<ShimadzuSpectrumMeta>()}");
+        if (Marshal.SizeOf<ShimadzuSpectrumMetaV2>() != 88)
+            throw new Exception($"ShimadzuSpectrumMetaV2 must be 88 bytes, is {Marshal.SizeOf<ShimadzuSpectrumMetaV2>()}");
+        // The V1 prefix must stay byte-identical, or `SpectrumMeta` and `SpectrumMetaV2` would
+        // disagree about where the shared fields live.
+        foreach (var name in new[] { "ScanNumber", "MsLevel", "Polarity", "SignalContinuity",
+                                     "PrecursorCharge", "RetentionTimeSeconds", "PrecursorMz", "NPoints" })
+        {
+            var a = Marshal.OffsetOf<ShimadzuSpectrumMeta>(name);
+            var b = Marshal.OffsetOf<ShimadzuSpectrumMetaV2>(name);
+            if (a != b) throw new Exception($"ShimadzuSpectrumMetaV2.{name} is at {b}, V1 has it at {a}");
+        }
     }
 
     [UnmanagedCallersOnly(EntryPoint = "Open")]
@@ -648,6 +761,36 @@ public static class Api
     {
         try { lock (Gate) { return Readers.TryGetValue(handle, out var d) ? d.ScanCount : -1; } }
         catch (Exception e) { _lastError = e.ToString(); return -1; }
+    }
+
+    /// <summary>ABI generation of this glue build. Resolved OPTIONALLY by the Rust side: a DLL too
+    /// old to export it is treated as version 1.
+    ///
+    /// This exists because nothing else made a version mismatch detectable. Both sides assert their
+    /// OWN struct size (48 here, a const assert there) and exports resolve by name, so neither
+    /// learns anything about the other: a new binary against a stale DLL would have read
+    /// uninitialised tail bytes as metadata, and a stale binary against a new DLL would have taken
+    /// a 40-byte out-param overrun. Layout changes never fail on their own — only ADDED exports do,
+    /// which is why every layout change gets a new versioned entry point rather than a wider
+    /// struct behind the old name.</summary>
+    [UnmanagedCallersOnly(EntryPoint = "ShimadzuAbiVersion")]
+    public static int ShimadzuAbiVersion() => 2;
+
+    /// <summary>V2 metadata. A separate entry point from `SpectrumMeta` ON PURPOSE: an old binary
+    /// resolving `SpectrumMeta` still gets exactly 48 bytes written into its 48-byte buffer, and a
+    /// new binary against an old DLL fails to resolve THIS name and errors at load.</summary>
+    [UnmanagedCallersOnly(EntryPoint = "SpectrumMetaV2")]
+    public static unsafe int SpectrumMetaV2(long handle, long index, ShimadzuSpectrumMetaV2* outMeta)
+    {
+        try
+        {
+            ShimadzuData? d;
+            lock (Gate) { Readers.TryGetValue(handle, out d); }
+            if (d == null) { _lastError = "unknown handle"; return 1; }
+            *outMeta = MetaV2(d, (int)index + 1); // reader index 0-based -> 1-based scan
+            return 0;
+        }
+        catch (Exception e) { _lastError = e.ToString(); return 1; }
     }
 
     [UnmanagedCallersOnly(EntryPoint = "SpectrumMeta")]

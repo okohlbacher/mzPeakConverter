@@ -37,6 +37,41 @@ Requires Windows + a .NET 8 runtime. Only the newer LabSolutions `.lcd` (LCMS-90
 triple-quad, 2020 single-quad) is supported; the legacy **LCMS-IT-TOF** `.lcd` is not (the vendor
 library returns `E_UNSUPPORTEDFILE`). For those, no path exists short of Shimadzu's own export.
 
+## Known vendor defect: misaligned centroids on profile-less `.lcd`
+
+For a spectrum that carries **no profile signal**, `Shimadzu.LabSolutions.IO` returns a
+`CentroidList` whose entries pair the correct `Mass` with the **wrong `Intensity`**. Measured on
+`DIA_Hela_20ng`, scan 2, against the LabSolutions mzML export of the same run:
+
+| | stored | oracle |
+|---|---|---|
+| `CentroidList[0].Mass` | 1002162 → m/z 100.2162 | 100.2162 ✓ |
+| `CentroidList[0].Intensity` | 12455 | 68 ✗ |
+| `CentroidList.Count` | 15,484 | 15,485 |
+
+The intensities lag their m/z by 1–7 positions (3 in ~94 % of spectra) and the leading "intensities"
+are the spectrum's own header scalars — `BPInt = 45640` from the same object appears verbatim as the
+second value. The vendor's own `Count` is short by one, which is where the missing final peak comes
+from. Values are otherwise bit-exact once shifted, so the numbers are right and only the pairing is
+wrong; because the archive's TIC/BPI are recomputed from the stored arrays, nothing self-consistent
+can detect it.
+
+**It is not reachable through the API.** `profileDesired=0`, centroid-only fetch,
+centroid-before-profile ordering and two independent decodes all return identical rotated data, and
+**msconvert — reading the same DLL — produces byte-identical corrupt output**, so `--via-msconvert`
+is *not* a workaround. Spectra that carry profile signal are unaffected through every path
+(`Blind_P1_pos_012`: 13,200/13,200 spectra bit-exact).
+
+Consequence: the reader refuses to emit centroids from a profile-less `.lcd`
+(`MZPC_SHIMADZU_UNSAFE_CENTROID=1` overrides, for reproduction only). The supported route for those
+files is a **LabSolutions mzML export**, whose exporter takes a different internal path and is exact.
+The `.lcd` container does hold the data — a `Centroid Data` stream plus a 24 B/spectrum
+`Centroid Index` — but decoding it directly is deliberately out of scope.
+
+To reproduce: `MZPC_SHIMADZU_UNSAFE_CENTROID=1 MZPC_SHIMADZU_PROBE=6` on a profile-less `.lcd`,
+optionally with `MZPC_SHIMADZU_FETCH=legacy|centroid-first|centroid-only|split` and
+`MZPC_SHIMADZU_DUMP=<scan>`.
+
 ## EULA
 
 The Shimadzu access libraries are governed by Shimadzu's EULA (bundled inside ProteoWizard), which

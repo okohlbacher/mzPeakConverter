@@ -44,8 +44,10 @@ use mzpeaks::{CentroidPeak, PeakSet};
 use mzdata::params::{Param, Unit};
 use mzdata::prelude::ParamDescribed;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
+use mzdata::meta::DissociationMethodTerm;
 use mzdata::spectrum::{
-    MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
+    Activation, IsolationWindow, IsolationWindowState, MultiLayerSpectrum, Precursor, ScanEvent,
+    ScanPolarity, SelectedIon, SignalContinuity, SpectrumDescription,
 };
 
 /// Hard cap on points per spectrum (guards a corrupt/hostile length). ≈1.2 GiB at the max.
@@ -74,10 +76,55 @@ struct ShimadzuSpectrumMeta {
 const _: () = assert!(std::mem::size_of::<ShimadzuSpectrumMeta>() == 48);
 const _: () = assert!(std::mem::align_of::<ShimadzuSpectrumMeta>() == 8);
 
+/// V2 metadata: the V1 layout verbatim as a prefix, plus the precursor/acquisition scalars the
+/// native lane was missing against the mzML lane. Filled by the SEPARATE `SpectrumMetaV2` export —
+/// see [`GlueApi::load`] for why widening the struct behind the old name would be unsafe.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShimadzuSpectrumMetaV2 {
+    // V1 prefix, byte-for-byte.
+    scan_number: i64,
+    ms_level: i32,
+    polarity: i32,
+    signal_continuity: i32,
+    precursor_charge: i32,
+    retention_time_seconds: f64,
+    precursor_mz: f64,
+    n_points: i64,
+    // V2 additions.
+    isolation_target_mz: f64,
+    isolation_width_mz: f64,
+    collision_energy: f64,
+    precursor_scan_number: i64,
+    segment_no: i32,
+    event_no: i32,
+}
+
+// Size AND prefix offsets: a total-size check alone would not catch a reordered prefix, and the two
+// entry points must agree about where the shared fields live. The C# side asserts the same pairs.
+const _: () = assert!(std::mem::size_of::<ShimadzuSpectrumMetaV2>() == 88);
+const _: () = assert!(std::mem::align_of::<ShimadzuSpectrumMetaV2>() == 8);
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, scan_number) == offset_of!(ShimadzuSpectrumMeta, scan_number));
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, ms_level) == offset_of!(ShimadzuSpectrumMeta, ms_level));
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, polarity) == offset_of!(ShimadzuSpectrumMeta, polarity));
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, signal_continuity) == offset_of!(ShimadzuSpectrumMeta, signal_continuity));
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, precursor_charge) == offset_of!(ShimadzuSpectrumMeta, precursor_charge));
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, retention_time_seconds) == offset_of!(ShimadzuSpectrumMeta, retention_time_seconds));
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, precursor_mz) == offset_of!(ShimadzuSpectrumMeta, precursor_mz));
+    assert!(offset_of!(ShimadzuSpectrumMetaV2, n_points) == offset_of!(ShimadzuSpectrumMeta, n_points));
+};
+
+/// ABI generation this binary requires from the glue DLL.
+const REQUIRED_ABI_VERSION: i32 = 2;
+
 type ShimOpen = extern "system" fn(*const u16, *const u16) -> i64;
 type ShimClose = extern "system" fn(i64);
 type ShimSpectrumCount = extern "system" fn(i64) -> i64;
 type ShimSpectrumMetaFn = extern "system" fn(i64, i64, *mut ShimadzuSpectrumMeta) -> i32;
+type ShimSpectrumMetaV2Fn = extern "system" fn(i64, i64, *mut ShimadzuSpectrumMetaV2) -> i32;
+type ShimAbiVersion = extern "system" fn() -> i32;
 /// `which`: 0 = profile, 1 = centroid. Both exist for the same scan; each is fetched separately so
 /// an archive can carry both facets (see `Representation`).
 type ShimSpectrumData =
@@ -92,6 +139,7 @@ struct GlueApi {
     close: ShimClose,
     spectrum_count: ShimSpectrumCount,
     spectrum_meta: ShimSpectrumMetaFn,
+    spectrum_meta_v2: ShimSpectrumMetaV2Fn,
     spectrum_data: ShimSpectrumData,
     data_free: ShimDataFree,
     last_error: ShimLastError,
@@ -164,6 +212,28 @@ impl GlueApi {
         let spectrum_meta = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumMetaFn>(ty, pdcstr!("SpectrumMeta"))
             .map_err(|e| anyhow!("resolving glue export SpectrumMeta: {e}"))?;
+
+        // ABI handshake. Nothing else makes a version mismatch detectable: each side asserts only
+        // its OWN struct size and exports resolve by name, so a stale DLL beside a new binary would
+        // have written 48 bytes into an 88-byte buffer (silent garbage metadata) and a stale binary
+        // beside a new DLL would have taken a 40-byte out-param overrun. Resolved OPTIONALLY —
+        // absence means a pre-handshake build, i.e. version 1 — so the error names the real problem
+        // instead of surfacing as a missing-export failure.
+        let abi_version = loader
+            .get_function_with_unmanaged_callers_only::<ShimAbiVersion>(ty, pdcstr!("ShimadzuAbiVersion"))
+            .map(|f| (*f)())
+            .unwrap_or(1);
+        if abi_version != REQUIRED_ABI_VERSION {
+            bail!(
+                "ShimadzuGlue.dll in {} reports ABI version {abi_version}, this binary needs \
+                 {REQUIRED_ABI_VERSION}. The DLL and the executable are one unit — rebuild the glue \
+                 (`dotnet build -c Release` in glue/shimadzu) from the same commit as this binary.",
+                glue_dir.display()
+            );
+        }
+        let spectrum_meta_v2 = *loader
+            .get_function_with_unmanaged_callers_only::<ShimSpectrumMetaV2Fn>(ty, pdcstr!("SpectrumMetaV2"))
+            .map_err(|e| anyhow!("resolving glue export SpectrumMetaV2: {e}"))?;
         let spectrum_data = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumData>(ty, pdcstr!("SpectrumData"))
             .map_err(|e| anyhow!("resolving glue export SpectrumData: {e}"))?;
@@ -180,6 +250,7 @@ impl GlueApi {
             close,
             spectrum_count,
             spectrum_meta,
+            spectrum_meta_v2,
             spectrum_data,
             data_free,
             last_error,
@@ -310,10 +381,10 @@ impl ShimadzuReader {
         &self.lcd_path
     }
 
-    fn meta(&self, i: usize) -> Result<ShimadzuSpectrumMeta> {
+    fn meta(&self, i: usize) -> Result<ShimadzuSpectrumMetaV2> {
         let index = i64::try_from(i).map_err(|_| anyhow!("Shimadzu index {i} does not fit in i64"))?;
-        let mut meta = ShimadzuSpectrumMeta::default();
-        let rc = (self.api.spectrum_meta)(self.handle, index, &mut meta as *mut _);
+        let mut meta = ShimadzuSpectrumMetaV2::default();
+        let rc = (self.api.spectrum_meta_v2)(self.handle, index, &mut meta as *mut _);
         if rc != 0 {
             bail!(
                 "Shimadzu glue SpectrumMeta failed for index {i} (rc {rc}): {}",
@@ -559,8 +630,41 @@ impl ShimadzuReader {
         scan.start_time = meta.retention_time_seconds / 60.0;
         descr.acquisition.scans.push(scan);
 
-        // NOTE: precursor m/z for MSn is available on `meta.precursor_mz` but the precursor linkage
-        // is not yet threaded into the SpectrumDescription — parity item vs. msconvert (see e2e).
+        // Precursor, mirroring `bruker_native::build_precursors`. The vendor reports the isolation
+        // window as a centre (`AcqModeMz`) plus a FULL width (`QTransmissionWidthMz`), so the bounds
+        // are half the width either side — that reproduces the mzML lane's ±8.5 from a 17.0 Th
+        // window. `precursor_id` names the parent scan so the writer's id→index map can resolve it.
+        if ms_level > 1 && meta.precursor_mz > 0.0 {
+            let half = (meta.isolation_width_mz / 2.0) as f32;
+            let target = meta.isolation_target_mz.max(meta.precursor_mz) as f32;
+            let ion = SelectedIon {
+                mz: meta.precursor_mz,
+                charge: (meta.precursor_charge != 0).then_some(meta.precursor_charge),
+                ..Default::default()
+            };
+            let mut activation = Activation::default();
+            activation.energy = meta.collision_energy as f32;
+            activation
+                .methods_mut()
+                .push(DissociationMethodTerm::CollisionInducedDissociation);
+            descr.precursor = Some(Precursor {
+                ions: vec![ion],
+                isolation_window: if half > 0.0 {
+                    IsolationWindow {
+                        target,
+                        lower_bound: target - half,
+                        upper_bound: target + half,
+                        flags: IsolationWindowState::Complete,
+                    }
+                } else {
+                    IsolationWindow { target, ..Default::default() }
+                },
+                activation,
+                precursor_id: (meta.precursor_scan_number > 0)
+                    .then(|| format!("scan={}", meta.precursor_scan_number)),
+                ..Default::default()
+            });
+        }
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), peak_set, None))
     }
