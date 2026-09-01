@@ -88,12 +88,78 @@ internal sealed class ShimadzuData
 /// reports 0 spectra with no clue why. Set MZPC_SHIMADZU_DEBUG=1 to trace it on stderr.</summary>
 internal static class Dbg
 {
-    private static readonly bool On =
+    // `internal`, not private: callers must be able to GUARD the interpolation, not just the write.
+    // A `Dbg.Say($"...{list.Count}...")` builds its string — and so calls the vendor Count getters —
+    // on every scan even with debug off, which is exactly the kind of extra vendor interaction the
+    // rotation investigation has to hold constant.
+    internal static readonly bool On =
         Environment.GetEnvironmentVariable("MZPC_SHIMADZU_DEBUG") is string v && v != "0" && v != "";
 
     internal static void Say(string msg)
     {
         if (On) Console.Error.WriteLine("[shimadzu-glue] " + msg);
+    }
+}
+
+/// <summary>Stage-B experiment levers for the centroid intensity rotation.
+///
+/// The defect: on `.lcd` files that store NO profile signal, the vendor's centroid list comes back
+/// with intensities rotated against the m/z axis (`[s alien values] + truth[0:n-s]`, s in 1..7, last
+/// peak dropped). Files that DO store profile are bit-exact, so the leading theory is that the
+/// centroid intensity view is mis-based when the decode struct carries no profile arrays. These
+/// levers exist to test that; they are read once, so a run cannot change mode mid-flight.</summary>
+internal static class Exp
+{
+    internal static readonly bool ProfileDesired =
+        Environment.GetEnvironmentVariable("MZPC_SHIMADZU_PROFILE_DESIRED") != "0";
+
+    /// legacy (default) · centroid-first · centroid-only · split
+    internal static readonly string Fetch =
+        (Environment.GetEnvironmentVariable("MZPC_SHIMADZU_FETCH") ?? "legacy").Trim().ToLowerInvariant();
+
+    /// 1-based vendor scan number to dump once, or -1.
+    internal static readonly int DumpScan =
+        int.TryParse(Environment.GetEnvironmentVariable("MZPC_SHIMADZU_DUMP"), out var s) ? s : -1;
+
+    /// Any lever off its default makes the one-entry memo a liability: an experiment that re-reads
+    /// the same scan would be served the cache instead of the vendor, and would report "unchanged"
+    /// no matter what the vendor does.
+    internal static bool Active => !ProfileDesired || Fetch != "legacy" || DumpScan >= 0;
+
+    private static bool _dumped;
+
+    /// <summary>One-shot reflective dump of the spectrum object and the first point of each list.
+    /// Call only AFTER the arrays have been copied out — these getters may themselves mutate vendor
+    /// state, which would contaminate the very reading being investigated.</summary>
+    internal static void Dump(int scan, object? specObj, IList? profile, IList? centroid)
+    {
+        if (_dumped || scan != DumpScan) return;
+        _dumped = true;
+        DumpObject($"scan {scan} MassSpectrumObject", specObj);
+        DumpObject($"scan {scan} ProfileList[0]", profile != null && profile.Count > 0 ? profile[0] : null);
+        DumpObject($"scan {scan} CentroidList[0]", centroid != null && centroid.Count > 0 ? centroid[0] : null);
+    }
+
+    private static void DumpObject(string label, object? o)
+    {
+        if (o == null) { Console.Error.WriteLine($"[shimadzu-dump] {label}: null"); return; }
+        var t = o.GetType();
+        Console.Error.WriteLine($"[shimadzu-dump] {label}: type {t.FullName}");
+        foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (p.GetIndexParameters().Length > 0) continue; // skip indexers
+            object? v;
+            try { v = p.GetValue(o); } catch (Exception e) { v = "<throws " + e.GetType().Name + ">"; }
+            if (v is IList list) v = $"IList[{list.Count}]";
+            Console.Error.WriteLine($"[shimadzu-dump]   {p.Name} ({p.PropertyType.Name}) = {v}");
+        }
+        foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.Instance))
+        {
+            object? v;
+            try { v = f.GetValue(o); } catch (Exception e) { v = "<throws " + e.GetType().Name + ">"; }
+            if (v is IList list) v = $"IList[{list.Count}]";
+            Console.Error.WriteLine($"[shimadzu-dump]   .{f.Name} ({f.FieldType.Name}) = {v}");
+        }
     }
 }
 
@@ -438,25 +504,76 @@ public static class Api
         // every spectrum costs two GetMSSpectrumByScan round-trips into the vendor assembly. A
         // one-entry cache halves that. Keyed by scan; the reader is single-threaded per handle
         // (`_not_thread_safe` in src/shimadzu.rs) so no locking is needed.
-        if (d.CachedScan == scan && d.CachedData != null) return d.CachedData.Value;
+        // Bypassed whenever a Stage-B lever is set: an experiment that re-reads the same scan must
+        // reach the vendor, not this cache, or it reports "unchanged" whatever the vendor did.
+        if (!Exp.Active && d.CachedScan == scan && d.CachedData != null) return d.CachedData.Value;
 
-        object? specObj = null;
-        // MZPC_SHIMADZU_PROFILE_DESIRED=0 flips the vendor's profileDesired flag, to establish whether
-        // the API actually has profile data for a run or is returning centroids either way.
-        bool wantProfile = Environment.GetEnvironmentVariable("MZPC_SHIMADZU_PROFILE_DESIRED") != "0";
-        var args = new object?[] { null, scan, wantProfile }; // out spectrum, scan, profileDesired
-        var st = Reflect.InvokeCoerced(d.GetSpectrumByScan, d.SpectrumObj, args);
-        if (Reflect.Ok(st)) specObj = args[0];
-        if (specObj == null) throw new Exception($"GetMSSpectrumByScan failed for scan {scan}: {st}");
+        var empty = (new double[0], new float[0]);
+        ((double[] mz, float[] intensity) profile, (double[] mz, float[] intensity) centroid) both;
 
-        var profile = Reflect.GetProp(specObj, "ProfileList") as IList;
-        var centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
-        Dbg.Say($"scan {scan}: ProfileList={(profile == null ? "null" : profile.Count.ToString())} " +
-                $"CentroidList={(centroidList == null ? "null" : centroidList.Count.ToString())}");
-        var both = (ToArrays(profile, d), ToArrays(centroidList, d));
+        if (Exp.Fetch == "split")
+        {
+            // Two INDEPENDENT vendor calls: profile from a profileDesired=true decode, centroid from
+            // a profileDesired=false one. Tests whether the centroid product depends on the flag.
+            var pSpec = FetchSpectrum(d, scan, true);
+            var pList = Reflect.GetProp(pSpec, "ProfileList") as IList;
+            var pArrays = ToArrays(pList, d);
+            var cSpec = FetchSpectrum(d, scan, false);
+            var cList = Reflect.GetProp(cSpec, "CentroidList") as IList;
+            both = (pArrays, ToArrays(cList, d));
+            Exp.Dump(scan, cSpec, pList, cList);
+        }
+        else
+        {
+            var specObj = FetchSpectrum(d, scan, Exp.ProfileDesired);
+            IList? profile = null, centroidList = null;
+            switch (Exp.Fetch)
+            {
+                case "centroid-only":
+                    // Never touch ProfileList at all — isolates "was the centroid list disturbed by
+                    // materialising the profile one first?" from the flag itself.
+                    centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
+                    both = (empty, ToArrays(centroidList, d));
+                    break;
+                case "centroid-first":
+                    // Same single decode as legacy, opposite order, and the centroid array is COPIED
+                    // OUT before ProfileList is even looked up.
+                    centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
+                    var centroidArrays = ToArrays(centroidList, d);
+                    profile = Reflect.GetProp(specObj, "ProfileList") as IList;
+                    both = (ToArrays(profile, d), centroidArrays);
+                    break;
+                default: // legacy
+                    profile = Reflect.GetProp(specObj, "ProfileList") as IList;
+                    centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
+                    if (Dbg.On)
+                    {
+                        // GUARDED: this interpolation calls the vendor `Count` getters, so building it
+                        // unconditionally added a vendor interaction to every scan of every run.
+                        Dbg.Say($"scan {scan}: ProfileList={(profile == null ? "null" : profile.Count.ToString())} " +
+                                $"CentroidList={(centroidList == null ? "null" : centroidList.Count.ToString())}");
+                    }
+                    both = (ToArrays(profile, d), ToArrays(centroidList, d));
+                    break;
+            }
+            // AFTER the arrays are copied: these getters may mutate vendor state themselves.
+            Exp.Dump(scan, specObj, profile, centroidList);
+        }
+
         d.CachedScan = scan;
         d.CachedData = both;
         return both;
+    }
+
+    /// <summary>One `GetMSSpectrumByScan(out spectrum, scan, profileDesired)` round trip.</summary>
+    private static object FetchSpectrum(ShimadzuData d, int scan, bool profileDesired)
+    {
+        var args = new object?[] { null, scan, profileDesired }; // out spectrum, scan, profileDesired
+        var st = Reflect.InvokeCoerced(d.GetSpectrumByScan, d.SpectrumObj, args);
+        var specObj = Reflect.Ok(st) ? args[0] : null;
+        if (specObj == null)
+            throw new Exception($"GetMSSpectrumByScan failed for scan {scan} (profileDesired={profileDesired}): {st}");
+        return specObj;
     }
 
     /// <summary>Vendor point list -> (m/z, intensity). Empty arrays when the list is absent.</summary>
