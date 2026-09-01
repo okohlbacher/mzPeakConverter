@@ -186,6 +186,13 @@ internal static class Exp
     {
         if (o == null) { Console.Error.WriteLine($"[shimadzu-dump] {label}: null"); return; }
         var t = o.GetType();
+        // A primitive has no properties to walk — print the value, which is the whole point when
+        // the list element IS the datum (PrecursorMzList is a List<Int32>).
+        if (t.IsPrimitive || o is string || o is decimal)
+        {
+            Console.Error.WriteLine($"[shimadzu-dump] {label}: {t.Name} = {o}");
+            return;
+        }
         Console.Error.WriteLine($"[shimadzu-dump] {label}: type {t.FullName}");
         foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
         {
