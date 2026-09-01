@@ -25,10 +25,23 @@ All notable changes to this project are documented here. The format follows
   scope, against the LabSolutions mzML exports: files that carry profile signal are unaffected —
   `Blind_P1_pos_012` compares 13,200/13,200 spectra with all 216,742 centroid intensities
   bit-exact — while the centroid-only DIA files are corrupt throughout. Conversion of an affected
-  file now fails with an explanation instead of writing corrupt intensities; `--via-msconvert`
-  converts them correctly, and `MZPC_SHIMADZU_UNSAFE_CENTROID=1` lifts the gate for diagnostics.
-  This also closes the fallback hole where `--representation profile` on a profile-less file
-  silently fell back to the centroid fetch. Root cause of the rotation is still open.
+  file now fails with an explanation instead of writing corrupt intensities, and
+  `MZPC_SHIMADZU_UNSAFE_CENTROID=1` lifts the gate for diagnostics. This also closes the fallback
+  hole where `--representation profile` on a profile-less file silently fell back to the centroid
+  fetch.
+
+  **Root cause: a defect in `Shimadzu.LabSolutions.IO` itself, not in this converter.** The vendor
+  API's own `CentroidList[i]` carries the right `Mass` beside the wrong `Intensity` — for DIA scan
+  2, `Mass = 1002162` (m/z 100.2162, exactly the oracle's first peak) with `Intensity = 12455`
+  where the oracle has 68 — and the alien leading values are the spectrum's own header scalars
+  (`BPInt = 45640` appears verbatim as the second "intensity"). The vendor's `CentroidList.Count`
+  is itself short by one, which is where the clipped final peak comes from. It is not reachable
+  through any API lever: `profileDesired=0`, centroid-only fetch, centroid-before-profile ordering
+  and two independent decodes all return identical rotated data, and **msconvert, reading the same
+  DLL, produces byte-identical corrupt output** — so `--via-msconvert` is not a workaround for
+  these files. Files that carry profile signal are unaffected through every path. The only correct
+  source for a profile-less `.lcd` is a LabSolutions mzML export, whose exporter takes a different
+  internal path and is exact.
 
 - **Shimadzu spectra were all typed `MS:1000294 "mass spectrum"`.** That parent term was added
   unconditionally and, because mzdata's `spectrum_type()` is a first-match lookup, it shadowed the

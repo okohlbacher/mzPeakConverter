@@ -358,11 +358,14 @@ impl ShimadzuReader {
             return Ok(());
         }
         bail!(
-            "{} stores no profile signal, and on such files this native lane pairs each centroid \
-             intensity with the wrong m/z (values are shifted by 1-7 positions and the last peak \
-             is dropped). Refusing to write corrupt data. Use `--via-msconvert` to convert this \
-             file, or set MZPC_SHIMADZU_UNSAFE_CENTROID=1 if you are reproducing the defect on \
-             purpose.",
+            "{} stores no profile signal, and for such spectra the Shimadzu.LabSolutions.IO API \
+             itself returns centroids whose intensities are misaligned against their m/z (shifted \
+             by 1-7 positions, last peak missing). This is a VENDOR-side defect, not a converter \
+             one: msconvert reads the same API and produces byte-identical corrupt data, so \
+             `--via-msconvert` is NOT a workaround. The only correct source for these files is a \
+             LabSolutions mzML export (its exporter uses a different internal path and is exact) — \
+             convert that .mzML instead. Set MZPC_SHIMADZU_UNSAFE_CENTROID=1 only to reproduce the \
+             defect deliberately.",
             self.lcd_path.display()
         )
     }
