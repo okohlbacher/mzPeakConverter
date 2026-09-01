@@ -3539,10 +3539,42 @@ fn convert_shimadzu(
         RepresentationArg::Centroid => shimadzu::Representation::Centroid,
     };
     let reader = shimadzu::ShimadzuReader::open_with(input, rep)?;
+    // Stage-B diagnostic: `MZPC_SHIMADZU_PROBE=N` dumps the first N spectra as JSON lines and
+    // exits without writing an archive. A full DIA conversion is 21,500 spectra and tens of
+    // minutes, which makes a factorial experiment matrix (profileDesired x fetch order) impossible
+    // to run; the head of each spectrum is all the rotation check needs.
+    if let Ok(n) = std::env::var("MZPC_SHIMADZU_PROBE") {
+        let n: usize = n.parse().unwrap_or(10);
+        return shimadzu_probe(&reader, n);
+    }
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
+}
+
+/// Emit `{"index","n","mz":[..4],"intensity":[..8]}` per spectrum, for comparison against the
+/// vendor mzML export. Deliberately prints raw heads: the rotation shows up as the first values
+/// being alien while the rest are the oracle's values shifted.
+#[cfg(windows)]
+fn shimadzu_probe(reader: &shimadzu::ShimadzuReader, n: usize) -> Result<()> {
+    use mzdata::prelude::SpectrumLike;
+    for i in 0..n.min(reader.len()) {
+        let spec = reader.spectrum(i)?;
+        let arrays = spec.raw_arrays().ok_or_else(|| anyhow!("spectrum {i} has no arrays"))?;
+        let mz = arrays.mzs()?;
+        let inten = arrays.intensities()?;
+        let head_mz: Vec<String> = mz.iter().take(4).map(|v| format!("{v:.6}")).collect();
+        let head_in: Vec<String> = inten.iter().take(8).map(|v| format!("{v}")).collect();
+        println!(
+            "{{\"index\":{i},\"id\":\"{}\",\"n\":{},\"mz\":[{}],\"intensity\":[{}]}}",
+            spec.id(),
+            mz.len(),
+            head_mz.join(","),
+            head_in.join(",")
+        );
+    }
+    Ok(())
 }
 
 // Off-Windows a `.lcd` is routed straight to `guard_unsupported_vendor` (the native dispatch is
