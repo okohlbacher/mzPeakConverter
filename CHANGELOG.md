@@ -54,6 +54,27 @@ All notable changes to this project are documented here. The format follows
   leaked both `GCHandle`s. On the Rust side the pin guard is armed before the return-code check, so
   a failed call cannot strand a pin.
 
+- **Shimadzu native lane: MSn spectra had no precursor at all, and the one precursor field that
+  did cross the ABI was the wrong number.** The lane now emits a precursor per MSn spectrum with
+  isolation window, CID activation with collision energy, and a `precursor_id` naming the parent
+  scan — 1,837 precursors for 1,837 MS2 spectra on `HEK_PosOAD1`, where the native lane previously
+  wrote zero. The m/z is taken from the vendor's own selection record on the same fixed-point scale
+  as the m/z axis (`AcqModeMz` where the vendor sets it, validated by DIA against the mzML lane's
+  452.5 isolation target; `PrecursorMzList` otherwise). What it is NOT taken from: the scalar
+  `GetSpectrumInfo` returns, which on `HEK_PosOAD1` scan 18 is 2241279 — that spectrum's own
+  **base peak mass**, not its precursor. Through the old 1e-9 multiplier that reached archives as
+  m/z 0.0022; msconvert reads the same field and publishes it as 2.24e07. Neither value is inside
+  the instrument's 70–1250 range; the corrected output spans 202–1249 (median 367).
+
+- **Shimadzu ABI: a runtime version handshake, because mixed binary/DLL pairs failed silently.**
+  Each side asserted only its own struct size and exports resolve by name, so a new binary against
+  a stale `ShimadzuGlue.dll` read uninitialised tail bytes as metadata, and a stale binary against
+  a new DLL took a 40-byte out-param overrun — and the box updater ships the executable without the
+  DLL, so that pairing is a real deployment. `ShimadzuAbiVersion()` is now resolved optionally
+  (absent ⇒ version 1) and a mismatch aborts with a message naming the cause; the widened metadata
+  arrives through a separate `SpectrumMetaV2` entry point rather than behind the old name, and both
+  sides assert the shared field offsets rather than just the totals.
+
 ### Added
 
 - **`tools/compare_lcd_native_mzml.py`** — peak-for-peak comparison of an archive against the
