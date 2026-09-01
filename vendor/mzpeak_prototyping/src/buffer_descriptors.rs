@@ -652,6 +652,11 @@ pub const fn array_type_ordering_ordinal(array_type: &ArrayType) -> u64 {
         ArrayType::MZArray => 1,
         ArrayType::TimeArray => 2,
         ArrayType::WavelengthArray => 3,
+        // mzdata 0.66.0 added IndexArray (MS:1003870, "index array") -- a generic index/coordinate
+        // axis. Ordinal 4 was unused; placed with the other axis arrays (before IntensityArray),
+        // not the value arrays. Not currently emitted or consumed by any converter path -- this
+        // arm exists only to keep the match exhaustive against mzdata::spectrum::ArrayType.
+        ArrayType::IndexArray => 4,
         ArrayType::IntensityArray => 5,
         ArrayType::ChargeArray => 6,
         ArrayType::SignalToNoiseArray => 7,
