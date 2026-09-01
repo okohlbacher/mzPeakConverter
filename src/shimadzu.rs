@@ -647,7 +647,7 @@ impl ShimadzuReader {
             activation
                 .methods_mut()
                 .push(DissociationMethodTerm::CollisionInducedDissociation);
-            descr.precursor = Some(Precursor {
+            descr.precursor = vec![Precursor {
                 ions: vec![ion],
                 isolation_window: if half > 0.0 {
                     IsolationWindow {
@@ -663,7 +663,7 @@ impl ShimadzuReader {
                 precursor_id: (meta.precursor_scan_number > 0)
                     .then(|| format!("scan={}", meta.precursor_scan_number)),
                 ..Default::default()
-            });
+            }];
         }
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), peak_set, None))
