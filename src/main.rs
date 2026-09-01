@@ -227,8 +227,11 @@ struct Cli {
     #[arg(long)]
     bruker_sdk: bool,
 
-    /// Bruker timsTOF (TDF): disable vendor-grade scan→1/K0 recalibration (the `TimsCalibration`
-    /// ModelType-2 model) and use timsrust's linear approximation. Recalibration is ON by default.
+    /// Bruker timsTOF (TDF), ims-compact path only: disable this converter's vendor-grade
+    /// scan→1/K0 recalibration (the `TimsCalibration` ModelType-2 model) and use timsrust's linear
+    /// approximation. Recalibration is ON by default. INERT with `--no-ims-compact`: that lossy
+    /// path takes its mobility from mzdata's TDF reader, which (since mzdata 0.66) applies the
+    /// same ModelType-2 calibration itself, unconditionally — there is nothing to switch off.
     #[arg(long)]
     no_tims_recalibration: bool,
 
@@ -472,6 +475,12 @@ fn main() {
 
     let cli = Cli::parse();
     let _ = REPRESENTATION.set(cli.representation);
+    init_logging(cli.verbose, cli.quiet);
+    // Inert-flag warnings MUST come after init_logging: log::warn! against the uninitialized
+    // default logger is a silent no-op, which is precisely the failure mode these warn about.
+    // (The --representation warning below was emitted before init_logging from the day it was
+    // added, i.e. never actually printed — found when the TDF warning under it also stayed silent.)
+    //
     // Only the Shimadzu lane reads a representation choice today: every other vendor ABI hands back
     // one array pair per scan, and the mzML/imzML reader takes whatever the file declares. Setting
     // the flag anywhere else would otherwise look effective and do nothing.
@@ -481,7 +490,18 @@ fn main() {
             cli.input.display()
         );
     }
-    init_logging(cli.verbose, cli.quiet);
+    // Same inert-flag honesty for the TDF mobility knob: our ModelType-2 recalibration lives in the
+    // ims-compact reader (`bruker_native`). The lossy `--no-ims-compact` path flows through mzdata's
+    // TDF reader, whose own ModelType-2 tims calibration is unconditional (`im_enabled` is
+    // hard-coded true in mzdata 0.66's CalibrationStore::from_sql) — mzdata's mobility IS the
+    // default there and cannot be toggled from here.
+    if cli.no_tims_recalibration && cli.no_ims_compact {
+        log::warn!(
+            "--no-tims-recalibration only affects the default ims-compact path; with \
+             --no-ims-compact, mobility comes from mzdata's own ModelType-2 calibration and this \
+             flag is ignored"
+        );
+    }
 
     let code = match run(&cli) {
         Ok(code) => code,

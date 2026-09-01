@@ -6,7 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **TDF lossy path (`--no-ims-compact`): mobility now comes from mzdata's own ModelType-2
+  calibration — adopted as the default, deliberately.** Before the mzdata 0.66 bump this path
+  carried timsrust's linear 1/K0 approximation (documented error ~0.03 Vs·s/cm² against the vendor
+  model); mzdata 0.66.3 implemented the true `TimsCalibrationModel2` and applies it unconditionally
+  (`im_enabled` is hard-coded in its `CalibrationStore`), so the lossy path's mobility axis shifted
+  by ≤0.0318 toward vendor truth. Measured on `SBA415(1) Try`: m/z and intensity byte-identical,
+  mobility residuals vs the exact vendor model 4.2e-4 → 1.3e-4 (median). This entry records that
+  shift as the intended default, not an accident of the dependency bump.
+
+  Consequences: `--no-tims-recalibration` is **inert** on this path (it governs only the converter's
+  own ModelType-2 recalibration in the default ims-compact reader) — its help text now says so and
+  combining the two flags warns instead of silently doing nothing. The default ims-compact path is
+  untouched: its mobility is computed by `tims_mobility.rs`, validated against the Bruker SDK on 68
+  datasets. Lossy-path TDF archives written before and after mzdata 0.66 differ in their mobility
+  axis; the corpus default is ims-compact, so no corpus reconvert is triggered.
+
 ### Fixed
+
+- **The `--representation` inert-flag warning never actually printed.** It was emitted before
+  `init_logging`, so `log::warn!` hit the uninitialized default logger and was silently dropped —
+  from the day the warning was added. Found because the new `--no-tims-recalibration` +
+  `--no-ims-compact` warning placed beside it stayed silent too. Both now fire after logger init;
+  verified all fire/no-fire combinations.
 
 - **Dual-representation archives mixed layout families, and readers could not see their centroids.**
   `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, and `docs/conformance.md:68`
