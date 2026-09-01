@@ -296,18 +296,12 @@ pub struct ShimadzuReader {
     /// One-shot latch so the "you asked for X, the file has Y" warning is emitted once per file
     /// rather than once per spectrum.
     fallback_warned: AtomicBool,
-    /// Memoised answer to "does this `.lcd` store profile signal at all?", the discriminator the
-    /// A5 centroid gate rests on. `None` until the first centroid fetch probes for it.
+    /// Memoised answer to "does this `.lcd` store profile signal at all?", which decides whether
+    /// the vendor-defect warning applies. `None` until the first centroid fetch probes for it.
     stores_profile: std::cell::Cell<Option<bool>>,
+    /// One-shot latch for that warning.
+    rotation_warned: AtomicBool,
     _not_thread_safe: PhantomData<*const ()>,
-}
-
-/// Escape hatch for the A5 centroid gate — set only to reproduce or diagnose the rotation.
-fn unsafe_centroid_allowed() -> bool {
-    matches!(
-        std::env::var("MZPC_SHIMADZU_UNSAFE_CENTROID").as_deref(),
-        Ok("1") | Ok("true")
-    )
 }
 
 impl ShimadzuReader {
@@ -367,6 +361,7 @@ impl ShimadzuReader {
             representation,
             fallback_warned: AtomicBool::new(false),
             stores_profile: std::cell::Cell::new(None),
+            rotation_warned: AtomicBool::new(false),
             _not_thread_safe: PhantomData,
         })
     }
@@ -420,31 +415,44 @@ impl ShimadzuReader {
         Ok(found)
     }
 
-    /// Refuse to hand back native centroid data from a `.lcd` that stores no profile signal —
-    /// on those files the vendor centroid list arrives with its intensities rotated against the
-    /// m/z axis (see [`Self::stores_profile`]). Lifted by `MZPC_SHIMADZU_UNSAFE_CENTROID=1`,
-    /// which the Stage-B diagnostics need in order to reproduce the defect at all.
-    fn gate_centroid(&self) -> Result<()> {
-        if unsafe_centroid_allowed() || self.stores_profile()? {
-            return Ok(());
+    /// Warn — once per file — when this `.lcd` stores no profile signal, because the vendor API
+    /// returns misaligned centroid intensities for exactly those spectra (see
+    /// [`Self::stores_profile`]).
+    ///
+    /// This converter's job is to STORE what the vendor interface returns, not to correct or
+    /// second-guess it, so this does not refuse the conversion and does not alter a single value.
+    /// It says plainly what the data is, and leaves the science to the reader — msconvert stores
+    /// the same bytes silently.
+    fn warn_if_rotated_centroids(&self) {
+        if self.rotation_warned.load(Ordering::Relaxed) {
+            return;
         }
-        bail!(
-            "{} stores no profile signal, and for such spectra the Shimadzu.LabSolutions.IO API \
-             itself returns centroids whose intensities are misaligned against their m/z (shifted \
-             by 1-7 positions, last peak missing). This is a VENDOR-side defect, not a converter \
-             one: msconvert reads the same API and produces byte-identical corrupt data, so \
-             `--via-msconvert` is NOT a workaround. The only correct source for these files is a \
-             LabSolutions mzML export (its exporter uses a different internal path and is exact) — \
-             convert that .mzML instead. Set MZPC_SHIMADZU_UNSAFE_CENTROID=1 only to reproduce the \
-             defect deliberately.",
-            self.lcd_path.display()
-        )
+        match self.stores_profile() {
+            Ok(false) => {
+                if !self.rotation_warned.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "{} stores no profile signal. For such spectra Shimadzu.LabSolutions.IO \
+                         returns centroid intensities misaligned against their m/z (shifted by 1-7 \
+                         positions, the last peak missing) — a VENDOR-side defect that msconvert \
+                         reproduces byte-identically. These peaks are stored exactly as the vendor \
+                         API returned them, unaltered. For scientifically correct centroids from \
+                         this file use a LabSolutions mzML export, whose exporter takes a different \
+                         internal path and is exact.",
+                        self.lcd_path.display()
+                    );
+                }
+            }
+            Ok(true) => {
+                self.rotation_warned.store(true, Ordering::Relaxed);
+            }
+            Err(e) => log::debug!("could not probe {} for profile signal: {e}", self.lcd_path.display()),
+        }
     }
 
     /// Fetch one representation of spectrum `i`. `which`: 0 = profile, 1 = centroid.
     fn peaks(&self, i: usize, which: i32) -> Result<(Vec<f64>, Vec<f32>)> {
         if which == 1 {
-            self.gate_centroid()?;
+            self.warn_if_rotated_centroids();
         }
         let index = i64::try_from(i).map_err(|_| anyhow!("Shimadzu index {i} does not fit in i64"))?;
         let mut mz_ptr: *const f64 = std::ptr::null();
@@ -671,9 +679,8 @@ impl ShimadzuReader {
 
     /// A sample spectrum's array map, for deriving the writer's data-facet schema.
     pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        // A centroid-only file has nothing this lane may emit while the A5 gate stands, so say why
-        // here instead of scanning the whole run first and failing on the last step.
-        self.gate_centroid()?;
+        // Surface the vendor-defect warning up front rather than mid-run.
+        self.warn_if_rotated_centroids();
         // Look through BOTH representations: on a centroid-only file every `which = 0` fetch comes
         // back empty, and settling for spectrum 0 would hand the writer an empty schema sample.
         let mut chosen = 0usize;

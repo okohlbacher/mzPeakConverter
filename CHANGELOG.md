@@ -18,17 +18,19 @@ All notable changes to this project are documented here. The format follows
   (chromatograms 0 → 26,400; spectra now 216,742 points rather than 59,948 chunks), and pinned by
   `tests/footer_counts.rs`, which fails on the pre-fix code.
 
-- **Shimadzu native lane: refuse to emit centroid data from a `.lcd` that stores no profile
-  signal.** On those files the vendor centroid list arrives with its intensities rotated against
-  the m/z axis (`[s alien values] + truth[0:n−s]`, s ∈ 1..7, and the final peak dropped), which
-  poisons TIC, BPI and base-peak m/z while leaving the archive perfectly self-consistent. Measured
-  scope, against the LabSolutions mzML exports: files that carry profile signal are unaffected —
+- **Shimadzu native lane: warn when a `.lcd` stores no profile signal.** For those spectra the
+  vendor API returns centroid intensities rotated against the m/z axis
+  (`[s alien values] + truth[0:n−s]`, s ∈ 1..7, and the final peak dropped), which poisons TIC, BPI
+  and base-peak m/z while leaving the archive perfectly self-consistent. Measured scope, against
+  the LabSolutions mzML exports: files that carry profile signal are unaffected —
   `Blind_P1_pos_012` compares 13,200/13,200 spectra with all 216,742 centroid intensities
-  bit-exact — while the centroid-only DIA files are corrupt throughout. Conversion of an affected
-  file now fails with an explanation instead of writing corrupt intensities, and
-  `MZPC_SHIMADZU_UNSAFE_CENTROID=1` lifts the gate for diagnostics. This also closes the fallback
-  hole where `--representation profile` on a profile-less file silently fell back to the centroid
-  fetch.
+  bit-exact — while the centroid-only DIA files are affected throughout.
+
+  The peaks are stored exactly as the vendor interface returned them: this converter's job is to
+  store vendor data in a new format, not to correct or second-guess it, and msconvert stores the
+  same bytes silently. What changes is that the archive is no longer produced *quietly* — a
+  one-shot warning names the defect and points at the LabSolutions mzML export, whose exporter
+  takes a different internal path and is exact.
 
   **Root cause: a defect in `Shimadzu.LabSolutions.IO` itself, not in this converter.** The vendor
   API's own `CentroidList[i]` carries the right `Mass` beside the wrong `Intensity` — for DIA scan

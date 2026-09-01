@@ -62,15 +62,16 @@ centroid-before-profile ordering and two independent decodes all return identica
 is *not* a workaround. Spectra that carry profile signal are unaffected through every path
 (`Blind_P1_pos_012`: 13,200/13,200 spectra bit-exact).
 
-Consequence: the reader refuses to emit centroids from a profile-less `.lcd`
-(`MZPC_SHIMADZU_UNSAFE_CENTROID=1` overrides, for reproduction only). The supported route for those
-files is a **LabSolutions mzML export**, whose exporter takes a different internal path and is exact.
-The `.lcd` container does hold the data — a `Centroid Data` stream plus a 24 B/spectrum
-`Centroid Index` — but decoding it directly is deliberately out of scope.
+Consequence: the reader **stores these peaks exactly as the vendor API returned them** and emits a
+one-shot warning naming the defect. Correcting or dropping vendor data is not this converter's job —
+it stores vendor data in a new format — and msconvert writes the same bytes without saying anything.
+For scientifically correct centroids from such a file, use a **LabSolutions mzML export**, whose
+exporter takes a different internal path and is exact. The `.lcd` container does hold the data — a
+`Centroid Data` stream plus a 24 B/spectrum `Centroid Index` — but decoding it directly is
+deliberately out of scope.
 
-To reproduce: `MZPC_SHIMADZU_UNSAFE_CENTROID=1 MZPC_SHIMADZU_PROBE=6` on a profile-less `.lcd`,
-optionally with `MZPC_SHIMADZU_FETCH=legacy|centroid-first|centroid-only|split` and
-`MZPC_SHIMADZU_DUMP=<scan>`.
+To reproduce: `MZPC_SHIMADZU_PROBE=6` on a profile-less `.lcd`, optionally with
+`MZPC_SHIMADZU_FETCH=legacy|centroid-first|centroid-only|split` and `MZPC_SHIMADZU_DUMP=<scan>`.
 
 ## EULA
 
