@@ -367,6 +367,7 @@ impl PointBuffers {
                 }
             }
         }
+        self.point_count += n_pts as u64;
         (Vec::new(), n_pts)
     }
 
@@ -442,6 +443,11 @@ impl PointBuffers {
         if filled > 0 {
             log::trace!("Filled {filled} columns with nulls for {index_of_insertion:?}");
         }
+        // Counted here, not in the `ArrayBufferWriter` impl: this inherent method shadows the
+        // trait one, so enum dispatch (`ArrayBufferWriterVariants`) lands here directly and the
+        // trait's increment never ran. `n` is rows actually stored (may be < `size` after the
+        // zero-intensity drop).
+        self.point_count += n as u64;
         n
     }
 
@@ -514,7 +520,7 @@ impl ArrayBufferWriter for PointBuffers {
 
     #[inline(always)]
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool) -> usize {
-        self.point_count += size as u64;
+        // The inherent method does the counting (see there) — do not increment twice.
         self.add_arrays(fields, arrays, size, is_profile)
     }
 

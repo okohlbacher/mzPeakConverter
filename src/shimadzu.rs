@@ -225,7 +225,18 @@ pub struct ShimadzuReader {
     /// One-shot latch so the "you asked for X, the file has Y" warning is emitted once per file
     /// rather than once per spectrum.
     fallback_warned: AtomicBool,
+    /// Memoised answer to "does this `.lcd` store profile signal at all?", the discriminator the
+    /// A5 centroid gate rests on. `None` until the first centroid fetch probes for it.
+    stores_profile: std::cell::Cell<Option<bool>>,
     _not_thread_safe: PhantomData<*const ()>,
+}
+
+/// Escape hatch for the A5 centroid gate — set only to reproduce or diagnose the rotation.
+fn unsafe_centroid_allowed() -> bool {
+    matches!(
+        std::env::var("MZPC_SHIMADZU_UNSAFE_CENTROID").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 impl ShimadzuReader {
@@ -284,6 +295,7 @@ impl ShimadzuReader {
             lcd_path: path.to_path_buf(),
             representation,
             fallback_warned: AtomicBool::new(false),
+            stores_profile: std::cell::Cell::new(None),
             _not_thread_safe: PhantomData,
         })
     }
@@ -311,8 +323,55 @@ impl ShimadzuReader {
         Ok(meta)
     }
 
+    /// Does this `.lcd` store profile signal at all? Probes the head of the run plus a stride
+    /// across it, and stops at the first spectrum that yields profile points.
+    ///
+    /// This is the discriminator for the A5 gate below: measured against the LabSolutions mzML
+    /// exports, the native centroid lists come back correct on files that carry profile signal
+    /// (Blind_P1_pos_012: 13,200/13,200 spectra, all 216,742 intensities bit-exact) and rotated —
+    /// `[s alien values] + truth[0:n-s]`, plus a clipped final peak — on files that carry none
+    /// (the DIA_Hela pair).
+    fn stores_profile(&self) -> Result<bool> {
+        if let Some(known) = self.stores_profile.get() {
+            return Ok(known);
+        }
+        let head = self.count.min(16);
+        let stride = (self.count / 8).max(1);
+        let probes = (0..head).chain((0..self.count).step_by(stride));
+        let mut found = false;
+        for i in probes {
+            if !self.peaks(i, 0)?.0.is_empty() {
+                found = true;
+                break;
+            }
+        }
+        self.stores_profile.set(Some(found));
+        Ok(found)
+    }
+
+    /// Refuse to hand back native centroid data from a `.lcd` that stores no profile signal —
+    /// on those files the vendor centroid list arrives with its intensities rotated against the
+    /// m/z axis (see [`Self::stores_profile`]). Lifted by `MZPC_SHIMADZU_UNSAFE_CENTROID=1`,
+    /// which the Stage-B diagnostics need in order to reproduce the defect at all.
+    fn gate_centroid(&self) -> Result<()> {
+        if unsafe_centroid_allowed() || self.stores_profile()? {
+            return Ok(());
+        }
+        bail!(
+            "{} stores no profile signal, and on such files this native lane pairs each centroid \
+             intensity with the wrong m/z (values are shifted by 1-7 positions and the last peak \
+             is dropped). Refusing to write corrupt data. Use `--via-msconvert` to convert this \
+             file, or set MZPC_SHIMADZU_UNSAFE_CENTROID=1 if you are reproducing the defect on \
+             purpose.",
+            self.lcd_path.display()
+        )
+    }
+
     /// Fetch one representation of spectrum `i`. `which`: 0 = profile, 1 = centroid.
     fn peaks(&self, i: usize, which: i32) -> Result<(Vec<f64>, Vec<f32>)> {
+        if which == 1 {
+            self.gate_centroid()?;
+        }
         let index = i64::try_from(i).map_err(|_| anyhow!("Shimadzu index {i} does not fit in i64"))?;
         let mut mz_ptr: *const f64 = std::ptr::null();
         let mut int_ptr: *const f32 = std::ptr::null();
@@ -326,14 +385,9 @@ impl ShimadzuReader {
             &mut int_ptr as *mut _,
             &mut len as *mut _,
         );
-        if rc != 0 {
-            bail!(
-                "Shimadzu glue SpectrumData failed for index {i} (rc {rc}): {}",
-                self.api.last_error().unwrap_or_default()
-            );
-        }
-
         // RAII guard: DataFree must release the managed pins even on a panic/early bail.
+        // Armed BEFORE the rc check: a partially-successful call can have pinned one array and then
+        // failed, and bailing straight out of here would strand that pin for the process lifetime.
         struct PinGuard<'a> {
             api: &'a GlueApi,
             handle: i64,
@@ -356,6 +410,12 @@ impl ShimadzuReader {
             armed: true,
         };
 
+        if rc != 0 {
+            bail!(
+                "Shimadzu glue SpectrumData failed for index {i} (rc {rc}): {}",
+                self.api.last_error().unwrap_or_default()
+            );
+        }
         if len < 0 {
             bail!("Shimadzu spectrum {i} reports negative length {len}");
         }
@@ -395,10 +455,12 @@ impl ShimadzuReader {
         let want_centroid = self.representation != Representation::Profile;
         let mut profile = if want_profile { self.peaks(i, 0)? } else { (Vec::new(), Vec::new()) };
         let mut centroid = if want_centroid { self.peaks(i, 1)? } else { (Vec::new(), Vec::new()) };
-        // An explicit `--representation profile` on a file that stores only centroids (which is what
-        // these Shimadzu `.lcd` runs are) would otherwise leave both arrays empty and then LABEL that
-        // emptiness -- writing a zero-point spectrum tagged as the representation that is absent.
-        // Fall back to the representation the file does have, keep its true label, and say so once.
+        // An explicit `--representation profile` on a file that stores only centroids would otherwise
+        // leave both arrays empty and then LABEL that emptiness -- writing a zero-point spectrum
+        // tagged as the representation that is absent. Fall back to the representation the file does
+        // have, keep its true label, and say so once. NOTE: on a profile-less file that fallback now
+        // hits the A5 gate and hard-errors instead of quietly emitting rotated centroids — closing
+        // the hole that made `--representation profile` look like a safe lane for those files.
         if profile.0.is_empty() && centroid.0.is_empty() {
             match self.representation {
                 Representation::Profile => centroid = self.peaks(i, 1)?,
@@ -485,7 +547,10 @@ impl ShimadzuReader {
             polarity,
             ..Default::default()
         };
-        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // No blanket `MS:1000294 "mass spectrum"` here. mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs — every
+        // Shimadzu spectrum was typed "mass spectrum" while the mzML lane recorded MS1/MSn.
         let mut scan = ScanEvent::default();
         // ABI carries seconds; mzdata scan start_time is minutes.
         scan.start_time = meta.retention_time_seconds / 60.0;
@@ -499,6 +564,9 @@ impl ShimadzuReader {
 
     /// A sample spectrum's array map, for deriving the writer's data-facet schema.
     pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
+        // A centroid-only file has nothing this lane may emit while the A5 gate stands, so say why
+        // here instead of scanning the whole run first and failing on the last step.
+        self.gate_centroid()?;
         // Look through BOTH representations: on a centroid-only file every `which = 0` fetch comes
         // back empty, and settling for spectrum 0 would hand the writer an empty schema sample.
         let mut chosen = 0usize;

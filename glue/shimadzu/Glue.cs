@@ -563,10 +563,27 @@ public static class Api
             int scan = (int)index + 1;
             var both = Data(d, scan);
             var (mz, inten) = which == 1 ? both.centroid : both.profile;
+            // Boundary contract: Rust reads both arrays with ONE length. A mismatch here would make
+            // it walk off the end of the shorter one, so refuse rather than hand over the pair.
+            if (mz.Length != inten.Length)
+            {
+                _lastError = $"scan {scan} which={which}: m/z has {mz.Length} values, intensity has {inten.Length}";
+                return 1;
+            }
+            // Nothing to hand over, and nothing to pin. Pinning empty arrays anyway would key every
+            // such fetch on (handle, null) — the second one overwrote the first entry in `Pins`, so
+            // its GCHandles could never be freed.
+            if (mz.Length == 0)
+            {
+                *mzOut = null;
+                *intOut = null;
+                *nOut = 0;
+                return 0;
+            }
             var mzH = GCHandle.Alloc(mz, GCHandleType.Pinned);
             var inH = GCHandle.Alloc(inten, GCHandleType.Pinned);
-            var mzP = mz.Length > 0 ? (double*)mzH.AddrOfPinnedObject() : null;
-            var inP = inten.Length > 0 ? (float*)inH.AddrOfPinnedObject() : null;
+            var mzP = (double*)mzH.AddrOfPinnedObject();
+            var inP = (float*)inH.AddrOfPinnedObject();
             lock (Gate) { Pins[(handle, (IntPtr)mzP)] = (mzH, inH); }
             *mzOut = mzP;
             *intOut = inP;

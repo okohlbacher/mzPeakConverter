@@ -242,7 +242,7 @@ impl GenericDataArrayWriter {
                 )?;
 
                 if let Some(chunks) = chunks {
-                    let size = chunks.len();
+                    let size = n_pts;
                     let (fields, arrays, _nulls) = chunks.into_parts();
                     buffer.add_arrays(fields, arrays, size, is_profile);
                 }
@@ -303,7 +303,7 @@ impl GenericDataArrayWriter {
                 buffer_ref.fields(),
             )?;
             if let Some(chunks) = chunks {
-                let size = chunks.len();
+                let size = n_pts;
                 let (fields, arrays, _nulls) = chunks.into_parts();
                 buffer_ref.add_arrays(fields, arrays, size, false);
             }
@@ -560,7 +560,7 @@ pub trait AbstractMzPeakWriter {
                 )?;
 
                 if let Some(chunks) = chunks {
-                    let size = chunks.len();
+                    let size = n_pts;
                     let (fields, arrays, _nulls) = chunks.into_parts();
                     buffer_ref.add_arrays(fields, arrays, size, true);
                 }
@@ -761,7 +761,7 @@ pub trait AbstractMzPeakWriter {
             )?;
 
             if let Some(chunks) = chunks {
-                let size = chunks.len();
+                let size = n_pts;
                 let (fields, arrays, _nulls) = chunks.into_parts();
                 buffer_ref.add_arrays(fields, arrays, size, is_profile);
             }
@@ -835,7 +835,7 @@ pub trait AbstractMzPeakWriter {
             )?;
 
             if let Some(chunks) = chunks {
-                let size = chunks.len();
+                let size = n_pts;
                 let (fields, arrays, _nulls) = chunks.into_parts();
                 buffer_ref.add_arrays(fields, arrays, size, false);
             }

@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Data-point counters in the Parquet footers were wrong in both layouts.** A `.mzpeak` could
+  declare `chromatogram_data_point_count = 0` while holding thousands of rows. Two independent
+  causes: `PointBuffers`' inherent `add_arrays` shadows the `ArrayBufferWriter` impl that did the
+  counting, so enum dispatch landed on the inherent one and nothing incremented; and five chunked
+  call sites passed `chunks.len()` — the number of chunk ROWS — as the point count. Counting now
+  happens in the inherent methods, and the chunk sites pass `n_pts`. Verified on the tiny pwiz
+  fixture (chromatograms 0 → 6, matching the stored rows) and on a 13,200-spectrum run
+  (chromatograms 0 → 26,400; spectra now 216,742 points rather than 59,948 chunks), and pinned by
+  `tests/footer_counts.rs`, which fails on the pre-fix code.
+
+- **Shimadzu native lane: refuse to emit centroid data from a `.lcd` that stores no profile
+  signal.** On those files the vendor centroid list arrives with its intensities rotated against
+  the m/z axis (`[s alien values] + truth[0:n−s]`, s ∈ 1..7, and the final peak dropped), which
+  poisons TIC, BPI and base-peak m/z while leaving the archive perfectly self-consistent. Measured
+  scope, against the LabSolutions mzML exports: files that carry profile signal are unaffected —
+  `Blind_P1_pos_012` compares 13,200/13,200 spectra with all 216,742 centroid intensities
+  bit-exact — while the centroid-only DIA files are corrupt throughout. Conversion of an affected
+  file now fails with an explanation instead of writing corrupt intensities; `--via-msconvert`
+  converts them correctly, and `MZPC_SHIMADZU_UNSAFE_CENTROID=1` lifts the gate for diagnostics.
+  This also closes the fallback hole where `--representation profile` on a profile-less file
+  silently fell back to the centroid fetch. Root cause of the rotation is still open.
+
+- **Shimadzu spectra were all typed `MS:1000294 "mass spectrum"`.** That parent term was added
+  unconditionally and, because mzdata's `spectrum_type()` is a first-match lookup, it shadowed the
+  writer's inference — so no Shimadzu spectrum ever carried `MS:1000579`/`MS:1000580` the way the
+  mzML lane does. Removed; the writer now infers from MS level.
+
+- **Shimadzu FFI boundary hardening.** The glue now rejects a fetch whose m/z and intensity arrays
+  differ in length (Rust reads both with one length), and no longer pins empty arrays — every
+  zero-length fetch keyed its pin on `(handle, null)`, so the second one overwrote the first and
+  leaked both `GCHandle`s. On the Rust side the pin guard is armed before the return-code check, so
+  a failed call cannot strand a pin.
+
+### Added
+
+- **`tools/compare_lcd_native_mzml.py`** — peak-for-peak comparison of an archive against the
+  vendor mzML export of the same run: per-spectrum peak count, ordered m/z within tolerance,
+  bit-exact intensities, and rotation detection. Exits 2 rather than passing when no oracle exists,
+  and `--baseline` replays the known defect against a preserved pre-fix archive. This is the gate
+  the Shimadzu lane is released against; the earlier ad-hoc check compared profile data only and
+  was never committed.
+
 ## [0.9.0] — 2026-09-01
 
 ### Changed
