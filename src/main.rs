@@ -3561,17 +3561,32 @@ fn shimadzu_probe(reader: &shimadzu::ShimadzuReader, n: usize) -> Result<()> {
     use mzdata::prelude::SpectrumLike;
     for i in 0..n.min(reader.len()) {
         let spec = reader.spectrum(i)?;
-        let arrays = spec.raw_arrays().ok_or_else(|| anyhow!("spectrum {i} has no arrays"))?;
-        let mz = arrays.mzs()?;
-        let inten = arrays.intensities()?;
-        let head_mz: Vec<String> = mz.iter().take(4).map(|v| format!("{v:.6}")).collect();
-        let head_in: Vec<String> = inten.iter().take(8).map(|v| format!("{v}")).collect();
+        // BOTH facets: on a dual file the raw arrays hold the profile and the centroid list rides
+        // as the peak set, so printing only the raw arrays hides the very list under investigation.
+        let (n_data, mz_head, in_head) = match spec.raw_arrays() {
+            Some(arrays) => {
+                let mz = arrays.mzs()?;
+                let inten = arrays.intensities()?;
+                (
+                    mz.len(),
+                    mz.iter().take(4).map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","),
+                    inten.iter().take(8).map(|v| format!("{v}")).collect::<Vec<_>>().join(","),
+                )
+            }
+            None => (0, String::new(), String::new()),
+        };
+        let (n_peaks, pk_mz, pk_in) = match spec.peaks.as_ref() {
+            Some(peaks) => (
+                peaks.len(),
+                peaks.iter().take(4).map(|p| format!("{:.6}", p.mz)).collect::<Vec<_>>().join(","),
+                peaks.iter().take(8).map(|p| format!("{}", p.intensity)).collect::<Vec<_>>().join(","),
+            ),
+            None => (0, String::new(), String::new()),
+        };
         println!(
-            "{{\"index\":{i},\"id\":\"{}\",\"n\":{},\"mz\":[{}],\"intensity\":[{}]}}",
+            "{{\"index\":{i},\"id\":\"{}\",\"n_data\":{n_data},\"mz\":[{mz_head}],\"intensity\":[{in_head}],\
+             \"n_peaks\":{n_peaks},\"peak_mz\":[{pk_mz}],\"peak_intensity\":[{pk_in}]}}",
             spec.id(),
-            mz.len(),
-            head_mz.join(","),
-            head_in.join(",")
         );
     }
     Ok(())
