@@ -257,6 +257,18 @@ pub enum LatticeOutcome {
     NoCentroids,
 }
 
+impl LatticeOutcome {
+    /// `Some(true)` on the lattice, `Some(false)` kept f64, `None` nothing to route — the shape
+    /// the converter's per-facet summary counters record.
+    pub fn on_lattice(self) -> Option<bool> {
+        match self {
+            LatticeOutcome::Lattice => Some(true),
+            LatticeOutcome::KeptF64 => Some(false),
+            LatticeOutcome::NoCentroids => None,
+        }
+    }
+}
+
 /// Per-spectrum routing of the CENTROID list. The list is the peak set when the spectrum also
 /// carries a profile (a dual `.lcd`), or the raw arrays of a Centroid spectrum otherwise. On
 /// success the spectrum is returned UNCHANGED (its peak set / raw arrays still feed the metadata

@@ -37,6 +37,30 @@ Requires Windows + a .NET 8 runtime. Only the newer LabSolutions `.lcd` (LCMS-90
 triple-quad, 2020 single-quad) is supported; the legacy **LCMS-IT-TOF** `.lcd` is not (the vendor
 library returns `E_UNSUPPORTEDFILE`). For those, no path exists short of Shimadzu's own export.
 
+## What the archive stores
+
+The Rust side reads `MassHigh` (Int64, 1e-9 Da — what LabSolutions' own mzML exporter writes)
+rather than the coarse `Mass` (Int32, 1e-4 Da, what ProteoWizard reads); `MZPC_SHIMADZU_COARSE_MZ=1`
+selects `Mass`. Both representations are kept by default (`--representation both|profile|centroid`),
+each on the exact integer grid it sits on:
+
+| facet | column(s) | reconstruct | index block |
+|---|---|---|---|
+| `spectra_data` (profile, point layout) | `tof_index` Int32 + per-spectrum `tof_c0`, `tof_c1`; `mz` f64 NULL on gridded rows | `m/z = (tof_c0 + tof_c1·tof_index)²` | `tof_calibration` `{codec: tof-grid, model: sciex_sqrt_per_spectrum, vendor: shimadzu, run_wide_c1}` |
+| `spectra_peaks` (centroids, point layout, never chunked) | `point.tof_index` Int64 (`LinearMz`, `transform_params = "1e-9"`); `point.mz` f64 NULL on lattice rows; `point.intensity` f32 | `m/z = 1e-9 · tof_index` | `mz_calibration` `{codec: mz-grid, scale: 1e9, vendor: shimadzu, applies_to: spectra_peaks}` |
+
+Every spectrum is checked on its own before it is gridded (profile: every point within 1e-9 of the
+sqrt grid; centroids: `|m/z·1e9 − k| < max(1e-3, 8 ulp)` and `k` non-decreasing), and one that fails
+keeps its f64 m/z in the same facet — nothing is snapped or dropped. Readers resolve the axis **per
+facet** (centroids: `mz_calibration`; profile: `tof_calibration`) and treat a finite, positive `mz`
+as the f64 fallback that wins over the integer axis. Measured on the reference files: m/z equal to the
+LabSolutions export to the last f64 digit, every spectrum on its grid, and archive sizes of 3.79 MB
+(Blind_P1_pos_012), 23.9 MB (HEK_PosOAD1) and 1.31 GB (DIA_Hela_20ng; 2.19 GB as f64 `MassHigh`,
+839 MB on the coarse `Mass`). The run summary in the log (`N spectra on the sqrt grid / on the
+1e-9 m/z lattice`) counts the written spectra. Precursors, scan windows, the instrument
+configuration and the source SHA-1 (digested before the DLL locks the file) ride in
+`spectra_metadata` / the index as for every other lane.
+
 ## Known vendor defect: misaligned centroids on profile-less `.lcd`
 
 For a spectrum that carries **no profile signal**, `Shimadzu.LabSolutions.IO` returns a
