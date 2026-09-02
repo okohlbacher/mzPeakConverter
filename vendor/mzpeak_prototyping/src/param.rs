@@ -40,11 +40,31 @@ pub const MZP_CV_PREFIX: &str = "MZP";
 /// prefix to `Unknown` and discards the prefix string, so within this converter — which only ever
 /// constructs `Unknown` CURIEs for MZP terms — `Unknown` is synonymous with MZP.
 #[inline]
-pub(crate) fn is_mzp(c: &CURIE) -> bool {
+pub fn is_mzp(c: &CURIE) -> bool {
     matches!(
         c.controlled_vocabulary,
         mzdata::params::ControlledVocabulary::Unknown
     )
+}
+
+/// The `cv_list` entry for the converter-owned MZP vocabulary (`cv/mzpeak.obo`). An archive that
+/// carries any `MZP:` accession MUST list it, exactly as it lists MS and UO, so a reader can resolve
+/// the prefix; the writer seeds only MS+UO, so lanes that emit MZP terms push this themselves
+/// (see [`ensure_mzp_cv_entry`]).
+pub fn mzp_cv_entry() -> ControlledVocabularyEntry {
+    ControlledVocabularyEntry::new(
+        MZP_CV_PREFIX,
+        "mzPeak converter provisional controlled vocabulary",
+        "https://raw.githubusercontent.com/okohlbacher/mzPeakConverter/main/cv/mzpeak.obo",
+        Some("0.1.0"),
+    )
+}
+
+/// Push [`mzp_cv_entry`] onto a `cv_list` unless an `MZP` entry is already there.
+pub fn ensure_mzp_cv_entry(cvs: &mut Vec<ControlledVocabularyEntry>) {
+    if !cvs.iter().any(|c| c.id == MZP_CV_PREFIX) {
+        cvs.push(mzp_cv_entry());
+    }
 }
 
 /// Render a CURIE to its wire string. MZP terms get the converter-owned `MZP:` prefix; everything
@@ -1673,5 +1693,39 @@ mod test {
         }
         assert_eq!(k, 34);
         Ok(())
+    }
+
+    /// A converter-owned MZP term is an `Unknown`-CV CURIE; it must render as `MZP:<7 digits>` and
+    /// parse back to the same CURIE (both spellings), and the `cv_list` helper must list the
+    /// vocabulary exactly once.
+    #[test]
+    fn mzp_curie_round_trips_as_string() {
+        let lower = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_006);
+        assert!(is_mzp(&lower));
+        assert_eq!(curie_to_string(&lower), "MZP:1000006");
+        assert_eq!(parse_curie("MZP:1000006").unwrap(), lower);
+        assert_eq!(parse_curie("MZP_1000006").unwrap(), lower);
+        assert!(parse_curie("MZP:abc").is_err());
+        // MetaParam carries the accession through its JSON form the same way.
+        let mp = MetaParam {
+            name: Some("isolation window inverse reduced ion mobility lower limit".into()),
+            accession: Some(lower),
+            value: serde_json::json!(1.25),
+            unit: Some(curie!(MS:1002814)),
+        };
+        let json = serde_json::to_string(&mp).unwrap();
+        assert!(json.contains("\"MZP:1000006\""), "{json}");
+        let back: MetaParam = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.accession, Some(lower));
+        // Standard CURIEs are untouched.
+        assert_eq!(curie_to_string(&curie!(MS:1002815)), "MS:1002815");
+
+        let mut cvs: Vec<ControlledVocabularyEntry> = vec![mzdata::params::ControlledVocabulary::MS.into()];
+        ensure_mzp_cv_entry(&mut cvs);
+        ensure_mzp_cv_entry(&mut cvs);
+        assert_eq!(cvs.len(), 2);
+        assert_eq!(cvs[1].id, "MZP");
+        assert_eq!(cvs[1].version.as_deref(), Some("0.1.0"));
+        assert!(cvs[1].uri.ends_with("cv/mzpeak.obo"));
     }
 }

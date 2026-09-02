@@ -4,6 +4,151 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **timsTOF isolation-window mobility band now carries accessions (MZP:1000006 / MZP:1000007).**
+  The `isolation window inverse reduced ion mobility lower/upper limit` params on every selected
+  ion (`src/bruker_native.rs` `add_isolation_mobility_band`) were name-only because PSI-MS has no
+  term for an isolation window's 1/K0 bounds and mzdata's CURIE `Display` panics on a non-PSI
+  prefix. They are now the converter's provisional `cv/mzpeak.obo` terms, represented as
+  `Unknown`-CV CURIEs and rendered `MZP:` by the vendored writer/reader (`param::curie_to_string` /
+  `parse_curie`). Unit stays MS:1002814. Both ims-compact lanes (native, `--bruker-sdk`) and the
+  `--no-ims-compact` lane write them; on PXD059079 2485.d: 15,977/15,977 selected ions,
+  `lower <= ion_mobility_value <= upper` everywhere, validator PASS on both lanes.
+- The archive `cv_list` lists the MZP vocabulary
+  (`{id: MZP, full_name: "mzPeak converter provisional controlled vocabulary", version: 0.1.0,
+  uri: …/cv/mzpeak.obo}`) on every timsTOF conversion — also an MS1-only run that never writes a
+  band; the entry is spec-legal and costs one row (`ensure_mzp_cv` in `main.rs`;
+  `mzpeak_prototyping::param::mzp_cv_entry` / `ensure_mzp_cv_entry`).
+- `tests/tdf_ims_window_band.rs` (corpus-gated, ~10 s): converts 2485.d both ways, asserts the
+  band + accession on every selected-ion row of both archives, lane agreement on 1/K0 and band to
+  1e-9, the pinned ModelType-2 value on frame 2 / m/z 1276.05, the spectrum-level
+  `ion mobility lower/upper limit` pair ordered and equal to the band wherever present,
+  `--no-tims-recalibration` giving the same (linear, 1.317349) value in both lanes, and a
+  panic-free mzML export with the band as `userParam`. Unit tests: MZP CURIE string/JSON round trip (vendored `param.rs`),
+  writer→reader round trip + demotion + mzdata mzML write of an MZP param (`main.rs`),
+  `TdfMobilityRemap` arithmetic and band ordering (`bruker_native.rs`).
+- Two-row `MzCalibration` fixture (`bruker_native::vendor_mz_calibration_tests::
+  two_calibration_rows_select_per_frame_and_null_frame_is_tolerated`): both rows carried verbatim
+  in `vendor_mz_calibration`, `tdf_mz_calibration_id` selects the right row per frame, and a
+  `Frames` row with NULL `T1` yields no per-frame calibration for that frame only (no abort, no
+  index shift).
+
+- `tests/tmp_cleanup.rs`: a conversion whose final rename fails (the output path is an occupied
+  directory, `--force`) exits non-zero and leaves no `<out>.mzpeak.tmp`; unit tests for the guard's
+  drop / finish / failed-rename paths, the panic hook, and the vendor-reader tally
+  (`vendor_reader_tally_counts_written_spectra_not_probes`).
+- **User manual:** the Shimadzu native lane (§6, §8, §9, §10, §11 — `MassHigh` vs the coarse
+  `Mass`, `MZPC_SHIMADZU_COARSE_MZ`, the per-spectrum sqrt grid and the Int64 centroid lattice with
+  their index blocks and the per-facet reader rule, measured sizes and fidelity, the vendor
+  centroid-intensity defect on profile-less `.lcd` files), `--representation` in the option table,
+  and for timsTOF: `ims_calibration.exact = false` with the chord's measured error, and the
+  multi-precursor pairing rule. `glue/shimadzu/README.md` gains a "What the archive stores"
+  section; the viewer compliance reply an addendum on resolving integer axes per facet.
+
+### Fixed
+
+- **A failed conversion no longer leaves `<out>.mzpeak.tmp` behind.** Every lane writes to the
+  tmp and renames it into place at the end, and any failure in between — a writer error, the rename
+  itself, or the peak-writer-open panic introduced in 0.9.5 (which fires on the main thread before
+  the ims-compact writer thread exists) — left the partial file beside the missing output. A
+  `TmpGuard` (`main.rs`) now owns the tmp in all six lanes (mzML/imzML/Thermo, TOF-grid, Agilent
+  grid, ims-compact, SciEX grid, and the shared vendor-reader path used by TSF/BAF/SDK/Agilent
+  MIDAC/Waters/Shimadzu): it is removed when the guard drops on an error and, because the release
+  profile is `panic = "abort"` and runs no destructors, by a panic hook that sweeps the in-flight
+  tmp files (all of them under abort; only the panicking thread's own under unwind, so a caught
+  panic in a test process cannot remove another conversion's file). The successful rename is the
+  only thing that disarms it. The output path is never touched: the `--force`, in-place and
+  nested-output refusals are as before. The sanitized copy `sanitize_param_groups` writes for an
+  mzML with empty `<referenceableParamGroup/>` elements (`mzpc-san-*.mzML` in the temp dir) is now
+  an RAII guard too (`SanitizedTemp`): it used to survive every failed conversion and every
+  `-o x.mzML` export (`tests/tmp_cleanup.rs::failed_conversion_leaves_no_sanitized_copy_behind`).
+- **Shimadzu run summary counted the schema probes.** `convert_vendor_reader` fetches up to six
+  spectra through the lane's routing closure before the write loop to sample the facet schema, and
+  the "N spectra on the sqrt grid / on the 1e-9 m/z lattice" counters lived in that closure, so the
+  logged totals exceeded the spectrum count by the probe count (13,206 for the 13,200-spectrum
+  Blind_P1_pos_012). Each spectrum now reports its route (`FacetRoutes` on `VendorSpectrum`) and
+  the counting moved into the write loop of the host-independent `convert_vendor_reader`
+  (`FacetTally`), which also logs the summary; `shimadzu_grid_route` lost its counter arguments and
+  its `#[cfg(windows)]` (only the `.lcd` reader is Windows-only), so the routing compiles and is
+  tested on every host. Archives are unchanged.
+
+- **Viewer (`mzPeakViewer/packages/core`): the non-engine spectrum readers decode grid-encoded
+  facets instead of reading the null-filled `mz` verbatim.** Since the Shimadzu Int64 `mz-grid`
+  lattice landed, the engine's `reconstructSpectrum` resolved the grid per facet, but two readers
+  still took `centroids[i].mz` / `dataArrays["m/z array"]` as-is — `src/reader/arrays.ts
+  harvestDataArraysOrNull` (the ion-image / mean / ROI source read) and `src/reader/explorer/
+  browse.ts getSpectrumArrays` (the Browse tab) — and on a lattice archive saw the 0 that mzpeakts
+  materialises for the NULL fallback column; the previous fix wave turned that into a throw
+  (`assertNoGridAxis`). Both now decode each facet through a new engine export,
+  `readFacetSignal` (`src/engine/spectrum.ts`) — the same per-facet resolver (`resolveFacetGridMz`)
+  and ims-compact calibration the Spectra view uses, BigInt axes coerced — and only fall back to
+  `assertNoGridAxis` when no resolver exists for the file at all; a facet whose rows need an axis
+  its resolver cannot supply throws the new `UnresolvedGridAxisError` instead of returning zeros.
+- **Viewer: the grid-axis rule is now per row on BOTH facets, independent of row order.** `mz`
+  finite and > 0 wins, the axis is authoritative only where `mz` is the null fill (absent / null
+  / 0). A fallback f64 spectrum inside a lattice facet arrives either with NO axis key at all
+  (mzpeakts drops a column that is all-null within the selected rows — the most likely shape,
+  as for the Int32 profile case) or, where a NULL Int64 cell is materialised, as `tof_index 0n`
+  beside its real `mz`; either way it is read from `mz` and never reconstructed from the zero
+  (the converter routes per spectrum, so the real archives are homogeneous per spectrum — blind
+  / hek / d100: 0 mixed spectra — and the mixed shapes are defensive). `readCentroids` located
+  the axis column from row 0 only, so a fallback row FIRST followed by a gridded row read the
+  gridded row's null-fill 0 verbatim as m/z 0; the axis is now located from the first gridded
+  row. `readDataArrays` previously let the axis win over any `m/z array` and, with no profile
+  resolver, fell through to the zero-filled `m/z array` silently — both closed. Pre-lattice
+  Shimadzu archives (`tof_calibration` only, plain f64 centroids) keep reading their centroids
+  verbatim. Unit tests: `src/reader/arrays.test.ts` (synthetic readers with bigint axes, both row
+  orders, absent-axis fallback); smoke on the real lattice + pre-lattice archives showed every
+  sampled spectrum non-zero, ascending and value-equal to the engine on all entry points.
+- **Viewer: the `mz-grid` codec multiplies by `1/scale` instead of dividing by `scale`.** The
+  archive's Parquet-level contract is a multiplier (`point.tof_index` MS:1003824 with
+  `transform_params [1e-9]`; the reference reader computes `s · k`, `vendor/mzpeak_prototyping/
+  src/reader/point.rs`) and `k / 1e9` differs from `k · 1e-9` by 1 ulp on ~40 % of lattice
+  values (100000123456 → 100.000123456 vs 100.00012345600001), so the viewer was 1 ulp off every
+  other conformant reader — and off the converter's own `--to mzml` export — on the same archive.
+  `1/1e9 === 1e-9` and `1/1e4 === 1e-4` exactly, so `axis * (1/scale)` is bit-identical to the
+  transform (0 mismatches over 1e6 random lattice values). Round lattice values now read as the
+  reference reader's value (5e11 → 500.00000000000006, not 500); ordinary display formatting hides
+  it. Spec follow-up (not viewer work): `index-file.md` still lists only `tof_calibration` /
+  `ims_calibration` / `vendor_files` / `vendor_metadata` — `mz_calibration` (`{codec: mz-grid,
+  scale}`) and `vendor_mz_calibration` are undocumented, and `signal-data.md` §grid says the
+  transform applies when the rank-0 axis is "not stored at all", whereas the lattice facet stores
+  an all-NULL `mz` beside the axis (null-marking would tell a generic reader to interpolate).
+  Needs: both blocks in the index table, and the rule "a null-filled rank-0 axis MAY sit beside an
+  MS:1003824/MS:1003825 grid column; where the rank-0 value is NULL the grid column is
+  authoritative, no null-marking interpolation".
+
+- **The two timsTOF lanes disagreed on a selected ion's 1/K0 by up to 0.03 Vs/cm².** For the same
+  dia-PASEF window (frame 2, m/z 1276.05 of 2485.d) ims-compact wrote 1.332429 and
+  `--no-ims-compact` 1.317349. Both are the window's scan midpoint `(ScanNumBegin+ScanNumEnd)/2`
+  (this file has no `Precursors` table); the difference is the calibration: the native lane
+  evaluates the vendor ModelType-2 `TimsCalibration` (`src/tims_mobility.rs`, the model
+  `timsdata`'s `tims_scannum_to_oneoverk0` implements, validated to ~1e-3 against the SDK), while
+  mzdata 0.66.6 builds every 1/K0 it attaches as a *param* — the selected ion's MS:1002815, the
+  scan-level midpoint and the frame's `ion mobility lower/upper limit` — from timsrust's LINEAR
+  nominal-range interpolation (`io/tdf/reader.rs:1487,1527,1607-1641`), even though its own signal
+  arrays use ModelType-2 (`io/tdf/arrays.rs:73`). The `--no-ims-compact` lane now inverts the
+  (exactly invertible) linear map back to the scan position and re-evaluates the ModelType-2 model
+  (`bruker_native::TdfMobilityRemap`, applied in `convert_file`); both lanes agree to 4e-16 on all
+  15,977 windows. mzdata's spectrum-level `ion mobility lower/upper limit` spelling is kept: the
+  pair is remapped AND put in order — mzdata emits it inverted (`lower` = convert(ScanNumBegin),
+  `upper` = convert(ScanNumEnd), and 1/K0 falls with the scan index: 15,977/15,977 MS2 spectra of
+  the v0.9.5 archive had `lower > upper`), so the archive no longer carries a negative-width
+  spectrum-level window beside the correctly ordered selected-ion band. The selected ion
+  additionally gets the MZP:1000006/7 band. `--no-tims-recalibration` is honoured on this lane
+  too (the params then stay on timsrust's linear map, as in the ims-compact lane — the lanes agree
+  either way; the mzdata arrays cannot be switched and the warning says so), and an unreadable
+  `TimsCalibration` table degrades to the linear values with a warning instead of dropping the
+  band (as in the native lane). Remaining, separate: the mzdata lane's mobility *arrays* use
+  mzdata's own unanchored ModelType-2 form, ≤5e-4 Vs/cm² from `tims_mobility.rs` (1.467115 vs
+  1.466959 at scan 0).
+- `mzpeak-convert ARCHIVE -o x.mzML` (and the native-reader `--to mzml` paths) no longer panic on
+  an MZP accession: `demote_mzp_params` strips the CV binding so the term is written as a
+  `userParam` (name + value + unit), since mzdata's mzML writer unwraps `curie().to_string()`.
+
 ## [0.9.5] — 2026-09-02
 
 ### Added

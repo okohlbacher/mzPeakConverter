@@ -88,6 +88,132 @@ impl MobilityCal {
     }
 }
 
+/// Re-expresses the 1/K0 values mzdata's TDF reader puts in spectrum METADATA on the vendor model.
+///
+/// mzdata 0.66.6 converts its signal arrays through the frame's ModelType-2 `TimsCalibration`
+/// (`io/tdf/arrays.rs:73`), but every 1/K0 it attaches as a *param* — the selected ion's
+/// `inverse reduced ion mobility` (MS:1002815, `io/tdf/reader.rs:1487,1527`), the scan-level
+/// MS:1002815 midpoint (`:1607`) and the frame's `ion mobility lower/upper limit` (`:1615-1641`) —
+/// goes through timsrust's LINEAR nominal-range interpolation (`metadata.im_converter`). On
+/// PXD059079 2485.d that put the `--no-ims-compact` selected ion at 1.317349 against the ims-compact
+/// lane's 1.332429 for the same window (0.015 Vs/cm², up to ~0.03 at the high-mobility edge). The
+/// linear map is exactly invertible, so this recovers the scan position and re-evaluates the same
+/// ModelType-2 model the native lane uses ([`crate::tims_mobility`]); with no ModelType-2 row the
+/// values are left as they are (the native lane falls back to the same linear map then).
+///
+/// It also attaches the window's 1/K0 band to each selected ion as MZP:1000006/7, from mzdata's
+/// spectrum-level `ion mobility lower/upper limit` (that spelling is kept), so both lanes spell the
+/// selected ion identically. mzdata emits that pair INVERTED — `lower` = convert(ScanNumBegin),
+/// `upper` = convert(ScanNumEnd), and 1/K0 decreases with the scan index — so the pair is also put
+/// in order here (`lower <= upper`), on the same values the band gets.
+pub struct TdfMobilityRemap {
+    linear: Scan2ImConverter,
+    recal: Option<crate::tims_mobility::TimsMobilityCalibration>,
+}
+
+impl TdfMobilityRemap {
+    /// Open, choosing whether to re-express the params on the vendor ModelType-2 model
+    /// (`recalibrate`, the `--no-tims-recalibration` knob — the same choice as
+    /// [`NativeTofReader::open_with`], so both lanes stay on the same model either way) or leave
+    /// them on timsrust's linear map. The band is attached in both cases. A missing/unreadable
+    /// `TimsCalibration` table is best-effort here as in the native lane: a warning and the linear
+    /// values, never a lane without the band.
+    pub fn open_with(dot_d: &Path, recalibrate: bool) -> Result<Self> {
+        let tdf = dot_d.join("analysis.tdf");
+        let linear = MetadataReader::new(&tdf)
+            .map_err(|e| anyhow::anyhow!("reading TDF metadata {}: {e}", tdf.display()))?
+            .im_converter;
+        let recal = if recalibrate {
+            crate::tims_mobility::TimsMobilityCalibration::from_tdf_path(&tdf).unwrap_or_else(|e| {
+                log::warn!(
+                    "TDF TimsCalibration unreadable ({e:#}); mobility params stay on timsrust's \
+                     linear approximation"
+                );
+                None
+            })
+        } else {
+            None
+        };
+        Ok(Self { linear, recal })
+    }
+
+    /// For tests: a remap over explicit models.
+    #[cfg(test)]
+    fn new(linear: Scan2ImConverter, recal: Option<crate::tims_mobility::TimsMobilityCalibration>) -> Self {
+        Self { linear, recal }
+    }
+
+    /// A 1/K0 produced by timsrust's linear converter → the same scan position on the vendor model.
+    #[inline]
+    pub fn remap(&self, im: f64) -> f64 {
+        match &self.recal {
+            Some(c) => c.one_over_k0(self.linear.invert(im)),
+            None => im,
+        }
+    }
+
+    fn remap_param(&self, p: &mut Param) {
+        if let Ok(v) = p.value.to_f64() {
+            p.value = mzdata::params::Value::Float(self.remap(v));
+        }
+    }
+
+    /// Rewrite one mzdata-produced TDF spectrum description in place (see the type docs).
+    pub fn apply(&self, descr: &mut SpectrumDescription) {
+        let im_term = curie!(MS:1002815);
+        let (mut lo, mut hi) = (None, None);
+        let (mut lo_at, mut hi_at) = (None, None);
+        for (i, p) in descr.params.iter_mut().enumerate() {
+            match p.name.as_str() {
+                "ion mobility lower limit" => {
+                    self.remap_param(p);
+                    lo = p.value.to_f64().ok();
+                    lo_at = Some(i);
+                }
+                "ion mobility upper limit" => {
+                    self.remap_param(p);
+                    hi = p.value.to_f64().ok();
+                    hi_at = Some(i);
+                }
+                _ => {}
+            }
+        }
+        // mzdata writes the pair as (convert(ScanNumBegin), convert(ScanNumEnd)), which is
+        // (larger, smaller) because 1/K0 falls with the scan index — put it in order, so the
+        // spectrum-level pair and the selected-ion band never contradict each other.
+        if let (Some(a), Some(b), Some(i), Some(j)) = (lo, hi, lo_at, hi_at) {
+            if a > b {
+                descr.params[i].value = mzdata::params::Value::Float(b);
+                descr.params[j].value = mzdata::params::Value::Float(a);
+                (lo, hi) = (Some(b), Some(a));
+            }
+        }
+        for scan in descr.acquisition.scans.iter_mut() {
+            if let Some(ps) = scan.params.as_mut() {
+                for p in ps.iter_mut().filter(|p| p.curie() == Some(im_term)) {
+                    self.remap_param(p);
+                }
+            }
+        }
+        for prec in descr.precursor.iter_mut() {
+            for ion in prec.ions.iter_mut() {
+                if let Some(ps) = ion.params.as_mut() {
+                    for p in ps.iter_mut().filter(|p| p.curie() == Some(im_term)) {
+                        self.remap_param(p);
+                    }
+                }
+                let has_band = ion
+                    .params
+                    .as_ref()
+                    .is_some_and(|ps| ps.iter().any(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)));
+                if let (Some(a), Some(b), false) = (lo, hi, has_band) {
+                    add_isolation_mobility_band(ion, a, b);
+                }
+            }
+        }
+    }
+}
+
 /// Native integer-TOF reader over a Bruker `.d` (TDF). The mzdata-integration seam: a future
 /// upstream native-TOF API would back this same surface.
 pub struct NativeTofReader {
@@ -138,6 +264,39 @@ struct FrameTable {
 pub(crate) const TDF_T1_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_903);
 pub(crate) const TDF_T2_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_904);
 pub(crate) const TDF_MZ_CAL_ID_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_905);
+
+/// Converter-owned accessions for an isolation window's 1/K0 band (`cv/mzpeak.obo` MZP:1000006 /
+/// MZP:1000007). PSI-MS has no term for the mobility bounds of an isolation window (children of
+/// MS:1000792 / MS:1002892 checked at 4.1.259); the provisional MZP vocabulary is represented in
+/// this crate as `ControlledVocabulary::Unknown` CURIEs, which the vendored writer/reader render and
+/// parse as `MZP:` (see `mzpeak_prototyping::param::curie_to_string`). mzdata's own `Display` panics
+/// on `Unknown`, so these must never reach an mzdata writer un-demoted (`demote_mzp_params` in
+/// `main.rs` handles the mzML export).
+pub(crate) const MZP_IM_WINDOW_LOWER: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_006);
+pub(crate) const MZP_IM_WINDOW_UPPER: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_007);
+pub(crate) const IM_WINDOW_LOWER_NAME: &str = "isolation window inverse reduced ion mobility lower limit";
+pub(crate) const IM_WINDOW_UPPER_NAME: &str = "isolation window inverse reduced ion mobility upper limit";
+
+/// Attach the isolation window's 1/K0 band `[lo, hi]` to a selected ion as MZP:1000006/7 params.
+/// Shared by every timsTOF lane so the band is spelled identically whichever reader produced the
+/// spectrum. `lo`/`hi` are ordered here: 1/K0 DECREASES as the scan index increases, so callers
+/// converting scan bounds must not assume begin<end maps to lower<upper.
+pub(crate) fn add_isolation_mobility_band(ion: &mut SelectedIon, a: f64, b: f64) {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    for (name, curie, value) in [
+        (IM_WINDOW_LOWER_NAME, MZP_IM_WINDOW_LOWER, lo),
+        (IM_WINDOW_UPPER_NAME, MZP_IM_WINDOW_UPPER, hi),
+    ] {
+        ion.add_param(
+            Param::builder()
+                .name(name)
+                .curie(curie)
+                .value(value)
+                .unit(Unit::VoltSecondPerSquareCentimeter)
+                .build(),
+        );
+    }
+}
 
 /// Attach one frame's calibration inputs as spectrum params. Shared by the native and `--bruker-sdk`
 /// ims-compact lanes so both write identical columns.
@@ -409,29 +568,15 @@ pub(crate) fn build_precursors(
                 // reader splitting at the midpoint between adjacent centres misplaces the
                 // boundary — measured 3.5% of the mobility axis on average, up to 10.3%, on a
                 // real dia-PASEF run. Emit the true bounds so readers never have to guess.
-                let (mob_a, mob_b) = (
+                // Carried as MZP:1000006/7 (converter-owned provisional terms; PSI-MS has none
+                // for an isolation window's mobility bounds). The vendored writer/reader route
+                // every CURIE through `curie_to_string`/`parse_curie`, so the Unknown-CV
+                // representation is safe there; the mzML export demotes them to userParam.
+                add_isolation_mobility_band(
+                    &mut ion,
                     mobility(w.scan_begin as f64),
                     mobility(w.scan_end as f64),
                 );
-                // 1/K0 DECREASES as the scan index increases, so order the bounds explicitly
-                // rather than assuming begin<end maps to lower<upper.
-                let (mob_lo, mob_hi) = if mob_a <= mob_b { (mob_a, mob_b) } else { (mob_b, mob_a) };
-                // Emitted WITHOUT a CURIE: mzdata panics ("Cannot encode unknown CV") when a
-                // non-standard accession reaches its param encoder, and PSI-MS has no term for
-                // an isolation window's mobility bounds. Readers match on the name, as they
-                // already do for the nonstandard "tof" / mobility array names.
-                for (name, value) in [
-                    ("isolation window inverse reduced ion mobility lower limit", mob_lo),
-                    ("isolation window inverse reduced ion mobility upper limit", mob_hi),
-                ] {
-                    ion.add_param(
-                        Param::builder()
-                            .name(name)
-                            .value(value)
-                            .unit(Unit::VoltSecondPerSquareCentimeter)
-                            .build(),
-                    );
-                }
                 let mut activation = Activation::default();
                 activation.energy = w.collision_energy as f32;
                 activation
@@ -468,9 +613,7 @@ impl NativeTofReader {
 
     /// Per-frame `T1`/`T2`/`MzCalibration` → spectrum params (absent when the table lacks them).
     fn add_frame_calibration(&self, descr: &mut SpectrumDescription, i: usize) {
-        if let (Some(&Some(t1)), Some(&Some(t2)), Some(&Some(id))) =
-            (self.table.t1.get(i), self.table.t2.get(i), self.table.mz_cal_id.get(i))
-        {
+        if let Some((t1, t2, id)) = frame_calibration_at(&self.table, i) {
             add_frame_calibration_params(descr, t1, t2, id);
         }
     }
@@ -803,6 +946,16 @@ pub(crate) fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWin
     Ok(out)
 }
 
+/// The calibration inputs (`T1`, `T2`, `MzCalibration`) of frame `i`, or `None` when the table
+/// lacks the columns or any of the three is NULL for that frame — such a frame simply gets no
+/// per-frame calibration columns; it never aborts the conversion.
+fn frame_calibration_at(table: &FrameTable, i: usize) -> Option<(f64, f64, i64)> {
+    match (table.t1.get(i), table.t2.get(i), table.mz_cal_id.get(i)) {
+        (Some(&Some(t1)), Some(&Some(t2)), Some(&Some(id))) => Some((t1, t2, id)),
+        _ => None,
+    }
+}
+
 /// Read the per-frame [`FrameTable`] from `analysis.tdf`, ordered by `Id` so position `i` matches
 /// timsrust's frame index.
 fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
@@ -887,6 +1040,229 @@ mod vendor_mz_calibration_tests {
         let cols: Vec<&str> = v["per_frame_columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
         assert!(cols[0].ends_with("_tdf_t1") && cols[1].ends_with("_tdf_t2") && cols[2].ends_with("_tdf_mz_calibration_id"), "{cols:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run may reference MORE THAN ONE `MzCalibration` row (the instrument recalibrates
+    /// mid-run): both rows must be carried verbatim, in `Id` order, and each frame's
+    /// `tdf_mz_calibration_id` must select ITS row. A frame with NULL `T1` (seen on interrupted
+    /// runs) yields no per-frame calibration for that frame only — never an abort, and never a
+    /// shift of the neighbouring frames' positions.
+    #[test]
+    fn two_calibration_rows_select_per_frame_and_null_frame_is_tolerated() {
+        let dir = std::env::temp_dir().join(format!("mzpc-vmc2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tdf = dir.join("analysis.tdf");
+        let _ = std::fs::remove_file(&tdf);
+        let conn = rusqlite::Connection::open(&tdf).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE MzCalibration (Id INTEGER PRIMARY KEY, ModelType INTEGER, DigitizerTimebase REAL, \
+             DigitizerDelay REAL, T1 REAL, T2 REAL, dC1 REAL, dC2 REAL, C0 REAL, C1 REAL, C2 REAL, C3 REAL, C4 REAL); \
+             INSERT INTO MzCalibration VALUES (1, 1, 0.125, 26464.125, 25.6148127740566, 25.1594285616696, \
+             20.0, 0.0, 1008.59723408404, 154314.98518964, 0.0, 0.0, 0.0); \
+             INSERT INTO MzCalibration VALUES (2, 1, 0.125, 26464.125, 25.7001, 25.2002, \
+             20.0, 0.0, 1008.61, 154315.5, 1.26e-3, 0.0, 0.0); \
+             CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT); \
+             INSERT INTO GlobalMetadata VALUES ('DigitizerNumSamples', '636031'), \
+             ('MzAcqRangeLower', '99.993933'), ('MzAcqRangeUpper', '1700.000000'); \
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, NumPeaks INTEGER, Time REAL, MsMsType INTEGER, \
+             Polarity TEXT, T1 REAL, T2 REAL, MzCalibration INTEGER); \
+             INSERT INTO Frames VALUES (1, 10, 0.5, 0, '+', 25.61, 25.16, 1); \
+             INSERT INTO Frames VALUES (2, 10, 0.6, 9, '+', 25.62, 25.16, 2); \
+             INSERT INTO Frames VALUES (3, 10, 0.7, 0, '+', NULL, 25.16, 1); \
+             INSERT INTO Frames VALUES (4, 10, 0.8, 9, '+', 25.64, 25.17, 2); \
+             INSERT INTO Frames VALUES (5, 10, 0.9, 0, '+', 25.65, 25.17, 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Index block: both rows, verbatim, Id-ordered.
+        let v = super::vendor_mz_calibration(&tdf).unwrap();
+        let rows = v["mz_calibration"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["Id"], 1);
+        assert_eq!(rows[1]["Id"], 2);
+        assert_eq!(rows[0]["C2"], 0.0);
+        assert_eq!(rows[1]["C2"], 1.26e-3);
+        assert_eq!(rows[1]["T1"], 25.7001);
+        assert_eq!(rows[1]["C1"], 154315.5);
+        assert_eq!(rows[1].as_object().unwrap().len(), 13);
+
+        // Per-frame table: five entries (the NULL frame keeps its slot), ids select the right row.
+        let table = super::read_frame_table(&tdf).unwrap();
+        assert_eq!(table.num_peaks.len(), 5);
+        assert_eq!(table.mz_cal_id, vec![Some(1), Some(2), Some(1), Some(2), Some(1)]);
+        assert_eq!(table.t1, vec![Some(25.61), Some(25.62), None, Some(25.64), Some(25.65)]);
+        assert_eq!(table.ms_level, vec![1, 2, 1, 2, 1]);
+        assert_eq!(super::frame_calibration_at(&table, 0), Some((25.61, 25.16, 1)));
+        assert_eq!(super::frame_calibration_at(&table, 1), Some((25.62, 25.16, 2)));
+        assert_eq!(super::frame_calibration_at(&table, 2), None, "NULL T1 frame yields no params");
+        assert_eq!(super::frame_calibration_at(&table, 3), Some((25.64, 25.17, 2)));
+        assert_eq!(super::frame_calibration_at(&table, 4), Some((25.65, 25.17, 1)));
+        assert_eq!(super::frame_calibration_at(&table, 5), None, "past the end");
+
+        // The spectrum params the writer promotes to columns name the row per frame.
+        use mzdata::prelude::ParamDescribed;
+        let mut d = mzdata::spectrum::SpectrumDescription::default();
+        let (t1, t2, id) = super::frame_calibration_at(&table, 1).unwrap();
+        super::add_frame_calibration_params(&mut d, t1, t2, id);
+        let id_param = d.get_param_by_curie(&super::TDF_MZ_CAL_ID_CURIE).unwrap();
+        assert_eq!(id_param.value.to_i64().unwrap(), 2);
+        assert_eq!(d.get_param_by_curie(&super::TDF_T1_CURIE).unwrap().value.to_f64().unwrap(), 25.62);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod isolation_mobility_band_tests {
+    use super::*;
+    use mzdata::spectrum::ScanEvent;
+
+    fn im(p: &Param) -> f64 {
+        p.value.to_f64().unwrap()
+    }
+
+    /// The window band is carried as MZP:1000006/7 (Unknown-CV CURIEs rendered `MZP:` by the
+    /// vendored writer), ordered lower <= upper whatever order the scan bounds arrive in.
+    #[test]
+    fn band_is_accessioned_and_ordered() {
+        let mut ion = SelectedIon::default();
+        add_isolation_mobility_band(&mut ion, 1.36, 1.30); // scan_begin (high 1/K0) first
+        let ps = ion.params.as_ref().unwrap();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].curie(), Some(MZP_IM_WINDOW_LOWER));
+        assert_eq!(ps[1].curie(), Some(MZP_IM_WINDOW_UPPER));
+        assert_eq!(ps[0].name, IM_WINDOW_LOWER_NAME);
+        assert_eq!(im(&ps[0]), 1.30);
+        assert_eq!(im(&ps[1]), 1.36);
+        assert_eq!(ps[0].unit, Unit::VoltSecondPerSquareCentimeter);
+        assert_eq!(
+            mzpeak_prototyping::param::curie_to_string(&ps[0].curie().unwrap()),
+            "MZP:1000006"
+        );
+        assert_eq!(
+            mzpeak_prototyping::param::curie_to_string(&ps[1].curie().unwrap()),
+            "MZP:1000007"
+        );
+    }
+
+    /// mzdata's TDF reader puts timsrust-LINEAR 1/K0 in the selected ion, the scan and the frame's
+    /// `ion mobility lower/upper limit`; the remap must move all three onto the ModelType-2 model at
+    /// the SAME scan position (what the ims-compact lane writes) and attach the MZP band from the
+    /// limits — without touching anything else, and idempotently for the band.
+    ///
+    /// The input is spelled the way mzdata 0.66 spells it (`io/tdf/reader.rs`): `lower` =
+    /// convert(ScanNumBegin), `upper` = convert(ScanNumEnd) — i.e. INVERTED, since 1/K0 falls with
+    /// the scan index. The remap must leave the pair ordered.
+    #[test]
+    fn remap_moves_linear_values_onto_vendor_model_and_adds_band() {
+        // SBA415: nominal 1/K0 range 0.600..1.600 over 909 scans; ModelType-2 row from its TDF.
+        let linear = Scan2ImConverter::from_boundaries(0.600, 1.600, 909);
+        let recal = crate::tims_mobility::TimsMobilityCalibration::new(
+            1.0, 909.0, 211.45198604901222, 73.95258004355563, 0.00492817555366883,
+            131.11541877221117, 0.600,
+        );
+        let remap = TdfMobilityRemap::new(linear, Some(recal));
+        let (sb, se) = (100u32, 160u32);
+        let mid = (sb + se) as f64 / 2.0;
+        // The premise of the ordering fix: mzdata's "lower" (scan begin) is the LARGER 1/K0.
+        assert!(linear.convert(sb) > linear.convert(se));
+
+        let mut descr = SpectrumDescription::default();
+        descr.add_param(
+            Param::new_key_value("ion mobility lower limit", linear.convert(sb))
+                .with_unit_t(&Unit::VoltSecondPerSquareCentimeter),
+        );
+        descr.add_param(
+            Param::new_key_value("ion mobility upper limit", linear.convert(se))
+                .with_unit_t(&Unit::VoltSecondPerSquareCentimeter),
+        );
+        descr.add_param(Param::new_key_value("window group", 3i64));
+        let mut scan = ScanEvent::default();
+        scan.add_param(
+            Param::builder()
+                .name("inverse reduced ion mobility")
+                .curie(curie!(MS:1002815))
+                .value(linear.convert(mid))
+                .unit(Unit::VoltSecondPerSquareCentimeter)
+                .build(),
+        );
+        descr.acquisition.scans.push(scan);
+        let mut ion = SelectedIon { mz: 500.0, ..Default::default() };
+        ion.add_param(
+            Param::builder()
+                .name("inverse reduced ion mobility")
+                .curie(curie!(MS:1002815))
+                .value(linear.convert(mid))
+                .unit(Unit::VoltSecondPerSquareCentimeter)
+                .build(),
+        );
+        descr.precursor.push(Precursor { ions: vec![ion], ..Default::default() });
+
+        remap.apply(&mut descr);
+        remap.apply(&mut descr); // idempotent for the band (values re-remap only if linear again)
+
+        let lo = descr.get_param_by_name("ion mobility lower limit").unwrap();
+        let hi = descr.get_param_by_name("ion mobility upper limit").unwrap();
+        // Applied twice: the second pass inverts a ModelType-2 value through the linear map, which
+        // is NOT the identity — so check the first pass's arithmetic on a fresh description below
+        // and here only that the band exists once and is ordered.
+        assert!(im(lo) <= im(hi));
+        let ion = &descr.precursor[0].ions[0];
+        let ps = ion.params.as_ref().unwrap();
+        assert_eq!(ps.iter().filter(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)).count(), 1);
+        assert_eq!(ps.iter().filter(|p| p.curie() == Some(MZP_IM_WINDOW_UPPER)).count(), 1);
+        assert!(descr.get_param_by_name("window group").is_some());
+
+        // Fresh description, single pass: exact ModelType-2 values at the same scan positions, and
+        // the pair comes out ORDERED (lower = the scan-end value, the smaller one).
+        let mut d = SpectrumDescription::default();
+        d.add_param(Param::new_key_value("ion mobility lower limit", linear.convert(sb)));
+        d.add_param(Param::new_key_value("ion mobility upper limit", linear.convert(se)));
+        let mut ion = SelectedIon::default();
+        ion.add_param(
+            Param::builder()
+                .name("inverse reduced ion mobility")
+                .curie(curie!(MS:1002815))
+                .value(linear.convert(mid))
+                .build(),
+        );
+        d.precursor.push(Precursor { ions: vec![ion], ..Default::default() });
+        remap.apply(&mut d);
+        let tol = 1e-12;
+        assert!((im(d.get_param_by_name("ion mobility lower limit").unwrap()) - recal.one_over_k0(se as f64)).abs() < tol);
+        assert!((im(d.get_param_by_name("ion mobility upper limit").unwrap()) - recal.one_over_k0(sb as f64)).abs() < tol);
+        let ps = d.precursor[0].ions[0].params.as_ref().unwrap();
+        let v = ps.iter().find(|p| p.curie() == Some(curie!(MS:1002815))).unwrap();
+        assert!((im(v) - recal.one_over_k0(mid)).abs() < tol, "{} vs {}", im(v), recal.one_over_k0(mid));
+        // The linear value really was different (else this test proves nothing).
+        assert!((linear.convert(mid) - recal.one_over_k0(mid)).abs() > 1e-3);
+        let band_lo = ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)).unwrap();
+        let band_hi = ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_UPPER)).unwrap();
+        assert!((im(band_lo) - recal.one_over_k0(se as f64)).abs() < tol);
+        assert!((im(band_hi) - recal.one_over_k0(sb as f64)).abs() < tol);
+        assert!(im(band_lo) <= im(v) && im(v) <= im(band_hi));
+
+        // No ModelType-2 row (or `--no-tims-recalibration`): values stay linear but the pair is
+        // still put in order, and the band is still attached (from the ordered linear limits).
+        let none = TdfMobilityRemap::new(linear, None);
+        let mut d = SpectrumDescription::default();
+        d.add_param(Param::new_key_value("ion mobility lower limit", linear.convert(sb)));
+        d.add_param(Param::new_key_value("ion mobility upper limit", linear.convert(se)));
+        d.precursor.push(Precursor { ions: vec![SelectedIon::default()], ..Default::default() });
+        none.apply(&mut d);
+        assert_eq!(im(d.get_param_by_name("ion mobility lower limit").unwrap()), linear.convert(se));
+        assert_eq!(im(d.get_param_by_name("ion mobility upper limit").unwrap()), linear.convert(sb));
+        let ps = d.precursor[0].ions[0].params.as_ref().unwrap();
+        assert_eq!(im(ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)).unwrap()), linear.convert(se));
+        assert_eq!(im(ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_UPPER)).unwrap()), linear.convert(sb));
+
+        // An already-ordered pair is left alone (idempotent ordering).
+        let mut d = SpectrumDescription::default();
+        d.add_param(Param::new_key_value("ion mobility lower limit", 0.9));
+        d.add_param(Param::new_key_value("ion mobility upper limit", 1.1));
+        none.apply(&mut d);
+        assert_eq!(im(d.get_param_by_name("ion mobility lower limit").unwrap()), 0.9);
+        assert_eq!(im(d.get_param_by_name("ion mobility upper limit").unwrap()), 1.1);
     }
 }
 

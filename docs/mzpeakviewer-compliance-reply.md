@@ -159,3 +159,29 @@ without the embedded `vendor/analysis.tdf.gz` (also present with `--no-vendor`):
 - Measured on PXD059079 2485.d (`C2 = 0`): chord − exact runs from +3.2 ppm at tof 0 to −4.2 ppm at
   the top of the range.
 - Nothing to do if you don't want it: `ims_calibration` still reconstructs as before.
+
+---
+
+## Addendum 2026-09-02 — integer axes are resolved PER FACET (Shimadzu grid + lattice)
+
+The `ims_calibration` rule above (one `tof` column, one block, one formula) is the timsTOF case.
+The Shimadzu lane writes **two** integer axes, both named `tof_index`, in different facets, with
+different dtypes and transforms — and the viewer must pick the resolver by facet, not by column name:
+
+| facet | axis | block to consult first | reconstruct |
+|---|---|---|---|
+| `spectra_data` (profile) | `tof_index` Int32, `SqrtMzFromTof`, per-spectrum `tof_c0`/`tof_c1` | `tof_calibration` | `(tof_c0 + tof_c1·tof_index)²` |
+| `spectra_peaks` (centroids) | `point.tof_index` Int64, `LinearMz`, params `[1e-9]` | `mz_calibration` (`codec: mz-grid, scale: 1e9`) | `1e-9 · tof_index` |
+
+On both facets the fallback rule is per row and independent of row order: `mz` finite and > 0
+wins (that row kept f64 m/z), the axis is authoritative only where `mz` is the NULL fill. The
+converter routes whole spectra (a spectrum is either all-lattice or all-f64; blind / hek / d100
+carry 0 mixed spectra), and a fallback spectrum inside the lattice facet most likely arrives with
+NO `tof_index` key at all — mzpeakts drops a column that is all-null within the selected rows —
+or, where a NULL Int64 cell is materialised, as `tof_index 0n` beside its real `mz`. Either shape
+reads `mz`; never reconstruct from the zero. The `1e-9 · tof_index` column above is literal: the
+viewer multiplies by `1/scale` (`=== 1e-9`), matching the Parquet transform and the reference
+reader's `s · k` bit for bit — NOT `tof_index / scale`, which is 1 ulp off on ~40 % of lattice
+values. Pre-lattice Shimadzu archives (`tof_calibration` only, plain f64 centroids) keep reading
+their centroids verbatim. This is what `engine/spectrum.ts resolveFacetGridMz` / `readFacetSignal`
+implement now; every other reader entry point goes through the same resolver.
