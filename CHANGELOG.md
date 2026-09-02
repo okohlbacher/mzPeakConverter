@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Numpress-linear data facets were written UNCOMPRESSED.** The all-null-twin prune backstop
+  rewrote the finished peak facet with parquet's default `WriterProperties` (no ZSTD, no
+  byte-stream-split, no delta packing, Parquet 1.0, encryption dropped) and a numpress facet always
+  tripped it — its `mz_chunk_values` column is empty by design beside `mz_numpress_linear_bytes`
+  — so `--zstd-level` had no effect on any numpress archive (DIA_Hela_20ng: ~380 MB of the mzML-lane
+  archive). The rewrite now re-applies the facet's own properties, skips chunk facets altogether
+  (nothing to prune, no 1 GB re-encode), and drops the pruned columns from `spectrum_array_index`
+  instead of leaving an entry that pointed at a column that no longer existed. Pinned by
+  `tests/data_facet_compression.rs`. Every numpress archive written since the backstop landed is
+  affected; the corpus rebuild under this release covers them.
+
 ### Changed
 
 - **Shimadzu native lane reads the vendor's high-resolution m/z.** Each vendor point carries a
@@ -25,9 +38,15 @@ All notable changes to this project are documented here. The format follows
   per-spectrum `tof_c0`/`tof_c1` (the same per-spectrum sqrt contract mzPeakViewer already
   reconstructs), verified on every point to ≤ 1e-9 before a spectrum is gridded; a spectrum that
   does not fit (LabSolutions clamps the first/last sample of some MS2 scans to the scan-window
-  bound) keeps its f64 m/z beside it — nothing is snapped. Centroids stay f64 delta. This undoes
-  the size cost of `MassHigh` on the profile facet (HEK 57.9 MB → ~15 MB emulated) while keeping
-  the vendor-exact values.
+  bound) keeps its f64 m/z beside it — nothing is snapped. Centroids stay f64 delta. Measured:
+  Blind_P1_pos_012 13,200/13,200 spectra gridded, worst reconstruction error 7.4e-10; HEK_PosOAD1
+  2,092 gridded + 9 f64 fallbacks (bit-exact), worst 5.8e-10; reader round-trip exact on both.
+  Archive sizes (coarse `Mass` → `MassHigh` f64 → grid): Blind 3,540,575 → 5,456,550 → 5,241,787 B;
+  HEK 33,439,279 → 72,164,027 → 28,961,221 B — the grid undoes the size cost of `MassHigh` on the
+  profile facet (HEK ends 13 % below the old coarse archive) while keeping the vendor-exact values.
+  Viewer contract: the grid axis is authoritative whenever `tof_index` is present and resolvable —
+  a gridded row's null-filled `mz` column reads back as zeros through mzpeakts, and mzPeakViewer
+  (`engine/spectrum.ts`) no longer treats that as an m/z array.
 - **Mixed layout families per entity are accepted** (project decision, 2026-09-02 — a deliberate
   deviation from the spec text). The writer's one-family-per-entity check is a warning, not an
   error: a point-layout grid facet beside chunked centroids is the canonical case, `--ims-chunked`

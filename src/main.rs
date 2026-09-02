@@ -74,7 +74,7 @@ use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzpeak_prototyping::{BufferContext, BufferName};
 use mzpeak_prototyping::archive::ZipArchiveWriter;
 use mzpeak_prototyping::chunk_series::ChunkingStrategy;
-use mzpeak_prototyping::peak_series::{INTENSITY_ARRAY, MZ_ARRAY};
+use mzpeak_prototyping::peak_series::INTENSITY_ARRAY;
 use mzpeak_prototyping::writer::{
     AbstractMzPeakWriter, ArrayBuffersBuilder, CustomBuilderFromParameter, MzPeakWriterType,
 };

@@ -375,7 +375,7 @@ impl PointBuffers {
         &mut self,
         fields: Fields,
         mut arrays: Vec<ArrayRef>,
-        size: usize,
+        _size: usize,
         is_profile: bool,
     ) -> usize {
 
