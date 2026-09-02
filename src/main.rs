@@ -3645,9 +3645,12 @@ fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
     while i < n && dense.len() < 64 {
         if let Ok(spec) = reader.spectrum(i) {
             if spec.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
-                if let Some(mz) = spec.arrays.as_ref().and_then(|a| a.mzs().ok()) {
-                    if mz.len() >= 64 {
-                        dense.push(mz.to_vec());
+                if let Some(arrays) = spec.arrays.as_ref() {
+                    if let (Ok(mz), Ok(inten)) = (arrays.mzs(), arrays.intensities()) {
+                        let (a, b) = shimadzu_grid::signal_span(&inten);
+                        if b - a >= 64 {
+                            dense.push(mz[a..b].to_vec());
+                        }
                     }
                 }
             }
@@ -3688,11 +3691,15 @@ fn shimadzu_grid_route(
     }
     let Some(arrays) = spec.arrays.as_ref() else { return spec };
     let (Ok(mz), Ok(inten)) = (arrays.mzs(), arrays.intensities()) else { return spec };
-    let Some((grid, k)) = shimadzu_grid::fit_spectrum(&mz, step) else {
+    // Fit and store the signal span only: the zero-intensity pad points at the scan-window bounds
+    // are off-grid and the writer drops them from the profile facet regardless.
+    let (a, b) = shimadzu_grid::signal_span(&inten);
+    let (mz, inten) = (&mz[a..b], &inten[a..b]);
+    let Some((grid, k)) = shimadzu_grid::fit_spectrum(mz, step) else {
         *n_f64 += 1;
         return spec;
     };
-    let intensity: Vec<f32> = inten.iter().copied().collect();
+    let intensity: Vec<f32> = inten.to_vec();
     let mut out = BinaryArrayMap::new();
     let mut tof_da =
         DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());

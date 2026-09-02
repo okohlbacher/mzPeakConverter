@@ -11,6 +11,19 @@
 //! spectra to the scan-window bound (a spacing of 0.41 / 0.56 bins), off the lattice. Those keep
 //! their f64 m/z, per spectrum — nothing is snapped.
 
+/// The span of a profile array with its zero-intensity edge padding removed.
+///
+/// LabSolutions pads every profile spectrum with a zero-intensity sample at each scan-window
+/// bound (e.g. m/z 50.000000 exactly, intensity 0) — off the flight-time grid by construction.
+/// The writer drops zero-intensity profile runs anyway, so these points never reach the archive;
+/// fitting on them would reject every spectrum as off-grid. Interior zeros are on the grid and
+/// are left to the writer's own policy.
+pub fn signal_span(intensity: &[f32]) -> (usize, usize) {
+    let start = intensity.iter().position(|v| *v > 0.0).unwrap_or(intensity.len());
+    let end = intensity.iter().rposition(|v| *v > 0.0).map_or(start, |e| e + 1);
+    (start, end.max(start))
+}
+
 /// Per-spectrum sqrt grid: `m/z = (c0 + c1·k)²`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SqrtGrid {
@@ -140,6 +153,14 @@ mod tests {
             let r = g.c0 + g.c1 * *kk as f64;
             assert!((r * r - m).abs() <= TOL);
         }
+    }
+
+    #[test]
+    fn zero_intensity_pad_points_are_outside_the_signal_span() {
+        let inten = [0.0f32, 0.0, 91.0, 215.0, 299.0, 0.0, 58.0, 0.0];
+        assert_eq!(signal_span(&inten), (2, 7));
+        assert_eq!(signal_span(&[0.0f32, 0.0]), (2, 2));
+        assert_eq!(signal_span(&[5.0f32]), (0, 1));
     }
 
     #[test]
