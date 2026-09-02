@@ -234,15 +234,21 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
   recorded in `ims_calibration.tof_encoding`:
   - **Archive** *(default)* — a flat table of **absolute integer TOF bins** (`absolute`). Maximum
     compression and fast whole-spectrum access; no m/z index (an m/z-range query is a full scan).
-    Below the vendor `.d` on every reference file. (A per-scan delta variant existed up to v0.7.2 and
-    was removed in v0.7.3 — no reader decoded it correctly; reconvert any such archive.)
+    Size vs the vendor `analysis.tdf_bin`: DDA-PASEF runs come out below it; a dense diaPASEF run
+    (S30, 2.47 G peaks) is **+3–5 %** at zstd 3–15, with `tof` two thirds of the table. (A per-scan
+    delta variant existed up to v0.7.2 and was removed in v0.7.3 — no reader decoded it correctly and
+    its m/z is wrong after the first peak of each scan; such archives are ~8 % smaller only because
+    small deltas byte-shuffle well. Reconvert them, and never use one as a size baseline.)
   - **Chunked** *(`--ims-chunked`)* — each frame's peaks are split into true m/z bins (`--chunk-size`,
     default 50 Th); each chunk stores its main-axis (TOF) bounds (`chunk_start`/`chunk_end`, Parquet
     page-prunable) and delta-encodes TOF within the chunk (`m/z-chunked`). **m/z-slice / XIC queries
     are ~20–30× faster** (they touch only the overlapping chunks) at roughly parity size. Reconstruct
     a chunk's absolute TOF by cumulative-summing its values. Whole-spectrum access matches archive when
     row groups are sized finely (`MZPC_ROW_GROUP_ROWS`); the default (8192 chunks/row group) is coarse
-    on very large files.
+    on very large files. On the diaPASEF S30 run the chunked table is **−2 %** vs the vendor file
+    (−8 % on a DDA run): TOF deltas shrink to a fifth, but the per-peak `1/K0` column becomes half the
+    table — sorting each frame by TOF scrambles the scan id, ~1.2 B/peak of irreducible entropy — so a
+    per-scan mobility representation would not help here either.
 
 ## 10. Exit codes & environment
 
