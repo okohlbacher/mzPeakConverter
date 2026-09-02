@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.1] — 2026-09-02
 
 ### Fixed
 
@@ -86,6 +86,9 @@ All notable changes to this project are documented here. The format follows
   ESI when the spectra say so, and the quadrupole + TOF analysers implied by `DeviceID = MSID_QTFL`
   (no detector, no serial: the API exposes neither); and the source file's SHA-1 (MS:1000569),
   the same digest msconvert records, so the two lanes agree on provenance byte-for-byte. The
+  digest is added wherever the converter has to synthesise the `sourceFile` entry itself — every
+  single-file vendor input, and an mzML that declares no `sourceFileList` of its own — never for
+  a `.d` directory, which has no single byte stream to digest. The
   glue ABI moved to version 3 behind a runtime handshake, so a stale DLL beside a new binary is a
   clean load error rather than a silently mis-read struct. Along the way: the value the lane had
   been treating as the precursor m/z was the base-peak mass, mis-scaled — fixed.
