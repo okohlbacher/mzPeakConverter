@@ -434,7 +434,12 @@ impl PointBuffers {
                         .map(|a| a.data_type())
                 }) {
                     filled += 1;
-                    chunk.push(new_null_array(t, size));
+                    // `n`, not `size`: when the zero-intensity-run drop above shortened the present
+                    // arrays, a null column padded to the ORIGINAL point count no longer matches
+                    // them and `drain` panics building the record batch ("all columns in a record
+                    // batch must have the same length"). Reached whenever a facet leaves a column
+                    // absent per spectrum — a gridded profile facet with an f64 fallback column.
+                    chunk.push(new_null_array(t, n));
                 } else {
                     log::error!("Failed to store a value for {f}");
                 }
