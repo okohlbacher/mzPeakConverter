@@ -3630,7 +3630,9 @@ fn convert_shimadzu(
 /// file's profile axis is not an exact grid (coarse `Mass` data, or no profile at all).
 #[cfg(windows)]
 fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
-    if !reader.stores_profile().unwrap_or(false) {
+    let stores_profile = reader.stores_profile();
+    log::info!("Shimadzu grid probe: stores_profile = {stores_profile:?}");
+    if !stores_profile.unwrap_or(false) {
         return None;
     }
     // Probe up to 64 spectra spread over the run. Blind_P1_pos_012's profile spectra are small
@@ -3652,9 +3654,16 @@ fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
         }
         i += stride;
     }
-    let step = shimadzu_grid::run_wide_step(&dense)?;
+    let step = shimadzu_grid::run_wide_step(&dense);
+    log::info!(
+        "Shimadzu grid probe: {} probes with >= 64 profile points (of {} sampled), run-wide step = {step:?}",
+        dense.len(),
+        (n + stride - 1) / stride
+    );
+    let step = step?;
     // The grid must actually hold on the probes (coarse Mass data has ~5e-5 residuals and fails).
     let fits = dense.iter().filter(|mz| shimadzu_grid::fit_spectrum(mz, step).is_some()).count();
+    log::info!("Shimadzu grid probe: {fits}/{} probes fit within {:e}", dense.len(), shimadzu_grid::TOL);
     if fits * 10 < dense.len() * 9 {
         log::info!(
             "Shimadzu profile axis: sqrt grid fits only {fits}/{} probes; keeping f64 m/z",
