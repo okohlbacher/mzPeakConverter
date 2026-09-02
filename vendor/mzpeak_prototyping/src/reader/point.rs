@@ -109,7 +109,18 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
             continue;
         }
         let Some(src) = out.get(&v.array_type) else { continue };
-        let Ok(ks) = src.to_i32() else { continue };
+        // Grid indices are Int32 for flight-time bins (k ≲ 3e5) but Int64 for a fine linear m/z
+        // lattice (Shimadzu `MassHigh` at 1e-9 Da runs to 1.25e12). Read whichever the column is.
+        let ks: Vec<i64> = match src.dtype {
+            BinaryDataArrayType::Int64 => match src.to_i64() {
+                Ok(v) => v.to_vec(),
+                Err(_) => continue,
+            },
+            _ => match src.to_i32() {
+                Ok(v) => v.iter().map(|&k| k as i64).collect(),
+                Err(_) => continue,
+            },
+        };
         let p = v.transform_params.clone().unwrap_or_default();
         let mzs: Vec<f64> = if is_sqrt {
             let c0 = p.first().copied().unwrap_or(0.0);

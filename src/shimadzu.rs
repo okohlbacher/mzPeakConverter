@@ -451,7 +451,7 @@ impl ShimadzuReader {
     /// (Blind_P1_pos_012: 13,200/13,200 spectra, all 216,742 intensities bit-exact) and rotated —
     /// `[s alien values] + truth[0:n-s]`, plus a clipped final peak — on files that carry none
     /// (the DIA_Hela pair).
-    fn stores_profile(&self) -> Result<bool> {
+    pub(crate) fn stores_profile(&self) -> Result<bool> {
         if let Some(known) = self.stores_profile.get() {
             return Ok(known);
         }

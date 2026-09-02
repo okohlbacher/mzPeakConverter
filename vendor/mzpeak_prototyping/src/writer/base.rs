@@ -193,9 +193,35 @@ impl GenericDataArrayWriter {
         series_time: Option<f32>,
         series_index: u64,
     ) -> io::Result<EntryMetadataDerivedFromData> {
-        let main_axis_array = binary_array_map
-            .get(&self.data_buffers.buffer_context().default_sorted_array())
-            .unwrap();
+        // The sort axis is m/z when the spectrum carries one. A GRID-ENCODED spectrum carries an
+        // integer index instead (`tof_index` under SqrtMzFromTof / LinearMz) and no m/z at all —
+        // the Shimadzu native lane stores its profile facet that way — so fall back to the first
+        // grid-transform column declared in this facet's schema that the map actually holds.
+        let default_axis = self.data_buffers.buffer_context().default_sorted_array();
+        let axis = if binary_array_map.get(&default_axis).is_some() {
+            default_axis
+        } else {
+            let ctx = self.data_buffers.buffer_context();
+            self.data_buffers
+                .fields()
+                .iter()
+                .filter_map(|f| crate::BufferName::from_field(ctx, f.clone()))
+                .find(|b| {
+                    matches!(
+                        b.transform,
+                        Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof)
+                            | Some(crate::buffer_descriptors::BufferTransform::LinearMz)
+                    ) && binary_array_map.get(&b.array_type).is_some()
+                })
+                .map(|b| b.array_type)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "{} {series_index} has neither an m/z array nor a grid-index array",
+                        self.data_buffers.buffer_context().main_struct_name()
+                    ))
+                })?
+        };
+        let main_axis_array = binary_array_map.get(&axis).unwrap();
 
         let n_points = main_axis_array.data_len()?;
         let sorted = is_data_array_sorted(main_axis_array)?;
@@ -207,8 +233,7 @@ impl GenericDataArrayWriter {
                 self.data_buffers.buffer_context().main_struct_name()
             );
             binary_array_map.clone_into(&mut tmp_binary_array_map);
-            tmp_binary_array_map
-                .sort_by_array(&self.data_buffers.buffer_context().default_sorted_array())?;
+            tmp_binary_array_map.sort_by_array(&axis)?;
         }
 
         let delta_model = if self.data_buffers.nullify_zero_intensity() {
@@ -1032,13 +1057,21 @@ pub trait AbstractMzPeakWriter {
         // But the guarantee a reader is entitled to is that one `entity_type` has one family, and
         // an archive that breaks it is only readable by luck of implementation. No validator rule
         // covers this, so nothing downstream would catch it. Fail at write time instead.
+        // DELIBERATE DEVIATION from the spec text (2026-09-02, project decision): mixed families
+        // ARE accepted. The rule was enforced here as a hard error, which made every profile+centroid
+        // archive choose one family for both facets and aborted `--ims-chunked` on timsTOF outright
+        // (point data facet beside a chunk peaks facet). Readers that resolve the layout PER SOURCE
+        // (mzpeakts, this crate's reader) read mixed archives correctly, and each facet has its own
+        // best layout — a TOF-grid profile facet beside an integer-lattice centroid facet is the
+        // canonical case. Say so once, loudly, and carry on.
         if peak_buffer.prefix() != data_facet_prefix {
-            return Err(io::Error::other(format!(
-                "layout family mismatch between spectrum facets: spectra_data is \
-                 '{data_facet_prefix}' but spectra_peaks would be '{}'. Both belong to the \
-                 `spectrum` entity and MUST share one layout family.",
+            log::warn!(
+                "spectrum facets use different layout families: spectra_data is '{data_facet_prefix}', \
+                 spectra_peaks is '{}'. mzPeak-specification docs/conformance.md asks for one family \
+                 per entity; this converter deliberately writes the best layout per facet. Readers \
+                 that resolve the layout per source read this correctly.",
                 peak_buffer.prefix()
-            )));
+            );
         }
 
         let peak_encrytion_props = encryption_properties

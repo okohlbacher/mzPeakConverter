@@ -41,6 +41,9 @@ mod sciex;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod shimadzu;
+// Exact sqrt-grid fit for Shimadzu profile axes; pure arithmetic, tested on every host.
+#[allow(dead_code)]
+mod shimadzu_grid;
 // libloading-based (cross-platform compile); only *runs* on Windows with the MassLynx DLLs, so the
 // `convert_waters` dispatch stays `#[cfg(windows)]` and the reader is dead code off-Windows.
 #[allow(dead_code)]
@@ -3561,11 +3564,144 @@ fn convert_shimadzu(
         let n: usize = n.parse().unwrap_or(10);
         return shimadzu_probe(&reader, n);
     }
-    let hints = VendorHints { instrument: shimadzu_instrument(&reader.instrument_info()), source_sha1 };
-    convert_vendor_reader(
+    let mut hints = VendorHints { instrument: shimadzu_instrument(&reader.instrument_info()), source_sha1, ..Default::default() };
+    // Profile facet as an exact sqrt grid (see `shimadzu_grid`): probe dense profile spectra across
+    // the run for the run-wide step; if the fit holds, the profile of every spectrum that fits is
+    // stored as `tof_index` + per-spectrum `tof_c0`/`tof_c1`, and any that does not keeps f64 m/z.
+    let grid_step = shimadzu_grid_step(&reader);
+    if let Some(step) = grid_step {
+        let tof_field = {
+            let base = BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::nonstandard("tof_index"),
+                BinaryDataArrayType::Int32,
+            )
+            .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+            .to_field();
+            let mut md = base.metadata().clone();
+            // (0,1) is the identity placeholder the reader deliberately skips; the real grid is the
+            // per-spectrum pair below (same contract as the SciEX per-spectrum encoding).
+            md.insert("mzpeak:transform_params".to_string(), "0,1".to_string());
+            md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+            std::sync::Arc::new((*base).clone().with_metadata(md))
+        };
+        hints.data_facet_fields.push(tof_field);
+        hints.spectrum_param_fields.push((TOF_C0_CURIE, "tof_c0"));
+        hints.spectrum_param_fields.push((TOF_C1_CURIE, "tof_c1"));
+        hints.data_facet_point_layout = true;
+        hints.index_blocks.push((
+            "tof_calibration".to_string(),
+            serde_json::json!({
+                "codec": "tof-grid",
+                // The model string names the FORMULA family the viewer reconstructs with
+                // (per-spectrum sqrt); the instrument is a Shimadzu Q-TOF, recorded beside it.
+                "model": "sciex_sqrt_per_spectrum",
+                "vendor": "shimadzu",
+                "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
+                "per_spectrum_columns": ["tof_c0", "tof_c1"],
+                "run_wide_c1": step,
+                "vendor_mz_rounding": 1e-9,
+            }),
+        ));
+        log::info!(
+            "Shimadzu profile axis is an exact sqrt grid (run-wide c1 = {step:.15}); storing tof_index + per-spectrum tof_c0/tof_c1"
+        );
+    }
+    let mut n_grid = 0usize;
+    let mut n_f64 = 0usize;
+    let result = convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms, hints,
-        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
-    )
+        reader.len(), reader.sample_arrays()?,
+        |i| {
+            let spec = reader.spectrum(i)?;
+            match grid_step {
+                Some(step) => Ok(shimadzu_grid_route(spec, step, &mut n_grid, &mut n_f64)),
+                None => Ok(spec),
+            }
+        },
+    );
+    if grid_step.is_some() {
+        log::info!("Shimadzu profile facet: {n_grid} spectra on the sqrt grid, {n_f64} kept f64 m/z");
+    }
+    result
+}
+
+/// Run-wide sqrt-grid step from dense profile spectra spread across the run, or `None` when this
+/// file's profile axis is not an exact grid (coarse `Mass` data, or no profile at all).
+#[cfg(windows)]
+fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
+    if !reader.stores_profile().unwrap_or(false) {
+        return None;
+    }
+    let n = reader.len();
+    let stride = (n / 48).max(1);
+    let mut dense: Vec<Vec<f64>> = Vec::new();
+    let mut i = 0;
+    while i < n && dense.len() < 48 {
+        if let Ok(spec) = reader.spectrum(i) {
+            if spec.signal_continuity() == SignalContinuity::Profile {
+                if let Some(mz) = spec.arrays.as_ref().and_then(|a| a.mzs().ok()) {
+                    if mz.len() >= 200 {
+                        dense.push(mz.to_vec());
+                    }
+                }
+            }
+        }
+        i += stride;
+    }
+    let step = shimadzu_grid::run_wide_step(&dense)?;
+    // The grid must actually hold on the probes (coarse Mass data has ~5e-5 residuals and fails).
+    let fits = dense.iter().filter(|mz| shimadzu_grid::fit_spectrum(mz, step).is_some()).count();
+    if fits * 10 < dense.len() * 9 {
+        log::info!(
+            "Shimadzu profile axis: sqrt grid fits only {fits}/{} probes; keeping f64 m/z",
+            dense.len()
+        );
+        return None;
+    }
+    Some(step)
+}
+
+/// Replace a fitting profile spectrum's f64 m/z with `tof_index` + per-spectrum `tof_c0`/`tof_c1`;
+/// leave anything else (centroid-only spectra, off-grid spectra) untouched.
+#[cfg(windows)]
+fn shimadzu_grid_route(
+    spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
+    step: f64,
+    n_grid: &mut usize,
+    n_f64: &mut usize,
+) -> MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> {
+    if spec.signal_continuity() != SignalContinuity::Profile {
+        return spec;
+    }
+    let Some(arrays) = spec.arrays.as_ref() else { return spec };
+    let (Ok(mz), Ok(inten)) = (arrays.mzs(), arrays.intensities()) else { return spec };
+    let Some((grid, k)) = shimadzu_grid::fit_spectrum(&mz, step) else {
+        *n_f64 += 1;
+        return spec;
+    };
+    let intensity: Vec<f32> = inten.iter().copied().collect();
+    let mut out = BinaryArrayMap::new();
+    let mut tof_da =
+        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
+    if tof_da.update_buffer(k.as_slice()).is_err() {
+        *n_f64 += 1;
+        return spec;
+    }
+    out.add(tof_da);
+    let mut int_da =
+        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    if int_da.update_buffer(intensity.as_slice()).is_err() {
+        *n_f64 += 1;
+        return spec;
+    }
+    int_da.unit = Unit::DetectorCounts;
+    out.add(int_da);
+    let mut descr = spec.description().clone();
+    descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
+    descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
+    *n_grid += 1;
+    MultiLayerSpectrum::new(descr, Some(out), spec.peaks.clone(), spec.deconvoluted_peaks.clone())
 }
 
 /// Instrument configuration from what the vendor API states — and only that. `SystemName()` is the
@@ -3946,6 +4082,16 @@ struct VendorHints {
     /// is still empty after the generic fixup (i.e. the run/scans reference configuration 0 with
     /// nothing behind it).
     instrument: Option<InstrumentConfiguration>,
+    /// Extra columns for the `spectra_data` facet (e.g. a `tof_index` grid axis). Sampling from
+    /// the probe spectra adds the ordinary ones.
+    data_facet_fields: Vec<std::sync::Arc<arrow::datatypes::Field>>,
+    /// Per-spectrum Float64 parameter columns, `(accession, name)` — the sqrt-grid `tof_c0`/`tof_c1`.
+    spectrum_param_fields: Vec<(mzdata::params::CURIE, &'static str)>,
+    /// Force the point layout on `spectra_data` (an integer grid axis cannot be delta-chunked)
+    /// while the peaks facet keeps the requested chunking — a deliberate mixed-family archive.
+    data_facet_point_layout: bool,
+    /// Index blocks (`tof_calibration` …) added to `mzpeak_index.json` at finish.
+    index_blocks: Vec<(String, serde_json::Value)>,
     /// MS:1000569 SHA-1 of the input, computed BEFORE the vendor reader opened it. The Shimadzu DLL
     /// holds a byte-range lock on the `.lcd` for as long as it is open, so hashing afterwards fails
     /// on large files (`os error 33`) — msconvert hashes first for the same reason. When present,
@@ -3968,6 +4114,14 @@ fn convert_vendor_reader(
     if len == 0 {
         bail!("no spectra in {}", input.display());
     }
+    let VendorHints {
+        instrument,
+        data_facet_fields,
+        spectrum_param_fields,
+        data_facet_point_layout,
+        index_blocks,
+        source_sha1,
+    } = hints;
     let tmp = output.with_extension("mzpeak.tmp");
     let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let level = ZstdLevel::try_new(zstd_level)
@@ -3986,10 +4140,23 @@ fn convert_vendor_reader(
         pi += step;
     }
     // Pick delta-vs-numpress from the actual m/z values in the probes, not from the extension.
-    let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
-    let builder = MzPeakWriterType::<fs::File>::builder()
-        .chunked_encoding(chunk)
-        // Same family as the data facet — see the note above `is_unindexed_mzml`'s neighbours.
+    // When the data facet is grid-encoded the probes carry no m/z array — the values being chunked
+    // are the CENTROIDS in the peak set, so sample those instead.
+    let sample_mz: Vec<f64> = if data_facet_point_layout {
+        probes
+            .iter()
+            .filter_map(|s| s.peaks.as_ref())
+            .flat_map(|p| p.iter().map(|pk| pk.mz))
+            .collect()
+    } else {
+        sample_mz_from(&probes)
+    };
+    let chunk = refine_chunking(&sample_mz, chunk);
+    // A grid-encoded data facet is an integer axis, which has no chunk encoder: point layout there,
+    // chunked peaks beside it — the mixed-family archive this project accepts on purpose.
+    let data_chunk = if data_facet_point_layout { None } else { chunk };
+    let mut builder = MzPeakWriterType::<fs::File>::builder()
+        .chunked_encoding(data_chunk)
         .peaks_chunked_encoding(chunk)
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
@@ -4005,6 +4172,16 @@ fn convert_vendor_reader(
         // the chunked writer hands it list-typed ones.
         .sample_array_types_from_spectra(probes.clone().into_iter())
         .sample_array_types_for_peaks_from_spectra(probes.into_iter());
+    for f in data_facet_fields {
+        builder = builder.add_spectrum_field(f);
+    }
+    for (curie, name) in spectrum_param_fields {
+        builder = builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            curie,
+            name,
+            DataType::Float64,
+        ));
+    }
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
     let mut ms1 = Ms1Chroms::default();
@@ -4017,7 +4194,7 @@ fn convert_vendor_reader(
         writer.write_spectrum(&spec)?;
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
-    if let Some(hex) = hints.source_sha1 {
+    if let Some(hex) = source_sha1 {
         if writer.file_description().source_files.is_empty() {
             let mut sf = SourceFile {
                 name: input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
@@ -4036,12 +4213,18 @@ fn convert_vendor_reader(
         }
     }
     fixup_run_metadata(&mut writer, input);
-    if let Some(cfg) = hints.instrument {
+    if let Some(cfg) = instrument {
         if writer.instrument_configurations().is_empty() {
             writer.instrument_configurations_mut().insert(0, cfg);
         }
     }
-    finish_with_vendor(writer, input, vendor)?;
+    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    for (key, block) in &index_blocks {
+        zip.add_index_metadata(key, block)
+            .with_context(|| format!("writing {key} index block"))?;
+    }
+    embed_vendor_members(&mut zip, input, vendor)?;
+    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
     Ok(())
 }
