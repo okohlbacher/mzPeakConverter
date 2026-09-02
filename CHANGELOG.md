@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.4] — 2026-09-02
+
+### Fixed
+
+- **0.9.3 did not compile on Windows.** `MZ_ARRAY` was imported for the `#[cfg(windows)]` Shimadzu
+  grid path only, and the import had been dropped as unused on other hosts. No other change; 0.9.3
+  archives (none were built) would have been identical.
+
 ## [0.9.3] — 2026-09-02
 
 ### Fixed

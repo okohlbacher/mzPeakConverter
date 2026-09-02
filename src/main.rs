@@ -3590,7 +3590,7 @@ fn convert_shimadzu(
         // rare off-grid spectrum keeps (null for gridded rows), and the intensity. Without the
         // explicit intensity field it spilled into `auxiliary_arrays` on every spectrum.
         hints.data_facet_fields.push(tof_field);
-        hints.data_facet_fields.push(MZ_ARRAY.to_field());
+        hints.data_facet_fields.push(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field());
         hints.data_facet_fields.push(INTENSITY_ARRAY.to_field());
         hints.spectrum_param_fields.push((TOF_C0_CURIE, "tof_c0"));
         hints.spectrum_param_fields.push((TOF_C1_CURIE, "tof_c1"));
