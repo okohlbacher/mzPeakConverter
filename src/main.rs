@@ -3613,21 +3613,57 @@ fn convert_shimadzu(
             "Shimadzu profile axis is an exact sqrt grid (run-wide c1 = {step:.15}); storing tof_index + per-spectrum tof_c0/tof_c1"
         );
     }
+    // Centroid facet as an exact integer lattice (see `shimadzu_grid`): the vendor's `MassHigh`
+    // is an Int64 at 1e-9 Da (and the coarse `Mass` under MZPC_SHIMADZU_COARSE_MZ=1 lies on the
+    // same lattice), so every centroid list is checked per spectrum and stored as `tof_index`
+    // Int64 + intensity in the custom peaks facet; one that fails the guard keeps f64 m/z in the
+    // same facet's `mz` column. The `mz_calibration` block tells the viewer's `mz-grid` codec. A
+    // profile-only run builds no centroid list at all, so neither the facet nor the block that
+    // claims `applies_to: spectra_peaks` is declared for it.
+    if rep != shimadzu::Representation::Profile {
+        hints.peaks_facet = Some(shimadzu_grid::lattice_peak_schema());
+        hints.index_blocks.push(("mz_calibration".to_string(), shimadzu_grid::mz_calibration_block()));
+    }
     let mut n_grid = 0usize;
     let mut n_f64 = 0usize;
+    let mut n_lattice = 0usize;
+    let mut n_centroid_f64 = 0usize;
     let result = convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms, hints,
         reader.len(), reader.sample_arrays()?,
         |i| {
             let spec = reader.spectrum(i)?;
-            match grid_step {
-                Some(step) => Ok(shimadzu_grid_route(spec, step, &mut n_grid, &mut n_f64)),
-                None => Ok(spec),
+            let spec = match grid_step {
+                Some(step) => shimadzu_grid_route(spec, step, &mut n_grid, &mut n_f64),
+                None => spec,
+            };
+            let (spec, peak_arrays, outcome) = shimadzu_grid::lattice_route(spec);
+            match outcome {
+                shimadzu_grid::LatticeOutcome::Lattice => n_lattice += 1,
+                shimadzu_grid::LatticeOutcome::KeptF64 => n_centroid_f64 += 1,
+                shimadzu_grid::LatticeOutcome::NoCentroids => {}
             }
+            Ok(VendorSpectrum { spectrum: spec, peak_arrays })
         },
     );
     if grid_step.is_some() {
         log::info!("Shimadzu profile facet: {n_grid} spectra on the sqrt grid, {n_f64} kept f64 m/z");
+    }
+    log::info!(
+        "Shimadzu centroid facet: {n_lattice} spectra on the 1e-9 m/z lattice (tof_index Int64), \
+         {n_centroid_f64} kept f64 m/z"
+    );
+    if n_lattice == 0 && n_centroid_f64 > 0 {
+        // The archive is still correct (exact f64 m/z in `point.mz` on every row), but the size
+        // target is missed, and silently so without this: e.g. a file whose MassHigh/Mass ratio
+        // is not 1e5 puts the centroids on a finer lattice than 1e-9.
+        log::warn!(
+            "Shimadzu centroid facet: none of the {n_centroid_f64} centroid lists passed the 1e-9 \
+             lattice guard (|m/z·1e9 − k| < max(1e-3, 8 ulp) on every point, k non-decreasing); every \
+             centroid is stored as exact f64 m/z under the mz_calibration block. Is this file's \
+             MassHigh at 1e-9 Da? (MZPC_SHIMADZU_COARSE_MZ=1 selects the 1e-4 Mass field, which \
+             lies on the same lattice.)"
+        );
     }
     result
 }
@@ -4122,9 +4158,30 @@ struct VendorHints {
     /// on large files (`os error 33`) — msconvert hashes first for the same reason. When present,
     /// the `sourceFile` entry is seeded with it so `fixup_run_metadata` neither re-hashes nor warns.
     source_sha1: Option<String>,
+    /// A custom `spectra_peaks` schema (the Shimadzu centroid lattice: point layout,
+    /// `spectrum_index` + `tof_index` Int64 + f64 `mz` fallback + `intensity`). When set the peaks
+    /// facet is never chunked or numpressed (the lattice replaces both), its schema is not sampled
+    /// from the probes, and a spectrum may hand the writer its peak rows explicitly through
+    /// [`VendorSpectrum::peak_arrays`]; the reader-side calibration block rides in `index_blocks`.
+    peaks_facet: Option<ArrayBuffersBuilder>,
 }
 
-fn convert_vendor_reader(
+/// One spectrum from a vendor reader, plus — for a lattice-routed centroid list — the arrays that
+/// go to the peaks facet in place of `spectrum.peaks()` (see
+/// `MzPeakWriterType::write_spectrum_with_peak_arrays`). Every reader that has no such facet
+/// returns a bare `MultiLayerSpectrum` and converts through `From`.
+struct VendorSpectrum {
+    spectrum: MultiLayerSpectrum,
+    peak_arrays: Option<BinaryArrayMap>,
+}
+
+impl From<MultiLayerSpectrum> for VendorSpectrum {
+    fn from(spectrum: MultiLayerSpectrum) -> Self {
+        Self { spectrum, peak_arrays: None }
+    }
+}
+
+fn convert_vendor_reader<S: Into<VendorSpectrum>>(
     input: &Path,
     output: &Path,
     chunk: Option<ChunkingStrategy>,
@@ -4134,7 +4191,7 @@ fn convert_vendor_reader(
     hints: VendorHints,
     len: usize,
     _sample: mzdata::spectrum::bindata::BinaryArrayMap,
-    mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
+    mut spectrum: impl FnMut(usize) -> Result<S>,
 ) -> Result<()> {
     if len == 0 {
         bail!("no spectra in {}", input.display());
@@ -4146,6 +4203,7 @@ fn convert_vendor_reader(
         data_facet_point_layout,
         index_blocks,
         source_sha1,
+        peaks_facet,
     } = hints;
     let tmp = output.with_extension("mzpeak.tmp");
     let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -4160,14 +4218,22 @@ fn convert_vendor_reader(
     let mut pi = 0usize;
     while pi < len && probes.len() < N_PROBE {
         if let Ok(s) = spectrum(pi) {
-            probes.push(s);
+            let s: VendorSpectrum = s.into();
+            probes.push(s.spectrum);
         }
         pi += step;
     }
+    // A custom peaks facet (the Shimadzu centroid lattice) is an integer axis with an f64 fallback
+    // column: never chunked, never numpressed — the lattice replaces both.
+    let lattice_peaks = peaks_facet.is_some();
     // Pick delta-vs-numpress from the actual m/z values in the probes, not from the extension.
-    // When the data facet is grid-encoded the probes carry no m/z array — the values being chunked
-    // are the CENTROIDS in the peak set, so sample those instead.
-    let sample_mz: Vec<f64> = if data_facet_point_layout {
+    // Only a facet that is actually chunked needs the sample: when the data facet is grid-encoded
+    // the probes carry no m/z array, so the values being chunked are the CENTROIDS in the peak
+    // set (or nothing at all, when those go to the lattice facet — a probe with no m/z array must
+    // not be sampled).
+    let sample_mz: Vec<f64> = if data_facet_point_layout && lattice_peaks {
+        Vec::new()
+    } else if data_facet_point_layout {
         probes
             .iter()
             .filter_map(|s| s.peaks.as_ref())
@@ -4180,9 +4246,10 @@ fn convert_vendor_reader(
     // A grid-encoded data facet is an integer axis, which has no chunk encoder: point layout there,
     // chunked peaks beside it — the mixed-family archive this project accepts on purpose.
     let data_chunk = if data_facet_point_layout { None } else { chunk };
+    let peaks_chunk = if lattice_peaks { None } else { chunk };
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(data_chunk)
-        .peaks_chunked_encoding(chunk)
+        .peaks_chunked_encoding(peaks_chunk)
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -4195,8 +4262,13 @@ fn convert_vendor_reader(
         // Both facets need their schema sampled: the data facet from the probes, and — when the
         // peak facet is chunked — the peak facet too, or its buffer declares scalar columns while
         // the chunked writer hands it list-typed ones.
-        .sample_array_types_from_spectra(probes.clone().into_iter())
-        .sample_array_types_for_peaks_from_spectra(probes.into_iter());
+        .sample_array_types_from_spectra(probes.clone().into_iter());
+    builder = match peaks_facet {
+        // The lattice facet is fully declared (its four columns are the contract); sampling the
+        // probes' peak sets would only re-add the f64 `mz`/`intensity` it already carries.
+        Some(schema) => builder.store_peaks_and_profiles_apart(Some(schema)),
+        None => builder.sample_array_types_for_peaks_from_spectra(probes.into_iter()),
+    };
     for f in data_facet_fields {
         builder = builder.add_spectrum_field(f);
     }
@@ -4212,11 +4284,16 @@ fn convert_vendor_reader(
     let mut ms1 = Ms1Chroms::default();
     let len = max_spectra().map_or(len, |m| m.min(len));
     for i in 0..len {
-        let spec = spectrum(i)?;
+        let VendorSpectrum { spectrum: spec, peak_arrays } = spectrum(i)?.into();
         if synth_chroms {
             ms1.observe(&spec);
         }
-        writer.write_spectrum(&spec)?;
+        match peak_arrays.as_ref() {
+            // Lattice-routed centroids: the spectrum keeps its peak set / raw arrays for the
+            // metadata row, the explicit arrays are what the peaks facet stores.
+            Some(arrays) => writer.write_spectrum_with_peak_arrays(&spec, arrays)?,
+            None => writer.write_spectrum(&spec)?,
+        }
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     if let Some(hex) = source_sha1 {

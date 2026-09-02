@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Shimadzu native lane stores centroid m/z as an exact Int64 lattice.** The vendor's
+  `MassHigh` is an Int64 at 1e-9 Da, so every centroid is `k = round(m/z · 1e9)` exactly — one
+  delta-packed integer per peak instead of an f64 whose deltas are all distinct. `spectra_peaks`
+  (point layout) now carries `point.tof_index` Int64 (`LinearMz`, `mzpeak:transform_params =
+  "1e-9"`, dictionary off + DELTA_BINARY_PACKED via the writer's `*_index` rule), a Float64
+  `point.mz` fallback that is NULL on lattice rows, and `point.intensity` Float32 as before; the
+  facet is never chunked or numpressed. Every spectrum is checked on its own (`|m/z·1e9 − k| <
+  max(1e-3, 8 ulp)` on every point — the relative term keeps the margin at the top of a wide
+  Q-TOF range, where the coarse `Mass` path's double rounding approaches 1e-3 — and `k`
+  non-decreasing) and one that fails keeps f64 m/z in the same facet — nothing is snapped,
+  nothing is refused; a run in which no centroid list passes the guard is logged as a warning,
+  and an empty scan counts as nothing-to-route, not as kept-f64. `--representation profile`
+  declares neither the facet nor the block. `mzpeak_index.json` gains an `mz_calibration` block
+  (`{"codec":"mz-grid","scale":1e9,"vendor":"shimadzu","lossless":"tof_index","applies_to":
+  "spectra_peaks",…}`) beside the profile facet's `tof_calibration`; the vendored reader
+  reconstructs m/z from the column metadata alone (`m/z = 1e-9 · k`), the viewer's existing
+  `mz-grid` codec from the block. `MZPC_SHIMADZU_COARSE_MZ=1` (`Mass`, 1e-4 Da) lands on the same
+  lattice as multiples of 1e5 and takes the same route. The profile facet (per-spectrum sqrt grid),
+  precursors, scan windows, instrument configuration and the source SHA-1 are unchanged.
+  Expected size effect (contract, DIA_Hela_20ng): the centroid m/z column ≈ 1.0 GB, down from
+  1.90 GB as f64 delta (553 MB at the old 1e-4 lattice). Writer: the vendored
+  `MzPeakWriterType` gains `write_spectrum_with_peak_arrays`, which lets a profile spectrum hand
+  its centroid list to the custom peaks schema as raw arrays — `write_spectrum` could only route
+  a peak SET as f64 `CentroidPeak` columns. Pinned by unit tests in `src/shimadzu_grid.rs` and
+  `tests/shimadzu_lattice_peaks.rs` (synthetic archive with the real two-facet shape — Int32
+  sqrt-grid `tof_index` in `spectra_data` beside the Int64 lattice `tof_index` in
+  `spectra_peaks` — through the vendored writer, read back with the vendored reader including
+  the per-spectrum sqrt fixup, column encodings inspected with the parquet crate).
+
 ## [0.9.4] — 2026-09-02
 
 ### Fixed

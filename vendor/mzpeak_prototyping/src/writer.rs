@@ -1058,6 +1058,24 @@ impl<
         AbstractMzPeakWriter::write_spectrum(self, spectrum)
     }
 
+    /// Write a `spectrum` whose peak-facet rows are supplied as `peak_arrays` — a profile spectrum
+    /// can thereby carry a custom-schema centroid list (integer `tof_index` lattice) in
+    /// `spectra_peaks` while its raw arrays go to `spectra_data`.
+    ///
+    /// # See also
+    /// [`AbstractMzPeakWriter::write_spectrum_with_peak_arrays`]
+    pub fn write_spectrum_with_peak_arrays<
+        A: ToMzPeakDataSeries + CentroidLike,
+        B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        S: SpectrumLike<A, B> + 'static,
+    >(
+        &mut self,
+        spectrum: &S,
+        peak_arrays: &BinaryArrayMap,
+    ) -> io::Result<()> {
+        AbstractMzPeakWriter::write_spectrum_with_peak_arrays(self, spectrum, peak_arrays)
+    }
+
     fn flush_data_arrays(&mut self) -> io::Result<()> {
         for batch in self.spectrum_data_buffers.drain() {
             if let Some(writer) = self.archive_writer.as_mut() {
