@@ -678,6 +678,68 @@ pub trait AbstractMzPeakWriter {
         Ok(())
     }
 
+    /// Write a `spectrum` whose PEAK-facet rows are supplied explicitly as `peak_arrays` instead
+    /// of being derived from `spectrum.peaks()`.
+    ///
+    /// [`write_spectrum`](Self::write_spectrum) serializes a peak SET as `CentroidPeak` columns
+    /// (f64 m/z + f32 intensity), so a custom peak schema that replaces m/z with an integer axis is
+    /// only reachable by a Centroid spectrum carrying raw arrays — never by a Profile spectrum that
+    /// ALSO has a centroid list (a Shimadzu dual `.lcd`: profile in the data facet, centroids in the
+    /// peaks facet). This entry point decouples the two facets: the profile signal (`raw_arrays()`
+    /// of a Profile spectrum) goes to `spectra_data` exactly as before, and `peak_arrays` goes to
+    /// `spectra_peaks` through the peak writer's raw-array path, so the peak schema decides the
+    /// columns (an absent column is null-filled). The metadata row — counts, TIC, base peak, m/z
+    /// range — is still derived from the spectrum itself, so leave its peak set / raw arrays on
+    /// it: a Profile spectrum's `number_of_peaks` is its peak set's length, and a Centroid
+    /// spectrum's counts fall back to the number of peak rows written here.
+    fn write_spectrum_with_peak_arrays<
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        S: SpectrumLike<C, D> + 'static,
+    >(
+        &mut self,
+        spectrum: &S,
+        peak_arrays: &BinaryArrayMap,
+    ) -> io::Result<()> {
+        log::trace!("Writing spectrum {} with explicit peak arrays", spectrum.id());
+        let spectrum_index = self.spectrum_counter();
+        let spectrum_time = if self.spectrum_data_buffer_mut().include_time() {
+            Some(spectrum.start_time() as f32)
+        } else {
+            None
+        };
+        // Unknown continuity is routed with Profile, as `write_spectrum_data` does: the metadata
+        // side already assumes profile for Unknown, so the raw signal belongs in `spectra_data`.
+        let mut entry_derived = match spectrum.raw_arrays() {
+            Some(raw)
+                if matches!(
+                    spectrum.signal_continuity(),
+                    SignalContinuity::Profile | SignalContinuity::Unknown
+                ) =>
+            {
+                log::trace!("Writing profile signal beside explicit peak arrays for {spectrum_index}");
+                self.write_spectrum_binary_array_map(spectrum, spectrum_index, raw)?
+            }
+            _ => EntryMetadataDerivedFromData::default(),
+        };
+        let from_peaks = self.get_or_create_spectrum_peak_writer()?.write_peaks(
+            spectrum_index,
+            spectrum_time,
+            RefPeakDataLevel::<C, D>::RawData(peak_arrays),
+        )?;
+        entry_derived.peak_count = from_peaks.peak_count;
+        if let Some(aux) = from_peaks.auxiliary_arrays {
+            entry_derived
+                .auxiliary_arrays
+                .get_or_insert_with(Vec::new)
+                .extend(aux);
+        }
+        self.spectrum_entry_buffer_mut()
+            .append_value(spectrum, entry_derived);
+        self.check_data_buffer()?;
+        Ok(())
+    }
+
     /// Fit an [`MZDeltaModel`] instance on the provided (sparse) spectrum signal, and return the parameter
     /// buffer.
     ///
