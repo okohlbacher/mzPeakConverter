@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed peak-writer open no longer produces a silently wrong archive.** Both writers logged the
+  failure and fell back to a default `(m/z f64, intensity f32)` point peak writer that cannot describe
+  a chunked or grid facet: on diaPASEF that killed the parallel encoder mid-run (`--ims-chunked` on a
+  TDF, before the layout-family check became a warning in 0.9.3), and on a DDA `.d` it exited 0 with
+  all-null m/z and the real data in a 163 MB `auxiliary_arrays` blob. There is no correct archive on
+  that path, so the writer now refuses to write one.
+
 ### Changed
 
 - **Shimadzu native lane stores centroid m/z as an exact Int64 lattice.** The vendor's

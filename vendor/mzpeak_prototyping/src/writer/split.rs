@@ -277,8 +277,13 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             buffer_size,
             &encryption_properties,
         )
-        .map_err(|e| log::error!("Failed to open peak writer: {e}"))
-        .ok();
+        // A failed open used to be logged and SWALLOWED: the writer then fell back to a default
+        // (m/z f64, intensity f32) point peak writer, which cannot describe a chunked or grid facet.
+        // On diaPASEF that killed the parallel encoder mid-run ("peak-encode collector died"); on a
+        // DDA `.d` it exited 0 with all-null m/z and the real data dumped into a 163 MB
+        // `auxiliary_arrays` blob. There is no correct archive on this path, so refuse to write one.
+        .unwrap_or_else(|e| panic!("Failed to open peak writer: {e}"));
+        let separate_peak_writer = Some(separate_peak_writer);
 
         let metadata_props = Self::spectrum_metadata_writer_props(&metadata_fields, None);
 
