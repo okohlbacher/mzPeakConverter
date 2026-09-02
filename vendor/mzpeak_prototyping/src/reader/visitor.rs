@@ -648,12 +648,14 @@ impl<'a> CURIEStrArray<'a> {
         if self.is_null(index) {
             None
         } else {
-            Some(self.0.value(index).parse().unwrap())
+            // `parse_curie`, not `parse()`: mzdata cannot parse the converter-owned `MZP:`
+            // prefix, so an archive carrying one would panic the reader on `unwrap`.
+            crate::param::parse_curie(self.0.value(index)).ok()
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Option<CURIE>> {
-        self.0.iter().map(|v| v.map(|v| v.parse().unwrap()))
+        self.0.iter().map(|v| v.and_then(|v| crate::param::parse_curie(v).ok()))
     }
 }
 
@@ -684,12 +686,14 @@ impl<'a> LargeCURIEStrArray<'a> {
         if self.is_null(index) {
             None
         } else {
-            Some(self.0.value(index).parse().unwrap())
+            // `parse_curie`, not `parse()`: mzdata cannot parse the converter-owned `MZP:`
+            // prefix, so an archive carrying one would panic the reader on `unwrap`.
+            crate::param::parse_curie(self.0.value(index)).ok()
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Option<CURIE>> {
-        self.0.iter().map(|v| v.map(|v| v.parse().unwrap()))
+        self.0.iter().map(|v| v.and_then(|v| crate::param::parse_curie(v).ok()))
     }
 }
 

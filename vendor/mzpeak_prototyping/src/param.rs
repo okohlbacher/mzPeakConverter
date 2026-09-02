@@ -50,7 +50,7 @@ pub(crate) fn is_mzp(c: &CURIE) -> bool {
 /// Render a CURIE to its wire string. MZP terms get the converter-owned `MZP:` prefix; everything
 /// else uses mzdata's standard rendering. (mzdata's own `Display` *panics* on `Unknown`, so all
 /// CURIE stringification in this crate MUST go through here.)
-pub(crate) fn curie_to_string(c: &CURIE) -> String {
+pub fn curie_to_string(c: &CURIE) -> String {
     if is_mzp(c) {
         format!("{}:{:07}", MZP_CV_PREFIX, c.accession)
     } else {
@@ -60,7 +60,7 @@ pub(crate) fn curie_to_string(c: &CURIE) -> String {
 
 /// Parse a wire CURIE string, recognising the converter-owned `MZP:` prefix (which mzdata cannot
 /// parse to a usable CV) and falling back to mzdata for standard prefixes.
-pub(crate) fn parse_curie(v: &str) -> Result<CURIE, String> {
+pub fn parse_curie(v: &str) -> Result<CURIE, String> {
     if let Some(rest) = v.strip_prefix("MZP:").or_else(|| v.strip_prefix("MZP_")) {
         rest.trim()
             .parse::<u32>()
