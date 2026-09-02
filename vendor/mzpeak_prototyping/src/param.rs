@@ -536,6 +536,36 @@ impl From<SourceFile> for mzdata::meta::SourceFile {
     }
 }
 
+/// One entry of a [`ScanSettings`] target (inclusion) list. The mzPeak schema requires each
+/// target to be an object `{"parameters": [...]}`, not a bare parameter list.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(from = "ScanTargetRepr")]
+pub struct ScanTarget {
+    #[serde(default)]
+    pub parameters: Vec<MetaParam>,
+}
+
+/// Archives written before the fix stored each target as a bare parameter list; keep reading them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScanTargetRepr {
+    Object {
+        #[serde(default)]
+        parameters: Vec<MetaParam>,
+    },
+    Legacy(Vec<MetaParam>),
+}
+
+impl From<ScanTargetRepr> for ScanTarget {
+    fn from(value: ScanTargetRepr) -> Self {
+        match value {
+            ScanTargetRepr::Object { parameters } | ScanTargetRepr::Legacy(parameters) => {
+                Self { parameters }
+            }
+        }
+    }
+}
+
 /// An adaption of [`mzdata::meta::ScanSettings`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ScanSettings {
@@ -544,7 +574,7 @@ pub struct ScanSettings {
     /// List with the source files containing the acquisition settings
     pub source_file_refs: Vec<String>,
     /// Target list (or 'inclusion list') configured prior to the run
-    pub targets: Vec<Vec<MetaParam>>,
+    pub targets: Vec<ScanTarget>,
     /// The controlled vocabulary and user parameters of the settings
     pub parameters: Vec<MetaParam>,
 }
@@ -557,7 +587,9 @@ impl From<&mzdata::meta::ScanSettings> for ScanSettings {
             targets: value
                 .targets
                 .iter()
-                .map(|v| v.iter().map(MetaParam::from).collect())
+                .map(|v| ScanTarget {
+                    parameters: v.iter().map(MetaParam::from).collect(),
+                })
                 .collect(),
             parameters: value.params.iter().map(MetaParam::from).collect(),
         }
@@ -577,7 +609,7 @@ impl From<ScanSettings> for mzdata::meta::ScanSettings {
             value
                 .targets
                 .into_iter()
-                .map(|v| v.into_iter().map(mzdata::Param::from).collect())
+                .map(|v| v.parameters.into_iter().map(mzdata::Param::from).collect())
                 .collect(),
         )
     }

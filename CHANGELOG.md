@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`scan_settings_list[*].targets` violated the mzPeak 0.9 schema.** Each target was written as a
+  bare JSON list of params; the schema (`scan_settings_list.json`, definition `target`) requires an
+  object `{"parameters": [...]}`, and mzPeakValidator's `meta_scan_settings_valid` rejected every
+  archive converted from an mzML with a `<scanSettings>` target list (e.g. the tiny pwiz fixture).
+  Present in 0.9.0 and 0.9.1. Targets are now written as objects; the reader still accepts the old
+  bare-list form so archives written by earlier versions open unchanged.
+
 ## [0.9.1] — 2026-09-02
 
 ### Fixed
