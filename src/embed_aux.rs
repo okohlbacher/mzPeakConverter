@@ -544,8 +544,18 @@ fn media_type_for_extension(ext: &str) -> String {
 /// Stream a SHA-256 digest AND exact byte count in one bounded pass. Returns `(hex, size)`. Never
 /// loads the whole file.
 fn sha256_and_size(path: &Path) -> Result<(String, u64)> {
+    stream_digest::<Sha256>(path)
+}
+
+/// SHA-1 of a file, hex — the `MS:1000569` digest msconvert records on every source file.
+pub(crate) fn sha1_hex(path: &Path) -> Result<String> {
+    Ok(stream_digest::<sha1::Sha1>(path)?.0)
+}
+
+/// One bounded pass for any `Digest`: `(hex, byte count)`.
+fn stream_digest<D: Digest>(path: &Path) -> Result<(String, u64)> {
     let mut f = File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = D::new();
     let mut buf = vec![0u8; CHUNK];
     let mut size: u64 = 0;
     loop {

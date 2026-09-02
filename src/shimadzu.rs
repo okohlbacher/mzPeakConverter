@@ -116,8 +116,8 @@ const _: () = {
     assert!(offset_of!(ShimadzuSpectrumMetaV2, n_points) == offset_of!(ShimadzuSpectrumMeta, n_points));
 };
 
-/// ABI generation this binary requires from the glue DLL.
-const REQUIRED_ABI_VERSION: i32 = 2;
+/// ABI generation this binary requires from the glue DLL. 3 = V2 metadata + MassRange + InstrumentInfo.
+const REQUIRED_ABI_VERSION: i32 = 3;
 
 type ShimOpen = extern "system" fn(*const u16, *const u16) -> i64;
 type ShimClose = extern "system" fn(i64);
@@ -125,6 +125,8 @@ type ShimSpectrumCount = extern "system" fn(i64) -> i64;
 type ShimSpectrumMetaFn = extern "system" fn(i64, i64, *mut ShimadzuSpectrumMeta) -> i32;
 type ShimSpectrumMetaV2Fn = extern "system" fn(i64, i64, *mut ShimadzuSpectrumMetaV2) -> i32;
 type ShimAbiVersion = extern "system" fn() -> i32;
+type ShimMassRange = extern "system" fn(i64, i32, i32, *mut f64, *mut f64) -> i32;
+type ShimInstrumentInfo = extern "system" fn(i64, *mut u16, i32) -> i32;
 /// `which`: 0 = profile, 1 = centroid. Both exist for the same scan; each is fetched separately so
 /// an archive can carry both facets (see `Representation`).
 type ShimSpectrumData =
@@ -140,6 +142,8 @@ struct GlueApi {
     spectrum_count: ShimSpectrumCount,
     spectrum_meta: ShimSpectrumMetaFn,
     spectrum_meta_v2: ShimSpectrumMetaV2Fn,
+    mass_range: ShimMassRange,
+    instrument_info: ShimInstrumentInfo,
     spectrum_data: ShimSpectrumData,
     data_free: ShimDataFree,
     last_error: ShimLastError,
@@ -234,6 +238,12 @@ impl GlueApi {
         let spectrum_meta_v2 = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumMetaV2Fn>(ty, pdcstr!("SpectrumMetaV2"))
             .map_err(|e| anyhow!("resolving glue export SpectrumMetaV2: {e}"))?;
+        let mass_range = *loader
+            .get_function_with_unmanaged_callers_only::<ShimMassRange>(ty, pdcstr!("MassRange"))
+            .map_err(|e| anyhow!("resolving glue export MassRange: {e}"))?;
+        let instrument_info = *loader
+            .get_function_with_unmanaged_callers_only::<ShimInstrumentInfo>(ty, pdcstr!("InstrumentInfo"))
+            .map_err(|e| anyhow!("resolving glue export InstrumentInfo: {e}"))?;
         let spectrum_data = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumData>(ty, pdcstr!("SpectrumData"))
             .map_err(|e| anyhow!("resolving glue export SpectrumData: {e}"))?;
@@ -251,6 +261,8 @@ impl GlueApi {
             spectrum_count,
             spectrum_meta,
             spectrum_meta_v2,
+            mass_range,
+            instrument_info,
             spectrum_data,
             data_free,
             last_error,
@@ -285,6 +297,19 @@ pub enum Representation {
     Both,
     Profile,
     Centroid,
+}
+
+/// Instrument identity as the vendor API states it (`IO.SystemName()`, `Parameters.DeviceID`,
+/// `SampleInfo.AnalysisDate`, spectrum `IfKind`). Every field optional: absent is absent.
+#[derive(Debug, Default, Clone)]
+pub struct ShimadzuInstrumentInfo {
+    pub system_name: Option<String>,
+    /// e.g. `MSID_QTFL` — the LCMS-9030 Q-TOF.
+    pub device_id: Option<String>,
+    /// ISO 8601, local instrument time, no zone.
+    pub analysis_date: Option<String>,
+    /// e.g. `ESI`.
+    pub ionization: Option<String>,
 }
 
 pub struct ShimadzuReader {
@@ -387,6 +412,37 @@ impl ShimadzuReader {
             );
         }
         Ok(meta)
+    }
+
+    /// Scan window of one (segment, event) in m/z, or `None` when the vendor reports no range.
+    /// The glue memoises per pair, so this is one vendor call per event, not per scan.
+    fn mass_range(&self, segment_no: i32, event_no: i32) -> Option<(f64, f64)> {
+        let (mut lo, mut hi) = (0.0f64, 0.0f64);
+        let rc = (self.api.mass_range)(self.handle, segment_no, event_no, &mut lo, &mut hi);
+        if rc != 0 || !(hi > lo) || lo < 0.0 {
+            return None;
+        }
+        Some((lo, hi))
+    }
+
+    /// What the vendor states about the instrument and the run — nothing more.
+    pub fn instrument_info(&self) -> ShimadzuInstrumentInfo {
+        let needed = (self.api.instrument_info)(self.handle, std::ptr::null_mut(), 0);
+        if needed <= 0 {
+            return ShimadzuInstrumentInfo::default();
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written = (self.api.instrument_info)(self.handle, buf.as_mut_ptr(), needed);
+        let n = (written.max(0) as usize).min(buf.len());
+        let text = String::from_utf16_lossy(&buf[..n]);
+        let mut fields = text.split('\u{1F}').map(|f| f.trim().to_string());
+        let mut next = || fields.next().filter(|f| !f.is_empty());
+        ShimadzuInstrumentInfo {
+            system_name: next(),
+            device_id: next(),
+            analysis_date: next(),
+            ionization: next(),
+        }
     }
 
     /// Does this `.lcd` store profile signal at all? Probes the head of the run plus a stride
@@ -636,6 +692,14 @@ impl ShimadzuReader {
         let mut scan = ScanEvent::default();
         // ABI carries seconds; mzdata scan start_time is minutes.
         scan.start_time = meta.retention_time_seconds / 60.0;
+        // Scan window = the acquisition event's configured m/z range (`GetMassRawRange`), which the
+        // mzML lanes record as MS:1000501/MS:1000500. One range per (segment, event), memoised.
+        if let Some((lo, hi)) = self.mass_range(meta.segment_no, meta.event_no) {
+            scan.scan_windows.push(mzdata::spectrum::ScanWindow {
+                lower_bound: lo as f32,
+                upper_bound: hi as f32,
+            });
+        }
         descr.acquisition.scans.push(scan);
 
         // Precursor, mirroring `bruker_native::build_precursors`. The vendor reports the isolation

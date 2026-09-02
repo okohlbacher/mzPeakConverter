@@ -105,6 +105,10 @@ internal sealed class ShimadzuData
     // Reflection method handles (resolved once at open).
     public required MethodInfo GetSpectrumInfo;
     public required MethodInfo GetSpectrumByScan;
+    public object? ParametersObj;   // .MS.Parameters — GetMassRawRange(seg, event) is the scan window
+    public object? SampleInfoObj;   // .SampleInfo  — AnalysisDate is the run start time
+    // (segment, event) -> m/z range, memoised: an event's range is fixed for the whole run.
+    public readonly Dictionary<(int, int), (double lo, double hi)> RangeCache = new();
 
     // One-entry memo for Api.Data: the caller fetches profile then centroid for the same scan.
     public int CachedScan = -1;
@@ -469,6 +473,8 @@ public static class Api
             MassMultiplier = massMul,
             GetSpectrumInfo = getInfo,
             GetSpectrumByScan = getByScan,
+            ParametersObj = parameters,
+            SampleInfoObj = Reflect.GetProp(data, "SampleInfo"),
         };
     }
 
@@ -858,7 +864,89 @@ public static class Api
     /// which is why every layout change gets a new versioned entry point rather than a wider
     /// struct behind the old name.</summary>
     [UnmanagedCallersOnly(EntryPoint = "ShimadzuAbiVersion")]
-    public static int ShimadzuAbiVersion() => 2;
+    public static int ShimadzuAbiVersion() => 3;   // 3: + MassRange, InstrumentInfo
+
+    /// <summary>Scan window for one (segment, event): `MS.Parameters.GetMassRawRange`, in raw mass
+    /// units (× MassMultiplier, like point masses). Every scan of an event shares it, so the answer
+    /// is memoised per pair. Returns 1 with both outputs 0 when the vendor has no range.</summary>
+    [UnmanagedCallersOnly(EntryPoint = "MassRange")]
+    public static unsafe int MassRange(long handle, int segmentNo, int eventNo, double* loOut, double* hiOut)
+    {
+        *loOut = 0; *hiOut = 0;
+        try
+        {
+            ShimadzuData? d;
+            lock (Gate) { Readers.TryGetValue(handle, out d); }
+            if (d == null) { _lastError = "unknown handle"; return 1; }
+            if (d.RangeCache.TryGetValue((segmentNo, eventNo), out var hit)) { *loOut = hit.lo; *hiOut = hit.hi; return 0; }
+            if (d.ParametersObj == null) { _lastError = "MS.Parameters unavailable"; return 1; }
+            var m = Reflect.Method(d.ParametersObj.GetType(), "GetMassRawRange", 4);
+            if (m == null) { _lastError = "GetMassRawRange(4 args) missing"; return 1; }
+            var args = new object?[] { 0, 0, (short)segmentNo, (short)eventNo }; // ref start, ref end, seg, event
+            var st = Reflect.InvokeCoerced(m, d.ParametersObj, args);
+            if (!Reflect.Ok(st)) { _lastError = $"GetMassRawRange({segmentNo},{eventNo}): {st}"; return 1; }
+            double lo = Convert.ToInt64(args[0] ?? 0L) * d.MassMultiplier;
+            double hi = Convert.ToInt64(args[1] ?? 0L) * d.MassMultiplier;
+            d.RangeCache[(segmentNo, eventNo)] = (lo, hi);
+            *loOut = lo; *hiOut = hi;
+            return 0;
+        }
+        catch (Exception e) { _lastError = e.ToString(); return 1; }
+    }
+
+    /// <summary>Instrument identity + run start, as one UTF-16 string of '\u001F'-separated fields:
+    /// `systemName ␟ deviceId ␟ analysisDateIso8601 ␟ ionization`. Same buffer convention as
+    /// `LastError` (returns the length needed; fills up to `cap`). Fields the vendor does not expose
+    /// are empty, never invented — the Rust side asserts only what is present.</summary>
+    [UnmanagedCallersOnly(EntryPoint = "InstrumentInfo")]
+    public static unsafe int InstrumentInfo(long handle, ushort* buf, int cap)
+    {
+        try
+        {
+            ShimadzuData? d;
+            lock (Gate) { Readers.TryGetValue(handle, out d); }
+            if (d == null) { _lastError = "unknown handle"; return 0; }
+
+            string system = "";
+            try
+            {
+                var sn = Reflect.Method(d.IoObj.GetType(), "SystemName", 0);
+                system = (sn?.Invoke(d.IoObj, null) as string ?? "").Trim();
+            }
+            catch (Exception e) { Dbg.Say($"SystemName: {e.Message}"); }
+
+            string device = "";
+            try { device = Reflect.GetProp(d.ParametersObj ?? new object(), "DeviceID")?.ToString() ?? ""; }
+            catch (Exception e) { Dbg.Say($"DeviceID: {e.Message}"); }
+
+            string date = "";
+            try
+            {
+                var v = d.SampleInfoObj == null ? null : Reflect.GetProp(d.SampleInfoObj, "AnalysisDate");
+                if (v is DateTime dt && dt.Year > 1900)
+                    date = dt.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture);
+            }
+            catch (Exception e) { Dbg.Say($"AnalysisDate: {e.Message}"); }
+
+            string ionization = "";
+            try
+            {
+                // On the decoded spectrum object (IfKind); one memoised decode of scan 1.
+                var spec = SpecFor(d, 1, Exp.ProfileDesired);
+                ionization = Reflect.GetProp(spec, "IfKind")?.ToString() ?? "";
+            }
+            catch (Exception e) { Dbg.Say($"IfKind: {e.Message}"); }
+
+            var msg = string.Join("\u001F", new[] { system, device, date, ionization });
+            if (buf != null && cap > 0)
+            {
+                int n = Math.Min(cap, msg.Length);
+                for (int i = 0; i < n; i++) buf[i] = msg[i];
+            }
+            return msg.Length;
+        }
+        catch (Exception e) { _lastError = e.ToString(); return 0; }
+    }
 
     /// <summary>V2 metadata. A separate entry point from `SpectrumMeta` ON PURPOSE: an old binary
     /// resolving `SpectrumMeta` still gets exactly 48 bytes written into its 48-byte buffer, and a

@@ -3480,7 +3480,7 @@ fn convert_baf(
 ) -> Result<()> {
     let reader = bruker_baf::BafReader::open_with(input, None, representation())?;
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms,
+        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
 }
@@ -3500,7 +3500,7 @@ fn convert_bruker_sdk(
 ) -> Result<()> {
     let reader = bruker_sdk::BrukerSdkReader::open(input)?;
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms,
+        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
 }
@@ -3547,10 +3547,41 @@ fn convert_shimadzu(
         let n: usize = n.parse().unwrap_or(10);
         return shimadzu_probe(&reader, n);
     }
+    let hints = VendorHints { instrument: shimadzu_instrument(&reader.instrument_info()) };
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms,
+        input, output, chunk, zstd_level, vendor, synth_chroms, hints,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
+}
+
+/// Instrument configuration from what the vendor API states — and only that. `SystemName()` is the
+/// model; `DeviceID = MSID_QTFL` names the Q-TOF family, so the quadrupole + TOF analysers are not
+/// in doubt; the ion source is asserted only when the spectra say `ESI`. No detector is invented.
+#[cfg(windows)]
+fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo) -> Option<InstrumentConfiguration> {
+    let model = info.system_name.clone()?;
+    let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+    cfg.params.push(Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model).build());
+    let mut order = 1;
+    if info.ionization.as_deref() == Some("ESI") {
+        cfg.components.push(Component {
+            component_type: ComponentType::IonSource,
+            order,
+            params: vec![Param::builder().name("electrospray ionization").curie(curie!(MS:1000073)).build()],
+        });
+        order += 1;
+    }
+    if info.device_id.as_deref().is_some_and(|d| d.contains("QTFL")) {
+        for (name, curie) in [("quadrupole", curie!(MS:1000081)), ("time-of-flight", curie!(MS:1000084))] {
+            cfg.components.push(Component {
+                component_type: ComponentType::Analyzer,
+                order,
+                params: vec![Param::builder().name(name).curie(curie).build()],
+            });
+            order += 1;
+        }
+    }
+    Some(cfg)
 }
 
 /// Emit `{"index","n","mz":[..4],"intensity":[..8]}` per spectrum, for comparison against the
@@ -3858,7 +3889,7 @@ fn convert_waters(
     // index or the mass-calibration coefficients). The statistical TOF-grid detector (strategy A) is
     // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
     let reader = waters::WatersReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak via the MHDAC .NET glue (feature `agilent`,
@@ -3873,7 +3904,7 @@ fn convert_agilent(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent::AgilentReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent **IM-MS** `.d` → mzPeak via the MIDAC .NET glue (Windows-runtime-only,
@@ -3889,11 +3920,20 @@ fn convert_agilent_midac(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent_midac::AgilentMidacReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
 }
 
 /// Shared writer wiring for a custom (non-mzdata) reader: sample-derived schema + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by
 /// every custom-reader path (Bruker TSF/BAF, SciEX, Agilent) so they don't each duplicate the body.
+/// What a vendor reader can state about the run beyond its spectra — asserted only when present.
+#[derive(Default)]
+struct VendorHints {
+    /// Instrument identity for `instrument_configuration_list`; applied only if the writer's list
+    /// is still empty after the generic fixup (i.e. the run/scans reference configuration 0 with
+    /// nothing behind it).
+    instrument: Option<InstrumentConfiguration>,
+}
+
 fn convert_vendor_reader(
     input: &Path,
     output: &Path,
@@ -3901,6 +3941,7 @@ fn convert_vendor_reader(
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
+    hints: VendorHints,
     len: usize,
     _sample: mzdata::spectrum::bindata::BinaryArrayMap,
     mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
@@ -3958,6 +3999,11 @@ fn convert_vendor_reader(
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
+    if let Some(cfg) = hints.instrument {
+        if writer.instrument_configurations().is_empty() {
+            writer.instrument_configurations_mut().insert(0, cfg);
+        }
+    }
     finish_with_vendor(writer, input, vendor)?;
     fs::rename(&tmp, output).with_context(|| format!("finalizing {}", output.display()))?;
     Ok(())
@@ -3976,7 +4022,7 @@ fn convert_tsf(
 ) -> Result<()> {
     let reader = bruker_tsf::TsfReader::open(input)?;
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms,
+        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
     )
 }
@@ -4114,12 +4160,28 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         // every distributed archive. Record the bare `file://` authority instead of an absolute path.
         let location = "file://".to_string();
         let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        target.file_description_mut().source_files.push(SourceFile {
+        let mut sf = SourceFile {
             name,
             location,
             id: "sourceFile".to_string(),
             ..Default::default()
-        });
+        };
+        // MS:1000569 SHA-1 of the source, as msconvert records it: the digest, not the path, is the
+        // provenance that survives distribution. Single files only — a `.d` directory has no
+        // single byte stream to digest, and hashing one arbitrary member would be a false claim.
+        if input.is_file() {
+            match embed_aux::sha1_hex(input) {
+                Ok(hex) => sf.add_param(
+                    Param::builder()
+                        .name("SHA-1")
+                        .curie(curie!(MS:1000569))
+                        .value(mzdata::params::Value::String(hex))
+                        .build(),
+                ),
+                Err(e) => log::warn!("could not digest {}: {e}", input.display()),
+            }
+        }
+        target.file_description_mut().source_files.push(sf);
     }
 
     // 1b. Ensure an instrument_configuration exists. Bruker leaves the list empty while `run`

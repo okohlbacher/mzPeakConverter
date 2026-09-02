@@ -54,6 +54,7 @@ tiff = { version = "=0.11.3", default-features = false }
 # SHA-256 over embedded optical-image / SDRF bytes (bounded streamed pass). Already in the tree
 # transitively; declared explicitly here so the embed_aux module can depend on it directly.
 sha2 = "0.10"
+sha1 = "0.10"   # MS:1000569 source-file digest (msconvert parity); already in the lock via mzdata
 
 # RFC 3339 parsing for the Bruker acquisition timestamp -> run.start_time. Already in the tree via
 # mzdata; declared here so main.rs can use it directly.
