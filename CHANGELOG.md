@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.5] — 2026-09-02
 
 ### Added
 
@@ -79,8 +79,12 @@ All notable changes to this project are documented here. The format follows
   `mz-grid` codec from the block. `MZPC_SHIMADZU_COARSE_MZ=1` (`Mass`, 1e-4 Da) lands on the same
   lattice as multiples of 1e5 and takes the same route. The profile facet (per-spectrum sqrt grid),
   precursors, scan windows, instrument configuration and the source SHA-1 are unchanged.
-  Expected size effect (contract, DIA_Hela_20ng): the centroid m/z column ≈ 1.0 GB, down from
-  1.90 GB as f64 delta (553 MB at the old 1e-4 lattice). Writer: the vendored
+  Measured on the box, every spectrum of all four reference files on the lattice with zero f64
+  fallbacks, and peak for peak identical to the f64 archives (ids, intensities, and the lattice
+  reproduces each m/z exactly; DIA 20ng 279,686,550 peaks, 100ng 278,399,598): archive sizes
+  Blind 5,239,837 → 3,794,397 B, HEK 28,959,271 → 23,914,635 B, DIA_Hela_20ng 2,187,984,551 →
+  1,311,817,690 B (m/z column 1.90 GB → 1.03 GB; 553 MB at the old 1e-4 lattice),
+  DIA_Hela_100ng 2,198,869,148 → 1,324,910,848 B. Writer: the vendored
   `MzPeakWriterType` gains `write_spectrum_with_peak_arrays`, which lets a profile spectrum hand
   its centroid list to the custom peaks schema as raw arrays — `write_spectrum` could only route
   a peak SET as f64 `CentroidPeak` columns. Pinned by unit tests in `src/shimadzu_grid.rs` and
