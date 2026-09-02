@@ -39,10 +39,8 @@ use netcorehost::hostfxr::AssemblyDelegateLoader;
 use netcorehost::pdcstring::PdCString;
 use netcorehost::{nethost, pdcstr};
 
-use mzdata::curie;
 use mzpeaks::{CentroidPeak, PeakSet};
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::meta::DissociationMethodTerm;
 use mzdata::spectrum::{

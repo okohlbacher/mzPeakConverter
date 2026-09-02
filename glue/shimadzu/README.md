@@ -73,6 +73,12 @@ deliberately out of scope.
 To reproduce: `MZPC_SHIMADZU_PROBE=6` on a profile-less `.lcd`, optionally with
 `MZPC_SHIMADZU_FETCH=legacy|centroid-first|centroid-only|split` and `MZPC_SHIMADZU_DUMP=<scan>`.
 
+**`MZPC_SHIMADZU_DUMP_READER=1` MODIFIES THE `.lcd` — run it on a copy only.** It walks the
+`DataObject` graph reflectively, and some of those property getters commit the OLE2 storage back to
+disk: on `HEK_PosOAD1.lcd` the file kept its 63,188,992 bytes but its SHA-1 changed
+(`3a55dde0…` → `405f35f8…`) and the very next `GetMSSpectrumByScan` failed with `E_FAIL`. Ordinary
+conversions do not write — `Blind_P1_pos_012.lcd` is byte-identical after dozens of opens.
+
 ## EULA
 
 The Shimadzu access libraries are governed by Shimadzu's EULA (bundled inside ProteoWizard), which

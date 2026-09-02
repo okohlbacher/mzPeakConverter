@@ -77,6 +77,19 @@ All notable changes to this project are documented here. The format follows
   arrives through a separate `SpectrumMetaV2` entry point rather than behind the old name, and both
   sides assert the shared field offsets rather than just the totals.
 
+- **Shimadzu native lane now carries the metadata the mzML lane had and it lacked.** Precursors
+  on every MSn spectrum (isolation target with half-width offsets from `QTransmissionWidthMz`, the
+  selected ion, CID with collision energy, and the parent-scan link — 1,837/1,837 on
+  `HEK_PosOAD1`); scan windows on every scan from the acquisition event's configured range
+  (`GetMassRawRange`: 70–1250 on HEK, 50–700 on Blind, with every observed m/z inside); an
+  instrument configuration stating only what the API states — `SystemName()` as MS:1000031,
+  ESI when the spectra say so, and the quadrupole + TOF analysers implied by `DeviceID = MSID_QTFL`
+  (no detector, no serial: the API exposes neither); and the source file's SHA-1 (MS:1000569),
+  the same digest msconvert records, so the two lanes agree on provenance byte-for-byte. The
+  glue ABI moved to version 3 behind a runtime handshake, so a stale DLL beside a new binary is a
+  clean load error rather than a silently mis-read struct. Along the way: the value the lane had
+  been treating as the precursor m/z was the base-peak mass, mis-scaled — fixed.
+
 ### Added
 
 - **`tools/compare_lcd_native_mzml.py`** — peak-for-peak comparison of an archive against the
