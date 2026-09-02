@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Shimadzu: the source-file SHA-1 was missing on large `.lcd` inputs.** The digest ran after the
+  vendor reader had opened the file, and `Shimadzu.LabSolutions.IO` holds a byte-range lock for as
+  long as the file is open (`os error 33`); the 55–63 MB files slipped through, the 2.8 GB DIA runs
+  did not. The digest is now taken before the reader opens the file — as msconvert does — and
+  seeds the `sourceFile` entry, so MS:1000569 is present on every single-file Shimadzu input.
+
 ## [0.9.1] — 2026-09-02
 
 ### Fixed
