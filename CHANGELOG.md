@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Shimadzu native lane reads the vendor's high-resolution m/z.** Each vendor point carries a
+  coarse `Mass` (Int32, 1e-4 Da lattice — what ProteoWizard reads) and `MassHigh` (Int64, 1e-9 Da)
+  — and `MassHigh` is what LabSolutions' own mzML exporter writes (Blind_P1_pos_012: the native
+  archive now matches the export to 5.7e-14 instead of 5.0e-5). The scale is established once per
+  file — a power of ten fitted over ≥1,000 points with `|MassHigh − Mass×R| ≤ R/2` on every one,
+  monotone within each list — and the whole file stays on `Mass` otherwise; precision is never
+  mixed inside a file. `MZPC_SHIMADZU_COARSE_MZ=1` restores the old behaviour. Measured on three
+  LCMS-9030 runs (R = 100,000; profile points exactly on the coarse grid, centroids carrying the
+  sub-lattice digits an interpolated apex has). Physically this is ~100× below the instrument's
+  mass accuracy (isotope-spacing residual 9.045 → 9.026 mDa); it is done for fidelity to the
+  vendor's stated value, and it costs archive size — the 1e-4 lattice made delta encoding cheap.
+- **Lattice detection extended to the 1e-9 scale** (with a ulp-relative tolerance), so both
+  `MassHigh` data and LabSolutions mzML exports take the lossless delta route instead of lossy
+  numpress-linear. On the Blind export that is −13 % (4,247,050 → 3,708,846 B) AND lossless.
+
 ## [0.9.2] — 2026-09-02
 
 ### Fixed

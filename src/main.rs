@@ -960,18 +960,23 @@ fn is_agilent_d(input: &Path) -> bool {
 /// there delta is 1.6x LARGER than numpress. Same instrument, same run, opposite answers — so the
 /// extension cannot decide this and the values have to be looked at.
 fn is_fixed_point_lattice(mzs: &[f64]) -> bool {
-    // Vendor fixed-point scales seen in the wild. 1e-4 is Shimadzu's MASSNUMBER_UNIT.
-    const SCALES: [f64; 3] = [10_000.0, 100_000.0, 1_000.0];
+    // Vendor fixed-point scales seen in the wild. 1e-4 is Shimadzu's coarse MASSNUMBER_UNIT; 1e-9 is
+    // its `MassHigh` field, which is also what LabSolutions' own mzML exporter writes.
+    const SCALES: [f64; 4] = [10_000.0, 100_000.0, 1_000.0, 1_000_000_000.0];
     let sample: Vec<f64> = mzs.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
     if sample.len() < 64 {
         return false;
     }
     SCALES.iter().any(|scale| {
         // Every value must land on the grid, not merely most: a genuine lattice has NO exceptions,
-        // while off-lattice data occasionally lands near an integer by chance.
+        // while off-lattice data occasionally lands near an integer by chance. The tolerance is
+        // relative: at the 1e-9 scale m/z 1700 becomes 1.7e12, whose f64 ulp (~2.4e-4) is far above
+        // a fixed 1e-6 — while off-lattice residuals are uniform on [0, 0.5], so a few ulps still
+        // discriminate (P(64 chance hits) ~ 0).
         sample.iter().all(|v| {
             let scaled = v * scale;
-            (scaled - scaled.round()).abs() < 1e-6
+            let tol = (scaled.abs() * 8.0 * f64::EPSILON).max(1e-6);
+            (scaled - scaled.round()).abs() < tol
         })
     })
 }

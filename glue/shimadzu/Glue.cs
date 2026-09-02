@@ -107,6 +107,9 @@ internal sealed class ShimadzuData
     public required MethodInfo GetSpectrumByScan;
     public object? ParametersObj;   // .MS.Parameters — GetMassRawRange(seg, event) is the scan window
     public object? SampleInfoObj;   // .SampleInfo  — AnalysisDate is the run start time
+    /// Multiplier for the point's `MassHigh` (Int64) field, or 0 to read the coarse `Mass` (Int32)
+    /// instead. Decided ONCE per file at open (see `Api.DecideMassScale`); never mixed within a file.
+    public double HighMassMul;
     // (segment, event) -> m/z range, memoised: an event's range is fixed for the whole run.
     public readonly Dictionary<(int, int), (double lo, double hi)> RangeCache = new();
 
@@ -464,7 +467,7 @@ public static class Api
         var getByScan = Reflect.Method(spectrum.GetType(), "GetMSSpectrumByScan", 3)
             ?? throw new Exception("ISpectrum.GetMSSpectrumByScan(3 args) missing");
 
-        return new ShimadzuData
+        var reader = new ShimadzuData
         {
             DataObject = data,
             IoObj = io,
@@ -476,6 +479,8 @@ public static class Api
             ParametersObj = parameters,
             SampleInfoObj = Reflect.GetProp(data, "SampleInfo"),
         };
+        DecideMassScale(reader);
+        return reader;
     }
 
     /// <summary>Max scan number across all (segment, event) pairs, via RetTimeToScan(endTime).
@@ -767,21 +772,111 @@ public static class Api
         return specObj;
     }
 
-    /// <summary>Vendor point list -> (m/z, intensity). Empty arrays when the list is absent.</summary>
+    /// Property handles for one vendor point type, resolved once. `ToArrays` used to walk
+    /// `GetProperty` twice per point on the hottest loop of the conversion.
+    private sealed record PointProps(PropertyInfo Mass, PropertyInfo Intensity, PropertyInfo? MassHigh);
+    private static readonly Dictionary<Type, PointProps> PointPropCache = new();
+
+    private static PointProps PropsFor(object pt)
+    {
+        var t = pt.GetType();
+        lock (PointPropCache)
+        {
+            if (PointPropCache.TryGetValue(t, out var cached)) return cached;
+            var pp = new PointProps(
+                Reflect.Prop(pt, "Mass") ?? throw new Exception($"{t.FullName} has no Mass"),
+                Reflect.Prop(pt, "Intensity") ?? throw new Exception($"{t.FullName} has no Intensity"),
+                Reflect.Prop(pt, "MassHigh"));
+            PointPropCache[t] = pp;
+            return pp;
+        }
+    }
+
+    /// <summary>Vendor point list -> (m/z, intensity). Empty arrays when the list is absent.
+    ///
+    /// m/z comes from `MassHigh` (Int64, ~1e-9 Da) when `d.HighMassMul` was established for this
+    /// file, else from the coarse `Mass` (Int32, 1e-4 Da lattice — what ProteoWizard reads).
+    /// `MassHigh` is what LabSolutions' own mzML exporter writes (verified bit-for-bit on
+    /// Blind_P1_pos_012), so it is the vendor's stated coordinate; the converter stores it
+    /// rather than the truncation. A whole SPECTRUM falls back to `Mass` if any of its points lacks
+    /// a usable `MassHigh`, so precision is never mixed inside one array.</summary>
     private static (double[] mz, float[] intensity) ToArrays(IList? list, ShimadzuData d)
     {
         int n = list?.Count ?? 0;
         var mz = new double[n];
         var inten = new float[n];
+        if (n == 0) return (mz, inten);
+        var pp = PropsFor(list![0]!);
+        bool high = d.HighMassMul > 0 && pp.MassHigh != null;
         for (int i = 0; i < n; i++)
         {
-            var pt = list![i]!;
-            long massInt = System.Convert.ToInt64(Reflect.GetProp(pt, "Mass") ?? 0L);
-            double intensity = System.Convert.ToDouble(Reflect.GetProp(pt, "Intensity") ?? 0.0);
-            mz[i] = massInt * d.MassMultiplier;
+            var pt = list[i]!;
+            long massInt = System.Convert.ToInt64(pp.Mass.GetValue(pt) ?? 0L);
+            double intensity = System.Convert.ToDouble(pp.Intensity.GetValue(pt) ?? 0.0);
             inten[i] = (float)intensity;
+            if (high)
+            {
+                long mh = System.Convert.ToInt64(pp.MassHigh!.GetValue(pt) ?? 0L);
+                if (mh <= 0 && massInt > 0) { high = false; i = -1; continue; } // restart on Mass
+                mz[i] = mh * d.HighMassMul;
+            }
+            else
+            {
+                mz[i] = massInt * d.MassMultiplier;
+            }
         }
         return (mz, inten);
+    }
+
+    /// <summary>Decide, once per file, whether `MassHigh` can be trusted and at what scale.
+    ///
+    /// Guards (from the size-analysis review): the scale is a FILE-level constant, never a per-point
+    /// ratio (that divides by zero on Mass = 0 and carries a truncation bias); it is snapped to a
+    /// power of ten; every sampled point must satisfy |MassHigh − Mass×R| ≤ R/2 (i.e. Mass is the
+    /// rounding of MassHigh); ≥ 1000 positive points across the first scans, or the whole file stays
+    /// on `Mass`. Measured on three LCMS-9030 runs: R = 100000 exactly, profile points exactly on
+    /// the grid, centroids carrying sub-lattice digits (an interpolated apex should).</summary>
+    internal static void DecideMassScale(ShimadzuData d)
+    {
+        d.HighMassMul = 0;
+        if (Environment.GetEnvironmentVariable("MZPC_SHIMADZU_COARSE_MZ") == "1") { Dbg.Say("MassHigh disabled by env"); return; }
+        var ratios = new List<double>();
+        var pairs = new List<(long mass, long high)>();
+        int scan = 1;
+        try
+        {
+            while (pairs.Count < 1000 && scan <= 8 && scan <= d.ScanCount)
+            {
+                var spec = SpecFor(d, scan, Exp.ProfileDesired);
+                foreach (var name in new[] { "ProfileList", "CentroidList" })
+                {
+                    if (Reflect.GetProp(spec, name) is not IList list || list.Count == 0) continue;
+                    var pp = PropsFor(list[0]!);
+                    if (pp.MassHigh == null) { Dbg.Say($"{list[0]!.GetType().Name} has no MassHigh; using Mass"); return; }
+                    long prevHigh = long.MinValue;
+                    foreach (var pt in list)
+                    {
+                        long m = System.Convert.ToInt64(pp.Mass.GetValue(pt) ?? 0L);
+                        long h = System.Convert.ToInt64(pp.MassHigh.GetValue(pt) ?? 0L);
+                        if (h < prevHigh) { Dbg.Say("MassHigh not non-decreasing; using Mass"); return; }
+                        prevHigh = h;
+                        if (m > 0 && h > 0) { pairs.Add((m, h)); ratios.Add((double)h / m); }
+                    }
+                }
+                scan++;
+            }
+        }
+        catch (Exception e) { Dbg.Say($"MassHigh probe failed ({e.Message}); using Mass"); return; }
+        if (pairs.Count < 1000) { Dbg.Say($"only {pairs.Count} points to establish the MassHigh scale; using Mass"); return; }
+        ratios.Sort();
+        double median = ratios[ratios.Count / 2];
+        double r = Math.Pow(10, Math.Round(Math.Log10(median)));
+        if (r < 1e3 || r > 1e9 || Math.Abs(median / r - 1.0) > 1e-3) { Dbg.Say($"MassHigh/Mass median {median} is not a power of ten; using Mass"); return; }
+        long R = (long)r;
+        int bad = pairs.Count(p => Math.Abs(p.high - p.mass * R) > R / 2);
+        if (bad > 0) { Dbg.Say($"{bad}/{pairs.Count} points violate |MassHigh - Mass*R| <= R/2; using Mass"); return; }
+        d.HighMassMul = d.MassMultiplier / R;
+        Dbg.Say($"MassHigh scale R={R} from {pairs.Count} points; m/z = MassHigh * {d.HighMassMul:G}");
     }
 
     // --- C ABI (matches src/shimadzu.rs) -----------------------------------------------------
