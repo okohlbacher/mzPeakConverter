@@ -3538,6 +3538,15 @@ fn convert_shimadzu(
         RepresentationArg::Profile => shimadzu::Representation::Profile,
         RepresentationArg::Centroid => shimadzu::Representation::Centroid,
     };
+    // Digest FIRST: once the vendor DLL has the file open it holds a byte-range lock and the read
+    // fails with os error 33 (seen on the 2.8 GB DIA runs; the small files happened to slip through).
+    let source_sha1 = match embed_aux::sha1_hex(input) {
+        Ok(hex) => Some(hex),
+        Err(e) => {
+            log::warn!("could not digest {}: {e}", input.display());
+            None
+        }
+    };
     let reader = shimadzu::ShimadzuReader::open_with(input, rep)?;
     // Stage-B diagnostic: `MZPC_SHIMADZU_PROBE=N` dumps the first N spectra as JSON lines and
     // exits without writing an archive. A full DIA conversion is 21,500 spectra and tens of
@@ -3547,7 +3556,7 @@ fn convert_shimadzu(
         let n: usize = n.parse().unwrap_or(10);
         return shimadzu_probe(&reader, n);
     }
-    let hints = VendorHints { instrument: shimadzu_instrument(&reader.instrument_info()) };
+    let hints = VendorHints { instrument: shimadzu_instrument(&reader.instrument_info()), source_sha1 };
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms, hints,
         reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
@@ -3932,6 +3941,11 @@ struct VendorHints {
     /// is still empty after the generic fixup (i.e. the run/scans reference configuration 0 with
     /// nothing behind it).
     instrument: Option<InstrumentConfiguration>,
+    /// MS:1000569 SHA-1 of the input, computed BEFORE the vendor reader opened it. The Shimadzu DLL
+    /// holds a byte-range lock on the `.lcd` for as long as it is open, so hashing afterwards fails
+    /// on large files (`os error 33`) — msconvert hashes first for the same reason. When present,
+    /// the `sourceFile` entry is seeded with it so `fixup_run_metadata` neither re-hashes nor warns.
+    source_sha1: Option<String>,
 }
 
 fn convert_vendor_reader(
@@ -3998,6 +4012,24 @@ fn convert_vendor_reader(
         writer.write_spectrum(&spec)?;
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
+    if let Some(hex) = hints.source_sha1 {
+        if writer.file_description().source_files.is_empty() {
+            let mut sf = SourceFile {
+                name: input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                location: "file://".to_string(),
+                id: "sourceFile".to_string(),
+                ..Default::default()
+            };
+            sf.add_param(
+                Param::builder()
+                    .name("SHA-1")
+                    .curie(curie!(MS:1000569))
+                    .value(mzdata::params::Value::String(hex))
+                    .build(),
+            );
+            writer.file_description_mut().source_files.push(sf);
+        }
+    }
     fixup_run_metadata(&mut writer, input);
     if let Some(cfg) = hints.instrument {
         if writer.instrument_configurations().is_empty() {

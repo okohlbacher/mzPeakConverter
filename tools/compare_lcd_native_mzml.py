@@ -240,7 +240,10 @@ def metamorphic(archive: Path, baseline: Path, limit: int | None) -> dict:
             keys = keys[:limit]
         shifts = Counter()
         for k in keys:
-            shifts[find_rotation(old[k][1], new[k][1])] += 1
+            if np.array_equal(old[k][1].astype(np.float32), new[k][1].astype(np.float32)):
+                shifts["identical"] += 1
+            else:
+                shifts[find_rotation(old[k][1], new[k][1])] += 1
         out["facets"][member] = {
             "compared": len(keys),
             "shift_histogram": {str(k): v for k, v in sorted(shifts.items(), key=lambda kv: str(kv[0]))},
