@@ -36,14 +36,14 @@ fn lstsq(k: &[f64], r: &[f64]) -> (f64, f64) {
     (mr - c1 * mk, c1)
 }
 
-/// The run-wide step `c1` from dense spectra (≥ 200 points), each fitted on its own with the bin
+/// The run-wide step `c1` from dense spectra (≥ 64 points), each fitted on its own with the bin
 /// assignment taken from its smallest positive spacing; the median of those fits. The minimum
 /// spacing itself is a BIASED estimate (its rounding error accumulates to ~5e-4 Da over 2e5 bins),
 /// which is why the per-spectrum least-squares step is what gets pooled.
 pub fn run_wide_step(spectra: &[Vec<f64>]) -> Option<f64> {
     let mut steps: Vec<f64> = Vec::new();
     for mz in spectra {
-        if mz.len() < 200 {
+        if mz.len() < 64 {
             continue;
         }
         let r: Vec<f64> = mz.iter().map(|v| v.sqrt()).collect();

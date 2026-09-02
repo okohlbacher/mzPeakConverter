@@ -3633,15 +3633,18 @@ fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
     if !reader.stores_profile().unwrap_or(false) {
         return None;
     }
+    // Probe up to 64 spectra spread over the run. Blind_P1_pos_012's profile spectra are small
+    // (median 76 points, only 324/13,200 reach 200), so the density floor is 64 points — enough for
+    // an unambiguous bin assignment — and HEK's (median 3,491) clear it trivially.
     let n = reader.len();
-    let stride = (n / 48).max(1);
+    let stride = (n / 64).max(1);
     let mut dense: Vec<Vec<f64>> = Vec::new();
     let mut i = 0;
-    while i < n && dense.len() < 48 {
+    while i < n && dense.len() < 64 {
         if let Ok(spec) = reader.spectrum(i) {
-            if spec.signal_continuity() == SignalContinuity::Profile {
+            if spec.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile {
                 if let Some(mz) = spec.arrays.as_ref().and_then(|a| a.mzs().ok()) {
-                    if mz.len() >= 200 {
+                    if mz.len() >= 64 {
                         dense.push(mz.to_vec());
                     }
                 }
@@ -3671,7 +3674,7 @@ fn shimadzu_grid_route(
     n_grid: &mut usize,
     n_f64: &mut usize,
 ) -> MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> {
-    if spec.signal_continuity() != SignalContinuity::Profile {
+    if spec.signal_continuity() != mzdata::spectrum::SignalContinuity::Profile {
         return spec;
     }
     let Some(arrays) = spec.arrays.as_ref() else { return spec };

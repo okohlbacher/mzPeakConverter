@@ -19,6 +19,20 @@ All notable changes to this project are documented here. The format follows
   sub-lattice digits an interpolated apex has). Physically this is ~100× below the instrument's
   mass accuracy (isotope-spacing residual 9.045 → 9.026 mDa); it is done for fidelity to the
   vendor's stated value, and it costs archive size — the 1e-4 lattice made delta encoding cheap.
+- **Shimadzu profile facet stored as an exact sqrt grid.** With `MassHigh` the profile axis is a
+  flight-time lattice — `sqrt(m/z) = c0 + c1·k`, `c1` constant across the run (spread 3e-17), `c0`
+  per spectrum — that the vendor rounds to 1e-9. It is now stored as `tof_index` (Int32) with
+  per-spectrum `tof_c0`/`tof_c1` (the same per-spectrum sqrt contract mzPeakViewer already
+  reconstructs), verified on every point to ≤ 1e-9 before a spectrum is gridded; a spectrum that
+  does not fit (LabSolutions clamps the first/last sample of some MS2 scans to the scan-window
+  bound) keeps its f64 m/z beside it — nothing is snapped. Centroids stay f64 delta. This undoes
+  the size cost of `MassHigh` on the profile facet (HEK 57.9 MB → ~15 MB emulated) while keeping
+  the vendor-exact values.
+- **Mixed layout families per entity are accepted** (project decision, 2026-09-02 — a deliberate
+  deviation from the spec text). The writer's one-family-per-entity check is a warning, not an
+  error: a point-layout grid facet beside chunked centroids is the canonical case, `--ims-chunked`
+  on timsTOF no longer aborts, and readers that resolve the layout per source read such archives
+  correctly.
 - **Lattice detection extended to the 1e-9 scale** (with a ulp-relative tolerance), so both
   `MassHigh` data and LabSolutions mzML exports take the lossless delta route instead of lossy
   numpress-linear. On the Blind export that is −13 % (4,247,050 → 3,708,846 B) AND lossless.
