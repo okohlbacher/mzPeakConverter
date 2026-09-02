@@ -532,7 +532,10 @@ impl VisitorBase for CURIEBuilder {
 
 impl StructVisitor<mzdata::params::CURIE> for CURIEBuilder {
     fn append_value(&mut self, item: &mzdata::params::CURIE) -> bool {
-        let item = item.to_string();
+        // NOT `to_string()`: mzdata's Display PANICS on an `Unknown` CV, which is exactly how this
+        // crate represents its provisional `MZP:` terms (see `param::curie_to_string`). Writing one
+        // through the plain Display aborted the conversion.
+        let item = crate::param::curie_to_string(item);
         self.0.append_value(&item);
         true
     }
