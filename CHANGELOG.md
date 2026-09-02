@@ -37,6 +37,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A spectrum with several precursors got all of its selected ions on the first one.** The
+  precursor/selected-ion join key `(source_index, precursor_index)` is not unique for such a
+  spectrum — dia-PASEF writes two precursors per MS2 frame with the same pair on each row — so the
+  reader's scan matched the first precursor every time and its siblings came back empty. Two fixes:
+  the precursor sort is stable (an unstable sort on the tied key also reordered the precursors
+  against the ions they were being matched to), and where a spectrum's precursor and selected-ion
+  counts agree, the ions are paired positionally in row order, which is the only reading the archive
+  supports. Where the counts differ — one precursor with several ions (SPS-MS3), or ions missing —
+  nothing is assumed and the previous behaviour stands. Round-tripping PXD059079 2485.d to mzML now
+  gives exactly one ion on each of its 15,977 precursors (previously patterns like 0,0,0,0,5).
+  Pinned by `tests/multi_precursor_roundtrip.rs`. Found by the speXtract S30 analysis; the
+  underlying ambiguity is a spec matter — the key needs a per-spectrum precursor ordinal to be
+  unique — and is unchanged here.
+
 - **A failed peak-writer open no longer produces a silently wrong archive.** Both writers logged the
   failure and fell back to a default `(m/z f64, intensity f32)` point peak writer that cannot describe
   a chunked or grid facet: on diaPASEF that killed the parallel encoder mid-run (`--ims-chunked` on a
