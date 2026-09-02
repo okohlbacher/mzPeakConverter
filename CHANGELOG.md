@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `tools/compare_lcd_native_mzml.py` (the Shimadzu native-lane release gate) reads the v0.9.5+ lattice
+  centroid facet (`point.tof_index` × 1e-9 with the f64 `point.mz` fallback) and slices the point layout
+  at spectrum boundaries instead of one boolean mask per spectrum (280 M rows × 21,500 spectra never
+  finished). On the v0.9.6 DIA_Hela_20ng archive it reports the same vendor-defect signature as on the
+  0.9.4 f64 archive and max |Δm/z| 2.27e-13 against the LabSolutions export.
+
 ## [0.9.6] — 2026-09-02
 
 ### Added
