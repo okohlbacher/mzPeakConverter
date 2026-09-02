@@ -16,7 +16,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use mzdata::params::{CURIE, ControlledVocabulary};
+use rusqlite::{OptionalExtension, types::ValueRef};
 
 use mzdata::params::{Param, Unit};
 use mzdata::prelude::ParamDescribed;
@@ -120,6 +122,124 @@ struct FrameTable {
     rt: Vec<f64>,
     ms_level: Vec<u8>,
     polarity: Vec<ScanPolarity>,
+    /// `T1` / `T2` / `MzCalibration` — the per-frame inputs of the vendor's exact ModelType-1
+    /// TOF→m/z model (see [`vendor_mz_calibration`]). Empty when the schema lacks the columns;
+    /// `None` for a frame whose own value is NULL, which must not abort the conversion (nor shift
+    /// the per-frame indices, so the entry is kept and the columns come out null for that frame).
+    t1: Vec<Option<f64>>,
+    t2: Vec<Option<f64>>,
+    mz_cal_id: Vec<Option<i64>>,
+}
+
+/// Local CURIEs for the per-frame calibration inputs (`Frames.T1`, `Frames.T2`,
+/// `Frames.MzCalibration`), which the ims-compact writer promotes to `spectra_metadata` columns
+/// (`…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id`). MS:4000903–4000905 are unused local
+/// accessions, following the `tof_c0`/`tof_c1` precedent in `main.rs`.
+pub(crate) const TDF_T1_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_903);
+pub(crate) const TDF_T2_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_904);
+pub(crate) const TDF_MZ_CAL_ID_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_905);
+
+/// Attach one frame's calibration inputs as spectrum params. Shared by the native and `--bruker-sdk`
+/// ims-compact lanes so both write identical columns.
+pub(crate) fn add_frame_calibration_params(
+    descr: &mut SpectrumDescription,
+    t1: f64,
+    t2: f64,
+    mz_cal_id: i64,
+) {
+    descr.add_param(Param::builder().name("tdf_t1").curie(TDF_T1_CURIE).value(t1).build());
+    descr.add_param(Param::builder().name("tdf_t2").curie(TDF_T2_CURIE).value(t2).build());
+    descr.add_param(
+        Param::builder()
+            .name("tdf_mz_calibration_id")
+            .curie(TDF_MZ_CAL_ID_CURIE)
+            .value(mz_cal_id)
+            .build(),
+    );
+}
+
+/// The vendor's exact TOF→m/z calibration, carried verbatim so an archive is self-sufficient even
+/// with `--no-vendor`: every `MzCalibration` row of `analysis.tdf` (all columns, as stored) plus the
+/// `GlobalMetadata` constants timsrust's two-point `ims_calibration` chord is built from. The
+/// per-frame inputs (`Frames.T1/T2/MzCalibration`) ride in `spectra_metadata` via
+/// [`add_frame_calibration_params`].
+///
+/// The expression readers are expected to evaluate for `ModelType = 1` — derived and verified in
+/// speXtract v0.2.0 to 2.5e-5 ppm against Bruker's timsdata SDK (three diaPASEF runs, 60 golden
+/// points); `dC2 = 0` on every file seen, so `T2`'s role is unverified and it is carried as-is:
+///
+/// ```text
+///   t_ns   = tof * DigitizerTimebase + DigitizerDelay
+///   C1_eff = C1 * (1 + dC1 * (T1 - tdf_t1) / 1e6)             // T1: calibration row; tdf_t1: the frame
+///   t_ns   = C0 + (1e6 / sqrt(C1_eff)) * sqrt(mz) + C2 * mz   // solve for sqrt(mz); C2 = 0 → pure sqrt
+/// ```
+///
+/// Dropping `C2·mz` costs −11…−40 ppm, dropping the temperature term ~0.7 ppm over speXtract's ~30 mK
+/// runs (0.06 ppm over 2485.d's 3 mK); the two-point chord in `ims_calibration` is −5…−11 ppm
+/// biased there and +3.2…−4.2 ppm on 2485.d (m/z dependent). `ims_calibration.a/b` stay the reader
+/// contract; this block is the exact model beside it.
+pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
+    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {}", tdf.display()))?;
+    let mut stmt = conn
+        .prepare("SELECT * FROM MzCalibration ORDER BY Id")
+        .context("querying MzCalibration")?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let mut rows_out = Vec::new();
+    let mut rows = stmt.query([]).context("reading MzCalibration")?;
+    while let Some(row) = rows.next().context("reading MzCalibration")? {
+        let mut obj = serde_json::Map::new();
+        for (k, name) in cols.iter().enumerate() {
+            let v = match row.get_ref(k).context("MzCalibration cell")? {
+                ValueRef::Null => serde_json::Value::Null,
+                ValueRef::Integer(i) => i.into(),
+                ValueRef::Real(f) => f.into(),
+                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned().into(),
+                ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()).into(),
+            };
+            obj.insert(name.clone(), v);
+        }
+        rows_out.push(serde_json::Value::Object(obj));
+    }
+    if rows_out.is_empty() {
+        bail!("MzCalibration has no rows");
+    }
+    let mut global = serde_json::Map::new();
+    for key in ["DigitizerNumSamples", "MzAcqRangeLower", "MzAcqRangeUpper"] {
+        let v: Option<String> = conn
+            .query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [key], |r| r.get(0))
+            .optional()
+            .with_context(|| format!("reading GlobalMetadata.{key}"))?;
+        // GlobalMetadata values are TEXT; store the ones that parse as numbers.
+        let v = match v {
+            Some(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(serde_json::Value::from)
+                .or_else(|_| s.trim().parse::<f64>().map(serde_json::Value::from))
+                .unwrap_or(serde_json::Value::String(s)),
+            None => serde_json::Value::Null,
+        };
+        global.insert(key.to_string(), v);
+    }
+    // The exact spectra_metadata column names the writer derives for the per-frame params.
+    let per_frame_columns: Vec<String> = [
+        (TDF_T1_CURIE, "tdf_t1"),
+        (TDF_T2_CURIE, "tdf_t2"),
+        (TDF_MZ_CAL_ID_CURIE, "tdf_mz_calibration_id"),
+    ]
+    .iter()
+    .map(|(c, n)| mzpeak_prototyping::writer::inflect_cv_term_to_column_name(*c, n, None))
+    .collect();
+    Ok(serde_json::json!({
+        "source": "analysis.tdf",
+        "mz_calibration": rows_out,
+        "global_metadata": global,
+        "per_frame_columns": per_frame_columns,
+        "per_frame_columns_note": "spectra_metadata columns holding Frames.T1, Frames.T2, Frames.MzCalibration per spectrum (in this order); the id selects the mz_calibration row by Id",
+        "model_type_1": "t_ns = tof*DigitizerTimebase + DigitizerDelay; C1_eff = C1*(1 + dC1*(T1 - tdf_t1)/1e6); t_ns = C0 + (1e6/sqrt(C1_eff))*sqrt(mz) + C2*mz, solve for sqrt(mz) (C2 = 0: mz = ((t_ns - C0)*sqrt(C1_eff)/1e6)^2)",
+        "model_type_1_verified": "2.5e-5 ppm vs Bruker timsdata SDK (speXtract v0.2.0); dC2 = 0 on every file seen, T2 role unverified",
+    }))
 }
 
 /// One quadrupole isolation window within an MS2 frame.
@@ -346,6 +466,15 @@ impl NativeTofReader {
         self.table.ms_level.get(i).copied().unwrap_or(1)
     }
 
+    /// Per-frame `T1`/`T2`/`MzCalibration` → spectrum params (absent when the table lacks them).
+    fn add_frame_calibration(&self, descr: &mut SpectrumDescription, i: usize) {
+        if let (Some(&Some(t1)), Some(&Some(t2)), Some(&Some(id))) =
+            (self.table.t1.get(i), self.table.t2.get(i), self.table.mz_cal_id.get(i))
+        {
+            add_frame_calibration_params(descr, t1, t2, id);
+        }
+    }
+
     #[inline]
     pub fn mobility_for_scan(&self, scan: usize) -> f64 {
         self.mobility_for_scan_f(scan as f64)
@@ -454,6 +583,7 @@ impl NativeTofReader {
         // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
         descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
         descr.precursor = self.precursors_at(i);
+        self.add_frame_calibration(&mut descr, i);
         // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z via the model
         // (m/z = (a + b·tof)², monotonic in tof) over the min/max ABSOLUTE TOF bin present. Without
         // this the viewer reports "m/z 0–0".
@@ -567,6 +697,7 @@ impl NativeTofReader {
         // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
         descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
         descr.precursor = self.precursors_at(i);
+        self.add_frame_calibration(&mut descr, i);
         if tof_min <= tof_max {
             let (mz_a, mz_b) = (self.model.mz(tof_min), self.model.mz(tof_max));
             crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
@@ -677,34 +808,86 @@ pub(crate) fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWin
 fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
     let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| anyhow::anyhow!("opening {} for Frames: {e}", tdf.display()))?;
-    let mut stmt = conn
-        .prepare("SELECT NumPeaks, Time, MsMsType, Polarity FROM Frames ORDER BY Id")
-        .map_err(|e| anyhow::anyhow!("querying Frames: {e}"))?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?.max(0) as u32,
-                r.get::<_, f64>(1)?,
-                // TDF MsMsType: 0 is full-scan MS1; every other value (2 MRM, 8 PASEF, 9 dia-PASEF)
-                // is a fragmentation frame, i.e. MS2.
-                if r.get::<_, i64>(2)? == 0 { 1u8 } else { 2u8 },
-                match r.get::<_, String>(3)?.trim() {
-                    "+" => ScanPolarity::Positive,
-                    "-" => ScanPolarity::Negative,
-                    _ => ScanPolarity::Unknown,
-                },
-            ))
-        })
-        .map_err(|e| anyhow::anyhow!("reading Frames: {e}"))?;
+    // T1/T2/MzCalibration are in every TDF schema seen; should one lack them, keep the core four
+    // rather than failing the conversion.
+    match read_frame_rows(&conn, true) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            log::warn!("TDF Frames T1/T2/MzCalibration unavailable ({e}); per-frame calibration columns omitted");
+            read_frame_rows(&conn, false)
+        }
+    }
+}
+
+fn read_frame_rows(conn: &rusqlite::Connection, with_cal: bool) -> Result<FrameTable> {
+    let sql = if with_cal {
+        "SELECT NumPeaks, Time, MsMsType, Polarity, T1, T2, MzCalibration FROM Frames ORDER BY Id"
+    } else {
+        "SELECT NumPeaks, Time, MsMsType, Polarity FROM Frames ORDER BY Id"
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| anyhow::anyhow!("querying Frames: {e}"))?;
+    let mut rows = stmt.query([]).map_err(|e| anyhow::anyhow!("reading Frames: {e}"))?;
     let mut t = FrameTable::default();
-    for row in rows {
-        let (n, rt, lvl, pol) = row.map_err(|e| anyhow::anyhow!("collecting Frames: {e}"))?;
-        t.num_peaks.push(n);
-        t.rt.push(rt);
-        t.ms_level.push(lvl);
-        t.polarity.push(pol);
+    while let Some(r) = rows.next().map_err(|e| anyhow::anyhow!("collecting Frames: {e}"))? {
+        t.num_peaks.push(r.get::<_, i64>(0)?.max(0) as u32);
+        t.rt.push(r.get::<_, f64>(1)?);
+        // TDF MsMsType: 0 is full-scan MS1; every other value (2 MRM, 8 PASEF, 9 dia-PASEF)
+        // is a fragmentation frame, i.e. MS2.
+        t.ms_level.push(if r.get::<_, i64>(2)? == 0 { 1u8 } else { 2u8 });
+        t.polarity.push(match r.get::<_, String>(3)?.trim() {
+            "+" => ScanPolarity::Positive,
+            "-" => ScanPolarity::Negative,
+            _ => ScanPolarity::Unknown,
+        });
+        if with_cal {
+            t.t1.push(r.get::<_, Option<f64>>(4)?);
+            t.t2.push(r.get::<_, Option<f64>>(5)?);
+            t.mz_cal_id.push(r.get::<_, Option<i64>>(6)?);
+        }
     }
     Ok(t)
+}
+
+#[cfg(test)]
+mod vendor_mz_calibration_tests {
+    /// Rows come back verbatim (every column, typed) and the TEXT GlobalMetadata constants parse to
+    /// numbers. Values are the PXD059079 2485.d calibration.
+    #[test]
+    fn carries_rows_verbatim_and_global_constants() {
+        let dir = std::env::temp_dir().join(format!("mzpc-vmc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tdf = dir.join("analysis.tdf");
+        let _ = std::fs::remove_file(&tdf);
+        let conn = rusqlite::Connection::open(&tdf).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE MzCalibration (Id INTEGER PRIMARY KEY, ModelType INTEGER, DigitizerTimebase REAL, \
+             DigitizerDelay REAL, T1 REAL, T2 REAL, dC1 REAL, dC2 REAL, C0 REAL, C1 REAL, C2 REAL, C3 REAL, C4 REAL); \
+             INSERT INTO MzCalibration VALUES (1, 1, 0.125, 26464.125, 25.6148127740566, 25.1594285616696, \
+             20.0, 0.0, 1008.59723408404, 154314.98518964, 0.0, 0.0, 0.0); \
+             CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT); \
+             INSERT INTO GlobalMetadata VALUES ('DigitizerNumSamples', '636031'), \
+             ('MzAcqRangeLower', '99.993933'), ('MzAcqRangeUpper', '1700.000000');",
+        )
+        .unwrap();
+        drop(conn);
+        let v = super::vendor_mz_calibration(&tdf).unwrap();
+        let rows = v["mz_calibration"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["Id"], 1);
+        assert_eq!(rows[0]["ModelType"], 1);
+        assert_eq!(rows[0]["DigitizerTimebase"], 0.125);
+        assert_eq!(rows[0]["DigitizerDelay"], 26464.125);
+        assert_eq!(rows[0]["dC1"], 20.0);
+        assert_eq!(rows[0]["C1"], 154314.98518964);
+        assert_eq!(rows[0].as_object().unwrap().len(), 13, "all 13 columns: {}", rows[0]);
+        assert_eq!(v["global_metadata"]["DigitizerNumSamples"], 636031);
+        assert_eq!(v["global_metadata"]["MzAcqRangeLower"], 99.993933);
+        assert_eq!(v["global_metadata"]["MzAcqRangeUpper"], 1700.0);
+        assert!(v["model_type_1"].as_str().unwrap().contains("DigitizerTimebase"));
+        let cols: Vec<&str> = v["per_frame_columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+        assert!(cols[0].ends_with("_tdf_t1") && cols[1].ends_with("_tdf_t2") && cols[2].ends_with("_tdf_mz_calibration_id"), "{cols:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

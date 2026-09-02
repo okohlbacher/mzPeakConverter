@@ -237,6 +237,11 @@ struct FrameMeta {
     polarity: ScanPolarity,
     /// Mobility scans in this frame (TDF only; 0 for TSF).
     num_scans: u32,
+    /// `Frames.T1` / `T2` / `MzCalibration` (TDF only): the per-frame inputs of the vendor's exact
+    /// TOF→m/z model, promoted to `spectra_metadata` columns on the ims-compact lane.
+    t1: Option<f64>,
+    t2: Option<f64>,
+    mz_cal_id: Option<i64>,
 }
 
 /// MsMsType → 1-based MS level. 0 is MS1 for both TDF and TSF; every non-zero acquisition type
@@ -258,11 +263,28 @@ fn polarity_from_str(s: &str) -> ScanPolarity {
 }
 
 /// Read the `Frames` table in Id order. `with_scans` pulls `NumScans` (TDF); TSF has no such column.
+/// A TDF also yields `T1`/`T2`/`MzCalibration`, the per-frame inputs of the vendor's exact TOF→m/z
+/// model — but only when its schema has them: an older TDF without those columns must still convert,
+/// so the query falls back to the core four (the calibration columns then come out null).
 fn read_frames(conn: &Connection, with_scans: bool) -> Result<Vec<FrameMeta>> {
-    let sql = if with_scans {
-        "SELECT Id, Time, MsMsType, Polarity, NumScans FROM Frames ORDER BY Id"
-    } else {
-        "SELECT Id, Time, MsMsType, Polarity FROM Frames ORDER BY Id"
+    if with_scans {
+        match read_frames_inner(conn, true, true) {
+            Ok(rows) => return Ok(rows),
+            Err(e) => log::warn!(
+                "TDF Frames T1/T2/MzCalibration unavailable ({e}); per-frame calibration columns omitted"
+            ),
+        }
+    }
+    read_frames_inner(conn, with_scans, false)
+}
+
+fn read_frames_inner(conn: &Connection, with_scans: bool, with_cal: bool) -> Result<Vec<FrameMeta>> {
+    let sql = match (with_scans, with_cal) {
+        (true, true) => {
+            "SELECT Id, Time, MsMsType, Polarity, NumScans, T1, T2, MzCalibration FROM Frames ORDER BY Id"
+        }
+        (true, false) => "SELECT Id, Time, MsMsType, Polarity, NumScans FROM Frames ORDER BY Id",
+        (false, _) => "SELECT Id, Time, MsMsType, Polarity FROM Frames ORDER BY Id",
     };
     let mut stmt = conn.prepare(sql).context("preparing Frames query")?;
     let rows = stmt
@@ -278,6 +300,9 @@ fn read_frames(conn: &Connection, with_scans: bool) -> Result<Vec<FrameMeta>> {
                 } else {
                     0
                 },
+                t1: if with_cal { row.get::<_, Option<f64>>(5)? } else { None },
+                t2: if with_cal { row.get::<_, Option<f64>>(6)? } else { None },
+                mz_cal_id: if with_cal { row.get::<_, Option<i64>>(7)? } else { None },
             })
         })
         .context("querying Frames")?
@@ -639,6 +664,9 @@ impl TdfSdkReader {
         arrays.add(mob_da);
 
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
+        if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
+            crate::bruker_native::add_frame_calibration_params(&mut descr, t1, t2, id);
+        }
         self.attach_precursors(&mut descr, frame);
         // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (a + b·tof)²
         // (monotonic in tof) over the min/max TOF index present. Without this the viewer shows

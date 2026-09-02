@@ -191,7 +191,17 @@ charge / isolation window, ion-mobility (`mean inverse reduced ion mobility` for
 TDF), and the `MS:1000294` spectrum-type. Bruker TSF/BAF m/z is produced from the
 vendor calibration (TSF applies the otofControl ±Th correction); Bruker TDF stores
 the native integer TOF grid plus the `a,b` calibration in `ims_calibration` so a
-reader reconstructs `m/z = (a + b·tof)²` exactly.
+reader reconstructs `m/z = (a + b·tof)²` exactly. That `a,b` is timsrust's two-point
+chord (−5…−11 ppm against the vendor SDK), so the archive also carries the vendor's
+**exact** calibration: the `vendor_mz_calibration` index block holds every
+`analysis.tdf` `MzCalibration` row verbatim plus `DigitizerNumSamples` /
+`MzAcqRangeLower` / `MzAcqRangeUpper`, and `spectra_metadata` gains per-frame
+`…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id` columns (`Frames.T1/T2/MzCalibration`).
+The block spells out the ModelType-1 expression a reader evaluates —
+`t_ns = tof·DigitizerTimebase + DigitizerDelay`,
+`C1_eff = C1·(1 + dC1·(T1 − tdf_t1)/1e6)`, `t_ns = C0 + (1e6/√C1_eff)·√mz + C2·mz`
+solved for √mz — verified in speXtract to 2.5e-5 ppm against Bruker's SDK. It is
+present with `--no-vendor` too.
 
 **Profile zero-run compaction (the one transform that is not byte-for-byte).** In **profile**
 spectra, a run of two or more *consecutive* zero-intensity points is collapsed to a single zero at

@@ -6,6 +6,35 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **timsTOF ims-compact archives now carry the vendor's exact TOF→m/z calibration.** Until now the
+  archive held only `ims_calibration.a/b` — timsrust's two-point chord, through
+  (`MzAcqRangeLower`, 0) and (`MzAcqRangeUpper`, `DigitizerNumSamples`) on most files but through a
+  ±5 Th widened range on `Bruker otofControl` TDFs, so do not re-derive it from `GlobalMetadata`;
+  speXtract measured it at −5…−11 ppm (m/z dependent) against Bruker's SDK — and the exact model was
+  reachable
+  only through the embedded `vendor/analysis.tdf.gz`; `--no-vendor` archives lost it entirely. Two
+  additions, both lanes (native timsrust and `--bruker-sdk`), cost ≈13 numbers per calibration row
+  plus 3 values per frame:
+  - a `vendor_mz_calibration` index block: every `analysis.tdf` `MzCalibration` row **verbatim**
+    (`Id, ModelType, DigitizerTimebase, DigitizerDelay, T1, T2, dC1, dC2, C0…C4` — all columns,
+    as stored, so future schema columns ride along), the `GlobalMetadata` constants the chord is
+    built from (`DigitizerNumSamples`, `MzAcqRangeLower/Upper`), the exact per-frame column names,
+    and the ModelType-1 expression readers are expected to evaluate (speXtract v0.2.0, verified to
+    2.5e-5 ppm against the Bruker SDK):
+    `t_ns = tof·DigitizerTimebase + DigitizerDelay`, `C1_eff = C1·(1 + dC1·(T1 − T1_frame)/1e6)`,
+    `t_ns = C0 + (1e6/√C1_eff)·√mz + C2·mz`, solved for √mz;
+  - three per-frame `spectra_metadata` columns, `…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id`
+    (`Frames.T1`, `T2`, `MzCalibration`), because the model is temperature-compensated per frame
+    (T1 drifts ~3 mK within PXD059079 2485.d) and a run may reference more than one calibration
+    row. Nulls on a TDF whose `Frames` lacks the columns; the block is best-effort (a TDF without
+    the table still converts).
+  `ims_calibration` is unchanged and remains the reader contract; the exact model sits beside it.
+  Verified on PXD059079 2485.d (ModelType 1, `C2 = 0`, 3,994 frames, one calibration row): rows
+  and per-frame values bit-identical to `analysis.tdf`, present with `--no-vendor`; on this file the
+  chord runs from +3.2 ppm (tof 0) to −4.2 ppm (top of range) against the exact model.
+
 ### Fixed
 
 - **A failed peak-writer open no longer produces a silently wrong archive.** Both writers logged the
