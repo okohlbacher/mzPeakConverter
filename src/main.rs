@@ -74,7 +74,7 @@ use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzpeak_prototyping::{BufferContext, BufferName};
 use mzpeak_prototyping::archive::ZipArchiveWriter;
 use mzpeak_prototyping::chunk_series::ChunkingStrategy;
-use mzpeak_prototyping::peak_series::INTENSITY_ARRAY;
+use mzpeak_prototyping::peak_series::{INTENSITY_ARRAY, MZ_ARRAY};
 use mzpeak_prototyping::writer::{
     AbstractMzPeakWriter, ArrayBuffersBuilder, CustomBuilderFromParameter, MzPeakWriterType,
 };
@@ -3585,7 +3585,13 @@ fn convert_shimadzu(
             md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
             std::sync::Arc::new((*base).clone().with_metadata(md))
         };
+        // The schema sampler derives columns from probe spectra, and a gridded probe carries no
+        // m/z array — so declare the data facet explicitly: the grid axis, the f64 m/z that the
+        // rare off-grid spectrum keeps (null for gridded rows), and the intensity. Without the
+        // explicit intensity field it spilled into `auxiliary_arrays` on every spectrum.
         hints.data_facet_fields.push(tof_field);
+        hints.data_facet_fields.push(MZ_ARRAY.to_field());
+        hints.data_facet_fields.push(INTENSITY_ARRAY.to_field());
         hints.spectrum_param_fields.push((TOF_C0_CURIE, "tof_c0"));
         hints.spectrum_param_fields.push((TOF_C1_CURIE, "tof_c1"));
         hints.data_facet_point_layout = true;
