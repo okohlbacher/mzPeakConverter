@@ -12,9 +12,21 @@
 
 const SRC: &str = include_str!("../src/main.rs");
 
+/// `src/main.rs` with CRLF folded to LF.
+///
+/// Windows checks this repo out with `core.autocrlf=true`, so `include_str!` hands back `\r\n`
+/// and any needle containing a bare `\n` — `pinned("TOF_C0_CURIE,\n    \"tof_c0\",")` — silently
+/// never matches. That made this suite RED on the Windows box and green on macOS, which is the
+/// platform where the `#[cfg(windows)]` code these pins guard is not even compiled. Normalize once
+/// so a pin means the same thing on both.
+fn src() -> &'static str {
+    static NORM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NORM.get_or_init(|| SRC.replace("\r\n", "\n"))
+}
+
 fn pinned(needle: &str) {
     assert!(
-        SRC.contains(needle),
+        src().contains(needle),
         "calibration contract drift: `{needle}` is no longer emitted verbatim in src/main.rs \
          — this is a BREAKING change for mzPeakViewer (fail-loud -> empty spectra). \
          If intentional, update this pin + bump the version + tell the viewer team."
@@ -69,30 +81,30 @@ fn agilent_and_sciex_global_models_pinned() {
 fn tof_grid_reconstruction_keys_pinned() {
     // One per `codec: "tof-grid"` emission site. Counted against the sites themselves so that
     // adding a fifth lane without its keys fails here rather than in someone's reader.
-    let sites = SRC.matches("\"codec\": \"tof-grid\"").count();
+    let sites = src().matches("\"codec\": \"tof-grid\"").count();
     assert_eq!(sites, 4, "expected 4 `codec: \"tof-grid\"` emission sites, found {sites}");
     assert_eq!(
-        SRC.matches("\"lossless\": \"tof_index\"").count(),
+        src().matches("\"lossless\": \"tof_index\"").count(),
         sites,
         "every `codec: \"tof-grid\"` block must name its exactly-stored column with the spec's \
          `lossless` key; found {} of {sites} emission sites",
-        SRC.matches("\"lossless\": \"tof_index\"").count()
+        src().matches("\"lossless\": \"tof_index\"").count()
     );
     assert!(
-        !SRC.contains("integer_column"),
+        !src().contains("integer_column"),
         "`integer_column` is a synonym for the spec's `lossless` and was reverted; two keys naming \
          the same column is how they drift apart"
     );
     // The two honest values of `mz_reconstruction`, and the bound that must accompany the lossy one.
     pinned("\"mz_reconstruction\": \"exact\"");
     assert_eq!(
-        SRC.matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
+        src().matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
         2,
         "the run-wide and per-spectrum SCIEX grid lanes are bounded-lossy and must say so \
          (the Agilent and Shimadzu lanes are exact)"
     );
     assert_eq!(
-        SRC.matches("\"roundtrip_tolerance_ppm\": tof_grid::ppm_tol()").count(),
+        src().matches("\"roundtrip_tolerance_ppm\": tof_grid::ppm_tol()").count(),
         2,
         "a bounded-lossy block must state its bound"
     );
@@ -100,7 +112,7 @@ fn tof_grid_reconstruction_keys_pinned() {
     // stored column — so the `mz-grid` lattice (src/mz_lattice.rs) and `ims-compact` blocks spell
     // it identically. One archive can carry it twice, once per facet, without ambiguity.
     assert!(
-        SRC.contains("\"lossless\": \"tof\""),
+        src().contains("\"lossless\": \"tof\""),
         "the ims-compact block names its exactly-stored integer column the same way"
     );
 }
