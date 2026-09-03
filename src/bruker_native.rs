@@ -1770,6 +1770,59 @@ mod empty_frame_read_tests {
 
 #[cfg(test)]
 mod exact_tof_calibration_tests {
+
+    /// The C2 = 0 branch against Bruker's OWN `tims_index_to_mz` (timsdata SDK on the Flash box,
+    /// `MZPC_TDF_SDK_GOLDEN`, 2026-09-03): 240 (frame, tof) points on 12 frames of PXD059079 2485.d,
+    /// each with the frame's T1 and calibration id. The pair reproduced the SDK to 1.0e-7 ppm; the
+    /// run-wide chord was 4.28 ppm off. Corpus-free: everything needed is in the fixture.
+    #[test]
+    fn sqrt_linear_pair_matches_the_vendor_sdk_goldens() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tdf_2485_sdk_golden.json"
+        ))
+        .unwrap();
+        let g: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let rows: Vec<super::TdfMzCalibrationRow> = g["mz_calibration"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let f = |k: &str| r[k].as_f64().unwrap_or(0.0);
+                super::TdfMzCalibrationRow {
+                    id: r["Id"].as_i64().unwrap(),
+                    model_type: r["ModelType"].as_i64().unwrap(),
+                    digitizer_timebase: f("DigitizerTimebase"),
+                    digitizer_delay: f("DigitizerDelay"),
+                    t1: f("T1"),
+                    dc1: f("dC1"),
+                    dc2: f("dC2"),
+                    c0: f("C0"),
+                    c1: f("C1"),
+                    c2: f("C2"),
+                    c3: f("C3"),
+                    c4: f("C4"),
+                    quadratic_terms_stored: true,
+                }
+            })
+            .collect();
+        let pts = g["points"].as_array().unwrap();
+        assert!(pts.len() >= 200, "fixture has {} points", pts.len());
+        let mut worst_ppm: f64 = 0.0;
+        for p in pts {
+            let sdk = p["mz_sdk"].as_f64().unwrap();
+            if !(sdk > 0.0) {
+                continue;
+            }
+            let id = p["cal_id"].as_i64().unwrap();
+            let row = rows.iter().find(|r| r.id == id).expect("calibration row for the point");
+            let (c0, c1) = row.sqrt_linear_coeffs(p["t1"].as_f64().unwrap()).expect("C2 = 0 row is linear");
+            let u = c0 + c1 * p["tof"].as_f64().unwrap();
+            let ppm = ((u * u - sdk) / sdk).abs() * 1e6;
+            worst_ppm = worst_ppm.max(ppm);
+        }
+        assert!(worst_ppm < 1e-5, "pair vs SDK worst {worst_ppm:.3e} ppm (expected ~1e-7)");
+    }
     use super::*;
 
     /// PXD059079 2485.d's single `MzCalibration` row (ModelType 1, C2 = 0).

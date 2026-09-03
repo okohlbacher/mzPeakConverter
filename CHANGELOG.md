@@ -4,10 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.7] — 2026-09-03
 
 ### Added
 
+- **SDK-verified (2026-09-03):** Bruker's own `tims_index_to_mz` (timsdata SDK, via
+  `MZPC_TDF_SDK_GOLDEN` on the Flash box) agrees with the archive's per-frame pair to **1.0e-7 ppm**
+  on 240 (frame, tof) points over 12 frames of PXD059079 2485.d; the run-wide chord is 4.28 ppm off.
+  Pinned corpus-free by `sqrt_linear_pair_matches_the_vendor_sdk_goldens` with the fixture
+  `tests/fixtures/tdf_2485_sdk_golden.json`.
 - **timsTOF ims-compact: exact per-frame `tof_c0`/`tof_c1` when the vendor calibration is
   sqrt-linear (`C2 = 0`).** The Bruker ModelType-1 model (speXtract, 2.5e-5 ppm vs the SDK) is
   `C2·u² + (1e6/√C1_eff)·u + (C0 − t_ns) = 0`, `m/z = u²`, with `C1_eff` temperature-corrected
