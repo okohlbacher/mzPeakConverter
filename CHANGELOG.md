@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.9] — 2026-09-03
+
+### Fixed
+
+- **The Shimadzu "vendor defect" was a STALE LIBRARY, and it is now fixed.** Since 0.9.0 this project
+  has documented, in the CHANGELOG, `glue/shimadzu/README.md` and a collaborator reply, that centroid
+  intensities on profile-less `.lcd` files come back misaligned against their m/z (shifted 1–7
+  positions, the highest-m/z peak dropped), that no API lever reaches it, and that msconvert
+  reproduces it byte-identically — so the only remedy was a LabSolutions mzML export. **Every one of
+  those statements is true only of `Shimadzu.LabSolutions.IO.IoModule.dll` 3.8.4.6016**, the version
+  bundled with the ProteoWizard tree `MZPC_PWIZ_DIR` had been pointed at (the FLASHApp/OpenMS
+  third-party bundle: ProteoWizard **3.0.22187, July 2022**). Version **5.0.0.0** of the same library,
+  shipped by current ProteoWizard (**3.0.26151** verified), reads those files CORRECTLY. msconvert
+  appeared to confirm the defect only because it was driving the same old library.
+
+  Measured on `DIA_Hela_20ng.lcd`, spectra 1/10/100/1000, against the LabSolutions 5.128 SP2 export:
+
+  | reader | peaks | intensities |
+  |---|---|---|
+  | this converter + 3.8.4.6016 | 611 / 14,299 / 13,557 / 11,360 | shifted 1–7, header scalars at the head |
+  | msconvert + 3.8.4.6016 | identical to the above | identical to the above |
+  | msconvert + 5.0.0.0 | **612 / 14,300 / 13,558 / 11,361** | **max \|Δ\| = 0**, m/z to 5e-5 (coarse `Mass`) |
+  | **this converter + 5.0.0.0** | **612 / 14,300 / 13,558 / 11,361** | **max \|Δ\| = 0**, m/z to **2e-13** (`MassHigh`) |
+
+  Files that DO store profile signal (`Blind_P1_pos_012.lcd`) were always exact, through either
+  library. Reader guidance is therefore reversed: use a current ProteoWizard, not the mzML export.
+
+- **The glue can load the newer library at all.** 5.0.0.0 deserialises part of the `.lcd` through
+  `BinaryFormatter`, disabled by default since .NET 5, so `LoadData` threw `NotSupportedException`
+  inside a `TargetInvocationException` and every file looked unreadable. Enabled with
+  `<EnableUnsafeBinaryFormatterSerialization>` in the glue project. The bare
+  `RuntimeHostConfigurationOption` form does NOT work — the SDK's own default wins and the generated
+  `runtimeconfig.json` still reads `false`. Note .NET 9 removes `BinaryFormatter` outright, so a
+  retarget needs a vendor DLL that does not use it. Security: the switch is scoped to this glue, whose
+  input is a vendor instrument file the user chose to convert — the same path ProteoWizard itself runs.
+
+- **The Agilent lane no longer pins the whole box to one ProteoWizard layout.** It hard-required
+  `<MZPC_PWIZ_DIR>/vendor_api/Agilent`, which only the bundled build provides; the standalone
+  installer flattens those DLLs beside `msconvert.exe`. `agilent_dll_dir` probes both (subdirectory
+  preferred), so one current ProteoWizard serves every lane. This is what had kept the box on the
+  bundle, and thus on the broken Shimadzu reader.
+
+### Known gaps in this release
+
+- The one-shot runtime warning, `glue/shimadzu/README.md`, the 0.9.x entries above and the
+  `REPLY-mzpeak-converter-S30.md` sent to speXtract still describe the defect as inherent and
+  unreachable. The CODE is correct as of this release; those TEXTS are not yet corrected, and a
+  reader of them will be misled about which library to use. Correcting them, and deciding whether the
+  warning should fire at all (ideally only on a known-bad library version, which the glue could report
+  over the existing ABI), is the next change.
+- Archives converted before this release from a profile-less Shimadzu `.lcd` carry the misaligned
+  intensities. Reconvert them with a current ProteoWizard.
+
 ## [0.9.8] — 2026-09-03
 
 ### Added
