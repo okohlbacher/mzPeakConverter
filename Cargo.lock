@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "mzpeak-convert"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "anyhow",
  "arrow",
