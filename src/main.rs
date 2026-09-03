@@ -2145,9 +2145,11 @@ fn tof_grid_spectrum(
 /// — `base`/`coeff` vary per scan — so a single run-wide `[c0,c1]` is ~100 ppm off; we store c0/c1 as
 /// per-spectrum columns instead). MS:4000900/4000901 are unused local accessions reserved for this
 /// converter's grid handoff; a reader recovers `m/z = (tof_c0 + tof_c1·tof_index)²` per spectrum.
-const TOF_C0_CURIE: mzdata::params::CURIE =
+/// Also carried per spectrum by the timsTOF ims-compact lanes when the vendor `MzCalibration` row
+/// is sqrt-linear (`bruker_native::add_exact_tof_params`).
+pub(crate) const TOF_C0_CURIE: mzdata::params::CURIE =
     mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_900);
-const TOF_C1_CURIE: mzdata::params::CURIE =
+pub(crate) const TOF_C1_CURIE: mzdata::params::CURIE =
     mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::MS, 4_000_901);
 /// Per-spectrum CalibrationID column — selects the polynomial-refinement row in the
 /// `tof_calibration` index block, so the EXACT MassHunter m/z (quadratic + polynomial) reconstructs.
@@ -3058,6 +3060,7 @@ fn write_ims_compact_archive<F>(
     n_total: usize,
     tof_encoding: &str,
     chunk_cfg: Option<f64>,
+    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
     spectrum: F,
 ) -> Result<()>
 where
@@ -3068,7 +3071,7 @@ where
     type ParPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
     write_ims_compact_archive_impl::<F, ParPlaceholder>(
         input, output, zstd_level, vendor, synth_chroms, model_a, model_b, n_total,
-        tof_encoding, chunk_cfg, Driver::Serial(spectrum),
+        tof_encoding, chunk_cfg, exact_per_spectrum, Driver::Serial(spectrum),
     )
 }
 
@@ -3086,6 +3089,7 @@ fn write_ims_compact_archive_parallel<F>(
     n_total: usize,
     tof_encoding: &str,
     chunk_cfg: Option<f64>,
+    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
     spectrum: F,
 ) -> Result<()>
 where
@@ -3094,7 +3098,7 @@ where
     type SerPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
     write_ims_compact_archive_impl::<SerPlaceholder, F>(
         input, output, zstd_level, vendor, synth_chroms, model_a, model_b, n_total,
-        tof_encoding, chunk_cfg, Driver::Parallel(spectrum),
+        tof_encoding, chunk_cfg, exact_per_spectrum, Driver::Parallel(spectrum),
     )
 }
 
@@ -3120,6 +3124,7 @@ fn ims_chunked_peak_schema(
     model_b: f64,
     width_th: f64,
     int_intensity: bool,
+    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
 ) -> ArrayBuffersBuilder {
     use mzpeak_prototyping::chunk_series::{ArrowArrayChunk, TofMzBoundary};
     let boundary = TofMzBoundary { a: model_a, b: model_b };
@@ -3196,6 +3201,9 @@ fn ims_chunked_peak_schema(
         let f = if f.metadata().contains_key("transform") {
             let mut md = f.metadata().clone();
             md.insert("mzpeak:transform_params".to_string(), format!("{model_a},{model_b}"));
+            if exact_per_spectrum.is_some() {
+                md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+            }
             std::sync::Arc::new((*f).clone().with_metadata(md))
         } else {
             f
@@ -3216,6 +3224,11 @@ fn write_ims_compact_archive_impl<S, P>(
     n_total: usize,
     tof_encoding: &str,
     chunk_cfg: Option<f64>,
+    // `Some`: the run carries exact `tof_c0`/`tof_c1` params (`bruker_native::exact_tof_coeffs`;
+    // frames with a NULL `Frames.T1` have none — their count rides in the summary): declare them as
+    // spectra_metadata columns, stamp the `tof` column's per-spectrum transform parameters and say
+    // so in `ims_calibration`. `None`: the archive is exactly as before.
+    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
     mut driver: Driver<S, P>,
 ) -> Result<()>
 where
@@ -3253,6 +3266,11 @@ where
             "mzpeak:transform_params".to_string(),
             format!("{},{}", model_a, model_b),
         );
+        // Exact per-frame coefficients override the run-wide chord in the reader (the same
+        // per-spectrum contract as the sqrt-grid lanes; `reconstruct_per_spectrum_grid_mz`).
+        if exact_per_spectrum.is_some() {
+            md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+        }
         std::sync::Arc::new((*base).clone().with_metadata(md))
     };
     let mob_field = BufferName::new(
@@ -3282,7 +3300,7 @@ where
         // true m/z bins. The chunk-shaped fields are materialized by running the chunker on a
         // representative sample of the real per-frame arrays (identical BufferNames/units), so the
         // write-time schema matches the runtime chunk struct exactly.
-        Some(width_th) => ims_chunked_peak_schema(model_a, model_b, width_th, int_intensity),
+        Some(width_th) => ims_chunked_peak_schema(model_a, model_b, width_th, int_intensity, exact_per_spectrum),
         None => ArrayBuffersBuilder::default()
             .prefix("point")
             .with_context(BufferContext::Spectrum)
@@ -3313,6 +3331,24 @@ where
             DataType::Int64,
         ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
+    if exact_per_spectrum.is_some() {
+        // The exact per-frame `m/z = (tof_c0 + tof_c1·tof)²` coefficients (vendor ModelType 1 with
+        // C2 = 0, temperature-corrected with Frames.T1), as Float64 spectra_metadata columns — the
+        // same columns/CURIEs the sqrt-grid lanes write, so the vendored reader's per-spectrum
+        // fixup (`reconstruct_per_spectrum_grid_mz`, applied on the PEAKS facet where ims-compact
+        // keeps its points — `get_spectrum_peak_arrays_for`) recovers the exact m/z.
+        builder = builder
+            .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+                TOF_C0_CURIE,
+                "tof_c0",
+                DataType::Float64,
+            ))
+            .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+                TOF_C1_CURIE,
+                "tof_c1",
+                DataType::Float64,
+            ));
+    }
     // Peak-facet row-group size (rows) = the per-chunk zstd granularity. Smaller = finer random
     // access (fewer peaks to decompress per frame) but worse compression; default is parquet's 2^20.
     // Tunable via $MZPC_ROW_GROUP_ROWS for benchmarking the size/random-access tradeoff.
@@ -3454,6 +3490,27 @@ where
         "approximation": "two-point chord (timsrust); drops C2 and the per-frame temperature term",
         "exact_model": "metadata.vendor_mz_calibration (ModelType 1) when present",
     });
+    if let Some(exact) = exact_per_spectrum {
+        // Every frame's MzCalibration row is ModelType 1 with C2 = C3 = C4 = dC2 = 0 (stored zeros,
+        // not NULL), so the vendor model IS a sqrt-linear law in tof per frame: the per-spectrum
+        // pair reproduces the ModelType-1 formula exactly (1e-12 relative, `tests/
+        // tdf_exact_tof_calibration.rs`; the formula is SDK-verified on C2 ≠ 0 rows, the C2 = 0
+        // SDK golden comes from `MZPC_TDF_SDK_GOLDEN`). `a`/`b` and `exact: false` stay as they are
+        // for readers that only know the run-wide chord. `exact_per_spectrum` is a PER-SPECTRUM
+        // statement: a spectrum whose tof_c0/tof_c1 cells are NULL (NULL Frames.T1, counted in
+        // `per_spectrum_chord_frames`) is on the chord, and both readers treat it so.
+        cal["per_spectrum"] = serde_json::json!("tof_c0,tof_c1");
+        cal["exact_per_spectrum"] = serde_json::json!(true);
+        if exact.chord_frames > 0 {
+            cal["per_spectrum_chord_frames"] = serde_json::json!(exact.chord_frames);
+        }
+        cal["per_spectrum_note"] = serde_json::json!(
+            "spectra_metadata tof_c0/tof_c1 give the vendor ModelType-1 m/z per spectrum, m/z = (tof_c0 + tof_c1*tof)^2 \
+             (MzCalibration ModelType 1 with C2 = 0, C1 temperature-corrected with Frames.T1); a spectrum with NULL \
+             tof_c0/tof_c1 (NULL Frames.T1, count in per_spectrum_chord_frames) is on the run-wide chord a/b, which \
+             remains for legacy readers"
+        );
+    }
     if let Some(width_th) = chunk_cfg {
         cal["chunk_bounds"] = serde_json::json!("mz");
         cal["chunk_width_th"] = serde_json::json!(width_th);
@@ -3499,8 +3556,9 @@ fn convert_ims_compact_archive(
     } else {
         ("absolute", None)
     };
+    let exact = reader.exact_tof_per_spectrum();
     // The native reader is Sync (mmap-backed timsrust FrameReader), so decode frames in parallel.
-    write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, n, tof_encoding, chunk_cfg, move |i, int| {
+    write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, n, tof_encoding, chunk_cfg, exact, move |i, int| {
         if ims_chunked {
             // Chunked layout: absolute TOF, whole frame sorted by TOF (== sorted by m/z) so the
             // chunker's m/z bins are contiguous. Per-scan delta OFF (chunker deltas per chunk).
@@ -3524,8 +3582,19 @@ fn convert_ims_compact_sdk(
     let reader = bruker_sdk::TdfSdkReader::open(input)?;
     let (a, b) = reader.tof_mz_model();
     let n = reader.len();
+    let exact = reader.exact_tof_per_spectrum();
+    // Diagnostic (MZPC_TDF_SDK_GOLDEN=<out.json>): sample the SDK's own tims_index_to_mz over the
+    // run so the ModelType-1 formula can be checked against the vendor library off-box. Never
+    // fails the conversion.
+    if let Some(out) = std::env::var_os("MZPC_TDF_SDK_GOLDEN").filter(|v| !v.is_empty()) {
+        let out = PathBuf::from(out);
+        match reader.dump_sdk_golden(&out) {
+            Ok(n_pts) => log::info!("MZPC_TDF_SDK_GOLDEN: wrote {n_pts} SDK (frame, tof, m/z) points to {}", out.display()),
+            Err(e) => log::warn!("MZPC_TDF_SDK_GOLDEN: no golden dump written to {} ({e:#}); continuing", out.display()),
+        }
+    }
     // The SDK decoder writes absolute TOF (its ims_compact_spectrum has no delta and no chunking).
-    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, n, "absolute", None, |i, int| {
+    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, n, "absolute", None, exact, |i, int| {
         reader.ims_compact_spectrum(i, int)
     })
 }

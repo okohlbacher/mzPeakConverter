@@ -6,6 +6,111 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **timsTOF ims-compact: exact per-frame `tof_c0`/`tof_c1` when the vendor calibration is
+  sqrt-linear (`C2 = 0`).** The Bruker ModelType-1 model (speXtract, 2.5e-5 ppm vs the SDK) is
+  `C2·u² + (1e6/√C1_eff)·u + (C0 − t_ns) = 0`, `m/z = u²`, with `C1_eff` temperature-corrected
+  per frame; when `C2 = C3 = C4 = dC2 = 0` it is EXACTLY `m/z = (c0 + c1·tof)²` per frame with
+  `c1 = DigitizerTimebase·√C1_eff/1e6`, `c0 = (DigitizerDelay − C0)·√C1_eff/1e6`. Both ims-compact
+  lanes (native timsrust and `--bruker-sdk`) now resolve each frame's `MzCalibration` row
+  (`Frames.MzCalibration → Id`, `Frames.T1` for the temperature) and, when EVERY referenced row
+  is of that form — `C2`/`C3`/`C4`/`dC2` STORED as numeric zeros: a NULL or text cell reads as 0
+  for the informational model but is a missing term, not a zero, and keeps the run on the chord,
+  as the reference `TdfMzCalibration.h` refuses it — attach the pair as
+  per-spectrum Float64 params `tof_c0`/`tof_c1` (`TOF_C0_CURIE`/`TOF_C1_CURIE`, the sqrt-grid
+  lanes' columns), stamp the `tof` column with `mzpeak:transform_params_per_spectrum =
+  "tof_c0,tof_c1"` and add `per_spectrum: "tof_c0,tof_c1"`, `exact_per_spectrum: true` and a
+  note to `ims_calibration` (`a`/`b` and `exact: false` kept for legacy readers). A frame whose
+  `Frames.T1` is NULL cannot be evaluated (the vendor library would see 0 K through
+  `sqlite3_column_double`, ~5e-4 on `C1`, or drop the term — unknowable) and gets NO pair: NULL
+  `tof_c0`/`tof_c1` cells, which both the vendored reader and the viewer already treat as "chord
+  for this spectrum"; the count is recorded as `ims_calibration.per_spectrum_chord_frames`, and
+  `exact_per_spectrum: true` is a per-spectrum statement (a spectrum WITH the pair is on the
+  model). Any `C2 ≠ 0` row → no columns, no keys, archive unchanged. The `--bruker-sdk` lane
+  claims exactness only when the `T1`/`MzCalibration` columns were actually read (`read_frames`
+  now reports it), mirroring the native lane's `table.t1.len() == frames.len()` guard — a TDF
+  without them stays on the chord on both lanes. `src/bruker_native.rs`: `TdfMzCalibrationRow`
+  (`tof_to_mz` general formula, cancellation-free quadratic; `is_sqrt_linear`;
+  `sqrt_linear_coeffs`; `quadratic_terms_stored`), `read_mz_calibration_rows` (NULL → 0 +
+  stored-ness), `exact_tof_coeffs` / `exact_tof_coeffs_for` (all-or-nothing on the model,
+  per-frame `None` for NULL `T1`, self-checked against the general formula), `ExactTofSummary`,
+  `add_exact_tof_params`; `NativeTofReader.exact_tof` + `observed_mz_range` on the exact pair;
+  `src/bruker_sdk.rs` `TdfSdkReader.exact_tof`; `src/main.rs` `write_ims_compact_archive*`
+  gain `exact_per_spectrum: Option<ExactTofSummary>`. The vendored reader's per-spectrum fixup
+  (`reader/point.rs reconstruct_per_spectrum_grid_mz`) keys on the `SqrtMzFromTof` array index
+  entry, not on an array name, so it covers ims-compact's `tof` column — but it only ran on the
+  PROFILE facet, and ims-compact keeps its points in the PEAKS facet (see Fixed below);
+  `mzpeak-convert ARCHIVE -o x.mzML` now emits the ModelType-1 m/z. On PXD059079 2485.d (one
+  row, `C2 = 0`): 3,994/3,994 frames carry the pair, `(c0 + c1·tof)²` vs the model 5.9e-16
+  relative, chord off by up to 4.29 ppm; the vendored reader's m/z (654,681 points over 5 frames,
+  flat and `--ims-chunked`) and the mzML export's (577,096 points, back on the integer tof
+  lattice to 1.2e-10 bins) sit on the per-frame pair, 4.2–4.3 ppm from the chord. Caveat: the
+  ModelType-1 formula is SDK-verified on `C2 ≠ 0` rows only (all 60 goldens), so the `C2 = 0`
+  branch reproduces the FORMULA exactly and is not yet itself checked against `tims_index_to_mz`;
+  a `MZPC_TDF_SDK_GOLDEN` dump of 2485.d from the box, dropped in as
+  `tests/fixtures/tdf_calibration_golden_c2zero.json`, is picked up by
+  `c2_zero_sdk_goldens_match_the_sqrt_linear_pair` (< 1e-4 ppm per point; the test says
+  "skipping" until the fixture exists).
+- `MZPC_TDF_SDK_GOLDEN=<out.json>` (`--bruker-sdk` TDF conversions, Windows/Linux): samples the
+  SDK's `tims_index_to_mz` at up to 240 points (frame 1, last, 10 evenly spaced × 20 tof values
+  over `0..DigitizerNumSamples−1`; `bruker_native::sdk_golden_sample_plan`) and writes
+  `{file, digitizer_num_samples, mz_calibration, points: [{frame, t1, t2, cal_id, tof, mz_sdk}]}`
+  (`TdfSdkReader::dump_sdk_golden`). Zero cost unset; never fails the conversion. Manual §8/§10.
+- Tests: `bruker_native::exact_tof_calibration_tests` — the derived pair reproduces the
+  ModelType-1 formula at tof 0/1e5/3e5/6.36e5 to 1e-12 relative at a frame `T1` ≠ row `T1`, the
+  quadratic branch reproduces all 60 speXtract SDK goldens (`tests/fixtures/
+  tdf_calibration_golden.json`, BSD-3) to < 1e-4 ppm, NaN on out-of-model input, per-frame
+  resolution (NULL/NaN `T1` → no pair, NULL id, mixed rows, unknown id, unstored quadratic
+  terms), sqlite NULL/text `C2`/`C3`/`C4`/`dC2` → chord and NULL `Frames.T1` → no pair on a
+  synthetic TDF, sampling-plan shape, the fixture-gated `C2 = 0` SDK golden check;
+  `tests/contract_strings.rs ims_compact_per_spectrum_exact_pinned` pins the viewer contract
+  (`per_spectrum`/`exact_per_spectrum`/`per_spectrum_chord_frames` keys, the
+  `mzpeak:transform_params_per_spectrum` stamp, the `tof_c0`/`tof_c1` column names behind the
+  `_tof_c0`/`_tof_c1` suffix the viewer matches, and the MS:4000900/4000901 accessions);
+  `tests/tdf_exact_tof_calibration.rs` (corpus-gated, ~3 s) converts 2485.d with the default
+  lane and asserts the `ims_calibration` keys, the pair on all 3,994 frames, 50 frames × 10 tof
+  values vs the model < 1e-12, the vendored reader's peak-facet arrays
+  (`get_spectrum_peak_arrays_for`) AND the collapsed `get_spectrum` peak list equal to the
+  per-frame reconstruction (not the chord) with the chord > 1 ppm off, the mzML export's m/z back
+  on the integer tof lattice of the per-frame pair, and the same on an `--ims-chunked` archive
+  (chunk-reader branch).
+- The viewer counterpart (mzPeakViewer `packages/core`: per-spectrum exact pair on every ims-compact
+  tof → m/z path and the XIC) is recorded in `~/Claude/mzPeakViewer/CHANGELOG.md`, not here.
+
+### Fixed
+
+- **Vendored reader: per-spectrum sqrt TOF-grid m/z on the PEAKS facet.** The per-spectrum
+  `tof_c0`/`tof_c1` fixup (`reader/point.rs reconstruct_per_spectrum_grid_mz`) ran only on the
+  profile facet (`get_spectrum_arrays`, and `get_spectrum`'s post-pass over `spectrum.arrays`);
+  ims-compact stores its points in the peaks facet, whose four read branches (single row group
+  via the peak cache, multi row group, and both chunked paths) materialised the run-wide chord and
+  collapsed straight into a `PeakDataLevel` — so every consumer of an ims-compact archive
+  (`get_spectrum`, `mzpeak-convert ARCHIVE -o x.mzML`) stayed on the chord no matter what
+  `spectra_metadata` carried. `MzPeakReaderType::get_spectrum_peaks_for` now goes through a new
+  `get_spectrum_peak_arrays_for` (public: the peak-facet arrays with the integer `tof` still
+  alongside the reconstructed m/z), which applies the per-spectrum fixup before the collapse when
+  the facet's grid column is `SqrtMzFromTof`; `get_spectrum` hands it the description params it
+  already read (no second metadata row fetch). Same on the async reader (that feature does not
+  build in this checkout for unrelated reasons — missing `AsyncChunkReader` — so it is mirrored,
+  not compiled). The now-unused `PointDataReader::get_peak_list_for` (sync + async) is gone.
+  `vendor/mzpeak_prototyping/src/reader.rs`, `reader/object_store_async.rs`, `reader/point.rs`.
+  Two consequences to know about: (1) the fixup is gated on the grid column's
+  `mzpeak:transform_params_per_spectrum` stamp, read from the peaks facet's footer schema that
+  is already in hand (`reader/point.rs schema_declares_per_spectrum_grid`, unit-tested on nested
+  point and chunk schemas) — so the stamp the converter has written since the sqrt-grid lanes is
+  now load-bearing, and a legacy chord-only ims-compact archive neither re-reads the
+  spectrum-metadata row per spectrum nor changes output (verified: a v0.9.6-built 2485 archive
+  exports the same chord lattice through the new reader); (2) every OTHER `SqrtMzFromTof` peaks
+  facet gets the per-spectrum pair too: native SciEX (`point.tof_index` with the run-wide `0,1`
+  placeholder) previously yielded NO m/z on the peaks facet, so `get_spectrum` returned
+  `PeakDataLevel::Missing` and the mzML export of a SciEX archive was empty — it now yields a
+  Centroid peak list on the spectrum's own `tof_c0`/`tof_c1`; Agilent tof-grid archives
+  previously collapsed every spectrum on the FIRST spectrum's chord hint and now use each
+  spectrum's own pair (the polynomial refinement the viewer applies is still not applied by the
+  vendored reader). Neither lane is exercised on the macOS host; the box's SciEX `.wiff` →
+  `.mzpeak` → mzML round trip is the check.
+
 ### Changed
 
 - `tools/compare_lcd_native_mzml.py` (the Shimadzu native-lane release gate) reads the v0.9.5+ lattice

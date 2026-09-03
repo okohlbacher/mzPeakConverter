@@ -265,17 +265,19 @@ fn polarity_from_str(s: &str) -> ScanPolarity {
 /// Read the `Frames` table in Id order. `with_scans` pulls `NumScans` (TDF); TSF has no such column.
 /// A TDF also yields `T1`/`T2`/`MzCalibration`, the per-frame inputs of the vendor's exact TOF→m/z
 /// model — but only when its schema has them: an older TDF without those columns must still convert,
-/// so the query falls back to the core four (the calibration columns then come out null).
-fn read_frames(conn: &Connection, with_scans: bool) -> Result<Vec<FrameMeta>> {
+/// so the query falls back to the core four (the calibration columns then come out null). The
+/// returned flag says whether the calibration columns WERE read, so the exact per-frame lane can
+/// refuse a file where every `t1`/`mz_cal_id` is `None` merely because the columns are missing.
+fn read_frames(conn: &Connection, with_scans: bool) -> Result<(Vec<FrameMeta>, bool)> {
     if with_scans {
         match read_frames_inner(conn, true, true) {
-            Ok(rows) => return Ok(rows),
+            Ok(rows) => return Ok((rows, true)),
             Err(e) => log::warn!(
                 "TDF Frames T1/T2/MzCalibration unavailable ({e}); per-frame calibration columns omitted"
             ),
         }
     }
-    read_frames_inner(conn, with_scans, false)
+    Ok((read_frames_inner(conn, with_scans, false)?, false))
 }
 
 fn read_frames_inner(conn: &Connection, with_scans: bool, with_cal: bool) -> Result<Vec<FrameMeta>> {
@@ -361,7 +363,7 @@ impl TsfSdkReader {
             anyhow!("tsf_open failed for {}: {e} ({})", dir.display(), api.last_error_tsf())
         })?;
         let conn = open_sqlite(&dir, "analysis.tsf")?;
-        let frames = read_frames(&conn, false)?;
+        let (frames, _) = read_frames(&conn, false)?;
         Ok(Self { api, handle, frames, _not_thread_safe: PhantomData })
     }
 
@@ -464,6 +466,13 @@ pub struct TdfSdkReader {
     /// these the SDK lane wrote every MS2 frame with NO precursor at all — the whole precursor facet
     /// silently absent on the lane that exists precisely for files the native reader cannot decode.
     windows: HashMap<i64, Vec<crate::bruker_native::FrameWindow>>,
+    /// The `.d` directory (for the golden dump's re-read of `analysis.tdf`).
+    dir: PathBuf,
+    /// EXACT per-frame `(c0, c1)` with `m/z = (c0 + c1·tof)²` when every frame's `MzCalibration`
+    /// row is sqrt-linear (ModelType 1, `C2 = 0`) — identical to the native lane's
+    /// (`crate::bruker_native::exact_tof_coeffs`), so both lanes write the same columns. A `None`
+    /// entry is a frame with a NULL `Frames.T1`, which stays on the chord.
+    exact_tof: Option<Vec<Option<(f64, f64)>>>,
     _not_thread_safe: PhantomData<*const ()>,
 }
 
@@ -475,17 +484,95 @@ impl TdfSdkReader {
             anyhow!("tims_open failed for {}: {e} ({})", dir.display(), api.last_error_tims())
         })?;
         let conn = open_sqlite(&dir, "analysis.tdf")?;
-        let frames = read_frames(&conn, true)?;
-        let windows = crate::bruker_native::read_frame_windows(&dir.join("analysis.tdf"))
-            .unwrap_or_else(|e| {
-                log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
-                HashMap::new()
-            });
-        Ok(Self { api, handle, frames, windows, _not_thread_safe: PhantomData })
+        let (frames, has_cal) = read_frames(&conn, true)?;
+        let tdf = dir.join("analysis.tdf");
+        let windows = crate::bruker_native::read_frame_windows(&tdf).unwrap_or_else(|e| {
+            log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
+            HashMap::new()
+        });
+        // Exact per-frame coefficients need the per-frame T1 / MzCalibration columns — the same
+        // guard as the native lane (`table.t1.len() == frames.len()`). Without it a TDF lacking
+        // the columns would resolve every frame to the single row at its reference T1 and ship as
+        // "exact" with no temperature term, while the native lane keeps the chord for the same file.
+        let exact_tof = if has_cal {
+            crate::bruker_native::exact_tof_coeffs_for(
+                &tdf,
+                frames.len(),
+                frames.iter().map(|f| (f.t1, f.mz_cal_id)),
+            )
+        } else {
+            None
+        };
+        Ok(Self { api, handle, frames, windows, dir, exact_tof, _not_thread_safe: PhantomData })
     }
 
     pub fn len(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Whether the run carries exact `tof_c0`/`tof_c1` params (see `exact_tof`), with the count of
+    /// frames that have none (NULL `Frames.T1`) and stay on the chord.
+    pub fn exact_tof_per_spectrum(&self) -> Option<crate::bruker_native::ExactTofSummary> {
+        self.exact_tof.as_deref().map(crate::bruker_native::ExactTofSummary::of)
+    }
+
+    /// `MZPC_TDF_SDK_GOLDEN` diagnostic: sample the SDK's own `tims_index_to_mz` on up to 240
+    /// `(frame, tof)` points spread over the run and the digitizer range
+    /// (`bruker_native::sdk_golden_sample_plan`) and write them, with the `MzCalibration` rows and
+    /// each frame's `T1`/`T2`/`MzCalibration`, as JSON — the ground truth for checking the
+    /// ModelType-1 formula (and the exact per-frame `tof_c0`/`tof_c1`) against the vendor library
+    /// off-box. A frame the SDK refuses is logged and skipped, never fatal. Returns the point count.
+    pub fn dump_sdk_golden(&self, out: &Path) -> Result<usize> {
+        let tdf = self.dir.join("analysis.tdf");
+        let conn = open_sqlite(&self.dir, "analysis.tdf")?;
+        let num_samples: i64 = conn
+            .query_row(
+                "SELECT Value FROM GlobalMetadata WHERE Key = 'DigitizerNumSamples'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .context("reading GlobalMetadata.DigitizerNumSamples")?
+            .trim()
+            .parse()
+            .context("parsing DigitizerNumSamples")?;
+        let rows = crate::bruker_native::vendor_mz_calibration(&tdf)
+            .map(|v| v["mz_calibration"].clone())
+            .unwrap_or_else(|e| {
+                log::warn!("MZPC_TDF_SDK_GOLDEN: MzCalibration rows unavailable ({e})");
+                serde_json::Value::Null
+            });
+        let (frame_idx, tofs) = crate::bruker_native::sdk_golden_sample_plan(self.len(), num_samples);
+        let mut points = Vec::with_capacity(frame_idx.len() * tofs.len());
+        for &i in &frame_idx {
+            let Some(frame) = self.frames.get(i) else { continue };
+            let mz = match self.convert(self.api.tims_index_to_mz, frame.id, &tofs, "tims_index_to_mz") {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("MZPC_TDF_SDK_GOLDEN: frame {} skipped ({e})", frame.id);
+                    continue;
+                }
+            };
+            for (t, m) in tofs.iter().zip(mz) {
+                points.push(serde_json::json!({
+                    "frame": frame.id,
+                    "t1": frame.t1,
+                    "t2": frame.t2,
+                    "cal_id": frame.mz_cal_id,
+                    "tof": t,
+                    "mz_sdk": m,
+                }));
+            }
+        }
+        let doc = serde_json::json!({
+            "file": self.dir.display().to_string(),
+            "digitizer_num_samples": num_samples,
+            "mz_calibration": rows,
+            "sampling": "frame 1, last frame, 10 evenly spaced frames; 20 tof values over 0..DigitizerNumSamples-1",
+            "points": points,
+        });
+        let bytes = serde_json::to_vec_pretty(&doc)?;
+        std::fs::write(out, bytes).with_context(|| format!("writing {}", out.display()))?;
+        Ok(points.len())
     }
 
     /// Attach this frame's MS2 precursors, using the VENDOR's own scan→1/K0 conversion
@@ -667,12 +754,16 @@ impl TdfSdkReader {
         if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
             crate::bruker_native::add_frame_calibration_params(&mut descr, t1, t2, id);
         }
+        let exact = self.exact_tof.as_ref().and_then(|v| v.get(i).copied().flatten());
+        if let Some((c0, c1)) = exact {
+            crate::bruker_native::add_exact_tof_params(&mut descr, c0, c1);
+        }
         self.attach_precursors(&mut descr, frame);
-        // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (a + b·tof)²
-        // (monotonic in tof) over the min/max TOF index present. Without this the viewer shows
-        // "m/z 0–0".
+        // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (c0 + c1·tof)²
+        // (monotonic in tof; the exact per-frame pair when the run has one, else the run-wide
+        // chord) over the min/max TOF index present. Without this the viewer shows "m/z 0–0".
         if let (Some(&tmin), Some(&tmax)) = (tof.iter().min(), tof.iter().max()) {
-            let (a, b) = self.tof_mz_model();
+            let (a, b) = exact.unwrap_or_else(|| self.tof_mz_model());
             let mz = |t: i32| -> f64 {
                 let v = a + b * t as f64;
                 v * v

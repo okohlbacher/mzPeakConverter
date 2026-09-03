@@ -861,7 +861,65 @@ impl<
         &mut self,
         index: u64,
     ) -> io::Result<Option<PeakDataLevel<C, D>>> {
+        self.get_spectrum_peaks_with_params(index, None)
+    }
+
+    /// Read the peak-facet ARRAYS of a spectrum (before they collapse into a [`PeakDataLevel`]):
+    /// for a TOF-grid / ims-compact facet that is the integer `tof` column plus intensity and ion
+    /// mobility, with m/z reconstructed — from the spectrum's own `tof_c0`/`tof_c1` when the facet's
+    /// grid column is stamped `mzpeak:transform_params_per_spectrum` (one spectrum-metadata row
+    /// read; none otherwise), else from the run-wide chord. Same return contract as
+    /// [`Self::get_spectrum_peaks_for`].
+    pub fn get_spectrum_peak_arrays_for(
+        &mut self,
+        index: u64,
+    ) -> io::Result<Option<BinaryArrayMap>> {
+        self.get_spectrum_peak_arrays_with_params(index, None)
+    }
+
+    /// [`Self::get_spectrum_peaks_for`] with the spectrum's already-read description params, so
+    /// [`Self::get_spectrum`] does not fetch the metadata row twice.
+    fn get_spectrum_peaks_with_params(
+        &mut self,
+        index: u64,
+        params: Option<&[mzdata::params::Param]>,
+    ) -> io::Result<Option<PeakDataLevel<C, D>>> {
+        match self.get_spectrum_peak_arrays_with_params(index, params)? {
+            Some(arrays) => PeakDataLevel::try_from(&arrays).map(Some).map_err(io::Error::from),
+            None => Ok(None),
+        }
+    }
+
+    fn get_spectrum_peak_arrays_with_params(
+        &mut self,
+        index: u64,
+        params: Option<&[mzdata::params::Param]>,
+    ) -> io::Result<Option<BinaryArrayMap>> {
         let builder = self.handle.spectrum_peaks()?;
+        // Per-spectrum sqrt TOF-grid m/z (3c) on the PEAKS facet: the point/chunk readers below
+        // materialize the run-wide `(a + b·tof)²` chord; a facet whose grid column declares
+        // per-spectrum coefficients (`tof_c0`/`tof_c1` on the description — the timsTOF ims-compact
+        // exact lane, the SciEX/Agilent sqrt grids; the same contract `get_spectrum_arrays` honours
+        // on the profile facet) gets that overridden with the spectrum's own pair BEFORE the arrays
+        // collapse into a peak list, where the `tof` column is gone. Without this every ims-compact
+        // consumer (`get_spectrum`, the mzML export) stayed on the chord no matter what the archive
+        // declared. Gated on the writer's `mzpeak:transform_params_per_spectrum` stamp on the grid
+        // column (read from the facet's footer schema already in hand), so a legacy chord-only
+        // ims-compact archive neither re-reads the metadata row per spectrum nor changes output.
+        let per_spectrum_grid = self.metadata.spectra.peak_indices.as_ref().is_some_and(|m| {
+            m.array_indices.iter().any(|v| {
+                matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+            })
+        }) && crate::reader::point::schema_declares_per_spectrum_grid(builder.schema());
+        let owned_params: Option<Vec<mzdata::params::Param>> = if per_spectrum_grid && params.is_none() {
+            self.get_spectrum_metadata(index)
+                .ok()
+                .flatten()
+                .map(|d| d.params().to_vec())
+        } else {
+            None
+        };
+
         let meta_index = self
             .metadata
             .spectra
@@ -880,21 +938,18 @@ impl<
         // A CHUNKED peaks facet (timsTOF --ims-chunked) must go through the chunk reader. The peak
         // cache below is point-layout only, so this dispatch has to come first — otherwise a chunked
         // archive decodes to nothing and every consumer sees empty spectra.
-        if let SpectrumDataIndex::Chunk(query_index) = &meta_index.query_index {
-            let arrays = ChunkDataReader::new(builder, BufferContext::Spectrum).read_chunks_for(
+        let mut out: Option<BinaryArrayMap> = if let SpectrumDataIndex::Chunk(query_index) = &meta_index.query_index {
+            Some(ChunkDataReader::new(builder, BufferContext::Spectrum).read_chunks_for(
                 index,
                 query_index,
                 &meta_index.array_indices,
                 None,
                 Some(PageQuery::new(row_group_indices, pages)),
-            )?;
-            return PeakDataLevel::try_from(&arrays).map(Some).map_err(io::Error::from);
-        }
-
-        // If there is only one row group in the scan, take the fast path through the cache
-        if row_group_indices.len() == 1 {
+            )?)
+        } else if row_group_indices.len() == 1 {
+            // If there is only one row group in the scan, take the fast path through the cache
             let row_group_index = row_group_indices[0];
-            let arrays = if self.spectrum_peak_cache.contains(row_group_index, index) {
+            if self.spectrum_peak_cache.contains(row_group_index, index) {
                 self.spectrum_peak_cache
                     .slice_to_arrays_of(row_group_index, index, None)?
             } else {
@@ -917,36 +972,42 @@ impl<
                 self.spectrum_peak_cache.accept(block);
                 self.spectrum_peak_cache
                     .slice_to_arrays_of(row_group_index, index, None)?
-            };
-            match arrays {
-                Some(arrays) => match PeakDataLevel::try_from(&arrays) {
-                    Ok(peaks) => Ok(Some(peaks)),
-                    Err(e) => Err(e.into()),
-                },
-                None => Ok(None),
             }
         } else {
             match meta_index.query_index {
-                index::GenericDataIndex::Point(ref _query_index) => {
-                    PointDataReader(builder, BufferContext::Spectrum)
-                        .get_peak_list_for(index, meta_index)
+                index::GenericDataIndex::Point(ref query_index) => {
+                    PointDataReader(builder, BufferContext::Spectrum).read_points_of(
+                        index,
+                        query_index,
+                        &meta_index.array_indices,
+                        None,
+                    )?
                 }
                 index::GenericDataIndex::Chunk(ref query_index) => {
                     let reader = ChunkDataReader::new(builder, BufferContext::Spectrum);
-                    let out = reader.read_chunks_for(
+                    Some(reader.read_chunks_for(
                         index,
                         query_index,
                         &meta_index.array_indices,
                         None,
                         None,
-                    )?;
-                    match PeakDataLevel::try_from(&out) {
-                        Ok(val) => return Ok(Some(val)),
-                        Err(e) => return Err(e.into()),
-                    }
+                    )?)
                 }
             }
+        };
+
+        if per_spectrum_grid {
+            if let Some(arrays) = out.as_mut() {
+                let params: &[mzdata::params::Param] =
+                    params.or(owned_params.as_deref()).unwrap_or(&[]);
+                crate::reader::point::reconstruct_per_spectrum_grid_mz(
+                    arrays,
+                    params,
+                    &meta_index.array_indices,
+                );
+            }
         }
+        Ok(out)
     }
 
     /// Perform slicing random access over the peak data for spectra in this file.
@@ -1595,7 +1656,9 @@ impl<
 
             let peaks = if read_peaks
             {
-                self.get_spectrum_peaks_for(index as u64)
+                // The description is already in hand: hand its params to the peaks path so a
+                // per-spectrum TOF grid does not re-read the metadata row.
+                self.get_spectrum_peaks_with_params(index as u64, Some(description.params()))
                     .inspect_err(|e| {
                         log::error!("Failed to read spectrum peak data for {index}: {e}")
                     })

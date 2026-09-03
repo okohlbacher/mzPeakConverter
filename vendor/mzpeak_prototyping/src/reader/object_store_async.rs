@@ -666,7 +666,39 @@ impl<
         &mut self,
         index: u64,
     ) -> io::Result<Option<PeakDataLevel<C, D>>> {
+        match self.get_spectrum_peak_arrays_for(index).await? {
+            Some(arrays) => PeakDataLevel::try_from(&arrays).map(Some).map_err(io::Error::from),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the peak-facet ARRAYS of a spectrum with m/z reconstructed — from the spectrum's own
+    /// `tof_c0`/`tof_c1` when the facet's grid column carries per-spectrum coefficients (the
+    /// timsTOF ims-compact exact lane), else from the run-wide chord. Mirrors the sync reader's
+    /// `get_spectrum_peak_arrays_for`; the fixup has to happen here, before the arrays collapse into
+    /// a peak list and the `tof` column is gone.
+    pub async fn get_spectrum_peak_arrays_for(
+        &mut self,
+        index: u64,
+    ) -> io::Result<Option<BinaryArrayMap>> {
         let builder = self.handle.spectrum_peaks().await?;
+        // Gated on the grid column's `mzpeak:transform_params_per_spectrum` stamp (footer schema
+        // already in hand), exactly like the sync reader: no metadata re-read on legacy archives.
+        let per_spectrum_grid = self.metadata.spectra.peak_indices.as_ref().is_some_and(|m| {
+            m.array_indices.iter().any(|v| {
+                matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+            })
+        }) && crate::reader::point::schema_declares_per_spectrum_grid(builder.schema());
+        let params: Vec<mzdata::params::Param> = if per_spectrum_grid {
+            self.get_spectrum_metadata(index)
+                .await
+                .ok()
+                .flatten()
+                .map(|d| d.params().to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let meta_index = self
             .metadata
             .spectra
@@ -677,9 +709,19 @@ impl<
                 "peak data index was not found",
             ))?;
 
-        return AsyncPointDataReader(builder, BufferContext::Spectrum)
-            .get_peak_list_for(index, meta_index)
-            .await;
+        let mut out = AsyncPointDataReader(builder, BufferContext::Spectrum)
+            .read_points_of(index, &meta_index.query_index, &meta_index.array_indices, None)
+            .await?;
+        if per_spectrum_grid {
+            if let Some(arrays) = out.as_mut() {
+                crate::reader::point::reconstruct_per_spectrum_grid_mz(
+                    arrays,
+                    &params,
+                    &meta_index.array_indices,
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Read all signal data within the specified `time_range`, optionally constrained to `mz_range` m/z values and/or
