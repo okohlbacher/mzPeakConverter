@@ -35,4 +35,27 @@
     <Platforms>x64</Platforms>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Shimadzu.LabSolutions.IO 5.0.0.0 (the version ProteoWizard 3.0.26151+ ships) deserializes
+         part of the .lcd through BinaryFormatter, which .NET disables by default since .NET 5:
+         `LoadData` then throws NotSupportedException wrapped in a TargetInvocationException and the
+         file looks unreadable. The 3.8.4 DLL did not need it.
+
+         This matters far beyond loading: 3.8.4 returns centroid intensities MISALIGNED against
+         their m/z on profile-less .lcd files (shifted 1-7 positions, last peak dropped) — the
+         long-standing "vendor defect". 5.0.0.0 returns them CORRECTLY: measured on
+         DIA_Hela_20ng.lcd, msconvert driving 5.0.0.0 reproduces the LabSolutions export exactly
+         (612/14,300/13,558/11,361 peaks, max |dintensity| = 0), where 3.8.4 gives n-1 and the
+         rotation. So enabling this switch is what lets the native lane read those files correctly.
+
+         SECURITY: BinaryFormatter is disabled by default because deserializing UNTRUSTED input is
+         unsafe. The input here is a vendor instrument file the user chose to convert, and the same
+         code path is what ProteoWizard itself runs. Do not widen this to other inputs. Note .NET 9
+         REMOVES BinaryFormatter outright, so a future retarget needs Shimadzu to ship a DLL that
+         does not use it. -->
+    <RuntimeHostConfigurationOption
+      Include="System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization"
+      Value="true" Trim="false" />
+  </ItemGroup>
+
 </Project>
