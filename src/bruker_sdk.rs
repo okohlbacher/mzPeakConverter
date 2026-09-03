@@ -762,15 +762,24 @@ impl TdfSdkReader {
         // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (c0 + c1·tof)²
         // (monotonic in tof; the exact per-frame pair when the run has one, else the run-wide
         // chord) over the min/max TOF index present. Without this the viewer shows "m/z 0–0".
+        let (a, b) = exact.unwrap_or_else(|| self.tof_mz_model());
+        let mz = |t: i32| -> f64 {
+            let v = a + b * t as f64;
+            v * v
+        };
         if let (Some(&tmin), Some(&tmax)) = (tof.iter().min(), tof.iter().max()) {
-            let (a, b) = exact.unwrap_or_else(|| self.tof_mz_model());
-            let mz = |t: i32| -> f64 {
-                let v = a + b * t as f64;
-                v * v
-            };
             let (mz_a, mz_b) = (mz(tmin), mz(tmax));
             crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
         }
+        // TIC / base peak: this lane REPLACES the m/z array with integer `tof`, so mzdata derives
+        // tic = 0 and base peak (0, 0) from the m/z-less array map. Compute them from the
+        // intensities actually stored, reconstructing m/z only at the running maximum bin.
+        let (tic, base) = if int_intensity {
+            crate::summarize_points(int_i32.iter().map(|&v| v as f32), |k| mz(tof[k]))
+        } else {
+            crate::summarize_points(int_f32.iter().copied(), |k| mz(tof[k]))
+        };
+        crate::set_spectrum_summary_params(&mut descr, tic, base);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
