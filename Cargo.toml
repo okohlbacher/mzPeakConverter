@@ -1,6 +1,6 @@
 [package]
 name = "mzpeak-convert"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2024"
 # MSRV floor: 1.88 (time 0.3.55 / serde_with 3.22 via mzdata 0.66; was 1.87 from mzpeak_prototyping).
 rust-version = "1.88"
