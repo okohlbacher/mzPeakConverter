@@ -6,6 +6,70 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Grid-routed spectra shipped `total_ion_current = 0`, no base peak, and NULL observed-m/z
+  bounds.** Every route that replaces a spectrum's f64 `m/z array` with an integer axis
+  (`tof_index` / `tof`) handed the writer a `BinaryArrayMap` with no m/z, and mzdata derives the
+  per-spectrum summaries from m/z + intensity: an m/z-less map folds to `tic = 0`,
+  `base peak = (0, 0)`, `m/z range = (0, 0)`. Measured on the published corpus: Shimadzu
+  `Blind_P1_pos_012.mzpeak` 13,200/13,200 spectra with TIC 0, `MTBLS5861/HEK_PosOAD1.mzpeak`
+  2,092/2,101 (exactly the gridded set — the 9 f64 fallbacks were correct),
+  `agilent-qtof/…-S25.mzpeak` 1,502/1,502, and the SCIEX `Sample002.mzpeak` 112,610 gridded rows
+  with TIC 0 and NULL base peak. The peak DATA was always intact — recomputing TIC from the archive
+  peaks reproduces the LabSolutions oracle exactly, and the archive TIC/BPC chromatograms are
+  bit-identical to it — so only these summary columns were wrong. Fixed in both halves:
+  - **Converter.** A shared helper (`summarize_points` / `set_spectrum_summary_params` /
+    `set_gridded_spectrum_summary`, next to `set_observed_mz_range` in `src/main.rs`) computes
+    MS:1000285 total ion current, MS:1000504/MS:1000505 base peak m/z + intensity and
+    MS:1000528/MS:1000527 observed range from the (m/z, intensity) pairs the route is about to
+    discard, and states them on the `SpectrumDescription`. Applied at every such site: the mzML
+    `--tof-grid` lane, the Shimadzu profile grid route, the SCIEX per-spectrum grid, the Agilent
+    `MSProfile.bin` grid (m/z reconstructed the way a reader does — polynomial-refined when the
+    spectrum has a calibration row), and both timsTOF ims-compact lanes (native + `--bruker-sdk`),
+    which had the same defect on all 3,994 frames of PXD059079 2485.d. Ties in intensity resolve to
+    the lowest m/z (mzdata breaks them first-in-array; the two coincide on an m/z-ascending source
+    array, and lowest-m/z is the reproducible rule on the ims lanes, whose points are grouped by
+    mobility scan); a point whose m/z is not finite AND positive can never be the base peak, though
+    its intensity still counts towards the TIC; an empty or all-zero spectrum keeps TIC 0 and gains
+    NO base peak. The terms REPLACE any the source stated, so a gridded archive agrees with the same
+    input converted without the grid (`swath.api-sample-centroid.mzML` declares a profile-mode
+    `MS:1000285` of 1.184903e6 where its own centroid points sum to 272,543).
+
+    On a DUAL Shimadzu scan (profile trace + centroid list, the shape of both published `.lcd`
+    archives) the stated summary is the PROFILE SIGNAL SPAN — the points written to the
+    `spectra_data` facet, not the zero-padded source array and not the centroid list riding
+    alongside. That is what the writer derives for the same file with `--tof-grid` off (the raw
+    array map wins over the peak list) and what its own `base_peak_mz` precedence already used, so
+    the two lanes describe the file identically. Concretely, `Blind_P1_pos_012` spectrum 0 now
+    reports 13,220 (profile), not 12,877 (centroid); the TIC/BPC chromatograms are built from
+    `peaks()` and stay centroid-derived at 12,877, a split that predates this change. The published
+    `HEK_PosOAD1.mzpeak` settles it from within: its 9 never-broken rows (the off-lattice spectra
+    kept as f64) carry the PROFILE sum exactly — row 149 is 672,849 profile vs 607,167 centroid,
+    and the column says 672,849 — so stating the profile sum on the other 2,092 makes the column
+    mean the same thing on every row of the file.
+  - **Vendored writer (defence in depth).** `writer/visitor.rs` now falls back to the explicit
+    MS:1000285 / MS:1000504 / MS:1000505 params — the same fallback the observed-m/z range already
+    had — at both the spectrum and the wavelength builder, so no future lane can ship zeros. The
+    gate names the CAUSE, "the raw arrays carry signal on a non-m/z axis", rather than the symptom
+    "no summary came out anywhere". Both halves matter: a dual `.lcd` scan keeps its centroid
+    `PeakSet` through the grid route, so a symptom gate would skip the fallback and leave the two
+    published Shimadzu archives at TIC 0; and an mzML `defaultArrayLength="0"` scan still carries
+    MS:1000285/504/505 in its header, so a symptom gate would stamp a measurement onto a row with
+    zero data points and zero peaks. A spectrum whose raw arrays DO carry m/z is untouched, and a
+    genuinely empty spectrum still gets NULL bounds, no base peak and TIC 0 even when its header
+    states otherwise.
+
+  Verified on this host: `swath.api-sample-centroid.mzML --tof-grid on` went from 201/201 spectra
+  with TIC 0 and a NULL base peak to 0/201, with all five summary columns now bit-identical to the
+  `--tof-grid off` lane; PXD059079 2485.d went from 3,994/3,994 frames with TIC 0 to 0/3,994 on
+  BOTH ims lanes (compact and `--ims-chunked`), the TIC column matching the sum of the archive's own
+  stored points to Float32 precision (max relative error 5.8e-8) and the base peak lying inside the
+  observed range on all 3,994 rows. No ordinary lane moved: the 31 MB Thermo FT-ICR mzML
+  (4,880 spectra, 2,847 of them empty) and the Waters `DDA_IsolationWindow.mzML` (2 empty spectra)
+  are byte-for-byte unchanged in all five summary columns against the pre-fix binary. The Shimadzu
+  and Agilent `.d`/`.lcd` lanes are Windows-only and must be re-measured on the Flash box.
+
 ### Removed
 
 - **The reflective Shimadzu reader dump (`MZPC_SHIMADZU_DUMP_READER=1`) is gone.** It walked the

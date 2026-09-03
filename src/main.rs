@@ -2046,9 +2046,176 @@ fn set_observed_mz_range(descr: &mut mzdata::spectrum::SpectrumDescription, mz_m
     }
 }
 
+/// TIC and base peak over an intensity slice, with m/z supplied lazily per point.
+///
+/// Returns `(tic, Some((base_peak_mz, base_peak_intensity)))`, or `(tic, None)` when the spectrum
+/// carries no positive intensity at all (empty, or an all-zero trace) — a spectrum with nothing in
+/// it has no base peak, and inventing one at m/z 0 is worse than leaving the term absent.
+///
+/// `mz_at(i)` is only called for points that can still win, so a caller reconstructing m/z from an
+/// integer axis (`m/z = (c0 + c1·tof)²`) pays for the model only on the running maximum. Ties in
+/// intensity resolve to the LOWEST m/z, which does NOT fall out of a first-wins scan: the ims
+/// lanes emit points grouped by mobility scan, so the array is not globally m/z-ascending.
+///
+/// TIE RULE, stated because it is observable in the archive: mzdata's own `fetch_summaries` breaks
+/// an intensity tie first-in-array, this breaks it at the lowest m/z. On an m/z-ascending source
+/// array (the mzML and SCIEX grid lanes) the two rules coincide, so a gridded archive and the same
+/// file converted without the grid agree exactly. On the ims lanes, where the points are grouped by
+/// mobility scan, first-in-array would be an arbitrary pick among equal maxima and lowest-m/z is
+/// the reproducible one. A tied spectrum can therefore report a different `base_peak_mz` than a
+/// first-wins reader would — at the same `base_peak_intensity`.
+///
+/// A point is only eligible to be the base peak if its m/z is finite AND positive: the Agilent
+/// reconstruction can hand back a non-positive m/z for a bin outside the calibration's usable
+/// range, and the writer discards a non-positive MS:1000504 anyway (which would silently drop the
+/// base peak entirely rather than move it to the next-best point). Such points still count towards
+/// the TIC — their intensity was measured, only their m/z is unusable.
+///
+/// The TIC accumulates in f64 (mzdata sums the f32 array in f32); the column is Float32 either way,
+/// so this only removes accumulation error, it does not shift the value.
+fn summarize_points<I, F>(intensities: I, mut mz_at: F) -> (f64, Option<(f64, f32)>)
+where
+    I: IntoIterator<Item = f32>,
+    F: FnMut(usize) -> f64,
+{
+    let mut tic = 0.0f64;
+    let mut best: Option<(f64, f32)> = None;
+    for (i, inten) in intensities.into_iter().enumerate() {
+        if !inten.is_finite() {
+            continue;
+        }
+        tic += inten as f64;
+        if inten <= 0.0 {
+            continue;
+        }
+        match best {
+            // Cannot beat the running maximum: skip the m/z reconstruction entirely.
+            Some((_, bint)) if inten < bint => {}
+            Some((bmz, bint)) => {
+                let mz = mz_at(i);
+                if mz.is_finite() && mz > 0.0 && (inten > bint || mz < bmz) {
+                    best = Some((mz, inten));
+                }
+            }
+            None => {
+                let mz = mz_at(i);
+                if mz.is_finite() && mz > 0.0 {
+                    best = Some((mz, inten));
+                }
+            }
+        }
+    }
+    (tic, best)
+}
+
+/// Drop every instance of the given CV terms from a description.
+fn drop_params(descr: &mut mzdata::spectrum::SpectrumDescription, curies: &[mzdata::params::CURIE]) {
+    descr
+        .params_mut()
+        .retain(|p| p.curie().is_none_or(|c| !curies.contains(&c)));
+}
+
+/// Write the summary CV terms — MS:1000285 total ion current, MS:1000504 base peak m/z,
+/// MS:1000505 base peak intensity — onto a spectrum description, REPLACING any the source already
+/// stated.
+///
+/// Replacing (rather than deferring) is what keeps a gridded archive agreeing with the same input
+/// converted without the grid. mzdata derives these columns from the data and masks the source's
+/// own terms out, so the non-grid lane writes `sum(intensity)`; an mzML that declares a
+/// profile-mode `MS:1000285` (SCIEX `swath.api-sample-centroid.mzML` says 1.184903e6 where its own
+/// centroid points sum to 272,543) would otherwise make the gridded column disagree with the
+/// non-gridded one by 4x. The column must describe the points in the archive.
+///
+/// `base` of `None` means "no positive intensity in this spectrum": the TIC term is still written
+/// (0 is the truth there), but NO base-peak terms are — and any the source stated are removed, so
+/// an all-zero spectrum cannot end up claiming a peak it does not contain.
+fn set_spectrum_summary_params(
+    descr: &mut mzdata::spectrum::SpectrumDescription,
+    tic: f64,
+    base: Option<(f64, f32)>,
+) {
+    drop_params(descr, &[curie!(MS:1000285), curie!(MS:1000504), curie!(MS:1000505)]);
+    descr.add_param(
+        Param::builder()
+            .name("total ion current")
+            .curie(curie!(MS:1000285))
+            .value(tic)
+            .unit(Unit::DetectorCounts)
+            .build(),
+    );
+    if let Some((mz, inten)) = base {
+        descr.add_param(
+            Param::builder()
+                .name("base peak m/z")
+                .curie(curie!(MS:1000504))
+                .value(mz)
+                .unit(Unit::MZ)
+                .build(),
+        );
+        descr.add_param(
+            Param::builder()
+                .name("base peak intensity")
+                .curie(curie!(MS:1000505))
+                .value(inten as f64)
+                .unit(Unit::DetectorCounts)
+                .build(),
+        );
+    }
+}
+
+/// THE grid-route summary helper: every route that REPLACES a spectrum's f64 m/z array with an
+/// integer axis (`tof_index` / `tof`) must call this with the (m/z, intensity) pairs it is about to
+/// discard, BEFORE discarding them.
+///
+/// Why: mzdata derives the per-spectrum summaries from the m/z + intensity arrays, and a
+/// `BinaryArrayMap` holding an integer axis + intensity but NO `MZArray` folds to
+/// `tic = 0, base peak = (0, 0), m/z range = (0, 0)` — so the writer shipped
+/// `total_ion_current = 0`, `base_peak_* = 0`/null and NULL observed-m/z bounds on every gridded
+/// spectrum (13,200/13,200 on a Shimadzu run, 1,502/1,502 on an Agilent one). The peak DATA was
+/// always intact; only these summary columns were wrong.
+///
+/// Pass the points ACTUALLY STORED, not the source array: a route that trims (e.g. the Shimadzu
+/// profile route fits the grid on the signal span and drops the zero-intensity pad at the scan
+/// window bounds) must summarize the same slice it writes, so the summary describes the archive.
+///
+/// The Shimadzu CENTROID lattice route is deliberately NOT a caller: it returns the spectrum
+/// unchanged and hands the lattice arrays to the writer separately, so its peak list still yields
+/// correct summaries. Only routes that replace the arrays need this.
+fn set_gridded_spectrum_summary(
+    descr: &mut mzdata::spectrum::SpectrumDescription,
+    mzs: &[f64],
+    intensities: &[f32],
+) {
+    // Misaligned input is a bug in the caller, not something to summarize half of. Silently
+    // truncating to the shorter array would state an authoritative-looking TIC over a subset — and
+    // an empty m/z array (a decode that failed upstream) would DELETE the source's own terms and
+    // write `total_ion_current = 0` in their place, which is strictly worse than not touching the
+    // description at all. Leave it untouched and say so.
+    if mzs.len() != intensities.len() {
+        log::warn!(
+            "gridded spectrum summary skipped: {} m/z values vs {} intensities",
+            mzs.len(),
+            intensities.len()
+        );
+        debug_assert_eq!(mzs.len(), intensities.len(), "gridded summary input misaligned");
+        return;
+    }
+    let n = mzs.len();
+    let (tic, base) = summarize_points(intensities[..n].iter().copied(), |i| mzs[i]);
+    set_spectrum_summary_params(descr, tic, base);
+    if let Some((lo, hi)) = mz_min_max(&mzs[..n]) {
+        // Same reason as the summary terms: the range must describe the points STORED, so a
+        // source-stated range (a padded scan window, say) is replaced rather than deferred to.
+        drop_params(descr, &[curie!(MS:1000528), curie!(MS:1000527)]);
+        set_observed_mz_range(descr, lo, hi);
+    }
+}
+
 /// Min/max over an m/z slice, guarding empty and unsorted input. Returns `None` if empty.
+/// Non-finite and non-positive values are skipped: the writer requires a finite positive
+/// MS:1000528/MS:1000527 and would drop the term rather than record "m/z ≤ 0 was observed".
 fn mz_min_max(mzs: &[f64]) -> Option<(f64, f64)> {
-    let mut it = mzs.iter().copied().filter(|v| v.is_finite());
+    let mut it = mzs.iter().copied().filter(|v| v.is_finite() && *v > 0.0);
     let first = it.next()?;
     let (mut lo, mut hi) = (first, first);
     for v in it {
@@ -2127,11 +2294,11 @@ fn tof_grid_spectrum(
     if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
         descr.add_param(mass_spectrum.clone());
     }
-    // Observed-m/z range from the source f64 m/z array (the output stores integer tof_index, so
-    // these CV terms would otherwise be absent and the viewer would show "m/z 0–0").
-    if let Some((lo, hi)) = mz_min_max(&mzs) {
-        set_observed_mz_range(&mut descr, lo, hi);
-    }
+    // Summary terms (TIC, base peak, observed-m/z range) from the source f64 m/z + intensity the
+    // grid is about to replace: the output stores integer tof_index, so mzdata would derive
+    // tic = 0, base peak = (0, 0) and "m/z 0–0" from the m/z-less array map. All points are on the
+    // grid on this branch, so `mzs`/`intensity` are exactly the points written.
+    set_gridded_spectrum_summary(&mut descr, &mzs, &intensity);
     // Route the arrays through the custom peak facet (spectra_peaks) instead of the profile-array
     // facet: the writer sends RawData+Profile to `write_spectrum_binary_array_map` (standard m/z
     // schema → our tof_index would spill to auxiliary), but RawData+Centroid to the separate peak
@@ -2396,16 +2563,28 @@ fn agilent_grid_spectrum(
             .value(ps.calibration_id as i64)
             .build(),
     );
-    // Observed-m/z range: the output stores integer tof_index, so reconstruct m/z = grid.mz(k) for
-    // the min/max tof_index actually present (grid m/z is monotonic in tof_index, so the extremes
-    // of the index range give the extremes of m/z). Without this the viewer shows "m/z 0–0".
-    if let (Some(&kmin), Some(&kmax)) = (
-        ps.tof_index.iter().min(),
-        ps.tof_index.iter().max(),
-    ) {
-        let (mz_a, mz_b) = (grid.mz(kmin), grid.mz(kmax));
-        set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
-    }
+    // Summary terms: the output stores integer tof_index and NO m/z array, so mzdata would derive
+    // tic = 0, base peak = (0, 0) and "m/z 0–0". Reconstruct m/z the way a conformant reader does —
+    // the polynomial-refined MassHunter value when this spectrum has a calibration row, else the
+    // bare 2-coefficient grid — and hand the reconstructed array to the shared grid-summary helper.
+    //
+    // The reconstruction is materialized rather than evaluated lazily at the index extremes: the
+    // bare quadratic grid is monotonic in `tof_index`, but the polynomial refinement subtracted
+    // from it is not guaranteed to be, so "min/max of m/z = m/z at min/max index" is an assumption
+    // this code has never checked. Scanning costs one `calibrated_mz` per stored point, in a
+    // function that already evaluates it twice per point for the losslessness gate above.
+    let calib = reader.calib_row(ps.index).map(|row| (row, reader.poly_flags_for(ps.index)));
+    let mz_of = |k: i32| -> f64 {
+        match calib {
+            Some((row, uf)) => {
+                let (coeff, base) = (row[0], row[1]);
+                agilent_profile::calibrated_mz(row, uf, base + (grid.c0 + grid.c1 * k as f64) / coeff)
+            }
+            None => grid.mz(k),
+        }
+    };
+    let mzs: Vec<f64> = ps.tof_index.iter().map(|&k| mz_of(k)).collect();
+    set_gridded_spectrum_summary(&mut descr, &mzs, &intensity);
     // Set retention time on the scan event.
     let mut acq = mzdata::spectrum::Acquisition::default();
     if let Some(ev) = acq.first_scan_mut() {
@@ -3984,6 +4163,27 @@ fn shimadzu_grid_route(
     int_da.unit = Unit::DetectorCounts;
     out.add(int_da);
     let mut descr = spec.description().clone();
+    // Summarize BEFORE the f64 m/z is thrown away: the output map holds tof_index + intensity and
+    // no MZArray, so mzdata would fold it to tic = 0, base peak = (0, 0), m/z range = (0, 0).
+    //
+    // WHICH POINTS: the SIGNAL SPAN of the PROFILE trace (`mz`/`inten` above are already the
+    // `signal_span` slice) — the points this route writes to the `spectra_data` facet.
+    //
+    //  * Span, not the untrimmed source array: the zero-intensity pad at the scan-window bounds is
+    //    off-grid and dropped. It carries no intensity, so the TIC is identical either way, but the
+    //    observed-m/z range must describe the stored points, not the padded scan window.
+    //  * PROFILE, not the centroid list that a dual `.lcd` scan carries alongside it. A dual scan
+    //    writes both facets, and the two sum differently (Blind_P1_pos_012 spectrum 0: profile
+    //    13,220, centroid 12,877). The profile sum is the one that keeps this lane self-consistent:
+    //    it is exactly what the writer derives for the SAME file with `--tof-grid` off (the raw
+    //    array map wins over the peak list in `raw_summaries`), and it matches the writer's own
+    //    precedence for `base_peak_mz` on every dual archive. The published `HEK_PosOAD1.mzpeak`
+    //    settles it from within: its 9 never-broken rows (off-lattice spectra kept as f64) carry
+    //    the PROFILE sum exactly — row 149 is 672,849 profile vs 607,167 centroid, and the column
+    //    says 672,849 — so the other 2,092 must state the same thing. Note the TIC/BPC
+    //    CHROMATOGRAMS are built from `spec.peaks()` and so remain centroid-derived (12,877) —
+    //    that split predates this route and is not changed here.
+    set_gridded_spectrum_summary(&mut descr, mz, inten);
     descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
     descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
     let out = MultiLayerSpectrum::new(descr, Some(out), spec.peaks.clone(), spec.deconvoluted_peaks.clone());
@@ -4264,12 +4464,18 @@ fn sciex_grid_spectrum(
     grid: tof_grid::TofGrid,
     mass_spectrum: &Param,
 ) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
-    let intensity: Vec<f32> = spec
-        .arrays
-        .as_ref()
-        .and_then(|a| a.intensities().ok())
-        .map(|c| c.into_owned())
-        .unwrap_or_default();
+    // Both arrays are decoded up front and a failure is propagated, not swallowed: an empty
+    // intensity vector would silently write an empty spectrum, and an empty m/z vector would make
+    // the summary helper state `total_ion_current = 0` over points that do exist.
+    let arrays = spec.arrays.as_ref().context("SCIEX grid spectrum has no arrays")?;
+    let intensity: Vec<f32> = arrays
+        .intensities()
+        .map_err(|e| anyhow::anyhow!("decoding SCIEX intensity: {e}"))?
+        .into_owned();
+    let src_mzs: Vec<f64> = arrays
+        .mzs()
+        .map_err(|e| anyhow::anyhow!("decoding SCIEX m/z: {e}"))?
+        .into_owned();
 
     let mut out = BinaryArrayMap::new();
     let mut tof_da =
@@ -4287,6 +4493,11 @@ fn sciex_grid_spectrum(
     if !descr.params().iter().any(|p| p.curie() == Some(curie!(MS:1000294))) {
         descr.add_param(mass_spectrum.clone());
     }
+    // Summarize from the SOURCE f64 m/z + intensity being replaced by `tof_index`. Every point of
+    // this spectrum is on the lattice (that is why it took this route), so the source arrays and
+    // the stored points are the same set — but the summary must be taken here, because the output
+    // map has no MZArray and would fold to tic = 0 / base peak (0, 0) / "m/z 0–0".
+    set_gridded_spectrum_summary(&mut descr, &src_mzs, &intensity);
     descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
     descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
     Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
@@ -5355,8 +5566,10 @@ mod tests {
         let grid = tof_grid::TofGrid { c0: 14.0, c1: 1.0e-4 };
         let mass_spectrum = Param::builder().name("mass spectrum").build();
         let on: Vec<f64> = (200_000i32..200_400).map(|k| grid.mz(k)).collect();
-        let on_int = vec![1.0f32; on.len()];
+        let mut on_int = vec![1.0f32; on.len()];
+        on_int[7] = 5.0; // an unambiguous base peak
         let (want_lo, want_hi) = (on[0], on[on.len() - 1]);
+        let want_tic = (on.len() - 1) as f64 + 5.0;
         match tof_grid_spectrum(&spec_from(&on, &on_int, 0), &grid, &mass_spectrum).unwrap() {
             TofRoute::Gridded(s) => {
                 let lo = s
@@ -5376,9 +5589,169 @@ mod tests {
                 assert!((lo_v - want_lo).abs() < 1e-6, "lo {lo_v} vs {want_lo}");
                 assert!((hi_v - want_hi).abs() < 1e-6, "hi {hi_v} vs {want_hi}");
                 assert!(lo_v > 0.0 && hi_v > lo_v, "observed m/z must be a non-zero range");
+                // The gridded spectrum's arrays carry NO m/z, so mzdata derives tic = 0 and base
+                // peak (0, 0) from them: the summary MUST be stated explicitly on the description
+                // or the archive ships zeros (13,200/13,200 spectra on a published Shimadzu run).
+                let tic = param_value(&s, mzdata::curie!(MS:1000285))
+                    .expect("total ion current (MS:1000285) present");
+                assert!((tic - want_tic).abs() < 1e-6, "tic {tic} vs {want_tic}");
+                let bp_mz = param_value(&s, mzdata::curie!(MS:1000504))
+                    .expect("base peak m/z (MS:1000504) present");
+                let bp_int = param_value(&s, mzdata::curie!(MS:1000505))
+                    .expect("base peak intensity (MS:1000505) present");
+                assert!((bp_mz - on[7]).abs() < 1e-9, "base peak m/z {bp_mz} vs {}", on[7]);
+                assert_eq!(bp_int, 5.0);
             }
             TofRoute::F64(_) => panic!("on-lattice spectrum should grid"),
         }
+    }
+
+    /// Read one CV term's numeric value off a spectrum description.
+    fn param_value(
+        s: &MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
+        c: mzdata::params::CURIE,
+    ) -> Option<f64> {
+        s.description()
+            .params()
+            .iter()
+            .find(|p| p.curie() == Some(c))
+            .and_then(|p| p.to_f64().ok())
+    }
+
+    /// REGRESSION (the Shimadzu profile grid lane). `shimadzu_grid_route` replaces the f64 m/z with
+    /// `tof_index`, and mzdata folds an m/z-less array map to tic = 0 / base peak (0, 0) / "m/z 0–0",
+    /// so every gridded spectrum of a published Shimadzu archive shipped zeros while the peak data
+    /// itself was intact. The route must state the summary explicitly — and it must describe the
+    /// SIGNAL SPAN it actually stores, not the zero-padded source array.
+    #[test]
+    fn shimadzu_grid_route_summarizes_the_points_it_stores() {
+        let (c0, c1) = (14.0f64, 1.0e-4f64);
+        let mz: Vec<f64> = (0..80i32)
+            .map(|k| {
+                let r = c0 + c1 * k as f64;
+                r * r
+            })
+            .collect();
+        // Zero-intensity pad at the scan-window bounds (indices 0..10 and 70..80) plus 60 points of
+        // signal, one of which is the base peak. The route trims to the span before fitting.
+        let mut inten = vec![0.0f32; mz.len()];
+        for v in inten.iter_mut().take(70).skip(10) {
+            *v = 100.0;
+        }
+        inten[42] = 900.0;
+
+        let (out, routed) = super::shimadzu_grid_route(spec_from(&mz, &inten, 0), c1);
+        assert_eq!(routed, Some(true), "an on-grid profile spectrum must route to the grid");
+
+        // The m/z array is gone, replaced by tof_index — which is exactly why the summary has to be
+        // carried as CV terms.
+        let arrays = out.arrays.as_ref().expect("gridded spectrum keeps arrays");
+        assert!(
+            arrays.get(&ArrayType::nonstandard("tof_index")).is_some(),
+            "the grid route must emit a tof_index array"
+        );
+        assert!(arrays.mzs().is_err(), "the grid route must drop the m/z array");
+        assert_eq!(
+            arrays.get(&ArrayType::IntensityArray).unwrap().data_len().unwrap(),
+            60,
+            "only the signal span is stored"
+        );
+
+        let want_tic = 59.0 * 100.0 + 900.0;
+        let tic = param_value(&out, mzdata::curie!(MS:1000285)).expect("MS:1000285 present");
+        assert!((tic - want_tic).abs() < 1e-6, "tic {tic} vs {want_tic}");
+        let bp_mz = param_value(&out, mzdata::curie!(MS:1000504)).expect("MS:1000504 present");
+        let bp_int = param_value(&out, mzdata::curie!(MS:1000505)).expect("MS:1000505 present");
+        assert!((bp_mz - mz[42]).abs() < 1e-9, "base peak m/z {bp_mz} vs {}", mz[42]);
+        assert_eq!(bp_int, 900.0);
+        // Observed range = the stored span, NOT the padded source array.
+        let lo = param_value(&out, mzdata::curie!(MS:1000528)).expect("MS:1000528 present");
+        let hi = param_value(&out, mzdata::curie!(MS:1000527)).expect("MS:1000527 present");
+        assert!((lo - mz[10]).abs() < 1e-9, "lo {lo} vs {}", mz[10]);
+        assert!((hi - mz[69]).abs() < 1e-9, "hi {hi} vs {}", mz[69]);
+    }
+
+    /// The shape that actually ships in the published `.lcd` archives: a DUAL scan, whose profile
+    /// trace occupies the data facet while a centroid `PeakSet` rides alongside it as the peak
+    /// facet. The route must keep the peak set (it is a facet of the archive) AND state a summary
+    /// of the PROFILE span — the points it writes to `spectra_data` — not of the centroid list.
+    /// That is the same value the writer derives for this file with `--tof-grid` off, which is what
+    /// keeps the two lanes describing the same file identically.
+    #[test]
+    fn shimadzu_grid_route_keeps_the_peak_set_and_summarizes_the_profile() {
+        let (c0, c1) = (14.0f64, 1.0e-4f64);
+        let mz: Vec<f64> = (0..80i32)
+            .map(|k| {
+                let r = c0 + c1 * k as f64;
+                r * r
+            })
+            .collect();
+        let mut inten = vec![0.0f32; mz.len()];
+        for v in inten.iter_mut().take(70).skip(10) {
+            *v = 100.0;
+        }
+        inten[42] = 900.0;
+
+        let mut spec = spec_from(&mz, &inten, 0);
+        // A centroid list that sums to something DIFFERENT from the profile (as on the real file:
+        // 12,877 vs 13,220), so the assertion below can tell the two apart.
+        spec.peaks = Some(mzpeaks::PeakSet::new(vec![
+            CentroidPeak::new(mz[20], 10.0, 0),
+            CentroidPeak::new(mz[42], 20.0, 1),
+        ]));
+
+        let (out, routed) = super::shimadzu_grid_route(spec, c1);
+        assert_eq!(routed, Some(true));
+        assert_eq!(
+            out.peaks.as_ref().map(|p| p.len()),
+            Some(2),
+            "the centroid facet must survive the grid route"
+        );
+
+        let want_tic = 59.0 * 100.0 + 900.0;
+        let tic = param_value(&out, mzdata::curie!(MS:1000285)).expect("MS:1000285 present");
+        assert!(
+            (tic - want_tic).abs() < 1e-6,
+            "TIC {tic} must be the profile span sum {want_tic}, not the centroid sum 30"
+        );
+        let bp_int = param_value(&out, mzdata::curie!(MS:1000505)).expect("MS:1000505 present");
+        assert_eq!(bp_int, 900.0, "the base peak is the profile's, not the centroid list's");
+    }
+
+    /// A spectrum with no positive intensity has no base peak: TIC 0 is the truth, but MS:1000504 /
+    /// MS:1000505 must stay ABSENT rather than claiming a peak at m/z 0.
+    #[test]
+    fn all_zero_gridded_spectrum_gets_tic_zero_and_no_base_peak() {
+        let grid = tof_grid::TofGrid { c0: 14.0, c1: 1.0e-4 };
+        let mass_spectrum = Param::builder().name("mass spectrum").build();
+        let on: Vec<f64> = (200_000i32..200_100).map(|k| grid.mz(k)).collect();
+        let on_int = vec![0.0f32; on.len()];
+        match tof_grid_spectrum(&spec_from(&on, &on_int, 0), &grid, &mass_spectrum).unwrap() {
+            TofRoute::Gridded(s) => {
+                let tic = param_value(&s, mzdata::curie!(MS:1000285)).expect("MS:1000285 present");
+                assert_eq!(tic, 0.0, "an all-zero spectrum's TIC is legitimately 0");
+                assert!(
+                    param_value(&s, mzdata::curie!(MS:1000504)).is_none(),
+                    "no base peak m/z may be fabricated"
+                );
+                assert!(
+                    param_value(&s, mzdata::curie!(MS:1000505)).is_none(),
+                    "no base peak intensity may be fabricated"
+                );
+            }
+            TofRoute::F64(_) => panic!("on-lattice spectrum should grid"),
+        }
+    }
+
+    /// Ties in intensity resolve to the LOWEST m/z — the ims lanes emit points grouped by mobility
+    /// scan, so "first wins" is not the same thing as "lowest m/z".
+    #[test]
+    fn summary_base_peak_ties_resolve_to_lowest_mz() {
+        let mzs = [300.0f64, 100.0, 200.0];
+        let intens = [7.0f32, 7.0, 1.0];
+        let (tic, base) = super::summarize_points(intens.iter().copied(), |i| mzs[i]);
+        assert_eq!(tic, 15.0);
+        assert_eq!(base, Some((100.0, 7.0)));
     }
 
     /// Regression (Option E backstop): `spectra_peaks` must never carry two `intensity array`

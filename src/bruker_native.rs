@@ -849,15 +849,21 @@ impl NativeTofReader {
 
     /// Observed-m/z range for a frame's `[tof_min, tof_max]`: on the exact per-frame model when the
     /// run has one, else on the run-wide chord. Both are monotonic in `tof`.
-    fn observed_mz_range(&self, i: usize, tof_min: i32, tof_max: i32) -> (f64, f64) {
-        let mz = |t: i32| match self.exact_tof_at(i) {
+    /// m/z for ONE absolute TOF bin in frame `i`: the exact per-frame sqrt-linear pair when the
+    /// vendor calibration gives one, else the run-wide chord. This is the model a reader applies to
+    /// the stored integer `tof`, so it is also what the per-spectrum summary terms must use.
+    fn mz_at_tof(&self, i: usize, t: i32) -> f64 {
+        match self.exact_tof_at(i) {
             Some((c0, c1)) => {
                 let u = c0 + c1 * t as f64;
                 u * u
             }
             None => self.model.mz(t),
-        };
-        let (a, b) = (mz(tof_min), mz(tof_max));
+        }
+    }
+
+    fn observed_mz_range(&self, i: usize, tof_min: i32, tof_max: i32) -> (f64, f64) {
+        let (a, b) = (self.mz_at_tof(i, tof_min), self.mz_at_tof(i, tof_max));
         (a.min(b), a.max(b))
     }
 
@@ -1127,6 +1133,17 @@ impl NativeTofReader {
             let (lo, hi) = self.observed_mz_range(i, tof_min, tof_max);
             crate::set_observed_mz_range(&mut descr, lo, hi);
         }
+        // TIC / base peak: this lane REPLACES the m/z array with integer `tof`, so mzdata derives
+        // tic = 0 and base peak (0, 0) from the m/z-less array map. Compute them from the
+        // intensities actually stored, reconstructing m/z only at the running maximum bin.
+        let (tic, base) = if int_intensity {
+            crate::summarize_points(intensity_i32.iter().map(|&v| v as f32), |k| {
+                self.mz_at_tof(i, tof[k])
+            })
+        } else {
+            crate::summarize_points(intensity_f32.iter().copied(), |k| self.mz_at_tof(i, tof[k]))
+        };
+        crate::set_spectrum_summary_params(&mut descr, tic, base);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
@@ -1238,6 +1255,17 @@ impl NativeTofReader {
             let (lo, hi) = self.observed_mz_range(i, tof_min, tof_max);
             crate::set_observed_mz_range(&mut descr, lo, hi);
         }
+        // TIC / base peak: this lane REPLACES the m/z array with integer `tof`, so mzdata derives
+        // tic = 0 and base peak (0, 0) from the m/z-less array map. Compute them from the
+        // intensities actually stored, reconstructing m/z only at the running maximum bin.
+        let (tic, base) = if int_intensity {
+            crate::summarize_points(intensity_i32.iter().map(|&v| v as f32), |k| {
+                self.mz_at_tof(i, tof[k])
+            })
+        } else {
+            crate::summarize_points(intensity_f32.iter().copied(), |k| self.mz_at_tof(i, tof[k]))
+        };
+        crate::set_spectrum_summary_params(&mut descr, tic, base);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 }

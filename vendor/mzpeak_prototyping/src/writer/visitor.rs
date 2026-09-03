@@ -2029,6 +2029,56 @@ impl SpectrumDetailsBuilder {
             pk_summaries.as_ref().map(|s| s.base_peak.intensity)
         };
 
+        // DEFENCE IN DEPTH for grid / ims-compact lanes (see also the observed-m/z-range fallback
+        // below). A spectrum whose raw arrays carry an INTEGER axis (`tof`, `tof_index`) instead of
+        // `m/z array` yields NO data-derived summary at all: mzdata's `fetch_summaries` bails when
+        // `mzs()` errors, so tic folds to 0.0, base peak to (0.0, 0.0) and count to 0. That shipped
+        // `total_ion_current = 0` on every gridded spectrum of several published archives while the
+        // peak data itself was intact. When the derived summary is empty, read the explicit
+        // MS:1000285 / MS:1000504 / MS:1000505 the writer's caller set on the description from the
+        // pre-grid m/z. These CURIEs are in BUILTIN_SPECTRUM_PARAMS (masked out of the generic
+        // params blob) but `get_param_by_curie` still sees them on the item.
+        //
+        // The gate names the CAUSE, not the symptom: raw arrays that carry SIGNAL on a non-m/z
+        // axis. Two things depend on that precision.
+        //
+        //  * It must fire even when a peak list is attached. A dual `.lcd` scan (profile + centroid)
+        //    keeps its centroid `PeakSet` through the grid route, so a gate of "no derived summary
+        //    anywhere" would be false and the two published Shimadzu archives would keep shipping
+        //    `total_ion_current = 0` — the very rows this fallback exists for.
+        //  * It must NOT fire for a genuinely empty spectrum. An mzML `defaultArrayLength="0"` scan
+        //    still carries MS:1000285/504/505 in its header; reading them would stamp a measurement
+        //    onto a row with zero data points and zero peaks. Its arrays hold an EMPTY intensity
+        //    array (and usually an empty `m/z array`), so `mz_less_signal` is false and it keeps
+        //    tic = 0 with a null base peak.
+        //
+        // A spectrum whose arrays DO carry m/z is never touched, even when its derived summary is a
+        // legitimate zero.
+        let mz_less_signal = item.raw_arrays().is_some_and(|a| {
+            a.mzs().is_err() && a.intensities().is_ok_and(|i| !i.is_empty())
+        });
+        let derived_empty = summaries.len() == 0 && mz_less_signal;
+        let finite_pos = |v: f64| v.is_finite() && v > 0.0;
+        let param_f64 = |c: CURIE| {
+            item.get_param_by_curie(&c)
+                .and_then(|p| p.to_f64().ok())
+                .filter(|v| finite_pos(*v))
+        };
+        let (base_peak_mz, base_peak_intensity, tic) = if derived_empty {
+            // Both halves of the base peak or neither: half a base peak is not a measurement.
+            let (bp_mz, bp_int) = match (param_f64(curie!(MS:1000504)), param_f64(curie!(MS:1000505)))
+            {
+                (Some(mz), Some(int)) => (Some(mz), Some(int as f32)),
+                _ => (base_peak_mz, base_peak_intensity),
+            };
+            let tic = param_f64(curie!(MS:1000285))
+                .map(|v| v as f32)
+                .unwrap_or(summaries.tic);
+            (bp_mz, bp_int, tic)
+        } else {
+            (base_peak_mz, base_peak_intensity, summaries.tic)
+        };
+
         let spectrum_type = if let Some(v) = item
             .spectrum_type()
             .map(|t| crate::CURIE::from(t.to_param().curie().unwrap()))
@@ -2083,7 +2133,6 @@ impl SpectrumDetailsBuilder {
         // `lowest_observed_mz = +inf` while `highest_observed_mz` on the same rows was null — the two
         // bounds disagreeing about how to say "absent", and poisoning any reader that computes a
         // file-level m/z range by aggregation. Require a FINITE positive value on both sides.
-        let finite_pos = |v: f64| v.is_finite() && v > 0.0;
         let (data_lo, data_hi) = summaries.mz_range;
         let lo_mz = if finite_pos(data_lo) {
             Some(data_lo)
@@ -2104,7 +2153,7 @@ impl SpectrumDetailsBuilder {
 
         self.base_peak_mz.append_option(base_peak_mz);
         self.base_peak_intensity.append_option(base_peak_intensity);
-        self.total_ion_current.append_value(summaries.tic);
+        self.total_ion_current.append_value(tic);
         match item.signal_continuity() {
             SignalContinuity::Unknown => {
                 log::warn!(
@@ -2949,6 +2998,36 @@ impl WavelengthSpectrumDetailsBuilder {
             None
         };
 
+        // Same defence in depth as `SpectrumDetailsBuilder::append_value`, gated on the same CAUSE:
+        // arrays that carry signal on an axis this builder cannot read (no `wavelength array`), so
+        // the derived summary folds to 0. Fall back to the explicit MS:1000285 / MS:1000504 /
+        // MS:1000505 params rather than shipping a hard 0. A genuinely empty spectrum has an empty
+        // intensity array, so the gate is false and it keeps tic = 0 with a null base peak — even
+        // if its source header states a TIC.
+        let wave_less_signal = item.raw_arrays().is_some_and(|a| {
+            a.get(&ArrayType::WavelengthArray).is_none()
+                && a.intensities().is_ok_and(|i| !i.is_empty())
+        });
+        let finite_pos = |v: f64| v.is_finite() && v > 0.0;
+        let param_f64 = |c: CURIE| {
+            item.get_param_by_curie(&c)
+                .and_then(|p| p.to_f64().ok())
+                .filter(|v| finite_pos(*v))
+        };
+        let (base_peak_mz, base_peak_intensity, tic) = if n_pts == 0 && wave_less_signal {
+            let (bp_mz, bp_int) = match (param_f64(curie!(MS:1000504)), param_f64(curie!(MS:1000505)))
+            {
+                (Some(mz), Some(int)) => (Some(mz), Some(int as f32)),
+                _ => (base_peak_mz, base_peak_intensity),
+            };
+            let tic = param_f64(curie!(MS:1000285))
+                .map(|v| v as f32)
+                .unwrap_or(summaries.tic);
+            (bp_mz, bp_int, tic)
+        } else {
+            (base_peak_mz, base_peak_intensity, summaries.tic)
+        };
+
         let spectrum_type = item
             .spectrum_type()
             .map(|t| crate::CURIE::from(t.to_param().curie().unwrap()));
@@ -2967,7 +3046,7 @@ impl WavelengthSpectrumDetailsBuilder {
 
         self.base_peak_mz.append_option(base_peak_mz);
         self.base_peak_intensity.append_option(base_peak_intensity);
-        self.total_ion_current.append_value(summaries.tic);
+        self.total_ion_current.append_value(tic);
         self.number_of_data_points.append_value(n_pts as u64);
 
         self.data_processing_ref.append_null();
@@ -3474,5 +3553,256 @@ mod test {
         assert_eq!(arr3.len(), 2);
 
         Ok(())
+    }
+
+    /// Build a spectrum whose raw arrays are an INTEGER axis + intensity and carry NO `m/z array` —
+    /// exactly what the grid / ims-compact lanes hand the writer.
+    #[cfg(test)]
+    fn mz_less_spectrum(
+        n: usize,
+    ) -> mzdata::spectrum::MultiLayerSpectrum<mzpeaks::CentroidPeak, mzpeaks::DeconvolutedPeak> {
+        use mzdata::spectrum::bindata::{BinaryDataArrayType, DataArray};
+        let mut arrays = mzdata::spectrum::BinaryArrayMap::new();
+        let tofs: Vec<i32> = (0..n as i32).collect();
+        let intens: Vec<f32> = vec![1.0; n];
+        let mut tof = DataArray::wrap(
+            &mzdata::spectrum::ArrayType::nonstandard("tof_index"),
+            BinaryDataArrayType::Int32,
+            Vec::new(),
+        );
+        tof.update_buffer(tofs.as_slice()).unwrap();
+        arrays.add(tof);
+        let mut it = DataArray::wrap(
+            &mzdata::spectrum::ArrayType::IntensityArray,
+            BinaryDataArrayType::Float32,
+            Vec::new(),
+        );
+        it.update_buffer(intens.as_slice()).unwrap();
+        arrays.add(it);
+        mzdata::spectrum::MultiLayerSpectrum::new(
+            SpectrumDescription::default(),
+            Some(arrays),
+            None,
+            None,
+        )
+    }
+
+    fn summary_param(name: &str, c: CURIE, v: f64) -> mzdata::params::Param {
+        mzdata::params::Param::builder()
+            .name(name)
+            .curie(c)
+            .value(v)
+            .build()
+    }
+
+    /// REGRESSION. A spectrum whose raw arrays hold an integer axis instead of `m/z array` yields no
+    /// data-derived summary at all (mzdata's `fetch_summaries` bails when `mzs()` errors), so the
+    /// writer used to ship `total_ion_current = 0` with a null base peak on every gridded spectrum.
+    /// When the derived summary is empty, the explicit MS:1000285 / MS:1000504 / MS:1000505 params
+    /// on the description must win — the same fallback the observed-m/z range already had.
+    #[test]
+    fn mz_less_arrays_fall_back_to_explicit_summary_params() {
+        use arrow::array::ArrayBuilder;
+        use arrow::datatypes::Float32Type;
+
+        let mut spec = mz_less_spectrum(60);
+        let d = spec.description_mut();
+        d.add_param(summary_param("total ion current", curie!(MS:1000285), 6800.0));
+        d.add_param(summary_param("base peak m/z", curie!(MS:1000504), 500.5));
+        d.add_param(summary_param("base peak intensity", curie!(MS:1000505), 900.0));
+        d.add_param(summary_param("lowest observed m/z", curie!(MS:1000528), 100.25));
+        d.add_param(summary_param("highest observed m/z", curie!(MS:1000527), 900.75));
+
+        let mut builder = SpectrumDetailsBuilder::default();
+        builder.append_value::<mzpeaks::CentroidPeak, mzpeaks::DeconvolutedPeak, _>(
+            0,
+            &spec,
+            EntryMetadataDerivedFromData::default(),
+        );
+        let arrays = builder.finish();
+        let arrays = arrays.as_struct();
+
+        let tic = arrays
+            .column_by_name("total_ion_current")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert!(!tic.is_null(0), "TIC must not be null");
+        assert_eq!(tic.value(0), 6800.0, "TIC must come from MS:1000285");
+
+        let bpmz = arrays
+            .column_by_name("base_peak_mz")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        assert!(!bpmz.is_null(0), "base peak m/z must not be null");
+        assert_eq!(bpmz.value(0), 500.5);
+        let bpint = arrays
+            .column_by_name("base_peak_intensity")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert_eq!(bpint.value(0), 900.0);
+
+        let lo = arrays
+            .column_by_name("lowest_observed_mz")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        let hi = arrays
+            .column_by_name("highest_observed_mz")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        assert_eq!(lo.value(0), 100.25);
+        assert_eq!(hi.value(0), 900.75);
+    }
+
+    /// REGRESSION for the dual-facet shape that ships in the published Shimadzu archives: a `.lcd`
+    /// scan holding BOTH a profile trace and a centroid list keeps its `PeakSet` through the grid
+    /// route, so the raw arrays are m/z-less while `peaks()` still yields a summary. The fallback
+    /// must fire anyway — gated on "the arrays carry signal on a non-m/z axis", not on "nothing
+    /// anywhere produced a summary" — and the TIC must come from MS:1000285 (the stored profile
+    /// span), not from the centroid list riding alongside it.
+    #[test]
+    fn mz_less_arrays_with_a_peak_set_still_use_the_explicit_params() {
+        use arrow::array::ArrayBuilder;
+        use arrow::datatypes::Float32Type;
+
+        let mut spec = mz_less_spectrum(128);
+        spec.peaks = Some(mzpeaks::PeakSet::new(vec![
+            mzpeaks::CentroidPeak::new(300.0, 111.0, 0),
+            mzpeaks::CentroidPeak::new(456.0, 222.0, 1),
+        ]));
+        let d = spec.description_mut();
+        d.add_param(summary_param("total ion current", curie!(MS:1000285), 13220.0));
+        d.add_param(summary_param("base peak m/z", curie!(MS:1000504), 500.5));
+        d.add_param(summary_param("base peak intensity", curie!(MS:1000505), 900.0));
+
+        let mut builder = SpectrumDetailsBuilder::default();
+        builder.append_value::<mzpeaks::CentroidPeak, mzpeaks::DeconvolutedPeak, _>(
+            0,
+            &spec,
+            EntryMetadataDerivedFromData::new(None, None, Some(128), Some(2)),
+        );
+        let arrays = builder.finish();
+        let arrays = arrays.as_struct();
+
+        let tic = arrays
+            .column_by_name("total_ion_current")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert_eq!(
+            tic.value(0),
+            13220.0,
+            "an attached peak set must not suppress the MS:1000285 fallback"
+        );
+        let bpmz = arrays
+            .column_by_name("base_peak_mz")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        assert_eq!(
+            bpmz.value(0),
+            500.5,
+            "base peak must come from MS:1000504, not from the centroid list"
+        );
+        let bpint = arrays
+            .column_by_name("base_peak_intensity")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert_eq!(bpint.value(0), 900.0);
+    }
+
+    /// The fallback must NOT invent data. A genuinely empty spectrum has an empty intensity array,
+    /// so the gate is false even though its source header may state a TIC and a base peak (mzML
+    /// `defaultArrayLength="0"` scans do exactly that): its bounds stay NULL, it gains no base peak,
+    /// and its TIC stays 0 — the truth for a spectrum with nothing in it.
+    #[test]
+    fn empty_spectrum_keeps_null_bounds_and_no_base_peak() {
+        use arrow::array::ArrayBuilder;
+        use arrow::datatypes::Float32Type;
+
+        let mut spec = mz_less_spectrum(0);
+        let d = spec.description_mut();
+        d.add_param(summary_param("total ion current", curie!(MS:1000285), 1104.94));
+        d.add_param(summary_param("base peak m/z", curie!(MS:1000504), 268.833));
+        d.add_param(summary_param("base peak intensity", curie!(MS:1000505), 197.18));
+        let spec = spec;
+        let mut builder = SpectrumDetailsBuilder::default();
+        builder.append_value::<mzpeaks::CentroidPeak, mzpeaks::DeconvolutedPeak, _>(
+            0,
+            &spec,
+            EntryMetadataDerivedFromData::default(),
+        );
+        let arrays = builder.finish();
+        let arrays = arrays.as_struct();
+
+        for col in ["lowest_observed_mz", "highest_observed_mz", "base_peak_mz"] {
+            let a = arrays
+                .column_by_name(col)
+                .unwrap()
+                .as_primitive::<Float64Type>();
+            assert!(a.is_null(0), "{col} must stay NULL on an empty spectrum");
+        }
+        let bpint = arrays
+            .column_by_name("base_peak_intensity")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert!(bpint.is_null(0), "base_peak_intensity must stay NULL");
+        let tic = arrays
+            .column_by_name("total_ion_current")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert_eq!(tic.value(0), 0.0, "an empty spectrum's TIC is legitimately 0");
+    }
+
+    /// The fallback must not disturb the ordinary path: when the raw arrays DO carry m/z, the
+    /// data-derived summary wins even if the description states something else.
+    #[test]
+    fn data_derived_summary_wins_when_mz_array_is_present() {
+        use arrow::array::ArrayBuilder;
+        use arrow::datatypes::Float32Type;
+        use mzdata::spectrum::bindata::{BinaryDataArrayType, DataArray};
+
+        let mut arrays_map = mzdata::spectrum::BinaryArrayMap::new();
+        let mzs: Vec<f64> = vec![100.0, 200.0, 300.0];
+        let intens: Vec<f32> = vec![1.0, 7.0, 2.0];
+        let mut mz = DataArray::wrap(
+            &mzdata::spectrum::ArrayType::MZArray,
+            BinaryDataArrayType::Float64,
+            Vec::new(),
+        );
+        mz.update_buffer(mzs.as_slice()).unwrap();
+        arrays_map.add(mz);
+        let mut it = DataArray::wrap(
+            &mzdata::spectrum::ArrayType::IntensityArray,
+            BinaryDataArrayType::Float32,
+            Vec::new(),
+        );
+        it.update_buffer(intens.as_slice()).unwrap();
+        arrays_map.add(it);
+        let mut descr = SpectrumDescription::default();
+        // Deliberately wrong explicit params: they must be ignored here.
+        descr.add_param(summary_param("total ion current", curie!(MS:1000285), 99999.0));
+        descr.add_param(summary_param("base peak m/z", curie!(MS:1000504), 4242.0));
+        descr.add_param(summary_param("base peak intensity", curie!(MS:1000505), 4242.0));
+        let spec: mzdata::spectrum::MultiLayerSpectrum<
+            mzpeaks::CentroidPeak,
+            mzpeaks::DeconvolutedPeak,
+        > = mzdata::spectrum::MultiLayerSpectrum::new(descr, Some(arrays_map), None, None);
+
+        let mut builder = SpectrumDetailsBuilder::default();
+        builder.append_value::<mzpeaks::CentroidPeak, mzpeaks::DeconvolutedPeak, _>(
+            0,
+            &spec,
+            EntryMetadataDerivedFromData::default(),
+        );
+        let arrays = builder.finish();
+        let arrays = arrays.as_struct();
+        let tic = arrays
+            .column_by_name("total_ion_current")
+            .unwrap()
+            .as_primitive::<Float32Type>();
+        assert_eq!(tic.value(0), 10.0, "TIC must stay data-derived");
+        let bpmz = arrays
+            .column_by_name("base_peak_mz")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        assert_eq!(bpmz.value(0), 200.0, "base peak m/z must stay data-derived");
     }
 }
