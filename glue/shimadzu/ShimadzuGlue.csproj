@@ -33,6 +33,10 @@
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <!-- 64-bit only: the Shimadzu native bits are x64. -->
     <Platforms>x64</Platforms>
+    <!-- See the ItemGroup note below. This FIRST-CLASS SDK property is what actually lands in
+         ShimadzuGlue.runtimeconfig.json; a bare RuntimeHostConfigurationOption is overridden by the
+         SDK's own default of false (observed: the generated config still read `false`). -->
+    <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
   </PropertyGroup>
 
   <ItemGroup>
@@ -57,5 +61,7 @@
       Include="System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization"
       Value="true" Trim="false" />
   </ItemGroup>
+  <!-- (the PropertyGroup switch above is the one that takes effect; this ItemGroup is kept as
+       documentation of the exact runtime knob being set) -->
 
 </Project>
