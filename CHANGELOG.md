@@ -4,6 +4,235 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The synthesized BASE-PEAK chromatogram was dead on every grid lane.** `Ms1Chroms::observe`
+  called `peaks.base_peak()`, which resolves through mzdata's m/z-keyed summary and folds to
+  `(0, 0)` when the spectrum has no m/z array — precisely the case on the `tof_index` / `tof`
+  lanes. Measured on published corpus archives: timsTOF `…_2485.mzpeak` BPC max **0** across all
+  400 points; SciEX `Sample002.mzpeak` zero on **2,371 of 2,372**. The TIC was unaffected because
+  summing intensities never needed m/z. This is the same defect class as the metadata fix in
+  `bc8497c`, one facet over. `observe` now goes through a single `chromatogram_summary`, which
+  calls exactly what the writer's `raw_summaries` calls (so on every ordinary lane the chromatogram
+  point is BIT-EQUAL to the `total_ion_current` / `base_peak_intensity` column of the same
+  spectrum — verified on `waters-xevo-g2s-qtof/QC01`, 2,281 of 2,281 MS1 rows, max diff 0.0) and
+  folds the intensities directly only where mzdata cannot answer.
+  **Published grid-lane archives carry a zero BPC and are worth reconverting** — measured across the
+  201-archive corpus, 12 carry a genuinely dead BPC beside a healthy TIC (the grid / `ims-compact`
+  set; a further 5 all-zero hits are empty single-spectrum pwiz test files, and 59 archives have no
+  BPC chromatogram at all, which is expected for MS2-only and imzML inputs).
+  ⚠️ **Value-moving on dual-facet archives too.** Where a spectrum carries BOTH raw arrays and a
+  centroid peak list — a Shimadzu `.lcd` under `--representation both` — the synthesized TIC/BPC now
+  state the PROFILE trace, because that is what the writer's own `raw_summaries` picks and the
+  chromatogram must agree with the metadata column beside it. Previously the two disagreed:
+  `Blind_P1_pos_012` spectrum 0 shipped column TIC 13,220 / base 834 next to chromatogram TIC
+  12,877 / BPC 2,844. Those chromatogram values change on reconversion; they were never consistent
+  with their own archive.
+- **Agilent profile spectra were all hardcoded to negative polarity.** `src/main.rs` set
+  `descr.polarity = ScanPolarity::Negative` unconditionally, with a comment admitting it was
+  because one dataset happened to be negative-mode. Polarity now comes from the scan record's own
+  `IonPolarity` field (resolved in the `ScanRecordType` offset walk). Only the two unambiguous
+  codes become a polarity — `Unassigned` (2), `Mixed` (3), an unknown code and a schema without the
+  optional element all stay `Unknown`, which the writer stores as NULL. Both profile-bearing corpus
+  files are positive-mode, so the old hardcode was wrong for 100% of the profile data we hold.
+- **`glue/shimadzu/ShimadzuGlue.runtimeconfig.json` could not load the vendor library.** The
+  committed hand-maintained config lacked the
+  `System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization` property that the csproj
+  sets, and `Shimadzu.LabSolutions.IO` 5.0.0.0 deserializes part of the `.lcd` through
+  `BinaryFormatter` — so on the documented DLL-only deployment `LoadData` threw
+  `NotSupportedException` and **every** `.lcd` looked unreadable. The property is now in the
+  committed file (verified a strict superset of a fresh `dotnet build` output), with a
+  keep-in-sync note on both sides.
+- **`glue/shimadzu/Glue.cs` multiplied by a reciprocal where the vendor divides by a scale.**
+  `HighMassMul = MassMultiplier / R` then `mz = MassHigh * HighMassMul` is two roundings deep and
+  disagrees with the exact form on ~40 % of lattice values. Every integer→m/z site now divides by
+  the integer scale it is given: `MassUnit` replaces `MassMultiplier`, `HighMassDivisor =
+  MassUnit * R` (both exact integers, product ≤ 1e13, so exact in `double`) replaces `HighMassMul`,
+  and `PrecursorMzUnit` / `MillisecondsPerSecond` replace their `1/x` constants. The Int64 m/z
+  lattice re-rounds and was unaffected; `--no-mz-lattice`, precursor m/z and mass ranges carried the
+  inexact value.
+- **`tof_calibration` blocks did not say whether reconstructed m/z is exact, and one said nothing
+  at all.** A reader could not tell a lane that rebuilds m/z exactly from one that accepts anything
+  within `MZPC_TOF_GRID_PPM`: on `MSV000095995` the source and reconstructed base-peak m/z differ
+  by 4.6 ppm. All **four** `codec: "tof-grid"` models now emit the same key set — `lossless` names
+  the exactly-stored integer column (the spec's key, unchanged), and a new `mz_reconstruction` says
+  `"exact"` (Agilent file-direct, Shimadzu profile) or `"bounded-lossy"` + `roundtrip_tolerance_ppm`
+  (both SCIEX lanes). The fourth block, the Shimadzu profile lane, previously emitted NEITHER key
+  while sharing its `model` string with the per-spectrum SCIEX lane, so a reader keying off the
+  model got one answer there and null here; two published archives (`HEK_PosOAD1`,
+  `Blind_P1_pos_012`) carry that gap. `tests/contract_strings.rs::tof_grid_reconstruction_keys_pinned`
+  now counts emission SITES rather than asserting a fixed number, which is what let the fourth hide.
+  **Additive: no key changed name or meaning, so existing readers keep working.** An interim commit
+  in this cycle did rename `lossless` to `integer_column`, on the reading that it asserted a
+  fidelity the lane lacked; the spec defines it as "name of the exactly-preserved stored column",
+  which `tof_index` genuinely is, so the rename was reverted before release. The converter's own log
+  line no longer says "lossless fit accepted" either — that one WAS a false fidelity claim.
+- **Gridded spectra summarized coordinates no point in the archive occupies.** `base_peak_mz`,
+  `lowest_observed_mz` and `highest_observed_mz` named the SOURCE f64 m/z while the archive stores
+  an integer axis a reader can only evaluate as `(c0 + c1·k)²`. Every grid route now summarizes the
+  RECONSTRUCTED coordinate, so the observed-m/z bounds contain the file's own data.
+  ⚠️ **Values move**: on `swath.api-sample-centroid` all 201 spectra shift (`base_peak_mz` ≤ 2.17
+  ppm, `lowest_observed_mz` ≤ 3.10 ppm, `highest_observed_mz` ≤ 1.01 ppm). Intensity-derived
+  columns are untouched — intensity is stored verbatim.
+  `tests/gridded_spectrum_summaries.rs` asserted the opposite contract and was relaxed to the
+  grid's own round-trip bound for the three m/z columns only.
+- **Unequal m/z / intensity arrays were silently truncated.** `tof_grid_spectrum` walked the pair
+  with `zip`, which stops at the shorter array and returns success, so a broken decode produced a
+  structurally valid archive with signal missing and no diagnostic; `sciex_grid_spectrum` guarded
+  it with a `debug_assert_eq!`, a no-op in the shipped release build. Both now go through
+  `require_aligned_arrays`, which refuses the conversion naming the spectrum and both lengths.
+- **An Agilent scan naming an undefined `CalibrationID` used an arbitrary polynomial.**
+  `load_calibration` fell back to `default_rows.values().next()` — a HashMap row chosen by a
+  per-process random seed, so the same input reconstructed different m/z on different runs. Now:
+  exactly one defined calibration is still used for every scan (the vendor's single-calibration
+  files are unaffected); more than one with the requested ID missing is an error listing the
+  missing and the defined IDs. ⚠️ **A `.d` that converted at 0.9.10 with wrong m/z now fails to
+  convert.** That is deliberate — it was never producing usable data — but it is a behaviour change.
+- **`MZPC_MAX_SPECTRA` truncated an archive in total silence**, and suppressed the source
+  completeness check while doing it. It now emits one `WARN` per run saying the archive is PARTIAL
+  and that the check is disabled.
+- **The Agilent profile reader dropped scan records without a trace** — empty segments, all-zero
+  intensities, and a segment past EOF, which additionally **abandoned the entire rest of the run**.
+  This lane never reaches `assert_source_complete` (a `.d` declares no readable spectrum count), so
+  a truncated acquisition produced a short archive and exit 0. A per-cause skip tally now backs a
+  "wrote N profile spectra of M scan records" line and a warning naming each cause.
+- **Nothing re-checked the `.lcd` after the vendor DLL had it open.** The source SHA-1 must be taken
+  BEFORE the open (the open takes a byte-range lock), and nothing looked again afterwards. A source
+  fingerprint (length + mtime, in the ungated `src/embed_aux.rs`) is now compared after the reader
+  is dropped, so an OLE2 commit by the vendor library is reported instead of leaving a digest that
+  silently no longer describes the file. Size+mtime rather than a re-digest: an OLE2 commit moves
+  both, and re-hashing would cost a second full read of a multi-GB run on every conversion.
+- **The rotated-centroid warning fired on good libraries and could stay silent on bad ones.** It now
+  requires the loaded `Shimadzu.LabSolutions.IO` to be a version carrying the defect (major < 5)
+  AND the file to store no profile signal, checked in that order — so a current ProteoWizard never
+  probes the file at all. A version we cannot read is treated as its own state: it still warns, but
+  with "could not check", never with an accusation. The glue reports the version over a new
+  `LibraryVersion` export, taking the HIGHER of AssemblyVersion and FileVersion so a vendor DLL that
+  pins a low AssemblyVersion cannot be called stale.
+- 🚨 **`ShimadzuGlue` ABI 3 → 4** (`LibraryVersion` added). **Any prebuilt `ShimadzuGlue.dll` —
+  the Flash box's included — must be rebuilt from this commit** (`dotnet build -c Release` in
+  `glue/shimadzu`) before the next `.lcd` conversion: a stale DLL reports ABI 3 against a binary
+  needing 4 and the first open aborts on the handshake. That refusal is by design, but the rebuild
+  is a required step of this upgrade, not an optional one.
+
+### Removed
+
+- **The Shimadzu Stage-B experiment levers.** `MZPC_SHIMADZU_FETCH`
+  (`legacy|centroid-first|centroid-only|split`), `MZPC_SHIMADZU_PROFILE_DESIRED` and
+  `MZPC_SHIMADZU_DUMP` existed to prove the centroid rotation belonged to the library and not to the
+  file. That question is answered (3.8.4.6016 rotates; 5.0.0.0 reads the same file correctly), and
+  the answer is version-specific, so re-running the matrix on a newer library teaches nothing. They
+  were also live hazards: three of the four `FETCH` modes — `PROFILE_DESIRED=0` included — select the
+  very configuration that returns rotated intensities, so one stray environment variable could write
+  a corrupt archive from a supported build; and `MZPC_SHIMADZU_DUMP` walked the decoded spectrum
+  object's public getters by reflection, the same mechanism that got `MZPC_SHIMADZU_DUMP_READER`
+  removed for rewriting the `.lcd` it was reading. Their removal also lets the glue's one-entry
+  spectrum memo run unconditionally (it was bypassed whenever any lever was set), and collapses
+  `SpecFor`/`FetchSpectrum` into one memoised vendor call. `MZPC_SHIMADZU_PROBE` and
+  `MZPC_SHIMADZU_DEBUG` stay — neither touches the vendor object outside the ordinary read path.
+- **`--mz`**, which never filtered anything: it was declared "NOT YET IMPLEMENTED" and its only
+  behaviour, on both the mzPeak→mzPeak and mzPeak→mzML filter lanes, was to abort the run. `--rt`,
+  `--ms-level` and `--drop-aux` are unaffected.
+- **`MZPC_WATERS_GLUE` from the documentation.** No code path has ever read it: the Waters lane
+  loads `MassLynxRaw.dll` directly with `libloading` and takes its directory from
+  `MZPC_MASSLYNX_DIR` / `MZPC_PWIZ_DIR`. `docs/USER_MANUAL.md` §10, `docs/PLATFORM_SUPPORT.md`'s
+  glue table and its `dotnet build glue/waters` line told operators to build and point at a project
+  the converter never loads. (The `glue/waters/` project itself is left in the tree; it is dead
+  weight, but deleting it is a call for its owner.)
+- Dead code with no caller anywhere in the tree: `finish_with_vendor` (superseded by
+  `finish_with_vendor_and_aux`), `filter::u8_child`, `bruker_sdk::frame_mz_minmax` (a diagnostic for
+  a resolved allocation bug), `agilent_profile::d_dir` (an identity function "kept for symmetry"),
+  and the unread `SciexReader::wiff_path` / `BafReader::baf_file` accessors together with the fields
+  behind them.
+
+### Changed
+
+- `#[allow(dead_code)]` on `mod shimadzu_grid`, `mod mz_lattice` and `mod waters` is now
+  `#[cfg_attr(not(windows), allow(dead_code))]`, and `src/pwiz_layout.rs` / `src/embed_aux.rs` say
+  per item (or once, at module scope) *why* an item has no caller on this host. A blanket allow on a
+  module that compiles everywhere hides real rot; the four dead functions above were found underneath
+  exactly such an allow.
+
+### Documentation
+
+- **Every text that still called the Shimadzu centroid defect inherent and unreachable is
+  corrected** (the gap 0.9.9 recorded). The defect belongs to
+  `Shimadzu.LabSolutions.IO.IoModule.dll` **3.8.4.6016**; version **5.0.0.0**, shipped by a current
+  ProteoWizard (**3.0.26151** verified), reads the same profile-less `.lcd` files correctly, and
+  msconvert only appeared to confirm the defect because it was driving the same old DLL out of the
+  same directory. The remedy is a current ProteoWizard — **not** a LabSolutions mzML export.
+  - `glue/shimadzu/README.md`: the "Known vendor defect" section is now "Stale-library defect:
+    misaligned centroids from `Shimadzu.LabSolutions.IO` **3.8.4.6016**", keeping the measured 3.8.4
+    evidence as history beside the 5.0.0.0 numbers, plus how to check the installed `FileVersion`,
+    and why a hand-placed `ShimadzuGlue.runtimeconfig.json` must carry the
+    `System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization` property or **every**
+    `.lcd` fails to load.
+  - `docs/USER_MANUAL.md` §8 and §11, and `docs/PLATFORM_SUPPORT.md`: the minimum ProteoWizard
+    expectation is stated where `MZPC_PWIZ_DIR` is documented, and the **FLASHApp/OpenMS third-party
+    bundle is named as a known-stale source** (it carries ProteoWizard 3.0.22187, July 2022, hence
+    3.8.4.6016). Both DLL layouts (`vendor_api/<Vendor>` and flat beside `msconvert.exe`) are now
+    described, matching the 0.9.9 probe.
+  - `REPLY-mzpeak-converter-S30.md` (the speXtract collaborator reply) gains a dated addendum. Note
+    for the record: that reply never actually carried the Shimadzu guidance the 0.9.9 "Known gaps"
+    note attributed to it — it is a timsTOF document — so the addendum states the corrected
+    guidance rather than retracting text that was never there.
+  - Older CHANGELOG entries are left as released history with short bracketed
+    *[superseded — see 0.9.9]* pointers; nothing measured has been rewritten.
+- **`docs/USER_MANUAL.md` §10 now documents every `MZPC_*` variable the converter reads**, split
+  into deployment, output-affecting and diagnostic groups: the table named six of the twenty-five
+  it reads. The output-affecting group carries the warning that these change the written bytes without
+  being recorded in the archive (`MZPC_MAX_SPECTRA` in particular truncates AND disables the
+  completeness check, so a partial archive exits 0), and points at the equivalent CLI flag where one
+  exists.
+- **`docs/mzpeakviewer-compliance-reply.md` told readers to reconstruct lattice m/z the wrong way
+  round.** Its 2026-09-02 addendum said the viewer should multiply by `mzpeak:transform_params`
+  (`1/scale`) and called `tof_index / scale` "1 ulp off on ~40 % of lattice values" — the exact
+  inverse of the contract v0.9.8 shipped, where the DIVISION is normative and the reference reader
+  was fixed to divide. The stale paragraph now carries an inline reversal marker and a dated
+  addendum states the normative rule (recover the integer scale, divide; multiply only for a
+  transform that is not an exact reciprocal). `glue/shimadzu/README.md`'s reconstruct column said
+  `1e-9 · tof_index` and now says `tof_index / 1e9`, matching `docs/USER_MANUAL.md` §9, which was
+  already correct.
+- **Three in-code comments asserted behaviour the code does not have.** `src/shimadzu.rs` claimed
+  the `--representation profile` fallback "hits the A5 gate and hard-errors" on a profile-less file
+  — there is no such gate and `warn_if_rotated_centroids` deliberately only warns, as its own doc
+  says two screens up. `src/shimadzu_grid.rs` and `src/main.rs` justified trimming the scan-window
+  zero pad by claiming "the writer drops zero-intensity profile runs anyway"; it does not — the
+  compaction keeps one boundary zero per run (the published `HEK_PosOAD1.mzpeak` stores 4.76 M
+  zeros), so the route's own `signal_span` trim is the only thing keeping the pad out. `bruker_baf`'s
+  `prefer_profile` field still described itself as "currently always false" after `--representation
+  profile` started setting it. Also reunited a `sanitize_param_groups` doc comment that a later
+  insertion had split in half, leaving `assert_source_complete_tmp` documented by a truncated
+  paragraph about an unrelated mzML workaround.
+- `README.md` gains the missing **Shimadzu `.lcd` (native)** row, and `docs/PLATFORM_SUPPORT.md`
+  the missing **Shimadzu** row in the .NET glue table plus its `dotnet build` line.
+- **Two support-matrix rows advertised lanes that open nothing.**
+  - *Agilent `.d` (non-IM, native)* was ✅ on Windows "via `AgilentGlueHost.exe`". The two halves
+    are different programs: `glue/agilent/Glue.cs` has no `Exports` type and zero
+    `[UnmanagedCallersOnly]` attributes, its csproj builds a **net48 EXE** (so no `AgilentGlue.dll`
+    and no runtimeconfig), while `src/agilent.rs` still requires both files and resolves six
+    exports from `AgilentGlue.Exports` — and nothing in `src/` spawns the EXE or reads its `AGL1`
+    output. Every entry point (`convert`, `--to mzml`, `inspect`) fails at open, loudly. The row is
+    now ⛔ **not wired**, with the diagnosis and the revive-or-delete pointer to `BACKLOG.md`; the
+    matching glue-table row and `dotnet build` line are annotated the same way.
+  - *Agilent `.d` profile (`--agilent-grid`)* was ✅ on all three platforms. Neither profile-bearing
+    `.d` in the corpus converts today (`LZF: back-reference before output start` on one, an IM-QTOF
+    `MSScan.xsd` with no `SpectrumParamsType` on the other), so the row is ⚠️ with both gaps named.
+    Consequence for the polarity fix above: it is verified at the scan-record level, not end to end.
+- **`glue/waters/` is labelled ⛔ NOT WIRED** at the top of its README and in `WatersGlue.csproj`.
+  Both still told operators to build it and point `MZPC_WATERS_GLUE` at it, contradicting the
+  removal of that variable from the user-facing docs — and they are the files an operator working
+  that lane actually opens. `src/waters.rs` loads `MassLynxRaw.dll` directly from
+  `MZPC_MASSLYNX_DIR` / `MZPC_PWIZ_DIR`.
+- Two more in-code comments corrected beyond the three above: `tests/shimadzu_lattice_peaks.rs`
+  documented itself as asserting `m/z == k · 1e-9` while its assertions pin `k / 1e9` (the division
+  is normative — `1e-9` is not exactly 10⁻⁹, which is the whole point of that test), and the
+  `tof_grid_spectrum` rustdoc had been stranded by a later insertion above `set_observed_mz_range`,
+  leaving that function documented by a paragraph about TOF routing. Same defect class as the
+  `sanitize_param_groups` split above; the paragraph is back on its function.
+
 ## [0.9.10] — 2026-09-03
 
 ### Fixed
@@ -424,7 +653,9 @@ All notable changes to this project are documented here. The format follows
 - **User manual:** the Shimadzu native lane (§6, §8, §9, §10, §11 — `MassHigh` vs the coarse
   `Mass`, `MZPC_SHIMADZU_COARSE_MZ`, the per-spectrum sqrt grid and the Int64 centroid lattice with
   their index blocks and the per-facet reader rule, measured sizes and fidelity, the vendor
-  centroid-intensity defect on profile-less `.lcd` files), `--representation` in the option table,
+  centroid-intensity defect on profile-less `.lcd` files *[that manual text described the defect as
+  inherent; corrected after 0.9.9 — it is specific to `Shimadzu.LabSolutions.IO` 3.8.4.6016]*),
+  `--representation` in the option table,
   and for timsTOF: `ims_calibration.exact = false` with the chord's measured error, and the
   multi-precursor pairing rule. `glue/shimadzu/README.md` gains a "What the archive stores"
   section; the viewer compliance reply an addendum on resolving integer axes per facet.
@@ -710,7 +941,11 @@ All notable changes to this project are documented here. The format follows
   (chromatograms 0 → 26,400; spectra now 216,742 points rather than 59,948 chunks), and pinned by
   `tests/footer_counts.rs`, which fails on the pre-fix code.
 
-- **Shimadzu native lane: warn when a `.lcd` stores no profile signal.** For those spectra the
+- **Shimadzu native lane: warn when a `.lcd` stores no profile signal.**
+  *[Superseded — see 0.9.9: everything below is true only of `Shimadzu.LabSolutions.IO` 3.8.4.6016.
+  Version 5.0.0.0, shipped by a current ProteoWizard, reads these files correctly; the msconvert
+  cross-check was driving the same old DLL, and the LabSolutions mzML export is NOT the remedy.]*
+  For those spectra the
   vendor API returns centroid intensities rotated against the m/z axis
   (`[s alien values] + truth[0:n−s]`, s ∈ 1..7, and the final peak dropped), which poisons TIC, BPI
   and base-peak m/z while leaving the archive perfectly self-consistent. Measured scope, against

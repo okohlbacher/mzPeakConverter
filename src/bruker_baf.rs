@@ -681,12 +681,11 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 /// A Bruker BAF `.d` reader yielding one [`MultiLayerSpectrum`] per spectrum,
 /// built the same way [`crate::bruker_tsf::TsfReader`] builds its spectra.
 pub struct BafReader {
-    baf_file: PathBuf,
     rows: Vec<BafSpectrumRow>,
     storage: BafStorage,
     /// When true, read profile arrays for spectra that have them; otherwise
-    /// default to line arrays (finding 2). Currently always false (line-first);
-    /// kept as a field so a profile-requesting entry point is a one-liner.
+    /// default to line arrays (finding 2). Set from `--representation profile`
+    /// (see `open_with`); every other representation reads line-first.
     prefer_profile: bool,
     /// Finding 10: the baf2sql_c storage handle is not known to be thread-safe,
     /// and FFI calls through it must not happen concurrently. A raw-pointer
@@ -736,7 +735,6 @@ impl BafReader {
         )?;
 
         Ok(Self {
-            baf_file: paths.baf_file,
             rows,
             storage,
             prefer_profile,
@@ -750,10 +748,6 @@ impl BafReader {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
-    }
-
-    pub fn baf_file(&self) -> &Path {
-        &self.baf_file
     }
 
     /// Choose which `(m/z id, intensity id)` pair and continuity to read for a

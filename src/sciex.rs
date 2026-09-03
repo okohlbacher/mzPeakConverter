@@ -287,7 +287,6 @@ pub struct SciexReader {
     api: GlueApi,
     handle: i64,
     count: usize,
-    wiff_path: PathBuf,
     /// The managed handle / runtime is not known to be thread-safe and FFI calls through it
     /// must not happen concurrently. A raw-pointer marker makes [`SciexReader`] neither `Send`
     /// nor `Sync`, so the type system prevents cross-thread sharing. Sound for the existing
@@ -350,7 +349,6 @@ impl SciexReader {
             api,
             handle,
             count,
-            wiff_path: path.to_path_buf(),
             _not_thread_safe: PhantomData,
         })
     }
@@ -361,10 +359,6 @@ impl SciexReader {
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
-    }
-
-    pub fn wiff_path(&self) -> &Path {
-        &self.wiff_path
     }
 
     /// Fetch one spectrum's scalar metadata via the glue.

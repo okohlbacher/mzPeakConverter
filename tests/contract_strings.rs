@@ -49,6 +49,62 @@ fn agilent_and_sciex_global_models_pinned() {
     pinned("\"model\": \"sciex_sqrt\"");
 }
 
+/// Every `codec: "tof-grid"` block must name its integer axis and say whether m/z survives the
+/// round trip — with the SAME keys across all three models, so a reader needs one code path.
+///
+/// History this pins, and it is worth reading before touching these strings. `lossless` was read as
+/// a claim that m/z reconstruction is exact, judged self-contradictory beside a 4.99 ppm bound in
+/// the same block, and renamed to `integer_column`. That was a MISREADING: the spec defines
+/// `lossless` as "name of the exactly-preserved stored column", and `tof_index` is exactly that —
+/// the integer we store and read back bit-for-bit. The rename broke no runtime consumer, but it
+/// diverged from the spec's schema and from the 11 published archives carrying the key, to fix a
+/// contradiction that was never there. It is restored; the genuinely new information — whether the
+/// m/z you REBUILD from that column is exact — lives in `mz_reconstruction` beside it.
+///
+/// The count is FOUR, not three. A fourth emission site (the Shimadzu profile lane) shipped with
+/// NEITHER key while sharing its `model` string with the per-spectrum SCIEX lane, so a reader
+/// keying off the model got one answer there and null here. It stayed invisible because this pin
+/// asserted three. Hence: assert the number of sites, not merely the presence of a string.
+#[test]
+fn tof_grid_reconstruction_keys_pinned() {
+    // One per `codec: "tof-grid"` emission site. Counted against the sites themselves so that
+    // adding a fifth lane without its keys fails here rather than in someone's reader.
+    let sites = SRC.matches("\"codec\": \"tof-grid\"").count();
+    assert_eq!(sites, 4, "expected 4 `codec: \"tof-grid\"` emission sites, found {sites}");
+    assert_eq!(
+        SRC.matches("\"lossless\": \"tof_index\"").count(),
+        sites,
+        "every `codec: \"tof-grid\"` block must name its exactly-stored column with the spec's \
+         `lossless` key; found {} of {sites} emission sites",
+        SRC.matches("\"lossless\": \"tof_index\"").count()
+    );
+    assert!(
+        !SRC.contains("integer_column"),
+        "`integer_column` is a synonym for the spec's `lossless` and was reverted; two keys naming \
+         the same column is how they drift apart"
+    );
+    // The two honest values of `mz_reconstruction`, and the bound that must accompany the lossy one.
+    pinned("\"mz_reconstruction\": \"exact\"");
+    assert_eq!(
+        SRC.matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
+        2,
+        "the run-wide and per-spectrum SCIEX grid lanes are bounded-lossy and must say so \
+         (the Agilent and Shimadzu lanes are exact)"
+    );
+    assert_eq!(
+        SRC.matches("\"roundtrip_tolerance_ppm\": tof_grid::ppm_tol()").count(),
+        2,
+        "a bounded-lossy block must state its bound"
+    );
+    // `lossless` means the same thing in every block that carries it — the name of the exactly
+    // stored column — so the `mz-grid` lattice (src/mz_lattice.rs) and `ims-compact` blocks spell
+    // it identically. One archive can carry it twice, once per facet, without ambiguity.
+    assert!(
+        SRC.contains("\"lossless\": \"tof\""),
+        "the ims-compact block names its exactly-stored integer column the same way"
+    );
+}
+
 #[test]
 fn ims_compact_per_spectrum_exact_pinned() {
     // The timsTOF exact lane (MzCalibration ModelType 1, C2 = 0): the viewer keys the per-spectrum

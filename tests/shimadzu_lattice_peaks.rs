@@ -10,7 +10,7 @@
 //! explicit lattice arrays), a centroid-only one on the coarse 1e-4 sub-lattice, a centroid-only
 //! off-lattice one, and a dual one whose f64 profile AND off-lattice peak SET go through plain
 //! `write_spectrum` (both fallbacks at once). Then (a) the vendored reader must hand back
-//! `m/z == k · 1e-9` on the lattice spectra and the exact f64 on the fallbacks — through
+//! `m/z == k / 1e9` on the lattice spectra and the exact f64 on the fallbacks — through
 //! `get_spectrum` too, i.e. with the per-spectrum sqrt fixup applied to the profile and NOT to the
 //! lattice — and (b) the parquet column metadata must show `point.tof_index` as INT64,
 //! DELTA_BINARY_PACKED, ZSTD, dictionary disabled, with `spectrum_array_index` listing it as
@@ -299,7 +299,10 @@ fn lattice_peaks_facet_round_trips_and_is_delta_packed_int64() {
     let _ = std::fs::remove_file(&out);
     write_archive(&out);
 
-    // (a) Read back with the vendored reader: m/z == k · 1e-9 on the lattice spectra, from the
+    // (a) Read back with the vendored reader: m/z == k / 1e9 on the lattice spectra (DIVISION by
+    // the integer scale is normative — `1e-9` is not exactly 10^-9, so multiplying by it differs on
+    // ~40% of lattice values; see the assertions below and docs/mzpeakviewer-compliance-reply.md),
+    // from the
     // column metadata alone (the `mz_calibration` block is for the viewer); the exact f64 on the
     // fallback; the profile facet untouched.
     let mut reader = MzPeakReader::new(&out).unwrap();
@@ -325,7 +328,7 @@ fn lattice_peaks_facet_round_trips_and_is_delta_packed_int64() {
     assert_eq!(&reader.metadata.spectra.peak_counts()[..4], &[3, 3, 2, 2]);
     assert_eq!(&reader.metadata.spectra.data_point_counts()[..4], &[4, 0, 0, 4]);
     // The full `get_spectrum` path — the one that applies the per-spectrum sqrt fixup — must
-    // touch the profile only: the lattice centroids are still k·1e-9, not (c0 + c1·k)². (The
+    // touch the profile only: the lattice centroids are still k/1e9, not (c0 + c1·k)². (The
     // reader's default preference loads only the profile of a dual spectrum; ask for both.)
     reader.set_prefer_spectra_peaks(
         mzpeak_prototyping::reader::SignalLoadingPreference::ProfilesAndCentroids,

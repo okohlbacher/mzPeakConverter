@@ -9,8 +9,21 @@
 //! itself was intact.
 //!
 //! The mzML `--tof-grid` lane is the one grid lane reachable off Windows, and it gives the sharpest
-//! possible assertion: the SAME input converted with and without the grid must produce the SAME
-//! summary columns. A gridded archive is not allowed to be a worse description of its own data.
+//! possible assertion: the SAME input converted with and without the grid must describe its data
+//! the same way. A gridded archive is not allowed to be a worse description of its own data.
+//!
+//! WHAT "the same" MEANS, and why it is not bit-equality on m/z. The summary columns describe the
+//! points STORED IN THIS ARCHIVE, so the grid lane states the m/z a reader RECONSTRUCTS from
+//! `tof_index`, not the source f64 the fit consumed. The grid accepts a point whose reconstruction
+//! lands within `MZPC_TOF_GRID_PPM` (default 5) of the source, so those two differ — which is the
+//! encoding being bounded-lossy, exactly as the `tof_calibration` block now says. The alternative
+//! (copy the source m/z into the columns) makes the archive contradict ITSELF: the published
+//! `20240826_RNAseB_…_MRM_03.mzpeak` states `base_peak_mz = 519.1402875577935` on spectrum 7313
+//! while its own stored `tof_index` reconstructs to `519.1426532537401`, so no point in the file
+//! sits at the m/z its metadata names and the observed-m/z bounds exclude 4.7 ppm of its own data.
+//! Intra-archive consistency is what a reader can check and depend on; cross-lane bit-equality on a
+//! quantized axis is not available at all. INTENSITY is stored verbatim, so TIC and
+//! `base_peak_intensity` do stay bit-equal between the lanes.
 //!
 //! Skips (passes) when the reference mzML is absent; override the corpus root with `MZPEAK_CORPUS`.
 
@@ -130,29 +143,104 @@ fn gridded_archive_summaries_match_the_f64_lane() {
         assert!(g.hi_mz[i].is_some(), "spectrum {i}: gridded highest_observed_mz is NULL");
     }
 
-    // 2. The stronger statement: gridding must not change what the summary SAYS. Both lanes see the
-    //    same f64 (m/z, intensity); the grid lane just has to state it explicitly instead of letting
-    //    the writer derive it. Exact equality — these are the same numbers by construction.
+    // 2. The stronger statement: gridding must not change what the summary SAYS — exactly for the
+    //    intensity-derived columns (intensity is stored verbatim), and to within the grid's own
+    //    round-trip bound for the m/z columns (see the module header).
+    let tol = std::env::var("MZPC_TOF_GRID_PPM")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(5.0)
+        * 1e-6;
+    let near = |a: f64, b: f64| (a - b).abs() <= b.abs() * tol;
     for i in 0..SPECTRA {
         assert_eq!(g.tic[i], f.tic[i], "spectrum {i}: total_ion_current differs between lanes");
         assert_eq!(
             g.bp_int[i], f.bp_int[i],
             "spectrum {i}: base_peak_intensity differs between lanes"
         );
-        // base_peak_mz may legitimately differ on an INTENSITY TIE: the grid lane resolves ties to
-        // the lowest m/z, mzdata's derived summary resolves them first-in-array. Both name a real
-        // maximum, so the height must match exactly (asserted above) and the m/z is only allowed to
-        // move when there is a tie to move within.
-        if g.bp_mz[i] != f.bp_mz[i] {
-            let (gm, fm) = (g.bp_mz[i].unwrap(), f.bp_mz[i].unwrap());
-            assert!(
-                gm <= fm,
-                "spectrum {i}: base_peak_mz {gm} > {fm}; a tie must resolve to the LOWER m/z"
-            );
-        }
-        assert_eq!(g.lo_mz[i], f.lo_mz[i], "spectrum {i}: lowest_observed_mz differs between lanes");
-        assert_eq!(g.hi_mz[i], f.hi_mz[i], "spectrum {i}: highest_observed_mz differs between lanes");
+        // base_peak_mz names the SAME point in both lanes, at that point's own coordinate in each:
+        // within the grid tolerance of the f64 lane's value. It may also differ further on an
+        // INTENSITY TIE — the grid lane resolves ties to the lowest m/z, mzdata's derived summary
+        // resolves them first-in-array — so a value BELOW the f64 lane's is allowed outright, while
+        // a value above it is only allowed by the quantization bound.
+        // Bounded on BOTH sides, or the tie allowance swallows the assertion: "anything at or below
+        // the f64 lane's value" would accept the spectrum's LOWEST m/z as its base peak. The floor
+        // is a coordinate that must exist in this spectrum — its own observed-m/z minimum — so a tie
+        // may only move the answer to another real point of the same spectrum.
+        let (gm, fm) = (g.bp_mz[i].unwrap(), f.bp_mz[i].unwrap());
+        assert!(
+            gm <= fm * (1.0 + tol),
+            "spectrum {i}: base_peak_mz {gm} exceeds {fm} by more than the grid tolerance"
+        );
+        assert!(
+            gm >= g.lo_mz[i].unwrap() * (1.0 - tol),
+            "spectrum {i}: base_peak_mz {gm} is below the archive's own lowest_observed_mz {:?}",
+            g.lo_mz[i]
+        );
+        let (glo, flo) = (g.lo_mz[i].unwrap(), f.lo_mz[i].unwrap());
+        assert!(near(glo, flo), "spectrum {i}: lowest_observed_mz {glo} vs {flo} off-tolerance");
+        let (ghi, fhi) = (g.hi_mz[i].unwrap(), f.hi_mz[i].unwrap());
+        assert!(near(ghi, fhi), "spectrum {i}: highest_observed_mz {ghi} vs {fhi} off-tolerance");
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `tof_calibration` block a real gridded archive carries must be self-consistent with the
+/// summary columns asserted above: it must NAME the integer axis a reader has to evaluate, and it
+/// must ADMIT that m/z is quantized — because the columns state the reconstructed coordinate, not
+/// the source f64, and a reader comparing them against an mzML needs to know the difference is
+/// encoding loss and not a defect.
+///
+/// This is the archive-level half of `contract_strings::tof_grid_reconstruction_keys_pinned`, which
+/// pins the same keys in the source. Both exist because the string pin cannot see whether the block
+/// actually reaches the file, and this one cannot run without the corpus.
+#[test]
+fn gridded_archive_states_its_reconstruction_contract() {
+    let input = corpus_root().join(MZML);
+    if !input.exists() {
+        eprintln!("skipping: {} not present", input.display());
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("mzpc-gridcal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gridded = dir.join("grid.mzpeak");
+    run(&[input.to_str().unwrap(), "-o", gridded.to_str().unwrap(), "--tof-grid", "on"]);
+
+    let f = std::fs::File::open(&gridded).unwrap();
+    let mut z = zip::ZipArchive::new(f).unwrap();
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut z.by_name("mzpeak_index.json").unwrap(), &mut buf).unwrap();
+    let idx: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    let cal = idx
+        .get("metadata")
+        .and_then(|m| m.get("tof_calibration"))
+        .expect("metadata.tof_calibration present in a --tof-grid archive");
+
+    assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("tof-grid"));
+    assert_eq!(cal.get("model").and_then(|v| v.as_str()), Some("sciex_sqrt"));
+    assert_eq!(
+        cal.get("lossless").and_then(|v| v.as_str()),
+        Some("tof_index"),
+        "the block must name its exactly-stored column with the spec's `lossless` key; got {cal}"
+    );
+    assert_eq!(
+        cal.get("mz_reconstruction").and_then(|v| v.as_str()),
+        Some("bounded-lossy"),
+        "the run-wide grid accepts a reconstruction within tolerance, so it is not exact; got {cal}"
+    );
+    assert!(
+        cal.get("roundtrip_tolerance_ppm").and_then(|v| v.as_f64()).is_some_and(|v| v > 0.0),
+        "a bounded-lossy block must state its bound; got {cal}"
+    );
+    // The two keys answer DIFFERENT questions and must not be conflated: `lossless` names the
+    // column stored exactly, `mz_reconstruction` rates the m/z rebuilt from it. `integer_column`
+    // was a short-lived synonym for the first and must not come back.
+    assert!(
+        cal.get("integer_column").is_none(),
+        "`integer_column` duplicated the spec's `lossless`; got {cal}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

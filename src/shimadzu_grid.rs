@@ -15,9 +15,13 @@
 ///
 /// LabSolutions pads every profile spectrum with a zero-intensity sample at each scan-window
 /// bound (e.g. m/z 50.000000 exactly, intensity 0) — off the flight-time grid by construction.
-/// The writer drops zero-intensity profile runs anyway, so these points never reach the archive;
-/// fitting on them would reject every spectrum as off-grid. Interior zeros are on the grid and
-/// are left to the writer's own policy.
+/// Fitting on them would reject every spectrum as off-grid, so the pad is trimmed HERE and the
+/// spectrum is stored from its first non-zero sample to its last.
+///
+/// This trim is what keeps the pad out of the archive; the writer would not. Its zero-run
+/// compaction collapses a run of consecutive zeros but deliberately KEEPS one boundary zero per
+/// run, so the pad would survive as a leading/trailing zero (HEK_PosOAD1.mzpeak stores 4.76 M
+/// zeros — the interior ones). Interior zeros are on the grid and are left to that policy.
 pub fn signal_span(intensity: &[f32]) -> (usize, usize) {
     let start = intensity.iter().position(|v| *v > 0.0).unwrap_or(intensity.len());
     let end = intensity.iter().rposition(|v| *v > 0.0).map_or(start, |e| e + 1);
@@ -29,6 +33,16 @@ pub fn signal_span(intensity: &[f32]) -> (usize, usize) {
 pub struct SqrtGrid {
     pub c0: f64,
     pub c1: f64,
+}
+
+impl SqrtGrid {
+    /// Reconstruct m/z from a stored bin ordinal, exactly as a conformant reader does:
+    /// `m/z = (c0 + c1·k)²`. The summary CV terms must be computed from THIS, not from the source
+    /// f64 m/z the fit consumed, so the archive's metadata names coordinates that exist in it.
+    pub fn mz(&self, k: i32) -> f64 {
+        let r = self.c0 + self.c1 * (k as f64);
+        r * r
+    }
 }
 
 /// Reconstruction tolerance in Da: the vendor's own 1e-9 rounding is ±5e-10, plus f64 slack.

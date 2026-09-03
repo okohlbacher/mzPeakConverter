@@ -552,6 +552,63 @@ pub(crate) fn sha1_hex(path: &Path) -> Result<String> {
     Ok(stream_digest::<sha1::Sha1>(path)?.0)
 }
 
+/// Size + modification time of a source file: enough to tell whether a vendor library rewrote the
+/// input while it held it open.
+///
+/// This is not paranoia. Some vendor SDKs have no read-only open at all — the Shimadzu glue opens
+/// the `.lcd` read-write because that is the only overload the library exposes — and one code path
+/// was already found committing changes back to the OLE2 storage of the file it was only supposed
+/// to read. The `MS:1000569` digest we archive is taken BEFORE the library opens the file (it has to
+/// be: the open takes a byte-range lock), so if the library then rewrites the input, the archive
+/// records the digest of a file that no longer exists on disk and nothing anywhere notices.
+///
+/// Size and mtime cost one `stat` and catch the rewrite that actually happens (an OLE2 commit
+/// changes both). Re-digesting the input would be authoritative but means a second full read of a
+/// multi-gigabyte file on every conversion, so it is reserved for the case where this already
+/// says something changed.
+// Taken and compared only on the `#[cfg(windows)]` Shimadzu lane — the one vendor API with no
+// read-only open. The logic itself is host-independent so that it can be tested here.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceFingerprint {
+    pub len: u64,
+    /// `None` when the platform/filesystem does not report one — then only the length is compared.
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl SourceFingerprint {
+    /// `stat` the path. `None` when it cannot be read; a fingerprint we could not take is simply
+    /// not compared, never treated as "unchanged".
+    pub fn of(path: &Path) -> Option<Self> {
+        let md = std::fs::metadata(path).ok()?;
+        Some(Self { len: md.len(), mtime: md.modified().ok() })
+    }
+}
+
+/// Describe how a source file changed while a vendor library held it open, or `None` if it did not.
+///
+/// `None` for either fingerprint means "could not tell" — a missing observation is not evidence of
+/// a rewrite, so it stays quiet rather than crying wolf on, say, a filesystem with no mtime.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn describe_source_rewrite(
+    before: Option<&SourceFingerprint>,
+    after: Option<&SourceFingerprint>,
+) -> Option<String> {
+    let (b, a) = (before?, after?);
+    let mut what = Vec::new();
+    if b.len != a.len {
+        what.push(format!("size {} → {} bytes", b.len, a.len));
+    }
+    // Only compare times when BOTH sides reported one.
+    if let (Some(bt), Some(at)) = (b.mtime, a.mtime) {
+        if bt != at {
+            what.push("modification time advanced".to_string());
+        }
+    }
+    (!what.is_empty()).then(|| what.join(", "))
+}
+
 /// One bounded pass for any `Digest`: `(hex, byte count)`.
 fn stream_digest<D: Digest>(path: &Path) -> Result<(String, u64)> {
     let mut f = File::open(path)?;
@@ -583,6 +640,42 @@ mod tests {
         let p = std::env::temp_dir().join(format!("mzpc_embed_aux_{}_{name}", std::process::id()));
         File::create(&p).unwrap().write_all(bytes).unwrap();
         p
+    }
+
+    /// The vendor-rewrote-my-input detector. Runs on every host (no FFI, no vendor DLL): it is
+    /// plain `stat` arithmetic, which is exactly why it lives here and not inside the
+    /// Windows-gated Shimadzu lane where it could never be executed.
+    #[test]
+    fn source_rewrite_is_detected_by_size_or_mtime() {
+        let p = write_tmp("fingerprint", b"original contents");
+        let before = SourceFingerprint::of(&p).expect("fingerprint the file we just wrote");
+
+        // Untouched: no report.
+        assert_eq!(describe_source_rewrite(Some(&before), SourceFingerprint::of(&p).as_ref()), None);
+
+        // A rewrite that changes the length is named, and names both lengths.
+        File::create(&p).unwrap().write_all(b"vendor rewrote this, longer now").unwrap();
+        let after = SourceFingerprint::of(&p).expect("fingerprint after the rewrite");
+        let msg = describe_source_rewrite(Some(&before), Some(&after))
+            .expect("a length change must be reported");
+        assert!(msg.contains("17"), "old length missing from {msg:?}");
+        assert!(msg.contains("31"), "new length missing from {msg:?}");
+
+        // A same-length rewrite is caught by mtime alone.
+        let same_len = SourceFingerprint { len: before.len, mtime: after.mtime };
+        let msg = describe_source_rewrite(Some(&before), Some(&same_len))
+            .expect("a same-length rewrite must still be reported when mtime moved");
+        assert!(msg.contains("modification time"), "{msg:?}");
+
+        // A missing observation is not evidence of a rewrite — it must stay silent, not guess.
+        assert_eq!(describe_source_rewrite(None, Some(&after)), None);
+        assert_eq!(describe_source_rewrite(Some(&before), None), None);
+        // Nor is a filesystem that reports no mtime on either side.
+        let no_time_a = SourceFingerprint { len: 5, mtime: None };
+        let no_time_b = SourceFingerprint { len: 5, mtime: None };
+        assert_eq!(describe_source_rewrite(Some(&no_time_a), Some(&no_time_b)), None);
+
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

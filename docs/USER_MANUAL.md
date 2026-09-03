@@ -264,14 +264,22 @@ signal: precursor m/z / charge / isolation window, the scan window, the instrume
 configuration (model, ESI source, quadrupole + TOF analysers, as the API states them — no
 detector is invented) and the source `SHA-1` (MS:1000569), which is taken **before** the
 vendor DLL opens the file because `Shimadzu.LabSolutions.IO` holds a byte-range lock for as
-long as it does. One vendor defect to know about: for a spectrum that carries **no profile
-signal**, the vendor API returns a centroid list whose intensities are shifted against
-their m/z by 1–7 positions with the last peak missing — msconvert, reading the same DLL,
-writes byte-identical data. The converter stores those peaks exactly as returned and logs
-one warning per file naming the defect; files whose spectra carry profile signal are
-bit-exact through every path. For scientifically correct centroids from a profile-less
-`.lcd`, use a LabSolutions mzML export (its exporter takes a different path and is exact).
-See `glue/shimadzu/README.md` for the measurements.
+long as it does. **One library version to avoid:** `Shimadzu.LabSolutions.IO.IoModule.dll`
+**3.8.4.6016** returns, for a spectrum that carries no profile signal, a centroid list whose
+intensities are shifted against their m/z by 1–7 positions with the last peak missing.
+Version **5.0.0.0** — shipped by a current ProteoWizard (3.0.26151 verified) — reads the same
+files correctly, so **the remedy is to point `$MZPC_PWIZ_DIR` at a current ProteoWizard**
+(§11), not to fall back on a LabSolutions mzML export as this manual advised before v0.9.9.
+msconvert appeared to confirm the defect only because it was driving the same 3.8.4.6016 DLL
+out of the same directory. Files whose spectra carry profile signal were always bit-exact
+through either library. On a stale library the converter still stores the peaks exactly as
+returned (correcting vendor data is not its job) and logs one warning per file naming the loaded
+version and the fix; that warning fires only when the loaded library reports a major version
+below 5 **and** the file stores no profile signal, so a current ProteoWizard never raises it.
+Archives
+converted from a profile-less `.lcd` before v0.9.9 carry the misaligned intensities and should
+be reconverted. See `glue/shimadzu/README.md` for the measurements and for how to check the
+installed version.
 
 **Profile zero-run compaction (the one transform that is not byte-for-byte).** In **profile**
 spectra, a run of two or more *consecutive* zero-intensity points is collapsed to a single zero at
@@ -374,7 +382,8 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
     MS2 scans to the scan-window bound) keeps f64 m/z in the same facet.
   - **Centroids → exact Int64 lattice** in `spectra_peaks` (point layout, never chunked or
     numpressed): `point.tof_index` Int64 with `LinearMz` and `mzpeak:transform_params = "1e-9"`,
-    i.e. `m/z = 1e-9 · tof_index`, plus the f64 `point.mz` fallback (NULL on lattice rows) and
+    i.e. `m/z = tof_index / 1e9` (the division, not `1e-9 · tof_index` — see above), plus the
+    f64 `point.mz` fallback (NULL on lattice rows) and
     `point.intensity`; index block `mz_calibration: {codec: mz-grid, scale: 1e9, vendor:
     shimadzu, lossless: tof_index, applies_to: spectra_peaks}`. Each centroid list is checked on
     its own (`|m/z·1e9 − k| < max(1e-3, 8 ulp)`, `k` non-decreasing); one that fails keeps f64.
@@ -401,9 +410,49 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 | `DOTNET_ROLL_FORWARD` | set automatically to `LatestMajor` if unset (Thermo) |
 | `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` | set automatically to `ignore` if unset |
 | `MSCONVERT_PATH` | `msconvert` location for `--via-msconvert` |
-| `MZPC_PWIZ_DIR`, `MZPC_SCIEX_GLUE`, `MZPC_AGILENT_GLUE`, `MZPC_SHIMADZU_GLUE` | native vendor-SDK runtime (§11) |
+
+Every `MZPC_*` variable the converter reads is listed below. They fall into three groups:
+**deployment** (where the vendor libraries and glue live — you will set these on a Windows
+conversion host), **output-affecting** (they change what is written, and are not recorded in the
+archive — prefer the equivalent CLI flag where one exists) and **diagnostic** (they dump or trace
+and are not for production runs).
+
+**Deployment (§11).**
+
+| Variable | Effect |
+|---|---|
+| `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe`. **Use a current ProteoWizard** (3.0.26151 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
+| `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback |
+| `MZPC_AGILENT_GLUE` | Directory holding the built `AgilentGlueHost.exe` (net48) |
+| `MZPC_AGILENT_MIDAC_GLUE` | Directory holding the built `AgilentMidacGlue.dll` + runtimeconfig (Agilent ion mobility) |
+| `MZPC_SCIEX_GLUE` | Directory holding the built `SciexGlue.dll` + runtimeconfig |
+| `MZPC_SHIMADZU_GLUE` | Directory holding the built `ShimadzuGlue.dll` + runtimeconfig |
+
+**Output-affecting.** These change the bytes that are written and leave no trace in the archive;
+where a CLI flag exists, use it instead so the run is reproducible from its command line.
+
+| Variable | Effect |
+|---|---|
+| `MZPC_NO_MZ_LATTICE=1` | Same as `--no-mz-lattice` (§9): store f64 `mz` instead of the fixed-point lattice, on every lane |
 | `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8) |
-| `MZPC_TDF_SDK_GOLDEN=<out.json>` | Bruker TDF, `--bruker-sdk` only (Windows/Linux): diagnostic dump of the SDK's `tims_index_to_mz` at up to 240 `(frame, tof)` points — frame 1, the last frame and 10 evenly spaced frames × 20 tof values over `0..DigitizerNumSamples−1` — as `{file, digitizer_num_samples, mz_calibration, points: [{frame, t1, t2, cal_id, tof, mz_sdk}]}`, the ground truth for the ModelType-1 model and the per-spectrum `tof_c0`/`tof_c1` (§8). Zero cost when unset; a bad path or an SDK refusal is logged and never fails the conversion |
+| `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to f32 |
+| `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible |
+| `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`). Logged as a warning when set |
+| `MZPC_MAX_SPECTRA=<n>` | Stop after `n` spectra. **Deliberately truncating**: it also disables the "all source spectra written" completeness check, so the archive is a partial one that exits 0. Diagnostics only |
+
+**Performance / diagnostic.** No effect on the bytes written (except as noted), zero cost when unset.
+
+| Variable | Effect |
+|---|---|
+| `MZPC_BUFFER_SPECTRA=<n>` | Spectra buffered in RAM before the writer flushes a row group (default 256) on the standard f64 paths |
+| `MZPC_DECODE_WINDOW=<n>` | Bounded reorder window for the parallel timsTOF decoder (default 8× rayon threads, capped at 128). Output order — and therefore the bytes — is unchanged |
+| `MZPC_ROW_GROUP_ROWS=<n>` | Peak-facet parquet row-group size in rows (default 8192 chunks/group on chunked facets, parquet's 2^20 otherwise). Trades size against per-frame random access |
+| `MZPC_TIMING=1` | Log decode-vs-write busy times for the pipelined timsTOF path |
+| `MZPC_SHIMADZU_DEBUG=1` | Shimadzu glue: trace scan-count discovery on stderr |
+| `MZPC_SHIMADZU_PROBE=<n>` | Shimadzu: dump the first `n` spectra as JSON lines and exit **without writing an archive** |
+| `MZPC_DUMP_IM_TABLE=1` | Bruker TDF: dump the scan→1/K0 table (timsrust, and the SDK where available) and exit without converting |
+| `MZPC_DUMP_AGILENT_PROFILE=1` | Agilent: dump decoded profile spectra (sum, nnz, first/last `(k,v)`, max `v`) and exit without converting |
+| `MZPC_TDF_SDK_GOLDEN=<out.json>` | Bruker TDF, `--bruker-sdk` only (Windows/Linux): diagnostic dump of the SDK's `tims_index_to_mz` at up to 240 `(frame, tof)` points — frame 1, the last frame and 10 evenly spaced frames × 20 tof values over `0..DigitizerNumSamples−1` — as `{file, digitizer_num_samples, mz_calibration, points: [{frame, t1, t2, cal_id, tof, mz_sdk}]}`, the ground truth for the ModelType-1 model and the per-spectrum `tof_c0`/`tof_c1` (§8). A bad path or an SDK refusal is logged and never fails the conversion |
 
 ## 11. Native vendor-SDK readers
 
@@ -413,11 +462,25 @@ vendor libraries exist — Windows for all four, Linux also for Bruker BAF. Ther
 opt-in; macOS gets none (no vendor SDKs exist there).
 
 They load the proprietary vendor DLLs at **runtime**, sourced from a ProteoWizard
-install: point `$MZPC_PWIZ_DIR` at it (MHDAC under `vendor_api/Agilent`, Clearcore2
-under `vendor_api/ABI`), and for the .NET glues set `$MZPC_AGILENT_GLUE` /
+install: point `$MZPC_PWIZ_DIR` at it, and for the .NET glues set `$MZPC_AGILENT_GLUE` /
 `$MZPC_SCIEX_GLUE` / `$MZPC_SHIMADZU_GLUE` to the built C# glue dir (`dotnet build
 glue/agilent/AgilentGlue.csproj`, likewise `glue/shimadzu/ShimadzuGlue.csproj`; the Shimadzu
 DLL is loaded from `$MZPC_PWIZ_DIR` by reflection — see `glue/shimadzu/README.md`).
+Both ProteoWizard layouts work: the MHDAC/Clearcore2 assemblies may sit under
+`vendor_api/Agilent` / `vendor_api/ABI` (the bundled builds) or flat beside `msconvert.exe`
+(the standalone installer); the Agilent lane probes both, subdirectory first. Shimadzu's
+`Shimadzu.LabSolutions.IO.IoModule.dll` is always flat.
+
+**Which ProteoWizard: use a current one.** 3.0.26151 is verified, and anything that ships
+`Shimadzu.LabSolutions.IO.IoModule.dll` **5.0.0.0** is fine. Older trees ship **3.8.4.6016**,
+which mispairs centroid intensities on profile-less Shimadzu `.lcd` files (§8). The known-stale
+source is the **FLASHApp / OpenMS third-party bundle, which carries ProteoWizard 3.0.22187
+(July 2022)** — if `$MZPC_PWIZ_DIR` points into that bundle, replace it with a current
+ProteoWizard install rather than working around the symptom. To check on the conversion host:
+
+```powershell
+(Get-Item "$env:MZPC_PWIZ_DIR\Shimadzu.LabSolutions.IO.IoModule.dll").VersionInfo.FileVersion
+```
 Without the DLLs the reader reports a clear error. Where no native reader exists for
 a format on the current platform (e.g. Agilent/SciEX on macOS or Linux), use
 `--via-msconvert` — it needs no special build.

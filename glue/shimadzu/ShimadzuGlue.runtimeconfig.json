@@ -1,5 +1,6 @@
 {
   "//": "Standalone runtimeconfig consumed by netcorehost's initialize_for_runtime_config. dotnet build also emits one next to the DLL; this committed copy documents the expected shape and lets the Rust host boot even when pointed at a directory that only holds the DLL + this file. Targets the .NET 8 shared runtime (Microsoft.NETCore.App).",
+  "//keep-in-sync-with-csproj": "Every configProperty ShimadzuGlue.csproj sets must appear here too, or the documented DLL-only deployment behaves differently from a `dotnet build` output. EnableUnsafeBinaryFormatterSerialization was missing here for one release and is REQUIRED, not optional: Shimadzu.LabSolutions.IO 5.0.0.0 (ProteoWizard 3.0.26151+) deserializes part of the .lcd through BinaryFormatter, which .NET disables by default since .NET 5, so without it LoadData throws NotSupportedException and every .lcd looks unreadable.",
   "runtimeOptions": {
     "tfm": "net8.0",
     "framework": {
@@ -8,7 +9,8 @@
     },
     "configProperties": {
       "System.Reflection.Metadata.MetadataUpdater.IsSupported": false,
-      "System.Runtime.Loader.UseRidGraph": true
+      "System.Runtime.Loader.UseRidGraph": true,
+      "System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization": true
     },
     "rollForward": "LatestMinor"
   }

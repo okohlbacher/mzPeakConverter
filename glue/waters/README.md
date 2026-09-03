@@ -1,5 +1,15 @@
 # WatersGlue — native Waters `.raw` reader shim
 
+> ## ⛔ NOT WIRED — nothing in the converter loads this project.
+>
+> The Waters lane needs **no glue at all**: `MassLynxRaw.dll` exposes a plain C ABI, and
+> `src/waters.rs` loads it directly with `libloading` from `MZPC_MASSLYNX_DIR` (or
+> `MZPC_PWIZ_DIR`). No code path reads `MZPC_WATERS_GLUE` or loads `WatersGlue.dll` — the
+> variable and the build output below describe an alternative design that was never connected.
+> Building this project is harmless; pointing environment variables at it changes nothing.
+> Whether to revive or delete it is an open decision (see `BACKLOG.md`). Everything under
+> "Running" is therefore documentation of an unreached path, kept for that decision.
+
 A thin .NET 8 C# library that the mzPeakConverter Rust `waters` path hosts in-process
 (via `netcorehost` / CoreCLR) to read Waters MassLynx `.raw` directories through the vendor
 **MassLynx SDK** managed API, and exposes the data back to Rust over a tiny C ABI.
@@ -45,11 +55,11 @@ this project and must not be committed here. Two common sources:
 2. A **ProteoWizard** install that bundles the Waters vendor API — look under
    `<pwiz-install>\vendor_api\Waters\` for `MassLynxRaw.dll` (+ `cdt.dll` and friends).
 
-## Running (environment variables read by `src/waters.rs`)
+## Running (environment variables — only `MZPC_MASSLYNX_DIR` is actually read)
 
 | Variable             | Meaning                                                                       |
 | -------------------- | ----------------------------------------------------------------------------- |
-| `MZPC_WATERS_GLUE`   | Directory holding the built `WatersGlue.dll` + `WatersGlue.runtimeconfig.json` (e.g. `glue/waters/bin/Release/net8.0`). |
+| `MZPC_WATERS_GLUE`   | ⛔ **Not read by any code.** Would hold the built `WatersGlue.dll` + `WatersGlue.runtimeconfig.json` (e.g. `glue/waters/bin/Release/net8.0`) if this lane were wired. |
 | `MZPC_MASSLYNX_DIR`  | Directory holding the MassLynx managed DLLs. From a ProteoWizard install this is `<MZPC_MASSLYNX_DIR>/vendor_api/Waters` (and the glue accepts `MZPC_MASSLYNX_DIR` itself if it directly contains them). |
 
 A .NET 8 runtime (`Microsoft.NETCore.App` 8.0+) must be installed on the host.
@@ -57,7 +67,7 @@ A .NET 8 runtime (`Microsoft.NETCore.App` 8.0+) must be installed on the host.
 Example (Windows PowerShell):
 
 ```powershell
-$env:MZPC_WATERS_GLUE   = "C:\...\mzPeakConverter\glue\waters\bin\Release\net8.0"
+# MZPC_WATERS_GLUE is inert; MZPC_MASSLYNX_DIR is the one that matters.
 $env:MZPC_MASSLYNX_DIR  = "C:\Program Files\ProteoWizard\ProteoWizard 3.0.24"
 mzpeak-convert convert sample.raw -o sample.mzpeak
 ```
