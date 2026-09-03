@@ -44,6 +44,11 @@ mod shimadzu;
 // Exact sqrt-grid fit for Shimadzu profile axes; pure arithmetic, tested on every host.
 #[allow(dead_code)]
 mod shimadzu_grid;
+// Vendor-neutral fixed-point m/z lattice (`k = round(m/z * scale)`): the detector, the per-spectrum
+// guard, the `spectra_peaks` schema and the `mz_calibration` block. Used by the Shimadzu native lane
+// (through `shimadzu_grid`, at 1e-9) and by the ordinary mzML/generic lane at the detected scale.
+#[allow(dead_code)]
+mod mz_lattice;
 // libloading-based (cross-platform compile); only *runs* on Windows with the MassLynx DLLs, so the
 // `convert_waters` dispatch stays `#[cfg(windows)]` and the reader is dead code off-Windows.
 #[allow(dead_code)]
@@ -112,6 +117,20 @@ static REPRESENTATION: std::sync::OnceLock<RepresentationArg> = std::sync::OnceL
 
 fn representation() -> RepresentationArg {
     *REPRESENTATION.get().unwrap_or(&RepresentationArg::Both)
+}
+
+/// The `--no-mz-lattice` opt-out, published the same way and for the same reason as
+/// [`REPRESENTATION`]. Default (unset) = the lattice is ON wherever the data is on one.
+static NO_MZ_LATTICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Is the fixed-point m/z lattice (see [`mz_lattice`]) allowed on this run? `--no-mz-lattice`
+/// turns it off; `$MZPC_NO_MZ_LATTICE=1` does the same without touching the command line, which is
+/// what the before/after byte-identity checks use on one and the same binary.
+fn mz_lattice_enabled() -> bool {
+    if *NO_MZ_LATTICE.get().unwrap_or(&false) {
+        return false;
+    }
+    !std::env::var("MZPC_NO_MZ_LATTICE").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
 /// CLI spelling of the signal representation to read. Mirrors `shimadzu::Representation`, and is
@@ -183,6 +202,23 @@ struct Cli {
     /// Lossless delta m/z chunking instead of the default lossy numpress-linear.
     #[arg(long)]
     no_numpress: bool,
+
+    /// Disable the fixed-point m/z LATTICE for centroid peaks and store f64 `mz` instead.
+    ///
+    /// Some vendors hand over m/z that are really integers over a power of ten (Shimadzu `MassHigh`
+    /// at 1e-9 Da, and the LabSolutions mzML export of the same acquisition). When the sampled
+    /// centroids all land on such a lattice, the peaks facet stores `tof_index` = round(m/z·scale)
+    /// as Int64 (DELTA_BINARY_PACKED) with an `mz_calibration` index block, which is LOSSLESS and
+    /// smaller than both numpress-linear (lossy) and delta chunking — measured on a 4.5 GB
+    /// LabSolutions DIA mzML: 2.19 GB delta / 1.36 GB numpress / 1.31 GB lattice. Any spectrum that
+    /// does not fit keeps its exact f64 m/z in the same facet's `mz` column; nothing is snapped.
+    ///
+    /// This flag turns the whole thing off, on every lane (the native Shimadzu `.lcd` one
+    /// included); `MZPC_NO_MZ_LATTICE=1` does the same from the environment. Use it when the
+    /// archive is destined for a reader that does not know the `mz-grid` codec and so cannot
+    /// reconstruct an integer m/z axis. Data that is not on a lattice is unaffected either way.
+    #[arg(long)]
+    no_mz_lattice: bool,
 
     /// m/z chunk width (Th) for the chunked layout [default: 50].
     #[arg(long)]
@@ -369,6 +405,7 @@ struct FileConfig {
     to: Option<OutputFormat>,
     layout: Option<Layout>,
     no_numpress: Option<bool>,
+    no_mz_lattice: Option<bool>,
     chunk_size: Option<f64>,
     zstd_level: Option<i32>,
     force: Option<bool>,
@@ -393,6 +430,8 @@ struct Settings {
     output_format: OutputFormat,
     layout: Layout,
     no_numpress: bool,
+    /// `--no-mz-lattice`: store f64 `mz` even when the centroids are on a fixed-point lattice.
+    no_mz_lattice: bool,
     chunk_size: f64,
     zstd_level: i32,
     /// zstd level for the byte-plane timsTOF ims-compact path. Defaults to 5 (the measured plateau —
@@ -441,6 +480,7 @@ impl Settings {
             output_format,
             layout: cli.layout.or(fc.layout).unwrap_or(Layout::Chunked),
             no_numpress: cli.no_numpress || fc.no_numpress.unwrap_or(false),
+            no_mz_lattice: cli.no_mz_lattice || fc.no_mz_lattice.unwrap_or(false),
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
             zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(3),
             ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(5),
@@ -648,6 +688,9 @@ fn run(cli: &Cli) -> Result<i32> {
     }
 
     let cfg = Settings::resolve(cli)?;
+    // Published out-of-band like `--representation` (see NO_MZ_LATTICE): from the RESOLVED setting,
+    // so a config-file `no_mz_lattice: true` counts as much as the flag.
+    let _ = NO_MZ_LATTICE.set(cfg.no_mz_lattice);
     let verbose = cli.verbose > 0;
 
     // Inspection report: always when there is no output (the whole job is "inspect"), and also as a
@@ -1051,46 +1094,21 @@ fn is_agilent_d(input: &Path) -> bool {
     input.is_dir() && input.join("AcqData").is_dir()
 }
 
-/// Does this m/z axis sit on a fixed-point lattice — i.e. are the values vendor-stored scaled
-/// integers?
-///
-/// This decides delta-vs-numpress from the DATA rather than from the file extension, which is a bad
-/// proxy and was measurably wrong. A Shimadzu `.lcd` read natively is on an exact 1e-4 lattice
-/// (residual 9.3e-10) where delta chunking is ~3x smaller than numpress-linear AND bit-exact. But
-/// msconvert's mzML **of the same acquisition** is off that lattice (residual ~0.5, uniform), and
-/// there delta is 1.6x LARGER than numpress. Same instrument, same run, opposite answers — so the
-/// extension cannot decide this and the values have to be looked at.
-fn is_fixed_point_lattice(mzs: &[f64]) -> bool {
-    // Vendor fixed-point scales seen in the wild. 1e-4 is Shimadzu's coarse MASSNUMBER_UNIT; 1e-9 is
-    // its `MassHigh` field, which is also what LabSolutions' own mzML exporter writes.
-    const SCALES: [f64; 4] = [10_000.0, 100_000.0, 1_000.0, 1_000_000_000.0];
-    let sample: Vec<f64> = mzs.iter().copied().filter(|v| v.is_finite() && *v > 0.0).collect();
-    if sample.len() < 64 {
-        return false;
-    }
-    SCALES.iter().any(|scale| {
-        // Every value must land on the grid, not merely most: a genuine lattice has NO exceptions,
-        // while off-lattice data occasionally lands near an integer by chance. The tolerance is
-        // relative: at the 1e-9 scale m/z 1700 becomes 1.7e12, whose f64 ulp (~2.4e-4) is far above
-        // a fixed 1e-6 — while off-lattice residuals are uniform on [0, 0.5], so a few ulps still
-        // discriminate (P(64 chance hits) ~ 0).
-        sample.iter().all(|v| {
-            let scaled = v * scale;
-            let tol = (scaled.abs() * 8.0 * f64::EPSILON).max(1e-6);
-            (scaled - scaled.round()).abs() < tol
-        })
-    })
-}
-
 /// Refine a requested chunking strategy against real m/z values: numpress-linear's floating-point
 /// prediction fights a fixed-point lattice, so swap it for lossless delta when the data is on one.
 /// An explicitly requested delta (`--no-numpress`) is left alone.
+///
+/// The detector itself moved to [`mz_lattice::fixed_point_lattice_scale`] (formerly the local
+/// `is_fixed_point_lattice`, returning a bool) because the lattice ROUTE needs the matched scale,
+/// not just the fact of a match. The decision here is unchanged: `.is_some()` is the old bool.
 fn refine_chunking(
     sample_mz: &[f64],
     requested: Option<ChunkingStrategy>,
 ) -> Option<ChunkingStrategy> {
     match requested {
-        Some(ChunkingStrategy::NumpressLinear { chunk_size }) if is_fixed_point_lattice(sample_mz) => {
+        Some(ChunkingStrategy::NumpressLinear { chunk_size })
+            if mz_lattice::fixed_point_lattice_scale(sample_mz).is_some() =>
+        {
             log::info!(
                 "m/z is on a fixed-point lattice; using lossless delta chunking (numpress-linear \
                  would be both larger and lossy on this data)"
@@ -1099,6 +1117,28 @@ fn refine_chunking(
         }
         other => other,
     }
+}
+
+/// The fixed-point m/z scale the CENTROID lists of these probe spectra sit on, or `None`.
+///
+/// Deliberately NOT `sample_mz_from` (which takes the raw arrays of every spectrum, profile
+/// included): only the peaks facet is lattice-encoded, so only the values that would reach it get a
+/// vote. On a centroid mzML the two coincide — the raw arrays ARE the centroids — but on a
+/// profile/dual run they do not, and a profile axis (a flight-time grid) must not arm a route that
+/// will never touch it.
+fn probe_lattice_scale(spectra: &[mzdata::spectrum::MultiLayerSpectrum]) -> Option<f64> {
+    let lists: Vec<Vec<f64>> =
+        spectra.iter().filter_map(mz_lattice::centroid_pairs).map(|(mz, _)| mz).collect();
+    let centroids: Vec<f64> = lists.iter().flatten().copied().collect();
+    let scale = mz_lattice::fixed_point_lattice_scale(&centroids)?;
+    // The detector pools the probes' values; the ROUTE decides one spectrum at a time, and its
+    // `centroid_lattice` also requires a non-decreasing k. Re-ask it per probe list so the scale
+    // this run commits to is one every probe would actually have taken, not merely one their
+    // concatenation passes.
+    lists
+        .iter()
+        .all(|mz| mz.is_empty() || mz_lattice::centroid_lattice(mz, scale).is_some())
+        .then_some(scale)
 }
 
 /// Collect m/z values from a few sample spectra, for `refine_chunking`.
@@ -2745,9 +2785,33 @@ fn convert_file(
     };
     let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
 
+    // FIXED-POINT m/z LATTICE (see `mz_lattice`). The same probes decide, from the CENTROID values
+    // only, whether this run's peaks are vendor integers over a power of ten. When they are, the
+    // peaks facet stores `tof_index` = round(m/z·scale) as Int64 (DELTA_BINARY_PACKED, with an
+    // `mz_calibration` index block) instead of f64 `mz` — lossless AND smaller than either chunk
+    // encoding, so it takes precedence over both numpress-linear and delta on that facet. It
+    // supersedes NOTHING on the data facet: profile arrays keep `chunk` exactly as refined above,
+    // including the `--no-numpress` / `--layout point` / explicit-strategy choices, so a
+    // profile-only lattice input is byte-identical to before (the route needs centroids to fire).
+    // `--no-mz-lattice` (or $MZPC_NO_MZ_LATTICE) opts out.
+    let lattice_scale = if mz_lattice_enabled() {
+        probe_lattice_scale(&probes)
+    } else {
+        None
+    };
+    if let Some(scale) = lattice_scale {
+        log::info!(
+            "centroid m/z is on a 1/{scale:e} fixed-point lattice; storing the peaks facet as \
+             Int64 tof_index = round(m/z·{scale:e}) (lossless; off-lattice spectra keep f64 m/z)"
+        );
+    }
+
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(chunk)
-        .peaks_chunked_encoding(chunk)
+        // A lattice peaks facet is an integer axis with an f64 fallback column: never chunked,
+        // never numpressed — the lattice replaces both. This MUST precede
+        // `store_peaks_and_profiles_apart`, which stamps the configured strategy onto the schema.
+        .peaks_chunked_encoding(if lattice_scale.is_some() { None } else { chunk })
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -2760,10 +2824,15 @@ fn convert_file(
 
     // Derive the data schema from the data actually present (one m/z + one intensity column at
     // their source dtype) so points land in point.mz/point.intensity, not auxiliary_arrays.
-    builder = builder
-        .sample_array_types_from_spectrum_source(&mut reader)
-        .sample_array_types_for_peaks_from_spectrum_source(&mut reader)
-        .sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
+    builder = builder.sample_array_types_from_spectrum_source(&mut reader);
+    builder = match lattice_scale {
+        // The lattice facet is fully declared (its four columns are the contract: spectrum_index,
+        // tof_index Int64, the f64 `mz` fallback, intensity); sampling the source's peak arrays
+        // would only re-add the f64 `mz` it already carries.
+        Some(scale) => builder.store_peaks_and_profiles_apart(Some(mz_lattice::lattice_peak_schema(scale))),
+        None => builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader),
+    };
+    builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
 
     let mut writer = builder.build(handle, true);
 
@@ -2810,6 +2879,7 @@ fn convert_file(
     let mut n = 0usize;
     let cap = max_spectra();
     let mut ms1 = Ms1Chroms::default();
+    let mut lattice_tally = FacetTally::default();
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
@@ -2847,10 +2917,51 @@ fn convert_file(
         if synth_chroms {
             ms1.observe(&entry);
         }
-        writer.write_spectrum(&entry)?;
+        match lattice_scale {
+            // Lattice lane: the spectrum comes back UNCHANGED (its m/z array is what the writer
+            // derives the TIC / base peak / observed-m/z columns from — see `lattice_route`'s
+            // summary contract), and only the peak-facet ROWS become integers. A spectrum whose
+            // centroids miss the lattice falls through to `write_spectrum`, which stores its exact
+            // f64 m/z in the same facet's `mz` column: nothing is snapped, nothing is refused.
+            Some(scale) => {
+                let (spec, peak_arrays, outcome) = mz_lattice::lattice_route(entry, scale);
+                lattice_tally.record(FacetRoutes {
+                    centroid_lattice: outcome.on_lattice(),
+                    ..FacetRoutes::default()
+                });
+                match peak_arrays.as_ref() {
+                    Some(arrays) => writer.write_spectrum_with_peak_arrays(&spec, arrays)?,
+                    None => writer.write_spectrum(&spec)?,
+                }
+            }
+            None => writer.write_spectrum(&entry)?,
+        }
         n += 1;
     }
     log::debug!("wrote {n} spectra");
+    if let Some(scale) = lattice_scale {
+        log::info!(
+            "m/z lattice (1/{scale:e}): {} spectra stored as Int64 tof_index, {} kept exact f64 m/z",
+            lattice_tally.centroid_lattice,
+            lattice_tally.centroid_f64
+        );
+        // The scale is decided from a handful of probe spectra but the SCHEMA is run-wide, so a
+        // spectrum that misses it keeps its exact f64 m/z in a point column that is neither
+        // chunked nor numpressed. Values are never wrong, but a run that lands mostly there can be
+        // BIGGER than the same file with `--no-mz-lattice`. Say so rather than let it pass in
+        // silence: this is the one way the lattice can cost space instead of saving it.
+        let routed = lattice_tally.centroid_lattice + lattice_tally.centroid_f64;
+        if routed > 0 && lattice_tally.centroid_f64 * 10 > routed {
+            log::warn!(
+                "{} of {routed} spectra ({:.0} %) missed the 1/{scale:e} lattice the probe spectra \
+                 chose, so their m/z are stored as unchunked f64: this archive may be \
+                 LARGER than the same conversion with --no-mz-lattice. Mixed-lattice \
+                 input (two different scales in one run) is the usual cause.",
+                lattice_tally.centroid_f64,
+                100.0 * lattice_tally.centroid_f64 as f64 / routed as f64
+            );
+        }
+    }
 
     // Cross-check against the source's own declared count. A reader that stops early — a truncated
     // imzML `.ibd`, a half-downloaded mzML — otherwise yields a structurally valid archive that is
@@ -2874,7 +2985,23 @@ fn convert_file(
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     fixup_run_metadata(&mut writer, input);
 
-    finish_with_vendor_and_aux(writer, input, vendor, images, sdrf)?;
+    // The `mz_calibration` block is what the viewer's `mz-grid` codec (and any conformant reader
+    // that would rather not re-derive the scale from the column metadata) gates on.
+    let index_blocks: Vec<(String, serde_json::Value)> = lattice_scale
+        .map(|scale| {
+            (
+                "mz_calibration".to_string(),
+                mz_lattice::mz_calibration_block(
+                    scale,
+                    "detected",
+                    "fixed-point m/z lattice detected in the decoded f64 m/z of the source \
+                     (see mzpeak-convert --no-mz-lattice); off-lattice spectra keep f64 point.mz",
+                ),
+            )
+        })
+        .into_iter()
+        .collect();
+    finish_with_vendor_and_aux(writer, input, vendor, images, sdrf, &index_blocks)?;
     tmp_guard.finish(output)?;
     Ok(())
 }
@@ -3809,14 +3936,21 @@ fn finish_with_vendor(
 /// Like [`finish_with_vendor`], but the mzML/imzML path also embeds optical images (`--image` +
 /// sibling discovery) and an SDRF (`--sdrf`) into the still-open archive BEFORE `zip.finish()`,
 /// adding the `metadata.imaging` / `metadata.study` / `metadata.sample_metadata` index blocks.
+/// `index_blocks` carries any extra reader-side calibration the lane produced (today: the
+/// `mz_calibration` block of the fixed-point m/z lattice); pass `&[]` when there is none.
 fn finish_with_vendor_and_aux(
     writer: MzPeakWriterType<fs::File>,
     input: &Path,
     vendor: Option<&vendor::VendorPolicy>,
     images: &[PathBuf],
     sdrf: Option<&Path>,
+    index_blocks: &[(String, serde_json::Value)],
 ) -> Result<()> {
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    for (key, block) in index_blocks {
+        zip.add_index_metadata(key, block)
+            .with_context(|| format!("writing {key} index block"))?;
+    }
     embed_vendor_members(&mut zip, input, vendor)?;
     embed_aux::embed_into_archive(&mut zip, input, images, sdrf)
         .context("embedding optical images / SDRF")?;
@@ -4049,7 +4183,12 @@ fn convert_shimadzu(
     // same facet's `mz` column. The `mz_calibration` block tells the viewer's `mz-grid` codec. A
     // profile-only run builds no centroid list at all, so neither the facet nor the block that
     // claims `applies_to: spectra_peaks` is declared for it.
-    if rep != shimadzu::Representation::Profile {
+    // `--no-mz-lattice` (config `no_mz_lattice`, `$MZPC_NO_MZ_LATTICE`) turns it off here too, so
+    // the flag means the same thing on every lane: without this the native lane wrote `tof_index`
+    // regardless and the opt-out silently did nothing for exactly the users who need it (a
+    // downstream reader that cannot reconstruct the integer axis).
+    let lattice_on = mz_lattice_enabled();
+    if rep != shimadzu::Representation::Profile && lattice_on {
         hints.peaks_facet = Some(shimadzu_grid::lattice_peak_schema());
         hints.index_blocks.push(("mz_calibration".to_string(), shimadzu_grid::mz_calibration_block()));
     }
@@ -4065,7 +4204,11 @@ fn convert_shimadzu(
                 Some(step) => shimadzu_grid_route(spec, step),
                 None => (spec, None),
             };
-            let (spec, peak_arrays, outcome) = shimadzu_grid::lattice_route(spec);
+            let (spec, peak_arrays, outcome) = if lattice_on {
+                shimadzu_grid::lattice_route(spec)
+            } else {
+                (spec, None, shimadzu_grid::LatticeOutcome::NoCentroids)
+            };
             Ok(VendorSpectrum {
                 spectrum: spec,
                 peak_arrays,

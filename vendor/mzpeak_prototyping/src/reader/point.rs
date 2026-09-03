@@ -132,7 +132,17 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
             ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect()
         } else {
             let s = p.first().copied().unwrap_or(1.0);
-            ks.iter().map(|&k| s * k as f64).collect()
+            // The archive's `mz_calibration` contract is `m/z = tof_index / scale`, and the column
+            // params carry `1/scale`. Multiplying by that reciprocal is NOT the same number: for a
+            // power-of-ten lattice `1e-9` is not exactly 10⁻⁹, so `s · k` differs from the
+            // correctly-rounded `k / 1e9` by one ulp on ~40 % of values (measured: 85,706 of
+            // 216,742 centroids of a LabSolutions mzML), which is exactly the difference between
+            // reproducing the source f64 bit for bit and not. Recover the scale when `s` IS the
+            // correctly-rounded reciprocal of an integer and DIVIDE; otherwise multiply as before.
+            match exact_reciprocal_scale(s) {
+                Some(scale) => ks.iter().map(|&k| k as f64 / scale).collect(),
+                None => ks.iter().map(|&k| s * k as f64).collect(),
+            }
         };
         let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
         if mz_da.update_buffer(mzs.as_slice()).is_ok() {
@@ -142,6 +152,24 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
     }
     for mz_da in reconstructed {
         out.add(mz_da);
+    }
+}
+
+/// The integer `scale` a `LinearMz` params value `s` is the reciprocal of, when it is one exactly
+/// (`1/scale` round-trips back to `s` bit for bit). `1e-9` recovers `1e9`, `1e-5` recovers `1e5`;
+/// an arbitrary non-reciprocal transform recovers nothing and keeps the multiply.
+///
+/// `1.0 / s` alone is not the answer — `1.0 / 1e-9` is 999999999.9999999, not 1e9 — so the
+/// candidate is rounded and then VERIFIED by re-computing the stored reciprocal from it.
+fn exact_reciprocal_scale(s: f64) -> Option<f64> {
+    if !(s > 0.0) || !s.is_finite() {
+        return None;
+    }
+    let candidate = (1.0 / s).round();
+    if candidate.is_finite() && candidate > 0.0 && 1.0 / candidate == s {
+        Some(candidate)
+    } else {
+        None
     }
 }
 

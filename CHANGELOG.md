@@ -6,6 +6,119 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The fixed-point m/z lattice is no longer Shimadzu-native-only: any input whose centroids are
+  vendor integers over a power of ten now gets it, the mzML lane included.** Some vendors' m/z are
+  not really floating point — Shimadzu `MassHigh` is an Int64 at 1e-9 Da, its coarse `Mass` field an
+  Int32 at 1e-4 Da, and LabSolutions' own **mzML export** writes those same 1e-9 values as f64
+  `binary`. The native `.lcd` lane has stored them as `point.tof_index = round(m/z · 1e9)` (Int64,
+  DELTA_BINARY_PACKED) since v0.9.0; the mzML lane had to choose between LOSSY numpress-linear and
+  67 % more space. Measured on the 4.5 GB LabSolutions `DIA_Hela_20ng` mzML, 279,707,903 centroids:
+
+  | encoding | archive | m/z bytes | lossless |
+  |---|---|---|---|
+  | delta chunking (today's default on this data) | 2,188,011,754 B | 1,896,603,579 B | yes |
+  | numpress-linear | 1,354,604,168 B | ~847 MB | **no** |
+  | **m/z lattice (this change)** | **1,311,772,262 B** | **1,034,748,033 B** | yes (bit-exact) |
+
+  i.e. −40.0 % on the archive and −45.4 % on the m/z column against the lossless baseline, and
+  smaller than the lossy one. `Blind_P1_pos_012.mzML` (13,200 spectra, 216,742 centroids):
+  3,708,762 B → 2,264,008 B, −39.0 %, with all 216,742 m/z reconstructing to the source f64
+  **bit for bit** (`mzpeak-convert … --to mzml` back out of the archive: 0 of 216,742 differ).
+
+  - **`src/mz_lattice.rs`** is the vendor-neutral mechanism, parameterised by scale: the detector,
+    the per-spectrum guard, the `spectra_peaks` schema (`spectrum_index`, `tof_index` Int64 with
+    `LinearMz` + `mzpeak:transform_params = 1/scale`, the f64 `mz` fallback, `intensity`) and the
+    `mz_calibration` index block (`"codec": "mz-grid"`). `src/shimadzu_grid.rs` now delegates to it
+    at a fixed 1e-9, so that lane's archive shape is unchanged (`tests/shimadzu_lattice_peaks.rs`
+    still pins it; its one edit is the reconstruction formula, below).
+  - **The detector returns the scale.** `is_fixed_point_lattice` (bool) became
+    `mz_lattice::fixed_point_lattice_scale` → `Option<f64>`, naming the COARSEST of 1e3/1e4/1e5/1e9
+    that reproduces every sampled value (coarsest first keeps `k` as small as possible; a value on
+    the 1e-3 lattice is trivially also on the finer ones). `refine_chunking`'s delta-vs-numpress
+    decision is unchanged — it reads the same answer as `.is_some()`.
+  - **Nothing is snapped and no spectrum is refused.** The guard is per spectrum and
+    all-or-nothing: one value off the lattice (an interpolated apex) and that spectrum's exact f64
+    m/z goes to the same facet's `mz` column instead. `tof_index` is NULL on those rows, `mz` is
+    NULL on the lattice rows.
+  - **Only the peaks facet.** Profile arrays keep the chunked data facet and every existing choice
+    (`--layout`, `--chunk-size`, `--no-numpress`, an explicit strategy) exactly as before, so a
+    profile-only input is byte-identical. A run with both gets a point peaks facet beside a chunked
+    data facet — the mixed layout family this converter writes on purpose (the writer warns).
+  - **Precedence and opt-outs.** On the peaks facet the lattice supersedes both numpress-linear and
+    delta, because it is lossless AND smaller than either. `--tof-grid` (the sqrt/flight-time grid,
+    a different thing) still takes the file where it is asked for and fits. New `--no-mz-lattice`
+    (config `no_mz_lattice:`, or `$MZPC_NO_MZ_LATTICE`) turns it off entirely.
+  - **The summaries stay real.** A lattice-routed spectrum keeps its m/z array on the
+    `MultiLayerSpectrum` — only the facet ROWS become integers — so the writer's own MS:1000285 /
+    MS:1000504 / MS:1000505 / MS:1000527 / MS:1000528 derivation is still fed real m/z. Verified,
+    not assumed: on `Blind_P1_pos_012` all five columns are identical, value for value, to the same
+    file converted with `--no-mz-lattice` (13,200/13,200), and `tests/mz_lattice_mzml.rs` asserts
+    that equality on every fixture spectrum. This is the bc8497c regression, which this route must
+    not reintroduce.
+  - **Reconstruction is the DIVISION, and now exact.** The `mz_calibration` block has said
+    `mz_from_tof_index: "tof_index / scale"` since v0.9.0, but the reference reader multiplied by
+    the column's `mzpeak:transform_params` (`1/scale`) instead — and those are different numbers:
+    `1e-9` is not exactly 10⁻⁹, so `k · 1e-9` is not the correctly-rounded `k / 1e9` for about 40 %
+    of `k` (measured on `Blind_P1_pos_012`: 85,706 of 216,742 centroids, up to 1.137e-13 Da). That
+    made "lossless" false for the path readers actually took, and would have turned the mzML lane's
+    previously bit-exact round trip into a one-ulp-lossy one. `vendor/mzpeak_prototyping/src/
+    reader/point.rs` now recovers the integer scale from the params (rounding `1/s` and verifying
+    that `1/scale` reproduces `s` bit for bit) and DIVIDES, falling back to the multiply for a
+    transform that is not an exact reciprocal. The round trip is bit-exact at every scale, on the
+    Shimadzu native archives too, and `tests/shimadzu_lattice_peaks.rs` pins `k / 1e9` where it
+    previously pinned `k · 1e-9`.
+  - **The per-spectrum guard is no longer scale-blind.** `LATTICE_TOL`, the floor of the guard on
+    the SCALED value, was 1e-3 — sized for the 1e-9 lane, where it means 1e-12 Da. At the 1e3/1e4/
+    1e5 scales this change adds it would have meant up to 1e-6 Da, i.e. a genuinely off-lattice
+    value would have been SNAPPED onto the lattice instead of keeping its f64 — the opposite of the
+    stated invariant, and 1000× looser than the detector that armed the route. The floor is now
+    1e-6 and both the detector and the guard go through one `on_lattice_scaled`, so they cannot
+    drift apart again. No effect on real data: `Blind_P1_pos_012` still routes 13,200/13,200
+    spectra and `DIA_Hela_20ng` 21,500/21,500.
+  - **A probe-derived scale is checked, and a heavy fallback is no longer silent.** The scale comes
+    from six probe spectra but the schema is run-wide, so a spectrum that misses it stores f64 m/z
+    in a point column that is neither chunked nor numpressed — correct values, but a run that lands
+    mostly there can be BIGGER than the same file with `--no-mz-lattice`. `probe_lattice_scale` now
+    re-asks `centroid_lattice` per probe list (the pooled detector does not check the
+    non-decreasing-`k` rule), and the post-loop tally warns when more than 10 % of the routed
+    spectra kept f64, naming `--no-mz-lattice`. Mixed-lattice input — two different scales in one
+    run — is the case that provokes it.
+  - **Tests.** 17 unit tests in `mz_lattice` (each of the four scales detected by name, the
+    coarsest-wins rule, non-lattice / short / f32-rounded input rejected, the `1/scale` params
+    string, the per-spectrum guard at both scales, a coarse-scale value 5e-7 Da off its lattice
+    NOT being snapped, an off-lattice spectrum falling back beside an
+    on-lattice one, the four-column schema and the calibration block at two scales), two
+    scale-binding pins left in `shimadzu_grid`, and `tests/mz_lattice_mzml.rs` — three end-to-end
+    conversions through the real binary over two new committed fixtures (`tests/data/
+    mz_lattice_1e9.mzML`, one of whose 12 spectra is deliberately off-lattice, and
+    `mz_lattice_1e4.mzML`), asserting the index block, the Int64/DELTA_BINARY_PACKED/ZSTD/no-dictionary
+    column contract, the reader round trip against the source mzML, the null pattern of the
+    `tof_index`/`mz` pair, the summary columns, and that a NON-lattice input converts to
+    byte-identical parquet members with the lattice on and off. Both fixtures now span a realistic
+    120–1900 Da and the round trip is asserted BIT-FOR-BIT rather than against an epsilon: at
+    m/z 512 and above, one ulp is larger than the old `1e-4/scale` tolerance, so that assertion
+    could not have told the exact quotient from the one-ulp-off product it now pins.
+
+### Changed
+
+- **An mzML whose centroids are on a fixed-point lattice now converts to an INTEGER m/z axis by
+  default.** Its peaks facet carries `point.tof_index` (Int64) with `point.mz` NULL on the routed
+  rows, where before v0.9.7 every mzML archive had f64 `point.mz`. `mzpeak-convert`'s own reader
+  and mzPeakViewer reconstruct it (the `mz-grid` codec); the other readers in the mzPeak family —
+  OpenMS's `MzPeakFile`, mzPeakJ, mzPeakIV, mzPeakExplorer, mzPeakValidator — do not yet, and read
+  those cells as 0. Pass `--no-mz-lattice` (config `no_mz_lattice: true`, or
+  `MZPC_NO_MZ_LATTICE=1`) for an archive destined for one of them; the flag now applies to EVERY
+  lane, the native Shimadzu `.lcd` one included, where it previously did nothing. Which files this
+  affects is decided by the data, not the extension: on a ~80-file general-MS sweep exactly the
+  Shimadzu LabSolutions exports fire.
+- Re-converting a lattice archive through the mzpeak-to-mzpeak filter path is not size-preserving
+  (that lane rewrites the peaks facet without the `*_index` writer props, so `tof_index` loses
+  DELTA_BINARY_PACKED). Pre-existing — the pre-change binary produces a byte-identical inflated
+  archive from the same input — but until now only the Windows-only Shimadzu native lane could
+  produce such archives. Tracked separately.
+
 ### Fixed
 
 - **Grid-routed spectra shipped `total_ion_current = 0`, no base peak, and NULL observed-m/z
