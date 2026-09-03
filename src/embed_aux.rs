@@ -661,8 +661,16 @@ mod tests {
         assert!(msg.contains("17"), "old length missing from {msg:?}");
         assert!(msg.contains("31"), "new length missing from {msg:?}");
 
-        // A same-length rewrite is caught by mtime alone.
-        let same_len = SourceFingerprint { len: before.len, mtime: after.mtime };
+        // A same-length rewrite is caught by mtime alone. The moved time is SYNTHESIZED, not taken
+        // from the rewrite above: two writes this close together share an mtime on Windows, whose
+        // clock updates on a ~15.6 ms tick, and the test then asserted on whether the filesystem
+        // happened to tick rather than on the logic under test. It was red on the box and green on
+        // macOS (APFS, nanosecond stamps) for exactly that reason.
+        let moved = before
+            .mtime
+            .map(|t| t + std::time::Duration::from_secs(1))
+            .expect("the temp filesystem reports an mtime");
+        let same_len = SourceFingerprint { len: before.len, mtime: Some(moved) };
         let msg = describe_source_rewrite(Some(&before), Some(&same_len))
             .expect("a same-length rewrite must still be reported when mtime moved");
         assert!(msg.contains("modification time"), "{msg:?}");
