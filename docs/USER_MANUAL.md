@@ -212,6 +212,32 @@ was +8.5 / −10.6 / −3.4 ppm at TOF 0 / mid / max, and a 20 ppm search on it 
 the peptides at 1 % FDR. A reader that wants vendor-grade m/z evaluates the ModelType-1
 expression; one that does not is still exact to the archive's own `tof` grid.
 
+**Exact per-spectrum coefficients when `C2 = 0`.** When every `MzCalibration` row a run
+references is ModelType 1 with `C2 = C3 = C4 = dC2 = 0` — stored as numeric zeros; a NULL or
+text cell is a *missing* term, not a zero, and keeps the run on the chord (PXD059079 2485.d is
+such a file), the vendor model is *exactly* a sqrt-linear law in `tof` per frame:
+`m/z = (tof_c0 + tof_c1·tof)²` with `tof_c1 = DigitizerTimebase·√C1_eff/1e6`,
+`tof_c0 = (DigitizerDelay − C0)·√C1_eff/1e6` and `C1_eff` temperature-corrected with the
+frame's `Frames.T1`. Both ims-compact lanes (native and `--bruker-sdk`) then write the pair as
+per-spectrum Float64 columns `…_tof_c0` / `…_tof_c1` in `spectra_metadata` (the same columns
+and accessions the SciEX/Agilent/Shimadzu sqrt grids use), stamp the `tof` column with
+`mzpeak:transform_params_per_spectrum = "tof_c0,tof_c1"`, and add
+`"per_spectrum": "tof_c0,tof_c1"`, `"exact_per_spectrum": true` and a note to
+`ims_calibration`; `a`/`b` and `"exact": false` stay for readers that only know the run-wide
+chord. The vendored reader — and therefore `mzpeak-convert ARCHIVE -o x.mzML` — reconstructs
+m/z from the per-spectrum pair (1e-12 relative to the ModelType-1 model, versus up to 4.2 ppm
+for the chord on 2485.d). A frame whose `Frames.T1` is NULL cannot be evaluated and gets *no*
+pair: its `tof_c0`/`tof_c1` cells are NULL, readers fall back to the chord for that spectrum,
+and the count appears as `"per_spectrum_chord_frames"` — so `"exact_per_spectrum": true` is a
+per-spectrum statement (a spectrum *with* the pair is on the model). A run with any `C2 ≠ 0`
+row, or a TDF whose `Frames` table lacks `T1`/`MzCalibration` (both lanes), gets no
+`tof_c0`/`tof_c1` columns and no `per_spectrum` keys — nothing changes for it. One caveat: the
+ModelType-1 formula is SDK-verified on `C2 ≠ 0` runs only, so the `C2 = 0` pair reproduces the
+*formula* exactly; `MZPC_TDF_SDK_GOLDEN=<out.json>` (§10) dumps the SDK's own `tims_index_to_mz`
+at up to 240 `(frame, tof)` points during a `--bruker-sdk` conversion, and dropping that dump of
+2485.d in as `tests/fixtures/tdf_calibration_golden_c2zero.json` turns the converter's
+`c2_zero_sdk_goldens_match_the_sqrt_linear_pair` test into the missing vendor check.
+
 **Several precursors on one spectrum (timsTOF PASEF).** dia-PASEF writes two precursors
 per MS2 frame and DDA-PASEF several, all with the same `(source_index, precursor_index)`
 join key — the key the spec gives is not unique per precursor. The reference reader
@@ -344,6 +370,7 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 | `MSCONVERT_PATH` | `msconvert` location for `--via-msconvert` |
 | `MZPC_PWIZ_DIR`, `MZPC_SCIEX_GLUE`, `MZPC_AGILENT_GLUE`, `MZPC_SHIMADZU_GLUE` | native vendor-SDK runtime (§11) |
 | `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8) |
+| `MZPC_TDF_SDK_GOLDEN=<out.json>` | Bruker TDF, `--bruker-sdk` only (Windows/Linux): diagnostic dump of the SDK's `tims_index_to_mz` at up to 240 `(frame, tof)` points — frame 1, the last frame and 10 evenly spaced frames × 20 tof values over `0..DigitizerNumSamples−1` — as `{file, digitizer_num_samples, mz_calibration, points: [{frame, t1, t2, cal_id, tof, mz_sdk}]}`, the ground truth for the ModelType-1 model and the per-spectrum `tof_c0`/`tof_c1` (§8). Zero cost when unset; a bad path or an SDK refusal is logged and never fails the conversion |
 
 ## 11. Native vendor-SDK readers
 
