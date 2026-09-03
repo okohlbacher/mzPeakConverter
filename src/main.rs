@@ -4607,7 +4607,11 @@ fn convert_sciex_grid(
     output: &Path,
     chunk: Option<ChunkingStrategy>,
     zstd_level: i32,
-    vendor: Option<&vendor::VendorPolicy>,
+    // Deliberately unused: `vendor::embed_into_archive` WALKS A DIRECTORY (`collect_files(dot_d…)`),
+    // and a SCIEX input is a `.wiff` FILE. There are no side-files under it to embed, so the policy
+    // has nothing to act on here — unlike the Bruker `.d` and Agilent `.d` lanes, which do call it.
+    // Kept in the signature so every convert_* lane takes the same arguments.
+    _vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = sciex::SciexReader::open(input)?;

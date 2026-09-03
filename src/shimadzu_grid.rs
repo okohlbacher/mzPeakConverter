@@ -147,16 +147,25 @@ pub use crate::mz_lattice::{lattice_tolerance, LatticeOutcome, LATTICE_SCALE, LA
 
 use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum};
 
+// The four items below bind the shared lattice to Shimadzu's 1e-9 `MassHigh` scale. `convert_shimadzu`
+// now calls `crate::mz_lattice::*` directly, so on Windows — the only host that compiles this lane —
+// rustc reports them as never used. They are NOT dead: `mod lattice_tests` exists precisely to pin
+// this binding, and `cargo build` does not compile tests, which is why the warning appears there and
+// nowhere else. Deleting them deletes the thing under test.
+
 /// The `mzpeak:transform_params` string the reader multiplies `k` by (`LinearMz`: m/z = p0*k).
 /// Kept as the literal `"1e-9"` so the archive carries exactly what the contract names.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const LATTICE_TRANSFORM_PARAMS: &str = "1e-9";
 
 /// [`crate::mz_lattice::centroid_lattice`] at Shimadzu's 1e-9 scale.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn centroid_lattice(mz: &[f64]) -> Option<Vec<i64>> {
     crate::mz_lattice::centroid_lattice(mz, LATTICE_SCALE)
 }
 
 /// [`crate::mz_lattice::lattice_tof_index_field`] at Shimadzu's 1e-9 scale.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn lattice_tof_index_field() -> std::sync::Arc<arrow::datatypes::Field> {
     crate::mz_lattice::lattice_tof_index_field(LATTICE_SCALE)
 }
@@ -167,6 +176,7 @@ pub fn lattice_peak_schema() -> mzpeak_prototyping::writer::ArrayBuffersBuilder 
 }
 
 /// [`crate::mz_lattice::lattice_peak_arrays`], unchanged (the arrays carry no scale).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn lattice_peak_arrays(k: &[i64], intensity: &[f32]) -> Option<BinaryArrayMap> {
     crate::mz_lattice::lattice_peak_arrays(k, intensity)
 }
