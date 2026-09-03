@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **v0.9.9 did not compile on Windows** — a syntax error inside `#[cfg(windows)] mod agilent`, where a
+  doc comment split a multi-line `use`. The host cannot parse that module at all, so `cargo build` and
+  `cargo test` were green on macOS while the box failed; the release shell chain then carried on with
+  the previous binary, so the box silently reported `0.9.8` and the four Shimadzu reconversions ran
+  with the wrong executable. The unit test written to cover that helper never ran either
+  (`0 passed; 78 filtered out`) because it lived inside the same gated module.
+  `agilent_dll_dir` now lives in a new, UNGATED `src/pwiz_layout.rs` with its test, so it compiles and
+  runs on every host (`1 passed`, verified); only the FFI stays Windows-gated. Third Windows-only
+  break of the day — the durable fix is to require the box to build the exact commit and print the
+  expected `--version` before any tag, and to confirm a new test actually ran rather than trusting a
+  green suite.
+
 ## [0.9.9] — 2026-09-03
 
 ### Fixed

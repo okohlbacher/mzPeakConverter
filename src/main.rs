@@ -27,6 +27,7 @@ mod bruker_baf;
 #[cfg(any(windows, target_os = "linux"))]
 #[allow(dead_code)]
 mod bruker_sdk;
+mod pwiz_layout;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod agilent;

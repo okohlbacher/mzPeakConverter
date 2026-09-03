@@ -233,7 +233,7 @@ fn resolve_dirs() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let pwiz_dir = std::env::var_os("MZPC_PWIZ_DIR").map(std::path::PathBuf::from).ok_or_else(|| {
         anyhow!("MZPC_PWIZ_DIR not set — the MIDAC DLLs load from <MZPC_PWIZ_DIR>/vendor_api/Agilent")
     })?;
-    Ok((glue_dir, crate::agilent::agilent_dll_dir(&pwiz_dir)))
+    Ok((glue_dir, crate::pwiz_layout::agilent_dll_dir(&pwiz_dir)))
 }
 
 /// RAII guard freeing a filled [`FrameOut`]'s unmanaged buffers on drop (panic/early-return path).
