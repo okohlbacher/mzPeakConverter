@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Removed
+
+- **The reflective Shimadzu reader dump (`MZPC_SHIMADZU_DUMP_READER=1`) is gone.** It walked the
+  vendor `DataObject` graph invoking every public property getter, and those getters make the vendor
+  library rewrite the `.lcd` it is reading: measured on a copy of `HEK_PosOAD1.lcd`, the size stayed
+  at 63,188,992 B but 33,661 bytes changed across the OLE2 header and directory sectors, five streams
+  under `Mass Data Load Format` were DELETED (including `Profile Load Parameter`, which is why the
+  next profile read failed with `E_FAIL`), and two storage timestamps were reset — while no stream's
+  content changed. `IDataIO.LoadData` has no read-only overload, so a lazy getter commits straight to
+  disk. The lever had already served its purpose (finding scan windows and instrument identity) and
+  nothing depends on it. The conversion path calls only readers plus `IO.Close` and does not write;
+  the read-only diagnostics (`MZPC_SHIMADZU_PROBE`, `_FETCH`, `_DUMP`) are unaffected.
+
 ## [0.9.7] — 2026-09-03
 
 ### Added

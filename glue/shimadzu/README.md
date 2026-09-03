@@ -97,11 +97,33 @@ deliberately out of scope.
 To reproduce: `MZPC_SHIMADZU_PROBE=6` on a profile-less `.lcd`, optionally with
 `MZPC_SHIMADZU_FETCH=legacy|centroid-first|centroid-only|split` and `MZPC_SHIMADZU_DUMP=<scan>`.
 
-**`MZPC_SHIMADZU_DUMP_READER=1` MODIFIES THE `.lcd` — run it on a copy only.** It walks the
-`DataObject` graph reflectively, and some of those property getters commit the OLE2 storage back to
-disk: on `HEK_PosOAD1.lcd` the file kept its 63,188,992 bytes but its SHA-1 changed
-(`3a55dde0…` → `405f35f8…`) and the very next `GetMSSpectrumByScan` failed with `E_FAIL`. Ordinary
-conversions do not write — `Blind_P1_pos_012.lcd` is byte-identical after dozens of opens.
+## Removed: the reflective reader dump (it modified the `.lcd`)
+
+`MZPC_SHIMADZU_DUMP_READER=1` walked the `DataObject` graph with reflection, invoking every public
+property getter to find where the metadata lived. It is **removed** (2026-09-03) because those
+getters make the vendor library rewrite the file it is reading. Measured on a copy of
+`HEK_PosOAD1.lcd`, diffed against the pristine file at the structured-storage level:
+
+| | before | after |
+|---|---|---|
+| size | 63,188,992 B | 63,188,992 B (unchanged) |
+| SHA-1 | `3a55dde0…` | `8ba2ca57…` |
+| differing bytes | — | 33,661 in 431 ranges, **all** in the OLE2 header + directory/FAT sectors |
+| stream *contents* | — | **none changed** |
+| streams | 229 | **224** — `Mass Data Load Format/{DDA Filter Parameter, Fragment Table, MIC Table, Precursor Sort Filter Parameter, Profile Load Parameter}` deleted |
+| `Root Entry` / `Mass Data Load Format` modify time | original | set to the run time |
+
+Losing `Profile Load Parameter` is why the very next `GetMSSpectrumByScan(profileDesired=true)`
+failed with `E_FAIL` in the same process. The cause is structural: `IDataIO.LoadData(path)` has no
+read-only overload — it opens the compound file read-write (and byte-range-locks it, hence
+`os error 33` when hashing while open), so a lazy getter that normalises the load-format storage
+commits straight to disk in OLE2 direct mode.
+
+**The conversion path never writes.** It calls only `LoadData`, `GetMSSpectrumInfo`,
+`GetMSSpectrumByScan`, `GetAnalysisTime`, `RetTimeToScan`, `GetMassRawRange`, `SystemName`,
+`EventCount`, `GetEventNo`, thirteen property reads and `IO.Close` on drop — no setter, save, write,
+commit or update is referenced anywhere in this glue. `Blind_P1_pos_012.lcd` is byte-identical after
+dozens of opens, and every `.lcd` in the corpus still hashes to its canonical value after conversion.
 
 ## EULA
 

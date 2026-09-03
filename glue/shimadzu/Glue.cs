@@ -189,44 +189,6 @@ internal static class Exp
         }
     }
 
-    /// <summary>Reflective map of the reader-level object graph (DataObject → MS → Parameters …),
-    /// for finding where scan windows and instrument identity live. `MZPC_SHIMADZU_DUMP_READER=1`.
-    /// Lists properties WITH scalar values, and method signatures, two levels deep.</summary>
-    internal static readonly bool DumpReader =
-        Environment.GetEnvironmentVariable("MZPC_SHIMADZU_DUMP_READER") is string r && r != "0" && r != "";
-
-    internal static void DumpGraph(string label, object? o, int depth)
-    {
-        if (o == null) { Console.Error.WriteLine($"[shimadzu-graph] {label}: null"); return; }
-        var t = o.GetType();
-        Console.Error.WriteLine($"[shimadzu-graph] {label}: {t.FullName}");
-        foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
-        {
-            if (m.IsSpecialName) continue; // property accessors
-            var ps = string.Join(", ", m.GetParameters().Select(x => (x.IsOut ? "out " : "") + x.ParameterType.Name + " " + x.Name));
-            Console.Error.WriteLine($"[shimadzu-graph]   {m.ReturnType.Name} {m.Name}({ps})");
-        }
-        foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
-        {
-            if (p.GetIndexParameters().Length > 0) continue;
-            object? v;
-            try { v = p.GetValue(o); } catch (Exception e) { v = "<throws " + e.GetType().Name + ">"; }
-            bool scalar = v == null || v is string || v.GetType().IsPrimitive || v.GetType().IsEnum || v is decimal;
-            if (v is IList list)
-            {
-                Console.Error.WriteLine($"[shimadzu-graph]   .{p.Name} : IList[{list.Count}] of {p.PropertyType.Name}");
-                if (depth > 0 && list.Count > 0) DumpGraph($"{label}.{p.Name}[0]", list[0], depth - 1);
-            }
-            else if (scalar)
-                Console.Error.WriteLine($"[shimadzu-graph]   .{p.Name} ({p.PropertyType.Name}) = {v}");
-            else
-            {
-                Console.Error.WriteLine($"[shimadzu-graph]   .{p.Name} : {p.PropertyType.Name}");
-                if (depth > 0) DumpGraph($"{label}.{p.Name}", v, depth - 1);
-            }
-        }
-    }
-
     private static void DumpObject(string label, object? o)
     {
         if (o == null) { Console.Error.WriteLine($"[shimadzu-dump] {label}: null"); return; }
@@ -449,13 +411,6 @@ public static class Api
         var spectrum = Reflect.GetProp(ms, "Spectrum") ?? throw new Exception("MS.Spectrum missing");
         var parameters = Reflect.GetProp(ms, "Parameters");
         var chromatogram = Reflect.GetProp(ms, "Chromatogram");
-
-        if (Exp.DumpReader)
-        {
-            Exp.DumpGraph("DataObject", data, 1);
-            Exp.DumpGraph("DataObject.MS", ms, 1);
-            Exp.DumpGraph("DataObject.MS.Parameters", parameters, 2);
-        }
 
         var unit = ResolveMassNumberUnit();
         var massMul = 1.0 / unit;
