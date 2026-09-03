@@ -16,8 +16,6 @@
 //!     renumbered — surviving spectra keep their original (now-sparse) indices, so every
 //!     `source_index`/`precursor_index` cross-reference stays valid.
 //!
-//! **m/z-range filtering (Phase 3) is NOT implemented** — `--mz` errors loudly.
-//!
 //! Facets are classified by schema INTROSPECTION, not a hard-coded name list (the format is
 //! extensible): a member is per-spectrum if it has `spectrum.index`, a `point`/`chunk.spectrum_index`,
 //! or a top-level `ordinal`; a chromatogram facet if it has `chromatogram.index` /
@@ -60,8 +58,6 @@ pub struct FilterOpts {
     pub images: Vec<PathBuf>,
     /// Inject an SDRF sample-metadata TSV (verbatim).
     pub sdrf: Option<PathBuf>,
-    /// Present iff `--mz` was given — Phase 3, unimplemented; we error.
-    pub mz_requested: bool,
 }
 
 /// Parse an `--rt MIN-MAX` argument. Either bound may be omitted for an open range (`10-`, `-30`).
@@ -132,10 +128,6 @@ pub fn report_inspect(input: &Path) -> Result<()> {
 
 /// Filter `input` (a `.mzpeak`) into `output` (a new `.mzpeak`) per `opts`.
 pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
-    if opts.mz_requested {
-        bail!("--mz filtering not yet implemented");
-    }
-
     let f = File::open(input).with_context(|| format!("opening {}", input.display()))?;
     let mut zip = zip::ZipArchive::new(BufReader::new(f))
         .with_context(|| format!("reading {} as a mzPeak ZIP", input.display()))?;
@@ -1236,10 +1228,6 @@ fn u64_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a UInt64Array> {
 
 fn f64_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a Float64Array> {
     s.column_by_name(name)?.as_any().downcast_ref::<Float64Array>()
-}
-
-fn u8_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a arrow::array::UInt8Array> {
-    s.column_by_name(name)?.as_any().downcast_ref::<arrow::array::UInt8Array>()
 }
 
 fn lstr_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a arrow::array::LargeStringArray> {

@@ -37,6 +37,10 @@
          ShimadzuGlue.runtimeconfig.json; a bare RuntimeHostConfigurationOption is overridden by the
          SDK's own default of false (observed: the generated config still read `false`). -->
     <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
+    <!-- ⚠️ ALSO MIRROR THIS in the committed ShimadzuGlue.runtimeconfig.json next to this file. That
+         copy is what the documented DLL-only deployment boots from, and it silently lacked this
+         switch: a deployment assembled from the committed config alone could not load the vendor
+         library at all, while a `dotnet build` output could. -->
   </PropertyGroup>
 
   <ItemGroup>

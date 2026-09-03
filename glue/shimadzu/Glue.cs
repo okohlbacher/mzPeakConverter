@@ -32,8 +32,11 @@
 //       IList ProfileList { get; }   // elements: .Mass (int), .Intensity (double)
 //       IList CentroidList { get; }
 //       double RetentionTime, Polarities Polarity, IList PrecursorMzList, ...
-//   Unit scaling (ShimadzuReader.cpp): m/z = Mass * (1.0 / MASSNUMBER_UNIT); precursor m/z stored
-//   ×1e9; retention time in ms (×0.001). MASSNUMBER_UNIT is a managed constant — reflected below.
+//   Unit scaling (ShimadzuReader.cpp): m/z = Mass / MASSNUMBER_UNIT; precursor m/z stored ×1e9;
+//   retention time in ms. Every one of these is a DIVISION by the vendor's integer scale, never a
+//   multiplication by a pre-computed reciprocal: 1/10000 is not representable in binary and the two
+//   forms disagree in the last bit on ~40% of lattice values. MASSNUMBER_UNIT is a managed constant
+//   — reflected below.
 //
 // Member names/casing can drift between LabSolutions releases, so lookups are tolerant (try a list
 // of candidate names, fall back gracefully). Best-effort glue, not a hardened reader.
@@ -98,18 +101,25 @@ internal sealed class ShimadzuData
     public required object IoObj;       // .IO
     public required object SpectrumObj; // .MS.Spectrum
     public required int ScanCount;
-    public required double MassMultiplier;  // 1 / MASSNUMBER_UNIT
-    public const double PrecursorMzMultiplier = 1.0 / 1e9;
-    public const double TimeMultiplier = 0.001; // ms -> s
+    /// MASSNUMBER_UNIT: the vendor stores m/z as the integer `round(m/z * MassUnit)`, so m/z is
+    /// recovered by DIVIDING by this scale. Held as the scale itself, never as a pre-computed
+    /// reciprocal: 1/10000 is not representable in binary, and `k * (1/10000)` disagrees with
+    /// `k / 10000` on ~40% of lattice values (last-bit, but this is the m/z axis).
+    public required double MassUnit;
+    /// Precursor m/z scale: the vendor scalar is m/z * 1e9.
+    public const double PrecursorMzUnit = 1e9;
+    /// Retention times arrive in milliseconds; seconds = ms / 1000.
+    public const double MillisecondsPerSecond = 1000.0;
 
     // Reflection method handles (resolved once at open).
     public required MethodInfo GetSpectrumInfo;
     public required MethodInfo GetSpectrumByScan;
     public object? ParametersObj;   // .MS.Parameters — GetMassRawRange(seg, event) is the scan window
     public object? SampleInfoObj;   // .SampleInfo  — AnalysisDate is the run start time
-    /// Multiplier for the point's `MassHigh` (Int64) field, or 0 to read the coarse `Mass` (Int32)
-    /// instead. Decided ONCE per file at open (see `Api.DecideMassScale`); never mixed within a file.
-    public double HighMassMul;
+    /// Divisor for the point's `MassHigh` (Int64) field (`MassUnit * R`, both exact integers), or
+    /// 0 to read the coarse `Mass` (Int32) instead. Decided ONCE per file at open (see
+    /// `Api.DecideMassScale`); never mixed within a file.
+    public double HighMassDivisor;
     // (segment, event) -> m/z range, memoised: an event's range is fixed for the whole run.
     public readonly Dictionary<(int, int), (double lo, double hi)> RangeCache = new();
 
@@ -138,84 +148,6 @@ internal static class Dbg
     internal static void Say(string msg)
     {
         if (On) Console.Error.WriteLine("[shimadzu-glue] " + msg);
-    }
-}
-
-/// <summary>Stage-B experiment levers for the centroid intensity rotation.
-///
-/// The defect: on `.lcd` files that store NO profile signal, the vendor's centroid list comes back
-/// with intensities rotated against the m/z axis (`[s alien values] + truth[0:n-s]`, s in 1..7, last
-/// peak dropped). Files that DO store profile are bit-exact, so the leading theory is that the
-/// centroid intensity view is mis-based when the decode struct carries no profile arrays. These
-/// levers exist to test that; they are read once, so a run cannot change mode mid-flight.</summary>
-internal static class Exp
-{
-    internal static readonly bool ProfileDesired =
-        Environment.GetEnvironmentVariable("MZPC_SHIMADZU_PROFILE_DESIRED") != "0";
-
-    /// legacy (default) · centroid-first · centroid-only · split
-    internal static readonly string Fetch =
-        (Environment.GetEnvironmentVariable("MZPC_SHIMADZU_FETCH") ?? "legacy").Trim().ToLowerInvariant();
-
-    /// 1-based vendor scan number to dump once, or -1.
-    internal static readonly int DumpScan =
-        int.TryParse(Environment.GetEnvironmentVariable("MZPC_SHIMADZU_DUMP"), out var s) ? s : -1;
-
-    /// Any lever off its default makes the one-entry memo a liability: an experiment that re-reads
-    /// the same scan would be served the cache instead of the vendor, and would report "unchanged"
-    /// no matter what the vendor does.
-    internal static bool Active => !ProfileDesired || Fetch != "legacy" || DumpScan >= 0;
-
-    private static bool _dumped;
-
-    /// <summary>One-shot reflective dump of the spectrum object and the first point of each list.
-    /// Call only AFTER the arrays have been copied out — these getters may themselves mutate vendor
-    /// state, which would contaminate the very reading being investigated.</summary>
-    internal static void Dump(int scan, object? specObj, IList? profile, IList? centroid)
-    {
-        if (_dumped || scan != DumpScan) return;
-        _dumped = true;
-        DumpObject($"scan {scan} MassSpectrumObject", specObj);
-        DumpObject($"scan {scan} ProfileList[0]", profile != null && profile.Count > 0 ? profile[0] : null);
-        DumpObject($"scan {scan} CentroidList[0]", centroid != null && centroid.Count > 0 ? centroid[0] : null);
-        // The precursor list is the vendor's own answer for "what was selected"; the scalar that
-        // GetSpectrumInfo hands back has no documented scale and lands outside the instrument's
-        // m/z range under every obvious one, so read this instead of guessing a divisor.
-        if (Reflect.GetProp(specObj!, "PrecursorMzList") is IList pl)
-        {
-            Console.Error.WriteLine($"[shimadzu-dump] scan {scan} PrecursorMzList: {pl.Count} entries");
-            for (int i = 0; i < Math.Min(pl.Count, 3); i++)
-                DumpObject($"scan {scan} PrecursorMzList[{i}]", pl[i]);
-        }
-    }
-
-    private static void DumpObject(string label, object? o)
-    {
-        if (o == null) { Console.Error.WriteLine($"[shimadzu-dump] {label}: null"); return; }
-        var t = o.GetType();
-        // A primitive has no properties to walk — print the value, which is the whole point when
-        // the list element IS the datum (PrecursorMzList is a List<Int32>).
-        if (t.IsPrimitive || o is string || o is decimal)
-        {
-            Console.Error.WriteLine($"[shimadzu-dump] {label}: {t.Name} = {o}");
-            return;
-        }
-        Console.Error.WriteLine($"[shimadzu-dump] {label}: type {t.FullName}");
-        foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
-        {
-            if (p.GetIndexParameters().Length > 0) continue; // skip indexers
-            object? v;
-            try { v = p.GetValue(o); } catch (Exception e) { v = "<throws " + e.GetType().Name + ">"; }
-            if (v is IList list) v = $"IList[{list.Count}]";
-            Console.Error.WriteLine($"[shimadzu-dump]   {p.Name} ({p.PropertyType.Name}) = {v}");
-        }
-        foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.Instance))
-        {
-            object? v;
-            try { v = f.GetValue(o); } catch (Exception e) { v = "<throws " + e.GetType().Name + ">"; }
-            if (v is IList list) v = $"IList[{list.Count}]";
-            Console.Error.WriteLine($"[shimadzu-dump]   .{f.Name} ({f.FieldType.Name}) = {v}");
-        }
     }
 }
 
@@ -315,6 +247,13 @@ public static class Api
         return File.Exists(dll) ? Assembly.LoadFrom(dll) : null;
     }
 
+    /// <summary>Version of the Shimadzu.LabSolutions.IO.IoModule assembly actually LOADED (e.g.
+    /// "5.0.0.0", or "3.8.4.6016" for the ProteoWizard 3.0.22x-era DLL). Empty until the first
+    /// successful open. Published over the ABI as `LibraryVersion` because the centroid
+    /// MISALIGNMENT is a property of the LIBRARY, not of the file: 3.8.4.6016 returns rotated
+    /// centroid intensities for profile-less .lcd, 5.0.0.0 returns the same file correctly.</summary>
+    private static string _ioModuleVersion = "";
+
     private static Assembly LoadIoModule(string pwizDir)
     {
         _pwizDir = pwizDir;
@@ -323,7 +262,54 @@ public static class Api
         var dll = Path.Combine(pwizDir, "Shimadzu.LabSolutions.IO.IoModule.dll");
         if (!File.Exists(dll))
             throw new FileNotFoundException($"Shimadzu.LabSolutions.IO.IoModule.dll not found in {pwizDir}");
-        return Assembly.LoadFrom(dll);
+        var asm = Assembly.LoadFrom(dll);
+        _ioModuleVersion = DescribeVersion(asm, dll);
+        Dbg.Say($"Shimadzu.LabSolutions.IO.IoModule version {(_ioModuleVersion.Length == 0 ? "<unknown>" : _ioModuleVersion)} from {dll}");
+        return asm;
+    }
+
+    /// <summary>The loaded assembly's version, reported as the HIGHER of its managed
+    /// AssemblyVersion and its Win32 FileVersion.
+    ///
+    /// Taking the higher of the two, rather than preferring one, is deliberate. The Rust side turns
+    /// this string into a defect verdict by comparing the major against 5, so the only outcome that
+    /// must never happen is a GOOD library being called bad. On the one library we can actually
+    /// inspect (3.8.4.6016) the two agree, but pinning a low AssemblyVersion (1.0.0.0 is a common
+    /// vendor convention) while shipping a real FileVersion is normal .NET practice — preferring
+    /// AssemblyVersion would then false-alarm on a current DLL. Preferring FileVersion has the
+    /// mirror-image failure. The maximum cannot understate, so it cannot cry wolf; it can only ever
+    /// stay silent about a stale library that misreports itself upward, and silence is the safe
+    /// error here. Both raw values go into the debug trace so the first Windows run settles which
+    /// one the vendor actually populates. Empty when neither is usable — the Rust side then says
+    /// "could not check" rather than guessing.</summary>
+    private static string DescribeVersion(Assembly asm, string dll)
+    {
+        Version? av = null, fv = null;
+        string avRaw = "", fvRaw = "";
+        try
+        {
+            var v = asm.GetName().Version;
+            if (v != null && v != new Version(0, 0, 0, 0)) { av = v; avRaw = v.ToString(); }
+        }
+        catch { }
+        try
+        {
+            var s = System.Diagnostics.FileVersionInfo.GetVersionInfo(dll).FileVersion;
+            if (!string.IsNullOrWhiteSpace(s))
+            {
+                fvRaw = s!.Trim();
+                if (Version.TryParse(fvRaw, out var parsed) && parsed != new Version(0, 0, 0, 0)) fv = parsed;
+            }
+        }
+        catch { }
+        Dbg.Say($"IoModule AssemblyVersion={(avRaw.Length == 0 ? "<none>" : avRaw)} FileVersion={(fvRaw.Length == 0 ? "<none>" : fvRaw)}");
+        if (av != null && fv != null) return (av >= fv ? av : fv).ToString();
+        if (av != null) return av.ToString();
+        if (fv != null) return fv.ToString();
+        // FileVersion that is not a dotted Version (a vendor free-text stamp) is still better than
+        // nothing: the Rust side parses the leading integer and treats anything unparseable as
+        // "unknown", which is the same answer as returning empty here.
+        return fvRaw;
     }
 
     /// <summary>Reflect ShimadzuUtil/Tool.MASSNUMBER_UNIT from the loaded Shimadzu assemblies; the
@@ -413,8 +399,7 @@ public static class Api
         var chromatogram = Reflect.GetProp(ms, "Chromatogram");
 
         var unit = ResolveMassNumberUnit();
-        var massMul = 1.0 / unit;
-        Dbg.Say($"MASSNUMBER_UNIT resolved to {unit} (massMul={massMul})");
+        Dbg.Say($"MASSNUMBER_UNIT resolved to {unit} (m/z = intMass / {unit})");
         int scanCount = ComputeScanCount(spectrum, parameters, chromatogram);
 
         var getInfo = Reflect.Method(spectrum.GetType(), "GetMSSpectrumInfo", 8)
@@ -428,7 +413,7 @@ public static class Api
             IoObj = io,
             SpectrumObj = spectrum,
             ScanCount = scanCount,
-            MassMultiplier = massMul,
+            MassUnit = unit,
             GetSpectrumInfo = getInfo,
             GetSpectrumByScan = getByScan,
             ParametersObj = parameters,
@@ -532,8 +517,8 @@ public static class Api
             int retTime = Convert.ToInt32(args[1] ?? 0);
             m.MsLevel = Math.Max(1, Convert.ToInt32(args[2] ?? 1));
             int precursorMassInt = Convert.ToInt32(args[3] ?? 0);
-            m.RetentionTimeSeconds = retTime * ShimadzuData.TimeMultiplier;
-            m.PrecursorMz = precursorMassInt > 0 ? precursorMassInt * ShimadzuData.PrecursorMzMultiplier : 0.0;
+            m.RetentionTimeSeconds = retTime / ShimadzuData.MillisecondsPerSecond;
+            m.PrecursorMz = precursorMassInt > 0 ? precursorMassInt / ShimadzuData.PrecursorMzUnit : 0.0;
             m.Polarity = PolarityCode(args[5]);
         }
         return m;
@@ -558,14 +543,16 @@ public static class Api
             NPoints = v1.NPoints,
         };
         object spec;
-        try { spec = SpecFor(d, scan, Exp.ProfileDesired); }
+        try { spec = SpecFor(d, scan); }
         catch (Exception e) { Dbg.Say($"MetaV2 scan {scan}: no spectrum object ({e.Message})"); return m; }
 
+        // `scale` is the vendor's fixed-point UNIT (the value the real number was multiplied by to
+        // make the stored integer), so the value is recovered by dividing — see ShimadzuData.MassUnit.
         double AsDouble(string name, double scale)
         {
             var v = Reflect.GetProp(spec, name);
             if (v == null) return 0.0;
-            try { return Convert.ToDouble(v, CultureInfo.InvariantCulture) * scale; }
+            try { return Convert.ToDouble(v, CultureInfo.InvariantCulture) / scale; }
             catch { return 0.0; }
         }
         long AsLong(string name)
@@ -576,8 +563,8 @@ public static class Api
             catch { return 0L; }
         }
 
-        m.IsolationTargetMz = AsDouble("AcqModeMz", d.MassMultiplier);
-        m.IsolationWidthMz = AsDouble("QTransmissionWidthMz", 1e-1);
+        m.IsolationTargetMz = AsDouble("AcqModeMz", d.MassUnit);
+        m.IsolationWidthMz = AsDouble("QTransmissionWidthMz", 10.0);
         m.CollisionEnergy = AsDouble("CollisionEnergy", 1.0);
         // The precursor m/z, from the vendor's own selection record and on the SAME fixed-point
         // scale as the m/z axis (`Mass` 1002162 -> 100.2162), which is proven bit-exact against the
@@ -596,7 +583,7 @@ public static class Api
         {
             try
             {
-                double first = Convert.ToDouble(pl[0], CultureInfo.InvariantCulture) * d.MassMultiplier;
+                double first = Convert.ToDouble(pl[0], CultureInfo.InvariantCulture) / d.MassUnit;
                 if (first > 0.0) m.PrecursorMz = first;
             }
             catch { /* leave 0: better no precursor than an invented one */ }
@@ -645,85 +632,44 @@ public static class Api
         // every spectrum costs two GetMSSpectrumByScan round-trips into the vendor assembly. A
         // one-entry cache halves that. Keyed by scan; the reader is single-threaded per handle
         // (`_not_thread_safe` in src/shimadzu.rs) so no locking is needed.
-        // Bypassed whenever a Stage-B lever is set: an experiment that re-reads the same scan must
-        // reach the vendor, not this cache, or it reports "unchanged" whatever the vendor did.
-        if (!Exp.Active && d.CachedScan == scan && d.CachedData != null) return d.CachedData.Value;
+        if (d.CachedScan == scan && d.CachedData != null) return d.CachedData.Value;
 
-        var empty = (new double[0], new float[0]);
-        ((double[] mz, float[] intensity) profile, (double[] mz, float[] intensity) centroid) both;
-
-        if (Exp.Fetch == "split")
+        var specObj = SpecFor(d, scan);
+        var profile = Reflect.GetProp(specObj, "ProfileList") as IList;
+        var centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
+        if (Dbg.On)
         {
-            // Two INDEPENDENT vendor calls: profile from a profileDesired=true decode, centroid from
-            // a profileDesired=false one. Tests whether the centroid product depends on the flag.
-            var pSpec = FetchSpectrum(d, scan, true);
-            var pList = Reflect.GetProp(pSpec, "ProfileList") as IList;
-            var pArrays = ToArrays(pList, d);
-            var cSpec = FetchSpectrum(d, scan, false);
-            var cList = Reflect.GetProp(cSpec, "CentroidList") as IList;
-            both = (pArrays, ToArrays(cList, d));
-            Exp.Dump(scan, cSpec, pList, cList);
+            // GUARDED: this interpolation calls the vendor `Count` getters, so building it
+            // unconditionally added a vendor interaction to every scan of every run.
+            Dbg.Say($"scan {scan}: ProfileList={(profile == null ? "null" : profile.Count.ToString())} " +
+                    $"CentroidList={(centroidList == null ? "null" : centroidList.Count.ToString())}");
         }
-        else
-        {
-            var specObj = SpecFor(d, scan, Exp.ProfileDesired);
-            IList? profile = null, centroidList = null;
-            switch (Exp.Fetch)
-            {
-                case "centroid-only":
-                    // Never touch ProfileList at all — isolates "was the centroid list disturbed by
-                    // materialising the profile one first?" from the flag itself.
-                    centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
-                    both = (empty, ToArrays(centroidList, d));
-                    break;
-                case "centroid-first":
-                    // Same single decode as legacy, opposite order, and the centroid array is COPIED
-                    // OUT before ProfileList is even looked up.
-                    centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
-                    var centroidArrays = ToArrays(centroidList, d);
-                    profile = Reflect.GetProp(specObj, "ProfileList") as IList;
-                    both = (ToArrays(profile, d), centroidArrays);
-                    break;
-                default: // legacy
-                    profile = Reflect.GetProp(specObj, "ProfileList") as IList;
-                    centroidList = Reflect.GetProp(specObj, "CentroidList") as IList;
-                    if (Dbg.On)
-                    {
-                        // GUARDED: this interpolation calls the vendor `Count` getters, so building it
-                        // unconditionally added a vendor interaction to every scan of every run.
-                        Dbg.Say($"scan {scan}: ProfileList={(profile == null ? "null" : profile.Count.ToString())} " +
-                                $"CentroidList={(centroidList == null ? "null" : centroidList.Count.ToString())}");
-                    }
-                    both = (ToArrays(profile, d), ToArrays(centroidList, d));
-                    break;
-            }
-            // AFTER the arrays are copied: these getters may mutate vendor state themselves.
-            Exp.Dump(scan, specObj, profile, centroidList);
-        }
+        ((double[] mz, float[] intensity) profile, (double[] mz, float[] intensity) centroid) both =
+            (ToArrays(profile, d), ToArrays(centroidList, d));
 
         d.CachedScan = scan;
         d.CachedData = both;
         return both;
     }
 
-    /// <summary>The decoded spectrum object for `scan`, memoised so that a meta call and a data
-    /// call on the same scan share one decode. Bypassed whenever a Stage-B lever is set.</summary>
-    internal static object SpecFor(ShimadzuData d, int scan, bool profileDesired)
+    /// <summary>The decoded spectrum object for `scan` — one
+    /// `GetMSSpectrumByScan(out spectrum, scan, profileDesired: true)` round trip, memoised so that
+    /// a meta call and a data call on the same scan share one decode.
+    /// <para>`profileDesired` is always true: it is what asks the vendor to decode the profile
+    /// arrays as well as the centroid list, and mzPeak stores BOTH representations of a spectrum
+    /// (spectra_data + spectra_peaks). Asking for centroids alone is not an optimisation — it is a
+    /// different, worse decode: on 3.8.4.6016 that is the configuration whose centroid intensities
+    /// come back rotated against their m/z.</para></summary>
+    internal static object SpecFor(ShimadzuData d, int scan)
     {
-        if (!Exp.Active && d.CachedSpecScan == scan && d.CachedSpecObj != null) return d.CachedSpecObj;
-        var o = FetchSpectrum(d, scan, profileDesired);
-        if (!Exp.Active) { d.CachedSpecScan = scan; d.CachedSpecObj = o; }
-        return o;
-    }
-
-    /// <summary>One `GetMSSpectrumByScan(out spectrum, scan, profileDesired)` round trip.</summary>
-    private static object FetchSpectrum(ShimadzuData d, int scan, bool profileDesired)
-    {
-        var args = new object?[] { null, scan, profileDesired }; // out spectrum, scan, profileDesired
+        if (d.CachedSpecScan == scan && d.CachedSpecObj != null) return d.CachedSpecObj;
+        var args = new object?[] { null, scan, true }; // out spectrum, scan, profileDesired
         var st = Reflect.InvokeCoerced(d.GetSpectrumByScan, d.SpectrumObj, args);
         var specObj = Reflect.Ok(st) ? args[0] : null;
         if (specObj == null)
-            throw new Exception($"GetMSSpectrumByScan failed for scan {scan} (profileDesired={profileDesired}): {st}");
+            throw new Exception($"GetMSSpectrumByScan failed for scan {scan}: {st}");
+        d.CachedSpecScan = scan;
+        d.CachedSpecObj = specObj;
         return specObj;
     }
 
@@ -749,7 +695,7 @@ public static class Api
 
     /// <summary>Vendor point list -> (m/z, intensity). Empty arrays when the list is absent.
     ///
-    /// m/z comes from `MassHigh` (Int64, ~1e-9 Da) when `d.HighMassMul` was established for this
+    /// m/z comes from `MassHigh` (Int64, ~1e-9 Da) when `d.HighMassDivisor` was established for this
     /// file, else from the coarse `Mass` (Int32, 1e-4 Da lattice — what ProteoWizard reads).
     /// `MassHigh` is what LabSolutions' own mzML exporter writes (verified bit-for-bit on
     /// Blind_P1_pos_012), so it is the vendor's stated coordinate; the converter stores it
@@ -762,7 +708,7 @@ public static class Api
         var inten = new float[n];
         if (n == 0) return (mz, inten);
         var pp = PropsFor(list![0]!);
-        bool high = d.HighMassMul > 0 && pp.MassHigh != null;
+        bool high = d.HighMassDivisor > 0 && pp.MassHigh != null;
         for (int i = 0; i < n; i++)
         {
             var pt = list[i]!;
@@ -773,11 +719,11 @@ public static class Api
             {
                 long mh = System.Convert.ToInt64(pp.MassHigh!.GetValue(pt) ?? 0L);
                 if (mh <= 0 && massInt > 0) { high = false; i = -1; continue; } // restart on Mass
-                mz[i] = mh * d.HighMassMul;
+                mz[i] = mh / d.HighMassDivisor;
             }
             else
             {
-                mz[i] = massInt * d.MassMultiplier;
+                mz[i] = massInt / d.MassUnit;
             }
         }
         return (mz, inten);
@@ -793,7 +739,7 @@ public static class Api
     /// the grid, centroids carrying sub-lattice digits (an interpolated apex should).</summary>
     internal static void DecideMassScale(ShimadzuData d)
     {
-        d.HighMassMul = 0;
+        d.HighMassDivisor = 0;
         if (Environment.GetEnvironmentVariable("MZPC_SHIMADZU_COARSE_MZ") == "1") { Dbg.Say("MassHigh disabled by env"); return; }
         var ratios = new List<double>();
         var pairs = new List<(long mass, long high)>();
@@ -802,7 +748,7 @@ public static class Api
         {
             while (pairs.Count < 1000 && scan <= 8 && scan <= d.ScanCount)
             {
-                var spec = SpecFor(d, scan, Exp.ProfileDesired);
+                var spec = SpecFor(d, scan);
                 foreach (var name in new[] { "ProfileList", "CentroidList" })
                 {
                     if (Reflect.GetProp(spec, name) is not IList list || list.Count == 0) continue;
@@ -830,8 +776,11 @@ public static class Api
         long R = (long)r;
         int bad = pairs.Count(p => Math.Abs(p.high - p.mass * R) > R / 2);
         if (bad > 0) { Dbg.Say($"{bad}/{pairs.Count} points violate |MassHigh - Mass*R| <= R/2; using Mass"); return; }
-        d.HighMassMul = d.MassMultiplier / R;
-        Dbg.Say($"MassHigh scale R={R} from {pairs.Count} points; m/z = MassHigh * {d.HighMassMul:G}");
+        // m/z = MassHigh / (MassUnit * R). Both factors are exact integers (10000 and a power of
+        // ten <= 1e9), so the product is exact in double and the division is correctly rounded --
+        // unlike the old `MassMultiplier / R` reciprocal, which was two roundings deep.
+        d.HighMassDivisor = d.MassUnit * R;
+        Dbg.Say($"MassHigh scale R={R} from {pairs.Count} points; m/z = MassHigh / {d.HighMassDivisor:G}");
     }
 
     // --- C ABI (matches src/shimadzu.rs) -----------------------------------------------------
@@ -914,10 +863,32 @@ public static class Api
     /// which is why every layout change gets a new versioned entry point rather than a wider
     /// struct behind the old name.</summary>
     [UnmanagedCallersOnly(EntryPoint = "ShimadzuAbiVersion")]
-    public static int ShimadzuAbiVersion() => 3;   // 3: + MassRange, InstrumentInfo
+    public static int ShimadzuAbiVersion() => 4;   // 4: + LibraryVersion (3: + MassRange, InstrumentInfo)
+
+    /// <summary>Version string of the LOADED `Shimadzu.LabSolutions.IO.IoModule` assembly, e.g.
+    /// "5.0.0.0"; empty before the first successful `Open`, or when the assembly carries no usable
+    /// version. Same buffer convention as `LastError`: returns the length needed in UTF-16 code
+    /// units and fills up to `cap`; a null buffer just asks for the length.
+    ///
+    /// This exists so the Rust side can gate the centroid-alignment warning on the VENDOR LIBRARY
+    /// instead of on the file. The misalignment is a defect of 3.8.4.6016; 5.0.0.0 reads the same
+    /// profile-less .lcd correctly, so warning on "this file stores no profile signal" alone cried
+    /// wolf on good data and taught users to ignore the message.</summary>
+    [UnmanagedCallersOnly(EntryPoint = "LibraryVersion")]
+    public static unsafe int LibraryVersion(ushort* buf, int cap)
+    {
+        var v = _ioModuleVersion;
+        if (v.Length == 0) return 0;
+        if (buf != null && cap > 0)
+        {
+            int n = Math.Min(cap, v.Length);
+            for (int i = 0; i < n; i++) buf[i] = v[i];
+        }
+        return v.Length;
+    }
 
     /// <summary>Scan window for one (segment, event): `MS.Parameters.GetMassRawRange`, in raw mass
-    /// units (× MassMultiplier, like point masses). Every scan of an event shares it, so the answer
+    /// units (÷ MassUnit, like point masses). Every scan of an event shares it, so the answer
     /// is memoised per pair. Returns 1 with both outputs 0 when the vendor has no range.</summary>
     [UnmanagedCallersOnly(EntryPoint = "MassRange")]
     public static unsafe int MassRange(long handle, int segmentNo, int eventNo, double* loOut, double* hiOut)
@@ -935,8 +906,8 @@ public static class Api
             var args = new object?[] { 0, 0, (short)segmentNo, (short)eventNo }; // ref start, ref end, seg, event
             var st = Reflect.InvokeCoerced(m, d.ParametersObj, args);
             if (!Reflect.Ok(st)) { _lastError = $"GetMassRawRange({segmentNo},{eventNo}): {st}"; return 1; }
-            double lo = Convert.ToInt64(args[0] ?? 0L) * d.MassMultiplier;
-            double hi = Convert.ToInt64(args[1] ?? 0L) * d.MassMultiplier;
+            double lo = Convert.ToInt64(args[0] ?? 0L) / d.MassUnit;
+            double hi = Convert.ToInt64(args[1] ?? 0L) / d.MassUnit;
             d.RangeCache[(segmentNo, eventNo)] = (lo, hi);
             *loOut = lo; *hiOut = hi;
             return 0;
@@ -982,7 +953,7 @@ public static class Api
             try
             {
                 // On the decoded spectrum object (IfKind); one memoised decode of scan 1.
-                var spec = SpecFor(d, 1, Exp.ProfileDesired);
+                var spec = SpecFor(d, 1);
                 ionization = Reflect.GetProp(spec, "IfKind")?.ToString() ?? "";
             }
             catch (Exception e) { Dbg.Say($"IfKind: {e.Message}"); }

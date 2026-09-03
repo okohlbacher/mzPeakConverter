@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -38,6 +38,30 @@ use crate::tof_grid::TofGrid;
 pub fn has_profile(input: &Path) -> bool {
     let p = input.join("AcqData").join("MSProfile.bin");
     fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// Ion polarity as MSScan.bin states it. The `IonPolarity` element of `ScanRecordType` is
+/// Agilent's own `IonPolarity` enum: `Positive = 0`, `Negative = 1`, `Unassigned = 2`, `Mixed = 3`.
+/// Only the two unambiguous codes become a polarity; `Unassigned`/`Mixed`/an unknown code, and a
+/// schema with no `IonPolarity` element at all (it is `minOccurs="0"`), stay [`Polarity::Unknown`]
+/// — the archive says "not stated" rather than guessing one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Polarity {
+    #[default]
+    Unknown,
+    Positive,
+    Negative,
+}
+
+impl Polarity {
+    /// Decode one raw `IonPolarity` field value.
+    pub fn from_ion_polarity(code: i32) -> Self {
+        match code {
+            0 => Polarity::Positive,
+            1 => Polarity::Negative,
+            _ => Polarity::Unknown,
+        }
+    }
 }
 
 /// One profile spectrum read straight from `MSProfile.bin`: the integer flight-time bin ordinals,
@@ -57,6 +81,9 @@ pub struct ProfileSpectrum {
     pub ms_level: u8,
     /// CalibrationID for this scan (selects the polynomial-refinement row in the calibration block).
     pub calibration_id: i32,
+    /// Ion polarity from the scan record's `IonPolarity` field, or `Unknown` when the schema has
+    /// no such field / the vendor stated `Unassigned` or `Mixed`.
+    pub polarity: Polarity,
 }
 
 /// A parsed Agilent profile `.d`, ready to iterate spectra. Holds the open `MSProfile.bin` handle
@@ -72,12 +99,52 @@ pub struct AgilentProfileReader {
     poly_flags: HashMap<i32, u32>,
     /// Index of the next scan to yield.
     cursor: usize,
+    /// How many scan records this reader declined to yield, and why. Iteration drops scans in three
+    /// silent ways — an empty/unwritten segment, a segment reaching past the end of the file (which
+    /// also ABANDONS the rest of the run), and a decoded scan whose intensities are all zero — and
+    /// this lane has no `assert_source_complete` cross-check behind it, so without a tally a `.d`
+    /// can lose spectra with a clean exit 0. See [`Self::skipped`].
+    skipped: SkipTally,
+}
+
+/// Scan records the profile reader did not turn into spectra, by cause.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SkipTally {
+    /// `point_count <= 0` or `byte_count <= 0`: no profile segment was written for this scan.
+    pub empty_segment: usize,
+    /// Every decoded intensity was zero, so the sparse (tof_index, intensity) point list is empty.
+    pub all_zero: usize,
+    /// Scans never examined because a segment ran past the end of `MSProfile.bin` and iteration
+    /// stopped there (an interrupted acquisition truncates the tail of the run).
+    pub truncated_tail: usize,
+}
+
+impl SkipTally {
+    pub fn total(&self) -> usize {
+        self.empty_segment + self.all_zero + self.truncated_tail
+    }
+
+    /// One human-readable line naming what was dropped, or `None` when nothing was.
+    pub fn describe(&self) -> Option<String> {
+        (self.total() > 0).then(|| {
+            format!(
+                "{} scan record(s) produced no spectrum: {} with no profile segment, {} all-zero, \
+                 {} beyond the end of MSProfile.bin (interrupted acquisition — the rest of the run \
+                 was not read)",
+                self.total(),
+                self.empty_segment,
+                self.all_zero,
+                self.truncated_tail
+            )
+        })
+    }
 }
 
 struct ScanInfo {
     scan_time: f64,
     ms_level: u8,
     calibration_id: i32,
+    polarity: Polarity,
     /// Offset of the profile segment in MSProfile.bin.
     offset: u64,
     /// Compressed/stored byte length of the segment.
@@ -110,14 +177,27 @@ impl AgilentProfileReader {
             .with_context(|| format!("opening {}", profile_path.display()))?;
         let profile_size = profile.metadata()?.len();
 
-        Ok(Self { profile, profile_size, scans, calib, poly_flags, cursor: 0 })
+        Ok(Self {
+            profile,
+            profile_size,
+            scans,
+            calib,
+            poly_flags,
+            cursor: 0,
+            skipped: SkipTally::default(),
+        })
     }
 
     /// Number of scan records (an upper bound on the spectra yielded — truncated/empty segments are
     /// skipped during iteration).
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.scans.len()
+    }
+
+    /// Scan records dropped so far, by cause. Meaningful once iteration has run to completion; the
+    /// converter reports it then, because this lane has no completeness cross-check of its own.
+    pub fn skipped(&self) -> SkipTally {
+        self.skipped
     }
 
     /// Decode the next non-empty profile spectrum, or `None` at end of run. Skips scans whose
@@ -129,10 +209,14 @@ impl AgilentProfileReader {
             let info = &self.scans[i];
             // Skip truncated / empty / non-profile segments.
             if info.point_count <= 0 || info.byte_count <= 0 {
+                self.skipped.empty_segment += 1;
                 continue;
             }
             if info.offset + info.byte_count as u64 > self.profile_size {
-                // An interrupted acquisition: the rest of the run is unwritten — stop.
+                // An interrupted acquisition: the rest of the run is unwritten — stop. Count this
+                // scan AND every one after it, so the caller can report how much of the run is gone.
+                self.skipped.truncated_tail += self.scans.len() - i;
+                self.cursor = self.scans.len();
                 break;
             }
             let n = info.point_count as usize;
@@ -162,6 +246,12 @@ impl AgilentProfileReader {
                 }
             }
             if tof_index.is_empty() {
+                // An all-zero scan. It is a real acquisition with a real retention time, but the
+                // sparse point list this lane stores has nowhere to put "nothing", so the spectrum
+                // is dropped rather than written empty. Count it: dropping it shifts nothing (the
+                // spectrum index is the source record index) but it does mean the archive holds
+                // fewer spectra than the `.d` has scans.
+                self.skipped.all_zero += 1;
                 continue;
             }
             return Ok(Some(ProfileSpectrum {
@@ -172,6 +262,7 @@ impl AgilentProfileReader {
                 index: i,
                 ms_level: info.ms_level,
                 calibration_id: info.calibration_id,
+                polarity: info.polarity,
             }));
         }
         Ok(None)
@@ -473,11 +564,34 @@ fn load_calibration(
                 acq.display()
             );
         }
-        let fallback = *default_rows.values().next().unwrap();
+        // A scan naming a CalibrationID that `DefaultMassCal.xml` does not define used to fall back
+        // to `default_rows.values().next()` — an ARBITRARY row, picked by HashMap iteration order,
+        // which is randomly seeded per process. Every m/z in that scan is then reconstructed from
+        // someone else's calibration, differently on each run of the same input, with no diagnostic.
+        //
+        // A single defined calibration is not ambiguous: there is only one thing the file can mean,
+        // and using it for every scan is what the vendor's own single-calibration files intend.
+        // More than one, with the requested ID missing, has no defensible answer — say which ID is
+        // missing and stop.
+        let sole = (default_rows.len() == 1).then(|| *default_rows.values().next().unwrap());
         calibration_ids
             .iter()
-            .map(|cid| *default_rows.get(cid).unwrap_or(&fallback))
-            .collect()
+            .map(|cid| match (default_rows.get(cid), sole) {
+                (Some(row), _) => Ok(*row),
+                (None, Some(only)) => Ok(only),
+                (None, None) => {
+                    let mut known: Vec<i32> = default_rows.keys().copied().collect();
+                    known.sort_unstable();
+                    Err(anyhow!(
+                        "DefaultMassCal.xml in {} defines calibrations {known:?} but a scan \
+                         requests CalibrationID {cid}, and there is no MSMassCal.bin to fall back \
+                         on. Guessing one of the defined calibrations would silently reconstruct \
+                         every m/z in that scan from the wrong polynomial.",
+                        acq.display()
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
     };
     let poly_flags = parse_default_masscal_flags(&acq.join("DefaultMassCal.xml"));
     Ok((calib, poly_flags))
@@ -755,6 +869,11 @@ fn read_scan_records(
             .filter(|&l| l > 0)
             .unwrap_or(1);
         let calibration_id = layout.calibration_id.map(|o| read_i32(rec, o)).unwrap_or(0);
+        // `IonPolarity` is optional in MSScan.xsd; absent ⇒ Unknown, never a guessed default.
+        let polarity = layout
+            .ion_polarity
+            .map(|o| Polarity::from_ion_polarity(read_i32(rec, o)))
+            .unwrap_or(Polarity::Unknown);
         // First (profile) block fields, at `scalar + block-relative offset`.
         let bofs = scalar;
         let offset = read_i64(rec, bofs + layout.block_spectrum_offset) as u64;
@@ -764,6 +883,7 @@ fn read_scan_records(
             scan_time,
             ms_level,
             calibration_id,
+            polarity,
             offset,
             byte_count,
             point_count,
@@ -778,6 +898,7 @@ struct RecordLayout {
     scan_time: usize,
     ms_level: Option<usize>,
     calibration_id: Option<usize>,
+    ion_polarity: Option<usize>,
     block_spectrum_offset: usize,
     block_byte_count: usize,
     block_point_count: usize,
@@ -794,11 +915,13 @@ impl RecordLayout {
         let mut scan_time = None;
         let mut ms_level = None;
         let mut calibration_id = None;
+        let mut ion_polarity = None;
         for (name, ty) in members {
             match name.as_str() {
                 "ScanTime" => scan_time = Some(off),
                 "MSLevel" => ms_level = Some(off),
                 "CalibrationID" => calibration_id = Some(off),
+                "IonPolarity" => ion_polarity = Some(off),
                 _ => {}
             }
             if name == "SpectrumParamValues" {
@@ -830,6 +953,7 @@ impl RecordLayout {
             scan_time,
             ms_level,
             calibration_id,
+            ion_polarity,
             block_spectrum_offset: block_spectrum_offset
                 .ok_or_else(|| anyhow!("SpectrumParamsType has no SpectrumOffset"))?,
             block_byte_count: block_byte_count
@@ -853,15 +977,161 @@ fn read_i64(rec: &[u8], off: usize) -> i64 {
     i64::from_le_bytes(rec[off..off + 8].try_into().unwrap())
 }
 
-/// The `.d` directory path for a possibly-nested input (kept for symmetry with other readers).
-#[allow(dead_code)]
-pub fn d_dir(input: &Path) -> PathBuf {
-    input.to_path_buf()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// The Agilent-grid lane drops scan records in three ways and has no `assert_source_complete`
+    /// behind it, so a `.d` could lose spectra with a clean exit 0. The tally is what makes that
+    /// visible; it must stay silent when nothing was dropped and name every cause when something
+    /// was — a truncated tail especially, since that abandons the whole rest of the run.
+    #[test]
+    fn the_skip_tally_says_nothing_unless_something_was_dropped() {
+        assert_eq!(SkipTally::default().total(), 0);
+        assert_eq!(SkipTally::default().describe(), None);
+
+        let t = SkipTally { empty_segment: 2, all_zero: 3, truncated_tail: 5 };
+        assert_eq!(t.total(), 10);
+        let msg = t.describe().expect("a non-empty tally must be reported");
+        assert!(msg.contains("10 scan record(s)"), "{msg}");
+        assert!(msg.contains("2 with no profile segment"), "{msg}");
+        assert!(msg.contains("3 all-zero"), "{msg}");
+        assert!(msg.contains("5 beyond the end"), "{msg}");
+        assert!(msg.contains("interrupted acquisition"), "{msg}");
+
+        // A single all-zero scan is still worth a line.
+        assert!(SkipTally { all_zero: 1, ..Default::default() }.describe().is_some());
+    }
+
+    /// Write a scratch `AcqData` holding only a `DefaultMassCal.xml` with the given calibrations —
+    /// no `MSMassCal.bin`, which is the branch under test.
+    fn acq_with_default_masscal(tag: &str, ids: &[(i32, f64, f64)]) -> PathBuf {
+        let acq = std::env::temp_dir()
+            .join(format!("mzpc_agilent_cal_{}_{tag}", std::process::id()))
+            .join("AcqData");
+        let _ = fs::remove_dir_all(acq.parent().unwrap());
+        fs::create_dir_all(&acq).unwrap();
+        let mut xml = String::from("<CalibrationList>");
+        for (id, coeff, base) in ids {
+            xml.push_str(&format!(
+                "<DefaultCalibration DefaultCalibrationID=\"{id}\"><Step>\
+                 <CalibrationFormula>Traditional</CalibrationFormula>\
+                 <Value Number=\"1\">{coeff}</Value><Value Number=\"2\">{base}</Value>\
+                 </Step></DefaultCalibration>"
+            ));
+        }
+        xml.push_str("</CalibrationList>");
+        fs::write(acq.join("DefaultMassCal.xml"), xml).unwrap();
+        acq
+    }
+
+    /// REGRESSION: a scan naming an undefined CalibrationID must NOT silently borrow someone
+    /// else's calibration.
+    ///
+    /// The fallback used to be `default_rows.values().next()` — an arbitrary entry chosen by
+    /// HashMap iteration order, which Rust seeds randomly per process. So a `.d` whose scans
+    /// request an ID that `DefaultMassCal.xml` does not define reconstructed every m/z in those
+    /// scans from an unrelated polynomial, picked differently on each run of the same input, with
+    /// nothing logged. One defined calibration is unambiguous and is still used for every scan;
+    /// several, with the requested one missing, has no defensible answer and must fail.
+    #[test]
+    fn a_missing_calibration_id_is_an_error_not_an_arbitrary_row() {
+        // Ambiguous: two calibrations defined, a scan asks for a third.
+        let acq = acq_with_default_masscal("ambiguous", &[(1, 1.5, 0.25), (2, 2.5, 0.75)]);
+        let err = load_calibration(&acq, &[1, 99]).unwrap_err().to_string();
+        assert!(err.contains("99"), "the missing ID must be named: {err}");
+        assert!(err.contains("[1, 2]"), "the defined IDs must be listed: {err}");
+
+        // Unambiguous: exactly one calibration defined, so every scan means that one — including a
+        // scan whose CalibrationID field is absent and defaults to 0.
+        let acq = acq_with_default_masscal("sole", &[(7, 1.5, 0.25)]);
+        let rows = load_calibration(&acq, &[7, 0, 99]).unwrap().0;
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!((row[0], row[1]), (1.5, 0.25));
+        }
+
+        // And a defined ID is still resolved to its own row, not to the first one.
+        let acq = acq_with_default_masscal("exact", &[(1, 1.5, 0.25), (2, 2.5, 0.75)]);
+        let rows = load_calibration(&acq, &[2, 1]).unwrap().0;
+        assert_eq!((rows[0][0], rows[0][1]), (2.5, 0.75));
+        assert_eq!((rows[1][0], rows[1][1]), (1.5, 0.25));
+
+        let _ = fs::remove_dir_all(acq.parent().unwrap());
+    }
+
+    /// The Agilent profile lane used to HARDCODE `ScanPolarity::Negative` on every spectrum,
+    /// because the one dataset it was written against (MTBLS1334) was negative-mode — so every
+    /// positive-mode `.d` was mislabelled, including both profile-bearing corpus files. Polarity
+    /// now comes from the scan record's own `IonPolarity` field, and only the two unambiguous
+    /// codes become a polarity: `Unassigned` (2) and `Mixed` (3) are NOT a polarity, and a schema
+    /// without the (optional) field leaves it Unknown rather than inventing one.
+    #[test]
+    fn ion_polarity_decodes_only_the_unambiguous_codes() {
+        assert_eq!(Polarity::from_ion_polarity(0), Polarity::Positive);
+        assert_eq!(Polarity::from_ion_polarity(1), Polarity::Negative);
+        for code in [2, 3, 4, -1, i32::MAX, i32::MIN] {
+            assert_eq!(
+                Polarity::from_ion_polarity(code),
+                Polarity::Unknown,
+                "IonPolarity {code} is not a stated polarity"
+            );
+        }
+        // No field at all (minOccurs="0") is the default, and it is Unknown.
+        assert_eq!(Polarity::default(), Polarity::Unknown);
+    }
+
+    /// End-to-end on a REAL `.d`: the schema walk must land `IonPolarity` on the right bytes, and
+    /// this file must come back positive. `240319-…-pos-S25.d` is acquired in positive mode and its
+    /// `IonPolarity` field reads 0 on all 1,502 records.
+    ///
+    /// Reading 0 is on its own weak evidence — a misaligned offset can land on any zero word — so
+    /// the check is anchored on the NEIGHBOURING members of the same walk: `ScanTime` must be a
+    /// strictly increasing series of plausible retention times and `MSLevel` must be 1 or 2 on
+    /// every record. Those are the fields immediately around `IonPolarity` in `ScanRecordType`, and
+    /// they are decoded by the same offset accumulation, so if the walk had drifted they would be
+    /// nonsense long before the polarity was. Together they say the offsets are aligned against the
+    /// file's real layout and not merely self-consistent.
+    ///
+    /// Corpus-gated. When the file is absent this test prints a `skipping` line and passes without
+    /// asserting anything, so a green result here is only evidence on a machine that HAS the
+    /// corpus — check the line, not the tick.
+    #[test]
+    fn corpus_agilent_scan_records_carry_the_vendor_polarity() {
+        let acq = PathBuf::from(std::env::var("MZPEAK_CORPUS").unwrap_or_else(|_| {
+            format!("{}/Claude/mzpeak-example-data/data", std::env::var("HOME").unwrap_or_default())
+        }))
+        .join("general-ms/agilent-qtof/240319-LL-LeeMaire_c18-isoflavone-pos-S25.d/AcqData");
+        if !acq.join("MSScan.bin").exists() {
+            eprintln!("skipping: no Agilent corpus at {}", acq.display());
+            return;
+        }
+        let schema = ScanSchema::parse(&acq.join("MSScan.xsd")).unwrap();
+        let scans =
+            read_scan_records(&acq.join("MSScan.bin"), &schema, count_scans(&acq)).unwrap();
+        assert_eq!(scans.len(), 1502, "MSScan.bin record count");
+        // Neighbours first: if these are wrong the polarity below proves nothing.
+        assert!(
+            scans.iter().all(|s| s.ms_level == 1 || s.ms_level == 2),
+            "MSLevel decoded outside {{1,2}} — the ScanRecordType offset walk has drifted, so the \
+             IonPolarity assertion below would be meaningless"
+        );
+        assert!(
+            scans.windows(2).all(|w| w[1].scan_time > w[0].scan_time),
+            "ScanTime is not strictly increasing — the ScanRecordType offset walk has drifted"
+        );
+        assert!(
+            scans[0].scan_time >= 0.0 && scans[1501].scan_time < 1e4,
+            "ScanTime {} .. {} is not a plausible retention-time series",
+            scans[0].scan_time,
+            scans[1501].scan_time
+        );
+        assert!(
+            scans.iter().all(|s| s.polarity == Polarity::Positive),
+            "a positive-mode acquisition must not be labelled negative"
+        );
+    }
 
     #[test]
     fn rle_roundtrip_simple() {

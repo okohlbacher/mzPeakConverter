@@ -8,9 +8,15 @@
 //! DELTA_BINARY_PACKED) and a per-run `{c0, c1}` calibration block; the reader recovers
 //! `m/z = (c0 + c1·k)²`.
 //!
-//! This is only applied when a strict lossless check passes (SCIEX TOF passes; Orbitrap / QqQ-SRM
-//! fail and fall back to f64 m/z). The acceptance gate is on ppm error, matching the proven
-//! research (SCIEX TripleTOF reconstructs to <0.1 ppm with a 2-coefficient per-run calibration).
+//! The lane is **bounded-lossy, not lossless**, and the acceptance gate IS the bound: a fit is
+//! taken when every sampled point reconstructs within [`ppm_tol()`] (default 5 ppm) of its source
+//! m/z, so a stored `tof_index` is a quantized m/z and the archive's `tof_calibration` block says
+//! exactly that (`mz_reconstruction: "bounded-lossy"`, `roundtrip_tolerance_ppm`). In practice the
+//! fit is far tighter than the bound on the instruments this targets (SCIEX TripleTOF reconstructs
+//! to <0.1 ppm with a 2-coefficient per-run calibration), which is what makes it usable — but
+//! "tight" is not "exact", and only INTENSITY is stored verbatim. Data that is not on a flight-time
+//! lattice at all (Orbitrap / QqQ-SRM) misses the gate by tens to hundreds of ppm and falls back to
+//! f64 m/z.
 
 /// A fitted per-run TOF grid: `sqrt(m/z) = c0 + c1·k`, `k` a non-negative integer (`tof_index`).
 /// Reconstruction: `m/z = (c0 + c1·k)²`.
@@ -213,7 +219,7 @@ pub const MIN_PROBES: usize = 2;
 /// coefficients. Returns `(grid, tof_index per input point in order, max ppm)` iff every point
 /// reconstructs within `PPM_TOL` and fits Int32; `None` otherwise (caller keeps that spectrum f64).
 /// No non-TOF rejection here — the caller already knows the instrument is TOF; this is just the
-/// lossless gate.
+/// ppm bound.
 #[cfg_attr(not(windows), allow(dead_code))] // only the cfg(windows) SCIEX grid path calls it
 pub fn fit_one(mzs: &[f64]) -> Option<(TofGrid, Vec<i32>, f64)> {
     let base = base_step(mzs)?;
