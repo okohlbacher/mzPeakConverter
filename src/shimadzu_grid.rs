@@ -119,187 +119,61 @@ pub fn fit_spectrum(mz: &[f64], step: f64) -> Option<(SqrtGrid, Vec<i32>)> {
 // ---------------------------------------------------------------------------------------------
 // Centroid m/z as an exact integer lattice (the viewer's `mz-grid` codec).
 //
-// The vendor's centroid m/z is `MassHigh`, an Int64 at 1e-9 Da; the coarse `Mass` fallback
-// (`MZPC_SHIMADZU_COARSE_MZ=1`, Int32 at 1e-4 Da) is a multiple of 1e5 on the same lattice. So
-// `k = round(m/z · 1e9)` is exact by construction and one Int64 per centroid, delta-packed,
-// replaces an f64 whose deltas are all distinct. The peaks facet keeps a Float64 `mz` column
-// beside it — NULL on lattice rows — so a spectrum that fails the guard is stored, never refused.
+// The mechanism now lives in the vendor-neutral [`crate::mz_lattice`] (the mzML lane uses it too,
+// at whatever scale the data is on). This lane binds it to Shimadzu's `MassHigh`: Int64 at
+// 1e-9 Da, with the coarse `Mass` fallback (`MZPC_SHIMADZU_COARSE_MZ=1`, Int32 at 1e-4 Da) a
+// multiple of 1e5 on the same lattice. The re-exports below keep that binding — and the callers in
+// `convert_shimadzu` — spelled exactly as before.
 // ---------------------------------------------------------------------------------------------
 
-use mzdata::params::Unit;
-use mzdata::prelude::*;
-use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
-use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum, SignalContinuity};
-use mzpeak_prototyping::buffer_descriptors::BufferTransform;
-use mzpeak_prototyping::peak_series::{INTENSITY_ARRAY, MZ_ARRAY};
-use mzpeak_prototyping::writer::ArrayBuffersBuilder;
-use mzpeak_prototyping::{BufferContext, BufferName};
+// `lattice_tolerance` / `LATTICE_TOL` are re-exported for the lane's own callers and for the
+// warning text in `convert_shimadzu`, both `#[cfg(windows)]` — hence unused on this host.
+#[allow(unused_imports)]
+pub use crate::mz_lattice::{lattice_tolerance, LatticeOutcome, LATTICE_SCALE, LATTICE_TOL};
 
-/// Lattice scale: `k = round(m/z · LATTICE_SCALE)`.
-pub const LATTICE_SCALE: f64 = 1e9;
-/// The `mzpeak:transform_params` string the reader multiplies `k` by (`LinearMz`: m/z = p₀·k).
+use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum};
+
+/// The `mzpeak:transform_params` string the reader multiplies `k` by (`LinearMz`: m/z = p0*k).
 /// Kept as the literal `"1e-9"` so the archive carries exactly what the contract names.
 pub const LATTICE_TRANSFORM_PARAMS: &str = "1e-9";
-/// Floor of the per-point guard on the scaled value: `|m/z·1e9 − k| < lattice_tolerance(m/z·1e9)`.
-/// The product's own rounding grows with m/z (ulp of 1.25e12 is 2.4e-4; of 4e12 — m/z 4000 — it is
-/// 4.9e-4) and the coarse `Mass` path rounds twice (`massInt · 1e-4`, then `· 1e9`), so a fixed
-/// 1e-3 had a <10 % margin at the top of a wide Q-TOF range; [`lattice_tolerance`] adds a relative
-/// term (8 ulp, as `is_fixed_point_lattice` does) so the margin holds at any m/z. An off-lattice
-/// value (an interpolated apex not from `MassHigh`) is uniformly off by up to 0.5, so
-/// discrimination is unaffected.
-pub const LATTICE_TOL: f64 = 1e-3;
 
-/// The guard for one scaled value: `max(LATTICE_TOL, 8 ulp of the scaled value)`.
-pub fn lattice_tolerance(scaled: f64) -> f64 {
-    (scaled.abs() * 8.0 * f64::EPSILON).max(LATTICE_TOL)
-}
-
-/// `Some(k)` when EVERY centroid lies on the 1e-9 lattice within [`lattice_tolerance`] and `k` is
-/// non-decreasing; `None` (keep f64 m/z) for an empty list, a non-finite or negative value, an
-/// off-lattice point, or a descending pair. Nothing is snapped.
+/// [`crate::mz_lattice::centroid_lattice`] at Shimadzu's 1e-9 scale.
 pub fn centroid_lattice(mz: &[f64]) -> Option<Vec<i64>> {
-    if mz.is_empty() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(mz.len());
-    let mut prev = i64::MIN;
-    for &m in mz {
-        if !m.is_finite() || m < 0.0 {
-            return None;
-        }
-        let scaled = m * LATTICE_SCALE;
-        let k = scaled.round();
-        if (scaled - k).abs() >= lattice_tolerance(scaled) {
-            return None;
-        }
-        let k = k as i64;
-        if k < prev {
-            return None;
-        }
-        prev = k;
-        out.push(k);
-    }
-    Some(out)
+    crate::mz_lattice::centroid_lattice(mz, LATTICE_SCALE)
 }
 
-/// The `point.tof_index` field: Int64, nonstandard `tof_index`, `LinearMz` with params `"1e-9"`.
-/// The name ends in `_index` ON PURPOSE — the vendored writer disables the dictionary and applies
-/// DELTA_BINARY_PACKED to `*_index` columns (writer/base.rs `spectrum_data_writer_props`).
+/// [`crate::mz_lattice::lattice_tof_index_field`] at Shimadzu's 1e-9 scale.
 pub fn lattice_tof_index_field() -> std::sync::Arc<arrow::datatypes::Field> {
-    let base = BufferName::new(
-        BufferContext::Spectrum,
-        ArrayType::nonstandard("tof_index"),
-        BinaryDataArrayType::Int64,
-    )
-    .with_transform(Some(BufferTransform::LinearMz))
-    .to_field();
-    let mut md = base.metadata().clone();
-    md.insert("mzpeak:transform_params".to_string(), LATTICE_TRANSFORM_PARAMS.to_string());
-    std::sync::Arc::new((*base).clone().with_metadata(md))
+    crate::mz_lattice::lattice_tof_index_field(LATTICE_SCALE)
 }
 
-/// Custom `spectra_peaks` schema for the Shimadzu native lane (point layout, prefix `point`):
-/// `spectrum_index` UInt64, `tof_index` Int64 (the lattice), `mz` Float64 (the per-spectrum f64
-/// fallback, NULL on lattice rows), `intensity` Float32. The BufferNames MUST match the DataArrays
-/// [`lattice_peak_arrays`] builds, or the columns spill to auxiliary.
-pub fn lattice_peak_schema() -> ArrayBuffersBuilder {
-    ArrayBuffersBuilder::default()
-        .prefix("point")
-        .with_context(BufferContext::Spectrum)
-        .add_field(BufferContext::Spectrum.index_field())
-        .add_field(lattice_tof_index_field())
-        .add_field(MZ_ARRAY.to_field())
-        .add_field(INTENSITY_ARRAY.to_field())
+/// [`crate::mz_lattice::lattice_peak_schema`] at Shimadzu's 1e-9 scale.
+pub fn lattice_peak_schema() -> mzpeak_prototyping::writer::ArrayBuffersBuilder {
+    crate::mz_lattice::lattice_peak_schema(LATTICE_SCALE)
 }
 
-/// The `mz_calibration` index block the viewer's `mz-grid` codec gates on (`scale` MUST be a JSON
-/// number > 0).
-pub fn mz_calibration_block() -> serde_json::Value {
-    serde_json::json!({
-        "codec": "mz-grid",
-        "scale": LATTICE_SCALE,
-        "vendor": "shimadzu",
-        "lossless": "tof_index",
-        "applies_to": "spectra_peaks",
-        "mz_from_tof_index": "tof_index / scale",
-        "source": "MassHigh (Int64, 1e-9 Da); Mass (Int32, 1e-4 Da) under MZPC_SHIMADZU_COARSE_MZ=1 lies on the same lattice",
-    })
-}
-
-/// The peak-facet arrays for one lattice spectrum: `tof_index` Int64 + `intensity` Float32
-/// (detector counts, matching `INTENSITY_ARRAY` so it maps to `point.intensity`).
+/// [`crate::mz_lattice::lattice_peak_arrays`], unchanged (the arrays carry no scale).
 pub fn lattice_peak_arrays(k: &[i64], intensity: &[f32]) -> Option<BinaryArrayMap> {
-    if k.len() != intensity.len() {
-        return None;
-    }
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int64, Vec::new());
-    tof_da.update_buffer(k).ok()?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity).ok()?;
-    int_da.unit = Unit::DetectorCounts;
-    out.add(int_da);
-    Some(out)
+    crate::mz_lattice::lattice_peak_arrays(k, intensity)
 }
 
-/// What [`lattice_route`] decided for one spectrum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LatticeOutcome {
-    /// Every centroid on the lattice: the peak facet gets `tof_index` + intensity.
-    Lattice,
-    /// At least one centroid off the lattice (or descending): the spectrum keeps f64 m/z.
-    KeptF64,
-    /// No centroid list on this spectrum (profile-only), or an empty one (a 0-point scan):
-    /// nothing to route, and nothing kept in f64 either.
-    NoCentroids,
+/// The `mz_calibration` index block for this lane, naming the Shimadzu source fields.
+pub fn mz_calibration_block() -> serde_json::Value {
+    crate::mz_lattice::mz_calibration_block(
+        LATTICE_SCALE,
+        "shimadzu",
+        "MassHigh (Int64, 1e-9 Da); Mass (Int32, 1e-4 Da) under MZPC_SHIMADZU_COARSE_MZ=1 lies on the same lattice",
+    )
 }
 
-impl LatticeOutcome {
-    /// `Some(true)` on the lattice, `Some(false)` kept f64, `None` nothing to route — the shape
-    /// the converter's per-facet summary counters record.
-    pub fn on_lattice(self) -> Option<bool> {
-        match self {
-            LatticeOutcome::Lattice => Some(true),
-            LatticeOutcome::KeptF64 => Some(false),
-            LatticeOutcome::NoCentroids => None,
-        }
-    }
-}
-
-/// Per-spectrum routing of the CENTROID list. The list is the peak set when the spectrum also
-/// carries a profile (a dual `.lcd`), or the raw arrays of a Centroid spectrum otherwise. On
-/// success the spectrum is returned UNCHANGED (its peak set / raw arrays still feed the metadata
-/// summaries — counts, TIC, base peak) together with the lattice arrays the writer sends to the
-/// peak facet through `write_spectrum_with_peak_arrays`; otherwise `None` and the ordinary
-/// `write_spectrum` path stores the f64 m/z in the same facet's `mz` column.
+/// [`crate::mz_lattice::lattice_route`] at Shimadzu's 1e-9 scale. The list is the peak set when the
+/// spectrum also carries a profile (a dual `.lcd`), or the raw arrays of a Centroid spectrum
+/// otherwise; the spectrum comes back UNCHANGED so its peak list still yields the metadata
+/// summaries (counts, TIC, base peak, observed m/z range).
 pub fn lattice_route(
     spec: MultiLayerSpectrum,
 ) -> (MultiLayerSpectrum, Option<BinaryArrayMap>, LatticeOutcome) {
-    let centroids: Option<(Vec<f64>, Vec<f32>)> = if let Some(peaks) = spec.peaks.as_ref() {
-        Some(peaks.iter().map(|p| (p.mz, p.intensity)).unzip())
-    } else if spec.signal_continuity() == SignalContinuity::Centroid {
-        spec.arrays.as_ref().and_then(|a| match (a.mzs(), a.intensities()) {
-            (Ok(mz), Ok(inten)) => Some((mz.to_vec(), inten.to_vec())),
-            _ => None,
-        })
-    } else {
-        None
-    };
-    // An empty list is not an off-lattice one: report it as nothing-to-route so the summary
-    // counters do not call every empty scan "kept f64 m/z".
-    let Some((mz, intensity)) = centroids.filter(|(mz, _)| !mz.is_empty()) else {
-        return (spec, None, LatticeOutcome::NoCentroids);
-    };
-    let Some(k) = centroid_lattice(&mz) else {
-        return (spec, None, LatticeOutcome::KeptF64);
-    };
-    match lattice_peak_arrays(&k, &intensity) {
-        Some(arrays) => (spec, Some(arrays), LatticeOutcome::Lattice),
-        None => (spec, None, LatticeOutcome::KeptF64),
-    }
+    crate::mz_lattice::lattice_route(spec, LATTICE_SCALE)
 }
 
 #[cfg(test)]
@@ -372,207 +246,48 @@ mod tests {
 
 #[cfg(test)]
 mod lattice_tests {
+    //! The lattice mechanism itself is tested in [`crate::mz_lattice`]; what is Shimadzu-specific,
+    //! and what `convert_shimadzu` and `tests/shimadzu_lattice_peaks.rs` depend on, is that this
+    //! lane binds it to the 1e-9 `MassHigh` scale and to that literal params string. Pin exactly
+    //! that, so a change of scale in the shared module cannot silently move this lane.
     use super::*;
-    use mzdata::spectrum::SpectrumDescription;
-    use mzpeak_prototyping::writer::ArrayBufferWriter;
-    use mzpeaks::{CentroidPeak, PeakSet};
 
-    fn on_lattice(ks: &[i64]) -> Vec<f64> {
-        ks.iter().map(|&k| k as f64 * 1e-9).collect()
+    #[test]
+    fn this_lane_is_bound_to_the_1e_minus_9_masshigh_scale() {
+        assert_eq!(LATTICE_SCALE, 1e9);
+        assert_eq!(LATTICE_TRANSFORM_PARAMS, "1e-9");
+        assert_eq!(
+            crate::mz_lattice::transform_params(LATTICE_SCALE),
+            LATTICE_TRANSFORM_PARAMS
+        );
+        assert_eq!(
+            lattice_tof_index_field()
+                .metadata()
+                .get("mzpeak:transform_params")
+                .map(String::as_str),
+            Some(LATTICE_TRANSFORM_PARAMS)
+        );
+        let b = mz_calibration_block();
+        assert_eq!(b["codec"], "mz-grid");
+        assert_eq!(b["vendor"], "shimadzu");
+        assert_eq!(b["scale"].as_f64(), Some(1e9));
+        assert!(b["source"].as_str().unwrap().contains("MassHigh"));
     }
 
     #[test]
-    fn masshigh_values_recover_their_integer_exactly() {
-        // 1e-9 Da lattice up to m/z 1250 (k ≈ 1.25e12, still exact in f64).
-        let ks = [50_000_000_000i64, 123_456_789_012, 999_999_999_999, 1_250_123_456_789];
-        assert_eq!(centroid_lattice(&on_lattice(&ks)).unwrap(), ks);
-        // Equal neighbours (a duplicated centroid) are non-decreasing, hence allowed.
-        assert_eq!(centroid_lattice(&on_lattice(&[7, 7, 8])).unwrap(), vec![7, 7, 8]);
-    }
-
-    #[test]
-    fn coarse_mass_values_lie_on_the_same_lattice() {
-        // MZPC_SHIMADZU_COARSE_MZ=1: `Mass` at 1e-4 Da → multiples of 1e5 on the 1e-9 lattice.
+    fn masshigh_and_coarse_mass_both_land_on_this_lanes_lattice() {
+        // MassHigh (1e-9 Da) recovers its own integer ...
+        let ks = [100_000_123_456i64, 200_000_000_001, 1_250_123_456_789];
+        let mz: Vec<f64> = ks.iter().map(|&k| k as f64 * 1e-9).collect();
+        assert_eq!(centroid_lattice(&mz).unwrap(), ks);
+        // ... and the coarse `Mass` field (1e-4 Da) is a multiple of 1e5 on the same lattice.
         let coarse: Vec<f64> = [500_001i64, 500_002, 12_345_678].iter().map(|&m| m as f64 * 1e-4).collect();
         let k = centroid_lattice(&coarse).unwrap();
         assert_eq!(k, vec![50_000_100_000, 50_000_200_000, 1_234_567_800_000]);
         assert!(k.iter().all(|v| v % 100_000 == 0));
-    }
-
-    #[test]
-    fn an_off_lattice_point_keeps_the_spectrum_in_f64() {
-        let mut mz = on_lattice(&[100_000_000_000, 200_000_000_000, 300_000_000_000]);
-        mz[1] += 0.3e-9; // an interpolated apex, 0.3 of a lattice step off
-        assert!(centroid_lattice(&mz).is_none());
-        // Inside the guard is still accepted (the f64 product's own rounding).
-        let mut mz = on_lattice(&[100_000_000_000, 200_000_000_000]);
-        mz[1] += 0.5e-12;
-        assert!(centroid_lattice(&mz).is_some());
-    }
-
-    #[test]
-    fn the_guard_scales_with_mz_at_the_top_of_a_wide_range() {
-        // MassHigh at m/z 4000–4500 (k up to 4.5e12): 8 ulp there is ≈7e-3, still ≪ 0.5.
-        let ks: Vec<i64> = (0..4000).map(|i| 4_000_000_000_000 + i * 123_456_789).collect();
-        assert_eq!(centroid_lattice(&on_lattice(&ks)).unwrap(), ks);
-        // The coarse `Mass` path rounds twice (massInt·1e-4, then ·1e9) — its worst case near
-        // m/z 4000 is ≈9e-4, inside the relative guard where the fixed 1e-3 floor had <10 % margin.
-        let ints: Vec<i64> = (39_990_000..40_010_000).step_by(7).collect();
-        let coarse: Vec<f64> = ints.iter().map(|&m| m as f64 * 1e-4).collect();
-        let k = centroid_lattice(&coarse).expect("coarse Mass at m/z 4000 is on the lattice");
-        assert_eq!(k, ints.iter().map(|m| m * 100_000).collect::<Vec<_>>());
-        // An interpolated apex 0.3 of a step off at m/z 4000 is still refused.
-        let mut mz = on_lattice(&[4_000_000_000_000, 4_000_000_000_001]);
-        mz[1] += 0.3e-9;
-        assert!(centroid_lattice(&mz).is_none());
-        assert!(lattice_tolerance(4e12) > LATTICE_TOL && lattice_tolerance(4e12) < 0.01);
-        assert_eq!(lattice_tolerance(1e11), LATTICE_TOL);
-    }
-
-    #[test]
-    fn descending_empty_and_non_finite_input_is_refused() {
-        assert!(centroid_lattice(&on_lattice(&[5, 4])).is_none());
-        assert!(centroid_lattice(&[]).is_none());
-        assert!(centroid_lattice(&[100.0, f64::NAN]).is_none());
-        assert!(centroid_lattice(&[-1e-9]).is_none());
-    }
-
-    fn arrays(mz: &[f64], inten: &[f32]) -> BinaryArrayMap {
-        let mut out = BinaryArrayMap::new();
-        let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
-        mz_da.update_buffer(mz).unwrap();
-        out.add(mz_da);
-        let mut int_da =
-            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        int_da.update_buffer(inten).unwrap();
-        out.add(int_da);
-        out
-    }
-
-    fn spectrum(
-        continuity: SignalContinuity,
-        raw: Option<BinaryArrayMap>,
-        peaks: Option<&[(f64, f32)]>,
-    ) -> MultiLayerSpectrum {
-        let descr = SpectrumDescription { signal_continuity: continuity, ..Default::default() };
-        let peak_set = peaks.map(|p| {
-            PeakSet::new(
-                p.iter().enumerate().map(|(i, (m, it))| CentroidPeak::new(*m, *it, i as u32)).collect(),
-            )
-        });
-        MultiLayerSpectrum::new(descr, raw, peak_set, None)
-    }
-
-    fn tof_index_of(arrays: &BinaryArrayMap) -> Vec<i64> {
-        arrays.get(&ArrayType::nonstandard("tof_index")).unwrap().to_i64().unwrap().to_vec()
-    }
-
-    #[test]
-    fn a_dual_spectrum_routes_its_peak_set_and_keeps_the_profile() {
-        let profile = arrays(&[100.0, 100.0001, 100.0002], &[1.0, 5.0, 2.0]);
-        let centroids = [(100.000_123_456, 5.0f32), (200.000_000_001, 7.0)];
-        let spec = spectrum(SignalContinuity::Profile, Some(profile), Some(&centroids));
-        let (spec, lattice, outcome) = lattice_route(spec);
-        assert_eq!(outcome, LatticeOutcome::Lattice);
-        let lattice = lattice.expect("lattice arrays");
-        assert_eq!(tof_index_of(&lattice), vec![100_000_123_456, 200_000_000_001]);
-        assert_eq!(lattice.intensities().unwrap().to_vec(), vec![5.0, 7.0]);
-        // The spectrum itself is untouched: the profile still feeds the data facet and the peak
-        // set still feeds `number_of_peaks` / base peak.
-        assert_eq!(spec.signal_continuity(), SignalContinuity::Profile);
-        assert_eq!(spec.arrays.as_ref().unwrap().mzs().unwrap().len(), 3);
-        assert_eq!(spec.peaks.as_ref().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn a_centroid_only_spectrum_routes_its_raw_arrays() {
-        let raw = arrays(&[100.000_123_456, 200.000_000_001], &[5.0, 7.0]);
-        let spec = spectrum(SignalContinuity::Centroid, Some(raw), None);
-        let (spec, lattice, outcome) = lattice_route(spec);
-        assert_eq!(outcome, LatticeOutcome::Lattice);
-        assert_eq!(tof_index_of(&lattice.unwrap()), vec![100_000_123_456, 200_000_000_001]);
-        assert!(spec.arrays.is_some());
-    }
-
-    #[test]
-    fn off_lattice_centroids_keep_f64_and_profile_only_has_nothing_to_route() {
-        let raw = arrays(&[100.000_123_456_3, 200.0], &[5.0, 7.0]);
-        let spec = spectrum(SignalContinuity::Centroid, Some(raw), None);
-        let (_, lattice, outcome) = lattice_route(spec);
-        assert_eq!(outcome, LatticeOutcome::KeptF64);
-        assert!(lattice.is_none());
-
-        let spec = spectrum(SignalContinuity::Profile, Some(arrays(&[100.0], &[1.0])), None);
-        let (_, lattice, outcome) = lattice_route(spec);
-        assert_eq!(outcome, LatticeOutcome::NoCentroids);
-        assert!(lattice.is_none());
-    }
-
-    #[test]
-    fn an_empty_centroid_list_is_nothing_to_route_not_kept_f64() {
-        // A 0-point scan: shimadzu.rs builds it as Centroid with empty raw arrays …
-        let spec = spectrum(SignalContinuity::Centroid, Some(arrays(&[], &[])), None);
-        let (_, lattice, outcome) = lattice_route(spec);
-        assert_eq!(outcome, LatticeOutcome::NoCentroids);
-        assert!(lattice.is_none());
-        // … and a dual spectrum with an empty peak set is the same case.
-        let spec = spectrum(SignalContinuity::Profile, Some(arrays(&[100.0], &[1.0])), Some(&[]));
-        let (_, lattice, outcome) = lattice_route(spec);
-        assert_eq!(outcome, LatticeOutcome::NoCentroids);
-        assert!(lattice.is_none());
-    }
-
-    #[test]
-    fn the_peak_schema_declares_the_four_columns() {
-        let f = lattice_tof_index_field();
-        // The builder marks the first array of each type primary and shortens its name to
-        // `tof_index` at build time (the mzML lane's Int32 field goes `tof_index_i32` → `tof_index`
-        // the same way); the raw field carries the dtype suffix.
-        assert!(f.name().starts_with("tof_index"), "{}", f.name());
-        assert_eq!(f.data_type(), &arrow::datatypes::DataType::Int64);
-        assert_eq!(f.metadata().get("mzpeak:transform_params").map(String::as_str), Some("1e-9"));
-        let buffers = lattice_peak_schema().build(
-            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-            BufferContext::Spectrum,
-            false,
-        );
-        let schema = buffers.schema();
-        let point = schema.field_with_name("point").expect("point struct");
-        let arrow::datatypes::DataType::Struct(children) = point.data_type() else {
-            panic!("point is not a struct: {:?}", point.data_type())
-        };
-        let dtype = |name: &str| {
-            children
-                .iter()
-                .find(|c| c.name() == name)
-                .unwrap_or_else(|| panic!("no `{name}` column in {children:?}"))
-                .data_type()
-                .clone()
-        };
-        assert_eq!(children.len(), 4, "{children:?}");
-        assert_eq!(children[0].name(), "spectrum_index");
-        assert_eq!(dtype("spectrum_index"), arrow::datatypes::DataType::UInt64);
-        assert_eq!(dtype("tof_index"), arrow::datatypes::DataType::Int64);
-        assert_eq!(dtype("mz"), arrow::datatypes::DataType::Float64);
-        assert_eq!(dtype("intensity"), arrow::datatypes::DataType::Float32);
-        let tof = children.iter().find(|c| c.name() == "tof_index").unwrap();
-        assert_eq!(tof.metadata().get("mzpeak:transform_params").map(String::as_str), Some("1e-9"));
-        assert!(
-            BufferName::from_field(BufferContext::Spectrum, tof.clone())
-                .is_some_and(|b| b.transform == Some(BufferTransform::LinearMz)),
-            "tof_index must carry the LinearMz transform: {:?}",
-            tof.metadata()
-        );
-    }
-
-    #[test]
-    fn the_mz_calibration_block_is_what_the_viewer_gates_on() {
-        let b = mz_calibration_block();
-        assert_eq!(b["codec"], "mz-grid");
-        assert_eq!(b["applies_to"], "spectra_peaks");
-        assert_eq!(b["lossless"], "tof_index");
-        assert_eq!(b["mz_from_tof_index"], "tof_index / scale");
-        let scale = b["scale"].as_f64().expect("scale is a JSON number");
-        assert!(scale > 0.0 && scale == 1e9);
+        // An interpolated apex 0.3 of a step off keeps the spectrum in f64.
+        let mut off = mz.clone();
+        off[1] += 0.3e-9;
+        assert!(centroid_lattice(&off).is_none());
     }
 }

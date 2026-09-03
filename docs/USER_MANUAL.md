@@ -87,6 +87,7 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 | `-c, --config <FILE>` | — | YAML config file setting defaults for any option (see §5) |
 | `--layout <chunked\|point>` | `chunked` | Signal layout (see §9) |
 | `--no-numpress` | off | Lossless delta m/z chunking instead of lossy numpress-linear |
+| `--no-mz-lattice` | off | Disable the fixed-point m/z **lattice** for centroid peaks (see §9) and store f64 `mz` instead — on every lane, the native Shimadzu `.lcd` one included. Also `MZPC_NO_MZ_LATTICE=1`. No effect on data that is not on a lattice |
 | `--chunk-size <Th>` | `50` | m/z chunk width for the chunked layout |
 | `--zstd-level <1–22>` | `3` | Parquet zstd level |
 | `--no-ims-compact` | off | Bruker TDF: write standard f64 m/z instead of the default ims-compact |
@@ -304,6 +305,38 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
   encodes each with numpress-linear (lossy, compact) or, with `--no-numpress`,
   lossless delta. `point` writes one row per (m/z, intensity).
 - **zstd** — applied inside Parquet, `--zstd-level` 1–22 (default 3).
+- **Fixed-point m/z lattice** *(automatic; `--no-mz-lattice` to disable)* — some vendors hand over
+  m/z that are really integers over a power of ten: Shimadzu `MassHigh` at 1e-9 Da, its coarse
+  `Mass` field at 1e-4 Da, and the LabSolutions **mzML export** of the same acquisition. The
+  converter samples the CENTROID m/z of six spectra spread across the run and, if every one of them
+  lands on such a lattice, stores the peaks facet as `point.tof_index` = `round(m/z · scale)`
+  (Int64, DELTA_BINARY_PACKED) with an `mz_calibration` index block (`"codec": "mz-grid"`) and a
+  `LinearMz` transform on the column; readers recover `m/z = tof_index / scale` — the DIVISION, not
+  a multiplication by the column's `mzpeak:transform_params` (`1/scale`), which is a different
+  number: `1e-9` is not exactly 10⁻⁹, so `tof_index · 1e-9` lands one ulp (~1e-13 Da) off the
+  source value on about 40 % of points. Dividing by the `scale` in the `mz_calibration` block
+  reproduces the vendor's f64 **bit for bit**, which is what makes the lattice **lossless
+  and smaller than either chunk encoding**, so on the peaks facet it supersedes both numpress-linear
+  and delta. Measured on the 4.5 GB LabSolutions `DIA_Hela_20ng` mzML (279.7 M centroids):
+  **2,188 MB** (lossless delta) or 1,355 MB (lossy numpress) → **1,312 MB**, with the m/z bytes
+  going 1,897 MB → 1,035 MB (−45 %); on the 13,200-spectrum `Blind_P1_pos_012.mzML`,
+  3,709 kB → 2,264 kB (−39 %). Nothing is snapped: a spectrum with even one off-lattice value keeps
+  its exact f64 m/z in the same facet's `mz` column, per spectrum. Only the **peaks** facet is
+  affected — profile arrays keep the chunked layout and the `--no-numpress` / `--chunk-size` /
+  `--layout` choices exactly as before, so a profile-only input converts unchanged. The native
+  Shimadzu `.lcd` lane has done this at 1e-9 since v0.9.0; this is the same mechanism applied to any
+  input whose data earns it. `--tof-grid` (a different, sqrt/flight-time grid) still wins where it
+  is asked for and fits.
+- **Reader support for the lattice, and when to turn it off.** A lattice archive's peaks facet has
+  an Int64 `point.tof_index` and an all-NULL `point.mz` on the routed rows, so a reader that does
+  not know the `mz-grid` codec sees no m/z there (`mzpeak-convert`'s own vendored reader and
+  mzPeakViewer do know it; other tools in the mzPeak family — OpenMS's `MzPeakFile`, mzPeakJ,
+  mzPeakIV, mzPeakExplorer, mzPeakValidator — do not, at the time of writing, and read those cells
+  as 0). Until they do, pass **`--no-mz-lattice`** (config `no_mz_lattice: true`, or
+  `MZPC_NO_MZ_LATTICE=1` in the environment) when the archive is destined for one of them: it
+  stores plain f64 `mz` instead, on **every** lane — the mzML/generic one and the native Shimadzu
+  `.lcd` one alike. Note this is a change of on-disk representation for ordinary mzML input, which
+  before v0.9.7 always got f64 `mz`; the values are the same either way.
 - **ims-compact** — for Bruker timsTOF (**TDF**) this is the **default**: the
   native integer `tof` is stored bit-exact (Int32 + `ims_calibration`) instead of
   f64 m/z, roughly halving the m/z bytes with an exact grid. Disable with

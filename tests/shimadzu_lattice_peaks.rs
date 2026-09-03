@@ -175,8 +175,12 @@ fn peak_set(mz: &[f64], intensity: &[f32]) -> PeakSet {
     )
 }
 
+/// The archive's own contract, `m/z = tof_index / scale` (the `mz_calibration` block's
+/// `mz_from_tof_index`), NOT `k · 1e-9`: `1e-9` is not exactly 10⁻⁹, so multiplying by it differs
+/// from the correctly-rounded quotient by one ulp on ~40 % of k — the difference between
+/// reproducing the vendor's f64 bit for bit and not.
 fn lattice_mz(k: &[i64]) -> Vec<f64> {
-    k.iter().map(|&v| v as f64 * 1e-9).collect()
+    k.iter().map(|&v| v as f64 / 1e9).collect()
 }
 
 fn write_archive(path: &Path) {
@@ -302,7 +306,7 @@ fn lattice_peaks_facet_round_trips_and_is_delta_packed_int64() {
     assert_eq!(reader.len(), 4);
     for (index, ks) in [(0u64, &LATTICE_A), (1, &LATTICE_B)] {
         let mz = peak_mzs(reader.get_spectrum_peaks_for(index).unwrap().expect("peaks"));
-        assert_eq!(mz, lattice_mz(ks), "spectrum {index}: m/z must be exactly k·1e-9");
+        assert_eq!(mz, lattice_mz(ks), "spectrum {index}: m/z must be exactly k / 1e9");
     }
     let mz = peak_mzs(reader.get_spectrum_peaks_for(2).unwrap().expect("fallback peaks"));
     assert_eq!(mz, FALLBACK_MZ.to_vec(), "the off-lattice spectrum keeps its exact f64 m/z");
