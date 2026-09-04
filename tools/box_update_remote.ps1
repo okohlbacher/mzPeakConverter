@@ -44,7 +44,9 @@ try {
         $lockHeld = $true
     } catch {
         $age = (Get-Date) - (Get-Item $lock).LastWriteTime
-        if ($age.TotalSeconds -gt 7200) {          # stale: a previous run died before its finally
+        if ($age.TotalSeconds -gt 1800) {          # stale: a previous run died before its finally
+            # 1800s, not 7200s: a cargo build takes minutes, so a lock older than half an hour is a
+            # corpse. At 7200 a host killed mid-update blocked every later run for two hours.
             Remove-Item $lock -Force -ErrorAction SilentlyContinue
             New-Item -ItemType File -Path $lock -ErrorAction Stop | Out-Null
             $lockHeld = $true
