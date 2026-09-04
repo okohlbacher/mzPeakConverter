@@ -450,20 +450,54 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
         if (cand / "python3").exists():
             env["PATH"] = f"{cand}:{env.get('PATH', '')}"
             break
+    # Fingerprint every target BEFORE the run. "The archive exists" does NOT mean the box just
+    # delivered it: with S3-first the box PUTs to the corpus KEY and the local copy stays stale by
+    # design until the deferred pull. Stamping on existence alone labelled 21 August archives as
+    # 0.9.0 after box_convert.sh had aborted (exit 3) without converting anything, and then reported
+    # "COMPLETENESS 199/199 (100.0%)". Only a CHANGED file may be stamped.
+    before = {}
+    for u in units:
+        out = target_for(u)
+        try:
+            st = out.stat()
+            before[out] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            before[out] = None
     proc = subprocess.run(
-        ["bash", str(TOOLS / "box_convert.sh"), "--local-manifest", str(manifest), "--jobs", str(jobs)],
+        # --overwrite: the durable target is an ALREADY-PUBLISHED corpus key, and replacing it is
+        # the whole point of a reconvert. Without it box_convert.sh refuses the publish after a
+        # successful conversion ("REFUSING to overwrite existing"), drops the staging key, and the
+        # box's work is thrown away -- 19 of 21 units converted and then discarded.
+        ["bash", str(TOOLS / "box_convert.sh"), "--overwrite",
+         "--local-manifest", str(manifest), "--jobs", str(jobs)],
         text=True, env=env,
     )
     print(f"box       : box_convert exited {proc.returncode}")
-    for u in units:  # stamp whatever came back so the next run sees it as current
+    stamped, unchanged = 0, []
+    for u in units:
         out = target_for(u)
-        if out.exists():
-            try:
-                with zipfile.ZipFile(out) as z:
-                    if any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
-                        stamp_for(out).write_text(version + "\n")
-            except Exception:
-                pass
+        try:
+            st = out.stat()
+            now = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            unchanged.append(u.name)
+            continue
+        if before.get(out) == now:
+            unchanged.append(u.name)
+            continue
+        try:
+            with zipfile.ZipFile(out) as z:
+                if any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
+                    stamp_for(out).write_text(version + "\n")
+                    stamped += 1
+                else:
+                    unchanged.append(u.name)
+        except Exception:
+            unchanged.append(u.name)
+    print(f"box       : stamped {stamped} delivered archive(s)")
+    if unchanged:
+        print(f"box       : {len(unchanged)} NOT delivered, left unstamped: "
+              + ", ".join(sorted(unchanged)[:6]) + (" ..." if len(unchanged) > 6 else ""))
 
 
 def convert_target(cands: list[Path], binary: str, version: str, dry: bool, recipes: dict | None = None) -> tuple[Path, str, str]:
@@ -492,7 +526,12 @@ def main() -> int:
     ap.add_argument("--report-only", action="store_true", help="audit completeness, convert nothing")
     ap.add_argument("--box", action="store_true",
                     help="also convert host-unsupported vendor units on the flash workstation")
-    ap.add_argument("--box-jobs", type=int, default=1, help="box concurrency (disk-bound; default 1)")
+    # Was 1, because every box job re-downloaded its own raw and N of those at once thrashed the box
+    # temp disk. box_convert_remote.ps1 now keeps a persistent raw cache, so the download leg is a
+    # local copy and the box sits idle ~98 % of the run. 3 is under box_convert.sh's own cap of 4,
+    # which still clamps this (and MZPC_ALLOW_PARALLEL=1 there lifts the cap).
+    ap.add_argument("--box-jobs", type=int, default=3,
+                    help="box concurrency (default 3; box_convert.sh caps at MZPC_BOX_JOBS_CAP=4)")
     ap.add_argument("--no-s3-first", action="store_true",
                     help="box returns archives to the host instead of PUTting them to the corpus bucket")
     args = ap.parse_args()
