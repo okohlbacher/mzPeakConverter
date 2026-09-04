@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.12] — 2026-09-04
+
+No converter behaviour change: the shipped binary produces byte-identical
+archives to 0.9.11. This release carries the conversion HARNESS and two
+build-warning corrections.
+
+### Fixed
+
+- **The box pipeline could report a corpus fully converted while converting
+  nothing.** Four independent defects in `tools/`. The ssh watchdog inherited
+  its caller's stdout, so inside a command substitution the orphaned `sleep`
+  held the pipe open and every invocation blocked for the full 7200 s timeout
+  even though ssh had returned in seconds. A busy build lock aborted the entire
+  run with exit 3 instead of retrying. Archives were stamped on EXISTENCE rather
+  than on having changed — and because S3-first leaves the local copy stale by
+  design, that labelled August archives as freshly built after the box had
+  aborted without converting anything, then reported `199/199 (100.0%)`. Stale
+  update locks expired after two hours rather than thirty minutes, so a host
+  killed mid-update blocked every later run.
+- **Two false `never used` warnings on Windows, silenced with the reason rather
+  than a deletion.** `shimadzu_grid`'s four lattice wrappers bind the shared
+  lattice to Shimadzu's 1e-9 `MassHigh` scale; `mod lattice_tests` exists to pin
+  exactly that, and `cargo build` does not compile tests — so deleting them
+  deletes the thing under test. `convert_sciex_grid`'s `vendor` parameter is
+  genuinely unused and correctly so: `vendor::embed_into_archive` walks a
+  DIRECTORY and a SCIEX input is a `.wiff` FILE.
+
 ## [0.9.11] — 2026-09-03
 
 ### Fixed
