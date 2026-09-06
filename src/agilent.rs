@@ -73,9 +73,7 @@ use netcorehost::hostfxr::AssemblyDelegateLoader;
 use netcorehost::pdcstring::PdCString;
 use netcorehost::{nethost, pdcstr};
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -433,8 +431,9 @@ impl AgilentReader {
     }
 
     /// Build the mzdata spectrum for scan `i` (0-based). Built EXACTLY like `bruker_tsf.rs`:
-    /// Float64 MZArray (`Unit::MZ`) + Float32 IntensityArray (`Unit::DetectorCounts`), the
-    /// `MS:1000294 "mass spectrum"` param, and a single `ScanEvent` with `start_time` in minutes.
+    /// Float64 MZArray (`Unit::MZ`) + Float32 IntensityArray (`Unit::DetectorCounts`),
+    /// and a single `ScanEvent` with `start_time` in minutes (no blanket `MS:1000294`; the writer
+    /// types rows from ms_level).
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
         if i >= self.count {
             bail!("Agilent spectrum index {i} out of range (count {})", self.count);
@@ -477,7 +476,10 @@ impl AgilentReader {
             polarity,
             ..Default::default()
         };
-        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
 
         let mut scan = ScanEvent::default();
         // Agilent reports RT in minutes; mzdata ScanEvent.start_time is also minutes.

@@ -136,49 +136,26 @@ pub fn fit_spectrum(mz: &[f64], step: f64) -> Option<(SqrtGrid, Vec<i32>)> {
 // The mechanism now lives in the vendor-neutral [`crate::mz_lattice`] (the mzML lane uses it too,
 // at whatever scale the data is on). This lane binds it to Shimadzu's `MassHigh`: Int64 at
 // 1e-9 Da, with the coarse `Mass` fallback (`MZPC_SHIMADZU_COARSE_MZ=1`, Int32 at 1e-4 Da) a
-// multiple of 1e5 on the same lattice. The re-exports below keep that binding — and the callers in
-// `convert_shimadzu` — spelled exactly as before.
+// multiple of 1e5 on the same lattice. The three wrappers below are the binding: they are what
+// `convert_shimadzu` (main.rs) calls — `lattice_peak_schema` for the peaks-facet hint,
+// `mz_calibration_block` for the index block, `lattice_route` per spectrum — so the scale is fixed
+// in exactly one place. Anything else the lane once re-exported is gone; `mod lattice_tests` pins
+// the binding through these same three entry points.
 // ---------------------------------------------------------------------------------------------
 
-// `lattice_tolerance` / `LATTICE_TOL` are re-exported for the lane's own callers and for the
-// warning text in `convert_shimadzu`, both `#[cfg(windows)]` — hence unused on this host.
-#[allow(unused_imports)]
-pub use crate::mz_lattice::{lattice_tolerance, LatticeOutcome, LATTICE_SCALE, LATTICE_TOL};
+pub use crate::mz_lattice::{LatticeOutcome, LATTICE_SCALE};
 
 use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum};
 
-// The four items below bind the shared lattice to Shimadzu's 1e-9 `MassHigh` scale. `convert_shimadzu`
-// now calls `crate::mz_lattice::*` directly, so on Windows — the only host that compiles this lane —
-// rustc reports them as never used. They are NOT dead: `mod lattice_tests` exists precisely to pin
-// this binding, and `cargo build` does not compile tests, which is why the warning appears there and
-// nowhere else. Deleting them deletes the thing under test.
-
 /// The `mzpeak:transform_params` string the reader multiplies `k` by (`LinearMz`: m/z = p0*k).
-/// Kept as the literal `"1e-9"` so the archive carries exactly what the contract names.
-#[cfg_attr(not(test), allow(dead_code))]
-pub const LATTICE_TRANSFORM_PARAMS: &str = "1e-9";
-
-/// [`crate::mz_lattice::centroid_lattice`] at Shimadzu's 1e-9 scale.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn centroid_lattice(mz: &[f64]) -> Option<Vec<i64>> {
-    crate::mz_lattice::centroid_lattice(mz, LATTICE_SCALE)
-}
-
-/// [`crate::mz_lattice::lattice_tof_index_field`] at Shimadzu's 1e-9 scale.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn lattice_tof_index_field() -> std::sync::Arc<arrow::datatypes::Field> {
-    crate::mz_lattice::lattice_tof_index_field(LATTICE_SCALE)
-}
+/// Kept as the literal `"1e-9"` so the test pins exactly what the archive must carry; production
+/// derives it from `LATTICE_SCALE` inside `crate::mz_lattice`, which is what the test checks.
+#[cfg(test)]
+const LATTICE_TRANSFORM_PARAMS: &str = "1e-9";
 
 /// [`crate::mz_lattice::lattice_peak_schema`] at Shimadzu's 1e-9 scale.
 pub fn lattice_peak_schema() -> mzpeak_prototyping::writer::ArrayBuffersBuilder {
     crate::mz_lattice::lattice_peak_schema(LATTICE_SCALE)
-}
-
-/// [`crate::mz_lattice::lattice_peak_arrays`], unchanged (the arrays carry no scale).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn lattice_peak_arrays(k: &[i64], intensity: &[f32]) -> Option<BinaryArrayMap> {
-    crate::mz_lattice::lattice_peak_arrays(k, intensity)
 }
 
 /// The `mz_calibration` index block for this lane, naming the Shimadzu source fields.
@@ -273,24 +250,56 @@ mod lattice_tests {
     //! The lattice mechanism itself is tested in [`crate::mz_lattice`]; what is Shimadzu-specific,
     //! and what `convert_shimadzu` and `tests/shimadzu_lattice_peaks.rs` depend on, is that this
     //! lane binds it to the 1e-9 `MassHigh` scale and to that literal params string. Pin exactly
-    //! that, so a change of scale in the shared module cannot silently move this lane.
+    //! that — through the three wrappers production calls, not through test-only copies — so a
+    //! change of scale in the shared module cannot silently move this lane.
     use super::*;
+    use mzdata::prelude::*;
+    use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
+    use mzdata::spectrum::{SignalContinuity, SpectrumDescription};
+    use mzpeak_prototyping::writer::ArrayBufferWriter;
+    use mzpeak_prototyping::BufferContext;
+
+    /// A Centroid spectrum whose raw arrays are the given m/z list — the shape `lattice_route`
+    /// sees for a centroid-only `.lcd`.
+    fn centroid_spectrum(mz: &[f64]) -> MultiLayerSpectrum {
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz_da.update_buffer(mz).unwrap();
+        arrays.add(mz_da);
+        let mut int_da =
+            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        int_da.update_buffer(&vec![1.0f32; mz.len()]).unwrap();
+        arrays.add(int_da);
+        let descr = SpectrumDescription { signal_continuity: SignalContinuity::Centroid, ..Default::default() };
+        MultiLayerSpectrum::new(descr, Some(arrays), None, None)
+    }
+
+    fn tof_index_of(arrays: &BinaryArrayMap) -> Vec<i64> {
+        arrays.get(&ArrayType::nonstandard("tof_index")).unwrap().to_i64().unwrap().to_vec()
+    }
 
     #[test]
     fn this_lane_is_bound_to_the_1e_minus_9_masshigh_scale() {
         assert_eq!(LATTICE_SCALE, 1e9);
-        assert_eq!(LATTICE_TRANSFORM_PARAMS, "1e-9");
-        assert_eq!(
-            crate::mz_lattice::transform_params(LATTICE_SCALE),
-            LATTICE_TRANSFORM_PARAMS
+        assert_eq!(crate::mz_lattice::transform_params(LATTICE_SCALE), LATTICE_TRANSFORM_PARAMS);
+        // The peaks-facet schema `convert_shimadzu` hands the writer carries the literal params.
+        let buffers = lattice_peak_schema().build(
+            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+            BufferContext::Spectrum,
+            false,
         );
+        let schema = buffers.schema();
+        let point = schema.field_with_name("point").expect("point struct");
+        let arrow::datatypes::DataType::Struct(children) = point.data_type() else {
+            panic!("point is not a struct: {:?}", point.data_type())
+        };
+        let tof = children.iter().find(|c| c.name() == "tof_index").expect("tof_index column");
+        assert_eq!(tof.data_type(), &arrow::datatypes::DataType::Int64);
         assert_eq!(
-            lattice_tof_index_field()
-                .metadata()
-                .get("mzpeak:transform_params")
-                .map(String::as_str),
+            tof.metadata().get("mzpeak:transform_params").map(String::as_str),
             Some(LATTICE_TRANSFORM_PARAMS)
         );
+        // The index block names this lane and its scale.
         let b = mz_calibration_block();
         assert_eq!(b["codec"], "mz-grid");
         assert_eq!(b["vendor"], "shimadzu");
@@ -300,18 +309,24 @@ mod lattice_tests {
 
     #[test]
     fn masshigh_and_coarse_mass_both_land_on_this_lanes_lattice() {
-        // MassHigh (1e-9 Da) recovers its own integer ...
+        // MassHigh (1e-9 Da) recovers its own integer through the per-spectrum route ...
         let ks = [100_000_123_456i64, 200_000_000_001, 1_250_123_456_789];
         let mz: Vec<f64> = ks.iter().map(|&k| k as f64 * 1e-9).collect();
-        assert_eq!(centroid_lattice(&mz).unwrap(), ks);
+        let (_, lattice, outcome) = lattice_route(centroid_spectrum(&mz));
+        assert_eq!(outcome, LatticeOutcome::Lattice);
+        assert_eq!(tof_index_of(&lattice.expect("lattice arrays")), ks);
         // ... and the coarse `Mass` field (1e-4 Da) is a multiple of 1e5 on the same lattice.
         let coarse: Vec<f64> = [500_001i64, 500_002, 12_345_678].iter().map(|&m| m as f64 * 1e-4).collect();
-        let k = centroid_lattice(&coarse).unwrap();
+        let (_, lattice, outcome) = lattice_route(centroid_spectrum(&coarse));
+        assert_eq!(outcome, LatticeOutcome::Lattice);
+        let k = tof_index_of(&lattice.expect("lattice arrays"));
         assert_eq!(k, vec![50_000_100_000, 50_000_200_000, 1_234_567_800_000]);
         assert!(k.iter().all(|v| v % 100_000 == 0));
         // An interpolated apex 0.3 of a step off keeps the spectrum in f64.
         let mut off = mz.clone();
         off[1] += 0.3e-9;
-        assert!(centroid_lattice(&off).is_none());
+        let (_, lattice, outcome) = lattice_route(centroid_spectrum(&off));
+        assert_eq!(outcome, LatticeOutcome::KeptF64);
+        assert!(lattice.is_none());
     }
 }

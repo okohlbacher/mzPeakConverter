@@ -210,7 +210,14 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
             std::fs::create_dir_all(parent).ok();
         }
     }
-    let out = File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    // Same atomic-output discipline as the convert lanes: the archive is assembled under
+    // `<out>.mzpeak.tmp` and renamed into place at the end, so a failure mid-copy cannot leave a
+    // partial archive under the output name — and under `--force` cannot have already destroyed
+    // the previous one. The guard is declared before the handle so the file closes before it is
+    // removed (Windows cannot unlink an open file).
+    let tmp = output.with_extension("mzpeak.tmp");
+    let tmp_guard = crate::TmpGuard::new(&tmp);
+    let out = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let mut w = ZipArchiveWriter::new(out);
 
     let drop_globs = &opts.drop_aux;
@@ -277,6 +284,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     carry_index_metadata(&mut w, &index, opts, input, &dropped, &injected)?;
 
     w.finish().map_err(|e| anyhow!("finalizing {}: {e}", output.display()))?;
+    tmp_guard.finish(output)?;
     Ok(())
 }
 

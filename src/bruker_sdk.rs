@@ -27,9 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
 use rusqlite::{Connection, OpenFlags};
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -332,12 +330,10 @@ fn make_description(i: usize, frame: &FrameMeta, continuity: SignalContinuity) -
         polarity: frame.polarity,
         ..Default::default()
     };
-    descr.add_param(
-        Param::builder()
-            .name("mass spectrum")
-            .curie(curie!(MS:1000294))
-            .build(),
-    );
+    // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+    // lookup, so that parent term wins over the specific one and the writer's inference
+    // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+    // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
     let mut scan = ScanEvent::default();
     scan.start_time = frame.rt_seconds / 60.0; // mzdata scan start_time is minutes
     descr.acquisition.scans.push(scan);

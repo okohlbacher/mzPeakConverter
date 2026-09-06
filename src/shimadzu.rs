@@ -780,13 +780,25 @@ impl ShimadzuReader {
         // window as a centre (`AcqModeMz`) plus a FULL width (`QTransmissionWidthMz`), so the bounds
         // are half the width either side — that reproduces the mzML lane's ±8.5 from a 17.0 Th
         // window. `precursor_id` names the parent scan so the writer's id→index map can resolve it.
-        if ms_level > 1 && meta.precursor_mz > 0.0 {
+        //
+        // The window is keyed on the vendor's isolation target (`AcqModeMz`), NOT on the selected
+        // ion: `max(target, selected ion)` (pre-0.9.13) silently shifted the window whenever the
+        // selected ion was heavier than the target (target 500, ion 501, width 2 → 500–502 instead
+        // of 499–501). The selected ion only stands in for the target when the vendor reports none,
+        // and a window with a target but no selected ion is still written — preserve what is there.
+        if ms_level > 1 && (meta.isolation_target_mz > 0.0 || meta.precursor_mz > 0.0) {
             let half = (meta.isolation_width_mz / 2.0) as f32;
-            let target = meta.isolation_target_mz.max(meta.precursor_mz) as f32;
-            let ion = SelectedIon {
-                mz: meta.precursor_mz,
-                charge: (meta.precursor_charge != 0).then_some(meta.precursor_charge),
-                ..Default::default()
+            let target_mz =
+                if meta.isolation_target_mz > 0.0 { meta.isolation_target_mz } else { meta.precursor_mz };
+            let target = target_mz as f32;
+            let ions = if meta.precursor_mz > 0.0 {
+                vec![SelectedIon {
+                    mz: meta.precursor_mz,
+                    charge: (meta.precursor_charge != 0).then_some(meta.precursor_charge),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
             };
             let mut activation = Activation::default();
             activation.energy = meta.collision_energy as f32;
@@ -794,7 +806,7 @@ impl ShimadzuReader {
                 .methods_mut()
                 .push(DissociationMethodTerm::CollisionInducedDissociation);
             descr.precursor = vec![Precursor {
-                ions: vec![ion],
+                ions,
                 isolation_window: if half > 0.0 {
                     IsolationWindow {
                         target,

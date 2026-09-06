@@ -43,6 +43,17 @@ fn ims_compact_calibration_pinned() {
     // m/z. Do not re-add the pin: the label must not reappear in emitted output.
     pinned("\"absolute\"");
     pinned("\"m/z-chunked\"");
+    // The chunked-TOF decoding rule the block states. Until 0.9.13 it read "delta-within-chunk;
+    // first absolute; cumsum", which describes a layout the writer never produced (the first point
+    // is EXCLUDED from the delta array and the chunk rebuilds from `chunk_start`); a consumer who
+    // followed the sentence decoded every chunk wrongly. The rule is pinned so it cannot drift
+    // back to describing something else.
+    pinned("cal[\"chunk_tof_encoding\"] = serde_json::json!(\"chunk_start + cumsum(deltas); first delta is relative to chunk_start\")");
+    // Which derivation the (a, b) chord comes from — native GlobalMetadata or the SDK's own
+    // tims_index_to_mz — so a reader knows which of two chords (4.28 ppm apart on 2485.d) it holds.
+    pinned("\"chord_source\": chord_source");
+    pinned("\"global_metadata\"");
+    pinned("\"sdk_tims_index_to_mz\"");
 }
 
 #[test]
@@ -95,13 +106,24 @@ fn tof_grid_reconstruction_keys_pinned() {
         "`integer_column` is a synonym for the spec's `lossless` and was reverted; two keys naming \
          the same column is how they drift apart"
     );
-    // The two honest values of `mz_reconstruction`, and the bound that must accompany the lossy one.
-    pinned("\"mz_reconstruction\": \"exact\"");
+    // The three honest values of `mz_reconstruction`, and the bound that must accompany each
+    // inexact one. `exact` is ONE site (Agilent: the vendor's own bin ordinal, re-evaluated through
+    // the vendor's own calibration). The Shimadzu profile lane said `exact` until 0.9.13; measured
+    // on HEK_PosOAD1, 4,890 of 5,000 gridded points rebuild off the vendor's 1e-9 lattice by up to
+    // 0.5 step (4.15e-10 Da) — inside the vendor's ±5e-10 rounding, so accurate to vendor precision,
+    // but "exact" read as bit-exact. It now states the bound.
+    assert_eq!(
+        src().matches("\"mz_reconstruction\": \"exact\"").count(),
+        1,
+        "only the Agilent lane rebuilds m/z exactly; a new `exact` claim needs the same evidence"
+    );
+    pinned("\"mz_reconstruction\": \"within-vendor-rounding\"");
+    pinned("\"max_error_da\": 5e-10");
     assert_eq!(
         src().matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
         2,
         "the run-wide and per-spectrum SCIEX grid lanes are bounded-lossy and must say so \
-         (the Agilent and Shimadzu lanes are exact)"
+         (the Agilent lane is exact, the Shimadzu lane within vendor rounding)"
     );
     assert_eq!(
         src().matches("\"roundtrip_tolerance_ppm\": tof_grid::ppm_tol()").count(),
@@ -133,4 +155,18 @@ fn ims_compact_per_spectrum_exact_pinned() {
     // The accessions behind the `opt_MS_4000900_tof_c0` / `opt_MS_4000901_tof_c1` column names.
     pinned("ControlledVocabulary::MS, 4_000_900)");
     pinned("ControlledVocabulary::MS, 4_000_901)");
+}
+
+/// The `transformations` index block — the invariant's second half, "every transformation declared
+/// in the archive" — is written by every mzPeak lane under one key, and the entry names are what a
+/// reader (or a corpus audit) matches on.
+#[test]
+fn transformations_block_pinned() {
+    pinned("(\"transformations\".to_string(), serde_json::json!(applied))");
+    pinned("\"zero-run-mask\"");
+    pinned("\"numpress-linear\"");
+    pinned("\"sort-by-mz\"");
+    pinned("\"tof-grid:{}ppm\"");
+    pinned("\"shimadzu:span-trim\"");
+    pinned("\"agilent:drop-zero-samples\"");
 }

@@ -40,6 +40,11 @@ VENDOR_PAYLOAD_MARKERS = (
     "analysis.tdf", "analysis.tsf", "analysis.baf", "AcqData", "_FUNC001.DAT", "_extern.inf",
 )
 FILE_UNIT_SUFFIXES = {".mzml", ".imzml", ".raw", ".wiff", ".lcd", ".baf", ".tdf"}
+# A vendor DIRECTORY that only exists as its download zip (`X.raw.zip`, `X.d.zip`) is a unit too:
+# the box extracts it (box_convert_remote.ps1 sniffs .zip) and the corpus publishes `X.mzpeak` for
+# it. Without this the walk could not see two Waters units at all, so the completeness line said
+# "199/199 (100%)" while 201 archives sat on disk and those two stayed frozen at an old converter.
+ZIPPED_UNIT_SUFFIXES = tuple(f"{d}.zip" for d in DIR_UNIT_SUFFIXES)
 FORMAT_MARKER = "spectra_metadata_scans.parquet"  # split-facet layout, v0.7.0+
 
 # Host can't do these; the message is the converter's own, matched loosely.
@@ -58,8 +63,8 @@ def converter() -> str:
     # target/release BEFORE $PATH: this repo's own build is the authority on "current". A stale
     # ~/.cargo/bin/mzpeak-convert shadows it otherwise (seen in the wild: PATH 0.7.10 masking a
     # target/release 0.8.0), which silently pins the corpus to an old converter — and would make a
-    # version-sync driven off this function DOWNGRADE the box. convert_corpus.sh:12 and
-    # corpus_full.sh:19 already resolve in this order; match them.
+    # version-sync driven off this function DOWNGRADE the box. (The older shell harnesses that
+    # resolved in this same order were removed in 0.9.13; this is the one resolver left.)
     local = Path(__file__).resolve().parent.parent / "target/release/mzpeak-convert"
     if local.exists():
         return str(local)
@@ -118,6 +123,9 @@ def find_units(root: Path) -> list[Path]:
         dirnames[:] = keep
         for f in filenames:
             p = here / f
+            if is_zipped_unit(p):
+                units.append(p)
+                continue
             if p.suffix.lower() in FILE_UNIT_SUFFIXES:
                 # A Thermo `.raw` FILE is a unit; a Waters `.raw` DIRECTORY was caught above.
                 # Zero-byte files are never acquisitions — corpora carry stubs left by partial
@@ -132,7 +140,22 @@ def find_units(root: Path) -> list[Path]:
     return sorted(set(units))
 
 
+def is_zipped_unit(p: Path) -> bool:
+    """True for `X.raw.zip` / `X.d.zip` when `X.raw` / `X.d` is NOT extracted beside it.
+
+    When the directory has been extracted, the zip is its packaging, not a second acquisition: the
+    directory is the unit (native readers want the directory) and the zip stays invisible, exactly
+    as before. Only a zip with no extracted sibling is a unit in its own right.
+    """
+    name = p.name.lower()
+    if not name.endswith(ZIPPED_UNIT_SUFFIXES):
+        return False
+    return not p.with_suffix("").exists()
+
+
 def target_for(unit: Path) -> Path:
+    if is_zipped_unit(unit):
+        return unit.with_suffix("").with_suffix(".mzpeak")   # X.raw.zip -> X.mzpeak
     return unit.with_suffix(".mzpeak")
 
 
@@ -332,6 +355,10 @@ def convert(unit: Path, binary: str, version: str, dry: bool,
     # it "failed" would hide a data-availability problem behind a converter error.
     if unit.is_dir() and not any((unit / m).exists() for m in VENDOR_PAYLOAD_MARKERS):
         return unit, "skipped", "vendor payload missing (incomplete download)"
+    # The converter reads directories, not zips of them; box_convert_remote.ps1 extracts a .zip
+    # before converting, so a zipped unit is `skipped` here and thereby deferred to the box phase.
+    if is_zipped_unit(unit):
+        return unit, "skipped", "zipped vendor directory — extracted and converted on the box"
     proc = subprocess.run(
         [binary, str(unit), "-o", str(out), "-f", *(extra or [])],
         capture_output=True,
@@ -351,57 +378,6 @@ def convert(unit: Path, binary: str, version: str, dry: bool,
 
 
 TOOLS = Path(__file__).resolve().parent
-
-
-def box_ssh(command: str, timeout: int = 3600) -> str:
-    """Run a PowerShell command on the flash workstation through the jump host."""
-    env = {}
-    envfile = TOOLS / "box.env"
-    if envfile.exists():
-        for line in envfile.read_text().splitlines():
-            if "=" in line and not line.strip().startswith("#"):
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip().strip('"').strip("'")
-    for k in ("BOX_SSH", "BOX_JUMP", "BOX_SSH_KEY"):
-        env.setdefault(k, os.environ.get(k, ""))
-        if not env[k]:
-            sys.exit(f"box: {k} not set (env or tools/box.env)")
-    proxy = (f"ProxyCommand=ssh -i {env['BOX_SSH_KEY']} -o IdentitiesOnly=yes "
-             f"-o StrictHostKeyChecking=accept-new -W %h:%p {env['BOX_JUMP']}")
-    proc = subprocess.run(
-        ["ssh", "-i", env["BOX_SSH_KEY"], "-o", "IdentitiesOnly=yes",
-         "-o", "StrictHostKeyChecking=accept-new", "-o", proxy,
-         "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=30",
-         env["BOX_SSH"], f"powershell -NoProfile -Command \"{command}\""],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return (proc.stdout or "").replace("\r", "").strip()
-
-
-def sync_box(version: str, repo: str = r"C:\Users\User\src\mzPeakConverter") -> bool:
-    """Ensure the box's converter matches `version`, fast-forwarding and rebuilding if not.
-
-    Without this the box silently converts with whatever binary it last built — the same stale-binary
-    trap that PATH resolution creates on the host. Per the box-follows-repo rule we only ever check
-    out a canonical tag; nothing is committed on the box.
-    """
-    want = version.split()[-1]  # "mzpeak-convert 0.7.0" -> "0.7.0"
-    have = box_ssh(f"cd {repo}; (& .\\target\\release\\mzpeak-convert.exe --version)")
-    print(f"box       : has {have or '(no binary)'}, want {version}")
-    if have.split()[-1:] == [want]:
-        return True
-    dirty = box_ssh(f"cd {repo}; ((git status --porcelain) | Measure-Object -Line).Lines")
-    if dirty.strip() not in ("0", ""):
-        print(f"box       : REFUSING to update — working tree has {dirty} modified file(s)")
-        return False
-    print(f"box       : updating to v{want} and rebuilding (several minutes)...")
-    box_ssh(f"cd {repo}; git fetch origin --tags 2>&1 | Select-Object -Last 1; "
-            f"git checkout --detach v{want} 2>&1 | Select-Object -Last 1", timeout=900)
-    box_ssh(f"cd {repo}; cargo build --release 2>&1 | Select-Object -Last 2", timeout=7200)
-    have = box_ssh(f"cd {repo}; (& .\\target\\release\\mzpeak-convert.exe --version)")
-    ok = have.split()[-1:] == [want]
-    print(f"box       : now {have} — {'ok' if ok else 'MISMATCH, aborting box phase'}")
-    return ok
 
 
 def s3_target(local: Path) -> str:
@@ -425,9 +401,13 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     if not units:
         print("box       : nothing to do")
         return
-    if not sync_box(version):
-        print("box       : skipped (converter could not be brought up to date)")
-        return
+    # ONE updater. This harness used to run its own sync_box() (ssh + git checkout + cargo build)
+    # and then box_convert.sh ran box_update_remote.ps1 on top of it: two updaters, two locks, and
+    # on 2026-09-03 a box_update_remote.ps1 nobody had asked for sat beside five idle convert
+    # workers for 32 minutes. box_convert.sh's updater is the only one now; it is told the exact
+    # version to bring the box to, and BOX_REQUIRE_VERSION=1 (set by main) makes it abort instead
+    # of converting with a stale exe, so the stamps written below can never mislabel an archive.
+    want = version.split()[-1]  # "mzpeak-convert 0.9.12" -> "0.9.12"
     manifest = root.parent / "validator_logs" / "box-jobs.tsv"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("w") as fh:
@@ -442,14 +422,11 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
             # target and a sync destination can never disagree.
             out = s3_target(target_for(u)) if s3_first else target_for(u)
             fh.write(f"{u}\t{out}\t{' '.join(flags)}\n")
-    print(f"box       : {len(units)} unit(s) -> {manifest}")
-    # box_convert.sh shells out to `python3` for the S3 relay, which needs boto3. The system python3
-    # doesn't have it; the anaconda one does. Prepend it rather than patching the shared script.
+    print(f"box       : {len(units)} unit(s) -> {manifest}  (box converter pinned to v{want})")
+    # box_convert.sh resolves a boto3-capable interpreter for the S3 relay itself (MZPC_PYTHON
+    # overrides); nothing to arrange here.
     env = dict(os.environ)
-    for cand in (Path.home() / "anaconda3/bin", Path.home() / "miniconda3/bin"):
-        if (cand / "python3").exists():
-            env["PATH"] = f"{cand}:{env.get('PATH', '')}"
-            break
+    env["BOX_CONVERTER_VERSION"] = f"v{want}"
     # Fingerprint every target BEFORE the run. "The archive exists" does NOT mean the box just
     # delivered it: with S3-first the box PUTs to the corpus KEY and the local copy stays stale by
     # design until the deferred pull. Stamping on existence alone labelled 21 August archives as
@@ -629,6 +606,19 @@ def main() -> int:
         for a, why in stale[:40]:
             print(f"  - {a.relative_to(root)}\n      {why}")
 
+    # The denominator must be the corpus, not what the walk happened to recognise. An archive on
+    # disk that no recognised unit produces is a unit the walk cannot see -- the failure mode that
+    # hid two Waters `.raw.zip` units behind a "199/199 (100%)" line -- so it is a hard failure,
+    # not a footnote. (An archive missing from disk is already visible in the COMPLETENESS count.)
+    on_disk = {a for a in root.rglob("*.mzpeak") if not any(q.suffix == ".mzpeak" for q in a.parents)}
+    unaccounted = sorted(on_disk - set(groups))
+    if unaccounted:
+        print(f"\nUNACCOUNTED ON DISK: {len(unaccounted)} archive(s) that no recognised raw unit "
+              f"produces ({len(on_disk)} archives on disk vs {len(groups)} targets) -- the walk is "
+              f"blind to their units; fix find_units, do not trust the completeness line")
+        for a in unaccounted[:40]:
+            print(f"  - {a.relative_to(root)}")
+
     if have:
         # "Last update" of the SET is governed by its oldest member: the set is only as fresh as
         # the staleast archive in it.
@@ -640,7 +630,7 @@ def main() -> int:
         print(f"              {oldest_p.relative_to(root)}")
         print(f"newest        {fmt(newest_ts)}")
     print("=" * 72)
-    return 1 if results["failed"] else 0
+    return 1 if results["failed"] or unaccounted else 0
 
 
 if __name__ == "__main__":

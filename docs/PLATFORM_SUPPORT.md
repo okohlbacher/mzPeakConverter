@@ -16,7 +16,7 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | Thermo `.raw` | ✅ | ✅ | ✅ | `dotnetrawfilereader` (managed, in-process) | **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | `libbaf2sql_c` (native C, in-process) | `libbaf2sql_c` at runtime |
 | Bruker `.d` via **timsdata SDK** (`--bruker-sdk`) | ✅ | ❌ | ✅ | Bruker `timsdata` lib (opt-in) | `libtimsdata.so`/`.dll` via `TIMSDATA_LIB_DIR` |
-| Agilent `.d` (non-IM, native) | ❌ | ❌ | ⛔ **not wired** | see note below | — |
+| Agilent `.d` (non-IM, native) | ❌ | ❌ | ⛔ **not wired** — decision pending, `BACKLOG.md` #23 | see note below | — |
 | Agilent `.d` IM-MS (6560, native) | ❌ | ❌ | ⚠️ scaffold | in-process .NET glue → MIDAC | MIDAC DLLs |
 | Agilent `.d` **profile** (`--agilent-grid`) | ⚠️ | ⚠️ | ⚠️ | pure Rust (reads `MSProfile.bin`) | — (two known decode gaps, below) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`SciexGlue.dll`) → Clearcore2 | Clearcore2 DLLs |
@@ -47,13 +47,15 @@ ProteoWizard with `--via-msconvert` (all platforms).
   **.NET Framework 4.x** assembly set whose `OpenDataFile` calls `Delegate.BeginInvoke`,
   permanently unsupported on .NET Core/5+, so it cannot be hosted in-process under .NET 8. The
   C# side was accordingly rewritten as a **separate net48 executable** (`AgilentGlueHost.exe`,
-  `OutputType=Exe`, no `[UnmanagedCallersOnly]` exports, speaking an `AGL1` file protocol) — but
-  `src/agilent.rs` was never adapted: it still requires `AgilentGlue.dll` +
-  `AgilentGlue.runtimeconfig.json` and resolves six exports from `AgilentGlue.Exports`, none of
-  which the current project produces, and nothing in `src/` spawns the EXE or reads `AGL1`.
-  Every entry point (`convert`, `--to mzml`, `inspect`) therefore fails at open on Windows, loudly.
-  Use `--via-msconvert` meanwhile. Revive-or-delete is tracked in `BACKLOG.md`; see also
-  [`glue/agilent/README.md`](../glue/agilent/README.md).
+  `OutputType=Exe`, no `[UnmanagedCallersOnly]` exports, speaking an `AGL1` file protocol), and
+  `src/agilent.rs` **was** adapted to spawn it — at cc8245e (2026-06-27). Merge 5a62b90 the next
+  day took `src/` from the box line, which still carried the original in-process design, and
+  deferred the reconciliation; it never happened. HEAD's `src/agilent.rs` therefore requires
+  `AgilentGlue.dll` + `AgilentGlue.runtimeconfig.json` and resolves six exports from
+  `AgilentGlue.Exports`, none of which the current project produces, and nothing in `src/` spawns
+  the EXE or reads `AGL1`. Every entry point therefore fails at open on Windows, loudly. Use
+  `--via-msconvert` meanwhile. Restore (from cc8245e) / port / delete is an open owner decision,
+  tracked as `BACKLOG.md` #23; see also [`glue/agilent/README.md`](../glue/agilent/README.md).
 
 - **Agilent profile (`--agilent-grid`) — ⚠️ pure Rust, two known decode gaps.** Neither
   profile-bearing `.d` in the project corpus converts today: one fails LZF decompression of an
@@ -69,7 +71,7 @@ DLLs**, on any OS with a .NET SDK). Build each once and point the converter at i
 
 | Glue | Project | Build output | Env var |
 |---|---|---|---|
-| Agilent (MHDAC) ⛔ | `glue/agilent` (**net48**) | `bin/Release/net48/AgilentGlueHost.exe` | `MZPC_AGILENT_GLUE` (read, but the lane cannot open a file — see above) |
+| Agilent (MHDAC) ⛔ | `glue/agilent` (**net48**) | `bin/Release/net48/AgilentGlueHost.exe` | `MZPC_AGILENT_GLUE` (read, but the lane cannot open a file — see above; `BACKLOG.md` #23) |
 | Agilent IM (MIDAC) | `glue/agilent_midac` (net8) | `bin/Release/net8.0/AgilentMidacGlue.dll` | `MZPC_AGILENT_MIDAC_GLUE` |
 | SciEX (Clearcore2) | `glue/sciex` (net8) | `bin/Release/net8.0/SciexGlue.dll` | `MZPC_SCIEX_GLUE` |
 | Shimadzu (LabSolutions.IO) | `glue/shimadzu` (net8) | `bin/Release/net8.0/ShimadzuGlue.dll` | `MZPC_SHIMADZU_GLUE` |
@@ -100,7 +102,12 @@ The matrix above is exercised by CI (`.github/workflows/`):
   smoke-convert the committed `tests/fixtures/tiny.pwiz.1.1.mzML`. On Linux the BAF/timsdata
   readers compile in; on macOS they're correctly excluded. (Optional licensed-SDK e2e runs
   only when a runner provides the SDK + sample data.)
-- **`windows.yml`** — Windows: build with the native vendor readers, run tests, build **all
-  four .NET glue executables/assemblies** and verify each artifact is produced, smoke-convert
-  the fixture, and (separate jobs) exercise the `--via-msconvert` lane and a real timsTOF
-  ion-mobility comparison.
+- **`windows.yml`** — Windows: build with the native vendor readers, run tests, build the
+  **glues `src/` actually loads — `glue/sciex`, `glue/shimadzu`, `glue/agilent_midac`, plus the
+  Agilent net48 host so it stays compilable while `BACKLOG.md` #23 is decided** — and verify
+  each artifact is produced (for Shimadzu also that the generated runtimeconfig carries
+  `EnableUnsafeBinaryFormatterSerialization=true`, the switch whose absence broke 0.9.11),
+  smoke-convert the fixture, and (separate jobs) exercise the `--via-msconvert` lane and a real
+  timsTOF ion-mobility comparison. The unwired `glue/waters` is deliberately not built or
+  asserted (it was until 2026-09-04; Shimadzu — the one wired glue with an ABI handshake — was
+  not built at all).

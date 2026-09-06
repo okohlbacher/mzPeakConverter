@@ -254,6 +254,20 @@ impl AgilentProfileReader {
                 self.skipped.all_zero += 1;
                 continue;
             }
+            // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it
+            // writes is an orphan — no selected ion, no isolation window, no activation — and the
+            // archive is otherwise indistinguishable from a complete one. MSScan.bin's precursor
+            // fields are not decoded by this reader yet.
+            if info.ms_level > 1 {
+                static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+                PRECURSOR_GAP_SAID.call_once(|| {
+                    log::warn!(
+                        "Agilent profile (MSProfile.bin): this reader does not yet extract precursors; \
+                         MS2 rows will have none (no selected ion, isolation window or collision energy \
+                         in the archive)"
+                    );
+                });
+            }
             return Ok(Some(ProfileSpectrum {
                 tof_index,
                 intensity,

@@ -51,10 +51,15 @@ jobs:
       - name: Test
         run: cargo test --release --verbose
 
+      # Only glues src/ actually loads: SCIEX, Shimadzu, Agilent MHDAC (net48 host) and MIDAC.
+      # glue/waters is NOT built here — src/waters.rs drives MassLynxRaw directly and no code path
+      # reads WatersGlue.dll (see the doc comment on the Waters lane in src/main.rs), so asserting
+      # it only verified an artifact nothing ships. Shimadzu WAS missing and it is the one wired
+      # glue with an ABI handshake -- the one that broke at 0.9.11 with CI green.
       - name: Build C# interop glues (reflection-only, no vendor DLLs)
         run: |
           dotnet build glue/sciex/SciexGlue.csproj -c Release
-          dotnet build glue/waters/WatersGlue.csproj -c Release
+          dotnet build glue/shimadzu/ShimadzuGlue.csproj -c Release
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
           dotnet build glue/agilent_midac/AgilentMidacGlue.csproj -c Release
 
@@ -68,12 +73,31 @@ jobs:
             "target/release/mzpeak-convert.exe",
             "glue/agilent/bin/Release/net48/AgilentGlueHost.exe",
             "glue/sciex/bin/Release/net8.0/SciexGlue.dll",
-            "glue/waters/bin/Release/net8.0/WatersGlue.dll",
+            "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.dll",
+            "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.runtimeconfig.json",
             "glue/agilent_midac/bin/Release/net8.0/AgilentMidacGlue.dll"
           )
           $missing = $need | Where-Object { -not (Test-Path $_) }
           if ($missing) { Write-Error "missing build artifacts:`n$($missing -join "`n")"; exit 1 }
           $need | ForEach-Object { Write-Host "OK $_ ($((Get-Item $_).Length) bytes)" }
+
+      # Shimadzu.LabSolutions.IO 5.0.0.0 deserialises part of the .lcd through BinaryFormatter,
+      # which .NET disables by default: without this runtime switch LoadData throws and EVERY .lcd
+      # looks unreadable, with the DLL itself building fine. The csproj sets it as a first-class
+      # SDK property because a bare RuntimeHostConfigurationOption was observed to be overridden
+      # back to false -- so check the GENERATED config, the file the Rust host actually boots from.
+      - name: Verify ShimadzuGlue.runtimeconfig.json enables BinaryFormatter
+        shell: pwsh
+        run: |
+          $cfg = "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.runtimeconfig.json"
+          $key = "System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization"
+          $props = (Get-Content $cfg -Raw | ConvertFrom-Json).runtimeOptions.configProperties
+          $val = $props.$key
+          if ($val -ne $true) {
+            Write-Error "$cfg : $key is '$val', expected true -- native .lcd reads will fail (NotSupportedException from BinaryFormatter)"
+            exit 1
+          }
+          Write-Host "OK $cfg : $key = true"
 
       # Core convert path, end-to-end on Windows, against a tiny committed mzML.
       - name: Smoke test — convert a tiny mzML
@@ -222,7 +246,7 @@ jobs:
   # Convert the Windows-only vendor datasets (Sciex .wiff, Agilent .d, Waters .raw) of the reference
   # corpus to mzPeak on the runner via the ProteoWizard lane, and TRANSFER THE .mzpeak BACK as a
   # build artifact (plus a raw-vs-mzpeak size table). Pure-Rust/Thermo/Bruker formats are converted
-  # on the host (tools/convert_corpus.sh); this job covers only what macOS/Linux can't read.
+  # on the host (tools/corpus_reconvert.py); this job covers only what macOS/Linux can't read.
   #
   # The vendor inputs aren't in git (proprietary + large), so each file is fetched per-URL from a
   # public object store, listed in tools/vendor_ci_manifest.tsv (public bucket listing is denied, so
