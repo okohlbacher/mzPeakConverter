@@ -15,7 +15,8 @@
 //!   * `MZPC_AGILENT_MIDAC_GLUE` — dir with `AgilentMidacGlue.dll` + its runtimeconfig (the
 //!     `dotnet build` output of `glue/agilent_midac/`).
 //!   * `MZPC_PWIZ_DIR` — a ProteoWizard install; the MIDAC DLLs live under
-//!     `<MZPC_PWIZ_DIR>/vendor_api/Agilent` alongside MHDAC.
+//!     `<MZPC_PWIZ_DIR>/vendor_api/Agilent` (or `<MZPC_PWIZ_DIR>` itself on the flattened installer
+//!     layout — `pwiz_layout::agilent_dll_dir`) alongside MHDAC.
 //!
 //! ## C-ABI contract (Rust ⇄ glue, all `[UnmanagedCallersOnly]` on the C# side)
 //! Paths are UTF-16 (`*const u16`) NUL-terminated.
@@ -229,7 +230,7 @@ fn resolve_dirs() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
             )
         })?;
     let pwiz_dir = std::env::var_os("MZPC_PWIZ_DIR").map(std::path::PathBuf::from).ok_or_else(|| {
-        anyhow!("MZPC_PWIZ_DIR not set — the MIDAC DLLs load from <MZPC_PWIZ_DIR>/vendor_api/Agilent")
+        anyhow!("MZPC_PWIZ_DIR not set — the MIDAC DLLs load from <MZPC_PWIZ_DIR>/vendor_api/Agilent or <MZPC_PWIZ_DIR> itself")
     })?;
     Ok((glue_dir, crate::pwiz_layout::agilent_dll_dir(&pwiz_dir)))
 }
@@ -309,10 +310,6 @@ impl AgilentMidacReader {
 
     pub fn len(&self) -> usize {
         self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
     }
 
     /// Pull one frame's three arrays across the boundary, copy them out, then free.
@@ -407,22 +404,6 @@ impl AgilentMidacReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let mut idx = 0usize;
-        for i in 0..self.count {
-            if let Ok((mz, _, _, _)) = self.fetch(i) {
-                if !mz.is_empty() {
-                    idx = i;
-                    break;
-                }
-            }
-        }
-        self.spectrum(idx)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample frame has no arrays"))
-    }
 }
 
 impl Drop for AgilentMidacReader {

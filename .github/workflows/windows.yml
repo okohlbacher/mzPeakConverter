@@ -1,9 +1,10 @@
 name: Windows
 
 # Validates the converter on the real Windows target:
-#  - `windows` job: builds default + all Windows-only vendor-SDK features
-#    (Agilent MHDAC / SciEX Clearcore2 / Bruker BAF FFI), the C# interop glues,
-#    runs the tests, and smoke-converts a tiny bundled mzML.
+#  - `windows` job: builds the default configuration — which on Windows compiles every native
+#    vendor reader automatically (Agilent MHDAC host, SciEX Clearcore2, Shimadzu, Bruker BAF FFI;
+#    there are no cargo features) — plus the C# interop glues, runs the tests, boots the Agilent
+#    host, and smoke-converts a tiny bundled mzML.
 #  - `msconvert` job: installs ProteoWizard and exercises the --via-msconvert lane.
 # Runtime conversion of actual Agilent/SciEX/BAF *data* via the native readers
 # still needs the proprietary vendor DLLs + vendor data and stays out of CI.
@@ -86,6 +87,16 @@ jobs:
       # looks unreadable, with the DLL itself building fine. The csproj sets it as a first-class
       # SDK property because a bare RuntimeHostConfigurationOption was observed to be overridden
       # back to false -- so check the GENERATED config, the file the Rust host actually boots from.
+      # The only MHDAC-free execution of the net48 host: with no arguments it must print its usage
+      # line and exit 2 (Glue.cs Main). That proves the exe boots on this runner (x64 target, .NET
+      # Framework present, no config surprise) — the difference between "an exe was emitted" and
+      # "the exe runs". The AGL2 magic is pinned against src/agl.rs by the Rust tests.
+      - name: Boot the Agilent host (usage exit)
+        shell: pwsh
+        run: |
+          & glue/agilent/bin/Release/net48/AgilentGlueHost.exe 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 2) { throw "AgilentGlueHost.exe exited $LASTEXITCODE, expected 2 (usage)" }
+
       - name: Verify ShimadzuGlue.runtimeconfig.json enables BinaryFormatter
         shell: pwsh
         run: |

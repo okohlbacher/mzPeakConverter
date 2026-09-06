@@ -106,7 +106,7 @@ if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE 
 if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
 if (Test-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0") { $env:MZPC_SHIMADZU_GLUE = (Resolve-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0").Path }  # native Shimadzu .lcd (LabSolutions.IO)
-$env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent loads from $pwiz/vendor_api/Agilent
+$env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent: $pwiz/vendor_api/Agilent or $pwiz itself (agilent_dll_dir probes both; 26175 is flat)
 # --via-msconvert resolves msconvert via $MSCONVERT_PATH; pin it to THIS pwiz so it has the bundled
 # vendor readers (vendor_api/Agilent etc.) — else it grabs a msconvert on PATH that lacks them ([ReaderFail]).
 if (Test-Path "$pwiz/msconvert.exe") { $env:MSCONVERT_PATH = (Join-Path $pwiz 'msconvert.exe') }
@@ -363,11 +363,20 @@ try {
         if ($o -eq '--tof-grid') { $skipNext = $true; continue }   # drop the flag AND its mode arg
         $nativeOpts += $o
     }
+    # The Agilent host materialises the whole run into a temp file (16 B/point, gigabytes for a
+    # profile Q-TOF .d): keep it in this job's DISK work dir even when TEMP is redirected to the
+    # ramdisk below for the msconvert intermediate.
+    $env:MZPC_AGILENT_TMPDIR = $work
     $swcv = [Diagnostics.Stopwatch]::StartNew()
     & $converter $inputPath @nativeOpts -o $out --force *> $log
     $res.exit = $LASTEXITCODE
     if ($res.exit -eq 0) {
         $res.note = ((@($res.note, 'path=native') | Where-Object { $_ }) -join ' ')
+    } elseif (Select-String -Path $log -Pattern 'MRM/SIM dwell data only|is an Agilent IM-QTOF run' -Quiet) {
+        # The native lane REFUSED the file by design (MRM/SIM dwell data are chromatograms; an
+        # IM-QTOF run needs the drift dimension): msconvert is the intended path, not a fallback
+        # after a failure, so box_convert.sh must not raise the contention alarm for it.
+        $res.note = ((@($res.note, 'path=refused->msconvert') | Where-Object { $_ }) -join ' ')
     } else {
         # native failed on this file/model -> msconvert FALLBACK (the ONLY place msconvert ever runs)
         $res.note = ((@($res.note, 'path=native-fail->msconvert') | Where-Object { $_ }) -join ' ')

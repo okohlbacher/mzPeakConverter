@@ -8,11 +8,20 @@
 // converter (src/agilent.rs) spawns once per .d.
 //
 // PROTOCOL (one-shot, argv in / file out):  AgilentGlueHost <in.d> <mhdacDir> <out.bin>
-// Reads every MS scan via MHDAC and writes this little-endian binary file:
-//     magic "AGL1" (4 bytes) | count u64 | offset[count] u64 (abs file offset of each record)
+// Reads every MS scan via MHDAC and writes this little-endian binary file (the Rust twin of this
+// layout, with tests, is src/agl.rs):
+//     magic "AGL2" (4 bytes) | count u64 |
+//     scanTypes: len u32 + UTF-8 (MHDAC MSScanFileInformation.ScanTypes.ToString(), e.g.
+//                "Scan" or "MultipleReaction, SelectedIon"; empty when unreadable) |
+//     device:    len u32 + UTF-8 ("<DeviceType>" + U+001F + "<device name>" + U+001F + "<serial>",
+//                parts empty when unreadable) |
+//     offset[count] u64 (abs file offset of each record)
 //   then, per record:
 //     rt f64 | msLevel i32 | polarity i32 | isCentroid i32 | scanId i32 |
 //     nPoints u64 | mz[nPoints] f64 | intensity[nPoints] f64
+// AGL1 (0.9.x) had no strings; the converter refuses it and asks for a rebuilt host. ScanTypes is
+// what lets the converter keep MRM/SIM dwell runs (chromatograms, not spectra) out of the native
+// lane: MHDAC hands those over as one one-point "MS2 spectrum" per dwell.
 // Exit 0 on success; non-zero with one diagnostic line on stderr on failure (and out.bin removed).
 // stdout is left clean (reserved). Little-endian is assumed (x64 Windows) for the bulk array copies.
 //
@@ -50,8 +59,10 @@ namespace AgilentGlue
                 using (var fs = new FileStream(partPath, FileMode.Create, FileAccess.ReadWrite))
                 using (var bw = new BinaryWriter(fs))
                 {
-                    bw.Write((byte)'A'); bw.Write((byte)'G'); bw.Write((byte)'L'); bw.Write((byte)'1');
+                    bw.Write((byte)'A'); bw.Write((byte)'G'); bw.Write((byte)'L'); bw.Write((byte)'2');
                     bw.Write((ulong)count);
+                    WriteString(bw, reader.ScanTypes);
+                    WriteString(bw, reader.Device);
                     long tablePos = fs.Position;
                     var offsets = new long[count];
                     for (int i = 0; i < count; i++) bw.Write((ulong)0);   // reserve the offset table
@@ -77,6 +88,10 @@ namespace AgilentGlue
                 }
                 if (File.Exists(outPath)) File.Delete(outPath);
                 File.Move(partPath, outPath);                              // atomic publish
+                // A rewrite the archive would otherwise not know about: say so (the converter logs
+                // a non-empty stderr of a successful host at warn level).
+                if (reader.NonFiniteIntensities > 0)
+                    Console.Error.WriteLine("AgilentGlueHost: " + reader.NonFiniteIntensities + " intensity value(s) were NaN/Inf and were stored as 0");
                 return 0;
             }
             catch (Exception ex)
@@ -90,6 +105,14 @@ namespace AgilentGlue
             {
                 reader.Close();
             }
+        }
+
+        // len u32 + UTF-8 bytes (no BinaryWriter 7-bit length prefix: the Rust side reads a plain u32).
+        private static void WriteString(BinaryWriter bw, string s)
+        {
+            byte[] b = System.Text.Encoding.UTF8.GetBytes(s ?? "");
+            bw.Write((uint)b.Length);
+            bw.Write(b);
         }
 
         // Bulk little-endian write of the first n doubles. Buffer.BlockCopy of a double[] is the raw
@@ -123,6 +146,13 @@ namespace AgilentGlue
         private MhdacApi _api;      // cached reflected members
         private int _count;
 
+        /// <summary>Points whose MHDAC intensity was NaN/Inf and were stored as 0 — reported on stderr at exit.</summary>
+        public long NonFiniteIntensities { get; private set; }
+        /// <summary>MHDAC <c>MSScanFileInformation.ScanTypes</c> as its flags string; "" when unreadable.</summary>
+        public string ScanTypes { get; private set; } = "";
+        /// <summary>DeviceType, device name and serial joined by U+001F; each part "" when unreadable.</summary>
+        public string Device { get; private set; } = "\u001F\u001F";
+
         // MHDAC assembly set, loaded once from the mhdac dir.
         private static Assembly _mhdac;
         private static string _mhdacDir;
@@ -142,6 +172,7 @@ namespace AgilentGlue
                 if (!ok) throw new Exception("MassSpecDataReader.OpenDataFile returned false for '" + dPath + "'");
                 object scanFileInfo = _api.MsScanFileInfo.GetValue(_reader);
                 _count = Convert.ToInt32(_api.TotalScansPresent.GetValue(scanFileInfo));
+                ReadRunInfo(scanFileInfo);   // best effort: never fails the open
                 return _count;
             }
             catch
@@ -149,6 +180,57 @@ namespace AgilentGlue
                 Close();   // don't leak the native handle a failed open may hold
                 throw;
             }
+        }
+
+        // ScanTypes (the MRM/SIM guard) and the instrument identity, every step best-effort: a
+        // reflection miss on one MHDAC version must cost a metadata field, never the conversion.
+        private void ReadRunInfo(object scanFileInfo)
+        {
+            // Like TotalScansPresent: these are EXPLICIT interface implementations on the concrete
+            // MHDAC object, invisible to GetType().GetProperty — FindProp walks the interfaces.
+            try
+            {
+                object st = FindProp(scanFileInfo.GetType(), "ScanTypes").GetValue(scanFileInfo);
+                if (st != null) ScanTypes = st.ToString();
+            }
+            catch { }
+            string deviceType = "", deviceName = "", serial = "";
+            object dt = null;
+            try
+            {
+                dt = FindProp(scanFileInfo.GetType(), "DeviceType").GetValue(scanFileInfo);
+                if (dt != null) deviceType = dt.ToString();
+            }
+            catch { }
+            try
+            {
+                // IMsdrDataReader.FileInformation (IBDAFileInformation): GetDeviceName(DeviceType) and
+                // the instrument serial. Explicit-interface members, hence the interface walk.
+                object fileInfo = FindProp(_reader.GetType(), "FileInformation").GetValue(_reader);
+                if (fileInfo != null)
+                {
+                    MethodInfo getName = fileInfo.GetType().GetMethod("GetDeviceName");
+                    if (getName == null)
+                        foreach (Type iface in fileInfo.GetType().GetInterfaces())
+                        { getName = iface.GetMethod("GetDeviceName"); if (getName != null) break; }
+                    if (getName != null && dt != null)
+                    {
+                        try { object n = getName.Invoke(fileInfo, new object[] { dt }); if (n != null) deviceName = n.ToString(); }
+                        catch { }
+                    }
+                    foreach (string p in new[] { "InstrumentSerialNumber", "SerialNumber" })
+                    {
+                        try
+                        {
+                            object v = FindProp(fileInfo.GetType(), p).GetValue(fileInfo);
+                            if (v != null && v.ToString().Length > 0) { serial = v.ToString(); break; }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            Device = deviceType + "\u001F" + deviceName + "\u001F" + serial;
         }
 
         /// <summary>Read scan <paramref name="index"/> (0-based) into a <see cref="Spec"/>.</summary>
@@ -173,10 +255,13 @@ namespace AgilentGlue
             {
                 s.Mz[i] = x[i];
                 double yi = Convert.ToDouble(yRaw.GetValue(i));
-                s.Intensity[i] = (!double.IsNaN(yi) && !double.IsInfinity(yi)) ? yi : 0.0;
+                if (double.IsNaN(yi) || double.IsInfinity(yi)) { yi = 0.0; NonFiniteIntensities++; }
+                s.Intensity[i] = yi;
             }
 
-            // Retention time (minutes) is best-effort: leave 0 if the scan record is unavailable.
+            // Retention time (minutes) is best-effort. NaN, not 0.0, when the scan record is
+            // unavailable: 0.0 is a legitimate time and the reader must be able to tell the two apart.
+            s.RtMinutes = double.NaN;
             try
             {
                 object rec = _api.GetScanRecord.Invoke(_reader, new object[] { index });

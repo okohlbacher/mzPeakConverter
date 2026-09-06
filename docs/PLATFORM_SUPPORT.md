@@ -16,7 +16,7 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | Thermo `.raw` | ✅ | ✅ | ✅ | `dotnetrawfilereader` (managed, in-process) | **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | `libbaf2sql_c` (native C, in-process) | `libbaf2sql_c` at runtime |
 | Bruker `.d` via **timsdata SDK** (`--bruker-sdk`) | ✅ | ❌ | ✅ | Bruker `timsdata` lib (opt-in) | `libtimsdata.so`/`.dll` via `TIMSDATA_LIB_DIR` |
-| Agilent `.d` (non-IM, native) | ❌ | ❌ | ⛔ **not wired** — decision pending, `BACKLOG.md` #23 | see note below | — |
+| Agilent `.d` (non-IM, native) | ❌ | ❌ | ✅ (scan data; MRM/SIM-only runs refused) | out-of-process **net48** host (`AgilentGlueHost.exe`) → MHDAC, `AGL2` file protocol | MHDAC DLLs (ProteoWizard), .NET Framework 4.8 |
 | Agilent `.d` IM-MS (6560, native) | ❌ | ❌ | ⚠️ scaffold | in-process .NET glue → MIDAC | MIDAC DLLs |
 | Agilent `.d` **profile** (`--agilent-grid`) | ⚠️ | ⚠️ | ⚠️ | pure Rust (reads `MSProfile.bin`) | — (two known decode gaps, below) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`SciexGlue.dll`) → Clearcore2 | Clearcore2 DLLs |
@@ -43,19 +43,26 @@ ProteoWizard with `--via-msconvert` (all platforms).
   `src/waters.rs` loads with `libloading` and calls directly. Point `MZPC_MASSLYNX_DIR` (or
   `MZPC_PWIZ_DIR`) at the directory holding that DLL. The `glue/waters` C# project is a
   never-wired alternative to this lane — no code path reads it or `MZPC_WATERS_GLUE`.
-- **Agilent (MHDAC) — ⛔ the two halves do not meet, so this lane opens nothing.** MHDAC is a
-  **.NET Framework 4.x** assembly set whose `OpenDataFile` calls `Delegate.BeginInvoke`,
-  permanently unsupported on .NET Core/5+, so it cannot be hosted in-process under .NET 8. The
-  C# side was accordingly rewritten as a **separate net48 executable** (`AgilentGlueHost.exe`,
-  `OutputType=Exe`, no `[UnmanagedCallersOnly]` exports, speaking an `AGL1` file protocol), and
-  `src/agilent.rs` **was** adapted to spawn it — at cc8245e (2026-06-27). Merge 5a62b90 the next
-  day took `src/` from the box line, which still carried the original in-process design, and
-  deferred the reconciliation; it never happened. HEAD's `src/agilent.rs` therefore requires
-  `AgilentGlue.dll` + `AgilentGlue.runtimeconfig.json` and resolves six exports from
-  `AgilentGlue.Exports`, none of which the current project produces, and nothing in `src/` spawns
-  the EXE or reads `AGL1`. Every entry point therefore fails at open on Windows, loudly. Use
-  `--via-msconvert` meanwhile. Restore (from cc8245e) / port / delete is an open owner decision,
-  tracked as `BACKLOG.md` #23; see also [`glue/agilent/README.md`](../glue/agilent/README.md).
+- **Agilent (MHDAC) — ✅ out-of-process since 0.11.0.** MHDAC is a **.NET Framework 4.x**
+  assembly set whose `OpenDataFile` calls `Delegate.BeginInvoke`, permanently unsupported on
+  .NET Core/5+, so it cannot be hosted in-process under .NET 8. The converter therefore spawns
+  `AgilentGlueHost.exe` (net48, `glue/agilent`) once per `.d`; the host reads every scan through
+  MHDAC (reflection only) and writes one `AGL2` file — scan types, instrument identity, an
+  offset table, then per-scan records — that `src/agilent.rs` reads back through the
+  host-testable parser in `src/agl.rs`. The subprocess reader shipped at cc8245e (2026-06-27),
+  was dropped by merge 5a62b90 the next day in favour of an in-process design the host no longer
+  implemented, and was restored on 2026-09-06 (owner decision, option A). Verified on the box
+  against the msconvert lane: a 5977B GC-MS run (7,017 scans) is identical spectrum for spectrum
+  (same points, same TIC to the last digit, RT to 1e-13); a 6545 Q-TOF profile run (1,502 scans,
+  181 M points, 242 MB `.d`) converts in 20 s with the same points and RT. **MRM/SIM-only runs
+  are refused** with a pointer to `--via-msconvert`: MHDAC hands a 6490 dMRM `.d` over as one
+  one-point "MS2 spectrum" per dwell (27,674 of them for MTBLS243) while the data are the 113
+  transition chromatograms the msconvert lane writes; the guard reads MHDAC's `ScanTypes`, so
+  the corpus harness falls back to msconvert for those units. Not carried yet: precursor
+  metadata for MS2 scans, MRM chromatograms (by design), the flight-time grid (`--tof-grid` is
+  not applied on this lane; m/z is the f64 MHDAC returns, numpress-chunked by default).
+  Cost model: the host materialises the whole run into a temp file at 16 B/point before the
+  first spectrum is read (~3 GB for the 242 MB Q-TOF run), removed on close.
 
 - **Agilent profile (`--agilent-grid`) — ⚠️ pure Rust, two known decode gaps.** Neither
   profile-bearing `.d` in the project corpus converts today: one fails LZF decompression of an
@@ -71,7 +78,7 @@ DLLs**, on any OS with a .NET SDK). Build each once and point the converter at i
 
 | Glue | Project | Build output | Env var |
 |---|---|---|---|
-| Agilent (MHDAC) ⛔ | `glue/agilent` (**net48**) | `bin/Release/net48/AgilentGlueHost.exe` | `MZPC_AGILENT_GLUE` (read, but the lane cannot open a file — see above; `BACKLOG.md` #23) |
+| Agilent (MHDAC) | `glue/agilent` (**net48**, out-of-process) | `bin/Release/net48/AgilentGlueHost.exe` | `MZPC_AGILENT_GLUE` |
 | Agilent IM (MIDAC) | `glue/agilent_midac` (net8) | `bin/Release/net8.0/AgilentMidacGlue.dll` | `MZPC_AGILENT_MIDAC_GLUE` |
 | SciEX (Clearcore2) | `glue/sciex` (net8) | `bin/Release/net8.0/SciexGlue.dll` | `MZPC_SCIEX_GLUE` |
 | Shimadzu (LabSolutions.IO) | `glue/shimadzu` (net8) | `bin/Release/net8.0/ShimadzuGlue.dll` | `MZPC_SHIMADZU_GLUE` |
@@ -79,7 +86,7 @@ DLLs**, on any OS with a .NET SDK). Build each once and point the converter at i
 ```sh
 dotnet build glue/sciex/SciexGlue.csproj      -c Release   # → SciexGlue.dll
 dotnet build glue/shimadzu/ShimadzuGlue.csproj -c Release   # → ShimadzuGlue.dll
-# glue/agilent builds AgilentGlueHost.exe, but no code path launches it yet — see above.
+dotnet build glue/agilent/AgilentGlue.csproj   -c Release   # → AgilentGlueHost.exe (net48)
 ```
 
 The vendor DLLs themselves are sourced at **runtime** from a ProteoWizard install

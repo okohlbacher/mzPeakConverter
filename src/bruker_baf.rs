@@ -78,7 +78,6 @@ struct Baf2SqlApi {
     get_last_error_string: GetLastErrorString,
     array_get_num_elements: ArrayGetNumElements,
     array_read_double: ArrayReadDouble,
-    library_path: PathBuf,
 }
 
 impl Baf2SqlApi {
@@ -122,7 +121,6 @@ impl Baf2SqlApi {
                 get_last_error_string,
                 array_get_num_elements,
                 array_read_double,
-                library_path,
             })
         }
     }
@@ -189,11 +187,7 @@ impl Baf2SqlApi {
                 self.last_error()
             );
         }
-        Ok(BafStorage {
-            api: self.clone(),
-            handle,
-            calibration_used: calibration,
-        })
+        Ok(BafStorage { api: self.clone(), handle })
     }
 
     fn last_error(&self) -> String {
@@ -248,7 +242,6 @@ impl BafCalibrationMode {
 struct BafStorage {
     api: Baf2SqlApi,
     handle: u64,
-    calibration_used: BafCalibrationMode,
 }
 
 impl BafStorage {
@@ -744,10 +737,6 @@ impl BafReader {
         self.rows.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
     /// Choose which `(m/z id, intensity id)` pair and continuity to read for a
     /// row.
     ///
@@ -868,22 +857,6 @@ impl BafReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet
-    /// schema (mirrors `TsfReader::sample_arrays`).
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let i = (0..self.len())
-            .find(|&i| {
-                matches!(
-                    Self::select_pair(&self.rows[i], self.prefer_profile),
-                    (Some(_), Some(_), _)
-                )
-            })
-            .unwrap_or(0);
-        self.spectrum(i)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 #[cfg(test)]

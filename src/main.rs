@@ -30,6 +30,7 @@ mod bruker_baf;
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 mod bruker_sdk;
 mod pwiz_layout;
+mod agl;
 #[cfg(windows)]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod agilent;
@@ -478,7 +479,7 @@ fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
 /// bounded-lossy (reconstruction within `PPM_TOL`). It applies on the mzML path (default `off`) and
 /// on the native SCIEX lane, whose vendor library also returns only decoded f64 (default `auto`
 /// there — see `Cli::tof_grid`); the lane reads the resolved `Option<TofGridMode>` so it can tell
-/// "not given" from an explicit `off`. Native readers with the true grid (Bruker, Agilent) do NOT
+/// "not given" from an explicit `off`. Native readers with the true grid (Bruker, `--agilent-grid`) do NOT
 /// use this — they read it from the vendor calibration (strategy B), lossless by construction.
 #[derive(ValueEnum, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1549,9 +1550,25 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_agilent_d(input) {
         println!("format:        Agilent .d");
         #[cfg(windows)]
-        println!("spectra:       {}", agilent::AgilentReader::open(input)?.len());
+        {
+            if is_agilent_ims_d(input) {
+                println!("note:          IM-QTOF run (AcqData/IMSFrame.bin): the native lane cannot carry the drift dimension; use --via-msconvert");
+            } else {
+                // Inspecting runs the host over the whole file (16 B/point in a temp file), and an
+                // MRM/SIM-only run is refused by design: report either outcome, never fail the
+                // inspection — `-v` calls this before every conversion, whatever lane was asked for.
+                match agilent::AgilentReader::open(input) {
+                    Ok(r) => {
+                        println!("spectra:       {}", r.len());
+                        println!("scan types:    {}", if r.scan_types().is_empty() { "unknown" } else { r.scan_types() });
+                        println!("instrument:    {}", r.device_label());
+                    }
+                    Err(e) => println!("note:          native reader: {e:#}"),
+                }
+            }
+        }
         #[cfg(not(windows))]
-        println!("note:          native Agilent reading needs a `--features agilent` build (or use --via-msconvert)");
+        println!("note:          the native Agilent (MHDAC) reader runs on Windows only; use --via-msconvert here");
         return Ok(());
     }
     if is_wiff(input) {
@@ -1559,7 +1576,7 @@ fn report_inspect(input: &Path) -> Result<()> {
         #[cfg(windows)]
         println!("spectra:       {}", sciex::SciexReader::open(input)?.len());
         #[cfg(not(windows))]
-        println!("note:          native SciEX reading needs a `--features sciex` build (or use --via-msconvert)");
+        println!("note:          the native SciEX (Clearcore2) reader runs on Windows only; use --via-msconvert here");
         return Ok(());
     }
     if is_waters_raw(input) {
@@ -1594,6 +1611,13 @@ fn report_inspect(input: &Path) -> Result<()> {
 /// True for an Agilent `.d` (folder with an `AcqData/` subdir).
 fn is_agilent_d(input: &Path) -> bool {
     input.is_dir() && input.join("AcqData").is_dir()
+}
+
+/// True for an Agilent ion-mobility (6560 IM-QTOF) `.d`: `AcqData/IMSFrame.bin` holds the drift
+/// frames and is absent or empty on every non-IM instrument.
+#[cfg(windows)]
+fn is_agilent_ims_d(input: &Path) -> bool {
+    std::fs::metadata(input.join("AcqData").join("IMSFrame.bin")).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
 /// Refine a requested chunking strategy against real m/z values: numpress-linear's floating-point
@@ -1935,6 +1959,13 @@ fn convert_to_mzml(
     }
     #[cfg(windows)]
     if is_agilent_d(input) {
+        if is_agilent_ims_d(input) {
+            bail!(
+                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the drift dimension \
+                 needs the MIDAC lane, which is not available; export this run with --via-msconvert",
+                input.display()
+            );
+        }
         let r = agilent::AgilentReader::open(input)?;
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
@@ -3341,9 +3372,26 @@ fn convert_file(
     #[cfg(windows)]
     if is_agilent_d(input) {
         // Agilent ion-mobility (6560 IM-QTOF) needs the MIDAC SDK to read the drift dimension;
-        // non-IM Agilent uses MHDAC. Probe via MIDAC; fall back to MHDAC when there's no IM data.
-        if agilent_midac::file_has_ims_data(input) {
-            return convert_agilent_midac(input, output, chunk, zstd_level, vendor, synth_chroms);
+        // non-IM Agilent uses MHDAC. The file says which it is (`AcqData/IMSFrame.bin`); the MIDAC
+        // probe only says whether that lane can serve it — and today it cannot (the MIDAC glue is
+        // still the in-process design MHDAC-family DLLs cannot run under), so an IM-QTOF `.d` is
+        // refused here rather than flattened through MHDAC without its drift dimension.
+        if is_agilent_ims_d(input) {
+            if agilent_midac::file_has_ims_data(input) {
+                return convert_agilent_midac(input, output, chunk, zstd_level, vendor, synth_chroms);
+            }
+            bail!(
+                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the drift dimension \
+                 needs the MIDAC lane, which is not available; convert this run with --via-msconvert",
+                input.display()
+            );
+        }
+        if tof_grid.is_some() {
+            log::warn!(
+                "--tof-grid is not applied on the native Agilent (MHDAC) lane: m/z is the f64 the \
+                 vendor library returns; use --via-msconvert --tof-grid for the statistical grid or \
+                 --agilent-grid for the flight-time grid of a profile .d"
+            );
         }
         return convert_agilent(input, output, chunk, zstd_level, vendor, synth_chroms);
     }
@@ -4844,7 +4892,7 @@ fn convert_baf(
     let reader = bruker_baf::BafReader::open_with(input, None, representation())?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
-        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+        reader.len(), |i| reader.spectrum(i),
     )
 }
 
@@ -4864,7 +4912,7 @@ fn convert_bruker_sdk(
     let reader = bruker_sdk::BrukerSdkReader::open(input)?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
-        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+        reader.len(), |i| reader.spectrum(i),
     )
 }
 
@@ -4993,7 +5041,7 @@ fn convert_shimadzu(
     // this closure only reports each spectrum's route.
     let result = convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms, hints,
-        reader.len(), reader.sample_arrays()?,
+        reader.len(),
         |i| {
             let spec = reader.spectrum(i)?;
             let (spec, profile_grid) = match grid_step {
@@ -5561,11 +5609,11 @@ fn convert_waters(
     // index or the mass-calibration coefficients). The statistical TOF-grid detector (strategy A) is
     // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
     let reader = waters::WatersReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), |i| reader.spectrum(i))
 }
 
-/// Convert a native Agilent MassHunter `.d` → mzPeak via the MHDAC .NET glue (feature `agilent`,
-/// Windows-runtime-only, UNTESTED here; IM-MS/MIDAC out of scope). Mirrors `convert_tsf`.
+/// Convert a native Agilent MassHunter `.d` → mzPeak through the net48 MHDAC host (`agilent.rs`;
+/// Windows only; IM-QTOF runs are refused before this point). Mirrors `convert_tsf`.
 #[cfg(windows)]
 fn convert_agilent(
     input: &Path,
@@ -5576,7 +5624,8 @@ fn convert_agilent(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent::AgilentReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    let hints = VendorHints { instrument: reader.instrument(), ..Default::default() };
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent **IM-MS** `.d` → mzPeak via the MIDAC .NET glue (Windows-runtime-only,
@@ -5592,10 +5641,10 @@ fn convert_agilent_midac(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent_midac::AgilentMidacReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i))
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), |i| reader.spectrum(i))
 }
 
-/// Shared writer wiring for a custom (non-mzdata) reader: sample-derived schema + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by
+/// Shared writer wiring for a custom (non-mzdata) reader: probe-derived schema + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by
 /// every custom-reader path (Bruker TSF/BAF, SciEX, Agilent) so they don't each duplicate the body.
 /// What a vendor reader can state about the run beyond its spectra — asserted only when present.
 #[derive(Default)]
@@ -5734,11 +5783,10 @@ fn convert_vendor_reader<S: Into<VendorSpectrum>>(
     synth_chroms: bool,
     hints: VendorHints,
     len: usize,
-    sample: mzdata::spectrum::bindata::BinaryArrayMap,
     spectrum: impl FnMut(usize) -> Result<S>,
 ) -> Result<()> {
     let tally = convert_vendor_reader_tallied(
-        input, output, chunk, zstd_level, vendor, synth_chroms, hints, len, sample, spectrum,
+        input, output, chunk, zstd_level, vendor, synth_chroms, hints, len, spectrum,
     )?;
     tally.report();
     Ok(())
@@ -5755,7 +5803,6 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     synth_chroms: bool,
     hints: VendorHints,
     len: usize,
-    _sample: mzdata::spectrum::bindata::BinaryArrayMap,
     mut spectrum: impl FnMut(usize) -> Result<S>,
 ) -> Result<FacetTally> {
     if len == 0 {
@@ -5932,7 +5979,7 @@ fn convert_tsf(
     let reader = bruker_tsf::TsfReader::open(input)?;
     convert_vendor_reader(
         input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
-        reader.len(), reader.sample_arrays()?, |i| reader.spectrum(i),
+        reader.len(), |i| reader.spectrum(i),
     )
 }
 
@@ -6584,7 +6631,6 @@ mod tests {
             false,
             VendorHints::default(),
             LEN,
-            BinaryArrayMap::new(),
             |i| {
                 calls.set(calls.get() + 1);
                 let mut spec = spec_from(&[100.0 + i as f64, 200.0, 300.0], &[1.0, 2.0, 3.0], i);

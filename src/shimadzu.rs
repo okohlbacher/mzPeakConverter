@@ -142,7 +142,6 @@ struct GlueApi {
     open: ShimOpen,
     close: ShimClose,
     spectrum_count: ShimSpectrumCount,
-    spectrum_meta: ShimSpectrumMetaFn,
     spectrum_meta_v2: ShimSpectrumMetaV2Fn,
     mass_range: ShimMassRange,
     instrument_info: ShimInstrumentInfo,
@@ -216,7 +215,10 @@ impl GlueApi {
         let spectrum_count = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumCount>(ty, pdcstr!("SpectrumCount"))
             .map_err(|e| anyhow!("resolving glue export SpectrumCount: {e}"))?;
-        let spectrum_meta = *loader
+        // The v1 export is resolved by name (a glue that lost it fails here, and its struct twin
+        // stays part of the pinned ABI — `tests/shimadzu_abi_pin.rs`) but never called: every
+        // metadata read goes through `SpectrumMetaV2`, so nothing keeps the pointer.
+        let _spectrum_meta: ShimSpectrumMetaFn = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumMetaFn>(ty, pdcstr!("SpectrumMeta"))
             .map_err(|e| anyhow!("resolving glue export SpectrumMeta: {e}"))?;
 
@@ -265,7 +267,6 @@ impl GlueApi {
             open,
             close,
             spectrum_count,
-            spectrum_meta,
             spectrum_meta_v2,
             mass_range,
             instrument_info,
@@ -331,8 +332,6 @@ pub struct ShimadzuInstrumentInfo {
     pub system_name: Option<String>,
     /// e.g. `MSID_QTFL` — the LCMS-9030 Q-TOF.
     pub device_id: Option<String>,
-    /// ISO 8601, local instrument time, no zone.
-    pub analysis_date: Option<String>,
     /// e.g. `ESI`.
     pub ionization: Option<String>,
 }
@@ -420,12 +419,6 @@ impl ShimadzuReader {
     pub fn len(&self) -> usize {
         self.count
     }
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-    pub fn lcd_path(&self) -> &Path {
-        &self.lcd_path
-    }
 
     fn meta(&self, i: usize) -> Result<ShimadzuSpectrumMetaV2> {
         let index = i64::try_from(i).map_err(|_| anyhow!("Shimadzu index {i} does not fit in i64"))?;
@@ -466,8 +459,13 @@ impl ShimadzuReader {
         ShimadzuInstrumentInfo {
             system_name: next(),
             device_id: next(),
-            analysis_date: next(),
-            ionization: next(),
+            // Slot 3 is `SampleInfo.AnalysisDate`: a naive local time with no zone, deliberately
+            // not recorded (writing it would assert a zone the vendor never stated). Consumed so
+            // the ionization field keeps its position.
+            ionization: {
+                let _analysis_date = next();
+                next()
+            },
         }
     }
 
@@ -827,28 +825,6 @@ impl ShimadzuReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), peak_set, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        // Surface the vendor-defect warning up front rather than mid-run.
-        self.warn_if_rotated_centroids();
-        // Look through BOTH representations: on a centroid-only file every `which = 0` fetch comes
-        // back empty, and settling for spectrum 0 would hand the writer an empty schema sample.
-        let mut chosen = 0usize;
-        'outer: for i in 0..self.count {
-            for which in [0, 1] {
-                if let Ok((mz, _)) = self.peaks(i, which) {
-                    if !mz.is_empty() {
-                        chosen = i;
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        self.spectrum(chosen)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 impl Drop for ShimadzuReader {

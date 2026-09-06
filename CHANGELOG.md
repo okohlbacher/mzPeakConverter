@@ -4,6 +4,80 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] — 2026-09-06
+
+The Agilent native lane, restored (owner decision 2026-09-04, option A, time-boxed and gated on a
+real conversion), plus the Windows-only dead-code sweep the same decision bundled with it.
+
+### Added
+
+- **Native Agilent `.d` (MHDAC) conversion on Windows.** `src/agilent.rs` is the subprocess reader
+  from cc8245e (2026-06-27) that merge 5a62b90 dropped: it spawns the net48 `AgilentGlueHost.exe`
+  (`glue/agilent`, unchanged design) once per `.d` and reads the host's binary output back
+  through a new host-testable parser, `src/agl.rs` (3 unit tests that run on every OS, the same
+  pattern as `pwiz_layout`). Two adaptations from cc8245e: the MHDAC directory comes from
+  `pwiz_layout::agilent_dll_dir` (both ProteoWizard layouts), and no blanket `MS:1000294` is
+  attached. Verified on the box against the msconvert lane: a 5977B GC-MS run (MTBLS11742
+  blank1.D, 7,017 scans) is identical spectrum for spectrum — same 83,850 points, per-spectrum
+  TIC equal to the last digit, RT to 1e-13 min; a 6545 Q-TOF profile run (agilent-qtof S25,
+  242 MB, 1,502 scans, 181,196,503 points) converts in 20 s with the same points and RT and,
+  on the spectrum compared point by point, intensities equal to the last digit (m/z within
+  1.07 ppm of the msconvert+`--tof-grid` build, which is that build's own quantization).
+- **Protocol `AGL2`.** The host now writes MHDAC's `ScanTypes` and the instrument identity
+  (device type, device name, serial) ahead of the offset table; the converter refuses an `AGL1`
+  file with "rebuild glue/agilent" instead of guessing where the table starts.
+- ⚠️ **MRM/SIM-only runs are refused by the native lane** and pointed at `--via-msconvert`.
+  MHDAC presents a 6490 dMRM `.d` as one one-point "MS2 spectrum" per dwell — 27,674 of them for
+  MTBLS243, 11,728 for PC_Allan1 — while the data are the 113 / 201 SRM transition chromatograms
+  the msconvert lane writes; the guard (`agl::is_dwell_only`) keys on MHDAC's scan-type names, so
+  a run with any scan type keeps its scans and the corpus harness falls back to msconvert for the
+  dwell-only ones — verified on the box: both 6490 units exit 1 with the message and no output,
+  the GC-MS and Q-TOF runs report `Scan` and convert. The instrument model is recorded from MHDAC's
+  device type and name (`QTOF (QuadrupoleTimeOfFlight)`, `SingleQuadrupole`); the serial number is
+  not yet (the msconvert lane has it — the MHDAC member is still to be found, backlog).
+
+### Changed
+
+- ⚠️ **IM-QTOF runs are refused by the native lane too.** `AcqData/IMSFrame.bin` non-empty means a
+  6560 drift-tube run; the MIDAC lane that would carry the drift dimension is still the in-process
+  scaffold MHDAC-family DLLs cannot run under, so the converter refuses rather than flattening the
+  run through MHDAC. The corpus unit MSV000090203 FM_01_Pos.d is such a run (it was misremembered
+  as Bruker); it stays on msconvert.
+- **Safety and diagnostics around the host** (review findings, all landed): the `.part` file a
+  natively crashed host leaves is removed with the `.bin`; `MZPC_AGILENT_TMPDIR` places the
+  materialised run on disk when `TEMP` points at a RAM disk (the box scripts set it); a missing
+  `MassSpecDataReader.dll` is reported before the spawn, naming `MZPC_PWIZ_DIR`; a successful
+  host's stderr is logged at warn level (it now reports how many NaN/Inf intensities it stored as
+  0); a scan whose retention time MHDAC could not supply is written as NaN by the host and stored
+  as 0.0 with one counted warning (0.0 used to be both the value and the sentinel); a mixed
+  Scan+MRM method warns that its dwells are stored as one-point spectra; `--tof-grid` on this
+  lane warns that it is not applied; inspecting an Agilent `.d` never fails the run (it prints the
+  scan types and instrument, or the refusal as a note); the box scripts mark a refusal as
+  `path=refused->msconvert` so it does not trip the native-failure alarm. The Shimadzu
+  centroid-rotation warning, once raised by the removed `sample_arrays()` before the writer
+  opened, is now raised at the first centroid fetch — same warning, later.
+- **Pins and CI.** `agl::glue_writes_what_this_parser_reads` pins the C# writer's magic, string
+  order and record layout against the Rust parser on every host (the Shimadzu-style source pin,
+  before drift can ship); the Windows workflow boots the built `AgilentGlueHost.exe` and expects
+  its usage exit, the only MHDAC-free execution available.
+- ⚠️ **Corpus routing.** Under the native-first box policy the Q-TOF unit `agilent-qtof/…S25` will
+  convert natively on the next rerun (f64 m/z, numpress-chunked by default: 245 MB against the
+  200 MB msconvert+`--tof-grid` build; `--tof-grid` on this lane is a backlog item), the two
+  6490 dMRM units stay on msconvert via the refusal, the 5977B GC-MS unit converts natively with
+  identical spectra.
+- **Windows-only dead code swept** (the seven items the 0.10.0 `cfg_attr` change surfaced, plus
+  what the restore made unused): the ignored `sample` parameter of the shared vendor writer and
+  every reader's `sample_arrays()` (probes supply the schema since 0.9.x), `library_path`
+  (BAF, timsdata), `calibration_used` (BAF), `is_empty` on five readers, Shimadzu's unread
+  `spectrum_meta` v1 pointer (the export is still resolved by name), `analysis_date` (never
+  recorded — a naive local time) and `lcd_path()`. The Windows build is warning-free apart from
+  the vendored reader's one.
+- The stale net8 `glue/agilent/AgilentGlue.runtimeconfig.json` is deleted;
+  `tools/box_local_convert.ps1` points at the same ProteoWizard 3.0.26175 as the remote script;
+  README, `docs/PLATFORM_SUPPORT.md`, `docs/USER_MANUAL.md`, `glue/agilent/README.md` and
+  `BACKLOG.md` say the lane is wired, what it refuses, and what it costs (the host materialises
+  the run at 16 B/point, ~3 GB for the 242 MB Q-TOF `.d`, removed on close).
+
 ## [0.10.2] — 2026-09-06
 
 ### Fixed
