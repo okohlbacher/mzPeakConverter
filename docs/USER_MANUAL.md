@@ -557,7 +557,10 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
   every gridded spectrum was rewritten to centroid to reach it: the 13 published TOF-grid archives
   labelled 1.6 M profile spectra as centroid spectra with `number_of_peaks` set (review item M6;
   fixed together with the accession move above, one corpus rebuild). Under `--tof-grid off`
-  (SCIEX) nothing is gridded and `spectra_data` keeps the requested chunked layout.
+  (SCIEX) nothing is gridded and `spectra_data` keeps the requested chunked layout. Size: the
+  off-lattice profile minority of a native SCIEX run is now stored as exact f64 points rather than
+  numpress chunks — on the corpus that share is 0.07–9.2 % of the points and the archives grew
+  0.2–27 % (see the 0.10.1 changelog for the per-file numbers).
 - **ims-compact TOF layout (two modes)** — the peak facet has two mutually-exclusive layouts,
   recorded in `ims_calibration.tof_encoding`:
   - **Archive** *(default)* — a flat table of **absolute integer TOF bins** (`absolute`). Maximum
