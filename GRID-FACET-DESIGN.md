@@ -1,5 +1,9 @@
 # Generic grid facet — design proposal
 
+> **SUPERSEDED (2026-09-04):** describes a CLI/design that no longer exists; kept for history.
+> Current status: `docs/PLATFORM_SUPPORT.md` and the review ledger
+> (`scratchpad/review2/review-ledger.html`).
+
 Status: DRAFT v0.1, 2026-06-28. Addresses backlog **#11** (converge grid *storage*) and
 **#12** (materialized low-res grids). **No code yet** — this is a proposal to align with the
 upstream `mzpeak_prototyping` author (Josh) and the HUPO-PSI spec process *before*

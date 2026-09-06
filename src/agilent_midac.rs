@@ -36,9 +36,7 @@ use netcorehost::hostfxr::AssemblyDelegateLoader;
 use netcorehost::pdcstring::PdCString;
 use netcorehost::{nethost, pdcstr};
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -356,8 +354,9 @@ impl AgilentMidacReader {
     }
 
     /// Build the mzdata spectrum for frame `i`: Float64 MZArray + Float32 IntensityArray + Float64
-    /// `MeanInverseReducedIonMobilityArray` (the drift dimension MIDAC exposes), plus the
-    /// `MS:1000294 "mass spectrum"` param and a `ScanEvent` with `start_time` in minutes.
+    /// `MeanInverseReducedIonMobilityArray` (the drift dimension MIDAC exposes), plus
+    /// a `ScanEvent` with `start_time` in minutes (no blanket `MS:1000294`; the writer types rows
+    /// from ms_level).
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
         if i >= self.count {
             bail!("Agilent MIDAC frame index {i} out of range (count {})", self.count);
@@ -397,7 +396,10 @@ impl AgilentMidacReader {
             polarity,
             ..Default::default()
         };
-        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
         let mut scan = ScanEvent::default();
         scan.start_time = meta.rt_minutes;
         descr.acquisition.scans.push(scan);

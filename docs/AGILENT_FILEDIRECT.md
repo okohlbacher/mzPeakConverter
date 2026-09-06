@@ -1,5 +1,9 @@
 # Agilent Q-TOF `.d` — file-direct grid-TOF reader
 
+> **SUPERSEDED (2026-09-04):** describes a CLI/design that no longer exists; kept for history.
+> Current status: `docs/PLATFORM_SUPPORT.md` and the review ledger
+> (`scratchpad/review2/review-ledger.html`).
+
 > **2026-06-24 — END-TO-END, FIRST-PARTY, ON A REAL PROFILE `.d`.** The pure-Rust reader
 > (`src/agilent_profile.rs` + `convert_agilent_grid` in `src/main.rs`, gated `--agilent-grid`) is
 > implemented and measured on a real profile-mode Agilent Q-TOF `.d` — **no MHDAC, no msconvert, no

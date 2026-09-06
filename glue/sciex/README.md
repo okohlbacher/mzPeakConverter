@@ -1,19 +1,21 @@
 # SciexGlue — native SciEX `.wiff` / `.wiff2` reader shim
 
-A thin .NET 8 C# library that the mzPeakConverter Rust `sciex` feature hosts in-process
-(via `netcorehost` / CoreCLR) to read SciEX WIFF files through the vendor **Clearcore2**
-.NET API, and exposes the data back to Rust over a tiny C ABI.
+A thin .NET 8 C# library that the mzPeakConverter Rust `sciex` module (compiled in automatically
+on Windows — there is no cargo feature) hosts in-process (via `netcorehost` / CoreCLR) to read
+SciEX WIFF files through the vendor **Clearcore2** .NET API, and exposes the data back to Rust
+over a tiny C ABI.
 
-> ⚠️ **Windows-runtime-only and currently UNTESTED.** This project *builds* on any platform
-> (including macOS) because it has **no compile-time reference** to Clearcore2 — every vendor
-> call is made through runtime reflection. But it only *runs* where the Clearcore2 DLLs and a
-> compatible .NET 8 runtime are present. In practice that means Windows (Linux *may* work with
-> the Linux Clearcore2 build but is unverified).
+> ⚠️ **Windows-runtime-only.** This project *builds* on any platform (including macOS) because it
+> has **no compile-time reference** to Clearcore2 — every vendor call is made through runtime
+> reflection. But it only *runs* where the Clearcore2 DLLs and a compatible .NET 8 runtime are
+> present. In practice that means Windows (Linux *may* work with the Linux Clearcore2 build but is
+> unverified). It is the lane that produced the published native-SCIEX corpus archives (e.g.
+> MSV000095995, PXD065872, sciex-qtrap-6500).
 
 ## How it fits together
 
 ```
-mzPeakConverter (Rust, --features sciex)
+mzPeakConverter (Rust, src/sciex.rs — Windows build, no feature flag)
         │  netcorehost: load_hostfxr → initialize_for_runtime_config → delegate loader
         ▼
 SciexGlue.dll  (this project)   ── reflection (Assembly.LoadFrom) ──►  Clearcore2*.dll
@@ -61,7 +63,7 @@ Example (Windows PowerShell):
 ```powershell
 $env:MZPC_SCIEX_GLUE = "C:\...\mzPeakConverter\glue\sciex\bin\Release\net8.0"
 $env:MZPC_PWIZ_DIR   = "C:\Program Files\ProteoWizard\ProteoWizard 3.0.24"
-mzpeak-convert convert sample.wiff -o sample.mzpeak   # built with --features sciex
+mzpeak-convert sample.wiff -o sample.mzpeak
 ```
 
 ## EULA / licensing caveat
@@ -75,10 +77,15 @@ binaries.
 
 ## Status / caveats
 
-- **Untested.** No WIFF file has been read through this path; member names/casing in the
-  Clearcore2 API drift between releases, so the reflection lookups are deliberately tolerant
-  (candidate-name fallbacks) but may still need adjustment against a specific Clearcore2
-  version. Compare against ProteoWizard's `pwiz_aux/msrc/utility/vendor_api/ABI/WiffFile.cpp`.
+- **In production use** on the Windows conversion box; member names/casing in the Clearcore2
+  API drift between releases, so the reflection lookups are deliberately tolerant
+  (candidate-name fallbacks) and may need adjustment against a Clearcore2 version other than the
+  one ProteoWizard 3.0.26151 bundles. Compare against ProteoWizard's
+  `pwiz_aux/msrc/utility/vendor_api/ABI/WiffFile.cpp`.
+- **Known gaps (2026-09-04 review):** MS2 rows carry no precursor / isolation window / CE across
+  this ABI (ledger M32), every spectrum is typed `MS:1000294` (M33), out-of-range values are
+  clamped and NaN mapped to zero in `Glue.cs` (M9), and `--tof-grid off` does not reach the
+  native lane (M3) — all tracked in the review ledger.
 - Intensities are narrowed from Clearcore2 `double` to `float` to match the mzPeak schema.
 - Retention time from Clearcore2 is in **minutes**; the glue converts to seconds at the ABI,
   and the Rust side converts back to minutes for mzdata. (Net: mzdata gets minutes.)

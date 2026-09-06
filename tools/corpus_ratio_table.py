@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render results.tsv from convert_corpus.sh into a Markdown mzpeak/raw size-ratio table.
+"""Render results.tsv (from the retired convert_corpus.sh, removed in 0.9.13) into a Markdown mzpeak/raw size-ratio table.
 
 Usage: tools/corpus_ratio_table.py RESULTS.tsv [MORE.tsv ...] > table.md
 Multiple TSVs (e.g. host + CI vendor results) are concatenated.

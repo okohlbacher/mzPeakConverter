@@ -1,5 +1,9 @@
 # mzPeakConverter — handoff summary
 
+> **SUPERSEDED (2026-09-04):** describes a CLI/design that no longer exists; kept for history.
+> Current status: `docs/PLATFORM_SUPPORT.md` and the review ledger
+> (`scratchpad/review2/review-ledger.html`).
+
 Status as of 2026-06-21. Built autonomously with per-phase adversarial review (codex/vibe/kimi).
 See `PLAN.md` for full detail, `README.md` for usage.
 

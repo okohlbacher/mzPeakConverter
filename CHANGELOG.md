@@ -4,11 +4,335 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] — 2026-09-04
+
+This cycle implements the verified findings of the 2026-09-04/05 two-model adversarial review
+(the ledger's blocker B2, majors M2–M5, M7–M14, M19, M22–M27, M29–M34 (open: M1, M6, M15–M18, M20–M21, M28, M35–M36 — see the review ledger) and documentation items D1–D10) under the
+invariant decided on 2026-09-04: **the data is preserved as much as possible, and every
+transformation is declared in the archive.** ⚠️ marks an entry that changes what an archive
+*contains* — a new or reworded index key, a removed CV term, a moved value — so every archive
+written by ≤ 0.9.12 differs there and the published corpus needs a reconversion to carry it.
+Everything under `#[cfg(windows)]` / `#[cfg(any(windows, target_os = "linux"))]` was edited on a
+macOS host and is unbuilt until the next box build; expect new (non-fatal) dead-code warnings in
+the vendor modules, see *Removed*.
+
+### Fixed
+
+- **`.mzML.gz` input never worked.** Three support tables advertised it from the first release,
+  and mzdata's `open_path` refused every gzipped file outright ("Gzipped files are not supported
+  with this method"). Found by the 2026-09-04 two-model review (Fable, lens Q4), verified live.
+  A gzipped input is now detected by its `1f 8b` magic — not its name — and stream-decompressed to
+  a temp copy before the Latin-1 transcode and param-group sanitize stages (both sniff XML bytes,
+  which do not exist until the stream is inflated), so every downstream lane sees exactly what it
+  would see for the plain file: the archive is facet-for-facet identical, and `source_files` and
+  the SHA-1 still describe the `.gz` the user gave us. A plain file that merely *carries* a `.gz`
+  name is handed to the reader under its inner name (mzdata decides "gzipped" from the extension),
+  via a hardlink, nothing decompressed. Inspection without `-o` handles both too.
+  `tests/gzip_mzml.rs` pins all four cases.
+- ⚠️ **No lane adds the blanket `MS:1000294 mass spectrum` any more (M33).** mzdata's
+  `spectrum_type()` is first-match and the mzPeak writer infers `MS:1000579` / `MS:1000580` from
+  `ms_level` only when nothing shadows it — so the parent term the vendor lanes added put
+  `MS:1000294` in `spectrum_type` on every row of every SCIEX / Waters / BAF / SDK / Agilent archive
+  in the corpus (83,931 of 83,931 on the SWATH archive, 154,520 of 154,520 on the QTRAP one) while
+  the manual documented it as the design. Removed at `src/sciex.rs:531`, `src/waters.rs:303`,
+  `src/bruker_baf.rs:860`, `src/bruker_sdk.rs:333` (`make_description`, shared by the TDF and TSF
+  SDK readers), `src/bruker_tsf.rs:229`, `src/agilent.rs:479`, `src/agilent_midac.rs:399`, and the
+  four unconditional plus four add-if-absent sites in `src/main.rs` (see `src/main.rs:2921`),
+  together with the `mass_spectrum: &Param` parameter of `tof_grid_spectrum`, `agilent_grid_spectrum`,
+  `sciex_grid_spectrum` and `sciex_f64_spectrum`. mzdata's mzML writer emits 579/580 itself. Pinned
+  by `tests::spectrum_type_is_the_ms_level_child_never_the_generic_parent` and an absence assertion
+  on the gridded route in `tests::tof_grid_routes_per_spectrum`.
+- ⚠️ **Run metadata no longer leaks the converting machine's filesystem or a dangling instrument
+  reference (M2, M34).** `fixup_run_metadata` (`src/main.rs:6139`; helpers `is_filesystem_location`
+  / `is_path_shaped_run_id` at `:6119` / `:6126`) reduces every `source_files[].location` that is a
+  filesystem path in any spelling (`file:////Users/…`, bare path, drive letter) to the bare `file://`
+  authority — non-`file` URL schemes (`https://`, `s3://`) are kept — resets a path-shaped `run.id`
+  (mzdata's TDF reader copies the full `.d` path) to the input stem, and never mints
+  `default_instrument_id = 0` against an empty `instrument_configuration_list`: an absent or
+  non-resolving id is clamped onto an existing configuration or left `null`. `VendorHints.instrument`
+  is applied BEFORE the fixup in `convert_vendor_reader` (`src/main.rs:5716`) so the Shimadzu/SDK
+  instrument is what the reference resolves against. Archives of runs without an instrument record
+  (Waters, SCIEX, mzML without one) now carry `default_instrument_id: null` instead of a dangling
+  `0`. Not fixed (needs the vendored writer / mzdata): the per-scan `instrument_configuration_id` —
+  mzdata's `ScanEvent` has no None state and defaults to 0 (carried to `BACKLOG.md`).
+- ⚠️ **`ims_calibration.chunk_tof_encoding` states the real decoding rule (M5):**
+  `"chunk_start + cumsum(deltas); first delta is relative to chunk_start"` (`src/main.rs:4564`).
+  The old `"delta-within-chunk; first absolute; cumsum"` described a layout the writer never
+  produced — anyone implementing the stated rule decoded every chunk wrongly from its first point.
+  Pinned in `tests/contract_strings.rs:51`; the manual's §9 sentence says the same.
+- ⚠️ **The Shimadzu profile `tof_calibration` block says `"mz_reconstruction":
+  "within-vendor-rounding"` with `"max_error_da": 5e-10` instead of `"exact"`** (ledger 0.2;
+  `src/main.rs:4944`). Measured: 4,890 of 5,000 gridded points rebuild off the vendor's 1e-9 lattice
+  by ≤ 0.5 step (4.15e-10 Da), inside the vendor's own ±5e-10 rounding — accurate to vendor
+  precision, not bit-exact. `tests/contract_strings.rs` now asserts exactly ONE `exact` site
+  (Agilent file-direct) and pins the new value (`:120`).
+- ⚠️ **Shimadzu isolation window is keyed on the vendor's isolation target (`AcqModeMz`)**, no
+  longer on `max(target, selected ion)`, which shifted the window whenever the selected ion was
+  heavier (M7): `src/shimadzu.rs:779–810`. The selected ion is only the fallback target when the
+  vendor reports none, and a window with a target but no selected ion is still written (precursor
+  row without selected-ion rows) rather than dropped — the vendored writer emits the precursor row
+  independently of selected-ion rows (`vendor/mzpeak_prototyping/src/writer/visitor.rs:2397–2410`,
+  checked before allowing empty `ions`). Unbuilt here (`cfg(windows)`); no corpus `.lcd` with
+  differing `AcqModeMz` / selected ion was checked.
+- **The four mzML export lanes and the mzPeak→mzPeak filter are atomic (M14).** They wrote the
+  FINAL path directly, so a failure left a partial file and under `--force` had already destroyed
+  the previous output. All five now write to a temp under `TmpGuard` and rename on success:
+  `mzml_tmp_path` (`src/main.rs:724`; `x.mzML` → `x.mzML.tmp`, `x.mzML.gz` → `x.mzML.tmp.gz` —
+  `.gz` kept LAST so the untouched `mzml_sink` still picks the gzip encoder), and `src/filter.rs:219`
+  (`<out>.mzpeak.tmp` via `crate::TmpGuard`). The gzip trailer is written by dropping the writer
+  before the rename. New `tests/mzml_export_atomic.rs` (4 tests).
+- **Environment levers read one way (M29–M31).** One `env_flag()` helper (`src/main.rs:113`:
+  unset → `None`; empty / `0` / `false` / `no` → `Some(false)`; else `Some(true)`) now serves
+  `MZPC_NO_MZ_LATTICE` (`:190`), `MZPC_DUMP_IM_TABLE` / `MZPC_DUMP_AGILENT_PROFILE` (`:904`, `:912`),
+  `MZPC_BYTE_PLANE_INTENSITY` (`:4326`) and `MZPC_TIMING` (`:4447`). Before, `MZPC_BYTE_PLANE_INTENSITY=`
+  (empty) silently switched the ims-compact intensity column to Float32, and the two dump levers
+  fired on mere presence. ⚠️ `ims_calibration.intensity_dtype` (`int32` | `float32`,
+  `src/main.rs:4569`) now records which intensity column an ims-compact archive holds, so the
+  `MZPC_BYTE_PLANE_INTENSITY=0` opt-out is declared in the archive. `tests::env_flag_is_three_way`.
+- **The diagnostic levers refuse to shadow a requested archive (M29, M30).** `MZPC_DUMP_IM_TABLE`,
+  `MZPC_DUMP_AGILENT_PROFILE` and `MZPC_SHIMADZU_PROBE` with `--output` now exit non-zero naming the
+  variable and saying no archive would be written (`refuse_diagnostic_with_output`,
+  `src/main.rs:889`); they used to print and exit 0 with nothing written. `MZPC_SHIMADZU_PROBE` is
+  handled in `run()` (`src/main.rs:917`; `shimadzu_probe_lever` `:1412`) instead of inside the
+  Shimadzu lane — which only runs with `-o`, so the probe always swallowed the archive — a
+  non-numeric or empty value is an error rather than 10, and off Windows the set lever is an error
+  instead of silently ignored. `tests::dump_lever_with_output_bails_and_writes_nothing`.
+- ⚠️ **A `MZPC_MAX_SPECTRA`-truncated archive is detectable offline.** Every mzPeak lane that
+  honours the cap writes a `metadata.partial` index block `{partial: true, max_spectra,
+  source_declared, spectra_written, cause: "MZPC_MAX_SPECTRA"}` when the cap bit (`partial_marker`,
+  `src/main.rs:126`; eight sites: `convert_file`, the TOF-grid finisher, the Agilent grid, both
+  ims-compact lanes, the vendor readers, native SCIEX). "No declared count and written == cap" is
+  taken as truncated (an honest "maybe partial" beats a silent "complete"); a cap larger than the
+  file writes no marker. The WARN stays. `tests::max_spectra_cap_writes_partial_marker`.
+- **`--config` accepts the six options it promised and rejected (M12):** `representation`, `rt`,
+  `ms_level`, `drop_aux`, `verbose`, `quiet` (`FileConfig`, `src/main.rs:497`; merged
+  CLI-over-config-over-default in `Settings::resolve`). `--representation` is now an `Option` on the
+  CLI (default `both`), and `-v` / `-q` from a config file take effect because settings resolve
+  before logging is initialised (`main`, `src/main.rs:770`).
+  `tests::file_config_accepts_the_six_promised_keys`.
+- **`-v` / `-q` win over `RUST_LOG` (M13):** `init_logging` (`src/main.rs:867`) builds the filter
+  from an explicit flag and consults `RUST_LOG` only when neither is given; the `-v` / `-q` help
+  text says exactly that (it used to say the opposite of what the code did).
+  `tests::explicit_verbosity_flags_win_over_rust_log`.
+- **Flags dropped with exit 0 are now either honoured or refused (M10, M11).** (a) `--image` /
+  `--sdrf` are threaded through the mzML TOF-grid sub-path (`convert_file_tof_grid` →
+  `finish_tof_grid_archive`, `src/main.rs:2434`, `:2547`, which embeds vendor members + images +
+  SDRF exactly as `finish_with_vendor_and_aux`) — the same command used to keep or lose the SDRF
+  depending on whether the grid fit passed — and through `--via-msconvert` (`convert_via_msconvert`,
+  `:1810`, no longer hard-codes `&[], None`). (b) A per-lane honoured-flags table (`Lane`,
+  `unsupported_flags_for`, `refuse_unsupported_flags`, `src/main.rs:1214`–`:1387`) is checked in
+  `run()` right after lane selection against the options the user actually passed on the command
+  line (`Settings::given` — never defaults, and never a config profile's values: a profile is a
+  standing default that takes effect where a lane can use it and cannot make a lane refuse; this
+  holds for its `aux:` / `image:` / `sdrf:` lists too), bailing in the existing
+  `--rt` / `--ms-level` style with the flag, the lane and the remedy: `.mzpeak → mzML` and `--to mzml`
+  (encoder / embedding options, `--bruker-sdk`), `--agilent-grid` (images / SDRF,
+  `--via-msconvert`), `--via-msconvert` (`--aux`), both `--bruker-sdk` lanes (images / SDRF,
+  `--ims-chunked`, `--no-tims-recalibration`), native ims-compact and the native vendor readers
+  (images / SDRF). The `.mzpeak → .mzpeak` filter lane only WARNS about its listed convert-only
+  options (the dead `--zstd-level` included): it re-packs members verbatim, so an inert flag there
+  loses nothing. Options a lane merely has no use for but that cannot change its output are
+  deliberately not refused, so shared recipes keep working — the corpus descriptors and
+  `tools/convert_vendor_ci.sh` were checked and none is refused. The `--representation` inert-flag
+  warning now knows BAF honours it for mzPeak output (`representation_is_honoured`,
+  `src/main.rs:852`). `tests::unsupported_flags_are_checked_against_given_only`,
+  `tests::unsupported_flag_combination_is_refused_by_the_binary`, `tests::tof_grid_subpath_embeds_sdrf`.
+- **`--tof-grid` reaches native SCIEX `.wiff` (M3 — the first application of the invariant).** The
+  resolved mode is an `Option<TofGridMode>` (`Settings::tof_grid`) threaded through `convert_file`
+  to `convert_sciex` (`src/main.rs:5238`): not given → `auto` (unchanged output), `off` → exact f64
+  m/z for every spectrum via `sciex_f64_spectrum` with no `tof_calibration` block (nothing
+  transformed — the opt-out the invariant requires; the published MSV000095995 archive records a
+  4.986 ppm grid with no way to have switched it off), `on` → the run-wide clock fit is required.
+  The mzML lane maps not-given → `off` as before. Help text updated. Unbuilt here (`cfg(windows)`).
+- **`DOTNET_ROLL_FORWARD=LatestMajor` is set for Thermo `.raw` input only (M8;
+  `src/main.rs:785`).** Set for every input it overrode the Shimadzu glue's own `rollForward:
+  LatestMinor`, which on a .NET 9 host hoists the glue onto a runtime without the `BinaryFormatter`
+  path it needs. The Shimadzu-on-.NET-9 scenario itself was not reproducible (the box has .NET 8).
+- **The Shimadzu lattice-guard warning quotes the guard's tolerance from `mz_lattice::LATTICE_TOL`
+  (1e-6)** instead of a hardcoded `1e-3` (`src/main.rs:5710`).
+- **`mzml_output_preserves_srm_chromatograms` (`src/main.rs:7303`) is pinned to
+  `general-ms/sciex-qtrap-6500/En_PPY.mzpeak`**, checks both the mzPeak→mzML and the mzML→mzML lane,
+  and FAILS when the file is missing or carries no chromatograms (M27); it used to pick any
+  `*MRM*.mzML` and return quietly. Still `#[ignore]` (corpus); run explicitly it passes in ~30 s.
+  It drives the binary with `MZPC_MAX_SPECTRA=2000` because a full in-process pass over the
+  154,520-spectrum archive through `filter_mzpeak_to_mzml` ran > 3 minutes without writing a byte
+  (`MzPeakReader` per-index access: parquet page decode + `skip_records` per spectrum) — a
+  performance finding for `BACKLOG.md`, not touched here. Chromatograms are carried whole regardless
+  of the cap.
+
+### Changed
+
+- `run()` takes the resolved settings (`fn run(cli: &Cli, cfg: &Settings)`, `src/main.rs:901`);
+  `Settings::resolve` runs in `main()` before `init_logging`; `convert_file`'s `tof_grid` parameter
+  is `Option<TofGridMode>`.
+- `tests/gridded_spectrum_summaries.rs:82` — "gridded" is keyed on FACET MEMBERSHIP (the
+  `spectrum_index` appears in `spectra_peaks.parquet`, not `spectra_data.parquet`) instead of
+  `number_of_peaks` being non-null, so the assertion survives the M6 fix (carrying
+  `spectrum_representation` through unchanged instead of forcing centroid to steer the facet). The
+  helper locates the row struct by its `spectrum_index` child so it reads both the grid lane's
+  `point` and the f64 lane's `chunk` layout, and asserts no spectrum sits in both facets.
+- `tools/box_convert_remote.ps1:103`: one-line note that ProteoWizard 3.0.26175 (same
+  Shimadzu.LabSolutions.IO 5.0.0.0) is installed beside the pinned 3.0.26151; the pin is unchanged.
+
+### Added
+
+- ⚠️ **Every mzPeak lane writes a `metadata.transformations` index block** (the second half of
+  the invariant; M9): `transformations_block` / `base_transformations` at `src/main.rs:4683` /
+  `:4689`. Entries: `zero-run-mask` (every lane), `numpress-linear` (when that chunk codec is chosen
+  on any facet), `sort-by-mz` (the generic lane actually re-ordered at least one spectrum —
+  `src/main.rs:3664` tracks it instead of assuming), `tof-grid:<ppm>ppm` (a fitted grid replaced
+  f64 m/z; mzML tof-grid and SCIEX per-spectrum lanes), `shimadzu:span-trim` (`src/main.rs:4924`,
+  profile sqrt-grid route), `agilent:drop-zero-samples` (`src/main.rs:3136`, Agilent profile grid
+  lane). `VendorHints` gained `transformations: Vec<String>`. Pinned in
+  `tests/contract_strings.rs:164`; asserted on the tiny-fixture archive
+  (`tests::transformations_block_declares_what_the_lane_applied`). Not declared, on purpose: the
+  `--ims-chunked` layout's per-frame TOF sort (re-orders points across scans) — `BACKLOG.md`.
+- ⚠️ **`ims_calibration.chord_source`** (M4; `src/main.rs:4529`): `"global_metadata"` on the
+  native timsrust lane, `"sdk_tims_index_to_mz"` on `--bruker-sdk`, so a reader knows which of the
+  two (a, b) chords — measured 4.28 ppm apart on 2485.d — an archive holds. Threaded as a parameter
+  through `write_ims_compact_archive{,_parallel,_impl}`; pinned in `tests/contract_strings.rs:54`.
+- **One loud, once-per-process `log::warn!`** (`std::sync::Once`) when a lane that carries no
+  precursor writes an `ms_level > 1` row — "this reader does not yet extract precursors; MS2 rows
+  will have none" (M32 interim measure): `src/sciex.rs:502`, `src/waters.rs:282`,
+  `src/bruker_baf.rs:825`, `src/bruker_tsf.rs:202`, `src/agilent_profile.rs:265`. The message
+  names the vendor API that carries the data.
+- **`tests/shimadzu_abi_pin.rs`** (new, fixture-free, host-independent; M26): `include_str!`s
+  `src/shimadzu.rs` and `glue/shimadzu/Glue.cs` and pins the Shimadzu C ABI across the language
+  boundary — `REQUIRED_ABI_VERSION` (`src/shimadzu.rs:119`) equals `ShimadzuAbiVersion() => N`
+  (`glue/shimadzu/Glue.cs:865`); the ordered fields and counts of `ShimadzuSpectrumMeta` /
+  `ShimadzuSpectrumMetaV2` match their C# twins and V2 starts with V1 on both sides; any
+  `[StructLayout]` on a twin is plain `Sequential`; every `pdcstr!("…")` export the loader resolves
+  has an `[UnmanagedCallersOnly(EntryPoint = "…")]` with the same parameter count. Failure messages
+  name the drifted field/export; mutation-tested (a bumped version literal, a renamed C# field and a
+  renamed Rust export each fail exactly one assertion by name). It reads the sources as text, so it
+  runs on macOS although the module is `cfg(windows)`; it cannot tell whether the glue DLL was
+  rebuilt — that remains the release checklist's job.
+- **`tests/tdf_exact_tof_calibration.rs`** (corpus-gated) now also asserts, after building
+  2485.mzpeak, `metadata.ims_calibration.lossless == "tof"`, that every MS1 row of
+  `spectra_metadata` carries `total_ion_current > 0` and `base_peak_intensity > 0`, and that the
+  synthesized BPC (MS:1000628) and TIC (MS:1000235) traces are bit-equal, point for point, to those
+  columns (400 MS1 frames) — the archive-level pin of the 0.9.11 chromatogram fix.
+- **`tests/mzml_export_atomic.rs`** (new): a failed `.mzML` / `.mzML.gz` export, a failed
+  `.mzpeak` filter and a failed `.mzpeak → mzML` export leave no `.tmp` behind; a successful export
+  is renamed into place. Further `src/main.rs` unit tests:
+  `fixup_run_metadata_strips_paths_and_never_mints_a_dangling_instrument`,
+  `index_carries_no_operator_paths` (no scratch or home directory anywhere in
+  `mzpeak_index.json`; every `source_files[].location == file://`), and the A1 set listed above.
+- **Harness (`tools/`, ledger M22–M23):** `tools/corpus_reconvert.py:43–47`, `:143–159`, `:361` —
+  a `.raw.zip` / `.d.zip` whose directory is NOT extracted beside it is a raw unit; it maps to
+  `<stem>.mzpeak`, ranks below every extracted format, and is `skipped` on the host (the converter
+  reads directories, not zips) so it is deferred to the box, whose remote script already extracts
+  archives. The corpus now reports 201 units / 201 archives instead of 199 with two Waters archives
+  (PXD052561, PXD077098) invisible. `tools/corpus_reconvert.py:616` — the report asserts
+  archives-on-disk == targets; any `.mzpeak` no recognised unit produces is printed under
+  `UNACCOUNTED ON DISK` and makes the run exit 1. `tools/box_convert.sh:46–63` —
+  `resolve_relay_python()` picks one boto3-capable interpreter for `s3_relay.py` at startup
+  (`$MZPC_PYTHON` if set, verified, no silent fallback; else the first of `python3`,
+  `python3.14/13/12`, `~/anaconda3/bin/python3`, `~/miniconda3/bin/python3`, the `mzpeak314` env,
+  the repo `.venv` that can `import boto3`; otherwise exit 2 naming the fix). The bare `python3`
+  previously used had no boto3 on this host, so the documented single-job invocation staged
+  nothing.
+- **CI (`.github/workflows/windows.yml:55–100`, ledger M25):** the Windows job builds
+  `glue/shimadzu/ShimadzuGlue.csproj`, asserts `glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.dll`
+  and its generated `ShimadzuGlue.runtimeconfig.json` exist, and asserts that config carries
+  `System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization: true` — the switch
+  without which Shimadzu.LabSolutions.IO 5.0.0.0 makes every `.lcd` unreadable while the DLL still
+  builds. Unrun CI (no `pwsh` on the host); the paths and the expected value were confirmed against
+  a real `dotnet build` output in a scratch copy.
+
+### Removed
+
+- The off-Windows `convert_shimadzu` stub (its own comment said it had no caller) and the
+  corpus-only test `contract_tof_grid_calibration_keys` (could not pass on its documented input;
+  superseded by `tests/gridded_spectrum_summaries.rs`).
+- The unconditional `#[allow(dead_code)]` on `mod bruker_baf / bruker_sdk / agilent / agilent_midac /
+  sciex / shimadzu` (`src/main.rs:26–57`) is now `#[cfg_attr(not(<the module's own cfg>),
+  allow(dead_code))]` — where a module is compiled it must earn its keep. The box build may show
+  new dead-code WARNINGS in those modules (not errors; no `-D warnings` anywhere).
+- `src/waters.rs`: the never-read `WatersReader.is_continuum` field (the per-function
+  `continuum: Vec<Option<bool>>` is what is read) — the last Windows dead-code warning.
+- `src/bruker_native.rs`: the placeholder test `c2_zero_sdk_goldens_match_the_sqrt_linear_pair`,
+  which read a fixture that never existed and printed "skipping" forever; the same assertion runs
+  against `tests/fixtures/tdf_2485_sdk_golden.json` in `sqrt_linear_pair_matches_the_vendor_sdk_goldens`.
+- `src/shimadzu_grid.rs`: the unused `pub use crate::mz_lattice::{lattice_tolerance, LATTICE_TOL}`
+  re-export (`:146` now re-exports only `LatticeOutcome` and `LATTICE_SCALE`) and the three
+  test-only wrappers `centroid_lattice` / `lattice_tof_index_field` / `lattice_peak_arrays`;
+  `LATTICE_TRANSFORM_PARAMS` is `#[cfg(test)]` (`:154`). The 0.9.12 comment claiming
+  `convert_shimadzu` "calls `crate::mz_lattice::*` directly" was false — it calls
+  `lattice_peak_schema` / `mz_calibration_block` / `lattice_route`; the comment and
+  `mod lattice_tests` (`:249`) now say and pin exactly that, asserting through those three
+  production wrappers. The now-unused `mzdata::curie`, `Param` and `ParamDescribed` imports were
+  dropped from the seven vendor files of the MS:1000294 change.
+- **The superseded corpus/box harness set (ledger M24** — they inferred success from a file's
+  existence, the defect class 0.9.12 fixed in the live harness): `tools/convert_corpus.sh`,
+  `corpus_full.sh`, `corpus_bench.sh`, `rerun-tests.sh`, `corpus_box_convert.sh`,
+  `corpus_manifest.tsv`, `box_pxd_convert.sh`, `box_url_convert.ps1`, `pxd014690_convert.ps1`,
+  `tof_grid_verify_lossless.py`, `tof_grid_make_mixed_mzml.py` and `tools/flash/`. Nothing live
+  referenced them; git keeps the history. `.github/workflows/windows.yml:249` names the live entry
+  point (`tools/corpus_reconvert.py`); `tools/corpus_ratio_table.py:2` and
+  `tools/render_ratio_table.py:2` note that the TSV producers they render are gone.
+- `tools/corpus_reconvert.py`: `sync_box()` and its `box_ssh()` helper (ledger M19). `box_convert.sh`
+  already runs `box_update_remote.ps1`; two updaters on every `--box` run were the stray process in
+  the 32-minute 2026-09-03 hang. `run_box` now passes `BOX_CONVERTER_VERSION=v<x.y.z>` to
+  `box_convert.sh` explicitly (`tools/corpus_reconvert.py:404–429`), which with the existing
+  `BOX_REQUIRE_VERSION=1` gives one updater, one lock, one stamp of the version that ran. The
+  matching PATH-prepend workaround for the relay interpreter is gone too.
+- `.github/workflows/windows.yml:55–79`: the Windows job no longer builds or asserts `glue/waters`
+  (ledger M25) — no code path in `src/` loads `WatersGlue.dll`; `src/waters.rs` drives
+  `MassLynxRaw.dll` directly.
+
+### Documentation
+
+- **Fidelity language rewritten to the decided invariant (D10).** `README.md` and
+  `docs/USER_MANUAL.md` §1 no longer call the archive "lossless" or zero-run compaction "the one
+  transform that is not byte-for-byte"; §8 gains a *Fidelity* block naming the four non-bit-exact
+  encodings with their bounds, the six-entry `transformations` vocabulary (which lane writes which
+  entry, and the one re-order not yet declared), the `mz_reconstruction` values per lane
+  (`within-vendor-rounding` + `max_error_da` for Shimadzu, `exact` for Agilent file-direct,
+  `bounded-lossy` + `roundtrip_tolerance_ppm` for SCIEX), and the two other new audit keys
+  (`metadata.partial`, `ims_calibration.chord_source`). §7 lists `transformations` / `partial` in
+  the index and states the new provenance guarantees (`source_files[].location` is never an
+  operator path, `run.id` never a path, `default_instrument_id` may be `null`).
+- **`docs/USER_MANUAL.md` §4 regenerated from `mzpeak-convert --help` (D1):** all 28 options with
+  the help's wording and defaults (`--to`, `--rt`, `--ms-level`, `--drop-aux`, `--image`, `--sdrf`,
+  `--no-chromatograms`, `--agilent-grid`, `--tof-grid` were missing; `--zstd-level` now says 3, and
+  5 on the ims-compact lanes — D7), a "refused, not dropped" paragraph with the per-lane table
+  generated from `unsupported_flags_for` (including the rules that config-file values never count
+  as supplied and that the filter lane warns instead of refusing), and
+  three subsections for the modes that existed only in `--help`: §4.1 mzML output (`--to mzml`,
+  `-o x.mzML`, `-o x.mzML.gz`, atomic temp names), §4.2 filtering an existing archive, §4.3
+  embedding (`--sdrf` / `--image`) with the lane-by-lane embedded / injected / refused table and the
+  imzML-only nature of an explicit `--image`.
+- **§5 regenerated from `FileConfig` (M12):** all 27 keys, the six new ones marked; the example was
+  run against the built binary (the full file parses — the `rt`/`ms_level` keys trigger the
+  documented raw-input refusal; the convert-only subset converts). States that only `<INPUT>` and
+  `--config` are command-line only, and that a config value is a standing default that never counts
+  as "supplied" for the refusal table.
+- **§10 reconciled with the code (D8):** all 26 `MZPC_*` names (19 in `src/`, 4 in the vendored
+  writer, 2 in the Shimadzu glue, 1 comment-only `MZPC_WATERS_GLUE`), the `env_flag()` semantics
+  (unset / `""` / `0` / `false` / `no`), the narrower spellings the vendored writer and the C# glue
+  keep (`MZPC_SHIMADZU_COARSE_MZ` is compared to the literal `1`), that the dump/probe levers refuse
+  to run with `-o`, a "recorded in the archive?" column for the output-affecting levers
+  (`intensity_dtype`, `partial`, `transformations`), the `MZPC_SHIMADZU_PROBE` relocation and
+  numeric-only rule, and `DOTNET_ROLL_FORWARD` as Thermo-only. §8 documents the spectrum type as
+  `MS:1000579` / `MS:1000580` inferred from `ms_level` (it documented `MS:1000294`); §9's chunked-TOF
+  sentence says `chunk_start + cumsum(deltas)` with the first point excluded (M5).
+- **The Agilent native lane is documented as not wired (B1):** `docs/USER_MANUAL.md` §6 / §11,
+  `docs/PLATFORM_SUPPORT.md` and `BACKLOG.md` #9 (✅ struck, regressed by merge 5a62b90; options A /
+  B / C costed under #23, decision pending) say the same thing. `BACKLOG.md` also corrects the
+  `tof_c0` / `tof_c1` accession (`MS:4000900` / `MS:4000901`, not `MZP:`), marks #17–#21 as shipped,
+  notes the byte-plane lever as shipped, and points at the review ledger as the current issue list.
+  `README.md` badges: Rust 1.88+ (was 1.87, could obstruct a build) and the live GitHub release
+  badge (was hard-coded v0.3.1) (D5). `src/bruker_baf.rs:20–22` names the real gate
+  (`#[cfg(any(windows, target_os = "linux"))]`), not a non-existent `bruker_sdk` cargo feature.
+
 ## [0.9.12] — 2026-09-04
 
-No converter behaviour change: the shipped binary produces byte-identical
-archives to 0.9.11. This release carries the conversion HARNESS and two
-build-warning corrections.
+No converter behaviour change: no change to any spectrum, chromatogram or
+index value against 0.9.11; the recorded converter version differs (the binary
+writes `CARGO_PKG_VERSION` into every archive's processing metadata, so the
+bytes are not identical — an earlier wording of this entry claimed they were).
+This release carries the conversion HARNESS and two build-warning corrections.
 
 ### Fixed
 

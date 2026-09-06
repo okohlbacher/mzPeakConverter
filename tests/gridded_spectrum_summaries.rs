@@ -78,26 +78,58 @@ struct Summaries {
     bp_int: Vec<Option<f32>>,
     lo_mz: Vec<Option<f64>>,
     hi_mz: Vec<Option<f64>>,
-    /// `number_of_peaks` non-null == routed to the custom peak facet (i.e. gridded).
+    /// Routed to the integer-axis peak facet (i.e. gridded): the spectrum's points live in
+    /// `spectra_peaks.parquet`, not `spectra_data.parquet`. Keyed on FACET MEMBERSHIP, not on
+    /// `number_of_peaks` being non-null — that column follows `spectrum_representation`, which the
+    /// grid route currently forces to centroid to steer the facet choice (review M6); once the
+    /// representation is carried through unchanged, the count column stops saying which facet the
+    /// points went to, and the file they are actually in is the only thing that does.
     gridded: Vec<bool>,
+}
+
+/// The set of `spectrum_index` values whose points live in `member`. A facet's rows are one struct
+/// column — `point` on the grid lane, `chunk` on the f64 lane (the mzML→mzPeak default is m/z-chunked)
+/// — and either carries a `spectrum_index` child, so the struct is located by that child, not by name.
+fn spectrum_indices_in(archive: &Path, member: &str, dir: &Path) -> std::collections::HashSet<u64> {
+    let mut set = std::collections::HashSet::new();
+    for b in batches(archive, member, dir) {
+        let rows = b
+            .columns()
+            .iter()
+            .filter_map(|c| c.as_struct_opt())
+            .find(|st| st.column_by_name("spectrum_index").is_some())
+            .unwrap_or_else(|| panic!("{member}: no struct column with a spectrum_index child: {:?}", b.schema()));
+        let idx = rows.column_by_name("spectrum_index").unwrap().as_primitive::<arrow::datatypes::UInt64Type>();
+        for i in 0..b.num_rows() {
+            set.insert(idx.value(i));
+        }
+    }
+    set
 }
 
 fn summaries(archive: &Path, dir: &Path) -> Summaries {
     let mut s = Summaries::default();
+    let in_peaks = spectrum_indices_in(archive, "spectra_peaks.parquet", dir);
+    let in_data = spectrum_indices_in(archive, "spectra_data.parquet", dir);
     for b in batches(archive, "spectra_metadata.parquet", dir) {
+        let index = b.column_by_name("index").unwrap().as_primitive::<arrow::datatypes::UInt64Type>();
         let tic = b.column_by_name("total_ion_current").unwrap().as_primitive::<Float32Type>();
         let bpm = b.column_by_name("base_peak_mz").unwrap().as_primitive::<Float64Type>();
         let bpi = b.column_by_name("base_peak_intensity").unwrap().as_primitive::<Float32Type>();
         let lo = b.column_by_name("lowest_observed_mz").unwrap().as_primitive::<Float64Type>();
         let hi = b.column_by_name("highest_observed_mz").unwrap().as_primitive::<Float64Type>();
-        let npk = b.column_by_name("number_of_peaks").unwrap();
         for i in 0..b.num_rows() {
+            let ix = index.value(i);
+            assert!(
+                !(in_peaks.contains(&ix) && in_data.contains(&ix)),
+                "spectrum {ix}: points in BOTH spectra_peaks and spectra_data; facet membership is ambiguous"
+            );
             s.tic.push((!tic.is_null(i)).then(|| tic.value(i)));
             s.bp_mz.push((!bpm.is_null(i)).then(|| bpm.value(i)));
             s.bp_int.push((!bpi.is_null(i)).then(|| bpi.value(i)));
             s.lo_mz.push((!lo.is_null(i)).then(|| lo.value(i)));
             s.hi_mz.push((!hi.is_null(i)).then(|| hi.value(i)));
-            s.gridded.push(!npk.is_null(i));
+            s.gridded.push(in_peaks.contains(&ix));
         }
     }
     s

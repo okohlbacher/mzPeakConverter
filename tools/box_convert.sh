@@ -37,7 +37,31 @@ PUT_EXPIRES="${PUT_EXPIRES:-21600}"
 ARCHIVE="${ARCHIVE:-false}"
 CORPUS_ROOT="${CORPUS_ROOT:-$HOME/Claude/mzpeak-example-data/data}"   # where s3:// targets mirror to
 REMOTE_PS='C:\Users\User\box_convert_remote.ps1'
-RELAY=(python3 "$here/s3_relay.py")
+
+# The S3 relay needs boto3, and a bare `python3` is whatever the shell finds first: on the host
+# that is a Homebrew python WITHOUT boto3, so the documented single-job invocation died with
+# ModuleNotFoundError before staging anything. Resolve one capable interpreter here, once, and
+# fail loudly when there is none -- silently picking the wrong one is how this went unnoticed.
+# $MZPC_PYTHON wins outright (no probe) so an operator can pin an environment explicitly.
+resolve_relay_python(){
+  local c
+  if [ -n "${MZPC_PYTHON:-}" ]; then
+    "$MZPC_PYTHON" -c 'import boto3' >/dev/null 2>&1 && { printf '%s\n' "$MZPC_PYTHON"; return 0; }
+    echo "FATAL: MZPC_PYTHON=$MZPC_PYTHON cannot 'import boto3' -- fix: $MZPC_PYTHON -m pip install boto3" >&2
+    return 1
+  fi
+  for c in python3 python3.14 python3.13 python3.12 \
+           "$HOME/anaconda3/bin/python3" "$HOME/miniconda3/bin/python3" \
+           "$HOME/anaconda3/envs/mzpeak314/bin/python" "$here/../.venv/bin/python"; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    "$c" -c 'import boto3' >/dev/null 2>&1 && { command -v "$c"; return 0; }
+  done
+  echo "FATAL: no python with boto3 found (tried python3, python3.14/13/12, ~/anaconda3, ~/miniconda3, the repo .venv)." >&2
+  echo "       fix: python3 -m pip install boto3   -- or point MZPC_PYTHON at an interpreter that has it" >&2
+  return 1
+}
+RELAY_PY="$(resolve_relay_python)" || exit 2
+RELAY=("$RELAY_PY" "$here/s3_relay.py")
 PROXY="ProxyCommand=ssh -i $BOX_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -W %h:%p $BOX_JUMP"
 SSH=(ssh -i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
      -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=30 -o "$PROXY")

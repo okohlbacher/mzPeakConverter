@@ -1,12 +1,28 @@
 # AgilentGlueHost — native Agilent MassHunter (`.d`) reader for mzPeakConverter
 
-A small **.NET Framework 4.8 console EXE** (`AgilentGlueHost.exe`) that lets the Rust `agilent`
-reader read Agilent MassHunter `.d` data through Agilent's **MHDAC** (MassHunter Data Access
-Component) DLLs — **out of process**. The Rust converter spawns it once per `.d`.
+> ## ⛔ NOT WIRED since merge 5a62b90 (2026-06-28) — decision pending (`BACKLOG.md` #23)
+>
+> This project builds a **net48 subprocess EXE**; the Rust side in HEAD (`src/agilent.rs`) still
+> **hosts `AgilentGlue.dll` in-process** via `netcorehost` and resolves six `AgilentGlue.Exports`
+> — a design this project no longer produces. Nothing in `src/` spawns the EXE or reads the `AGL1`
+> file described below, so the native Agilent lane opens nothing on any platform; use
+> `--via-msconvert` (or `--agilent-grid` for profile `.d`). The Rust reader that *does* speak this
+> protocol exists in history at **`cc8245e:src/agilent.rs`** (284 lines, `std::process::Command`,
+> `MAGIC = b"AGL1"`, `HOST_EXE = "AgilentGlueHost.exe"`); merge 5a62b90 took `src/` from the box
+> line and dropped it, deferring a reconciliation that never happened. Restore it (time-boxed),
+> port to the in-process pattern, or delete the lane — the owner decision is open; see
+> `BACKLOG.md` #23 and `docs/PLATFORM_SUPPORT.md`. Note also that no version of this lane has
+> demonstrably produced spectra from a real `.d`. The protocol description below is kept because
+> option A needs it unchanged.
 
-**Status: Windows-runtime-only; runs.** It *builds* on macOS/Linux/Windows (no Agilent DLLs needed at
-build time — see "Why reflection"), and *runs* on x64 Windows with the MHDAC DLLs present. Verified
-against MHDAC `10.0.1.10305`.
+A small **.NET Framework 4.8 console EXE** (`AgilentGlueHost.exe`) that lets a Rust `agilent`
+reader read Agilent MassHunter `.d` data through Agilent's **MHDAC** (MassHunter Data Access
+Component) DLLs — **out of process**. The Rust side at cc8245e spawned it once per `.d`; HEAD does not.
+
+**Status: builds everywhere; not reachable from the converter (see the banner).** It *builds* on
+macOS/Linux/Windows (no Agilent DLLs needed at build time — see "Why reflection"), and *runs* on x64
+Windows with the MHDAC DLLs present. Reflection names were validated against MHDAC `10.0.1.10305`
+(one version).
 
 ## Why a separate .NET Framework process (and not in-process .NET 8)
 
@@ -27,7 +43,7 @@ AgilentGlueHost.exe  <in.d>  <mhdacDir>  <out.bin>
 ```
 
 It opens the `.d` via MHDAC, reads every MS scan, and writes a little-endian binary file that the
-Rust side (`src/agilent.rs`) reads back:
+Rust side (`cc8245e:src/agilent.rs` — not HEAD's) reads back:
 
 ```
 magic "AGL1" (4 bytes) | count u64 | offset[count] u64 (abs file offset of each record)
@@ -67,7 +83,7 @@ ordinary `dotnet` SDK — no Visual Studio / .NET Framework targeting pack requi
 
 | Env var             | Meaning                                                                              |
 |---------------------|--------------------------------------------------------------------------------------|
-| `MZPC_AGILENT_GLUE` | Directory containing `AgilentGlueHost.exe` (the build output above).                  |
+| `MZPC_AGILENT_GLUE` | Directory containing `AgilentGlueHost.exe` (the build output above). HEAD's `src/agilent.rs` reads this variable but looks for `AgilentGlue.dll` + `AgilentGlue.runtimeconfig.json` in it — which this project does not build. |
 | `MZPC_PWIZ_DIR`     | A ProteoWizard install directory. MHDAC DLLs are loaded from `<MZPC_PWIZ_DIR>/vendor_api/Agilent`. |
 
 > **Box note.** Some ProteoWizard builds (e.g. the FLASHApp bundle) flatten the Agilent DLLs directly

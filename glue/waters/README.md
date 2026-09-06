@@ -60,7 +60,7 @@ this project and must not be committed here. Two common sources:
 | Variable             | Meaning                                                                       |
 | -------------------- | ----------------------------------------------------------------------------- |
 | `MZPC_WATERS_GLUE`   | ⛔ **Not read by any code.** Would hold the built `WatersGlue.dll` + `WatersGlue.runtimeconfig.json` (e.g. `glue/waters/bin/Release/net8.0`) if this lane were wired. |
-| `MZPC_MASSLYNX_DIR`  | Directory holding the MassLynx managed DLLs. From a ProteoWizard install this is `<MZPC_MASSLYNX_DIR>/vendor_api/Waters` (and the glue accepts `MZPC_MASSLYNX_DIR` itself if it directly contains them). |
+| `MZPC_MASSLYNX_DIR`  | The directory that **directly holds `MassLynxRaw.dll`** (the C-ABI DLL `src/waters.rs` loads with `libloading`). No `vendor_api/Waters` sub-path is probed under it; point it at the folder containing the DLL. `MZPC_PWIZ_DIR` is the fallback and is taken the same way — as the directory itself (`resolve_masslynx_dir` in `src/waters.rs`), so with a bundled-layout ProteoWizard set `MZPC_MASSLYNX_DIR=<pwiz>/vendor_api/Waters` explicitly. |
 
 A .NET 8 runtime (`Microsoft.NETCore.App` 8.0+) must be installed on the host.
 
@@ -69,7 +69,7 @@ Example (Windows PowerShell):
 ```powershell
 # MZPC_WATERS_GLUE is inert; MZPC_MASSLYNX_DIR is the one that matters.
 $env:MZPC_MASSLYNX_DIR  = "C:\Program Files\ProteoWizard\ProteoWizard 3.0.24"
-mzpeak-convert convert sample.raw -o sample.mzpeak
+mzpeak-convert sample.raw -o sample.mzpeak
 ```
 
 ## EULA / licensing caveat
@@ -91,8 +91,11 @@ vendor binaries.
   `GetIonMode`).
 - Intensities are narrowed from MassLynx `float`/`double` to `float` to match the mzPeak schema.
 - Retention time from MassLynx is in **minutes**; the glue converts to seconds at the ABI, and
-  the Rust side converts back to minutes for mzdata. (Net: mzdata gets minutes.)
-- Polarity is mapped 0 = positive, 1 = negative, other = unknown (from the ion-mode sign).
+  the Rust side converts back to minutes for mzdata. (Net: mzdata gets minutes.) **This describes
+  the unwired glue.** The live lane, `src/waters.rs`, currently writes RT = 0.0 on every spectrum
+  and polarity unknown, and takes the MS level from the function index (review ledger M1).
+- Polarity is mapped 0 = positive, 1 = negative, other = unknown (from the ion-mode sign) —
+  again in this unwired glue only; the live lane does not read ion mode yet.
 - The reader flattens every `(function, scan)` into a single index. IMS/TWIMS drift scans
   (`ReadDriftScan` / `GetDriftScanCount`) are wired as optional/best-effort and are NOT
   currently expanded into the flattened index — a basic non-IMS path runs first.

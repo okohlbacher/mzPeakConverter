@@ -1,5 +1,9 @@
 # box-convert — URL-driven, S3-relayed, parallel box conversions
 
+> **SUPERSEDED (2026-09-04):** describes a CLI/design that no longer exists; kept for history.
+> Current status: `docs/PLATFORM_SUPPORT.md` and the review ledger
+> (`scratchpad/review2/review-ledger.html`).
+
 ## Goal
 Convert a raw file that lives at a **URL** on the Windows flash-workstation ("the box"), without
 host↔box file copies, so conversions are **isolated** (each in its own temp dir, no shared state) and
