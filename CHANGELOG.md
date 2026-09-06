@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.2] — 2026-09-06
+
+### Fixed
+
+- ⚠️ **`run.default_instrument_id` is an integer again.** 0.10.0 wrote `null` for a run without an
+  instrument record, calling the previous `0` a dangling reference. The specification's run block
+  requires the field as an integer (`schema/ms_run.json`), so the first corpus rebuild under the
+  0.10.x line produced three archives the validator refuses (`index_schema_valid`,
+  `meta_run_valid`: "None is not of type 'integer'"): an LA-ESI imzML, a timsTOF `.d` without an
+  instrument record, and a Bruker impact II `.d`. The normaliser now inserts one EMPTY instrument
+  configuration `0` when the list is empty and points the run at it — what mzML does for an
+  unknown instrument — so the reference resolves and the schema holds. The 0.10.0 changelog entry
+  and manual §7 sentence that announced the `null` are superseded by this one. Found by the
+  validator on the 0.10.1 corpus rerun, which was stopped and restarts under this tag.
+
 ## [0.10.1] — 2026-09-06
 
 The two archive-content items the owner sequenced first after 0.10.0 (review ledger M6 and the

@@ -6237,8 +6237,19 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     // 2. default_source_file_id / default_data_processing_id ← first list entry, when unset.
     let first_sf = target.file_description().source_files.first().map(|sf| sf.id.clone());
     let first_dp = target.data_processings().first().map(|dp| dp.id.clone());
-    // `None` when the list is empty: minting `0` against an empty list (the old `unwrap_or(0)`)
-    // is the dangling reference eighteen published Waters/SCIEX archives carry.
+    // The spec's run block REQUIRES an integer `default_instrument_id` (mzPeak-specification
+    // `schema/ms_run.json`: required, `"type": "integer"`), so a run without an instrument record
+    // gets an EMPTY configuration `0` to point at — what mzML does too (`instrumentConfigurationList`
+    // needs one entry; msconvert writes a bare one for an unknown instrument). 0.10.0 wrote `null`
+    // instead ("a null is honest, a dangling 0 is a schema violation"); the validator's
+    // `index_schema_valid` / `meta_run_valid` refused the three instrument-less corpus archives
+    // rebuilt under it, and the null was the schema violation. The dangling `0` of the eighteen
+    // pre-0.10.0 Waters/SCIEX archives is still fixed: the id now resolves to a real (empty) entry.
+    if target.instrument_configurations().is_empty() {
+        target
+            .instrument_configurations_mut()
+            .insert(0, InstrumentConfiguration { id: 0, ..Default::default() });
+    }
     let instr_ids: Vec<u32> = target.instrument_configurations().keys().copied().collect();
     let first_instr = instr_ids.iter().copied().min();
     if let Some(run) = target.run_description_mut() {
@@ -6258,10 +6269,9 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         if run.id.as_deref().unwrap_or("").is_empty() {
             run.id = Some(stem.unwrap_or_else(|| "run".to_string()));
         }
-        // Every emitted reference must resolve: fill an absent one from the list, clamp an
-        // inherited one (mzdata's readers hand us `Some(0)` regardless) onto a real configuration,
-        // and leave it null when there is nothing to point at — a null is honest, a dangling `0`
-        // is a schema violation.
+        // Every emitted reference must resolve: fill an absent one from the list (never empty
+        // after the step above), and clamp an inherited one (mzdata's readers hand us `Some(0)`
+        // regardless) onto a real configuration.
         match run.default_instrument_id {
             Some(id) if instr_ids.contains(&id) => {}
             _ => run.default_instrument_id = first_instr,
@@ -6404,7 +6414,9 @@ mod tests {
 
     /// The run-metadata normaliser on what mzdata's readers actually hand over: a Thermo-style
     /// `file:////Users/…` location, a TDF-style full-path `run.id`, and a `default_instrument_id`
-    /// of 0 against an EMPTY instrument list (the published-corpus defects M2/M34).
+    /// of 0 against an EMPTY instrument list (the published-corpus defects M2/M34). The id must come
+    /// out as an INTEGER that resolves — the spec requires the field — so an empty list gains an
+    /// empty configuration `0` (0.10.0's `null` failed the validator's schema check).
     #[test]
     fn fixup_run_metadata_strips_paths_and_never_mints_a_dangling_instrument() {
         use mzdata::meta::SourceFile;
@@ -6438,8 +6450,14 @@ mod tests {
         assert_eq!(sfs[1].location, "https://ftp.pride.ebi.ac.uk/pride/data/archive", "a remote locator is not a path");
         let run = w.run_description().unwrap();
         assert_eq!(run.id.as_deref(), Some("SZB8102938"), "path-shaped run.id reset to the input stem");
-        assert_eq!(run.default_instrument_id, None, "no instrument to point at, so no reference");
+        assert_eq!(run.default_instrument_id, Some(0), "the required integer, pointing at a real entry");
         assert_eq!(run.default_source_file_id.as_deref(), Some("RAW1"));
+        assert_eq!(
+            w.instrument_configurations().keys().copied().collect::<Vec<_>>(),
+            vec![0],
+            "an instrument-less run gets one empty configuration so the reference resolves"
+        );
+        assert!(w.instrument_configurations()[&0].components.is_empty() && w.instrument_configurations()[&0].params.is_empty());
 
         // With a list present, an inherited id that resolves is kept and one that does not is
         // clamped onto a real configuration.
