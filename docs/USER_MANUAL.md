@@ -305,8 +305,9 @@ Contents:
   `partial` (only when `MZPC_MAX_SPECTRA` truncated the run, §10), declared file entries.
   Since 0.9.13 `source_files[].location` never carries the converting machine's path (it is
   reduced to the bare `file://` authority; non-`file` URL schemes are kept), `run.id` is never a
-  path, and `default_instrument_id` is `null` rather than a dangling `0` for runs without an
-  instrument record (Waters, SCIEX, mzML without one).
+  path, and `default_instrument_id` always resolves: a run without an instrument record gets one
+  empty configuration `0` to point at (the spec requires the integer; 0.10.0 briefly wrote `null`,
+  which the validator's schema check refuses — fixed in 0.10.2).
 - `spectra_metadata.parquet` — per-spectrum descriptors (id, index, MS level,
   polarity, scan time, precursor info, …).
 - `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point): profile
