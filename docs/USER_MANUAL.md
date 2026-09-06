@@ -114,8 +114,8 @@ per option.
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
 | `--drop-aux <DROP_AUX>` | — | mzPeak input only: drop archive members matching this glob (repeatable) (§4.2) |
-| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. Native readers with the true grid (Bruker, Agilent) ignore it — they read the grid losslessly from the vendor calibration. **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
-| `--agilent-grid` | off | Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + a per-run `{c0,c1}` instead of f64 m/z. Far smaller than the msconvert lane (≈0.14×). Only applies when `MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path) |
+| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. Native readers with the true grid (Bruker, Agilent) ignore it — they read the grid losslessly from the vendor calibration. **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
+| `--agilent-grid` | off | Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id` columns (the MassHunter calibration drifts per scan) instead of f64 m/z — in `spectra_data`, since it is profile data (0.10.1; earlier releases filed it as centroid). Far smaller than the msconvert lane (≈0.14×). Only applies when `MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path) |
 | `--via-msconvert` | off | Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor path for formats without a native reader in this build (Agilent `.d`, SciEX `.wiff`, …) |
 | `--msconvert-path <MSCONVERT_PATH>` | `$MSCONVERT_PATH`, else `msconvert` on `PATH` | Path to the `msconvert` executable |
 | `-v, --verbose` | off | Verbose: print the inspection report and debug logs (repeat `-vv` for trace logs). An explicit `-v` / `-q` WINS over `RUST_LOG`; `RUST_LOG` is consulted only when neither flag is given (default level `info`) |
@@ -309,7 +309,9 @@ Contents:
   instrument record (Waters, SCIEX, mzML without one).
 - `spectra_metadata.parquet` — per-spectrum descriptors (id, index, MS level,
   polarity, scan time, precursor info, …).
-- `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point).
+- `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point): profile
+  spectra in `spectra_data`, centroid spectra in `spectra_peaks`, by the representation the source
+  declares — since 0.10.1 for grid-encoded TOF axes too (§9).
 - `chromatograms.parquet` — TIC/BPC/SRM and other chromatograms.
 - `vendor/…` — embedded original side-files (optional, see §8).
 
@@ -343,7 +345,8 @@ chord (−5…−11 ppm against the vendor SDK), so the archive also carries the
 **exact** calibration: the `vendor_mz_calibration` index block holds every
 `analysis.tdf` `MzCalibration` row verbatim plus `DigitizerNumSamples` /
 `MzAcqRangeLower` / `MzAcqRangeUpper`, and `spectra_metadata` gains per-frame
-`…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id` columns (`Frames.T1/T2/MzCalibration`).
+`…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id` columns (`Frames.T1/T2/MzCalibration`;
+`MZP:1000008`–`MZP:1000010` since 0.10.1, `MS:4000903`–`MS:4000905` before — match the suffix).
 The block spells out the ModelType-1 expression a reader evaluates —
 `t_ns = tof·DigitizerTimebase + DigitizerDelay`,
 `C1_eff = C1·(1 + dC1·(T1 − tdf_t1)/1e6)`, `t_ns = C0 + (1e6/√C1_eff)·√mz + C2·mz`
@@ -365,7 +368,11 @@ such a file), the vendor model is *exactly* a sqrt-linear law in `tof` per frame
 `tof_c0 = (DigitizerDelay − C0)·√C1_eff/1e6` and `C1_eff` temperature-corrected with the
 frame's `Frames.T1`. Both ims-compact lanes (native and `--bruker-sdk`) then write the pair as
 per-spectrum Float64 columns `…_tof_c0` / `…_tof_c1` in `spectra_metadata` (the same columns
-and accessions the SciEX/Agilent/Shimadzu sqrt grids use), stamp the `tof` column with
+and accessions the SciEX/Agilent/Shimadzu sqrt grids use: the converter-owned `MZP:1000003` /
+`MZP:1000004` terms of `cv/mzpeak.obo`, so the columns are `opt_MZP_1000003_tof_c0` /
+`opt_MZP_1000004_tof_c1`; archives written before 0.10.1 carry them as `opt_MS_4000900_tof_c0` /
+`opt_MS_4000901_tof_c1`, and every reader in the family binds by the `_tof_c0` / `_tof_c1` suffix
+or by name, so both generations reconstruct), stamp the `tof` column with
 `mzpeak:transform_params_per_spectrum = "tof_c0,tof_c1"`, and add
 `"per_spectrum": "tof_c0,tof_c1"`, `"exact_per_spectrum": true` and a note to
 `ims_calibration`; `a`/`b` and `"exact": false` stay for readers that only know the run-wide
@@ -411,7 +418,7 @@ vendor DLL opens the file because `Shimadzu.LabSolutions.IO` holds a byte-range 
 long as it does. **One library version to avoid:** `Shimadzu.LabSolutions.IO.IoModule.dll`
 **3.8.4.6016** returns, for a spectrum that carries no profile signal, a centroid list whose
 intensities are shifted against their m/z by 1–7 positions with the last peak missing.
-Version **5.0.0.0** — shipped by a current ProteoWizard (3.0.26151 verified) — reads the same
+Version **5.0.0.0** — shipped by a current ProteoWizard (3.0.26151 and 3.0.26175 verified) — reads the same
 files correctly, so **the remedy is to point `$MZPC_PWIZ_DIR` at a current ProteoWizard**
 (§11), not to fall back on a LabSolutions mzML export as this manual advised before v0.9.9.
 msconvert appeared to confirm the defect only because it was driving the same 3.8.4.6016 DLL
@@ -538,6 +545,18 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
   `--no-ims-compact` to write standard f64 m/z. m/z is reconstructed by readers as
   `m/z = (a + b·tof)²` — the chord, marked `"exact": false`; the vendor's exact model sits
   beside it in `vendor_mz_calibration` (§8).
+- **TOF-grid archives (`--tof-grid`, native SCIEX `.wiff`, `--agilent-grid`) — one axis, two
+  facets (since 0.10.1).** The Int32 `tof_index` column (`SqrtMzFromTof`, `mzpeak:transform_params`
+  or `…_per_spectrum` on the field) is declared on BOTH `spectra_data` (point layout) and
+  `spectra_peaks`, each beside an f64 `mz`. A spectrum goes to the facet its declared representation
+  selects and is gridded or not independently of that: on a gridded row `tof_index` is set and `mz`
+  NULL, on an off-lattice row `mz` holds the exact f64 and `tof_index` is NULL — never both. Readers
+  therefore decide per row, not per facet, and `spectrum_representation` / `number_of_data_points` /
+  `number_of_peaks` mean what the source said. Until 0.10.0 only the peaks facet knew the axis, so
+  every gridded spectrum was rewritten to centroid to reach it: the 13 published TOF-grid archives
+  labelled 1.6 M profile spectra as centroid spectra with `number_of_peaks` set (review item M6;
+  fixed together with the accession move above, one corpus rebuild). Under `--tof-grid off`
+  (SCIEX) nothing is gridded and `spectra_data` keeps the requested chunked layout.
 - **ims-compact TOF layout (two modes)** — the peak facet has two mutually-exclusive layouts,
   recorded in `ims_calibration.tof_encoding`:
   - **Archive** *(default)* — a flat table of **absolute integer TOF bins** (`absolute`). Maximum
@@ -630,7 +649,7 @@ the requested output missing. Run them without `-o`.
 
 | Variable | Effect |
 |---|---|
-| `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC/MIDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe`. **Use a current ProteoWizard** (3.0.26151 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
+| `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC/MIDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe`. **Use a current ProteoWizard** (3.0.26151 / 3.0.26175 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
 | `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` (+ `cdt.dll`) for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback. (`MZPC_WATERS_GLUE` is **not read by any code path** — the Waters lane has no .NET glue; the name survives only in a comment) |
 | `MZPC_AGILENT_GLUE` | Directory holding the built Agilent glue (`AgilentGlue.dll` + runtimeconfig is what `src/agilent.rs` hosts; the project builds a net48 `AgilentGlueHost.exe` — the lane is **not wired**, §6) |
 | `MZPC_AGILENT_MIDAC_GLUE` | Directory holding the built `AgilentMidacGlue.dll` + runtimeconfig (Agilent ion mobility) |
@@ -690,7 +709,7 @@ Both ProteoWizard layouts work: the MHDAC/Clearcore2 assemblies may sit under
 (the standalone installer); the Agilent lane probes both, subdirectory first. Shimadzu's
 `Shimadzu.LabSolutions.IO.IoModule.dll` is always flat.
 
-**Which ProteoWizard: use a current one.** 3.0.26151 is verified, and anything that ships
+**Which ProteoWizard: use a current one.** 3.0.26151 and 3.0.26175 are verified, and anything that ships
 `Shimadzu.LabSolutions.IO.IoModule.dll` **5.0.0.0** is fine. Older trees ship **3.8.4.6016**,
 which mispairs centroid intensities on profile-less Shimadzu `.lcd` files (§8). The known-stale
 source is the **FLASHApp / OpenMS third-party bundle, which carries ProteoWizard 3.0.22187

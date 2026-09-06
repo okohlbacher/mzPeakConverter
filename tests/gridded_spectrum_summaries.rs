@@ -58,7 +58,8 @@ fn run(args: &[&str]) {
 fn batches(archive: &Path, member: &str, dir: &Path) -> Vec<RecordBatch> {
     let f = std::fs::File::open(archive).unwrap();
     let mut z = zip::ZipArchive::new(f).unwrap();
-    let mut e = z.by_name(member).unwrap_or_else(|_| panic!("{member} missing"));
+    // A facet nothing was filed to may be absent (the peak writer is created lazily).
+    let Ok(mut e) = z.by_name(member) else { return Vec::new() };
     let out = dir.join(format!("{}-{member}", archive.file_name().unwrap().to_string_lossy()));
     let mut o = std::fs::File::create(&out).unwrap();
     std::io::copy(&mut e, &mut o).unwrap();
@@ -78,20 +79,24 @@ struct Summaries {
     bp_int: Vec<Option<f32>>,
     lo_mz: Vec<Option<f64>>,
     hi_mz: Vec<Option<f64>>,
-    /// Routed to the integer-axis peak facet (i.e. gridded): the spectrum's points live in
-    /// `spectra_peaks.parquet`, not `spectra_data.parquet`. Keyed on FACET MEMBERSHIP, not on
-    /// `number_of_peaks` being non-null — that column follows `spectrum_representation`, which the
-    /// grid route currently forces to centroid to steer the facet choice (review M6); once the
-    /// representation is carried through unchanged, the count column stops saying which facet the
-    /// points went to, and the file they are actually in is the only thing that does.
+    /// Gridded: the spectrum's rows carry a non-null `tof_index` — in `spectra_peaks.parquet` for a
+    /// centroid spectrum, in `spectra_data.parquet` for a profile one. Since 0.10.1 the facet follows
+    /// the source's representation and BOTH facets declare the axis (review M6), so neither facet
+    /// membership nor `number_of_peaks` says whether a spectrum was gridded; the axis column does.
     gridded: Vec<bool>,
 }
 
-/// The set of `spectrum_index` values whose points live in `member`. A facet's rows are one struct
-/// column — `point` on the grid lane, `chunk` on the f64 lane (the mzML→mzPeak default is m/z-chunked)
-/// — and either carries a `spectrum_index` child, so the struct is located by that child, not by name.
-fn spectrum_indices_in(archive: &Path, member: &str, dir: &Path) -> std::collections::HashSet<u64> {
-    let mut set = std::collections::HashSet::new();
+/// `(all, gridded)`: the set of `spectrum_index` values whose points live in `member`, and the subset
+/// whose rows carry a non-null `tof_index`. A facet's rows are one struct column — `point` on the
+/// grid lane, `chunk` on the f64 lane (the mzML→mzPeak default is m/z-chunked) — and either carries a
+/// `spectrum_index` child, so the struct is located by that child, not by name.
+fn spectrum_indices_in(
+    archive: &Path,
+    member: &str,
+    dir: &Path,
+) -> (std::collections::HashSet<u64>, std::collections::HashSet<u64>) {
+    let mut all = std::collections::HashSet::new();
+    let mut gridded = std::collections::HashSet::new();
     for b in batches(archive, member, dir) {
         let rows = b
             .columns()
@@ -100,17 +105,21 @@ fn spectrum_indices_in(archive: &Path, member: &str, dir: &Path) -> std::collect
             .find(|st| st.column_by_name("spectrum_index").is_some())
             .unwrap_or_else(|| panic!("{member}: no struct column with a spectrum_index child: {:?}", b.schema()));
         let idx = rows.column_by_name("spectrum_index").unwrap().as_primitive::<arrow::datatypes::UInt64Type>();
+        let tof = rows.column_by_name("tof_index");
         for i in 0..b.num_rows() {
-            set.insert(idx.value(i));
+            all.insert(idx.value(i));
+            if tof.is_some_and(|c| c.is_valid(i)) {
+                gridded.insert(idx.value(i));
+            }
         }
     }
-    set
+    (all, gridded)
 }
 
 fn summaries(archive: &Path, dir: &Path) -> Summaries {
     let mut s = Summaries::default();
-    let in_peaks = spectrum_indices_in(archive, "spectra_peaks.parquet", dir);
-    let in_data = spectrum_indices_in(archive, "spectra_data.parquet", dir);
+    let (in_peaks, grid_peaks) = spectrum_indices_in(archive, "spectra_peaks.parquet", dir);
+    let (in_data, grid_data) = spectrum_indices_in(archive, "spectra_data.parquet", dir);
     for b in batches(archive, "spectra_metadata.parquet", dir) {
         let index = b.column_by_name("index").unwrap().as_primitive::<arrow::datatypes::UInt64Type>();
         let tic = b.column_by_name("total_ion_current").unwrap().as_primitive::<Float32Type>();
@@ -129,7 +138,7 @@ fn summaries(archive: &Path, dir: &Path) -> Summaries {
             s.bp_int.push((!bpi.is_null(i)).then(|| bpi.value(i)));
             s.lo_mz.push((!lo.is_null(i)).then(|| lo.value(i)));
             s.hi_mz.push((!hi.is_null(i)).then(|| hi.value(i)));
-            s.gridded.push(in_peaks.contains(&ix));
+            s.gridded.push(grid_peaks.contains(&ix) || grid_data.contains(&ix));
         }
     }
     s

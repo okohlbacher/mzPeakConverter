@@ -145,16 +145,61 @@ fn ims_compact_per_spectrum_exact_pinned() {
     // pair off `ims_calibration.per_spectrum == "tof_c0,tof_c1"` (resolveImsCalibration) and reads
     // the cells by the `_tof_c0` / `_tof_c1` column-name SUFFIX — the accession prefix is allowed to
     // drift, the suffix is not. Both halves of that contract live in main.rs: the index-block keys and
-    // the spectra_metadata column specs (`from_spec(TOF_C0_CURIE, "tof_c0", …)` → `opt_MS_4000900_tof_c0`).
+    // the spectra_metadata column specs (`from_spec(TOF_C0_CURIE, "tof_c0", …)` → `opt_MZP_1000003_tof_c0`).
     pinned("cal[\"per_spectrum\"] = serde_json::json!(\"tof_c0,tof_c1\")");
     pinned("cal[\"exact_per_spectrum\"] = serde_json::json!(true)");
     pinned("cal[\"per_spectrum_chord_frames\"]");
     pinned("\"mzpeak:transform_params_per_spectrum\".to_string(), \"tof_c0,tof_c1\".to_string()");
     pinned("TOF_C0_CURIE,\n                \"tof_c0\",");
     pinned("TOF_C1_CURIE,\n                \"tof_c1\",");
-    // The accessions behind the `opt_MS_4000900_tof_c0` / `opt_MS_4000901_tof_c1` column names.
-    pinned("ControlledVocabulary::MS, 4_000_900)");
-    pinned("ControlledVocabulary::MS, 4_000_901)");
+    // The accessions behind the `opt_MZP_1000003_tof_c0` / `opt_MZP_1000004_tof_c1` column names:
+    // converter-owned MZP terms since 0.10.1 (`cv/mzpeak.obo`), rendered `MZP:` by the vendored
+    // writer. The viewer and the vendored reader bind by name/suffix, so the accession may move
+    // again without breaking them — but it must never move back into the PSI-owned `MS:` space.
+    pinned("ControlledVocabulary::Unknown, 1_000_003)");
+    pinned("ControlledVocabulary::Unknown, 1_000_004)");
+    pinned("ControlledVocabulary::Unknown, 1_000_005)");
+    assert!(
+        !src().contains("ControlledVocabulary::MS, 4_000_9"),
+        "the converter's own per-spectrum columns squatted MS:4000900–4000905 until 0.10.1; they are MZP terms now"
+    );
+}
+
+/// M6: the TOF-grid lanes file each spectrum by the representation its source stated, so BOTH facets
+/// must declare the integer axis — one field definition, declared on the data facet and inside the
+/// peaks schema — and the grid route must never rewrite `signal_continuity`. Pinned as strings because
+/// the only Windows-hosted lane (SCIEX) cannot be compiled here.
+#[test]
+fn tof_grid_files_by_representation_pinned() {
+    pinned("fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool)");
+    pinned("fn tof_index_peak_schema(tof_field: std::sync::Arc<arrow::datatypes::Field>)");
+    // the peaks schema carries the f64 fallback beside the axis, like the mz-grid lattice facet
+    pinned(".add_field(tof_field)\n        .add_field(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field())");
+    // every lane that declares the peaks schema also declares the axis on the data facet
+    assert_eq!(
+        src().matches("tof_index_peak_schema(tof_field.clone())").count(),
+        2,
+        "the mzML --tof-grid lane and the native SCIEX lane share one peaks schema"
+    );
+    assert!(
+        src().matches(".add_spectrum_field(tof_field)").count() >= 3,
+        "mzML tof-grid, Agilent and SCIEX must declare the axis on spectra_data"
+    );
+    // The four forcing assignments the review found (mzML gridded → Centroid, mzML f64 fallback →
+    // Profile, SCIEX gridded → Centroid, SCIEX f64 fallback → Profile) are gone: outside the unit
+    // tests no lane assigns Centroid at all, and the one Profile assignment left is the Agilent
+    // profile reader stating what MSProfile.bin is.
+    let lanes = src().split("#[cfg(test)]").next().unwrap();
+    assert_eq!(
+        lanes.matches("signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;").count(),
+        0,
+        "a lane rewrote signal_continuity to Centroid — the representation is not a routing knob (M6)"
+    );
+    assert_eq!(
+        lanes.matches("signal_continuity = mzdata::spectrum::SignalContinuity::Profile;").count(),
+        1,
+        "only the Agilent MSProfile.bin reader may state Profile; a tof-grid route must carry the source's"
+    );
 }
 
 /// The `transformations` index block — the invariant's second half, "every transformation declared
