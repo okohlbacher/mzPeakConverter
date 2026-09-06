@@ -249,6 +249,8 @@ EOF
   case "$R_NOTE" in
     *native-fail-\>msconvert*)
       echo "[$tag] WARNING: native reader FAILED, output came from the msconvert fallback (larger/slower archive). If this unit converted natively on a serial run, suspect vendor-SDK contention: re-run it with --jobs 1 before trusting the archive." >&2 ;;
+    *refused-\>msconvert*)
+      echo "[$tag] native lane refused this unit by design (MRM/SIM dwell data or an IM-QTOF run); the msconvert archive is the intended output" >&2 ;;
   esac
   if [ "$R_UP" = "1" ] && [ "$R_EXIT" = "0" ]; then
     # S3-FIRST: a durable s3:// target is ALREADY the deliverable -- the box PUT it to its final

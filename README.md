@@ -56,7 +56,7 @@ zero-intensity pad at the scan-window bounds outside the signal span is not stor
 | Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; `libbaf2sql_c` at runtime |
-| Agilent `.d` (native) | ❌ | ❌ | ⛔ | **not wired, decision pending** ([BACKLOG #23](BACKLOG.md)): the net48 host and `src/agilent.rs` speak different protocols since merge 5a62b90, so this lane opens nothing — use `--via-msconvert` ([details](docs/PLATFORM_SUPPORT.md)) |
+| Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | out-of-process **net48** host (`glue/agilent`) → MHDAC; since 0.11.0. MRM/SIM-only runs are refused (they are chromatograms) — use `--via-msconvert` for those ([details](docs/PLATFORM_SUPPORT.md)) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/shimadzu`); LabSolutions.IO at runtime — **needs a current ProteoWizard**, see [`glue/shimadzu/README.md`](glue/shimadzu/README.md) |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
@@ -68,9 +68,9 @@ install for the vendor DLLs — see each `glue/*/README.md`). Point `MZPC_PWIZ_D
 **current** ProteoWizard (3.0.26151 verified): an old one ships a Shimadzu library that
 mispairs centroid intensities on profile-less `.lcd` files. Waters needs no glue —
 `src/waters.rs` calls `MassLynxRaw.dll`'s C ABI directly. MHDAC needs .NET Framework, so the
-Agilent C# side is a separate net48 EXE; the Rust side that launched it (cc8245e) was dropped by
-merge 5a62b90, so that lane is currently **not wired** — restore or delete is an open decision
-(BACKLOG #23). Everywhere else, the cross-vendor `--via-msconvert` path covers them.
+Agilent C# side is a separate **net48 EXE** (`AgilentGlueHost.exe`) that the converter spawns
+once per `.d` (restored in 0.11.0; it reads scan spectra — MRM/SIM runs stay on
+`--via-msconvert`). Everywhere else, the cross-vendor `--via-msconvert` path covers them.
 
 **Full matrix** — every format × OS, the runtime requirements (.NET 8 for Thermo,
 .NET Framework 4.8 for Agilent, the vendor DLLs), and how to build/point at each glue

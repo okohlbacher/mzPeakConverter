@@ -114,7 +114,7 @@ per option.
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
 | `--drop-aux <DROP_AUX>` | — | mzPeak input only: drop archive members matching this glob (repeatable) (§4.2) |
-| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. Native readers with the true grid (Bruker, Agilent) ignore it — they read the grid losslessly from the vendor calibration. **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
+| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. Native readers ignore it: Bruker reads the integer grid from the vendor calibration, and the native Agilent (MHDAC) lane stores the f64 m/z the vendor library returns (a warning names the alternatives: `--via-msconvert --tof-grid`, or `--agilent-grid` for the flight-time grid of a profile `.d`). **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
 | `--agilent-grid` | off | Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id` columns (the MassHunter calibration drifts per scan) instead of f64 m/z — in `spectra_data`, since it is profile data (0.10.1; earlier releases filed it as centroid). Far smaller than the msconvert lane (≈0.14×). Only applies when `MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path) |
 | `--via-msconvert` | off | Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor path for formats without a native reader in this build (Agilent `.d`, SciEX `.wiff`, …) |
 | `--msconvert-path <MSCONVERT_PATH>` | `$MSCONVERT_PATH`, else `msconvert` on `PATH` | Path to the `msconvert` executable |
@@ -283,7 +283,7 @@ take effect because settings are resolved before logging is initialised.
 | Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; otofControl m/z correction |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; needs `libbaf2sql_c` at runtime |
-| Agilent `.d` (native) | ❌ | ❌ | ⛔ | **not wired** since merge 5a62b90 — the Rust side and the net48 host speak different protocols, so it opens nothing; use `--via-msconvert`. Restore-or-delete is pending (`BACKLOG.md` #23, `docs/PLATFORM_SUPPORT.md`) |
+| Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | net48 `AgilentGlueHost.exe` (§11) → MHDAC, since 0.11.0; **MRM/SIM-only runs are refused** — they are transition chromatograms, use `--via-msconvert` for them |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | auto-built; Clearcore2 DLLs at runtime |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | LabSolutions.IO DLLs at runtime (§11); profile as a sqrt grid, centroids as an exact lattice (§8, §9) |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Windows, or Wine elsewhere) |
@@ -653,10 +653,11 @@ the requested output missing. Run them without `-o`.
 
 | Variable | Effect |
 |---|---|
-| `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC/MIDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe`. **Use a current ProteoWizard** (3.0.26151 / 3.0.26175 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
+| `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC/MIDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe` (the 3.0.26175 installer is flat; the Agilent host is handed whichever directory holds `MassSpecDataReader.dll`). **Use a current ProteoWizard** (3.0.26151 / 3.0.26175 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
 | `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` (+ `cdt.dll`) for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback. (`MZPC_WATERS_GLUE` is **not read by any code path** — the Waters lane has no .NET glue; the name survives only in a comment) |
-| `MZPC_AGILENT_GLUE` | Directory holding the built Agilent glue (`AgilentGlue.dll` + runtimeconfig is what `src/agilent.rs` hosts; the project builds a net48 `AgilentGlueHost.exe` — the lane is **not wired**, §6) |
-| `MZPC_AGILENT_MIDAC_GLUE` | Directory holding the built `AgilentMidacGlue.dll` + runtimeconfig (Agilent ion mobility) |
+| `MZPC_AGILENT_GLUE` | Directory holding the built net48 `AgilentGlueHost.exe` (`glue/agilent/bin/Release/net48`); the converter spawns it once per `.d` and reads its `AGL2` output back (§11) |
+| `MZPC_AGILENT_TMPDIR` | Where the Agilent host materialises a run before it is read (16 B/point — about 3 GB for a 240 MB Q-TOF `.d`; removed when the reader closes). Default `%TEMP%`; set it to a disk directory when `TEMP` points at a RAM disk (the box scripts do) |
+| `MZPC_AGILENT_MIDAC_GLUE` | Directory holding the built `AgilentMidacGlue.dll` + runtimeconfig (Agilent ion mobility; the MIDAC lane is a scaffold — an IM-QTOF `.d` is refused by the native lane and goes through `--via-msconvert`) |
 | `MZPC_SCIEX_GLUE` | Directory holding the built `SciexGlue.dll` + runtimeconfig |
 | `MZPC_SHIMADZU_GLUE` | Directory holding the built `ShimadzuGlue.dll` + runtimeconfig |
 
@@ -700,8 +701,13 @@ the converter binary and are documented in the scripts themselves.
 The Agilent (MHDAC), SciEX (Clearcore2), Shimadzu (LabSolutions.IO) and Bruker BAF
 (libbaf2sql_c) readers are **compiled in automatically** on the platforms where those
 vendor libraries exist — Windows for all four, Linux also for Bruker BAF. There is **no build flag** and no
-opt-in; macOS gets none (no vendor SDKs exist there). The Agilent (MHDAC) one compiles but is
-**not wired** (§6, `BACKLOG.md` #23): it hosts a `.dll` the net48 glue project does not build.
+opt-in; macOS gets none (no vendor SDKs exist there). The Agilent (MHDAC) one is the odd one
+out: MHDAC needs the .NET **Framework**, so it runs in a separate net48 process
+(`AgilentGlueHost.exe`, spawned once per `.d`; the whole run is materialised into a temp file at
+16 B/point first — about 3 GB for a 240 MB Q-TOF run — and removed when the reader closes).
+It reads scan spectra; an MRM/SIM-only `.d` is refused with a pointer to `--via-msconvert`,
+because MHDAC presents each dwell as a one-point "MS2 spectrum" while the data are the
+transition chromatograms the msconvert lane writes.
 
 They load the proprietary vendor DLLs at **runtime**, sourced from a ProteoWizard
 install: point `$MZPC_PWIZ_DIR` at it, and for the .NET glues set `$MZPC_AGILENT_GLUE` /
@@ -742,7 +748,10 @@ inventory of all transitive dependencies (with licenses) is in
 |---|---|
 | Thermo `.raw` fails to open | install a .NET 8+ runtime |
 | `--via-msconvert` not found | install ProteoWizard or set `--msconvert-path`/`$MSCONVERT_PATH` |
-| Agilent/SciEX exits with code 3 | no native reader for that format on this platform (macOS/Linux; the Windows Agilent MHDAC lane is not wired either, §6); use `--via-msconvert` |
+| Agilent/SciEX exits with code 3 | no native reader for that format on this platform (macOS/Linux); use `--via-msconvert` |
+| Agilent `.d`: `holds MRM/SIM dwell data only` | the native lane stores scan spectra; MRM/SIM dwells are transition chromatograms — use `--via-msconvert` (the box harness does this on its own) |
+| Agilent `.d`: `is an Agilent IM-QTOF run` | the drift dimension needs the MIDAC lane, which is not available — use `--via-msconvert` |
+| Agilent `.d`: `output is the AGL1 format of an older AgilentGlueHost.exe` | rebuild `glue/agilent` (`dotnet build -c Release`) so the host and the converter agree |
 | Nothing was written | give `-o/--output`; without it the run only inspects |
 | Output exists error | pass `--force` to overwrite |
 | UV/PDA spectra missing | non-MS spectra are not yet carried (known limitation) |

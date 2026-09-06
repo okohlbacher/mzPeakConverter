@@ -7,13 +7,23 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Current issues, ranked, with evidence and status:** the *mzPeakConverter Review Ledger*
   (claude.ai artifact, §8 "Measures" carries a Status column: *done* / *open*). Its source is kept
   at `scratchpad/review2/review-ledger.html` in the maintainer's session; ask for the link.
-- **What the ledger says is open** (2026-09-06, after 0.10.1 closed M6 and F5): Agilent native lane —
-  restore the subprocess reader from `cc8245e`, time-boxed, delete as fallback, with the Windows
-  dead-code sweep in the same box session; precursors on the seven lanes that write orphan MS2
+- **What the ledger says is open** (2026-09-06, after 0.11.0 restored the Agilent lane and swept the
+  Windows dead code): precursors on the seven lanes that write orphan MS2
   (SCIEX native, Waters, BAF, TSF, Agilent ×3) — first among vendor-API work; then Waters
   RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
   prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).
+- **Not in the ledger — Agilent native lane follow-ups (0.11.0, 2026-09-06):** `--tof-grid` on the
+  MHDAC lane (the Q-TOF profile points sit on the flight-time lattice — the msconvert+`--tof-grid`
+  build of the same run is 200 MB against 245 MB numpress-chunked f64; a SciEX-style per-run fit
+  would close that); MRM/SIM transition chromatograms through MHDAC (today refused → msconvert);
+  `agilent_midac` is still the in-process net8 design MHDAC cannot run under and has never opened
+  a file — port to the net48 host or delete; the temp-file materialisation (16 B/point, whole run)
+  could stream, and the inspect path (no `-o`) pays it in full just to print a scan count (a host
+  `--count` mode would fix both); the instrument serial number (msconvert records it; the MHDAC member
+  the host tries is not it); no timeout or kill-on-parent-death for the host process (a killed converter
+  orphans it); per-record scan types in the protocol so a mixed Scan+MRM method can drop the dwell rows
+  instead of storing them as one-point spectra (today: a warning).
 - **Not in the ledger — surfaced by the 0.10.2 corpus rebuild (2026-09-06):** a chunk-capable
   integer axis. M6 put gridded profile spectra into `spectra_data`, which therefore has to be point
   layout, so a native SCIEX run's off-lattice profile minority is now stored as exact f64 points
@@ -42,5 +52,5 @@ Everything this file used to contain — 23 numbered items with their analyses, 
 resolutions (grid CV terms, the generic grid facet, timsTOF mobility grids, the `tof` column
 encoding, timsrust 5.1.x decompression, the performance section, the Agilent hosting mismatch) —
 is preserved in git: `git show v0.9.12:BACKLOG.md`. Of those, #1–#3, #5–#7, #13–#14, #16–#21 were
-done; #9 was regressed by merge `5a62b90` and is the Agilent item above; #4, #8, #10–#12, #15, #22
+done; #9 was regressed by merge `5a62b90` and restored in 0.11.0; #4, #8, #10–#12, #15, #22
 are the deferred spec/research items listed here or superseded by the ledger.
