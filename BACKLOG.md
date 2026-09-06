@@ -7,11 +7,10 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Current issues, ranked, with evidence and status:** the *mzPeakConverter Review Ledger*
   (claude.ai artifact, §8 "Measures" carries a Status column: *done* / *open*). Its source is kept
   at `scratchpad/review2/review-ledger.html` in the maintainer's session; ask for the link.
-- **What the ledger says is open** (2026-09-04 evening): Agilent native lane — restore the subprocess
-  reader from `cc8245e`, time-boxed, delete as fallback; M6 grid-facet routing (gridded profile rows
-  mislabelled centroid) — fix before the next corpus rerun; F5 — move `tof_c0`/`tof_c1` accessions
-  from `MS:4000900/1` to `MZP:100000x` (same rebuild); precursors on the seven lanes that write
-  orphan MS2 (SCIEX native, Waters, BAF, TSF, Agilent ×3) — first among vendor-API work; then Waters
+- **What the ledger says is open** (2026-09-06, after 0.10.1 closed M6 and F5): Agilent native lane —
+  restore the subprocess reader from `cc8245e`, time-boxed, delete as fallback, with the Windows
+  dead-code sweep in the same box session; precursors on the seven lanes that write orphan MS2
+  (SCIEX native, Waters, BAF, TSF, Agilent ×3) — first among vendor-API work; then Waters
   RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
   prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).

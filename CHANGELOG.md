@@ -4,6 +4,78 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.10.1] — 2026-09-06
+
+The two archive-content items the owner sequenced first after 0.10.0 (review ledger M6 and the
+speXtract handoff's F5), sharing one corpus rebuild. ⚠️ marks an entry that changes what an archive
+contains; the fix is verified on macOS (host suite green) and on the Windows box.
+
+### Changed
+
+- ⚠️ **TOF-grid lanes file each spectrum by the representation its source declares (M6).** The
+  integer `tof_index` axis is now declared on BOTH facets — `spectra_data` (point layout) for
+  profile spectra and `spectra_peaks` for centroid ones, each beside an f64 `mz` that is NULL on
+  gridded rows — through one shared field definition (`tof_index_field`) and one peaks schema
+  (`tof_index_peak_schema`, now carrying the f64 fallback like the `mz-grid` lattice facet). No
+  route rewrites `signal_continuity` any more: the four forcing assignments (mzML `--tof-grid`
+  gridded → centroid and off-grid → profile, native SCIEX gridded → centroid and off-grid →
+  profile) and the Agilent `--agilent-grid` lane's blanket centroid are gone; the Agilent lane
+  states Profile, which is what `MSProfile.bin` holds, and writes to `spectra_data`. Consequences
+  in the archive: `spectrum_representation`, `number_of_data_points` and `number_of_peaks` mean
+  what the source said (a gridded profile row now carries `MS:1000128` and `number_of_data_points`
+  where it carried `MS:1000127` and `number_of_peaks`), and a reader tells a gridded row from an
+  f64 one by which column is non-null, never by facet. Verified: the pwiz ABI 7600 ZenoTOF profile
+  example (21 spectra, all gridded at 3.9 ppm) round-trips through `-o x.mzML` with every intensity
+  identical and every m/z within the declared 5 ppm, its 118,835 points all in `spectra_data`; the
+  ABI SWATH centroid example (201 spectra) stays in `spectra_peaks` with `number_of_peaks`; the
+  validator passes both; the viewer reads both facets (new golden fixtures + test in mzPeakViewer,
+  the first to exercise the run-wide `sciex_sqrt` grid on the profile facet). The 13 published
+  TOF-grid archives (1.6 M spectra, 50 % of the corpus) carried the wrong label and are rebuilt.
+- ⚠️ **Native SCIEX `spectra_data` is point layout under `--tof-grid auto|on`.** The axis has no
+  chunk encoder, so the facet that now holds gridded profile spectra cannot be chunked; the
+  off-lattice minority (measured at well under 1 % of the points on every published SCIEX archive
+  since the run-wide clock fit) is stored flat and exact instead of numpress-chunked, and
+  `transformations` no longer lists `numpress-linear` for that lane. `--tof-grid off` keeps the
+  requested chunking (nothing is gridded).
+- ⚠️ **Converter-owned per-spectrum columns are MZP terms (F5).** `tof_c0` / `tof_c1` /
+  `tof_calibration_id` moved from `MS:4000900`–`MS:4000902` to `MZP:1000003`–`MZP:1000005`, and
+  the timsTOF frame inputs `tdf_t1` / `tdf_t2` / `tdf_mz_calibration_id` from `MS:4000903`–
+  `MS:4000905` to new `MZP:1000008`–`MZP:1000010` (`cv/mzpeak.obo`), so the `spectra_metadata`
+  columns are `opt_MZP_1000003_tof_c0` … instead of squatting the PSI-owned `MS:` namespace — what
+  the specification calls a column-naming artifact and asks to be converter-owned. The SCIEX,
+  Agilent and Shimadzu lanes now add the `MZP` `cv_list` entry the timsTOF lanes already wrote.
+  Readers were built for the move: the vendored reader binds the coefficients by name and the
+  viewer by the `_tof_c0` / `_tof_c1` / `_tdf_t1` … column-name suffix, so archives of either
+  generation reconstruct; `tests/contract_strings.rs` now refuses any `MS:40009xx` accession.
+
+### Fixed
+
+- **mzML export of a profile-facet grid archive carried a third binary array per spectrum.** The
+  vendored reader rebuilds `m/z array` from the integer axis but leaves the axis in a Profile
+  spectrum's raw arrays, so `mzpeak-convert ARCHIVE -o x.mzML` wrote the raw `tof_index` as a
+  nameless `MS:1000786 non-standard data array` (32-bit integers) beside m/z and intensity — on
+  every native Shimadzu `.lcd` archive since 0.9.3 (13,200 of 13,200 spectra of the published
+  Blind run), and, after M6 moved profile grids into `spectra_data`, on every TOF-grid archive.
+  A re-import then stored it as a nameless column. The export now drops the axis once m/z has
+  been reconstructed (`strip_grid_axis`); it is kept only when no m/z array exists, so a failed
+  reconstruction stays visible. Verified: the ZenoTOF grid archive and the Blind native archive
+  export with exactly two arrays per spectrum and no `MS:1000786`.
+- `docs/USER_MANUAL.md`: `--agilent-grid` said "a per-run `{c0,c1}`" (it has always written
+  per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id`); §7, §8 and §9 state the facet rule, the
+  accession move and the legacy column names; the verified ProteoWizard list includes 3.0.26175.
+
+### Tests
+
+- `tests::tof_grid_keeps_the_source_representation` (unit, both routes, centroid source);
+  `contract_strings::tof_grid_files_by_representation_pinned` (the shared field + schema, the
+  axis declared on the data facet of all three lanes, no lane assigns Centroid, only the Agilent
+  reader states Profile); `tests/gridded_spectrum_summaries.rs` decides "gridded" by a non-null
+  `tof_index` in either facet and tolerates an absent facet; `tests/tof_grid_facets.rs` synthesizes
+  a profile + centroid mzML with mzdata, converts it with `--tof-grid on`, and asserts the facet of
+  every spectrum, the representation and count columns, the two-array export and the round-trip
+  values (self-contained, no corpus); mzPeakViewer `tof-grid.golden.test.ts` with
+  `tof-grid-profile.mzpeak` / `tof-grid-centroid.mzpeak`.
+
 ## [0.10.0] — 2026-09-04
 
 This cycle implements the verified findings of the 2026-09-04/05 two-model adversarial review

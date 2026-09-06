@@ -261,13 +261,15 @@ struct FrameTable {
     mz_cal_id: Vec<Option<i64>>,
 }
 
-/// Local CURIEs for the per-frame calibration inputs (`Frames.T1`, `Frames.T2`,
+/// Converter-owned CURIEs for the per-frame calibration inputs (`Frames.T1`, `Frames.T2`,
 /// `Frames.MzCalibration`), which the ims-compact writer promotes to `spectra_metadata` columns
-/// (`…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id`). MS:4000903–4000905 are unused local
-/// accessions, following the `tof_c0`/`tof_c1` precedent in `main.rs`.
-pub(crate) const TDF_T1_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_903);
-pub(crate) const TDF_T2_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_904);
-pub(crate) const TDF_MZ_CAL_ID_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_905);
+/// (`opt_MZP_1000008_tdf_t1`, `opt_MZP_1000009_tdf_t2`, `opt_MZP_1000010_tdf_mz_calibration_id`).
+/// `cv/mzpeak.obo` MZP:1000008–1000010, following the `tof_c0`/`tof_c1` terms in `main.rs`; until
+/// 0.10.1 they squatted `MS:4000903`–`MS:4000905` (columns `opt_MS_4000903_tdf_t1` …). Readers bind
+/// these by the `_tdf_t1` … column-name suffix, so both generations read.
+pub(crate) const TDF_T1_CURIE: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_008);
+pub(crate) const TDF_T2_CURIE: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_009);
+pub(crate) const TDF_MZ_CAL_ID_CURIE: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_010);
 
 /// Converter-owned accessions for an isolation window's 1/K0 band (`cv/mzpeak.obo` MZP:1000006 /
 /// MZP:1000007). PSI-MS has no term for the mobility bounds of an isolation window (children of
