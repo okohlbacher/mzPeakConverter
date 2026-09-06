@@ -101,7 +101,7 @@ $cvtRoot = 'C:\Users\User\src\mzPeakConverter'
 # NOTE the two builds lay Agilent out differently (bundle: vendor_api\Agilent; installer: flattened)
 # — the converter probes both since `agilent_dll_dir` (src/agilent.rs).
 # 3.0.26175 is installed beside this one (same Shimadzu.LabSolutions.IO 5.0.0.0); the pin stays on 26151 until its owner moves it.
-$pwiz = 'C:/Users/User/AppData/Local/Apps/ProteoWizard 3.0.26151.e7e989c 64-bit'
+$pwiz = 'C:/Users/User/AppData/Local/Apps/ProteoWizard 3.0.26175.31fd1ca 64-bit'
 if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE  = (Resolve-Path "$cvtRoot\glue\sciex\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
