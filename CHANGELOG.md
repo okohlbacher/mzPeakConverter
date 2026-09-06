@@ -48,10 +48,16 @@ contains; the fix is verified on macOS (host suite green) and on the Windows box
   TOF-grid archives (1.6 M spectra, 50 % of the corpus) carried the wrong label and are rebuilt.
 - ⚠️ **Native SCIEX `spectra_data` is point layout under `--tof-grid auto|on`.** The axis has no
   chunk encoder, so the facet that now holds gridded profile spectra cannot be chunked; the
-  off-lattice minority (measured at well under 1 % of the points on every published SCIEX archive
-  since the run-wide clock fit) is stored flat and exact instead of numpress-chunked, and
-  `transformations` no longer lists `numpress-linear` for that lane. `--tof-grid off` keeps the
-  requested chunking (nothing is gridded).
+  off-lattice minority is stored flat and exact instead of numpress-chunked, and `transformations`
+  no longer lists `numpress-linear` for that lane. `--tof-grid off` keeps the requested chunking
+  (nothing is gridded). **Size effect, measured on the 0.10.2 corpus rebuild** (this entry first
+  claimed "well under 1 % of the points" — that counted chunk rows of the old facet, not points):
+  the off-lattice share is 9.2 % of the points on MSV000093587 Sample002 (758 → 966 MB, +27 %),
+  3.2 % on PXD011326 (1,090 → 1,218 MB, +12 %), 2.7 % on PXD053710 (+7 %), 1.6 % on MSV000090684
+  (+3.5 %), 1.1 % on PXD065872 (+2.3 %) and 0.07 % on PXD071869 (+0.2 %); the f64 `mz` column
+  costs 6–9.5 B per point where numpress cost ~2–3. The other seven TOF-grid archives are within
+  0.3 % of their previous size. Fidelity up, size up; a chunk-capable integer axis would recover
+  it and is a backlog item, owner's call.
 - ⚠️ **Converter-owned per-spectrum columns are MZP terms (F5).** `tof_c0` / `tof_c1` /
   `tof_calibration_id` moved from `MS:4000900`–`MS:4000902` to `MZP:1000003`–`MZP:1000005`, and
   the timsTOF frame inputs `tdf_t1` / `tdf_t2` / `tdf_mz_calibration_id` from `MS:4000903`–

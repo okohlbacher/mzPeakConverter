@@ -14,6 +14,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
   prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).
+- **Not in the ledger — surfaced by the 0.10.2 corpus rebuild (2026-09-06):** a chunk-capable
+  integer axis. M6 put gridded profile spectra into `spectra_data`, which therefore has to be point
+  layout, so a native SCIEX run's off-lattice profile minority is now stored as exact f64 points
+  instead of numpress chunks: 9.2 % of the points on MSV000093587 Sample002 (+27 % archive), 3.2 %
+  on PXD011326 (+12 %), 1–3 % on three more SWATH runs. A `tof_index` list column beside the chunk
+  encoding (or a per-facet mixed layout) would recover it. Owner's call: fidelity vs size.
 - **Not in the ledger — spec and CV items, all deferred by decision:**
   - PSI-MS term request for the per-window ion-mobility band (currently `MZP:1000006/1000007`).
     *Decision: keep MZP, do not file for now.*

@@ -5358,9 +5358,15 @@ fn convert_sciex_grid(
 
     // The data facet holds the integer axis, which has no chunk encoder: point layout whenever the
     // grid is in play (`convert_vendor_reader` makes the same call for the Shimadzu profile grid).
-    // The off-lattice f64 minority — measured at well under 1 % of the points on every published
-    // SCIEX archive once the run-wide clock fit landed — is stored flat and exact in the same
-    // facet. Under `--tof-grid off` nothing is gridded, so the facet keeps the requested chunking.
+    // The off-lattice f64 minority is stored flat and EXACT in the same facet instead of
+    // numpress-chunked. Measured on the 0.10.2 corpus rebuild (rows of `spectra_data` with a
+    // non-null `mz`): 9.2 % of the points on MSV000093587 Sample002, 3.2 % on PXD011326, 2.7 % on
+    // PXD053710, 1.6 % on MSV000090684, 1.1 % on PXD065872, 0.07 % on PXD071869 — at 6–9.5 B per f64
+    // point, which is +27 %, +12 %, +7 %, +3.5 %, +2.3 % and +0.2 % on the archive. (An earlier
+    // version of this comment said "well under 1 %"; it counted chunk ROWS of the old facet, not
+    // points.) A chunk-capable integer axis would recover that; until then the trade is fidelity
+    // for size, declared by `transformations` no longer listing `numpress-linear` here. Under
+    // `--tof-grid off` nothing is gridded, so the facet keeps the requested chunking.
     let data_chunk = if mode == TofGridMode::Off { chunk } else { None };
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
