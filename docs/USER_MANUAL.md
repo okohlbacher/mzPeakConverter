@@ -316,6 +316,21 @@ Contents:
 - `chromatograms.parquet` — TIC/BPC/SRM and other chromatograms.
 - `vendor/…` — embedded original side-files (optional, see §8).
 
+**Footer count keys.** Every Parquet facet carries `<entity>_count` (and the data facets
+`<entity>_data_point_count`) in its key–value footer. The specification does not define these
+keys; this converter writes them with one definition (since the release after 0.11.1, issue #1):
+on a **data facet** (`spectra_data`, `spectra_peaks`, `chromatograms_data`) the count is the number
+of entities with at least one row *in that file* and the point count is the points *in that
+file* — so a centroid-only run's empty `spectra_data` says `0 / 0`, and a mixed run's
+`spectra_data` counts only its profile spectra. It is a cardinality, **not an index bound**:
+`spectrum_index` values in a data facet are sparse, so never iterate `0..spectrum_count`. The
+**run total** lives on the primary metadata facets (`spectra_metadata`, `chromatograms_metadata`)
+and is also what the secondaries (`_scans`, `_precursors`, `_selected_ions`) carry. To plan reads,
+use the per-spectrum `number_of_data_points` / `number_of_peaks` columns of `spectra_metadata`
+(the spec's mechanism) or the actual indices in the facet; a facet with `num_rows == 0` has
+nothing to read whatever its footer says (archives from 0.11.1 and earlier declare the run total
+there).
+
 **The format itself** — rationale, the draft specification, and the controlled
 vocabulary — is documented at:
 
