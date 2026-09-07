@@ -1145,16 +1145,19 @@ impl<
     ) -> Result<ZipArchiveWriter<W>, parquet::errors::ParquetError> {
         if self.archive_writer.is_some() {
             self.flush_data_arrays()?;
+            // Per-facet counts (mzPeakConverter issue #1): `spectrum_count` on a DATA facet is the
+            // number of spectra with at least one row in THIS file, and `spectrum_data_point_count`
+            // the points in THIS file — never the run total (which stays on `spectra_metadata`) and
+            // never the sum of both data facets. A centroid-only run therefore declares 0 / 0 on its
+            // empty `spectra_data`, instead of every spectrum and every peak of `spectra_peaks`.
             self.append_key_value_metadata(
                 SPECTRUM_COUNT.into(),
-                Some(self.spectrum_counter().to_string()),
+                Some(self.spectrum_data_buffers.entry_count().to_string()),
             );
-            let n_p = self
-                .spectrum_peak_writer()
-                .map(|v| v.point_count())
-                .unwrap_or_default()
-                + self.spectrum_data_buffers.point_count();
-            self.append_key_value_metadata(SPECTRUM_DATA_POINT_COUNT.into(), Some(n_p.to_string()));
+            self.append_key_value_metadata(
+                SPECTRUM_DATA_POINT_COUNT.into(),
+                Some(self.spectrum_data_buffers.point_count().to_string()),
+            );
 
             let mut writer = self.archive_writer.take().unwrap().into_inner()?;
 
@@ -1298,6 +1301,9 @@ impl<
                     ),
                 )?);
 
+                // Captured BEFORE `finish_spectrum()` drains the builder: the scans facet below
+                // used to read `len()` after the drain and declared 0 on a populated table.
+                let n_wavelength_spectra = self.wavelength_spectrum_metadata_buffer.index_counter();
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_DATA_POINT_COUNT.into(),
                     Some(
@@ -1311,7 +1317,7 @@ impl<
 
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_COUNT.into(),
-                    Some(self.wavelength_spectrum_metadata_buffer.len().to_string()),
+                    Some(n_wavelength_spectra.to_string()),
                 );
 
                 self.append_metadata();
@@ -1344,7 +1350,7 @@ impl<
 
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_COUNT.into(),
-                    Some(self.wavelength_spectrum_metadata_buffer.len().to_string()),
+                    Some(n_wavelength_spectra.to_string()),
                 );
 
                 self.append_metadata();
@@ -1509,6 +1515,11 @@ impl<
                 )?);
                 self.flush_chromatogram_data_records()?;
                 self.add_chromatogram_array_metadata();
+                // Per-facet, like `spectra_data`: chromatograms with rows in this file.
+                self.append_key_value_metadata(
+                    CHROMATOGRAM_COUNT.into(),
+                    Some(self.chromatogram_data_buffers.entry_count().to_string()),
+                );
                 self.append_key_value_metadata(
                     CHROMATOGRAM_DATA_POINT_COUNT.into(),
                     Some(self.chromatogram_data_buffers.point_count().to_string()),
