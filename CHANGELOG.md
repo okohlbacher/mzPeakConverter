@@ -4,12 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.11.2] — 2026-09-07
 
 **Output change.** The footer count keys of the data facets change meaning (below) — every
 `spectra_data`, every `spectra_peaks` with zero-peak spectra, and every `chromatograms_data` and
-`wavelength_spectra_data` (new keys) — so archives written by 0.11.1 are not current once this
-ships: the corpus is rebuilt once with the release, as usual. Parquet data bytes do not change.
+`wavelength_spectra_data` (new keys) — so archives written by 0.11.1 are not current: the corpus
+is rebuilt once with this release, as usual. Parquet data bytes do not change.
 
 ### Fixed
 
