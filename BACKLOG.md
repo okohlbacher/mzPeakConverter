@@ -13,6 +13,25 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
   prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).
+- **Not in the ledger — the native lanes lose vendor metadata the mzML lane carries (measured
+  2026-09-07 by `tests/lane_metadata_parity.rs`).** The two lanes take metadata from different
+  places: the mzML lane inherits ProteoWizard's finished model via `copy_metadata_from`, the native
+  lanes build an archive from the per-spectrum descriptions plus `VendorHints`, so every field must
+  be plumbed by hand. Measured on four pairs (Shimadzu `.lcd`, Agilent GC-MS `.d`, 2× SciEX `.wiff`),
+  the native side does not carry: the **sample list and the sample name in `run.id`**; the
+  **acquisition start time**; the **instrument serial (MS:1000529)**, the vendor model term and the
+  **instrument components** (only the Shimadzu lane builds components); the **per-member source
+  files and their MS:1000569 checksums** (one synthesised entry instead of 2–24 real ones); the
+  **acquisition software version**; the specific **`file_description.contents`** terms; and the
+  **non-MS device chromatograms**. Cheapest first: the Agilent serial and model are plain XML in
+  `AcqData/Devices.xml`, and per-member hashing of a directory input is the existing backlog item.
+- **Not in the ledger — the SciEX native lane stores MRM/SIM dwells as one-point spectra
+  (2026-09-07).** The same defect class Agilent 0.11.0 fixed by refusing: `En_PPY.wiff` and
+  `IPX0002633001_D-239.wiff` are MRM acquisitions whose PUBLISHED corpus archives are native builds
+  with 154,520 and 2,215 one-point "spectra", 2 chromatograms and **zero transition identity**;
+  msconvert produces 4 and 95 SRM chromatograms carrying compound name, Q1/Q3, collision energy and
+  RT window. SciEX has no `is_dwell_only` equivalent, so nothing routes those runs to msconvert.
+  Decide as for Agilent: refuse and fall back, or read the transitions natively.
 - **Not in the ledger — Agilent native lane follow-ups (0.11.0, 2026-09-06):** `--tof-grid` on the
   MHDAC lane (the Q-TOF profile points sit on the flight-time lattice — the msconvert+`--tof-grid`
   build of the same run is 200 MB against 245 MB numpress-chunked f64; a SciEX-style per-run fit

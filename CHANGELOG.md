@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Test and tooling only — no change to what a conversion produces, so archives written by 0.11.1
+remain current.
+
+### Added
+
+- **`tests/lane_metadata_parity.rs` — does the native lane carry the same metadata as the mzML
+  lane?** Given pairs of archives built from the SAME source by both lanes, it extracts a
+  normalised metadata surface from each (index blocks, run block, source files and checksums,
+  instrument configurations, software, the column set and population of every metadata facet, the
+  chromatogram inventory, the categorical histograms), diffs them, and classifies every difference
+  as `ByDesign` (the lanes legitimately differ — layout, codec blocks, or the native lane carrying
+  MORE, such as its MZP grid coefficients) or `Defect` (metadata the native lane could carry and
+  does not). Anything matching neither fails the test, so a new loss cannot land unnoticed; the
+  `EXPECTED` table is the written record of the known ones. `tools/lane_pairs.ps1` builds the pairs
+  on the Windows box from its raw cache, since the native lanes exist nowhere else; without
+  `MZPC_LANE_PAIRS` the test skips like the other corpus-gated tests.
+- First run over four pairs — Shimadzu `.lcd`, Agilent 5977B GC-MS `.d`, and two SciEX `.wiff`:
+  83/12/7, 83/6/11, 39/12/51 and 40/12/50 facts identical / by design / tracked losses. The two
+  SciEX units are MRM acquisitions, where the lanes disagree about what the data ARE — see
+  `BACKLOG.md`.
+
 ## [0.11.1] — 2026-09-07
 
 ### Fixed
