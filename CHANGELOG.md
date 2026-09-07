@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.11.1] — 2026-09-07
+
+### Fixed
+
+- **The by-design refusal introduced in 0.11.0 skipped the msconvert fallback it was supposed to
+  label.** `tools/box_convert_remote.ps1` gained an `elseif` that recognised a refused Agilent unit
+  (MRM/SIM dwell data, IM-QTOF) and set `path=refused->msconvert` so `box_convert.sh` would not
+  raise its native-failure alarm — but that branch sat ahead of the `else` that actually runs
+  msconvert, so it intercepted exactly the units that need the fallback. The native non-zero exit
+  survived, no archive was written, the upload gate rejected the job, and the driver reported
+  CONV-FAIL one line after announcing that the msconvert archive was the intended output. The three
+  refused corpus units (PC_Allan1, MTBLS243, FM_01_Pos) would have hard-failed the next rebuild —
+  which 0.11.0 forces, since every `.built` stamp reads 0.10.2 and `OUTPUT_COMPATIBLE` groups only
+  0.7.6–0.7.8. Nothing could have been lost (the box publishes only on verified success), but the
+  units would have frozen at 0.10.2 and the run would have reported failures. Classification and
+  fallback are now separate: the branch chooses the note, then every non-zero exit falls through to
+  the conversion, with the ramdisk free-space guard covering the refusal route too (FM_01_Pos is a
+  1.2 GB `.d` that always takes it). The classifier also collapses whitespace before matching,
+  because PowerShell wraps native stderr under `*>` and a line-wise match can miss a split phrase;
+  a misclassification now costs only the wording of a warning, never an archive.
+
 ## [0.11.0] — 2026-09-06
 
 The Agilent native lane, restored (owner decision 2026-09-04, option A, time-boxed and gated on a
