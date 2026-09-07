@@ -6,19 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-**Output change.** Every data facet's footer count keys change meaning (below), so archives written
-by 0.11.1 are not current once this ships: the corpus is rebuilt once with the release, as usual.
+**Output change.** The footer count keys of the data facets change meaning (below) — every
+`spectra_data`, every `spectra_peaks` with zero-peak spectra, and every `chromatograms_data` and
+`wavelength_spectra_data` (new keys) — so archives written by 0.11.1 are not current once this
+ships: the corpus is rebuilt once with the release, as usual. Parquet data bytes do not change.
 
 ### Fixed
 
 - **Data-facet footer counts describe THIS file, not the run — and an empty `spectra_data`
   says 0 (issue #1, pjones).** The vendored writer stamped the archive-wide spectrum ordinal as
-  `spectrum_count` on every spectrum facet, and on `spectra_data` a `spectrum_data_point_count`
-  that was the SUM of both data facets' points. A centroid-only run therefore shipped an empty
+  `spectrum_count` on `spectra_data` and every metadata facet (and on `spectra_peaks` the number
+  of centroid spectra handed to it, zero-peak spectra included), and on `spectra_data` a
+  `spectrum_data_point_count` that was the SUM of both data facets' points. A centroid-only run therefore shipped an empty
   `spectra_data.parquet` declaring every spectrum and every peak of `spectra_peaks` (84 of the 201
   published archives; thermo-orbitrap-astral declared 307,590 on 0 rows), a mixed profile/centroid
-  run over-declared its non-empty `spectra_data` (22 archives; PXD076001 declared 255,623 where
-  2,521 spectra have rows), and a reader that plans from the footer — the issue's C++ dumper —
+  run over-declared its non-empty `spectra_data` (at least 22 archives — the largest facets were
+  not scanned; PXD076001 declared 255,623 where 2,521 spectra have rows), and a reader that plans from the footer — the issue's C++ dumper —
   queried hundreds of thousands of spectra that were not there. The definition now: on a DATA facet
   (`spectra_data`, `spectra_peaks`, `chromatograms_data`), `<entity>_count` is the number of
   entities with at least one row in this file — a cardinality, never an index bound (facet indices
@@ -28,21 +31,25 @@ by 0.11.1 are not current once this ships: the corpus is rebuilt once with the r
   (`vendor/mzpeak_prototyping/src/writer/array_buffer.rs`), counted where rows are stored, so every
   write path (peak lists, raw arrays, chunked, ims-chunked, TOF-grid) is covered; `spectra_peaks`
   now counts spectra WITH rows rather than spectra handed to it (a zero-peak spectrum is not an
-  entry — 18 corpus archives were off by exactly their zero-peak spectra). `chromatograms_data`
-  gains `chromatogram_count` under the same definition. The metadata secondaries
+  entry — at least 18 corpus archives were off by exactly their zero-peak spectra).
+  `chromatograms_data` gains `chromatogram_count` and `wavelength_spectra_data` gains
+  `wavelength_spectrum_count` under the same definition. The metadata secondaries
   (`_scans`, `_precursors`, `_selected_ions`) keep the run total: no count of theirs is "the"
   count, and nothing reads it. The archive rewrite path (`src/filter.rs`) already used this
   definition on data facets. Pinned by `tests/footer_counts.rs` over `tiny.pwiz.1.1.mzML` (1/10
   profile, 2/30 peaks with the empty spectrum excluded, run total 4) and the new
-  `tests/fixtures/tiny_centroid_only.mzML` (0/0 on `spectra_data`). Data bytes are untouched: the
-  four fixture archives are body-identical to their 0.11.1 builds, only the footers differ.
-  The keys are not defined by the specification; the definition above is being proposed to
-  HUPO-PSI, and the upstream python reader — which uses `spectrum_count` as its default iteration
-  bound and already reads 0 of 52 spectra from an `--rt`-filtered archive — needs to prefer its
-  row-group-max fallback (filed alongside).
+  `tests/fixtures/tiny_centroid_only.mzML` (0/0 on `spectra_data`) and the PDA-UV
+  `tests/fixtures/pda_uv.pwiz.mzML` (8/8 on the wavelength facets). Data bytes are untouched: the
+  Parquet bodies of the fixture archives are byte-identical to their 0.11.1 builds, only the
+  footers differ. The keys are not defined by the specification; the definition above is to be
+  proposed to HUPO-PSI (draft in the analysis directory), together with an issue against the
+  upstream python reader, which uses `spectrum_count` as its default iteration bound and already
+  reads 0 of 52 spectra from an `--rt`-filtered archive — it needs to prefer its row-group-max
+  fallback.
 - **`wavelength_spectra_metadata_scans` declared `wavelength_spectrum_count = 0` on a populated
   table.** The count was read from the metadata builder AFTER `finish_spectrum()` had drained it;
-  the published PDA-UV archive shows 8 rows / 0. Captured before the drain now.
+  the published PDA-UV archive shows 8 rows / 0. Taken from the builder's ordinal counter now,
+  before the drain.
 
 ### Added
 

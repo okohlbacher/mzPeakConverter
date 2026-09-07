@@ -316,20 +316,24 @@ Contents:
 - `chromatograms.parquet` — TIC/BPC/SRM and other chromatograms.
 - `vendor/…` — embedded original side-files (optional, see §8).
 
-**Footer count keys.** Every Parquet facet carries `<entity>_count` (and the data facets
-`<entity>_data_point_count`) in its key–value footer. The specification does not define these
-keys; this converter writes them with one definition (since the release after 0.11.1, issue #1):
-on a **data facet** (`spectra_data`, `spectra_peaks`, `chromatograms_data`) the count is the number
-of entities with at least one row *in that file* and the point count is the points *in that
+**Footer count keys.** The spectrum, chromatogram and wavelength facets carry `<entity>_count`
+and `<entity>_data_point_count` in their Parquet key–value footers (the `vendor/…` facets carry
+neither). The specification does not define these keys; this converter writes them with one
+definition (since the release after 0.11.1, issue #1): on a **data facet** (`spectra_data`,
+`spectra_peaks`, `chromatograms_data`, `wavelength_spectra_data`) the count is the number of
+entities with at least one row *in that file* and the point count is the points *in that
 file* — so a centroid-only run's empty `spectra_data` says `0 / 0`, and a mixed run's
 `spectra_data` counts only its profile spectra. It is a cardinality, **not an index bound**:
 `spectrum_index` values in a data facet are sparse, so never iterate `0..spectrum_count`. The
-**run total** lives on the primary metadata facets (`spectra_metadata`, `chromatograms_metadata`)
-and is also what the secondaries (`_scans`, `_precursors`, `_selected_ions`) carry. To plan reads,
-use the per-spectrum `number_of_data_points` / `number_of_peaks` columns of `spectra_metadata`
-(the spec's mechanism) or the actual indices in the facet; a facet with `num_rows == 0` has
-nothing to read whatever its footer says (archives from 0.11.1 and earlier declare the run total
-there).
+**run total** lives on the primary metadata facets (`spectra_metadata`, `chromatograms_metadata`,
+`wavelength_spectra_metadata`), which also repeat the data facets' point totals; the secondaries
+(`_scans`, `_precursors`, `_selected_ions`) carry the run total after a direct conversion (an
+archive rewrite re-stamps them with the entities present in that facet — nothing reads them). To
+plan reads, use the per-spectrum `number_of_data_points` / `number_of_peaks` columns of
+`spectra_metadata` (the spec's mechanism) or the actual indices in the facet; a facet with
+`num_rows == 0` has nothing to read whatever its footer says. Archives from 0.11.1 and earlier
+declare the run total on `spectra_data` (and the sum of both data facets' points), and on
+`spectra_peaks` the number of centroid spectra handed to it, zero-peak spectra included.
 
 **The format itself** — rationale, the draft specification, and the controlled
 vocabulary — is documented at:

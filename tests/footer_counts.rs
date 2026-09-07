@@ -17,7 +17,9 @@
 //!
 //! `tiny.pwiz.1.1.mzML` has 4 spectra: index 1 is profile (10 points, chunk layout), 0 and 3 are
 //! centroid (15 peaks each), 2 is an EMPTY centroid spectrum. `tiny_centroid_only.mzML` is the same
-//! file without the profile spectrum (indices renumbered 0..3).
+//! file without the profile spectrum (indices renumbered 0..3). `pda_uv.pwiz.mzML` (Waters PDA via
+//! ProteoWizard, 2 MS spectra + 8 wavelength spectra) exercises the wavelength facets, whose scans
+//! facet used to declare 0 because the count was read after the metadata builder was drained.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -27,10 +29,15 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 
 /// `tag` keeps the parallel test threads (same pid) off each other's output file.
 fn convert_fixture(name: &str, tag: &str) -> PathBuf {
+    convert_fixture_with(name, tag, &[])
+}
+
+fn convert_fixture_with(name: &str, tag: &str, extra: &[&str]) -> PathBuf {
     let out = std::env::temp_dir().join(format!("mzpc-footer-{}-{tag}-{name}.mzpeak", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let status = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
         .arg(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR")))
+        .args(extra)
         .arg("-o")
         .arg(&out)
         .arg("--force")
@@ -135,5 +142,33 @@ fn empty_data_facet_declares_zero() {
     assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_data_point_count"), 30);
     assert_eq!(facet(&archive, "spectra_metadata.parquet", "spectrum_count"), (3, 3));
 
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn wavelength_facets_carry_their_own_counts() {
+    let archive = convert_fixture("pda_uv.pwiz.mzML", "pda");
+
+    // The metadata facet carries the run total of wavelength spectra …
+    assert_eq!(facet(&archive, "wavelength_spectra_metadata.parquet", "wavelength_spectrum_count"), (8, 8));
+    // … and so does its scans facet — this was 0 on 8 rows before the drain-order fix.
+    assert_eq!(facet(&archive, "wavelength_spectra_metadata_scans.parquet", "wavelength_spectrum_count"), (8, 8));
+    // The data facet: entities with rows in this file, and its own point count (point layout).
+    assert_eq!(declared(&archive, "wavelength_spectra_data.parquet", "wavelength_spectrum_count"), 8);
+    let (rows, points) = facet(&archive, "wavelength_spectra_data.parquet", "wavelength_spectrum_data_point_count");
+    assert!(rows > 0, "fixture no longer carries wavelength points");
+    assert_eq!(points, rows);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn chromatogram_data_count_is_zero_when_nothing_was_written() {
+    // With synthesis off the fixture's (unindexed, unread) chromatogramList yields a metadata row
+    // with no points: the DATA facet must say 0 entities / 0 points, not repeat the metadata's 1.
+    let archive = convert_fixture_with("tiny.pwiz.1.1.mzML", "nochrom", &["--no-chromatograms"]);
+    assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_count"), (0, 0));
+    assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_data_point_count"), (0, 0));
+    assert_eq!(declared(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), 1);
     let _ = std::fs::remove_file(&archive);
 }
