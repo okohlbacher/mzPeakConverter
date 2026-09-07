@@ -319,7 +319,7 @@ Contents:
 **Footer count keys.** The spectrum, chromatogram and wavelength facets carry `<entity>_count`
 and `<entity>_data_point_count` in their Parquet key–value footers (the `vendor/…` facets carry
 neither). The specification does not define these keys; this converter writes them with one
-definition (since the release after 0.11.1, issue #1): on a **data facet** (`spectra_data`,
+definition (since 0.11.2, issue #1): on a **data facet** (`spectra_data`,
 `spectra_peaks`, `chromatograms_data`, `wavelength_spectra_data`) the count is the number of
 entities with at least one row *in that file* and the point count is the points *in that
 file* — so a centroid-only run's empty `spectra_data` says `0 / 0`, and a mixed run's
