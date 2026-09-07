@@ -352,6 +352,11 @@ impl GenericDataArrayWriter {
         self.data_buffers.point_count()
     }
 
+    /// Entities with at least one row in this facet (see [`ArrayBufferWriter::entry_count`]).
+    pub fn entry_count(&self) -> u64 {
+        self.data_buffers.entry_count()
+    }
+
     pub fn as_array_index(&self) -> crate::peak_series::ArrayIndex {
         self.data_buffers.as_array_index()
     }

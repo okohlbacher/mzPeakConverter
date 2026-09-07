@@ -251,8 +251,11 @@ impl EntryCounter {
                 self.last = Some(i);
             }
             // No index column in the batch (should not happen for a spectrum/chromatogram facet):
-            // count the call rather than silently under-report.
-            None => self.count += 1,
+            // count the call rather than silently under-report, and say so.
+            None => {
+                log::debug!("entry_count: batch without an index column — counting the call");
+                self.count += 1;
+            }
         }
     }
 }

@@ -1402,6 +1402,17 @@ impl<
                         schema,
                         ArrowWriterOptions::new().with_properties(props),
                     )?);
+                    // Same per-facet definition as `spectra_data` / `chromatograms_data`.
+                    self.append_key_value_metadata(
+                        WAVELENGTH_SPECTRUM_COUNT.into(),
+                        Some(
+                            self.wavelength_spectrum_data_buffers
+                                .as_ref()
+                                .unwrap()
+                                .entry_count()
+                                .to_string(),
+                        ),
+                    );
                     self.append_key_value_metadata(
                         WAVELENGTH_SPECTRUM_DATA_POINT_COUNT.into(),
                         Some(
