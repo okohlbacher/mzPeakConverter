@@ -372,18 +372,38 @@ try {
     $res.exit = $LASTEXITCODE
     if ($res.exit -eq 0) {
         $res.note = ((@($res.note, 'path=native') | Where-Object { $_ }) -join ' ')
-    } elseif (Select-String -Path $log -Pattern 'MRM/SIM dwell data only|is an Agilent IM-QTOF run' -Quiet) {
-        # The native lane REFUSED the file by design (MRM/SIM dwell data are chromatograms; an
-        # IM-QTOF run needs the drift dimension): msconvert is the intended path, not a fallback
-        # after a failure, so box_convert.sh must not raise the contention alarm for it.
-        $res.note = ((@($res.note, 'path=refused->msconvert') | Where-Object { $_ }) -join ' ')
     } else {
-        # native failed on this file/model -> msconvert FALLBACK (the ONLY place msconvert ever runs)
-        $res.note = ((@($res.note, 'path=native-fail->msconvert') | Where-Object { $_ }) -join ' ')
+        # No native archive -> msconvert. TWO reasons, ONE path. A by-design REFUSAL (MRM/SIM dwell
+        # data are transition chromatograms; an IM-QTOF run needs the drift dimension MHDAC cannot
+        # give) is the intended routing and must not raise box_convert.sh's contention alarm; a
+        # genuine failure must. Both still need the fallback to RUN.
+        #
+        # 0.11.0 shipped the refusal as an `elseif` ahead of this block whose body only set the note.
+        # That branch intercepted exactly the units that need the fallback: `$res.exit` kept the
+        # native non-zero exit, no archive was written, the upload gate below rejected the job, and
+        # box_convert.sh reported CONV-FAIL one line after announcing that the msconvert archive was
+        # the intended output. The three refused corpus units (2x 6490 dMRM, 1x 6560 IM-QTOF) would
+        # have hard-failed the next rebuild. Classify, then fall through -- never branch around the
+        # conversion. To re-verify in a minute, run one refused unit through the real driver and
+        # check it comes back with an archive:
+        #   printf '%s\t%s\t%s\n' <corpus>/agilent-6490-triplequad/PC_Allan1.d /tmp/r.mzpeak --via-msconvert > /tmp/r.tsv
+        #   BOX_AUTOUPDATE=0 tools/box_convert.sh --local-manifest /tmp/r.tsv --jobs 1
+        # Expect `path=refused->msconvert`, the by-design line (not the contention alarm), `OK exit=0`.
+        #
+        # The classification reads the WHOLE log with whitespace collapsed: PowerShell wraps native
+        # stderr under `*>`, so the message can be split mid-phrase and a line-wise -Pattern match
+        # silently misses it. Misclassifying now costs only the wording of a warning, not an archive.
+        $logText = if (Test-Path $log) { ((Get-Content $log -Raw) -replace '\s+', ' ') } else { '' }
+        if ($logText -match 'MRM/SIM dwell data only|is an Agilent IM-QTOF run') {
+            $res.note = ((@($res.note, 'path=refused->msconvert') | Where-Object { $_ }) -join ' ')
+        } else {
+            $res.note = ((@($res.note, 'path=native-fail->msconvert') | Where-Object { $_ }) -join ' ')
+        }
         # RAMDISK GUARD. box_convert.sh's job cap is justified against C: free space, but when
         # MZPC_MZML_TMPDIR points TEMP at a RAM-backed volume the mzML intermediate lands in the
         # box's 63 GB of RAM instead — and this fallback is the one path that writes a multi-tens-of-GB
-        # mzML. Several concurrent fallbacks would fill it and stall mid-write, which looks nothing
+        # mzML. It guards the REFUSAL route too (FM_01_Pos.d is a 1.2 GB IM-QTOF `.d` that always
+        # takes it), which is why the check sits below the classification rather than inside a branch. Several concurrent fallbacks would fill it and stall mid-write, which looks nothing
         # like "too much concurrency". Fail loudly instead. 4x raw is a floor, not a guarantee:
         # msconvert's mzML is typically several times the vendor raw for profile data.
         if ($mzmlTmp) {
