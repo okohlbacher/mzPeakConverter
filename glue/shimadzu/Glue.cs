@@ -963,6 +963,9 @@ public static class Api
                     // Where else might the date live? Every readable scalar of SampleInfo and of the
                     // MS parameters, once, under the lever only.
                     Dbg.Say($"AnalysisDate: same instance as at open = {ReferenceEquals(si, d.SampleInfoObj)}; SampleInfo methods: {(si == null ? "" : string.Join(",", si.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly).Select(m => m.Name).Distinct()))}");
+                    // What could still load it? The IO object's and the DataObject's method surface.
+                    foreach (var (label, obj) in new[] { ("IO", d.IoObj), ("DataObject", d.DataObject) })
+                        Dbg.Say($"  {label} methods: {string.Join(",", obj.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance).Where(m => !m.IsSpecialName).Select(m => m.Name + "/" + m.GetParameters().Length).Distinct())}");
                     foreach (var (label, obj) in new[] { ("SampleInfo", si), ("MS.Parameters", d.ParametersObj), ("DataObject", d.DataObject) })
                     {
                         if (obj == null) continue;
