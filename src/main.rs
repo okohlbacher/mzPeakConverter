@@ -64,6 +64,10 @@ mod tof_grid;
 mod tims_mobility;
 mod thermo_status;
 mod thermo_trailers;
+mod run_metadata;
+mod agilent_meta;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod waters_meta;
 mod vendor;
 mod embed_aux;
 mod filter;
@@ -72,7 +76,7 @@ use arrow::datatypes::DataType;
 use mzdata::curie;
 use mzdata::io::MZReaderType;
 use mzdata::meta::{
-    Component, ComponentType, DataProcessing, InstrumentConfiguration, ProcessingMethod, Software,
+    DataProcessing, InstrumentConfiguration, ProcessingMethod, Software,
     SourceFile, custom_software_name,
 };
 use mzdata::params::{ControlledVocabulary, Param, Unit};
@@ -5609,7 +5613,8 @@ fn convert_waters(
     // index or the mass-calibration coefficients). The statistical TOF-grid detector (strategy A) is
     // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
     let reader = waters::WatersReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), |i| reader.spectrum(i))
+    let hints = VendorHints { run_metadata: waters_meta::read(input), ..Default::default() };
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak through the net48 MHDAC host (`agilent.rs`;
@@ -5677,6 +5682,9 @@ struct VendorHints {
     /// Lane-specific entries for the `transformations` index block (see [`transformations_block`]);
     /// the writer-level ones (zero-run mask, numpress) are added by `convert_vendor_reader`.
     transformations: Vec<String>,
+    /// What the vendor file states about the run (sample, time, instrument, software, members):
+    /// merged field by field before `fixup_run_metadata` — see `run_metadata`.
+    run_metadata: Option<run_metadata::VendorRunMetadata>,
 }
 
 /// One spectrum from a vendor reader, plus — for a lattice-routed centroid list — the arrays that
@@ -5817,7 +5825,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         source_sha1,
         peaks_facet,
         transformations,
+        run_metadata,
     } = hints;
+    let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
     let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -5944,6 +5954,13 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     if let Some(cfg) = instrument {
         if writer.instrument_configurations().is_empty() {
             writer.instrument_configurations_mut().insert(0, cfg);
+        }
+    }
+    // What the vendor states about the run, merged onto whatever the lane already set; a naive
+    // acquisition time becomes an `acquisition_time` index block rather than a false instant.
+    if let Some(meta) = run_metadata {
+        if let Some(block) = run_metadata::apply(&mut writer, meta) {
+            index_blocks.push(block);
         }
     }
     fixup_run_metadata(&mut writer, input);
@@ -6073,10 +6090,19 @@ struct Ms1Chroms {
     time: Vec<f64>,
     tic: Vec<f64>,
     bpc: Vec<f64>,
+    /// Which spectrum kinds were written: the basis of `file_description.contents` on the native
+    /// lanes (the mzML lane inherits ProteoWizard's list and keeps it).
+    saw_ms1: bool,
+    saw_msn: bool,
 }
 
 impl Ms1Chroms {
     fn observe(&mut self, spec: &MultiLayerSpectrum) {
+        if spec.ms_level() == 1 {
+            self.saw_ms1 = true;
+        } else {
+            self.saw_msn = true;
+        }
         if spec.ms_level() != 1 {
             return;
         }
@@ -6152,6 +6178,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     source: I,
     synth: bool,
 ) -> Result<()> {
+    set_file_contents(writer, ms1.saw_ms1, ms1.saw_msn);
     let synthesized = if synth { ms1.write(writer)? } else { 0 };
     let mut n = synthesized;
     for chrom in source {
@@ -6197,6 +6224,37 @@ fn is_path_shaped_run_id(id: &str) -> bool {
 /// nothing about the run), and a `default_instrument_id` that points at no configuration is
 /// clamped or cleared (a dangling foreign key fails the spec's semantic invariants). Faithful values
 /// only (real source stem / real list entry / the input file as its own source).
+/// `file_description.contents` from what was actually written: `MS1 spectrum` / `MSn spectrum`, the
+/// two terms ProteoWizard states. Only when the lane said nothing more specific than the generic
+/// parent term (or nothing at all) — an inherited list (the mzML lane) is kept verbatim.
+fn set_file_contents(target: &mut impl MSDataFileMetadata, saw_ms1: bool, saw_msn: bool) {
+    let contents = &mut target.file_description_mut().contents;
+    let only_generic = contents.iter().all(|p| p.curie() == Some(curie!(MS:1000294)));
+    if !only_generic || (!saw_ms1 && !saw_msn) {
+        return;
+    }
+    contents.retain(|p| p.curie() != Some(curie!(MS:1000294)));
+    if saw_ms1 {
+        contents.push(Param::builder().name("MS1 spectrum").curie(curie!(MS:1000579)).build());
+    }
+    if saw_msn {
+        contents.push(Param::builder().name("MSn spectrum").curie(curie!(MS:1000580)).build());
+    }
+}
+
+/// The run metadata a vendor DIRECTORY input states in its side files, readable on any host:
+/// Bruker `.d` (`GlobalMetadata`), Agilent `.d` (`AcqData` XML). Waters `.raw` is handled by its
+/// lane through `VendorHints` because its naive time needs an index block.
+fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> {
+    if !input.is_dir() {
+        return None;
+    }
+    if vendor::bruker_sqlite(input).is_some() {
+        return vendor::bruker_run_metadata(input);
+    }
+    agilent_meta::read(input)
+}
+
 fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     // 0. Provenance hygiene on what the reader ALREADY copied. Step 1 below sanitises only the
     // entry it synthesises itself; mzdata's Thermo reader writes the converting machine's parent
@@ -6215,7 +6273,17 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         }
     }
 
-    // 1. Ensure at least one source_file (the input itself) so default_source_file_id can resolve.
+    // 1. What the vendor directory states about the run — instrument model/serial, acquisition
+    // time, software, sample, the source members with their digests — merged onto whatever the
+    // reader already set. Bruker used to be special-cased here; the same seam now serves every
+    // vendor directory the host can read. Only what the file states is asserted: no ion source or
+    // detector is guessed (a wrong `MS:1000008` child is worse than an absent one).
+    if let Some(meta) = vendor_dir_metadata(input) {
+        let _naive_time_block = run_metadata::apply(target, meta);
+    }
+
+    // 1b. Ensure at least one source_file (the input itself) so default_source_file_id can resolve
+    //     — only when no member was stated above.
     if target.file_description().source_files.is_empty() {
         // `name` identifies the source; the directory it happened to sit in on the converting
         // machine is not provenance, it is the operator's filesystem — and it would travel with
@@ -6246,47 +6314,6 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         target.file_description_mut().source_files.push(sf);
     }
 
-    // 1b. Ensure an instrument_configuration exists. Bruker leaves the list empty while `run`
-    // and every `scan` still reference configuration 0, which is a dangling foreign key — the
-    // spec's semantic invariants require every non-null FK to resolve. The instrument is described
-    // in the `.d`'s GlobalMetadata, so promote it into a real record rather than inventing one.
-    //
-    // Only what the vendor file actually states is asserted: model, serial and (for a timsTOF, where
-    // the analyzer is not in doubt) the TOF analyzer. The ion source and detector are NOT guessed —
-    // `InstrumentSourceType` is an opaque Bruker code, and a wrong `MS:1000008` child is worse than
-    // an absent one, since the CV-mapping rules only bind to components that exist.
-    if target.instrument_configurations().is_empty() {
-        if let Some(meta) = vendor::read_global_metadata(input) {
-            let get = |k: &str| meta.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
-            if let Some(model) = get("InstrumentName") {
-                let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
-                cfg.params.push(
-                    Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model).build(),
-                );
-                if let Some(serial) = get("InstrumentSerialNumber") {
-                    cfg.params.push(
-                        // Force String: a serial is an identifier, not a quantity. `Into<Value>`
-                        // on a &str auto-types numeric-looking text to Float, which would drop
-                        // leading zeros and re-render the value.
-                        Param::builder()
-                            .name("instrument serial number")
-                            .curie(curie!(MS:1000529))
-                            .value(mzdata::params::Value::String(serial))
-                            .build(),
-                    );
-                }
-                cfg.components.push(Component {
-                    component_type: ComponentType::Analyzer,
-                    order: 1,
-                    params: vec![
-                        Param::builder().name("time-of-flight").curie(curie!(MS:1000084)).build(),
-                    ],
-                });
-                target.instrument_configurations_mut().insert(0, cfg);
-            }
-        }
-    }
-
     // 2. default_source_file_id / default_data_processing_id ← first list entry, when unset.
     let first_sf = target.file_description().source_files.first().map(|sf| sf.id.clone());
     let first_dp = target.data_processings().first().map(|dp| dp.id.clone());
@@ -6306,13 +6333,6 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     let instr_ids: Vec<u32> = target.instrument_configurations().keys().copied().collect();
     let first_instr = instr_ids.iter().copied().min();
     if let Some(run) = target.run_description_mut() {
-        // Bruker leaves `run.start_time` unset, but the `.d` records the acquisition timestamp in
-        // GlobalMetadata as RFC 3339 already.
-        if run.start_time.is_none() {
-            run.start_time = vendor::read_global_metadata(input)
-                .and_then(|m| m.get("AcquisitionDateTime")?.as_str().map(str::to_owned))
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok());
-        }
         if run.default_source_file_id.is_none() {
             run.default_source_file_id = first_sf;
         }

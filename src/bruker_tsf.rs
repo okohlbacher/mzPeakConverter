@@ -16,9 +16,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
+use mzdata::meta::DissociationMethodTerm;
 use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
+    Activation, IsolationWindow, IsolationWindowState, Precursor, SelectedIon,
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
 };
 
@@ -50,10 +52,22 @@ struct Frame {
 }
 
 /// A TSF `.d` reader yielding one centroid [`MultiLayerSpectrum`] per frame.
+/// One `FrameMsMsInfo` row: what the instrument selected for an MS2 frame.
+#[derive(Debug, Clone, Copy)]
+struct MsMsInfo {
+    parent: Option<i64>,
+    trigger_mass: f64,
+    isolation_width: f64,
+    charge: Option<i32>,
+    collision_energy: f64,
+}
+
 pub struct TsfReader {
     bin: Vec<u8>,
     frames: Vec<Frame>,
     calib: TofMz,
+    /// Keyed by frame id. Absent for MS1 frames and for files without the table.
+    msms: std::collections::HashMap<i64, MsMsInfo>,
 }
 
 impl TsfReader {
@@ -142,7 +156,42 @@ impl TsfReader {
         let bin = std::fs::read(dot_d.join("analysis.tsf_bin"))
             .with_context(|| format!("reading {}", dot_d.join("analysis.tsf_bin").display()))?;
 
-        Ok(Self { bin, frames, calib })
+        // Precursors: `FrameMsMsInfo(Frame, Parent, TriggerMass, IsolationWidth, PrecursorCharge,
+        // CollisionEnergy)`, one row per MS2 frame (measured: 3,486 rows for 3,486 MsMsType-2 frames,
+        // every Parent an MS1 frame; PrecursorCharge stated on ~28 % of them, NULL elsewhere;
+        // CollisionEnergy signed — negative in negative mode — and stored as stated, like the TDF
+        // lane). Read once, keyed by frame; a file without the table simply has no precursors.
+        let mut msms = std::collections::HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT Frame, Parent, TriggerMass, IsolationWidth, PrecursorCharge, CollisionEnergy FROM FrameMsMsInfo",
+        ) {
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<f64>>(5)?,
+                ))
+            });
+            if let Ok(rows) = rows {
+                for (frame, parent, trigger, width, charge, ce) in rows.flatten() {
+                    let Some(trigger_mass) = trigger.filter(|m| m.is_finite() && *m > 0.0) else { continue };
+                    msms.insert(
+                        frame,
+                        MsMsInfo {
+                            parent: parent.filter(|p| *p > 0),
+                            trigger_mass,
+                            isolation_width: width.filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0),
+                            charge: charge.and_then(|c| i32::try_from(c).ok()).filter(|c| *c != 0),
+                            collision_energy: ce.filter(|e| e.is_finite()).unwrap_or(0.0),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(Self { bin, frames, calib, msms })
     }
 
     pub fn len(&self) -> usize {
@@ -191,17 +240,15 @@ impl TsfReader {
     /// Build the centroid mzdata spectrum for frame `i` (0-based reader order).
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
         let frame = self.frames.get(i).with_context(|| format!("TSF frame index {i} out of range"))?;
-        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
-        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
-        // otherwise indistinguishable from a complete one. `FrameMsMsInfo` in analysis.tsf carries
-        // it; not read yet.
-        if frame.ms_level > 1 {
+        // An MSn frame without a `FrameMsMsInfo` row is a genuine orphan: say so once, loudly,
+        // because the archive would otherwise be indistinguishable from a complete one.
+        if frame.ms_level > 1 && !self.msms.contains_key(&frame.id) {
             static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
             PRECURSOR_GAP_SAID.call_once(|| {
                 log::warn!(
-                    "Bruker TSF (native): this reader does not yet extract precursors; \
-                     MS2 rows will have none (no selected ion, isolation window or collision energy \
-                     in the archive)"
+                    "Bruker TSF (native): frame {} is MS{} but analysis.tsf has no FrameMsMsInfo row for it; \
+                     such rows are written without a precursor",
+                    frame.id, frame.ms_level
                 );
             });
         }
@@ -234,7 +281,37 @@ impl TsfReader {
         scan.start_time = frame.rt_seconds / 60.0; // mzdata scan start_time is minutes
         descr.acquisition.scans.push(scan);
 
+        if let Some(m) = self.msms.get(&frame.id) {
+            descr.precursor.push(Self::precursor(m));
+        }
+
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
+    }
+
+    /// The vendor's selection, verbatim: selected ion = `TriggerMass` (with the stated charge when
+    /// there is one), isolation window `TriggerMass ± IsolationWidth/2` — or target-only when the
+    /// width is not stated, which the writer keeps as null offsets — CID at the stated (signed)
+    /// collision energy, and `precursor_id = frame=<Parent>` so the writer resolves the MS1 it was
+    /// selected from. ProteoWizard emits the same window and ion for TSF but no energy and no parent.
+    fn precursor(m: &MsMsInfo) -> Precursor {
+        let ion = SelectedIon { mz: m.trigger_mass, charge: m.charge, ..Default::default() };
+        let half = (m.isolation_width / 2.0) as f32;
+        let target = m.trigger_mass as f32;
+        let mut activation = Activation::default();
+        activation.energy = m.collision_energy as f32;
+        activation.methods_mut().push(DissociationMethodTerm::CollisionInducedDissociation);
+        Precursor {
+            ions: vec![ion],
+            isolation_window: IsolationWindow {
+                target,
+                lower_bound: if half > 0.0 { target - half } else { 0.0 },
+                upper_bound: if half > 0.0 { target + half } else { 0.0 },
+                flags: IsolationWindowState::Complete,
+            },
+            activation,
+            precursor_id: m.parent.map(|p| format!("frame={p}")),
+            ..Default::default()
+        }
     }
 
 }
