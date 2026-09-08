@@ -394,7 +394,7 @@ try {
         # stderr under `*>`, so the message can be split mid-phrase and a line-wise -Pattern match
         # silently misses it. Misclassifying now costs only the wording of a warning, not an archive.
         $logText = if (Test-Path $log) { ((Get-Content $log -Raw) -replace '\s+', ' ') } else { '' }
-        if ($logText -match 'MRM/SIM dwell data only|is an Agilent IM-QTOF run') {
+        if ($logText -match 'MRM/SIM dwell|is an Agilent IM-QTOF run') {
             $res.note = ((@($res.note, 'path=refused->msconvert') | Where-Object { $_ }) -join ' ')
         } else {
             $res.note = ((@($res.note, 'path=native-fail->msconvert') | Where-Object { $_ }) -join ' ')
