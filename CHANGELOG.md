@@ -4,6 +4,79 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change.** The native lanes now write run metadata they used to drop (below), the Bruker
+TSF lane writes precursors, and the SciEX native lane refuses MRM/SIM dwell runs. Archives of
+those lanes written by 0.11.2 are not current; the corpus is rebuilt once with the next release.
+
+### Added
+
+- **Run metadata the vendor states, read natively (`src/run_metadata.rs`).** Measured by
+  `tests/lane_metadata_parity.rs` on 2026-09-07, the native lanes carried none of the run-level
+  metadata the mzML lane inherits from ProteoWizard: no sample, no acquisition time, no serial,
+  no vendor model term, no acquisition-software version, one synthesised source-file entry
+  instead of the digested members, and a generic `file_description.contents`. A shared seam now
+  merges what each vendor file STATES onto the archive, field by field and idempotently, and
+  every lane declares its members with MS:1000569 SHA-1s:
+  - **Bruker TDF/TSF** — `GlobalMetadata` (`analysis.tdf`/`analysis.tsf`, read-only): timsTOF
+    family term MS:1003123, `InstrumentName` as the MS:1000031 value, serial, TOF analyzer,
+    `AcquisitionSoftware` + version (MS:1000692), `SampleName`, the zoned
+    `AcquisitionDateTime`; members `analysis.tdf` + `analysis.tdf_bin` (MS:1002817/MS:1002818) or
+    `.tsf` + `.tsf_bin` (MS:1003282/MS:1003283). A 0-byte `analysis.tsf` beside a real `.tdf`
+    (PXD076703) no longer wins the lookup.
+  - **Agilent `.d`** (`src/agilent_meta.rs`, any host) — `AcqData/Devices.xml` (MS:1000490,
+    model name, model number, serial, the analyzers the device type implies), `Contents.xml`
+    (`AcquiredTime` WITH its stated UTC offset, MassHunter MS:1000678 + `AcqSoftwareVersion`),
+    `sample_info.xml` (sample name); members = the AcqData files ProteoWizard lists, minus
+    exported text formats and dot/AppleDouble names.
+  - **Waters `.raw`** (`src/waters_meta.rs`, any host) — `_HEADER.TXT` (`Instrument` →
+    MS:1000126 + model + serial unless `#NotSet`, `Acquired Name` + descriptors → sample,
+    `Acquired Date/Time`), `_extern.inf` (`Created by` → MassLynx MS:1000534 version); members
+    `_FUNCnnn.DAT` in numeric order (Waters nativeID format) then the side files.
+  - **SciEX `.wiff`** (glue `RunInfo`/`RunString`, Windows) — MS:1000121 + `InstrumentName`,
+    serial, Analyst MS:1000551 + `SoftwareVersion` (e.g. `SCIEX OS 3.0.0.3339`), the sample's
+    name, `AcquisitionDateTime`; members `.wiff` + `.wiff.scan` (MS:1000562/MS:1000770),
+    digested BEFORE Clearcore2 opens them.
+  - **Shimadzu `.lcd`** — the MS:1002998 family term beside the `SystemName` value;
+    `SampleInfo.AnalysisDate`.
+  `file_description.contents` now states what was written (MS1/MSn spectrum, centroid/profile,
+  TIC chromatogram) instead of the generic `mass spectrum` (the adapter injects MS:1000294 only
+  when no data-file-content child is present).
+- **Acquisition time policy.** A vendor time WITH a stated offset (Agilent `Contents.xml`,
+  Bruker `GlobalMetadata`) becomes `run.start_time` verbatim. A wall clock WITHOUT a zone
+  (Waters, Shimadzu, SciEX) does NOT: RFC 3339 has no "zone unknown", so `run.start_time` stays
+  null and the clock is preserved verbatim in a `metadata.acquisition_time` index block
+  `{wall_clock, zone: "unstated", source, note}`. ProteoWizard labels the same clock `Z`
+  (Capan2) or shifts a stated one by the CONVERTING host's zone (blank1: 18:11Z for a file that
+  says 13:11:27-04:00 = 17:11Z) — claims the native lane refuses to make.
+- **Bruker TSF precursors.** Every MS2 frame carries its `FrameMsMsInfo` row: selected ion
+  `TriggerMass` with the stated charge (unstated stays null), isolation window ±`IsolationWidth`/2
+  (target only when the width is unstated), CID with the signed `CollisionEnergy`,
+  `precursor_id = frame=<Parent>` so `precursor_index` resolves. 30/30 against the pwiz twin of
+  the urine fixture. Pinned by `tests/run_metadata_native.rs` (set `MZPC_TSF_FIXTURE`).
+- **`--sample N`** selects the sample of a multi-sample WIFF (1-based; the msconvert lane maps it
+  to `--runIndexSet N-1`). A multi-sample WIFF without `--sample` is refused and lists its samples.
+
+### Fixed
+
+- **SciEX MRM/SIM dwell runs are refused by the native lane** (`En_PPY.wiff`,
+  `IPX0002633001_D-239.wiff` in the corpus): it stored each dwell as a one-point spectrum without
+  its transition (154,520 and 2,215 "spectra"), where msconvert writes SRM chromatograms with Q1/Q3,
+  compound and collision energy. The glue classifies every experiment by type; a run whose
+  experiments are all MRM/SIM dwells exits 1 naming `--via-msconvert`, and the box harness routes
+  it there (`tools/box_convert_remote.ps1`). MRM-HR (scan) runs still convert natively. Unreadable
+  samples are refused too, instead of being read as empty.
+- **Target-only isolation windows keep NULL offsets.** An isolation window whose width the
+  source does not state was written with lower/upper offsets of ±target (measured on RS080806,
+  Minimal_DDA and En_PPY). Pinned by `tests/fixtures/target_only_window.mzML`.
+
+### Changed
+
+- `tests/lane_metadata_parity.rs` compares VALUES, not just presence: `run.start_time` as an
+  instant, serial and model strings, per-member digests, `id@version` software, sample names,
+  the contents set and the `acquisition_time` wall clock; a rule that no longer fires is an error.
+
 ## [0.11.2] — 2026-09-07
 
 **Output change.** The footer count keys of the data facets change meaning (below) — every

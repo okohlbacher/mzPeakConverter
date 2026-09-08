@@ -62,46 +62,32 @@ const EXPECTED: &[Expected] = &[
     Expected {
         key: "software.ids",
         kind: Kind::Defect,
-        reason: "the mzML lane inherits the acquisition software and pwiz from the mzML softwareList; \
-                 a native lane knows only itself. Recording the vendor's acquisition-software version \
-                 natively would need a new field from each vendor SDK.",
+        reason: "the native Shimadzu lane still records no acquisition software (LabSolutions version needs a glue export); elsewhere the difference is ProteoWizard's own entries (pwiz, pwiz_Reader_*) and the vendor's FULL version string the native lane carries (`MassHunter GC/MS Acquisition 10.0.368 …`, `MassLynx 4.1 SCN916`) where pwiz prints `8.0` / `4.1`.",
     },
     Expected {
         key: "file_description.source_files.count",
-        kind: Kind::Defect,
-        reason: "ProteoWizard enumerates every member of the acquisition directory; the native lanes \
-                 synthesise ONE entry for the input path (`fixup_run_metadata`).",
+        kind: Kind::ByDesign,
+        reason: "ProteoWizard lists whatever sits in the acquisition directory, AppleDouble `._*` siblings of the box's copy included (blank1: 17 entries, 9 of them `._*` with one shared bogus digest); the native lane lists the vendor's members (Agilent AcqData files, Bruker analysis.tdf/tsf + _bin, Waters _FUNCnnn.DAT and side files, WIFF + WIFF.scan) with their real SHA-1s.",
     },
     Expected {
         key: "file_description.source_files.with_checksum",
-        kind: Kind::Defect,
-        reason: "only the Shimadzu lane passes a source digest through `VendorHints.source_sha1`; \
-                 nothing hashes the members of a directory input. Backlog: per-member SHA-1 for \
-                 directory inputs.",
+        kind: Kind::ByDesign,
+        reason: "follows source_files.count (every member the native lane lists is digested).",
     },
     Expected {
         key: "file_description.source_files.names",
-        kind: Kind::Defect,
-        reason: "same cause as the count: one synthesised entry versus the vendor directory listing.",
+        kind: Kind::ByDesign,
+        reason: "follows source_files.count.",
     },
     Expected {
         key: "instrument.components",
-        kind: Kind::Defect,
-        reason: "only the Shimadzu lane builds ion-source/analyser/detector components; the other \
-                 native lanes emit a configuration with parameters but no components.",
+        kind: Kind::ByDesign,
+        reason: "the native lanes assert only what the vendor file states — the analyzers a device type implies (Agilent Devices.xml), ESI + quadrupole + TOF from the Shimadzu device id, the TOF of a timsTOF — never a guessed source or detector; ProteoWizard adds hand-tabled sources and detectors per vendor (EI + electron multiplier for a 5977, nanospray + MCP + PMT for a timsTOF).",
     },
     Expected {
         key: "instrument.param_accessions",
-        kind: Kind::Defect,
-        reason: "the mzML lane carries the vendor-specific model term and the serial number \
-                 (MS:1000529) that ProteoWizard read from the acquisition directory; the native lanes \
-                 emit what their SDK hands back, which is usually a device-type string only.",
-    },
-    Expected {
-        key: "instrument.serial",
-        kind: Kind::Defect,
-        reason: "the serial lives in the vendor's own device table (for Agilent, plainly in \
-                 AcqData/Devices.xml); no native lane reads it yet.",
+        kind: Kind::ByDesign,
+        reason: "the native lanes carry the vendor's model string as the MS:1000031 value beside the family term (MS:1000490 Agilent, MS:1002998 Shimadzu, MS:1000126 Waters, MS:1003123 timsTOF, MS:1000121 SciEX) and the file's model number / instrument name as user params; ProteoWizard maps the string to a specific CV term through a hand-curated table and drops the string.",
     },
     Expected {
         key: "chromatograms.inventory",
@@ -121,10 +107,9 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "data_processing.count",
-        kind: Kind::Defect,
-        reason: "the mzML lane inherits ProteoWizard's processing entries in addition to ours.",
+        kind: Kind::ByDesign,
+        reason: "the mzML lane inherits ProteoWizard's own conversion entry beside ours; a native lane has no such step to inherit.",
     },
-    // --- encoding, not metadata loss: the two lanes legitimately choose different layouts ---
     Expected {
         key: "index.metadata.keys",
         kind: Kind::ByDesign,
@@ -159,12 +144,6 @@ const EXPECTED: &[Expected] = &[
         reason: "same: chunk rows versus point rows.",
     },
     Expected {
-        key: "spectra_metadata.mz_delta_model.nonnull",
-        kind: Kind::ByDesign,
-        reason: "set only by the chunked layout's delta model.",
-    },
-    // --- surfaced by the first four pairs (Shimadzu .lcd, 2x SciEX .wiff, Agilent GC-MS .d) -----
-    Expected {
         key: "cv.ids",
         kind: Kind::ByDesign,
         reason: "the native lanes declare the converter's own MZP vocabulary because they emit MZP \
@@ -194,16 +173,13 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "run.start_time",
-        kind: Kind::Defect,
-        reason: "the mzML lane inherits the acquisition timestamp; no native lane reads it. The \
-                 Shimadzu lane declines it deliberately (SampleInfo.AnalysisDate is a naive local \
-                 time and mzdata's field carries an offset), but the others simply never ask.",
+        kind: Kind::ByDesign,
+        reason: "the lanes read different things. A vendor-STATED offset is carried verbatim by the native lane (Agilent Contents.xml 13:11:27-04:00 = 17:11Z) while ProteoWizard shifts the same clock by the CONVERTING host's zone (18:11Z on blank1 — wrong by an hour); a vendor time WITHOUT a zone (Waters _HEADER.TXT, Shimadzu AnalysisDate, SciEX) stays null on the native lane and is preserved verbatim in the acquisition_time index block, while ProteoWizard labels the same wall clock Z (Capan2) — a claim the native lane refuses to make.",
     },
     Expected {
         key: "file_description.contents",
-        kind: Kind::Defect,
-        reason: "the native lanes state only the generic MS:1000294 'mass spectrum'; the mzML lane \
-                 carries the specific contents (MS1 spectrum, SRM chromatogram) ProteoWizard derived.",
+        kind: Kind::ByDesign,
+        reason: "the native lane states what it wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram); ProteoWizard's list is per-vendor and inconsistent — its Waters reader says `MS1 spectrum` only while writing 136,400 MS2 spectra with precursors (Capan2).",
     },
     Expected {
         key: "chromatograms_metadata.*",
@@ -224,42 +200,73 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "sample.count",
-        kind: Kind::Defect,
-        reason: "the vendor file names its sample(s) — a SciEX .wiff carries a sample list, and \
-                 ProteoWizard turns it into a `sample_list` entry. No native lane reads it, so the \
-                 sample identity (name, and any vendor sample fields) is dropped.",
+        kind: Kind::ByDesign,
+        reason: "the native lane carries the vendor's sample (Waters `Acquired Name`, Bruker SampleName, Agilent sample_info.xml, the selected WIFF sample) where ProteoWizard writes none (Waters, Bruker) or an unnamed one (Agilent).",
     },
     Expected {
         key: "run.id",
         kind: Kind::Defect,
-        reason: "same cause: the mzML lane's run id is '<file stem>-<sample name>' because \
-                 ProteoWizard knew the sample; the native lanes fall back to the file stem alone \
-                 (`fixup_run_metadata`).",
+        reason: "ProteoWizard names a WIFF run after its SAMPLE (En_PPY: the sample name), the native lane after the file stem; pwiz's XML-id escaping of a leading digit (`_x0032_0181203…`) is decoded before comparing, so only the SciEX naming rule remains.",
     },
-    // --- MRM/SIM: the two lanes disagree about what the data ARE ------------------------------
     Expected {
         key: "facet.spectra_metadata.parquet.rows",
         kind: Kind::Defect,
-        reason: "MRM/SIM acquisitions: the vendor SDKs present each dwell as a one-point spectrum, so \
-                 a native lane writes N one-point 'spectra' where the data are transition \
-                 chromatograms. Agilent refuses such runs (agl::is_dwell_only) and routes them to \
-                 msconvert; the SciEX lane has no such guard and stores them.",
+        reason: "the Waters native lane writes one mobility-COMBINED spectrum per scan (Capan2: 1,989 across six functions, ~44k profile points each) where ProteoWizard expands every HDMSe scan into its 200 drift bins (397,800 rows, 719 points median) — the drift dimension is not read natively (`_FUNCnnn.CDT`), so the ion-mobility data of a Waters IM run is lost on this lane. It also labels functions 3–6 (lock-mass REFERENCE and the three 200-scan auxiliary functions) MS2, which ProteoWizard calls MS1 (W-P2 in BACKLOG).",
     },
     Expected {
         key: "facet.spectra_metadata_scans.parquet.rows",
         kind: Kind::Defect,
-        reason: "follows the spectra row count on MRM/SIM acquisitions.",
+        reason: "follows facet.spectra_metadata.parquet.rows.",
     },
     Expected {
         key: "spectra_metadata.*",
         kind: Kind::Defect,
-        reason: "follows the spectra row count: on an MRM/SIM unit one lane has spectra and the other \
-                 has none, so every per-spectrum column differs in population.",
+        reason: "the native Waters lane writes RT 0.0, no scan window and unknown polarity on every scan, and labels functions 3–6 MS2 (W-P2/W-P5 in BACKLOG: `_FUNCnnn.IDX`/`_FUNCTNS.INF` are reverse-engineered layouts awaiting an SDK side-by-side on the box); the SciEX MRM rows this rule was first written for are now refused to the msconvert lane.",
     },
     Expected {
         key: "spectra_metadata_scans.*",
         kind: Kind::Defect,
-        reason: "follows the spectra row count on MRM/SIM acquisitions.",
+        reason: "follows spectra_metadata.* (the Waters native lane's scans carry no start time or window yet).",
+    },
+    Expected {
+        key: "instrument.model",
+        kind: Kind::ByDesign,
+        reason: "the native lane carries the vendor's model string as the MS:1000031 value (Devices.xml Name, Shimadzu SystemName, Waters _HEADER.TXT Instrument, Clearcore2 InstrumentName); ProteoWizard keeps it in a user param or maps it to a specific term.",
+    },
+    Expected {
+        key: "sample.names",
+        kind: Kind::ByDesign,
+        reason: "follows sample.count: the native lane's sample carries the vendor's name; ProteoWizard's, where it exists, is unnamed.",
+    },
+    Expected {
+        key: "acquisition_time.wall_clock",
+        kind: Kind::ByDesign,
+        reason: "the native lane's record of a vendor wall clock that has no zone; the mzML lane has no such block (it labelled the same clock Z or shifted it).",
+    },
+    Expected {
+        key: "file_description.source_files.digests",
+        kind: Kind::ByDesign,
+        reason: "follows source_files.count: the AppleDouble entries in ProteoWizard's list carry one shared bogus digest; the members both lanes list agree byte for byte (measured on blank1's eight AcqData files).",
+    },
+    Expected {
+        key: "facet.spectra_metadata_precursors.parquet.rows",
+        kind: Kind::Defect,
+        reason: "ORPHAN MS2 on the Waters native lane: the 682 high-energy MSe scans of Capan2 (function 2) carry no precursor, where ProteoWizard writes its MSe placeholder precursor on each of the 136,400 drift-bin spectra it expands them into (682 × 200). The per-scan Set Mass and collision energies of a real DDA run live in `_FUNCnnn.STS`, a reverse-engineered layout the review refused to publish from before an SDK side-by-side on the box (BACKLOG). Bruker TSF and TDF carry theirs; SciEX needs the MetaV2 glue export.",
+    },
+    Expected {
+        key: "facet.spectra_metadata_selected_ions.parquet.rows",
+        kind: Kind::Defect,
+        reason: "follows facet.spectra_metadata_precursors.parquet.rows.",
+    },
+    Expected {
+        key: "spectra_metadata_precursors.*",
+        kind: Kind::Defect,
+        reason: "follows facet.spectra_metadata_precursors.parquet.rows.",
+    },
+    Expected {
+        key: "spectra_metadata_selected_ions.*",
+        kind: Kind::Defect,
+        reason: "follows facet.spectra_metadata_precursors.parquet.rows.",
     },
 ];
 
@@ -374,6 +381,28 @@ fn facet_population(archive: &Path, member: &str, dir: &Path, into: &mut Surface
     let _ = std::fs::remove_file(&p);
 }
 
+/// ProteoWizard escapes characters an XML id may not start with as `_xHHHH_` (`_x0032_0181203…`
+/// for a run whose name starts with a digit). The native lane uses the plain stem.
+fn decode_pwiz_id(v: &str) -> String {
+    let mut out = String::new();
+    let mut rest = v;
+    while let Some(i) = rest.find("_x") {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        if tail.len() >= 8 && &tail[6..8] == "_" && tail[2..6].chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Some(ch) = u32::from_str_radix(&tail[2..6], 16).ok().and_then(char::from_u32) {
+                out.push(ch);
+                rest = &tail[8..];
+                continue;
+            }
+        }
+        out.push_str("_x");
+        rest = &tail[2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn json_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
     let mut cur = v;
     for p in path {
@@ -432,7 +461,10 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
         // The id itself is the run stem on both lanes; compare only its shape, not the string.
         s.insert(
             "run.id".into(),
-            run.get("id").and_then(|v| v.as_str()).map(|v| if v.is_empty() { "empty".into() } else { v.to_string() }).unwrap_or("absent".into()),
+            run.get("id")
+                .and_then(|v| v.as_str())
+                .map(|v| if v.is_empty() { "empty".into() } else { decode_pwiz_id(v) })
+                .unwrap_or("absent".into()),
         );
     }
 

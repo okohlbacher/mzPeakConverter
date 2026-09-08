@@ -943,9 +943,19 @@ public static class Api
             string date = "";
             try
             {
-                var v = d.SampleInfoObj == null ? null : Reflect.GetProp(d.SampleInfoObj, "AnalysisDate");
-                if (v is DateTime dt && dt.Year > 1900)
-                    date = dt.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture);
+                var si = d.SampleInfoObj ?? (d.DataObject is object dobj ? Reflect.GetProp(dobj, "SampleInfo", "Sample") : null);
+                var v = si == null ? null : Reflect.GetProp(si, "AnalysisDate", "AcquisitionDate", "AcquiredDate");
+                // The WALL CLOCK only: the vendor states no zone, and a DateTimeOffset here would carry
+                // the converting host's zone, not the instrument's (see run_metadata.rs).
+                date = v switch
+                {
+                    DateTime dt when dt.Year > 1900 => dt.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture),
+                    DateTimeOffset dto when dto.Year > 1900 => dto.DateTime.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture),
+                    string str => str.Trim(),
+                    _ => "",
+                };
+                if (date == "")
+                    Dbg.Say($"AnalysisDate: SampleInfo {(si == null ? "absent" : si.GetType().Name)}, value {(v == null ? "null" : v.GetType().Name + " " + v)}");
             }
             catch (Exception e) { Dbg.Say($"AnalysisDate: {e.Message}"); }
 
