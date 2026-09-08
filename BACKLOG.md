@@ -13,25 +13,37 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
   prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).
-- **Not in the ledger — the native lanes lose vendor metadata the mzML lane carries (measured
-  2026-09-07 by `tests/lane_metadata_parity.rs`).** The two lanes take metadata from different
-  places: the mzML lane inherits ProteoWizard's finished model via `copy_metadata_from`, the native
-  lanes build an archive from the per-spectrum descriptions plus `VendorHints`, so every field must
-  be plumbed by hand. Measured on four pairs (Shimadzu `.lcd`, Agilent GC-MS `.d`, 2× SciEX `.wiff`),
-  the native side does not carry: the **sample list and the sample name in `run.id`**; the
-  **acquisition start time**; the **instrument serial (MS:1000529)**, the vendor model term and the
-  **instrument components** (only the Shimadzu lane builds components); the **per-member source
-  files and their MS:1000569 checksums** (one synthesised entry instead of 2–24 real ones); the
-  **acquisition software version**; the specific **`file_description.contents`** terms; and the
-  **non-MS device chromatograms**. Cheapest first: the Agilent serial and model are plain XML in
-  `AcqData/Devices.xml`, and per-member hashing of a directory input is the existing backlog item.
-- **Not in the ledger — the SciEX native lane stores MRM/SIM dwells as one-point spectra
-  (2026-09-07).** The same defect class Agilent 0.11.0 fixed by refusing: `En_PPY.wiff` and
-  `IPX0002633001_D-239.wiff` are MRM acquisitions whose PUBLISHED corpus archives are native builds
-  with 154,520 and 2,215 one-point "spectra", 2 chromatograms and **zero transition identity**;
-  msconvert produces 4 and 95 SRM chromatograms carrying compound name, Q1/Q3, collision energy and
-  RT window. SciEX has no `is_dwell_only` equivalent, so nothing routes those runs to msconvert.
-  Decide as for Agilent: refuse and fall back, or read the transitions natively.
+- **Run metadata on the native lanes — landed after 0.11.2** (`src/run_metadata.rs`,
+  `agilent_meta.rs`, `waters_meta.rs`, Bruker `GlobalMetadata`, SciEX `RunInfo`; CHANGELOG
+  Unreleased). Measured against fresh lane pairs: blank1 now carries the vendor serial, sample,
+  MassHunter version and the STATED `-04:00` start time where pwiz's is shifted by the box's zone;
+  Capan2 carries the model, sample, MassLynx version and its unzoned wall clock in
+  `acquisition_time`; SWATH/Sample002/MRM-HR WIFFs carry model, serial, `SCIEX OS`/`Analyst TF`
+  versions, sample and both digested members. **Still open, by lane:**
+  - **Orphan MS2 (precursors):** Waters (Capan2: the 682 high-energy MSe scans, which pwiz expands into 136,400 drift-bin
+    spectra with a placeholder precursor each; per-scan `SET_MASS` and collision energies live in `_FUNCnnn.STS`, a reverse-engineered layout the 2026-09-08 review refused to
+    publish from before an SDK side-by-side on the box); SciEX (663k in the corpus; needs the
+    `SpectrumMetaV2` glue export — S-P2); Agilent MHDAC (`MSScan.bin` precursor decode; no DDA/QQQ
+    `.d` on host or in the corpus to verify against); BAF (SQL `Steps`/`Variables` tables; box-only).
+    Bruker TDF/TSF and Shimadzu carry theirs.
+  - **Waters ion mobility is not read natively:** the native lane writes the mobility-COMBINED scan
+    (Capan2: 1,989 spectra of ~44k points) where pwiz expands each HDMSe scan into its 200 drift bins
+    (397,800 spectra); `_FUNCnnn.CDT` is unread, so the drift dimension is lost on this lane. It also
+    labels functions 3–6 MS2 (pwiz: MS1) and writes RT 0.0 everywhere (W-P2).
+  - **Device chromatograms** (UV, pressure, temperature; B-P3): the mzML lane gets 620 traces on
+    8 Agilent archives and more from pwiz's Waters/SciEX/Thermo readers; the native lanes write
+    TIC/BPC only. Agilent `.cg`/`.cd` layouts unknown; Bruker `chromatography-data.sqlite` is
+    readable on any host.
+  - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
+    per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
+  - Shimadzu acquisition-software version (LabSolutions; needs a glue export); Waters per-function
+    polarity / RT / scan windows (W-P2/W-P5: `_FUNCTNS.INF` + `_FUNCnnn.IDX`, same SDK cross-check);
+    `src/agilent_midac.rs` scaffold deletion.
+- **SciEX MRM/SIM dwell runs — refused after 0.11.2** (`refuse_if_unsupported`; the box harness
+  routes the refusal to `--via-msconvert`). `En_PPY.wiff` and `IPX0002633001_D-239.wiff` will be
+  rebuilt on the msconvert lane at the next corpus rerun (154,520 / 2,215 one-point "spectra" → 4 /
+  95 SRM chromatograms). Reading the transitions natively (Q1/Q3, compound, CE, RT window — S-P4)
+  stays open; MRM-HR scan runs convert natively as before.
 - **Not in the ledger — Agilent native lane follow-ups (0.11.0, 2026-09-06):** `--tof-grid` on the
   MHDAC lane (the Q-TOF profile points sit on the flight-time lattice — the msconvert+`--tof-grid`
   build of the same run is 200 MB against 245 MB numpress-chunked f64; a SciEX-style per-run fit

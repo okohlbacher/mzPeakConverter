@@ -448,11 +448,13 @@ impl SciexReader {
         if info.dwell_experiments > 0 {
             bail!(
                 "{}: MRM/SIM dwell data only handled by the msconvert lane — {} of {} experiments are \
-                 MRM/SIM dwells (types: {}); the native reader would store each dwell as a one-point \
-                 spectrum without its transition. Use --via-msconvert, which writes SRM chromatograms.",
+                 MRM/SIM dwells and {} are scans (types: {}); the native reader would store each dwell \
+                 as a one-point spectrum without its transition. Use --via-msconvert, which writes SRM \
+                 chromatograms.",
                 path.display(),
                 info.dwell_experiments,
                 info.total_experiments,
+                info.scan_experiments,
                 self.run_string(0)
             );
         }
