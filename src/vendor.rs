@@ -204,13 +204,82 @@ pub fn embed_into_archive(
     Ok(())
 }
 
-/// Read run-level `GlobalMetadata` (key/value) from a TSF or TDF SQLite, as a JSON object.
-pub(crate) fn read_global_metadata(dot_d: &Path) -> Option<serde_json::Value> {
-    let sql = ["analysis.tsf", "analysis.tdf"]
+/// The SQLite that describes this `.d`: `analysis.tdf` when it holds data, else `analysis.tsf`.
+///
+/// Bruker writes an EMPTY `analysis.tsf` beside every `analysis.tdf` (and 0-byte `analysis.tdf`
+/// stubs turned up in the corpus next to real BAF/TSF data). The old rule — the first name that
+/// EXISTS — picked the stub, every query failed silently, and PXD076703 was published with a null
+/// start time, an empty instrument and no `vendor_metadata` block although its `.tdf` states the
+/// model, serial and a zoned timestamp. Non-empty, in the order the converter routes the lanes.
+pub(crate) fn bruker_sqlite(dot_d: &Path) -> Option<std::path::PathBuf> {
+    ["analysis.tdf", "analysis.tsf"]
         .iter()
         .map(|n| dot_d.join(n))
-        .find(|p| p.exists())?;
-    let conn = Connection::open(&sql).ok()?;
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0))
+}
+
+/// What a Bruker `.d` states about its run, from `GlobalMetadata` (TDF/TSF) — shared by every
+/// Bruker lane. Everything is optional; nothing the file does not state is asserted (no ion source,
+/// no detector: `InstrumentSourceType` is an opaque code whose legend differs between files).
+pub(crate) fn bruker_run_metadata(dot_d: &Path) -> Option<crate::run_metadata::VendorRunMetadata> {
+    use crate::run_metadata::{parse_vendor_time, source_files_from_members, term, term_str, MemberPolicy, Members, VendorRunMetadata};
+    use mzdata::meta::{Component, ComponentType, InstrumentConfiguration, Sample, Software};
+
+    let sql = bruker_sqlite(dot_d)?;
+    let meta = read_global_metadata(dot_d)?;
+    let get = |k: &str| meta.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let mut out = VendorRunMetadata::default();
+
+    if let Some(model) = get("InstrumentName") {
+        let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+        // The series term ProteoWizard uses for every timsTOF, plus the vendor's own model string.
+        if model.to_ascii_lowercase().contains("timstof") {
+            cfg.params.push(term(1003123, "Bruker Daltonics timsTOF series"));
+        }
+        cfg.params.push(term_str(1000031, "instrument model", &model));
+        if let Some(serial) = get("InstrumentSerialNumber") {
+            cfg.params.push(term_str(1000529, "instrument serial number", &serial));
+        }
+        // A timsTOF is a TOF: the one component that is not in doubt (the existing rule).
+        cfg.components.push(Component {
+            component_type: ComponentType::Analyzer,
+            order: 1,
+            params: vec![term(1000084, "time-of-flight")],
+        });
+        out.instrument = Some(cfg);
+    }
+    if let Some(t) = get("AcquisitionDateTime") {
+        match parse_vendor_time(&t, "Bruker GlobalMetadata AcquisitionDateTime") {
+            Ok(at) => out.start_time = Some(at),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
+    if let Some(name) = get("AcquisitionSoftware") {
+        let version = get("AcquisitionSoftwareVersion").unwrap_or_else(|| "unknown".to_string());
+        out.acquisition_software = Some(Software::new(name, version, vec![term(1000692, "Bruker software")]));
+    }
+    if let Some(sample) = get("SampleName") {
+        out.samples.push(Sample::new("sample_1".to_string(), Some(sample), vec![]));
+    }
+    let is_tdf = sql.file_name().is_some_and(|n| n == "analysis.tdf");
+    let (members, fmt, idfmt): (&[&str], _, _) = if is_tdf {
+        (&["analysis.tdf", "analysis.tdf_bin"], term(1002817, "Bruker TDF format"), term(1002818, "Bruker TDF nativeID format"))
+    } else {
+        (&["analysis.tsf", "analysis.tsf_bin"], term(1003282, "Bruker TSF format"), term(1003283, "Bruker TSF nativeID format"))
+    };
+    let (files, default) = source_files_from_members(
+        dot_d,
+        &MemberPolicy { members: Members::Explicit(members), file_format: Some(fmt), id_format: Some(idfmt), default_member: Some(members[0]) },
+    );
+    out.source_files = files;
+    out.default_source_file = default;
+    Some(out)
+}
+
+/// Read run-level `GlobalMetadata` (key/value) from a TSF or TDF SQLite, as a JSON object.
+pub(crate) fn read_global_metadata(dot_d: &Path) -> Option<serde_json::Value> {
+    let sql = bruker_sqlite(dot_d)?;
+    let conn = Connection::open_with_flags(&sql, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     let mut stmt = conn.prepare("SELECT Key, Value FROM GlobalMetadata").ok()?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))

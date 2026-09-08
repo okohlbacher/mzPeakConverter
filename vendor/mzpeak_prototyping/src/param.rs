@@ -674,8 +674,22 @@ impl From<&mzdata::meta::FileDescription> for FileDescription {
             .collect();
         // CvMapping `filecontent_must` requires a CHILD of MS:1000524 "data file content"
         // (use_term:false → the abstract parent itself is not valid). MS:1000294 "mass spectrum"
-        // is the safe generic child present in any MS file.
-        ensure_cv_term(&mut contents, mzdata::curie!(MS:1000294), "mass spectrum");
+        // is the safe generic child present in any MS file — injected ONLY when nothing more
+        // specific is stated: the converter now records `MS1 spectrum` / `MSn spectrum` from what
+        // it wrote (and the mzML lane inherits ProteoWizard's list), and the generic parent beside
+        // its own children is noise, not information.
+        const DATA_FILE_CONTENT_CHILDREN: &[u32] = &[
+            1000294, 1000579, 1000580, 1000341, 1000343, 1000325, 1000326, 1000581, 1000582, 1000583,
+            1000322, 1000789, 1000790, 1000804, 1000805, 1000806, 1000620, 1000235, 1000628, 1001472,
+            1001473,
+        ];
+        let has_specific = contents.iter().any(|p| {
+            p.accession
+                .is_some_and(|a| a.controlled_vocabulary == mzdata::params::ControlledVocabulary::MS && DATA_FILE_CONTENT_CHILDREN.contains(&a.accession))
+        });
+        if !has_specific {
+            ensure_cv_term(&mut contents, mzdata::curie!(MS:1000294), "mass spectrum");
+        }
         let source_files = value.source_files.iter().map(SourceFile::from).collect();
         Self {
             contents,
