@@ -77,13 +77,12 @@ use mzdata::curie;
 use mzdata::io::MZReaderType;
 use mzdata::meta::{
     DataProcessing, InstrumentConfiguration, ProcessingMethod, Software,
+    SourceFile, custom_software_name,
 };
 // Used only inside `cfg(windows)` lanes (Shimadzu instrument components): unused on macOS, where
 // removing the import broke the Windows build twice already.
 #[cfg_attr(not(windows), allow(unused_imports))]
-use mzdata::meta::{Component, ComponentType
-    SourceFile, custom_software_name,
-};
+use mzdata::meta::{Component, ComponentType};
 use mzdata::params::{ControlledVocabulary, Param, Unit};
 use mzdata::prelude::*;
 use mzdata::spectrum::bindata::BinaryArrayMap3D;
