@@ -36,6 +36,14 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     readable on any host.
   - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
     per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
+  - **Shimadzu acquisition date:** ProteoWizard records `2024-02-15T08:47:18Z` for Blind_P1_pos_012 from
+    `dataObject_->SampleInfo->AnalysisDate.ToUniversalTime()`; our glue reads the same property through the
+    same IoModule 5.0.0.0 and gets `DateTime.MinValue` — under `MZPC_SHIMADZU_DEBUG` every SampleInfo scalar
+    (name, operator, vial, date) is at its default and `MS.Parameters.CurrentStorage` throws, so the DLL's
+    sample-info load fails silently in the .NET 8 host (pwiz hosts it under .NET Framework). The `.lcd`'s
+    OLE2 storages were created 2024-02-15 10:46:49 (FILETIME) — not pwiz's value either. Next step: the same
+    call from a net48 host (the Agilent glue host pattern) or a Shimadzu question; until then the lane records
+    no date rather than a false one.
   - Shimadzu acquisition-software version (LabSolutions; needs a glue export); Waters per-function
     polarity / RT / scan windows (W-P2/W-P5: `_FUNCTNS.INF` + `_FUNCnnn.IDX`, same SDK cross-check);
     `src/agilent_midac.rs` scaffold deletion.
