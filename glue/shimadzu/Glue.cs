@@ -943,7 +943,10 @@ public static class Api
             string date = "";
             try
             {
-                var si = d.SampleInfoObj ?? (d.DataObject is object dobj ? Reflect.GetProp(dobj, "SampleInfo", "Sample") : null);
+                // Fetch it NOW rather than using the instance captured at open: ProteoWizard reads
+                // `dataObject_->SampleInfo->AnalysisDate` at call time, and the snapshot taken right
+                // after LoadData came back with every field at its default on Blind_P1_pos_012.
+                var si = Reflect.GetProp(d.DataObject, "SampleInfo", "Sample") ?? d.SampleInfoObj;
                 var v = si == null ? null : Reflect.GetProp(si, "AnalysisDate", "AcquisitionDate", "AcquiredDate");
                 // The WALL CLOCK only: the vendor states no zone, and a DateTimeOffset here would carry
                 // the converting host's zone, not the instrument's (see run_metadata.rs).
@@ -959,6 +962,7 @@ public static class Api
                     Dbg.Say($"AnalysisDate: SampleInfo {(si == null ? "absent" : si.GetType().Name)}, value {(v == null ? "null" : v.GetType().Name + " " + v)}");
                     // Where else might the date live? Every readable scalar of SampleInfo and of the
                     // MS parameters, once, under the lever only.
+                    Dbg.Say($"AnalysisDate: same instance as at open = {ReferenceEquals(si, d.SampleInfoObj)}; SampleInfo methods: {(si == null ? "" : string.Join(",", si.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly).Select(m => m.Name).Distinct()))}");
                     foreach (var (label, obj) in new[] { ("SampleInfo", si), ("MS.Parameters", d.ParametersObj), ("DataObject", d.DataObject) })
                     {
                         if (obj == null) continue;
