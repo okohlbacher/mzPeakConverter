@@ -954,8 +954,24 @@ public static class Api
                     string str => str.Trim(),
                     _ => "",
                 };
-                if (date == "")
+                if (date == "" && Dbg.On)
+                {
                     Dbg.Say($"AnalysisDate: SampleInfo {(si == null ? "absent" : si.GetType().Name)}, value {(v == null ? "null" : v.GetType().Name + " " + v)}");
+                    // Where else might the date live? Every readable scalar of SampleInfo and of the
+                    // MS parameters, once, under the lever only.
+                    foreach (var (label, obj) in new[] { ("SampleInfo", si), ("MS.Parameters", d.ParametersObj), ("DataObject", d.DataObject) })
+                    {
+                        if (obj == null) continue;
+                        foreach (var pr in obj.GetType().GetProperties())
+                        {
+                            if (pr.GetIndexParameters().Length != 0) continue;
+                            object? pv;
+                            try { pv = pr.GetValue(obj); } catch (Exception e) { pv = $"<{e.GetType().Name}>"; }
+                            if (pv is null || pv is string || pv.GetType().IsValueType)
+                                Dbg.Say($"  {label}.{pr.Name} : {pr.PropertyType.Name} = {pv ?? "null"}");
+                        }
+                    }
+                }
             }
             catch (Exception e) { Dbg.Say($"AnalysisDate: {e.Message}"); }
 

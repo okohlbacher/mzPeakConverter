@@ -101,11 +101,6 @@ const EXPECTED: &[Expected] = &[
         reason: "follows chromatograms.inventory: the device traces carry most of the points.",
     },
     Expected {
-        key: "facet.chromatograms_metadata.parquet.rows",
-        kind: Kind::Defect,
-        reason: "follows chromatograms.inventory.",
-    },
-    Expected {
         key: "data_processing.count",
         kind: Kind::ByDesign,
         reason: "the mzML lane inherits ProteoWizard's own conversion entry beside ours; a native lane has no such step to inherit.",
@@ -180,18 +175,6 @@ const EXPECTED: &[Expected] = &[
         key: "file_description.contents",
         kind: Kind::ByDesign,
         reason: "the native lane states what it wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram); ProteoWizard's list is per-vendor and inconsistent — its Waters reader says `MS1 spectrum` only while writing 136,400 MS2 spectra with precursors (Capan2).",
-    },
-    Expected {
-        key: "chromatograms_metadata.*",
-        kind: Kind::Defect,
-        reason: "follows chromatograms.inventory — the native lanes write only the synthesised \
-                 TIC/BPC, so every per-chromatogram column is populated for 2 rows instead of N.",
-    },
-    Expected {
-        key: "facet.chromatograms_metadata_precursors.parquet.rows",
-        kind: Kind::Defect,
-        reason: "an SRM chromatogram carries its precursor (Q1) and product (Q3); the native lanes \
-                 write no SRM chromatograms, so no chromatogram precursors either.",
     },
     Expected {
         key: "facet.chromatograms_data.parquet.columns",
