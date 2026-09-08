@@ -155,6 +155,14 @@ fn partial_marker(input: &Path, cap: Option<usize>, written: usize) -> Option<(S
 /// quick cross-checks (e.g. the ion-mobility comparison only needs a handful of frames to cover the
 /// full mobility axis), so a multi-GB run becomes seconds. `None` = convert everything. Every
 /// mzPeak lane that honours the cap also writes the [`partial_marker`] index block when it bites.
+/// `--sample N` (SciEX multi-sample WIFF), set once after argument parsing and read by the SciEX
+/// lanes — the alternative was threading one more parameter through five conversion signatures.
+static SCIEX_SAMPLE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+fn sciex_sample() -> Option<u32> {
+    SCIEX_SAMPLE.get().copied().flatten()
+}
+
 fn max_spectra() -> Option<usize> {
     let cap = std::env::var("MZPC_MAX_SPECTRA")
         .ok()
@@ -402,6 +410,13 @@ struct Cli {
     #[arg(long, value_enum)]
     tof_grid: Option<TofGridMode>,
 
+    /// SciEX `.wiff` holding SEVERAL samples: which one to convert (1-based). An archive is ONE
+    /// run, so a multi-sample file is refused without this (concatenating the samples under one
+    /// run id, as before 0.12, was a conversion of none of them). The msconvert lane maps it to
+    /// `--runIndexSet <N-1>`; without it that lane silently kept only the LAST sample.
+    #[arg(long, value_name = "N")]
+    sample: Option<u32>,
+
     /// Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from
     /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + a
     /// per-run `{c0,c1}` calibration instead of f64 m/z, recovering `m/z = (c0 + c1·tof_index)²`.
@@ -630,6 +645,7 @@ impl Settings {
         note(!cli.image.is_empty(), "--image");
         note(cli.sdrf.is_some(), "--sdrf");
         note(cli.tof_grid.is_some(), "--tof-grid");
+        let _ = SCIEX_SAMPLE.set(cli.sample);
         note(cli.agilent_grid, "--agilent-grid");
         note(cli.via_msconvert, "--via-msconvert");
         note(cli.msconvert_path.is_some(), "--msconvert-path");
@@ -1882,6 +1898,14 @@ fn convert_via_msconvert(
         .arg(&tmpdir)
         .arg("--outfile")
         .arg("via_msconvert.mzML");
+    // A multi-sample WIFF is several runs; with one `--outfile` msconvert writes them in turn and
+    // the LAST wins (En_PPY: 117 samples, one survived). `--sample N` picks the run explicitly.
+    if let Some(n) = sciex_sample() {
+        let ext = input.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if ext == "wiff" || ext == "wiff2" {
+            cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
+        }
+    }
     // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
     // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
     if let Ok(f) = fs::File::create(&mzcvt_log) {
@@ -4975,7 +4999,27 @@ fn convert_shimadzu(
     // (`MZPC_SHIMADZU_PROBE=N` — the "what does the reader hand back" diagnostic — is handled in
     // `run` before any lane is entered, see `shimadzu_probe_lever`: this lane only runs with `-o`,
     // so a probe here always swallowed the requested archive.)
-    let mut hints = VendorHints { instrument: shimadzu_instrument(&reader.instrument_info()), source_sha1, ..Default::default() };
+    let info = reader.instrument_info();
+    // `SampleInfo.AnalysisDate` is a naive local time: it goes to the `acquisition_time` index block,
+    // never to `run.start_time` (see `run_metadata`). Every other run fact this lane knows is the
+    // instrument, set below the old way (the lane predates the seam).
+    let run_meta = info.analysis_date.as_deref().and_then(|d| {
+        // The DLL renders `dd.MM.yyyy HH:mm:ss`-style or ISO text depending on locale; accept both.
+        let text = d.trim();
+        let parsed = run_metadata::parse_vendor_time(text, "Shimadzu SampleInfo.AnalysisDate")
+            .ok()
+            .or_else(|| {
+                ["%d.%m.%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%d.%m.%Y %H:%M"]
+                    .iter()
+                    .find_map(|f| chrono::NaiveDateTime::parse_from_str(text, f).ok())
+                    .map(|n| run_metadata::AcquisitionTime::Naive { wall_clock: n, source: "Shimadzu SampleInfo.AnalysisDate" })
+            });
+        if parsed.is_none() {
+            log::warn!("Shimadzu SampleInfo.AnalysisDate {text:?} not understood; not recorded");
+        }
+        parsed.map(|t| run_metadata::VendorRunMetadata { start_time: Some(t), ..Default::default() })
+    });
+    let mut hints = VendorHints { instrument: shimadzu_instrument(&info), source_sha1, run_metadata: run_meta, ..Default::default() };
     // Profile facet as an exact sqrt grid (see `shimadzu_grid`): probe dense profile spectra across
     // the run for the run-wide step; if the fit holds, the profile of every spectrum that fits is
     // stored as `tof_index` + per-spectrum `tof_c0`/`tof_c1`, and any that does not keeps f64 m/z.
@@ -5244,6 +5288,8 @@ fn shimadzu_grid_route(
 fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo) -> Option<InstrumentConfiguration> {
     let model = info.system_name.clone()?;
     let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+    // The family term ProteoWizard states, plus the vendor's own system name as the model value.
+    cfg.params.push(run_metadata::term(1002998, "Shimadzu instrument model"));
     cfg.params.push(Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model).build());
     let mut order = 1;
     if info.ionization.as_deref() == Some("ESI") {
@@ -5361,7 +5407,26 @@ fn convert_sciex_grid(
     // run-wide clock fit must succeed. `Auto`: the behaviour before the mode existed.
     mode: TofGridMode,
 ) -> Result<()> {
-    let reader = sciex::SciexReader::open(input)?;
+    // The source members are digested BEFORE Clearcore2 opens them (the `.wiff` and, when present,
+    // its `.wiff.scan` sibling — ProteoWizard lists both).
+    let wiff_name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let scan_name = format!("{wiff_name}.scan");
+    let member_names = [wiff_name.as_str(), scan_name.as_str()];
+    let (source_files, default_source) = run_metadata::source_files_from_members(
+        input.parent().unwrap_or(Path::new(".")),
+        &run_metadata::MemberPolicy {
+            members: run_metadata::Members::Explicit(&member_names),
+            file_format: Some(run_metadata::term(1000562, "ABI WIFF format")),
+            id_format: Some(run_metadata::term(1000770, "WIFF nativeID format")),
+            default_member: Some(wiff_name.as_str()),
+        },
+    );
+    let sample = sciex_sample();
+    let mut reader = sciex::SciexReader::open(input)?;
+    reader.refuse_if_unsupported(input, sample)?;
+    if let Some(n) = sample {
+        reader.select_sample(n)?;
+    }
     let total = reader.len();
     if total == 0 {
         bail!("no spectra in {}", input.display());
@@ -5498,9 +5563,19 @@ fn convert_sciex_grid(
          max round-trip {max_ppm:.4} ppm"
     );
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
+    // What the WIFF states about the run (instrument, serial, Analyst version, acquisition time,
+    // the sample's name) plus the digested members; a naive acquisition time becomes an index block.
+    let acquisition_block = reader.run_metadata(sample).and_then(|mut m| {
+        m.source_files = source_files;
+        m.default_source_file = default_source;
+        run_metadata::apply(&mut writer, m)
+    });
     fixup_run_metadata(&mut writer, input);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    if let Some((key, block)) = acquisition_block {
+        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
+    }
     // `lossless` names the exactly-stored column, `mz_reconstruction` rates the m/z you rebuild
     // from it — see `finish_tof_grid_archive`. `max_roundtrip_ppm` is the measured worst case over
     // this run (it has run at ~5 ppm on the published MSV000095995 archive), and
@@ -6098,6 +6173,8 @@ struct Ms1Chroms {
     /// lanes (the mzML lane inherits ProteoWizard's list and keeps it).
     saw_ms1: bool,
     saw_msn: bool,
+    saw_centroid: bool,
+    saw_profile: bool,
 }
 
 impl Ms1Chroms {
@@ -6106,6 +6183,11 @@ impl Ms1Chroms {
             self.saw_ms1 = true;
         } else {
             self.saw_msn = true;
+        }
+        match spec.signal_continuity() {
+            mzdata::spectrum::SignalContinuity::Centroid => self.saw_centroid = true,
+            mzdata::spectrum::SignalContinuity::Profile => self.saw_profile = true,
+            _ => {}
         }
         if spec.ms_level() != 1 {
             return;
@@ -6182,7 +6264,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     source: I,
     synth: bool,
 ) -> Result<()> {
-    set_file_contents(writer, ms1.saw_ms1, ms1.saw_msn);
+    set_file_contents(writer, ms1, synth && !ms1.time.is_empty());
     let synthesized = if synth { ms1.write(writer)? } else { 0 };
     let mut n = synthesized;
     for chrom in source {
@@ -6231,18 +6313,29 @@ fn is_path_shaped_run_id(id: &str) -> bool {
 /// `file_description.contents` from what was actually written: `MS1 spectrum` / `MSn spectrum`, the
 /// two terms ProteoWizard states. Only when the lane said nothing more specific than the generic
 /// parent term (or nothing at all) — an inherited list (the mzML lane) is kept verbatim.
-fn set_file_contents(target: &mut impl MSDataFileMetadata, saw_ms1: bool, saw_msn: bool) {
+fn set_file_contents(target: &mut impl MSDataFileMetadata, seen: &Ms1Chroms, tic_written: bool) {
     let contents = &mut target.file_description_mut().contents;
     let only_generic = contents.iter().all(|p| p.curie() == Some(curie!(MS:1000294)));
-    if !only_generic || (!saw_ms1 && !saw_msn) {
+    if !only_generic || (!seen.saw_ms1 && !seen.saw_msn) {
         return;
     }
     contents.retain(|p| p.curie() != Some(curie!(MS:1000294)));
-    if saw_ms1 {
+    // The terms ProteoWizard lists for a file: the spectrum kinds, their representation, and the
+    // TIC chromatogram when one is written.
+    if seen.saw_ms1 {
         contents.push(Param::builder().name("MS1 spectrum").curie(curie!(MS:1000579)).build());
     }
-    if saw_msn {
+    if seen.saw_msn {
         contents.push(Param::builder().name("MSn spectrum").curie(curie!(MS:1000580)).build());
+    }
+    if seen.saw_centroid {
+        contents.push(Param::builder().name("centroid spectrum").curie(curie!(MS:1000127)).build());
+    }
+    if seen.saw_profile {
+        contents.push(Param::builder().name("profile spectrum").curie(curie!(MS:1000128)).build());
+    }
+    if tic_written {
+        contents.push(Param::builder().name("total ion current chromatogram").curie(curie!(MS:1000235)).build());
     }
 }
 

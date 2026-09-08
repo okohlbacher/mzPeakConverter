@@ -410,15 +410,24 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     if let Some(t) = meta.get("transformations") {
         s.insert("transformations".into(), t.to_string());
     }
+    if let Some(a) = meta.get("acquisition_time") {
+        s.insert("acquisition_time.wall_clock".into(), a.get("wall_clock").map(|v| v.to_string()).unwrap_or_default());
+    }
 
     // --- run ----------------------------------------------------------------------------------
     if let Some(run) = meta.get("run") {
         for f in ["default_instrument_id", "default_source_file_id", "default_data_processing_id"] {
             s.insert(format!("run.{f}"), run.get(f).map(|v| v.to_string()).unwrap_or_else(|| "absent".into()));
         }
+        // The INSTANT, in UTC, so a vendor-stated offset and ProteoWizard's host-zone shift are
+        // compared as values (presence-only let a wrong-by-hours time pass as "identical").
         s.insert(
             "run.start_time".into(),
-            if run.get("start_time").is_some_and(|v| !v.is_null()) { "set" } else { "null" }.into(),
+            run.get("start_time")
+                .and_then(|v| v.as_str())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.to_utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "null".into()),
         );
         // The id itself is the run stem on both lanes; compare only its shape, not the string.
         s.insert(
@@ -435,8 +444,21 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     let mut names: Vec<String> = sfs.iter().filter_map(|sf| sf.get("name").and_then(|v| v.as_str()).map(str::to_string)).collect();
     names.sort();
     s.insert("file_description.source_files.names".into(), names.join(","));
+    let mut digests: Vec<String> = sfs
+        .iter()
+        .filter_map(|sf| {
+            let name = sf.get("name").and_then(|v| v.as_str())?;
+            let sha = sf.get("parameters")?.as_array()?.iter().find(|p| p.get("accession").and_then(|a| a.as_str()) == Some("MS:1000569"))?;
+            let hex = sha.get("value").and_then(|v| v.get("string").or(Some(v))).and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("{}={hex}", name.to_ascii_lowercase()))
+        })
+        .collect();
+    digests.sort();
+    s.insert("file_description.source_files.digests".into(), digests.join(","));
     if let Some(c) = json_at(&meta, &["file_description", "contents"]) {
-        s.insert("file_description.contents".into(), c.to_string());
+        let mut accs: Vec<String> = c.as_array().map(|a| a.iter().filter_map(|p| p.get("accession").and_then(|x| x.as_str()).map(str::to_string)).collect()).unwrap_or_default();
+        accs.sort();
+        s.insert("file_description.contents".into(), accs.join(","));
     }
 
     // --- instrument configurations ------------------------------------------------------------
@@ -444,19 +466,29 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     s.insert("instrument.configs".into(), configs.len().to_string());
     let mut accs: BTreeSet<String> = BTreeSet::new();
     let mut components = 0usize;
-    let mut serial = "absent";
+    let mut serial = "absent".to_string();
+    let mut model = "absent".to_string();
+    let value_of = |p: &serde_json::Value| -> String {
+        let v = p.get("value").cloned().unwrap_or_default();
+        v.get("string").or(v.get("float")).or(v.get("integer")).cloned().unwrap_or(v).to_string().trim_matches('"').to_string()
+    };
     for c in &configs {
         for p in params_of(c) {
-            if p == "MS:1000529" {
-                serial = "present";
-            }
             accs.insert(p);
+        }
+        for p in c.get("parameters").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            match p.get("accession").and_then(|a| a.as_str()) {
+                Some("MS:1000529") => serial = value_of(&p),
+                Some("MS:1000031") => model = value_of(&p),
+                _ => {}
+            }
         }
         components += c.get("components").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
     }
     s.insert("instrument.param_accessions".into(), accs.iter().cloned().collect::<Vec<_>>().join(","));
     s.insert("instrument.components".into(), components.to_string());
-    s.insert("instrument.serial".into(), serial.into());
+    s.insert("instrument.serial".into(), serial);
+    s.insert("instrument.model".into(), model);
 
     // --- the other lists ----------------------------------------------------------------------
     for (key, field) in [
@@ -468,12 +500,23 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     ] {
         let arr = meta.get(field).and_then(|v| v.as_array()).cloned().unwrap_or_default();
         if key.ends_with(".ids") {
-            let mut ids: Vec<String> =
-                arr.iter().filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string)).collect();
+            let mut ids: Vec<String> = arr
+                .iter()
+                .filter_map(|e| {
+                    let id = e.get("id").and_then(|v| v.as_str())?;
+                    let version = e.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(if version.is_empty() { id.to_string() } else { format!("{id}@{version}") })
+                })
+                .collect();
             ids.sort();
             s.insert(key.into(), ids.join(","));
         } else {
             s.insert(key.into(), arr.len().to_string());
+        }
+        if key == "sample.count" {
+            let mut names: Vec<String> = arr.iter().filter_map(|e| e.get("name").and_then(|v| v.as_str()).map(str::to_string)).collect();
+            names.sort();
+            s.insert("sample.names".into(), names.join(","));
         }
     }
 
@@ -651,16 +694,13 @@ fn unexpected_and_stale() {
     }
     let _ = std::fs::remove_dir_all(&scratch);
     let stale: Vec<&str> = EXPECTED.iter().map(|e| e.reason).filter(|r| !fired.contains(r)).collect();
-    // Not an assertion: which rules fire depends on WHICH pairs are present (a Shimadzu pair does
-    // carry a source checksum, an Agilent one does not). Report so the list can be pruned when the
-    // pair set is broad enough to justify it.
-    if !stale.is_empty() {
-        println!(
-            "{} EXPECTED rule(s) did not fire on this pair set — closed, or never applicable here:",
-            stale.len()
-        );
-        for r in stale {
-            println!("  - {r}");
-        }
-    }
+    // An assertion since 0.12: a rule that fires on no pair either records a loss that has been
+    // CLOSED (delete it, the parity is the proof) or never matched anything. Which rules fire does
+    // depend on which pairs are present, so the pair set must stay broad (one unit per native lane).
+    assert!(
+        stale.is_empty(),
+        "{} EXPECTED rule(s) did not fire on this pair set — closed, or never applicable here; prune them:\n  - {}",
+        stale.len(),
+        stale.join("\n  - ")
+    );
 }
