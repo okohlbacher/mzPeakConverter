@@ -84,3 +84,12 @@ netcorehost = "0.18"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# mzdata 0.66.6's mzML reader drops the SECOND isolation-window offset when both offsets precede the
+# target m/z (ProteoWizard's Waters order: upper, lower, target — SpectrumList_Waters.cpp:308-316), so
+# every pwiz Waters MSe archive carried isolation_window_lower_offset = 0. Same crate, same version,
+# one 7-line reader fix on our fork (branch fix/isolation-window-offsets-before-target), upstream PR
+# mobiusklein/mzdata#58. Drop this block and bump the pin above once a release carries the fix.
+# Pinned by tests/isolation_window_offset_order.rs.
+[patch.crates-io]
+mzdata = { git = "https://github.com/okohlbacher/mzdata.git", rev = "1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db" }
