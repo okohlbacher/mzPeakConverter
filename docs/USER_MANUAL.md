@@ -53,6 +53,23 @@ Passing `-v` prints that same inspection report *and still performs the conversi
 | C toolchain | for the bundled native libs (SQLite is compiled from source) |
 | .NET 8+ runtime | **only for Thermo `.raw`**; auto-rolls-forward to 9/10 |
 
+**macOS, from a release (Homebrew).** The cask tap lives in the converter's own
+repository:
+
+```sh
+brew tap okohlbacher/mzpeak https://github.com/okohlbacher/mzPeakConverter
+brew install --cask mzpeak-convert
+```
+
+It installs the published binary for the machine's architecture, so no Rust toolchain
+is needed; `brew upgrade --cask mzpeak-convert` moves to a later release. The released
+binaries are ad-hoc signed and not notarized by Apple, so the cask removes the
+download-quarantine attribute from the executable it installs — macOS refuses to run a
+quarantined binary that carries no Developer ID. Verify a download against the
+`.sha256` file published beside it.
+
+**Any platform, from source:**
+
 ```sh
 git clone https://github.com/okohlbacher/mzPeakConverter.git
 cd mzPeakConverter

@@ -1,0 +1,133 @@
+# macOS release artifacts + the Homebrew cask that serves them.
+#
+# Runs on a `v*` tag, or on demand against a tag that already exists (a release cut
+# before this workflow landed still gets its assets this way). Both architectures are
+# built on the arm64 runner: aarch64 natively, x86_64 cross-compiled against the same
+# SDK — measured at 1m24s for the full dependency tree, and it keeps the workflow off
+# the Intel runner images, which GitHub is retiring.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach macOS assets to (e.g. v0.11.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      # One floor for both architectures, so the cask's `depends_on macos:` is the truth.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/mzpeak-convert" "$stage/"
+          strip -x "$stage/mzpeak-convert"
+          # strip invalidates the linker's signature, and an arm64 binary must carry
+          # one to run at all — re-sign ad-hoc. Replace this with a Developer ID
+          # signature plus `xcrun notarytool submit --wait` when Apple credentials are
+          # configured for this repository; the cask can then drop its quarantine
+          # stanza, because a notarized binary passes Gatekeeper on its own.
+          codesign --force --sign - "$stage/mzpeak-convert"
+          cp LICENSE README.md "$stage/"
+          tarball="mzpeak-convert-${version}-${{ matrix.target }}.tar.gz"
+          ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$RUNNER_TEMP/$tarball" \
+              mzpeak-convert LICENSE README.md )
+          shasum -a 256 "$RUNNER_TEMP/$tarball" | sed "s| .*/| |" > "$RUNNER_TEMP/$tarball.sha256"
+          echo "tarball=$RUNNER_TEMP/$tarball" >> "$GITHUB_OUTPUT"
+          { echo "### ${{ matrix.target }}"; echo '```'; cat "$RUNNER_TEMP/$tarball.sha256"; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the artifact
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage"
+          file "$stage/mzpeak-convert"
+          lipo -archs "$stage/mzpeak-convert"
+          codesign -dvv "$stage/mzpeak-convert" 2>&1 | grep -E "Signature|flags"
+          # Only the native slice can be executed on this runner.
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            "$stage/mzpeak-convert" --version
+            "$stage/mzpeak-convert" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
+            test -s "$RUNNER_TEMP/smoke.mzpeak"
+          fi
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.tarball }}.sha256" \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+  cask:
+    name: Update the Homebrew cask
+    needs: macos
+    runs-on: macos-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Point the cask at this release
+        run: tools/update_cask.sh "$TAG"
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Casks/mzpeak-convert.rb; then
+            echo "cask already current"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/mzpeak-convert.rb
+          git commit -m "cask: mzpeak-convert $TAG [skip ci]"
+          git push || {
+            echo "::error::could not push the cask update (protected branch?). Run" \
+                 "\`tools/update_cask.sh $TAG\` locally and commit Casks/mzpeak-convert.rb."
+            exit 1
+          }
