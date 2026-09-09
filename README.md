@@ -78,20 +78,25 @@ executable: **[docs/PLATFORM_SUPPORT.md](docs/PLATFORM_SUPPORT.md)**.
 
 ## Install
 
-**macOS — Homebrew.** The tap lives in this repository, so one `brew tap` serves the
-cask:
+**macOS — Homebrew.** The tap lives in this repository, so one `brew tap` serves it:
 
 ```sh
 brew tap okohlbacher/mzpeak https://github.com/okohlbacher/mzPeakConverter
-brew install --cask mzpeak-convert
+brew install okohlbacher/mzpeak/mzpeak-convert          # formula (recommended)
+brew install --cask okohlbacher/mzpeak/mzpeak-convert   # or the cask
 ```
 
-That installs the released binary for your architecture (Apple silicon or Intel) as
-`mzpeak-convert`. `brew upgrade --cask mzpeak-convert` follows later releases and
-`brew uninstall --cask mzpeak-convert` removes it. The binaries are ad-hoc signed
-rather than notarized by Apple, so the cask drops the download-quarantine attribute
-from the executable it installs — without that macOS kills it on the first run. Each
-archive is published with a `.sha256` sidecar to check against.
+Both install the released binary for your architecture — Apple silicon or Intel, no
+Rust toolchain — as `mzpeak-convert`; install one, not both. Name the tap in full:
+Homebrew 6 rejects a bare token from a tap it has not been told to trust, and the
+two-argument `brew tap` is required because the repository is not named
+`homebrew-mzpeak`. `brew upgrade` follows later releases and `brew uninstall` (add
+`--cask` if that is how you installed it) removes it.
+
+Prefer the formula. The binaries are ad-hoc signed rather than notarized by Apple, and
+Homebrew quarantines every *cask* download, which macOS then refuses to execute — so
+the cask has to strip that attribute itself and says so when it installs. Formula
+downloads are not quarantined. Each archive is published with a `.sha256` sidecar.
 
 **From source** (every platform):
 
