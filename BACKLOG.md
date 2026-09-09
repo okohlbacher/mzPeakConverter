@@ -64,7 +64,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   the Agilent +1 h is not yet pinned to it. Open, in order: (1) **Shimadzu — resolved 2026-09-09** by
   reading the file (option c); the DLL-side emptiness is still being analysed (Codex's leading
   hypothesis: the 1252 code page has no decoder in .NET 8 unless the provider is registered — the glue
-  now registers it; verification on the box pending). (2) **Consumer
+  now registers it; on the next Blind run the debug dump that fires on an empty date no longer fired). (2) **Consumer
   guidance + validator rule:** readers must fall back to `acquisition_time.wall_clock` when
   `run.start_time` is null; the validator should flag a null `run.start_time` WITHOUT the block on a
   vendor-derived archive, and never flag the block itself (handoff to mzPeakValidator pending). (3)
