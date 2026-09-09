@@ -407,6 +407,113 @@ impl WatersReader {
             }
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Read one spectrum: `readScan` → m/z (f64, widened from the vendor's f32) + intensity (f32).
+    pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
+        let (func, scan) = *self
+            .index
+            .get(i)
+            .ok_or_else(|| anyhow!("Waters spectrum index {i} out of range (len {})", self.len()))?;
+
+        let mut p_masses: *mut f32 = ptr::null_mut();
+        let mut p_intensities: *mut f32 = ptr::null_mut();
+        let mut n: c_int = 0;
+        let rc = unsafe {
+            (self.read_scan)(
+                self.scan_reader,
+                func,
+                scan,
+                &mut p_masses,
+                &mut p_intensities,
+                &mut n,
+            )
+        };
+        if rc != 0 {
+            bail!("MassLynx readScan(func={func}, scan={scan}) failed (rc={rc})");
+        }
+        if n < 0 || n > MAX_WATERS_SPECTRUM_POINTS {
+            bail!("MassLynx readScan returned implausible point count {n}");
+        }
+        let n = n as usize;
+
+        // The masses/intensities arrays are READER-OWNED — internal buffers valid until the next
+        // readScan (or reader destroy), NOT caller-allocated. Copy out immediately; do NOT free them
+        // (calling releaseMemory on them corrupts the heap — 0xC0000374). m/z widened f32→f64.
+        let mz: Vec<f64> = if n > 0 && !p_masses.is_null() {
+            unsafe { std::slice::from_raw_parts(p_masses, n) }
+                .iter()
+                .map(|&x| x as f64)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let intensity: Vec<f32> = if n > 0 && !p_intensities.is_null() {
+            unsafe { std::slice::from_raw_parts(p_intensities, n) }.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz_da =
+            DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz_da
+            .update_buffer(mz.as_slice())
+            .map_err(|e| anyhow!("encoding m/z: {e}"))?;
+        mz_da.unit = Unit::MZ;
+        arrays.add(mz_da);
+        let mut int_da =
+            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        int_da
+            .update_buffer(intensity.as_slice())
+            .map_err(|e| anyhow!("encoding intensity: {e}"))?;
+        int_da.unit = Unit::DetectorCounts;
+        arrays.add(int_da);
+
+        // MS level: function 0 is the MS1 acquisition; higher functions are MS2/lockmass. Refining
+        // this needs getFunctionType (TODO); function index is a sound first approximation.
+        let ms_level: u8 = if func == 0 { 1 } else { 2 };
+        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
+        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
+        // otherwise indistinguishable from a complete one. The set mass is reachable via
+        // `getScanItemValue`; not wired yet.
+        if ms_level > 1 {
+            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+            PRECURSOR_GAP_SAID.call_once(|| {
+                log::warn!(
+                    "Waters MassLynx: this reader does not yet extract precursors; \
+                     MS2 rows will have none (no selected ion, isolation window or collision energy \
+                     in the archive)"
+                );
+            });
+        }
+        let mut descr = SpectrumDescription {
+            // ProteoWizard Waters native-id convention (1-based function/scan).
+            id: format!("function={} process=0 scan={}", func + 1, scan + 1),
+            index: i,
+            ms_level,
+            // From the vendor's per-function flag, not assumed. Unknown (export missing or the call
+            // failed) keeps the historical Profile default.
+            signal_continuity: match self.continuum.get(func as usize).copied().flatten() {
+                Some(true) => SignalContinuity::Profile,
+                Some(false) => SignalContinuity::Centroid,
+                None => SignalContinuity::Profile,
+            },
+            polarity: ScanPolarity::Unknown,
+            ..Default::default()
+        };
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
+        // RT is available via readScanItemValue (TODO); leave a default scan event for now.
+        descr.acquisition.scans.push(ScanEvent::default());
+
+        Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
+    }
 }
 
 impl Drop for WatersReader {
