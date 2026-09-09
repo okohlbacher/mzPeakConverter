@@ -36,7 +36,20 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     charge); a SONAR file to decide how quadrupole-position bins should be stored; mixed IMS/non-IMS
     runs beyond the sFtsk_2 probe; the id convention — pwiz's `function=F process=0 scan=S` names a
     frame here and a drift bin there (pwiz's own combined mode uses `merged=I function=F block=B`), a
-    spec question. Viewer: mzPeakViewer keys its mobility panel on the
+    spec question. From the 2026-09-09 adversarial review (78 findings, synthesis in the data dir's
+    `waters/review/SYNTHESIS.md`; every wrong-data path closed and re-verified at HEAD), the items that need a
+    DECISION rather than code: (a) the MSe precursor's isolation window — the row states the activation only
+    and leaves the window NULL, which `spectra.md` (one MS:1000792 child MUST) does not allow; pwiz writes the
+    acquisition range as the window (target = midpoint) — either declare activation-only rows legitimate in
+    the spec or write the acquisition range with a param saying so; (b) MS:1000045 on MSe rows is the scan
+    item's 4 eV trap energy (pwiz writes the same); the transfer ramp is on MS:1002013/1002014; (c) the
+    synthesized TIC keeps the lock-mass function's frames, as pwiz's does; (d) the mzML twin's isolation
+    window drops the lower offset (mzdata 0.66.6 reads only one; a fix exists on `claude/eager-robinson-83facb`
+    1add0469) — cherry-pick and rebuild the pwiz twins; (e) mzPeakViewer cannot see a Waters frame at all
+    (keys on `ims_calibration` and the 1/K0 array name; needs MS:1003007 + `waters_drift`); (f) non-ASCII
+    `.raw` paths go through the narrow-char `createRawReaderFromPath` — untested. Coverage still owed:
+    a centroid IMS run, an all-empty frame, a non-IMS `.raw`, a SONAR file, a full uncapped HDDDA
+    conversion, `validate_everything.py` on the frame archives. Viewer: mzPeakViewer keys its mobility panel on the
     `ims_calibration` block and the 1/K0 array name; it needs to recognise `raw_ion_mobility` (ms)
     and the `waters_drift` block.
   - **Device chromatograms** (UV, pressure, temperature; B-P3): the mzML lane gets 620 traces on

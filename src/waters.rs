@@ -434,7 +434,7 @@ impl WatersReader {
             let ion_mode = int_of(ion_mode, f).and_then(|code| string_of(mode_string, code));
             let mass_range = mass_range.and_then(|g| {
                 let (mut lo, mut hi): (f32, f32) = (0.0, 0.0);
-                (unsafe { g(info_reader, f, 0, &mut lo, &mut hi) } == 0 && hi > lo).then_some((lo, hi))
+                (unsafe { g(info_reader, f, 0, &mut lo, &mut hi) } == 0 && hi >= lo && hi > 0.0).then_some((lo, hi))
             });
             // pwiz's rule (WatersRawFile.hpp): a function is ion-mobility data when its `.cdt`
             // exists AND MassLynx counts drift bins for it.
@@ -449,7 +449,11 @@ impl WatersReader {
                         log::warn!("MassLynx function {}: getDriftScanCount says {n} bins (> {MAX_DRIFT_BINS}); treated as a summed scan", f + 1);
                         0
                     }
-                    _ => 0,
+                    Some(_) => 0,
+                    None => {
+                        log::warn!("MassLynx function {}: has a .cdt but getDriftScanCount failed; written as the summed scan", f + 1);
+                        0
+                    }
                 }
             } else {
                 0
@@ -466,6 +470,14 @@ impl WatersReader {
                     sonar = !(v.trim() == "0" || v.trim().is_empty() || v.eq_ignore_ascii_case("false"));
                 }
                 collision_energy_0 = get(item_ids.collision_energy).and_then(|v| v.trim().parse::<f64>().ok()).map(f64::abs);
+            }
+            if drift_bins > 0 && !sonar && (scan_items.is_none() || item_ids.sonar.is_none()) {
+                log::warn!(
+                    "MassLynx function {}: {} — its {} bins are written as drift times on trust (a SONAR function would be mislabelled)",
+                    f + 1,
+                    if scan_items.is_none() { "scan items unavailable, SONAR not checked" } else { "the item table has no `Sonar Enabled`" },
+                    drift_bins
+                );
             }
             if sonar && drift_bins > 0 {
                 log::warn!(
@@ -508,7 +520,7 @@ impl WatersReader {
             )));
         }
 
-        // The run's drift-time table: bin → ms, read once from the first IMS function's bin count.
+        // The run's drift-time table: bin → ms, read once for the largest bin count of any IMS function.
         let mut drift_time_ms = Vec::new();
         if let Some(n) = functions.iter().map(|fi| fi.drift_bins).max().filter(|n| *n > 0) {
             let Some(g) = drift_time else {
@@ -611,7 +623,9 @@ impl WatersReader {
             }
         }
         if rt_failures > 0 {
-            log::warn!("MassLynx getRetentionTime failed for {rt_failures} scans; their time is written as 0.0");
+            return Err(close(format!(
+                "MassLynx getRetentionTime failed for {rt_failures} scans; refusing to write an index whose time order is unknown"
+            )));
         }
         // Time order across functions (stable, so ties keep function then scan order).
         index.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
@@ -778,12 +792,11 @@ impl WatersReader {
             id: format!("function={} process=0 scan={}", func + 1, scan + 1),
             index: i,
             ms_level: fi.ms_level,
-            // From the vendor's per-function flag, not assumed. Unknown (export missing or the call
-            // failed) keeps the historical Profile default.
+            // From the vendor's per-function flag, not assumed — unknown stays unknown.
             signal_continuity: match fi.continuum {
                 Some(true) => SignalContinuity::Profile,
                 Some(false) => SignalContinuity::Centroid,
-                None => SignalContinuity::Profile,
+                None => SignalContinuity::Unknown,
             },
             polarity: match fi.ion_mode.as_deref().and_then(|m| m.chars().last()) {
                 Some('+') => ScanPolarity::Positive,
@@ -924,8 +937,11 @@ fn copy_points(p_masses: *mut f32, p_intensities: *mut f32, n: c_int) -> Result<
     if n < 0 || n > MAX_WATERS_SPECTRUM_POINTS {
         bail!("MassLynx read returned implausible point count {n}");
     }
+    if n > 0 && (p_masses.is_null() || p_intensities.is_null()) {
+        bail!("MassLynx read returned {n} points but a NULL buffer");
+    }
     let n = n as usize;
-    if n == 0 || p_masses.is_null() || p_intensities.is_null() {
+    if n == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
     let mz = unsafe { std::slice::from_raw_parts(p_masses, n) }.iter().map(|&x| x as f64).collect();
@@ -1008,13 +1024,11 @@ fn ms_level_for(f: usize, functions: &[FunctionInfo], lockmass: Option<c_int>) -
             }
         }
         Some(_) => 1, // skipped before the index is built
-        // No type information at all (export missing): the historical index rule.
+        // No type information at all (export missing or the call failed): MS1, said out loud —
+        // guessing MS2 from the function's position invented precursorless MS2 rows.
         None => {
-            if f == 0 {
-                1
-            } else {
-                2
-            }
+            log::warn!("MassLynx function {}: type unknown (getFunctionType unavailable or failed); written as MS1", f + 1);
+            1
         }
     }
 }
@@ -1124,9 +1138,9 @@ mod tests {
         assert!(matches!(FunctionKind::from_code(201), Some(FunctionKind::Chromatogram(_))));
         assert!(matches!(FunctionKind::from_code(207), Some(FunctionKind::Chromatogram(_))));
         assert!(matches!(FunctionKind::from_code(212), Some(FunctionKind::NotMs(_))));
-        // No type information: the historical index rule.
+        // No type information: MS1 everywhere (with a warning), never a positional MS2 guess.
         let fs = vec![fi(None, 0, None), fi(None, 0, None), fi(None, 0, None)];
-        assert_eq!((0..3).map(|f| ms_level_for(f, &fs, None)).collect::<Vec<_>>(), vec![1, 2, 2]);
+        assert_eq!((0..3).map(|f| ms_level_for(f, &fs, None)).collect::<Vec<_>>(), vec![1, 1, 1]);
     }
 
     #[test]
