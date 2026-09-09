@@ -53,6 +53,28 @@ Passing `-v` prints that same inspection report *and still performs the conversi
 | C toolchain | for the bundled native libs (SQLite is compiled from source) |
 | .NET 8+ runtime | **only for Thermo `.raw`**; auto-rolls-forward to 9/10 |
 
+**macOS, from a release (Homebrew).** The tap lives in the converter's own repository:
+
+```sh
+brew tap okohlbacher/mzpeak https://github.com/okohlbacher/mzPeakConverter
+brew install okohlbacher/mzpeak/mzpeak-convert          # formula (recommended)
+brew install --cask okohlbacher/mzpeak/mzpeak-convert   # or the cask
+```
+
+Either installs the published binary for the machine's architecture, so no Rust
+toolchain is needed; install one of the two, not both, since they provide the same
+command. The tap and the package must be named in full — Homebrew 6 refuses a bare
+token from an untrusted third-party tap, and a repository not called
+`homebrew-mzpeak` needs the two-argument `brew tap`.
+
+The formula is the better route. Released binaries are ad-hoc signed and not notarized
+by Apple; Homebrew quarantines every *cask* download and macOS kills a quarantined
+binary that carries no Developer ID, so the cask removes that attribute from the file
+it installs (its caveats say so). A formula download is never quarantined. Verify any
+archive against the `.sha256` file published beside it.
+
+**Any platform, from source:**
+
 ```sh
 git clone https://github.com/okohlbacher/mzPeakConverter.git
 cd mzPeakConverter
