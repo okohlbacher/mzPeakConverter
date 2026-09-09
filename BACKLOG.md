@@ -15,11 +15,10 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).
 - **Run metadata on the native lanes — landed after 0.11.2** (`src/run_metadata.rs`,
   `agilent_meta.rs`, `waters_meta.rs`, Bruker `GlobalMetadata`, SciEX `RunInfo`; CHANGELOG
-  Unreleased). Measured against fresh lane pairs: blank1 now carries the vendor serial, sample,
-  MassHunter version and the STATED `-04:00` start time where pwiz's is shifted by the box's zone;
-  Capan2 carries the model, sample, MassLynx version and its unzoned wall clock in
-  `acquisition_time`; SWATH/Sample002/MRM-HR WIFFs carry model, serial, `SCIEX OS`/`Analyst TF`
-  versions, sample and both digested members. **Still open, by lane:**
+  Unreleased). Measured against fresh lane pairs: blank1 now carries the vendor serial, sample and
+  MassHunter version; Capan2 the model, sample and MassLynx version; SWATH/Sample002/MRM-HR WIFFs
+  model, serial, `SCIEX OS`/`Analyst TF` versions, sample and both digested members. Acquisition
+  clocks are tracked in their own item below. **Still open, by lane:**
   - **Orphan MS2 (precursors):** Waters (Capan2: the 682 high-energy MSe scans, which pwiz expands into 136,400 drift-bin
     spectra with a placeholder precursor each; per-scan `SET_MASS` and collision energies live in `_FUNCnnn.STS`, a reverse-engineered layout the 2026-09-08 review refused to
     publish from before an SDK side-by-side on the box); SciEX (663k in the corpus; needs the
@@ -36,17 +35,38 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     readable on any host.
   - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
     per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
-  - **Shimadzu acquisition date:** ProteoWizard records `2024-02-15T08:47:18Z` for Blind_P1_pos_012 from
-    `dataObject_->SampleInfo->AnalysisDate.ToUniversalTime()`; our glue reads the same property through the
-    same IoModule 5.0.0.0 and gets `DateTime.MinValue` — under `MZPC_SHIMADZU_DEBUG` every SampleInfo scalar
-    (name, operator, vial, date) is at its default and `MS.Parameters.CurrentStorage` throws, so the DLL's
-    sample-info load fails silently in the .NET 8 host (pwiz hosts it under .NET Framework). The `.lcd`'s
-    OLE2 storages were created 2024-02-15 10:46:49 (FILETIME) — not pwiz's value either. Next step: the same
-    call from a net48 host (the Agilent glue host pattern) or a Shimadzu question; until then the lane records
-    no date rather than a false one.
   - Shimadzu acquisition-software version (LabSolutions; needs a glue export); Waters per-function
     polarity / RT / scan windows (W-P2/W-P5: `_FUNCTNS.INF` + `_FUNCnnn.IDX`, same SDK cross-check);
     `src/agilent_midac.rs` scaffold deletion.
+- **Acquisition clocks — every open point in one place (2026-09-09).** `run.start_time` is an RFC 3339
+  instant and RFC 3339 cannot say "zone unknown", so the converter's rule (branch
+  `feat/native-run-metadata`, `src/run_metadata.rs`) is: a vendor time that STATES its UTC offset is
+  written verbatim; a wall clock WITHOUT a zone leaves `run.start_time` null and is preserved verbatim in
+  `metadata.acquisition_time = {wall_clock, zone: "unstated", source, note}`. Nothing is shifted by the
+  converting host's zone. Measured per vendor on the six lane pairs (native vs ProteoWizard 3.0.26175):
+  | vendor (pair) | what the file states | native lane | ProteoWizard writes |
+  |---|---|---|---|
+  | Agilent `.d` (blank1) | `Contents.xml` `AcquiredTime` `2022-11-01T13:11:27.729717400-04:00` (= 17:11:27Z) | `run.start_time` verbatim | `2022-11-01T18:11:27Z` — off by +1 h from the stated instant; mechanism not established (not the box's offset either: CET would give 16:11Z or 12:11Z) |
+  | Bruker TDF/TSF | `GlobalMetadata.AcquisitionDateTime` with offset | verbatim | verbatim (agrees) |
+  | Waters `.raw` (Capan2) | `_HEADER.TXT` `Acquired Date/Time` `03-Dec-2018 22:39:33`, no zone | null + block `22:39:33` | `2018-12-03T22:39:33Z` — labels the wall clock UTC |
+  | SciEX `.wiff` (SWATH, Sample002, MRM_03) | Clearcore2 `AcquisitionDateTime`, `Kind = Unspecified` | null + block (`09:52:14`, `19:58:37`, `02:56:30`) | wall clock − 2 h on all three (`07:52:14Z`, `17:58:37Z`, `00:56:30Z`) although the runs are from November, February and August — the box's CURRENT offset, not the acquisition date's |
+  | Shimadzu `.lcd` (Blind) | `SampleInfo.AnalysisDate` — IoModule 5.0.0.0 returns `DateTime.MinValue` in our .NET 8 host (every SampleInfo scalar default, `DataObject.FileName` empty, `MS.Parameters.CurrentStorage` throws); OLE2 storages created 2024-02-15 10:46:49 FILETIME | nothing recorded | `2024-02-15T08:47:18Z` via `SampleInfo->AnalysisDate.ToUniversalTime()` (a host-zone conversion of whatever the DLL returns) — adversarial analysis in `~/Claude/mzPeak/data/native-run-metadata-2026-09-08/shimadzu/` |
+  | Thermo `.raw` | mzdata's reader, zoned | verbatim | verbatim (agrees) |
+  Open, in order: (1) **Shimadzu:** get the date at all — the hosting difference (.NET 8 in-process via
+  netcorehost vs pwiz's C++/CLI .NET Framework) is the leading hypothesis; the decisive experiment is a
+  net48 console probe on the box (reflection-load IoModule, `LoadData`, print `SampleInfo.AnalysisDate`,
+  `FileName`, `GetLastError`); fix options a) net8 glue fix, b) out-of-process net48 host (Agilent pattern),
+  c) read the OLE2 stream directly once the byte search names it, d) record nothing. (2) **Consumer
+  guidance + validator rule:** readers must fall back to `acquisition_time.wall_clock` when
+  `run.start_time` is null; the validator should flag a null `run.start_time` WITHOUT the block on a
+  vendor-derived archive, and never flag the block itself (handoff to mzPeakValidator pending). (3)
+  **Decision recorded, revisit only on request:** we do NOT assert a zone for an unzoned wall clock for
+  consumer compatibility — pwiz's `Z`/host-offset labels are exactly the false precision the rule avoids.
+  (4) **Upstream:** the Agilent +1 h and the SciEX current-offset shifts are ProteoWizard behaviours worth
+  a report once the mechanism is pinned (pwiz's `Reader_Agilent` / `Reader_ABI` date handling; not
+  reproduced by us). (5) Agilent `Contents.xml` without `AcquiredTime` and Waters headers without
+  `Acquired Date` are handled (nothing recorded); a vendor time that fails to parse is logged at WARN
+  with the raw text and dropped — pinned by `run_metadata::tests::parse_vendor_time`.
 - **SciEX MRM/SIM dwell runs — refused after 0.11.2** (`refuse_if_unsupported`; the box harness
   routes the refusal to `--via-msconvert`). `En_PPY.wiff` and `IPX0002633001_D-239.wiff` will be
   rebuilt on the msconvert lane at the next corpus rerun (154,520 / 2,215 one-point "spectra" → 4 /
