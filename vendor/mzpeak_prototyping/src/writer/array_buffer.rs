@@ -687,7 +687,7 @@ impl ChunkBuffers {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         let boundary = self.mz_boundary?;
         // The chunk main axis is the integer `tof` flight-time array (replaces m/z for this facet).
         let main_axis = crate::BufferName::new(
@@ -710,7 +710,7 @@ impl ChunkBuffers {
             Some(boundary),
         );
         match res {
-            Ok((chunks, _aux, n_pts)) => {
+            Ok((chunks, aux, n_pts)) => {
                 if let Some(chunks) = chunks {
                     let (fields, cols, _) = chunks.into_parts();
                     self.add_arrays(fields, cols, n_pts, false);
@@ -718,7 +718,7 @@ impl ChunkBuffers {
                     // Empty frame (no points): nothing to buffer, but count the (zero) points.
                     self.point_count += 0;
                 }
-                Some(Ok(n_pts))
+                Some(Ok((aux, n_pts)))
             }
             Err(e) => Some(Err(e)),
         }
@@ -735,7 +735,7 @@ impl ChunkBuffers {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         let series_time = if self.include_time { series_time } else { None };
         let res = ArrowArrayChunk::build(
             series_index,
@@ -749,12 +749,14 @@ impl ChunkBuffers {
             &self.chunk_array_fields,
         );
         match res {
-            Ok((chunks, _aux, n_pts)) => {
+            // An array the chunk schema does not carry comes back as an auxiliary array; hand it
+            // up so it lands in the metadata facet rather than being dropped here.
+            Ok((chunks, aux, n_pts)) => {
                 if let Some(chunks) = chunks {
                     let (fields, cols, _) = chunks.into_parts();
                     self.add_arrays(fields, cols, n_pts, false);
                 }
-                Some(Ok(n_pts))
+                Some(Ok((aux, n_pts)))
             }
             Err(e) => Some(Err(e)),
         }
@@ -921,7 +923,7 @@ impl ArrayBufferWriterVariants {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
                 chunk_buffers.add_raw_mz_boundary(series_index, series_time, arrays)
@@ -938,7 +940,7 @@ impl ArrayBufferWriterVariants {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
                 chunk_buffers.add_raw_chunked(series_index, series_time, arrays)
