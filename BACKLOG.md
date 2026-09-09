@@ -104,6 +104,23 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   rebuilt on the msconvert lane at the next corpus rerun (154,520 / 2,215 one-point "spectra" → 4 /
   95 SRM chromatograms). Reading the transitions natively (Q1/Q3, compound, CE, RT window — S-P4)
   stays open; MRM-HR scan runs convert natively as before.
+- **QUESTION for the owner — the isolation-window group's rule and the MS:1003159 marker (2026-09-09).**
+  The mzPeak spec's prose (`docs/schemas/spectra.md:196-201`) says an `isolation_window` group MUST carry
+  at least one MS:1000792 child; its schema rules (`schema/table_rules.json` `precursor_isolationwindow_may`)
+  and the validator say MAY, and spec PR #13 deferred the choice. PSI's DIA recommendation v1.0 (§3.4)
+  wants full-range acquisitions (MSe/HDMSe, AIF, bbCID) marked with MS:1003159 "no isolation" (= "isolation
+  window full range") on the window and no placeholder numbers. The Waters lane now writes conformant
+  numbers under either reading (acquisition range as the window) but cannot place the marker: mzdata's
+  `IsolationWindow` has no parameter list and the vendored writer appends an empty one. Decide: (a) settle
+  MUST vs MAY in the spec, (b) add a window-parameter path (writer side channel + the mzML export) so MSe,
+  Thermo AIF, Bruker bbCID and SciEX MSall rows can carry MS:1003159 beside their numbers.
+- **QUESTION for the owner — how long to carry the mzdata git fork (2026-09-09).** `Cargo.toml` pins
+  `mzdata =0.66.6` to `okohlbacher/mzdata@1d53971` (v0.66.6 + the 7-line isolation-offset reader fix,
+  upstream mobiusklein/mzdata#58 still open). Every fresh build — three CI runners, the vendor jobs, the
+  Flash box — clones the fork over git and the lockfile carries `git+` sources without checksums. Options:
+  nudge #58 and drop the patch on the next mzdata release, or keep the fork branch
+  (`fix/isolation-window-offsets-before-target`) pinned until then and note it in THIRD-PARTY-NOTICES.md
+  (line 26 still says "(crates.io)").
 - **Not in the ledger — temporary `[patch.crates-io]` on mzdata (2026-09-09).** The mzML reader's
   isolation-window fix ([mobiusklein/mzdata#58](https://github.com/mobiusklein/mzdata/pull/58)) is
   pinned from our fork at 0.66.6. When upstream releases it: bump the `mzdata` pin, delete the patch
