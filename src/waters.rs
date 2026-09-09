@@ -52,6 +52,37 @@ type IsContinuumFn = unsafe extern "C" fn(*mut c_void, c_int, *mut bool) -> c_in
 type ReadScanFn =
     unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *mut f32, *mut *mut f32, *mut c_int)
         -> c_int;
+// Exports of the same DLL that the lane did not bind until 2026-09-09 (all present in the export
+// table of MassLynxRaw.dll 4.9.0.0; signatures INFERRED from the shapes above and from the calls
+// ProteoWizard's C++ wrapper makes — `MZPC_WATERS_PROBE=1` validates them against known values
+// before anything is written from them). `(infoReader, function, out)` / `(infoReader, function,
+// scan|bin, out)` shapes; every call returns int, 0 = OK.
+/// `getDriftScanCount(infoReader, function, *out int)` — drift bins per scan of an IMS function.
+type GetIntPerFunctionFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int) -> c_int;
+/// `getDriftTime(infoReader, function, bin, *out float ms)` / `getRetentionTime(infoReader, function, scan, *out float min)`.
+type GetFloatPerScanFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut f32) -> c_int;
+/// `getAcquisitionMassRange(infoReader, function, *out float lo, *out float hi)`.
+type GetMassRangeFn = unsafe extern "C" fn(*mut c_void, c_int, *mut f32, *mut f32) -> c_int;
+/// `getFunctionTypeString(infoReader, function, *out char*)` / `getIonModeString(...)`. The string
+/// is copied out and NEVER released (ownership unknown; see the `readScan` note below).
+type GetStringPerFunctionFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *const c_char) -> c_int;
+/// `getScanItemsInFunction(infoReader, function, *out int*, *out int n)` — the MassLynxScanItem ids
+/// a function records; `getScanItemName(infoReader, item, *out char*)` names one.
+type GetScanItemsFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *const c_int, *mut c_int) -> c_int;
+type GetScanItemNameFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *const c_char) -> c_int;
+/// `getScanItemValue(infoReader, function, scan, item, *out char*)`.
+type GetScanItemValueFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *mut *const c_char) -> c_int;
+/// `readDriftScan(scanReader, function, scan, bin, *out float*, *out float*, *out int n)` — ONE
+/// drift bin of one scan, where `readScan` returns the drift-summed spectrum.
+type ReadDriftScanFn = unsafe extern "C" fn(
+    *mut c_void,
+    c_int,
+    c_int,
+    c_int,
+    *mut *mut f32,
+    *mut *mut f32,
+    *mut c_int,
+) -> c_int;
 
 /// A native Waters `.raw` reader. Holds the loaded library, the resolved C function pointers, the
 /// info + scan reader handles, and the flattened `(function, scan)` spectrum index.
@@ -192,7 +223,7 @@ impl WatersReader {
             bail!("Waters .raw {} has no readable scans", input.display());
         }
 
-        Ok(WatersReader {
+        let reader = WatersReader {
             _lib: lib,
             read_scan,
             destroy,
@@ -200,7 +231,150 @@ impl WatersReader {
             scan_reader,
             index,
             continuum,
-        })
+        };
+        // `MZPC_WATERS_PROBE=1`: exercise the exports the drift/RT work needs and log what they
+        // return, so their inferred C signatures can be checked against ProteoWizard's values for
+        // the same file (Capan2 f1 scan1: RT 0.03705 min, drift bins 0.0 / 0.0392495 / … / 7.8107 ms,
+        // bin 0 = 42 points, 200 bins per function). Diagnostics only; nothing is written from it.
+        if std::env::var_os("MZPC_WATERS_PROBE").is_some_and(|v| !v.is_empty() && v != "0") {
+            reader.probe(input, n_functions);
+        }
+        Ok(reader)
+    }
+
+    /// Log-only exercise of the not-yet-used exports (see `open`). Every symbol is optional and
+    /// every value is printed raw; a wrong signature shows as an implausible number, not as data.
+    fn probe(&self, input: &Path, n_functions: c_int) {
+        let lib = &self._lib;
+        let sym = |name: &[u8]| unsafe { lib.get::<*const c_void>(name) }.is_ok();
+        let names: [&[u8]; 13] = [
+            b"getDriftScanCount\0",
+            b"getDriftTime\0",
+            b"readDriftScan\0",
+            b"getRetentionTime\0",
+            b"getFunctionType\0",
+            b"getFunctionTypeString\0",
+            b"getIonMode\0",
+            b"getIonModeString\0",
+            b"getAcquisitionMassRange\0",
+            b"getScanItemsInFunction\0",
+            b"getScanItemName\0",
+            b"getScanItemValue\0",
+            b"getCollisionalCrossSection\0",
+        ] {
+            log::info!(
+                "waters-probe: export {} {}",
+                String::from_utf8_lossy(&name[..name.len() - 1]),
+                if sym(name) { "present" } else { "ABSENT" }
+            );
+        }
+        let drift_count: Option<GetIntPerFunctionFn> = unsafe { lib.get(b"getDriftScanCount\0") }.ok().map(|f| *f);
+        let function_type: Option<GetIntPerFunctionFn> = unsafe { lib.get(b"getFunctionType\0") }.ok().map(|f| *f);
+        let ion_mode: Option<GetIntPerFunctionFn> = unsafe { lib.get(b"getIonMode\0") }.ok().map(|f| *f);
+        let drift_time: Option<GetFloatPerScanFn> = unsafe { lib.get(b"getDriftTime\0") }.ok().map(|f| *f);
+        let retention_time: Option<GetFloatPerScanFn> = unsafe { lib.get(b"getRetentionTime\0") }.ok().map(|f| *f);
+        let mass_range: Option<GetMassRangeFn> = unsafe { lib.get(b"getAcquisitionMassRange\0") }.ok().map(|f| *f);
+        let type_string: Option<GetStringPerFunctionFn> = unsafe { lib.get(b"getFunctionTypeString\0") }.ok().map(|f| *f);
+        let mode_string: Option<GetStringPerFunctionFn> = unsafe { lib.get(b"getIonModeString\0") }.ok().map(|f| *f);
+        let scan_items: Option<GetScanItemsFn> = unsafe { lib.get(b"getScanItemsInFunction\0") }.ok().map(|f| *f);
+        let item_name: Option<GetScanItemNameFn> = unsafe { lib.get(b"getScanItemName\0") }.ok().map(|f| *f);
+        let item_value: Option<GetScanItemValueFn> = unsafe { lib.get(b"getScanItemValue\0") }.ok().map(|f| *f);
+        let read_drift: Option<ReadDriftScanFn> = unsafe { lib.get(b"readDriftScan\0") }.ok().map(|f| *f);
+        let cstr = |p: *const c_char| -> String {
+            if p.is_null() {
+                "<null>".into()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            }
+        };
+        for f in 0..n_functions {
+            let cdt = input.join(format!("_func{:03}.cdt", f + 1)).is_file() || input.join(format!("_FUNC{:03}.CDT", f + 1)).is_file();
+            let mut out_i: c_int = -1;
+            let ftype = function_type.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut out_i) }; format!("{out_i} (rc={rc})") });
+            let mut mode_i: c_int = -1;
+            let imode = ion_mode.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut mode_i) }; format!("{mode_i} (rc={rc})") });
+            let mut ps: *const c_char = ptr::null();
+            let tstr = type_string.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut ps) }; format!("{:?} (rc={rc})", cstr(ps)) });
+            let mut pm: *const c_char = ptr::null();
+            let mstr = mode_string.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut pm) }; format!("{:?} (rc={rc})", cstr(pm)) });
+            let (mut lo, mut hi): (f32, f32) = (f32::NAN, f32::NAN);
+            let range = mass_range.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut lo, &mut hi) }; format!("{lo}..{hi} (rc={rc})") });
+            let mut nd: c_int = -1;
+            let ndrift = drift_count.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut nd) }; format!("{nd} (rc={rc})") });
+            let mut rts = Vec::new();
+            if let Some(g) = retention_time {
+                for scan in [0, 1] {
+                    let mut v: f32 = f32::NAN;
+                    let rc = unsafe { g(self.info_reader, f, scan, &mut v) };
+                    rts.push(format!("scan{scan}={v} (rc={rc})"));
+                }
+            }
+            let mut dts = Vec::new();
+            if let (Some(g), true) = (drift_time, nd > 0) {
+                for bin in [0, 1, 2, nd - 1] {
+                    let mut v: f32 = f32::NAN;
+                    let rc = unsafe { g(self.info_reader, f, bin, &mut v) };
+                    dts.push(format!("bin{bin}={v} (rc={rc})"));
+                }
+            }
+            log::info!(
+                "waters-probe: function {} cdt={cdt} type={} typeString={} ionMode={} ionModeString={} massRange={} driftScanCount={} rt=[{}] driftTime=[{}]",
+                f + 1,
+                ftype.as_deref().unwrap_or("-"),
+                tstr.as_deref().unwrap_or("-"),
+                imode.as_deref().unwrap_or("-"),
+                mstr.as_deref().unwrap_or("-"),
+                range.as_deref().unwrap_or("-"),
+                ndrift.as_deref().unwrap_or("-"),
+                rts.join(" "),
+                dts.join(" ")
+            );
+            // The scan items this function records (ids + names) and their values on scan 0 — the
+            // route to SET_MASS / COLLISION_ENERGY / SONAR_ENABLED without the SDK header.
+            if let (Some(gi), Some(gn)) = (scan_items, item_name) {
+                let mut items: *const c_int = ptr::null();
+                let mut n_items: c_int = 0;
+                let rc = unsafe { gi(self.info_reader, f, &mut items, &mut n_items) };
+                if rc == 0 && !items.is_null() && (0..=256).contains(&n_items) {
+                    let ids: Vec<c_int> = unsafe { std::slice::from_raw_parts(items, n_items as usize) }.to_vec();
+                    let mut described = Vec::new();
+                    for id in ids {
+                        let mut pn: *const c_char = ptr::null();
+                        let rcn = unsafe { gn(self.info_reader, id, &mut pn) };
+                        let value = item_value.map(|gv| {
+                            let mut pv: *const c_char = ptr::null();
+                            let rcv = unsafe { gv(self.info_reader, f, 0, id, &mut pv) };
+                            if rcv == 0 { cstr(pv) } else { format!("rc={rcv}") }
+                        });
+                        described.push(format!("{id}:{}={}", if rcn == 0 { cstr(pn) } else { format!("rc={rcn}") }, value.unwrap_or_default()));
+                    }
+                    log::info!("waters-probe: function {} scan items (id:name=value@scan1): {}", f + 1, described.join(" | "));
+                } else {
+                    log::info!("waters-probe: function {} getScanItemsInFunction rc={rc} n={n_items}", f + 1);
+                }
+            }
+            // One drift bin of scan 0, when the function has bins: point count + first points + sum.
+            if let (Some(g), true) = (read_drift, nd > 0) {
+                for bin in [0, 1, nd - 1] {
+                    let mut pm: *mut f32 = ptr::null_mut();
+                    let mut pi: *mut f32 = ptr::null_mut();
+                    let mut n: c_int = -1;
+                    let rc = unsafe { g(self.scan_reader, f, 0, bin, &mut pm, &mut pi, &mut n) };
+                    if rc == 0 && n >= 0 && n <= MAX_WATERS_SPECTRUM_POINTS && !pm.is_null() && !pi.is_null() {
+                        let m = unsafe { std::slice::from_raw_parts(pm, n as usize) };
+                        let i = unsafe { std::slice::from_raw_parts(pi, n as usize) };
+                        let tic: f64 = i.iter().map(|&x| x as f64).sum();
+                        log::info!(
+                            "waters-probe: readDriftScan(f={}, scan=1, bin={bin}) n={n} tic={tic} first={:?}",
+                            f + 1,
+                            m.iter().zip(i).take(3).collect::<Vec<_>>()
+                        );
+                    } else {
+                        log::info!("waters-probe: readDriftScan(f={}, scan=1, bin={bin}) rc={rc} n={n}", f + 1);
+                    }
+                }
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
