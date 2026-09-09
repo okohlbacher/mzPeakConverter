@@ -50,13 +50,14 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   | Bruker TDF/TSF | `GlobalMetadata.AcquisitionDateTime` with offset | verbatim | verbatim (agrees) |
   | Waters `.raw` (Capan2) | `_HEADER.TXT` `Acquired Date/Time` `03-Dec-2018 22:39:33`, no zone | null + block `22:39:33` | `2018-12-03T22:39:33Z` — labels the wall clock UTC |
   | SciEX `.wiff` (SWATH, Sample002, MRM_03) | Clearcore2 `AcquisitionDateTime`, `Kind = Unspecified` | null + block (`09:52:14`, `19:58:37`, `02:56:30`) | wall clock − 2 h on all three (`07:52:14Z`, `17:58:37Z`, `00:56:30Z`) although the runs are from November, February and August — the box's CURRENT offset, not the acquisition date's |
-  | Shimadzu `.lcd` (Blind) | `SampleInfo.AnalysisDate` — IoModule 5.0.0.0 returns `DateTime.MinValue` in our .NET 8 host (every SampleInfo scalar default, `DataObject.FileName` empty, `MS.Parameters.CurrentStorage` throws); OLE2 storages created 2024-02-15 10:46:49 FILETIME | nothing recorded | `2024-02-15T08:47:18Z` via `SampleInfo->AnalysisDate.ToUniversalTime()` (a host-zone conversion of whatever the DLL returns) — adversarial analysis in `~/Claude/mzPeak/data/native-run-metadata-2026-09-08/shimadzu/` |
+  | Shimadzu `.lcd` (Blind) | `File Property` stream: `SampleInfo.DateTime` = UTC FILETIME `2024-02-15T10:47:18.756Z` beside `szLocGMTDiffGenDateTime = +01'00'` (measured: OLE2 directory FILETIMEs and the MS-CAB local stamps in the same file agree) | `2024-02-15T11:47:18.756+01:00` — read from the file on any host (`src/shimadzu_meta.rs`; the DLL's `SampleInfo` is empty in the .NET 8 host) | `2024-02-15T08:47:18Z` — the DLL's UTC value minus the box's CURRENT offset (+2 h in September): `ShimadzuReader.cpp::getAnalysisDate` adds `universal_time() − local_time()` evaluated at conversion time (`adjustUnknownTimeZonesToHostTimeZone`) |
   | Thermo `.raw` | mzdata's reader, zoned | verbatim | verbatim (agrees) |
-  Open, in order: (1) **Shimadzu:** get the date at all — the hosting difference (.NET 8 in-process via
-  netcorehost vs pwiz's C++/CLI .NET Framework) is the leading hypothesis; the decisive experiment is a
-  net48 console probe on the box (reflection-load IoModule, `LoadData`, print `SampleInfo.AnalysisDate`,
-  `FileName`, `GetLastError`); fix options a) net8 glue fix, b) out-of-process net48 host (Agilent pattern),
-  c) read the OLE2 stream directly once the byte search names it, d) record nothing. (2) **Consumer
+  The SciEX and Shimadzu shifts are the same ProteoWizard mechanism — the host's offset at CONVERSION
+  time applied to a value that already is UTC (Shimadzu) or that the reader treats as unzoned (SciEX);
+  the Agilent +1 h is not yet pinned to it. Open, in order: (1) **Shimadzu — resolved 2026-09-09** by
+  reading the file (option c); the DLL-side emptiness is still being analysed (Codex's leading
+  hypothesis: the 1252 code page has no decoder in .NET 8 unless the provider is registered — the glue
+  now registers it; verification on the box pending). (2) **Consumer
   guidance + validator rule:** readers must fall back to `acquisition_time.wall_clock` when
   `run.start_time` is null; the validator should flag a null `run.start_time` WITHOUT the block on a
   vendor-derived archive, and never flag the block itself (handoff to mzPeakValidator pending). (3)

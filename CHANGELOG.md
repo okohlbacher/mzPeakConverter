@@ -55,6 +55,17 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   (target only when the width is unstated), CID with the signed `CollisionEnergy`,
   `precursor_id = frame=<Parent>` so `precursor_index` resolves. 30/30 against the pwiz twin of
   the urine fixture. Pinned by `tests/run_metadata_native.rs` (set `MZPC_TSF_FIXTURE`).
+- **Shimadzu acquisition start, sample and LabSolutions version from the `.lcd` itself
+  (`src/shimadzu_meta.rs`, any host).** The file's OLE2 `File Property` stream holds
+  `SampleInfo.DateTime` as a UTC FILETIME (split into `dwLow/dwHighDateTime`) beside the writing PC's
+  own GMT offset (`szLocGMTDiffGenDateTime`, `+01'00'`), so the native lane now writes a fully zoned
+  `run.start_time` (Blind: `2024-02-15T11:47:18.756+01:00`), the sample name/id/vial/operator/
+  injection volume and `LabSolutions 5.114`. Established by a byte-level search of the file (the
+  OLE2 directory FILETIMEs and the MS-CAB local stamps inside the same file agree on UTC and on the
+  +1 h). The vendor DLL exposes the same instant as `SampleInfo.AnalysisDate`, which comes back empty
+  in this converter's .NET 8 host; ProteoWizard reads it and then shifts it by the CONVERTING host's
+  current offset (`adjustUnknownTimeZonesToHostTimeZone`), writing `08:47:18Z` — two hours early.
+  The `cfb` crate is a new dependency.
 - **`--sample N`** selects the sample of a multi-sample WIFF (1-based; the msconvert lane maps it
   to `--runIndexSet N-1`). A multi-sample WIFF without `--sample` is refused and lists its samples.
 
@@ -73,6 +84,11 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
 
 ### Changed
 
+- **Empty spectra stay.** The SciEX native lane writes every acquired spectrum, including the
+  zero-point ones ProteoWizard drops (SWATH: 11,583 of 148,571; a scheduled MRM-HR run: 16,790 of
+  23,646). Measured cost after re-encoding the metadata facets without them: 0.007–0.012 % of the
+  SWATH archive and 0.2–0.6 % of the MRM-HR archive — an empty row compresses to ~7–20 B. Keeping
+  them preserves the cycle structure; nothing changes here.
 - `tests/lane_metadata_parity.rs` compares VALUES, not just presence: `run.start_time` as an
   instant, serial and model strings, per-member digests, `id@version` software, sample names,
   the contents set and the `acquisition_time` wall clock; a rule that no longer fires is an error.
