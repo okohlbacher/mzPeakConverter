@@ -30,7 +30,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     polarity, scan window and function-type MS levels come from the SDK (W-P2 closed for those fields).
     Verified bin-for-bin against pwiz on Capan2 frames. Followed on 2026-09-09: precursors from the scan
     items, lock-mass detection (`getLockMassFunction`, else the method text), MS levels by function-type
-    code, SONAR detection (refused, not mislabelled), the collapsed retention-time functions skipped, the
+    code, SONAR detection (written summed with a warning, not mislabelled as drift), the collapsed retention-time functions skipped, the
     zero-run mask off for frames (plus the writer bug that masked every profile spectrum regardless),
     acquisition-time order. Remaining on this lane: CCS per peak (`getCollisionalCrossSection` needs a
     charge); a SONAR file to decide how quadrupole-position bins should be stored; mixed IMS/non-IMS

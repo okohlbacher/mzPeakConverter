@@ -91,8 +91,9 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   same way and 600/600 precursor rows agree with pwiz's (selected ion, target-only window, CE). The
   transfer collision-energy ramp
   comes from the method text (`_extern.inf`) as MS:1002013/1002014. `SONAR Enabled` is read per
-  function: a SONAR function's bins are quadrupole positions, not drift times, so such a function is
-  refused rather than mislabelled. **Collapsed retention-time functions** (Capan2 functions 4–6:
+  function: a SONAR function's bins are quadrupole positions, not drift times, so it is written as the
+  drift-summed scan with a warning and `sonar: true` in the block rather than mislabelled as drift
+  (`sonar_checked` is false when the file's item table has no such item — Capan2's 44-entry table). **Collapsed retention-time functions** (Capan2 functions 4–6:
   one row per drift bin whose "retention time" is the drift table — run-summed mobilograms of
   functions 1–3, which pwiz writes as 200 × 200 mostly empty spectra) are recognised structurally
   and not written as spectra (`MZPC_WATERS_KEEP_COLLAPSED=1` keeps them). The C shapes of all these
