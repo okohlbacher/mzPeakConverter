@@ -5707,13 +5707,10 @@ fn convert_waters(
         // and the drift column must be declared even if the IMS function is a small part of the run.
         hints.keep_zero_runs = true;
         hints.probe_indices = reader.probe_indices();
-        // Declare the drift column outright (the TDF lane does the same for `tof`): a probe frame
-        // that happens to be empty contributes no fields, and an undeclared secondary array would
-        // spill into `auxiliary_arrays`. The builder dedups by logical array, so a probe-derived
-        // field is not doubled.
-        hints.data_facet_fields.push(
-            BufferName::new(BufferContext::Spectrum, ArrayType::RawIonMobilityArray, BinaryDataArrayType::Float32).to_field(),
-        );
+        // The drift column is declared through the per-function probes above; an explicit
+        // `data_facet_fields` push of the f32 array (as the TDF lane does for `tof`) declares the
+        // POINT-layout shape and made the chunked writer panic on a column-type mismatch
+        // (box round 21) — the chunked secondary-array field shape needs its own constructor first.
     }
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }

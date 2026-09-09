@@ -422,6 +422,7 @@ impl WatersReader {
                 Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().trim().to_string())
             })
         };
+        let mut sonar_unchecked: Vec<c_int> = Vec::new();
         let mut functions: Vec<FunctionInfo> = Vec::with_capacity(n_functions as usize);
         for f in 0..n_functions {
             let continuum = is_continuum.and_then(|g| {
@@ -472,12 +473,7 @@ impl WatersReader {
                 collision_energy_0 = get(item_ids.collision_energy).and_then(|v| v.trim().parse::<f64>().ok()).map(f64::abs);
             }
             if drift_bins > 0 && !sonar && (scan_items.is_none() || item_ids.sonar.is_none()) {
-                log::warn!(
-                    "MassLynx function {}: {} — its {} bins are written as drift times on trust (a SONAR function would be mislabelled)",
-                    f + 1,
-                    if scan_items.is_none() { "scan items unavailable, SONAR not checked" } else { "the item table has no `Sonar Enabled`" },
-                    drift_bins
-                );
+                sonar_unchecked.push(f + 1);
             }
             if sonar && drift_bins > 0 {
                 log::warn!(
@@ -490,6 +486,13 @@ impl WatersReader {
             }
             let ce_ramp = method_ramps.get(&f).copied();
             functions.push(FunctionInfo { continuum, type_code, type_string, ion_mode, mass_range, drift_bins, sonar, collision_energy_0, ce_ramp, ms_level: 1 });
+        }
+        if !sonar_unchecked.is_empty() {
+            log::warn!(
+                "MassLynx: {} — the drift bins of function(s) {:?} are written as drift times on trust (a SONAR function would be mislabelled)",
+                if scan_items.is_none() { "scan items unavailable, SONAR not checked" } else { "the item table has no `Sonar Enabled`" },
+                sonar_unchecked
+            );
         }
         for f in 0..functions.len() {
             functions[f].ms_level = ms_level_for(f, &functions, lockmass_function);
