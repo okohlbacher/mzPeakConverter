@@ -242,11 +242,12 @@ impl WatersReader {
         Ok(reader)
     }
 
-    /// Log-only exercise of the not-yet-used exports (see `open`). Every symbol is optional and
-    /// every value is printed raw; a wrong signature shows as an implausible number, not as data.
+    /// Log-only exercise of the not-yet-used exports (see `open`). Staged by `MZPC_WATERS_PROBE=N`
+    /// — 1: integer/float out-params, 2: + string out-params, 3: + scan items, 4: + `readDriftScan` —
+    /// and every call is announced BEFORE it is made, so an access violation names its culprit.
     fn probe(&self, input: &Path, n_functions: c_int) {
+        let level: u8 = std::env::var("MZPC_WATERS_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1);
         let lib = &self._lib;
-        let sym = |name: &[u8]| unsafe { lib.get::<*const c_void>(name) }.is_ok();
         let names: [&[u8]; 13] = [
             b"getDriftScanCount\0",
             b"getDriftTime\0",
@@ -263,10 +264,11 @@ impl WatersReader {
             b"getCollisionalCrossSection\0",
         ];
         for name in names {
+            let present = unsafe { lib.get::<*const c_void>(name) }.is_ok();
             log::info!(
                 "waters-probe: export {} {}",
                 String::from_utf8_lossy(&name[..name.len() - 1]),
-                if sym(name) { "present" } else { "ABSENT" }
+                if present { "present" } else { "ABSENT" }
             );
         }
         let drift_count: Option<GetIntPerFunctionFn> = unsafe { lib.get(b"getDriftScanCount\0") }.ok().map(|f| *f);
@@ -285,206 +287,126 @@ impl WatersReader {
             if p.is_null() {
                 "<null>".into()
             } else {
-                unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+                unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().chars().take(80).collect()
             }
         };
+        // Out-params live in 16-byte slots: a callee that writes a double (or two floats) into what we
+        // think is a float cannot corrupt a neighbour, and the raw bytes are logged.
         for f in 0..n_functions {
             let cdt = input.join(format!("_func{:03}.cdt", f + 1)).is_file() || input.join(format!("_FUNC{:03}.CDT", f + 1)).is_file();
-            let mut out_i: c_int = -1;
-            let ftype = function_type.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut out_i) }; format!("{out_i} (rc={rc})") });
-            let mut mode_i: c_int = -1;
-            let imode = ion_mode.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut mode_i) }; format!("{mode_i} (rc={rc})") });
-            let mut ps: *const c_char = ptr::null();
-            let tstr = type_string.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut ps) }; format!("{:?} (rc={rc})", cstr(ps)) });
-            let mut pm: *const c_char = ptr::null();
-            let mstr = mode_string.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut pm) }; format!("{:?} (rc={rc})", cstr(pm)) });
-            let (mut lo, mut hi): (f32, f32) = (f32::NAN, f32::NAN);
-            let range = mass_range.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut lo, &mut hi) }; format!("{lo}..{hi} (rc={rc})") });
-            let mut nd: c_int = -1;
-            let ndrift = drift_count.map(|g| { let rc = unsafe { g(self.info_reader, f, &mut nd) }; format!("{nd} (rc={rc})") });
-            let mut rts = Vec::new();
+            let mut parts: Vec<String> = vec![format!("function {} cdt={cdt}", f + 1)];
+            if let Some(g) = function_type {
+                log::info!("waters-probe: calling getFunctionType(f={})", f + 1);
+                let mut slot = [0i32; 4];
+                let rc = unsafe { g(self.info_reader, f, slot.as_mut_ptr()) };
+                parts.push(format!("type={} rc={rc} raw={:?}", slot[0], slot));
+            }
+            if let Some(g) = ion_mode {
+                log::info!("waters-probe: calling getIonMode(f={})", f + 1);
+                let mut slot = [0i32; 4];
+                let rc = unsafe { g(self.info_reader, f, slot.as_mut_ptr()) };
+                parts.push(format!("ionMode={} rc={rc} raw={:?}", slot[0], slot));
+            }
+            if let Some(g) = drift_count {
+                log::info!("waters-probe: calling getDriftScanCount(f={})", f + 1);
+                let mut slot = [0i32; 4];
+                let rc = unsafe { g(self.info_reader, f, slot.as_mut_ptr()) };
+                parts.push(format!("driftScanCount={} rc={rc} raw={:?}", slot[0], slot));
+            }
+            if let Some(g) = mass_range {
+                log::info!("waters-probe: calling getAcquisitionMassRange(f={})", f + 1);
+                let mut lo = [0f32; 4];
+                let mut hi = [0f32; 4];
+                let rc = unsafe { g(self.info_reader, f, lo.as_mut_ptr(), hi.as_mut_ptr()) };
+                parts.push(format!("massRange={}..{} rc={rc} rawLo={:?} rawHi={:?}", lo[0], hi[0], lo, hi));
+            }
             if let Some(g) = retention_time {
                 for scan in [0, 1] {
-                    let mut v: f32 = f32::NAN;
-                    let rc = unsafe { g(self.info_reader, f, scan, &mut v) };
-                    rts.push(format!("scan{scan}={v} (rc={rc})"));
+                    log::info!("waters-probe: calling getRetentionTime(f={}, scan={})", f + 1, scan + 1);
+                    let mut slot = [0f32; 4];
+                    let rc = unsafe { g(self.info_reader, f, scan, slot.as_mut_ptr()) };
+                    let as_f64 = f64::from_bits((slot[0].to_bits() as u64) | ((slot[1].to_bits() as u64) << 32));
+                    parts.push(format!("rt[scan{}]={} (as f64 {as_f64}) rc={rc}", scan + 1, slot[0]));
                 }
             }
-            let mut dts = Vec::new();
-            if let (Some(g), true) = (drift_time, nd > 0) {
-                for bin in [0, 1, 2, nd - 1] {
-                    let mut v: f32 = f32::NAN;
-                    let rc = unsafe { g(self.info_reader, f, bin, &mut v) };
-                    dts.push(format!("bin{bin}={v} (rc={rc})"));
+            if let Some(g) = drift_time {
+                for bin in [0, 1, 199] {
+                    log::info!("waters-probe: calling getDriftTime(f={}, bin={bin})", f + 1);
+                    let mut slot = [0f32; 4];
+                    let rc = unsafe { g(self.info_reader, f, bin, slot.as_mut_ptr()) };
+                    let as_f64 = f64::from_bits((slot[0].to_bits() as u64) | ((slot[1].to_bits() as u64) << 32));
+                    parts.push(format!("dt[bin{bin}]={} (as f64 {as_f64}) rc={rc}", slot[0]));
                 }
             }
-            log::info!(
-                "waters-probe: function {} cdt={cdt} type={} typeString={} ionMode={} ionModeString={} massRange={} driftScanCount={} rt=[{}] driftTime=[{}]",
-                f + 1,
-                ftype.as_deref().unwrap_or("-"),
-                tstr.as_deref().unwrap_or("-"),
-                imode.as_deref().unwrap_or("-"),
-                mstr.as_deref().unwrap_or("-"),
-                range.as_deref().unwrap_or("-"),
-                ndrift.as_deref().unwrap_or("-"),
-                rts.join(" "),
-                dts.join(" ")
-            );
-            // The scan items this function records (ids + names) and their values on scan 0 — the
-            // route to SET_MASS / COLLISION_ENERGY / SONAR_ENABLED without the SDK header.
-            if let (Some(gi), Some(gn)) = (scan_items, item_name) {
-                let mut items: *const c_int = ptr::null();
-                let mut n_items: c_int = 0;
-                let rc = unsafe { gi(self.info_reader, f, &mut items, &mut n_items) };
-                if rc == 0 && !items.is_null() && (0..=256).contains(&n_items) {
-                    let ids: Vec<c_int> = unsafe { std::slice::from_raw_parts(items, n_items as usize) }.to_vec();
-                    let mut described = Vec::new();
-                    for id in ids {
-                        let mut pn: *const c_char = ptr::null();
-                        let rcn = unsafe { gn(self.info_reader, id, &mut pn) };
-                        let value = item_value.map(|gv| {
-                            let mut pv: *const c_char = ptr::null();
-                            let rcv = unsafe { gv(self.info_reader, f, 0, id, &mut pv) };
-                            if rcv == 0 { cstr(pv) } else { format!("rc={rcv}") }
-                        });
-                        described.push(format!("{id}:{}={}", if rcn == 0 { cstr(pn) } else { format!("rc={rcn}") }, value.unwrap_or_default()));
-                    }
-                    log::info!("waters-probe: function {} scan items (id:name=value@scan1): {}", f + 1, described.join(" | "));
-                } else {
-                    log::info!("waters-probe: function {} getScanItemsInFunction rc={rc} n={n_items}", f + 1);
+            log::info!("waters-probe: {}", parts.join(" | "));
+            if level >= 2 {
+                if let Some(g) = type_string {
+                    log::info!("waters-probe: calling getFunctionTypeString(f={})", f + 1);
+                    let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                    let rc = unsafe { g(self.info_reader, f, ps.as_mut_ptr()) };
+                    log::info!("waters-probe: function {} typeString={:?} rc={rc}", f + 1, if rc == 0 { cstr(ps[0]) } else { String::new() });
+                }
+                if let Some(g) = mode_string {
+                    log::info!("waters-probe: calling getIonModeString(f={})", f + 1);
+                    let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                    let rc = unsafe { g(self.info_reader, f, ps.as_mut_ptr()) };
+                    log::info!("waters-probe: function {} ionModeString={:?} rc={rc}", f + 1, if rc == 0 { cstr(ps[0]) } else { String::new() });
                 }
             }
-            // One drift bin of scan 0, when the function has bins: point count + first points + sum.
-            if let (Some(g), true) = (read_drift, nd > 0) {
-                for bin in [0, 1, nd - 1] {
-                    let mut pm: *mut f32 = ptr::null_mut();
-                    let mut pi: *mut f32 = ptr::null_mut();
-                    let mut n: c_int = -1;
-                    let rc = unsafe { g(self.scan_reader, f, 0, bin, &mut pm, &mut pi, &mut n) };
-                    if rc == 0 && n >= 0 && n <= MAX_WATERS_SPECTRUM_POINTS && !pm.is_null() && !pi.is_null() {
-                        let m = unsafe { std::slice::from_raw_parts(pm, n as usize) };
-                        let i = unsafe { std::slice::from_raw_parts(pi, n as usize) };
-                        let tic: f64 = i.iter().map(|&x| x as f64).sum();
-                        log::info!(
-                            "waters-probe: readDriftScan(f={}, scan=1, bin={bin}) n={n} tic={tic} first={:?}",
-                            f + 1,
-                            m.iter().zip(i).take(3).collect::<Vec<_>>()
-                        );
-                    } else {
-                        log::info!("waters-probe: readDriftScan(f={}, scan=1, bin={bin}) rc={rc} n={n}", f + 1);
+            if level >= 3 {
+                if let (Some(gi), Some(gn)) = (scan_items, item_name) {
+                    log::info!("waters-probe: calling getScanItemsInFunction(f={})", f + 1);
+                    let mut items: [*const c_int; 4] = [ptr::null(); 4];
+                    let mut n_items = [0i32; 4];
+                    let rc = unsafe { gi(self.info_reader, f, items.as_mut_ptr(), n_items.as_mut_ptr()) };
+                    log::info!("waters-probe: function {} scan items rc={rc} n={} ptr_null={}", f + 1, n_items[0], items[0].is_null());
+                    if rc == 0 && !items[0].is_null() && (0..=256).contains(&n_items[0]) {
+                        let ids: Vec<c_int> = unsafe { std::slice::from_raw_parts(items[0], n_items[0] as usize) }.to_vec();
+                        log::info!("waters-probe: function {} scan item ids {:?}", f + 1, ids);
+                        let mut described = Vec::new();
+                        for id in ids {
+                            log::info!("waters-probe: calling getScanItemName(item={id})");
+                            let mut pn: [*const c_char; 4] = [ptr::null(); 4];
+                            let rcn = unsafe { gn(self.info_reader, id, pn.as_mut_ptr()) };
+                            let name = if rcn == 0 { cstr(pn[0]) } else { format!("rc={rcn}") };
+                            let value = item_value.map(|gv| {
+                                log::info!("waters-probe: calling getScanItemValue(f={}, scan=1, item={id})", f + 1);
+                                let mut pv: [*const c_char; 4] = [ptr::null(); 4];
+                                let rcv = unsafe { gv(self.info_reader, f, 0, id, pv.as_mut_ptr()) };
+                                if rcv == 0 { cstr(pv[0]) } else { format!("rc={rcv}") }
+                            });
+                            described.push(format!("{id}:{name}={}", value.unwrap_or_default()));
+                        }
+                        log::info!("waters-probe: function {} scan items (id:name=value@scan1): {}", f + 1, described.join(" | "));
                     }
                 }
             }
+            if level >= 4 {
+                if let Some(g) = read_drift {
+                    for bin in [0, 1, 199] {
+                        log::info!("waters-probe: calling readDriftScan(f={}, scan=1, bin={bin})", f + 1);
+                        let mut pm: *mut f32 = ptr::null_mut();
+                        let mut pi: *mut f32 = ptr::null_mut();
+                        let mut n = [-1i32; 4];
+                        let rc = unsafe { g(self.scan_reader, f, 0, bin, &mut pm, &mut pi, n.as_mut_ptr()) };
+                        let n0 = n[0];
+                        if rc == 0 && n0 >= 0 && n0 <= MAX_WATERS_SPECTRUM_POINTS && !pm.is_null() && !pi.is_null() {
+                            let m = unsafe { std::slice::from_raw_parts(pm, n0 as usize) };
+                            let i = unsafe { std::slice::from_raw_parts(pi, n0 as usize) };
+                            let tic: f64 = i.iter().map(|&x| x as f64).sum();
+                            log::info!(
+                                "waters-probe: readDriftScan(f={}, scan=1, bin={bin}) n={n0} tic={tic} first={:?}",
+                                f + 1,
+                                m.iter().zip(i).take(3).collect::<Vec<_>>()
+                            );
+                        } else {
+                            log::info!("waters-probe: readDriftScan(f={}, scan=1, bin={bin}) rc={rc} n={n0}", f + 1);
+                        }
+                    }
+                }
+            }
         }
     }
-
-    pub fn len(&self) -> usize {
-        self.index.len()
-    }
-
-    /// Read one spectrum: `readScan` → m/z (f64, widened from the vendor's f32) + intensity (f32).
-    pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
-        let (func, scan) = *self
-            .index
-            .get(i)
-            .ok_or_else(|| anyhow!("Waters spectrum index {i} out of range (len {})", self.len()))?;
-
-        let mut p_masses: *mut f32 = ptr::null_mut();
-        let mut p_intensities: *mut f32 = ptr::null_mut();
-        let mut n: c_int = 0;
-        let rc = unsafe {
-            (self.read_scan)(
-                self.scan_reader,
-                func,
-                scan,
-                &mut p_masses,
-                &mut p_intensities,
-                &mut n,
-            )
-        };
-        if rc != 0 {
-            bail!("MassLynx readScan(func={func}, scan={scan}) failed (rc={rc})");
-        }
-        if n < 0 || n > MAX_WATERS_SPECTRUM_POINTS {
-            bail!("MassLynx readScan returned implausible point count {n}");
-        }
-        let n = n as usize;
-
-        // The masses/intensities arrays are READER-OWNED — internal buffers valid until the next
-        // readScan (or reader destroy), NOT caller-allocated. Copy out immediately; do NOT free them
-        // (calling releaseMemory on them corrupts the heap — 0xC0000374). m/z widened f32→f64.
-        let mz: Vec<f64> = if n > 0 && !p_masses.is_null() {
-            unsafe { std::slice::from_raw_parts(p_masses, n) }
-                .iter()
-                .map(|&x| x as f64)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let intensity: Vec<f32> = if n > 0 && !p_intensities.is_null() {
-            unsafe { std::slice::from_raw_parts(p_intensities, n) }.to_vec()
-        } else {
-            Vec::new()
-        };
-
-        let mut arrays = BinaryArrayMap::new();
-        let mut mz_da =
-            DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
-        mz_da
-            .update_buffer(mz.as_slice())
-            .map_err(|e| anyhow!("encoding m/z: {e}"))?;
-        mz_da.unit = Unit::MZ;
-        arrays.add(mz_da);
-        let mut int_da =
-            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        int_da
-            .update_buffer(intensity.as_slice())
-            .map_err(|e| anyhow!("encoding intensity: {e}"))?;
-        int_da.unit = Unit::DetectorCounts;
-        arrays.add(int_da);
-
-        // MS level: function 0 is the MS1 acquisition; higher functions are MS2/lockmass. Refining
-        // this needs getFunctionType (TODO); function index is a sound first approximation.
-        let ms_level: u8 = if func == 0 { 1 } else { 2 };
-        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
-        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
-        // otherwise indistinguishable from a complete one. The set mass is reachable via
-        // `getScanItemValue`; not wired yet.
-        if ms_level > 1 {
-            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
-            PRECURSOR_GAP_SAID.call_once(|| {
-                log::warn!(
-                    "Waters MassLynx: this reader does not yet extract precursors; \
-                     MS2 rows will have none (no selected ion, isolation window or collision energy \
-                     in the archive)"
-                );
-            });
-        }
-        let mut descr = SpectrumDescription {
-            // ProteoWizard Waters native-id convention (1-based function/scan).
-            id: format!("function={} process=0 scan={}", func + 1, scan + 1),
-            index: i,
-            ms_level,
-            // From the vendor's per-function flag, not assumed. Unknown (export missing or the call
-            // failed) keeps the historical Profile default.
-            signal_continuity: match self.continuum.get(func as usize).copied().flatten() {
-                Some(true) => SignalContinuity::Profile,
-                Some(false) => SignalContinuity::Centroid,
-                None => SignalContinuity::Profile,
-            },
-            polarity: ScanPolarity::Unknown,
-            ..Default::default()
-        };
-        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
-        // lookup, so that parent term wins over the specific one and the writer's inference
-        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
-        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
-        // RT is available via readScanItemValue (TODO); leave a default scan event for now.
-        descr.acquisition.scans.push(ScanEvent::default());
-
-        Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
-    }
-
 }
 
 impl Drop for WatersReader {
