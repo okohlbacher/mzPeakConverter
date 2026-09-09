@@ -92,7 +92,9 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   quadrupole is non-resolving in MSe; `getFunction/IndexPrecursorMassRange` and `getPrecursorMass`
   answer only for SONAR, and the DDA processor's quad-isolation-window parameters are 0/0 unless a
   `_dda.inf` sidecar supplies them). A DDA set mass keeps its target-only window: its width is not
-  stated either (Capan2: 682 precursor rows on the 682 high-energy scans, where pwiz writes the same
+  stated either; the tune page's quadrupole settings (`LM/HM Resolution`, `MS Profile Type`,
+  `MSProfileMass/Dwell/Ramp 1..3`) travel verbatim as instrument-configuration parameters so a reader can
+  bound the RF-only pass band (Capan2: 682 precursor rows on the 682 high-energy scans, where pwiz writes the same
   window on each of the 136,400 drift-bin spectra). On a Fast-DDA HDDDA run (PXD073126, ten IMS functions) the frames are identical to pwiz's bins the
   same way and 600/600 precursor rows agree with pwiz's (selected ion, target-only window, CE). The
   transfer collision-energy ramp
