@@ -63,21 +63,43 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1003007, ms), the
   shape of pwiz's own `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane. The
   frame states its drift-time bounds (MS:1003439/1003440), `transformations` gains `sort-by-mz`,
-  and a `waters_drift` index block carries the run's bin → ms table and `mob_cal.csv` verbatim.
-  Verified bin by bin against pwiz's per-bin spectra on ten Capan2 frames (functions 1–6): the
-  non-zero point multisets and intensities are identical in 1,200/1,200 populated bins, m/z within
-  2.6e-7 (numpress on both sides), the drift table identical, frame TIC = Σ pwiz per-bin TIC, RT
-  identical. The frame archive is 552 MB where the per-bin twin is 959 MB and the summed archive
-  was 166 MB. Point counts differ by zero-intensity flanks only (the writer's zero-run mask strips
-  more zeros once bins are interleaved).
-  The same SDK calls fix the lane's per-scan metadata: **retention time** (`getRetentionTime`; it was
-  0.0 on every row), **polarity** (`getIonModeString`), **scan window** (`getAcquisitionMassRange`)
-  and **MS level from the function type** (`getFunctionTypeString`): product-ion types are MS2, the
-  second function of an MSe pair is MS2, every other MS function is MS1 — Capan2's lock-mass and
-  auxiliary functions 3–6 are MS1 again, as pwiz labels them (they were MS2). The C shapes of these
-  exports differ from what pwiz's C++ wrapper suggests and were established by probing
-  (`src/waters.rs` header). Still missing on this lane: precursors (`getScanItemsInFunction`
-  crashes with every spelling tried, so SET_MASS / collision energy stay unread).
+  and a `waters_drift` index block carries the run's bin → ms table, `mob_cal.csv` verbatim, the
+  lock-mass function and the functions that were not written (below). Frames are written with the
+  writer's zero-run mask OFF — in the interleaved frame a run of zeros is several bins' trace
+  boundaries meeting, and the mask kept only its first and last zero — so every point MassLynx
+  returns is stored, and the spectra are in acquisition-time order across functions, as pwiz orders
+  them. Verified bin by bin against pwiz's per-bin spectra on Capan2 frames of every function:
+  on nine frames of functions 1–3 the non-zero point multisets and intensities are identical in
+  1,799/1,799 populated bins, m/z within 2.6e-7 (numpress on both sides), the drift table identical,
+  frame TIC = Σ pwiz per-bin TIC, RT identical; the only difference is MassLynx's two zero-intensity
+  sentinel points at the scan-window bounds (m/z 49.98 and 600.06 on Capan2) that every bin carries —
+  the native lane keeps them, pwiz strips them. The frame archive is 531 MB where the per-bin twin is 965 MB and the summed archive was
+  166 MB.
+  **Per-scan metadata and precursors from the SDK.** Retention time (`getRetentionTime`; it was 0.0
+  on every row), polarity (`getIonMode`), scan window (`getAcquisitionMassRange`), the MS level from
+  the function-type CODE (`getFunctionType`, pwiz's table: MSMS / MS2 / TOFD / QUAD AUTO DAU are MS2,
+  the second function of an MSe pair is MS2, every other MS function is MS1; SIR / MRM / NL / NG
+  functions are chromatograms and DAD / DLY / CAT / OFF / PSD / AutoSpec ones are not spectra — both
+  are skipped with a log line, and a file with no spectrum function is refused with the msconvert
+  remedy), the lock-mass function (`getLockMassFunction`, else the method's REFERENCE section) and
+  the **scan items** through the MassLynx parameters object (`createParameters` /
+  `getScanItemsInFunction` / `getScanItemValue`): SET_MASS > 0 becomes a selected ion with a
+  target-only isolation window, COLLISION_ENERGY the activation energy (beam-type CID), and an MSe
+  elevated-energy scan whose set mass is 0 gets a precursor stating the activation only — no
+  isolation window is invented (Capan2: 682 precursor rows on the 682 high-energy scans, where pwiz
+  writes a placeholder on each of the 136,400 drift-bin spectra). On a Fast-DDA HDDDA run (PXD073126, ten IMS functions) the frames are identical to pwiz's bins the
+  same way and 600/600 precursor rows agree with pwiz's (selected ion, target-only window, CE). The
+  transfer collision-energy ramp
+  comes from the method text (`_extern.inf`) as MS:1002013/1002014. `SONAR Enabled` is read per
+  function: a SONAR function's bins are quadrupole positions, not drift times, so such a function is
+  refused rather than mislabelled. **Collapsed retention-time functions** (Capan2 functions 4–6:
+  one row per drift bin whose "retention time" is the drift table — run-summed mobilograms of
+  functions 1–3, which pwiz writes as 200 × 200 mostly empty spectra) are recognised structurally
+  and not written as spectra (`MZPC_WATERS_KEEP_COLLAPSED=1` keeps them). The C shapes of all these
+  exports differ from what pwiz's C++ wrapper suggests and were established by probing on the box
+  (`src/waters.rs` header): `getDriftTime` has no function argument, `getAcquisitionMassRange` has
+  a fifth, function type and ion mode come back as codes, and scan items are reachable only through
+  the parameters object (the DLL's item table starts at 401).
 - **Shimadzu acquisition start, sample and LabSolutions version from the `.lcd` itself
   (`src/shimadzu_meta.rs`, any host).** The file's OLE2 `File Property` stream holds
   `SampleInfo.DateTime` as a UTC FILETIME (split into `dwLow/dwHighDateTime`) beside the writing PC's
@@ -93,6 +115,14 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   to `--runIndexSet N-1`). A multi-sample WIFF without `--sample` is refused and lists its samples.
 
 ### Fixed
+
+- **The writer masked zero-intensity runs on every profile spectrum of the chunked data facet,
+  whatever it was built with.** `write_spectrum` passed `is_profile` where the chunk builder expects
+  the `drop_zero_intensity` flag, so `mask_zero_intensity_runs = false` never reached the data facet.
+  No released archive changes — every lane passed `true` and declared `zero-run-mask` — but the
+  Waters frame lane, the first to turn the mask off, still lost its bins' zero flanks until this
+  fix. `tests/frame_zero_runs.rs` pins it: a four-bin interleaved frame round-trips 56/56 points
+  with the mask off under numpress, delta and basic chunking, and 52/56 with it on.
 
 - **SciEX MRM/SIM dwell runs are refused by the native lane** (`En_PPY.wiff`,
   `IPX0002633001_D-239.wiff` in the corpus): it stored each dwell as a one-point spectrum without

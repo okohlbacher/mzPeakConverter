@@ -19,21 +19,24 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   MassHunter version; Capan2 the model, sample and MassLynx version; SWATH/Sample002/MRM-HR WIFFs
   model, serial, `SCIEX OS`/`Analyst TF` versions, sample and both digested members. Acquisition
   clocks are tracked in their own item below. **Still open, by lane:**
-  - **Orphan MS2 (precursors):** Waters (Capan2: the 682 high-energy MSe scans, which pwiz expands into 136,400 drift-bin
-    spectra with a placeholder precursor each; the SDK route is `getScanItemValue(SET_MASS / COLLISION_ENERGY)`, blocked on the
-    crashing `getScanItemsInFunction` — see the ion-mobility item; the `_FUNCnnn.STS` layout stays off limits); SciEX (663k in the corpus; needs the
+  - **Orphan MS2 (precursors):** Waters landed 2026-09-09 (scan items through the MassLynx parameters object:
+    SET_MASS / COLLISION_ENERGY; Capan2's 682 high-energy MSe scans carry a precursor stating the activation, DDA set
+    masses a selected ion with a target-only window); SciEX (663k in the corpus; needs the
     `SpectrumMetaV2` glue export — S-P2); Agilent MHDAC (`MSScan.bin` precursor decode; no DDA/QQQ
     `.d` on host or in the corpus to verify against); BAF (SQL `Steps`/`Variables` tables; box-only).
     Bruker TDF/TSF and Shimadzu carry theirs.
   - **Waters ion mobility — landed 2026-09-09:** HDMSe/HDDDA functions are read bin by bin and written as
     frames (one spectrum per MassLynx scan, per-point `raw_ion_mobility` in ms, sorted by m/z); RT,
     polarity, scan window and function-type MS levels come from the SDK (W-P2 closed for those fields).
-    Verified bin-for-bin against pwiz on ten Capan2 frames. Remaining on this lane: precursors
-    (`getScanItemsInFunction` crashes in every spelling tried; SET_MASS / COLLISION_ENERGY unread — the
-    MSe rule therefore assumes the second MS function is the elevated-energy one), lock-mass function
-    detection (`getLockMassFunction` unbound), SONAR (bins are quadrupole positions; the frame writer
-    would mislabel them — refuse or skip until a SONAR file is available), CCS per peak
-    (`getCollisionalCrossSection` needs a charge). Viewer: mzPeakViewer keys its mobility panel on the
+    Verified bin-for-bin against pwiz on Capan2 frames. Followed on 2026-09-09: precursors from the scan
+    items, lock-mass detection (`getLockMassFunction`, else the method text), MS levels by function-type
+    code, SONAR detection (refused, not mislabelled), the collapsed retention-time functions skipped, the
+    zero-run mask off for frames (plus the writer bug that masked every profile spectrum regardless),
+    acquisition-time order. Remaining on this lane: CCS per peak (`getCollisionalCrossSection` needs a
+    charge); a SONAR file to decide how quadrupole-position bins should be stored; mixed IMS/non-IMS
+    runs beyond the sFtsk_2 probe; the id convention — pwiz's `function=F process=0 scan=S` names a
+    frame here and a drift bin there (pwiz's own combined mode uses `merged=I function=F block=B`), a
+    spec question. Viewer: mzPeakViewer keys its mobility panel on the
     `ims_calibration` block and the 1/K0 array name; it needs to recognise `raw_ion_mobility` (ms)
     and the `waters_drift` block.
   - **Device chromatograms** (UV, pressure, temperature; B-P3): the mzML lane gets 620 traces on

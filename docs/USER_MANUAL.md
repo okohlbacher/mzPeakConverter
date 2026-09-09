@@ -387,17 +387,26 @@ drift-scan count is read bin by bin and written as one spectrum per MassLynx sca
 sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1003007, ms) — the
 shape of ProteoWizard's `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane —
 with the frame's drift-time bounds (MS:1003439/1003440), `sort-by-mz` in `transformations`, and a
-`waters_drift` index block holding the run's bin → ms table and the vendor's `mob_cal.csv` CCS
-calibration verbatim. ProteoWizard's default instead writes one spectrum per drift bin (Capan2:
-397,800 spectra for 1,989 scans); the two are the same data (verified bin for bin), 552 MB as
-frames against 959 MB as bins. The scan row's `ion_mobility_value` stays NULL on purpose: a frame
-has no single drift time. Retention time, polarity, scan window and the MS level per function come
-from the SDK (`getRetentionTime`, `getIonModeString`, `getAcquisitionMassRange`,
-`getFunctionTypeString`): product-ion function types are MS2, the second function of an MSe pair is
-MS2, every other MS function (lock mass, auxiliary) is MS1.
+`waters_drift` index block holding the run's bin → ms table, the vendor's `mob_cal.csv` CCS
+calibration verbatim, the lock-mass function and the functions not written as spectra. Frames keep
+every point MassLynx returns: the writer's zero-run mask is off for them (`zero-run-mask` is absent
+from `transformations`), because a run of zeros in an interleaved frame is several bins' trace
+boundaries meeting. ProteoWizard's default instead writes one spectrum per drift bin (Capan2:
+397,800 spectra for 1,989 scans); the two are the same data (verified bin for bin), 531 MB as
+frames against 965 MB as bins. Spectra are in acquisition-time order across functions. The scan
+row's `ion_mobility_value` stays NULL on purpose: a frame has no single drift time. Retention time,
+polarity, scan window, the MS level (from the function-type code: product-ion types are MS2, the
+second function of an MSe pair is MS2, every other MS function — lock mass, auxiliary — is MS1) and
+the precursors come from the SDK: a set mass > 0 (DDA) gives a selected ion with a target-only
+isolation window and the collision energy; an MSe elevated-energy scan (set mass 0) gets a
+precursor stating the activation only — no isolation window is invented. Chromatogram functions
+(SIR, MRM, neutral loss/gain) and non-MS functions (DAD, delay, calibration) are skipped with a log
+line; a SONAR function (its bins are quadrupole positions) is refused; "collapsed retention time"
+functions (one row per drift bin, the run's summed mobilograms — Capan2 functions 4–6) are
+recognised and not written as spectra (`MZPC_WATERS_KEEP_COLLAPSED=1` keeps them).
 
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
-the Waters, Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF and Shimadzu have them), and the
+the Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF, Shimadzu and Waters have them), and the
 non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz.
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
