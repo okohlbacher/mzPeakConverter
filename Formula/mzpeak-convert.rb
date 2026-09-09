@@ -2,7 +2,7 @@ class MzpeakConvert < Formula
   desc "Converter from mass-spectrometry formats to the HUPO-PSI mzPeak format"
   homepage "https://github.com/okohlbacher/mzPeakConverter"
   # Load-bearing, not redundant with the URL: the URLs below are built from it.
-  version "0.11.3"
+  version "0.11.4"
   license "MIT"
 
   livecheck do
@@ -18,12 +18,12 @@ class MzpeakConvert < Formula
     on_arm do
       url "https://github.com/okohlbacher/mzPeakConverter/releases/download/v#{version}/" \
           "mzpeak-convert-#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "7afa0f3f44fbd70ab249d59455348db7a2146ce7b4c5ab33058416ed25100ee8"
+      sha256 "5cc2b92613fe1e74d8a61955f977d09e5d9b0f850ac4bccb60756b2e98d8c9e5"
     end
     on_intel do
       url "https://github.com/okohlbacher/mzPeakConverter/releases/download/v#{version}/" \
           "mzpeak-convert-#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "fc8c503b7bfee5ed325a30a2819d217ed7d9b15209df7fd9a05f6f9c04ab1ca7"
+      sha256 "703a904346aee96e9371b173b296a64e7437453424201c3af9fbe93332bb35e5"
     end
   end
 
