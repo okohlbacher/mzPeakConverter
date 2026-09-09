@@ -3149,6 +3149,24 @@ where
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
+        // Per-frame inputs of the vendor's exact TOF→m/z model (`Frames.T1/T2/MzCalibration`) as
+        // spectra_metadata columns; the calibration rows themselves go into the
+        // `vendor_mz_calibration` index block below. Null on a TDF whose Frames lacks them.
+        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            bruker_native::TDF_T1_CURIE,
+            "tdf_t1",
+            DataType::Float64,
+        ))
+        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            bruker_native::TDF_T2_CURIE,
+            "tdf_t2",
+            DataType::Float64,
+        ))
+        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
+            bruker_native::TDF_MZ_CAL_ID_CURIE,
+            "tdf_mz_calibration_id",
+            DataType::Int64,
+        ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
     // Peak-facet row-group size (rows) = the per-chunk zstd granularity. Smaller = finer random
     // access (fewer peaks to decompress per frame) but worse compression; default is parquet's 2^20.
@@ -3288,6 +3306,16 @@ where
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     zip.add_index_metadata("ims_calibration", &cal)
         .context("writing ims_calibration index")?;
+    // The vendor's exact calibration, verbatim, so the archive is self-sufficient without the
+    // embedded `vendor/analysis.tdf.gz` (`--no-vendor`). Best-effort: a TDF without the table is
+    // still a valid ims-compact archive on the two-point model above.
+    let tdf = if input.is_dir() { input.join("analysis.tdf") } else { input.to_path_buf() };
+    match bruker_native::vendor_mz_calibration(&tdf) {
+        Ok(v) => zip
+            .add_index_metadata("vendor_mz_calibration", &v)
+            .context("writing vendor_mz_calibration index")?,
+        Err(e) => log::warn!("vendor MzCalibration unavailable ({e}); vendor_mz_calibration index block omitted"),
+    }
     if let Some(policy) = vendor {
         vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
     }
@@ -4869,6 +4897,31 @@ mod tests {
             assert!(cal.get(key).is_some(), "ims_calibration missing key `{key}`: {cal}");
         }
         assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("ims-compact"));
+        // The vendor's exact calibration rides beside the two-point chord.
+        let vmc = idx
+            .get("metadata")
+            .and_then(|m| m.get("vendor_mz_calibration"))
+            .expect("metadata.vendor_mz_calibration present");
+        assert!(
+            vmc["mz_calibration"].as_array().is_some_and(|r| !r.is_empty()),
+            "vendor_mz_calibration.mz_calibration must hold the MzCalibration rows: {vmc}"
+        );
+        for key in ["DigitizerNumSamples", "MzAcqRangeLower", "MzAcqRangeUpper"] {
+            assert!(vmc["global_metadata"].get(key).is_some(), "global_metadata missing `{key}`: {vmc}");
+        }
+        // … and the per-frame inputs are spectra_metadata columns.
+        let meta_path = extract_zip_entry(&mut zip, "spectra_metadata.parquet", scratch);
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            fs::File::open(&meta_path).unwrap(),
+        )
+        .unwrap();
+        let cols = leaf_column_names(builder.schema());
+        for suffix in ["_tdf_t1", "_tdf_t2", "_tdf_mz_calibration_id"] {
+            assert!(
+                cols.iter().any(|n| n.ends_with(suffix)),
+                "spectra_metadata must carry a `*{suffix}` column; got {cols:?}"
+            );
+        }
 
         // peaks schema has a `tof` column.
         let peaks_path = extract_zip_entry(&mut zip, "spectra_peaks.parquet", scratch);

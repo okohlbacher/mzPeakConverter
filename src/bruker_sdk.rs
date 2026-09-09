@@ -237,6 +237,11 @@ struct FrameMeta {
     polarity: ScanPolarity,
     /// Mobility scans in this frame (TDF only; 0 for TSF).
     num_scans: u32,
+    /// `Frames.T1` / `T2` / `MzCalibration` (TDF only): the per-frame inputs of the vendor's exact
+    /// TOF→m/z model, promoted to `spectra_metadata` columns on the ims-compact lane.
+    t1: Option<f64>,
+    t2: Option<f64>,
+    mz_cal_id: Option<i64>,
 }
 
 /// MsMsType → 1-based MS level. 0 is MS1 for both TDF and TSF; every non-zero acquisition type
@@ -260,7 +265,7 @@ fn polarity_from_str(s: &str) -> ScanPolarity {
 /// Read the `Frames` table in Id order. `with_scans` pulls `NumScans` (TDF); TSF has no such column.
 fn read_frames(conn: &Connection, with_scans: bool) -> Result<Vec<FrameMeta>> {
     let sql = if with_scans {
-        "SELECT Id, Time, MsMsType, Polarity, NumScans FROM Frames ORDER BY Id"
+        "SELECT Id, Time, MsMsType, Polarity, NumScans, T1, T2, MzCalibration FROM Frames ORDER BY Id"
     } else {
         "SELECT Id, Time, MsMsType, Polarity FROM Frames ORDER BY Id"
     };
@@ -278,6 +283,9 @@ fn read_frames(conn: &Connection, with_scans: bool) -> Result<Vec<FrameMeta>> {
                 } else {
                     0
                 },
+                t1: if with_scans { row.get::<_, Option<f64>>(5)? } else { None },
+                t2: if with_scans { row.get::<_, Option<f64>>(6)? } else { None },
+                mz_cal_id: if with_scans { row.get::<_, Option<i64>>(7)? } else { None },
             })
         })
         .context("querying Frames")?
@@ -639,6 +647,9 @@ impl TdfSdkReader {
         arrays.add(mob_da);
 
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
+        if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
+            crate::bruker_native::add_frame_calibration_params(&mut descr, t1, t2, id);
+        }
         self.attach_precursors(&mut descr, frame);
         // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (a + b·tof)²
         // (monotonic in tof) over the min/max TOF index present. Without this the viewer shows
