@@ -25,8 +25,11 @@
 //!     Both hand back READER-OWNED `float[n]` buffers valid until the next read; copy, never free
 //!     (`releaseMemory` on them corrupts the heap, 0xC0000374).
 //!   * `destroyRawReader(reader)`. All return `int` (0 = OK).
-//!   Still unbound: `getScanItemsInFunction` (both pointer spellings crash) and therefore the per-scan
-//!   SET_MASS / COLLISION_ENERGY items pwiz reads for precursors and its MSe heuristic.
+//!   * Scan items go through a MassLynx "parameters" object (`createParameters` / `getParameterValue`
+//!     / `getParameterKeys` / `destroyParameters`): `getScanItemsInFunction(info, f, params)` lists the
+//!     ids as keys, `getScanItemName(info, ids, n, params)` and `getScanItemValue(info, f, scan, ids,
+//!     n, params)` fill strings per id. Every direct-out spelling crashed (probe rounds 12–16); the
+//!     shapes come from the public MassLynx SDK bindings. `getLockMassFunction(info, &char, &int)`.
 //!
 //! ION MOBILITY (HDMSe / HDDDA): a function whose `_funcNNN.cdt` exists and whose `getDriftScanCount`
 //! is > 0 is read bin by bin and written as ONE spectrum per MassLynx scan — a frame — whose points are
@@ -48,10 +51,12 @@ use std::ptr;
 use anyhow::{Context, Result, anyhow, bail};
 use libloading::Library;
 
+use mzdata::meta::DissociationMethodTerm;
 use mzdata::params::{Param, ParamDescribed, Unit};
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
-    MultiLayerSpectrum, ScanEvent, ScanPolarity, ScanWindow, SignalContinuity, SpectrumDescription,
+    Activation, IsolationWindow, IsolationWindowState, MultiLayerSpectrum, Precursor, ScanEvent,
+    ScanPolarity, ScanWindow, SelectedIon, SignalContinuity, SpectrumDescription,
 };
 
 /// Guard against a corrupt/hostile vendor library returning an enormous length that would exhaust
@@ -93,6 +98,116 @@ type ReadDriftScanFn = unsafe extern "C" fn(
     *mut c_int,
 ) -> c_int;
 
+// The scan-item family returns its results through a MassLynx "parameters" object (the shapes the
+// public MassLynx SDK bindings declare: getScanItemsInFunction(info, f, params) → item ids as the
+// parameter KEYS; getScanItemValue(info, f, scan, ids, n, params) / getScanItemName(info, ids, n,
+// params) → strings per id). Every earlier direct-out spelling access-violated (probe rounds 12–16).
+type CreateParametersFn = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
+type DestroyParametersFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type GetParameterValueFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *const c_char) -> c_int;
+type GetParameterKeysFn = unsafe extern "C" fn(*mut c_void, *mut *const c_int, *mut c_int) -> c_int;
+type ScanItemsInFunctionFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
+type ScanItemValueFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *const c_int, c_int, *mut c_void) -> c_int;
+type ScanItemNameFn = unsafe extern "C" fn(*mut c_void, *const c_int, c_int, *mut c_void) -> c_int;
+/// `getLockMassFunction(info, *out char hasLockMass, *out int whichFunction)`.
+type LockMassFunctionFn = unsafe extern "C" fn(*mut c_void, *mut c_char, *mut c_int) -> c_int;
+
+/// MassLynxScanItem ids (SDK enum, base 400) used when the DLL's own item names cannot be read.
+const SCAN_ITEM_BASE: c_int = 400;
+
+/// The scan-item API, resolved as a whole (any missing export disables all of it).
+#[derive(Clone, Copy)]
+struct ScanItemApi {
+    create: CreateParametersFn,
+    destroy: DestroyParametersFn,
+    value: GetParameterValueFn,
+    keys: GetParameterKeysFn,
+    in_function: ScanItemsInFunctionFn,
+    item_value: ScanItemValueFn,
+    item_name: ScanItemNameFn,
+}
+
+impl ScanItemApi {
+    fn resolve(lib: &Library) -> Option<Self> {
+        unsafe {
+            Some(ScanItemApi {
+                create: *lib.get::<CreateParametersFn>(b"createParameters\0").ok()?,
+                destroy: *lib.get::<DestroyParametersFn>(b"destroyParameters\0").ok()?,
+                value: *lib.get::<GetParameterValueFn>(b"getParameterValue\0").ok()?,
+                keys: *lib.get::<GetParameterKeysFn>(b"getParameterKeys\0").ok()?,
+                in_function: *lib.get::<ScanItemsInFunctionFn>(b"getScanItemsInFunction\0").ok()?,
+                item_value: *lib.get::<ScanItemValueFn>(b"getScanItemValue\0").ok()?,
+                item_name: *lib.get::<ScanItemNameFn>(b"getScanItemName\0").ok()?,
+            })
+        }
+    }
+
+    /// Run `fill` against a fresh parameters object, read what `read` wants, destroy it.
+    fn with<T>(&self, fill: impl FnOnce(*mut c_void) -> c_int, read: impl FnOnce(*mut c_void) -> T) -> Option<T> {
+        let mut p: *mut c_void = ptr::null_mut();
+        if unsafe { (self.create)(&mut p) } != 0 || p.is_null() {
+            return None;
+        }
+        let out = if fill(p) == 0 { Some(read(p)) } else { None };
+        unsafe { (self.destroy)(p) };
+        out
+    }
+
+    fn string(&self, p: *mut c_void, key: c_int) -> Option<String> {
+        let mut v: *const c_char = ptr::null();
+        (unsafe { (self.value)(p, key, &mut v) } == 0 && !v.is_null())
+            .then(|| unsafe { CStr::from_ptr(v) }.to_string_lossy().trim().to_string())
+    }
+
+    /// The item ids a function records.
+    fn available(&self, info: *mut c_void, f: c_int) -> Vec<c_int> {
+        self.with(
+            |p| unsafe { (self.in_function)(info, f, p) },
+            |p| {
+                let mut keys: *const c_int = ptr::null();
+                let mut n: c_int = 0;
+                if unsafe { (self.keys)(p, &mut keys, &mut n) } == 0 && !keys.is_null() && (0..=4096).contains(&n) {
+                    unsafe { std::slice::from_raw_parts(keys, n as usize) }.to_vec()
+                } else {
+                    Vec::new()
+                }
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    fn names(&self, info: *mut c_void, ids: &[c_int]) -> Vec<(c_int, String)> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.with(
+            |p| unsafe { (self.item_name)(info, ids.as_ptr(), ids.len() as c_int, p) },
+            |p| ids.iter().filter_map(|&id| self.string(p, id).map(|n| (id, n))).collect(),
+        )
+        .unwrap_or_default()
+    }
+
+    fn values(&self, info: *mut c_void, f: c_int, scan: c_int, ids: &[c_int]) -> Vec<Option<String>> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.with(
+            |p| unsafe { (self.item_value)(info, f, scan, ids.as_ptr(), ids.len() as c_int, p) },
+            |p| ids.iter().map(|&id| self.string(p, id)).collect(),
+        )
+        .unwrap_or_else(|| vec![None; ids.len()])
+    }
+}
+
+/// The scan items this lane reads, resolved by NAME from the DLL's own table (falling back to the
+/// SDK enum constants when the names cannot be read).
+#[derive(Debug, Clone, Copy, Default)]
+struct ScanItemIds {
+    set_mass: Option<c_int>,
+    collision_energy: Option<c_int>,
+    sonar: Option<c_int>,
+}
+
 /// What MassLynx states about one function, resolved once at open.
 #[derive(Debug, Clone, Default)]
 struct FunctionInfo {
@@ -106,6 +221,10 @@ struct FunctionInfo {
     mass_range: Option<(f32, f32)>,
     /// Drift bins per scan when the function carries a `.cdt` and MassLynx counts bins; 0 otherwise.
     drift_bins: c_int,
+    /// SONAR: the "drift" bins are quadrupole positions, not drift times.
+    sonar: bool,
+    /// `COLLISION_ENERGY` of the function's first scan (eV), when readable.
+    collision_energy_0: Option<f64>,
     ms_level: u8,
 }
 
@@ -126,6 +245,10 @@ pub struct WatersReader {
     /// One entry per spectrum: (function index, scan index), both 0-based.
     index: Vec<(c_int, c_int)>,
     input: PathBuf,
+    scan_items: Option<ScanItemApi>,
+    item_ids: ScanItemIds,
+    /// The lock-mass reference function, when MassLynx names one.
+    lockmass_function: Option<c_int>,
 }
 
 impl WatersReader {
@@ -171,6 +294,8 @@ impl WatersReader {
         let drift_count: Option<GetIntPerFunctionFn> = unsafe { lib.get(b"getDriftScanCount\0") }.ok().map(|f| *f);
         let drift_time: Option<GetDriftTimeFn> = unsafe { lib.get(b"getDriftTime\0") }.ok().map(|f| *f);
         let read_drift_scan: Option<ReadDriftScanFn> = unsafe { lib.get(b"readDriftScan\0") }.ok().map(|f| *f);
+        let scan_items = ScanItemApi::resolve(&lib);
+        let lockmass_fn: Option<LockMassFunctionFn> = unsafe { lib.get(b"getLockMassFunction\0") }.ok().map(|f| *f);
         for (name, present) in [
             ("isContinuum", opt(b"isContinuum\0")),
             ("getFunctionType", opt(b"getFunctionType\0")),
@@ -178,6 +303,7 @@ impl WatersReader {
             ("getDriftScanCount", opt(b"getDriftScanCount\0")),
             ("getDriftTime", opt(b"getDriftTime\0")),
             ("readDriftScan", opt(b"readDriftScan\0")),
+            ("getScanItemValue (+ parameters object)", scan_items.is_some()),
         ] {
             if !present {
                 log::warn!("MassLynxRaw.dll does not export {name}; the archive will lack what it provides");
@@ -222,6 +348,43 @@ impl WatersReader {
             return Err(close(format!("MassLynx getFunctionCount failed (rc={rc}, n={n_functions})")));
         }
 
+        // The lock-mass reference function, if the method names one.
+        let lockmass_function = lockmass_fn.and_then(|g| {
+            let mut has: c_char = 0;
+            let mut which: c_int = -1;
+            (unsafe { g(info_reader, &mut has, &mut which) } == 0 && has != 0 && which >= 0).then_some(which)
+        });
+        // The scan items the DLL records, by NAME, so the ids do not depend on the enum base.
+        let mut item_ids = ScanItemIds::default();
+        if let Some(api) = scan_items {
+            let ids = api.available(info_reader, 0);
+            let named = api.names(info_reader, &ids);
+            log::info!(
+                "MassLynx scan items (function 1, {} ids): {}",
+                ids.len(),
+                named.iter().map(|(i, n)| format!("{i}:{n}")).collect::<Vec<_>>().join(" | ")
+            );
+            for (id, name) in &named {
+                let u = name.to_ascii_uppercase().replace(['_', '-'], " ");
+                if u.contains("SET MASS") && !u.contains("CAL") && !u.contains("SUPPORTED") && item_ids.set_mass.is_none() {
+                    item_ids.set_mass = Some(*id);
+                } else if u == "COLLISION ENERGY" || (u.contains("COLLISION ENERGY") && !u.contains('2') && item_ids.collision_energy.is_none()) {
+                    item_ids.collision_energy = Some(*id);
+                } else if u.contains("SONAR") && item_ids.sonar.is_none() {
+                    item_ids.sonar = Some(*id);
+                }
+            }
+            if named.is_empty() {
+                log::warn!("MassLynx scan item names unreadable; using the SDK enum ids (base {SCAN_ITEM_BASE})");
+                item_ids = ScanItemIds {
+                    set_mass: Some(SCAN_ITEM_BASE + 76),
+                    collision_energy: Some(SCAN_ITEM_BASE + 61),
+                    sonar: Some(SCAN_ITEM_BASE + 80),
+                };
+            }
+            log::info!("MassLynx scan item ids: {item_ids:?}; lock-mass function: {:?}", lockmass_function.map(|f| f + 1));
+        }
+
         // Per-function facts, each an independent optional call (a failed one leaves its field None).
         let int_of = |g: Option<GetIntPerFunctionFn>, f: c_int| -> Option<c_int> {
             g.and_then(|g| {
@@ -258,15 +421,37 @@ impl WatersReader {
                 input.join(format!("_func{:03}.{ext}", f + 1)).is_file()
                     || input.join(format!("_FUNC{:03}.{ext}", f + 1)).is_file()
             });
-            let drift_bins = if has_cdt && read_drift_scan.is_some() {
+            let mut drift_bins = if has_cdt && read_drift_scan.is_some() {
                 int_of(drift_count, f).filter(|n| (1..=MAX_DRIFT_BINS).contains(n)).unwrap_or(0)
             } else {
                 0
             };
-            functions.push(FunctionInfo { continuum, type_string, ion_mode, mass_range, drift_bins, ms_level: 1 });
+            // SONAR: the bins are quadrupole positions (pwiz gates its drift-time labelling on it);
+            // until the lane can state them as such, the summed scan is the honest product.
+            let mut sonar = false;
+            let mut collision_energy_0 = None;
+            if let Some(api) = scan_items {
+                let ids: Vec<c_int> = [item_ids.sonar, item_ids.collision_energy].into_iter().flatten().collect();
+                let vals = api.values(info_reader, f, 0, &ids);
+                let get = |want: Option<c_int>| ids.iter().position(|&i| Some(i) == want).and_then(|k| vals.get(k).cloned().flatten());
+                if let Some(v) = get(item_ids.sonar) {
+                    sonar = !(v.trim() == "0" || v.trim().is_empty() || v.eq_ignore_ascii_case("false"));
+                }
+                collision_energy_0 = get(item_ids.collision_energy).and_then(|v| v.trim().parse::<f64>().ok()).map(f64::abs);
+            }
+            if sonar && drift_bins > 0 {
+                log::warn!(
+                    "MassLynx function {}: SONAR — its {} bins are quadrupole positions, not drift times; \
+                     written as the summed scan (SONAR support pending)",
+                    f + 1,
+                    drift_bins
+                );
+                drift_bins = 0;
+            }
+            functions.push(FunctionInfo { continuum, type_string, ion_mode, mass_range, drift_bins, sonar, collision_energy_0, ms_level: 1 });
         }
         for f in 0..functions.len() {
-            functions[f].ms_level = ms_level_for(f, &functions);
+            functions[f].ms_level = ms_level_for(f, &functions, lockmass_function);
         }
 
         // The run's drift-time table: bin → ms, read once from the first IMS function's bin count.
@@ -343,101 +528,11 @@ impl WatersReader {
             drift_time_ms,
             index,
             input: input.to_path_buf(),
+            scan_items,
+            item_ids,
+            lockmass_function,
         };
-        if let Ok(v) = std::env::var("MZPC_WATERS_PROBE") {
-            if let Some(variant) = v.trim().strip_prefix("items") {
-                reader.probe_scan_items(n_functions, variant.parse().unwrap_or(1));
-            }
-        }
         Ok(reader)
-    }
-
-    /// `MZPC_WATERS_PROBE=itemsN`: log-only discovery of the MassLynx scan items, one candidate
-    /// shape per process (round 15: `getScanItemName(info, id, char**)` access-violated on id 0):
-    /// 1 = `getScanItemName(info, id, char**)` for id 1..400 (id 0 skipped — an id-1 table index?);
-    /// 2 = `getScanItemName(info, function, id, char**)`; 3 = `getScanItemsInFunction(info, function,
-    /// scan, int**, int*)` — the recurring extra-int pattern of this DLL; 4 = `getScanItemValue(info,
-    /// function, scan, id, char**)` for the ids the public MassLynx SDK enum gives COLLISION_ENERGY
-    /// (62), ION_ENERGY (63), SET_MASS (77), COLLISION_ENERGY2 (78) — a value probe needs no name.
-    /// 5 = `getLockMassFunction(info, *int)`. Every call is announced first.
-    fn probe_scan_items(&self, n_functions: c_int, variant: u8) {
-        type ItemNameFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *const c_char) -> c_int;
-        type ItemNameFnF = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *const c_char) -> c_int;
-        type ItemsInFnScan = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *const c_int, *mut c_int) -> c_int;
-        type ItemValueFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *mut *const c_char) -> c_int;
-        type LockMassFn = unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int;
-        let lib = &self._lib;
-        let cstr = |p: *const c_char| -> String {
-            if p.is_null() { "<null>".into() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().chars().take(60).collect() }
-        };
-        match variant {
-            1 => {
-                if let Some(g) = unsafe { lib.get::<ItemNameFn>(b"getScanItemName\0") }.ok().map(|f| *f) {
-                    let mut named = Vec::new();
-                    for id in 1..400 {
-                        log::info!("waters-probe: calling getScanItemName(info, id={id}, char**)");
-                        let mut ps: [*const c_char; 4] = [ptr::null(); 4];
-                        let rc = unsafe { g(self.info_reader, id, ps.as_mut_ptr()) };
-                        if rc == 0 && !ps[0].is_null() {
-                            named.push(format!("{id}:{}", cstr(ps[0])));
-                        }
-                    }
-                    log::info!("waters-probe: variant 1 names ({}): {}", named.len(), named.join(" | "));
-                }
-            }
-            2 => {
-                if let Some(g) = unsafe { lib.get::<ItemNameFnF>(b"getScanItemName\0") }.ok().map(|f| *f) {
-                    let mut named = Vec::new();
-                    for id in 1..400 {
-                        log::info!("waters-probe: calling getScanItemName(info, function=0, id={id}, char**)");
-                        let mut ps: [*const c_char; 4] = [ptr::null(); 4];
-                        let rc = unsafe { g(self.info_reader, 0, id, ps.as_mut_ptr()) };
-                        if rc == 0 && !ps[0].is_null() {
-                            named.push(format!("{id}:{}", cstr(ps[0])));
-                        }
-                    }
-                    log::info!("waters-probe: variant 2 names ({}): {}", named.len(), named.join(" | "));
-                }
-            }
-            3 => {
-                if let Some(g) = unsafe { lib.get::<ItemsInFnScan>(b"getScanItemsInFunction\0") }.ok().map(|f| *f) {
-                    for f in 0..n_functions {
-                        log::info!("waters-probe: calling getScanItemsInFunction(info, f={}, scan=0, int**, int*)", f + 1);
-                        let mut items: [*const c_int; 4] = [ptr::null(); 4];
-                        let mut n = [0i32; 4];
-                        let rc = unsafe { g(self.info_reader, f, 0, items.as_mut_ptr(), n.as_mut_ptr()) };
-                        let ids = if rc == 0 && !items[0].is_null() && (0..=512).contains(&n[0]) {
-                            unsafe { std::slice::from_raw_parts(items[0], n[0] as usize) }.to_vec()
-                        } else {
-                            Vec::new()
-                        };
-                        log::info!("waters-probe: variant 3 function {} rc={rc} n={} ids={:?}", f + 1, n[0], ids);
-                    }
-                }
-            }
-            4 => {
-                if let Some(g) = unsafe { lib.get::<ItemValueFn>(b"getScanItemValue\0") }.ok().map(|f| *f) {
-                    for f in 0..n_functions {
-                        let mut vals = Vec::new();
-                        for id in [62, 63, 77, 78, 52, 61] {
-                            log::info!("waters-probe: calling getScanItemValue(info, f={}, scan=0, item={id}, char**)", f + 1);
-                            let mut ps: [*const c_char; 4] = [ptr::null(); 4];
-                            let rc = unsafe { g(self.info_reader, f, 0, id, ps.as_mut_ptr()) };
-                            vals.push(format!("{id}={}", if rc == 0 { cstr(ps[0]) } else { format!("rc={rc}") }));
-                        }
-                        log::info!("waters-probe: variant 4 function {} scan 1: {}", f + 1, vals.join(" | "));
-                    }
-                }
-            }
-            _ => {
-                if let Some(g) = unsafe { lib.get::<LockMassFn>(b"getLockMassFunction\0") }.ok().map(|f| *f) {
-                    log::info!("waters-probe: calling getLockMassFunction(info, *int)");
-                    let mut slot = [-1i32; 4];
-                    let rc = unsafe { g(self.info_reader, slot.as_mut_ptr()) };
-                    log::info!("waters-probe: variant 5 getLockMassFunction rc={rc} raw={:?}", slot);
-                }
-            }
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -541,17 +636,22 @@ impl WatersReader {
             arrays.add(im_da);
         }
 
-        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
-        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
-        // otherwise indistinguishable from a complete one. The set mass is a MassLynx scan item;
-        // `getScanItemsInFunction` is not bound yet (see the module docs).
-        if fi.ms_level > 1 {
+        // The precursor, from the scan's own SET_MASS and COLLISION_ENERGY items (what pwiz reads;
+        // `SpectrumList_Waters.cpp:276-330`). A set mass names the selected ion and the isolation
+        // target (its width is not stated — offsets stay NULL); a set mass of 0 is MSe: the whole
+        // acquisition range was transmitted, so the isolation window IS that range and no selected
+        // ion is invented (pwiz writes the range midpoint as a selected ion; we do not).
+        let precursor = if fi.ms_level > 1 {
+            self.precursor(func, scan, fi)
+        } else {
+            None
+        };
+        if fi.ms_level > 1 && precursor.is_none() {
             static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
             PRECURSOR_GAP_SAID.call_once(|| {
                 log::warn!(
-                    "Waters MassLynx: this reader does not yet extract precursors; \
-                     MS2 rows will have none (no selected ion, isolation window or collision energy \
-                     in the archive)"
+                    "Waters MassLynx: the scan-item API is unavailable in this MassLynxRaw.dll; \
+                     MS2 rows carry no precursor"
                 );
             });
         }
@@ -608,8 +708,40 @@ impl WatersReader {
         // A frame has no single drift time: `ion_mobility_value` stays NULL on purpose (pwiz's
         // combined spectra carry a meaningless mid-range value; TDF frames carry none).
         descr.acquisition.scans.push(event);
+        if let Some(p) = precursor {
+            descr.precursor.push(p);
+        }
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
+    }
+
+    /// The precursor MassLynx states for one MSn scan, or `None` when the scan-item API is absent.
+    fn precursor(&self, func: c_int, scan: c_int, fi: &FunctionInfo) -> Option<Precursor> {
+        let api = self.scan_items?;
+        let ids: Vec<c_int> = [self.item_ids.set_mass, self.item_ids.collision_energy].into_iter().flatten().collect();
+        let vals = api.values(self.info_reader, func, scan, &ids);
+        let get = |want: Option<c_int>| ids.iter().position(|&i| Some(i) == want).and_then(|k| vals.get(k).cloned().flatten());
+        let set_mass = get(self.item_ids.set_mass).and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(0.0);
+        let energy = get(self.item_ids.collision_energy).and_then(|v| v.trim().parse::<f64>().ok()).map(f64::abs).unwrap_or(0.0);
+        let mut activation = Activation::default();
+        // No Waters instrument has a trap collision cell (pwiz's note): beam-type CID.
+        activation.methods_mut().push(DissociationMethodTerm::BeamTypeCollisionInducedDissociation);
+        if energy > 0.0 {
+            activation.energy = energy as f32;
+        }
+        let (ions, isolation_window) = if set_mass > 0.0 {
+            (
+                vec![SelectedIon { mz: set_mass, ..Default::default() }],
+                IsolationWindow { target: set_mass as f32, lower_bound: 0.0, upper_bound: 0.0, flags: IsolationWindowState::Complete },
+            )
+        } else {
+            let (lo, hi) = fi.mass_range.unwrap_or((0.0, 0.0));
+            (
+                Vec::new(),
+                IsolationWindow { target: (lo + hi) / 2.0, lower_bound: lo, upper_bound: hi, flags: IsolationWindowState::Complete },
+            )
+        };
+        Some(Precursor { ions, isolation_window, activation, ..Default::default() })
     }
 
     /// One drift bin of one scan, copied out of the reader-owned buffers.
@@ -654,21 +786,25 @@ fn copy_points(p_masses: *mut f32, p_intensities: *mut f32, n: c_int) -> Result<
     Ok((mz, intensity))
 }
 
-/// MS level from the vendor's function type, with ProteoWizard's MSe convention.
+/// MS level from the vendor's function type, with ProteoWizard's MSe convention
+/// (`SpectrumList_Waters.cpp:161-185`).
 ///
 /// A product-ion type (`DAUGHTER`, `MSMS`, `MS/MS`, `PARENT`, `NEUTRAL`, `MRM`) is MS2. Among plain
 /// MS functions the SECOND function is the elevated-energy acquisition of an MSe / HDMSe method when
-/// it repeats the first function's type — pwiz (`SpectrumList_Waters.cpp`) additionally requires a
-/// collision energy > 0, which needs the still-unbound scan items; until then this is the documented
-/// assumption. Every other MS function (lock-mass reference, the auxiliary functions of a Synapt
-/// method) is MS1, as pwiz labels them. The pre-2026-09-09 rule (every function after the first is
-/// MS2) mislabelled functions 3–6 of Capan2.
-fn ms_level_for(f: usize, functions: &[FunctionInfo]) -> u8 {
+/// its first scan carries a collision energy > 0 and it is not the lock-mass function — pwiz's rule.
+/// When the collision energy cannot be read, the second function counts as MSe when it repeats the
+/// first function's type. Every other MS function (lock-mass reference, the auxiliary functions of a
+/// Synapt method) is MS1, as pwiz labels them.
+fn ms_level_for(f: usize, functions: &[FunctionInfo], lockmass: Option<c_int>) -> u8 {
     let ty = |i: usize| functions.get(i).and_then(|fi| fi.type_string.as_deref()).map(|s| s.to_ascii_uppercase());
     let is_product = |s: &str| ["DAUGHTER", "MSMS", "MS/MS", "PARENT", "NEUTRAL", "MRM"].iter().any(|k| s.contains(k));
+    let is_lockmass = lockmass == Some(f as c_int);
     match ty(f) {
         Some(s) if is_product(&s) => 2,
-        Some(s) if f == 1 && ty(0).as_deref() == Some(s.as_str()) => 2,
+        Some(s) if f == 1 && !is_lockmass => match functions[f].collision_energy_0 {
+            Some(ce) => (ce > 0.0) as u8 + 1,
+            None => (ty(0).as_deref() == Some(s.as_str())) as u8 + 1,
+        },
         Some(_) => 1,
         // No type information at all (export missing): the historical index rule.
         None => {
@@ -721,23 +857,32 @@ fn prepend_dir_to_path(dir: &Path) {
 mod tests {
     use super::*;
 
-    fn fi(t: Option<&str>, bins: c_int) -> FunctionInfo {
-        FunctionInfo { type_string: t.map(str::to_string), drift_bins: bins, ..Default::default() }
+    fn fi(t: Option<&str>, bins: c_int, ce: Option<f64>) -> FunctionInfo {
+        FunctionInfo { type_string: t.map(str::to_string), drift_bins: bins, collision_energy_0: ce, ..Default::default() }
     }
 
     #[test]
     fn ms_levels_follow_the_function_type_and_the_mse_convention() {
-        // Capan2: six TOF MS functions → 1, 2, 1, 1, 1, 1 (pwiz's labels).
-        let fs: Vec<FunctionInfo> = (0..6).map(|_| fi(Some("TOF MS"), 200)).collect();
-        assert_eq!((0..6).map(|f| ms_level_for(f, &fs)).collect::<Vec<_>>(), vec![1, 2, 1, 1, 1, 1]);
+        // Capan2: six TOF MS functions, the second with a collision energy → 1, 2, 1, 1, 1, 1 (pwiz's labels).
+        let mut fs: Vec<FunctionInfo> = (0..6).map(|_| fi(Some("TOF MS"), 200, Some(0.0))).collect();
+        fs[1].collision_energy_0 = Some(19.5);
+        assert_eq!((0..6).map(|f| ms_level_for(f, &fs, Some(2))).collect::<Vec<_>>(), vec![1, 2, 1, 1, 1, 1]);
+        // The second function at collision energy 0 is not MSe.
+        fs[1].collision_energy_0 = Some(0.0);
+        assert_eq!(ms_level_for(1, &fs, None), 1);
+        // The second function being the lock-mass function is never MS2.
+        fs[1].collision_energy_0 = Some(19.5);
+        assert_eq!(ms_level_for(1, &fs, Some(1)), 1);
         // A DDA method: MS survey + product-ion functions.
-        let fs = vec![fi(Some("TOF MS"), 0), fi(Some("TOF DAUGHTER"), 0), fi(Some("TOF DAUGHTER"), 0)];
-        assert_eq!((0..3).map(|f| ms_level_for(f, &fs)).collect::<Vec<_>>(), vec![1, 2, 2]);
-        // A second function of a DIFFERENT MS type is not the MSe pair.
-        let fs = vec![fi(Some("TOF MS"), 0), fi(Some("MS"), 0)];
-        assert_eq!(ms_level_for(1, &fs), 1);
+        let fs = vec![fi(Some("TOF MS"), 0, None), fi(Some("TOF DAUGHTER"), 0, None), fi(Some("TOF DAUGHTER"), 0, None)];
+        assert_eq!((0..3).map(|f| ms_level_for(f, &fs, None)).collect::<Vec<_>>(), vec![1, 2, 2]);
+        // Collision energy unreadable: the second function counts as MSe only when it repeats the first type.
+        let fs = vec![fi(Some("TOF MS"), 0, None), fi(Some("TOF MS"), 0, None)];
+        assert_eq!(ms_level_for(1, &fs, None), 2);
+        let fs = vec![fi(Some("TOF MS"), 0, None), fi(Some("MS"), 0, None)];
+        assert_eq!(ms_level_for(1, &fs, None), 1);
         // No type information: the historical index rule.
-        let fs = vec![fi(None, 0), fi(None, 0), fi(None, 0)];
-        assert_eq!((0..3).map(|f| ms_level_for(f, &fs)).collect::<Vec<_>>(), vec![1, 2, 2]);
+        let fs = vec![fi(None, 0, None), fi(None, 0, None), fi(None, 0, None)];
+        assert_eq!((0..3).map(|f| ms_level_for(f, &fs, None)).collect::<Vec<_>>(), vec![1, 2, 2]);
     }
 }
