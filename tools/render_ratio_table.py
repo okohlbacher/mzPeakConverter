@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the full-corpus mzpeak/raw ratio table from corpus_full.sh results.
+"""Render the full-corpus mzpeak/raw ratio table from corpus_full.sh results (harness removed in 0.9.13; kept for existing TSVs).
 
 Usage: render_ratio_table.py HOST_RESULTS.tsv BOX_RESULTS.tsv > ratio-table-full.md
 

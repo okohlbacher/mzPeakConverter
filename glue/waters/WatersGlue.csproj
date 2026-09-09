@@ -15,9 +15,12 @@
     ⚠️ The produced DLL only *runs* where the MassLynx managed stack + a compatible .NET
     runtime exist. It is Windows-runtime-only in practice and currently UNTESTED.
 
+    ⛔ NOT WIRED: no code path loads WatersGlue.dll or reads MZPC_WATERS_GLUE. src/waters.rs
+    calls MassLynxRaw.dll's C ABI directly via libloading (MZPC_MASSLYNX_DIR / MZPC_PWIZ_DIR).
+    See README.md in this directory.
+
     Build:  dotnet build -c Release
     Output: bin/Release/net8.0/WatersGlue.dll  (+ WatersGlue.runtimeconfig.json)
-    Then point the Rust env var MZPC_WATERS_GLUE at that directory.
   -->
 
   <PropertyGroup>

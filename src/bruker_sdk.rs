@@ -27,9 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
 use rusqlite::{Connection, OpenFlags};
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -78,7 +76,6 @@ struct TimsDataApi {
     tims_read_scans_v2: TimsReadScansV2,
     tims_index_to_mz: TimsIndexToMz,
     tims_scannum_to_oneoverk0: TimsScannumToOneOverK0,
-    library_path: PathBuf,
 }
 
 impl TimsDataApi {
@@ -114,7 +111,6 @@ impl TimsDataApi {
                 tims_index_to_mz: sym!(TimsIndexToMz, b"tims_index_to_mz\0"),
                 tims_scannum_to_oneoverk0: sym!(TimsScannumToOneOverK0, b"tims_scannum_to_oneoverk0\0"),
                 _library: library,
-                library_path,
             })
         }
     }
@@ -263,11 +259,30 @@ fn polarity_from_str(s: &str) -> ScanPolarity {
 }
 
 /// Read the `Frames` table in Id order. `with_scans` pulls `NumScans` (TDF); TSF has no such column.
-fn read_frames(conn: &Connection, with_scans: bool) -> Result<Vec<FrameMeta>> {
-    let sql = if with_scans {
-        "SELECT Id, Time, MsMsType, Polarity, NumScans, T1, T2, MzCalibration FROM Frames ORDER BY Id"
-    } else {
-        "SELECT Id, Time, MsMsType, Polarity FROM Frames ORDER BY Id"
+/// A TDF also yields `T1`/`T2`/`MzCalibration`, the per-frame inputs of the vendor's exact TOF→m/z
+/// model — but only when its schema has them: an older TDF without those columns must still convert,
+/// so the query falls back to the core four (the calibration columns then come out null). The
+/// returned flag says whether the calibration columns WERE read, so the exact per-frame lane can
+/// refuse a file where every `t1`/`mz_cal_id` is `None` merely because the columns are missing.
+fn read_frames(conn: &Connection, with_scans: bool) -> Result<(Vec<FrameMeta>, bool)> {
+    if with_scans {
+        match read_frames_inner(conn, true, true) {
+            Ok(rows) => return Ok((rows, true)),
+            Err(e) => log::warn!(
+                "TDF Frames T1/T2/MzCalibration unavailable ({e}); per-frame calibration columns omitted"
+            ),
+        }
+    }
+    Ok((read_frames_inner(conn, with_scans, false)?, false))
+}
+
+fn read_frames_inner(conn: &Connection, with_scans: bool, with_cal: bool) -> Result<Vec<FrameMeta>> {
+    let sql = match (with_scans, with_cal) {
+        (true, true) => {
+            "SELECT Id, Time, MsMsType, Polarity, NumScans, T1, T2, MzCalibration FROM Frames ORDER BY Id"
+        }
+        (true, false) => "SELECT Id, Time, MsMsType, Polarity, NumScans FROM Frames ORDER BY Id",
+        (false, _) => "SELECT Id, Time, MsMsType, Polarity FROM Frames ORDER BY Id",
     };
     let mut stmt = conn.prepare(sql).context("preparing Frames query")?;
     let rows = stmt
@@ -283,9 +298,9 @@ fn read_frames(conn: &Connection, with_scans: bool) -> Result<Vec<FrameMeta>> {
                 } else {
                     0
                 },
-                t1: if with_scans { row.get::<_, Option<f64>>(5)? } else { None },
-                t2: if with_scans { row.get::<_, Option<f64>>(6)? } else { None },
-                mz_cal_id: if with_scans { row.get::<_, Option<i64>>(7)? } else { None },
+                t1: if with_cal { row.get::<_, Option<f64>>(5)? } else { None },
+                t2: if with_cal { row.get::<_, Option<f64>>(6)? } else { None },
+                mz_cal_id: if with_cal { row.get::<_, Option<i64>>(7)? } else { None },
             })
         })
         .context("querying Frames")?
@@ -313,12 +328,10 @@ fn make_description(i: usize, frame: &FrameMeta, continuity: SignalContinuity) -
         polarity: frame.polarity,
         ..Default::default()
     };
-    descr.add_param(
-        Param::builder()
-            .name("mass spectrum")
-            .curie(curie!(MS:1000294))
-            .build(),
-    );
+    // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+    // lookup, so that parent term wins over the specific one and the writer's inference
+    // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+    // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
     let mut scan = ScanEvent::default();
     scan.start_time = frame.rt_seconds / 60.0; // mzdata scan start_time is minutes
     descr.acquisition.scans.push(scan);
@@ -344,7 +357,7 @@ impl TsfSdkReader {
             anyhow!("tsf_open failed for {}: {e} ({})", dir.display(), api.last_error_tsf())
         })?;
         let conn = open_sqlite(&dir, "analysis.tsf")?;
-        let frames = read_frames(&conn, false)?;
+        let (frames, _) = read_frames(&conn, false)?;
         Ok(Self { api, handle, frames, _not_thread_safe: PhantomData })
     }
 
@@ -421,10 +434,6 @@ impl TsfSdkReader {
         let descr = make_description(i, frame, SignalContinuity::Centroid);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
-
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        sample_first_nonempty(self.len(), |i| self.spectrum(i))
-    }
 }
 
 impl Drop for TsfSdkReader {
@@ -447,6 +456,13 @@ pub struct TdfSdkReader {
     /// these the SDK lane wrote every MS2 frame with NO precursor at all — the whole precursor facet
     /// silently absent on the lane that exists precisely for files the native reader cannot decode.
     windows: HashMap<i64, Vec<crate::bruker_native::FrameWindow>>,
+    /// The `.d` directory (for the golden dump's re-read of `analysis.tdf`).
+    dir: PathBuf,
+    /// EXACT per-frame `(c0, c1)` with `m/z = (c0 + c1·tof)²` when every frame's `MzCalibration`
+    /// row is sqrt-linear (ModelType 1, `C2 = 0`) — identical to the native lane's
+    /// (`crate::bruker_native::exact_tof_coeffs`), so both lanes write the same columns. A `None`
+    /// entry is a frame with a NULL `Frames.T1`, which stays on the chord.
+    exact_tof: Option<Vec<Option<(f64, f64)>>>,
     _not_thread_safe: PhantomData<*const ()>,
 }
 
@@ -458,17 +474,95 @@ impl TdfSdkReader {
             anyhow!("tims_open failed for {}: {e} ({})", dir.display(), api.last_error_tims())
         })?;
         let conn = open_sqlite(&dir, "analysis.tdf")?;
-        let frames = read_frames(&conn, true)?;
-        let windows = crate::bruker_native::read_frame_windows(&dir.join("analysis.tdf"))
-            .unwrap_or_else(|e| {
-                log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
-                HashMap::new()
-            });
-        Ok(Self { api, handle, frames, windows, _not_thread_safe: PhantomData })
+        let (frames, has_cal) = read_frames(&conn, true)?;
+        let tdf = dir.join("analysis.tdf");
+        let windows = crate::bruker_native::read_frame_windows(&tdf).unwrap_or_else(|e| {
+            log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
+            HashMap::new()
+        });
+        // Exact per-frame coefficients need the per-frame T1 / MzCalibration columns — the same
+        // guard as the native lane (`table.t1.len() == frames.len()`). Without it a TDF lacking
+        // the columns would resolve every frame to the single row at its reference T1 and ship as
+        // "exact" with no temperature term, while the native lane keeps the chord for the same file.
+        let exact_tof = if has_cal {
+            crate::bruker_native::exact_tof_coeffs_for(
+                &tdf,
+                frames.len(),
+                frames.iter().map(|f| (f.t1, f.mz_cal_id)),
+            )
+        } else {
+            None
+        };
+        Ok(Self { api, handle, frames, windows, dir, exact_tof, _not_thread_safe: PhantomData })
     }
 
     pub fn len(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Whether the run carries exact `tof_c0`/`tof_c1` params (see `exact_tof`), with the count of
+    /// frames that have none (NULL `Frames.T1`) and stay on the chord.
+    pub fn exact_tof_per_spectrum(&self) -> Option<crate::bruker_native::ExactTofSummary> {
+        self.exact_tof.as_deref().map(crate::bruker_native::ExactTofSummary::of)
+    }
+
+    /// `MZPC_TDF_SDK_GOLDEN` diagnostic: sample the SDK's own `tims_index_to_mz` on up to 240
+    /// `(frame, tof)` points spread over the run and the digitizer range
+    /// (`bruker_native::sdk_golden_sample_plan`) and write them, with the `MzCalibration` rows and
+    /// each frame's `T1`/`T2`/`MzCalibration`, as JSON — the ground truth for checking the
+    /// ModelType-1 formula (and the exact per-frame `tof_c0`/`tof_c1`) against the vendor library
+    /// off-box. A frame the SDK refuses is logged and skipped, never fatal. Returns the point count.
+    pub fn dump_sdk_golden(&self, out: &Path) -> Result<usize> {
+        let tdf = self.dir.join("analysis.tdf");
+        let conn = open_sqlite(&self.dir, "analysis.tdf")?;
+        let num_samples: i64 = conn
+            .query_row(
+                "SELECT Value FROM GlobalMetadata WHERE Key = 'DigitizerNumSamples'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .context("reading GlobalMetadata.DigitizerNumSamples")?
+            .trim()
+            .parse()
+            .context("parsing DigitizerNumSamples")?;
+        let rows = crate::bruker_native::vendor_mz_calibration(&tdf)
+            .map(|v| v["mz_calibration"].clone())
+            .unwrap_or_else(|e| {
+                log::warn!("MZPC_TDF_SDK_GOLDEN: MzCalibration rows unavailable ({e})");
+                serde_json::Value::Null
+            });
+        let (frame_idx, tofs) = crate::bruker_native::sdk_golden_sample_plan(self.len(), num_samples);
+        let mut points = Vec::with_capacity(frame_idx.len() * tofs.len());
+        for &i in &frame_idx {
+            let Some(frame) = self.frames.get(i) else { continue };
+            let mz = match self.convert(self.api.tims_index_to_mz, frame.id, &tofs, "tims_index_to_mz") {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("MZPC_TDF_SDK_GOLDEN: frame {} skipped ({e})", frame.id);
+                    continue;
+                }
+            };
+            for (t, m) in tofs.iter().zip(mz) {
+                points.push(serde_json::json!({
+                    "frame": frame.id,
+                    "t1": frame.t1,
+                    "t2": frame.t2,
+                    "cal_id": frame.mz_cal_id,
+                    "tof": t,
+                    "mz_sdk": m,
+                }));
+            }
+        }
+        let doc = serde_json::json!({
+            "file": self.dir.display().to_string(),
+            "digitizer_num_samples": num_samples,
+            "mz_calibration": rows,
+            "sampling": "frame 1, last frame, 10 evenly spaced frames; 20 tof values over 0..DigitizerNumSamples-1",
+            "points": points,
+        });
+        let bytes = serde_json::to_vec_pretty(&doc)?;
+        std::fs::write(out, bytes).with_context(|| format!("writing {}", out.display()))?;
+        Ok(points.len())
     }
 
     /// Attach this frame's MS2 precursors, using the VENDOR's own scan→1/K0 conversion
@@ -650,19 +744,32 @@ impl TdfSdkReader {
         if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
             crate::bruker_native::add_frame_calibration_params(&mut descr, t1, t2, id);
         }
+        let exact = self.exact_tof.as_ref().and_then(|v| v.get(i).copied().flatten());
+        if let Some((c0, c1)) = exact {
+            crate::bruker_native::add_exact_tof_params(&mut descr, c0, c1);
+        }
         self.attach_precursors(&mut descr, frame);
-        // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (a + b·tof)²
-        // (monotonic in tof) over the min/max TOF index present. Without this the viewer shows
-        // "m/z 0–0".
+        // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (c0 + c1·tof)²
+        // (monotonic in tof; the exact per-frame pair when the run has one, else the run-wide
+        // chord) over the min/max TOF index present. Without this the viewer shows "m/z 0–0".
+        let (a, b) = exact.unwrap_or_else(|| self.tof_mz_model());
+        let mz = |t: i32| -> f64 {
+            let v = a + b * t as f64;
+            v * v
+        };
         if let (Some(&tmin), Some(&tmax)) = (tof.iter().min(), tof.iter().max()) {
-            let (a, b) = self.tof_mz_model();
-            let mz = |t: i32| -> f64 {
-                let v = a + b * t as f64;
-                v * v
-            };
             let (mz_a, mz_b) = (mz(tmin), mz(tmax));
             crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
         }
+        // TIC / base peak: this lane REPLACES the m/z array with integer `tof`, so mzdata derives
+        // tic = 0 and base peak (0, 0) from the m/z-less array map. Compute them from the
+        // intensities actually stored, reconstructing m/z only at the running maximum bin.
+        let (tic, base) = if int_intensity {
+            crate::summarize_points(int_i32.iter().map(|&v| v as f32), |k| mz(tof[k]))
+        } else {
+            crate::summarize_points(int_f32.iter().copied(), |k| mz(tof[k]))
+        };
+        crate::set_spectrum_summary_params(&mut descr, tic, base);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
@@ -687,10 +794,6 @@ impl TdfSdkReader {
             bail!("{name} failed for frame {frame_id}: {}", self.api.last_error_tims());
         }
         Ok(out)
-    }
-
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        sample_first_nonempty(self.len(), |i| self.spectrum(i))
     }
 }
 
@@ -796,27 +899,6 @@ fn mz_intensity_arrays(mz: &[f64], intensity: &[f32], mobility: Option<&[f64]>) 
     Ok(arrays)
 }
 
-/// Find the first spectrum with non-empty arrays for schema sampling (mirrors the other readers).
-fn sample_first_nonempty(
-    len: usize,
-    mut spectrum: impl FnMut(usize) -> Result<MultiLayerSpectrum>,
-) -> Result<BinaryArrayMap> {
-    if len == 0 {
-        bail!("no frames to sample");
-    }
-    for i in 0..len {
-        let spec = spectrum(i)?;
-        if let Some(arrays) = spec.arrays {
-            if !arrays.is_empty() {
-                return Ok(arrays);
-            }
-        }
-    }
-    // All empty: fall back to the first spectrum's (empty) arrays so the schema still has the columns.
-    spectrum(0)?
-        .arrays
-        .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-}
 
 // --- unified entry point ---------------------------------------------------
 
@@ -842,13 +924,6 @@ impl BrukerSdkReader {
         match self {
             Self::Tsf(r) => r.len(),
             Self::Tdf(r) => r.len(),
-        }
-    }
-
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        match self {
-            Self::Tsf(r) => r.sample_arrays(),
-            Self::Tdf(r) => r.sample_arrays(),
         }
     }
 
@@ -881,20 +956,6 @@ pub fn scannum_to_oneoverk0_table(input: &Path, frame_id: i64, n: usize) -> Resu
     }
     out.truncate(n);
     Ok(out)
-}
-
-/// Diagnostic: the SDK's m/z `(min, max, n)` for one frame, via `tims_index_to_mz`. A garbage/huge
-/// m/z here would explode the chunked layout into millions of empty m/z chunks — the suspected cause
-/// of the 21 GB allocation.
-pub fn frame_mz_minmax(input: &Path, frame_idx: usize) -> Result<(f64, f64, usize)> {
-    let r = TdfSdkReader::open(input)?;
-    let frame = &r.frames[frame_idx.min(r.frames.len().saturating_sub(1))];
-    let peaks = r.read_frame_peaks(frame)?;
-    let indices: Vec<f64> = peaks.iter().map(|p| p.index as f64).collect();
-    let mz = r.convert(r.api.tims_index_to_mz, frame.id, &indices, "tims_index_to_mz")?;
-    let mn = mz.iter().copied().fold(f64::INFINITY, f64::min);
-    let mx = mz.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    Ok((mn, mx, mz.len()))
 }
 
 /// Diagnostic: number of points the SDK's `tims_read_scans_v2` returns for the first `n_frames`

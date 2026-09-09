@@ -16,9 +16,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -193,6 +191,20 @@ impl TsfReader {
     /// Build the centroid mzdata spectrum for frame `i` (0-based reader order).
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
         let frame = self.frames.get(i).with_context(|| format!("TSF frame index {i} out of range"))?;
+        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
+        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
+        // otherwise indistinguishable from a complete one. `FrameMsMsInfo` in analysis.tsf carries
+        // it; not read yet.
+        if frame.ms_level > 1 {
+            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+            PRECURSOR_GAP_SAID.call_once(|| {
+                log::warn!(
+                    "Bruker TSF (native): this reader does not yet extract precursors; \
+                     MS2 rows will have none (no selected ion, isolation window or collision energy \
+                     in the archive)"
+                );
+            });
+        }
         let (mz, intensity) = self.peaks(frame)?;
 
         let mut arrays = BinaryArrayMap::new();
@@ -214,7 +226,10 @@ impl TsfReader {
             polarity: frame.polarity,
             ..Default::default()
         };
-        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
         let mut scan = ScanEvent::default();
         scan.start_time = frame.rt_seconds / 60.0; // mzdata scan start_time is minutes
         descr.acquisition.scans.push(scan);
@@ -222,15 +237,4 @@ impl TsfReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        // Use the first non-empty frame so the m/z + intensity columns are actually present.
-        let i = (0..self.len())
-            .find(|&i| self.frames[i].num_peaks > 0)
-            .unwrap_or(0);
-        self.spectrum(i)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("sample spectrum has no arrays"))
-    }
 }

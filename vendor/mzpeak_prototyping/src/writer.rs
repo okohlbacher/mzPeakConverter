@@ -16,6 +16,7 @@ use parquet::{
     basic::Compression,
     encryption::encrypt::FileEncryptionProperties,
     file::metadata::KeyValue,
+    file::properties::WriterProperties,
 };
 
 use mzdata::{
@@ -400,8 +401,17 @@ pub fn sample_array_types_from_spectrum_source<
 /// point-layout write routing depends on) — it just rewrites the finished facet without the dead
 /// column. Detection is metadata-only (row-group null counts); the rewrite happens ONLY when a twin
 /// is actually present, so the common case pays nothing but a stats scan.
+///
+/// `props` MUST be the properties the facet was originally encoded with. Re-encoding with parquet's
+/// defaults instead silently drops compression, byte-stream-split, delta packing and any file
+/// encryption — a numpress-linear facet (which always carries an all-null `mz_chunk_values` twin, so
+/// the rewrite always fires) came out UNCOMPRESSED on every column, ~15% larger than the same data
+/// with `--no-numpress`. Column paths of the surviving children are unchanged by the prune, so the
+/// per-column overrides in `props` still apply; the entries for the dropped column are simply never
+/// looked up.
 fn prune_all_null_dup_point_columns(
     mut peak_file: fs::File,
+    props: &WriterProperties,
 ) -> Result<fs::File, parquet::errors::ParquetError> {
     use arrow::array::{Array, ArrayRef, StructArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -425,6 +435,14 @@ fn prune_all_null_dup_point_columns(
         return Ok(peak_file);
     };
     let DataType::Struct(children) = point_field.data_type().clone() else { unreachable!() };
+    // A chunk facet is out of scope: numpress-linear chunks carry an all-null `mz_chunk_values`
+    // beside `mz_numpress_linear_bytes` BY DESIGN (same `array_name`, different buffer format),
+    // and pruning it rewrote every numpress archive — ~1 GB re-encoded for nothing — and left the
+    // array index pointing at a column that no longer existed.
+    if point_field.name() != "point" {
+        peak_file.rewind()?;
+        return Ok(peak_file);
+    }
     let n = children.len();
     let total_rows = pq_meta.file_metadata().num_rows();
 
@@ -486,12 +504,27 @@ fn prune_all_null_dup_point_columns(
     let out_schema = Arc::new(Schema::new_with_metadata(out_fields, arrow_schema.metadata().clone()));
 
     let out = tempfile::tempfile()?;
-    let mut w = ArrowWriter::try_new(out.try_clone()?, out_schema.clone(), None)?;
+    let mut w = ArrowWriter::try_new_with_options(
+        out.try_clone()?,
+        out_schema.clone(),
+        ArrowWriterOptions::new().with_properties(props.clone()),
+    )?;
+    let dropped: Vec<String> = drop.iter().map(|&i| format!("{}.{}", point_field.name(), children[i].name())).collect();
     if let Some(kvs) = pq_meta.file_metadata().key_value_metadata() {
         for kv in kvs {
-            if kv.key != "ARROW:schema" {
-                w.append_key_value_metadata(kv.clone());
+            if kv.key == "ARROW:schema" {
+                continue;
             }
+            // The array index was written before the prune: drop the entries of the removed
+            // columns or readers resolve a path that no longer exists.
+            if kv.key == "spectrum_array_index" {
+                if let Some(mut idx) = kv.value.as_deref().and_then(|v| serde_json::from_str::<crate::buffer_descriptors::SerializedArrayIndex>(v).ok()) {
+                    idx.entries.retain(|e| !dropped.contains(&e.path));
+                    w.append_key_value_metadata(KeyValue::new(kv.key.clone(), serde_json::to_string(&idx).ok()));
+                    continue;
+                }
+            }
+            w.append_key_value_metadata(kv.clone());
         }
     }
     for batch in builder.build()? {
@@ -952,8 +985,13 @@ impl<
             buffer_size,
             &encryption_properties,
         )
-        .map_err(|e| log::error!("Failed to open peak writer: {e}"))
-        .ok();
+        // A failed open used to be logged and SWALLOWED: the writer then fell back to a default
+        // (m/z f64, intensity f32) point peak writer, which cannot describe a chunked or grid facet.
+        // On diaPASEF that killed the parallel encoder mid-run ("peak-encode collector died"); on a
+        // DDA `.d` it exited 0 with all-null m/z and the real data dumped into a 163 MB
+        // `auxiliary_arrays` blob. There is no correct archive on this path, so refuse to write one.
+        .unwrap_or_else(|e| panic!("Failed to open peak writer: {e}"));
+        let separate_peak_writer = Some(separate_peak_writer);
 
         let mut this = Self {
             archive_writer: Some(
@@ -1025,6 +1063,24 @@ impl<
         AbstractMzPeakWriter::write_spectrum(self, spectrum)
     }
 
+    /// Write a `spectrum` whose peak-facet rows are supplied as `peak_arrays` — a profile spectrum
+    /// can thereby carry a custom-schema centroid list (integer `tof_index` lattice) in
+    /// `spectra_peaks` while its raw arrays go to `spectra_data`.
+    ///
+    /// # See also
+    /// [`AbstractMzPeakWriter::write_spectrum_with_peak_arrays`]
+    pub fn write_spectrum_with_peak_arrays<
+        A: ToMzPeakDataSeries + CentroidLike,
+        B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        S: SpectrumLike<A, B> + 'static,
+    >(
+        &mut self,
+        spectrum: &S,
+        peak_arrays: &BinaryArrayMap,
+    ) -> io::Result<()> {
+        AbstractMzPeakWriter::write_spectrum_with_peak_arrays(self, spectrum, peak_arrays)
+    }
+
     fn flush_data_arrays(&mut self) -> io::Result<()> {
         for batch in self.spectrum_data_buffers.drain() {
             if let Some(writer) = self.archive_writer.as_mut() {
@@ -1089,24 +1145,28 @@ impl<
     ) -> Result<ZipArchiveWriter<W>, parquet::errors::ParquetError> {
         if self.archive_writer.is_some() {
             self.flush_data_arrays()?;
+            // Per-facet counts (mzPeakConverter issue #1): `spectrum_count` on a DATA facet is the
+            // number of spectra with at least one row in THIS file, and `spectrum_data_point_count`
+            // the points in THIS file — never the run total (which stays on `spectra_metadata`) and
+            // never the sum of both data facets. A centroid-only run therefore declares 0 / 0 on its
+            // empty `spectra_data`, instead of every spectrum and every peak of `spectra_peaks`.
             self.append_key_value_metadata(
                 SPECTRUM_COUNT.into(),
-                Some(self.spectrum_counter().to_string()),
+                Some(self.spectrum_data_buffers.entry_count().to_string()),
             );
-            let n_p = self
-                .spectrum_peak_writer()
-                .map(|v| v.point_count())
-                .unwrap_or_default()
-                + self.spectrum_data_buffers.point_count();
-            self.append_key_value_metadata(SPECTRUM_DATA_POINT_COUNT.into(), Some(n_p.to_string()));
+            self.append_key_value_metadata(
+                SPECTRUM_DATA_POINT_COUNT.into(),
+                Some(self.spectrum_data_buffers.point_count().to_string()),
+            );
 
             let mut writer = self.archive_writer.take().unwrap().into_inner()?;
 
             if let Some(peak_file_writer) = self.spectrum_peaks_writer.take() {
+                let peak_props = peak_file_writer.properties().clone();
                 let peak_file = peak_file_writer.finish()?;
                 // Option E backstop: drop any all-null column that duplicates a populated sibling's
                 // `array_name` (e.g. a spurious `intensity_f64` twin). No-op unless one is present.
-                let mut peak_file = prune_all_null_dup_point_columns(peak_file)?;
+                let mut peak_file = prune_all_null_dup_point_columns(peak_file, &peak_props)?;
                 log::trace!("Copying peaks file into zip archive");
                 peak_file.rewind()?;
                 writer.add_file_from_read(
@@ -1241,6 +1301,9 @@ impl<
                     ),
                 )?);
 
+                // Captured BEFORE `finish_spectrum()` drains the builder: the scans facet below
+                // used to read `len()` after the drain and declared 0 on a populated table.
+                let n_wavelength_spectra = self.wavelength_spectrum_metadata_buffer.index_counter();
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_DATA_POINT_COUNT.into(),
                     Some(
@@ -1254,7 +1317,7 @@ impl<
 
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_COUNT.into(),
-                    Some(self.wavelength_spectrum_metadata_buffer.len().to_string()),
+                    Some(n_wavelength_spectra.to_string()),
                 );
 
                 self.append_metadata();
@@ -1287,7 +1350,7 @@ impl<
 
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_COUNT.into(),
-                    Some(self.wavelength_spectrum_metadata_buffer.len().to_string()),
+                    Some(n_wavelength_spectra.to_string()),
                 );
 
                 self.append_metadata();
@@ -1339,6 +1402,17 @@ impl<
                         schema,
                         ArrowWriterOptions::new().with_properties(props),
                     )?);
+                    // Same per-facet definition as `spectra_data` / `chromatograms_data`.
+                    self.append_key_value_metadata(
+                        WAVELENGTH_SPECTRUM_COUNT.into(),
+                        Some(
+                            self.wavelength_spectrum_data_buffers
+                                .as_ref()
+                                .unwrap()
+                                .entry_count()
+                                .to_string(),
+                        ),
+                    );
                     self.append_key_value_metadata(
                         WAVELENGTH_SPECTRUM_DATA_POINT_COUNT.into(),
                         Some(
@@ -1452,6 +1526,11 @@ impl<
                 )?);
                 self.flush_chromatogram_data_records()?;
                 self.add_chromatogram_array_metadata();
+                // Per-facet, like `spectra_data`: chromatograms with rows in this file.
+                self.append_key_value_metadata(
+                    CHROMATOGRAM_COUNT.into(),
+                    Some(self.chromatogram_data_buffers.entry_count().to_string()),
+                );
                 self.append_key_value_metadata(
                     CHROMATOGRAM_DATA_POINT_COUNT.into(),
                     Some(self.chromatogram_data_buffers.point_count().to_string()),

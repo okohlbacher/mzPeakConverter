@@ -1,7 +1,6 @@
 use std::{collections::HashMap, fs, io, sync::Arc};
 
 use arrow::{
-    array::Array,
     datatypes::{Schema, SchemaRef},
 };
 use mzdata::{
@@ -193,9 +192,35 @@ impl GenericDataArrayWriter {
         series_time: Option<f32>,
         series_index: u64,
     ) -> io::Result<EntryMetadataDerivedFromData> {
-        let main_axis_array = binary_array_map
-            .get(&self.data_buffers.buffer_context().default_sorted_array())
-            .unwrap();
+        // The sort axis is m/z when the spectrum carries one. A GRID-ENCODED spectrum carries an
+        // integer index instead (`tof_index` under SqrtMzFromTof / LinearMz) and no m/z at all —
+        // the Shimadzu native lane stores its profile facet that way — so fall back to the first
+        // grid-transform column declared in this facet's schema that the map actually holds.
+        let default_axis = self.data_buffers.buffer_context().default_sorted_array();
+        let axis = if binary_array_map.get(&default_axis).is_some() {
+            default_axis
+        } else {
+            let ctx = self.data_buffers.buffer_context();
+            self.data_buffers
+                .fields()
+                .iter()
+                .filter_map(|f| crate::BufferName::from_field(ctx, f.clone()))
+                .find(|b| {
+                    matches!(
+                        b.transform,
+                        Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof)
+                            | Some(crate::buffer_descriptors::BufferTransform::LinearMz)
+                    ) && binary_array_map.get(&b.array_type).is_some()
+                })
+                .map(|b| b.array_type)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "{} {series_index} has neither an m/z array nor a grid-index array",
+                        self.data_buffers.buffer_context().main_struct_name()
+                    ))
+                })?
+        };
+        let main_axis_array = binary_array_map.get(&axis).unwrap();
 
         let n_points = main_axis_array.data_len()?;
         let sorted = is_data_array_sorted(main_axis_array)?;
@@ -207,8 +232,7 @@ impl GenericDataArrayWriter {
                 self.data_buffers.buffer_context().main_struct_name()
             );
             binary_array_map.clone_into(&mut tmp_binary_array_map);
-            tmp_binary_array_map
-                .sort_by_array(&self.data_buffers.buffer_context().default_sorted_array())?;
+            tmp_binary_array_map.sort_by_array(&axis)?;
         }
 
         let delta_model = if self.data_buffers.nullify_zero_intensity() {
@@ -326,6 +350,11 @@ impl GenericDataArrayWriter {
 
     pub fn point_count(&self) -> u64 {
         self.data_buffers.point_count()
+    }
+
+    /// Entities with at least one row in this facet (see [`ArrayBufferWriter::entry_count`]).
+    pub fn entry_count(&self) -> u64 {
+        self.data_buffers.entry_count()
     }
 
     pub fn as_array_index(&self) -> crate::peak_series::ArrayIndex {
@@ -648,6 +677,68 @@ pub trait AbstractMzPeakWriter {
             }
         }
         let entry_derived = self.write_spectrum_data(spectrum)?;
+        self.spectrum_entry_buffer_mut()
+            .append_value(spectrum, entry_derived);
+        self.check_data_buffer()?;
+        Ok(())
+    }
+
+    /// Write a `spectrum` whose PEAK-facet rows are supplied explicitly as `peak_arrays` instead
+    /// of being derived from `spectrum.peaks()`.
+    ///
+    /// [`write_spectrum`](Self::write_spectrum) serializes a peak SET as `CentroidPeak` columns
+    /// (f64 m/z + f32 intensity), so a custom peak schema that replaces m/z with an integer axis is
+    /// only reachable by a Centroid spectrum carrying raw arrays — never by a Profile spectrum that
+    /// ALSO has a centroid list (a Shimadzu dual `.lcd`: profile in the data facet, centroids in the
+    /// peaks facet). This entry point decouples the two facets: the profile signal (`raw_arrays()`
+    /// of a Profile spectrum) goes to `spectra_data` exactly as before, and `peak_arrays` goes to
+    /// `spectra_peaks` through the peak writer's raw-array path, so the peak schema decides the
+    /// columns (an absent column is null-filled). The metadata row — counts, TIC, base peak, m/z
+    /// range — is still derived from the spectrum itself, so leave its peak set / raw arrays on
+    /// it: a Profile spectrum's `number_of_peaks` is its peak set's length, and a Centroid
+    /// spectrum's counts fall back to the number of peak rows written here.
+    fn write_spectrum_with_peak_arrays<
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        S: SpectrumLike<C, D> + 'static,
+    >(
+        &mut self,
+        spectrum: &S,
+        peak_arrays: &BinaryArrayMap,
+    ) -> io::Result<()> {
+        log::trace!("Writing spectrum {} with explicit peak arrays", spectrum.id());
+        let spectrum_index = self.spectrum_counter();
+        let spectrum_time = if self.spectrum_data_buffer_mut().include_time() {
+            Some(spectrum.start_time() as f32)
+        } else {
+            None
+        };
+        // Unknown continuity is routed with Profile, as `write_spectrum_data` does: the metadata
+        // side already assumes profile for Unknown, so the raw signal belongs in `spectra_data`.
+        let mut entry_derived = match spectrum.raw_arrays() {
+            Some(raw)
+                if matches!(
+                    spectrum.signal_continuity(),
+                    SignalContinuity::Profile | SignalContinuity::Unknown
+                ) =>
+            {
+                log::trace!("Writing profile signal beside explicit peak arrays for {spectrum_index}");
+                self.write_spectrum_binary_array_map(spectrum, spectrum_index, raw)?
+            }
+            _ => EntryMetadataDerivedFromData::default(),
+        };
+        let from_peaks = self.get_or_create_spectrum_peak_writer()?.write_peaks(
+            spectrum_index,
+            spectrum_time,
+            RefPeakDataLevel::<C, D>::RawData(peak_arrays),
+        )?;
+        entry_derived.peak_count = from_peaks.peak_count;
+        if let Some(aux) = from_peaks.auxiliary_arrays {
+            entry_derived
+                .auxiliary_arrays
+                .get_or_insert_with(Vec::new)
+                .extend(aux);
+        }
         self.spectrum_entry_buffer_mut()
             .append_value(spectrum, entry_derived);
         self.check_data_buffer()?;
@@ -1032,13 +1123,21 @@ pub trait AbstractMzPeakWriter {
         // But the guarantee a reader is entitled to is that one `entity_type` has one family, and
         // an archive that breaks it is only readable by luck of implementation. No validator rule
         // covers this, so nothing downstream would catch it. Fail at write time instead.
+        // DELIBERATE DEVIATION from the spec text (2026-09-02, project decision): mixed families
+        // ARE accepted. The rule was enforced here as a hard error, which made every profile+centroid
+        // archive choose one family for both facets and aborted `--ims-chunked` on timsTOF outright
+        // (point data facet beside a chunk peaks facet). Readers that resolve the layout PER SOURCE
+        // (mzpeakts, this crate's reader) read mixed archives correctly, and each facet has its own
+        // best layout — a TOF-grid profile facet beside an integer-lattice centroid facet is the
+        // canonical case. Say so once, loudly, and carry on.
         if peak_buffer.prefix() != data_facet_prefix {
-            return Err(io::Error::other(format!(
-                "layout family mismatch between spectrum facets: spectra_data is \
-                 '{data_facet_prefix}' but spectra_peaks would be '{}'. Both belong to the \
-                 `spectrum` entity and MUST share one layout family.",
+            log::warn!(
+                "spectrum facets use different layout families: spectra_data is '{data_facet_prefix}', \
+                 spectra_peaks is '{}'. mzPeak-specification docs/conformance.md asks for one family \
+                 per entity; this converter deliberately writes the best layout per facet. Readers \
+                 that resolve the layout per source read this correctly.",
                 peak_buffer.prefix()
-            )));
+            );
         }
 
         let peak_encrytion_props = encryption_properties
@@ -1060,7 +1159,7 @@ pub trait AbstractMzPeakWriter {
         let peak_writer = ArrowWriter::try_new_with_options(
             stream,
             peak_buffer.schema().clone(),
-            ArrowWriterOptions::new().with_properties(peak_data_props),
+            ArrowWriterOptions::new().with_properties(peak_data_props.clone()),
         )?;
 
         // The peak facet is ~95% of the output bytes; its Arrow-encode + zstd is single-threaded and,
@@ -1090,9 +1189,15 @@ pub trait AbstractMzPeakWriter {
                 max_rows,
                 peak_buffer,
                 buffer_size,
+                peak_data_props,
             ))
         } else {
-            Ok(MiniPeakWriterType::new(peak_writer, peak_buffer, buffer_size))
+            Ok(MiniPeakWriterType::new(
+                peak_writer,
+                peak_buffer,
+                buffer_size,
+                peak_data_props,
+            ))
         }
     }
 

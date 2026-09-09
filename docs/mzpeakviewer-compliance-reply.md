@@ -159,3 +159,57 @@ without the embedded `vendor/analysis.tdf.gz` (also present with `--no-vendor`):
 - Measured on PXD059079 2485.d (`C2 = 0`): chord − exact runs from +3.2 ppm at tof 0 to −4.2 ppm at
   the top of the range.
 - Nothing to do if you don't want it: `ims_calibration` still reconstructs as before.
+
+---
+
+## Addendum 2026-09-02 — integer axes are resolved PER FACET (Shimadzu grid + lattice)
+
+The `ims_calibration` rule above (one `tof` column, one block, one formula) is the timsTOF case.
+The Shimadzu lane writes **two** integer axes, both named `tof_index`, in different facets, with
+different dtypes and transforms — and the viewer must pick the resolver by facet, not by column name:
+
+| facet | axis | block to consult first | reconstruct |
+|---|---|---|---|
+| `spectra_data` (profile) | `tof_index` Int32, `SqrtMzFromTof`, per-spectrum `tof_c0`/`tof_c1` | `tof_calibration` | `(tof_c0 + tof_c1·tof_index)²` |
+| `spectra_peaks` (centroids) | `point.tof_index` Int64, `LinearMz`, params `[1e-9]` | `mz_calibration` (`codec: mz-grid, scale: 1e9`) | `1e-9 · tof_index` |
+
+On both facets the fallback rule is per row and independent of row order: `mz` finite and > 0
+wins (that row kept f64 m/z), the axis is authoritative only where `mz` is the NULL fill. The
+converter routes whole spectra (a spectrum is either all-lattice or all-f64; blind / hek / d100
+carry 0 mixed spectra), and a fallback spectrum inside the lattice facet most likely arrives with
+NO `tof_index` key at all — mzpeakts drops a column that is all-null within the selected rows —
+or, where a NULL Int64 cell is materialised, as `tof_index 0n` beside its real `mz`. Either shape
+reads `mz`; never reconstruct from the zero. The `1e-9 · tof_index` column above is literal: the
+viewer multiplies by `1/scale` (`=== 1e-9`), matching the Parquet transform and the reference
+reader's `s · k` bit for bit — NOT `tof_index / scale`, which is 1 ulp off on ~40 % of lattice
+values. **[Reversed in v0.9.8 — see the addendum below: the division is the exact form and the
+reference reader now divides.]** Pre-lattice Shimadzu archives (`tof_calibration` only, plain f64 centroids) keep reading
+their centroids verbatim. This is what `engine/spectrum.ts resolveFacetGridMz` / `readFacetSignal`
+implement now; every other reader entry point goes through the same resolver.
+
+
+## Addendum 2026-09-03 (converter v0.9.8) — the reconstruction is the DIVISION, and it reverses the paragraph above
+
+The 2026-09-02 addendum told you to multiply by the column's `mzpeak:transform_params` (`1/scale`)
+and called `tof_index / scale` the inexact one. **That is backwards, and v0.9.8 fixed the reference
+reader accordingly.**
+
+`1e-9` is not exactly 10⁻⁹, so `k · 1e-9` is not the correctly-rounded value of `k / 1e9`. Measured
+on `Blind_P1_pos_012`: the two disagree for **85,706 of 216,742** centroids (~40 %), by up to
+1.137e-13 Da. The `mz_calibration` block has said `mz_from_tof_index: "tof_index / scale"` since
+v0.9.0; the reference reader was the thing that disagreed with the archive's own stated formula.
+
+**Normative rule for every reader, mzPeakViewer included:**
+
+- Recover the integer scale from `mz_calibration.scale` (or by rounding `1 / transform_params` and
+  verifying that `1 / scale` reproduces the stored parameter bit for bit) and compute
+  **`m/z = tof_index / scale`**.
+- Fall back to multiplying by the stored parameter only when it is *not* an exact reciprocal of an
+  integer scale.
+
+`vendor/mzpeak_prototyping/src/reader/point.rs` does this as of v0.9.8, the round trip is bit-exact
+at every scale (Shimadzu native archives included), and `tests/shimadzu_lattice_peaks.rs` pins
+`k / 1e9` where it previously pinned `k · 1e-9`. A viewer still multiplying will differ from the
+converter, from the mzML round trip and from the archive's own declared formula on ~40 % of lattice
+peaks — small in absolute terms (≤ ~1.1e-13 Da), but it makes "lossless" untrue for the path the
+reader actually takes.

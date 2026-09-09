@@ -76,7 +76,8 @@
 //! Each flattened spectrum becomes one mzdata [`MultiLayerSpectrum`], built EXACTLY like
 //! [`crate::bruker_tsf`] / [`crate::bruker_baf`]: an m/z `f64`/`Unit::MZ` array, an intensity
 //! `f32`/`Unit::DetectorCounts` array, and a [`SpectrumDescription`] carrying id / index /
-//! ms_level / polarity / the `MS:1000294` "mass spectrum" param, with `start_time` in minutes.
+//! ms_level / polarity (no blanket `MS:1000294` — the writer types rows from ms_level), with
+//! `start_time` in minutes.
 
 use std::ffi::OsStr;
 use std::marker::PhantomData;
@@ -89,9 +90,7 @@ use netcorehost::hostfxr::AssemblyDelegateLoader;
 use netcorehost::pdcstring::PdCString;
 use netcorehost::{nethost, pdcstr};
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -287,7 +286,6 @@ pub struct SciexReader {
     api: GlueApi,
     handle: i64,
     count: usize,
-    wiff_path: PathBuf,
     /// The managed handle / runtime is not known to be thread-safe and FFI calls through it
     /// must not happen concurrently. A raw-pointer marker makes [`SciexReader`] neither `Send`
     /// nor `Sync`, so the type system prevents cross-thread sharing. Sound for the existing
@@ -350,21 +348,12 @@ impl SciexReader {
             api,
             handle,
             count,
-            wiff_path: path.to_path_buf(),
             _not_thread_safe: PhantomData,
         })
     }
 
     pub fn len(&self) -> usize {
         self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    pub fn wiff_path(&self) -> &Path {
-        &self.wiff_path
     }
 
     /// Fetch one spectrum's scalar metadata via the glue.
@@ -498,6 +487,20 @@ impl SciexReader {
 
         let ms_level = u8::try_from(meta.ms_level.max(1))
             .map_err(|_| anyhow!("SciEX spectrum {i} reports implausible MS level {}", meta.ms_level))?;
+        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
+        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
+        // otherwise indistinguishable from a complete one. Clearcore2 exposes the precursor per
+        // experiment; the glue does not yet marshal it.
+        if ms_level > 1 {
+            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+            PRECURSOR_GAP_SAID.call_once(|| {
+                log::warn!(
+                    "SciEX native (Clearcore2): this reader does not yet extract precursors; \
+                     MS2 rows will have none (no selected ion, isolation window or collision energy \
+                     in the archive)"
+                );
+            });
+        }
         let polarity = match meta.polarity {
             0 => ScanPolarity::Positive,
             1 => ScanPolarity::Negative,
@@ -521,12 +524,10 @@ impl SciexReader {
             polarity,
             ..Default::default()
         };
-        descr.add_param(
-            Param::builder()
-                .name("mass spectrum")
-                .curie(curie!(MS:1000294))
-                .build(),
-        );
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
         let mut scan = ScanEvent::default();
         // RT UNIT CONTRACT: the ABI field is seconds (C# multiplies Clearcore2 minutes by 60);
         // mzdata's scan start_time is minutes, so divide by 60 here. See the field doc on
@@ -537,25 +538,6 @@ impl SciexReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema (mirrors
-    /// `TsfReader::sample_arrays` / `BafReader::sample_arrays`). Uses the first non-empty
-    /// spectrum so both columns are actually present.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let mut chosen = 0usize;
-        for i in 0..self.count {
-            // A non-empty spectrum is preferable so the m/z + intensity columns are present.
-            if let Ok((mz, _)) = self.peaks(i) {
-                if !mz.is_empty() {
-                    chosen = i;
-                    break;
-                }
-            }
-        }
-        self.spectrum(chosen)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 impl Drop for SciexReader {

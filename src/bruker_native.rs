@@ -88,6 +88,132 @@ impl MobilityCal {
     }
 }
 
+/// Re-expresses the 1/K0 values mzdata's TDF reader puts in spectrum METADATA on the vendor model.
+///
+/// mzdata 0.66.6 converts its signal arrays through the frame's ModelType-2 `TimsCalibration`
+/// (`io/tdf/arrays.rs:73`), but every 1/K0 it attaches as a *param* — the selected ion's
+/// `inverse reduced ion mobility` (MS:1002815, `io/tdf/reader.rs:1487,1527`), the scan-level
+/// MS:1002815 midpoint (`:1607`) and the frame's `ion mobility lower/upper limit` (`:1615-1641`) —
+/// goes through timsrust's LINEAR nominal-range interpolation (`metadata.im_converter`). On
+/// PXD059079 2485.d that put the `--no-ims-compact` selected ion at 1.317349 against the ims-compact
+/// lane's 1.332429 for the same window (0.015 Vs/cm², up to ~0.03 at the high-mobility edge). The
+/// linear map is exactly invertible, so this recovers the scan position and re-evaluates the same
+/// ModelType-2 model the native lane uses ([`crate::tims_mobility`]); with no ModelType-2 row the
+/// values are left as they are (the native lane falls back to the same linear map then).
+///
+/// It also attaches the window's 1/K0 band to each selected ion as MZP:1000006/7, from mzdata's
+/// spectrum-level `ion mobility lower/upper limit` (that spelling is kept), so both lanes spell the
+/// selected ion identically. mzdata emits that pair INVERTED — `lower` = convert(ScanNumBegin),
+/// `upper` = convert(ScanNumEnd), and 1/K0 decreases with the scan index — so the pair is also put
+/// in order here (`lower <= upper`), on the same values the band gets.
+pub struct TdfMobilityRemap {
+    linear: Scan2ImConverter,
+    recal: Option<crate::tims_mobility::TimsMobilityCalibration>,
+}
+
+impl TdfMobilityRemap {
+    /// Open, choosing whether to re-express the params on the vendor ModelType-2 model
+    /// (`recalibrate`, the `--no-tims-recalibration` knob — the same choice as
+    /// [`NativeTofReader::open_with`], so both lanes stay on the same model either way) or leave
+    /// them on timsrust's linear map. The band is attached in both cases. A missing/unreadable
+    /// `TimsCalibration` table is best-effort here as in the native lane: a warning and the linear
+    /// values, never a lane without the band.
+    pub fn open_with(dot_d: &Path, recalibrate: bool) -> Result<Self> {
+        let tdf = dot_d.join("analysis.tdf");
+        let linear = MetadataReader::new(&tdf)
+            .map_err(|e| anyhow::anyhow!("reading TDF metadata {}: {e}", tdf.display()))?
+            .im_converter;
+        let recal = if recalibrate {
+            crate::tims_mobility::TimsMobilityCalibration::from_tdf_path(&tdf).unwrap_or_else(|e| {
+                log::warn!(
+                    "TDF TimsCalibration unreadable ({e:#}); mobility params stay on timsrust's \
+                     linear approximation"
+                );
+                None
+            })
+        } else {
+            None
+        };
+        Ok(Self { linear, recal })
+    }
+
+    /// For tests: a remap over explicit models.
+    #[cfg(test)]
+    fn new(linear: Scan2ImConverter, recal: Option<crate::tims_mobility::TimsMobilityCalibration>) -> Self {
+        Self { linear, recal }
+    }
+
+    /// A 1/K0 produced by timsrust's linear converter → the same scan position on the vendor model.
+    #[inline]
+    pub fn remap(&self, im: f64) -> f64 {
+        match &self.recal {
+            Some(c) => c.one_over_k0(self.linear.invert(im)),
+            None => im,
+        }
+    }
+
+    fn remap_param(&self, p: &mut Param) {
+        if let Ok(v) = p.value.to_f64() {
+            p.value = mzdata::params::Value::Float(self.remap(v));
+        }
+    }
+
+    /// Rewrite one mzdata-produced TDF spectrum description in place (see the type docs).
+    pub fn apply(&self, descr: &mut SpectrumDescription) {
+        let im_term = curie!(MS:1002815);
+        let (mut lo, mut hi) = (None, None);
+        let (mut lo_at, mut hi_at) = (None, None);
+        for (i, p) in descr.params.iter_mut().enumerate() {
+            match p.name.as_str() {
+                "ion mobility lower limit" => {
+                    self.remap_param(p);
+                    lo = p.value.to_f64().ok();
+                    lo_at = Some(i);
+                }
+                "ion mobility upper limit" => {
+                    self.remap_param(p);
+                    hi = p.value.to_f64().ok();
+                    hi_at = Some(i);
+                }
+                _ => {}
+            }
+        }
+        // mzdata writes the pair as (convert(ScanNumBegin), convert(ScanNumEnd)), which is
+        // (larger, smaller) because 1/K0 falls with the scan index — put it in order, so the
+        // spectrum-level pair and the selected-ion band never contradict each other.
+        if let (Some(a), Some(b), Some(i), Some(j)) = (lo, hi, lo_at, hi_at) {
+            if a > b {
+                descr.params[i].value = mzdata::params::Value::Float(b);
+                descr.params[j].value = mzdata::params::Value::Float(a);
+                (lo, hi) = (Some(b), Some(a));
+            }
+        }
+        for scan in descr.acquisition.scans.iter_mut() {
+            if let Some(ps) = scan.params.as_mut() {
+                for p in ps.iter_mut().filter(|p| p.curie() == Some(im_term)) {
+                    self.remap_param(p);
+                }
+            }
+        }
+        for prec in descr.precursor.iter_mut() {
+            for ion in prec.ions.iter_mut() {
+                if let Some(ps) = ion.params.as_mut() {
+                    for p in ps.iter_mut().filter(|p| p.curie() == Some(im_term)) {
+                        self.remap_param(p);
+                    }
+                }
+                let has_band = ion
+                    .params
+                    .as_ref()
+                    .is_some_and(|ps| ps.iter().any(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)));
+                if let (Some(a), Some(b), false) = (lo, hi, has_band) {
+                    add_isolation_mobility_band(ion, a, b);
+                }
+            }
+        }
+    }
+}
+
 /// Native integer-TOF reader over a Bruker `.d` (TDF). The mzdata-integration seam: a future
 /// upstream native-TOF API would back this same surface.
 pub struct NativeTofReader {
@@ -102,6 +228,10 @@ pub struct NativeTofReader {
     table: FrameTable,
     /// MS2 isolation windows keyed by 1-based TDF frame Id. Empty for MS1-only runs.
     windows: HashMap<i64, Vec<FrameWindow>>,
+    /// EXACT per-frame `(c0, c1)` with `m/z = (c0 + c1·tof)²`, present only when every frame's
+    /// `MzCalibration` row is sqrt-linear (ModelType 1, `C2 = 0`); see [`exact_tof_coeffs`]. A
+    /// `None` entry is a frame with a NULL `Frames.T1`, which stays on the chord.
+    exact_tof: Option<Vec<Option<(f64, f64)>>>,
 }
 
 /// Per-frame `Frames` columns, ordered by `Id` so position `i` matches timsrust's frame index.
@@ -123,19 +253,56 @@ struct FrameTable {
     ms_level: Vec<u8>,
     polarity: Vec<ScanPolarity>,
     /// `T1` / `T2` / `MzCalibration` — the per-frame inputs of the vendor's exact ModelType-1
-    /// TOF→m/z model (see [`vendor_mz_calibration`]). Empty when the schema lacks the columns.
-    t1: Vec<f64>,
-    t2: Vec<f64>,
-    mz_cal_id: Vec<i64>,
+    /// TOF→m/z model (see [`vendor_mz_calibration`]). Empty when the schema lacks the columns;
+    /// `None` for a frame whose own value is NULL, which must not abort the conversion (nor shift
+    /// the per-frame indices, so the entry is kept and the columns come out null for that frame).
+    t1: Vec<Option<f64>>,
+    t2: Vec<Option<f64>>,
+    mz_cal_id: Vec<Option<i64>>,
 }
 
-/// Local CURIEs for the per-frame calibration inputs (`Frames.T1`, `Frames.T2`,
+/// Converter-owned CURIEs for the per-frame calibration inputs (`Frames.T1`, `Frames.T2`,
 /// `Frames.MzCalibration`), which the ims-compact writer promotes to `spectra_metadata` columns
-/// (`…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id`). MS:4000903–4000905 are unused local
-/// accessions, following the `tof_c0`/`tof_c1` precedent in `main.rs`.
-pub(crate) const TDF_T1_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_903);
-pub(crate) const TDF_T2_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_904);
-pub(crate) const TDF_MZ_CAL_ID_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_905);
+/// (`opt_MZP_1000008_tdf_t1`, `opt_MZP_1000009_tdf_t2`, `opt_MZP_1000010_tdf_mz_calibration_id`).
+/// `cv/mzpeak.obo` MZP:1000008–1000010, following the `tof_c0`/`tof_c1` terms in `main.rs`; until
+/// 0.10.1 they squatted `MS:4000903`–`MS:4000905` (columns `opt_MS_4000903_tdf_t1` …). Readers bind
+/// these by the `_tdf_t1` … column-name suffix, so both generations read.
+pub(crate) const TDF_T1_CURIE: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_008);
+pub(crate) const TDF_T2_CURIE: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_009);
+pub(crate) const TDF_MZ_CAL_ID_CURIE: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_010);
+
+/// Converter-owned accessions for an isolation window's 1/K0 band (`cv/mzpeak.obo` MZP:1000006 /
+/// MZP:1000007). PSI-MS has no term for the mobility bounds of an isolation window (children of
+/// MS:1000792 / MS:1002892 checked at 4.1.259); the provisional MZP vocabulary is represented in
+/// this crate as `ControlledVocabulary::Unknown` CURIEs, which the vendored writer/reader render and
+/// parse as `MZP:` (see `mzpeak_prototyping::param::curie_to_string`). mzdata's own `Display` panics
+/// on `Unknown`, so these must never reach an mzdata writer un-demoted (`demote_mzp_params` in
+/// `main.rs` handles the mzML export).
+pub(crate) const MZP_IM_WINDOW_LOWER: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_006);
+pub(crate) const MZP_IM_WINDOW_UPPER: CURIE = CURIE::new(ControlledVocabulary::Unknown, 1_000_007);
+pub(crate) const IM_WINDOW_LOWER_NAME: &str = "isolation window inverse reduced ion mobility lower limit";
+pub(crate) const IM_WINDOW_UPPER_NAME: &str = "isolation window inverse reduced ion mobility upper limit";
+
+/// Attach the isolation window's 1/K0 band `[lo, hi]` to a selected ion as MZP:1000006/7 params.
+/// Shared by every timsTOF lane so the band is spelled identically whichever reader produced the
+/// spectrum. `lo`/`hi` are ordered here: 1/K0 DECREASES as the scan index increases, so callers
+/// converting scan bounds must not assume begin<end maps to lower<upper.
+pub(crate) fn add_isolation_mobility_band(ion: &mut SelectedIon, a: f64, b: f64) {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    for (name, curie, value) in [
+        (IM_WINDOW_LOWER_NAME, MZP_IM_WINDOW_LOWER, lo),
+        (IM_WINDOW_UPPER_NAME, MZP_IM_WINDOW_UPPER, hi),
+    ] {
+        ion.add_param(
+            Param::builder()
+                .name(name)
+                .curie(curie)
+                .value(value)
+                .unit(Unit::VoltSecondPerSquareCentimeter)
+                .build(),
+        );
+    }
+}
 
 /// Attach one frame's calibration inputs as spectrum params. Shared by the native and `--bruker-sdk`
 /// ims-compact lanes so both write identical columns.
@@ -154,6 +321,353 @@ pub(crate) fn add_frame_calibration_params(
             .value(mz_cal_id)
             .build(),
     );
+}
+
+/// Attach one frame's EXACT sqrt-linear TOF→m/z coefficients as spectrum params (`tof_c0`/`tof_c1`,
+/// the same CURIEs + names the sqrt-grid lanes use), so the writer promotes them to
+/// `spectra_metadata` columns and the vendored reader reconstructs `m/z = (tof_c0 + tof_c1·tof)²`
+/// per spectrum instead of the run-wide chord. Shared by the native and `--bruker-sdk` lanes.
+pub(crate) fn add_exact_tof_params(descr: &mut SpectrumDescription, c0: f64, c1: f64) {
+    descr.add_param(Param::builder().name("tof_c0").curie(crate::TOF_C0_CURIE).value(c0).build());
+    descr.add_param(Param::builder().name("tof_c1").curie(crate::TOF_C1_CURIE).value(c1).build());
+}
+
+/// One `MzCalibration` row of `analysis.tdf` as numbers (SQL NULL → 0 for evaluation, matching the
+/// vendor library's `sqlite3_column_double` semantics — but see [`Self::quadratic_terms_stored`]),
+/// with the exact ModelType-1 TOF→m/z evaluation.
+///
+/// The model — derived numerically against Bruker's timsdata library and verified to 2.5e-5 ppm on
+/// 60 golden points (speXtract `src/TdfMzCalibration.h`, `tests/calibration_golden.json`, mirrored
+/// in `tests/fixtures/tdf_calibration_golden.json`):
+///
+/// ```text
+///   t_ns   = tof * DigitizerTimebase + DigitizerDelay
+///   C1_eff = C1 * (1 + dC1 * (T1_row - T1_frame) / 1e6)
+///   C2*u² + (1e6/sqrt(C1_eff))*u + (C0 - t_ns) = 0,   m/z = u²        (u = sqrt(m/z))
+/// ```
+///
+/// When `C2 = 0` (and `C3 = C4 = dC2 = 0`) the model is EXACTLY linear in `tof` through the sqrt
+/// transform the ims-compact archive already declares (`MS:1003825`): `u = c0 + c1·tof` with
+/// `c1 = DigitizerTimebase·sqrt(C1_eff)/1e6`, `c0 = (DigitizerDelay − C0)·sqrt(C1_eff)/1e6` —
+/// see [`Self::sqrt_linear_coeffs`]. `C1_eff` depends on the FRAME's `T1`, so the pair is per frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TdfMzCalibrationRow {
+    pub id: i64,
+    pub model_type: i64,
+    pub digitizer_timebase: f64,
+    pub digitizer_delay: f64,
+    /// Reference digitizer temperature of the calibration (`MzCalibration.T1`).
+    pub t1: f64,
+    pub dc1: f64,
+    pub dc2: f64,
+    pub c0: f64,
+    pub c1: f64,
+    pub c2: f64,
+    pub c3: f64,
+    pub c4: f64,
+    /// Whether `C2`, `C3`, `C4` and `dC2` were STORED as numbers (INTEGER/REAL). The vendor schema
+    /// declares `C0..C4` untyped and nullable, so a NULL `C2` is indistinguishable from a real
+    /// zero through `sqlite3_column_double` — a row whose quadratic term is MISSING must not be
+    /// declared exact (the reference `TdfMzCalibration.h` refuses it as "C2 <= 0 or missing"); it
+    /// is still evaluated with NULL → 0 for the informational `vendor_mz_calibration` block.
+    pub quadratic_terms_stored: bool,
+}
+
+impl TdfMzCalibrationRow {
+    /// `C1` corrected for the frame's digitizer temperature `t1_frame` (`Frames.T1`).
+    #[inline]
+    pub fn c1_eff(&self, t1_frame: f64) -> f64 {
+        self.c1 * (1.0 + self.dc1 * (self.t1 - t1_frame) / 1e6)
+    }
+
+    /// Exact ModelType-1 m/z for a (possibly fractional) TOF index at frame temperature `t1_frame`.
+    /// The quadratic is solved in its cancellation-free form `u = 2(t − C0)/(b + sqrt(disc))`, as
+    /// in the reference. Out-of-model inputs (`t < C0`, negative discriminant, `C1_eff ≤ 0`) yield
+    /// NaN, never a plausible-looking m/z. `C2 = 0` takes the linear branch `u = (t − C0)/b`.
+    pub fn tof_to_mz(&self, tof: f64, t1_frame: f64) -> f64 {
+        let t = tof * self.digitizer_timebase + self.digitizer_delay;
+        let c1_eff = self.c1_eff(t1_frame);
+        if !(c1_eff > 0.0) || !(t >= self.c0) {
+            return f64::NAN;
+        }
+        let b = 1e6 / c1_eff.sqrt();
+        let u = if self.c2 == 0.0 {
+            (t - self.c0) / b
+        } else {
+            let disc = b * b - 4.0 * self.c2 * (self.c0 - t);
+            if !(disc >= 0.0) {
+                return f64::NAN;
+            }
+            let denom = b + disc.sqrt();
+            if !(denom > 0.0) {
+                return f64::NAN;
+            }
+            2.0 * (t - self.c0) / denom
+        };
+        u * u
+    }
+
+    /// Whether the row is EXACTLY `m/z = (c0 + c1·tof)²`: ModelType 1 with no quadratic or
+    /// higher-order term (`C2 = C3 = C4 = 0`, each a STORED numeric zero, not NULL) and no `C2`
+    /// drift (`dC2 = 0`), plus sane constants.
+    pub fn is_sqrt_linear(&self) -> bool {
+        self.model_type == 1
+            && self.quadratic_terms_stored
+            && self.c2 == 0.0
+            && self.c3 == 0.0
+            && self.c4 == 0.0
+            && self.dc2 == 0.0
+            && self.digitizer_timebase > 0.0
+            && self.c1 > 0.0
+            && [self.digitizer_timebase, self.digitizer_delay, self.t1, self.dc1, self.c0, self.c1]
+                .iter()
+                .all(|v| v.is_finite())
+    }
+
+    /// The frame's exact `(c0, c1)` with `m/z = (c0 + c1·tof)²` at frame temperature `t1_frame`;
+    /// `None` unless [`Self::is_sqrt_linear`] (or `C1_eff` is not positive at that temperature).
+    pub fn sqrt_linear_coeffs(&self, t1_frame: f64) -> Option<(f64, f64)> {
+        if !self.is_sqrt_linear() {
+            return None;
+        }
+        let c1_eff = self.c1_eff(t1_frame);
+        if !(c1_eff > 0.0) || !c1_eff.is_finite() {
+            return None;
+        }
+        let s = c1_eff.sqrt() / 1e6;
+        Some(((self.digitizer_delay - self.c0) * s, self.digitizer_timebase * s))
+    }
+}
+
+/// Read every `MzCalibration` row of `analysis.tdf` as numbers, keyed by `Id`. The vendor schema
+/// declares `C0..C4` untyped and nullable, so NULL (and unparsable text) becomes 0 — the value the
+/// vendor library itself sees through `sqlite3_column_double` — while
+/// [`TdfMzCalibrationRow::quadratic_terms_stored`] records whether `C2`/`C3`/`C4`/`dC2` were
+/// actually stored as numbers, so the exact per-frame claim can refuse a merely-missing `C2`.
+pub(crate) fn read_mz_calibration_rows(tdf: &Path) -> Result<HashMap<i64, TdfMzCalibrationRow>> {
+    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {}", tdf.display()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT Id, ModelType, DigitizerTimebase, DigitizerDelay, T1, dC1, dC2, C0, C1, C2, C3, C4 \
+             FROM MzCalibration ORDER BY Id",
+        )
+        .context("querying MzCalibration")?;
+    let stored = |r: &rusqlite::Row, k: usize| -> Result<bool> {
+        Ok(matches!(r.get_ref(k).context("MzCalibration cell")?, ValueRef::Integer(_) | ValueRef::Real(_)))
+    };
+    let num = |r: &rusqlite::Row, k: usize| -> Result<f64> {
+        Ok(match r.get_ref(k).context("MzCalibration cell")? {
+            ValueRef::Null => 0.0,
+            ValueRef::Integer(i) => i as f64,
+            ValueRef::Real(f) => f,
+            ValueRef::Text(t) => String::from_utf8_lossy(t).trim().parse::<f64>().unwrap_or(0.0),
+            ValueRef::Blob(_) => 0.0,
+        })
+    };
+    let mut out = HashMap::new();
+    let mut rows = stmt.query([]).context("reading MzCalibration")?;
+    while let Some(r) = rows.next().context("reading MzCalibration")? {
+        let id: i64 = r.get(0).context("MzCalibration.Id")?;
+        let row = TdfMzCalibrationRow {
+            id,
+            model_type: num(r, 1)? as i64,
+            digitizer_timebase: num(r, 2)?,
+            digitizer_delay: num(r, 3)?,
+            t1: num(r, 4)?,
+            dc1: num(r, 5)?,
+            dc2: num(r, 6)?,
+            c0: num(r, 7)?,
+            c1: num(r, 8)?,
+            c2: num(r, 9)?,
+            c3: num(r, 10)?,
+            c4: num(r, 11)?,
+            quadratic_terms_stored: stored(r, 6)? && stored(r, 9)? && stored(r, 10)? && stored(r, 11)?,
+        };
+        out.insert(id, row);
+    }
+    if out.is_empty() {
+        bail!("MzCalibration has no rows");
+    }
+    Ok(out)
+}
+
+/// What the writer needs to know about a run's exact per-frame coefficients: the frame count and
+/// how many frames carry NO pair (NULL `Frames.T1`) and therefore stay on the run-wide chord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExactTofSummary {
+    pub frames: usize,
+    pub chord_frames: usize,
+}
+
+impl ExactTofSummary {
+    pub fn of(pairs: &[Option<(f64, f64)>]) -> Self {
+        Self { frames: pairs.len(), chord_frames: pairs.iter().filter(|p| p.is_none()).count() }
+    }
+}
+
+/// Resolve the EXACT per-frame `(c0, c1)` pairs for a run from its `MzCalibration` rows and each
+/// frame's `(Frames.T1, Frames.MzCalibration)`.
+///
+/// All-or-nothing on the MODEL, so the archive never claims an exactness it cannot deliver: `Some`
+/// (one entry per frame, in frame order) only when EVERY frame resolves to a row that is
+/// [`TdfMzCalibrationRow::is_sqrt_linear`]; a single quadratic row (`C2 ≠ 0`), a row whose
+/// `C2`/`C3`/`C4`/`dC2` are NULL rather than a stored 0, or an unresolvable frame makes the whole
+/// run stay on the chord (`None`), exactly as before.
+///
+/// A NULL (or non-finite) `Frames.T1` cannot be evaluated: the vendor library reading that NULL
+/// through `sqlite3_column_double` would see 0 K — a C1 shift of `dC1·T1_row` ppm, ~5e-4 relative
+/// on 2485.d's constants — or may drop the term; nobody knows. Such a frame gets NO pair (a `None`
+/// entry → NULL `tof_c0`/`tof_c1` cells; both the vendored reader and the viewer fall back to the
+/// chord for a spectrum without the pair), logged once with the count, which the writer records as
+/// `ims_calibration.per_spectrum_chord_frames`. A NULL `Frames.MzCalibration` resolves to the
+/// single row when the table has exactly one (logged once), otherwise the run is not exact.
+pub(crate) fn exact_tof_coeffs<I>(
+    rows: &HashMap<i64, TdfMzCalibrationRow>,
+    frames: I,
+) -> Option<Vec<Option<(f64, f64)>>>
+where
+    I: IntoIterator<Item = (Option<f64>, Option<i64>)>,
+{
+    let single = if rows.len() == 1 { rows.values().next().copied() } else { None };
+    let mut out = Vec::new();
+    let (mut null_t1, mut null_id) = (0usize, 0usize);
+    for (t1_frame, cal_id) in frames {
+        let row = match cal_id {
+            Some(id) => match rows.get(&id) {
+                Some(r) => *r,
+                None => {
+                    log::warn!("Frames.MzCalibration = {id} names no MzCalibration row; ims-compact stays on the run-wide chord");
+                    return None;
+                }
+            },
+            None => match single {
+                Some(r) => {
+                    null_id += 1;
+                    r
+                }
+                None => {
+                    log::warn!("Frames.MzCalibration is NULL on a multi-row MzCalibration; ims-compact stays on the run-wide chord");
+                    return None;
+                }
+            },
+        };
+        if !row.is_sqrt_linear() {
+            log::info!(
+                "MzCalibration row {} is not sqrt-linear (ModelType {}, C2 {}, C3 {}, C4 {}, dC2 {}{}); \
+                 ims-compact stays on the run-wide chord, exact model in vendor_mz_calibration",
+                row.id,
+                row.model_type,
+                row.c2,
+                row.c3,
+                row.c4,
+                row.dc2,
+                if row.quadratic_terms_stored { "" } else { "; C2/C3/C4/dC2 not all stored as numbers (NULL/text)" }
+            );
+            return None;
+        }
+        let pair = match t1_frame {
+            Some(t) if t.is_finite() => match row.sqrt_linear_coeffs(t) {
+                Some(p) => Some(p),
+                None => {
+                    log::warn!(
+                        "MzCalibration row {}: C1_eff is not positive at Frames.T1 = {t}; ims-compact stays on the run-wide chord",
+                        row.id
+                    );
+                    return None;
+                }
+            },
+            _ => {
+                null_t1 += 1;
+                None
+            }
+        };
+        out.push(pair);
+    }
+    if null_t1 > 0 {
+        log::warn!(
+            "Frames.T1 is NULL on {null_t1} frame(s); they carry no exact tof_c0/tof_c1 and stay on the run-wide \
+             chord (ims_calibration.per_spectrum_chord_frames)"
+        );
+    }
+    if null_id > 0 {
+        log::warn!("Frames.MzCalibration is NULL on {null_id} frame(s); using the single MzCalibration row");
+    }
+    Some(out)
+}
+
+/// Per-frame exact coefficients for a `.d` (or its `analysis.tdf`), or `None` — never an error:
+/// a TDF without the table/columns simply keeps the chord. `frames` is the run's per-frame
+/// `(Frames.T1, Frames.MzCalibration)` in frame order; `n_frames` guards the positional match.
+/// Entries are `None` for frames with a NULL `Frames.T1` (see [`exact_tof_coeffs`]).
+pub(crate) fn exact_tof_coeffs_for<I>(tdf: &Path, n_frames: usize, frames: I) -> Option<Vec<Option<(f64, f64)>>>
+where
+    I: IntoIterator<Item = (Option<f64>, Option<i64>)>,
+{
+    let rows = match read_mz_calibration_rows(tdf) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("MzCalibration unreadable ({e}); ims-compact stays on the run-wide chord");
+            return None;
+        }
+    };
+    let out = exact_tof_coeffs(&rows, frames)?;
+    if out.len() != n_frames {
+        log::warn!(
+            "per-frame calibration inputs ({}) do not match the frame count ({n_frames}); ims-compact stays on the run-wide chord",
+            out.len()
+        );
+        return None;
+    }
+    // Fail closed: for every sqrt-linear row the derived pair must reproduce the general
+    // ModelType-1 evaluation (a row whose constants slipped past `is_sqrt_linear` would otherwise
+    // ship as "exact"). Checked at the row's reference T1 and 0.1 K off it.
+    for row in rows.values() {
+        for t1 in [row.t1, row.t1 + 0.1] {
+            let Some((d0, d1)) = row.sqrt_linear_coeffs(t1) else { continue };
+            for tof in [1.0e5, 3.0e5] {
+                let lin = (d0 + d1 * tof).powi(2);
+                let model = row.tof_to_mz(tof, t1);
+                if !((lin - model).abs() <= 1e-9 * model.abs()) {
+                    log::warn!(
+                        "exact tof_c0/tof_c1 self-check failed on MzCalibration row {} at tof {tof}: linear {lin} vs model {model}; \
+                         ims-compact stays on the run-wide chord",
+                        row.id
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+    let summary = ExactTofSummary::of(&out);
+    log::info!(
+        "exact per-frame tof_c0/tof_c1 (MzCalibration ModelType 1, C2 = 0) on {} of {n_frames} frames{}",
+        n_frames - summary.chord_frames,
+        if summary.chord_frames > 0 { format!(" ({} on the chord: NULL Frames.T1)", summary.chord_frames) } else { String::new() }
+    );
+    Some(out)
+}
+
+/// The `(frame index, tof)` sampling plan of the `MZPC_TDF_SDK_GOLDEN` diagnostic: frame 1, the
+/// last frame and 10 evenly spaced frames in between (deduplicated, ascending), × 20 TOF values
+/// evenly spread over `0..=num_samples-1` — at most 240 points per run.
+// Only the Windows/Linux SDK lane calls it; the plan itself is host-testable.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub(crate) fn sdk_golden_sample_plan(n_frames: usize, num_samples: i64) -> (Vec<usize>, Vec<f64>) {
+    let mut frames: Vec<usize> = Vec::new();
+    if n_frames > 0 {
+        let last = n_frames - 1;
+        frames.push(0);
+        for k in 1..=10usize {
+            frames.push(((k as f64) * (last as f64) / 11.0).round() as usize);
+        }
+        frames.push(last);
+        frames.sort_unstable();
+        frames.dedup();
+    }
+    let max_tof = (num_samples - 1).max(0) as f64;
+    let tofs: Vec<f64> = (0..20).map(|j| (j as f64 * max_tof / 19.0).round()).collect();
+    (frames, tofs)
 }
 
 /// The vendor's exact TOF→m/z calibration, carried verbatim so an archive is self-sufficient even
@@ -308,7 +822,51 @@ impl NativeTofReader {
             log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
             HashMap::new()
         });
-        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows })
+        // Exact per-frame sqrt-linear coefficients (C2 = 0 rows only). Needs the per-frame T1 /
+        // MzCalibration columns, which `table` only carries when the row count matched above.
+        let exact_tof = if table.t1.len() == frames.len() {
+            exact_tof_coeffs_for(
+                &tdf,
+                frames.len(),
+                table.t1.iter().copied().zip(table.mz_cal_id.iter().copied()),
+            )
+        } else {
+            None
+        };
+        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows, exact_tof })
+    }
+
+    /// Whether the run carries exact `tof_c0`/`tof_c1` params (the writer then declares the
+    /// columns and stamps the `tof` column's per-spectrum transform parameters), with the count of
+    /// frames that have none (NULL `Frames.T1`) and stay on the chord.
+    pub fn exact_tof_per_spectrum(&self) -> Option<ExactTofSummary> {
+        self.exact_tof.as_deref().map(ExactTofSummary::of)
+    }
+
+    /// The exact `(c0, c1)` of frame `i`, if the run is exact and the frame has a pair.
+    #[inline]
+    fn exact_tof_at(&self, i: usize) -> Option<(f64, f64)> {
+        self.exact_tof.as_ref().and_then(|v| v.get(i).copied().flatten())
+    }
+
+    /// Observed-m/z range for a frame's `[tof_min, tof_max]`: on the exact per-frame model when the
+    /// run has one, else on the run-wide chord. Both are monotonic in `tof`.
+    /// m/z for ONE absolute TOF bin in frame `i`: the exact per-frame sqrt-linear pair when the
+    /// vendor calibration gives one, else the run-wide chord. This is the model a reader applies to
+    /// the stored integer `tof`, so it is also what the per-spectrum summary terms must use.
+    fn mz_at_tof(&self, i: usize, t: i32) -> f64 {
+        match self.exact_tof_at(i) {
+            Some((c0, c1)) => {
+                let u = c0 + c1 * t as f64;
+                u * u
+            }
+            None => self.model.mz(t),
+        }
+    }
+
+    fn observed_mz_range(&self, i: usize, tof_min: i32, tof_max: i32) -> (f64, f64) {
+        let (a, b) = (self.mz_at_tof(i, tof_min), self.mz_at_tof(i, tof_max));
+        (a.min(b), a.max(b))
     }
 
     pub fn len(&self) -> usize {
@@ -407,29 +965,15 @@ pub(crate) fn build_precursors(
                 // reader splitting at the midpoint between adjacent centres misplaces the
                 // boundary — measured 3.5% of the mobility axis on average, up to 10.3%, on a
                 // real dia-PASEF run. Emit the true bounds so readers never have to guess.
-                let (mob_a, mob_b) = (
+                // Carried as MZP:1000006/7 (converter-owned provisional terms; PSI-MS has none
+                // for an isolation window's mobility bounds). The vendored writer/reader route
+                // every CURIE through `curie_to_string`/`parse_curie`, so the Unknown-CV
+                // representation is safe there; the mzML export demotes them to userParam.
+                add_isolation_mobility_band(
+                    &mut ion,
                     mobility(w.scan_begin as f64),
                     mobility(w.scan_end as f64),
                 );
-                // 1/K0 DECREASES as the scan index increases, so order the bounds explicitly
-                // rather than assuming begin<end maps to lower<upper.
-                let (mob_lo, mob_hi) = if mob_a <= mob_b { (mob_a, mob_b) } else { (mob_b, mob_a) };
-                // Emitted WITHOUT a CURIE: mzdata panics ("Cannot encode unknown CV") when a
-                // non-standard accession reaches its param encoder, and PSI-MS has no term for
-                // an isolation window's mobility bounds. Readers match on the name, as they
-                // already do for the nonstandard "tof" / mobility array names.
-                for (name, value) in [
-                    ("isolation window inverse reduced ion mobility lower limit", mob_lo),
-                    ("isolation window inverse reduced ion mobility upper limit", mob_hi),
-                ] {
-                    ion.add_param(
-                        Param::builder()
-                            .name(name)
-                            .value(value)
-                            .unit(Unit::VoltSecondPerSquareCentimeter)
-                            .build(),
-                    );
-                }
                 let mut activation = Activation::default();
                 activation.energy = w.collision_energy as f32;
                 activation
@@ -464,12 +1008,14 @@ impl NativeTofReader {
         self.table.ms_level.get(i).copied().unwrap_or(1)
     }
 
-    /// Per-frame `T1`/`T2`/`MzCalibration` → spectrum params (absent when the table lacks them).
+    /// Per-frame `T1`/`T2`/`MzCalibration` → spectrum params (absent when the table lacks them),
+    /// plus the exact `tof_c0`/`tof_c1` pair when the run is sqrt-linear.
     fn add_frame_calibration(&self, descr: &mut SpectrumDescription, i: usize) {
-        if let (Some(&t1), Some(&t2), Some(&id)) =
-            (self.table.t1.get(i), self.table.t2.get(i), self.table.mz_cal_id.get(i))
-        {
+        if let Some((t1, t2, id)) = frame_calibration_at(&self.table, i) {
             add_frame_calibration_params(descr, t1, t2, id);
+        }
+        if let Some((c0, c1)) = self.exact_tof_at(i) {
+            add_exact_tof_params(descr, c0, c1);
         }
     }
 
@@ -583,12 +1129,23 @@ impl NativeTofReader {
         descr.precursor = self.precursors_at(i);
         self.add_frame_calibration(&mut descr, i);
         // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z via the model
-        // (m/z = (a + b·tof)², monotonic in tof) over the min/max ABSOLUTE TOF bin present. Without
+        // (m/z = (c0 + c1·tof)², monotonic in tof) over the min/max ABSOLUTE TOF bin present. Without
         // this the viewer reports "m/z 0–0".
         if tof_min <= tof_max {
-            let (mz_a, mz_b) = (self.model.mz(tof_min), self.model.mz(tof_max));
-            crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
+            let (lo, hi) = self.observed_mz_range(i, tof_min, tof_max);
+            crate::set_observed_mz_range(&mut descr, lo, hi);
         }
+        // TIC / base peak: this lane REPLACES the m/z array with integer `tof`, so mzdata derives
+        // tic = 0 and base peak (0, 0) from the m/z-less array map. Compute them from the
+        // intensities actually stored, reconstructing m/z only at the running maximum bin.
+        let (tic, base) = if int_intensity {
+            crate::summarize_points(intensity_i32.iter().map(|&v| v as f32), |k| {
+                self.mz_at_tof(i, tof[k])
+            })
+        } else {
+            crate::summarize_points(intensity_f32.iter().copied(), |k| self.mz_at_tof(i, tof[k]))
+        };
+        crate::set_spectrum_summary_params(&mut descr, tic, base);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
@@ -697,9 +1254,20 @@ impl NativeTofReader {
         descr.precursor = self.precursors_at(i);
         self.add_frame_calibration(&mut descr, i);
         if tof_min <= tof_max {
-            let (mz_a, mz_b) = (self.model.mz(tof_min), self.model.mz(tof_max));
-            crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
+            let (lo, hi) = self.observed_mz_range(i, tof_min, tof_max);
+            crate::set_observed_mz_range(&mut descr, lo, hi);
         }
+        // TIC / base peak: this lane REPLACES the m/z array with integer `tof`, so mzdata derives
+        // tic = 0 and base peak (0, 0) from the m/z-less array map. Compute them from the
+        // intensities actually stored, reconstructing m/z only at the running maximum bin.
+        let (tic, base) = if int_intensity {
+            crate::summarize_points(intensity_i32.iter().map(|&v| v as f32), |k| {
+                self.mz_at_tof(i, tof[k])
+            })
+        } else {
+            crate::summarize_points(intensity_f32.iter().copied(), |k| self.mz_at_tof(i, tof[k]))
+        };
+        crate::set_spectrum_summary_params(&mut descr, tic, base);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 }
@@ -801,6 +1369,16 @@ pub(crate) fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWin
     Ok(out)
 }
 
+/// The calibration inputs (`T1`, `T2`, `MzCalibration`) of frame `i`, or `None` when the table
+/// lacks the columns or any of the three is NULL for that frame — such a frame simply gets no
+/// per-frame calibration columns; it never aborts the conversion.
+fn frame_calibration_at(table: &FrameTable, i: usize) -> Option<(f64, f64, i64)> {
+    match (table.t1.get(i), table.t2.get(i), table.mz_cal_id.get(i)) {
+        (Some(&Some(t1)), Some(&Some(t2)), Some(&Some(id))) => Some((t1, t2, id)),
+        _ => None,
+    }
+}
+
 /// Read the per-frame [`FrameTable`] from `analysis.tdf`, ordered by `Id` so position `i` matches
 /// timsrust's frame index.
 fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
@@ -838,9 +1416,9 @@ fn read_frame_rows(conn: &rusqlite::Connection, with_cal: bool) -> Result<FrameT
             _ => ScanPolarity::Unknown,
         });
         if with_cal {
-            t.t1.push(r.get::<_, f64>(4)?);
-            t.t2.push(r.get::<_, f64>(5)?);
-            t.mz_cal_id.push(r.get::<_, i64>(6)?);
+            t.t1.push(r.get::<_, Option<f64>>(4)?);
+            t.t2.push(r.get::<_, Option<f64>>(5)?);
+            t.mz_cal_id.push(r.get::<_, Option<i64>>(6)?);
         }
     }
     Ok(t)
@@ -885,6 +1463,229 @@ mod vendor_mz_calibration_tests {
         let cols: Vec<&str> = v["per_frame_columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
         assert!(cols[0].ends_with("_tdf_t1") && cols[1].ends_with("_tdf_t2") && cols[2].ends_with("_tdf_mz_calibration_id"), "{cols:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run may reference MORE THAN ONE `MzCalibration` row (the instrument recalibrates
+    /// mid-run): both rows must be carried verbatim, in `Id` order, and each frame's
+    /// `tdf_mz_calibration_id` must select ITS row. A frame with NULL `T1` (seen on interrupted
+    /// runs) yields no per-frame calibration for that frame only — never an abort, and never a
+    /// shift of the neighbouring frames' positions.
+    #[test]
+    fn two_calibration_rows_select_per_frame_and_null_frame_is_tolerated() {
+        let dir = std::env::temp_dir().join(format!("mzpc-vmc2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tdf = dir.join("analysis.tdf");
+        let _ = std::fs::remove_file(&tdf);
+        let conn = rusqlite::Connection::open(&tdf).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE MzCalibration (Id INTEGER PRIMARY KEY, ModelType INTEGER, DigitizerTimebase REAL, \
+             DigitizerDelay REAL, T1 REAL, T2 REAL, dC1 REAL, dC2 REAL, C0 REAL, C1 REAL, C2 REAL, C3 REAL, C4 REAL); \
+             INSERT INTO MzCalibration VALUES (1, 1, 0.125, 26464.125, 25.6148127740566, 25.1594285616696, \
+             20.0, 0.0, 1008.59723408404, 154314.98518964, 0.0, 0.0, 0.0); \
+             INSERT INTO MzCalibration VALUES (2, 1, 0.125, 26464.125, 25.7001, 25.2002, \
+             20.0, 0.0, 1008.61, 154315.5, 1.26e-3, 0.0, 0.0); \
+             CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT); \
+             INSERT INTO GlobalMetadata VALUES ('DigitizerNumSamples', '636031'), \
+             ('MzAcqRangeLower', '99.993933'), ('MzAcqRangeUpper', '1700.000000'); \
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, NumPeaks INTEGER, Time REAL, MsMsType INTEGER, \
+             Polarity TEXT, T1 REAL, T2 REAL, MzCalibration INTEGER); \
+             INSERT INTO Frames VALUES (1, 10, 0.5, 0, '+', 25.61, 25.16, 1); \
+             INSERT INTO Frames VALUES (2, 10, 0.6, 9, '+', 25.62, 25.16, 2); \
+             INSERT INTO Frames VALUES (3, 10, 0.7, 0, '+', NULL, 25.16, 1); \
+             INSERT INTO Frames VALUES (4, 10, 0.8, 9, '+', 25.64, 25.17, 2); \
+             INSERT INTO Frames VALUES (5, 10, 0.9, 0, '+', 25.65, 25.17, 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Index block: both rows, verbatim, Id-ordered.
+        let v = super::vendor_mz_calibration(&tdf).unwrap();
+        let rows = v["mz_calibration"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["Id"], 1);
+        assert_eq!(rows[1]["Id"], 2);
+        assert_eq!(rows[0]["C2"], 0.0);
+        assert_eq!(rows[1]["C2"], 1.26e-3);
+        assert_eq!(rows[1]["T1"], 25.7001);
+        assert_eq!(rows[1]["C1"], 154315.5);
+        assert_eq!(rows[1].as_object().unwrap().len(), 13);
+
+        // Per-frame table: five entries (the NULL frame keeps its slot), ids select the right row.
+        let table = super::read_frame_table(&tdf).unwrap();
+        assert_eq!(table.num_peaks.len(), 5);
+        assert_eq!(table.mz_cal_id, vec![Some(1), Some(2), Some(1), Some(2), Some(1)]);
+        assert_eq!(table.t1, vec![Some(25.61), Some(25.62), None, Some(25.64), Some(25.65)]);
+        assert_eq!(table.ms_level, vec![1, 2, 1, 2, 1]);
+        assert_eq!(super::frame_calibration_at(&table, 0), Some((25.61, 25.16, 1)));
+        assert_eq!(super::frame_calibration_at(&table, 1), Some((25.62, 25.16, 2)));
+        assert_eq!(super::frame_calibration_at(&table, 2), None, "NULL T1 frame yields no params");
+        assert_eq!(super::frame_calibration_at(&table, 3), Some((25.64, 25.17, 2)));
+        assert_eq!(super::frame_calibration_at(&table, 4), Some((25.65, 25.17, 1)));
+        assert_eq!(super::frame_calibration_at(&table, 5), None, "past the end");
+
+        // The spectrum params the writer promotes to columns name the row per frame.
+        use mzdata::prelude::ParamDescribed;
+        let mut d = mzdata::spectrum::SpectrumDescription::default();
+        let (t1, t2, id) = super::frame_calibration_at(&table, 1).unwrap();
+        super::add_frame_calibration_params(&mut d, t1, t2, id);
+        let id_param = d.get_param_by_curie(&super::TDF_MZ_CAL_ID_CURIE).unwrap();
+        assert_eq!(id_param.value.to_i64().unwrap(), 2);
+        assert_eq!(d.get_param_by_curie(&super::TDF_T1_CURIE).unwrap().value.to_f64().unwrap(), 25.62);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod isolation_mobility_band_tests {
+    use super::*;
+    use mzdata::spectrum::ScanEvent;
+
+    fn im(p: &Param) -> f64 {
+        p.value.to_f64().unwrap()
+    }
+
+    /// The window band is carried as MZP:1000006/7 (Unknown-CV CURIEs rendered `MZP:` by the
+    /// vendored writer), ordered lower <= upper whatever order the scan bounds arrive in.
+    #[test]
+    fn band_is_accessioned_and_ordered() {
+        let mut ion = SelectedIon::default();
+        add_isolation_mobility_band(&mut ion, 1.36, 1.30); // scan_begin (high 1/K0) first
+        let ps = ion.params.as_ref().unwrap();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].curie(), Some(MZP_IM_WINDOW_LOWER));
+        assert_eq!(ps[1].curie(), Some(MZP_IM_WINDOW_UPPER));
+        assert_eq!(ps[0].name, IM_WINDOW_LOWER_NAME);
+        assert_eq!(im(&ps[0]), 1.30);
+        assert_eq!(im(&ps[1]), 1.36);
+        assert_eq!(ps[0].unit, Unit::VoltSecondPerSquareCentimeter);
+        assert_eq!(
+            mzpeak_prototyping::param::curie_to_string(&ps[0].curie().unwrap()),
+            "MZP:1000006"
+        );
+        assert_eq!(
+            mzpeak_prototyping::param::curie_to_string(&ps[1].curie().unwrap()),
+            "MZP:1000007"
+        );
+    }
+
+    /// mzdata's TDF reader puts timsrust-LINEAR 1/K0 in the selected ion, the scan and the frame's
+    /// `ion mobility lower/upper limit`; the remap must move all three onto the ModelType-2 model at
+    /// the SAME scan position (what the ims-compact lane writes) and attach the MZP band from the
+    /// limits — without touching anything else, and idempotently for the band.
+    ///
+    /// The input is spelled the way mzdata 0.66 spells it (`io/tdf/reader.rs`): `lower` =
+    /// convert(ScanNumBegin), `upper` = convert(ScanNumEnd) — i.e. INVERTED, since 1/K0 falls with
+    /// the scan index. The remap must leave the pair ordered.
+    #[test]
+    fn remap_moves_linear_values_onto_vendor_model_and_adds_band() {
+        // SBA415: nominal 1/K0 range 0.600..1.600 over 909 scans; ModelType-2 row from its TDF.
+        let linear = Scan2ImConverter::from_boundaries(0.600, 1.600, 909);
+        let recal = crate::tims_mobility::TimsMobilityCalibration::new(
+            1.0, 909.0, 211.45198604901222, 73.95258004355563, 0.00492817555366883,
+            131.11541877221117, 0.600,
+        );
+        let remap = TdfMobilityRemap::new(linear, Some(recal));
+        let (sb, se) = (100u32, 160u32);
+        let mid = (sb + se) as f64 / 2.0;
+        // The premise of the ordering fix: mzdata's "lower" (scan begin) is the LARGER 1/K0.
+        assert!(linear.convert(sb) > linear.convert(se));
+
+        let mut descr = SpectrumDescription::default();
+        descr.add_param(
+            Param::new_key_value("ion mobility lower limit", linear.convert(sb))
+                .with_unit_t(&Unit::VoltSecondPerSquareCentimeter),
+        );
+        descr.add_param(
+            Param::new_key_value("ion mobility upper limit", linear.convert(se))
+                .with_unit_t(&Unit::VoltSecondPerSquareCentimeter),
+        );
+        descr.add_param(Param::new_key_value("window group", 3i64));
+        let mut scan = ScanEvent::default();
+        scan.add_param(
+            Param::builder()
+                .name("inverse reduced ion mobility")
+                .curie(curie!(MS:1002815))
+                .value(linear.convert(mid))
+                .unit(Unit::VoltSecondPerSquareCentimeter)
+                .build(),
+        );
+        descr.acquisition.scans.push(scan);
+        let mut ion = SelectedIon { mz: 500.0, ..Default::default() };
+        ion.add_param(
+            Param::builder()
+                .name("inverse reduced ion mobility")
+                .curie(curie!(MS:1002815))
+                .value(linear.convert(mid))
+                .unit(Unit::VoltSecondPerSquareCentimeter)
+                .build(),
+        );
+        descr.precursor.push(Precursor { ions: vec![ion], ..Default::default() });
+
+        remap.apply(&mut descr);
+        remap.apply(&mut descr); // idempotent for the band (values re-remap only if linear again)
+
+        let lo = descr.get_param_by_name("ion mobility lower limit").unwrap();
+        let hi = descr.get_param_by_name("ion mobility upper limit").unwrap();
+        // Applied twice: the second pass inverts a ModelType-2 value through the linear map, which
+        // is NOT the identity — so check the first pass's arithmetic on a fresh description below
+        // and here only that the band exists once and is ordered.
+        assert!(im(lo) <= im(hi));
+        let ion = &descr.precursor[0].ions[0];
+        let ps = ion.params.as_ref().unwrap();
+        assert_eq!(ps.iter().filter(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)).count(), 1);
+        assert_eq!(ps.iter().filter(|p| p.curie() == Some(MZP_IM_WINDOW_UPPER)).count(), 1);
+        assert!(descr.get_param_by_name("window group").is_some());
+
+        // Fresh description, single pass: exact ModelType-2 values at the same scan positions, and
+        // the pair comes out ORDERED (lower = the scan-end value, the smaller one).
+        let mut d = SpectrumDescription::default();
+        d.add_param(Param::new_key_value("ion mobility lower limit", linear.convert(sb)));
+        d.add_param(Param::new_key_value("ion mobility upper limit", linear.convert(se)));
+        let mut ion = SelectedIon::default();
+        ion.add_param(
+            Param::builder()
+                .name("inverse reduced ion mobility")
+                .curie(curie!(MS:1002815))
+                .value(linear.convert(mid))
+                .build(),
+        );
+        d.precursor.push(Precursor { ions: vec![ion], ..Default::default() });
+        remap.apply(&mut d);
+        let tol = 1e-12;
+        assert!((im(d.get_param_by_name("ion mobility lower limit").unwrap()) - recal.one_over_k0(se as f64)).abs() < tol);
+        assert!((im(d.get_param_by_name("ion mobility upper limit").unwrap()) - recal.one_over_k0(sb as f64)).abs() < tol);
+        let ps = d.precursor[0].ions[0].params.as_ref().unwrap();
+        let v = ps.iter().find(|p| p.curie() == Some(curie!(MS:1002815))).unwrap();
+        assert!((im(v) - recal.one_over_k0(mid)).abs() < tol, "{} vs {}", im(v), recal.one_over_k0(mid));
+        // The linear value really was different (else this test proves nothing).
+        assert!((linear.convert(mid) - recal.one_over_k0(mid)).abs() > 1e-3);
+        let band_lo = ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)).unwrap();
+        let band_hi = ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_UPPER)).unwrap();
+        assert!((im(band_lo) - recal.one_over_k0(se as f64)).abs() < tol);
+        assert!((im(band_hi) - recal.one_over_k0(sb as f64)).abs() < tol);
+        assert!(im(band_lo) <= im(v) && im(v) <= im(band_hi));
+
+        // No ModelType-2 row (or `--no-tims-recalibration`): values stay linear but the pair is
+        // still put in order, and the band is still attached (from the ordered linear limits).
+        let none = TdfMobilityRemap::new(linear, None);
+        let mut d = SpectrumDescription::default();
+        d.add_param(Param::new_key_value("ion mobility lower limit", linear.convert(sb)));
+        d.add_param(Param::new_key_value("ion mobility upper limit", linear.convert(se)));
+        d.precursor.push(Precursor { ions: vec![SelectedIon::default()], ..Default::default() });
+        none.apply(&mut d);
+        assert_eq!(im(d.get_param_by_name("ion mobility lower limit").unwrap()), linear.convert(se));
+        assert_eq!(im(d.get_param_by_name("ion mobility upper limit").unwrap()), linear.convert(sb));
+        let ps = d.precursor[0].ions[0].params.as_ref().unwrap();
+        assert_eq!(im(ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_LOWER)).unwrap()), linear.convert(se));
+        assert_eq!(im(ps.iter().find(|p| p.curie() == Some(MZP_IM_WINDOW_UPPER)).unwrap()), linear.convert(sb));
+
+        // An already-ordered pair is left alone (idempotent ordering).
+        let mut d = SpectrumDescription::default();
+        d.add_param(Param::new_key_value("ion mobility lower limit", 0.9));
+        d.add_param(Param::new_key_value("ion mobility upper limit", 1.1));
+        none.apply(&mut d);
+        assert_eq!(im(d.get_param_by_name("ion mobility lower limit").unwrap()), 0.9);
+        assert_eq!(im(d.get_param_by_name("ion mobility upper limit").unwrap()), 1.1);
     }
 }
 
@@ -994,5 +1795,287 @@ mod empty_frame_read_tests {
             mzdata::prelude::SpectrumSource::get_spectrum_by_index(&mut r, i)
                 .is_some_and(|s| s.peaks().len() == 0)
         })
+    }
+}
+
+#[cfg(test)]
+mod exact_tof_calibration_tests {
+
+    /// The C2 = 0 branch against Bruker's OWN `tims_index_to_mz` (timsdata SDK on the Flash box,
+    /// `MZPC_TDF_SDK_GOLDEN`, 2026-09-03): 240 (frame, tof) points on 12 frames of PXD059079 2485.d,
+    /// each with the frame's T1 and calibration id. The pair reproduced the SDK to 1.0e-7 ppm; the
+    /// run-wide chord was 4.28 ppm off. Corpus-free: everything needed is in the fixture.
+    #[test]
+    fn sqrt_linear_pair_matches_the_vendor_sdk_goldens() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tdf_2485_sdk_golden.json"
+        ))
+        .unwrap();
+        let g: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let rows: Vec<super::TdfMzCalibrationRow> = g["mz_calibration"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let f = |k: &str| r[k].as_f64().unwrap_or(0.0);
+                super::TdfMzCalibrationRow {
+                    id: r["Id"].as_i64().unwrap(),
+                    model_type: r["ModelType"].as_i64().unwrap(),
+                    digitizer_timebase: f("DigitizerTimebase"),
+                    digitizer_delay: f("DigitizerDelay"),
+                    t1: f("T1"),
+                    dc1: f("dC1"),
+                    dc2: f("dC2"),
+                    c0: f("C0"),
+                    c1: f("C1"),
+                    c2: f("C2"),
+                    c3: f("C3"),
+                    c4: f("C4"),
+                    quadratic_terms_stored: true,
+                }
+            })
+            .collect();
+        let pts = g["points"].as_array().unwrap();
+        assert!(pts.len() >= 200, "fixture has {} points", pts.len());
+        let mut worst_ppm: f64 = 0.0;
+        for p in pts {
+            let sdk = p["mz_sdk"].as_f64().unwrap();
+            if !(sdk > 0.0) {
+                continue;
+            }
+            let id = p["cal_id"].as_i64().unwrap();
+            let row = rows.iter().find(|r| r.id == id).expect("calibration row for the point");
+            let (c0, c1) = row.sqrt_linear_coeffs(p["t1"].as_f64().unwrap()).expect("C2 = 0 row is linear");
+            let u = c0 + c1 * p["tof"].as_f64().unwrap();
+            let ppm = ((u * u - sdk) / sdk).abs() * 1e6;
+            worst_ppm = worst_ppm.max(ppm);
+        }
+        assert!(worst_ppm < 1e-5, "pair vs SDK worst {worst_ppm:.3e} ppm (expected ~1e-7)");
+    }
+    use super::*;
+
+    /// PXD059079 2485.d's single `MzCalibration` row (ModelType 1, C2 = 0).
+    fn row_2485() -> TdfMzCalibrationRow {
+        TdfMzCalibrationRow {
+            id: 1,
+            model_type: 1,
+            digitizer_timebase: 0.125,
+            digitizer_delay: 26464.125,
+            t1: 25.6148127740566,
+            dc1: 20.0,
+            dc2: 0.0,
+            c0: 1008.59723408404,
+            c1: 154314.98518964,
+            c2: 0.0,
+            c3: 0.0,
+            c4: 0.0,
+            quadratic_terms_stored: true,
+        }
+    }
+
+    /// The derived per-frame `(c0, c1)` reproduce the ModelType-1 formula EXACTLY (1e-12 relative)
+    /// at a frame temperature that differs from the row's reference T1 — i.e. the temperature term
+    /// is folded into the pair, not dropped.
+    #[test]
+    fn sqrt_linear_pair_reproduces_model_type_1_at_frame_temperature() {
+        let row = row_2485();
+        let t1_frame = 25.6193764709235; // Frames.T1 of frame 1: 4.6 mK off the reference
+        assert_ne!(t1_frame, row.t1);
+        assert!(row.is_sqrt_linear());
+        let (c0, c1) = row.sqrt_linear_coeffs(t1_frame).expect("C2 = 0 row is sqrt-linear");
+        for tof in [0.0, 1.0e5, 3.0e5, 6.36e5] {
+            let lin = (c0 + c1 * tof).powi(2);
+            let model = row.tof_to_mz(tof, t1_frame);
+            assert!(model.is_finite() && model > 0.0, "tof {tof}: model {model}");
+            let rel = (lin - model).abs() / model;
+            assert!(rel < 1e-12, "tof {tof}: linear {lin} vs model {model} (rel {rel:e})");
+        }
+        // The temperature term is live: the pair at the reference T1 differs from the pair at the
+        // frame's T1 (by dC1·ΔT/1e6 / 2 ≈ 4.6e-8 relative on c1 here).
+        let (_, c1_ref) = row.sqrt_linear_coeffs(row.t1).unwrap();
+        assert!((c1_ref - c1).abs() / c1 > 1e-9, "temperature correction must move c1: {c1_ref} vs {c1}");
+        // Sanity: the pair puts tof 0 at the file's MzAcqRangeLower neighbourhood (~100 Th) and the
+        // last digitizer sample near MzAcqRangeUpper (1700 Th).
+        assert!((99.0..101.0).contains(&(c0 * c0)), "tof 0 → {}", c0 * c0);
+        assert!((1690.0..1710.0).contains(&(c0 + c1 * 636030.0).powi(2)), "tof max → {}", (c0 + c1 * 636030.0).powi(2));
+    }
+
+    /// The general (quadratic) branch of the formula reproduces all 60 speXtract golden points
+    /// (Bruker timsdata SDK `tims_index_to_mz` on three diaPASEF runs) to < 1e-4 ppm — and those
+    /// rows (C2 ≠ 0) are correctly refused as sqrt-linear.
+    #[test]
+    fn quadratic_branch_matches_the_sdk_goldens() {
+        let text = include_str!("../tests/fixtures/tdf_calibration_golden.json");
+        let files: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+        assert_eq!(files.len(), 3);
+        let mut n = 0usize;
+        let mut worst = 0.0f64;
+        for f in &files {
+            let row = TdfMzCalibrationRow {
+                id: 1,
+                model_type: f["model_type"].as_i64().unwrap(),
+                digitizer_timebase: f["timebase"].as_f64().unwrap(),
+                digitizer_delay: f["delay"].as_f64().unwrap(),
+                t1: f["T1_ref"].as_f64().unwrap(),
+                dc1: f["dC1"].as_f64().unwrap(),
+                dc2: 0.0,
+                c0: f["C0"].as_f64().unwrap(),
+                c1: f["C1"].as_f64().unwrap(),
+                c2: f["C2"].as_f64().unwrap(),
+                c3: 0.0,
+                c4: 0.0,
+                quadratic_terms_stored: true,
+            };
+            assert!(row.c2 != 0.0 && !row.is_sqrt_linear(), "{}: C2 ≠ 0 rows stay on the quadratic", f["file"]);
+            assert_eq!(row.sqrt_linear_coeffs(row.t1), None);
+            for c in f["cases"].as_array().unwrap() {
+                let (t1, tof, mz_sdk) =
+                    (c["t1"].as_f64().unwrap(), c["tof"].as_f64().unwrap(), c["mz"].as_f64().unwrap());
+                let mz = row.tof_to_mz(tof, t1);
+                let ppm = (mz - mz_sdk).abs() / mz_sdk * 1e6;
+                worst = worst.max(ppm);
+                assert!(ppm < 1e-4, "{} frame {} tof {tof}: {mz} vs SDK {mz_sdk} ({ppm:e} ppm)", f["file"], c["frame"]);
+                n += 1;
+            }
+        }
+        assert_eq!(n, 60, "all 60 golden points exercised");
+        eprintln!("worst golden deviation: {worst:e} ppm");
+    }
+
+    /// Out-of-model inputs give NaN, never a plausible m/z.
+    #[test]
+    fn out_of_model_inputs_are_nan() {
+        let row = row_2485();
+        // t_ns < C0 (arrival before the calibration zero) — impossible with this delay, so force it.
+        let mut early = row;
+        early.digitizer_delay = 0.0;
+        assert!(early.tof_to_mz(0.0, row.t1).is_nan());
+        let mut bad_c1 = row;
+        bad_c1.c1 = -1.0;
+        assert!(bad_c1.tof_to_mz(1.0e5, row.t1).is_nan());
+        assert!(!bad_c1.is_sqrt_linear());
+        assert_eq!(bad_c1.sqrt_linear_coeffs(row.t1), None);
+    }
+
+    /// Per-frame resolution: a NULL (or non-finite) `Frames.T1` frame carries NO pair (it stays on
+    /// the chord; the reference T1 is never substituted), NULL `Frames.MzCalibration` resolves to
+    /// the single row, an unknown id, a mixed run (one quadratic row referenced) or a row whose
+    /// quadratic terms were NULL rather than stored zeros yields no exact pairs at all.
+    #[test]
+    fn per_frame_resolution_is_all_or_nothing() {
+        let lin = row_2485();
+        let mut quad = lin;
+        quad.id = 2;
+        quad.c2 = 1.26e-3;
+        let one: HashMap<i64, TdfMzCalibrationRow> = [(1, lin)].into_iter().collect();
+        let two: HashMap<i64, TdfMzCalibrationRow> = [(1, lin), (2, quad)].into_iter().collect();
+
+        let frames = vec![(Some(25.62), Some(1)), (None, Some(1)), (Some(25.63), None), (Some(f64::NAN), Some(1))];
+        let out = exact_tof_coeffs(&one, frames.clone()).expect("single linear row: exact");
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], lin.sqrt_linear_coeffs(25.62));
+        assert_eq!(out[1], None, "NULL T1 → no pair for that frame (chord), never the reference T1");
+        assert_eq!(out[2], lin.sqrt_linear_coeffs(25.63), "NULL id → the single row");
+        assert_eq!(out[3], None, "non-finite T1 → no pair");
+        assert_eq!(ExactTofSummary::of(&out), ExactTofSummary { frames: 4, chord_frames: 2 });
+
+        // Two rows, frames only on the linear one: still exact, selected by id.
+        let out = exact_tof_coeffs(&two, vec![(Some(25.62), Some(1)), (Some(25.64), Some(1))]).unwrap();
+        assert_eq!(out[1], lin.sqrt_linear_coeffs(25.64));
+        assert_eq!(ExactTofSummary::of(&out).chord_frames, 0);
+        // A row whose quadratic terms were NULL (not stored zeros) is not exact, however zero it reads.
+        let mut unstored = lin;
+        unstored.quadratic_terms_stored = false;
+        assert!(!unstored.is_sqrt_linear());
+        assert_eq!(unstored.sqrt_linear_coeffs(25.62), None);
+        let unstored: HashMap<i64, TdfMzCalibrationRow> = [(1, unstored)].into_iter().collect();
+        assert_eq!(exact_tof_coeffs(&unstored, vec![(Some(25.62), Some(1))]), None);
+        // One frame on the quadratic row → the whole run is not exact.
+        assert_eq!(exact_tof_coeffs(&two, vec![(Some(25.62), Some(1)), (Some(25.64), Some(2))]), None);
+        // NULL id on a multi-row table → not exact; unknown id → not exact.
+        assert_eq!(exact_tof_coeffs(&two, vec![(Some(25.62), None)]), None);
+        assert_eq!(exact_tof_coeffs(&one, vec![(Some(25.62), Some(7))]), None);
+        // No frames → empty (the caller's frame-count guard rejects it).
+        assert_eq!(exact_tof_coeffs(&one, Vec::new()), Some(Vec::new()));
+    }
+
+    /// `read_mz_calibration_rows` + `exact_tof_coeffs_for` on a synthetic TDF with the vendor's
+    /// untyped `C0..C4`: NULL / text `C2`/`C3`/`C4`/`dC2` still READ as 0 (for the informational
+    /// model block) but are not stored numeric zeros, so the run stays on the chord; once they are
+    /// stored as numbers the run is exact — except the NULL-`Frames.T1` frame, which carries no
+    /// pair — and the frame-count guard and the quadratic-row refusal hold.
+    #[test]
+    fn null_or_text_quadratic_terms_are_not_exact_and_null_t1_frames_carry_no_pair() {
+        let dir = std::env::temp_dir().join(format!("mzpc-exact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tdf = dir.join("analysis.tdf");
+        let _ = std::fs::remove_file(&tdf);
+        let conn = rusqlite::Connection::open(&tdf).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE MzCalibration (Id INTEGER PRIMARY KEY, ModelType INTEGER, DigitizerTimebase REAL, \
+             DigitizerDelay REAL, T1 REAL, T2 REAL, dC1 REAL, dC2, C0, C1, C2, C3, C4); \
+             INSERT INTO MzCalibration VALUES (1, 1, 0.125, 26464.125, 25.6148127740566, 25.1594285616696, \
+             20.0, NULL, 1008.59723408404, 154314.98518964, NULL, NULL, '0'); \
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, NumPeaks INTEGER, Time REAL, MsMsType INTEGER, \
+             Polarity TEXT, T1 REAL, T2 REAL, MzCalibration INTEGER); \
+             INSERT INTO Frames VALUES (1, 10, 0.5, 0, '+', 25.61, 25.16, 1); \
+             INSERT INTO Frames VALUES (2, 10, 0.6, 9, '+', NULL, 25.16, 1); \
+             INSERT INTO Frames VALUES (3, 10, 0.7, 0, '+', 25.63, 25.17, 1);",
+        )
+        .unwrap();
+        drop(conn);
+        let rows = read_mz_calibration_rows(&tdf).unwrap();
+        let row = rows[&1];
+        assert_eq!((row.c2, row.c3, row.c4, row.dc2), (0.0, 0.0, 0.0, 0.0), "NULL/text read as 0 for evaluation");
+        assert_eq!(row.c1, 154314.98518964);
+        assert!(!row.quadratic_terms_stored);
+        assert!(!row.is_sqrt_linear(), "a MISSING C2 is not a stored zero");
+        assert_eq!(row.sqrt_linear_coeffs(25.61), None);
+        assert!(row.tof_to_mz(1.0e5, 25.61).is_finite(), "the informational model still evaluates with NULL → 0");
+
+        let table = read_frame_table(&tdf).unwrap();
+        let frames = || table.t1.iter().copied().zip(table.mz_cal_id.iter().copied());
+        assert_eq!(exact_tof_coeffs_for(&tdf, 3, frames()), None, "NULL quadratic terms → chord");
+
+        // Store the quadratic terms as numbers: now the run is exact — except the NULL-T1 frame.
+        let conn = rusqlite::Connection::open(&tdf).unwrap();
+        conn.execute_batch("UPDATE MzCalibration SET dC2 = 0.0, C2 = 0, C3 = 0.0, C4 = 0.0 WHERE Id = 1;").unwrap();
+        drop(conn);
+        let rows = read_mz_calibration_rows(&tdf).unwrap();
+        let row = rows[&1];
+        assert!(row.quadratic_terms_stored && row.is_sqrt_linear());
+        let out = exact_tof_coeffs_for(&tdf, 3, frames()).expect("exact");
+        assert_eq!(out[0], row.sqrt_linear_coeffs(25.61));
+        assert_eq!(out[1], None, "NULL Frames.T1 → no pair, chord");
+        assert_eq!(out[2], row.sqrt_linear_coeffs(25.63));
+        assert_eq!(ExactTofSummary::of(&out), ExactTofSummary { frames: 3, chord_frames: 1 });
+        assert_eq!(exact_tof_coeffs_for(&tdf, 2, frames()), None, "frame-count mismatch → chord");
+
+        // Flip the row to quadratic: nothing is exact any more.
+        let conn = rusqlite::Connection::open(&tdf).unwrap();
+        conn.execute_batch("UPDATE MzCalibration SET C2 = 0.00126 WHERE Id = 1;").unwrap();
+        drop(conn);
+        assert_eq!(exact_tof_coeffs_for(&tdf, 3, frames()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The golden sampling plan: ≤ 12 frames × 20 tof values, first/last frame and tof 0 / N−1
+    /// always included, monotonic, and degenerate runs do not panic.
+    #[test]
+    fn golden_sample_plan_shape() {
+        let (frames, tofs) = sdk_golden_sample_plan(3994, 636031);
+        assert_eq!(frames.len(), 12);
+        assert_eq!((frames[0], *frames.last().unwrap()), (0, 3993));
+        assert!(frames.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(tofs.len(), 20);
+        assert_eq!((tofs[0], tofs[19]), (0.0, 636030.0));
+        assert!(tofs.windows(2).all(|w| w[0] < w[1]));
+        assert!(frames.len() * tofs.len() <= 240);
+        let (frames, _) = sdk_golden_sample_plan(1, 10);
+        assert_eq!(frames, vec![0]);
+        let (frames, tofs) = sdk_golden_sample_plan(0, 0);
+        assert!(frames.is_empty());
+        assert!(tofs.iter().all(|&t| t == 0.0));
     }
 }

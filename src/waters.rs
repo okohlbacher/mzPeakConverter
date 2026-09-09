@@ -26,9 +26,7 @@ use std::ptr;
 use anyhow::{Context, Result, anyhow, bail};
 use libloading::Library;
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -61,7 +59,6 @@ pub struct WatersReader {
     // `_lib` MUST outlive the function pointers + handles below (dropped together with this struct).
     _lib: Library,
     read_scan: ReadScanFn,
-    is_continuum: Option<IsContinuumFn>,
     /// Per-function continuum flag, resolved once at open. `None` when the export is unavailable.
     continuum: Vec<Option<bool>>,
     destroy: DestroyReaderFn,
@@ -202,7 +199,6 @@ impl WatersReader {
             info_reader,
             scan_reader,
             index,
-            is_continuum,
             continuum,
         })
     }
@@ -275,6 +271,20 @@ impl WatersReader {
         // MS level: function 0 is the MS1 acquisition; higher functions are MS2/lockmass. Refining
         // this needs getFunctionType (TODO); function index is a sound first approximation.
         let ms_level: u8 = if func == 0 { 1 } else { 2 };
+        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
+        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
+        // otherwise indistinguishable from a complete one. The set mass is reachable via
+        // `getScanItemValue`; not wired yet.
+        if ms_level > 1 {
+            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+            PRECURSOR_GAP_SAID.call_once(|| {
+                log::warn!(
+                    "Waters MassLynx: this reader does not yet extract precursors; \
+                     MS2 rows will have none (no selected ion, isolation window or collision energy \
+                     in the archive)"
+                );
+            });
+        }
         let mut descr = SpectrumDescription {
             // ProteoWizard Waters native-id convention (1-based function/scan).
             id: format!("function={} process=0 scan={}", func + 1, scan + 1),
@@ -290,33 +300,16 @@ impl WatersReader {
             polarity: ScanPolarity::Unknown,
             ..Default::default()
         };
-        descr.add_param(
-            Param::builder()
-                .name("mass spectrum")
-                .curie(curie!(MS:1000294))
-                .build(),
-        );
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
         // RT is available via readScanItemValue (TODO); leave a default scan event for now.
         descr.acquisition.scans.push(ScanEvent::default());
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema. Uses the first
-    /// non-empty spectrum so both m/z and intensity columns are present.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        for i in 0..self.len() {
-            if let Ok(spec) = self.spectrum(i) {
-                if let Some(arrays) = spec.arrays {
-                    let non_empty = arrays.mzs().map(|m| !m.is_empty()).unwrap_or(false);
-                    if non_empty {
-                        return Ok(arrays);
-                    }
-                }
-            }
-        }
-        Ok(self.spectrum(0)?.arrays.unwrap_or_default())
-    }
 }
 
 impl Drop for WatersReader {

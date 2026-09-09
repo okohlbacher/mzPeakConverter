@@ -17,9 +17,9 @@
 //!   * pull the calibrated (or raw) double arrays through the FFI per spectrum,
 //!   * and emit one [`MultiLayerSpectrum`] per spectrum.
 //!
-//! The entire module is gated behind the `bruker_sdk` cargo feature by the
-//! caller (`#[cfg(feature = "bruker_sdk")] mod bruker_baf;`), since it depends
-//! on `libloading` and only makes sense where the vendor SDK exists.
+//! There are no cargo features: the caller compiles the module in by target OS
+//! (`#[cfg(any(windows, target_os = "linux"))] mod bruker_baf;` in `main.rs`),
+//! the two platforms `baf2sql_c` ships for. macOS never builds it.
 
 use std::env;
 use std::ffi::{c_char, c_int, CString};
@@ -31,9 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
 use rusqlite::{Connection, OpenFlags};
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -80,7 +78,6 @@ struct Baf2SqlApi {
     get_last_error_string: GetLastErrorString,
     array_get_num_elements: ArrayGetNumElements,
     array_read_double: ArrayReadDouble,
-    library_path: PathBuf,
 }
 
 impl Baf2SqlApi {
@@ -124,7 +121,6 @@ impl Baf2SqlApi {
                 get_last_error_string,
                 array_get_num_elements,
                 array_read_double,
-                library_path,
             })
         }
     }
@@ -191,11 +187,7 @@ impl Baf2SqlApi {
                 self.last_error()
             );
         }
-        Ok(BafStorage {
-            api: self.clone(),
-            handle,
-            calibration_used: calibration,
-        })
+        Ok(BafStorage { api: self.clone(), handle })
     }
 
     fn last_error(&self) -> String {
@@ -250,7 +242,6 @@ impl BafCalibrationMode {
 struct BafStorage {
     api: Baf2SqlApi,
     handle: u64,
-    calibration_used: BafCalibrationMode,
 }
 
 impl BafStorage {
@@ -681,12 +672,11 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 /// A Bruker BAF `.d` reader yielding one [`MultiLayerSpectrum`] per spectrum,
 /// built the same way [`crate::bruker_tsf::TsfReader`] builds its spectra.
 pub struct BafReader {
-    baf_file: PathBuf,
     rows: Vec<BafSpectrumRow>,
     storage: BafStorage,
     /// When true, read profile arrays for spectra that have them; otherwise
-    /// default to line arrays (finding 2). Currently always false (line-first);
-    /// kept as a field so a profile-requesting entry point is a one-liner.
+    /// default to line arrays (finding 2). Set from `--representation profile`
+    /// (see `open_with`); every other representation reads line-first.
     prefer_profile: bool,
     /// Finding 10: the baf2sql_c storage handle is not known to be thread-safe,
     /// and FFI calls through it must not happen concurrently. A raw-pointer
@@ -736,7 +726,6 @@ impl BafReader {
         )?;
 
         Ok(Self {
-            baf_file: paths.baf_file,
             rows,
             storage,
             prefer_profile,
@@ -746,14 +735,6 @@ impl BafReader {
 
     pub fn len(&self) -> usize {
         self.rows.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    pub fn baf_file(&self) -> &Path {
-        &self.baf_file
     }
 
     /// Choose which `(m/z id, intensity id)` pair and continuity to read for a
@@ -822,6 +803,20 @@ impl BafReader {
             .get(i)
             .with_context(|| format!("BAF spectrum index {i} out of range"))?;
         let ms_level = checked_baf_ms_level_to_public(row.ms_level)?;
+        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
+        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
+        // otherwise indistinguishable from a complete one. The isolation data lives in the cache's
+        // `Steps` table; not read yet.
+        if ms_level > 1 {
+            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+            PRECURSOR_GAP_SAID.call_once(|| {
+                log::warn!(
+                    "Bruker BAF (baf2sql): this reader does not yet extract precursors; \
+                     MS2 rows will have none (no selected ion, isolation window or collision energy \
+                     in the archive)"
+                );
+            });
+        }
         let (mz, intensity, continuity) = self.peaks(row)?;
 
         let mut arrays = BinaryArrayMap::new();
@@ -851,12 +846,10 @@ impl BafReader {
             polarity: baf_polarity(row.polarity),
             ..Default::default()
         };
-        descr.add_param(
-            Param::builder()
-                .name("mass spectrum")
-                .curie(curie!(MS:1000294))
-                .build(),
-        );
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
         let mut scan = ScanEvent::default();
         scan.start_time = row.retention_time_seconds / 60.0; // mzdata scan start_time is minutes
         descr.acquisition.scans.push(scan);
@@ -864,22 +857,6 @@ impl BafReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet
-    /// schema (mirrors `TsfReader::sample_arrays`).
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let i = (0..self.len())
-            .find(|&i| {
-                matches!(
-                    Self::select_pair(&self.rows[i], self.prefer_profile),
-                    (Some(_), Some(_), _)
-                )
-            })
-            .unwrap_or(0);
-        self.spectrum(i)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 #[cfg(test)]
