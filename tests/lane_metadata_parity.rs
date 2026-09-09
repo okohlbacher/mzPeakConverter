@@ -62,46 +62,32 @@ const EXPECTED: &[Expected] = &[
     Expected {
         key: "software.ids",
         kind: Kind::Defect,
-        reason: "the mzML lane inherits the acquisition software and pwiz from the mzML softwareList; \
-                 a native lane knows only itself. Recording the vendor's acquisition-software version \
-                 natively would need a new field from each vendor SDK.",
+        reason: "the native Shimadzu lane still records no acquisition software (LabSolutions version needs a glue export); elsewhere the difference is ProteoWizard's own entries (pwiz, pwiz_Reader_*) and the vendor's FULL version string the native lane carries (`MassHunter GC/MS Acquisition 10.0.368 …`, `MassLynx 4.1 SCN916`) where pwiz prints `8.0` / `4.1`.",
     },
     Expected {
         key: "file_description.source_files.count",
-        kind: Kind::Defect,
-        reason: "ProteoWizard enumerates every member of the acquisition directory; the native lanes \
-                 synthesise ONE entry for the input path (`fixup_run_metadata`).",
+        kind: Kind::ByDesign,
+        reason: "ProteoWizard lists whatever sits in the acquisition directory, AppleDouble `._*` siblings of the box's copy included (blank1: 17 entries, 9 of them `._*` with one shared bogus digest); the native lane lists the vendor's members (Agilent AcqData files, Bruker analysis.tdf/tsf + _bin, Waters _FUNCnnn.DAT and side files, WIFF + WIFF.scan) with their real SHA-1s.",
     },
     Expected {
         key: "file_description.source_files.with_checksum",
-        kind: Kind::Defect,
-        reason: "only the Shimadzu lane passes a source digest through `VendorHints.source_sha1`; \
-                 nothing hashes the members of a directory input. Backlog: per-member SHA-1 for \
-                 directory inputs.",
+        kind: Kind::ByDesign,
+        reason: "follows source_files.count (every member the native lane lists is digested).",
     },
     Expected {
         key: "file_description.source_files.names",
-        kind: Kind::Defect,
-        reason: "same cause as the count: one synthesised entry versus the vendor directory listing.",
+        kind: Kind::ByDesign,
+        reason: "follows source_files.count.",
     },
     Expected {
         key: "instrument.components",
-        kind: Kind::Defect,
-        reason: "only the Shimadzu lane builds ion-source/analyser/detector components; the other \
-                 native lanes emit a configuration with parameters but no components.",
+        kind: Kind::ByDesign,
+        reason: "the native lanes assert only what the vendor file states — the analyzers a device type implies (Agilent Devices.xml), ESI + quadrupole + TOF from the Shimadzu device id, the TOF of a timsTOF — never a guessed source or detector; ProteoWizard adds hand-tabled sources and detectors per vendor (EI + electron multiplier for a 5977, nanospray + MCP + PMT for a timsTOF).",
     },
     Expected {
         key: "instrument.param_accessions",
-        kind: Kind::Defect,
-        reason: "the mzML lane carries the vendor-specific model term and the serial number \
-                 (MS:1000529) that ProteoWizard read from the acquisition directory; the native lanes \
-                 emit what their SDK hands back, which is usually a device-type string only.",
-    },
-    Expected {
-        key: "instrument.serial",
-        kind: Kind::Defect,
-        reason: "the serial lives in the vendor's own device table (for Agilent, plainly in \
-                 AcqData/Devices.xml); no native lane reads it yet.",
+        kind: Kind::ByDesign,
+        reason: "the native lanes carry the vendor's model string as the MS:1000031 value beside the family term (MS:1000490 Agilent, MS:1002998 Shimadzu, MS:1000126 Waters, MS:1003123 timsTOF, MS:1000121 SciEX) and the file's model number / instrument name as user params; ProteoWizard maps the string to a specific CV term through a hand-curated table and drops the string.",
     },
     Expected {
         key: "chromatograms.inventory",
@@ -115,16 +101,10 @@ const EXPECTED: &[Expected] = &[
         reason: "follows chromatograms.inventory: the device traces carry most of the points.",
     },
     Expected {
-        key: "facet.chromatograms_metadata.parquet.rows",
-        kind: Kind::Defect,
-        reason: "follows chromatograms.inventory.",
-    },
-    Expected {
         key: "data_processing.count",
-        kind: Kind::Defect,
-        reason: "the mzML lane inherits ProteoWizard's processing entries in addition to ours.",
+        kind: Kind::ByDesign,
+        reason: "the mzML lane inherits ProteoWizard's own conversion entry beside ours; a native lane has no such step to inherit.",
     },
-    // --- encoding, not metadata loss: the two lanes legitimately choose different layouts ---
     Expected {
         key: "index.metadata.keys",
         kind: Kind::ByDesign,
@@ -159,12 +139,6 @@ const EXPECTED: &[Expected] = &[
         reason: "same: chunk rows versus point rows.",
     },
     Expected {
-        key: "spectra_metadata.mz_delta_model.nonnull",
-        kind: Kind::ByDesign,
-        reason: "set only by the chunked layout's delta model.",
-    },
-    // --- surfaced by the first four pairs (Shimadzu .lcd, 2x SciEX .wiff, Agilent GC-MS .d) -----
-    Expected {
         key: "cv.ids",
         kind: Kind::ByDesign,
         reason: "the native lanes declare the converter's own MZP vocabulary because they emit MZP \
@@ -194,28 +168,13 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "run.start_time",
-        kind: Kind::Defect,
-        reason: "the mzML lane inherits the acquisition timestamp; no native lane reads it. The \
-                 Shimadzu lane declines it deliberately (SampleInfo.AnalysisDate is a naive local \
-                 time and mzdata's field carries an offset), but the others simply never ask.",
+        kind: Kind::ByDesign,
+        reason: "the lanes read different things. A vendor-STATED offset is carried verbatim by the native lane (Agilent Contents.xml 13:11:27-04:00 = 17:11Z) while ProteoWizard shifts the same clock by the CONVERTING host's zone (18:11Z on blank1 — wrong by an hour); a vendor time WITHOUT a zone (Waters _HEADER.TXT, Shimadzu AnalysisDate, SciEX) stays null on the native lane and is preserved verbatim in the acquisition_time index block, while ProteoWizard labels the same wall clock Z (Capan2) — a claim the native lane refuses to make.",
     },
     Expected {
         key: "file_description.contents",
-        kind: Kind::Defect,
-        reason: "the native lanes state only the generic MS:1000294 'mass spectrum'; the mzML lane \
-                 carries the specific contents (MS1 spectrum, SRM chromatogram) ProteoWizard derived.",
-    },
-    Expected {
-        key: "chromatograms_metadata.*",
-        kind: Kind::Defect,
-        reason: "follows chromatograms.inventory — the native lanes write only the synthesised \
-                 TIC/BPC, so every per-chromatogram column is populated for 2 rows instead of N.",
-    },
-    Expected {
-        key: "facet.chromatograms_metadata_precursors.parquet.rows",
-        kind: Kind::Defect,
-        reason: "an SRM chromatogram carries its precursor (Q1) and product (Q3); the native lanes \
-                 write no SRM chromatograms, so no chromatogram precursors either.",
+        kind: Kind::ByDesign,
+        reason: "the native lane states what it wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram); ProteoWizard's list is per-vendor and inconsistent — its Waters reader says `MS1 spectrum` only while writing 136,400 MS2 spectra with precursors (Capan2).",
     },
     Expected {
         key: "facet.chromatograms_data.parquet.columns",
@@ -224,42 +183,73 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "sample.count",
-        kind: Kind::Defect,
-        reason: "the vendor file names its sample(s) — a SciEX .wiff carries a sample list, and \
-                 ProteoWizard turns it into a `sample_list` entry. No native lane reads it, so the \
-                 sample identity (name, and any vendor sample fields) is dropped.",
+        kind: Kind::ByDesign,
+        reason: "the native lane carries the vendor's sample (Waters `Acquired Name`, Bruker SampleName, Agilent sample_info.xml, the selected WIFF sample) where ProteoWizard writes none (Waters, Bruker) or an unnamed one (Agilent).",
     },
     Expected {
         key: "run.id",
         kind: Kind::Defect,
-        reason: "same cause: the mzML lane's run id is '<file stem>-<sample name>' because \
-                 ProteoWizard knew the sample; the native lanes fall back to the file stem alone \
-                 (`fixup_run_metadata`).",
+        reason: "ProteoWizard names a WIFF run after its SAMPLE (En_PPY: the sample name), the native lane after the file stem; pwiz's XML-id escaping of a leading digit (`_x0032_0181203…`) is decoded before comparing, so only the SciEX naming rule remains.",
     },
-    // --- MRM/SIM: the two lanes disagree about what the data ARE ------------------------------
     Expected {
         key: "facet.spectra_metadata.parquet.rows",
-        kind: Kind::Defect,
-        reason: "MRM/SIM acquisitions: the vendor SDKs present each dwell as a one-point spectrum, so \
-                 a native lane writes N one-point 'spectra' where the data are transition \
-                 chromatograms. Agilent refuses such runs (agl::is_dwell_only) and routes them to \
-                 msconvert; the SciEX lane has no such guard and stores them.",
+        kind: Kind::ByDesign,
+        reason: "Waters ion mobility: the native lane writes one FRAME per MassLynx scan (Capan2: 1,989 rows, each carrying every drift bin's points with a per-point raw_ion_mobility array — verified bin for bin against pwiz), where ProteoWizard writes one spectrum per drift bin (397,800 = 1,989 × 200). Same data, 200× fewer rows.",
     },
     Expected {
         key: "facet.spectra_metadata_scans.parquet.rows",
-        kind: Kind::Defect,
-        reason: "follows the spectra row count on MRM/SIM acquisitions.",
+        kind: Kind::ByDesign,
+        reason: "follows facet.spectra_metadata.parquet.rows (frames vs drift bins).",
     },
     Expected {
         key: "spectra_metadata.*",
-        kind: Kind::Defect,
-        reason: "follows the spectra row count: on an MRM/SIM unit one lane has spectra and the other \
-                 has none, so every per-spectrum column differs in population.",
+        kind: Kind::ByDesign,
+        reason: "follows facet.spectra_metadata.parquet.rows: every per-row count is 200× smaller on the frame side, and the VALUES agree — Capan2 ms levels 1,307 MS1 / 682 MS2 natively vs 261,400 / 136,400 per bin (× 200 exactly), RT, polarity and scan window now come from the SDK on every row. The SciEX MRM rows this rule was first written for are refused to the msconvert lane.",
     },
     Expected {
         key: "spectra_metadata_scans.*",
-        kind: Kind::Defect,
-        reason: "follows the spectra row count on MRM/SIM acquisitions.",
+        kind: Kind::ByDesign,
+        reason: "follows spectra_metadata.* (frames vs drift bins; RT and scan window present on every native row).",
+    },
+    Expected {
+        key: "instrument.model",
+        kind: Kind::ByDesign,
+        reason: "the native lane carries the vendor's model string as the MS:1000031 value (Devices.xml Name, Shimadzu SystemName, Waters _HEADER.TXT Instrument, Clearcore2 InstrumentName); ProteoWizard keeps it in a user param or maps it to a specific term.",
+    },
+    Expected {
+        key: "sample.names",
+        kind: Kind::ByDesign,
+        reason: "follows sample.count: the native lane's sample carries the vendor's name; ProteoWizard's, where it exists, is unnamed.",
+    },
+    Expected {
+        key: "acquisition_time.wall_clock",
+        kind: Kind::ByDesign,
+        reason: "the native lane's record of a vendor wall clock that has no zone; the mzML lane has no such block (it labelled the same clock Z or shifted it).",
+    },
+    Expected {
+        key: "file_description.source_files.digests",
+        kind: Kind::ByDesign,
+        reason: "follows source_files.count: the AppleDouble entries in ProteoWizard's list carry one shared bogus digest; the members both lanes list agree byte for byte (measured on blank1's eight AcqData files).",
+    },
+    Expected {
+        key: "facet.spectra_metadata_precursors.parquet.rows",
+        kind: Kind::ByDesign,
+        reason: "frames vs drift bins: the native Waters lane writes one precursor per MSn FRAME (Capan2: 682, one per elevated-energy MSe scan, from the SDK's scan items SET_MASS / COLLISION_ENERGY), where ProteoWizard writes its MSe placeholder precursor on each of the 136,400 drift-bin spectra it expands them into (682 × 200).",
+    },
+    Expected {
+        key: "facet.spectra_metadata_selected_ions.parquet.rows",
+        kind: Kind::ByDesign,
+        reason: "an MSe elevated-energy scan selects nothing (SET_MASS = 0): both lanes state the acquisition range as the isolation window (target = midpoint), but the native lane writes no selected ion where ProteoWizard writes a placeholder ion at the midpoint on every drift-bin spectrum. A DDA function (SET_MASS > 0) gets a selected ion and a target-only window on both lanes.",
+    },
+    Expected {
+        key: "spectra_metadata_precursors.*",
+        kind: Kind::ByDesign,
+        reason: "follows the two row rules: ×200 rows on the pwiz side; the same acquisition-range MSe window on both, but the mzML twin carries only one offset (mzdata reads the lower one as 0) and the native lane adds the method's transfer-energy ramp (MS:1002013/1002014) and the window-source parameter.",
+    },
+    Expected {
+        key: "spectra_metadata_selected_ions.*",
+        kind: Kind::ByDesign,
+        reason: "follows facet.spectra_metadata_selected_ions.parquet.rows.",
     },
 ];
 
@@ -374,6 +364,28 @@ fn facet_population(archive: &Path, member: &str, dir: &Path, into: &mut Surface
     let _ = std::fs::remove_file(&p);
 }
 
+/// ProteoWizard escapes characters an XML id may not start with as `_xHHHH_` (`_x0032_0181203…`
+/// for a run whose name starts with a digit). The native lane uses the plain stem.
+fn decode_pwiz_id(v: &str) -> String {
+    let mut out = String::new();
+    let mut rest = v;
+    while let Some(i) = rest.find("_x") {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        if tail.len() >= 8 && &tail[6..8] == "_" && tail[2..6].chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Some(ch) = u32::from_str_radix(&tail[2..6], 16).ok().and_then(char::from_u32) {
+                out.push(ch);
+                rest = &tail[8..];
+                continue;
+            }
+        }
+        out.push_str("_x");
+        rest = &tail[2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn json_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
     let mut cur = v;
     for p in path {
@@ -410,20 +422,32 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     if let Some(t) = meta.get("transformations") {
         s.insert("transformations".into(), t.to_string());
     }
+    if let Some(a) = meta.get("acquisition_time") {
+        s.insert("acquisition_time.wall_clock".into(), a.get("wall_clock").map(|v| v.to_string()).unwrap_or_default());
+    }
 
     // --- run ----------------------------------------------------------------------------------
     if let Some(run) = meta.get("run") {
         for f in ["default_instrument_id", "default_source_file_id", "default_data_processing_id"] {
             s.insert(format!("run.{f}"), run.get(f).map(|v| v.to_string()).unwrap_or_else(|| "absent".into()));
         }
+        // The INSTANT, in UTC, so a vendor-stated offset and ProteoWizard's host-zone shift are
+        // compared as values (presence-only let a wrong-by-hours time pass as "identical").
         s.insert(
             "run.start_time".into(),
-            if run.get("start_time").is_some_and(|v| !v.is_null()) { "set" } else { "null" }.into(),
+            run.get("start_time")
+                .and_then(|v| v.as_str())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.to_utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "null".into()),
         );
         // The id itself is the run stem on both lanes; compare only its shape, not the string.
         s.insert(
             "run.id".into(),
-            run.get("id").and_then(|v| v.as_str()).map(|v| if v.is_empty() { "empty".into() } else { v.to_string() }).unwrap_or("absent".into()),
+            run.get("id")
+                .and_then(|v| v.as_str())
+                .map(|v| if v.is_empty() { "empty".into() } else { decode_pwiz_id(v) })
+                .unwrap_or("absent".into()),
         );
     }
 
@@ -435,8 +459,21 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     let mut names: Vec<String> = sfs.iter().filter_map(|sf| sf.get("name").and_then(|v| v.as_str()).map(str::to_string)).collect();
     names.sort();
     s.insert("file_description.source_files.names".into(), names.join(","));
+    let mut digests: Vec<String> = sfs
+        .iter()
+        .filter_map(|sf| {
+            let name = sf.get("name").and_then(|v| v.as_str())?;
+            let sha = sf.get("parameters")?.as_array()?.iter().find(|p| p.get("accession").and_then(|a| a.as_str()) == Some("MS:1000569"))?;
+            let hex = sha.get("value").and_then(|v| v.get("string").or(Some(v))).and_then(|v| v.as_str()).unwrap_or("?");
+            Some(format!("{}={hex}", name.to_ascii_lowercase()))
+        })
+        .collect();
+    digests.sort();
+    s.insert("file_description.source_files.digests".into(), digests.join(","));
     if let Some(c) = json_at(&meta, &["file_description", "contents"]) {
-        s.insert("file_description.contents".into(), c.to_string());
+        let mut accs: Vec<String> = c.as_array().map(|a| a.iter().filter_map(|p| p.get("accession").and_then(|x| x.as_str()).map(str::to_string)).collect()).unwrap_or_default();
+        accs.sort();
+        s.insert("file_description.contents".into(), accs.join(","));
     }
 
     // --- instrument configurations ------------------------------------------------------------
@@ -444,19 +481,29 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     s.insert("instrument.configs".into(), configs.len().to_string());
     let mut accs: BTreeSet<String> = BTreeSet::new();
     let mut components = 0usize;
-    let mut serial = "absent";
+    let mut serial = "absent".to_string();
+    let mut model = "absent".to_string();
+    let value_of = |p: &serde_json::Value| -> String {
+        let v = p.get("value").cloned().unwrap_or_default();
+        v.get("string").or(v.get("float")).or(v.get("integer")).cloned().unwrap_or(v).to_string().trim_matches('"').to_string()
+    };
     for c in &configs {
         for p in params_of(c) {
-            if p == "MS:1000529" {
-                serial = "present";
-            }
             accs.insert(p);
+        }
+        for p in c.get("parameters").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            match p.get("accession").and_then(|a| a.as_str()) {
+                Some("MS:1000529") => serial = value_of(&p),
+                Some("MS:1000031") => model = value_of(&p),
+                _ => {}
+            }
         }
         components += c.get("components").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
     }
     s.insert("instrument.param_accessions".into(), accs.iter().cloned().collect::<Vec<_>>().join(","));
     s.insert("instrument.components".into(), components.to_string());
-    s.insert("instrument.serial".into(), serial.into());
+    s.insert("instrument.serial".into(), serial);
+    s.insert("instrument.model".into(), model);
 
     // --- the other lists ----------------------------------------------------------------------
     for (key, field) in [
@@ -468,12 +515,23 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     ] {
         let arr = meta.get(field).and_then(|v| v.as_array()).cloned().unwrap_or_default();
         if key.ends_with(".ids") {
-            let mut ids: Vec<String> =
-                arr.iter().filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(str::to_string)).collect();
+            let mut ids: Vec<String> = arr
+                .iter()
+                .filter_map(|e| {
+                    let id = e.get("id").and_then(|v| v.as_str())?;
+                    let version = e.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(if version.is_empty() { id.to_string() } else { format!("{id}@{version}") })
+                })
+                .collect();
             ids.sort();
             s.insert(key.into(), ids.join(","));
         } else {
             s.insert(key.into(), arr.len().to_string());
+        }
+        if key == "sample.count" {
+            let mut names: Vec<String> = arr.iter().filter_map(|e| e.get("name").and_then(|v| v.as_str()).map(str::to_string)).collect();
+            names.sort();
+            s.insert("sample.names".into(), names.join(","));
         }
     }
 
@@ -651,16 +709,13 @@ fn unexpected_and_stale() {
     }
     let _ = std::fs::remove_dir_all(&scratch);
     let stale: Vec<&str> = EXPECTED.iter().map(|e| e.reason).filter(|r| !fired.contains(r)).collect();
-    // Not an assertion: which rules fire depends on WHICH pairs are present (a Shimadzu pair does
-    // carry a source checksum, an Agilent one does not). Report so the list can be pruned when the
-    // pair set is broad enough to justify it.
-    if !stale.is_empty() {
-        println!(
-            "{} EXPECTED rule(s) did not fire on this pair set — closed, or never applicable here:",
-            stale.len()
-        );
-        for r in stale {
-            println!("  - {r}");
-        }
-    }
+    // An assertion since 0.12: a rule that fires on no pair either records a loss that has been
+    // CLOSED (delete it, the parity is the proof) or never matched anything. Which rules fire does
+    // depend on which pairs are present, so the pair set must stay broad (one unit per native lane).
+    assert!(
+        stale.is_empty(),
+        "{} EXPECTED rule(s) did not fire on this pair set — closed, or never applicable here; prune them:\n  - {}",
+        stale.len(),
+        stale.join("\n  - ")
+    );
 }

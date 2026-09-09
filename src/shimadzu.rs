@@ -334,6 +334,10 @@ pub struct ShimadzuInstrumentInfo {
     pub device_id: Option<String>,
     /// e.g. `ESI`.
     pub ionization: Option<String>,
+    /// `SampleInfo.AnalysisDate` as the DLL rendered it: a naive local time with no zone. Never
+    /// becomes `run.start_time` (that would assert a zone the vendor did not state); preserved
+    /// verbatim in the `acquisition_time` index block by `run_metadata`.
+    pub analysis_date: Option<String>,
 }
 
 pub struct ShimadzuReader {
@@ -456,17 +460,12 @@ impl ShimadzuReader {
         let text = String::from_utf16_lossy(&buf[..n]);
         let mut fields = text.split('\u{1F}').map(|f| f.trim().to_string());
         let mut next = || fields.next().filter(|f| !f.is_empty());
-        ShimadzuInstrumentInfo {
-            system_name: next(),
-            device_id: next(),
-            // Slot 3 is `SampleInfo.AnalysisDate`: a naive local time with no zone, deliberately
-            // not recorded (writing it would assert a zone the vendor never stated). Consumed so
-            // the ionization field keeps its position.
-            ionization: {
-                let _analysis_date = next();
-                next()
-            },
-        }
+        let system_name = next();
+        let device_id = next();
+        // Slot 3 is `SampleInfo.AnalysisDate`: a naive local time with no zone — kept as text.
+        let analysis_date = next();
+        let ionization = next();
+        ShimadzuInstrumentInfo { system_name, device_id, ionization, analysis_date }
     }
 
     /// Does this `.lcd` store profile signal at all? Probes the head of the run plus a stride

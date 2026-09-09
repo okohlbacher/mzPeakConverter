@@ -6,11 +6,145 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-**Output change.** Archives of a centroid ion-mobility mzML gain the per-peak mobility column
-they were missing (below); nothing else changes bytes. The corpus rebuild picks them up.
+**Output change.** The native lanes now write run metadata they used to drop (below), the Bruker
+TSF lane writes precursors, and the SciEX native lane refuses MRM/SIM dwell runs. Archives of
+those lanes written by 0.11.2 are not current; the corpus is rebuilt once with the next release.
+
+### Added
+
+- **Run metadata the vendor states, read natively (`src/run_metadata.rs`).** Measured by
+  `tests/lane_metadata_parity.rs` on 2026-09-07, the native lanes carried none of the run-level
+  metadata the mzML lane inherits from ProteoWizard: no sample, no acquisition time, no serial,
+  no vendor model term, no acquisition-software version, one synthesised source-file entry
+  instead of the digested members, and a generic `file_description.contents`. A shared seam now
+  merges what each vendor file STATES onto the archive, field by field and idempotently, and
+  every lane declares its members with MS:1000569 SHA-1s:
+  - **Bruker TDF/TSF** — `GlobalMetadata` (`analysis.tdf`/`analysis.tsf`, read-only): timsTOF
+    family term MS:1003123, `InstrumentName` as the MS:1000031 value, serial, TOF analyzer,
+    `AcquisitionSoftware` + version (MS:1000692), `SampleName`, the zoned
+    `AcquisitionDateTime`; members `analysis.tdf` + `analysis.tdf_bin` (MS:1002817/MS:1002818) or
+    `.tsf` + `.tsf_bin` (MS:1003282/MS:1003283). A 0-byte `analysis.tsf` beside a real `.tdf`
+    (PXD076703) no longer wins the lookup.
+  - **Agilent `.d`** (`src/agilent_meta.rs`, any host) — `AcqData/Devices.xml` (MS:1000490,
+    model name, model number, serial, the analyzers the device type implies), `Contents.xml`
+    (`AcquiredTime` WITH its stated UTC offset, MassHunter MS:1000678 + `AcqSoftwareVersion`),
+    `sample_info.xml` (sample name); members = the AcqData files ProteoWizard lists, minus
+    exported text formats and dot/AppleDouble names.
+  - **Waters `.raw`** (`src/waters_meta.rs`, any host) — `_HEADER.TXT` (`Instrument` →
+    MS:1000126 + model + serial unless `#NotSet`, `Acquired Name` + descriptors → sample,
+    `Acquired Date/Time`), `_extern.inf` (`Created by` → MassLynx MS:1000534 version); members
+    `_FUNCnnn.DAT` in numeric order (Waters nativeID format) then the side files.
+  - **SciEX `.wiff`** (glue `RunInfo`/`RunString`, Windows) — MS:1000121 + `InstrumentName`,
+    serial, Analyst MS:1000551 + `SoftwareVersion` (e.g. `SCIEX OS 3.0.0.3339`), the sample's
+    name, `AcquisitionDateTime`; members `.wiff` + `.wiff.scan` (MS:1000562/MS:1000770),
+    digested BEFORE Clearcore2 opens them.
+  - **Shimadzu `.lcd`** — the MS:1002998 family term beside the `SystemName` value;
+    `SampleInfo.AnalysisDate`.
+  `file_description.contents` now states what was written (MS1/MSn spectrum, centroid/profile,
+  TIC chromatogram) instead of the generic `mass spectrum` (the adapter injects MS:1000294 only
+  when no data-file-content child is present).
+- **Acquisition time policy.** A vendor time WITH a stated offset (Agilent `Contents.xml`,
+  Bruker `GlobalMetadata`) becomes `run.start_time` verbatim. A wall clock WITHOUT a zone
+  (Waters, Shimadzu, SciEX) does NOT: RFC 3339 has no "zone unknown", so `run.start_time` stays
+  null and the clock is preserved verbatim in a `metadata.acquisition_time` index block
+  `{wall_clock, zone: "unstated", source, note}`. ProteoWizard labels the same clock `Z`
+  (Capan2) or shifts a stated one by the CONVERTING host's zone (blank1: 18:11Z for a file that
+  says 13:11:27-04:00 = 17:11Z) — claims the native lane refuses to make.
+- **Bruker TSF precursors.** Every MS2 frame carries its `FrameMsMsInfo` row: selected ion
+  `TriggerMass` with the stated charge (unstated stays null), isolation window ±`IsolationWidth`/2
+  (target only when the width is unstated), CID with the signed `CollisionEnergy`,
+  `precursor_id = frame=<Parent>` so `precursor_index` resolves. 30/30 against the pwiz twin of
+  the urine fixture. Pinned by `tests/run_metadata_native.rs` (set `MZPC_TSF_FIXTURE`).
+- **Waters ion mobility (HDMSe / HDDDA) read natively, as frames.** The native `.raw` lane read the
+  drift-SUMMED spectrum (`readScan`) and lost the drift dimension: Capan2 (Synapt G2-Si HDMSe) came
+  out as 1,989 summed scans where ProteoWizard writes 397,800 per-drift-bin spectra (1,989 × 200).
+  Every function whose `_funcNNN.cdt` exists and whose `getDriftScanCount` is > 0 is now read bin by
+  bin (`readDriftScan`) and written as ONE spectrum per MassLynx scan — a frame — whose points are
+  sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1003007, ms), the
+  shape of pwiz's own `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane. The
+  frame states its drift-time bounds (MS:1003439/1003440), `transformations` gains `sort-by-mz`,
+  and a `waters_drift` index block carries the run's bin → ms table, `mob_cal.csv` verbatim, the
+  lock-mass function and the functions that were not written (below). Frames are written with the
+  writer's zero-run mask OFF — in the interleaved frame a run of zeros is several bins' trace
+  boundaries meeting, and the mask kept only its first and last zero — so every point MassLynx
+  returns is stored, and the spectra are in acquisition-time order across functions, as pwiz orders
+  them. Verified bin by bin against pwiz's per-bin spectra on Capan2 frames of every function:
+  on nine frames of functions 1–3 the non-zero point multisets and intensities are identical in
+  1,799/1,799 populated bins, m/z within 2.6e-7 (numpress on both sides), the drift table identical,
+  frame TIC = Σ pwiz per-bin TIC, RT identical; the only difference is MassLynx's two zero-intensity
+  sentinel points at the scan-window bounds (m/z 49.98 and 600.06 on Capan2) that every bin carries —
+  the native lane keeps them, pwiz strips them. The frame archive is 531 MB where the per-bin twin is 965 MB and the summed archive was
+  166 MB.
+  **Per-scan metadata and precursors from the SDK.** Retention time (`getRetentionTime`; it was 0.0
+  on every row), polarity (`getIonMode`), scan window (`getAcquisitionMassRange`), the MS level from
+  the function-type CODE (`getFunctionType`, pwiz's table: MSMS / MS2 / TOFD / QUAD AUTO DAU are MS2,
+  the second function of an MSe pair is MS2, every other MS function is MS1; SIR / MRM / NL / NG
+  functions are chromatograms and DAD / DLY / CAT / OFF / PSD / AutoSpec ones are not spectra — both
+  are skipped with a log line, and a file with no spectrum function is refused with the msconvert
+  remedy), the lock-mass function (`getLockMassFunction`, else the method's REFERENCE section) and
+  the **scan items** through the MassLynx parameters object (`createParameters` /
+  `getScanItemsInFunction` / `getScanItemValue`): SET_MASS > 0 becomes a selected ion with a
+  target-only isolation window, COLLISION_ENERGY the activation energy (beam-type CID), and an MSe
+  elevated-energy scan whose set mass is 0 gets a precursor whose isolation window IS the function's
+  acquisition mass range (target = midpoint, bounds = the range) with an activation parameter
+  `isolation window source = acquisition mass range` and no selected ion — ProteoWizard's convention,
+  adopted after establishing that nothing in the file or the DLL states any narrower window (the
+  quadrupole is non-resolving in MSe; `getFunction/IndexPrecursorMassRange` and `getPrecursorMass`
+  answer only for SONAR, and the DDA processor's quad-isolation-window parameters are 0/0 unless a
+  `_dda.inf` sidecar supplies them). A DDA set mass keeps its target-only window: its width is not
+  stated either; the tune page's quadrupole settings (`LM/HM Resolution`, `MS Profile Type`,
+  `MSProfileMass/Dwell/Ramp 1..3`) travel verbatim as instrument-configuration parameters so a reader can
+  bound the RF-only pass band (Capan2: 682 precursor rows on the 682 high-energy scans, where pwiz writes the same
+  window on each of the 136,400 drift-bin spectra). On a Fast-DDA HDDDA run (PXD073126, ten IMS functions) the frames are identical to pwiz's bins the
+  same way and 600/600 precursor rows agree with pwiz's (selected ion, target-only window, CE). The
+  transfer collision-energy ramp
+  comes from the method text (`_extern.inf`) as MS:1002013/1002014. `SONAR Enabled` is read per
+  function: a SONAR function's bins are quadrupole positions, not drift times, so it is written as the
+  drift-summed scan with a warning and `sonar: true` in the block rather than mislabelled as drift
+  (`sonar_checked` is false when the file's item table has no such item — Capan2's 44-entry table). **Collapsed retention-time functions** (Capan2 functions 4–6:
+  one row per drift bin whose "retention time" is the drift table — run-summed mobilograms of
+  functions 1–3, which pwiz writes as 200 × 200 mostly empty spectra) are recognised structurally
+  and not written as spectra (`MZPC_WATERS_KEEP_COLLAPSED=1` keeps them). The C shapes of all these
+  exports differ from what pwiz's C++ wrapper suggests and were established by probing on the box
+  (`src/waters.rs` header): `getDriftTime` has no function argument, `getAcquisitionMassRange` has
+  a fifth, function type and ion mode come back as codes, and scan items are reachable only through
+  the parameters object (the DLL's item table starts at 401).
+- **Shimadzu acquisition start, sample and LabSolutions version from the `.lcd` itself
+  (`src/shimadzu_meta.rs`, any host).** The file's OLE2 `File Property` stream holds
+  `SampleInfo.DateTime` as a UTC FILETIME (split into `dwLow/dwHighDateTime`) beside the writing PC's
+  own GMT offset (`szLocGMTDiffGenDateTime`, `+01'00'`), so the native lane now writes a fully zoned
+  `run.start_time` (Blind: `2024-02-15T11:47:18.756+01:00`), the sample name/id/vial/operator/
+  injection volume and `LabSolutions 5.114`. Established by a byte-level search of the file (the
+  OLE2 directory FILETIMEs and the MS-CAB local stamps inside the same file agree on UTC and on the
+  +1 h). The vendor DLL exposes the same instant as `SampleInfo.AnalysisDate`, which comes back empty
+  in this converter's .NET 8 host; ProteoWizard reads it and then shifts it by the CONVERTING host's
+  current offset (`adjustUnknownTimeZonesToHostTimeZone`), writing `08:47:18Z` — two hours early.
+  The `cfb` crate is a new dependency.
+- **`--sample N`** selects the sample of a multi-sample WIFF (1-based; the msconvert lane maps it
+  to `--runIndexSet N-1`). A multi-sample WIFF without `--sample` is refused and lists its samples.
 
 ### Fixed
 
+- **The writer masked zero-intensity runs on every profile spectrum of the chunked data facet,
+  whatever it was built with.** `write_spectrum` passed `is_profile` where the chunk builder expects
+  the `drop_zero_intensity` flag, so `mask_zero_intensity_runs = false` never reached the data facet.
+  No released archive changes — every lane passed `true` and declared `zero-run-mask` — but the
+  Waters frame lane, the first to turn the mask off, still lost its bins' zero flanks until this
+  fix. `tests/frame_zero_runs.rs` pins it: a four-bin interleaved frame round-trips 56/56 points
+  with the mask off under numpress, delta and basic chunking, and 52/56 with it on.
+
+- **SciEX MRM/SIM dwell runs are refused by the native lane** (`En_PPY.wiff`,
+  `IPX0002633001_D-239.wiff` in the corpus): it stored each dwell as a one-point spectrum without
+  its transition (154,520 and 2,215 "spectra"), where msconvert writes SRM chromatograms with Q1/Q3,
+  compound and collision energy. The glue classifies every experiment by type; a run whose
+  experiments are all MRM/SIM dwells exits 1 naming `--via-msconvert`, and the box harness routes
+  it there (`tools/box_convert_remote.ps1`). MRM-HR (scan) runs still convert natively. Unreadable
+  samples are refused too, instead of being read as empty.
+- **Target-only isolation windows keep NULL offsets.** An isolation window whose width the
+  source does not state was written with lower/upper offsets of ±target (measured on RS080806,
+  Minimal_DDA and En_PPY). Pinned by `tests/fixtures/target_only_window.mzML`.
+**Output change.** Archives of a centroid ion-mobility mzML gain the per-peak mobility column
+they were missing (below); nothing else changes bytes. The corpus rebuild picks them up.
 - **The mzML lane silently dropped the per-peak ion-mobility array of a CENTROID IMS spectrum.**
   mzdata's mzML reader builds a `CentroidPeak` set eagerly for every centroid spectrum, and the
   vendored writer followed `peaks()` for both the peak-facet schema
@@ -44,8 +178,18 @@ they were missing (below); nothing else changes bytes. The corpus rebuild picks 
   the pin once a release carries it. Pinned by `tests/isolation_window_offset_order.rs` on a fixture
   that lists the offsets in both orders. Any mzML-lane archive whose source lists the offsets before
   the target (all pwiz Waters MSe/HDMSe twins) is not current and needs a rebuild; the native Waters
-  lane is unaffected (it writes no precursors yet).
+  lane is unaffected (it builds its precursors itself: set mass, acquisition-range MSe window).
 
+### Changed
+
+- **Empty spectra stay.** The SciEX native lane writes every acquired spectrum, including the
+  zero-point ones ProteoWizard drops (SWATH: 11,583 of 148,571; a scheduled MRM-HR run: 16,790 of
+  23,646). Measured cost after re-encoding the metadata facets without them: 0.007–0.012 % of the
+  SWATH archive and 0.2–0.6 % of the MRM-HR archive — an empty row compresses to ~7–20 B. Keeping
+  them preserves the cycle structure; nothing changes here.
+- `tests/lane_metadata_parity.rs` compares VALUES, not just presence: `run.start_time` as an
+  instant, serial and model strings, per-member digests, `id@version` software, sample names,
+  the contents set and the `acquisition_time` wall clock; a rule that no longer fires is an error.
 ## [0.11.2] — 2026-09-07
 
 **Output change.** The footer count keys of the data facets change meaning (below) — every

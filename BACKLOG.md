@@ -13,6 +13,114 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
   prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).
+- **Run metadata on the native lanes — landed after 0.11.2** (`src/run_metadata.rs`,
+  `agilent_meta.rs`, `waters_meta.rs`, Bruker `GlobalMetadata`, SciEX `RunInfo`; CHANGELOG
+  Unreleased). Measured against fresh lane pairs: blank1 now carries the vendor serial, sample and
+  MassHunter version; Capan2 the model, sample and MassLynx version; SWATH/Sample002/MRM-HR WIFFs
+  model, serial, `SCIEX OS`/`Analyst TF` versions, sample and both digested members. Acquisition
+  clocks are tracked in their own item below. **Still open, by lane:**
+  - **Orphan MS2 (precursors):** Waters landed 2026-09-09 (scan items through the MassLynx parameters object:
+    SET_MASS / COLLISION_ENERGY; Capan2's 682 high-energy MSe scans carry a precursor stating the activation, DDA set
+    masses a selected ion with a target-only window); SciEX (663k in the corpus; needs the
+    `SpectrumMetaV2` glue export — S-P2); Agilent MHDAC (`MSScan.bin` precursor decode; no DDA/QQQ
+    `.d` on host or in the corpus to verify against); BAF (SQL `Steps`/`Variables` tables; box-only).
+    Bruker TDF/TSF and Shimadzu carry theirs.
+  - **Waters ion mobility — landed 2026-09-09:** HDMSe/HDDDA functions are read bin by bin and written as
+    frames (one spectrum per MassLynx scan, per-point `raw_ion_mobility` in ms, sorted by m/z); RT,
+    polarity, scan window and function-type MS levels come from the SDK (W-P2 closed for those fields).
+    Verified bin-for-bin against pwiz on Capan2 frames. Followed on 2026-09-09: precursors from the scan
+    items, lock-mass detection (`getLockMassFunction`, else the method text), MS levels by function-type
+    code, SONAR detection (written summed with a warning, not mislabelled as drift), the collapsed retention-time functions skipped, the
+    zero-run mask off for frames (plus the writer bug that masked every profile spectrum regardless),
+    acquisition-time order. Remaining on this lane: CCS per peak (`getCollisionalCrossSection` needs a
+    charge); a SONAR file to decide how quadrupole-position bins should be stored; mixed IMS/non-IMS
+    runs beyond the sFtsk_2 probe; the id convention — pwiz's `function=F process=0 scan=S` names a
+    frame here and a drift bin there (pwiz's own combined mode uses `merged=I function=F block=B`), a
+    spec question. From the 2026-09-09 adversarial review (78 findings, synthesis in the data dir's
+    `waters/review/SYNTHESIS.md`; every wrong-data path closed and re-verified at HEAD), the items that need a
+    DECISION rather than code: (a) RESOLVED 2026-09-09 (research + DLL probe round 23: no window is stated anywhere for MSe — the
+    lane now writes the acquisition range as the window with a provenance parameter, as pwiz does); (a2) the PSI DIA recommendation v1.0 (§3.4) marks an MSe/HDMSe window with MS:1003159
+    "no isolation" (= "isolation window full range") on the isolation window itself; mzdata's `IsolationWindow`
+    carries no parameter list and the vendored writer appends an empty one, so the term has no home yet — add a
+    window-parameter path (writer + a side channel from the lane), then write MS:1003159 beside the numbers;
+    likewise `file_description.contents` could state MS:1003226 (HDMSe) / MS:1003227 (MSe). (a3) a `_dda.inf`
+    sidecar (Waters post-acquisition tooling; none in the corpus) makes the DLL's DDA processor return real
+    quad-isolation offsets (keys 1900/1901) — wire them, with provenance, if such a run ever arrives; the
+    probe lever `MZPC_WATERS_PROBE_QUAD=2` reads them today. (a4) record the tune-page quad profile
+    (`MS Profile Type`, `MSProfileMass1..3`, `LM/HM Resolution`) as run-level parameters so a reader can
+    bound the real RF-only passband (Waters: low cut ≈ 0.8 × set mass under a Manual profile).
+    (b) MS:1000045 on MSe rows is the scan
+    item's 4 eV trap energy (pwiz writes the same); the transfer ramp is on MS:1002013/1002014; (c) the
+    synthesized TIC keeps the lock-mass function's frames, as pwiz's does; (d) the mzML twin's isolation
+    window drops the lower offset (mzdata 0.66.6 reads only one; a fix exists on `claude/eager-robinson-83facb`
+    1add0469) — cherry-pick and rebuild the pwiz twins; (e) mzPeakViewer cannot see a Waters frame at all
+    (keys on `ims_calibration` and the 1/K0 array name; needs MS:1003007 + `waters_drift`); (f) non-ASCII
+    `.raw` paths go through the narrow-char `createRawReaderFromPath` — untested. Coverage still owed:
+    a centroid IMS run, an all-empty frame, a non-IMS `.raw`, a SONAR file, a full uncapped HDDDA
+    conversion, `validate_everything.py` on the frame archives. Viewer: mzPeakViewer keys its mobility panel on the
+    `ims_calibration` block and the 1/K0 array name; it needs to recognise `raw_ion_mobility` (ms)
+    and the `waters_drift` block.
+  - **Device chromatograms** (UV, pressure, temperature; B-P3): the mzML lane gets 620 traces on
+    8 Agilent archives and more from pwiz's Waters/SciEX/Thermo readers; the native lanes write
+    TIC/BPC only. Agilent `.cg`/`.cd` layouts unknown; Bruker `chromatography-data.sqlite` is
+    readable on any host.
+  - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
+    per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
+  - Shimadzu acquisition-software version (LabSolutions; needs a glue export); Waters per-function
+    polarity / RT / scan windows (W-P2/W-P5: `_FUNCTNS.INF` + `_FUNCnnn.IDX`, same SDK cross-check);
+    `src/agilent_midac.rs` scaffold deletion.
+- **Acquisition clocks — every open point in one place (2026-09-09).** `run.start_time` is an RFC 3339
+  instant and RFC 3339 cannot say "zone unknown", so the converter's rule (branch
+  `feat/native-run-metadata`, `src/run_metadata.rs`) is: a vendor time that STATES its UTC offset is
+  written verbatim; a wall clock WITHOUT a zone leaves `run.start_time` null and is preserved verbatim in
+  `metadata.acquisition_time = {wall_clock, zone: "unstated", source, note}`. Nothing is shifted by the
+  converting host's zone. Measured per vendor on the six lane pairs (native vs ProteoWizard 3.0.26175):
+  | vendor (pair) | what the file states | native lane | ProteoWizard writes |
+  |---|---|---|---|
+  | Agilent `.d` (blank1) | `Contents.xml` `AcquiredTime` `2022-11-01T13:11:27.729717400-04:00` (= 17:11:27Z) | `run.start_time` verbatim | `2022-11-01T18:11:27Z` — off by +1 h from the stated instant; mechanism not established (not the box's offset either: CET would give 16:11Z or 12:11Z) |
+  | Bruker TDF/TSF | `GlobalMetadata.AcquisitionDateTime` with offset | verbatim | verbatim (agrees) |
+  | Waters `.raw` (Capan2) | `_HEADER.TXT` `Acquired Date/Time` `03-Dec-2018 22:39:33`, no zone | null + block `22:39:33` | `2018-12-03T22:39:33Z` — labels the wall clock UTC |
+  | SciEX `.wiff` (SWATH, Sample002, MRM_03) | Clearcore2 `AcquisitionDateTime`, `Kind = Unspecified` | null + block (`09:52:14`, `19:58:37`, `02:56:30`) | wall clock − 2 h on all three (`07:52:14Z`, `17:58:37Z`, `00:56:30Z`) although the runs are from November, February and August — the box's CURRENT offset, not the acquisition date's |
+  | Shimadzu `.lcd` (Blind) | `File Property` stream: `SampleInfo.DateTime` = UTC FILETIME `2024-02-15T10:47:18.756Z` beside `szLocGMTDiffGenDateTime = +01'00'` (measured: OLE2 directory FILETIMEs and the MS-CAB local stamps in the same file agree) | `2024-02-15T11:47:18.756+01:00` — read from the file on any host (`src/shimadzu_meta.rs`; the DLL's `SampleInfo` is empty in the .NET 8 host) | `2024-02-15T08:47:18Z` — the DLL's UTC value minus the box's CURRENT offset (+2 h in September): `ShimadzuReader.cpp::getAnalysisDate` adds `universal_time() − local_time()` evaluated at conversion time (`adjustUnknownTimeZonesToHostTimeZone`) |
+  | Thermo `.raw` | mzdata's reader, zoned | verbatim | verbatim (agrees) |
+  The SciEX and Shimadzu shifts are the same ProteoWizard mechanism — the host's offset at CONVERSION
+  time applied to a value that already is UTC (Shimadzu) or that the reader treats as unzoned (SciEX);
+  the Agilent +1 h is not yet pinned to it. Open, in order: (1) **Shimadzu — resolved 2026-09-09** by
+  reading the file (option c); the DLL-side emptiness is still being analysed (Codex's leading
+  hypothesis: the 1252 code page has no decoder in .NET 8 unless the provider is registered — the glue
+  now registers it; on the next Blind run the debug dump that fires on an empty date no longer fired). (2) **Consumer
+  guidance + validator rule:** readers must fall back to `acquisition_time.wall_clock` when
+  `run.start_time` is null; the validator should flag a null `run.start_time` WITHOUT the block on a
+  vendor-derived archive, and never flag the block itself (handoff to mzPeakValidator pending). (3)
+  **Decision recorded, revisit only on request:** we do NOT assert a zone for an unzoned wall clock for
+  consumer compatibility — pwiz's `Z`/host-offset labels are exactly the false precision the rule avoids.
+  (4) **Upstream:** the Agilent +1 h and the SciEX current-offset shifts are ProteoWizard behaviours worth
+  a report once the mechanism is pinned (pwiz's `Reader_Agilent` / `Reader_ABI` date handling; not
+  reproduced by us). (5) Agilent `Contents.xml` without `AcquiredTime` and Waters headers without
+  `Acquired Date` are handled (nothing recorded); a vendor time that fails to parse is logged at WARN
+  with the raw text and dropped — pinned by `run_metadata::tests::parse_vendor_time`.
+- **SciEX MRM/SIM dwell runs — refused after 0.11.2** (`refuse_if_unsupported`; the box harness
+  routes the refusal to `--via-msconvert`). `En_PPY.wiff` and `IPX0002633001_D-239.wiff` will be
+  rebuilt on the msconvert lane at the next corpus rerun (154,520 / 2,215 one-point "spectra" → 4 /
+  95 SRM chromatograms). Reading the transitions natively (Q1/Q3, compound, CE, RT window — S-P4)
+  stays open; MRM-HR scan runs convert natively as before.
+- **QUESTION for the owner — the isolation-window group's rule and the MS:1003159 marker (2026-09-09).**
+  The mzPeak spec's prose (`docs/schemas/spectra.md:196-201`) says an `isolation_window` group MUST carry
+  at least one MS:1000792 child; its schema rules (`schema/table_rules.json` `precursor_isolationwindow_may`)
+  and the validator say MAY, and spec PR #13 deferred the choice. PSI's DIA recommendation v1.0 (§3.4)
+  wants full-range acquisitions (MSe/HDMSe, AIF, bbCID) marked with MS:1003159 "no isolation" (= "isolation
+  window full range") on the window and no placeholder numbers. The Waters lane now writes conformant
+  numbers under either reading (acquisition range as the window) but cannot place the marker: mzdata's
+  `IsolationWindow` has no parameter list and the vendored writer appends an empty one. Decide: (a) settle
+  MUST vs MAY in the spec, (b) add a window-parameter path (writer side channel + the mzML export) so MSe,
+  Thermo AIF, Bruker bbCID and SciEX MSall rows can carry MS:1003159 beside their numbers.
+- **QUESTION for the owner — how long to carry the mzdata git fork (2026-09-09).** `Cargo.toml` pins
+  `mzdata =0.66.6` to `okohlbacher/mzdata@1d53971` (v0.66.6 + the 7-line isolation-offset reader fix,
+  upstream mobiusklein/mzdata#58 still open). Every fresh build — three CI runners, the vendor jobs, the
+  Flash box — clones the fork over git and the lockfile carries `git+` sources without checksums. Options:
+  nudge #58 and drop the patch on the next mzdata release, or keep the fork branch
+  (`fix/isolation-window-offsets-before-target`) pinned until then and note it in THIRD-PARTY-NOTICES.md
+  (line 26 still says "(crates.io)").
 - **Not in the ledger — temporary `[patch.crates-io]` on mzdata (2026-09-09).** The mzML reader's
   isolation-window fix ([mobiusklein/mzdata#58](https://github.com/mobiusklein/mzdata/pull/58)) is
   pinned from our fork at 0.66.6. When upstream releases it: bump the `mzdata` pin, delete the patch
