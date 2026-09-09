@@ -2134,8 +2134,7 @@ dependencies = [
 [[package]]
 name = "mzdata"
 version = "0.66.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af5bb71c0ec087ab26422d583d47dcb5043202012776e50b5c72b5f4b2c3a207"
+source = "git+https://github.com/okohlbacher/mzdata.git?rev=1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db#1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db"
 dependencies = [
  "base64-simd",
  "bitflags 2.13.1",
@@ -2173,8 +2172,7 @@ dependencies = [
 [[package]]
 name = "mzdata-bindata"
 version = "0.66.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f97e0e1115dcb4086854a27ecc775a51e0e989878eb435a7b704386f997ed6"
+source = "git+https://github.com/okohlbacher/mzdata.git?rev=1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db#1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db"
 dependencies = [
  "base64-simd",
  "bytemuck",
@@ -2195,8 +2193,7 @@ dependencies = [
 [[package]]
 name = "mzdata-meta"
 version = "0.66.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b2d6c3cd73e39c158473265c2023edde8a415e581bb9ed1071642237dbd4853"
+source = "git+https://github.com/okohlbacher/mzdata.git?rev=1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db#1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db"
 dependencies = [
  "bitflags 2.13.1",
  "chrono",
@@ -2214,8 +2211,7 @@ dependencies = [
 [[package]]
 name = "mzdata-param"
 version = "0.66.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d46b2841ef1341c2c6094108f7d3d979cec5662e1dca1f96110583a437cec095"
+source = "git+https://github.com/okohlbacher/mzdata.git?rev=1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db#1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db"
 dependencies = [
  "log",
  "serde",
@@ -2226,8 +2222,7 @@ dependencies = [
 [[package]]
 name = "mzdata-spectrum"
 version = "0.66.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39daaf3737140dc22e4c12b84ab1fd117ee05bfc12c3883af6e9535d8b0d7660"
+source = "git+https://github.com/okohlbacher/mzdata.git?rev=1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db#1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db"
 dependencies = [
  "identity-hash",
  "log",

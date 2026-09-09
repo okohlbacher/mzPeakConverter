@@ -31,6 +31,21 @@ they were missing (below); nothing else changes bytes. The corpus rebuild picks 
   Pinned by `tests/ims_centroid_mobility_array.rs` over the new
   `tests/data/pasef_combineims_centroid.pwiz.mzML` (pwiz `Reader_Bruker_Test.data`, PASEF frame 6
   combined over its 100 scans, 1391 peaks), in both layouts.
+### Fixed
+
+- **pwiz Waters MSe archives carried `isolation_window_lower_offset = 0`.** mzdata 0.66.6's mzML
+  reader keeps only the FIRST isolation-window offset when both offsets precede the target m/z (the
+  second falls into a `_ => {}` arm while the window is in its `Offset` state), and ProteoWizard's
+  Waters writer emits exactly that order — upper offset, lower offset, target
+  (`SpectrumList_Waters.cpp:308-316`). Every precursor of the Capan2 pwiz twin (136,400/136,400)
+  read `{target 325, lower 0, upper 275}` for a window pwiz declares as 325 ± 275 (50..600). Fixed
+  in the reader on our mzdata fork, pinned through `[patch.crates-io]` at the same 0.66.6
+  (`Cargo.toml`), and sent upstream as
+  [mobiusklein/mzdata#58](https://github.com/mobiusklein/mzdata/pull/58) — drop the patch and bump
+  the pin once a release carries it. Pinned by `tests/isolation_window_offset_order.rs` on a fixture
+  that lists the offsets in both orders. Any mzML-lane archive whose source lists the offsets before
+  the target (all pwiz Waters MSe/HDMSe twins) is not current and needs a rebuild; the native Waters
+  lane is unaffected (it writes no precursors yet).
 
 ## [0.11.2] — 2026-09-07
 

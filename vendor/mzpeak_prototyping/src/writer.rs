@@ -83,6 +83,20 @@ struct ArrayTypesSampler<'a> {
     is_profile: i32,
 }
 
+/// Mirrors the routing test in `AbstractMzPeakWriter::write_spectrum`: a non-MS spectrum that carries
+/// the wavelength axis is written to the wavelength facet, whose schema is fixed
+/// (`add_default_fields_for_context`), never to `spectra_data` / `spectra_peaks`. Sampling it against
+/// the m/z main axis finds no axis, spills its intensity array to `auxiliary_arrays`, and trips the
+/// `guard_not_signal_array` debug assertion (a logged BUG per spectrum per pass in release).
+fn is_wavelength_spectrum<C: CentroidLike, D: DeconvolutedCentroidLike>(
+    s: &impl SpectrumLike<C, D>,
+) -> bool {
+    s.spectrum_type().is_some_and(|t| !t.is_mass_spectrum())
+        && s.raw_arrays().is_some_and(|m| {
+            m.has_array(&BufferContext::WavelengthSpectrum.default_sorted_array())
+        })
+}
+
 impl<'a> ArrayTypesSampler<'a> {
     fn new(
         overrides: &'a BufferOverrideTable,
@@ -186,6 +200,9 @@ impl<'a> ArrayTypesSampler<'a> {
         prefer_peaks: bool,
     ) -> Option<Vec<FieldRef>> {
         log::trace!("Sampling arrays from {}", s.id());
+        if is_wavelength_spectrum(&s) {
+            return None;
+        }
         if s.signal_continuity() == SignalContinuity::Profile {
             self.is_profile += 1;
         }
@@ -374,7 +391,7 @@ pub fn sample_array_types_from_spectrum_source<
         );
         let it = (0..n)
             .flat_map(|i| reader.get_spectrum_by_index(i))
-            .filter(|s| !s.peaks().is_empty())
+            .filter(|s| !s.peaks().is_empty() && !is_wavelength_spectrum(s))
             .take(pts.len());
         let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding)
             .sample_spectrum_array_types(it, prefer_peaks);
