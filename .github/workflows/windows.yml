@@ -91,16 +91,28 @@ jobs:
       # line and exit 2 (Glue.cs Main). That proves the exe boots on this runner (x64 target, .NET
       # Framework present, no config surprise) — the difference between "an exe was emitted" and
       # "the exe runs". The AGL2 magic is pinned against src/agl.rs by the Rust tests.
-      # The runner's pwsh (7.4+) turns a native non-zero exit into a terminating error under the
-      # `$ErrorActionPreference = 'stop'` GitHub sets, so the exit-2 we WANT killed the step before
-      # the check below ever ran (failing since 9792071). Inspect the code ourselves instead.
+      # Same shape as the msconvert step below: capture the code, report it on stdout, and finish
+      # with an explicit `exit` — the step has failed on every push since 9792071 with the usage
+      # line followed by a bare exit 1 and no thrown message, so nothing here may rely on the
+      # runner's `$ErrorActionPreference = 'stop'` prologue, on `throw`, or on its LASTEXITCODE
+      # epilogue.
       - name: Boot the Agilent host (usage exit)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           $PSNativeCommandUseErrorActionPreference = $false
-          & glue/agilent/bin/Release/net48/AgilentGlueHost.exe 2>&1 | Out-String | Write-Host
-          if ($LASTEXITCODE -ne 2) { throw "AgilentGlueHost.exe exited $LASTEXITCODE, expected 2 (usage)" }
+          Write-Host "pwsh $($PSVersionTable.PSVersion): booting AgilentGlueHost.exe with no arguments"
+          try {
+            $out = & glue/agilent/bin/Release/net48/AgilentGlueHost.exe 2>&1
+            $code = $LASTEXITCODE
+          } catch {
+            Write-Host "::error::AgilentGlueHost.exe boot threw $($_.Exception.GetType().FullName): $_"
+            exit 1
+          }
+          Write-Host ($out -join "`n")
+          Write-Host "AgilentGlueHost.exe exit code: $code"
+          if ($code -ne 2) { Write-Host "::error::AgilentGlueHost.exe exited $code, expected 2 (usage)"; exit 1 }
+          exit 0
 
       - name: Verify ShimadzuGlue.runtimeconfig.json enables BinaryFormatter
         shell: pwsh
