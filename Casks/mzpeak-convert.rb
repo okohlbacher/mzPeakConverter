@@ -17,8 +17,8 @@ cask "mzpeak-convert" do
     strategy :github_latest
   end
 
-  # The aarch64 binary is built for macOS 11; the x86_64 one runs on older systems
-  # than this, but one cask covers both, so the arm64 floor is what we declare.
+  # Both archives are built with MACOSX_DEPLOYMENT_TARGET=11.0 (release.yml), so Big
+  # Sur is the real floor for either architecture.
   depends_on macos: :big_sur
 
   binary "mzpeak-convert"
@@ -48,10 +48,16 @@ cask "mzpeak-convert" do
 
         codesign -dvv "$(brew --prefix)/bin/mzpeak-convert"
 
-      Converting Thermo .raw needs a .NET 8+ runtime as well; every other input
-      format (mzML, imzML, Bruker .d) works with no further dependency:
+      On macOS this reads mzML, imzML and Bruker .d (TDF/TSF); Thermo .raw needs a
+      .NET 8+ runtime as well. The Bruker BAF, Waters, SciEX, Agilent and Shimadzu
+      lanes are Windows-only — route those through msconvert. See
+      docs/PLATFORM_SUPPORT.md.
 
         brew install --cask dotnet-sdk
+
+      The formula in the same tap installs the same binary without this cask's
+      quarantine step. Install one of the two, not both: they provide the same
+      command, and uninstalling either would take it off your PATH.
     EOS
   end
 end
