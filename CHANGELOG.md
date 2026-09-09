@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.11.3] — 2026-09-09
 
 **Output change.** The native lanes now write run metadata they used to drop (below), the Bruker
 TSF lane writes precursors, and the SciEX native lane refuses MRM/SIM dwell runs. Archives of
