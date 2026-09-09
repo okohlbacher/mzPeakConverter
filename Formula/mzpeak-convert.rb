@@ -5,6 +5,11 @@ class MzpeakConvert < Formula
   version "0.11.3"
   license "MIT"
 
+  livecheck do
+    url "https://github.com/okohlbacher/mzPeakConverter/releases/latest"
+    strategy :github_latest
+  end
+
   # The released archive for this machine, not a source build: the dependency tree
   # (arrow, parquet, mzdata) takes minutes to compile and the binary is self-contained.
   on_macos do
@@ -18,11 +23,6 @@ class MzpeakConvert < Formula
           "mzpeak-convert-#{version}-x86_64-apple-darwin.tar.gz"
       sha256 "fc8c503b7bfee5ed325a30a2819d217ed7d9b15209df7fd9a05f6f9c04ab1ca7"
     end
-  end
-
-  livecheck do
-    url "https://github.com/okohlbacher/mzPeakConverter/releases/latest"
-    strategy :github_latest
   end
 
   depends_on macos: :big_sur
