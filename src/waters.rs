@@ -362,7 +362,7 @@ impl WatersReader {
             // process each: 2 = (info, f, scan=0, bin, *f32); 3 = (scan reader, f, bin, *f32);
             // 4 = (scan reader, f, scan=0, bin, *f32); 1 = the original. Only on functions with bins.
             if n_drift > 0 && dt_variant > 0 {
-                for bin in [0, 1, n_drift - 1] {
+                for bin in [0, 1, 2, n_drift - 1] {
                     let mut slot = [0f32; 4];
                     log::info!("waters-probe: calling getDriftTime variant {dt_variant} (f={}, bin={bin})", f + 1);
                     let rc = match dt_variant {
@@ -391,6 +391,15 @@ impl WatersReader {
                             let gb: Option<GetFloatOutThenIndexFn> = unsafe { lib.get(b"getDriftTime\0") }.ok().map(|f| *f);
                             gb.map(|g| unsafe { g(self.info_reader, f, slot.as_mut_ptr(), bin) })
                         }
+                        // 7 = (reader, bin, *out float): round 12's variant 6 returned dt[f] regardless of
+                        // `bin`, i.e. the DLL takes NO function argument — the second slot IS the bin.
+                        7 => {
+                            let gc: Option<GetIntPerFunctionFn> = None;
+                            let _ = gc;
+                            type GetDriftTimeFn = unsafe extern "C" fn(*mut c_void, c_int, *mut f32) -> c_int;
+                            let g7: Option<GetDriftTimeFn> = unsafe { lib.get(b"getDriftTime\0") }.ok().map(|f| *f);
+                            g7.map(|g| unsafe { g(self.info_reader, bin, slot.as_mut_ptr()) })
+                        }
                         _ => None,
                     };
                     let as_f64 = f64::from_bits((slot[0].to_bits() as u64) | ((slot[1].to_bits() as u64) << 32));
@@ -411,6 +420,18 @@ impl WatersReader {
                     let rc = unsafe { g(self.info_reader, f, ps.as_mut_ptr()) };
                     log::info!("waters-probe: function {} ionModeString={:?} rc={rc}", f + 1, if rc == 0 { cstr(ps[0]) } else { String::new() });
                 }
+                // The string getters may translate a CODE, not a function index: getFunctionType said
+                // 218 and getIonMode 108 for every Capan2 function, and both string calls failed with
+                // rc 27 / 28 when handed the function index.
+                for (name, code) in [(&b"getFunctionTypeString\0"[..], 218), (b"getIonModeString\0", 108)] {
+                    if let Some(g) = unsafe { lib.get::<GetStringPerFunctionFn>(name) }.ok().map(|f| *f) {
+                        let label = String::from_utf8_lossy(&name[..name.len() - 1]).into_owned();
+                        log::info!("waters-probe: calling {label} with code {code}");
+                        let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                        let rc = unsafe { g(self.info_reader, code, ps.as_mut_ptr()) };
+                        log::info!("waters-probe: {label}(code {code}) = {:?} rc={rc}", if rc == 0 { cstr(ps[0]) } else { String::new() });
+                    }
+                }
                 for name in [&b"getFunctionTypeString\0"[..], b"getIonModeString\0"] {
                     if let Some(g) = unsafe { lib.get::<GetStringBufPerFunctionFn>(name) }.ok().map(|f| *f) {
                         let label = String::from_utf8_lossy(&name[..name.len() - 1]).into_owned();
@@ -424,13 +445,17 @@ impl WatersReader {
             }
             if level >= 4 {
                 if let (Some(gi), Some(gn)) = (scan_items, item_name) {
-                    log::info!("waters-probe: calling getScanItemsInFunction(f={})", f + 1);
-                    let mut items: [*const c_int; 4] = [ptr::null(); 4];
+                    // Buffer variant `(reader, function, int* buf, int* n)`: the pointer-out form crashed.
+                    type GetScanItemsBufFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int, *mut c_int) -> c_int;
+                    let gib: Option<GetScanItemsBufFn> = unsafe { lib.get(b"getScanItemsInFunction\0") }.ok().map(|f| *f);
+                    let _ = gi;
+                    log::info!("waters-probe: calling getScanItemsInFunction buffer variant (f={})", f + 1);
+                    let mut buf = [0i32; 1024];
                     let mut n_items = [0i32; 4];
-                    let rc = unsafe { gi(self.info_reader, f, items.as_mut_ptr(), n_items.as_mut_ptr()) };
-                    log::info!("waters-probe: function {} scan items rc={rc} n={} ptr_null={}", f + 1, n_items[0], items[0].is_null());
-                    if rc == 0 && !items[0].is_null() && (0..=256).contains(&n_items[0]) {
-                        let ids: Vec<c_int> = unsafe { std::slice::from_raw_parts(items[0], n_items[0] as usize) }.to_vec();
+                    let rc = gib.map(|g| unsafe { g(self.info_reader, f, buf.as_mut_ptr(), n_items.as_mut_ptr()) }).unwrap_or(-1);
+                    log::info!("waters-probe: function {} scan items rc={rc} n={} first={:?}", f + 1, n_items[0], &buf[..8]);
+                    if rc == 0 && (0..=256).contains(&n_items[0]) {
+                        let ids: Vec<c_int> = buf[..n_items[0] as usize].to_vec();
                         log::info!("waters-probe: function {} scan item ids {:?}", f + 1, ids);
                         let mut described = Vec::new();
                         for id in ids {
