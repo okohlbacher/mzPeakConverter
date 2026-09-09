@@ -104,6 +104,19 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   rebuilt on the msconvert lane at the next corpus rerun (154,520 / 2,215 one-point "spectra" → 4 /
   95 SRM chromatograms). Reading the transitions natively (Q1/Q3, compound, CE, RT window — S-P4)
   stays open; MRM-HR scan runs convert natively as before.
+- **Surfaced by the 0.11.3 corpus rebuild (2026-09-09).** (1) The box relay returns archives through
+  one presigned S3 PUT, capped at 5 GB: PXD077098's Waters TWIMS run (15.4 GB `.raw`) now writes a
+  9.04 GB frame archive (it was 2.1 GB as drift-summed scans) and was delivered by hand (direct scp
+  with a checksum, then stamped); `tools/box_convert.sh` needs a multipart upload or an scp fallback
+  above 5 GB. (2) The frame representation's size cost on big HDMSe runs: Capan2 166 → 531 MB,
+  PXD077098 2.1 → 9.0 GB (58 % of the vendor `.raw`; every point of every bin is kept, zero flanks
+  included) — decide whether an opt-out (`--waters-summed`) or a per-bin zero policy is wanted for
+  archival use. (3) The harness's box updater could not fetch the release tag (twice); the manual
+  fast-forward script in the 2026-09-08 data dir (`box/box_v0113.ps1`) did — fix `box_update_remote.ps1`'s
+  `git fetch origin --tags --force` (shallow single-branch clone) or make the harness assert the box's
+  version before, not after, the jobs. (4) A long box conversion driven from an interactive SSH session
+  is dropped by the gateway (`Connection closed by remote host` after ~25 min of silence) even with
+  ServerAlive keepalives — run long box jobs detached and poll a log.
 - **QUESTION for the owner — the isolation-window group's rule and the MS:1003159 marker (2026-09-09).**
   The mzPeak spec's prose (`docs/schemas/spectra.md:196-201`) says an `isolation_window` group MUST carry
   at least one MS:1000792 child; its schema rules (`schema/table_rules.json` `precursor_isolationwindow_may`)
