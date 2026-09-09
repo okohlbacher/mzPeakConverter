@@ -757,10 +757,7 @@ impl WatersReader {
         }
 
         // The precursor, from the scan's own SET_MASS and COLLISION_ENERGY items (what pwiz reads;
-        // `SpectrumList_Waters.cpp:276-330`). A set mass names the selected ion and the isolation
-        // target (its width is not stated — offsets stay NULL); a set mass of 0 is MSe: the whole
-        // acquisition range was transmitted, so the isolation window IS that range and no selected
-        // ion is invented (pwiz writes the range midpoint as a selected ion; we do not).
+        // `SpectrumList_Waters.cpp:276-330`); see `precursor` for what is and is not stated.
         let precursor = if fi.ms_level > 1 {
             self.precursor(func, scan, fi)
         } else {
@@ -858,17 +855,17 @@ impl WatersReader {
             activation.add_param(Param::builder().name("collision energy ramp start").curie(mzdata::curie!(MS:1002013)).value(start).unit(Unit::Electronvolt).build());
             activation.add_param(Param::builder().name("collision energy ramp end").curie(mzdata::curie!(MS:1002014)).value(end).unit(Unit::Electronvolt).build());
         }
+        // A set mass names the selected ion and the isolation target (its width is not stated). A
+        // set mass of 0 is MSe: nothing was isolated — the row carries the activation only. pwiz's
+        // placeholder (target = range midpoint as a selected ion, offsets = the scan range) is a
+        // claim about quadrupole transmission the file does not make (review 2026-09-09).
         let (ions, isolation_window) = if set_mass > 0.0 {
             (
                 vec![SelectedIon { mz: set_mass, ..Default::default() }],
                 IsolationWindow { target: set_mass as f32, lower_bound: 0.0, upper_bound: 0.0, flags: IsolationWindowState::Complete },
             )
         } else {
-            let (lo, hi) = fi.mass_range.unwrap_or((0.0, 0.0));
-            (
-                Vec::new(),
-                IsolationWindow { target: (lo + hi) / 2.0, lower_bound: lo, upper_bound: hi, flags: IsolationWindowState::Complete },
-            )
+            (Vec::new(), IsolationWindow::default())
         };
         Some(Precursor { ions, isolation_window, activation, ..Default::default() })
     }

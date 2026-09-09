@@ -846,7 +846,11 @@ pub trait AbstractMzPeakWriter {
                 },
                 chunking,
                 buffer_ref.overrides(),
-                is_profile,
+                // The zero-run mask applies to profile signal AND only when the writer was built
+                // with it on: `is_profile` alone masked every chunked profile spectrum whatever the
+                // caller asked for (found 2026-09-09 by the Waters drift frames, whose bins'
+                // zero flanks it deleted; `tests/frame_zero_runs.rs`).
+                is_profile && buffer_ref.drop_zero_intensity(),
                 nullify_zero_intensity,
                 buffer_ref.fields(),
             )?;
