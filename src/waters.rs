@@ -61,6 +61,10 @@ type ReadScanFn =
 type GetIntPerFunctionFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int) -> c_int;
 /// `getDriftTime(infoReader, function, bin, *out float ms)` / `getRetentionTime(infoReader, function, scan, *out float min)`.
 type GetFloatPerScanFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut f32) -> c_int;
+/// Candidate 5-argument shape of `getDriftTime`: `(reader, function, scan, bin, *out float ms)` — the
+/// 4-argument call access-violates (probe round 10), which is what a missing integer argument
+/// looks like on x64 (the out-pointer lands in the bin slot).
+type GetFloatPerScanBinFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *mut f32) -> c_int;
 /// `getAcquisitionMassRange(infoReader, function, *out float lo, *out float hi)`.
 type GetMassRangeFn = unsafe extern "C" fn(*mut c_void, c_int, *mut f32, *mut f32) -> c_int;
 /// `getFunctionTypeString(infoReader, function, *out char*)` / `getIonModeString(...)`. The string
@@ -291,34 +295,41 @@ impl WatersReader {
             }
         };
         // Out-params live in 16-byte slots: a callee that writes a double (or two floats) into what we
-        // think is a float cannot corrupt a neighbour, and the raw bytes are logged.
+        // think is a float cannot corrupt a neighbour, and the raw bytes are logged. Every result is
+        // logged the moment it is known — a later crash must not take it along.
+        let dt_variant: u8 = std::env::var("MZPC_WATERS_DT_VARIANT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        let drift_time5: Option<GetFloatPerScanBinFn> = unsafe { lib.get(b"getDriftTime\0") }.ok().map(|f| *f);
         for f in 0..n_functions {
             let cdt = input.join(format!("_func{:03}.cdt", f + 1)).is_file() || input.join(format!("_FUNC{:03}.CDT", f + 1)).is_file();
-            let mut parts: Vec<String> = vec![format!("function {} cdt={cdt}", f + 1)];
+            log::info!("waters-probe: function {} cdt={cdt}", f + 1);
+            let mut n_drift: c_int = 0;
             if let Some(g) = function_type {
                 log::info!("waters-probe: calling getFunctionType(f={})", f + 1);
                 let mut slot = [0i32; 4];
                 let rc = unsafe { g(self.info_reader, f, slot.as_mut_ptr()) };
-                parts.push(format!("type={} rc={rc} raw={:?}", slot[0], slot));
+                log::info!("waters-probe: function {} type={} rc={rc} raw={:?}", f + 1, slot[0], slot);
             }
             if let Some(g) = ion_mode {
                 log::info!("waters-probe: calling getIonMode(f={})", f + 1);
                 let mut slot = [0i32; 4];
                 let rc = unsafe { g(self.info_reader, f, slot.as_mut_ptr()) };
-                parts.push(format!("ionMode={} rc={rc} raw={:?}", slot[0], slot));
+                log::info!("waters-probe: function {} ionMode={} rc={rc} raw={:?}", f + 1, slot[0], slot);
             }
             if let Some(g) = drift_count {
                 log::info!("waters-probe: calling getDriftScanCount(f={})", f + 1);
                 let mut slot = [0i32; 4];
                 let rc = unsafe { g(self.info_reader, f, slot.as_mut_ptr()) };
-                parts.push(format!("driftScanCount={} rc={rc} raw={:?}", slot[0], slot));
+                log::info!("waters-probe: function {} driftScanCount={} rc={rc} raw={:?}", f + 1, slot[0], slot);
+                if rc == 0 {
+                    n_drift = slot[0];
+                }
             }
             if let Some(g) = mass_range {
                 log::info!("waters-probe: calling getAcquisitionMassRange(f={})", f + 1);
                 let mut lo = [0f32; 4];
                 let mut hi = [0f32; 4];
                 let rc = unsafe { g(self.info_reader, f, lo.as_mut_ptr(), hi.as_mut_ptr()) };
-                parts.push(format!("massRange={}..{} rc={rc} rawLo={:?} rawHi={:?}", lo[0], hi[0], lo, hi));
+                log::info!("waters-probe: function {} massRange={}..{} rc={rc} rawLo={:?} rawHi={:?}", f + 1, lo[0], hi[0], lo, hi);
             }
             if let Some(g) = retention_time {
                 for scan in [0, 1] {
@@ -326,19 +337,28 @@ impl WatersReader {
                     let mut slot = [0f32; 4];
                     let rc = unsafe { g(self.info_reader, f, scan, slot.as_mut_ptr()) };
                     let as_f64 = f64::from_bits((slot[0].to_bits() as u64) | ((slot[1].to_bits() as u64) << 32));
-                    parts.push(format!("rt[scan{}]={} (as f64 {as_f64}) rc={rc}", scan + 1, slot[0]));
+                    log::info!("waters-probe: function {} rt[scan{}]={} (as f64 {as_f64}) rc={rc} raw={:?}", f + 1, scan + 1, slot[0], slot);
                 }
             }
-            if let Some(g) = drift_time {
-                for bin in [0, 1, 199] {
-                    log::info!("waters-probe: calling getDriftTime(f={}, bin={bin})", f + 1);
+            // getDriftTime: the 4-argument (info, f, bin, *f32) form crashed in round 10. Variants, one
+            // process each: 2 = (info, f, scan=0, bin, *f32); 3 = (scan reader, f, bin, *f32);
+            // 4 = (scan reader, f, scan=0, bin, *f32); 1 = the original. Only on functions with bins.
+            if n_drift > 0 && dt_variant > 0 {
+                for bin in [0, 1, n_drift - 1] {
                     let mut slot = [0f32; 4];
-                    let rc = unsafe { g(self.info_reader, f, bin, slot.as_mut_ptr()) };
+                    log::info!("waters-probe: calling getDriftTime variant {dt_variant} (f={}, bin={bin})", f + 1);
+                    let rc = match dt_variant {
+                        1 => drift_time.map(|g| unsafe { g(self.info_reader, f, bin, slot.as_mut_ptr()) }),
+                        2 => drift_time5.map(|g| unsafe { g(self.info_reader, f, 0, bin, slot.as_mut_ptr()) }),
+                        3 => drift_time.map(|g| unsafe { g(self.scan_reader, f, bin, slot.as_mut_ptr()) }),
+                        4 => drift_time5.map(|g| unsafe { g(self.scan_reader, f, 0, bin, slot.as_mut_ptr()) }),
+                        _ => None,
+                    };
                     let as_f64 = f64::from_bits((slot[0].to_bits() as u64) | ((slot[1].to_bits() as u64) << 32));
-                    parts.push(format!("dt[bin{bin}]={} (as f64 {as_f64}) rc={rc}", slot[0]));
+                    log::info!("waters-probe: function {} dt[bin{bin}] variant {dt_variant} = {} (as f64 {as_f64}) rc={rc:?} raw={:?}", f + 1, slot[0], slot);
                 }
             }
-            log::info!("waters-probe: {}", parts.join(" | "));
+            let nd = n_drift;
             if level >= 2 {
                 if let Some(g) = type_string {
                     log::info!("waters-probe: calling getFunctionTypeString(f={})", f + 1);
