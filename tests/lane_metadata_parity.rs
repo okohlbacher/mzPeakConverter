@@ -193,23 +193,23 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "facet.spectra_metadata.parquet.rows",
-        kind: Kind::Defect,
-        reason: "the Waters native lane writes one mobility-COMBINED spectrum per scan (Capan2: 1,989 across six functions, ~44k profile points each) where ProteoWizard expands every HDMSe scan into its 200 drift bins (397,800 rows, 719 points median) — the drift dimension is not read natively (`_FUNCnnn.CDT`), so the ion-mobility data of a Waters IM run is lost on this lane. It also labels functions 3–6 (lock-mass REFERENCE and the three 200-scan auxiliary functions) MS2, which ProteoWizard calls MS1 (W-P2 in BACKLOG).",
+        kind: Kind::ByDesign,
+        reason: "Waters ion mobility: the native lane writes one FRAME per MassLynx scan (Capan2: 1,989 rows, each carrying every drift bin's points with a per-point raw_ion_mobility array — verified bin for bin against pwiz), where ProteoWizard writes one spectrum per drift bin (397,800 = 1,989 × 200). Same data, 200× fewer rows.",
     },
     Expected {
         key: "facet.spectra_metadata_scans.parquet.rows",
-        kind: Kind::Defect,
-        reason: "follows facet.spectra_metadata.parquet.rows.",
+        kind: Kind::ByDesign,
+        reason: "follows facet.spectra_metadata.parquet.rows (frames vs drift bins).",
     },
     Expected {
         key: "spectra_metadata.*",
-        kind: Kind::Defect,
-        reason: "the native Waters lane writes RT 0.0, no scan window and unknown polarity on every scan, and labels functions 3–6 MS2 (W-P2/W-P5 in BACKLOG: `_FUNCnnn.IDX`/`_FUNCTNS.INF` are reverse-engineered layouts awaiting an SDK side-by-side on the box); the SciEX MRM rows this rule was first written for are now refused to the msconvert lane.",
+        kind: Kind::ByDesign,
+        reason: "follows facet.spectra_metadata.parquet.rows: every per-row count is 200× smaller on the frame side, and the VALUES agree — Capan2 ms levels 1,307 MS1 / 682 MS2 natively vs 261,400 / 136,400 per bin (× 200 exactly), RT, polarity and scan window now come from the SDK on every row. The SciEX MRM rows this rule was first written for are refused to the msconvert lane.",
     },
     Expected {
         key: "spectra_metadata_scans.*",
-        kind: Kind::Defect,
-        reason: "follows spectra_metadata.* (the Waters native lane's scans carry no start time or window yet).",
+        kind: Kind::ByDesign,
+        reason: "follows spectra_metadata.* (frames vs drift bins; RT and scan window present on every native row).",
     },
     Expected {
         key: "instrument.model",
@@ -234,7 +234,7 @@ const EXPECTED: &[Expected] = &[
     Expected {
         key: "facet.spectra_metadata_precursors.parquet.rows",
         kind: Kind::Defect,
-        reason: "ORPHAN MS2 on the Waters native lane: the 682 high-energy MSe scans of Capan2 (function 2) carry no precursor, where ProteoWizard writes its MSe placeholder precursor on each of the 136,400 drift-bin spectra it expands them into (682 × 200). The per-scan Set Mass and collision energies of a real DDA run live in `_FUNCnnn.STS`, a reverse-engineered layout the review refused to publish from before an SDK side-by-side on the box (BACKLOG). Bruker TSF and TDF carry theirs; SciEX needs the MetaV2 glue export.",
+        reason: "ORPHAN MS2 on the Waters native lane: the 682 elevated-energy MSe scans of Capan2 carry no precursor, where ProteoWizard writes its MSe placeholder precursor on each of the 136,400 drift-bin spectra it expands them into (682 × 200). The SDK route (getScanItemValue SET_MASS / COLLISION_ENERGY) is blocked on getScanItemsInFunction, which crashes in every spelling tried (BACKLOG). Bruker TSF and TDF carry theirs; SciEX needs the MetaV2 glue export.",
     },
     Expected {
         key: "facet.spectra_metadata_selected_ions.parquet.rows",
