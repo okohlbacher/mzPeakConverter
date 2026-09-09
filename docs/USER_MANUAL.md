@@ -404,7 +404,10 @@ precursor stating the activation only — no isolation window is invented. Chrom
 line; a SONAR function (its bins are quadrupole positions, not drift times) is written as the
 drift-summed scan with a warning and flagged in `waters_drift`; "collapsed retention time"
 functions (one row per drift bin, the run's summed mobilograms — Capan2 functions 4–6) are
-recognised and not written as spectra (`MZPC_WATERS_KEEP_COLLAPSED=1` keeps them).
+recognised and not written as spectra (`MZPC_WATERS_KEEP_COLLAPSED=1` keeps them). The synthesized TIC/BPC
+include the lock-mass function's frames, as ProteoWizard's do. A function whose type, drift-bin
+count or SONAR flag the DLL cannot report is written as MS1 / summed / drift-on-trust with a warning
+naming the function; a scan without a retention time refuses the conversion.
 
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
 the Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF, Shimadzu and Waters have them), and the
