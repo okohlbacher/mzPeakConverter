@@ -401,7 +401,8 @@ the precursors come from the SDK: a set mass > 0 (DDA) gives a selected ion with
 isolation window and the collision energy; an MSe elevated-energy scan (set mass 0) gets a
 precursor stating the activation only — no isolation window is invented. Chromatogram functions
 (SIR, MRM, neutral loss/gain) and non-MS functions (DAD, delay, calibration) are skipped with a log
-line; a SONAR function (its bins are quadrupole positions) is refused; "collapsed retention time"
+line; a SONAR function (its bins are quadrupole positions, not drift times) is written as the
+drift-summed scan with a warning and flagged in `waters_drift`; "collapsed retention time"
 functions (one row per drift bin, the run's summed mobilograms — Capan2 functions 4–6) are
 recognised and not written as spectra (`MZPC_WATERS_KEEP_COLLAPSED=1` keeps them).
 
