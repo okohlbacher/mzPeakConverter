@@ -112,8 +112,10 @@ type ScanItemNameFn = unsafe extern "C" fn(*mut c_void, *const c_int, c_int, *mu
 /// `getLockMassFunction(info, *out char hasLockMass, *out int whichFunction)`.
 type LockMassFunctionFn = unsafe extern "C" fn(*mut c_void, *mut c_char, *mut c_int) -> c_int;
 
-/// MassLynxScanItem ids (SDK enum, base 400) used when the DLL's own item names cannot be read.
-const SCAN_ITEM_BASE: c_int = 400;
+/// MassLynxScanItem ids used only when the DLL's own item names cannot be read: the table this DLL
+/// hands back (measured on the box) starts at 401 = LINEAR_DETECTOR_VOLTAGE, so SET_MASS = 477,
+/// COLLISION_ENERGY = 462, SONAR_ENABLED = 481.
+const SCAN_ITEM_FIRST: c_int = 401;
 
 /// The scan-item API, resolved as a whole (any missing export disables all of it).
 #[derive(Clone, Copy)]
@@ -213,8 +215,13 @@ struct ScanItemIds {
 struct FunctionInfo {
     /// `isContinuum`; `None` when the export is unavailable or failed.
     continuum: Option<bool>,
-    /// `getFunctionTypeString(getFunctionType(f))`, e.g. `TOF MS`.
+    /// `getFunctionType(f)`: ProteoWizard's function-type enum + 200 (218 = `TOF MS`, 216 = `TOFD`).
+    type_code: Option<c_int>,
+    /// `getFunctionTypeString(type_code)`, e.g. `TOF MS` — cosmetic; the CODE drives the rules.
     type_string: Option<String>,
+    /// The transfer-cell collision-energy ramp the METHOD states for this function (`_extern.inf`
+    /// "Transfer Collision Energy Ramp Start/End (eV)"), when it states one.
+    ce_ramp: Option<(f64, f64)>,
     /// `getIonModeString(getIonMode(f))`, e.g. `ES+`.
     ion_mode: Option<String>,
     /// `getAcquisitionMassRange(f, 0)`.
@@ -383,15 +390,19 @@ impl WatersReader {
                 }
             }
             if named.is_empty() {
-                log::warn!("MassLynx scan item names unreadable; using the SDK enum ids (base {SCAN_ITEM_BASE})");
+                log::warn!("MassLynx scan item names unreadable; using the SDK enum ids (first item {SCAN_ITEM_FIRST})");
                 item_ids = ScanItemIds {
-                    set_mass: Some(SCAN_ITEM_BASE + 76),
-                    collision_energy: Some(SCAN_ITEM_BASE + 61),
-                    sonar: Some(SCAN_ITEM_BASE + 80),
+                    set_mass: Some(SCAN_ITEM_FIRST + 76),
+                    collision_energy: Some(SCAN_ITEM_FIRST + 61),
+                    sonar: Some(SCAN_ITEM_FIRST + 80),
                 };
             }
             log::info!("MassLynx scan item ids: {item_ids:?}; lock-mass function: {:?}", lockmass_function.map(|f| f + 1));
         }
+
+        // The method text: per-function transfer collision-energy ramps (MSe's elevated energy lives
+        // there, not in the per-scan COLLISION_ENERGY item, which is the trap cell's 4 eV).
+        let method_ramps = method_ce_ramps_from_extern_inf(input);
 
         // Per-function facts, each an independent optional call (a failed one leaves its field None).
         let int_of = |g: Option<GetIntPerFunctionFn>, f: c_int| -> Option<c_int> {
@@ -418,7 +429,8 @@ impl WatersReader {
                 let mut slot = [0u8; 8];
                 (unsafe { g(info_reader, f, slot.as_mut_ptr() as *mut bool) } == 0).then_some(slot[0] != 0)
             });
-            let type_string = int_of(function_type, f).and_then(|code| string_of(type_string, code));
+            let type_code = int_of(function_type, f);
+            let type_string = type_code.and_then(|code| string_of(type_string, code));
             let ion_mode = int_of(ion_mode, f).and_then(|code| string_of(mode_string, code));
             let mass_range = mass_range.and_then(|g| {
                 let (mut lo, mut hi): (f32, f32) = (0.0, 0.0);
@@ -464,10 +476,36 @@ impl WatersReader {
                 );
                 drift_bins = 0;
             }
-            functions.push(FunctionInfo { continuum, type_string, ion_mode, mass_range, drift_bins, sonar, collision_energy_0, ms_level: 1 });
+            let ce_ramp = method_ramps.get(&f).copied();
+            functions.push(FunctionInfo { continuum, type_code, type_string, ion_mode, mass_range, drift_bins, sonar, collision_energy_0, ce_ramp, ms_level: 1 });
         }
         for f in 0..functions.len() {
             functions[f].ms_level = ms_level_for(f, &functions, lockmass_function);
+        }
+        // Functions ProteoWizard never emits as spectra: SIR/MRM-family (chromatogram data), neutral
+        // loss/gain, DAD (a wavelength axis), delay/concatenated/off/AutoSpec scan types. Written as
+        // spectra they would be MS1 rows with no m/z (DAD) or one-point "spectra" without their
+        // transition (MRM) — the same defect class the Agilent and SciEX lanes refuse.
+        let mut skipped_functions: Vec<c_int> = Vec::new();
+        for (f, fi) in functions.iter().enumerate() {
+            if let Some(kind) = fi.type_code.and_then(FunctionKind::from_code) {
+                if let FunctionKind::Chromatogram(what) | FunctionKind::NotMs(what) = kind {
+                    log::warn!(
+                        "MassLynx function {} ({}) is {what}; not written as spectra (ProteoWizard writes SIR/MRM as chromatograms and skips the rest)",
+                        f + 1,
+                        fi.type_string.as_deref().unwrap_or("?")
+                    );
+                    skipped_functions.push(f as c_int);
+                }
+            }
+        }
+        if skipped_functions.len() == functions.len() {
+            return Err(close(format!(
+                "{}: every MassLynx function is chromatogram-type or non-MS ({}); the native lane writes no spectra for those. \
+                 Use --via-msconvert, which writes SRM/SIM chromatograms.",
+                input.display(),
+                functions.iter().map(|fi| fi.type_string.clone().unwrap_or_else(|| "?".into())).collect::<Vec<_>>().join(", ")
+            )));
         }
 
         // The run's drift-time table: bin → ms, read once from the first IMS function's bin count.
@@ -527,6 +565,9 @@ impl WatersReader {
         let mut rt_failures = 0usize;
         let mut acquired_ims_functions: Vec<c_int> = Vec::new();
         for f in 0..n_functions {
+            if skipped_functions.contains(&f) {
+                continue;
+            }
             let Some(n_scans) = int_of(Some(read_scan_count), f).filter(|n| *n >= 0) else {
                 log::warn!("MassLynx getScanCount(function {}) failed; the function is skipped", f + 1);
                 continue;
@@ -807,8 +848,15 @@ impl WatersReader {
         let mut activation = Activation::default();
         // No Waters instrument has a trap collision cell (pwiz's note): beam-type CID.
         activation.methods_mut().push(DissociationMethodTerm::BeamTypeCollisionInducedDissociation);
+        // The per-scan COLLISION_ENERGY item (what pwiz writes as MS:1000045; on a Synapt it is the
+        // trap cell's energy) — and, when the method ramps the transfer cell for this function (MSe's
+        // elevated energy), the ramp under its own terms.
         if energy > 0.0 {
             activation.energy = energy as f32;
+        }
+        if let Some((start, end)) = fi.ce_ramp {
+            activation.add_param(Param::builder().name("collision energy ramp start").curie(mzdata::curie!(MS:1002013)).value(start).unit(Unit::Electronvolt).build());
+            activation.add_param(Param::builder().name("collision energy ramp end").curie(mzdata::curie!(MS:1002014)).value(end).unit(Unit::Electronvolt).build());
         }
         let (ions, isolation_window) = if set_mass > 0.0 {
             (
@@ -888,26 +936,81 @@ fn copy_points(p_masses: *mut f32, p_intensities: *mut f32, n: c_int) -> Result<
     Ok((mz, intensity))
 }
 
-/// MS level from the vendor's function type, with ProteoWizard's MSe convention
-/// (`SpectrumList_Waters.cpp:161-185`).
-///
-/// A product-ion type (`DAUGHTER`, `MSMS`, `MS/MS`, `PARENT`, `NEUTRAL`, `MRM`) is MS2. Among plain
-/// MS functions the SECOND function is the elevated-energy acquisition of an MSe / HDMSe method when
-/// its first scan carries a collision energy > 0 and it is not the lock-mass function — pwiz's rule.
-/// When the collision energy cannot be read, the second function counts as MSe when it repeats the
-/// first function's type. Every other MS function (lock-mass reference, the auxiliary functions of a
-/// Synapt method) is MS1, as pwiz labels them.
+/// What ProteoWizard makes of a MassLynx function type (`Reader_Waters_Detail.cpp`
+/// `translateFunctionType`), keyed by the CODE `getFunctionType` returns (pwiz's enum + 200; the
+/// strings the DLL prints for them are `MS SIR DLY CAT OFF PAR MSMS NL NG MRM Q1F MS2 DAD TOF PSD
+/// TOFS TOFD MTOF "TOF MS" "TOF P" ASP…`, measured from the binary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionKind {
+    /// A mass spectrum at this MS level.
+    Ms(u8),
+    /// SIR / MRM-family data: chromatograms, never spectra.
+    Chromatogram(&'static str),
+    /// No mass spectrum at all (diode array, delay, off, AutoSpec scan types).
+    NotMs(&'static str),
+}
+
+impl FunctionKind {
+    fn from_code(code: c_int) -> Option<Self> {
+        Some(match code - 200 {
+            0 => Self::Ms(1),                                   // MS
+            1 => Self::Chromatogram("SIR (selected ion recording)"),
+            2 => Self::NotMs("a delay function"),               // DLY
+            3 => Self::NotMs("a concatenated function"),        // CAT
+            4 => Self::NotMs("off"),                            // OFF
+            5 => Self::Ms(1),                                   // PAR (precursor-ion scan: pwiz labels MS1)
+            6 => Self::Ms(2),                                   // MSMS
+            7 => Self::Chromatogram("a constant-neutral-loss function"),
+            8 => Self::Chromatogram("a constant-neutral-gain function"),
+            9 => Self::Chromatogram("MRM"),
+            10 => Self::Ms(1),                                  // Q1F
+            11 => Self::Ms(2),                                  // MS2
+            12 => Self::NotMs("a diode-array (wavelength) function"),
+            13 => Self::Ms(1),                                  // TOF
+            14 => Self::NotMs("a TOF PSD function"),
+            15 => Self::Ms(1),                                  // TOFS (survey)
+            16 => Self::Ms(2),                                  // TOFD (TOF daughter / MS-MS)
+            17 => Self::Ms(1),                                  // MTOF
+            18 => Self::Ms(1),                                  // TOF MS (+ the MSe rule)
+            19 => Self::Ms(1),                                  // TOF P (parent)
+            20..=23 => Self::NotMs("an AutoSpec voltage/magnet scan"),
+            24 => Self::Ms(2),                                  // QUAD AUTO DAU
+            25..=27 | 30 => Self::NotMs("an AutoSpec scan type"),
+            28 => Self::Chromatogram("AutoSpec MIKES"),
+            29 | 31 => Self::Chromatogram("AutoSpec MRM"),
+            _ => return None,
+        })
+    }
+}
+
+/// MS level from the vendor's function-type CODE, with ProteoWizard's MSe convention
+/// (`SpectrumList_Waters.cpp:161-185`): a product-ion type is MS2; among MS functions the SECOND
+/// function is the elevated-energy acquisition of an MSe / HDMSe method when it repeats the first
+/// function's type, ion mode and mass range, is not the lock-mass function, and its first scan
+/// carries a collision energy > 0 (pwiz's test; when the energy is unreadable the repeated
+/// type/mode/range decides). Every other MS function (lock-mass reference, auxiliary) is MS1.
 fn ms_level_for(f: usize, functions: &[FunctionInfo], lockmass: Option<c_int>) -> u8 {
-    let ty = |i: usize| functions.get(i).and_then(|fi| fi.type_string.as_deref()).map(|s| s.to_ascii_uppercase());
-    let is_product = |s: &str| ["DAUGHTER", "MSMS", "MS/MS", "PARENT", "NEUTRAL", "MRM"].iter().any(|k| s.contains(k));
-    let is_lockmass = lockmass == Some(f as c_int);
-    match ty(f) {
-        Some(s) if is_product(&s) => 2,
-        Some(s) if f == 1 && !is_lockmass => match functions[f].collision_energy_0 {
-            Some(ce) => (ce > 0.0) as u8 + 1,
-            None => (ty(0).as_deref() == Some(s.as_str())) as u8 + 1,
-        },
-        Some(_) => 1,
+    let fi = &functions[f];
+    match fi.type_code.and_then(FunctionKind::from_code) {
+        Some(FunctionKind::Ms(2)) => 2,
+        Some(FunctionKind::Ms(_)) => {
+            let first = &functions[0];
+            let mse_pair = f == 1
+                && lockmass != Some(1)
+                && first.type_code == fi.type_code
+                && first.ion_mode == fi.ion_mode
+                && first.mass_range == fi.mass_range
+                && match fi.collision_energy_0 {
+                    Some(ce) => ce > 0.0,
+                    None => true,
+                };
+            if mse_pair {
+                2
+            } else {
+                1
+            }
+        }
+        Some(_) => 1, // skipped before the index is built
         // No type information at all (export missing): the historical index rule.
         None => {
             if f == 0 {
@@ -917,6 +1020,39 @@ fn ms_level_for(f: usize, functions: &[FunctionInfo], lockmass: Option<c_int>) -
             }
         }
     }
+}
+
+/// `_extern.inf`: per-function "Transfer Collision Energy Ramp Start (eV) 20.0" / "… End (eV) 50.0",
+/// keyed by 0-based function. The section headers read `Function Parameters - Function N - <kind>`.
+fn method_ce_ramps_from_extern_inf(raw: &Path) -> std::collections::HashMap<c_int, (f64, f64)> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(text) = crate::run_metadata::read_text_lossy(&raw.join("_extern.inf")) else { return out };
+    let mut current: Option<c_int> = None;
+    let mut start: Option<f64> = None;
+    let mut end: Option<f64> = None;
+    let flush = |current: Option<c_int>, start: &mut Option<f64>, end: &mut Option<f64>, out: &mut std::collections::HashMap<c_int, (f64, f64)>| {
+        if let (Some(f), Some(a), Some(b)) = (current, *start, *end) {
+            out.insert(f, (a, b));
+        }
+        *start = None;
+        *end = None;
+    };
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("Function Parameters - Function ") {
+            flush(current, &mut start, &mut end, &mut out);
+            current = rest.split(' ').next().and_then(|n| n.parse::<c_int>().ok()).map(|n| n - 1);
+            continue;
+        }
+        let number = |s: &str| s.split_whitespace().last().and_then(|v| v.parse::<f64>().ok());
+        if l.starts_with("Transfer Collision Energy Ramp Start") {
+            start = number(l);
+        } else if l.starts_with("Transfer Collision Energy Ramp End") {
+            end = number(l);
+        }
+    }
+    flush(current, &mut start, &mut end, &mut out);
+    out
 }
 
 impl Drop for WatersReader {
@@ -959,32 +1095,52 @@ fn prepend_dir_to_path(dir: &Path) {
 mod tests {
     use super::*;
 
-    fn fi(t: Option<&str>, bins: c_int, ce: Option<f64>) -> FunctionInfo {
-        FunctionInfo { type_string: t.map(str::to_string), drift_bins: bins, collision_energy_0: ce, ..Default::default() }
+    fn fi(code: Option<c_int>, bins: c_int, ce: Option<f64>) -> FunctionInfo {
+        FunctionInfo { type_code: code, drift_bins: bins, collision_energy_0: ce, ion_mode: Some("ES+".into()), mass_range: Some((50.0, 600.0)), ..Default::default() }
     }
 
     #[test]
-    fn ms_levels_follow_the_function_type_and_the_mse_convention() {
-        // Capan2: six TOF MS functions, the second with a collision energy → 1, 2, 1, 1, 1, 1 (pwiz's labels).
-        let mut fs: Vec<FunctionInfo> = (0..6).map(|_| fi(Some("TOF MS"), 200, Some(0.0))).collect();
-        fs[1].collision_energy_0 = Some(19.5);
+    fn ms_levels_follow_the_function_type_code_and_the_mse_convention() {
+        const TOF_MS: c_int = 218;
+        const TOFD: c_int = 216;
+        // Capan2: six TOF MS functions, the second with a collision energy, the third the lock-mass
+        // reference → 1, 2, 1, 1, 1, 1 (pwiz's labels).
+        let mut fs: Vec<FunctionInfo> = (0..6).map(|_| fi(Some(TOF_MS), 200, Some(4.0))).collect();
         assert_eq!((0..6).map(|f| ms_level_for(f, &fs, Some(2))).collect::<Vec<_>>(), vec![1, 2, 1, 1, 1, 1]);
         // The second function at collision energy 0 is not MSe.
         fs[1].collision_energy_0 = Some(0.0);
         assert_eq!(ms_level_for(1, &fs, None), 1);
-        // The second function being the lock-mass function is never MS2.
-        fs[1].collision_energy_0 = Some(19.5);
+        // The second function being the lock-mass function (PXD059353: MS + REFERENCE) is never MS2.
+        fs[1].collision_energy_0 = Some(4.0);
         assert_eq!(ms_level_for(1, &fs, Some(1)), 1);
-        // A DDA method: MS survey + product-ion functions.
-        let fs = vec![fi(Some("TOF MS"), 0, None), fi(Some("TOF DAUGHTER"), 0, None), fi(Some("TOF DAUGHTER"), 0, None)];
-        assert_eq!((0..3).map(|f| ms_level_for(f, &fs, None)).collect::<Vec<_>>(), vec![1, 2, 2]);
-        // Collision energy unreadable: the second function counts as MSe only when it repeats the first type.
-        let fs = vec![fi(Some("TOF MS"), 0, None), fi(Some("TOF MS"), 0, None)];
-        assert_eq!(ms_level_for(1, &fs, None), 2);
-        let fs = vec![fi(Some("TOF MS"), 0, None), fi(Some("MS"), 0, None)];
+        // A polarity-switching pair is not MSe.
+        fs[1].ion_mode = Some("ES-".into());
         assert_eq!(ms_level_for(1, &fs, None), 1);
+        // HDDDA (PXD073126): TOF MS survey + TOFD product-ion functions + REFERENCE → 1, 2, 2, 1.
+        let fs = vec![fi(Some(TOF_MS), 200, Some(4.0)), fi(Some(TOFD), 200, None), fi(Some(TOFD), 200, None), fi(Some(TOF_MS), 200, Some(4.0))];
+        assert_eq!((0..4).map(|f| ms_level_for(f, &fs, Some(3))).collect::<Vec<_>>(), vec![1, 2, 2, 1]);
+        // MSMS, MS2, QUAD AUTO DAU are product-ion kinds; MRM/SIR/NL/NG are chromatograms; DAD is not MS.
+        assert_eq!(FunctionKind::from_code(206), Some(FunctionKind::Ms(2)));
+        assert_eq!(FunctionKind::from_code(211), Some(FunctionKind::Ms(2)));
+        assert_eq!(FunctionKind::from_code(224), Some(FunctionKind::Ms(2)));
+        assert!(matches!(FunctionKind::from_code(209), Some(FunctionKind::Chromatogram(_))));
+        assert!(matches!(FunctionKind::from_code(201), Some(FunctionKind::Chromatogram(_))));
+        assert!(matches!(FunctionKind::from_code(207), Some(FunctionKind::Chromatogram(_))));
+        assert!(matches!(FunctionKind::from_code(212), Some(FunctionKind::NotMs(_))));
         // No type information: the historical index rule.
         let fs = vec![fi(None, 0, None), fi(None, 0, None), fi(None, 0, None)];
         assert_eq!((0..3).map(|f| ms_level_for(f, &fs, None)).collect::<Vec<_>>(), vec![1, 2, 2]);
+    }
+
+    #[test]
+    fn method_ramps_and_reference_functions_parse_from_extern_inf() {
+        let dir = std::env::temp_dir().join(format!("mzpc-waters-extern-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("_extern.inf"), "Function Parameters - Function 1 - MOBILITY MS FUNCTION\r\nUsing Auto Transfer Collision Energy (eV)\t2.000000\r\nFunction Parameters - Function 2 - MOBILITY MS FUNCTION\r\nTransfer Collision Energy Ramp Start (eV)\t20.0\r\nTransfer Collision Energy Ramp End (eV)\t50.0\r\nFunction Parameters - Function 3 - REFERENCE\r\nTrap Collision Energy (eV)\t4.0\r\n").unwrap();
+        let ramps = method_ce_ramps_from_extern_inf(&dir);
+        assert_eq!(ramps.get(&1), Some(&(20.0, 50.0)));
+        assert!(ramps.get(&0).is_none() && ramps.get(&2).is_none());
+        assert_eq!(reference_functions_from_extern_inf(&dir), vec![2]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
