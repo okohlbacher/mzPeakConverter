@@ -37,7 +37,7 @@ use crate::{
     },
     param::ControlledVocabularyEntry,
     peak_series::{ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays},
-    writer::{base::GenericDataArrayWriter, builder::SpectrumFieldVisitors},
+    writer::{base::{GenericDataArrayWriter, centroid_arrays_beyond_peaks}, builder::SpectrumFieldVisitors},
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -208,6 +208,11 @@ impl<'a> ArrayTypesSampler<'a> {
         }
 
         if prefer_peaks {
+            // Same rule as the write path: a centroid peak set that is only part of the raw
+            // arrays is sampled from the raw arrays, so the extra dimension gets a column.
+            if let Some(map) = centroid_arrays_beyond_peaks(&s) {
+                return self.from_binary_array_map(map, BufferContext::Spectrum);
+            }
             match s.peaks() {
                 mzdata::spectrum::RefPeakDataLevel::Missing => None,
                 mzdata::spectrum::RefPeakDataLevel::RawData(map) => {
