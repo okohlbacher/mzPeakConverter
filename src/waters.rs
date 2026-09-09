@@ -344,70 +344,99 @@ impl WatersReader {
             index,
             input: input.to_path_buf(),
         };
-        if std::env::var("MZPC_WATERS_PROBE").is_ok_and(|v| v.trim() == "items") {
-            reader.probe_scan_items(n_functions);
+        if let Ok(v) = std::env::var("MZPC_WATERS_PROBE") {
+            if let Some(variant) = v.trim().strip_prefix("items") {
+                reader.probe_scan_items(n_functions, variant.parse().unwrap_or(1));
+            }
         }
         Ok(reader)
     }
 
-    /// `MZPC_WATERS_PROBE=items`: log-only discovery of the MassLynx scan items WITHOUT the
-    /// enumerator that crashes (`getScanItemsInFunction`). `getScanItemName(info, id, char**)` has
-    /// the verified shape of the other string getters, so sweeping ids is safe; the values are then
-    /// read with `getScanItemValue(info, function, scan, id, char**)` for the ids whose names matter
-    /// (set mass, collision energy, SONAR, lock mass, TIC/base peak). Every call is announced first.
-    fn probe_scan_items(&self, n_functions: c_int) {
+    /// `MZPC_WATERS_PROBE=itemsN`: log-only discovery of the MassLynx scan items, one candidate
+    /// shape per process (round 15: `getScanItemName(info, id, char**)` access-violated on id 0):
+    /// 1 = `getScanItemName(info, id, char**)` for id 1..400 (id 0 skipped — an id-1 table index?);
+    /// 2 = `getScanItemName(info, function, id, char**)`; 3 = `getScanItemsInFunction(info, function,
+    /// scan, int**, int*)` — the recurring extra-int pattern of this DLL; 4 = `getScanItemValue(info,
+    /// function, scan, id, char**)` for the ids the public MassLynx SDK enum gives COLLISION_ENERGY
+    /// (62), ION_ENERGY (63), SET_MASS (77), COLLISION_ENERGY2 (78) — a value probe needs no name.
+    /// 5 = `getLockMassFunction(info, *int)`. Every call is announced first.
+    fn probe_scan_items(&self, n_functions: c_int, variant: u8) {
         type ItemNameFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *const c_char) -> c_int;
+        type ItemNameFnF = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *const c_char) -> c_int;
+        type ItemsInFnScan = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *const c_int, *mut c_int) -> c_int;
         type ItemValueFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *mut *const c_char) -> c_int;
         type LockMassFn = unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int;
         let lib = &self._lib;
-        let name_fn: Option<ItemNameFn> = unsafe { lib.get(b"getScanItemName\0") }.ok().map(|f| *f);
-        let value_fn: Option<ItemValueFn> = unsafe { lib.get(b"getScanItemValue\0") }.ok().map(|f| *f);
-        let lock_fn: Option<LockMassFn> = unsafe { lib.get(b"getLockMassFunction\0") }.ok().map(|f| *f);
         let cstr = |p: *const c_char| -> String {
             if p.is_null() { "<null>".into() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().chars().take(60).collect() }
         };
-        let mut named: Vec<(c_int, String)> = Vec::new();
-        if let Some(g) = name_fn {
-            for id in 0..400 {
-                if id % 50 == 0 {
-                    log::info!("waters-probe: calling getScanItemName(id={id}..{})", id + 49);
+        match variant {
+            1 => {
+                if let Some(g) = unsafe { lib.get::<ItemNameFn>(b"getScanItemName\0") }.ok().map(|f| *f) {
+                    let mut named = Vec::new();
+                    for id in 1..400 {
+                        log::info!("waters-probe: calling getScanItemName(info, id={id}, char**)");
+                        let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                        let rc = unsafe { g(self.info_reader, id, ps.as_mut_ptr()) };
+                        if rc == 0 && !ps[0].is_null() {
+                            named.push(format!("{id}:{}", cstr(ps[0])));
+                        }
+                    }
+                    log::info!("waters-probe: variant 1 names ({}): {}", named.len(), named.join(" | "));
                 }
-                let mut ps: [*const c_char; 4] = [ptr::null(); 4];
-                let rc = unsafe { g(self.info_reader, id, ps.as_mut_ptr()) };
-                if rc == 0 && !ps[0].is_null() {
-                    let name = cstr(ps[0]);
-                    if !name.is_empty() {
-                        named.push((id, name));
+            }
+            2 => {
+                if let Some(g) = unsafe { lib.get::<ItemNameFnF>(b"getScanItemName\0") }.ok().map(|f| *f) {
+                    let mut named = Vec::new();
+                    for id in 1..400 {
+                        log::info!("waters-probe: calling getScanItemName(info, function=0, id={id}, char**)");
+                        let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                        let rc = unsafe { g(self.info_reader, 0, id, ps.as_mut_ptr()) };
+                        if rc == 0 && !ps[0].is_null() {
+                            named.push(format!("{id}:{}", cstr(ps[0])));
+                        }
+                    }
+                    log::info!("waters-probe: variant 2 names ({}): {}", named.len(), named.join(" | "));
+                }
+            }
+            3 => {
+                if let Some(g) = unsafe { lib.get::<ItemsInFnScan>(b"getScanItemsInFunction\0") }.ok().map(|f| *f) {
+                    for f in 0..n_functions {
+                        log::info!("waters-probe: calling getScanItemsInFunction(info, f={}, scan=0, int**, int*)", f + 1);
+                        let mut items: [*const c_int; 4] = [ptr::null(); 4];
+                        let mut n = [0i32; 4];
+                        let rc = unsafe { g(self.info_reader, f, 0, items.as_mut_ptr(), n.as_mut_ptr()) };
+                        let ids = if rc == 0 && !items[0].is_null() && (0..=512).contains(&n[0]) {
+                            unsafe { std::slice::from_raw_parts(items[0], n[0] as usize) }.to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        log::info!("waters-probe: variant 3 function {} rc={rc} n={} ids={:?}", f + 1, n[0], ids);
                     }
                 }
             }
-            log::info!("waters-probe: scan item names ({}): {}", named.len(), named.iter().map(|(i, n)| format!("{i}:{n}")).collect::<Vec<_>>().join(" | "));
-        }
-        if let Some(g) = value_fn {
-            let wanted: Vec<(c_int, String)> = named
-                .iter()
-                .filter(|(_, n)| {
-                    let u = n.to_ascii_uppercase();
-                    ["SET MASS", "SETMASS", "COLLISION", "SONAR", "LOCK", "TIC", "TOTAL ION", "BASE PEAK", "PEAKS", "PUSH", "DRIFT", "QUAD"].iter().any(|k| u.contains(k))
-                })
-                .cloned()
-                .collect();
-            for f in 0..n_functions {
-                let mut vals = Vec::new();
-                for (id, name) in &wanted {
-                    log::info!("waters-probe: calling getScanItemValue(f={}, scan=1, item={id} {name})", f + 1);
-                    let mut ps: [*const c_char; 4] = [ptr::null(); 4];
-                    let rc = unsafe { g(self.info_reader, f, 0, *id, ps.as_mut_ptr()) };
-                    vals.push(format!("{name}={}", if rc == 0 { cstr(ps[0]) } else { format!("rc={rc}") }));
+            4 => {
+                if let Some(g) = unsafe { lib.get::<ItemValueFn>(b"getScanItemValue\0") }.ok().map(|f| *f) {
+                    for f in 0..n_functions {
+                        let mut vals = Vec::new();
+                        for id in [62, 63, 77, 78, 52, 61] {
+                            log::info!("waters-probe: calling getScanItemValue(info, f={}, scan=0, item={id}, char**)", f + 1);
+                            let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                            let rc = unsafe { g(self.info_reader, f, 0, id, ps.as_mut_ptr()) };
+                            vals.push(format!("{id}={}", if rc == 0 { cstr(ps[0]) } else { format!("rc={rc}") }));
+                        }
+                        log::info!("waters-probe: variant 4 function {} scan 1: {}", f + 1, vals.join(" | "));
+                    }
                 }
-                log::info!("waters-probe: function {} scan 1 items: {}", f + 1, vals.join(" | "));
             }
-        }
-        if let Some(g) = lock_fn {
-            log::info!("waters-probe: calling getLockMassFunction(info, *int)");
-            let mut slot = [-1i32; 4];
-            let rc = unsafe { g(self.info_reader, slot.as_mut_ptr()) };
-            log::info!("waters-probe: getLockMassFunction rc={rc} raw={:?}", slot);
+            _ => {
+                if let Some(g) = unsafe { lib.get::<LockMassFn>(b"getLockMassFunction\0") }.ok().map(|f| *f) {
+                    log::info!("waters-probe: calling getLockMassFunction(info, *int)");
+                    let mut slot = [-1i32; 4];
+                    let rc = unsafe { g(self.info_reader, slot.as_mut_ptr()) };
+                    log::info!("waters-probe: variant 5 getLockMassFunction rc={rc} raw={:?}", slot);
+                }
+            }
         }
     }
 
