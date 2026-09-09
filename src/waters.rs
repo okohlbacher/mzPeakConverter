@@ -331,7 +331,7 @@ impl WatersReader {
             return Err(close(format!("Waters .raw {} has no readable scans", input.display())));
         }
 
-        Ok(WatersReader {
+        let reader = WatersReader {
             _lib: lib,
             read_scan,
             read_drift_scan,
@@ -343,7 +343,72 @@ impl WatersReader {
             drift_time_ms,
             index,
             input: input.to_path_buf(),
-        })
+        };
+        if std::env::var("MZPC_WATERS_PROBE").is_ok_and(|v| v.trim() == "items") {
+            reader.probe_scan_items(n_functions);
+        }
+        Ok(reader)
+    }
+
+    /// `MZPC_WATERS_PROBE=items`: log-only discovery of the MassLynx scan items WITHOUT the
+    /// enumerator that crashes (`getScanItemsInFunction`). `getScanItemName(info, id, char**)` has
+    /// the verified shape of the other string getters, so sweeping ids is safe; the values are then
+    /// read with `getScanItemValue(info, function, scan, id, char**)` for the ids whose names matter
+    /// (set mass, collision energy, SONAR, lock mass, TIC/base peak). Every call is announced first.
+    fn probe_scan_items(&self, n_functions: c_int) {
+        type ItemNameFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *const c_char) -> c_int;
+        type ItemValueFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *mut *const c_char) -> c_int;
+        type LockMassFn = unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int;
+        let lib = &self._lib;
+        let name_fn: Option<ItemNameFn> = unsafe { lib.get(b"getScanItemName\0") }.ok().map(|f| *f);
+        let value_fn: Option<ItemValueFn> = unsafe { lib.get(b"getScanItemValue\0") }.ok().map(|f| *f);
+        let lock_fn: Option<LockMassFn> = unsafe { lib.get(b"getLockMassFunction\0") }.ok().map(|f| *f);
+        let cstr = |p: *const c_char| -> String {
+            if p.is_null() { "<null>".into() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().chars().take(60).collect() }
+        };
+        let mut named: Vec<(c_int, String)> = Vec::new();
+        if let Some(g) = name_fn {
+            for id in 0..400 {
+                if id % 50 == 0 {
+                    log::info!("waters-probe: calling getScanItemName(id={id}..{})", id + 49);
+                }
+                let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                let rc = unsafe { g(self.info_reader, id, ps.as_mut_ptr()) };
+                if rc == 0 && !ps[0].is_null() {
+                    let name = cstr(ps[0]);
+                    if !name.is_empty() {
+                        named.push((id, name));
+                    }
+                }
+            }
+            log::info!("waters-probe: scan item names ({}): {}", named.len(), named.iter().map(|(i, n)| format!("{i}:{n}")).collect::<Vec<_>>().join(" | "));
+        }
+        if let Some(g) = value_fn {
+            let wanted: Vec<(c_int, String)> = named
+                .iter()
+                .filter(|(_, n)| {
+                    let u = n.to_ascii_uppercase();
+                    ["SET MASS", "SETMASS", "COLLISION", "SONAR", "LOCK", "TIC", "TOTAL ION", "BASE PEAK", "PEAKS", "PUSH", "DRIFT", "QUAD"].iter().any(|k| u.contains(k))
+                })
+                .cloned()
+                .collect();
+            for f in 0..n_functions {
+                let mut vals = Vec::new();
+                for (id, name) in &wanted {
+                    log::info!("waters-probe: calling getScanItemValue(f={}, scan=1, item={id} {name})", f + 1);
+                    let mut ps: [*const c_char; 4] = [ptr::null(); 4];
+                    let rc = unsafe { g(self.info_reader, f, 0, *id, ps.as_mut_ptr()) };
+                    vals.push(format!("{name}={}", if rc == 0 { cstr(ps[0]) } else { format!("rc={rc}") }));
+                }
+                log::info!("waters-probe: function {} scan 1 items: {}", f + 1, vals.join(" | "));
+            }
+        }
+        if let Some(g) = lock_fn {
+            log::info!("waters-probe: calling getLockMassFunction(info, *int)");
+            let mut slot = [-1i32; 4];
+            let rc = unsafe { g(self.info_reader, slot.as_mut_ptr()) };
+            log::info!("waters-probe: getLockMassFunction rc={rc} raw={:?}", slot);
+        }
     }
 
     pub fn len(&self) -> usize {
