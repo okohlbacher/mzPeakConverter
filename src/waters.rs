@@ -1205,7 +1205,8 @@ fn ms_level_for(f: usize, functions: &[FunctionInfo], lockmass: Option<c_int>) -
     }
 }
 
-/// `_extern.inf`: per-function "Transfer Collision Energy Ramp Start (eV) 20.0" / "… End (eV) 50.0",
+/// `_extern.inf`: per-function "Transfer Collision Energy Ramp Start (eV) 20.0" / "… End (eV) 50.0"
+/// (Synapt) or "MS Collision Energy Low (eV) 65.0" / "… High (eV) 75.0" (Xevo MSe),
 /// keyed by 0-based function. The section headers read `Function Parameters - Function N - <kind>`.
 fn method_ce_ramps_from_extern_inf(raw: &Path) -> std::collections::HashMap<c_int, (f64, f64)> {
     let mut out = std::collections::HashMap::new();
@@ -1228,9 +1229,11 @@ fn method_ce_ramps_from_extern_inf(raw: &Path) -> std::collections::HashMap<c_in
             continue;
         }
         let number = |s: &str| s.split_whitespace().last().and_then(|v| v.parse::<f64>().ok());
-        if l.starts_with("Transfer Collision Energy Ramp Start") {
+        // Synapt HDMSe methods: "Transfer Collision Energy Ramp Start/End (eV)"; Xevo MSe methods
+        // (TOF PARENT FUNCTION): "MS Collision Energy Low (eV)" / "MS Collision Energy High (eV)".
+        if l.starts_with("Transfer Collision Energy Ramp Start") || l.starts_with("MS Collision Energy Low") {
             start = number(l);
-        } else if l.starts_with("Transfer Collision Energy Ramp End") {
+        } else if l.starts_with("Transfer Collision Energy Ramp End") || l.starts_with("MS Collision Energy High") {
             end = number(l);
         }
     }
@@ -1319,10 +1322,11 @@ mod tests {
     fn method_ramps_and_reference_functions_parse_from_extern_inf() {
         let dir = std::env::temp_dir().join(format!("mzpc-waters-extern-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("_extern.inf"), "Function Parameters - Function 1 - MOBILITY MS FUNCTION\r\nUsing Auto Transfer Collision Energy (eV)\t2.000000\r\nFunction Parameters - Function 2 - MOBILITY MS FUNCTION\r\nTransfer Collision Energy Ramp Start (eV)\t20.0\r\nTransfer Collision Energy Ramp End (eV)\t50.0\r\nFunction Parameters - Function 3 - REFERENCE\r\nTrap Collision Energy (eV)\t4.0\r\n").unwrap();
+        std::fs::write(dir.join("_extern.inf"), "Function Parameters - Function 1 - MOBILITY MS FUNCTION\r\nUsing Auto Transfer Collision Energy (eV)\t2.000000\r\nFunction Parameters - Function 2 - MOBILITY MS FUNCTION\r\nTransfer Collision Energy Ramp Start (eV)\t20.0\r\nTransfer Collision Energy Ramp End (eV)\t50.0\r\nFunction Parameters - Function 3 - REFERENCE\r\nTrap Collision Energy (eV)\t4.0\r\nFunction Parameters - Function 4 - TOF PARENT FUNCTION\r\nRamp High Energy from\t\t\t\t65.0 to 75.0\r\n[COLLISION ENERGY]\r\nMS Collision Energy Low (eV)\t\t\t65.0\r\nMS Collision Energy High (eV)\t\t\t75.0\r\n").unwrap();
         let ramps = method_ce_ramps_from_extern_inf(&dir);
         assert_eq!(ramps.get(&1), Some(&(20.0, 50.0)));
         assert!(ramps.get(&0).is_none() && ramps.get(&2).is_none());
+        assert_eq!(ramps.get(&3), Some(&(65.0, 75.0)), "Xevo MSe key names");
         assert_eq!(reference_functions_from_extern_inf(&dir), vec![2]);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Waters MSe on Xevo: the elevated-energy ramp is read from the method text.** Xevo MSe methods
+  state it as `MS Collision Energy Low (eV)` / `MS Collision Energy High (eV)` under a `TOF PARENT
+  FUNCTION` section, not as the Synapt's `Transfer Collision Energy Ramp Start/End (eV)`; the 0.11.3
+  corpus archive of PXD052561 (`20231129_NM4_Xevo_MSe.raw`, 65–75 eV) therefore carried no
+  MS:1002013/1002014 on its 1,358 MSe precursors. Both spellings are read now.
+
 ## [0.11.3] — 2026-09-09
 
 **Output change.** The native lanes now write run metadata they used to drop (below), the Bruker
