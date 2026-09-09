@@ -91,15 +91,19 @@ jobs:
       # line and exit 2 (Glue.cs Main). That proves the exe boots on this runner (x64 target, .NET
       # Framework present, no config surprise) — the difference between "an exe was emitted" and
       # "the exe runs". The AGL2 magic is pinned against src/agl.rs by the Rust tests.
+      # Launched via Start-Process rather than `& exe 2>&1 | ... ; if ($LASTEXITCODE ...)`: that form
+      # ended the step with exit code 1 and NO diagnostic on every run since it was added (pwsh 7.6,
+      # windows-2025 image), so the assertion never said what it saw. Reading the exit code off the
+      # process object sidesteps $LASTEXITCODE, stderr redirection and the runner's
+      # $ErrorActionPreference = 'Stop' entirely, and the code is printed either way.
       - name: Boot the Agilent host (usage exit)
         shell: pwsh
         run: |
-          # Not `& exe 2>&1 | ...`: the runner's pwsh treats a native non-zero exit (and stderr
-          # through 2>&1) as a terminating error under its ErrorActionPreference=Stop, so the
-          # step died with exit 1 before the check below ever ran (failing on main since 2026-09-06).
-          $p = Start-Process -FilePath glue/agilent/bin/Release/net48/AgilentGlueHost.exe -NoNewWindow -Wait -PassThru -RedirectStandardOutput host.out -RedirectStandardError host.err
-          Get-Content host.out, host.err -ErrorAction SilentlyContinue | Write-Host
-          if ($p.ExitCode -ne 2) { throw "AgilentGlueHost.exe exited $($p.ExitCode), expected 2 (usage)" }
+          $exe = (Resolve-Path glue/agilent/bin/Release/net48/AgilentGlueHost.exe).Path
+          $p = Start-Process -FilePath $exe -NoNewWindow -Wait -PassThru
+          Write-Host "AgilentGlueHost.exe exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 2) { Write-Error "AgilentGlueHost.exe exited $($p.ExitCode), expected 2 (usage)"; exit 1 }
+          exit 0
 
       - name: Verify ShimadzuGlue.runtimeconfig.json enables BinaryFormatter
         shell: pwsh
