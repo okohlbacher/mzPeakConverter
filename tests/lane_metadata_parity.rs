@@ -233,23 +233,23 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "facet.spectra_metadata_precursors.parquet.rows",
-        kind: Kind::Defect,
-        reason: "ORPHAN MS2 on the Waters native lane: the 682 elevated-energy MSe scans of Capan2 carry no precursor, where ProteoWizard writes its MSe placeholder precursor on each of the 136,400 drift-bin spectra it expands them into (682 × 200). The SDK route (getScanItemValue SET_MASS / COLLISION_ENERGY) is blocked on getScanItemsInFunction, which crashes in every spelling tried (BACKLOG). Bruker TSF and TDF carry theirs; SciEX needs the MetaV2 glue export.",
+        kind: Kind::ByDesign,
+        reason: "frames vs drift bins: the native Waters lane writes one precursor per MSn FRAME (Capan2: 682, one per elevated-energy MSe scan, from the SDK's scan items SET_MASS / COLLISION_ENERGY), where ProteoWizard writes its MSe placeholder precursor on each of the 136,400 drift-bin spectra it expands them into (682 × 200).",
     },
     Expected {
         key: "facet.spectra_metadata_selected_ions.parquet.rows",
-        kind: Kind::Defect,
-        reason: "follows facet.spectra_metadata_precursors.parquet.rows.",
+        kind: Kind::ByDesign,
+        reason: "an MSe elevated-energy scan selects nothing (SET_MASS = 0): the native lane writes no selected ion and no isolation window, only the activation; ProteoWizard writes a placeholder selected ion and window on every drift-bin spectrum. A DDA function (SET_MASS > 0) gets a selected ion and a target-only window on both lanes.",
     },
     Expected {
         key: "spectra_metadata_precursors.*",
-        kind: Kind::Defect,
-        reason: "follows facet.spectra_metadata_precursors.parquet.rows.",
+        kind: Kind::ByDesign,
+        reason: "follows the two row rules: ×200 rows on the pwiz side, and pwiz's invented MSe isolation window / trap collision energy against the native lane's activation-only precursor with the method's transfer-energy ramp (MS:1002013/1002014).",
     },
     Expected {
         key: "spectra_metadata_selected_ions.*",
-        kind: Kind::Defect,
-        reason: "follows facet.spectra_metadata_precursors.parquet.rows.",
+        kind: Kind::ByDesign,
+        reason: "follows facet.spectra_metadata_selected_ions.parquet.rows.",
     },
 ];
 
