@@ -97,13 +97,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A tag pushed without a release yet (or a re-run) should still work. The two
+          # matrix jobs race here; whoever loses simply finds the release already there.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes \
+            || true
           gh release upload "$TAG" \
             "${{ steps.package.outputs.tarball }}" \
             "${{ steps.package.outputs.tarball }}.sha256" \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   cask:
-    name: Update the Homebrew cask
+    name: Update the Homebrew tap
     needs: macos
     runs-on: macos-latest
     env:
@@ -113,21 +118,21 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Point the cask at this release
-        run: tools/update_cask.sh "$TAG"
+      - name: Point the cask and formula at this release
+        run: tools/update_homebrew.sh "$TAG"
 
       - name: Commit
         run: |
           set -euo pipefail
-          if git diff --quiet -- Casks/mzpeak-convert.rb; then
+          if git diff --quiet -- Casks/mzpeak-convert.rb Formula/mzpeak-convert.rb; then
             echo "cask already current"; exit 0
           fi
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Casks/mzpeak-convert.rb
-          git commit -m "cask: mzpeak-convert $TAG [skip ci]"
+          git add Casks/mzpeak-convert.rb Formula/mzpeak-convert.rb
+          git commit -m "homebrew: mzpeak-convert $TAG [skip ci]"
           git push || {
             echo "::error::could not push the cask update (protected branch?). Run" \
-                 "\`tools/update_cask.sh $TAG\` locally and commit Casks/mzpeak-convert.rb."
+                 "\`tools/update_homebrew.sh $TAG\` locally and commit the two files it changes."
             exit 1
           }

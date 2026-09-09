@@ -1,0 +1,199 @@
+# box_convert_remote.ps1 — runs ON the flash-workstation. Reads ONE job as JSON from stdin:
+#   {"raw_url": "...", "put_url": "...", "opts": "--no-vendor", "archive": false, "converter": "..."}
+# Downloads the raw from its URL, converts in an isolated temp dir, uploads the .mzpeak via the
+# presigned PUT url, and prints base64(result-json) between <<<BOXRESULT / BOXRESULT>>> markers.
+#
+# Secret URLs (presigned PUT, and a possibly-authenticated raw URL) are written to curl -K config
+# files inside the per-user temp dir, NEVER passed on curl's command line — so they don't appear in
+# the box process table. The temp dir (raw + mzpeak + configs) is always removed (isolation+hygiene).
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'   # keep CLIXML progress out of stdout
+
+# Vendor SDK environment the converter needs for .wiff/.raw/.d (box-specific paths). Override any of
+# these by creating C:\Users\User\box_convert_env.ps1 (dot-sourced last if present).
+$env:DOTNET_ROOT = 'C:\Users\User\dotnet8'; $env:DOTNET_ROLL_FORWARD = 'LatestMajor'
+$cvtRoot = 'C:\Users\User\src\mzPeakConverter'
+$pwiz = 'C:/Program Files (x86)/FLASHApp-1.0.0/FLASHApp-1.0.0/share/OpenMS/THIRDPARTY/pwiz-bin'
+if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE  = (Resolve-Path "$cvtRoot\glue\sciex\bin\Release\net8.0").Path }
+if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
+if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
+if (Test-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0") { $env:MZPC_SHIMADZU_GLUE = (Resolve-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0").Path }  # native Shimadzu .lcd (LabSolutions.IO)
+$env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent loads from $pwiz/vendor_api/Agilent
+# --via-msconvert resolves msconvert via $MSCONVERT_PATH; pin it to THIS pwiz so it has the bundled
+# vendor readers (vendor_api/Agilent etc.) — else it grabs a msconvert on PATH that lacks them ([ReaderFail]).
+if (Test-Path "$pwiz/msconvert.exe") { $env:MSCONVERT_PATH = (Join-Path $pwiz 'msconvert.exe') }
+if (Test-Path "$pwiz/timsdata.dll") { $env:TIMSDATA_LIB_DIR = $pwiz }   # --bruker-sdk loads timsdata.dll from pwiz-bin
+if (Test-Path 'C:\Users\User\box_convert_env.ps1') { . 'C:\Users\User\box_convert_env.ps1' }
+
+$job = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$work = Join-Path $env:TEMP ("bxc-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+$res = [ordered]@{ stage='init'; exit=1; uploaded=$false; size=0; md5=''; log=''; error=''; note='';
+                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0 }
+
+try {
+    $converter = if ($job.converter) { $job.converter } else { 'C:\Users\User\src\mzPeakConverter\target\release\mzpeak-convert.exe' }
+    if (-not (Test-Path $converter)) { throw "converter not found: $converter" }
+
+    # 1. download the raw from its URL — url goes in a -K config file, not argv
+    $res.stage = 'download'
+    $rawName = [IO.Path]::GetFileName(([Uri]$job.raw_url).AbsolutePath)
+    if (-not $rawName) { $rawName = 'input.bin' }
+    $rawPath = Join-Path $work $rawName
+    $dlcfg = Join-Path $work 'dl.cfg'
+    Set-Content -LiteralPath $dlcfg -Value ('url = "' + $job.raw_url + '"') -Encoding ASCII
+    $swdl = [Diagnostics.Stopwatch]::StartNew()
+    & curl.exe -fSL --retry 3 --retry-delay 5 -K $dlcfg -o $rawPath
+    if ($LASTEXITCODE -ne 0) { throw "raw download failed (curl exit $LASTEXITCODE)" }
+    $res.dl_s = [math]::Round($swdl.Elapsed.TotalSeconds, 1)
+
+    # 2. archive (multi-file vendor formats) -> extract + pick the unit deterministically
+    $isArchive = $job.archive -or ($rawName -match '\.(zip|tgz|tar\.gz)$')
+    if ($isArchive) {
+        $res.stage = 'extract'
+        $ex = Join-Path $work 'unpacked'; New-Item -ItemType Directory -Force -Path $ex | Out-Null
+        & tar.exe -xf $rawPath -C $ex   # bsdtar on Win10+ handles .zip and .tar.gz
+        if ($LASTEXITCODE -ne 0) { throw "extract failed (tar exit $LASTEXITCODE)" }
+        $order = @('.d','.wiff','.raw','.imzml','.mzml')   # preference order
+        $units = @()
+        # vendor dirs: Bruker/Agilent .d AND Waters .raw (a directory, not a file).
+        # A vendor dir counts as a unit ONLY if it holds the vendor payload. Some archives nest the
+        # real unit inside a WRAPPER dir that also ends in .d (e.g. MSV000101607:
+        # `Blank_Try.d/Blank(1) Try_Slot1-1_1_8270.d/analysis.tdf`). Without this check the wrapper
+        # wins the FullName sort below (it is a path prefix of the nested unit) and the converter is
+        # handed a directory with no vendor data -> native read fails, msconvert fails, job lost.
+        $hasPayload = {
+            param($dir)
+            $markers = @('analysis.tdf','analysis.tsf','analysis.baf','_HEADER.TXT','MSScan.bin','msprofile.bin')
+            foreach ($mk in $markers) { if (Test-Path -LiteralPath (Join-Path $dir.FullName $mk)) { return $true } }
+            # Agilent keeps its payload under AcqData\; Waters uses _FUNC*.DAT
+            if (Test-Path -LiteralPath (Join-Path $dir.FullName 'AcqData')) { return $true }
+            if (Get-ChildItem -LiteralPath $dir.FullName -Filter '_FUNC*.DAT' -File -ea SilentlyContinue | Select-Object -First 1) { return $true }
+            return $false
+        }
+        $vendorDirs = @(Get-ChildItem -Path $ex -Recurse -Directory | Where-Object { @('.d','.raw') -contains $_.Extension.ToLower() })
+        $withPayload = @($vendorDirs | Where-Object { & $hasPayload $_ })
+        # Prefer dirs that actually hold vendor data; fall back to the old behaviour if none matched
+        # (unknown vendor layout) so this can never make a previously-working archive unconvertible.
+        if ($withPayload.Count -gt 0) {
+            if ($withPayload.Count -lt $vendorDirs.Count) {
+                $res.note = ((@($res.note, "skipped $($vendorDirs.Count - $withPayload.Count) wrapper dir(s) w/o vendor payload") | Where-Object { $_ }) -join ' ')
+            }
+            $units += $withPayload
+        } else {
+            $units += $vendorDirs
+        }
+        $units += Get-ChildItem -Path $ex -Recurse -File | Where-Object { $order -contains $_.Extension.ToLower() }
+        $units = $units | Where-Object { $_.Name -notlike '._*' }   # drop macOS AppleDouble junk
+        if (-not $units -or $units.Count -eq 0) { throw "no convertible unit (.d/.wiff/.raw/.imzML/.mzML) in archive" }
+        $unit = $units | Sort-Object @{ Expression = { $order.IndexOf($_.Extension.ToLower()) } }, FullName | Select-Object -First 1
+        if ($units.Count -gt 1) { $res.note = "archive held $($units.Count) units; picked $($unit.Name)" }
+        $inputPath = $unit.FullName
+    } else {
+        $inputPath = $rawPath
+    }
+
+    # 3. convert (capture every stream + the converter's own exit code)
+    # 2b. BENCH: measure raw footprint + msconvert->mzML size (reported via note; does not affect the mzpeak upload)
+    try {
+        $ri = Get-Item -LiteralPath $inputPath
+        $rawSize = if ($ri.PSIsContainer) { (Get-ChildItem -LiteralPath $inputPath -Recurse -File | Measure-Object Length -Sum).Sum } else { $ri.Length }
+        $res.raw_bytes = $rawSize
+        $mzmlSize = 0
+        # OPT-IN size-bench only: running msconvert here purely to MEASURE the mzML size doubles the
+        # work of every --via-msconvert job (a full multi-GB mzML write, then discarded). Gate it so
+        # production conversions never pay for it. Set MZPC_BENCH_MZML=1 for compression-bench runs.
+        if ($env:MZPC_BENCH_MZML -eq '1' -and $env:MSCONVERT_PATH -and (Test-Path $env:MSCONVERT_PATH)) {
+            $mzmlDir = Join-Path $work 'mzml'; New-Item -ItemType Directory -Force -Path $mzmlDir | Out-Null
+            $swmz = [Diagnostics.Stopwatch]::StartNew()
+            & $env:MSCONVERT_PATH $inputPath --mzML -o $mzmlDir *> (Join-Path $work 'msconvert.log')
+            $res.msconv_s = [math]::Round($swmz.Elapsed.TotalSeconds, 1)
+            $mz = Get-ChildItem -Path $mzmlDir -Filter *.mzML -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1
+            if ($mz) { $mzmlSize = $mz.Length }
+        }
+        $res.note = ((@($res.note, "raw=$rawSize", "mzml=$mzmlSize", "msconv_s=$($res.msconv_s)") | Where-Object { $_ }) -join ' ')
+    } catch { $res.note = ((@($res.note, "benchmeas-fail") | Where-Object { $_ }) -join ' ') }
+
+    $res.stage = 'convert'
+    $out = Join-Path $work 'out.mzpeak'
+    $log = Join-Path $work 'convert.log'
+    $optList = @()
+    if ($job.opts -and $job.opts.Trim()) { $optList = @([regex]::Split($job.opts.Trim(), '\s+') | Where-Object { $_ -ne '' }) }
+    # --byte-plane-intensity is a converter ENV toggle (MZPC_BYTE_PLANE_INTENSITY), not a CLI flag —
+    # lift it out of the opts so it can be driven per-job through box_convert.
+    if ($optList -contains '--byte-plane-intensity') {
+        $env:MZPC_BYTE_PLANE_INTENSITY = '1'
+        $optList = @($optList | Where-Object { $_ -ne '--byte-plane-intensity' })
+    }
+    # mzML intermediate -> RAMDISK when configured. The converter writes any msconvert mzML to
+    # $env:TEMP (Rust std::env::temp_dir), so pointing TEMP/TMP at a RAM-backed volume keeps the giant
+    # intermediate off disk. Set MZPC_MZML_TMPDIR to a ramdisk in C:\Users\User\box_convert_env.ps1.
+    if ($env:MZPC_MZML_TMPDIR -and (Test-Path $env:MZPC_MZML_TMPDIR)) {
+        $env:TMP = $env:MZPC_MZML_TMPDIR; $env:TEMP = $env:MZPC_MZML_TMPDIR
+        $res.note = ((@($res.note, 'mzmltmp=ram') | Where-Object { $_ }) -join ' ')
+    }
+    # Continue around the native call: the converter logs INFO to stderr on SUCCESS, which would
+    # otherwise raise a NativeCommandError under 'Stop' and mask a clean run. Exit is read explicitly.
+    $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    # msconvert is FALLBACK-ONLY, never the primary path. Windows has a native reader for every vendor
+    # (Thermo/.NET, Bruker TDF+BAF, Agilent MHDAC/grid, SciEX Clearcore2, Waters MassLynx, Shimadzu
+    # LabSolutions) and native is both faster and smaller (measured: Waters 946->163 MB, SciEX SWATH
+    # 1242->495 s and 2891->2040 MB; msconvert inflates the mzML round-trip). So the PRIMARY attempt is
+    # ALWAYS native: strip the mzML-lane flags (--via-msconvert, --tof-grid <mode>) so even a job that
+    # still asks for --via-msconvert is tried native first. msconvert runs ONLY if the native read fails.
+    $nativeOpts = @(); $skipNext = $false
+    foreach ($o in $optList) {
+        if ($skipNext) { $skipNext = $false; continue }
+        if ($o -eq '--via-msconvert') { continue }
+        if ($o -eq '--tof-grid') { $skipNext = $true; continue }   # drop the flag AND its mode arg
+        $nativeOpts += $o
+    }
+    $swcv = [Diagnostics.Stopwatch]::StartNew()
+    & $converter $inputPath @nativeOpts -o $out --force *> $log
+    $res.exit = $LASTEXITCODE
+    if ($res.exit -eq 0) {
+        $res.note = ((@($res.note, 'path=native') | Where-Object { $_ }) -join ' ')
+    } else {
+        # native failed on this file/model -> msconvert FALLBACK (the ONLY place msconvert ever runs)
+        $res.note = ((@($res.note, 'path=native-fail->msconvert') | Where-Object { $_ }) -join ' ')
+        $native_only = @('--agilent-grid', '--bruker-sdk')   # conflict with / ignored by the mzML lane
+        $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', 'auto')
+        & $converter $inputPath @fbOpts -o $out --force *>> $log
+        $res.exit = $LASTEXITCODE
+    }
+    $res.conv_s = [math]::Round($swcv.Elapsed.TotalSeconds, 1)
+    $ErrorActionPreference = $prevEAP
+    if (Test-Path $log) { $res.log = (Get-Content $log -Raw) }
+
+    # upload ONLY a clean success (exit 0 AND output present) — never ship a failed/partial archive
+    if ($res.exit -eq 0 -and (Test-Path $out)) {
+        $res.size = (Get-Item $out).Length
+        $res.md5 = (Get-FileHash $out -Algorithm MD5).Hash.ToLower()
+        if ($res.size -gt 5GB) { $res.stage = 'too-big'; throw "mzpeak $($res.size) B exceeds the 5 GB single-PUT limit" }
+        $res.stage = 'upload'
+        $upcfg = Join-Path $work 'up.cfg'
+        Set-Content -LiteralPath $upcfg -Value ('url = "' + $job.put_url + '"') -Encoding ASCII
+        $swup = [Diagnostics.Stopwatch]::StartNew()
+        & curl.exe -fS -X PUT --upload-file $out -K $upcfg
+        if ($LASTEXITCODE -ne 0) { throw "upload failed (curl exit $LASTEXITCODE)" }
+        $res.up_s = [math]::Round($swup.Elapsed.TotalSeconds, 1)
+        $res.uploaded = $true
+        $res.stage = 'done'
+    } elseif ($res.exit -eq 0) {
+        $res.stage = 'no-output'   # exit 0 but nothing written — treat as failure, don't ship
+    } else {
+        $res.stage = 'convert-failed'
+    }
+}
+catch {
+    $res.error = $_.Exception.Message
+}
+finally {
+    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    if ($res.log.Length -gt 16384) { $res.log = $res.log.Substring($res.log.Length - 16384) }  # tail only
+    $json = $res | ConvertTo-Json -Compress -Depth 4
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))   # marker-collision-proof
+    Write-Output "<<<BOXRESULT"
+    Write-Output $b64
+    Write-Output "BOXRESULT>>>"
+}
