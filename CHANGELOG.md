@@ -178,7 +178,7 @@ they were missing (below); nothing else changes bytes. The corpus rebuild picks 
   the pin once a release carries it. Pinned by `tests/isolation_window_offset_order.rs` on a fixture
   that lists the offsets in both orders. Any mzML-lane archive whose source lists the offsets before
   the target (all pwiz Waters MSe/HDMSe twins) is not current and needs a rebuild; the native Waters
-  lane is unaffected (it writes no precursors yet).
+  lane is unaffected (it builds its precursors itself: set mass, acquisition-range MSe window).
 
 ### Changed
 
