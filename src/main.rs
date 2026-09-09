@@ -5703,6 +5703,10 @@ fn convert_waters(
     if let Some(block) = reader.drift_block() {
         hints.transformations.push("sort-by-mz".to_string());
         hints.index_blocks.push(("waters_drift".to_string(), block));
+        // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
+        // and the drift column must be declared even if the IMS function is a small part of the run.
+        hints.keep_zero_runs = true;
+        hints.probe_indices = reader.probe_indices();
     }
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
@@ -5775,6 +5779,14 @@ struct VendorHints {
     /// What the vendor file states about the run (sample, time, instrument, software, members):
     /// merged field by field before `fixup_run_metadata` — see `run_metadata`.
     run_metadata: Option<run_metadata::VendorRunMetadata>,
+    /// Keep zero-intensity runs (the writer's zero-run mask OFF). Set by lanes whose spectra
+    /// interleave several traces in one array — Waters drift frames: masked across bins, the
+    /// mask deleted 3–6 % of the per-bin trace boundaries (review 2026-09-09).
+    keep_zero_runs: bool,
+    /// Spectrum indices the writer samples for its data-facet schema instead of the default
+    /// six-probe stride, so a column only some functions carry (the drift array of a mixed
+    /// IMS/non-IMS Waters run) is declared regardless of where those spectra sit.
+    probe_indices: Vec<usize>,
 }
 
 /// One spectrum from a vendor reader, plus — for a lattice-routed centroid list — the arrays that
@@ -5916,6 +5928,8 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         peaks_facet,
         transformations,
         run_metadata,
+        keep_zero_runs,
+        probe_indices,
     } = hints;
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
@@ -5929,13 +5943,21 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     const N_PROBE: usize = 6;
     let step = (len / N_PROBE).max(1);
     let mut probes: Vec<mzdata::spectrum::MultiLayerSpectrum> = Vec::new();
+    // The lane's own probe choice first (one spectrum per function), then the stride fills up to
+    // the usual six.
+    let mut wanted: Vec<usize> = probe_indices.into_iter().filter(|&i| i < len).collect();
     let mut pi = 0usize;
-    while pi < len && probes.len() < N_PROBE {
-        if let Ok(s) = spectrum(pi) {
+    while pi < len && wanted.len() < N_PROBE {
+        if !wanted.contains(&pi) {
+            wanted.push(pi);
+        }
+        pi += step;
+    }
+    for i in wanted {
+        if let Ok(s) = spectrum(i) {
             let s: VendorSpectrum = s.into();
             probes.push(s.spectrum);
         }
-        pi += step;
     }
     // A custom peaks facet (the Shimadzu centroid lattice) is an integer axis with an f64 fallback
     // column: never chunked, never numpressed — the lattice replaces both.
@@ -5994,7 +6016,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             DataType::Float64,
         ));
     }
-    let mut writer = builder.build(handle, true);
+    let mut writer = builder.build(handle, !keep_zero_runs);
     add_processing_metadata(&mut writer);
     // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band; the
     // per-spectrum grid coefficient columns (`TOF_C0_CURIE` …) are MZP terms too.
@@ -6055,6 +6077,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     }
     fixup_run_metadata(&mut writer, input);
     let mut applied = base_transformations(&[data_chunk, peaks_chunk]);
+    if keep_zero_runs {
+        applied.retain(|t| t != "zero-run-mask");
+    }
     applied.extend(transformations);
     let transformations = transformations_block(&applied);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
