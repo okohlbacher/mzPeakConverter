@@ -143,6 +143,29 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
 - **Target-only isolation windows keep NULL offsets.** An isolation window whose width the
   source does not state was written with lower/upper offsets of ±target (measured on RS080806,
   Minimal_DDA and En_PPY). Pinned by `tests/fixtures/target_only_window.mzML`.
+**Output change.** Archives of a centroid ion-mobility mzML gain the per-peak mobility column
+they were missing (below); nothing else changes bytes. The corpus rebuild picks them up.
+- **The mzML lane silently dropped the per-peak ion-mobility array of a CENTROID IMS spectrum.**
+  mzdata's mzML reader builds a `CentroidPeak` set eagerly for every centroid spectrum, and the
+  vendored writer followed `peaks()` for both the peak-facet schema
+  (`ArrayTypesSampler::visit_spectrum`) and the peak rows (`write_spectrum_data`). That set holds
+  only m/z + intensity, so an MS:1003006 `mean inverse reduced ion mobility array` (pwiz
+  `--combineIonMobilitySpectra` output — or any other per-peak array, a charge array included)
+  left behind in `raw_arrays()` reached neither a column nor `auxiliary_arrays`:
+  `spectrum_array_index` listed m/z + intensity and `number_of_auxiliary_arrays` was 0 on every
+  `*-combineIMS-*centroid` archive of the pwiz Bruker corpus. A centroid spectrum whose raw
+  arrays carry more than its peak set is now routed — schema and rows — through its raw arrays
+  (`centroid_arrays_beyond_peaks`, `vendor/mzpeak_prototyping/src/writer/base.rs`), so the
+  mobility lands as `chunk.mean_inverse_reduced_ion_mobility` (chunked layout) or
+  `point.mean_inverse_reduced_ion_mobility` (point layout) and reads back bit-identical. A
+  spectrum with nothing beyond m/z + intensity keeps the peak-set path and its schema unchanged.
+  A second hole on the same path is closed with it: `ChunkBuffers::add_raw_chunked` and
+  `add_raw_mz_boundary` discarded the chunker's auxiliary arrays, so an array absent from the
+  chunk schema was dropped instead of spilled to `auxiliary_arrays`; they are now handed up.
+  Pinned by `tests/ims_centroid_mobility_array.rs` over the new
+  `tests/data/pasef_combineims_centroid.pwiz.mzML` (pwiz `Reader_Bruker_Test.data`, PASEF frame 6
+  combined over its 100 scans, 1391 peaks), in both layouts.
+
 - **pwiz Waters MSe archives carried `isolation_window_lower_offset = 0`.** mzdata 0.66.6's mzML
   reader keeps only the FIRST isolation-window offset when both offsets precede the target m/z (the
   second falls into a `_ => {}` arm while the window is in its `Offset` state), and ProteoWizard's

@@ -388,6 +388,41 @@ impl GenericDataArrayWriter {
     }
 }
 
+/// The raw arrays of a Centroid spectrum when they carry MORE than its peak set does.
+///
+/// mzdata's mzML reader builds a `CentroidPeak` set eagerly for every centroid spectrum, and
+/// [`SpectrumLike::peaks`] then prefers that set — which holds only m/z + intensity. Any further
+/// per-peak array (a PASEF `mean inverse reduced ion mobility array`, a charge array, ...) stays
+/// behind in `raw_arrays()`, and a writer that follows `peaks()` never sees it: it is neither a
+/// column nor spilled to `auxiliary_arrays`. Both the schema sampler and the write path route such
+/// a spectrum through its raw arrays instead, which are the same peaks with every dimension.
+///
+/// `None` for anything else: profile signal, a peak set that is not a copy of the raw arrays
+/// (length mismatch), or raw arrays that hold nothing beyond m/z + intensity — those keep the
+/// peak-set path and its schema unchanged.
+pub(crate) fn centroid_arrays_beyond_peaks<
+    C: CentroidLike,
+    D: DeconvolutedCentroidLike,
+    S: SpectrumLike<C, D>,
+>(
+    spectrum: &S,
+) -> Option<&BinaryArrayMap> {
+    if spectrum.signal_continuity() != SignalContinuity::Centroid {
+        return None;
+    }
+    let RefPeakDataLevel::Centroid(peaks) = spectrum.peaks() else {
+        return None;
+    };
+    let raw = spectrum.raw_arrays()?;
+    let n_mz = raw.get(&ArrayType::MZArray).and_then(|a| a.data_len().ok())?;
+    if n_mz != peaks.len() {
+        return None;
+    }
+    raw.iter()
+        .any(|(t, _)| !matches!(t, ArrayType::MZArray | ArrayType::IntensityArray))
+        .then_some(raw)
+}
+
 pub(crate) fn is_data_array_sorted(array: &DataArray) -> Result<bool, ArrayRetrievalError> {
     Ok(match array.dtype() {
         mzdata::spectrum::BinaryDataArrayType::Unknown
@@ -1014,6 +1049,14 @@ pub trait AbstractMzPeakWriter {
             Some(spectrum.start_time() as f32)
         } else {
             None
+        };
+
+        // A centroid peak set that is only PART of the raw arrays (per-peak ion mobility left
+        // behind in `raw_arrays()`): write the raw arrays, so every dimension reaches the peak
+        // facet instead of being silently dropped. See `centroid_arrays_beyond_peaks`.
+        let peaks = match centroid_arrays_beyond_peaks(spectrum) {
+            Some(raw) => RefPeakDataLevel::RawData(raw),
+            None => peaks,
         };
 
         let entry_derived = if matches!(
