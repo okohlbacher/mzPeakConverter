@@ -78,25 +78,25 @@ executable: **[docs/PLATFORM_SUPPORT.md](docs/PLATFORM_SUPPORT.md)**.
 
 ## Install
 
-**macOS — Homebrew.** The tap lives in this repository, so one `brew tap` serves it:
+**macOS — Homebrew.** The tap is this repository, so three commands install a released
+build with no Rust toolchain:
 
 ```sh
+brew trust --cask okohlbacher/mzpeak/mzpeak-convert
 brew tap okohlbacher/mzpeak https://github.com/okohlbacher/mzPeakConverter
-brew install okohlbacher/mzpeak/mzpeak-convert          # formula (recommended)
-brew install --cask okohlbacher/mzpeak/mzpeak-convert   # or the cask
+brew install --cask okohlbacher/mzpeak/mzpeak-convert
 ```
 
-Both install the released binary for your architecture — Apple silicon or Intel, no
-Rust toolchain — as `mzpeak-convert`; install one, not both. Name the tap in full:
-Homebrew 6 rejects a bare token from a tap it has not been told to trust, and the
-two-argument `brew tap` is required because the repository is not named
-`homebrew-mzpeak`. `brew upgrade` follows later releases and `brew uninstall` (add
-`--cask` if that is how you installed it) removes it.
+All three names must be given in full. Homebrew 6 refuses to load anything from a
+third-party tap until you trust it, and it will not guess the repository URL for a tap
+whose repository is not named `homebrew-mzpeak`. You get `mzpeak-convert` for your
+architecture, Apple silicon or Intel; `brew upgrade --cask okohlbacher/mzpeak/mzpeak-convert`
+follows later releases and `brew uninstall --cask` removes it.
 
-Prefer the formula. The binaries are ad-hoc signed rather than notarized by Apple, and
-Homebrew quarantines every *cask* download, which macOS then refuses to execute — so
-the cask has to strip that attribute itself and says so when it installs. Formula
-downloads are not quarantined. Each archive is published with a `.sha256` sidecar.
+The binaries are ad-hoc signed rather than notarized by Apple, and Homebrew quarantines
+every cask download, which macOS then refuses to execute — so the cask strips that
+attribute from the executable it installs and says so when it does. Each archive is
+published with a `.sha256` sidecar you can check with `shasum -c`.
 
 **From source** (every platform):
 

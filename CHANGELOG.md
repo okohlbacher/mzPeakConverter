@@ -8,23 +8,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **Homebrew on macOS.** The tap lives in this repository, so one `brew tap` serves both a
-  formula and a cask built from the release's own archives:
+- **Homebrew on macOS.** The tap lives in this repository, so a released build installs
+  without a Rust toolchain:
 
   ```sh
+  brew trust --cask okohlbacher/mzpeak/mzpeak-convert
   brew tap okohlbacher/mzpeak https://github.com/okohlbacher/mzPeakConverter
-  brew install okohlbacher/mzpeak/mzpeak-convert          # formula (recommended)
-  brew install --cask okohlbacher/mzpeak/mzpeak-convert   # cask
+  brew install --cask okohlbacher/mzpeak/mzpeak-convert
   ```
 
-  A `v*` tag now builds both macOS architectures (`x86_64` cross-compiles on the arm64 runner
-  in ~90 s, so no Intel runner is needed), publishes each archive with a `.sha256` sidecar, and
-  points the tap at them (`.github/workflows/release.yml`, `tools/update_homebrew.sh`).
-  The formula is the recommended route: Homebrew quarantines every **cask** download and macOS
-  kills a quarantined binary that carries no Developer ID, so the cask has to strip that
-  attribute itself and says so in its caveats — a formula download is never quarantined.
-  Both stanzas can be simplified once the released binaries are signed and notarized; the
-  workflow marks where that goes, including the entitlements the .NET-based Thermo reader needs.
+  Homebrew 6 loads nothing from a third-party tap until it is trusted, and a repository
+  not named `homebrew-mzpeak` needs its URL given to `brew tap` — hence all three names
+  in full. A `v*` tag now builds both macOS architectures (`x86_64` cross-compiles on the
+  arm64 runner in ~90 s, so no Intel runner is needed), publishes each archive with a
+  `.sha256` sidecar and repoints the cask at them (`.github/workflows/release.yml`,
+  `tools/update_homebrew.sh`). Homebrew quarantines every cask download and macOS kills a
+  quarantined binary that carries no Developer ID, so the cask strips that attribute from
+  the executable it installs and its caveats say so; signing and notarizing the release
+  would let that stanza go, and the workflow marks where that belongs, including the
+  entitlements the .NET-based Thermo reader needs. A formula was prototyped and dropped:
+  in one tap it needed a second `brew trust`, collided with the cask on `bin/mzpeak-convert`,
+  and its `on_macos`-nested URL made `brew tap` fail validation outright.
 
 ### Fixed
 

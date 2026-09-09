@@ -55,9 +55,6 @@ cask "mzpeak-convert" do
 
         brew install --cask dotnet-sdk
 
-      The formula in the same tap installs the same binary without this cask's
-      quarantine step. Install one of the two, not both: they provide the same
-      command, and uninstalling either would take it off your PATH.
     EOS
   end
 end
