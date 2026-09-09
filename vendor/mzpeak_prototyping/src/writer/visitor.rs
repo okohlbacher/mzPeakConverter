@@ -1568,7 +1568,16 @@ impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::SelectedIon)> for Selec
         let (i, j, item) = item;
         self.source_index.append_value(*i);
         self.precursor_index.append_option(*j);
-        self.selected_ion_mz.append_value(item.mz);
+        // `null` means "absent"; 0.0 would assert an ion measured at m/z 0, which is not a
+        // possible measurement. mzdata's SelectedIon.mz is a plain f64, so a source that omits
+        // MS:1000744 -- Bruker diaTracer mzML routinely does, carrying only charge and intensity
+        // -- arrives here as 0.0 and is indistinguishable from a reported value. Written as 0.0 it
+        // silently ruins every consumer that prefers a PRESENT ion m/z over the isolation-window
+        // target: measured on a 3,086,644-spectrum diaPASEF run, FASTag tagged against precursor
+        // m/z 0 and returned 0 tags where the same run as mzML gives 62 million, with exit 0.
+        // Same reasoning as `intensity` below and `ion_injection_time` above.
+        self.selected_ion_mz
+            .append_option((item.mz.is_finite() && item.mz > 0.0).then_some(item.mz));
         self.charge_state.append_option(item.charge());
         // `null` means "absent" (metadata-tables.md); 0.0 would assert a measured zero. mzdata's
         // SelectedIon.intensity is a plain f32, so a backend that does not report it (dia-PASEF has

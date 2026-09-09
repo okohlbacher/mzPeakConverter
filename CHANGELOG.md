@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **An omitted selected-ion m/z is written as `null`, not `0.0`.** mzdata's `SelectedIon.mz`
+  is a plain `f64`, so a source that does not report `MS:1000744` handed the writer a `0.0`
+  that no consumer could tell from a measured value. Bruker diaTracer mzML routinely omits
+  the term, carrying only charge and peak intensity. Every consumer that prefers a *present*
+  selected-ion m/z over the isolation-window target then worked from precursor m/z 0:
+  measured on a 3,086,644-spectrum diaPASEF run, FASTag returned **0 tags where the same run
+  as mzML gives 62,347,705**, with exit code 0 and no warning. `null` is how the spec spells
+  "absent" (docs/layouts/metadata-tables.md, *Null semantics for metadata*), and it is
+  already what this writer does for `intensity`, `ion_injection_time` and `ion_mobility`.
+  A stated m/z is unaffected. Archives written before this fix are readable either way:
+  mzpeak-openms 929650f treats a stored `0.0` as absent.
+
 ## [0.11.4] — 2026-09-09
 
 ### Added
