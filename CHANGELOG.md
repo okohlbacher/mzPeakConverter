@@ -31,7 +31,6 @@ they were missing (below); nothing else changes bytes. The corpus rebuild picks 
   Pinned by `tests/ims_centroid_mobility_array.rs` over the new
   `tests/data/pasef_combineims_centroid.pwiz.mzML` (pwiz `Reader_Bruker_Test.data`, PASEF frame 6
   combined over its 100 scans, 1391 peaks), in both layouts.
-### Fixed
 
 - **pwiz Waters MSe archives carried `isolation_window_lower_offset = 0`.** mzdata 0.66.6's mzML
   reader keeps only the FIRST isolation-window offset when both offsets precede the target m/z (the
