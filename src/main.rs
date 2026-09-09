@@ -68,6 +68,8 @@ mod run_metadata;
 mod agilent_meta;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod waters_meta;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod shimadzu_meta;
 mod vendor;
 mod embed_aux;
 mod filter;
@@ -5003,7 +5005,10 @@ fn convert_shimadzu(
     // `SampleInfo.AnalysisDate` is a naive local time: it goes to the `acquisition_time` index block,
     // never to `run.start_time` (see `run_metadata`). Every other run fact this lane knows is the
     // instrument, set below the old way (the lane predates the seam).
-    let run_meta = info.analysis_date.as_deref().and_then(|d| {
+    // The `.lcd` itself states the run start as a UTC FILETIME plus the writer's GMT offset, the
+    // sample and the LabSolutions version (`shimadzu_meta`); the DLL's `AnalysisDate` (empty in this
+    // host, see BACKLOG) is only the fallback.
+    let run_meta = shimadzu_meta::read(input).or_else(|| info.analysis_date.as_deref().and_then(|d| {
         // The DLL renders `dd.MM.yyyy HH:mm:ss`-style or ISO text depending on locale; accept both.
         let text = d.trim();
         let parsed = run_metadata::parse_vendor_time(text, "Shimadzu SampleInfo.AnalysisDate")
@@ -5018,7 +5023,7 @@ fn convert_shimadzu(
             log::warn!("Shimadzu SampleInfo.AnalysisDate {text:?} not understood; not recorded");
         }
         parsed.map(|t| run_metadata::VendorRunMetadata { start_time: Some(t), ..Default::default() })
-    });
+    }));
     let mut hints = VendorHints { instrument: shimadzu_instrument(&info), source_sha1, run_metadata: run_meta, ..Default::default() };
     // Profile facet as an exact sqrt grid (see `shimadzu_grid`): probe dense profile spectra across
     // the run for the run-wide step; if the fit holds, the profile of every spectrum that fits is

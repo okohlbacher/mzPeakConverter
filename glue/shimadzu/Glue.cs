@@ -379,6 +379,11 @@ public static class Api
     // looked like an unsupported .lcd variant. Keep exported entry-point names unique in `Api`.
     internal static ShimadzuData OpenData(string path, string pwizDir)
     {
+        // The .lcd's property XML declares code page 1252; .NET 8 has no 1252 decoder unless the
+        // provider is registered, and LabSolutions.IO swallows the failure and leaves every
+        // SampleInfo field at its default (measured on Blind_P1_pos_012: date = DateTime.MinValue,
+        // empty names). Register BEFORE the vendor assembly loads — idempotent.
+        System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
         var asm = LoadIoModule(pwizDir);
         var dataType = asm.GetType("Shimadzu.LabSolutions.IO.Data.DataObject")
             ?? asm.GetTypes().FirstOrDefault(t => t.Name == "DataObject")
