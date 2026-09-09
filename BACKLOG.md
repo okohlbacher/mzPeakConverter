@@ -39,7 +39,17 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     spec question. From the 2026-09-09 adversarial review (78 findings, synthesis in the data dir's
     `waters/review/SYNTHESIS.md`; every wrong-data path closed and re-verified at HEAD), the items that need a
     DECISION rather than code: (a) RESOLVED 2026-09-09 (research + DLL probe round 23: no window is stated anywhere for MSe — the
-    lane now writes the acquisition range as the window with a provenance parameter, as pwiz does); (b) MS:1000045 on MSe rows is the scan
+    lane now writes the acquisition range as the window with a provenance parameter, as pwiz does); (a2) the PSI DIA recommendation v1.0 (§3.4) marks an MSe/HDMSe window with MS:1003159
+    "no isolation" (= "isolation window full range") on the isolation window itself; mzdata's `IsolationWindow`
+    carries no parameter list and the vendored writer appends an empty one, so the term has no home yet — add a
+    window-parameter path (writer + a side channel from the lane), then write MS:1003159 beside the numbers;
+    likewise `file_description.contents` could state MS:1003226 (HDMSe) / MS:1003227 (MSe). (a3) a `_dda.inf`
+    sidecar (Waters post-acquisition tooling; none in the corpus) makes the DLL's DDA processor return real
+    quad-isolation offsets (keys 1900/1901) — wire them, with provenance, if such a run ever arrives; the
+    probe lever `MZPC_WATERS_PROBE_QUAD=2` reads them today. (a4) record the tune-page quad profile
+    (`MS Profile Type`, `MSProfileMass1..3`, `LM/HM Resolution`) as run-level parameters so a reader can
+    bound the real RF-only passband (Waters: low cut ≈ 0.8 × set mass under a Manual profile).
+    (b) MS:1000045 on MSe rows is the scan
     item's 4 eV trap energy (pwiz writes the same); the transfer ramp is on MS:1002013/1002014; (c) the
     synthesized TIC keeps the lock-mass function's frames, as pwiz's does; (d) the mzML twin's isolation
     window drops the lower offset (mzdata 0.66.6 reads only one; a fix exists on `claude/eager-robinson-83facb`

@@ -88,6 +88,22 @@ pub(crate) fn read(raw: &Path) -> Option<VendorRunMetadata> {
         if let Some(v) = version {
             meta.acquisition_software = Some(Software::new("MassLynx".to_string(), v, vec![term(1000534, "MassLynx")]));
         }
+        // The tune page's quadrupole settings, verbatim and unitless: the only statement the file
+        // makes about the quadrupole's pass band (MSe runs it non-resolving; DDA widths derive from
+        // LM/HM Resolution through the instrument's tune, never stated in Da). A reader can bound the
+        // real RF-only pass band from these; the lane never converts them.
+        if let Some(cfg) = meta.instrument.as_mut() {
+            for key in ["LM Resolution", "HM Resolution", "MS Profile Type", "MSProfileMass1", "MSProfileMass2", "MSProfileMass3", "MSProfileDwellTime1", "MSProfileDwellTime2", "MSProfileRampTime1", "MSProfileRampTime2"] {
+                let value = ext.lines().find_map(|l| {
+                    let l = l.trim();
+                    let rest = l.strip_prefix(key)?;
+                    rest.starts_with(|c: char| c == '\t' || c == ' ').then(|| rest.trim().to_string()).filter(|v| !v.is_empty())
+                });
+                if let Some(v) = value {
+                    cfg.params.push(Param::new_key_value(format!("MassLynx tune {key}"), v));
+                }
+            }
+        }
     }
 
     // Source members, as ProteoWizard lists them: the `_FUNCnnn.DAT` files in numeric order carry

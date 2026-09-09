@@ -874,16 +874,21 @@ impl WatersReader {
             activation.add_param(Param::builder().name("collision energy ramp start").curie(mzdata::curie!(MS:1002013)).value(start).unit(Unit::Electronvolt).build());
             activation.add_param(Param::builder().name("collision energy ramp end").curie(mzdata::curie!(MS:1002014)).value(end).unit(Unit::Electronvolt).build());
         }
-        // A set mass names the selected ion and the isolation target; its WIDTH is not stated
-        // anywhere in the file or the DLL (the DDA processor's quad-isolation-window parameters
-        // come back 0/0 — caller-supplied, not acquired; probe round 23). A set mass of 0 is MSe:
-        // the quadrupole transmitted the whole acquisition range, and nothing in the file states
-        // any narrower window (getFunction/IndexPrecursorMassRange and getPrecursorMass fail on
-        // every MSe and DDA function; they answer only for SONAR). So the MSe row states the
-        // acquisition range as its isolation window — target = midpoint, bounds = the range —
-        // exactly what ProteoWizard writes, so consumers that key all-ion data on that window
-        // (Skyline, DIA-Umpire, …) see the same thing; a parameter on the activation says where the
-        // window came from. No selected ion: nothing was selected.
+        // A set mass names the selected ion and the isolation target; its WIDTH is not stated by
+        // the acquisition: the DDA processor's quad-isolation-window parameters (keys 1900/1901)
+        // are read by the DLL from an optional `_dda.inf` sidecar that Waters' post-acquisition
+        // tooling writes from user-entered offsets — absent on every run seen, so 0/0 (probe round
+        // 23; research 2026-09-09). A set mass of 0 is MSe: the quadrupole ran non-resolving over
+        // the acquisition range and nothing in the file, the method text or the DLL states any
+        // narrower window (getFunction/IndexPrecursorMassRange and getPrecursorMass answer only
+        // for SONAR). So the MSe row states the acquisition range as its isolation window —
+        // target = midpoint, bounds = the range — the numbers ProteoWizard writes (its author calls
+        // them a placeholder; Skyline recomputes the MSe window itself, DIA-Umpire ignores it, and
+        // OpenSWATH / MSFragger-DIA need a numeric centre, which is why a NULL window is the one
+        // shape that breaks something). A parameter on the activation names the source. No
+        // selected ion: nothing was selected. The PSI DIA recommendation's marker for this case,
+        // MS:1003159 "no isolation" (= "isolation window full range"), belongs on the window's own
+        // parameter list, which mzdata's IsolationWindow cannot carry — BACKLOG.
         let (ions, isolation_window) = if set_mass > 0.0 {
             (
                 vec![SelectedIon { mz: set_mass, ..Default::default() }],
@@ -972,7 +977,8 @@ fn copy_points(p_masses: *mut f32, p_intensities: *mut f32, n: c_int) -> Result<
 /// processor (`createRawProcessor(&p, DDA = 7, NULL, NULL)`, `setRawReader(p, scanReader)`,
 /// `getQuadIsolationWindowParameters(p, params)`, `getDDAParameters(p, params)` — every key/value
 /// dumped); level 3 = level 2 + `ddaGetScanCount(p, *n)` and `ddaGetScanInfo(p, idx, params)` for
-/// the first scans; level 4 = the MSE processor type (8) with the same parameter getters. Every
+/// the first scans; level 4 = the MSE processor type (8) with the same parameter getters; level 5
+/// = `getAcquisitionInfo(info, params)` dumped. Every
 /// call is announced before it runs so a crash log names it. Results go to the log only.
 fn probe_quad_windows(lib: &Library, info: *mut c_void, scan_reader: *mut c_void, n_functions: usize, index: &[(c_int, c_int, f32)], scan_items: Option<ScanItemApi>, level: &str) {
     type FnRangeFn = unsafe extern "C" fn(*mut c_void, c_int, *mut f32, *mut f32) -> c_int;
@@ -1096,7 +1102,22 @@ fn probe_quad_windows(lib: &Library, info: *mut c_void, scan_reader: *mut c_void
             let rc = unsafe { destroy(proc_) };
             say(format!("destroyRawProcessor rc={rc}"));
         }
-        other => say(format!("unknown level {other:?} (use 1, 2, 3 or 4)")),
+        "5" => {
+            // `getAcquisitionInfo(info, params)` (v5 SDK: argtypes [c_void_p, c_void_p]; keys 1650..):
+            // run-level acquisition facts, said to include a PRECURSOR_MASS_START/END pair.
+            let Some(api) = scan_items else {
+                say("parameters API unavailable; nothing to read".into());
+                return;
+            };
+            let Some(g) = unsafe { lib.get::<ProcParamsFn>(b"getAcquisitionInfo\0") }.ok().map(|g| *g) else {
+                say("getAcquisitionInfo export missing".into());
+                return;
+            };
+            say("calling getAcquisitionInfo(info, params)".into());
+            api.with(|p| unsafe { g(info, p) }, |p| dump(&api, p, "getAcquisitionInfo"))
+                .unwrap_or_else(|| say("getAcquisitionInfo: rc != 0".into()));
+        }
+        other => say(format!("unknown level {other:?} (use 1, 2, 3, 4 or 5)")),
     }
 }
 
