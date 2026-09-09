@@ -65,6 +65,15 @@ type GetFloatPerScanFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut f3
 /// 4-argument call access-violates (probe round 10), which is what a missing integer argument
 /// looks like on x64 (the out-pointer lands in the bin slot).
 type GetFloatPerScanBinFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *mut f32) -> c_int;
+/// Candidate array-out shape of `getDriftTime`: `(reader, function, *out float*, *out int n)` — every
+/// variant with an INTEGER in the third slot crashed (round 11), which a pointer parameter explains.
+type GetFloatArrayPerFunctionFn = unsafe extern "C" fn(*mut c_void, c_int, *mut *mut f32, *mut c_int) -> c_int;
+/// Candidate out-before-index shape: `(reader, function, *out float, bin)`.
+type GetFloatOutThenIndexFn = unsafe extern "C" fn(*mut c_void, c_int, *mut f32, c_int) -> c_int;
+/// Candidate buffer shape of the string getters: `(reader, function, char* buf, int cap)`.
+type GetStringBufPerFunctionFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_char, c_int) -> c_int;
+/// Candidate 5-argument mass range: `(reader, function, int which, *out lo, *out hi)`.
+type GetMassRange5Fn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut f32, *mut f32) -> c_int;
 /// `getAcquisitionMassRange(infoReader, function, *out float lo, *out float hi)`.
 type GetMassRangeFn = unsafe extern "C" fn(*mut c_void, c_int, *mut f32, *mut f32) -> c_int;
 /// `getFunctionTypeString(infoReader, function, *out char*)` / `getIonModeString(...)`. The string
@@ -324,12 +333,21 @@ impl WatersReader {
                     n_drift = slot[0];
                 }
             }
-            if let Some(g) = mass_range {
-                log::info!("waters-probe: calling getAcquisitionMassRange(f={})", f + 1);
+            let mr_variant: u8 = std::env::var("MZPC_WATERS_MR_VARIANT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1);
+            if mr_variant == 1 {
+                if let Some(g) = mass_range {
+                    log::info!("waters-probe: calling getAcquisitionMassRange(f={})", f + 1);
+                    let mut lo = [0f32; 4];
+                    let mut hi = [0f32; 4];
+                    let rc = unsafe { g(self.info_reader, f, lo.as_mut_ptr(), hi.as_mut_ptr()) };
+                    log::info!("waters-probe: function {} massRange={}..{} rc={rc} rawLo={:?} rawHi={:?}", f + 1, lo[0], hi[0], lo, hi);
+                }
+            } else if let Some(g) = unsafe { lib.get::<GetMassRange5Fn>(b"getAcquisitionMassRange\0") }.ok().map(|f| *f) {
+                log::info!("waters-probe: calling getAcquisitionMassRange variant 2 (f={}, which=0)", f + 1);
                 let mut lo = [0f32; 4];
                 let mut hi = [0f32; 4];
-                let rc = unsafe { g(self.info_reader, f, lo.as_mut_ptr(), hi.as_mut_ptr()) };
-                log::info!("waters-probe: function {} massRange={}..{} rc={rc} rawLo={:?} rawHi={:?}", f + 1, lo[0], hi[0], lo, hi);
+                let rc = unsafe { g(self.info_reader, f, 0, lo.as_mut_ptr(), hi.as_mut_ptr()) };
+                log::info!("waters-probe: function {} massRange variant 2 = {}..{} rc={rc} rawLo={:?} rawHi={:?}", f + 1, lo[0], hi[0], lo, hi);
             }
             if let Some(g) = retention_time {
                 for scan in [0, 1] {
@@ -352,6 +370,27 @@ impl WatersReader {
                         2 => drift_time5.map(|g| unsafe { g(self.info_reader, f, 0, bin, slot.as_mut_ptr()) }),
                         3 => drift_time.map(|g| unsafe { g(self.scan_reader, f, bin, slot.as_mut_ptr()) }),
                         4 => drift_time5.map(|g| unsafe { g(self.scan_reader, f, 0, bin, slot.as_mut_ptr()) }),
+                        // 5 = array out (info, f, &ptr, &n): logged separately below; 6 = (info, f, &out, bin).
+                        5 => {
+                            let ga: Option<GetFloatArrayPerFunctionFn> = unsafe { lib.get(b"getDriftTime\0") }.ok().map(|f| *f);
+                            ga.map(|g| {
+                                let mut ptr_out: *mut f32 = ptr::null_mut();
+                                let mut n = [0i32; 4];
+                                let rc = unsafe { g(self.info_reader, f, &mut ptr_out, n.as_mut_ptr()) };
+                                if rc == 0 && !ptr_out.is_null() && (1..=100_000).contains(&n[0]) {
+                                    let arr = unsafe { std::slice::from_raw_parts(ptr_out, n[0] as usize) };
+                                    log::info!("waters-probe: function {} getDriftTime array n={} first={:?} last={:?}", f + 1, n[0], &arr[..arr.len().min(4)], arr.last());
+                                    slot[0] = arr[bin.min(n[0] - 1) as usize];
+                                } else {
+                                    log::info!("waters-probe: function {} getDriftTime array rc={rc} n={} null={}", f + 1, n[0], ptr_out.is_null());
+                                }
+                                rc
+                            })
+                        }
+                        6 => {
+                            let gb: Option<GetFloatOutThenIndexFn> = unsafe { lib.get(b"getDriftTime\0") }.ok().map(|f| *f);
+                            gb.map(|g| unsafe { g(self.info_reader, f, slot.as_mut_ptr(), bin) })
+                        }
                         _ => None,
                     };
                     let as_f64 = f64::from_bits((slot[0].to_bits() as u64) | ((slot[1].to_bits() as u64) << 32));
@@ -372,8 +411,18 @@ impl WatersReader {
                     let rc = unsafe { g(self.info_reader, f, ps.as_mut_ptr()) };
                     log::info!("waters-probe: function {} ionModeString={:?} rc={rc}", f + 1, if rc == 0 { cstr(ps[0]) } else { String::new() });
                 }
+                for name in [&b"getFunctionTypeString\0"[..], b"getIonModeString\0"] {
+                    if let Some(g) = unsafe { lib.get::<GetStringBufPerFunctionFn>(name) }.ok().map(|f| *f) {
+                        let label = String::from_utf8_lossy(&name[..name.len() - 1]).into_owned();
+                        log::info!("waters-probe: calling {label} buffer variant (f={})", f + 1);
+                        let mut buf = [0u8; 256];
+                        let rc = unsafe { g(self.info_reader, f, buf.as_mut_ptr() as *mut c_char, 255) };
+                        let text = String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(0)]).into_owned();
+                        log::info!("waters-probe: function {} {label} buffer variant = {text:?} rc={rc}", f + 1);
+                    }
+                }
             }
-            if level >= 3 {
+            if level >= 4 {
                 if let (Some(gi), Some(gn)) = (scan_items, item_name) {
                     log::info!("waters-probe: calling getScanItemsInFunction(f={})", f + 1);
                     let mut items: [*const c_int; 4] = [ptr::null(); 4];
@@ -401,7 +450,7 @@ impl WatersReader {
                     }
                 }
             }
-            if level >= 4 {
+            if level >= 3 {
                 if let Some(g) = read_drift {
                     for bin in [0, 1, 199] {
                         log::info!("waters-probe: calling readDriftScan(f={}, scan=1, bin={bin})", f + 1);
