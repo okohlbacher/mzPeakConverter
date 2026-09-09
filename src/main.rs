@@ -5697,7 +5697,13 @@ fn convert_waters(
     // index or the mass-calibration coefficients). The statistical TOF-grid detector (strategy A) is
     // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
     let reader = waters::WatersReader::open(input)?;
-    let hints = VendorHints { run_metadata: waters_meta::read(input), ..Default::default() };
+    let mut hints = VendorHints { run_metadata: waters_meta::read(input), ..Default::default() };
+    // Ion-mobility functions arrive as frames whose bins were interleaved and re-sorted by m/z
+    // (`waters.rs`): declare the sort, and hand readers the run's drift table + CCS calibration.
+    if let Some(block) = reader.drift_block() {
+        hints.transformations.push("sort-by-mz".to_string());
+        hints.index_blocks.push(("waters_drift".to_string(), block));
+    }
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
