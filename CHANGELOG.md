@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Homebrew on macOS.** The tap lives in this repository, so one `brew tap` serves both a
+  formula and a cask built from the release's own archives:
+
+  ```sh
+  brew tap okohlbacher/mzpeak https://github.com/okohlbacher/mzPeakConverter
+  brew install okohlbacher/mzpeak/mzpeak-convert          # formula (recommended)
+  brew install --cask okohlbacher/mzpeak/mzpeak-convert   # cask
+  ```
+
+  A `v*` tag now builds both macOS architectures (`x86_64` cross-compiles on the arm64 runner
+  in ~90 s, so no Intel runner is needed), publishes each archive with a `.sha256` sidecar, and
+  points the tap at them (`.github/workflows/release.yml`, `tools/update_homebrew.sh`).
+  The formula is the recommended route: Homebrew quarantines every **cask** download and macOS
+  kills a quarantined binary that carries no Developer ID, so the cask has to strip that
+  attribute itself and says so in its caveats — a formula download is never quarantined.
+  Both stanzas can be simplified once the released binaries are signed and notarized; the
+  workflow marks where that goes, including the entitlements the .NET-based Thermo reader needs.
+
 ### Fixed
 
 - **Waters MSe on Xevo: the elevated-energy ramp is read from the method text.** Xevo MSe methods
