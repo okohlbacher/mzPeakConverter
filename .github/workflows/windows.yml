@@ -91,11 +91,19 @@ jobs:
       # line and exit 2 (Glue.cs Main). That proves the exe boots on this runner (x64 target, .NET
       # Framework present, no config surprise) — the difference between "an exe was emitted" and
       # "the exe runs". The AGL2 magic is pinned against src/agl.rs by the Rust tests.
+      # Two runner traps, both already worked around elsewhere in this file: (1) under the runner's
+      # `$ErrorActionPreference = 'stop'`, a native command's `2>&1`-redirected stderr becomes a
+      # terminating error on its FIRST line — the usage text itself killed this step before the
+      # exit-code check ever ran (every Windows run since this step landed failed here); (2) the
+      # runner appends `exit $LASTEXITCODE`, which would turn the wanted 2 into a failure. So merge
+      # the streams inside cmd, judge the code ourselves, and leave with an explicit 0.
       - name: Boot the Agilent host (usage exit)
         shell: pwsh
         run: |
-          & glue/agilent/bin/Release/net48/AgilentGlueHost.exe 2>&1 | Out-String | Write-Host
-          if ($LASTEXITCODE -ne 2) { throw "AgilentGlueHost.exe exited $LASTEXITCODE, expected 2 (usage)" }
+          cmd /c "glue\agilent\bin\Release\net48\AgilentGlueHost.exe 2>&1"
+          $code = $LASTEXITCODE
+          if ($code -ne 2) { throw "AgilentGlueHost.exe exited $code, expected 2 (usage)" }
+          exit 0
 
       - name: Verify ShimadzuGlue.runtimeconfig.json enables BinaryFormatter
         shell: pwsh
