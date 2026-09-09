@@ -277,8 +277,10 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             buffer_size,
             &encryption_properties,
         )
-        .map_err(|e| log::error!("Failed to open peak writer: {e}"))
-        .ok();
+        // LOCAL PATCH: a failed open used to be logged and swallowed; the writer then fell back to a
+        // default (mz f64, intensity f32) point peak writer and wrote null m/z with exit 0. Abort.
+        .unwrap_or_else(|e| panic!("Failed to open peak writer: {e}"));
+        let separate_peak_writer = Some(separate_peak_writer);
 
         let metadata_props = Self::spectrum_metadata_writer_props(&metadata_fields, None);
 

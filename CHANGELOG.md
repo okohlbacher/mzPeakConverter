@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — `--ims-chunked` on timsTOF wrote garbage (or aborted) since v0.9.0
+
+- **The ims-compact writer never put its (empty) `spectra_data` facet in the chunked family**, so
+  once `make_peaks_writer` began enforcing the one-family-per-entity rule (c9aaa28, v0.9.0) the
+  chunked `spectra_peaks` facet was refused at open. The archive writer then *logged* the error,
+  dropped the peak writer, and lazily built a default `(mz f64, intensity f32)` point peak writer:
+  on a DDA `.d` the conversion **exited 0** with every `mz` null, `tof`/mobility dumped into a
+  163 MB `auxiliary_arrays` blob in `spectra_metadata`, and no error above WARN; on diaPASEF
+  (S30/S08) the parallel encoder died instead (`peak-encode collector died`). The builder now
+  passes `chunked_encoding(Delta{chunk_size})` alongside the chunked peak schema, so both facets
+  declare `chunk`. Vendored writers (`writer.rs`, `writer/split.rs`) now **panic** on a failed peak
+  writer open instead of swallowing it — a wrong archive with exit 0 is the worst outcome.
+- Verified on PXD059079 `…2485.d`: the fixed chunked archive decodes to the same
+  (tof, intensity, 1/K0) multiset as the point archive on all 40 spectra of row group 0 (pyarrow,
+  cumsum from `tof_chunk_start`), and the Rust reader's `--to mzml` output agrees array-for-array
+  on the first 47 spectra. The default point lane is byte-identical before/after.
+
+### Size — chunked vs point vs vendor on Bruker timsTOF (measured)
+
+| run | vendor `tdf_bin` | point archive (`spectra_peaks`) | chunked (fixed) |
+|---|---|---|---|
+| S30 diaPASEF, 2.47 G peaks | 6,176,796,672 | 6,462,106,157 (zstd 3) / 6,387,886,265 (zstd 15) | **6,032,712,552** (−6.6 % / −2.3 % vs vendor) |
+| PXD059079 2485 DDA, 37.8 M peaks | 122 MB | 128,032,796 | **117,645,834** (−8.1 %) |
+
+  Where the bytes go: chunked delta-codes `tof` (S30: 4.22 GB → 0.81 GB) but sorts each frame by
+  TOF, which scrambles the 1/K0 column (55 MB → 3.09 GB, 51 % of the file — ~1.25 B/peak, the
+  entropy of a random scan id per peak). The point archive is mobility-major, so the same column
+  costs 0.9 %, while absolute `tof` costs 66 %. A *July 2026* S30 archive (converter 0.4.15,
+  5,678,808,562 B) is smaller than both only because it stored the vendor's per-scan TOF deltas
+  as if they were absolute bins (`tof_encoding: per-scan-delta`, removed in v0.7.3 as
+  unreadable): cumsum of its `tof` within each (frame, scan) run reproduces v0.9.2's `tof`
+  exactly. Its m/z is wrong for every peak after the first in a scan; ≥ v0.7.3 readers refuse it.
+- Tried and rejected: `DELTA_BINARY_PACKED` on the point-layout `tof` column (24 sampled row
+  groups of S30): −1.0 % vs `BYTE_STREAM_SPLIT`+zstd 3, equal to zstd 15. Not worth a writer change.
+
 ### Changed
 
 - **Shimadzu native lane reads the vendor's high-resolution m/z.** Each vendor point carries a

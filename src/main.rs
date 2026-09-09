@@ -3149,6 +3149,11 @@ where
 
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
+        // The (empty) `spectra_data` facet MUST share the peaks facet's layout family
+        // (conformance.md:68, enforced in make_peaks_writer since c9aaa28). Without this the
+        // chunked peaks facet was refused at open, the split writer swallowed the error, and a
+        // default point writer wrote null m/z instead — see CHANGELOG [Unreleased].
+        .chunked_encoding(chunk_cfg.map(|w| ChunkingStrategy::Delta { chunk_size: w }))
         .store_peaks_and_profiles_apart(Some(peak_schema));
     // Peak-facet row-group size (rows) = the per-chunk zstd granularity. Smaller = finer random
     // access (fewer peaks to decompress per frame) but worse compression; default is parquet's 2^20.
@@ -4881,6 +4886,42 @@ mod tests {
             cols.iter().any(|n| n == "tof"),
             "ims-compact peaks schema must have a `tof` column; got {cols:?}"
         );
+    }
+
+    /// `--ims-chunked` on TDF: both spectrum facets MUST come out in the `chunk` family. Until this
+    /// was fixed the chunked peaks facet was refused by the family invariant, silently replaced by
+    /// a default point writer, and the archive carried null m/z (exit 0). Corpus-gated like the
+    /// contract test above; run with `cargo test --release ims_chunked -- --ignored`.
+    #[test]
+    #[ignore = "needs a timsTOF .d corpus fixture; run with --ignored"]
+    fn ims_chunked_writes_one_layout_family() {
+        use std::fs;
+        let Some(input) = corpus_find(|p| {
+            p.is_dir()
+                && p.extension().is_some_and(|e| e == "d")
+                && std::fs::metadata(p.join("analysis.tdf")).is_ok_and(|m| m.len() > 0)
+        }) else {
+            eprintln!("skipping: no TDF .d under {}", corpus_root().display());
+            return;
+        };
+        let scratch = std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        fs::create_dir_all(&scratch).unwrap();
+        let output = scratch.join("ims_chunked_family.mzpeak");
+        let _ = fs::remove_file(&output);
+        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0)
+            .expect("ims-chunked conversion");
+        let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+        for member in ["spectra_data.parquet", "spectra_peaks.parquet"] {
+            let path = extract_zip_entry(&mut zip, member, &scratch);
+            let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                fs::File::open(&path).unwrap(),
+            )
+            .unwrap();
+            let roots: Vec<String> =
+                builder.schema().fields().iter().map(|f| f.name().clone()).collect();
+            assert_eq!(roots, ["chunk"], "{member} must be in the chunk family, got {roots:?}");
+        }
+        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
