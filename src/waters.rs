@@ -261,7 +261,8 @@ impl WatersReader {
             b"getScanItemName\0",
             b"getScanItemValue\0",
             b"getCollisionalCrossSection\0",
-        ] {
+        ];
+        for name in names {
             log::info!(
                 "waters-probe: export {} {}",
                 String::from_utf8_lossy(&name[..name.len() - 1]),
