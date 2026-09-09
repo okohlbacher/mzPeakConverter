@@ -20,15 +20,22 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   model, serial, `SCIEX OS`/`Analyst TF` versions, sample and both digested members. Acquisition
   clocks are tracked in their own item below. **Still open, by lane:**
   - **Orphan MS2 (precursors):** Waters (Capan2: the 682 high-energy MSe scans, which pwiz expands into 136,400 drift-bin
-    spectra with a placeholder precursor each; per-scan `SET_MASS` and collision energies live in `_FUNCnnn.STS`, a reverse-engineered layout the 2026-09-08 review refused to
-    publish from before an SDK side-by-side on the box); SciEX (663k in the corpus; needs the
+    spectra with a placeholder precursor each; the SDK route is `getScanItemValue(SET_MASS / COLLISION_ENERGY)`, blocked on the
+    crashing `getScanItemsInFunction` — see the ion-mobility item; the `_FUNCnnn.STS` layout stays off limits); SciEX (663k in the corpus; needs the
     `SpectrumMetaV2` glue export — S-P2); Agilent MHDAC (`MSScan.bin` precursor decode; no DDA/QQQ
     `.d` on host or in the corpus to verify against); BAF (SQL `Steps`/`Variables` tables; box-only).
     Bruker TDF/TSF and Shimadzu carry theirs.
-  - **Waters ion mobility is not read natively:** the native lane writes the mobility-COMBINED scan
-    (Capan2: 1,989 spectra of ~44k points) where pwiz expands each HDMSe scan into its 200 drift bins
-    (397,800 spectra); `_FUNCnnn.CDT` is unread, so the drift dimension is lost on this lane. It also
-    labels functions 3–6 MS2 (pwiz: MS1) and writes RT 0.0 everywhere (W-P2).
+  - **Waters ion mobility — landed 2026-09-09:** HDMSe/HDDDA functions are read bin by bin and written as
+    frames (one spectrum per MassLynx scan, per-point `raw_ion_mobility` in ms, sorted by m/z); RT,
+    polarity, scan window and function-type MS levels come from the SDK (W-P2 closed for those fields).
+    Verified bin-for-bin against pwiz on ten Capan2 frames. Remaining on this lane: precursors
+    (`getScanItemsInFunction` crashes in every spelling tried; SET_MASS / COLLISION_ENERGY unread — the
+    MSe rule therefore assumes the second MS function is the elevated-energy one), lock-mass function
+    detection (`getLockMassFunction` unbound), SONAR (bins are quadrupole positions; the frame writer
+    would mislabel them — refuse or skip until a SONAR file is available), CCS per peak
+    (`getCollisionalCrossSection` needs a charge). Viewer: mzPeakViewer keys its mobility panel on the
+    `ims_calibration` block and the 1/K0 array name; it needs to recognise `raw_ion_mobility` (ms)
+    and the `waters_drift` block.
   - **Device chromatograms** (UV, pressure, temperature; B-P3): the mzML lane gets 620 traces on
     8 Agilent archives and more from pwiz's Waters/SciEX/Thermo readers; the native lanes write
     TIC/BPC only. Agilent `.cg`/`.cd` layouts unknown; Bruker `chromatography-data.sqlite` is

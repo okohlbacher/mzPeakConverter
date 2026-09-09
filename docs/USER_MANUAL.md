@@ -359,7 +359,7 @@ serial, a sample or a source (ion source, detector) only where the file says so:
 |---|---|---|---|---|---|---|
 | Bruker TDF / TSF | `GlobalMetadata` | MS:1003123 timsTOF family + `InstrumentName`, serial, TOF analyzer | `AcquisitionSoftware` + version | `SampleName` | `AcquisitionDateTime` (zoned) | `analysis.tdf`/`.tsf` + `_bin` |
 | Agilent `.d` | `AcqData/Devices.xml`, `Contents.xml`, `sample_info.xml` (any host) | MS:1000490 + name, model number, serial, analyzers implied by the device type | MassHunter + `AcqSoftwareVersion` | `Sample Name` | `AcquiredTime` (with its offset) | the AcqData files (no exported text, no dot files) |
-| Waters `.raw` | `_HEADER.TXT`, `_extern.inf` (any host) | MS:1000126 + model, serial unless `#NotSet` | MassLynx `Created by` version | `Acquired Name` + descriptors | `Acquired Date/Time` (no zone) | `_FUNCnnn.DAT` (Waters nativeID) then the side files |
+| Waters `.raw` | `_HEADER.TXT`, `_extern.inf` (any host); per scan: MassLynxRaw (Windows) | MS:1000126 + model, serial unless `#NotSet` | MassLynx `Created by` version | `Acquired Name` + descriptors | `Acquired Date/Time` (no zone) | `_FUNCnnn.DAT` (Waters nativeID) then the side files |
 | SciEX `.wiff` | Clearcore2 sample/instrument details (Windows) | MS:1000121 + `InstrumentName`, serial | Analyst + `SoftwareVersion` | sample name | `AcquisitionDateTime` (no zone) | `.wiff` + `.wiff.scan`, digested before the library opens them |
 | Shimadzu `.lcd` | the `.lcd`'s own `File Property` stream (any host) + LabSolutions.IO (Windows) | MS:1002998 + `SystemName`, ESI + quadrupole + TOF from the device id | LabSolutions + `DataFileProperty.szVersion` | `smpl_name` (+ id, vial, operator, injection volume) | `SampleInfo.DateTime`: a UTC FILETIME presented in the writer's stated GMT offset (`+01'00'`) — fully zoned | `.lcd` |
 | Thermo `.raw` | mzdata's Thermo reader | complete already | Xcalibur | yes | zoned | `.raw` |
@@ -382,10 +382,23 @@ their month; blank1's stated 13:11:27-04:00 comes out 18:11:27Z). The archive's 
 vendor's; the mzML lane's is whatever pwiz computed. `file_description.contents` likewise states what the lane
 wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram), not a generic `mass spectrum`.
 
+**Waters ion mobility (HDMSe / HDDDA) is stored as frames.** A function with a `_funcNNN.cdt` and a
+drift-scan count is read bin by bin and written as one spectrum per MassLynx scan whose points are
+sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1003007, ms) — the
+shape of ProteoWizard's `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane —
+with the frame's drift-time bounds (MS:1003439/1003440), `sort-by-mz` in `transformations`, and a
+`waters_drift` index block holding the run's bin → ms table and the vendor's `mob_cal.csv` CCS
+calibration verbatim. ProteoWizard's default instead writes one spectrum per drift bin (Capan2:
+397,800 spectra for 1,989 scans); the two are the same data (verified bin for bin), 552 MB as
+frames against 959 MB as bins. The scan row's `ion_mobility_value` stays NULL on purpose: a frame
+has no single drift time. Retention time, polarity, scan window and the MS level per function come
+from the SDK (`getRetentionTime`, `getIonModeString`, `getAcquisitionMassRange`,
+`getFunctionTypeString`): product-ion function types are MS2, the second function of an MSe pair is
+MS2, every other MS function (lock mass, auxiliary) is MS1.
+
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
-the Waters, Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF and Shimadzu have them), the
-drift-time dimension of a Waters HDMSe run (the native lane writes the mobility-combined scan;
-ProteoWizard expands each scan into its 200 drift bins), and the non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz.
+the Waters, Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF and Shimadzu have them), and the
+non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz.
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
 PSI controlled-vocabulary meaning, it is mapped onto the standard

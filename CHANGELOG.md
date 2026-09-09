@@ -55,6 +55,29 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   (target only when the width is unstated), CID with the signed `CollisionEnergy`,
   `precursor_id = frame=<Parent>` so `precursor_index` resolves. 30/30 against the pwiz twin of
   the urine fixture. Pinned by `tests/run_metadata_native.rs` (set `MZPC_TSF_FIXTURE`).
+- **Waters ion mobility (HDMSe / HDDDA) read natively, as frames.** The native `.raw` lane read the
+  drift-SUMMED spectrum (`readScan`) and lost the drift dimension: Capan2 (Synapt G2-Si HDMSe) came
+  out as 1,989 summed scans where ProteoWizard writes 397,800 per-drift-bin spectra (1,989 × 200).
+  Every function whose `_funcNNN.cdt` exists and whose `getDriftScanCount` is > 0 is now read bin by
+  bin (`readDriftScan`) and written as ONE spectrum per MassLynx scan — a frame — whose points are
+  sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1003007, ms), the
+  shape of pwiz's own `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane. The
+  frame states its drift-time bounds (MS:1003439/1003440), `transformations` gains `sort-by-mz`,
+  and a `waters_drift` index block carries the run's bin → ms table and `mob_cal.csv` verbatim.
+  Verified bin by bin against pwiz's per-bin spectra on ten Capan2 frames (functions 1–6): the
+  non-zero point multisets and intensities are identical in 1,200/1,200 populated bins, m/z within
+  2.6e-7 (numpress on both sides), the drift table identical, frame TIC = Σ pwiz per-bin TIC, RT
+  identical. The frame archive is 552 MB where the per-bin twin is 959 MB and the summed archive
+  was 166 MB. Point counts differ by zero-intensity flanks only (the writer's zero-run mask strips
+  more zeros once bins are interleaved).
+  The same SDK calls fix the lane's per-scan metadata: **retention time** (`getRetentionTime`; it was
+  0.0 on every row), **polarity** (`getIonModeString`), **scan window** (`getAcquisitionMassRange`)
+  and **MS level from the function type** (`getFunctionTypeString`): product-ion types are MS2, the
+  second function of an MSe pair is MS2, every other MS function is MS1 — Capan2's lock-mass and
+  auxiliary functions 3–6 are MS1 again, as pwiz labels them (they were MS2). The C shapes of these
+  exports differ from what pwiz's C++ wrapper suggests and were established by probing
+  (`src/waters.rs` header). Still missing on this lane: precursors (`getScanItemsInFunction`
+  crashes with every spelling tried, so SET_MASS / collision energy stay unread).
 - **Shimadzu acquisition start, sample and LabSolutions version from the `.lcd` itself
   (`src/shimadzu_meta.rs`, any host).** The file's OLE2 `File Property` stream holds
   `SampleInfo.DateTime` as a UTC FILETIME (split into `dwLow/dwHighDateTime`) beside the writing PC's
