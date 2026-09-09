@@ -38,10 +38,8 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     frame here and a drift bin there (pwiz's own combined mode uses `merged=I function=F block=B`), a
     spec question. From the 2026-09-09 adversarial review (78 findings, synthesis in the data dir's
     `waters/review/SYNTHESIS.md`; every wrong-data path closed and re-verified at HEAD), the items that need a
-    DECISION rather than code: (a) the MSe precursor's isolation window — the row states the activation only
-    and leaves the window NULL, which `spectra.md` (one MS:1000792 child MUST) does not allow; pwiz writes the
-    acquisition range as the window (target = midpoint) — either declare activation-only rows legitimate in
-    the spec or write the acquisition range with a param saying so; (b) MS:1000045 on MSe rows is the scan
+    DECISION rather than code: (a) RESOLVED 2026-09-09 (research + DLL probe round 23: no window is stated anywhere for MSe — the
+    lane now writes the acquisition range as the window with a provenance parameter, as pwiz does); (b) MS:1000045 on MSe rows is the scan
     item's 4 eV trap energy (pwiz writes the same); the transfer ramp is on MS:1002013/1002014; (c) the
     synthesized TIC keeps the lock-mass function's frames, as pwiz's does; (d) the mzML twin's isolation
     window drops the lower offset (mzdata 0.66.6 reads only one; a fix exists on `claude/eager-robinson-83facb`
