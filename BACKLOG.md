@@ -13,6 +13,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
   prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
   directory inputs; the box harness stamps the *effective* recipe (native-first stays).
+- **Not in the ledger — temporary `[patch.crates-io]` on mzdata (2026-09-09).** The mzML reader's
+  isolation-window fix ([mobiusklein/mzdata#58](https://github.com/mobiusklein/mzdata/pull/58)) is
+  pinned from our fork at 0.66.6. When upstream releases it: bump the `mzdata` pin, delete the patch
+  block in `Cargo.toml`, keep `tests/isolation_window_offset_order.rs`. Until then every fresh
+  `cargo build` fetches the fork over git (the box included). Which published mzML-lane archives
+  carry a zero lower offset has not been swept; the Waters MSe/HDMSe twins certainly do.
 - **Not in the ledger — the native lanes lose vendor metadata the mzML lane carries (measured
   2026-09-07 by `tests/lane_metadata_parity.rs`).** The two lanes take metadata from different
   places: the mzML lane inherits ProteoWizard's finished model via `copy_metadata_from`, the native
