@@ -239,12 +239,12 @@ const EXPECTED: &[Expected] = &[
     Expected {
         key: "facet.spectra_metadata_selected_ions.parquet.rows",
         kind: Kind::ByDesign,
-        reason: "an MSe elevated-energy scan selects nothing (SET_MASS = 0): the native lane writes no selected ion and no isolation window, only the activation; ProteoWizard writes a placeholder selected ion and window on every drift-bin spectrum. A DDA function (SET_MASS > 0) gets a selected ion and a target-only window on both lanes.",
+        reason: "an MSe elevated-energy scan selects nothing (SET_MASS = 0): both lanes state the acquisition range as the isolation window (target = midpoint), but the native lane writes no selected ion where ProteoWizard writes a placeholder ion at the midpoint on every drift-bin spectrum. A DDA function (SET_MASS > 0) gets a selected ion and a target-only window on both lanes.",
     },
     Expected {
         key: "spectra_metadata_precursors.*",
         kind: Kind::ByDesign,
-        reason: "follows the two row rules: ×200 rows on the pwiz side, and pwiz's invented MSe isolation window / trap collision energy against the native lane's activation-only precursor with the method's transfer-energy ramp (MS:1002013/1002014).",
+        reason: "follows the two row rules: ×200 rows on the pwiz side; the same acquisition-range MSe window on both, but the mzML twin carries only one offset (mzdata reads the lower one as 0) and the native lane adds the method's transfer-energy ramp (MS:1002013/1002014) and the window-source parameter.",
     },
     Expected {
         key: "spectra_metadata_selected_ions.*",

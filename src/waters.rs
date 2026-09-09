@@ -874,15 +874,24 @@ impl WatersReader {
             activation.add_param(Param::builder().name("collision energy ramp start").curie(mzdata::curie!(MS:1002013)).value(start).unit(Unit::Electronvolt).build());
             activation.add_param(Param::builder().name("collision energy ramp end").curie(mzdata::curie!(MS:1002014)).value(end).unit(Unit::Electronvolt).build());
         }
-        // A set mass names the selected ion and the isolation target (its width is not stated). A
-        // set mass of 0 is MSe: nothing was isolated — the row carries the activation only. pwiz's
-        // placeholder (target = range midpoint as a selected ion, offsets = the scan range) is a
-        // claim about quadrupole transmission the file does not make (review 2026-09-09).
+        // A set mass names the selected ion and the isolation target; its WIDTH is not stated
+        // anywhere in the file or the DLL (the DDA processor's quad-isolation-window parameters
+        // come back 0/0 — caller-supplied, not acquired; probe round 23). A set mass of 0 is MSe:
+        // the quadrupole transmitted the whole acquisition range, and nothing in the file states
+        // any narrower window (getFunction/IndexPrecursorMassRange and getPrecursorMass fail on
+        // every MSe and DDA function; they answer only for SONAR). So the MSe row states the
+        // acquisition range as its isolation window — target = midpoint, bounds = the range —
+        // exactly what ProteoWizard writes, so consumers that key all-ion data on that window
+        // (Skyline, DIA-Umpire, …) see the same thing; a parameter on the activation says where the
+        // window came from. No selected ion: nothing was selected.
         let (ions, isolation_window) = if set_mass > 0.0 {
             (
                 vec![SelectedIon { mz: set_mass, ..Default::default() }],
                 IsolationWindow { target: set_mass as f32, lower_bound: 0.0, upper_bound: 0.0, flags: IsolationWindowState::Complete },
             )
+        } else if let Some((lo, hi)) = fi.mass_range.filter(|(lo, hi)| hi > lo) {
+            activation.add_param(Param::new_key_value("isolation window source", "acquisition mass range (MSe: no quadrupole isolation; ProteoWizard's convention)"));
+            (Vec::new(), IsolationWindow { target: (lo + hi) / 2.0, lower_bound: lo, upper_bound: hi, flags: IsolationWindowState::Complete })
         } else {
             (Vec::new(), IsolationWindow::default())
         };

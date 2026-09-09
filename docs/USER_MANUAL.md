@@ -399,7 +399,9 @@ polarity, scan window, the MS level (from the function-type code: product-ion ty
 second function of an MSe pair is MS2, every other MS function — lock mass, auxiliary — is MS1) and
 the precursors come from the SDK: a set mass > 0 (DDA) gives a selected ion with a target-only
 isolation window and the collision energy; an MSe elevated-energy scan (set mass 0) gets a
-precursor stating the activation only — no isolation window is invented. Chromatogram functions
+precursor whose isolation window is the function's acquisition mass range (target = midpoint), flagged
+by the activation parameter `isolation window source = acquisition mass range` and without a selected
+ion — ProteoWizard's convention; the file states no narrower window. Chromatogram functions
 (SIR, MRM, neutral loss/gain) and non-MS functions (DAD, delay, calibration) are skipped with a log
 line; a SONAR function (its bins are quadrupole positions, not drift times) is written as the
 drift-summed scan with a warning and flagged in `waters_drift`; "collapsed retention time"

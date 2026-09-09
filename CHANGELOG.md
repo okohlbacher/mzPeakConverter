@@ -85,9 +85,15 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   the **scan items** through the MassLynx parameters object (`createParameters` /
   `getScanItemsInFunction` / `getScanItemValue`): SET_MASS > 0 becomes a selected ion with a
   target-only isolation window, COLLISION_ENERGY the activation energy (beam-type CID), and an MSe
-  elevated-energy scan whose set mass is 0 gets a precursor stating the activation only — no
-  isolation window is invented (Capan2: 682 precursor rows on the 682 high-energy scans, where pwiz
-  writes a placeholder on each of the 136,400 drift-bin spectra). On a Fast-DDA HDDDA run (PXD073126, ten IMS functions) the frames are identical to pwiz's bins the
+  elevated-energy scan whose set mass is 0 gets a precursor whose isolation window IS the function's
+  acquisition mass range (target = midpoint, bounds = the range) with an activation parameter
+  `isolation window source = acquisition mass range` and no selected ion — ProteoWizard's convention,
+  adopted after establishing that nothing in the file or the DLL states any narrower window (the
+  quadrupole is non-resolving in MSe; `getFunction/IndexPrecursorMassRange` and `getPrecursorMass`
+  answer only for SONAR, and the DDA processor's quad-isolation-window parameters are 0/0 unless a
+  `_dda.inf` sidecar supplies them). A DDA set mass keeps its target-only window: its width is not
+  stated either (Capan2: 682 precursor rows on the 682 high-energy scans, where pwiz writes the same
+  window on each of the 136,400 drift-bin spectra). On a Fast-DDA HDDDA run (PXD073126, ten IMS functions) the frames are identical to pwiz's bins the
   same way and 600/600 precursor rows agree with pwiz's (selected ion, target-only window, CE). The
   transfer collision-energy ramp
   comes from the method text (`_extern.inf`) as MS:1002013/1002014. `SONAR Enabled` is read per
