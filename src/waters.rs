@@ -235,16 +235,21 @@ pub struct WatersReader {
     _lib: Library,
     read_scan: ReadScanFn,
     read_drift_scan: Option<ReadDriftScanFn>,
-    retention_time: Option<GetRetentionTimeFn>,
     destroy: DestroyReaderFn,
     info_reader: *mut c_void,
     scan_reader: *mut c_void,
     functions: Vec<FunctionInfo>,
     /// bin → drift time in ms, one table per run (MassLynx's `getDriftTime` takes no function).
     drift_time_ms: Vec<f32>,
-    /// One entry per spectrum: (function index, scan index), both 0-based.
-    index: Vec<(c_int, c_int)>,
+    /// One entry per spectrum: (function index, scan index, retention time in minutes), the
+    /// indices 0-based, ORDERED BY TIME across functions (stable: function, then scan, on ties) —
+    /// the order ProteoWizard uses and the order the reader's time lookups assume.
+    index: Vec<(c_int, c_int, f32)>,
     input: PathBuf,
+    /// Functions MassLynx appends as "collapsed retention time data": one row per drift bin holding
+    /// the run-summed spectrum of that bin, with the drift time in the RT slot — derived summaries
+    /// of `summary_of`, not acquisitions. Skipped unless `MZPC_WATERS_KEEP_COLLAPSED` is set.
+    collapsed: Vec<(c_int, Option<c_int>)>,
     scan_items: Option<ScanItemApi>,
     item_ids: ScanItemIds,
     /// The lock-mass reference function, when MassLynx names one.
@@ -348,12 +353,15 @@ impl WatersReader {
             return Err(close(format!("MassLynx getFunctionCount failed (rc={rc}, n={n_functions})")));
         }
 
-        // The lock-mass reference function, if the method names one.
-        let lockmass_function = lockmass_fn.and_then(|g| {
-            let mut has: c_char = 0;
-            let mut which: c_int = -1;
-            (unsafe { g(info_reader, &mut has, &mut which) } == 0 && has != 0 && which >= 0).then_some(which)
-        });
+        // The lock-mass reference function: MassLynx's answer, else the method text
+        // (`_extern.inf`: "Function Parameters - Function N - REFERENCE").
+        let lockmass_function = lockmass_fn
+            .and_then(|g| {
+                let mut has: c_char = 0;
+                let mut which: c_int = -1;
+                (unsafe { g(info_reader, &mut has, &mut which) } == 0 && has != 0 && which >= 0).then_some(which)
+            })
+            .or_else(|| reference_functions_from_extern_inf(input).first().copied());
         // The scan items the DLL records, by NAME, so the ids do not depend on the enum base.
         let mut item_ids = ScanItemIds::default();
         if let Some(api) = scan_items {
@@ -406,8 +414,9 @@ impl WatersReader {
         let mut functions: Vec<FunctionInfo> = Vec::with_capacity(n_functions as usize);
         for f in 0..n_functions {
             let continuum = is_continuum.and_then(|g| {
-                let mut flag = false;
-                (unsafe { g(info_reader, f, &mut flag) } == 0).then_some(flag)
+                // 8-byte slot: a BOOL-writing export cannot clobber a neighbour; byte 0 is the answer.
+                let mut slot = [0u8; 8];
+                (unsafe { g(info_reader, f, slot.as_mut_ptr() as *mut bool) } == 0).then_some(slot[0] != 0)
             });
             let type_string = int_of(function_type, f).and_then(|code| string_of(type_string, code));
             let ion_mode = int_of(ion_mode, f).and_then(|code| string_of(mode_string, code));
@@ -422,7 +431,14 @@ impl WatersReader {
                     || input.join(format!("_FUNC{:03}.{ext}", f + 1)).is_file()
             });
             let mut drift_bins = if has_cdt && read_drift_scan.is_some() {
-                int_of(drift_count, f).filter(|n| (1..=MAX_DRIFT_BINS).contains(n)).unwrap_or(0)
+                match int_of(drift_count, f) {
+                    Some(n) if (1..=MAX_DRIFT_BINS).contains(&n) => n,
+                    Some(n) if n > MAX_DRIFT_BINS => {
+                        log::warn!("MassLynx function {}: getDriftScanCount says {n} bins (> {MAX_DRIFT_BINS}); treated as a summed scan", f + 1);
+                        0
+                    }
+                    _ => 0,
+                }
             } else {
                 0
             };
@@ -456,13 +472,14 @@ impl WatersReader {
 
         // The run's drift-time table: bin → ms, read once from the first IMS function's bin count.
         let mut drift_time_ms = Vec::new();
-        if let (Some(g), Some(n)) = (drift_time, functions.iter().map(|fi| fi.drift_bins).max().filter(|n| *n > 0)) {
+        if let Some(n) = functions.iter().map(|fi| fi.drift_bins).max().filter(|n| *n > 0) {
+            let Some(g) = drift_time else {
+                return Err(close("MassLynxRaw.dll has drift bins but no getDriftTime export; refusing to label frames".into()));
+            };
             for bin in 0..n {
                 let mut ms: f32 = f32::NAN;
                 if unsafe { g(info_reader, bin, &mut ms) } != 0 || !ms.is_finite() {
-                    drift_time_ms.clear();
-                    log::warn!("MassLynx getDriftTime(bin={bin}) failed; drift frames will carry the bin index as their drift value");
-                    break;
+                    return Err(close(format!("MassLynx getDriftTime(bin={bin}) failed; refusing to write drift frames with an unknown time axis")));
                 }
                 drift_time_ms.push(ms);
             }
@@ -503,15 +520,60 @@ impl WatersReader {
             );
         }
 
-        let mut index = Vec::new();
+        // Every scan's retention time (pwiz calls it per scan too); the index is sorted by it.
+        let mut index: Vec<(c_int, c_int, f32)> = Vec::new();
+        let mut collapsed: Vec<(c_int, Option<c_int>)> = Vec::new();
+        let keep_collapsed = std::env::var_os("MZPC_WATERS_KEEP_COLLAPSED").is_some_and(|v| !v.is_empty() && v != "0");
+        let mut rt_failures = 0usize;
+        let mut acquired_ims_functions: Vec<c_int> = Vec::new();
         for f in 0..n_functions {
             let Some(n_scans) = int_of(Some(read_scan_count), f).filter(|n| *n >= 0) else {
-                continue; // skip a function we can't enumerate rather than abort the whole run
+                log::warn!("MassLynx getScanCount(function {}) failed; the function is skipped", f + 1);
+                continue;
             };
-            for s in 0..n_scans {
-                index.push((f, s));
+            let mut rts: Vec<f32> = Vec::with_capacity(n_scans as usize);
+            for scan in 0..n_scans {
+                let mut minutes: f32 = f32::NAN;
+                let ok = retention_time.is_some_and(|g| unsafe { g(info_reader, f, scan, &mut minutes) } == 0 && minutes.is_finite());
+                if !ok {
+                    rt_failures += 1;
+                    minutes = 0.0;
+                }
+                rts.push(minutes);
+            }
+            // "Save Collapsed Retention Time Data": a function with exactly one scan per drift bin whose
+            // "retention times" ARE the drift table is MassLynx's run-summed mobilogram of an earlier
+            // function — derived data, and poison as spectra (the run's ions a second time, folded
+            // into the first 7.8 "minutes" of the TIC). Detected structurally, never by index.
+            let fi = &functions[f as usize];
+            let is_collapsed = fi.drift_bins > 0
+                && n_scans == fi.drift_bins
+                && drift_time_ms.len() == n_scans as usize
+                && rts.iter().zip(&drift_time_ms).all(|(rt, dt)| (rt - dt).abs() < 1e-4);
+            if is_collapsed {
+                let summary_of = acquired_ims_functions.get(collapsed.len()).copied();
+                collapsed.push((f, summary_of));
+                log::info!(
+                    "MassLynx function {}: collapsed retention-time data (one row per drift bin, run-summed{}); {}",
+                    f + 1,
+                    summary_of.map(|s| format!(" — a summary of function {}", s + 1)).unwrap_or_default(),
+                    if keep_collapsed { "kept (MZPC_WATERS_KEEP_COLLAPSED)" } else { "not written as spectra" }
+                );
+                if !keep_collapsed {
+                    continue;
+                }
+            } else if fi.drift_bins > 0 {
+                acquired_ims_functions.push(f);
+            }
+            for (scan, rt) in rts.into_iter().enumerate() {
+                index.push((f, scan as c_int, rt));
             }
         }
+        if rt_failures > 0 {
+            log::warn!("MassLynx getRetentionTime failed for {rt_failures} scans; their time is written as 0.0");
+        }
+        // Time order across functions (stable, so ties keep function then scan order).
+        index.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
         if index.is_empty() {
             return Err(close(format!("Waters .raw {} has no readable scans", input.display())));
         }
@@ -520,7 +582,6 @@ impl WatersReader {
             _lib: lib,
             read_scan,
             read_drift_scan,
-            retention_time,
             destroy,
             info_reader,
             scan_reader,
@@ -528,6 +589,7 @@ impl WatersReader {
             drift_time_ms,
             index,
             input: input.to_path_buf(),
+            collapsed,
             scan_items,
             item_ids,
             lockmass_function,
@@ -544,6 +606,19 @@ impl WatersReader {
         self.functions.iter().any(|fi| fi.drift_bins > 0)
     }
 
+    /// Spectrum indices the writer should sample for its data-facet schema: the first scan of
+    /// every function, so the drift column is declared even when the IMS function is a small part
+    /// of a mixed run (the default six-probe stride would miss it).
+    pub fn probe_indices(&self) -> Vec<usize> {
+        let mut seen = std::collections::HashSet::new();
+        self.index
+            .iter()
+            .enumerate()
+            .filter(|(_, (f, _, _))| seen.insert(*f))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// The `waters_drift` index block: the run's bin → ms table, the bins per function and the
     /// vendor's CCS calibration file verbatim (`mob_cal.csv`, when present). What a reader needs to
     /// interpret the per-point `raw_ion_mobility` column and to go from drift time to CCS.
@@ -557,10 +632,14 @@ impl WatersReader {
         Some(serde_json::json!({
             "vendor": "waters",
             "source": "MassLynxRaw getDriftScanCount / getDriftTime / readDriftScan",
-            "representation": "one spectrum per MassLynx scan (frame); points sorted by (m/z, drift time); per-point raw ion mobility array MS:1003007 in milliseconds",
+            "representation": "one spectrum per MassLynx scan (frame); points sorted by (m/z, drift time); per-point raw ion mobility array MS:1003007 in milliseconds (the DLL's f32 values); the writer's zero-run mask is OFF for this archive so every bin's zero flanks survive",
+            "ids": "function=F process=0 scan=B addresses the MassLynx scan (ProteoWizard's per-bin ids are scan=(B-1)*bins+bin+1; its combined-frame ids are merged=I function=F block=B)",
             "drift_time_unit": "ms",
-            "drift_bins_per_function": self.functions.iter().enumerate().map(|(f, fi)| serde_json::json!({"function": f + 1, "drift_bins": fi.drift_bins})).collect::<Vec<_>>(),
+            "drift_bins_per_function": self.functions.iter().enumerate().map(|(f, fi)| serde_json::json!({"function": f + 1, "drift_bins": fi.drift_bins, "sonar": fi.sonar})).collect::<Vec<_>>(),
             "drift_time_ms": self.drift_time_ms,
+            "sonar_checked": self.scan_items.is_some() && self.item_ids.sonar.is_some(),
+            "lockmass_function": self.lockmass_function.map(|f| f + 1),
+            "collapsed_functions": self.collapsed.iter().map(|(f, of)| serde_json::json!({"function": f + 1, "summary_of": of.map(|o| o + 1), "written": std::env::var_os("MZPC_WATERS_KEEP_COLLAPSED").is_some()})).collect::<Vec<_>>(),
             "ccs_calibration_mob_cal_csv": ccs,
         }))
     }
@@ -568,7 +647,7 @@ impl WatersReader {
     /// Read one spectrum. A function with drift bins yields a FRAME (every bin's points, sorted by
     /// m/z then drift time, with a per-point drift-time array); any other function the summed scan.
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
-        let (func, scan) = *self
+        let (func, scan, rt_minutes) = *self
             .index
             .get(i)
             .ok_or_else(|| anyhow!("Waters spectrum index {i} out of range (len {})", self.len()))?;
@@ -695,16 +774,18 @@ impl WatersReader {
                     .build(),
             );
         }
-        let mut event = ScanEvent::default();
-        if let Some(g) = self.retention_time {
-            let mut minutes: f32 = f32::NAN;
-            if unsafe { g(self.info_reader, func, scan, &mut minutes) } == 0 && minutes.is_finite() {
-                event.start_time = minutes as f64;
-            }
-        }
+        let mut event = ScanEvent { start_time: rt_minutes as f64, ..Default::default() };
         if let Some((lo, hi)) = fi.mass_range {
             event.scan_windows.push(ScanWindow::new(lo, hi));
         }
+        // The function number, where pwiz puts it (the writer maps MS:1000616 to its own column).
+        event.add_param(
+            Param::builder()
+                .name("preset scan configuration")
+                .curie(mzdata::curie!(MS:1000616))
+                .value((func + 1) as i64)
+                .build(),
+        );
         // A frame has no single drift time: `ion_mobility_value` stays NULL on purpose (pwiz's
         // combined spectra carry a meaningless mid-range value; TDF frames carry none).
         descr.acquisition.scans.push(event);
@@ -769,6 +850,27 @@ impl WatersReader {
         }
         copy_points(p_masses, p_intensities, n)
     }
+}
+
+/// The REFERENCE (lock-mass) functions the method text names, 0-based:
+/// `Function Parameters - Function 3 - REFERENCE` in `_extern.inf`.
+fn reference_functions_from_extern_inf(raw: &Path) -> Vec<c_int> {
+    let Ok(text) = crate::run_metadata::read_text_lossy(&raw.join("_extern.inf")) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("Function Parameters - Function ") {
+            let mut parts = rest.splitn(2, " - ");
+            if let (Some(num), Some(kind)) = (parts.next(), parts.next()) {
+                if kind.trim().eq_ignore_ascii_case("REFERENCE") {
+                    if let Ok(n) = num.trim().parse::<c_int>() {
+                        out.push(n - 1);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Copy `n` points out of MassLynx's reader-owned buffers (valid only until the next read; NOT to be

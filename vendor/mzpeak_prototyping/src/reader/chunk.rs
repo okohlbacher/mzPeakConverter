@@ -622,6 +622,9 @@ impl<'a> ChunkDecoder<'a> {
                 name.dtype,
                 name.dtype.size_of() * n,
             );
+            // The column's unit (a drift time in ms, a 1/K0) travels with the array: the mzML export
+            // wrote `raw ion mobility array` without a unitAccession before this line existed.
+            store.unit = name.unit;
             let decoder: Option<BufferTransformDecoder> = name.transform.try_into().ok();
             let n_chunks_of = chunks.len();
             let total_n_of: usize = chunks.iter().map(|c| c.len()).sum();
