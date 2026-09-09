@@ -350,7 +350,7 @@ vocabulary — is documented at:
 Vendor acquisitions carry rich, format-specific metadata. mzPeakConverter
 preserves it along two routes:
 
-**Run metadata the vendor states (native lanes, since the release after 0.11.2).** The mzML lane
+**Run metadata the vendor states (native lanes, since 0.11.3).** The mzML lane
 inherits ProteoWizard's finished model; the native lanes build one from what each vendor file
 STATES, merged field by field (`src/run_metadata.rs`) — nothing is guessed, so a lane records a
 serial, a sample or a source (ion source, detector) only where the file says so:
