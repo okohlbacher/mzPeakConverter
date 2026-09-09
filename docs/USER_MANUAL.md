@@ -361,13 +361,13 @@ serial, a sample or a source (ion source, detector) only where the file says so:
 | Agilent `.d` | `AcqData/Devices.xml`, `Contents.xml`, `sample_info.xml` (any host) | MS:1000490 + name, model number, serial, analyzers implied by the device type | MassHunter + `AcqSoftwareVersion` | `Sample Name` | `AcquiredTime` (with its offset) | the AcqData files (no exported text, no dot files) |
 | Waters `.raw` | `_HEADER.TXT`, `_extern.inf` (any host) | MS:1000126 + model, serial unless `#NotSet` | MassLynx `Created by` version | `Acquired Name` + descriptors | `Acquired Date/Time` (no zone) | `_FUNCnnn.DAT` (Waters nativeID) then the side files |
 | SciEX `.wiff` | Clearcore2 sample/instrument details (Windows) | MS:1000121 + `InstrumentName`, serial | Analyst + `SoftwareVersion` | sample name | `AcquisitionDateTime` (no zone) | `.wiff` + `.wiff.scan`, digested before the library opens them |
-| Shimadzu `.lcd` | LabSolutions.IO (Windows) | MS:1002998 + `SystemName`, ESI + quadrupole + TOF from the device id | — (open) | — | `AnalysisDate` (no zone) | `.lcd` |
+| Shimadzu `.lcd` | the `.lcd`'s own `File Property` stream (any host) + LabSolutions.IO (Windows) | MS:1002998 + `SystemName`, ESI + quadrupole + TOF from the device id | LabSolutions + `DataFileProperty.szVersion` | `smpl_name` (+ id, vial, operator, injection volume) | `SampleInfo.DateTime`: a UTC FILETIME presented in the writer's stated GMT offset (`+01'00'`) — fully zoned | `.lcd` |
 | Thermo `.raw` | mzdata's Thermo reader | complete already | Xcalibur | yes | zoned | `.raw` |
 
 **Acquisition time: stated offset or nothing.** `run.start_time` is an RFC 3339 instant, and
 RFC 3339 cannot say "zone unknown". A vendor time that STATES its offset (Agilent
-`2022-11-01T13:11:27-04:00`, Bruker) is written verbatim. A wall clock WITHOUT one (Waters,
-Shimadzu, SciEX) leaves `run.start_time` null and is preserved verbatim in the index:
+`2022-11-01T13:11:27-04:00`, Bruker, Shimadzu's UTC FILETIME + `+01'00'`) is written verbatim. A wall
+clock WITHOUT one (Waters, SciEX) leaves `run.start_time` null and is preserved verbatim in the index:
 
 ```json
 "acquisition_time": {"wall_clock": "2018-12-03T22:39:33", "zone": "unstated",
@@ -375,16 +375,17 @@ Shimadzu, SciEX) leaves `run.start_time` null and is preserved verbatim in the i
 ```
 
 ProteoWizard resolves the same ambiguity by asserting: it labels an unzoned Waters clock `Z`, and
-shifts a STATED Agilent offset by the converting host's zone (an mzML built on a UTC box says
-18:11Z for a file that says 13:11:27-04:00, i.e. 17:11Z). The archive's value is the vendor's; the
-mzML lane's is whatever pwiz computed. `file_description.contents` likewise states what the lane
+its `adjustUnknownTimeZonesToHostTimeZone` default shifts other readers' values by the converting
+host's offset AT CONVERSION TIME (a Shimadzu run that the file states as 10:47:18Z comes out
+08:47:18Z when converted in September on a CEST box; SciEX wall clocks come out minus 2 h whatever
+their month; blank1's stated 13:11:27-04:00 comes out 18:11:27Z). The archive's value is the
+vendor's; the mzML lane's is whatever pwiz computed. `file_description.contents` likewise states what the lane
 wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram), not a generic `mass spectrum`.
 
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
 the Waters, Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF and Shimadzu have them), the
 drift-time dimension of a Waters HDMSe run (the native lane writes the mobility-combined scan;
-ProteoWizard expands each scan into its 200 drift bins), the non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz, and the
-Shimadzu acquisition-software version.
+ProteoWizard expands each scan into its 200 drift bins), and the non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz.
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
 PSI controlled-vocabulary meaning, it is mapped onto the standard
