@@ -154,6 +154,8 @@ type SciexDataFree = extern "system" fn(i64, *const f64, *const f32);
 /// to `cap` code units, and returns the FULL length in UTF-16 code units so the caller can detect
 /// truncation. A null `buf` or `cap <= 0` just returns the needed length.
 type SciexLastError = extern "system" fn(*mut u16, i32) -> i32;
+type SciexRunInfoFn = extern "system" fn(i64, *mut i32) -> i32;
+type SciexRunStringFn = extern "system" fn(i64, i32, *mut u16, i32) -> i32;
 
 /// Resolved + bound function pointers into the loaded `SciexGlue` assembly.
 #[derive(Clone)]
@@ -167,6 +169,20 @@ struct GlueApi {
     spectrum_data: SciexSpectrumData,
     data_free: SciexDataFree,
     last_error: SciexLastError,
+    /// Additive exports (glue 2026-09-08): absent on an older SciexGlue.dll, in which case the
+    /// run-level checks below are skipped with a warning rather than failing the conversion.
+    run_info: Option<SciexRunInfoFn>,
+    run_string: Option<SciexRunStringFn>,
+}
+
+/// Run-level counts the glue gathered while indexing the file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SciexRunInfo {
+    pub samples: i32,
+    pub unreadable_samples: i32,
+    pub dwell_experiments: i32,
+    pub scan_experiments: i32,
+    pub total_experiments: i32,
 }
 
 impl GlueApi {
@@ -242,6 +258,21 @@ impl GlueApi {
         let last_error = *loader
             .get_function_with_unmanaged_callers_only::<SciexLastError>(ty, pdcstr!("LastError"))
             .map_err(|e| anyhow!("resolving glue export LastError: {e}"))?;
+        let run_info = loader
+            .get_function_with_unmanaged_callers_only::<SciexRunInfoFn>(ty, pdcstr!("RunInfo"))
+            .ok()
+            .map(|f| *f);
+        let run_string = loader
+            .get_function_with_unmanaged_callers_only::<SciexRunStringFn>(ty, pdcstr!("RunString"))
+            .ok()
+            .map(|f| *f);
+        if run_info.is_none() || run_string.is_none() {
+            log::warn!(
+                "SciexGlue.dll in {} predates the RunInfo/RunString exports: MRM/SIM and multi-sample \
+                 runs cannot be recognised and no run metadata is read — rebuild glue/sciex",
+                glue_dir.display()
+            );
+        }
 
         Ok(Self {
             _runtime: loader,
@@ -252,6 +283,8 @@ impl GlueApi {
             spectrum_data,
             data_free,
             last_error,
+            run_info,
+            run_string,
         })
     }
 
@@ -286,6 +319,9 @@ pub struct SciexReader {
     api: GlueApi,
     handle: i64,
     count: usize,
+    /// When one sample of a multi-sample WIFF is selected: the flattened glue indices that belong
+    /// to it, in order. `None` = every index (a single-sample file).
+    selected: Option<Vec<usize>>,
     /// The managed handle / runtime is not known to be thread-safe and FFI calls through it
     /// must not happen concurrently. A raw-pointer marker makes [`SciexReader`] neither `Send`
     /// nor `Sync`, so the type system prevents cross-thread sharing. Sound for the existing
@@ -348,16 +384,188 @@ impl SciexReader {
             api,
             handle,
             count,
+            selected: None,
             _not_thread_safe: PhantomData,
         })
     }
 
     pub fn len(&self) -> usize {
-        self.count
+        self.selected.as_ref().map_or(self.count, Vec::len)
+    }
+
+    /// The glue's flattened index behind reader index `i`.
+    fn raw_index(&self, i: usize) -> usize {
+        self.selected.as_ref().map_or(i, |v| v[i])
+    }
+
+    /// Run-level counts, or `None` with an older glue.
+    pub fn run_info(&self) -> Option<SciexRunInfo> {
+        let f = self.api.run_info?;
+        let mut out = [0i32; 5];
+        if f(self.handle, out.as_mut_ptr()) != 0 {
+            log::warn!("SciEX glue RunInfo failed: {}", self.api.last_error().unwrap_or_default());
+            return None;
+        }
+        Some(SciexRunInfo {
+            samples: out[0],
+            unreadable_samples: out[1],
+            dwell_experiments: out[2],
+            scan_experiments: out[3],
+            total_experiments: out[4],
+        })
+    }
+
+    /// One of the glue's run strings (see `RunString` in Glue.cs); empty when absent.
+    fn run_string(&self, which: i32) -> String {
+        let Some(f) = self.api.run_string else { return String::new() };
+        let full = f(self.handle, which, std::ptr::null_mut(), 0);
+        if full <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; full as usize + 1];
+        let n = f(self.handle, which, buf.as_mut_ptr(), buf.len() as i32);
+        if n < 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())])
+    }
+
+    /// Refuse what this lane cannot store faithfully, BEFORE any spectrum is written:
+    ///
+    /// * **MRM / SIM experiments.** Clearcore2 hands a dwell out as a one-point "spectrum" whose
+    ///   m/z is the transition ORDINAL — the two published corpus archives built this way carried
+    ///   154,520 and 2,215 such rows with no Q1/Q3, dwell or compound identity (BACKLOG). They are
+    ///   transition chromatograms; msconvert writes them as SRM chromatograms with their identity,
+    ///   so the harness's fallback is the right lane (the message is what
+    ///   `tools/box_convert_remote.ps1` classifies on). A MIXED run is refused as a whole: dropping
+    ///   the dwell experiments would lose channels msconvert keeps.
+    /// * **Several samples without `--sample`.** The archive is one run; concatenating N samples
+    ///   under one run id is not a conversion of any of them (En_PPY: 116 of 117 samples in one
+    ///   archive, the mzML lane keeps only the last).
+    /// * **Unreadable samples.** A partial file must not publish as a complete one.
+    pub fn refuse_if_unsupported(&self, path: &Path, sample: Option<u32>) -> Result<()> {
+        let Some(info) = self.run_info() else { return Ok(()) };
+        if info.dwell_experiments > 0 {
+            bail!(
+                "{}: MRM/SIM dwell data only handled by the msconvert lane — {} of {} experiments are \
+                 MRM/SIM dwells and {} are scans (types: {}); the native reader would store each dwell \
+                 as a one-point spectrum without its transition. Use --via-msconvert, which writes SRM \
+                 chromatograms.",
+                path.display(),
+                info.dwell_experiments,
+                info.total_experiments,
+                info.scan_experiments,
+                self.run_string(0)
+            );
+        }
+        if info.unreadable_samples > 0 {
+            bail!(
+                "{}: {} of {} samples (or their experiments) could not be read by Clearcore2; refusing \
+                 to write a partial archive. Last glue error: {}",
+                path.display(),
+                info.unreadable_samples,
+                info.samples,
+                self.api.last_error().unwrap_or_default()
+            );
+        }
+        if info.samples > 1 && sample.is_none() {
+            bail!(
+                "{}: the WIFF holds {} samples and an archive is ONE run; pass --sample <1..{}> to \
+                 choose which to convert (sample names: {})",
+                path.display(),
+                info.samples,
+                info.samples,
+                self.run_string(5).replace('\u{1F}', " | ")
+            );
+        }
+        if let Some(n) = sample {
+            if n == 0 || n as i32 > info.samples.max(1) {
+                bail!("{}: --sample {n} is out of range (the WIFF holds {} samples)", path.display(), info.samples);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restrict the reader to sample `n` (1-based). Walks every flattened entry's metadata once.
+    pub fn select_sample(&mut self, n: u32) -> Result<()> {
+        let mut keep = Vec::new();
+        for i in 0..self.count {
+            let m = self.meta_raw(i)?;
+            if m.sample == n as i32 {
+                keep.push(i);
+            }
+        }
+        if keep.is_empty() {
+            bail!("--sample {n}: no spectra belong to that sample");
+        }
+        log::info!("SciEX: converting sample {n} only ({} of {} spectra)", keep.len(), self.count);
+        self.selected = Some(keep);
+        Ok(())
+    }
+
+    /// What the file states about the run, for `run_metadata::apply`: instrument, serial,
+    /// software version, acquisition time (a DateTime whose Kind decides whether it is an instant
+    /// or a wall clock), the selected sample's name. The source members (`.wiff` + `.wiff.scan`)
+    /// are digested by the caller.
+    pub fn run_metadata(&self, sample: Option<u32>) -> Option<crate::run_metadata::VendorRunMetadata> {
+        use crate::run_metadata::{term, term_str, AcquisitionTime, VendorRunMetadata};
+        use mzdata::meta::{InstrumentConfiguration, Sample, Software};
+        self.api.run_string?;
+        let mut out = VendorRunMetadata::default();
+        let instrument = self.run_string(1);
+        let serial = self.run_string(2);
+        if !instrument.is_empty() || !serial.is_empty() {
+            let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+            cfg.params.push(term(1000121, "SCIEX instrument model"));
+            if !instrument.is_empty() {
+                cfg.params.push(term_str(1000031, "instrument model", &instrument));
+            }
+            if !serial.is_empty() {
+                cfg.params.push(term_str(1000529, "instrument serial number", &serial));
+            }
+            out.instrument = Some(cfg);
+        }
+        let version = self.run_string(3);
+        out.acquisition_software = Some(Software::new(
+            "Analyst".to_string(),
+            if version.is_empty() { "unknown".to_string() } else { version },
+            vec![term(1000551, "Analyst")],
+        ));
+        let time = self.run_string(4);
+        if let Some((iso, kind)) = time.split_once('|') {
+            // Kind Utc / Local carry an offset in the "o" form; Unspecified renders without one.
+            match crate::run_metadata::parse_vendor_time(iso, "SciEX AcquisitionDateTime") {
+                Ok(t) => {
+                    out.start_time = Some(match (t, kind) {
+                        (AcquisitionTime::Stated(dt), "Utc" | "Local") => AcquisitionTime::Stated(dt),
+                        (AcquisitionTime::Stated(dt), _) => AcquisitionTime::Naive {
+                            wall_clock: dt.naive_local(),
+                            source: "SciEX AcquisitionDateTime",
+                        },
+                        (naive, _) => naive,
+                    });
+                }
+                Err(e) => log::warn!("{e}"),
+            }
+        }
+        let names: Vec<String> = self.run_string(5).split('\u{1F}').map(str::to_string).collect();
+        let idx = sample.map_or(0, |n| n.saturating_sub(1) as usize);
+        if let Some(name) = names.get(idx).filter(|n| !n.is_empty()) {
+            out.samples.push(Sample::new(format!("sample_{}", idx + 1), Some(name.clone()), vec![]));
+        }
+        let resolved = self.run_string(6);
+        if !resolved.is_empty() {
+            log::info!("SciEX run metadata resolved from: {resolved}");
+        }
+        Some(out)
     }
 
     /// Fetch one spectrum's scalar metadata via the glue.
     fn meta(&self, i: usize) -> Result<SciexSpectrumMeta> {
+        self.meta_raw(self.raw_index(i))
+    }
+
+    fn meta_raw(&self, i: usize) -> Result<SciexSpectrumMeta> {
         let index = i64::try_from(i).map_err(|_| anyhow!("SciEX index {i} does not fit in i64"))?;
         let mut meta = SciexSpectrumMeta::default();
         // SAFETY: `meta` is a valid, writable, correctly-laid-out destination for the glue.
@@ -460,11 +668,11 @@ impl SciexReader {
     /// Build the mzdata spectrum for spectrum `i` (0-based reader order). Built identically to
     /// [`crate::bruker_tsf::TsfReader::spectrum`].
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
-        if i >= self.count {
-            bail!("SciEX spectrum index {i} out of range (len {})", self.count);
+        if i >= self.len() {
+            bail!("SciEX spectrum index {i} out of range (len {})", self.len());
         }
         let meta = self.meta(i)?;
-        let (mz, intensity) = self.peaks(i)?;
+        let (mz, intensity) = self.peaks(self.raw_index(i))?;
 
         let mut arrays = BinaryArrayMap::new();
         let mut mz_da =

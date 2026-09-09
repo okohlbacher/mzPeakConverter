@@ -64,6 +64,12 @@ mod tof_grid;
 mod tims_mobility;
 mod thermo_status;
 mod thermo_trailers;
+mod run_metadata;
+mod agilent_meta;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod waters_meta;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod shimadzu_meta;
 mod vendor;
 mod embed_aux;
 mod filter;
@@ -72,9 +78,13 @@ use arrow::datatypes::DataType;
 use mzdata::curie;
 use mzdata::io::MZReaderType;
 use mzdata::meta::{
-    Component, ComponentType, DataProcessing, InstrumentConfiguration, ProcessingMethod, Software,
+    DataProcessing, InstrumentConfiguration, ProcessingMethod, Software,
     SourceFile, custom_software_name,
 };
+// Used only inside `cfg(windows)` lanes (Shimadzu instrument components): unused on macOS, where
+// removing the import broke the Windows build twice already.
+#[cfg_attr(not(windows), allow(unused_imports))]
+use mzdata::meta::{Component, ComponentType};
 use mzdata::params::{ControlledVocabulary, Param, Unit};
 use mzdata::prelude::*;
 use mzdata::spectrum::bindata::BinaryArrayMap3D;
@@ -147,6 +157,14 @@ fn partial_marker(input: &Path, cap: Option<usize>, written: usize) -> Option<(S
 /// quick cross-checks (e.g. the ion-mobility comparison only needs a handful of frames to cover the
 /// full mobility axis), so a multi-GB run becomes seconds. `None` = convert everything. Every
 /// mzPeak lane that honours the cap also writes the [`partial_marker`] index block when it bites.
+/// `--sample N` (SciEX multi-sample WIFF), set once after argument parsing and read by the SciEX
+/// lanes — the alternative was threading one more parameter through five conversion signatures.
+static SCIEX_SAMPLE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+fn sciex_sample() -> Option<u32> {
+    SCIEX_SAMPLE.get().copied().flatten()
+}
+
 fn max_spectra() -> Option<usize> {
     let cap = std::env::var("MZPC_MAX_SPECTRA")
         .ok()
@@ -394,6 +412,13 @@ struct Cli {
     #[arg(long, value_enum)]
     tof_grid: Option<TofGridMode>,
 
+    /// SciEX `.wiff` holding SEVERAL samples: which one to convert (1-based). An archive is ONE
+    /// run, so a multi-sample file is refused without this (concatenating the samples under one
+    /// run id, as before 0.12, was a conversion of none of them). The msconvert lane maps it to
+    /// `--runIndexSet <N-1>`; without it that lane silently kept only the LAST sample.
+    #[arg(long, value_name = "N")]
+    sample: Option<u32>,
+
     /// Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from
     /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + a
     /// per-run `{c0,c1}` calibration instead of f64 m/z, recovering `m/z = (c0 + c1·tof_index)²`.
@@ -622,6 +647,7 @@ impl Settings {
         note(!cli.image.is_empty(), "--image");
         note(cli.sdrf.is_some(), "--sdrf");
         note(cli.tof_grid.is_some(), "--tof-grid");
+        let _ = SCIEX_SAMPLE.set(cli.sample);
         note(cli.agilent_grid, "--agilent-grid");
         note(cli.via_msconvert, "--via-msconvert");
         note(cli.msconvert_path.is_some(), "--msconvert-path");
@@ -1874,6 +1900,14 @@ fn convert_via_msconvert(
         .arg(&tmpdir)
         .arg("--outfile")
         .arg("via_msconvert.mzML");
+    // A multi-sample WIFF is several runs; with one `--outfile` msconvert writes them in turn and
+    // the LAST wins (En_PPY: 117 samples, one survived). `--sample N` picks the run explicitly.
+    if let Some(n) = sciex_sample() {
+        let ext = input.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if ext == "wiff" || ext == "wiff2" {
+            cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
+        }
+    }
     // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
     // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
     if let Ok(f) = fs::File::create(&mzcvt_log) {
@@ -4967,7 +5001,30 @@ fn convert_shimadzu(
     // (`MZPC_SHIMADZU_PROBE=N` — the "what does the reader hand back" diagnostic — is handled in
     // `run` before any lane is entered, see `shimadzu_probe_lever`: this lane only runs with `-o`,
     // so a probe here always swallowed the requested archive.)
-    let mut hints = VendorHints { instrument: shimadzu_instrument(&reader.instrument_info()), source_sha1, ..Default::default() };
+    let info = reader.instrument_info();
+    // `SampleInfo.AnalysisDate` is a naive local time: it goes to the `acquisition_time` index block,
+    // never to `run.start_time` (see `run_metadata`). Every other run fact this lane knows is the
+    // instrument, set below the old way (the lane predates the seam).
+    // The `.lcd` itself states the run start as a UTC FILETIME plus the writer's GMT offset, the
+    // sample and the LabSolutions version (`shimadzu_meta`); the DLL's `AnalysisDate` (empty in this
+    // host, see BACKLOG) is only the fallback.
+    let run_meta = shimadzu_meta::read(input).or_else(|| info.analysis_date.as_deref().and_then(|d| {
+        // The DLL renders `dd.MM.yyyy HH:mm:ss`-style or ISO text depending on locale; accept both.
+        let text = d.trim();
+        let parsed = run_metadata::parse_vendor_time(text, "Shimadzu SampleInfo.AnalysisDate")
+            .ok()
+            .or_else(|| {
+                ["%d.%m.%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%d.%m.%Y %H:%M"]
+                    .iter()
+                    .find_map(|f| chrono::NaiveDateTime::parse_from_str(text, f).ok())
+                    .map(|n| run_metadata::AcquisitionTime::Naive { wall_clock: n, source: "Shimadzu SampleInfo.AnalysisDate" })
+            });
+        if parsed.is_none() {
+            log::warn!("Shimadzu SampleInfo.AnalysisDate {text:?} not understood; not recorded");
+        }
+        parsed.map(|t| run_metadata::VendorRunMetadata { start_time: Some(t), ..Default::default() })
+    }));
+    let mut hints = VendorHints { instrument: shimadzu_instrument(&info), source_sha1, run_metadata: run_meta, ..Default::default() };
     // Profile facet as an exact sqrt grid (see `shimadzu_grid`): probe dense profile spectra across
     // the run for the run-wide step; if the fit holds, the profile of every spectrum that fits is
     // stored as `tof_index` + per-spectrum `tof_c0`/`tof_c1`, and any that does not keeps f64 m/z.
@@ -5236,6 +5293,8 @@ fn shimadzu_grid_route(
 fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo) -> Option<InstrumentConfiguration> {
     let model = info.system_name.clone()?;
     let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+    // The family term ProteoWizard states, plus the vendor's own system name as the model value.
+    cfg.params.push(run_metadata::term(1002998, "Shimadzu instrument model"));
     cfg.params.push(Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model).build());
     let mut order = 1;
     if info.ionization.as_deref() == Some("ESI") {
@@ -5353,7 +5412,26 @@ fn convert_sciex_grid(
     // run-wide clock fit must succeed. `Auto`: the behaviour before the mode existed.
     mode: TofGridMode,
 ) -> Result<()> {
-    let reader = sciex::SciexReader::open(input)?;
+    // The source members are digested BEFORE Clearcore2 opens them (the `.wiff` and, when present,
+    // its `.wiff.scan` sibling — ProteoWizard lists both).
+    let wiff_name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let scan_name = format!("{wiff_name}.scan");
+    let member_names = [wiff_name.as_str(), scan_name.as_str()];
+    let (source_files, default_source) = run_metadata::source_files_from_members(
+        input.parent().unwrap_or(Path::new(".")),
+        &run_metadata::MemberPolicy {
+            members: run_metadata::Members::Explicit(&member_names),
+            file_format: Some(run_metadata::term(1000562, "ABI WIFF format")),
+            id_format: Some(run_metadata::term(1000770, "WIFF nativeID format")),
+            default_member: Some(wiff_name.as_str()),
+        },
+    );
+    let sample = sciex_sample();
+    let mut reader = sciex::SciexReader::open(input)?;
+    reader.refuse_if_unsupported(input, sample)?;
+    if let Some(n) = sample {
+        reader.select_sample(n)?;
+    }
     let total = reader.len();
     if total == 0 {
         bail!("no spectra in {}", input.display());
@@ -5490,9 +5568,19 @@ fn convert_sciex_grid(
          max round-trip {max_ppm:.4} ppm"
     );
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
+    // What the WIFF states about the run (instrument, serial, Analyst version, acquisition time,
+    // the sample's name) plus the digested members; a naive acquisition time becomes an index block.
+    let acquisition_block = reader.run_metadata(sample).and_then(|mut m| {
+        m.source_files = source_files;
+        m.default_source_file = default_source;
+        run_metadata::apply(&mut writer, m)
+    });
     fixup_run_metadata(&mut writer, input);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    if let Some((key, block)) = acquisition_block {
+        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
+    }
     // `lossless` names the exactly-stored column, `mz_reconstruction` rates the m/z you rebuild
     // from it — see `finish_tof_grid_archive`. `max_roundtrip_ppm` is the measured worst case over
     // this run (it has run at ~5 ppm on the published MSV000095995 archive), and
@@ -5609,7 +5697,22 @@ fn convert_waters(
     // index or the mass-calibration coefficients). The statistical TOF-grid detector (strategy A) is
     // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
     let reader = waters::WatersReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), |i| reader.spectrum(i))
+    let mut hints = VendorHints { run_metadata: waters_meta::read(input), ..Default::default() };
+    // Ion-mobility functions arrive as frames whose bins were interleaved and re-sorted by m/z
+    // (`waters.rs`): declare the sort, and hand readers the run's drift table + CCS calibration.
+    if let Some(block) = reader.drift_block() {
+        hints.transformations.push("sort-by-mz".to_string());
+        hints.index_blocks.push(("waters_drift".to_string(), block));
+        // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
+        // and the drift column must be declared even if the IMS function is a small part of the run.
+        hints.keep_zero_runs = true;
+        hints.probe_indices = reader.probe_indices();
+        // The drift column is declared through the per-function probes above; an explicit
+        // `data_facet_fields` push of the f32 array (as the TDF lane does for `tof`) declares the
+        // POINT-layout shape and made the chunked writer panic on a column-type mismatch
+        // (box round 21) — the chunked secondary-array field shape needs its own constructor first.
+    }
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak through the net48 MHDAC host (`agilent.rs`;
@@ -5677,6 +5780,17 @@ struct VendorHints {
     /// Lane-specific entries for the `transformations` index block (see [`transformations_block`]);
     /// the writer-level ones (zero-run mask, numpress) are added by `convert_vendor_reader`.
     transformations: Vec<String>,
+    /// What the vendor file states about the run (sample, time, instrument, software, members):
+    /// merged field by field before `fixup_run_metadata` — see `run_metadata`.
+    run_metadata: Option<run_metadata::VendorRunMetadata>,
+    /// Keep zero-intensity runs (the writer's zero-run mask OFF). Set by lanes whose spectra
+    /// interleave several traces in one array — Waters drift frames: masked across bins, the
+    /// mask deleted 3–6 % of the per-bin trace boundaries (review 2026-09-09).
+    keep_zero_runs: bool,
+    /// Spectrum indices the writer samples for its data-facet schema instead of the default
+    /// six-probe stride, so a column only some functions carry (the drift array of a mixed
+    /// IMS/non-IMS Waters run) is declared regardless of where those spectra sit.
+    probe_indices: Vec<usize>,
 }
 
 /// One spectrum from a vendor reader, plus — for a lattice-routed centroid list — the arrays that
@@ -5817,7 +5931,11 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         source_sha1,
         peaks_facet,
         transformations,
+        run_metadata,
+        keep_zero_runs,
+        probe_indices,
     } = hints;
+    let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
     let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -5829,13 +5947,21 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     const N_PROBE: usize = 6;
     let step = (len / N_PROBE).max(1);
     let mut probes: Vec<mzdata::spectrum::MultiLayerSpectrum> = Vec::new();
+    // The lane's own probe choice first (one spectrum per function), then the stride fills up to
+    // the usual six.
+    let mut wanted: Vec<usize> = probe_indices.into_iter().filter(|&i| i < len).collect();
     let mut pi = 0usize;
-    while pi < len && probes.len() < N_PROBE {
-        if let Ok(s) = spectrum(pi) {
+    while pi < len && wanted.len() < N_PROBE {
+        if !wanted.contains(&pi) {
+            wanted.push(pi);
+        }
+        pi += step;
+    }
+    for i in wanted {
+        if let Ok(s) = spectrum(i) {
             let s: VendorSpectrum = s.into();
             probes.push(s.spectrum);
         }
-        pi += step;
     }
     // A custom peaks facet (the Shimadzu centroid lattice) is an integer axis with an f64 fallback
     // column: never chunked, never numpressed — the lattice replaces both.
@@ -5894,7 +6020,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             DataType::Float64,
         ));
     }
-    let mut writer = builder.build(handle, true);
+    let mut writer = builder.build(handle, !keep_zero_runs);
     add_processing_metadata(&mut writer);
     // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band; the
     // per-spectrum grid coefficient columns (`TOF_C0_CURIE` …) are MZP terms too.
@@ -5946,8 +6072,18 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             writer.instrument_configurations_mut().insert(0, cfg);
         }
     }
+    // What the vendor states about the run, merged onto whatever the lane already set; a naive
+    // acquisition time becomes an `acquisition_time` index block rather than a false instant.
+    if let Some(meta) = run_metadata {
+        if let Some(block) = run_metadata::apply(&mut writer, meta) {
+            index_blocks.push(block);
+        }
+    }
     fixup_run_metadata(&mut writer, input);
     let mut applied = base_transformations(&[data_chunk, peaks_chunk]);
+    if keep_zero_runs {
+        applied.retain(|t| t != "zero-run-mask");
+    }
     applied.extend(transformations);
     let transformations = transformations_block(&applied);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
@@ -6073,10 +6209,26 @@ struct Ms1Chroms {
     time: Vec<f64>,
     tic: Vec<f64>,
     bpc: Vec<f64>,
+    /// Which spectrum kinds were written: the basis of `file_description.contents` on the native
+    /// lanes (the mzML lane inherits ProteoWizard's list and keeps it).
+    saw_ms1: bool,
+    saw_msn: bool,
+    saw_centroid: bool,
+    saw_profile: bool,
 }
 
 impl Ms1Chroms {
     fn observe(&mut self, spec: &MultiLayerSpectrum) {
+        if spec.ms_level() == 1 {
+            self.saw_ms1 = true;
+        } else {
+            self.saw_msn = true;
+        }
+        match spec.signal_continuity() {
+            mzdata::spectrum::SignalContinuity::Centroid => self.saw_centroid = true,
+            mzdata::spectrum::SignalContinuity::Profile => self.saw_profile = true,
+            _ => {}
+        }
         if spec.ms_level() != 1 {
             return;
         }
@@ -6152,6 +6304,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     source: I,
     synth: bool,
 ) -> Result<()> {
+    set_file_contents(writer, ms1, synth && !ms1.time.is_empty());
     let synthesized = if synth { ms1.write(writer)? } else { 0 };
     let mut n = synthesized;
     for chrom in source {
@@ -6197,6 +6350,48 @@ fn is_path_shaped_run_id(id: &str) -> bool {
 /// nothing about the run), and a `default_instrument_id` that points at no configuration is
 /// clamped or cleared (a dangling foreign key fails the spec's semantic invariants). Faithful values
 /// only (real source stem / real list entry / the input file as its own source).
+/// `file_description.contents` from what was actually written: `MS1 spectrum` / `MSn spectrum`, the
+/// two terms ProteoWizard states. Only when the lane said nothing more specific than the generic
+/// parent term (or nothing at all) — an inherited list (the mzML lane) is kept verbatim.
+fn set_file_contents(target: &mut impl MSDataFileMetadata, seen: &Ms1Chroms, tic_written: bool) {
+    let contents = &mut target.file_description_mut().contents;
+    let only_generic = contents.iter().all(|p| p.curie() == Some(curie!(MS:1000294)));
+    if !only_generic || (!seen.saw_ms1 && !seen.saw_msn) {
+        return;
+    }
+    contents.retain(|p| p.curie() != Some(curie!(MS:1000294)));
+    // The terms ProteoWizard lists for a file: the spectrum kinds, their representation, and the
+    // TIC chromatogram when one is written.
+    if seen.saw_ms1 {
+        contents.push(Param::builder().name("MS1 spectrum").curie(curie!(MS:1000579)).build());
+    }
+    if seen.saw_msn {
+        contents.push(Param::builder().name("MSn spectrum").curie(curie!(MS:1000580)).build());
+    }
+    if seen.saw_centroid {
+        contents.push(Param::builder().name("centroid spectrum").curie(curie!(MS:1000127)).build());
+    }
+    if seen.saw_profile {
+        contents.push(Param::builder().name("profile spectrum").curie(curie!(MS:1000128)).build());
+    }
+    if tic_written {
+        contents.push(Param::builder().name("total ion current chromatogram").curie(curie!(MS:1000235)).build());
+    }
+}
+
+/// The run metadata a vendor DIRECTORY input states in its side files, readable on any host:
+/// Bruker `.d` (`GlobalMetadata`), Agilent `.d` (`AcqData` XML). Waters `.raw` is handled by its
+/// lane through `VendorHints` because its naive time needs an index block.
+fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> {
+    if !input.is_dir() {
+        return None;
+    }
+    if vendor::bruker_sqlite(input).is_some() {
+        return vendor::bruker_run_metadata(input);
+    }
+    agilent_meta::read(input)
+}
+
 fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     // 0. Provenance hygiene on what the reader ALREADY copied. Step 1 below sanitises only the
     // entry it synthesises itself; mzdata's Thermo reader writes the converting machine's parent
@@ -6215,7 +6410,17 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         }
     }
 
-    // 1. Ensure at least one source_file (the input itself) so default_source_file_id can resolve.
+    // 1. What the vendor directory states about the run — instrument model/serial, acquisition
+    // time, software, sample, the source members with their digests — merged onto whatever the
+    // reader already set. Bruker used to be special-cased here; the same seam now serves every
+    // vendor directory the host can read. Only what the file states is asserted: no ion source or
+    // detector is guessed (a wrong `MS:1000008` child is worse than an absent one).
+    if let Some(meta) = vendor_dir_metadata(input) {
+        let _naive_time_block = run_metadata::apply(target, meta);
+    }
+
+    // 1b. Ensure at least one source_file (the input itself) so default_source_file_id can resolve
+    //     — only when no member was stated above.
     if target.file_description().source_files.is_empty() {
         // `name` identifies the source; the directory it happened to sit in on the converting
         // machine is not provenance, it is the operator's filesystem — and it would travel with
@@ -6246,47 +6451,6 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         target.file_description_mut().source_files.push(sf);
     }
 
-    // 1b. Ensure an instrument_configuration exists. Bruker leaves the list empty while `run`
-    // and every `scan` still reference configuration 0, which is a dangling foreign key — the
-    // spec's semantic invariants require every non-null FK to resolve. The instrument is described
-    // in the `.d`'s GlobalMetadata, so promote it into a real record rather than inventing one.
-    //
-    // Only what the vendor file actually states is asserted: model, serial and (for a timsTOF, where
-    // the analyzer is not in doubt) the TOF analyzer. The ion source and detector are NOT guessed —
-    // `InstrumentSourceType` is an opaque Bruker code, and a wrong `MS:1000008` child is worse than
-    // an absent one, since the CV-mapping rules only bind to components that exist.
-    if target.instrument_configurations().is_empty() {
-        if let Some(meta) = vendor::read_global_metadata(input) {
-            let get = |k: &str| meta.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
-            if let Some(model) = get("InstrumentName") {
-                let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
-                cfg.params.push(
-                    Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model).build(),
-                );
-                if let Some(serial) = get("InstrumentSerialNumber") {
-                    cfg.params.push(
-                        // Force String: a serial is an identifier, not a quantity. `Into<Value>`
-                        // on a &str auto-types numeric-looking text to Float, which would drop
-                        // leading zeros and re-render the value.
-                        Param::builder()
-                            .name("instrument serial number")
-                            .curie(curie!(MS:1000529))
-                            .value(mzdata::params::Value::String(serial))
-                            .build(),
-                    );
-                }
-                cfg.components.push(Component {
-                    component_type: ComponentType::Analyzer,
-                    order: 1,
-                    params: vec![
-                        Param::builder().name("time-of-flight").curie(curie!(MS:1000084)).build(),
-                    ],
-                });
-                target.instrument_configurations_mut().insert(0, cfg);
-            }
-        }
-    }
-
     // 2. default_source_file_id / default_data_processing_id ← first list entry, when unset.
     let first_sf = target.file_description().source_files.first().map(|sf| sf.id.clone());
     let first_dp = target.data_processings().first().map(|dp| dp.id.clone());
@@ -6306,13 +6470,6 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     let instr_ids: Vec<u32> = target.instrument_configurations().keys().copied().collect();
     let first_instr = instr_ids.iter().copied().min();
     if let Some(run) = target.run_description_mut() {
-        // Bruker leaves `run.start_time` unset, but the `.d` records the acquisition timestamp in
-        // GlobalMetadata as RFC 3339 already.
-        if run.start_time.is_none() {
-            run.start_time = vendor::read_global_metadata(input)
-                .and_then(|m| m.get("AcquisitionDateTime")?.as_str().map(str::to_owned))
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok());
-        }
         if run.default_source_file_id.is_none() {
             run.default_source_file_id = first_sf;
         }

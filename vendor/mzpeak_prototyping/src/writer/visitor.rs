@@ -1230,10 +1230,22 @@ impl StructVisitor<mzdata::spectrum::IsolationWindow> for IsolationWindowBuilder
             mzdata::spectrum::IsolationWindowState::Complete
             | mzdata::spectrum::IsolationWindowState::Explicit => {
                 self.target.append_value(item.target);
-                self.lower_bound
-                    .append_value(item.target - item.lower_bound);
-                self.upper_bound
-                    .append_value(item.upper_bound - item.target);
+                // A TARGET-ONLY window (the vendor states the isolation m/z but no width — Waters
+                // DDA `Set Mass`, Agilent `MZOfInterest`, an mzML with only MS:1000827) reaches
+                // this arm with both bounds still 0.0: mzdata's mzML reader promotes such a window
+                // to `Complete`, and the old arithmetic then wrote offsets of ±target, turning
+                // "width unknown" into "width = 2·target" (measured on RS080806, Minimal_DDA,
+                // En_PPY). Unknown stays unknown: the target is written, the offsets are null.
+                let width_unknown = item.lower_bound == 0.0 && item.upper_bound == 0.0 && item.target != 0.0;
+                if width_unknown {
+                    self.lower_bound.append_null();
+                    self.upper_bound.append_null();
+                } else {
+                    self.lower_bound
+                        .append_value(item.target - item.lower_bound);
+                    self.upper_bound
+                        .append_value(item.upper_bound - item.target);
+                }
             }
         }
         self.parameters.append_empty();

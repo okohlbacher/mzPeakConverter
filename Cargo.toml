@@ -66,6 +66,7 @@ rayon = "1"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+cfb = "0.14"
 
 # Vendor-SDK readers are compiled in automatically on the platforms where the proprietary vendor
 # libraries exist (see the cfg-gated modules in src/main.rs) — no opt-in feature, "on by default

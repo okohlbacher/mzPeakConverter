@@ -149,6 +149,14 @@ internal static class Dbg
     {
         if (On) Console.Error.WriteLine("[shimadzu-glue] " + msg);
     }
+
+    /// <summary>The exception that matters: reflection wraps a getter's or method's own throw in a
+    /// TargetInvocationException, whose name alone says nothing about WHY the vendor call failed.</summary>
+    internal static string Inner(Exception e)
+    {
+        var x = e.InnerException ?? e;
+        return $"{x.GetType().FullName}: {x.Message} (HResult 0x{x.HResult:X8})";
+    }
 }
 
 internal static class Reflect
@@ -318,34 +326,35 @@ public static class Api
     /// hit.</summary>
     private static double ResolveMassNumberUnit()
     {
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()
-                     .Where(a => (a.GetName().Name ?? "").StartsWith("Shimadzu", StringComparison.OrdinalIgnoreCase)))
+        var shimadzuAsms = AppDomain.CurrentDomain.GetAssemblies()
+            .Where(a => (a.GetName().Name ?? "").StartsWith("Shimadzu", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        // By full name first: ProteoWizard's ShimadzuReader.cpp compiles
+        // `ShimadzuGeneric::Tool::MASSNUMBER_UNIT` against IoModule 5.0, so the constant exists on
+        // that type. GetType(name) resolves ONE type and does not need the whole assembly to load,
+        // which is what the enumeration below has been failing at (see TypesOf).
+        foreach (var asm in shimadzuAsms)
         {
-            Type[] types;
-            try { types = asm.GetTypes(); } catch { continue; }
+            var tool = asm.GetType("Shimadzu.LabSolutions.IO.Generic.Tool", throwOnError: false);
+            if (tool == null) continue;
+            if (TryStaticNumber(tool, "MASSNUMBER_UNIT", out var byName)) return byName;
+            Dbg.Say($"{tool.FullName} found in {asm.GetName().Name} but MASSNUMBER_UNIT is not a readable static field/property on it");
+        }
+        foreach (var asm in shimadzuAsms)
+        {
+            var types = TypesOf(asm);
+            if (types == null) continue;
             foreach (var t in types)
-            {
-                var f = t.GetField("MASSNUMBER_UNIT", BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.IgnoreCase);
-                if (f != null)
-                {
-                    try { return Convert.ToDouble(f.GetValue(null), CultureInfo.InvariantCulture); } catch { }
-                }
-                var p = t.GetProperty("MASSNUMBER_UNIT", BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.IgnoreCase);
-                if (p != null)
-                {
-                    try { return Convert.ToDouble(p.GetValue(null), CultureInfo.InvariantCulture); } catch { }
-                }
-            }
+                if (TryStaticNumber(t, "MASSNUMBER_UNIT", out var v)) return v;
         }
         // Nothing found. Dump the candidates so the constant can be identified rather than guessed:
         // getting this wrong does not fail, it silently writes a WRONG m/z axis.
         if (true)
         {
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()
-                         .Where(a => (a.GetName().Name ?? "").StartsWith("Shimadzu", StringComparison.OrdinalIgnoreCase)))
+            foreach (var asm in shimadzuAsms)
             {
-                Type[] types;
-                try { types = asm.GetTypes(); } catch { continue; }
+                var types = TypesOf(asm);
+                if (types == null) continue;
                 foreach (var t in types)
                     foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
                     {
@@ -357,17 +366,60 @@ public static class Api
                     }
             }
         }
-        // The vendor assembly exposes NO such constant (verified by dumping every static field whose
-        // name mentions UNIT/MASS/SCALE on an LCMS-9030 install: none). ProteoWizard carries it as a
-        // C++ constant in ShimadzuReader.cpp, not in the managed DLL, so it cannot be reflected and
-        // must be pinned here.
+        // UNVERIFIED whether the vendor assembly exposes the constant. The earlier claim that it does
+        // not ("verified by dumping every static field whose name mentions UNIT/MASS/SCALE on an
+        // LCMS-9030 install: none") rested on a dump that never enumerated the IoModule at all: the
+        // round-8 log listed only this glue's own PrecursorMzUnit as a candidate, so GetTypes() on
+        // the vendor assembly almost certainly threw and the bare catch hid it. ProteoWizard does
+        // reference it as `ShimadzuGeneric::Tool::MASSNUMBER_UNIT` in ShimadzuReader.cpp (C++/CLI,
+        // compiled against IoModule 5.0), i.e. as a member of the managed DLL, not a C++ constant.
+        // The by-name lookup above and the loader-exception log in TypesOf are there to settle it.
         //
         // 10000 = masses stored as integers with 4 decimal places. Established against a known-good
         // msconvert conversion of the same file (MTBLS5861 HEK_PosOAD1.lcd, LCMS-9030 QTOF):
         // msconvert reports m/z 70.0-1250.0, the raw integers are 700000-12500000, ratio 10000
         // exactly on both bounds. The previous fallback of 20 was a guess and was wrong by 500x.
-        Dbg.Say("MASSNUMBER_UNIT not exposed by the vendor assembly; using the pinned 10000");
+        Dbg.Say("MASSNUMBER_UNIT not reachable by reflection; using the pinned 10000");
         return 10000.0;
+    }
+
+    /// <summary>`asm.GetTypes()`, or null when it throws. A ReflectionTypeLoadException is the
+    /// likely reason the IoModule never showed up in any enumeration; under the debug lever it says
+    /// which assembly, how much of it loaded, and the distinct loader failures (capped at 12).</summary>
+    private static Type[]? TypesOf(Assembly asm)
+    {
+        try { return asm.GetTypes(); }
+        catch (ReflectionTypeLoadException e)
+        {
+            if (Dbg.On)
+            {
+                var all = e.Types ?? Array.Empty<Type?>();
+                var reasons = (e.LoaderExceptions ?? Array.Empty<Exception?>())
+                    .Select(x => x == null ? "<null>" : $"{x.GetType().Name}: {x.Message}")
+                    .Distinct().Take(12);
+                Dbg.Say($"GetTypes() on {asm.GetName().Name}: ReflectionTypeLoadException, " +
+                        $"{all.Count(t => t != null)}/{all.Length} types loaded; loader exceptions: {string.Join(" | ", reasons)}");
+            }
+            return null;
+        }
+        catch (Exception e) { Dbg.Say($"GetTypes() on {asm.GetName().Name} threw {e.GetType().Name}: {e.Message}"); return null; }
+    }
+
+    /// <summary>Read a static field or property `name` of `t` as a double; false if absent or unreadable.</summary>
+    private static bool TryStaticNumber(Type t, string name, out double value)
+    {
+        const BindingFlags F = BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.IgnoreCase;
+        var f = t.GetField(name, F);
+        if (f != null)
+        {
+            try { value = Convert.ToDouble(f.GetValue(null), CultureInfo.InvariantCulture); return true; } catch { }
+        }
+        var p = t.GetProperty(name, F);
+        if (p != null)
+        {
+            try { value = Convert.ToDouble(p.GetValue(null), CultureInfo.InvariantCulture); return true; } catch { }
+        }
+        value = 0; return false;
     }
 
     // --- open / scan-count -------------------------------------------------------------------
@@ -379,6 +431,11 @@ public static class Api
     // looked like an unsupported .lcd variant. Keep exported entry-point names unique in `Api`.
     internal static ShimadzuData OpenData(string path, string pwizDir)
     {
+        // The .lcd's property XML declares code page 1252; .NET 8 has no 1252 decoder unless the
+        // provider is registered, and LabSolutions.IO swallows the failure and leaves every
+        // SampleInfo field at its default (measured on Blind_P1_pos_012: date = DateTime.MinValue,
+        // empty names). Register BEFORE the vendor assembly loads — idempotent.
+        System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
         var asm = LoadIoModule(pwizDir);
         var dataType = asm.GetType("Shimadzu.LabSolutions.IO.Data.DataObject")
             ?? asm.GetTypes().FirstOrDefault(t => t.Name == "DataObject")
@@ -390,6 +447,28 @@ public static class Api
         var loadData = Reflect.Method(io.GetType(), "LoadData", 1)
             ?? throw new Exception("IDataIO.LoadData(string) missing");
         var status = loadData.Invoke(io, new object[] { path });
+        if (Dbg.On)
+        {
+            string ival;
+            try { ival = Convert.ToInt64(status, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture); }
+            catch { ival = "?"; }
+            Dbg.Say($"LoadData status: {status?.GetType().FullName ?? "null"} {status ?? "null"} = {ival}");
+            // Read-only checks on the 5.0.0.0 surface, by reflection; never the setters or SaveRoot/SaveData.
+            foreach (var (label, target, name) in new[] {
+                ("IO.GetStatus", io, "GetStatus"), ("IO.GetLastError", io, "GetLastError"),
+                ("DataObject.GetStatus", data, "GetStatus"), ("DataObject.CheckDataVersionIsSupported", data, "CheckDataVersionIsSupported") })
+            {
+                var m = Reflect.Method(target.GetType(), name, 0);
+                if (m == null)
+                {
+                    var arities = target.GetType().GetMethods().Where(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).Select(x => x.GetParameters().Length);
+                    Dbg.Say($"  {label}(): no 0-arg overload (arities: {string.Join(",", arities)})");
+                    continue;
+                }
+                try { var r = m.Invoke(target, null); Dbg.Say($"  {label}() -> {r?.GetType().Name ?? "null"} {r ?? "null"}"); }
+                catch (Exception e) { Dbg.Say($"  {label}() threw {Dbg.Inner(e)}"); }
+            }
+        }
         if (!Reflect.Ok(status))
             throw new Exception($"LoadData error: {status}"); // may be E_UNSUPPORTEDFILE (IT-TOF/legacy)
 
@@ -943,9 +1022,42 @@ public static class Api
             string date = "";
             try
             {
-                var v = d.SampleInfoObj == null ? null : Reflect.GetProp(d.SampleInfoObj, "AnalysisDate");
-                if (v is DateTime dt && dt.Year > 1900)
-                    date = dt.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture);
+                // Fetch it NOW rather than using the instance captured at open: ProteoWizard reads
+                // `dataObject_->SampleInfo->AnalysisDate` at call time, and the snapshot taken right
+                // after LoadData came back with every field at its default on Blind_P1_pos_012.
+                var si = Reflect.GetProp(d.DataObject, "SampleInfo", "Sample") ?? d.SampleInfoObj;
+                var v = si == null ? null : Reflect.GetProp(si, "AnalysisDate", "AcquisitionDate", "AcquiredDate");
+                // The WALL CLOCK only: the vendor states no zone, and a DateTimeOffset here would carry
+                // the converting host's zone, not the instrument's (see run_metadata.rs).
+                date = v switch
+                {
+                    DateTime dt when dt.Year > 1900 => dt.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture),
+                    DateTimeOffset dto when dto.Year > 1900 => dto.DateTime.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture),
+                    string str => str.Trim(),
+                    _ => "",
+                };
+                if (date == "" && Dbg.On)
+                {
+                    Dbg.Say($"AnalysisDate: SampleInfo {(si == null ? "absent" : si.GetType().Name)}, value {(v == null ? "null" : v.GetType().Name + " " + v)}");
+                    // Where else might the date live? Every readable scalar of SampleInfo and of the
+                    // MS parameters, once, under the lever only.
+                    Dbg.Say($"AnalysisDate: same instance as at open = {ReferenceEquals(si, d.SampleInfoObj)}; SampleInfo methods: {(si == null ? "" : string.Join(",", si.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly).Select(m => m.Name).Distinct()))}");
+                    // What could still load it? The IO object's and the DataObject's method surface.
+                    foreach (var (label, obj) in new[] { ("IO", d.IoObj), ("DataObject", d.DataObject) })
+                        Dbg.Say($"  {label} methods: {string.Join(",", obj.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance).Where(m => !m.IsSpecialName).Select(m => m.Name + "/" + m.GetParameters().Length).Distinct())}");
+                    foreach (var (label, obj) in new[] { ("SampleInfo", si), ("MS.Parameters", d.ParametersObj), ("DataObject", d.DataObject) })
+                    {
+                        if (obj == null) continue;
+                        foreach (var pr in obj.GetType().GetProperties())
+                        {
+                            if (pr.GetIndexParameters().Length != 0) continue;
+                            object? pv;
+                            try { pv = pr.GetValue(obj); } catch (Exception e) { pv = $"<{Dbg.Inner(e)}>"; }
+                            if (pv is null || pv is string || pv.GetType().IsValueType)
+                                Dbg.Say($"  {label}.{pr.Name} : {pr.PropertyType.Name} = {pv ?? "null"}");
+                        }
+                    }
+                }
             }
             catch (Exception e) { Dbg.Say($"AnalysisDate: {e.Message}"); }
 
