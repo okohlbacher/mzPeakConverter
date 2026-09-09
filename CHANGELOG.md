@@ -143,19 +143,6 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
 - **Target-only isolation windows keep NULL offsets.** An isolation window whose width the
   source does not state was written with lower/upper offsets of ±target (measured on RS080806,
   Minimal_DDA and En_PPY). Pinned by `tests/fixtures/target_only_window.mzML`.
-
-### Changed
-
-- **Empty spectra stay.** The SciEX native lane writes every acquired spectrum, including the
-  zero-point ones ProteoWizard drops (SWATH: 11,583 of 148,571; a scheduled MRM-HR run: 16,790 of
-  23,646). Measured cost after re-encoding the metadata facets without them: 0.007–0.012 % of the
-  SWATH archive and 0.2–0.6 % of the MRM-HR archive — an empty row compresses to ~7–20 B. Keeping
-  them preserves the cycle structure; nothing changes here.
-- `tests/lane_metadata_parity.rs` compares VALUES, not just presence: `run.start_time` as an
-  instant, serial and model strings, per-member digests, `id@version` software, sample names,
-  the contents set and the `acquisition_time` wall clock; a rule that no longer fires is an error.
-### Fixed
-
 - **pwiz Waters MSe archives carried `isolation_window_lower_offset = 0`.** mzdata 0.66.6's mzML
   reader keeps only the FIRST isolation-window offset when both offsets precede the target m/z (the
   second falls into a `_ => {}` arm while the window is in its `Offset` state), and ProteoWizard's
@@ -170,6 +157,16 @@ those lanes written by 0.11.2 are not current; the corpus is rebuilt once with t
   the target (all pwiz Waters MSe/HDMSe twins) is not current and needs a rebuild; the native Waters
   lane is unaffected (it writes no precursors yet).
 
+### Changed
+
+- **Empty spectra stay.** The SciEX native lane writes every acquired spectrum, including the
+  zero-point ones ProteoWizard drops (SWATH: 11,583 of 148,571; a scheduled MRM-HR run: 16,790 of
+  23,646). Measured cost after re-encoding the metadata facets without them: 0.007–0.012 % of the
+  SWATH archive and 0.2–0.6 % of the MRM-HR archive — an empty row compresses to ~7–20 B. Keeping
+  them preserves the cycle structure; nothing changes here.
+- `tests/lane_metadata_parity.rs` compares VALUES, not just presence: `run.start_time` as an
+  instant, serial and model strings, per-member digests, `id@version` software, sample names,
+  the contents set and the `acquisition_time` wall clock; a rule that no longer fires is an error.
 ## [0.11.2] — 2026-09-07
 
 **Output change.** The footer count keys of the data facets change meaning (below) — every
