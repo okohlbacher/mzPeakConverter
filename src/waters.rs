@@ -636,6 +636,9 @@ impl WatersReader {
             return Err(close(format!("Waters .raw {} has no readable scans", input.display())));
         }
 
+        if let Some(level) = std::env::var("MZPC_WATERS_PROBE_QUAD").ok().filter(|v| !v.is_empty() && v != "0") {
+            probe_quad_windows(&lib, info_reader, scan_reader, functions.len(), &index, scan_items, &level);
+        }
         let reader = WatersReader {
             _lib: lib,
             read_scan,
@@ -950,6 +953,142 @@ fn copy_points(p_masses: *mut f32, p_intensities: *mut f32, n: c_int) -> Result<
     let mz = unsafe { std::slice::from_raw_parts(p_masses, n) }.iter().map(|&x| x as f64).collect();
     let intensity = unsafe { std::slice::from_raw_parts(p_intensities, n) }.to_vec();
     Ok((mz, intensity))
+}
+
+/// PROBE (lever `MZPC_WATERS_PROBE_QUAD=1|2|3|4`, one level per process): does the DLL state a
+/// quadrupole isolation / transmission window for MSe and DDA functions? Level 1 = the info-reader
+/// exports whose shapes the public SDK bindings declare (`getFunctionPrecursorMassRange(info, f,
+/// *lo, *hi)`, `getIndexPrecursorMassRange(info, f, idx, *lo, *hi)`, `getPrecursorMass(info, f, idx,
+/// *mass)`, `getAcquisitionMassRange(info, f, which, *lo, *hi)` for which = 0..3); level 2 = the DDA
+/// processor (`createRawProcessor(&p, DDA = 7, NULL, NULL)`, `setRawReader(p, scanReader)`,
+/// `getQuadIsolationWindowParameters(p, params)`, `getDDAParameters(p, params)` — every key/value
+/// dumped); level 3 = level 2 + `ddaGetScanCount(p, *n)` and `ddaGetScanInfo(p, idx, params)` for
+/// the first scans; level 4 = the MSE processor type (8) with the same parameter getters. Every
+/// call is announced before it runs so a crash log names it. Results go to the log only.
+fn probe_quad_windows(lib: &Library, info: *mut c_void, scan_reader: *mut c_void, n_functions: usize, index: &[(c_int, c_int, f32)], scan_items: Option<ScanItemApi>, level: &str) {
+    type FnRangeFn = unsafe extern "C" fn(*mut c_void, c_int, *mut f32, *mut f32) -> c_int;
+    type IdxRangeFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut f32, *mut f32) -> c_int;
+    type IdxMassFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut f32) -> c_int;
+    type CreateProcFn = unsafe extern "C" fn(*mut *mut c_void, c_int, *const c_void, *const c_void) -> c_int;
+    type ProcReaderFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+    type ProcParamsFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+    type ProcCountFn = unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int;
+    type ProcIdxParamsFn = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int;
+    type DestroyProcFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+    let say = |m: String| log::warn!("[probe-quad L{level}] {m}");
+    let last_scan = |f: usize| index.iter().filter(|e| e.0 == f as c_int).map(|e| e.1).max().unwrap_or(0);
+    let dump = |api: &ScanItemApi, p: *mut c_void, what: &str| {
+        let mut keys: *const c_int = ptr::null();
+        let mut n: c_int = 0;
+        let rc = unsafe { (api.keys)(p, &mut keys, &mut n) };
+        if rc != 0 || keys.is_null() || !(0..=4096).contains(&n) {
+            say(format!("{what}: getParameterKeys rc={rc} n={n}"));
+            return;
+        }
+        let ks = unsafe { std::slice::from_raw_parts(keys, n as usize) }.to_vec();
+        let kv: Vec<String> = ks.iter().map(|&k| format!("{k}={:?}", api.string(p, k))).collect();
+        say(format!("{what}: {} keys: {}", ks.len(), kv.join(" | ")));
+    };
+    match level {
+        "1" => {
+            let fr = unsafe { lib.get::<FnRangeFn>(b"getFunctionPrecursorMassRange\0") }.ok().map(|g| *g);
+            let ir = unsafe { lib.get::<IdxRangeFn>(b"getIndexPrecursorMassRange\0") }.ok().map(|g| *g);
+            let pm = unsafe { lib.get::<IdxMassFn>(b"getPrecursorMass\0") }.ok().map(|g| *g);
+            let ar = unsafe { lib.get::<IdxRangeFn>(b"getAcquisitionMassRange\0") }.ok().map(|g| *g);
+            say(format!("exports: functionPrecursorMassRange={} indexPrecursorMassRange={} precursorMass={} acquisitionMassRange={}", fr.is_some(), ir.is_some(), pm.is_some(), ar.is_some()));
+            for f in 0..n_functions as c_int {
+                let last = last_scan(f as usize);
+                if let Some(g) = fr {
+                    let (mut lo, mut hi) = ([f32::NAN; 4], [f32::NAN; 4]);
+                    say(format!("calling getFunctionPrecursorMassRange(f={f})"));
+                    let rc = unsafe { g(info, f, lo.as_mut_ptr(), hi.as_mut_ptr()) };
+                    say(format!("function {} getFunctionPrecursorMassRange rc={rc} lo={} hi={}", f + 1, lo[0], hi[0]));
+                }
+                if let Some(g) = ir {
+                    for idx in [0, 1, last] {
+                        let (mut lo, mut hi) = ([f32::NAN; 4], [f32::NAN; 4]);
+                        say(format!("calling getIndexPrecursorMassRange(f={f}, idx={idx})"));
+                        let rc = unsafe { g(info, f, idx, lo.as_mut_ptr(), hi.as_mut_ptr()) };
+                        say(format!("function {} scan {idx} getIndexPrecursorMassRange rc={rc} lo={} hi={}", f + 1, lo[0], hi[0]));
+                    }
+                }
+                if let Some(g) = pm {
+                    for idx in [0, 1, last] {
+                        let mut m = [f32::NAN; 4];
+                        say(format!("calling getPrecursorMass(f={f}, idx={idx})"));
+                        let rc = unsafe { g(info, f, idx, m.as_mut_ptr()) };
+                        say(format!("function {} scan {idx} getPrecursorMass rc={rc} mass={}", f + 1, m[0]));
+                    }
+                }
+                if let Some(g) = ar {
+                    for which in 0..4 {
+                        let (mut lo, mut hi) = ([f32::NAN; 4], [f32::NAN; 4]);
+                        say(format!("calling getAcquisitionMassRange(f={f}, which={which})"));
+                        let rc = unsafe { g(info, f, which, lo.as_mut_ptr(), hi.as_mut_ptr()) };
+                        say(format!("function {} getAcquisitionMassRange(which={which}) rc={rc} lo={} hi={}", f + 1, lo[0], hi[0]));
+                    }
+                }
+            }
+        }
+        "2" | "3" | "4" => {
+            let Some(api) = scan_items else {
+                say("parameters API unavailable; nothing to read".into());
+                return;
+            };
+            let (Some(create), Some(set_reader), Some(destroy)) = (
+                unsafe { lib.get::<CreateProcFn>(b"createRawProcessor\0") }.ok().map(|g| *g),
+                unsafe { lib.get::<ProcReaderFn>(b"setRawReader\0") }.ok().map(|g| *g),
+                unsafe { lib.get::<DestroyProcFn>(b"destroyRawProcessor\0") }.ok().map(|g| *g),
+            ) else {
+                say("processor exports missing".into());
+                return;
+            };
+            let quad = unsafe { lib.get::<ProcParamsFn>(b"getQuadIsolationWindowParameters\0") }.ok().map(|g| *g);
+            let dda_params = unsafe { lib.get::<ProcParamsFn>(b"getDDAParameters\0") }.ok().map(|g| *g);
+            let count = unsafe { lib.get::<ProcCountFn>(b"ddaGetScanCount\0") }.ok().map(|g| *g);
+            let info_fn = unsafe { lib.get::<ProcIdxParamsFn>(b"ddaGetScanInfo\0") }.ok().map(|g| *g);
+            let ptype: c_int = if level == "4" { 8 } else { 7 };
+            let mut proc_: *mut c_void = ptr::null_mut();
+            say(format!("calling createRawProcessor(type={ptype})"));
+            let rc = unsafe { create(&mut proc_, ptype, ptr::null(), ptr::null()) };
+            say(format!("createRawProcessor rc={rc} handle_null={}", proc_.is_null()));
+            if rc != 0 || proc_.is_null() {
+                return;
+            }
+            say("calling setRawReader(proc, scanReader)".into());
+            let rc = unsafe { set_reader(proc_, scan_reader) };
+            say(format!("setRawReader rc={rc}"));
+            if let Some(g) = quad {
+                say("calling getQuadIsolationWindowParameters(proc, params)".into());
+                api.with(|p| unsafe { g(proc_, p) }, |p| dump(&api, p, "getQuadIsolationWindowParameters"))
+                    .unwrap_or_else(|| say("getQuadIsolationWindowParameters: rc != 0 (or no parameters object)".into()));
+            }
+            if let Some(g) = dda_params {
+                say("calling getDDAParameters(proc, params)".into());
+                api.with(|p| unsafe { g(proc_, p) }, |p| dump(&api, p, "getDDAParameters"))
+                    .unwrap_or_else(|| say("getDDAParameters: rc != 0".into()));
+            }
+            if level == "3" {
+                if let Some(g) = count {
+                    let mut n = [0 as c_int; 4];
+                    say("calling ddaGetScanCount(proc, *n)".into());
+                    let rc = unsafe { g(proc_, n.as_mut_ptr()) };
+                    say(format!("ddaGetScanCount rc={rc} n={}", n[0]));
+                    if let (Some(gi), true) = (info_fn, rc == 0 && n[0] > 0) {
+                        for idx in 0..n[0].min(4) {
+                            say(format!("calling ddaGetScanInfo(proc, {idx}, params)"));
+                            api.with(|p| unsafe { gi(proc_, idx, p) }, |p| dump(&api, p, &format!("ddaGetScanInfo({idx})")))
+                                .unwrap_or_else(|| say(format!("ddaGetScanInfo({idx}): rc != 0")));
+                        }
+                    }
+                }
+            }
+            say("calling destroyRawProcessor".into());
+            let rc = unsafe { destroy(proc_) };
+            say(format!("destroyRawProcessor rc={rc}"));
+        }
+        other => say(format!("unknown level {other:?} (use 1, 2, 3 or 4)")),
+    }
 }
 
 /// What ProteoWizard makes of a MassLynx function type (`Reader_Waters_Detail.cpp`
