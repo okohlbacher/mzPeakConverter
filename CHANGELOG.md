@@ -38,6 +38,16 @@ All notable changes to this project are documented here. The format follows
   `analysis.tdf` read-write, after an existence check). A read-only open of a file with a hot
   journal now reports SQLite's own error rather than "GlobalMetadata missing/invalid". Pinned by
   `bruker_tsf::msms_tests::open_never_writes_into_the_input_directory`.
+- **`--to mzml` on a SciEX `.wiff` refuses what the mzPeak lane refuses, and honours
+  `--sample`.** The 0.11.3 refusals (MRM/SIM dwell runs, unreadable samples, a multi-sample
+  file without `--sample`) and the sample selection ran on the native mzPeak lane only; the
+  mzML export opened the reader and streamed every spectrum. On Windows,
+  `En_PPY.wiff -o x.mzML` wrote every dwell of all 117 samples as one-point spectra of a
+  single run and exited 0, and `--sample N` was ignored. Both lanes now open the file
+  through `SciexReader::open_run`, and the decision moved out of the Windows-only reader
+  into `src/sciex_run.rs`, whose tests run on every host. The refusal messages are
+  unchanged; a `--sample` above `i32::MAX` is now refused as out of range instead of
+  wrapping past the bound.
 
 ### Changed
 
