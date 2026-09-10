@@ -415,7 +415,8 @@ struct Cli {
 
     /// SciEX `.wiff` holding SEVERAL samples: which one to convert (1-based). An archive is ONE
     /// run, so a multi-sample file is refused without this (concatenating the samples under one
-    /// run id, as before 0.12, was a conversion of none of them). The msconvert lanes map it to
+    /// run id was a conversion of none of them). Inert, with a warning, on any other input. The
+    /// msconvert lanes map it to
     /// `--runIndexSet <N-1>` and refuse a multi-run file without it: msconvert writes every run
     /// onto the one output, so only the LAST would survive.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
@@ -554,6 +555,8 @@ struct FileConfig {
     drop_aux: Option<Vec<String>>,
     verbose: Option<u8>,
     quiet: Option<bool>,
+    // Missing from 0.11.3, when `--sample` arrived, until this key: rejected as an unknown field.
+    sample: Option<u32>,
 }
 
 /// Effective settings after merging CLI over config-file over defaults.
@@ -593,6 +596,8 @@ struct Settings {
     drop_aux: Vec<String>,
     verbose: u8,
     quiet: bool,
+    /// `--sample`: which sample of a multi-sample SciEX `.wiff` (1-based), published as `SCIEX_SAMPLE`.
+    sample: Option<u32>,
     /// The options the user supplied ON THE COMMAND LINE (a config-file value is a standing default
     /// and is never counted here — see `resolve`), by
     /// their command-line spelling. [`refuse_unsupported_flags`] checks these, and only these,
@@ -649,8 +654,12 @@ impl Settings {
         note(!cli.image.is_empty(), "--image");
         note(cli.sdrf.is_some(), "--sdrf");
         note(cli.tof_grid.is_some(), "--tof-grid");
-        let _ = SCIEX_SAMPLE.set(cli.sample);
+        note(cli.sample.is_some(), "--sample");
         note(cli.agilent_grid, "--agilent-grid");
+        // clap refuses `--sample 0`; a config file gets the same answer rather than sample 1.
+        if fc.sample == Some(0) {
+            bail!("sample: 0 in the config file; samples are numbered from 1");
+        }
         note(cli.via_msconvert, "--via-msconvert");
         note(cli.msconvert_path.is_some(), "--msconvert-path");
         Ok(Settings {
@@ -687,6 +696,7 @@ impl Settings {
             // is what `init_logging` has always done when both were set).
             verbose: if cli.verbose > 0 { cli.verbose } else { fc.verbose.unwrap_or(0) },
             quiet: cli.quiet || fc.quiet.unwrap_or(false),
+            sample: cli.sample.or(fc.sample),
             given,
         })
     }
@@ -840,6 +850,7 @@ fn main() {
         }
     };
     let _ = REPRESENTATION.set(cfg.representation);
+    let _ = SCIEX_SAMPLE.set(cfg.sample);
     init_logging(cfg.verbose, cfg.quiet);
     // Inert-flag warnings MUST come after init_logging: log::warn! against the uninitialized
     // default logger is a silent no-op, which is precisely the failure mode these warn about.
@@ -1036,6 +1047,16 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
                 output.display()
             );
         }
+    }
+
+    // `--sample` picks one sample of a multi-sample SciEX `.wiff`, on every lane that reads one; any
+    // other input holds one run, and there it is as inert as the flags `inert_flags_for` lists.
+    if cfg.given.contains(&"--sample") && !is_wiff(&cli.input) {
+        log::warn!(
+            "--sample is inert on {}: only a SciEX .wiff holds several samples, so it cannot change \
+             the output",
+            cli.input.display()
+        );
     }
 
     // mzPeak input → filter path. A `.mzpeak` (or any ZIP with mzpeak_index.json) cannot be read by
@@ -8784,14 +8805,15 @@ mod tests {
         assert!(index_metadata(&out).get("partial").is_none(), "no marker when the cap did not bite");
     }
 
-    /// The six keys `--config` promised and rejected: accepted, and merged CLI-over-config.
+    /// The six keys `--config` promised and rejected, and `sample`, which arrived later and was
+    /// rejected the same way: accepted, and merged CLI-over-config.
     #[test]
     fn file_config_accepts_the_six_promised_keys() {
         let dir = scratch("cfg");
         let cfg = dir.join("c.yaml");
         fs::write(
             &cfg,
-            "representation: profile\nrt: 1-2\nms_level: [1, 2]\ndrop_aux: ['vendor*']\nverbose: 2\nquiet: false\n",
+            "representation: profile\nrt: 1-2\nms_level: [1, 2]\ndrop_aux: ['vendor*']\nverbose: 2\nquiet: false\nsample: 2\n",
         )
         .unwrap();
         let cli = Cli::try_parse_from(["mzpeak-convert", TINY, "--config", cfg.to_str().unwrap()]).unwrap();
@@ -8802,6 +8824,8 @@ mod tests {
         assert_eq!(s.drop_aux, vec!["vendor*".to_string()]);
         assert_eq!(s.verbose, 2);
         assert!(!s.quiet);
+        assert_eq!(s.sample, Some(2));
+        assert!(!s.given.contains(&"--sample"), "config values must not count as given: {:?}", s.given);
         // A config value is a standing default, not this run's intent — it must NOT count as given
         // (see `Settings::resolve`), or a profile would trip the honoured-flags refusals.
         assert!(!s.given.contains(&"--representation"), "config values must not count as given: {:?}", s.given);
@@ -8809,7 +8833,7 @@ mod tests {
         // The command line wins over the file.
         let cli = Cli::try_parse_from([
             "mzpeak-convert", TINY, "--config", cfg.to_str().unwrap(),
-            "--representation", "centroid", "--rt", "3-4", "--ms-level", "3", "-v",
+            "--representation", "centroid", "--rt", "3-4", "--ms-level", "3", "-v", "--sample", "3",
         ])
         .unwrap();
         let s = Settings::resolve(&cli).unwrap();
@@ -8817,6 +8841,13 @@ mod tests {
         assert_eq!(s.rt.as_deref(), Some("3-4"));
         assert_eq!(s.ms_level, vec![3]);
         assert_eq!(s.verbose, 1);
+        assert_eq!(s.sample, Some(3));
+        assert!(s.given.contains(&"--sample"), "a command-line --sample is given like every option: {:?}", s.given);
+
+        // clap refuses `--sample 0`; the config file must not turn it into sample 1.
+        fs::write(&cfg, "sample: 0\n").unwrap();
+        let cli = Cli::try_parse_from(["mzpeak-convert", TINY, "--config", cfg.to_str().unwrap()]).unwrap();
+        assert!(Settings::resolve(&cli).is_err(), "sample: 0 must be refused");
 
         // A config `quiet: true` is honoured when the command line says nothing.
         fs::write(&cfg, "quiet: true\n").unwrap();
@@ -8882,6 +8913,18 @@ mod tests {
             "mzML software ids must stay escaped"
         );
         assert!(!xml.contains("Compass Xtract") && !xml.contains("Experiment 1"), "nothing decoded reaches the mzML");
+    }
+
+    /// `--sample` is given like every option, and on anything but a SciEX `.wiff` it is inert: warned
+    /// about, and the run goes on. It used to be taken without a word on every input.
+    #[test]
+    fn sample_is_warned_inert_off_a_wiff() {
+        let dir = scratch("sample-inert");
+        let out = dir.join("out.mzpeak");
+        let args: Vec<&std::ffi::OsStr> =
+            vec![TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref(), "--sample".as_ref(), "2".as_ref()];
+        let (ok, _, err) = run_bin(&args, &[]);
+        assert!(ok && err.contains("--sample is inert"), "{err}");
     }
 
     /// The honoured-flags table is checked against what was GIVEN: a default is never refused,
