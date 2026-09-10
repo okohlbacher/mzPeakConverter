@@ -3812,14 +3812,23 @@ impl Drop for TranscodeGuard {
 }
 
 /// A fresh directory under `parent` for msconvert to write `via_msconvert.mzML` into (`file`),
-/// removed on every return — not on a panic, which aborts the release build. The pid keeps
-/// concurrent runs apart; a directory a crashed run left under a recycled pid is cleared first, or
-/// its mzML would pass for this run's.
+/// removed on every return — not on a panic, which aborts the release build. Created exclusively,
+/// under a name no other run holds (pid, clock, attempt), and never reused: the pid alone is shared
+/// by containers whose entrypoint is PID 1 writing to one volume, and a directory a crashed run left
+/// behind must not hand its mzML to this run. Hidden, because it sits beside the user's output.
 fn msconvert_dir(parent: &Path) -> Result<TranscodeGuard> {
-    let dir = parent.join(format!("mzpc-msconvert-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(TranscodeGuard { file: dir.join("via_msconvert.mzML"), dir })
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for attempt in 0..100 {
+        let dir = parent.join(format!(".mzpc-msconvert-{}-{stamp}-{attempt}", std::process::id()));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(TranscodeGuard { file: dir.join("via_msconvert.mzML"), dir }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
+    }
+    bail!("could not create a fresh msconvert directory under {}", parent.display())
 }
 
 /// Sniff the XML encoding declared in the first ~200 bytes. Returns the lowercased charset name from

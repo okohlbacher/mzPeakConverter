@@ -96,9 +96,11 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   msconvert was handed the final output path as `--outdir`/`--outfile`, and success meant
   `output.exists()`. Under `--force` a file left by an earlier run satisfied that check, so
   the command exited 0, logged "wrote …" and left the old mzML in place. Real ProteoWizard
-  gets there reliably with `-o x.mzML.gz` (or `.mzml` on Linux), for which it writes a
-  different file name. msconvert now writes into a fresh `mzpc-msconvert-<pid>` directory
-  beside the output (not the temp dir, so the rename cannot cross a volume), only the file it
+  gets there with `--force` over an existing `-o x.mzML.gz` (or `.mzml` on Linux), for which it
+  writes a different file name. msconvert now writes into a fresh directory beside the output
+  (not the temp dir, so the rename cannot cross a volume), created exclusively under a hidden
+  `.mzpc-msconvert-<pid>-<clock>-<n>` name and never reused, so neither a same-pid run on shared
+  storage nor a crashed run's leftovers can supply its mzML; only the file it
   wrote there is renamed into place through `TmpGuard` like every other mzML export, and a
   `.mzML.gz` output is gzip-compressed from that file rather than left to msconvert's
   naming. The directory is removed on every error return, taking a crashed msconvert's stray
