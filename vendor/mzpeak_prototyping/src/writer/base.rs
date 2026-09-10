@@ -1060,7 +1060,7 @@ pub trait AbstractMzPeakWriter {
         let peak_writer = ArrowWriter::try_new_with_options(
             stream,
             peak_buffer.schema().clone(),
-            ArrowWriterOptions::new().with_properties(peak_data_props),
+            ArrowWriterOptions::new().with_properties(peak_data_props.clone()),
         )?;
 
         // The peak facet is ~95% of the output bytes; its Arrow-encode + zstd is single-threaded and,
@@ -1090,9 +1090,15 @@ pub trait AbstractMzPeakWriter {
                 max_rows,
                 peak_buffer,
                 buffer_size,
+                peak_data_props,
             ))
         } else {
-            Ok(MiniPeakWriterType::new(peak_writer, peak_buffer, buffer_size))
+            Ok(MiniPeakWriterType::new(
+                peak_writer,
+                peak_buffer,
+                buffer_size,
+                peak_data_props,
+            ))
         }
     }
 

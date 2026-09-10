@@ -16,6 +16,7 @@ use parquet::{
     basic::Compression,
     encryption::encrypt::FileEncryptionProperties,
     file::metadata::KeyValue,
+    file::properties::WriterProperties,
 };
 
 use mzdata::{
@@ -400,8 +401,17 @@ pub fn sample_array_types_from_spectrum_source<
 /// point-layout write routing depends on) — it just rewrites the finished facet without the dead
 /// column. Detection is metadata-only (row-group null counts); the rewrite happens ONLY when a twin
 /// is actually present, so the common case pays nothing but a stats scan.
+///
+/// `props` MUST be the properties the facet was originally encoded with. Re-encoding with parquet's
+/// defaults instead silently drops compression, byte-stream-split, delta packing and any file
+/// encryption — a numpress-linear facet (which always carries an all-null `mz_chunk_values` twin, so
+/// the rewrite always fires) came out UNCOMPRESSED on every column, ~15% larger than the same data
+/// with `--no-numpress`. Column paths of the surviving children are unchanged by the prune, so the
+/// per-column overrides in `props` still apply; the entries for the dropped column are simply never
+/// looked up.
 fn prune_all_null_dup_point_columns(
     mut peak_file: fs::File,
+    props: &WriterProperties,
 ) -> Result<fs::File, parquet::errors::ParquetError> {
     use arrow::array::{Array, ArrayRef, StructArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -486,7 +496,11 @@ fn prune_all_null_dup_point_columns(
     let out_schema = Arc::new(Schema::new_with_metadata(out_fields, arrow_schema.metadata().clone()));
 
     let out = tempfile::tempfile()?;
-    let mut w = ArrowWriter::try_new(out.try_clone()?, out_schema.clone(), None)?;
+    let mut w = ArrowWriter::try_new_with_options(
+        out.try_clone()?,
+        out_schema.clone(),
+        ArrowWriterOptions::new().with_properties(props.clone()),
+    )?;
     if let Some(kvs) = pq_meta.file_metadata().key_value_metadata() {
         for kv in kvs {
             if kv.key != "ARROW:schema" {
@@ -1103,10 +1117,11 @@ impl<
             let mut writer = self.archive_writer.take().unwrap().into_inner()?;
 
             if let Some(peak_file_writer) = self.spectrum_peaks_writer.take() {
+                let peak_props = peak_file_writer.properties().clone();
                 let peak_file = peak_file_writer.finish()?;
                 // Option E backstop: drop any all-null column that duplicates a populated sibling's
                 // `array_name` (e.g. a spurious `intensity_f64` twin). No-op unless one is present.
-                let mut peak_file = prune_all_null_dup_point_columns(peak_file)?;
+                let mut peak_file = prune_all_null_dup_point_columns(peak_file, &peak_props)?;
                 log::trace!("Copying peaks file into zip archive");
                 peak_file.rewind()?;
                 writer.add_file_from_read(

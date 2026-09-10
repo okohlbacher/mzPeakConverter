@@ -13,6 +13,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::{ArrowColumnChunk, ArrowRowGroupWriterFactory, compute_leaves};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::KeyValue;
+use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 
 use crate::{
@@ -48,6 +49,10 @@ pub struct MiniPeakWriterType<W: Write + Send + Seek + 'static> {
     buffer_size: usize,
     n_points: u64,
     n_entries: u64,
+    /// The properties the facet was encoded with, kept so any post-hoc rewrite of the finished
+    /// facet (see `prune_all_null_dup_point_columns`) can re-apply them instead of silently
+    /// falling back to parquet's defaults (UNCOMPRESSED, no byte-stream-split, no encryption).
+    props: WriterProperties,
 }
 
 enum PeakBackend<W: Write + Send + Seek + 'static> {
@@ -62,6 +67,7 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
         writer: ArrowWriter<W>,
         buffers: ArrayBufferWriterVariants,
         buffer_size: usize,
+        props: WriterProperties,
     ) -> Self {
         let mut this = Self {
             backend: PeakBackend::Serial(writer),
@@ -69,6 +75,7 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
             buffer_size,
             n_points: 0,
             n_entries: 0,
+            props,
         };
         this.init_array_index_metadata();
         this
@@ -84,6 +91,7 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
         max_rows: usize,
         buffers: ArrayBufferWriterVariants,
         buffer_size: usize,
+        props: WriterProperties,
     ) -> Self {
         let encoder = ParallelPeakEncoder::new(file_writer, factory, schema, max_rows);
         let mut this = Self {
@@ -92,6 +100,7 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
             buffer_size,
             n_points: 0,
             n_entries: 0,
+            props,
         };
         this.init_array_index_metadata();
         this
@@ -107,6 +116,11 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
 
     pub fn buffers(&self) -> &ArrayBufferWriterVariants {
         &self.buffers
+    }
+
+    /// The [`WriterProperties`] this facet is being encoded with.
+    pub fn properties(&self) -> &WriterProperties {
+        &self.props
     }
 
     pub fn append_key_value_metadata(
