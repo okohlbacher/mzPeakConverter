@@ -206,8 +206,9 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   it from the `okohlbacher/mzdata@1d53971` git fork (0.66.6 plus mobiusklein/mzdata#58, merged
   upstream and not yet released). The file now carries the Apache License 2.0 text and the NOTICE
   that `arrow` and `parquet` ship, which section 4(d) of that license requires redistributions to
-  pass on. It names the .NET bundle `thermorawfilereader` embeds in the binary: Thermo Fisher
-  Scientific's RawFileReader assemblies and OpenMcdf, whose terms neither crate states. Its
+  pass on. It names the .NET assemblies `thermorawfilereader` embeds in the binary, which no
+  crate declares: Thermo Fisher Scientific's RawFileReader, under Thermo's proprietary license, and
+  OpenMcdf 2.3, under MPL-2.0. Its
   vendor-SDK paragraph no longer names the `bruker_sdk` / `agilent` / `sciex` build features, which
   no longer exist. The license distribution comes from `cargo metadata` at this tree (415
   dependency packages) instead of the 0.1.0 SBOM; `mzpeak_prototyping` stays "not declared
