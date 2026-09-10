@@ -92,6 +92,14 @@ dotnet build glue/agilent/AgilentGlue.csproj   -c Release   # → AgilentGlueHos
 variable is unset — so an unpacked Windows release needs no glue variables (releases after 0.11.5;
 0.11.5's archive needs them set). The variable, when set, always wins.
 
+**.NET 8 support ends on 2026-11-10** (Microsoft's policy; .NET 9 ends the same day, .NET 10 on
+2028-11-14). The SciEX and Shimadzu glues target `net8.0` and stay there for now, so after that date
+they run on an out-of-support runtime. Shimadzu cannot simply move up: its vendor library
+deserialises through `BinaryFormatter`, which throws on .NET 9 and later unless Microsoft's
+unsupported compatibility package is added, untested inside a glue like this one (see
+[`glue/shimadzu/README.md`](../glue/shimadzu/README.md)). The Agilent host is .NET Framework 4.8
+and is not affected.
+
 The vendor DLLs themselves are sourced at **runtime** from a ProteoWizard install
 (`MZPC_PWIZ_DIR`); both layouts are probed — `<pwiz>/vendor_api/<Vendor>` as the bundled
 builds arrange it, and flat beside `msconvert.exe` as the standalone installer does (Shimadzu's
