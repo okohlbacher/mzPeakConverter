@@ -205,6 +205,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   and currency needs the recipe to match. Stamps from before this change carry no recipe and count
   as stale; the next converter release rebuilds the corpus anyway. The box's BENCH row names the
   options that ran, reported back by `box_convert_remote.ps1`, instead of the request.
+- **`tools/corpus_reconvert.py --box` exits 1 when a box unit did not come back.** Units deferred
+  to the box count as skipped, and the box phase only printed `NOT delivered`, so the run exited 0.
+  PXD077098's 9.04 GB archive, refused by the relay at `stage=too-big`, ended every rebuild that
+  way. The report now prints `BOX NOT DELIVERED` with the units and `box_convert.sh`'s exit code,
+  and either one fails the run. An archive that arrived but was left unstamped counts as not
+  delivered.
 
 ### Changed
 

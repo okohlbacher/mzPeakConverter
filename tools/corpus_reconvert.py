@@ -457,8 +457,9 @@ def s3_target(local: Path) -> str:
 
 
 def run_box(units: list[Path], root: Path, version: str, jobs: int,
-            recipes: dict[Path, Recipe] | None = None, s3_first: bool = True) -> None:
+            recipes: dict[Path, Recipe] | None = None, s3_first: bool = True) -> tuple[int, list[str]]:
     """Convert host-unsupported units on the box, relaying the archives back.
+    -> (box_convert.sh's exit code, names of the units whose archive did not arrive stamped).
 
     Delegates the transfer to tools/box_convert.sh --local-manifest, which already stages the raw
     through S3, converts in an isolated temp dir on the box, and pulls the .mzpeak back with a
@@ -466,7 +467,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     """
     if not units:
         print("box       : nothing to do")
-        return
+        return 0, []
     # ONE updater. This harness used to run its own sync_box() (ssh + git checkout + cargo build)
     # and then box_convert.sh ran box_update_remote.ps1 on top of it: two updaters, two locks, and
     # on 2026-09-03 a box_update_remote.ps1 nobody had asked for sat beside five idle convert
@@ -539,6 +540,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     if unchanged:
         print(f"box       : {len(unchanged)} NOT delivered, left unstamped: "
               + ", ".join(sorted(unchanged)[:6]) + (" ..." if len(unchanged) > 6 else ""))
+    return proc.returncode, unchanged
 
 
 def convert_target(cands: list[Path], binary: str, version: str, dry: bool, recipes: dict | None = None) -> tuple[Path, str, str]:
@@ -639,14 +641,15 @@ def main(argv: list[str] | None = None) -> int:
     # ---- box phase ----------------------------------------------------------
     # Units the host cannot convert (Windows-only vendor SDKs, missing msconvert) go to the flash
     # workstation. Payload-missing units are excluded: no binary can convert data that isn't there.
+    box_rc, undelivered = 0, []
     if args.box and not (args.report_only or args.dry_run):
         print()
         deferred = [u for u, d in results["skipped"] if "payload missing" not in d]
         # BOX_REQUIRE_VERSION: this harness STAMPS archives with a version string, so converting
         # with a stale box exe would mislabel them. Abort instead.
         os.environ.setdefault("BOX_REQUIRE_VERSION", "1")
-        run_box(deferred, root, version, args.box_jobs, recipes,
-                s3_first=not args.no_s3_first)
+        box_rc, undelivered = run_box(deferred, root, version, args.box_jobs, recipes,
+                                      s3_first=not args.no_s3_first)
 
     # ---- report -------------------------------------------------------------
     have = [t for t in groups if is_current(t, version, rid[t])]
@@ -659,6 +662,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n{label}: {len(rows)}")
             for u, d in sorted(rows)[:40]:
                 print(f"  - {u.relative_to(root)}" + (f"\n      {d}" if d else ""))
+    if box_rc or undelivered:
+        # A unit the box did not deliver is as unbuilt as a FAILED one. Deferred units sit in
+        # `skipped`, so the exit code used to say 0 while PXD077098 failed every rebuild at the relay.
+        print(f"\nBOX NOT DELIVERED: {len(undelivered)} unit(s), box_convert exit {box_rc} -- left "
+              f"unstamped, so the next run retries them")
+        for name in sorted(undelivered)[:40]:
+            print(f"  - {name}")
 
     stale = []
     for a in sorted(root.rglob("*.mzpeak")):
@@ -697,7 +707,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"              {oldest_p.relative_to(root)}")
         print(f"newest        {fmt(newest_ts)}")
     print("=" * 72)
-    return 1 if results["failed"] or unaccounted else 0
+    return 1 if results["failed"] or unaccounted or undelivered or box_rc else 0
 
 
 if __name__ == "__main__":
