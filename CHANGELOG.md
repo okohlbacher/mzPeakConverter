@@ -240,6 +240,17 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   but the requested fidelity was not honoured. The fallback now passes the requested mode, and
   `auto` only when the job named none. No corpus descriptor requests `off` or `on`. The script runs
   only on the box, so this is checked by reading, not run.
+- **A box archive over 5 GiB comes back by scp instead of being discarded.** The box returns
+  archives through one presigned S3 PUT, which stops at 5 GiB. `box_convert_remote.ps1` checked the
+  size only after the whole conversion, then threw the archive away at `stage=too-big`, so
+  PXD077098's 9.04 GB Waters TWIMS archive failed every rebuild and was delivered by hand. For a
+  local target, the default of `tools/corpus_reconvert.py --box`, the host now asks the box to
+  hold such an archive (`hold_oversize`). `box_convert.sh` pulls it through the jump host with
+  `scp`, checks its size and md5 against the box's figures, moves it into place and removes the
+  box copy; the box also sweeps holds older than two days. An `s3://` target still fails at
+  `stage=too-big`, because the `copy_object` publish and the md5 = ETag gate also stop at 5 GB.
+  Multipart upload remains a manual route. `tools/test_harness.py` covers the host half; the box
+  half runs only on the box.
 
 ### Changed
 

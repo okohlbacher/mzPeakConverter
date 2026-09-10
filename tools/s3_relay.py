@@ -15,7 +15,8 @@ Subcommands:
     s3_relay.py delete <key>                                          # delete object (idempotent)
     s3_relay.py md5  <path>                                           # -> md5 of a local file (verify)
 
-Above the 5 GB single-PUT ceiling, MANUAL only (the box harness still refuses at 5 GB — see below):
+Above the 5 GB single-PUT ceiling, MANUAL only (box_convert.sh pulls a LOCAL target's archive by scp
+instead; an s3:// target still stops at 5 GB -- see below):
     s3_relay.py presign-multipart <key> --parts N [--part-size B] [--expires S]
                                           # OPENS a multipart upload (server-side state!) and prints
                                           # {upload_id, part_size, urls:[...]} — one presigned PUT per
