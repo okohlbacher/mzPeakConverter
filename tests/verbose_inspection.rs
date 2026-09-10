@@ -10,8 +10,8 @@
 //! trigger for a failing report is a TSF `.d` whose `analysis.tsf` is not SQLite: the report fails
 //! to open it, and so does the conversion, with its own `converting …` context — which can only
 //! appear if the report did not end the run first. The vendor library the report could open on
-//! every platform is Thermo's RawFileReader (`small.RAW`); on Linux and Windows, Bruker's baf2sql
-//! as well.
+//! every platform is Thermo's RawFileReader (`small.RAW`, plain or gzipped); on Linux and Windows,
+//! Bruker's baf2sql as well.
 //!
 //! Without `-o` nothing is converted and no lane is chosen, so `--via-msconvert` changes nothing
 //! there: the report is the whole job and opens the reader.
@@ -74,6 +74,42 @@ fn verbose_leaves_the_thermo_reader_to_the_conversion() {
         .arg(&out)
         .arg("-v")
         .env_remove("DOTNET_ROLL_FORWARD") // the binary's own Thermo default decides (tests/thermo_raw.rs)
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let converted = out.is_file();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stdout.contains("format:        Thermo .raw"), "stdout:\n{stdout}");
+    assert!(stdout.contains(NOT_OPENED), "the report must leave RawFileReader closed; stdout:\n{stdout}");
+    assert!(!stdout.contains("spectra:"), "a spectrum count means the report opened the file; stdout:\n{stdout}");
+    assert!(run.status.success() && converted, "the conversion still runs; stderr:\n{stderr}");
+}
+
+/// A gzipped Thermo run is read the same way: the report and the conversion each gunzip
+/// `small.RAW.gz` to a plain `small.RAW`, which mzdata opens through RawFileReader. The gate tested
+/// only a plain `.raw` name, so beside a conversion the report still opened it (`spectra: 48`).
+/// The child gets `DOTNET_ROLL_FORWARD=LatestMajor` explicitly: the binary sets that default for a
+/// plain `.raw` name only, and without it a host whose newest runtime is .NET 9 or 10 cannot open
+/// the gunzipped copy in the conversion either.
+#[test]
+fn verbose_leaves_the_thermo_reader_closed_for_a_gzipped_run_too() {
+    let dir = std::env::temp_dir().join(format!("mzpc-verbose-thermo-gz-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let gz = dir.join("small.RAW.gz");
+    let raw = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/small.RAW")).unwrap();
+    let mut enc = flate2::write::GzEncoder::new(std::fs::File::create(&gz).unwrap(), flate2::Compression::default());
+    std::io::Write::write_all(&mut enc, &raw).unwrap();
+    enc.finish().unwrap();
+    let out = dir.join("small.mzpeak");
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&gz)
+        .arg("-o")
+        .arg(&out)
+        .arg("-v")
+        .env("DOTNET_ROLL_FORWARD", "LatestMajor")
         .output()
         .expect("failed to run mzpeak-convert");
     let converted = out.is_file();

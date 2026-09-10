@@ -1687,8 +1687,10 @@ fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
         return Ok(());
     }
     // mzdata reads a Thermo .raw through Thermo's RawFileReader, an in-process .NET runtime: a vendor
-    // library like the ones above, so it stays closed beside a conversion too.
-    if let Some(why) = skip_native.filter(|_| is_thermo_raw(input)) {
+    // library like the ones above, so it stays closed beside a conversion too. The test is mzdata's
+    // own, made before anything is gunzipped: a plain `.raw` name test let `x.raw.gz` through, and
+    // the report decompressed it and opened RawFileReader on the copy.
+    if let Some(why) = skip_native.filter(|_| mzdata_reads_thermo_raw(input)) {
         println!("format:        Thermo .raw");
         println!("note:          {why}");
         return Ok(());
@@ -5184,6 +5186,15 @@ fn is_thermo_raw(input: &Path) -> bool {
         && input.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("raw"))
 }
 
+/// True when mzdata would read `input` through Thermo's RawFileReader, decided as its `open_path`
+/// decides: the extension, looked up through a `.gz` suffix (`x.raw.gz`), else a Thermo header in
+/// the first 500 bytes, gunzipped when they are gzip. Nothing past those bytes is read; a file that
+/// cannot be read is not Thermo here and fails in its own open.
+fn mzdata_reads_thermo_raw(input: &Path) -> bool {
+    use mzdata::io::{MassSpectrometryFormat, infer_format};
+    input.is_file() && infer_format(input).is_ok_and(|(format, _)| format == MassSpectrometryFormat::ThermoRaw)
+}
+
 /// Build + embed the Thermo `vendor_scan_trailers.parquet` proprietary facet (Track 2). Best-effort:
 /// a trailer-read failure is logged but does not abort the (already-written) conversion.
 fn embed_thermo_trailers(zip: &mut ZipArchiveWriter<fs::File>, input: &Path) -> Result<()> {
@@ -7071,6 +7082,45 @@ mod tests {
             native_inspect_skip(true, true),
             Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
         );
+    }
+
+    /// The report's Thermo gate asks mzdata what it would open, before anything is gunzipped. A
+    /// plain `.raw` extension test missed `small.RAW.gz`, which the report then decompressed and
+    /// opened through RawFileReader beside the conversion.
+    #[test]
+    fn the_report_knows_a_thermo_run_as_mzdata_does() {
+        use super::mzdata_reads_thermo_raw;
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("mzpc-thermo-infer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/small.RAW")).unwrap();
+        let plain = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let gzip = |name: &str| {
+            let path = dir.join(name);
+            let mut enc = flate2::write::GzEncoder::new(std::fs::File::create(&path).unwrap(), flate2::Compression::default());
+            enc.write_all(&raw).unwrap();
+            enc.finish().unwrap();
+            path
+        };
+        let cases = [
+            (plain("small.RAW", &raw), true),
+            (gzip("small.RAW.gz"), true),
+            (gzip("upper.raw.GZ"), true),
+            (plain("small.dat", &raw), true), // a Thermo header under another name
+            (gzip("small.dat.gz"), true),
+            (plain("tiny.mzML", b"<?xml version=\"1.0\"?><mzML/>"), false),
+            (dir.join("missing.raw"), false),
+        ];
+        let seen: Vec<bool> = cases.iter().map(|(path, _)| mzdata_reads_thermo_raw(path)).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        for ((path, want), got) in cases.iter().zip(seen) {
+            assert_eq!(got, *want, "{}", path.display());
+        }
     }
 
     /// The installed panic hook removes the panicking thread's in-flight tmp. `mem::forget` keeps
