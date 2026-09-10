@@ -203,9 +203,11 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 - **The native Agilent (MHDAC) lane says once when it writes MS2 rows without a precursor**, as the
   SciEX, BAF, TSF, Waters and Agilent-profile lanes already did. The host's `AGL2` output has no
   precursor field, so every MSn row this lane writes lacks a selected ion, isolation window and
-  activation, and nothing said so; `docs/PLATFORM_SUPPORT.md` now mentions the warning. The reader
-  is Windows-only, so `agl::tests::reader_warns_once_about_ms2_rows_without_precursors` pins the
-  warning by its source text.
+  activation, and nothing said so. `docs/PLATFORM_SUPPORT.md` now states the gap and the warning for
+  both Agilent lanes; the profile (`--agilent-grid`) lane already warned, but the page did not say
+  so. The MHDAC reader is Windows-only, so
+  `agl::tests::reader_warns_once_about_ms2_rows_without_precursors` pins the warning by its source
+  text.
 - **The Agilent host has a deadline and leaves no temp file after a panic, and a
   `MZPC_AGILENT_TMPDIR` that names no directory is reported.** The converter ran
   `AgilentGlueHost.exe` with a bare `Command::output()`, so a wedged MHDAC call could hold the run
