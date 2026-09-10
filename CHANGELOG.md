@@ -230,6 +230,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `sic` points up to 0.05 s instead of 3 s — on archives built before this change too, whose source
   chromatograms are in seconds. mzML-lane archives change on reconversion (TIC/BPC times ×60).
   Pinned by `tests/chromatogram_time_unit.rs`.
+- **`--sample` is recorded like every other option, warned about where it is inert, and accepted
+  by `--config`.** It was copied into the SciEX lanes' setting without being counted as given, so
+  `--sample 3` on a Thermo `.raw`, an mzML, a timsTOF run or an archive exited 0 without a word;
+  on anything but a SciEX `.wiff` it now warns that it cannot change the output. `--config`
+  promises every option but rejected `sample:` as an unknown field since the flag arrived in
+  0.11.3; it is a config key now, merged under the command line like the others, and `sample: 0`
+  is refused as clap refuses `--sample 0`. The `--help` text no longer names an unreleased
+  version. Pinned by `sample_is_warned_inert_off_a_wiff` and the extended
+  `file_config_accepts_the_six_promised_keys`.
 - **An archive → mzML export reads each spectrum once.** It first read every spectrum's metadata to
   find the survivors, then read the survivors again in full, and it did so without a filter too:
   that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.

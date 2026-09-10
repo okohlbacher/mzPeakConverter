@@ -144,7 +144,7 @@ per option.
 | `--drop-aux <DROP_AUX>` | — | mzPeak input only: drop archive members matching this glob (repeatable) (§4.2) |
 | `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. Native readers ignore it: Bruker reads the integer grid from the vendor calibration, and the native Agilent (MHDAC) lane stores the f64 m/z the vendor library returns (a warning names the alternatives: `--via-msconvert --tof-grid`, or `--agilent-grid` for the flight-time grid of a profile `.d`). **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
 | `--agilent-grid` | off | Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id` columns (the MassHunter calibration drifts per scan) instead of f64 m/z — in `spectra_data`, since it is profile data (0.10.1; earlier releases filed it as centroid). Far smaller than the msconvert lane (≈0.14×). Only applies when `MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path) |
-| `--sample <N>` | — | SciEX `.wiff` only: convert sample `N` (1-based) of a multi-sample WIFF. Native lane and both `--via-msconvert` lanes, mzPeak and `--to mzml` (mapped to msconvert's `--runIndexSet N-1`). A multi-sample WIFF without it is refused: the native lane lists its samples, the msconvert lanes give their count once msconvert has written every run. `0`, and a number beyond the file's samples, are refused |
+| `--sample <N>` | — | SciEX `.wiff` only: convert sample `N` (1-based) of a multi-sample WIFF. Native lane and both `--via-msconvert` lanes, mzPeak and `--to mzml` (mapped to msconvert's `--runIndexSet N-1`). A multi-sample WIFF without it is refused: the native lane lists its samples, the msconvert lanes give their count once msconvert has written every run. `0`, and a number beyond the file's samples, are refused; on any other input it is inert and warned about. Config key `sample` |
 | `--via-msconvert` | off | Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor path for formats without a native reader in this build (Agilent `.d`, SciEX `.wiff`, …) |
 | `--msconvert-path <MSCONVERT_PATH>` | `$MSCONVERT_PATH`, else `msconvert` on `PATH` | Path to the `msconvert` executable |
 | `-v, --verbose` | off | Verbose: print the inspection report and debug logs (repeat `-vv` for trace logs). An explicit `-v` / `-q` WINS over `RUST_LOG`; `RUST_LOG` is consulted only when neither flag is given (default level `info`) |
@@ -175,8 +175,8 @@ re-packed verbatim): it is warned about by name and the run goes on. The table:
 | standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | nothing (`--ims-chunked` is inert there: warned about, not refused — also when a timsTOF run falls back to this lane because timsrust cannot decompress it) |
 
 Options a lane merely has no use for but that cannot change its output (`--no-vendor` on an mzML
-export, `--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input) are
-deliberately *not* refused, so a shared recipe or config keeps working. Config-file values never
+export, `--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input,
+`--sample` on anything but a SciEX `.wiff`, which is warned about) are deliberately *not* refused, so a shared recipe or config keeps working. Config-file values never
 count as supplied, so a shared profile carrying `zstd_level: 12` or `sdrf:` sets defaults for the
 lanes that use them and is a silent no-op on the lanes that cannot — put such an option on the
 command line when you want the refusal to protect you.
@@ -290,6 +290,7 @@ drop_aux:                  # .mzpeak input only                     (0.9.13)
   - "vendor/*.tdf_bin"
 verbose: 0                 # 1 = -v, 2 = -vv                        (0.9.13)
 quiet: false               #                                        (0.9.13)
+sample: 2                  # SciEX .wiff with several samples, §4
 ```
 
 ```sh
