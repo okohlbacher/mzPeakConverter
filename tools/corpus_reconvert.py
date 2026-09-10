@@ -23,10 +23,20 @@ A stamp from before the recipe line counts as stale.
 idempotent pass, only slower, so prefer the default unless you specifically want a from-scratch run.
 
 Units that cannot convert on this host (vendor SDKs that are Windows-only, or a missing msconvert)
-are reported as SKIPPED, never counted as complete — completeness has to mean something.
+are reported as SKIPPED, never counted as complete — completeness has to mean something. With
+`--box` they convert on the flash workstation and come back to the host beside their raw, through a
+transient S3 relay slot that is verified and deleted; a unit that does not come back fails the run.
+`--publish-s3` instead copies each box archive onto its durable corpus key (s3://v09/...) before any
+validator has seen it, so it is opt-in.
 
 Usage:
     tools/corpus_reconvert.py [ROOT] [--clean] [--jobs N] [--dry-run] [--report-only]
+                              [--box [--box-jobs N] [--publish-s3]]
+
+Release day, once the tag is pushed and `mzpeak-convert --version` names it:
+    tools/corpus_reconvert.py --box
+then validate the archives on the host, and only then publish them from the corpus repository
+(scripts/update.sh). `--no-s3-first`, which older notes pass, is still accepted: it is the default.
 """
 
 from __future__ import annotations
@@ -457,7 +467,7 @@ def s3_target(local: Path) -> str:
 
 
 def run_box(units: list[Path], root: Path, version: str, jobs: int,
-            recipes: dict[Path, Recipe] | None = None, s3_first: bool = True) -> tuple[int, list[str]]:
+            recipes: dict[Path, Recipe] | None = None, publish_s3: bool = False) -> tuple[int, list[str]]:
     """Convert host-unsupported units on the box, relaying the archives back.
     -> (box_convert.sh's exit code, names of the units whose archive did not arrive stamped).
 
@@ -483,12 +493,14 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
             # The descriptor's own flags, so a box-built archive matches its host-built recipe
             # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
             flags = recipe_for(u, recipes or {}).flags or ['--no-vendor']
-            # S3-FIRST (default): name the FINAL corpus key as the target, so the box PUTs the
-            # archive straight to where the corpus publishes it and the host only mirrors it down.
-            # Previously the archive came back to the host and needed a separate upload pass, which
-            # is where local and bucket drifted apart. corpus_lib owns the mapping so a conversion
+            # The archive comes back to the host by default: box_convert.sh relays it through a
+            # staging key that it verifies and deletes. --publish-s3 names the DURABLE corpus key
+            # instead, and box_convert.sh then copies the verified object onto s3://v09/..., the
+            # public distribution bucket, before any validator has run. That used to be the default,
+            # with `--no-s3-first` the one thing standing between a forgotten flag and unvalidated
+            # public objects; it is opt-in now. corpus_lib owns the key mapping, so a conversion
             # target and a sync destination can never disagree.
-            out = s3_target(target_for(u)) if s3_first else target_for(u)
+            out = s3_target(target_for(u)) if publish_s3 else target_for(u)
             fh.write(f"{u}\t{out}\t{' '.join(flags)}\n")
     print(f"box       : {len(units)} unit(s) -> {manifest}  (box converter pinned to v{want})")
     # box_convert.sh resolves a boto3-capable interpreter for the S3 relay itself (MZPC_PYTHON
@@ -496,7 +508,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     env = dict(os.environ)
     env["BOX_CONVERTER_VERSION"] = f"v{want}"
     # Fingerprint every target BEFORE the run. "The archive exists" does NOT mean the box just
-    # delivered it: with S3-first the box PUTs to the corpus KEY and the local copy stays stale by
+    # delivered it: with --publish-s3 the box PUTs to the corpus KEY and the local copy stays stale by
     # design until the deferred pull. Stamping on existence alone labelled 21 August archives as
     # 0.9.0 after box_convert.sh had aborted (exit 3) without converting anything, and then reported
     # "COMPLETENESS 199/199 (100.0%)". Only a CHANGED file may be stamped.
@@ -509,10 +521,11 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
         except OSError:
             before[out] = None
     proc = subprocess.run(
-        # --overwrite: the durable target is an ALREADY-PUBLISHED corpus key, and replacing it is
-        # the whole point of a reconvert. Without it box_convert.sh refuses the publish after a
-        # successful conversion ("REFUSING to overwrite existing"), drops the staging key, and the
-        # box's work is thrown away -- 19 of 21 units converted and then discarded.
+        # --overwrite, read only for a --publish-s3 target: the durable target is an ALREADY-PUBLISHED
+        # corpus key, and replacing it is the whole point of a reconvert. Without it box_convert.sh
+        # refuses the publish after a successful conversion ("REFUSING to overwrite existing"), drops
+        # the staging key, and the box's work is thrown away -- 19 of 21 units converted and then
+        # discarded.
         ["bash", str(TOOLS / "box_convert.sh"), "--overwrite",
          "--local-manifest", str(manifest), "--jobs", str(jobs)],
         text=True, env=env,
@@ -576,8 +589,11 @@ def main(argv: list[str] | None = None) -> int:
     # which still clamps this (and MZPC_ALLOW_PARALLEL=1 there lifts the cap).
     ap.add_argument("--box-jobs", type=int, default=3,
                     help="box concurrency (default 3; box_convert.sh caps at MZPC_BOX_JOBS_CAP=4)")
-    ap.add_argument("--no-s3-first", action="store_true",
-                    help="box returns archives to the host instead of PUTting them to the corpus bucket")
+    ap.add_argument("--publish-s3", action="store_true",
+                    help="box copies each verified archive onto its durable corpus key (s3://v09/...) "
+                         "instead of returning it to the host; nothing validates it first")
+    # The default since --publish-s3 became opt-in; still accepted so an older release-day command runs.
+    ap.add_argument("--no-s3-first", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
     root = Path(args.root).expanduser()
@@ -649,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
         # with a stale box exe would mislabel them. Abort instead.
         os.environ.setdefault("BOX_REQUIRE_VERSION", "1")
         box_rc, undelivered = run_box(deferred, root, version, args.box_jobs, recipes,
-                                      s3_first=not args.no_s3_first)
+                                      publish_s3=args.publish_s3)
 
     # ---- report -------------------------------------------------------------
     have = [t for t in groups if is_current(t, version, rid[t])]

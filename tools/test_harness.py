@@ -208,11 +208,24 @@ class BoxPhase(Harness):
             "general-ms/lost/undelivered.wiff": b"x",
             "general-ms/old/stale.wiff": b"x",
         })
-        rc, out = self.run_main(root, "--box", "--no-s3-first")
+        rc, out = self.run_main(root, "--box")
         self.assertEqual(rc, 1, out)
         self.assertIn("BOX NOT DELIVERED: 2 unit(s), box_convert exit 1", out)
         self.assertEqual(out.split("BOX NOT DELIVERED")[1].count("  - "), 2)
         self.assertTrue((root / "general-ms/ok/run.mzpeak.built").exists())
+
+    def test_box_archives_return_to_the_host_unless_publishing_is_asked_for(self):
+        root = make_corpus(self.tmp, {"general-ms/ds/ds.yaml": {"convert": {"input": "auto"}}},
+                           {"general-ms/ds/run.wiff": b"x"})
+        with mock.patch.object(cr, "s3_target", side_effect=AssertionError("a durable key by default")):
+            rc, out = self.run_main(root, "--box")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.manifest()["run.mzpeak"][0], str(root / "general-ms/ds/run.mzpeak"))
+
+        (root / "general-ms/ds/run.mzpeak.built").unlink()
+        with mock.patch.object(cr, "s3_target", side_effect=lambda p: f"s3://v09/{p.relative_to(root)}"):
+            self.run_main(root, "--box", "--publish-s3")
+        self.assertEqual(self.manifest()["run.mzpeak"][0], "s3://v09/general-ms/ds/run.mzpeak")
 
 
 class BoxScripts(unittest.TestCase):
