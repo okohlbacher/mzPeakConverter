@@ -243,7 +243,7 @@ const EXPECTED: &[Expected] = &[
         key: "run.id",
         vendors: None,
         kind: Kind::Defect,
-        reason: "ProteoWizard names a WIFF run after its SAMPLE (En_PPY: the sample name), the native lane after the file stem; pwiz's XML-id escaping of a leading digit (`_x0032_0181203…`) is decoded before comparing, so only the SciEX naming rule remains.",
+        reason: "ProteoWizard names a WIFF run after its SAMPLE (En_PPY: the sample name), the native lane after the file stem; pwiz's XML-id escaping (`_x0032_0181203…` for a leading digit, `_x0020_` for a space) is decoded before comparing — the mzML lane decodes it on copy now, but archives built before that carry it — so only the SciEX naming rule remains.",
     },
     Expected {
         key: "facet.spectra_metadata.parquet.rows",
@@ -434,8 +434,10 @@ fn facet_population(archive: &Path, member: &str, dir: &Path, into: &mut Surface
     let _ = std::fs::remove_file(&p);
 }
 
-/// ProteoWizard escapes characters an XML id may not start with as `_xHHHH_` (`_x0032_0181203…`
-/// for a run whose name starts with a digit). The native lane uses the plain stem.
+/// ProteoWizard escapes characters an XML id may not start with or hold as `_xHHHH_` (`_x0032_0181203…`
+/// for a run whose name starts with a digit). The native lane uses the plain stem, and the mzML lane
+/// decodes `run.id` and the software ids on copy (`decode_pwiz_ids` in `src/main.rs`); archives built
+/// before that still carry the escapes, so both keys are compared decoded.
 fn decode_pwiz_id(v: &str) -> String {
     let mut out = String::new();
     let mut rest = v;
@@ -588,7 +590,7 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
             let mut ids: Vec<String> = arr
                 .iter()
                 .filter_map(|e| {
-                    let id = e.get("id").and_then(|v| v.as_str())?;
+                    let id = decode_pwiz_id(e.get("id").and_then(|v| v.as_str())?);
                     let version = e.get("version").and_then(|v| v.as_str()).unwrap_or("");
                     Some(if version.is_empty() { id.to_string() } else { format!("{id}@{version}") })
                 })

@@ -308,6 +308,20 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
+- **mzML-lane archives hold ProteoWizard's ids decoded.** ProteoWizard writes ids as XML names and
+  escapes what a name may not hold as `_xHHHH_`, so `run.id` came into the archive as
+  `Experiment_x0020_1` (`tiny.pwiz.1.1.mzML`), `En_PPY-3_phenylpyruvic_x0020_acid_10NG_10ul` or
+  `_x0031_2_80` for a leading digit — 47 of the 201 published archives — and 7 of them carry
+  escaped software ids too (ltpmsi-chilli's `MassLynx_x0020_software`, six ProteoWizard Shimadzu
+  examples' `Shimadzu_x0020_software`). An mzPeak id is a plain string, and the native lanes write the
+  plain stem. The mzML and imzML lane now decodes `run.id` and the software ids on copy, with the
+  processing methods and instrument configurations that reference a software id, so every
+  reference still resolves. The mzML exports keep the escaped software ids, which an mzML id (an XML
+  name) needs; mzdata's mzML writer numbers the run itself.
+  `tests/lane_metadata_parity.rs` compares both keys decoded, so archives built before and after
+  compare alike. Pinned by `pwiz_escaped_ids_are_decoded` and
+  `mzml_lane_archive_decodes_pwiz_ids_and_mzml_export_keeps_them`; the published archives change on
+  reconversion.
 
 ## [0.11.5] — 2026-09-09
 
