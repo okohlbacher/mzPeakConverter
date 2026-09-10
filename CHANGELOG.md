@@ -40,19 +40,29 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   and BPC alone. Every Bruker lane now opens that file read-only and writes each trace after the
   TIC/BPC, with ProteoWizard's `chromatogram title` and `Instrument` parameters: a pressure,
   flow-rate or temperature trace as that PSI-MS chromatogram type with a pressure, flow-rate or
-  temperature array, anything else (solvent composition, setpoints, valve angles) as a non-standard
-  array named after the trace, each in the unit HyStar states. The value arrays are stored as
-  auxiliary arrays, which keep their own unit, and times are minutes like every other chromatogram.
-  HyStar's own `TIC,±MS` and `BPC,±MS` traces give way to the synthesized ones, as a source TIC/BPC
-  always has. A user-defined trace whose unit is a pressure or a flow rate is typed as one
-  (ProteoWizard does that only for a temperature). mzdata has no unit for bar, so a trace in bar is
-  stated in pascal, multiplied by exactly 10⁵, and the archive declares `bruker:trace-unit-rescale`
-  in `transformations`. The 32 TDF runs in the corpus hold 698 such traces, 139 of them in bar (25
-  Agilent pump traces on each PXD059079 run); their published archives change only when
-  reconverted. On the TSF run behind ProteoWizard's `timsTOF_autoMSMS_Urine_50s_neg` test file the
-  six Elute traces match its mzML exactly — values, times, chromatogram type and unit. Pinned by `bruker_traces::tests` (an in-memory HyStar database) and
-  `tests::finish_chromatograms_writes_the_bruker_device_traces`, which also checks that the input
-  directory is left untouched.
+  temperature array, anything else (solvent composition, setpoints, valve angles) as ProteoWizard's
+  generic `chromatogram` (MS:1000625) with a non-standard array named after the trace, each in the
+  unit HyStar states. The type is a parameter as well as the typed column, so an mzML export of the
+  archive states it. The value arrays are stored as auxiliary arrays, which keep their own unit, and
+  times are minutes like every other chromatogram. HyStar's own MS traces give way to the
+  synthesized TIC/BPC, as a source TIC/BPC always has; that includes its MS/MS TIC
+  (`TIC,±AllMS/MS`, on every corpus run), which the spectra still yield. A user-defined trace whose
+  unit is a pressure or a flow rate is typed as one (ProteoWizard does that only for a temperature).
+  mzdata has no unit for bar, so a trace in bar is stated in pascal, as 64-bit floats that divide
+  back to the stored value exactly, and the archive declares `bruker:trace-unit-rescale` in
+  `transformations`. HyStar stored the four Thermo pump and column-oven traces of PXD079300's
+  `…_27806.d` in overlapping chunks, every sample three times and out of time order (1,079,478
+  points for 359,826 samples on each pressure trace): such a trace is written in time order with
+  each exact (time, value) repeat once, and the archive declares `bruker:trace-sort-dedup`. A
+  database in WAL mode is skipped with a warning, since SQLite cannot open one without creating
+  files beside it; no corpus file is in WAL mode. The 32 corpus runs with the file hold 698 such
+  traces, 139 of them in bar (5 on each of the 27 PXD059079 runs, 2 each on PXD076703 and
+  PXD078573); their published archives change only when reconverted. On the TSF run behind
+  ProteoWizard's `timsTOF_autoMSMS_Urine_50s_neg` test file the six Elute traces match its mzML in
+  values, times, unit and chromatogram type (the two solvent traces through the `chromatogram`
+  parameter; their typed column stays null). Pinned by `bruker_traces::tests` (an in-memory HyStar
+  database) and `tests::finish_chromatograms_writes_the_bruker_device_traces`, which also checks
+  that the input directory is left untouched.
 
 ### Fixed
 

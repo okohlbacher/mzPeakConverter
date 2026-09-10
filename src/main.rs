@@ -5057,7 +5057,9 @@ fn convert_ims_compact_sdk(
 /// integer grid replaced f64 m/z within that bound), `shimadzu:span-trim` (the profile sqrt-grid
 /// route stores the signal span only), `agilent:drop-zero-samples` (the profile grid lane stores
 /// a sparse point list), `bruker:trace-unit-rescale` (a Bruker device trace recorded in a unit
-/// mzdata cannot state was multiplied by the exact factor into one it can — bar into pascal).
+/// mzdata cannot state was multiplied by the exact factor into one it can — bar into pascal),
+/// `bruker:trace-sort-dedup` (a Bruker device trace stored out of time order or with repeated
+/// samples was put in time order, each exact (time, value) repeat kept once).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -6562,8 +6564,8 @@ fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f6
 /// `chromatography-data.sqlite` ([`bruker_traces`]) — skipping a source TIC/base-peak (HyStar's
 /// own MS traces included) when we synthesized our own so they don't duplicate. Falls back to one
 /// empty chromatogram if nothing else was written (the reference reader requires the facet to open,
-/// and the writer finalizes index metadata here). Returns the `transformations` entries the
-/// chromatograms add, for the lane's index block.
+/// and the writer finalizes index metadata here). Returns the `transformations` entries the written
+/// device traces add, for the lane's index block ([`bruker_traces::Trace`]).
 fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     writer: &mut MzPeakWriterType<fs::File>,
     input: &Path,
@@ -6574,8 +6576,9 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     set_file_contents(writer, ms1, synth && !ms1.time.is_empty());
     let synthesized = if synth { ms1.write(writer)? } else { 0 };
     let mut n = synthesized;
-    let device = bruker_traces::read(input);
-    for chrom in source.chain(device.chromatograms) {
+    let mut applied: Vec<String> = Vec::new();
+    let traces = bruker_traces::read(input).into_iter().map(|t| (t.chromatogram, t.rescaled, t.merged));
+    for (chrom, rescaled, merged) in source.map(|c| (c, false, false)).chain(traces) {
         if synthesized > 0
             && matches!(
                 chrom.chromatogram_type(),
@@ -6586,12 +6589,17 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
         }
         writer.write_chromatogram(&chrom)?;
         n += 1;
+        for (done, entry) in [(rescaled, "bruker:trace-unit-rescale"), (merged, "bruker:trace-sort-dedup")] {
+            if done && !applied.iter().any(|a| a == entry) {
+                applied.push(entry.to_string());
+            }
+        }
     }
     log::info!("chromatograms: {synthesized} synthesized + {} from source = {n}", n - synthesized);
     if n == 0 {
         write_empty_chromatogram(writer)?;
     }
-    Ok(if device.rescaled { vec![bruker_traces::UNIT_RESCALE.to_string()] } else { Vec::new() })
+    Ok(applied)
 }
 
 /// Is this `source_files[].location` a filesystem path (in any spelling) rather than a genuine
@@ -6894,35 +6902,67 @@ mod tests {
     use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum, SpectrumDescription};
     use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 
+    /// `dir/run.d` holding only a HyStar `chromatography-data.sqlite`, one chunk per trace:
+    /// (Id, Description, Type, Unit, seconds, values).
+    fn hystar_dot_d(dir: &std::path::Path, traces: &[(i64, &str, i64, i64, &[f64], &[f32])]) -> std::path::PathBuf {
+        let dot_d = dir.join("run.d");
+        std::fs::create_dir_all(&dot_d).unwrap();
+        let c = rusqlite::Connection::open(dot_d.join("chromatography-data.sqlite")).unwrap();
+        c.execute_batch(
+            "CREATE TABLE TraceSources (Id INTEGER PRIMARY KEY,Description TEXT,Instrument TEXT,InstrumentId TEXT,Type INTEGER,Unit INTEGER,TimeOffset REAL,Color INTEGER);
+             CREATE TABLE TraceChunks (Trace INTEGER NOT NULL,Times BLOB NOT NULL,Intensities BLOB NOT NULL);",
+        )
+        .unwrap();
+        for (id, description, kind, unit, seconds, values) in traces {
+            c.execute(
+                "INSERT INTO TraceSources (Id, Description, Instrument, Type, Unit, TimeOffset) VALUES (?1, ?2, 'Agilent ICF System', ?3, ?4, 0.0)",
+                rusqlite::params![id, description, kind, unit],
+            )
+            .unwrap();
+            let t: Vec<u8> = seconds.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let v: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+            c.execute("INSERT INTO TraceChunks VALUES (?1, ?2, ?3)", rusqlite::params![id, t, v]).unwrap();
+        }
+        dot_d
+    }
+
+    /// `dot_d` through `finish_chromatograms` into `archive`, beside the TIC/BPC synthesized from one
+    /// MS1 spectrum at 2.5 min; returns the transformations entries it declared.
+    fn write_trace_archive(dot_d: &std::path::Path, archive: &std::path::Path) -> Vec<String> {
+        let mut writer = super::MzPeakWriterType::<std::fs::File>::builder()
+            .chromatogram_chunked_encoding(None)
+            .build(std::fs::File::create(archive).unwrap(), true);
+        super::fixup_run_metadata(&mut writer, dot_d);
+        let ms1 = super::Ms1Chroms { time: vec![2.5], tic: vec![10.0], bpc: vec![4.0], saw_ms1: true, ..Default::default() };
+        let applied = super::finish_chromatograms(&mut writer, dot_d, &ms1, std::iter::empty(), true).unwrap();
+        writer.finish_parquet().unwrap().finish().unwrap();
+        applied
+    }
+
+    /// A fresh `mzpc-device-traces-<tag>-<pid>` directory and the guard that removes it.
+    fn trace_scratch(tag: &str) -> (std::path::PathBuf, RmDir) {
+        let dir = std::env::temp_dir().join(format!("mzpc-device-traces-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), RmDir(dir))
+    }
+
     /// Every Bruker lane ends in `finish_chromatograms`, so this is where a `.d`'s HyStar device
     /// traces join the facet: after the synthesized TIC/BPC, HyStar's own MS trace giving way to
-    /// them, a bar trace stated in pascal with the rescale declared — and the input directory left
-    /// exactly as it was.
+    /// them, a bar trace stated in pascal (64-bit, dividing back to the stored bar exactly) with its
+    /// type also a parameter and the rescale declared — and the input directory left exactly as it
+    /// was.
     #[test]
     fn finish_chromatograms_writes_the_bruker_device_traces() {
         use mzdata::params::Unit;
         use mzdata::spectrum::ChromatogramType;
         use mzpeak_prototyping::MzPeakReader;
 
-        let dir = std::env::temp_dir().join(format!("mzpc-device-traces-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let dot_d = dir.join("run.d");
-        std::fs::create_dir_all(&dot_d).unwrap();
-        {
-            let c = rusqlite::Connection::open(dot_d.join("chromatography-data.sqlite")).unwrap();
-            c.execute_batch(
-                "CREATE TABLE TraceSources (Id INTEGER PRIMARY KEY,Description TEXT,Instrument TEXT,InstrumentId TEXT,Type INTEGER,Unit INTEGER,TimeOffset REAL,Color INTEGER);
-                 CREATE TABLE TraceChunks (Trace INTEGER NOT NULL,Times BLOB NOT NULL,Intensities BLOB NOT NULL);
-                 INSERT INTO TraceSources (Id, Description, Instrument, Type, Unit, TimeOffset)
-                   VALUES (1, 'TIC,±MS', 'Bruker OTOF MS', 1, 6, 0.0), (2, 'Pump HP:Pressure - [bar]', 'Agilent ICF System', 9999, 3, 0.0);",
-            )
-            .unwrap();
-            let seconds: Vec<u8> = [2.0f64, 3.0].iter().flat_map(|t| t.to_le_bytes()).collect();
-            let values: Vec<u8> = [180.0f32, 172.5].iter().flat_map(|v| v.to_le_bytes()).collect();
-            for trace in [1i64, 2] {
-                c.execute("INSERT INTO TraceChunks VALUES (?1, ?2, ?3)", rusqlite::params![trace, seconds, values]).unwrap();
-            }
-        }
+        let (dir, _cleanup) = trace_scratch("finish");
+        let dot_d = hystar_dot_d(
+            &dir,
+            &[(1, "TIC,±MS", 1, 6, &[2.0, 3.0], &[180.0, 170.02]), (2, "Pump HP:Pressure - [bar]", 9999, 3, &[2.0, 3.0], &[180.0, 170.02])],
+        );
         let listing = || {
             let mut entries: Vec<_> = std::fs::read_dir(&dot_d)
                 .unwrap()
@@ -6938,24 +6978,19 @@ mod tests {
         let before = listing();
 
         let path = dir.join("run.mzpeak");
-        let mut writer = super::MzPeakWriterType::<std::fs::File>::builder()
-            .chromatogram_chunked_encoding(None)
-            .build(std::fs::File::create(&path).unwrap(), true);
-        super::fixup_run_metadata(&mut writer, &dot_d);
-        let ms1 = super::Ms1Chroms { time: vec![0.5], tic: vec![10.0], bpc: vec![4.0], saw_ms1: true, ..Default::default() };
-        let applied = super::finish_chromatograms(&mut writer, &dot_d, &ms1, std::iter::empty(), true).unwrap();
-        writer.finish_parquet().unwrap().finish().unwrap();
+        let applied = write_trace_archive(&dot_d, &path);
         assert_eq!(listing(), before, "reading the device traces changed the input directory");
         assert_eq!(applied, ["bruker:trace-unit-rescale"]);
 
         let mut r = MzPeakReader::new(&path).unwrap();
         let chroms: Vec<_> = (0..r.len_chromatograms()).map(|i| r.get_chromatogram(i).unwrap()).collect();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["TIC", "BPC", "Pump HP:Pressure - [bar]"]);
         let pressure = &chroms[2];
         assert_eq!(pressure.chromatogram_type(), ChromatogramType::PressureChromatogram);
+        assert!(pressure.params().iter().any(|p| p.curie() == Some(mzdata::curie!(MS:1003019))), "the type is a parameter too");
         let p = pressure.arrays.get(&ArrayType::PressureArray).expect("a pressure array");
-        assert_eq!((p.unit, p.to_f32().unwrap().to_vec()), (Unit::Pascal, vec![18_000_000.0, 17_250_000.0]));
+        assert_eq!((p.unit, p.dtype), (Unit::Pascal, BinaryDataArrayType::Float64));
+        assert_eq!(p.to_f64().unwrap().iter().map(|pa| (pa / 1e5) as f32).collect::<Vec<_>>(), [180.0, 170.02]);
         let t = pressure.arrays.get(&ArrayType::TimeArray).unwrap();
         assert_eq!(t.to_f64().unwrap().to_vec(), vec![2.0 / 60.0, 3.0 / 60.0]);
     }
