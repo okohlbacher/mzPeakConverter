@@ -8720,9 +8720,11 @@ mod tests {
     }
 
     /// The `transformations` index block (invariant: every transformation declared) lists what was
-    /// applied, not what was configured. On the fixture the generic lane numpresses m/z, re-sorts
-    /// nothing, and masks nothing: its one profile spectrum (scan=20, 10 points) holds no run of
-    /// zeros, so the mask the writer was built with never shortened a spectrum.
+    /// applied, not what was configured. On the fixture the generic lane numpresses m/z and masks
+    /// nothing: its one profile spectrum (scan=20, 10 points) holds no run of zeros, so the mask the
+    /// writer was built with never shortened a spectrum. Its MS1 spectra arrive out of time order
+    /// (scan=19 at 5.89 min, scan=21 with no start time, cycle 22 at 42.05 s), so the synthesized TIC
+    /// and base-peak traces reach the writer unsorted and its backstop re-sorts them by time.
     #[test]
     fn transformations_block_declares_what_the_lane_applied() {
         let dir = scratch("transformations");
@@ -8740,7 +8742,7 @@ mod tests {
             .collect();
         // The whole list — `contains` let through an entry nothing applied, or one listed twice. No
         // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run.
-        assert_eq!(applied, ["numpress-linear"], "{applied:?}");
+        assert_eq!(applied, ["numpress-linear", "sort-by-time"], "{applied:?}");
         // The lossless request drops the codec entry — the list follows the choice, not the lane.
         let out2 = dir.join("tiny-delta.mzpeak");
         let args: Vec<&std::ffi::OsStr> = vec![
@@ -8751,7 +8753,7 @@ mod tests {
         let meta = index_metadata(&out2);
         let applied: Vec<&str> =
             meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(applied.is_empty(), "{applied:?}");
+        assert_eq!(applied, ["sort-by-time"], "{applied:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
