@@ -260,6 +260,27 @@ impl EntryCounter {
     }
 }
 
+/// VENDORED PATCH (mzPeakConverter D15): what a buffer's writes changed in the signal they were
+/// handed, so a converter declares the transformations that happened (`transformations` in the
+/// archive index) rather than the ones it configured. Counted over the buffer's lifetime.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SignalTally {
+    /// Series whose zero-intensity runs were compacted: at least one point dropped.
+    pub zero_runs_masked: u64,
+    /// Chunk rows stored with the lossy numpress-linear codec.
+    pub numpress_chunks: u64,
+    /// Series that arrived out of main-axis order and were re-sorted before they were stored.
+    pub resorted: u64,
+}
+
+impl std::ops::AddAssign for SignalTally {
+    fn add_assign(&mut self, rhs: Self) {
+        self.zero_runs_masked += rhs.zero_runs_masked;
+        self.numpress_chunks += rhs.numpress_chunks;
+        self.resorted += rhs.resorted;
+    }
+}
+
 /// The series index carried by an `add_arrays` batch: the (constant) `<entity>_index` column's
 /// first value. `None` when the column is absent, empty, or null.
 fn series_index_of(fields: &Fields, arrays: &[ArrayRef], index_name: &str) -> Option<u64> {
@@ -286,6 +307,7 @@ pub struct PointBuffers {
     include_time: bool,
     point_count: u64,
     entries: EntryCounter,
+    tally: SignalTally,
     nullable_targets: Vec<usize>,
     drop_zero_columns: Vec<usize>
 }
@@ -644,6 +666,7 @@ pub struct ChunkBuffers {
     mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
     point_count: u64,
     entries: EntryCounter,
+    tally: SignalTally,
 }
 
 impl ChunkBuffers {
@@ -676,6 +699,7 @@ impl ChunkBuffers {
             mz_boundary,
             point_count: 0,
             entries: EntryCounter::default(),
+            tally: SignalTally::default(),
         }
     }
 
@@ -791,6 +815,12 @@ impl ArrayBufferWriter for ChunkBuffers {
 
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool) -> usize {
         let series_index = series_index_of(&fields, &arrays, self.buffer_context.index_name());
+        // VENDORED PATCH (mzPeakConverter D15): every chunked write lands here. The float m/z path
+        // encodes each chunk with this buffer's strategy; the ims-chunked `tof` boundary path is
+        // an integer axis and is never numpress.
+        if matches!(self.chunking_strategy, ChunkingStrategy::NumpressLinear { .. }) && self.mz_boundary.is_none() {
+            self.tally.numpress_chunks += arrays.first().map_or(0, |a| a.len()) as u64;
+        }
         self.chunk_buffer
             .push(StructArray::new(fields, arrays, None));
         self.is_profile_buffer.push(is_profile);
@@ -912,6 +942,21 @@ impl ArrayBufferWriterVariants {
                 Some(&chunk_buffers.chunking_strategy)
             }
             ArrayBufferWriterVariants::PointBuffers(_) => None,
+        }
+    }
+
+    /// VENDORED PATCH (mzPeakConverter D15): what this buffer's writes changed ([`SignalTally`]).
+    pub fn tally(&self) -> SignalTally {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.tally,
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.tally,
+        }
+    }
+
+    pub fn tally_mut(&mut self) -> &mut SignalTally {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => &mut chunk_buffers.tally,
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => &mut point_buffers.tally,
         }
     }
 
@@ -1567,6 +1612,7 @@ impl ArrayBuffersBuilder {
             include_time: self.include_time,
             point_count: 0,
             entries: EntryCounter::default(),
+            tally: SignalTally::default(),
             nullable_targets,
             drop_zero_columns,
         }

@@ -587,14 +587,18 @@ Agilent file-direct block is the one lane that says `exact`, and the two SCIEX l
 `bounded-lossy` with `roundtrip_tolerance_ppm`.
 
 **The `transformations` index key.** Every mzPeak lane writes `metadata.transformations` — a JSON
-list of the declared, bounded changes the converter made to the vendor signal on its way in
-(`transformations_block`, `src/main.rs:4683`). An empty list is a statement too. The vocabulary:
+list of the declared, bounded changes that were APPLIED to this archive's stored data on the way in
+(`transformations_block` in `src/main.rs`). Each entry is written only when the change happened at
+least once, counted while the archive was written, never inferred from what the lane was configured
+to do; so an empty list says the signal is stored as it was handed over. Archives written by 0.11.5
+and earlier listed `zero-run-mask` on every lane and `numpress-linear` whenever the codec was chosen,
+whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 
 | Entry | Written when | Lanes |
 |---|---|---|
-| `zero-run-mask` | always — the writer's zero-intensity run compaction (item 2) | every lane |
-| `numpress-linear` | the lossy m/z chunk codec was chosen on any facet (item 1) | chunked layout without `--no-numpress` |
-| `sort-by-mz` | at least one spectrum arrived out of m/z order and was re-sorted (tracked per run, not assumed) | generic mzdata lane |
+| `zero-run-mask` | the writer's zero-intensity run compaction shortened at least one profile spectrum (item 2) | every lane whose writer masks (not native Waters frames) |
+| `numpress-linear` | at least one m/z chunk is stored with the lossy codec (item 1) | chunked layout without `--no-numpress` |
+| `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, native Waters frames, and any lane whose reader hands over an unsorted spectrum |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `shimadzu:span-trim` | the profile sqrt-grid route stored the signal span only (item 4) | native Shimadzu `.lcd` profile |
 | `agilent:drop-zero-samples` | the profile grid lane stored a sparse point list, dropping zero-intensity samples and all-zero scans | `--agilent-grid` |

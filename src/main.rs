@@ -2606,7 +2606,7 @@ fn convert_file_tof_grid(
     assert_source_complete_tmp(input, n, cap, &tmp)?;
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
     let acquisition_block = fixup_run_metadata(&mut writer, input);
-    let mut applied = base_transformations(&[]);
+    let mut applied = base_transformations(&writer);
     if n_gridded > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
@@ -3230,6 +3230,7 @@ fn convert_agilent_grid(
     let calibrations = reader.calibrations_json();
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     let acquisition_block = fixup_run_metadata(&mut writer, input);
+    let mut applied = base_transformations(&writer);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     if let Some((key, block)) = acquisition_block {
@@ -3262,7 +3263,6 @@ fn convert_agilent_grid(
     }
     // The reader stores a sparse point list: zero-intensity samples of the dense vendor vector are
     // dropped (`agilent_profile.rs`, `next_spectrum`), which is a transformation to declare.
-    let mut applied = base_transformations(&[]);
     applied.push("agilent:drop-zero-samples".to_string());
     let (key, block) = transformations_block(&applied);
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
@@ -3802,9 +3802,9 @@ fn convert_file(
         .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&{
-            let mut applied = base_transformations(&[chunk]);
+            let mut applied = base_transformations(&writer);
             if resorted {
-                applied.push("sort-by-mz".to_string());
+                declare(&mut applied, "sort-by-mz");
             }
             applied
         })))
@@ -4945,13 +4945,14 @@ where
     // `MZPC_BYTE_PLANE_INTENSITY=0` — stated here so a reader (or an offline audit) need not infer
     // it from the Parquet schema.
     cal["intensity_dtype"] = serde_json::json!(if int_intensity { "int32" } else { "float32" });
+    let applied = base_transformations(&writer);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     zip.add_index_metadata("ims_calibration", &cal)
         .context("writing ims_calibration index")?;
     if let Some((key, block)) = acquisition_block {
         zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
     }
-    let (key, block) = transformations_block(&base_transformations(&[]));
+    let (key, block) = transformations_block(&applied);
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
     if let Some((key, block)) = partial_marker(input, max_spectra(), n_frames) {
         zip.add_index_metadata(&key, &block).context("writing partial index block")?;
@@ -5052,27 +5053,46 @@ fn convert_ims_compact_sdk(
 
 /// The `transformations` index block — the second half of the fidelity invariant ("preserve as
 /// much as possible; every transformation declared in the archive"). Each entry names one
-/// declared, bounded change the converter made to the vendor signal on its way in; an empty list
-/// is a statement too. Written by every mzPeak lane, so a reader (or an audit over a corpus) can
-/// tell a masked, re-sorted or grid-quantized archive from a verbatim one without re-deriving it.
-/// Entries: `zero-run-mask` (the writer's zero-intensity run compaction, on every lane),
-/// `numpress-linear` (the lossy m/z chunk codec, when chosen), `sort-by-mz` (the generic lane
-/// re-ordered at least one out-of-order spectrum), `tof-grid:<ppm>ppm` (a statistically fitted
-/// integer grid replaced f64 m/z within that bound), `shimadzu:span-trim` (the profile sqrt-grid
-/// route stores the signal span only), `agilent:drop-zero-samples` (the profile grid lane stores
-/// a sparse point list).
+/// declared, bounded change that was APPLIED to this archive's stored data — counted while it was
+/// written, never inferred from what the lane was configured to do — so an empty list says the
+/// signal is stored as handed over, and a reader (or an audit over a corpus) can tell a masked,
+/// re-sorted or grid-quantized archive from a verbatim one without re-deriving it. Entries:
+/// `zero-run-mask` (the writer's zero-run compaction shortened at least one profile spectrum),
+/// `numpress-linear` (at least one m/z chunk is stored with the lossy codec), `sort-by-mz` (at
+/// least one spectrum was re-ordered, by the lane or by the writer's backstop), `tof-grid:<ppm>ppm`
+/// (a statistically fitted integer grid replaced f64 m/z within that bound on at least one
+/// spectrum), `shimadzu:span-trim` (the profile sqrt-grid route stores the signal span only),
+/// `agilent:drop-zero-samples` (the profile grid lane stores a sparse point list).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
 
-/// The entries every writer build shares: the zero-run mask (`build(handle, true)` on every lane)
-/// and numpress-linear when any facet's chunk strategy is it.
-fn base_transformations(chunks: &[Option<ChunkingStrategy>]) -> Vec<String> {
-    let mut applied = vec!["zero-run-mask".to_string()];
-    if chunks.iter().any(|c| matches!(c, Some(ChunkingStrategy::NumpressLinear { .. }))) {
+/// The entries the writer itself applied, from its own counters (`spectrum_signal_tally`) rather
+/// than its configuration: `zero-run-mask` when the mask shortened a profile spectrum,
+/// `numpress-linear` when a numpress chunk was stored, `sort-by-mz` when the writer's backstop
+/// re-sorted a spectrum the lane handed over out of order. Read before `finish_parquet`.
+fn base_transformations(writer: &MzPeakWriterType<fs::File>) -> Vec<String> {
+    let tally = writer.spectrum_signal_tally();
+    let mut applied = Vec::new();
+    if tally.zero_runs_masked > 0 {
+        applied.push("zero-run-mask".to_string());
+    }
+    if tally.numpress_chunks > 0 {
         applied.push("numpress-linear".to_string());
     }
+    if tally.resorted > 0 {
+        applied.push("sort-by-mz".to_string());
+    }
     applied
+}
+
+/// Add one entry to a `transformations` list, once: `sort-by-mz` can come both from the lane's own
+/// re-sort and from the writer's backstop.
+fn declare(applied: &mut Vec<String>, entry: impl Into<String>) {
+    let entry = entry.into();
+    if !applied.contains(&entry) {
+        applied.push(entry);
+    }
 }
 
 /// Flush Parquet, then stream-embed vendor side-files + vendor metadata into the archive index,
@@ -5841,6 +5861,7 @@ fn convert_sciex_grid(
     });
     let fixup_block = fixup_run_metadata(&mut writer, input);
     let acquisition_block = acquisition_block.or(fixup_block);
+    let mut applied = base_transformations(&writer);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     if let Some((key, block)) = acquisition_block {
@@ -5867,7 +5888,6 @@ fn convert_sciex_grid(
         zip.add_index_metadata("tof_calibration", &cal)
             .context("writing tof_calibration index")?;
     }
-    let mut applied = base_transformations(&[data_chunk]);
     if n_grid > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
@@ -6344,11 +6364,11 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             index_blocks.push(block);
         }
     }
-    let mut applied = base_transformations(&[data_chunk, peaks_chunk]);
-    if keep_zero_runs {
-        applied.retain(|t| t != "zero-run-mask");
+    // A lane that keeps zero runs built the writer with the mask off, so its tally has none to report.
+    let mut applied = base_transformations(&writer);
+    for entry in transformations {
+        declare(&mut applied, entry);
     }
-    applied.extend(transformations);
     let transformations = transformations_block(&applied);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     for (key, block) in index_blocks
@@ -8463,8 +8483,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The `transformations` index block (invariant: every transformation declared): the generic
-    /// lane on the fixture masks zero runs and numpresses m/z, and re-sorts nothing.
+    /// The `transformations` index block (invariant: every transformation declared) lists what was
+    /// applied, not what was configured. On the fixture the generic lane numpresses m/z, re-sorts
+    /// nothing, and masks nothing: its one profile spectrum (scan=20, 10 points) holds no run of
+    /// zeros, so the mask the writer was built with never shortened a spectrum.
     #[test]
     fn transformations_block_declares_what_the_lane_applied() {
         let dir = scratch("transformations");
@@ -8481,8 +8503,8 @@ mod tests {
             .map(|v| v.as_str().expect("entries are strings"))
             .collect();
         // The whole list — `contains` let through an entry nothing applied, or one listed twice. No
-        // `sort-by-mz`: the fixture is already in m/z order.
-        assert_eq!(applied, ["zero-run-mask", "numpress-linear"], "{applied:?}");
+        // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run.
+        assert_eq!(applied, ["numpress-linear"], "{applied:?}");
         // The lossless request drops the codec entry — the list follows the choice, not the lane.
         let out2 = dir.join("tiny-delta.mzpeak");
         let args: Vec<&std::ffi::OsStr> = vec![
@@ -8493,7 +8515,47 @@ mod tests {
         let meta = index_metadata(&out2);
         let applied: Vec<&str> =
             meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(applied, ["zero-run-mask"], "{applied:?}");
+        assert!(applied.is_empty(), "{applied:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The writer-level entries follow the writer's counters on the vendor-reader seam: a profile
+    /// with no zero run declares nothing, one with a run declares `zero-run-mask`, and a spectrum
+    /// handed over out of m/z order declares `sort-by-mz` — the writer's re-sort backstop, which
+    /// every native lane relies on and which no archive recorded before.
+    #[test]
+    fn writer_counters_decide_the_writer_level_transformations() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("writer-counters");
+        let declared = |name: &str, mzs: &'static [f64], intens: &'static [f32]| -> Vec<String> {
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(
+                std::path::Path::new(TINY),
+                &out,
+                None,
+                1,
+                None,
+                false,
+                VendorHints::default(),
+                4,
+                |i| Ok(spec_from(mzs, intens, i)),
+            )
+            .unwrap();
+            index_metadata(&out)["transformations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(declared("verbatim", &[100.0, 100.5, 101.0, 101.5], &[5.0, 0.0, 7.0, 9.0]), none);
+        assert_eq!(
+            declared("zero-run", &[100.0, 100.5, 101.0, 101.5, 102.0, 102.5], &[5.0, 0.0, 0.0, 0.0, 0.0, 9.0]),
+            ["zero-run-mask"]
+        );
+        assert_eq!(declared("unsorted", &[101.0, 100.0, 102.0, 103.0], &[5.0, 6.0, 7.0, 9.0]), ["sort-by-mz"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
