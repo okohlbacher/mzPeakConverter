@@ -114,7 +114,7 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 `mzpeak-convert [OPTIONS] <INPUT>`
 
 The table follows `mzpeak-convert --help` of the shipped binary (the wording is the help's own,
-shortened; `tests/docs_drift.rs` fails when an option is missing here). `--help` is the long form;
+shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help` is the long form;
 `-h` prints a one-line summary per option.
 
 | Option | Default | Description |

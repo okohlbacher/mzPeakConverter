@@ -33,8 +33,26 @@ fn mentions(text: &str, word: &str) -> bool {
     })
 }
 
+/// The flags of `flags` that no row of §4's option table (the one headed `| Option |`) names in its
+/// Option cell. A flag the refusal table or another row's description names still has no row. A
+/// `\|` inside a cell (`<chunked\|point>`) does not end it.
+fn options_without_a_row<'a>(flags: &BTreeSet<&'a str>, section: &str) -> Vec<&'a str> {
+    let cells: Vec<&str> = section
+        .lines()
+        .skip_while(|l| !l.starts_with("| Option |"))
+        .skip(2) // the header and its `|---|` line
+        .take_while(|l| l.starts_with('|'))
+        .map(|l| {
+            let row = &l[1..];
+            let end = row.match_indices('|').find(|&(i, _)| !row[..i].ends_with('\\')).map_or(row.len(), |(i, _)| i);
+            &row[..end]
+        })
+        .collect();
+    flags.iter().copied().filter(|f| !cells.iter().any(|c| mentions(c, f))).collect()
+}
+
 #[test]
-fn every_long_option_of_help_is_in_section_4() {
+fn every_long_option_of_help_has_a_row_in_section_4() {
     let out = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert")).arg("--help").output().unwrap();
     assert!(out.status.success(), "--help failed");
     let help = String::from_utf8(out.stdout).unwrap();
@@ -48,9 +66,19 @@ fn every_long_option_of_help_is_in_section_4() {
         .map(|t| &t[..t[2..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).map_or(t.len(), |e| e + 2)])
         .collect();
     assert!(flags.contains("--output") && flags.contains("--zstd-level"), "no options parsed from --help:\n{help}");
-    let section = manual_section(4);
-    let missing: Vec<_> = flags.iter().filter(|f| !mentions(&section, f)).collect();
-    assert!(missing.is_empty(), "options `--help` prints but USER_MANUAL.md §4 does not: {missing:?}");
+    let missing = options_without_a_row(&flags, &manual_section(4));
+    assert!(missing.is_empty(), "options `--help` prints that have no row in USER_MANUAL.md §4's option table: {missing:?}");
+}
+
+#[test]
+fn a_flag_named_only_outside_the_option_table_has_no_row() {
+    let section = "## 4. Command-line options\n\n\
+                   | Option | Default | Description |\n|---|---|---|\n\
+                   | `--layout <chunked\\|point>` / `--to` | `chunked` | see `--zstd-level` |\n\n\
+                   | Lane | Refused | Warned |\n|---|---|---|\n\
+                   | `--agilent-grid` on a profile `.d` | `--image` | — |\n";
+    let flags = BTreeSet::from(["--agilent-grid", "--layout", "--to", "--zstd-level"]);
+    assert_eq!(options_without_a_row(&flags, section), ["--agilent-grid", "--zstd-level"]);
 }
 
 #[test]
