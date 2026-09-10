@@ -342,8 +342,9 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `zero-run-mask` was written on every lane and `numpress-linear` whenever the codec was chosen:
   103 corpus archives declared the mask with no profile spectrum, and 32 declared numpress with no
   numpress chunk. The writer's backstop was never declared at all, although every native lane
-  relies on it. On `tiny.pwiz.1.1.mzML` the list is now `["numpress-linear"]` (its one profile
-  spectrum holds no zero run) and `[]` with `--no-numpress`;
+  relies on it. On `tiny.pwiz.1.1.mzML` the list is now `["numpress-linear", "sort-by-time"]` (its
+  one profile spectrum holds no zero run; its MS1 spectra arrive out of time order, so the writer
+  re-sorts the synthesized TIC and base-peak traces) and `["sort-by-time"]` with `--no-numpress`;
   `writer_counters_decide_the_writer_level_transformations` pins the mask, the backstop and the
   empty list on the vendor-reader seam. The two lane entries still derived from configuration are
   counted as well. `shimadzu:span-trim` now comes from the gridded spectra whose zero pad the profile
