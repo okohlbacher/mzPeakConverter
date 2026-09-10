@@ -37,6 +37,22 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 
 ### Fixed
 
+- **Thermo isolation windows that the reader library computed are written target-only.**
+  thermorawfilereader (0.8.0, the copy mzdata wraps, and 0.7.3 alike) takes a precursor's isolation
+  width from the scan's `MS<n> Isolation Width` trailer. For a scan without that trailer it takes the
+  scan filter's width and halves it, and the window constructor halves it again; a negative filter
+  width inverts the window. mzdata copies those bounds as stated. The published archives therefore
+  carry 13,004 MS3 windows at −0.25/−0.25, with the lower bound above the upper
+  (`ec04479_qy_4cell_SanJose_A1`), and 26,487 MS2 and SRM windows a quarter or half of the method's
+  width: `2013_30_Amrutha_050713_1` ±0.25 where its method says 2.00 and ProteoWizard ±1.0,
+  `SZB8102938` ±0.25 for a method width of 2.00, and `LD401_001fmol_r1` ±0.175 for a Q1 width of
+  0.7. A Thermo window now keeps the library's numbers only when its scan's own trailer states a
+  positive width and the window is neither empty nor inverted. Any other window keeps its target
+  and gets null offsets, declared as `thermo:target-only-isolation-window:<n>` in `transformations`
+  and warned about once per run. `--to mzml` applies the same rule and writes the target only.
+  Windows with a stated width are unchanged (`small.RAW` ±1.0, as ProteoWizard; ec04479's MS2 ±0.25
+  for its 0.50 trailer). The four archives above need rebuilding. Pinned by the tests in
+  `src/thermo_isolation.rs` and `contract_strings::transformations_block_pinned`.
 - **`--to mzml` wrote an isolation window of unknown width as a window from 0 to twice its
   target.** Every lane holds a window without a stated width as its target with both bounds 0 (a
   Waters DDA set mass, a TSF trigger mass without a width, mzdata's mzML reader on a target-only
