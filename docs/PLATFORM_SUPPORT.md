@@ -17,7 +17,7 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | `libbaf2sql_c` (native C, in-process) | `libbaf2sql_c` at runtime |
 | Bruker `.d` via **timsdata SDK** (`--bruker-sdk`) | ✅ | ❌ | ✅ | Bruker `timsdata` lib (opt-in) | `libtimsdata.so`/`.dll` via `TIMSDATA_LIB_DIR` |
 | Agilent `.d` (non-IM, native) | ❌ | ❌ | ✅ (scan data; MRM/SIM-only runs refused) | out-of-process **net48** host (`AgilentGlueHost.exe`) → MHDAC, `AGL2` file protocol | MHDAC DLLs (ProteoWizard), .NET Framework 4.8 |
-| Agilent `.d` IM-MS (6560 IM-QTOF) | ❌ | ❌ | ❌ | refused natively: the drift dimension needs MIDAC, whose in-process scaffold (`glue/agilent_midac`) has never converted a file — use `--via-msconvert` | — |
+| Agilent `.d` IM-MS (6560 IM-QTOF) | ❌ | ❌ | ❌ | the drift dimension needs MIDAC. Without the MIDAC glue and DLLs the run is refused; where they load, the in-process scaffold (`glue/agilent_midac`) is dispatched instead and cannot succeed — it has never converted a file, and can end in a CoreCLR error rather than the refusal. Use `--via-msconvert` | — |
 | Agilent `.d` **profile** (`--agilent-grid`) | ⚠️ | ⚠️ | ⚠️ | pure Rust (reads `MSProfile.bin`) | — (two known decode gaps, below) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`SciexGlue.dll`) → Clearcore2 | Clearcore2 DLLs |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`ShimadzuGlue.dll`) → LabSolutions.IO | LabSolutions.IO DLLs from a **current** ProteoWizard |

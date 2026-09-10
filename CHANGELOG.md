@@ -233,15 +233,17 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
-
 - **`--help` and the user manual say what the code does.** `--zstd-level` claimed a default of 3 on
   every lane, where the timsTOF ims-compact lanes default to 5. `--agilent-grid` claimed a per-run
   `{c0,c1}` pair, where the lane writes per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id`
   columns. `--tof-grid` said the native Bruker and Agilent readers take the grid from the vendor
-  calibration, which only the ims-compact lanes and `--agilent-grid` do. In the manual, the §4
-  refusal table listed options that are only warned about as refused and missed six real refusals
-  (four on `--via-msconvert`, `--aux` and `--bruker-sdk` on `--to mzml`); it now has a refused and
-  a warned column, taken from `dropped_flags_for` and `inert_flags_for`. §10 lacked
+  calibration, which only the ims-compact lanes and `--agilent-grid` do, and called itself mzML-only,
+  although every input read through mzdata reaches the fit (imzML, Thermo `.raw`, a TDF read as
+  f64). In the manual, the §4 refusal table listed options that are only warned about as refused and
+  missed four real refusals on `--via-msconvert` (`--bruker-sdk --no-ims-compact --ims-chunked
+  --no-tims-recalibration`); it now has a refused and a warned column, taken from
+  `dropped_flags_for` and `inert_flags_for`, and no longer calls the MHDAC lane's `--tof-grid`
+  warning silence. §10 lacked
   `MZPC_WATERS_KEEP_COLLAPSED`, `MZPC_WATERS_PROBE_QUAD` and `TIMSDATA_LIB_DIR`, claimed a variable
   count that no longer held, and said every boolean lever goes through `env_flag()`, which the
   Waters ones do not. Drifted line-number citations now name functions, and §8 names the test and
@@ -251,6 +253,7 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   shows the Agilent IM-QTOF lane as a working scaffold, and gives the right compile gates and TSF
   reader; it also no longer points at a `BACKLOG.md` #23 that does not exist. The Waters frame
   size (Capan2 166 → 531 MB) and the native SciEX size are recorded as accepted.
+
 ### Changed
 
 - **The ignored tests run, and no test that runs by default passes without asserting.** Of the six
