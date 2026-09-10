@@ -203,14 +203,25 @@ jobs:
           set -euo pipefail
           bin="$RUNNER_TEMP/stage/mzpeak-convert"
           file "$bin"
-          lipo -archs "$bin"
+          # Asserted, not just printed: the x86_64 slice never runs here, so this is what keeps an arm64
+          # build from shipping under the x86_64 name, or back.
+          archs="$(lipo -archs "$bin")"
+          [ "$archs" = "${{ matrix.arch }}" ] || { echo "::error::$bin holds '$archs', expected ${{ matrix.arch }}"; exit 1; }
           codesign -dvv "$bin" 2>&1 | grep -E "Signature|flags"
           ( cd "$RUNNER_TEMP/dist" && shasum -a 256 -c ./*.sha256 )
           # Only the native slice can be executed on this runner.
           if [ "${{ matrix.arch }}" = arm64 ]; then
-            "$bin" --version
+            have="$("$bin" --version)"
+            [ "$have" = "mzpeak-convert $VERSION" ] || { echo "::error::--version says '$have', expected mzpeak-convert $VERSION"; exit 1; }
             "$bin" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
-            test -s "$RUNNER_TEMP/smoke.mzpeak"
+            # Read the archive back, so one that is written but unreadable fails here: the inspection
+            # report and the mzML export must both hold every spectrum of the source.
+            n="$(grep -o '<spectrumList count="[0-9]*"' tests/fixtures/tiny.pwiz.1.1.mzML | tr -dc 0-9)"
+            report="$("$bin" "$RUNNER_TEMP/smoke.mzpeak")"
+            grep -Eqx "spectra: +$n" <<< "$report" || { echo "::error::inspecting smoke.mzpeak does not count $n spectra"; echo "$report"; exit 1; }
+            "$bin" "$RUNNER_TEMP/smoke.mzpeak" -o "$RUNNER_TEMP/smoke.mzML" --force
+            m="$(grep -c '<spectrum ' "$RUNNER_TEMP/smoke.mzML" || true)"
+            [ "$m" = "$n" ] || { echo "::error::smoke.mzML holds $m spectra, the source $n"; exit 1; }
           fi
 
       - uses: actions/upload-artifact@v4
@@ -279,9 +290,17 @@ jobs:
           [ "$(printf '%s\n' "$floor" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
             || { echo "::error::binary requires $floor, above the manylinux_2_28 floor"; exit 1; }
           ( cd "$RUNNER_TEMP/dist" && sha256sum -c ./*.sha256 )
-          "$bin" --version
+          have="$("$bin" --version)"
+          [ "$have" = "mzpeak-convert $VERSION" ] || { echo "::error::--version says '$have', expected mzpeak-convert $VERSION"; exit 1; }
           "$bin" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
-          test -s "$RUNNER_TEMP/smoke.mzpeak"
+          # Read the archive back, so one that is written but unreadable fails here: the inspection
+          # report and the mzML export must both hold every spectrum of the source.
+          n="$(grep -o '<spectrumList count="[0-9]*"' tests/fixtures/tiny.pwiz.1.1.mzML | tr -dc 0-9)"
+          report="$("$bin" "$RUNNER_TEMP/smoke.mzpeak")"
+          grep -Eqx "spectra: +$n" <<< "$report" || { echo "::error::inspecting smoke.mzpeak does not count $n spectra"; echo "$report"; exit 1; }
+          "$bin" "$RUNNER_TEMP/smoke.mzpeak" -o "$RUNNER_TEMP/smoke.mzML" --force
+          m="$(grep -c '<spectrum ' "$RUNNER_TEMP/smoke.mzML" || true)"
+          [ "$m" = "$n" ] || { echo "::error::smoke.mzML holds $m spectra, the source $n"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -408,11 +427,21 @@ jobs:
           $want = (Get-Content "$($zip.FullName).sha256").Split(' ')[0]
           if ((Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower() -ne $want) { Write-Output "::error::sidecar mismatch"; exit 1 }
 
-          & $exe --version
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $have = & $exe --version
+          if ($LASTEXITCODE -ne 0 -or $have -ne "mzpeak-convert $env:VERSION") { Write-Output "::error::--version says '$have', expected mzpeak-convert $env:VERSION"; exit 1 }
           $smoke = Join-Path $env:RUNNER_TEMP 'smoke.mzpeak'
           & $exe tests/fixtures/tiny.pwiz.1.1.mzML -o $smoke --force
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $smoke) -or (Get-Item $smoke).Length -eq 0) { Write-Output "::error::smoke conversion failed"; exit 1 }
+          # Read the archive back, so one that is written but unreadable fails here: the inspection
+          # report and the mzML export must both hold every spectrum of the source.
+          $n = [regex]::Match((Get-Content tests/fixtures/tiny.pwiz.1.1.mzML -Raw), '<spectrumList count="(\d+)"').Groups[1].Value
+          $report = & $exe $smoke
+          if ($LASTEXITCODE -ne 0 -or -not ($report -match ('^spectra:\s+{0}$' -f $n))) { Write-Output "::error::inspecting smoke.mzpeak does not count $n spectra"; $report; exit 1 }
+          $mzml = Join-Path $env:RUNNER_TEMP 'smoke.mzML'
+          & $exe $smoke -o $mzml --force
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::exporting smoke.mzpeak to mzML failed"; exit 1 }
+          $m = [regex]::Matches((Get-Content $mzml -Raw), '<spectrum ').Count
+          if ($m -ne [int]$n) { Write-Output "::error::smoke.mzML holds $m spectra, the source $n"; exit 1 }
 
       - uses: actions/upload-artifact@v4
         with:
