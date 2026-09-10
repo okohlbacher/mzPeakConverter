@@ -34,6 +34,14 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
+- **`metadata.conversion_route` names the timsTOF route that built an archive** (review D13/M35).
+  The default lane falls back to the mzdata reader when timsrust cannot decompress a frame (newer
+  timsTOF, e.g. 5.1.x), with the same recorded command line, so a fallback archive was recognisable
+  only by what it lacks. Both ims-compact lanes now write
+  `{"route": "ims-compact", "reader": "timsrust" | "timsdata"}` and the fallback writes
+  `{"route": "mzdata-fallback", "reader": "mzdata", "reason": <the error>}`.
+  `ims_compact_fallback_arm_records_the_route_it_took` forces the fallback arm with injected errors,
+  and `convert_file_writes_the_route_it_is_handed` pins the block in the archive.
 
 ### Fixed
 

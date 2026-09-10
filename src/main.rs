@@ -1218,24 +1218,19 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
             // fall back to the mzdata reader interface (f64 m/z), which decodes those files. mzdata may
             // silently drop a truly-undecodable frame, so the fallback is loud. (Backlog: fix timsrust /
             // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
-            match convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size) {
-                Ok(()) => {}
-                Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
-                    log::warn!(
-                        "native ims-compact failed on {} ({e}); falling back to the mzdata reader \
-                         (f64 m/z, larger; may skip any frame even mzdata can't decode)",
-                        cli.input.display()
-                    );
+            ims_compact_with_fallback(
+                &cli.input,
+                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size),
+                |route| {
                     guard_unsupported_vendor(&cli.input)?;
-                    convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration)
-                        .with_context(|| format!("mzdata-fallback converting {}", cli.input.display()))?;
-                }
-                Err(e) => return Err(e).with_context(|| format!("ims-compact converting {}", cli.input.display())),
-            }
+                    convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration, Some(route))
+                        .with_context(|| format!("mzdata-fallback converting {}", cli.input.display()))
+                },
+            )?;
         }
         Lane::VendorReader | Lane::Standard => {
             guard_unsupported_vendor(&cli.input)?;
-            convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration)
+            convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration, None)
                 .with_context(|| format!("converting {}", cli.input.display()))?;
         }
         // Both were dispatched above, before the raw-format guards.
@@ -1244,6 +1239,41 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
 
     log::info!("wrote {}", output.display());
     Ok(exit::OK)
+}
+
+/// The timsTOF default lane with its fallback. Native ims-compact (direct timsrust) runs first; when
+/// it cannot decompress a frame (newer timsTOF, e.g. 5.1.x, writes a TDF binary timsrust does not
+/// handle) the mzdata reader converts the run instead (f64 m/z), and that archive names its route
+/// in `conversion_route` together with the error that forced it. Any other native error is the
+/// lane's own. The recorded argv is the same on both routes, so until this block a fallback archive
+/// was recognisable only by what it lacks (review M35).
+fn ims_compact_with_fallback(
+    input: &Path,
+    native: impl FnOnce() -> Result<()>,
+    fallback: impl FnOnce((String, serde_json::Value)) -> Result<()>,
+) -> Result<()> {
+    match native() {
+        Ok(()) => Ok(()),
+        Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
+            // mzdata may silently drop a truly undecodable frame, so the fallback is loud.
+            log::warn!(
+                "native ims-compact failed on {} ({e}); falling back to the mzdata reader (f64 m/z, larger; may skip any frame even mzdata can't decode)",
+                input.display()
+            );
+            fallback(conversion_route_block("mzdata-fallback", "mzdata", Some(&format!("{e:#}"))))
+        }
+        Err(e) => Err(e).with_context(|| format!("ims-compact converting {}", input.display())),
+    }
+}
+
+/// The `conversion_route` index block: which timsTOF route built the archive (`ims-compact` read by
+/// `timsrust` or `timsdata`, or the `mzdata-fallback`) and, for the fallback, why.
+fn conversion_route_block(route: &str, reader: &str, reason: Option<&str>) -> (String, serde_json::Value) {
+    let mut block = serde_json::json!({"route": route, "reader": reader});
+    if let Some(reason) = reason {
+        block["reason"] = serde_json::json!(reason);
+    }
+    ("conversion_route".to_string(), block)
 }
 
 /// The conversion lane `run` selected, named so [`unsupported_flags_for`] can say which
@@ -1972,7 +2002,7 @@ fn convert_via_msconvert(
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
-    convert_file(mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true)
+    convert_file(mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true, None)
 }
 
 /// The `--to mzml` lane: convert `input` to a plain **mzML** via the mzdata writer, streaming the
@@ -3411,6 +3441,8 @@ fn convert_file(
     images: &[PathBuf],
     sdrf: Option<&Path>,
     tims_recalibration: bool,
+    // The `conversion_route` block when another lane handed the input over (the timsTOF fallback).
+    route: Option<(String, serde_json::Value)>,
 ) -> Result<()> {
     // --image / --sdrf are only honored on the mzML/imzML reader path below. A vendor-format input
     // (TSF/BAF/Agilent/SciEX/Waters) routes to a dedicated converter that does not embed them — warn
@@ -3801,6 +3833,7 @@ fn convert_file(
         .into_iter()
         .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
+        .chain(route)
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
             if resorted {
@@ -4952,6 +4985,12 @@ where
     if let Some((key, block)) = acquisition_block {
         zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
     }
+    let (key, block) = conversion_route_block(
+        "ims-compact",
+        if chord_source == "sdk_tims_index_to_mz" { "timsdata" } else { "timsrust" },
+        None,
+    );
+    zip.add_index_metadata(&key, &block).context("writing conversion_route index block")?;
     let (key, block) = transformations_block(&applied);
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
     if let Some((key, block)) = partial_marker(input, max_spectra(), n_frames) {
@@ -7890,7 +7929,7 @@ mod tests {
 
             // synth_chroms=true mirrors the CLI default. (An unrelated pre-existing point-layout write
             // clash triggers only with --no-chromatograms + mixed precision; not this test's concern.)
-            super::convert_file(&input, &output, chunk, 3, None, true, Some(super::TofGridMode::Off), &[], None, true)
+            super::convert_file(&input, &output, chunk, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
                 .unwrap_or_else(|e| panic!("[{tag}] conversion failed: {e:#}"));
 
             let f = fs::File::open(&output).unwrap();
@@ -7995,6 +8034,7 @@ mod tests {
             &[],
             None,
             true,
+            None,
         )
         .unwrap();
 
@@ -8604,6 +8644,60 @@ mod tests {
             ["zero-run-mask"]
         );
         assert_eq!(declared("unsorted", &[101.0, 100.0, 102.0, 103.0], &[5.0, 6.0, 7.0, 9.0]), ["sort-by-mz"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M35: which timsTOF route built an archive. The fallback arm runs only on a native error that
+    /// mentions `decompress`, and hands that error to the `conversion_route` block; any other error
+    /// keeps the native lane's context, and success needs no fallback. Forced with injected errors:
+    /// no committed TDF makes timsrust fail that way.
+    #[test]
+    fn ims_compact_fallback_arm_records_the_route_it_took() {
+        use super::ims_compact_with_fallback;
+        let input = std::path::Path::new("run.d");
+        let mut taken = None;
+        ims_compact_with_fallback(input, || Err(anyhow::anyhow!("frame 7: failed to decompress blob")), |route| {
+            taken = Some(route);
+            Ok(())
+        })
+        .unwrap();
+        let (key, block) = taken.expect("a decompress error takes the fallback");
+        assert_eq!(key, "conversion_route");
+        assert_eq!(block["route"], "mzdata-fallback");
+        assert_eq!(block["reader"], "mzdata");
+        assert!(block["reason"].as_str().unwrap().contains("decompress"), "{block}");
+        let mut called = false;
+        let err = ims_compact_with_fallback(input, || Err(anyhow::anyhow!("no frames")), |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!called, "only a decompress error falls back");
+        assert!(format!("{err:#}").contains("ims-compact converting run.d"), "{err:#}");
+        ims_compact_with_fallback(input, || Ok(()), |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!called, "success needs no fallback");
+    }
+
+    /// The route block the fallback hands over reaches the archive index through `convert_file`, and
+    /// the plain mzdata lane states none.
+    #[test]
+    fn convert_file_writes_the_route_it_is_handed() {
+        let dir = scratch("route");
+        let out = dir.join("fallback.mzpeak");
+        let route = super::conversion_route_block("mzdata-fallback", "mzdata", Some("frame 7: failed to decompress blob"));
+        super::convert_file(std::path::Path::new(TINY), &out, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, Some(route))
+            .unwrap();
+        let meta = index_metadata(&out);
+        assert_eq!(meta["conversion_route"]["route"], "mzdata-fallback", "{meta:#}");
+        assert!(meta["conversion_route"]["reason"].as_str().unwrap().contains("decompress"));
+        let plain = dir.join("plain.mzpeak");
+        super::convert_file(std::path::Path::new(TINY), &plain, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
+            .unwrap();
+        assert!(index_metadata(&plain).get("conversion_route").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
