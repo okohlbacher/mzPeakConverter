@@ -106,7 +106,6 @@ $cvtRoot = 'C:\Users\User\src\mzPeakConverter'
 # Pinned to 3.0.26175 (owner decision 2026-09-04); 3.0.26151 remains installed beside it with the same Shimadzu.LabSolutions.IO 5.0.0.0.
 $pwiz = 'C:/Users/User/AppData/Local/Apps/ProteoWizard 3.0.26175.31fd1ca 64-bit'
 if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE  = (Resolve-Path "$cvtRoot\glue\sciex\bin\Release\net8.0").Path }
-if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
 if (Test-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0") { $env:MZPC_SHIMADZU_GLUE = (Resolve-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0").Path }  # native Shimadzu .lcd (LabSolutions.IO)
 $env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent: $pwiz/vendor_api/Agilent or $pwiz itself (agilent_dll_dir probes both; 26175 is flat)

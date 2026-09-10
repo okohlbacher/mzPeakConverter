@@ -54,7 +54,11 @@ then per record:
 
 `AGL1` (0.9.x) had no strings; a converter given one asks for a rebuilt host. The whole run is
 materialised before the first spectrum is read — 16 B/point, about 3 GB for a 240 MB Q-TOF `.d` —
-and the file is removed when the reader closes.
+and the file is removed when the reader closes. The converter gives the host a deadline
+(`MZPC_AGILENT_HOST_TIMEOUT`, default two hours), so a stuck host is killed; its panic hook removes
+the `.bin` and `.part` as well. A Ctrl+C, which ends both processes, still leaves the file behind,
+and a converter killed on its own leaves the host running (Windows does not end children with their
+parent).
 
 Exit 0 on success; non-zero with one diagnostic line on **stderr** on failure (and `out.bin` is
 removed). stdout is left clean. The Rust side seeks per-record via the offset table, so spectra are
@@ -89,6 +93,8 @@ ordinary `dotnet` SDK — no Visual Studio / .NET Framework targeting pack requi
 |---------------------|--------------------------------------------------------------------------------------|
 | `MZPC_AGILENT_GLUE` | Directory containing `AgilentGlueHost.exe` (the build output above). |
 | `MZPC_PWIZ_DIR`     | A ProteoWizard install directory. MHDAC DLLs are loaded from `<MZPC_PWIZ_DIR>/vendor_api/Agilent` when that subdirectory exists, else from `<MZPC_PWIZ_DIR>` itself (the 3.0.26175 installer is flat). |
+| `MZPC_AGILENT_TMPDIR` | Directory for the host's temp file (default `%TEMP%`). A value that is not a directory is warned about, and `%TEMP%` is used. |
+| `MZPC_AGILENT_HOST_TIMEOUT` | Seconds the host may run before the converter kills it (default 7200; `0` = no deadline). |
 
 > **Layouts.** Bundled ProteoWizard trees keep `vendor_api/Agilent/`; the standalone installer
 > flattens the DLLs beside `msconvert.exe`. The converter probes both (`pwiz_layout::agilent_dll_dir`)
@@ -109,6 +115,6 @@ siblings resolve from the same directory.
 ## Scope
 
 Non-IM MS only (MS1/MS2, profile or centroid). Agilent ion-mobility (6560 IM-QTOF) requires the
-separate **MIDAC** SDK to read the drift dimension and is **out of scope** here (the MIDAC glue in
-`src/agilent_midac.rs` is still the in-process .NET 8 design and would hit the same `BeginInvoke`
-wall — port it to this out-of-process net48 pattern when IM-MS support is needed).
+separate **MIDAC** SDK to read the drift dimension and is **out of scope** here: the converter
+refuses an IM-QTOF `.d` (`AcqData/IMSFrame.bin`) with a pointer to `--via-msconvert`. Native IM-MS
+support would read MIDAC through this out-of-process net48 pattern.

@@ -161,8 +161,15 @@ The `ShimadzuGlue.runtimeconfig.json` committed beside this README carries it; k
 whenever the csproj gains a `configProperty`.
 
 Security: the switch is scoped to this glue, whose input is a vendor instrument file the user chose
-to convert, the same path ProteoWizard itself runs. .NET 9 removes `BinaryFormatter` outright, so a
-retarget needs a vendor DLL that does not use it.
+to convert, the same path ProteoWizard itself runs.
+
+The glue stays on .NET 8, whose support ends on 2026-11-10. On .NET 9 and later the in-box
+`BinaryFormatter` always throws, whatever this switch says; only Microsoft's unsupported
+`System.Runtime.Serialization.Formatters` compatibility package, together with the switch, brings
+back a working one. Whether that package takes effect inside a component loaded through hostfxr, as
+this glue is, is untested. A retarget therefore needs that package verified on the box, an
+out-of-process .NET Framework 4.8 host (the Agilent pattern, where `BinaryFormatter` is built in),
+or a vendor DLL that no longer uses it.
 
 ### The reader still stores what the vendor returns
 

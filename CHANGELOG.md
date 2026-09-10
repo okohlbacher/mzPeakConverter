@@ -35,7 +35,7 @@ keep their bytes.
   platform onto an existing tag without rebuilding the archives already published. The vendor
   readers are unverified on Windows ARM64: the vendor DLLs are x64, so use the x64 archive there.
 - **The converter finds its .NET glue beside the executable.** With `MZPC_SCIEX_GLUE`,
-  `MZPC_SHIMADZU_GLUE`, `MZPC_AGILENT_GLUE` or `MZPC_AGILENT_MIDAC_GLUE` unset it looks in
+  `MZPC_SHIMADZU_GLUE` or `MZPC_AGILENT_GLUE` unset it looks in
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
@@ -439,6 +439,51 @@ keep their bytes.
   shows the Agilent IM-QTOF lane as a working scaffold, and gives the right compile gates and TSF
   reader; it also no longer points at a `BACKLOG.md` #23 that does not exist. The Waters frame
   size (Capan2 166 → 531 MB) and the native SciEX size are recorded as accepted.
+- **`-v` no longer opens a native vendor reader beside a conversion, and its report cannot fail the
+  run.** The report `-v` prints ran before the lane was chosen and opened the native reader
+  whatever was asked for. `-v --via-msconvert` on a `.wiff`, `.lcd` or Waters `.raw` exited with
+  the native reader's error (no `MZPC_PWIZ_DIR`, no .NET 8, a file Clearcore2 rejects) and wrote
+  nothing. `-v` on a native Agilent conversion ran the MHDAC host over the whole run twice, 2.9 GB of
+  temp file each time for a 242 MB Q-TOF `.d`. On SciEX the second open booted CoreCLR again. A
+  Thermo `.raw` or a Bruker BAF `.d` was opened twice as well, or opened for `--via-msconvert`,
+  which needs neither RawFileReader nor baf2sql. Beside a conversion, through any lane, the report
+  now gives the format and says the native reader was not opened. A run without `-o` is only the
+  report and still opens it, even under `--via-msconvert`, since no lane runs. On
+  Windows a SciEX, Waters or Shimadzu reader that fails to open there is now a `note:` line and the
+  inspection exits 0, as the Agilent one already did. Any other report error under `-o` is a
+  `note:` as well, and the conversion goes ahead. Pinned by `tests/verbose_inspection.rs` (a TSF
+  `.d` whose report fails, `small.RAW` with and without `-o` and `--via-msconvert`, `small.RAW.gz`
+  under `-o`, and on Linux and Windows a BAF `.d`) and
+  `tests::inspection_opens_a_native_reader_only_when_inspecting_is_the_job`; the Windows branches are
+  compiled only by CI.
+- **The native Agilent (MHDAC) lane says once when it writes MS2 rows without a precursor**, as the
+  SciEX, BAF, TSF, Waters and Agilent-profile lanes already did. The host's `AGL2` output has no
+  precursor field, so every MSn row this lane writes lacks a selected ion, isolation window and
+  activation, and nothing said so. `docs/PLATFORM_SUPPORT.md` now states the gap and the warning for
+  both Agilent lanes; the profile (`--agilent-grid`) lane already warned, but the page did not say
+  so. The MHDAC reader is Windows-only, so
+  `agl::tests::reader_warns_once_about_ms2_rows_without_precursors` pins the warning by its source
+  text.
+- **The Agilent host has a deadline and leaves no temp file after a panic, and a
+  `MZPC_AGILENT_TMPDIR` that names no directory is reported.** The converter ran
+  `AgilentGlueHost.exe` with a bare `Command::output()`, so a wedged MHDAC call could hold the run
+  forever, and under `panic = "abort"` the `.bin` and `.part` stayed behind. Now the host runs under
+  `MZPC_AGILENT_HOST_TIMEOUT` (seconds, default 7200, `0` = none) and past it is killed and its
+  files removed; both temp files are on the panic-hook sweep; and the new wait drains stderr as
+  `output()` did. A mistyped `MZPC_AGILENT_TMPDIR` fell back to `%TEMP%` in silence, putting
+  gigabytes on the drive the variable was set to avoid; it now warns. The decisions and the wait
+  live in the host-compiled `src/agilent_host.rs`, with tests (a `sleep` past its deadline, a 1 MiB
+  stderr, the variable parsing); the call site compiles only on Windows CI. Not fixed: a converter
+  that is itself killed still leaves the host running (Windows does not end children with their
+  parent), because a kill-on-close Job Object needs windows-sys's `Win32_System_JobObjects`
+  feature, which the dependency tree does not enable; and a Ctrl+C still leaves the temp file.
+- **Documentation that contradicted the code.** `docs/PLATFORM_SUPPORT.md` named the
+  `#[cfg(windows)]` modules as Agilent, MIDAC, SciEX and Waters. They are Agilent, SciEX and
+  Shimadzu; the Waters reader compiles everywhere and only its dispatch is gated. The page's legend
+  also kept a ⛔ symbol that no row uses. The comment on Shimadzu's cached runtime said hostfxr
+  refuses a second initialisation in one process. It refuses one only after netcorehost has freed
+  the library, when the last handle to it dropped, which is why the runtime is cached. (The stale
+  "BACKLOG.md #23" and the windows.yml header went with the Windows CI change below.)
 
 ### Changed
 
@@ -544,6 +589,37 @@ keep their bytes.
   - a `FileConfig` key is missing from §5's example;
   - an `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` is missing from §10. Against the manual before this
   change it fails on `MZPC_WATERS_KEEP_COLLAPSED` and `MZPC_WATERS_PROBE_QUAD`.
+- **Windows CI builds the .NET glues before it runs the tests, and opens a glue again after a
+  reader was dropped, in a process of its own.** `cargo test` ran before `dotnet build`, so no test
+  could load a glue, and no push or pull-request job ever started one: the `-v` double boot that
+  broke every verbose Shimadzu conversion before 0446ea3 shipped with CI green. The new step runs
+  `shimadzu::tests::a_reader_opens_again_after_one_was_dropped` alone, with `MZPC_SHIMADZU_GLUE`
+  set and no vendor DLL: each open boots the glue and then fails in its `Open`, so reaching that
+  error twice proves the second start. It cannot share the `cargo test` process, where another
+  glue or a Thermo boot keeps hostfxr loaded and hides the bug, so it is `#[ignore]`d there, and the
+  step fails if the test did not run. Only CI can execute it. The workflow header no longer claims
+  that native vendor conversion stays out of CI: the manual `sciex-native-zeno` job does it.
+- **The .NET 8 end of support, 2026-11-10, is written down, and the BinaryFormatter note no longer
+  overstates .NET 9.** The Shimadzu glue README and csproj said .NET 9 removes `BinaryFormatter`
+  "outright", so a retarget needs a vendor DLL that does not use it. The in-box implementation does
+  throw on .NET 9 and later, but Microsoft's unsupported `System.Runtime.Serialization.Formatters`
+  package, together with the switch, restores a working one. Whether that holds inside a component
+  loaded through hostfxr is untested. Decided for now: the SciEX and Shimadzu glues stay on
+  `net8.0`, and `docs/PLATFORM_SUPPORT.md` states the date and what it means.
+
+### Removed
+
+- **The Agilent MIDAC (ion-mobility) scaffold: `src/agilent_midac.rs`, `glue/agilent_midac/` and
+  `MZPC_AGILENT_MIDAC_GLUE`.** It had never opened a file and could not: its probe booted CoreCLR
+  and dropped it, and the reader then booted it again, the reload hostfxr refuses (0x80008081). It
+  was still dispatched for every IM-QTOF `.d`, built and asserted by the Windows CI job, and shipped
+  in the Windows release archive, where the glue beside the executable made the probe run. An
+  IM-QTOF `.d` (`AcqData/IMSFrame.bin`) gets the same refusal as before, without that boot:
+  `is an Agilent IM-QTOF run … convert this run with --via-msconvert`, which the box harness routes
+  to msconvert. Native ion mobility would read MIDAC through the out-of-process net48 host pattern.
+- **`glue/waters/`, the C# Waters glue that was never wired (817 lines).** No code path loaded
+  `WatersGlue.dll` or read `MZPC_WATERS_GLUE`: the Waters lane calls `MassLynxRaw.dll`'s C exports
+  through `libloading`. The two box scripts no longer export that inert variable.
 
 ## [0.11.5] — 2026-09-09
 

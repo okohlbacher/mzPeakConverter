@@ -31,13 +31,11 @@ mod bruker_baf;
 mod bruker_sdk;
 mod pwiz_layout;
 mod agl;
+mod agilent_host;
 mod sciex_run;
 #[cfg(windows)]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod agilent;
-#[cfg(windows)]
-#[cfg_attr(not(windows), allow(dead_code))]
-mod agilent_midac;
 #[cfg(windows)]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sciex;
@@ -704,10 +702,20 @@ impl Settings {
     }
 }
 
-/// The `<out>.mzpeak.tmp` files currently being written, with the thread that registered each,
-/// for [`install_tmp_panic_hook`].
+/// The temp files currently being written — each lane's `<out>.mzpeak.tmp`, and the Agilent host's
+/// `.bin` / `.part` — with the thread that registered each, for [`install_tmp_panic_hook`].
 static TMP_IN_FLIGHT: std::sync::Mutex<Vec<(std::thread::ThreadId, PathBuf)>> =
     std::sync::Mutex::new(Vec::new());
+
+/// Register a temp file with the panic-hook sweep without owning it: the Agilent host's `.bin` and
+/// `.part`, which another process writes and `agilent.rs` removes on every ordinary exit. Under
+/// `panic = "abort"` no `Drop` runs, so the sweep is what removes them — 16 B/point of the run,
+/// gigabytes. [`TmpGuard::forget_path`] unregisters it.
+fn track_tmp_in_flight(path: &Path) {
+    if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
+        v.push((std::thread::current().id(), path.to_path_buf()));
+    }
+}
 
 /// Owns a lane's `<out>.mzpeak.tmp` until the archive is renamed into place, and removes it on
 /// every other exit: an `Err` unwinding out of the lane (the guard's `Drop`), or a panic — the
@@ -726,9 +734,7 @@ struct TmpGuard {
 
 impl TmpGuard {
     fn new(path: &Path) -> Self {
-        if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
-            v.push((std::thread::current().id(), path.to_path_buf()));
-        }
+        track_tmp_in_flight(path);
         Self { path: path.to_path_buf() }
     }
 
@@ -987,9 +993,16 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     let verbose = cfg.verbose > 0;
 
     // Inspection report: always when there is no output (the whole job is "inspect"), and also as a
-    // verbose extra during a real conversion.
+    // verbose extra during a real conversion. As an extra it opens no native vendor reader (see
+    // `native_inspect_skip`) and cannot fail the run: its error becomes a `note:` line.
     if verbose || cfg.output.is_none() {
-        report_inspect(&cli.input)?;
+        let skip_native = native_inspect_skip(cfg.output.is_some(), cfg.via_msconvert);
+        if let Err(e) = report_inspect(&cli.input, skip_native) {
+            if cfg.output.is_none() {
+                return Err(e);
+            }
+            println!("note:          inspection failed: {e:#}");
+        }
     }
     let Some(output) = cfg.output.clone() else {
         return Ok(exit::OK); // no --output: nothing written, just the report above
@@ -1568,9 +1581,30 @@ fn dump_im_table(input: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Why the inspection report must leave the native vendor readers closed, or `None` when it may
+/// open one. Only a run whose whole job is the report opens one. Under `-o` the conversion opens
+/// its own: the second open ran the Agilent host over the whole run twice (2.9 GB of temp file each
+/// on a 242 MB Q-TOF `.d`) and booted CoreCLR a second time for SciEX. The `--via-msconvert` lane
+/// never uses the native stack, so a missing one (no `MZPC_PWIZ_DIR`, no .NET 8) must not fail it —
+/// it aborted `-v --via-msconvert` on `.wiff`, `.lcd` and Waters `.raw`. Without `-o` no lane runs,
+/// so `--via-msconvert` (a flag, or a `--config` profile's default) leaves the report the job: it
+/// printed only a note that ProteoWizard reads the file, which nothing did.
+fn native_inspect_skip(output_given: bool, via_msconvert: bool) -> Option<&'static str> {
+    if !output_given {
+        None
+    } else if via_msconvert {
+        Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
+    } else {
+        Some("native reader not opened for this report: the conversion opens it")
+    }
+}
+
 /// Print a human report of what a reader sees (format, spectra, chromatograms) without converting —
-/// the behaviour of a no-output run, and the `-v` extra during a conversion.
-fn report_inspect(input: &Path) -> Result<()> {
+/// the behaviour of a no-output run, and the `-v` extra during a conversion. With `skip_native` set
+/// (see [`native_inspect_skip`]) no vendor library is opened: Thermo's RawFileReader, Bruker's
+/// baf2sql, Agilent MHDAC, SciEX, Waters and Shimadzu. A Windows vendor reader that fails to open
+/// is a `note:` line, never the run's error.
+fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
     // mzPeak archive: mzdata can't open it — report members + spectrum/chromatogram counts instead.
     if filter::is_mzpeak_input(input) {
         return filter::report_inspect(input);
@@ -1584,7 +1618,10 @@ fn report_inspect(input: &Path) -> Result<()> {
     #[cfg(any(windows, target_os = "linux"))]
     if is_baf_dir(input) {
         println!("format:        Bruker BAF (.d)");
-        println!("spectra:       {}", bruker_baf::BafReader::open(input, None)?.len());
+        match skip_native {
+            Some(why) => println!("note:          {why}"),
+            None => println!("spectra:       {}", bruker_baf::BafReader::open(input, None)?.len()),
+        }
         return Ok(());
     }
     if is_agilent_d(input) {
@@ -1593,10 +1630,12 @@ fn report_inspect(input: &Path) -> Result<()> {
         {
             if is_agilent_ims_d(input) {
                 println!("note:          IM-QTOF run (AcqData/IMSFrame.bin): the native lane cannot carry the drift dimension; use --via-msconvert");
+            } else if let Some(why) = skip_native {
+                println!("note:          {why}");
             } else {
                 // Inspecting runs the host over the whole file (16 B/point in a temp file), and an
                 // MRM/SIM-only run is refused by design: report either outcome, never fail the
-                // inspection — `-v` calls this before every conversion, whatever lane was asked for.
+                // inspection.
                 match agilent::AgilentReader::open(input) {
                     Ok(r) => {
                         println!("spectra:       {}", r.len());
@@ -1614,7 +1653,15 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_wiff(input) {
         println!("format:        SciEX .wiff");
         #[cfg(windows)]
-        println!("spectra:       {}", sciex::SciexReader::open(input)?.len());
+        {
+            match skip_native {
+                Some(why) => println!("note:          {why}"),
+                None => match sciex::SciexReader::open(input) {
+                    Ok(r) => println!("spectra:       {}", r.len()),
+                    Err(e) => println!("note:          native reader: {e:#}"),
+                },
+            }
+        }
         #[cfg(not(windows))]
         println!("note:          the native SciEX (Clearcore2) reader runs on Windows only; use --via-msconvert here");
         return Ok(());
@@ -1622,7 +1669,15 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_waters_raw(input) {
         println!("format:        Waters MassLynx .raw");
         #[cfg(windows)]
-        println!("spectra:       {}", waters::WatersReader::open(input)?.len());
+        {
+            match skip_native {
+                Some(why) => println!("note:          {why}"),
+                None => match waters::WatersReader::open(input) {
+                    Ok(r) => println!("spectra:       {}", r.len()),
+                    Err(e) => println!("note:          native reader: {e:#}"),
+                },
+            }
+        }
         #[cfg(not(windows))]
         println!("note:          native Waters reading needs the waters feature on Windows (or use --via-msconvert)");
         return Ok(());
@@ -1630,9 +1685,26 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_lcd(input) {
         println!("format:        Shimadzu LabSolutions .lcd");
         #[cfg(windows)]
-        println!("spectra:       {}", shimadzu::ShimadzuReader::open(input)?.len());
+        {
+            match skip_native {
+                Some(why) => println!("note:          {why}"),
+                None => match shimadzu::ShimadzuReader::open(input) {
+                    Ok(r) => println!("spectra:       {}", r.len()),
+                    Err(e) => println!("note:          native reader: {e:#}"),
+                },
+            }
+        }
         #[cfg(not(windows))]
         println!("note:          native Shimadzu reading is Windows-only (Shimadzu.LabSolutions.IO); or use --via-msconvert");
+        return Ok(());
+    }
+    // mzdata reads a Thermo .raw through Thermo's RawFileReader, an in-process .NET runtime: a vendor
+    // library like the ones above, so it stays closed beside a conversion too. The test is mzdata's
+    // own, made before anything is gunzipped: a plain `.raw` name test let `x.raw.gz` through, and
+    // the report decompressed it and opened RawFileReader on the copy.
+    if let Some(why) = skip_native.filter(|_| mzdata_reads_thermo_raw(input)) {
+        println!("format:        Thermo .raw");
+        println!("note:          {why}");
         return Ok(());
     }
     let _gz = if input.is_file() { gunzip_to_temp(input)? } else { None };
@@ -2031,8 +2103,8 @@ fn convert_to_mzml(
     if is_agilent_d(input) {
         if is_agilent_ims_d(input) {
             bail!(
-                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the drift dimension \
-                 needs the MIDAC lane, which is not available; export this run with --via-msconvert",
+                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the native lane cannot \
+                 carry its drift dimension; export this run with --via-msconvert",
                 input.display()
             );
         }
@@ -3482,18 +3554,15 @@ fn convert_file(
     }
     #[cfg(windows)]
     if is_agilent_d(input) {
-        // Agilent ion-mobility (6560 IM-QTOF) needs the MIDAC SDK to read the drift dimension;
-        // non-IM Agilent uses MHDAC. The file says which it is (`AcqData/IMSFrame.bin`); the MIDAC
-        // probe only says whether that lane can serve it — and today it cannot (the MIDAC glue is
-        // still the in-process design MHDAC-family DLLs cannot run under), so an IM-QTOF `.d` is
-        // refused here rather than flattened through MHDAC without its drift dimension.
+        // Agilent ion-mobility (6560 IM-QTOF) needs the MIDAC SDK to read the drift dimension, and
+        // this converter has no MIDAC reader; non-IM Agilent uses MHDAC. The file says which it is
+        // (`AcqData/IMSFrame.bin`), so an IM-QTOF `.d` is refused here rather than flattened through
+        // MHDAC without its drift dimension. The box harness routes the refusal to msconvert by
+        // matching "is an Agilent IM-QTOF run".
         if is_agilent_ims_d(input) {
-            if agilent_midac::file_has_ims_data(input) {
-                return convert_agilent_midac(input, output, chunk, zstd_level, vendor, synth_chroms);
-            }
             bail!(
-                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the drift dimension \
-                 needs the MIDAC lane, which is not available; convert this run with --via-msconvert",
+                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the native lane cannot \
+                 carry its drift dimension; convert this run with --via-msconvert",
                 input.display()
             );
         }
@@ -5184,6 +5253,15 @@ fn is_thermo_raw(input: &Path) -> bool {
         && input.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("raw"))
 }
 
+/// True when mzdata would read `input` through Thermo's RawFileReader, decided as its `open_path`
+/// decides: the extension, looked up through a `.gz` suffix (`x.raw.gz`), else a Thermo header in
+/// the first 500 bytes, gunzipped when they are gzip. Nothing past those bytes is read; a file that
+/// cannot be read is not Thermo here and fails in its own open.
+fn mzdata_reads_thermo_raw(input: &Path) -> bool {
+    use mzdata::io::{MassSpectrometryFormat, infer_format};
+    input.is_file() && infer_format(input).is_ok_and(|(format, _)| format == MassSpectrometryFormat::ThermoRaw)
+}
+
 /// Build + embed the Thermo `vendor_scan_trailers.parquet` proprietary facet (Track 2). Best-effort:
 /// a trailer-read failure is logged but does not abort the (already-written) conversion.
 fn embed_thermo_trailers(zip: &mut ZipArchiveWriter<fs::File>, input: &Path) -> Result<()> {
@@ -6017,8 +6095,7 @@ fn sciex_grid_spectrum(
 ///
 /// Unlike SciEX/Shimadzu this lane has NO .NET glue in the loop: [`waters::WatersReader`] loads
 /// `MassLynxRaw.dll` directly with `libloading` and calls its C exports. So it needs
-/// `$MZPC_MASSLYNX_DIR` (or `$MZPC_PWIZ_DIR`) at runtime and nothing else — `$MZPC_WATERS_GLUE` and
-/// the `glue/waters/` C# project are not read by any code path here.
+/// `$MZPC_MASSLYNX_DIR` (or `$MZPC_PWIZ_DIR`) at runtime and nothing else.
 #[cfg(windows)]
 fn convert_waters(
     input: &Path,
@@ -6064,22 +6141,6 @@ fn convert_agilent(
     let reader = agilent::AgilentReader::open(input)?;
     let hints = VendorHints { instrument: reader.instrument(), ..Default::default() };
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
-}
-
-/// Convert a native Agilent **IM-MS** `.d` → mzPeak via the MIDAC .NET glue (Windows-runtime-only,
-/// UNTESTED SCAFFOLD). Each IM frame becomes one spectrum with a mean-inverse-reduced-ion-mobility
-/// array; mirrors `convert_agilent` but through `agilent_midac`.
-#[cfg(windows)]
-fn convert_agilent_midac(
-    input: &Path,
-    output: &Path,
-    chunk: Option<ChunkingStrategy>,
-    zstd_level: i32,
-    vendor: Option<&vendor::VendorPolicy>,
-    synth_chroms: bool,
-) -> Result<()> {
-    let reader = agilent_midac::AgilentMidacReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), |i| reader.spectrum(i))
 }
 
 /// Shared writer wiring for a custom (non-mzdata) reader: probe-derived schema + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by
@@ -7086,6 +7147,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The `-v` report opens a native vendor reader only when the report is the whole job: under
+    /// `-o` the conversion opens its own, and the `--via-msconvert` lane must not need the native
+    /// stack. Without `-o` no lane runs, so `--via-msconvert` does not change that.
+    /// (`report_inspect`'s Windows vendor branches follow this decision too.)
+    #[test]
+    fn inspection_opens_a_native_reader_only_when_inspecting_is_the_job() {
+        use super::native_inspect_skip;
+        assert_eq!(native_inspect_skip(false, false), None, "a bare inspection opens it");
+        assert_eq!(native_inspect_skip(false, true), None, "so does one that names a lane it never runs");
+        assert_eq!(
+            native_inspect_skip(true, false),
+            Some("native reader not opened for this report: the conversion opens it")
+        );
+        assert_eq!(
+            native_inspect_skip(true, true),
+            Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
+        );
+    }
+
+    /// The report's Thermo gate asks mzdata what it would open, before anything is gunzipped. A
+    /// plain `.raw` extension test missed `small.RAW.gz`, which the report then decompressed and
+    /// opened through RawFileReader beside the conversion.
+    #[test]
+    fn the_report_knows_a_thermo_run_as_mzdata_does() {
+        use super::mzdata_reads_thermo_raw;
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("mzpc-thermo-infer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/small.RAW")).unwrap();
+        let plain = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let gzip = |name: &str| {
+            let path = dir.join(name);
+            let mut enc = flate2::write::GzEncoder::new(std::fs::File::create(&path).unwrap(), flate2::Compression::default());
+            enc.write_all(&raw).unwrap();
+            enc.finish().unwrap();
+            path
+        };
+        let cases = [
+            (plain("small.RAW", &raw), true),
+            (gzip("small.RAW.gz"), true),
+            (gzip("upper.raw.GZ"), true),
+            (plain("small.dat", &raw), true), // a Thermo header under another name
+            (gzip("small.dat.gz"), true),
+            (plain("tiny.mzML", b"<?xml version=\"1.0\"?><mzML/>"), false),
+            (dir.join("missing.raw"), false),
+        ];
+        let seen: Vec<bool> = cases.iter().map(|(path, _)| mzdata_reads_thermo_raw(path)).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        for ((path, want), got) in cases.iter().zip(seen) {
+            assert_eq!(got, *want, "{}", path.display());
+        }
+    }
+
     /// The installed panic hook removes the panicking thread's in-flight tmp. `mem::forget` keeps
     /// `Drop` out of this test: only the hook can remove the file here. Tests unwind, so this reaches
     /// the hook's `sweep_tmp_in_flight(false)` branch; the abort branch is the next test.
@@ -7102,6 +7221,26 @@ mod tests {
         let r = std::panic::catch_unwind(|| panic!("simulated writer-open failure"));
         assert!(r.is_err());
         assert!(!tmp.exists(), "the panic hook must remove the in-flight tmp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A temp file another process writes (the Agilent host's `.bin` / `.part`) is registered with
+    /// the sweep without a guard: the sweep removes it, and once forgotten it is left alone.
+    #[test]
+    fn tracked_host_temp_files_are_swept_until_forgotten() {
+        use super::{sweep_tmp_in_flight, track_tmp_in_flight, TmpGuard};
+        let dir = std::env::temp_dir().join(format!("mzpc-tracked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("mzpc-agilent-1-0.bin");
+        let part = dir.join("mzpc-agilent-1-0.bin.part");
+        for p in [&bin, &part] {
+            std::fs::write(p, b"host output").unwrap();
+            track_tmp_in_flight(p);
+        }
+        TmpGuard::forget_path(&bin);
+        sweep_tmp_in_flight(false);
+        assert!(!part.exists(), "a tracked host file is removed by the sweep");
+        assert!(bin.exists(), "a forgotten one is left alone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

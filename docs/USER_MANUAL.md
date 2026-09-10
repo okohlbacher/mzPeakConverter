@@ -43,7 +43,10 @@ It is a **single command**: give it an input and, optionally, an output.
 - **Without `--output`** — writes nothing; it just **inspects** the input and prints
   a report (format, spectrum count, chromatogram count).
 
-Passing `-v` prints that same inspection report *and still performs the conversion*.
+Passing `-v` prints that same inspection report *and still performs the conversion*. Beside a
+conversion the report never opens a vendor library — Thermo RawFileReader, Bruker baf2sql, Agilent
+MHDAC, SciEX, Waters or Shimadzu (the conversion opens its own, and `--via-msconvert` needs none) —
+and a report that fails is a `note:` line, not the run's error.
 
 ## 2. Installation & requirements
 
@@ -801,11 +804,11 @@ the requested output missing. Run them without `-o`.
 
 | Variable | Effect |
 |---|---|
-| `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC/MIDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe` (the 3.0.26175 installer is flat; the Agilent host is handed whichever directory holds `MassSpecDataReader.dll`). **Use a current ProteoWizard** (3.0.26151 / 3.0.26175 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
-| `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` (+ `cdt.dll`) for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback. (`MZPC_WATERS_GLUE` is **not read by any code path** — the Waters lane has no .NET glue; the name survives only in a comment) |
+| `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe` (the 3.0.26175 installer is flat; the Agilent host is handed whichever directory holds `MassSpecDataReader.dll`). **Use a current ProteoWizard** (3.0.26151 / 3.0.26175 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
+| `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` (+ `cdt.dll`) for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback. The Waters lane has no .NET glue |
 | `MZPC_AGILENT_GLUE` | Directory holding the built net48 `AgilentGlueHost.exe` (`glue/agilent/bin/Release/net48`); the converter spawns it once per `.d` and reads its `AGL2` output back (§11) |
-| `MZPC_AGILENT_TMPDIR` | Where the Agilent host materialises a run before it is read (16 B/point — about 3 GB for a 240 MB Q-TOF `.d`; removed when the reader closes). Default `%TEMP%`; set it to a disk directory when `TEMP` points at a RAM disk (the box scripts do) |
-| `MZPC_AGILENT_MIDAC_GLUE` | Directory holding the built `AgilentMidacGlue.dll` + runtimeconfig (Agilent ion mobility; the MIDAC lane is a scaffold — an IM-QTOF `.d` is refused by the native lane and goes through `--via-msconvert`) |
+| `MZPC_AGILENT_TMPDIR` | Where the Agilent host materialises a run before it is read (16 B/point — about 3 GB for a 240 MB Q-TOF `.d`; removed when the reader closes, and by the panic hook, but not after a Ctrl+C). Default `%TEMP%`; set it to a disk directory when `TEMP` points at a RAM disk (the box scripts do). A value that is not a directory is warned about, and `%TEMP%` is used |
+| `MZPC_AGILENT_HOST_TIMEOUT` | Seconds the Agilent host may run before the converter kills it and removes its temp file (default `7200`; `0` = no deadline). Killing the converter itself does not end the host: stop `AgilentGlueHost.exe` as well |
 | `MZPC_SCIEX_GLUE` | Directory holding the built `SciexGlue.dll` + runtimeconfig |
 | `MZPC_SHIMADZU_GLUE` | Directory holding the built `ShimadzuGlue.dll` + runtimeconfig |
 
@@ -903,7 +906,7 @@ release archive carries [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 | `--via-msconvert` not found | install ProteoWizard or set `--msconvert-path`/`$MSCONVERT_PATH` |
 | Agilent/SciEX exits with code 3 | no native reader for that format on this platform (macOS/Linux); use `--via-msconvert` |
 | Agilent `.d`: `holds MRM/SIM dwell data only` | the native lane stores scan spectra; MRM/SIM dwells are transition chromatograms — use `--via-msconvert` (the box harness does this on its own) |
-| Agilent `.d`: `is an Agilent IM-QTOF run` | the drift dimension needs the MIDAC lane, which is not available — use `--via-msconvert` |
+| Agilent `.d`: `is an Agilent IM-QTOF run` | the native lane cannot carry the drift dimension (that needs Agilent's MIDAC SDK, which this converter does not read) — use `--via-msconvert` (the box harness does this on its own) |
 | Agilent `.d`: `output is the AGL1 format of an older AgilentGlueHost.exe` | rebuild `glue/agilent` (`dotnet build -c Release`) so the host and the converter agree |
 | Nothing was written | give `-o/--output`; without it the run only inspects |
 | Output exists error | pass `--force` to overwrite |
