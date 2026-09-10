@@ -164,7 +164,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   When a scan has no `MS<n> Isolation Width` trailer, thermorawfilereader's `Lib.cs` builds its window
   from the scan filter's width, halved twice, and inverted when the filter reports a negative width.
   `src/thermo_isolation.rs` writes such windows target-only and declares
-  `thermo:target-only-isolation-window:<n>`. An upstream issue (code path, plus a minimal fix: drop the
+  `thermo:target-only-isolation-window`. An upstream issue (code path, plus a minimal fix: drop the
   second halving, treat a non-positive width as unknown) is drafted but not filed. Once a
   thermorawfilereader release with the fix reaches mzdata, delete the guard and its transformation
   entry. Rebuild `ec04479_qy_4cell_SanJose_A1`, `2013_30_Amrutha_050713_1`, `SZB8102938` and

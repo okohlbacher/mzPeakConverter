@@ -265,7 +265,8 @@ fn transformations_block_pinned() {
     pinned("\"tof-grid:{}ppm\"");
     pinned("\"shimadzu:span-trim\"");
     pinned("\"agilent:drop-zero-samples\"");
-    pinned("\"thermo:target-only-isolation-window:{}\"");
+    // A fixed identifier: how many windows were rewritten goes to the run's warning.
+    pinned("\"thermo:target-only-isolation-window\"");
     pinned("\"agilent:intensity-f32-rounding\"");
     pinned("\"bruker:trace-unit-rescale\"");
     pinned("\"bruker:trace-sort-dedup\"");

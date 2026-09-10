@@ -5492,10 +5492,12 @@ fn convert_ims_compact_sdk(
 /// state and multiplied by the exact factor into one it can — bar into pascal),
 /// `bruker:trace-sort-dedup` (a written Bruker device trace was stored out of time order or with
 /// repeated samples and was put in time order, each exact (time, value) repeat kept once),
-/// `thermo:target-only-isolation-window:<n>` (`n` Thermo precursor windows the reader library
-/// computed without a stated width were written target-only), and the native SciEX glue's counted
-/// value changes `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and
-/// `sciex:truncate-unequal-arrays` (`sciex_run::GlueValueChanges`).
+/// `thermo:target-only-isolation-window` (a Thermo precursor window the reader library computed
+/// without a stated width was written target-only), and the native SciEX glue's counted value
+/// changes `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and
+/// `sciex:truncate-unequal-arrays` (`sciex_run::GlueValueChanges`). An entry names the
+/// transformation and never how often it was applied, which the run's warning says;
+/// `tof-grid:<ppm>ppm` is the one entry with a parameter, the bound its grid was accepted within.
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -5528,11 +5530,10 @@ fn base_transformations(writer: &MzPeakWriterType<fs::File>) -> Vec<String> {
     applied
 }
 
-/// The `thermo:target-only-isolation-window:<n>` entry, when the Thermo guard rewrote any window.
+/// The `thermo:target-only-isolation-window` entry, when the Thermo guard rewrote any window. How
+/// many it rewrote is in the guard's warning ([`thermo_isolation::UnstatedWidthGuard::report`]).
 fn thermo_window_transformation(guard: Option<&thermo_isolation::UnstatedWidthGuard>) -> Option<String> {
-    guard
-        .filter(|g| g.rewritten() > 0)
-        .map(|g| format!("thermo:target-only-isolation-window:{}", g.rewritten()))
+    guard.filter(|g| g.rewritten() > 0).map(|_| "thermo:target-only-isolation-window".to_string())
 }
 
 /// Add one entry to a `transformations` list, once: `sort-by-mz` can come both from the lane's own
