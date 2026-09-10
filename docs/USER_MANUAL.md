@@ -627,10 +627,15 @@ ims-compact archive holds.
 calibration, acquisition databases, …) are **embedded by default** under `vendor/` in the archive —
 gzip-compressed where they compress and declared `proprietary` in the index — so nothing the
 converter does not yet model is lost; the `vendor_files` manifest records every embed and drop. The
-lossless ims-compact lane drops the bulk `*_bin` by default; every other lane keeps everything,
-including the raw signal files (`analysis.baf`, `AcqData/MSProfile.bin`, `_FUNC*.DAT`), which can
-be several times the archive: drop them with `--aux` or embed nothing with `--no-vendor`. Through
-0.11.5 only TDF/TSF directories, `--agilent-grid` and ims-compact embedded anything. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
+lossless ims-compact lane drops the bulk `*_bin` by default; every other lane keeps everything the
+vendor wrote, including the raw signal files (`analysis.baf`, `AcqData/MSProfile.bin`,
+`_FUNC*.DAT`), which can be several times the archive: drop them with `--aux` or embed nothing with
+`--no-vendor`. No default drops them because those lanes do not store everything the files hold: BAF
+reads line arrays unless `--representation profile`, the Agilent MHDAC host reads profile else peak,
+and native Waters leaves chromatogram-type functions out. The one file dropped by default is
+baf2sql's `analysis.sqlite`, the cache the BAF reader itself creates inside the `.d`
+(`--aux 'analysis.sqlite=embed'` keeps it). Through 0.11.5 only TDF/TSF directories,
+`--agilent-grid` and ims-compact embedded anything. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 …) and status log are captured verbatim into dedicated `vendor_scan_trailers`
 (tall + wide) and `vendor_status_log` facets.
 

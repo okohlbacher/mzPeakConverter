@@ -57,7 +57,8 @@ pub struct VendorPolicy {
 
 impl VendorPolicy {
     /// Built-in **preserve-by-default** policy: embed every side-file (gzip compressible types).
-    /// Nothing is dropped by default — dropping is opt-in via `--aux glob=drop` or a YAML policy.
+    /// Nothing the vendor wrote is dropped by default — dropping is opt-in via `--aux glob=drop` or a
+    /// YAML policy.
     /// Rationale: for the LOSSY paths (mzdata f64 m/z, or the Bruker SDK) `analysis.tdf_bin` is the
     /// only exact copy of the signal, so it must be preserved; and SQLite rollback journals can be
     /// needed to recover a DB snapshot. The converter's job is to ADD the mzPeak facets, not to
@@ -67,8 +68,18 @@ impl VendorPolicy {
     /// signal into the Parquet peak facet, so the raw `*_bin` bulk file is fully redundant (it was
     /// ~39% of the archive, a verbatim copy). That path uses [`load_lossless`](Self::load_lossless),
     /// which drops `*_bin` by default. To force-keep it: `--aux 'analysis.tdf_bin=embed'`.
+    ///
+    /// The one default drop is baf2sql's `analysis.sqlite`: the BAF reader has the library
+    /// materialize that cache next to `analysis.baf`, inside the `.d`, when it opens the run
+    /// (`bruker_baf.rs`), so it is this converter's by-product, not a file the vendor wrote. The
+    /// drop is recorded in `vendor_files`; `--aux 'analysis.sqlite=embed'` keeps it.
     pub fn builtin() -> Self {
-        VendorPolicy { rules: vec![Rule { pat: "*".to_string(), action: Action::Embed, gzip: Gzip::Auto }] }
+        VendorPolicy {
+            rules: vec![
+                Rule { pat: "analysis.sqlite".to_string(), action: Action::Drop, gzip: Gzip::Auto },
+                Rule { pat: "*".to_string(), action: Action::Embed, gzip: Gzip::Auto },
+            ],
+        }
     }
 
     /// Load from a YAML file (`rules: [{match, action, gzip}]`), falling back to the built-in
@@ -486,6 +497,19 @@ mod tests {
         assert!(safe_relative_member(Path::new("808.m/Maldi.method")).is_some());
         assert!(safe_relative_member(Path::new("../escape")).is_none());
         assert!(safe_relative_member(Path::new("/abs/path")).is_none());
+    }
+
+    /// Every vendor directory is embedded under one rule, and a BAF `.d` is one since the BAF reader
+    /// writes its baf2sql cache into it: that cache is dropped by default, and only that file.
+    #[test]
+    fn the_baf2sql_cache_is_dropped_unless_asked_for() {
+        for pol in [VendorPolicy::load(None, &[]).unwrap(), VendorPolicy::load_lossless(None, &[]).unwrap()] {
+            assert_eq!(pol.resolve("analysis.sqlite").0, Action::Drop);
+            assert_eq!(pol.resolve("analysis.baf").0, Action::Embed);
+            assert_eq!(pol.resolve("analysis.tdf").0, Action::Embed);
+        }
+        let keep = VendorPolicy::load(None, &["analysis.sqlite=embed".to_string()]).unwrap();
+        assert_eq!(keep.resolve("analysis.sqlite").0, Action::Embed);
     }
 
     #[test]
