@@ -267,6 +267,16 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
+- **Windows CI builds the .NET glues before it runs the tests, and opens a glue again after a
+  reader was dropped, in a process of its own.** `cargo test` ran before `dotnet build`, so no test
+  could load a glue, and no push or pull-request job ever started one: the `-v` double boot that
+  broke every verbose Shimadzu conversion before 0446ea3 shipped with CI green. The new step runs
+  `shimadzu::tests::a_reader_opens_again_after_one_was_dropped` alone, with `MZPC_SHIMADZU_GLUE`
+  set and no vendor DLL: each open boots the glue and then fails in its `Open`, so reaching that
+  error twice proves the second start. It cannot share the `cargo test` process, where another
+  glue or a Thermo boot keeps hostfxr loaded and hides the bug, so it is `#[ignore]`d there, and the
+  step fails if the test did not run. Only CI can execute it. The workflow header no longer claims
+  that native vendor conversion stays out of CI: the manual `sciex-native-zeno` job does it.
 
 ### Removed
 
