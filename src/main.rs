@@ -2071,10 +2071,12 @@ fn convert_to_mzml(
         .with_context(|| format!("opening {}", input.display()))?;
 
     use mzdata::prelude::{ChromatogramSource, MSDataFileMetadata, SpectrumSource, SpectrumWriter};
-    // Collect chromatograms FIRST: iterating the spectra can leave the reader positioned past the
-    // chromatogramList (fatal for a chromatogram-only SRM/MRM file — the mzPeak path samples them
-    // early for the same reason). Then rewind for the spectrum pass.
+    // mzdata reaches chromatograms only by offset through the embedded `<indexList>`, so where the
+    // spectrum pass leaves the reader does not matter. Chromatograms missing here mean that index
+    // was unreadable: a non-indexed mzML, or a rewritten temp copy with stale offsets (the reason
+    // `transcode_to_utf8` rebuilds them).
     let source_chroms: Vec<Chromatogram> = reader.iter_chromatograms().collect();
+    warn_unread_chromatograms(input, &read_path, source_chroms.len());
     let _ = reader.reset();
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
@@ -3477,6 +3479,8 @@ fn convert_file(
     let read_path: &Path = read_path.as_path();
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
+    // Here rather than at the chromatogram write, so the TOF-grid writer below is covered too.
+    warn_unread_chromatograms(input, read_path, reader.count_chromatograms());
 
     // TOF-grid m/z encoding (SCIEX / exact-lattice TOF): if requested, sample spectra and try to fit
     // a per-run integer flight-time grid `sqrt(m/z)=c0+c1·k`. When every sampled point reconstructs
@@ -3739,17 +3743,6 @@ fn convert_file(
     // not written, so a partial conversion can never be mistaken for a complete one.
     assert_source_complete_tmp(input, n, cap, &tmp)?;
 
-    // Say so when the source's chromatograms are unreadable, rather than writing an archive that
-    // quietly lacks them. Synthesis regenerates TIC/BPC from MS1 and so hides the loss of anything
-    // else — SIM/SRM traces are exactly what does not come back.
-    if reader.count_chromatograms() == 0 && is_unindexed_mzml(read_path) {
-        log::warn!(
-            "{} is a non-indexed mzML: its chromatogramList cannot be enumerated by this reader, so \
-             any chromatograms it declares (SIM/SRM traces included) are NOT carried into the \
-             archive. Re-index it (msconvert, or `--via-msconvert`) if you need them.",
-            read_path.display()
-        );
-    }
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
@@ -3965,11 +3958,83 @@ fn gunzip_to_temp(input: &Path) -> Result<Option<GunzipGuard>> {
     Ok(Some(guard))
 }
 
+/// Recompute an `<indexedmzML>`'s byte-offset index after a rewrite changed byte lengths.
+///
+/// The UTF-8 transcode shortens the declaration (`ISO-8859-1` → `UTF-8`) and widens every high byte
+/// to two, so every `<offset>` and the `<indexListOffset>` of the copy point at the wrong byte.
+/// mzdata then fails to read the index, falls back to a scan that finds the spectra, and cannot
+/// enumerate the chromatograms, which it reaches only through the index: they were lost with exit
+/// code 0. Each `<offset idRef="…">` is recomputed from the new position of the `<spectrum` /
+/// `<chromatogram` start tag carrying that id (an id not found keeps its value), and
+/// `<indexListOffset>` from the new position of `<indexList`. `None` for a document with no index:
+/// a plain mzML, or an imzML, whose offsets point into the `.ibd` rather than the XML.
+fn rebuild_mzml_index(doc: &str) -> Option<String> {
+    let list_at = doc
+        .rmatch_indices("<indexList")
+        .map(|(i, _)| i)
+        .find(|&i| !doc[i..].starts_with("<indexListOffset"))?;
+    let mut at = std::collections::HashMap::new();
+    for tag in ["<spectrum", "<chromatogram"] {
+        for (i, _) in doc[..list_at].match_indices(tag) {
+            let rest = &doc[i + tag.len()..list_at];
+            // `<spectrumList` / `<chromatogramList` share the prefix: the element name must end here.
+            if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+                continue;
+            }
+            if let Some(id) = rest.find('>').and_then(|gt| xml_attr(&rest[..gt], "id")) {
+                at.insert(id, i);
+            }
+        }
+    }
+    let mut out = String::with_capacity(doc.len());
+    out.push_str(&doc[..list_at]);
+    let mut rest = &doc[list_at..];
+    while let Some(o) = rest.find("<offset") {
+        let (Some(gt), Some(close)) = (rest[o..].find('>'), rest[o..].find("</offset>")) else { break };
+        let (gt, close) = (o + gt + 1, o + close);
+        out.push_str(&rest[..gt]);
+        match xml_attr(&rest[o..gt], "idRef").and_then(|id| at.get(id)) {
+            Some(pos) => out.push_str(&pos.to_string()),
+            None => out.push_str(&rest[gt..close]),
+        }
+        rest = &rest[close..];
+    }
+    const OPEN: &str = "<indexListOffset>";
+    if let (Some(a), Some(b)) = (rest.find(OPEN), rest.find("</indexListOffset>")) {
+        out.push_str(&rest[..a + OPEN.len()]);
+        out.push_str(&list_at.to_string());
+        rest = &rest[b..];
+    }
+    // ponytail: the checksum hashes the ORIGINAL bytes and mzdata never verifies it, so the reader's
+    // private copy drops it rather than rehashing the whole document.
+    if let (Some(a), Some(b)) = (rest.find("<fileChecksum>"), rest.find("</fileChecksum>")) {
+        out.push_str(&rest[..a]);
+        rest = &rest[b + "</fileChecksum>".len()..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The value of attribute `name` in a start tag's text, as written (entities not expanded).
+fn xml_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    tag.match_indices(name).find_map(|(i, _)| {
+        if !tag[..i].ends_with(|c: char| c.is_ascii_whitespace()) {
+            return None;
+        }
+        let v = tag[i + name.len()..].trim_start().strip_prefix('=')?.trim_start();
+        let q = v.chars().next().filter(|&c| c == '"' || c == '\'')?;
+        let v = &v[1..];
+        v.find(q).map(|end| &v[..end])
+    })
+}
+
 /// If `input` declares a non-UTF-8 XML encoding (ISO-8859-1, latin1, windows-1252, …), transcode it
 /// to UTF-8 in a throwaway temp dir and return a [`TranscodeGuard`] whose `file` is the path to hand
 /// to mzdata. Returns `Ok(None)` (zero overhead) for UTF-8/ASCII inputs or inputs with no XML
-/// declaration. For an imzML, the binary sidecar `<stem>.ibd` is hardlinked (or copied across
-/// filesystems) beside the temp under the SAME basename so mzdata finds it and the UUID matches.
+/// declaration. The transcode changes byte lengths, so an `<indexedmzML>` gets its offset index
+/// rebuilt for the copy ([`rebuild_mzml_index`]). For an imzML, the binary sidecar `<stem>.ibd` is
+/// hardlinked (or copied across filesystems) beside the temp under the SAME basename so mzdata
+/// finds it and the UUID matches.
 fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
     // Sniff only the first chunk — enough for the XML declaration, no full read for the common case.
     let mut f = fs::File::open(input).with_context(|| format!("opening {}", input.display()))?;
@@ -3981,10 +4046,13 @@ fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
     };
     log::info!("input declares {enc} XML encoding; transcoding to UTF-8 for the reader");
 
-    // Read the whole file and transcode. Legacy MS XML files are single-byte charsets.
-    let raw = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    let utf8 = decode_single_byte(&raw, &enc);
-    let utf8 = rewrite_encoding_decl_to_utf8(&utf8);
+    // Read the whole file and transcode. Legacy MS XML files are single-byte charsets. Scoped so the
+    // raw bytes and the pre-rewrite copy are freed before the index rebuild makes one more.
+    let utf8 = {
+        let raw = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+        rewrite_encoding_decl_to_utf8(&decode_single_byte(&raw, &enc))
+    };
+    let utf8 = rebuild_mzml_index(&utf8).unwrap_or(utf8);
 
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("xml");
@@ -4093,14 +4161,74 @@ fn declared_spectrum_count(input: &Path) -> Option<u64> {
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     let n = std::io::Read::read(&mut f, &mut buf).ok()?;
     let head = String::from_utf8_lossy(&buf[..n]);
-    let at = head.find("<spectrumList")?;
-    let rest = &head[at..];
-    let c = rest.find("count=")? + "count=".len();
-    let rest = &rest[c..];
+    count_attr(&head[head.find("<spectrumList")?..])
+}
+
+/// The first `count="N"` in `text`, which starts at a `<…List` start tag.
+fn count_attr(text: &str) -> Option<u64> {
+    let c = text.find("count=")? + "count=".len();
+    let rest = &text[c..];
     let q = rest.chars().next()?;
     let rest = &rest[q.len_utf8()..];
     let end = rest.find(q)?;
     rest[..end].trim().parse().ok()
+}
+
+/// The chromatogram count an mzML declares in `<chromatogramList count="N">`.
+///
+/// The list follows every spectrum, so it is searched for backwards from the end, a chunk at a
+/// time: a read or two for a spectrum-bearing file however large, and the whole file only when the
+/// chromatograms ARE the file. `None` for another format, or when the list is absent or unreadable.
+fn declared_chromatogram_count(path: &Path) -> Option<u64> {
+    use std::io::{Seek, SeekFrom};
+    const NEEDLE: &[u8] = b"<chromatogramList";
+    const CHUNK: u64 = 1 << 20;
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mzML")) {
+        return None;
+    }
+    let mut f = fs::File::open(path).ok()?;
+    let mut end = f.metadata().ok()?.len();
+    let mut buf = Vec::new();
+    loop {
+        let start = end.saturating_sub(CHUNK);
+        buf.resize((end - start) as usize, 0);
+        f.seek(SeekFrom::Start(start)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        if let Some(i) = buf.windows(NEEDLE.len()).rposition(|w| w == NEEDLE) {
+            let mut tag = [0u8; 256];
+            f.seek(SeekFrom::Start(start + i as u64)).ok()?;
+            let n = f.read(&mut tag).ok()?;
+            return count_attr(&String::from_utf8_lossy(&tag[..n]));
+        }
+        if start == 0 {
+            return None;
+        }
+        // Overlap by one byte short of the needle, so a needle the boundary cuts in two is still seen.
+        end = start + NEEDLE.len() as u64 - 1;
+    }
+}
+
+/// Warn when the reader yields fewer chromatograms than the source's `<chromatogramList count>`
+/// declares, rather than writing an output that quietly lacks them. TIC/BPC synthesis hides the loss
+/// of anything else: SIM/SRM traces are exactly what does not come back. mzdata reaches an mzML's
+/// chromatograms only through its embedded offset index, so a non-indexed file yields none, and a
+/// stale index (a rewritten copy whose offsets were not rebuilt) loses them the same way.
+fn warn_unread_chromatograms(input: &Path, read_path: &Path, got: usize) {
+    let Some(declared) = declared_chromatogram_count(read_path) else { return };
+    if got as u64 >= declared {
+        return;
+    }
+    let why = if is_unindexed_mzml(read_path) {
+        "it is a non-indexed mzML, and this reader enumerates chromatograms only through the index"
+    } else {
+        "its offset index does not lead to them"
+    };
+    log::warn!(
+        "{}: the source declares {declared} chromatograms but only {got} could be read ({why}). \
+         The rest, SIM/SRM traces included, are NOT carried into the output, and synthesized \
+         TIC/BPC do not replace them. Re-index it (msconvert, or `--via-msconvert`) if you need them.",
+        input.display()
+    );
 }
 
 /// Work around an mzdata defect: it `panic!`s when a `<referenceableParamGroupRef>` points at an
@@ -6977,6 +7105,28 @@ mod tests {
         // Same bytes under latin1: 0x80 is a C1 control (identity), 0xE9 is é.
         let lat = decode_single_byte(&raw, "iso-8859-1");
         assert_eq!(lat, "\u{0080}\u{00E9}");
+    }
+
+    /// The backward scan for `<chromatogramList count>` reads 1 MiB chunks from the end: a tag the
+    /// chunk boundary cuts in two must still be found, and a list-less file must end the scan.
+    #[test]
+    fn declared_chromatogram_count_across_a_chunk_boundary() {
+        let dir = std::env::temp_dir().join(format!("mzpc-chromcount-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.mzML");
+        let tag = br#"<chromatogramList count="7">"#;
+        // The first chunk starts 1 MiB before the end and the tag starts `k` bytes before that:
+        // 0 = wholly inside the first chunk, 1..=16 = cut in two, 17 = wholly before it.
+        for k in [0usize, 1, 8, 16, 17] {
+            let mut doc = vec![b' '; 100];
+            doc.extend_from_slice(tag);
+            doc.resize(100 + k + (1 << 20), b' ');
+            std::fs::write(&path, &doc).unwrap();
+            assert_eq!(super::declared_chromatogram_count(&path), Some(7), "tag {k} bytes before the boundary");
+        }
+        std::fs::write(&path, vec![b' '; (2 << 20) + 5]).unwrap();
+        assert_eq!(super::declared_chromatogram_count(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);
