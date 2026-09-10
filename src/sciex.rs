@@ -74,6 +74,12 @@
 //!     // the data out and then call `sciex_data_free(handle, mz_ptr, int_ptr)` to release the
 //!     // pins. Both arrays have exactly `*out_len` elements.
 //!
+//! sciex_spectrum_data_v2(handle, index, out_mz_ptr, out_int_ptr, out_len,
+//!                        out_changes: *mut SciexValueChanges) -> i32
+//!     // the same, plus what the glue changed in that spectrum's arrays (NaN intensities set to 0,
+//!     // intensities clamped to ±f32::MAX, points cut from unequal arrays). This binary reads it;
+//!     // `sciex_spectrum_data` stays for older ones.
+//!
 //! sciex_data_free(handle: i64, mz_ptr: *const f64, int_ptr: *const f32)
 //!     // release the pins handed out by the immediately preceding sciex_spectrum_data.
 //!
@@ -198,9 +204,23 @@ const _: () = {
     assert!(offset_of!(SciexSpectrumMetaV2, retention_time_seconds) == offset_of!(SciexSpectrumMeta, retention_time_seconds));
 };
 
+/// What the glue changed in one spectrum's arrays on their way out (`SpectrumDataV2`): intensity
+/// points it mapped from NaN to 0, points it clamped to ±`f32::MAX` (±Inf included), and points it
+/// dropped by cutting the longer of an unequal m/z / intensity pair. Summed per lane in
+/// [`crate::sciex_run::GlueValueChanges`].
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SciexValueChanges {
+    nan_to_zero: i64,
+    clamped_to_f32: i64,
+    truncated_points: i64,
+}
+const _: () = assert!(std::mem::size_of::<SciexValueChanges>() == 24);
+
 /// ABI generation this binary requires from the glue DLL. 1 = the glue before the handshake (no
-/// `SciexAbiVersion` export); 2 = + `SpectrumMetaV2` (precursor facts).
-const REQUIRED_ABI_VERSION: i32 = 2;
+/// `SciexAbiVersion` export); 2 = + `SpectrumMetaV2` (precursor facts); 3 = + `SpectrumDataV2`
+/// (value-change counts).
+const REQUIRED_ABI_VERSION: i32 = 3;
 
 // Function-pointer signatures for the glue's `[UnmanagedCallersOnly]` exports. The
 // `extern "system"` calling convention matches what `UnmanagedCallersOnly` emits and what
@@ -213,6 +233,8 @@ type SciexSpectrumMetaV2Fn = extern "system" fn(i64, i64, *mut SciexSpectrumMeta
 type SciexAbiVersion = extern "system" fn() -> i32;
 type SciexSpectrumData =
     extern "system" fn(i64, i64, *mut *const f64, *mut *const f32, *mut i64) -> i32;
+type SciexSpectrumDataV2 =
+    extern "system" fn(i64, i64, *mut *const f64, *mut *const f32, *mut i64, *mut SciexValueChanges) -> i32;
 type SciexDataFree = extern "system" fn(i64, *const f64, *const f32);
 /// `LastError(buf: *mut u16, cap: i32) -> i32` — fill-buffer diagnostics getter. Copies the
 /// glue's stashed last-error message (UTF-16, NOT NUL-terminated unless room) into `buf` for up
@@ -231,7 +253,7 @@ struct GlueApi {
     close: SciexClose,
     spectrum_count: SciexSpectrumCount,
     spectrum_meta_v2: SciexSpectrumMetaV2Fn,
-    spectrum_data: SciexSpectrumData,
+    spectrum_data_v2: SciexSpectrumDataV2,
     data_free: SciexDataFree,
     last_error: SciexLastError,
     run_info: SciexRunInfoFn,
@@ -356,12 +378,19 @@ impl GlueApi {
                 pdcstr!("SpectrumMetaV2"),
             )
             .map_err(|e| anyhow!("resolving glue export SpectrumMetaV2: {e}"))?;
-        let spectrum_data = *loader
+        // Like `SpectrumMeta`: the V1 export is resolved by name but never called.
+        let _spectrum_data: SciexSpectrumData = *loader
             .get_function_with_unmanaged_callers_only::<SciexSpectrumData>(
                 ty,
                 pdcstr!("SpectrumData"),
             )
             .map_err(|e| anyhow!("resolving glue export SpectrumData: {e}"))?;
+        let spectrum_data_v2 = *loader
+            .get_function_with_unmanaged_callers_only::<SciexSpectrumDataV2>(
+                ty,
+                pdcstr!("SpectrumDataV2"),
+            )
+            .map_err(|e| anyhow!("resolving glue export SpectrumDataV2: {e}"))?;
         let data_free = *loader
             .get_function_with_unmanaged_callers_only::<SciexDataFree>(ty, pdcstr!("DataFree"))
             .map_err(|e| anyhow!("resolving glue export DataFree: {e}"))?;
@@ -382,7 +411,7 @@ impl GlueApi {
             close,
             spectrum_count,
             spectrum_meta_v2,
-            spectrum_data,
+            spectrum_data_v2,
             data_free,
             last_error,
             run_info,
@@ -427,6 +456,9 @@ pub struct SciexReader {
     /// The instrument can fragment only by collision, so a precursor states beam-type CID
     /// ([`crate::sciex_run::collision_only_instrument`]).
     collision_only_instrument: bool,
+    /// The glue's value changes, summed over the spectra read since the last
+    /// [`take_value_changes`](Self::take_value_changes).
+    value_changes: std::cell::Cell<crate::sciex_run::GlueValueChanges>,
     /// The managed handle / runtime is not known to be thread-safe and FFI calls through it
     /// must not happen concurrently. A raw-pointer marker makes [`SciexReader`] neither `Send`
     /// nor `Sync`, so the type system prevents cross-thread sharing. Sound for the existing
@@ -491,6 +523,7 @@ impl SciexReader {
             count,
             selected: None,
             collision_only_instrument: false,
+            value_changes: Default::default(),
             _not_thread_safe: PhantomData,
         };
         let instrument = reader.run_string(1);
@@ -506,6 +539,11 @@ impl SciexReader {
 
     pub fn len(&self) -> usize {
         self.selected.as_ref().map_or(self.count, Vec::len)
+    }
+
+    /// The glue's value changes over the spectra read since the last call; resets them to none.
+    pub fn take_value_changes(&self) -> crate::sciex_run::GlueValueChanges {
+        self.value_changes.take()
     }
 
     /// The glue's flattened index behind reader index `i`.
@@ -664,23 +702,28 @@ impl SciexReader {
         let mut mz_ptr: *const f64 = std::ptr::null();
         let mut int_ptr: *const f32 = std::ptr::null();
         let mut len: i64 = 0;
+        let mut changes = SciexValueChanges::default();
 
-        // SAFETY: all three out-params are valid writable locals. On success the glue writes
-        // two pinned array pointers and a shared length; we own the obligation to call
-        // `data_free` afterwards (done unconditionally below).
-        let rc = (self.api.spectrum_data)(
+        // SAFETY: all four out-params are valid writable locals. On success the glue writes two
+        // pinned array pointers, a shared length and its value-change counts; we own the
+        // obligation to call `data_free` afterwards (done unconditionally below).
+        let rc = (self.api.spectrum_data_v2)(
             self.handle,
             index,
             &mut mz_ptr as *mut _,
             &mut int_ptr as *mut _,
             &mut len as *mut _,
+            &mut changes as *mut _,
         );
         if rc != 0 {
             bail!(
-                "SciEX glue SpectrumData failed for index {i} (rc {rc}): {}",
+                "SciEX glue SpectrumDataV2 failed for index {i} (rc {rc}): {}",
                 self.api.last_error().unwrap_or_default()
             );
         }
+        let mut tally = self.value_changes.get();
+        tally.add(changes.nan_to_zero, changes.clamped_to_f32, changes.truncated_points);
+        self.value_changes.set(tally);
 
         // RAII guard (finding #3): DataFree must run for the pins SpectrumData handed out, even
         // if a panic unwinds through the validation/copy below. A manual call at the end would be

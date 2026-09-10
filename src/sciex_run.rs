@@ -202,9 +202,58 @@ pub fn precursor(f: &PrecursorFacts) -> Option<Precursor> {
     })
 }
 
+/// What the glue changed in spectrum arrays on their way out (`SpectrumDataV2`), summed over the
+/// spectra a lane wrote. Clearcore2 returns intensities as f64 and the glue narrows them to the
+/// schema's f32: NaN becomes 0, a value beyond ±`f32::MAX` (±Inf included) is clamped to it, and an
+/// m/z / intensity pair of unequal length is cut to the shorter one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlueValueChanges {
+    /// Intensity points mapped from NaN to 0.
+    pub nan_to_zero: u64,
+    /// Intensity points clamped to ±`f32::MAX`.
+    pub clamped_to_f32: u64,
+    /// Points dropped by cutting the longer array.
+    pub truncated_points: u64,
+}
+
+impl GlueValueChanges {
+    /// Add one spectrum's counts as the glue reports them; a negative count (a glue bug) adds nothing.
+    pub fn add(&mut self, nan_to_zero: i64, clamped_to_f32: i64, truncated_points: i64) {
+        let count = |v: i64| u64::try_from(v).unwrap_or(0);
+        self.nan_to_zero = self.nan_to_zero.saturating_add(count(nan_to_zero));
+        self.clamped_to_f32 = self.clamped_to_f32.saturating_add(count(clamped_to_f32));
+        self.truncated_points = self.truncated_points.saturating_add(count(truncated_points));
+    }
+
+    /// The `transformations` entries for the kinds of change that happened, in a fixed order.
+    pub fn transformations(&self) -> Vec<String> {
+        [
+            (self.nan_to_zero, "sciex:nan-intensity-to-zero"),
+            (self.clamped_to_f32, "sciex:clamp-intensity-to-f32"),
+            (self.truncated_points, "sciex:truncate-unequal-arrays"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(_, entry)| entry.to_string())
+        .collect()
+    }
+
+    /// The warning both SciEX lanes log when anything changed.
+    pub fn warning(&self) -> Option<String> {
+        (*self != Self::default()).then(|| {
+            format!(
+                "SciEX glue changed values on their way out of Clearcore2: {} NaN intensities set to 0, \
+                 {} intensities clamped to ±f32::MAX, {} points dropped from m/z / intensity arrays of \
+                 unequal length",
+                self.nan_to_zero, self.clamped_to_f32, self.truncated_points
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{collision_only_instrument, precursor, refusal, PrecursorFacts, SciexRunInfo};
+    use super::{collision_only_instrument, precursor, refusal, GlueValueChanges, PrecursorFacts, SciexRunInfo};
     use mzdata::meta::DissociationMethodTerm;
     use mzdata::params::{ParamDescribed, Unit};
     use mzdata::spectrum::IsolationWindowState;
@@ -360,5 +409,32 @@ mod tests {
             .collect();
         assert_eq!(ramp, [("collision energy ramp start", 20.0, true), ("collision energy ramp end", 50.0, true)]);
         assert_eq!(a.params().iter().map(|p| p.accession).collect::<Vec<_>>(), [Some(1002013), Some(1002014)]);
+    }
+
+    /// Only a kind of change that happened is declared, and a spectrum the glue passed through
+    /// untouched declares nothing.
+    #[test]
+    fn only_glue_value_changes_that_happened_are_declared() {
+        let mut changes = GlueValueChanges::default();
+        changes.add(0, 0, 0);
+        assert!(changes.transformations().is_empty(), "untouched spectra declare nothing");
+        assert_eq!(changes.warning(), None);
+        changes.add(2, 0, 0);
+        changes.add(1, 0, -5);
+        assert_eq!(changes.transformations(), ["sciex:nan-intensity-to-zero"], "a negative count adds nothing");
+        changes.add(0, 1, 3);
+        assert_eq!(
+            changes.transformations(),
+            ["sciex:nan-intensity-to-zero", "sciex:clamp-intensity-to-f32", "sciex:truncate-unequal-arrays"]
+        );
+        assert_eq!(changes, GlueValueChanges { nan_to_zero: 3, clamped_to_f32: 1, truncated_points: 3 });
+        assert_eq!(
+            changes.warning().as_deref(),
+            Some(
+                "SciEX glue changed values on their way out of Clearcore2: 3 NaN intensities set to 0, \
+                 1 intensities clamped to ±f32::MAX, 3 points dropped from m/z / intensity arrays of \
+                 unequal length"
+            )
+        );
     }
 }

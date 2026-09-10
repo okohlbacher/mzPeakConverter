@@ -129,6 +129,20 @@ public struct SciexSpectrumMetaV2
 }
 
 /// <summary>
+/// What <c>SpectrumDataV2</c> changed in one spectrum's arrays on their way out: intensity points
+/// mapped from NaN to 0, points clamped to ±float.MaxValue (±Inf included), and points dropped by
+/// cutting an m/z / intensity pair of unequal length to the shorter one. Layout MUST match
+/// <c>SciexValueChanges</c> in src/sciex.rs: 3 × int64 = 24 bytes.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct SciexValueChanges
+{
+    public long NanToZero;
+    public long ClampedToF32;
+    public long TruncatedPoints;
+}
+
+/// <summary>
 /// All managed state for one opened WIFF: the reflected provider/batch plus a flattened index
 /// of every (sample, experiment, cycle) spectrum so Rust can address them by a single i64.
 /// </summary>
@@ -485,23 +499,26 @@ internal sealed class Clearcore2Api
         };
     }
 
-    /// <summary>Fetch the (m/z, intensity) double arrays for one flattened spectrum.</summary>
-    public (double[] mz, double[] intensity) GetData(WiffSession session, SpectrumAddress addr)
+    /// <summary>Fetch the (m/z, intensity) double arrays for one flattened spectrum, and how many
+    /// points were dropped to make their lengths agree.</summary>
+    public (double[] mz, double[] intensity, long truncated) GetData(WiffSession session, SpectrumAddress addr)
     {
         var (_, spectrum) = GetExperimentAndSpectrum(session, addr, fetchSpectrum: true);
         if (spectrum == null)
         {
-            return (Array.Empty<double>(), Array.Empty<double>());
+            return (Array.Empty<double>(), Array.Empty<double>(), 0);
         }
 
         var mz = (double[]?)Invoke(spectrum, "GetActualXValues") ?? Array.Empty<double>();
         var intensity = (double[]?)Invoke(spectrum, "GetActualYValues") ?? Array.Empty<double>();
 
-        // Defensive: clamp to the shorter length so we never read past either array.
+        // Defensive: clamp to the shorter length so we never read past either array. The points cut
+        // off are counted, and the archive declares the cut (`sciex:truncate-unequal-arrays`).
         int n = Math.Min(mz.Length, intensity.Length);
+        long truncated = Math.Abs((long)mz.Length - intensity.Length);
         if (mz.Length != n) { Array.Resize(ref mz, n); }
         if (intensity.Length != n) { Array.Resize(ref intensity, n); }
-        return (mz, intensity);
+        return (mz, intensity, truncated);
     }
 
     private (object experiment, object? spectrum) GetExperimentAndSpectrum(
@@ -743,6 +760,11 @@ public static unsafe class Exports
                 $"SciexSpectrumMetaV2 marshals to {Marshal.SizeOf<SciexSpectrumMetaV2>()} bytes; src/sciex.rs expects 72. " +
                 "Field order/types drifted — fix both sides in lockstep.");
         }
+        if (Marshal.SizeOf<SciexValueChanges>() != 24)
+        {
+            throw new InvalidOperationException(
+                $"SciexValueChanges marshals to {Marshal.SizeOf<SciexValueChanges>()} bytes; src/sciex.rs expects 24.");
+        }
         foreach (var name in new[] { "Sample", "Experiment", "Cycle", "MsLevel", "Polarity", "SignalContinuity", "RetentionTimeSeconds" })
         {
             var v1 = Marshal.OffsetOf<SciexSpectrumMeta>(name);
@@ -909,6 +931,7 @@ public static unsafe class Exports
 
     // ---- spectrum data (pointer + len + free) ----
 
+    // The V1 export, kept so a binary that predates the handshake still works; it reports no counts.
     [UnmanagedCallersOnly(EntryPoint = "SpectrumData")]
     public static int SpectrumData(
         long handle,
@@ -916,6 +939,37 @@ public static unsafe class Exports
         double** outMzPtr,
         float** outIntPtr,
         long* outLen)
+    {
+        return FillData(handle, index, outMzPtr, outIntPtr, outLen, null);
+    }
+
+    // SpectrumData plus what the glue changed in the arrays (SciexValueChanges), so the archive can
+    // declare it.
+    [UnmanagedCallersOnly(EntryPoint = "SpectrumDataV2")]
+    public static int SpectrumDataV2(
+        long handle,
+        long index,
+        double** outMzPtr,
+        float** outIntPtr,
+        long* outLen,
+        SciexValueChanges* outChanges)
+    {
+        if (outChanges == null)
+        {
+            return 1;
+        }
+        return FillData(handle, index, outMzPtr, outIntPtr, outLen, outChanges);
+    }
+
+    // Shared by SpectrumData and SpectrumDataV2: an [UnmanagedCallersOnly] method cannot be called from
+    // managed code. outChanges is null for the V1 export.
+    private static int FillData(
+        long handle,
+        long index,
+        double** outMzPtr,
+        float** outIntPtr,
+        long* outLen,
+        SciexValueChanges* outChanges)
     {
         // Track pins locally so we can free them if anything throws after allocation but before
         // ownership is transferred to _pins. See findings #1 and #2.
@@ -931,6 +985,10 @@ public static unsafe class Exports
             *outMzPtr = null;
             *outIntPtr = null;
             *outLen = 0;
+            if (outChanges != null)
+            {
+                *outChanges = default;
+            }
 
             var session = Get(handle);
             if (session == null)
@@ -944,11 +1002,16 @@ public static unsafe class Exports
 
             var addr = session.Index[(int)index];
             var api = ApiOrThrow();
-            var (mz, intensityDouble) = api.GetData(session, addr);
+            var (mz, intensityDouble, truncated) = api.GetData(session, addr);
             int n = mz.Length;
+            var changes = new SciexValueChanges { TruncatedPoints = truncated };
 
             if (n == 0)
             {
+                if (outChanges != null)
+                {
+                    *outChanges = changes;
+                }
                 return 0; // empty spectrum: null pointers, zero length
             }
 
@@ -956,7 +1019,7 @@ public static unsafe class Exports
             // here so the pinned buffer we expose is already f32 (matches the Rust ABI type).
             // Guard non-finite / out-of-f32-range values so a corrupt double can't become a NaN
             // or Inf in the output stream: clamp magnitudes beyond float.MaxValue and map any
-            // NaN to 0. See finding #6.
+            // NaN to 0. See finding #6. Each such change is counted so the archive can declare it.
             var intensity = new float[n];
             for (int i = 0; i < n; i++)
             {
@@ -964,14 +1027,17 @@ public static unsafe class Exports
                 if (double.IsNaN(v))
                 {
                     intensity[i] = 0f;
+                    changes.NanToZero++;
                 }
                 else if (v > float.MaxValue)
                 {
                     intensity[i] = float.MaxValue;
+                    changes.ClampedToF32++;
                 }
                 else if (v < -float.MaxValue)
                 {
                     intensity[i] = -float.MaxValue;
+                    changes.ClampedToF32++;
                 }
                 else
                 {
@@ -993,6 +1059,10 @@ public static unsafe class Exports
             }
             ownershipTransferred = true;
 
+            if (outChanges != null)
+            {
+                *outChanges = changes;
+            }
             *outMzPtr = (double*)mzAddr;
             *outIntPtr = (float*)intAddr;
             *outLen = n;
@@ -1055,7 +1125,7 @@ public static unsafe class Exports
     /// and each side asserts only its own struct sizes. A layout change therefore gets a new versioned
     /// entry point and a bump here, never a wider struct behind an old name.</summary>
     [UnmanagedCallersOnly(EntryPoint = "SciexAbiVersion")]
-    public static int SciexAbiVersion() => 2;   // 2: + SpectrumMetaV2 (precursor facts); 1: no handshake
+    public static int SciexAbiVersion() => 3;   // 3: + SpectrumDataV2 (value changes); 2: + SpectrumMetaV2; 1: no handshake
 
     /// <summary>
     /// Run-level counts: [sampleCount, unreadableSamples, dwellExperiments, scanExperiments,
