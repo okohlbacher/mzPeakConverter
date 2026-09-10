@@ -58,8 +58,9 @@ ProteoWizard with `--via-msconvert` (all platforms).
   one-point "MS2 spectrum" per dwell (27,674 of them for MTBLS243) while the data are the 113
   transition chromatograms the msconvert lane writes; the guard reads MHDAC's `ScanTypes`, so
   the corpus harness falls back to msconvert for those units. Not carried yet: precursor
-  metadata for MS2 scans, MRM chromatograms (by design), the flight-time grid (`--tof-grid` is
-  not applied on this lane; m/z is the f64 MHDAC returns, numpress-chunked by default).
+  metadata for MS2 scans (the lane warns once per run when it writes MS2 rows without one), MRM
+  chromatograms (by design), the flight-time grid (`--tof-grid` is not applied on this lane; m/z
+  is the f64 MHDAC returns, numpress-chunked by default).
   Cost model: the host materialises the whole run into a temp file at 16 B/point before the
   first spectrum is read (~3 GB for the 242 MB Q-TOF run), removed on close.
 

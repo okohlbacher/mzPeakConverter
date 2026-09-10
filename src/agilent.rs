@@ -51,7 +51,8 @@
 //! data. The lane refuses those, so the corpus harness falls back to `--via-msconvert`.
 //!
 //! ## Scope
-//! Non-IM MS only (profile or centroid, MS1/MS2). Agilent ion-mobility (6560 IM-QTOF) needs the
+//! Non-IM MS only (profile or centroid, MS1/MS2; MS2 rows carry no precursor yet, which the reader
+//! says once per run). Agilent ion-mobility (6560 IM-QTOF) needs the
 //! separate **MIDAC** SDK — out of scope here (TODO in [`AgilentReader::spectrum`]).
 
 use std::cell::RefCell;
@@ -299,6 +300,20 @@ impl AgilentReader {
             SignalContinuity::Profile
         };
         let ms_level = if meta.ms_level >= 1 { meta.ms_level as u8 } else { 1 };
+        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
+        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
+        // otherwise indistinguishable from a complete one. The AGL2 protocol (`crate::agl`) has no
+        // precursor field; the host does not marshal MHDAC's per-scan precursor yet.
+        if ms_level > 1 {
+            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+            PRECURSOR_GAP_SAID.call_once(|| {
+                log::warn!(
+                    "Agilent native (MHDAC): this reader does not yet extract precursors; \
+                     MS2 rows will have none (no selected ion, isolation window or collision energy \
+                     in the archive)"
+                );
+            });
+        }
 
         let mut descr = SpectrumDescription {
             id: format!("scanId={}", meta.scan_id),
