@@ -47,6 +47,47 @@ pub struct RecordHeader {
     pub n_points: u64,
 }
 
+/// What a successful host reported rewriting, read back from the `[count key=value]` tags on its
+/// stderr notes (`Glue.cs`). A host built before the tags existed reports nothing here; its notes
+/// are still logged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostCounts {
+    /// Intensities MHDAC returned as NaN or ±Inf, stored as 0.
+    pub nonfinite_intensities: u64,
+    /// Spectra whose m/z and intensity arrays differed in length and were cut to the shorter.
+    pub truncated_spectra: u64,
+}
+
+impl HostCounts {
+    /// The `transformations` entries, each only when its count is above zero.
+    pub fn transformations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.nonfinite_intensities > 0 {
+            out.push("agilent:nonfinite-intensity-to-zero".to_string());
+        }
+        if self.truncated_spectra > 0 {
+            out.push("agilent:truncate-unequal-arrays".to_string());
+        }
+        out
+    }
+}
+
+/// The [`HostCounts`] in a host's stderr. Lines without a tag, and unknown keys, are ignored.
+pub fn host_counts(stderr: &str) -> HostCounts {
+    let mut counts = HostCounts::default();
+    for line in stderr.lines() {
+        let Some((_, tag)) = line.rsplit_once("[count ") else { continue };
+        let Some((key, value)) = tag.trim_end().trim_end_matches(']').split_once('=') else { continue };
+        let Ok(n) = value.trim().parse::<u64>() else { continue };
+        match key.trim() {
+            "nonfinite_intensities" => counts.nonfinite_intensities += n,
+            "truncated_spectra" => counts.truncated_spectra += n,
+            _ => {}
+        }
+    }
+    counts
+}
+
 fn read_u32(f: &mut impl Read) -> Result<u32> {
     let mut b = [0u8; 4];
     f.read_exact(&mut b)?;
@@ -305,5 +346,27 @@ mod tests {
         assert!(cs.contains("bw.Write((ulong)n);"), "nPoints u64 after the header");
         assert_eq!(RECORD_HEADER_BYTES, 8 + 4 * 4 + 8);
         assert!(cs.contains("bw.Write((uint)b.Length);"), "strings are len u32 + UTF-8, not BinaryWriter's 7-bit prefix");
+    }
+}
+
+#[cfg(test)]
+mod host_counts_tests {
+    use super::*;
+
+    #[test]
+    fn host_counts_read_the_bracketed_tags() {
+        let stderr = [
+            "AgilentGlueHost: 3 intensity value(s) were NaN/Inf and were stored as 0 [count nonfinite_intensities=3]",
+            "AgilentGlueHost: 2 spectrum/spectra had m/z and intensity arrays of different lengths and were cut to the shorter (5 point(s) dropped) [count truncated_spectra=2]",
+            "an unrelated line",
+        ]
+        .join("\r\n");
+        let c = host_counts(&stderr);
+        assert_eq!(c, HostCounts { nonfinite_intensities: 3, truncated_spectra: 2 });
+        assert_eq!(c.transformations(), ["agilent:nonfinite-intensity-to-zero", "agilent:truncate-unequal-arrays"]);
+        // A host from before the tags: its note is logged, but nothing is counted or declared.
+        let old = host_counts("AgilentGlueHost: 3 intensity value(s) were NaN/Inf and were stored as 0");
+        assert_eq!(old, HostCounts::default());
+        assert!(old.transformations().is_empty());
     }
 }

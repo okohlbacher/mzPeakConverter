@@ -230,6 +230,26 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `baf_properties_state_the_series_their_family_code_names` and
   `baf_directory_members_are_digested_in_the_archive`. The `Properties` read runs only where
   baf2sql exists (Windows, Linux) and is unverified against a real cache; CI compiles it.
+- **Every transformation row 23 of the review found undeclared is now declared when it happens,
+  from a count.** `--ims-chunked` sorts each frame's points by TOF across mobility scans and now
+  declares `sort-by-mz` from the native reader's count of frames that sort changed; USER_MANUAL §8
+  had called it undeclared "on purpose", against the owner's no-silent-reorder decision.
+  `--bruker-sdk` re-sorts each mobility-major TDF frame by m/z and declares it from the reader's
+  counter, read over the written spectra only (`reader_reorder_counter_counts_written_spectra_only`).
+  `--agilent-grid` declares `agilent:drop-zero-samples` only when its reader dropped a zero sample or
+  an all-zero scan, declares a new `agilent:intensity-f32-rounding` when a count above 2^24 was rounded
+  into Float32 (logged only until now), and marks the archive `partial` when `MSProfile.bin` ends
+  before its scan records (`agilent_grid_declares_what_its_reader_counted`). The Agilent MHDAC host
+  counts spectra whose m/z and intensity arrays it cut to one length, reports both that and its
+  NaN/Inf count in a `[count key=value]` tag, and the lane declares `agilent:truncate-unequal-arrays`
+  and `agilent:nonfinite-intensity-to-zero` (`agl::host_counts`, pinned on host). The native Waters
+  lane writes a `waters_functions` block on every run (the skipped, SONAR and collapsed functions and
+  the lock mass lived only in `waters_drift`, which a run without drift bins never gets), declares
+  `waters:drop-functions` and `waters:sonar-summed`, and reads `MZPC_WATERS_KEEP_COLLAPSED` once
+  through `env_flag`: with `=0` it used to skip the collapsed functions while reporting them written.
+  A Shimadzu run under `MZPC_SHIMADZU_COARSE_MZ=1` names the coarse `Mass` field in
+  `mz_calibration.source`. The Agilent MHDAC, Waters, Shimadzu and `--bruker-sdk` lanes are
+  Windows/Linux-only: their decision logic is host-tested, their wiring compiles on CI only.
 
 ### Changed
 

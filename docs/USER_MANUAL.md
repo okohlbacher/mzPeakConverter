@@ -425,7 +425,10 @@ sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1
 shape of ProteoWizard's `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane —
 with the frame's drift-time bounds (MS:1003439/1003440), `sort-by-mz` in `transformations`, and a
 `waters_drift` index block holding the run's bin → ms table, the vendor's `mob_cal.csv` CCS
-calibration verbatim, the lock-mass function and the functions not written as spectra. Frames keep
+calibration verbatim, the lock-mass function and the functions not written as spectra. Every Waters
+archive, with drift bins or without, also carries a `waters_functions` block: each function's type,
+MS level, drift bins and SONAR flag, the functions skipped with their reason, the collapsed
+functions with whether they were written, and the lock-mass function. Frames keep
 every point MassLynx returns: the writer's zero-run mask is off for them (`zero-run-mask` is absent
 from `transformations`), because a run of zeros in an interleaved frame is several bins' trace
 boundaries meeting. ProteoWizard's default instead writes one spectrum per drift bin (Capan2:
@@ -599,18 +602,21 @@ whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 |---|---|---|
 | `zero-run-mask` | the writer's zero-intensity run compaction shortened at least one profile spectrum (item 2) | every lane whose writer masks (not native Waters frames) |
 | `numpress-linear` | at least one m/z chunk is stored with the lossy codec (item 1) | chunked layout without `--no-numpress` |
-| `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, native Waters frames, and any lane whose reader hands over an unsorted spectrum |
+| `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, `--ims-chunked` (each frame by TOF across mobility scans; mobility is stored per point), `--bruker-sdk` TDF (the SDK hands over mobility-major frames), native Waters frames, and any lane whose reader hands over an unsorted spectrum |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `shimadzu:span-trim` | the profile sqrt-grid route stored the signal span only (item 4) | native Shimadzu `.lcd` profile |
-| `agilent:drop-zero-samples` | the profile grid lane stored a sparse point list, dropping zero-intensity samples and all-zero scans | `--agilent-grid` |
+| `agilent:drop-zero-samples` | the profile grid lane left at least one zero-intensity sample, or an all-zero scan, out of its sparse point lists | `--agilent-grid` |
+| `agilent:intensity-f32-rounding` | an integer count above 2^24 was rounded into the Float32 intensity column | `--agilent-grid` |
+| `agilent:nonfinite-intensity-to-zero` | MHDAC returned a NaN or ±Inf intensity, stored as 0 (counted by the net48 host) | native Agilent (MHDAC) |
+| `agilent:truncate-unequal-arrays` | a spectrum's m/z and intensity arrays differed in length and were cut to the shorter (counted by the net48 host) | native Agilent (MHDAC) |
+| `waters:drop-functions` | a MassLynx function was not written as spectra: chromatogram-type (SIR/MRM/NL/NG), not MS (DAD, delay, …), or a collapsed retention-time summary not kept by `MZPC_WATERS_KEEP_COLLAPSED` | native Waters `.raw` |
+| `waters:sonar-summed` | a SONAR function's quadrupole bins were summed into one scan | native Waters `.raw` |
 
-Not declared today, on purpose and worth knowing: the `--ims-chunked` ims-compact layout sorts each
-frame by TOF before chunking, which re-orders points across scans (an entry of the `sort-by-mz`
-class; tracked in `BACKLOG.md`). Beside `transformations`, other index keys let a reader audit an
-archive offline: `metadata.conversion_route` says which timsTOF route built it (`ims-compact` read by
+Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built it (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
 decompress a frame; the recorded command line is the same on both routes), `metadata.partial` marks
-a run truncated by `MZPC_MAX_SPECTRA` (§10), and
+a run truncated by `MZPC_MAX_SPECTRA` (§10) or an `--agilent-grid` run whose `MSProfile.bin` ends
+before its scan records (`cause` says which), and
 `ims_calibration.chord_source` (`global_metadata` on the native timsrust lane, `sdk_tims_index_to_mz`
 under `--bruker-sdk`) says which of the two (a, b) chords — measured 4.28 ppm apart on 2485.d — an
 ims-compact archive holds.
@@ -803,7 +809,8 @@ instead.
 | Variable | Effect | Recorded in the archive? |
 |---|---|---|
 | `MZPC_NO_MZ_LATTICE=1` | Same as `--no-mz-lattice` (§9): store f64 `mz` instead of the fixed-point lattice, on every lane (`env_flag` spellings) | implicitly — the peaks facet has an `mz` column and no `mz_calibration` block |
-| `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | no — `mz_calibration.source` is the same string either way (open item) |
+| `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | yes — `mz_calibration.source` names `Mass (Int32, 1e-4 Da)` instead of `MassHigh (Int64, 1e-9 Da)`; the glue's own automatic fallbacks to `Mass` are not recorded yet |
+| `MZPC_WATERS_KEEP_COLLAPSED` | Native Waters lane: write MassLynx's collapsed retention-time functions (run-summed mobilograms) as spectra instead of leaving them out. On/off lever read through the common rule (empty, `0`, `false`, `no` are off) | yes — `collapsed_functions[].written` in `waters_functions` (and `waters_drift`), and `waters:drop-functions` when they were left out |
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |
 | `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`) | the fitted `{c0,c1}` is stored; the fact that `c1` was forced is not |
