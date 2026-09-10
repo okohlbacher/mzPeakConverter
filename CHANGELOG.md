@@ -87,6 +87,20 @@ All notable changes to this project are documented here. The format follows
   Windows jobs now share one cache, which only the `windows` job saves.
 - README: run the suite with `cargo test --release`, as CI does; the vendored writer's
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
+- **The Thermo `.raw` lane is tested.** Nothing exercised it before, although CI installs
+  .NET 8 for this reader. The untested parts were the `vendor_scan_trailers`,
+  `vendor_status_log` and `vendor_scan_trailers_wide` facets (`src/thermo_trailers.rs`,
+  `src/thermo_status.rs`), their embedding, and the Thermo-only `DOTNET_ROLL_FORWARD`
+  default (0.9.12). `tests/thermo_raw.rs` converts `tests/data/small.RAW` with the built
+  binary, runs by default and needs no corpus. The file is mzdata's 48-spectrum LTQ FT run
+  (Apache-2.0, 1.5 MB; provenance in `tests/fixtures/README.md`). `DOTNET_ROLL_FORWARD` is
+  removed from the child's environment. The test asserts 48 spectra, trailer ordinals 0–47,
+  a non-empty status log and one wide-trailer row per spectrum. On a host without .NET 8
+  the conversion depends on that default: with `DOTNET_ROLL_FORWARD=Disable` it fails with
+  "It was not possible to find a compatible framework version". With .NET 8 installed, as
+  on CI, that part passes either way.
+  `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
+  column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
 
 ## [0.11.5] — 2026-09-09
 

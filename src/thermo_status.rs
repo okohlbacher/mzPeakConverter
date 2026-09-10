@@ -234,3 +234,19 @@ pub fn build_trailer_wide_facet(handle: &RawFileReader) -> Result<Option<Vec<u8>
         "creating vendor_scan_trailers_wide writer",
     )?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_label_collapses_runs_and_trims() {
+        assert_eq!(sanitize_label("Ion Injection Time (ms):"), "Ion_Injection_Time_ms");
+        assert_eq!(sanitize_label("FAIMS CV"), "FAIMS_CV");
+        assert_eq!(sanitize_label("Monoisotopic M/Z:"), "Monoisotopic_M_Z");
+        assert_eq!(sanitize_label("::"), "col");
+        assert_eq!(sanitize_label(""), "col");
+        // Non-ASCII is not alphanumeric here: the column name stays plain ASCII.
+        assert_eq!(sanitize_label("Temp °C"), "Temp_C");
+    }
+}
