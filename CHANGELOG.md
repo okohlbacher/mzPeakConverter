@@ -205,13 +205,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 - **An unzoned Bruker or Agilent acquisition time reaches the `acquisition_time` index block.**
   `fixup_run_metadata` reads what a Bruker `.d` (`GlobalMetadata`) or Agilent `.d` (`AcqData`)
   states for every lane that does not pass it through its own hints: ims-compact, the mzdata lane
-  (with its TDF fallback and `--via-msconvert`), `--tof-grid`, `--agilent-grid`, and the TSF, BAF,
+  (with its TDF fallback), `--tof-grid`, `--agilent-grid`, and the TSF, BAF,
   `--bruker-sdk` and MHDAC vendor-reader lanes. It discarded the block `run_metadata::apply` returns
   for a clock without an offset, while the log said the clock was recorded, so such an archive had a
   null `run.start_time` and no block. The fixup now returns the block and each of those lanes writes
   it; an mzML export, whose run model holds only a zoned `start_time`, names the dropped clock in a
   warning.
-  No corpus archive is affected: every Bruker and Agilent clock in it states an offset. Pinned by
+  `--via-msconvert` is not among them: its fixup sees the intermediate mzML, whose run start is
+  ProteoWizard's. No corpus archive is affected: every Bruker and Agilent clock in it states an
+  offset. Pinned by
   `unzoned_vendor_directory_clock_reaches_the_index` on a synthetic TSF `.d` through the
   vendor-reader lane. USER_MANUAL §8 now tells readers to fall back to
   `acquisition_time.wall_clock` when `run.start_time` is null.
