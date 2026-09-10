@@ -2867,10 +2867,12 @@ where
 /// integer `tof_index` (Int32) column, with the per-run `{c0,c1}` grid stored in the index
 /// `tof_calibration` block. Readers reconstruct `m/z = (c0 + c1·tof_index)²`. The integer column is
 /// named `tof_index` so the vendored writer applies DELTA_BINARY_PACKED automatically. Mirrors
-/// `convert_ims_compact_archive`'s custom-peak-schema mechanism, but for the mzML path.
+/// `convert_ims_compact_archive`'s custom-peak-schema mechanism, but for the mzML path. `read_path`
+/// is the file `reader` was opened from, which differs from `input` for a gzipped source.
 #[allow(clippy::too_many_arguments)]
 fn convert_file_tof_grid(
     input: &Path,
+    read_path: &Path,
     output: &Path,
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
@@ -2918,7 +2920,7 @@ fn convert_file_tof_grid(
     let mut n_gridded = 0usize;
     let mut n_f64 = 0usize;
     let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
-        .then(|| thermo_isolation::UnstatedWidthGuard::open(input));
+        .then(|| thermo_isolation::UnstatedWidthGuard::open(read_path));
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
@@ -3940,7 +3942,7 @@ fn convert_file(
                 // PER-SPECTRUM routing: off-grid spectra (MS2 / sparse / off-lattice) are stored as
                 // exact f64 m/z in the `spectra_data` facet, while griddable spectra use `tof_index`.
                 // There is no longer a whole-run fallback — a single archive holds both facets.
-                return convert_file_tof_grid(input, output, zstd_level, vendor, synth_chroms, reader, fit.grid, images, sdrf);
+                return convert_file_tof_grid(input, read_path, output, zstd_level, vendor, synth_chroms, reader, fit.grid, images, sdrf);
             }
             None => {
                 if tof_grid == TofGridMode::On {
