@@ -128,6 +128,23 @@ fn quoted_mzpc_names(dir: &Path, names: &mut BTreeSet<String>) {
     }
 }
 
+/// Each `MZPC_…` variable has one row in §10's tables. Two streams each documented
+/// `MZPC_WATERS_KEEP_COLLAPSED`, and the older row, which the other test cannot tell from the right
+/// one, told users that `=0` keeps the collapsed functions.
+#[test]
+fn every_variable_has_one_row_in_section_10() {
+    let section = manual_section(10);
+    let mut seen = BTreeSet::new();
+    let twice: Vec<String> = section
+        .lines()
+        .filter_map(|l| l.strip_prefix("| `"))
+        .map(|cell| cell.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect::<String>())
+        .filter(|name| name.starts_with("MZPC_") && !seen.insert(name.clone()))
+        .collect();
+    assert!(seen.contains("MZPC_PWIZ_DIR"), "no variable rows parsed from USER_MANUAL.md §10");
+    assert!(twice.is_empty(), "variables with more than one row in USER_MANUAL.md §10: {twice:?}");
+}
+
 #[test]
 fn every_quoted_mzpc_variable_is_in_section_10() {
     let mut names = BTreeSet::new();

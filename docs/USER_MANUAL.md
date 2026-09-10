@@ -864,14 +864,16 @@ prefer the equivalent CLI flag where one exists, so the run is reproducible from
 where an archive can tell, the row says which index key records it) and **performance /
 diagnostic** (they tune or trace, and the dump levers replace the conversion).
 
-**How a boolean lever is read (since 0.9.13).** Every on/off `MZPC_*` lever in `src/` except the two Waters
-ones goes through one `env_flag()` in `src/main.rs`: **unset** → the built-in default; set to the empty string,
+**How a boolean lever is read (since 0.9.13).** Every on/off `MZPC_*` lever in `src/` goes through
+one `env_flag()` in `src/main.rs`, `MZPC_WATERS_KEEP_COLLAPSED` included: **unset** → the built-in
+default; set to the empty string,
 `0`, `false` or `no` (any case) → **off**; anything else → **on**. So `MZPC_DUMP_IM_TABLE=` (empty)
 is off, and `MZPC_BYTE_PLANE_INTENSITY=` (empty) is the same opt-out as `=0`. Before 0.9.13 each site
 spelt its own rule: the two dump levers fired on mere presence and an empty
 `MZPC_BYTE_PLANE_INTENSITY` silently switched the ims-compact intensity column to Float32. The two
 levers read by the vendored writer (`MZPC_PARALLEL_ENCODE`, `MZPC_TIMING`), the two read by the
-Shimadzu glue and the two Waters levers keep their own spellings, noted in their rows. Numeric levers ignore a value
+Shimadzu glue and `MZPC_WATERS_PROBE_QUAD`, a level rather than a switch, keep their own spellings,
+noted in their rows. Numeric levers ignore a value
 that does not parse (they fall back to the default) — except `MZPC_SHIMADZU_PROBE`, where a
 non-numeric value is an error.
 
@@ -904,7 +906,6 @@ instead.
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |
 | `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`) | the fitted `{c0,c1}` is stored; the fact that `c1` was forced is not |
-| `MZPC_WATERS_KEEP_COLLAPSED=1` | Waters `.raw` (Windows): also write the "collapsed retention time" functions MassLynx appends (one row per drift bin, the run's summed mobilograms), which are otherwise not written as spectra (§8). Its own rule: any value but empty or `0` keeps them (`false` and `no` too) | yes — `waters_drift.collapsed_functions` lists those functions; its `written` flag, however, says `true` whenever the variable is set, `=0` included |
 | `MZPC_MAX_SPECTRA=<n>` | Stop after `n` spectra. **Deliberately truncating**: it also disables the "all source spectra written" completeness check, so the archive is a partial one that exits 0. Diagnostics only; the WARN stays | yes — every mzPeak lane that honours the cap writes `metadata.partial` = `{partial: true, max_spectra, source_declared, spectra_written, cause: "MZPC_MAX_SPECTRA"}` when the cap bit (0.9.13); a cap larger than the file writes no marker |
 
 **Performance / diagnostic.** No effect on the values written (bytes only where noted); zero cost

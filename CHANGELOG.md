@@ -536,7 +536,7 @@ keep their bytes.
   warning silence. §10 lacked
   `MZPC_WATERS_KEEP_COLLAPSED`, `MZPC_WATERS_PROBE_QUAD` and `TIMSDATA_LIB_DIR`, claimed a variable
   count that no longer held, and said every boolean lever goes through `env_flag()`, which the
-  Waters ones do not. Drifted line-number citations now name functions, and §8 names the test and
+  Waters probe lever does not. Drifted line-number citations now name functions, and §8 names the test and
   fixture that already check the `C2 = 0` calibration pair against the vendor SDK, instead of a
   test and fixture that never existed. README and the manual gain the native Waters `.raw` row,
   and README says the test suite needs a .NET 8+ runtime. `docs/PLATFORM_SUPPORT.md` no longer
