@@ -1242,10 +1242,9 @@ impl<
             let s = self.spectrum_metadata_buffer.finish_scan();
             self.write_struct_arrays(s)?;
             self.append_metadata();
-            self.append_key_value_metadata(
-                SPECTRUM_COUNT.into(),
-                Some(self.spectrum_counter().to_string()),
-            );
+            // The secondaries carry no entity count (issue #1, decision D2): neither their rows nor
+            // their parents is a count a reader can plan from, and the run total stamped here sat on
+            // facets with no rows at all, such as an MS1-only run's precursors.
             writer = self.archive_writer.take().unwrap().into_inner()?;
 
             // ----------------------------------------------
@@ -1267,10 +1266,6 @@ impl<
             let s = self.spectrum_metadata_buffer.finish_precursor();
             self.write_struct_arrays(s)?;
             self.append_metadata();
-            self.append_key_value_metadata(
-                SPECTRUM_COUNT.into(),
-                Some(self.spectrum_counter().to_string()),
-            );
             writer = self.archive_writer.take().unwrap().into_inner()?;
 
             // ----------------------------------------------
@@ -1292,10 +1287,6 @@ impl<
             let s = self.spectrum_metadata_buffer.finish_selected_ion();
             self.write_struct_arrays(s)?;
             self.append_metadata();
-            self.append_key_value_metadata(
-                SPECTRUM_COUNT.into(),
-                Some(self.spectrum_counter().to_string()),
-            );
             writer = self.archive_writer.take().unwrap().into_inner()?;
 
             // ----------------------------------------------
@@ -1324,8 +1315,7 @@ impl<
                     ),
                 )?);
 
-                // Captured BEFORE `finish_spectrum()` drains the builder: the scans facet below
-                // used to read `len()` after the drain and declared 0 on a populated table.
+                // Captured BEFORE `finish_spectrum()` drains the builder, after which `len()` is 0.
                 let n_wavelength_spectra = self.wavelength_spectrum_metadata_buffer.index_counter();
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_DATA_POINT_COUNT.into(),
@@ -1370,11 +1360,6 @@ impl<
                         Self::spectrum_metadata_writer_props(&metadata_fields, encryption_props),
                     ),
                 )?);
-
-                self.append_key_value_metadata(
-                    WAVELENGTH_SPECTRUM_COUNT.into(),
-                    Some(n_wavelength_spectra.to_string()),
-                );
 
                 self.append_metadata();
 
@@ -1502,11 +1487,6 @@ impl<
                 self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
                 let s = self.chromatogram_metadata_buffer.finish_precursor();
                 self.write_struct_arrays(s)?;
-
-                self.append_key_value_metadata(
-                    CHROMATOGRAM_COUNT.into(),
-                    Some(self.chromatogram_counter().to_string()),
-                );
                 writer = self.archive_writer.take().unwrap().into_inner()?;
 
                 // ----------------------------------------------
@@ -1522,11 +1502,6 @@ impl<
 
                 let s = self.chromatogram_metadata_buffer.finish_selected_ion();
                 self.write_struct_arrays(s)?;
-
-                self.append_key_value_metadata(
-                    CHROMATOGRAM_COUNT.into(),
-                    Some(self.chromatogram_counter().to_string()),
-                );
                 writer = self.archive_writer.take().unwrap().into_inner()?;
 
                 // ----------------------------------------------

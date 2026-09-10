@@ -21,8 +21,8 @@
 //! `tiny.pwiz.1.1.mzML` has 4 spectra: index 1 is profile (10 points, chunk layout), 0 and 3 are
 //! centroid (15 peaks each), 2 is an EMPTY centroid spectrum. `tiny_centroid_only.mzML` is the same
 //! file without the profile spectrum (indices renumbered 0..3). `pda_uv.pwiz.mzML` (Waters PDA via
-//! ProteoWizard, 2 MS spectra + 8 wavelength spectra) exercises the wavelength facets, whose scans
-//! facet used to declare 0 because the count was read after the metadata builder was drained.
+//! ProteoWizard, 2 MS spectra + 8 wavelength spectra) exercises the wavelength facets. The metadata
+//! secondaries (`_scans`, `_precursors`, `_selected_ions`) carry no entity count at all.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,12 @@ fn convert_fixture_with(name: &str, tag: &str, extra: &[&str]) -> PathBuf {
 
 /// `(num_rows, declared value of `key`)` for one facet inside the archive.
 fn facet(archive: &Path, member: &str, key: &str) -> (i64, i64) {
+    let (rows, value) = footer_key(archive, member, key);
+    (rows, value.unwrap_or_else(|| panic!("{member} has no {key}")).parse().unwrap())
+}
+
+/// `(num_rows, value of `key` if the footer has it)` for one facet inside the archive.
+fn footer_key(archive: &Path, member: &str, key: &str) -> (i64, Option<String>) {
     let mut zip = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
     let extracted = std::env::temp_dir().join(format!(
         "mzpc-footer-{}-{}-{member}",
@@ -65,16 +71,10 @@ fn facet(archive: &Path, member: &str, key: &str) -> (i64, i64) {
     }
     let reader = SerializedFileReader::new(File::open(&extracted).unwrap()).unwrap();
     let meta = reader.metadata().file_metadata();
-    let declared = meta
-        .key_value_metadata()
-        .and_then(|kvs| kvs.iter().find(|kv| kv.key == key))
-        .and_then(|kv| kv.value.as_ref())
-        .unwrap_or_else(|| panic!("{member} has no {key}"))
-        .parse::<i64>()
-        .unwrap();
+    let value = meta.key_value_metadata().and_then(|kvs| kvs.iter().find(|kv| kv.key == key)).and_then(|kv| kv.value.clone());
     let rows = meta.num_rows();
     let _ = std::fs::remove_file(&extracted);
-    (rows, declared)
+    (rows, value)
 }
 
 fn declared(archive: &Path, member: &str, key: &str) -> i64 {
@@ -158,14 +158,32 @@ fn wavelength_facets_carry_their_own_counts() {
 
     // The metadata facet carries the run total of wavelength spectra …
     assert_eq!(facet(&archive, "wavelength_spectra_metadata.parquet", "wavelength_spectrum_count"), (8, 8));
-    // … and so does its scans facet — this was 0 on 8 rows before the drain-order fix.
-    assert_eq!(facet(&archive, "wavelength_spectra_metadata_scans.parquet", "wavelength_spectrum_count"), (8, 8));
+    // Its scans facet is a secondary and carries no count (0 on 8 rows before the drain-order fix,
+    // then the run total).
+    assert_eq!(footer_key(&archive, "wavelength_spectra_metadata_scans.parquet", "wavelength_spectrum_count"), (8, None));
     // The data facet: entities with rows in this file, and its own point count (point layout).
     assert_eq!(declared(&archive, "wavelength_spectra_data.parquet", "wavelength_spectrum_count"), 8);
     let (rows, points) = facet(&archive, "wavelength_spectra_data.parquet", "wavelength_spectrum_data_point_count");
     assert!(rows > 0, "fixture no longer carries wavelength points");
     assert_eq!(points, rows);
 
+    let _ = std::fs::remove_file(&archive);
+}
+
+/// Issue #1, decision D2: the metadata secondaries carry no entity count. They carried the run total,
+/// also where the facet has no rows (tiny's chromatograms have no precursors).
+#[test]
+fn secondary_facets_carry_no_entity_count() {
+    let archive = convert_fixture("tiny.pwiz.1.1.mzML", "secondaries");
+    for (member, key) in [
+        ("spectra_metadata_scans.parquet", "spectrum_count"),
+        ("spectra_metadata_precursors.parquet", "spectrum_count"),
+        ("spectra_metadata_selected_ions.parquet", "spectrum_count"),
+        ("chromatograms_metadata_precursors.parquet", "chromatogram_count"),
+        ("chromatograms_metadata_selected_ions.parquet", "chromatogram_count"),
+    ] {
+        assert_eq!(footer_key(&archive, member, key).1, None, "{member} declares {key}");
+    }
     let _ = std::fs::remove_file(&archive);
 }
 

@@ -177,6 +177,14 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   stamps the same. Pinned by `tests/footer_counts.rs` and
   `rewritten_data_facets_declare_an_index_bound`. This changes the footers of every archive; the
   corpus is rebuilt at the next release.
+- **The metadata secondaries no longer carry an entity count.** The writer stamped the run total on
+  `spectra_metadata_scans`, `_precursors`, `_selected_ions`, `wavelength_spectra_metadata_scans`
+  and the chromatogram precursors / selected ions, so an MS1-only run's empty precursors facet
+  declared every spectrum, issue #1's shape; an `--rt` / `--ms-level` rewrite stamped a third
+  meaning there (the distinct `source_index` values left). Neither counts anything a reader can
+  plan from, so both omit the key now, and a rewrite also drops it from an older archive's
+  spectrum and chromatogram secondaries. Pinned by `secondary_facets_carry_no_entity_count` and
+  `filter::tests::rewrite_leaves_no_entity_count_on_secondaries`.
 - **An archive rewritten with `--ms-level` or `--rt` can be read back.** The rewrite keeps each
   surviving spectrum's original index, but the vendored reader sized its per-spectrum tables (m/z
   models, point, peak and auxiliary-array counts) by the number of rows, so
