@@ -38,6 +38,22 @@ All notable changes to this project are documented here. The format follows
   `analysis.tdf` read-write, after an existence check). A read-only open of a file with a hot
   journal now reports SQLite's own error rather than "GlobalMetadata missing/invalid". Pinned by
   `bruker_tsf::msms_tests::open_never_writes_into_the_input_directory`.
+- **`--via-msconvert` refuses a multi-sample WIFF without `--sample` instead of keeping its
+  last sample.** With one `--outfile`, msconvert writes every run of a multi-run source onto
+  that path in turn and the last one wins (En_PPY: 117 samples, one survived), under exit 0
+  and without a warning. Only the native SciEX lane refused such a file, and it runs on
+  Windows alone, while the msconvert lanes also run under Wine with a user-supplied msconvert.
+  msconvert prints `writing output file:` once per run before writing it (`processFile` in
+  pwiz's `msconvert.cpp`), so both msconvert lanes, mzPeak and `--to mzml`, now count those
+  lines in the log they already capture and refuse more than one, giving the count for
+  `--sample <1..N>`; the `--to mzml` lane removes the file msconvert left at the output path,
+  and now passes `--sample` on as `--runIndexSet` as well, without which the refusal would
+  have had no way out. Dropping `--outfile` and counting the mzML files instead is not
+  enough: pwiz names each run `<wiff>-<sample name>`, so samples that share a name overwrite
+  each other there too. The refusal comes after msconvert has converted every run, as the
+  truncated conversion did. `--sample 0` is refused for every lane; the msconvert lanes used
+  to turn it into run index 0, sample 1. `tests/msconvert_multi_run.rs` pins both directions
+  with a stand-in msconvert that writes two runs, or one when `--runIndexSet` picks it.
 
 ### Changed
 
