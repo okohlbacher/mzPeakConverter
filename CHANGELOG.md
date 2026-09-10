@@ -34,6 +34,17 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
+- **Every release archive ships `THIRD-PARTY-NOTICES.md`, and every release its own SBOM.** The
+  archives carried only the binary, `LICENSE` and `README.md`, although the binary links about 400
+  crates whose licenses ask for their notices to travel with it. The notices file now goes into all
+  six archives, and each release job checks it is there. A new `sbom` job runs `cargo metadata
+  --locked` through `tools/gen_sbom.py`, refuses an SBOM whose component version is not the tag's,
+  and attaches `mzpeak-convert-<version>.cdx.json` with a `.sha256` sidecar. `gen_sbom.py` now
+  records a git source such as the mzdata fork, which the purl alone passes off as the crates.io
+  release of the same version. The tracked `sbom.cdx.json` is gone: it still described
+  mzpeak-convert 0.1.0 with 395 components (mzdata 0.64.1, arrow 57.0.0), nothing regenerated it,
+  and README and the manual linked it as the inventory. Publishing now needs at least one platform
+  archive, so a run whose platforms all failed cannot publish a release holding only the SBOM.
 
 ### Fixed
 
@@ -189,6 +200,18 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   re-run. Replayed against a stand-in `gh`: no check runs on a six-hour-old commit ends after 10
   simulated minutes (90 before), an unknown SHA after 2 (90 before); a pass, a pending check, a
   cancelled job and two 502s behave as before.
+- **`THIRD-PARTY-NOTICES.md` states the licenses and sources the build uses.** It listed `mzdata`,
+  `mzpeaks` and `thermorawfilereader` as MIT, where their manifests say Apache-2.0, and `zip` as
+  MIT/Apache-2.0 (it is MIT). It also put `mzdata` under a crates.io heading, although the build pins
+  it from the `okohlbacher/mzdata@1d53971` git fork (0.66.6 plus mobiusklein/mzdata#58, merged
+  upstream and not yet released). The file now carries the Apache License 2.0 text and the NOTICE
+  that `arrow` and `parquet` ship, which section 4(d) of that license requires redistributions to
+  pass on. It names the .NET bundle `thermorawfilereader` embeds in the binary: Thermo Fisher
+  Scientific's RawFileReader assemblies and OpenMcdf, whose terms neither crate states. Its
+  vendor-SDK paragraph no longer names the `bruker_sdk` / `agilent` / `sciex` build features, which
+  no longer exist. The license distribution comes from `cargo metadata` at this tree (415
+  dependency packages) instead of the 0.1.0 SBOM; `mzpeak_prototyping` stays "not declared
+  upstream".
 - **A release archive is checked for what it claims before it is attached.** The macOS job printed
   `lipo -archs` without asserting it, and the x86_64 binary never runs on the arm64 runner, so
   nothing stopped an arm64 build shipping under the x86_64 name: both architectures are now

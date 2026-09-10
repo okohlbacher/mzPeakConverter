@@ -10,6 +10,9 @@
 # whole matrix as a DRY RUN: built, verified, kept as workflow artifacts, nothing published — so a
 # broken release job is found before a tag needs it.
 #
+# Beside the archives each release carries a CycloneDX SBOM generated from Cargo.lock by
+# tools/gen_sbom.py, and every archive ships THIRD-PARTY-NOTICES.md, which holds the Apache-2.0 text.
+#
 # No Rust cache here: a tag builds once, and the six ~570 MB caches the first dry run saved pushed
 # the repository past GitHub's 10 GB Actions-cache limit, evicting CI's own. Cold builds take 6-13 min.
 #
@@ -190,9 +193,9 @@ jobs:
           # entitlements plist granting com.apple.security.cs.disable-library-validation, .allow-jit
           # and .allow-unsigned-executable-memory, or that path dies only on signed builds.
           codesign --force --sign - "$stage/mzpeak-convert"
-          cp LICENSE README.md "$stage/"
+          cp LICENSE README.md THIRD-PARTY-NOTICES.md "$stage/"
           tarball="mzpeak-convert-$VERSION-${{ matrix.target }}.tar.gz"
-          ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$dist/$tarball" mzpeak-convert LICENSE README.md )
+          ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$dist/$tarball" mzpeak-convert LICENSE README.md THIRD-PARTY-NOTICES.md )
           # Hash from inside the directory so the sidecar names the bare file with shasum's own
           # two-space separator — `shasum -c` rejects anything else.
           ( cd "$dist" && shasum -a 256 "$tarball" > "$tarball.sha256" )
@@ -209,6 +212,8 @@ jobs:
           [ "$archs" = "${{ matrix.arch }}" ] || { echo "::error::$bin holds '$archs', expected ${{ matrix.arch }}"; exit 1; }
           codesign -dvv "$bin" 2>&1 | grep -E "Signature|flags"
           ( cd "$RUNNER_TEMP/dist" && shasum -a 256 -c ./*.sha256 )
+          # The licenses travel with the binary: the notices hold the Apache-2.0 text and NOTICE.
+          tar -tzf "$RUNNER_TEMP"/dist/*.tar.gz | grep -x THIRD-PARTY-NOTICES.md > /dev/null || { echo "::error::the archive lacks THIRD-PARTY-NOTICES.md"; exit 1; }
           # Only the native slice can be executed on this runner.
           if [ "${{ matrix.arch }}" = arm64 ]; then
             have="$("$bin" --version)"
@@ -270,10 +275,10 @@ jobs:
           set -euo pipefail
           stage="$RUNNER_TEMP/stage" dist="$RUNNER_TEMP/dist"
           mkdir -p "$stage" "$dist"
-          cp target/release/mzpeak-convert LICENSE README.md "$stage/"
+          cp target/release/mzpeak-convert LICENSE README.md THIRD-PARTY-NOTICES.md "$stage/"
           strip "$stage/mzpeak-convert"
           tarball="mzpeak-convert-$VERSION-${{ matrix.target }}.tar.gz"
-          tar -C "$stage" -czf "$dist/$tarball" mzpeak-convert LICENSE README.md
+          tar -C "$stage" -czf "$dist/$tarball" mzpeak-convert LICENSE README.md THIRD-PARTY-NOTICES.md
           ( cd "$dist" && sha256sum "$tarball" > "$tarball.sha256" )
           { echo "### ${{ matrix.target }}"; echo '```'; cat "$dist/$tarball.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
@@ -290,6 +295,8 @@ jobs:
           [ "$(printf '%s\n' "$floor" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
             || { echo "::error::binary requires $floor, above the manylinux_2_28 floor"; exit 1; }
           ( cd "$RUNNER_TEMP/dist" && sha256sum -c ./*.sha256 )
+          # The licenses travel with the binary: the notices hold the Apache-2.0 text and NOTICE.
+          tar -tzf "$RUNNER_TEMP"/dist/*.tar.gz | grep -x THIRD-PARTY-NOTICES.md > /dev/null || { echo "::error::the archive lacks THIRD-PARTY-NOTICES.md"; exit 1; }
           have="$("$bin" --version)"
           [ "$have" = "mzpeak-convert $VERSION" ] || { echo "::error::--version says '$have', expected mzpeak-convert $VERSION"; exit 1; }
           "$bin" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
@@ -371,7 +378,7 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP $name
           $dist  = Join-Path $env:RUNNER_TEMP 'dist'
           New-Item -ItemType Directory -Force $stage, $dist | Out-Null
-          Copy-Item target/release/mzpeak-convert.exe, LICENSE, README.md $stage
+          Copy-Item target/release/mzpeak-convert.exe, LICENSE, README.md, THIRD-PARTY-NOTICES.md $stage
           # The converter looks for each glue under glue\<name>\ beside the exe when its MZPC_*_GLUE
           # variable is unset, so this layout is the contract, not a convenience.
           $glue = [ordered]@{
@@ -402,7 +409,8 @@ jobs:
           Write-Output ("PE machine 0x{0:X4}" -f $machine)
           if ($machine -ne ${{ matrix.machine }}) { Write-Output "::error::expected machine ${{ matrix.machine }}"; exit 1 }
 
-          $need = 'glue/sciex/SciexGlue.dll', 'glue/sciex/SciexGlue.runtimeconfig.json',
+          $need = 'LICENSE', 'THIRD-PARTY-NOTICES.md',
+                  'glue/sciex/SciexGlue.dll', 'glue/sciex/SciexGlue.runtimeconfig.json',
                   'glue/shimadzu/ShimadzuGlue.dll', 'glue/shimadzu/ShimadzuGlue.runtimeconfig.json',
                   'glue/agilent/AgilentGlueHost.exe',
                   'glue/agilent_midac/AgilentMidacGlue.dll', 'glue/agilent_midac/AgilentMidacGlue.runtimeconfig.json'
@@ -450,11 +458,49 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # What the binaries link, from the same Cargo.lock the platform jobs build with. Generated per
+  # release rather than tracked: the tracked sbom.cdx.json still described 0.1.0 at 0.11.5.
+  sbom:
+    name: SBOM
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate the CycloneDX SBOM from Cargo.lock
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "${TAG#v}" != "$version" ]; then
+            echo "::error::tag $TAG carries version ${TAG#v} but Cargo.toml says $version"
+            exit 1
+          fi
+          dist="$RUNNER_TEMP/dist"
+          sbom="mzpeak-convert-$version.cdx.json"
+          mkdir -p "$dist"
+          cargo metadata --format-version 1 --all-features --locked | python3 tools/gen_sbom.py > "$dist/$sbom"
+          # `$v` is jq's variable, not the shell's.
+          # shellcheck disable=SC2016
+          jq -e --arg v "$version" '.metadata.component.version == $v' "$dist/$sbom" > /dev/null \
+            || { echo "::error::$sbom does not describe mzpeak-convert $version"; exit 1; }
+          ( cd "$dist" && sha256sum "$sbom" > "$sbom.sha256" )
+          { echo "### SBOM"; jq -r '"\(.components | length) dependency components"' "$dist/$sbom"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-sbom
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   # One place attaches everything, so the platform jobs no longer race to create the release, and a
   # platform that failed does not hold back the ones that built — the run still goes red for it.
   publish:
     name: Attach to the release
-    needs: [ci, macos, linux, windows]
+    needs: [ci, macos, linux, windows, sbom]
     if: ${{ always() && needs.ci.result == 'success' && !cancelled() && github.event_name != 'pull_request' && !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -470,7 +516,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           files=(dist/*)
-          [ ${#files[@]} -gt 0 ] || { echo "::error::no platform produced an archive"; exit 1; }
+          archives=(dist/*.tar.gz dist/*.zip)
+          [ ${#archives[@]} -gt 0 ] || { echo "::error::no platform produced an archive"; exit 1; }
           # Hashes written on three operating systems, checked on a fourth.
           ( cd dist && sha256sum -c ./*.sha256 )
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \

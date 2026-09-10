@@ -851,9 +851,10 @@ a format on the current platform (e.g. Agilent/SciEX on macOS or Linux), use
 Pure Rust plus a small C# interop layer for Thermo/native vendor readers. Core
 crates: `mzdata`, `mzpeaks`, `arrow`/`parquet`, `zip`, `timsrust`,
 `rusqlite`(bundled SQLite)/`zstd`, `flate2`, `clap`, `serde`, `anyhow`. The
-reference writer `mzpeak_prototyping` is vendored under `vendor/`. A complete
-inventory of all transitive dependencies (with licenses) is in
-[`sbom.cdx.json`](../sbom.cdx.json); see [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
+reference writer `mzpeak_prototyping` is vendored under `vendor/`. Each release attaches a
+CycloneDX inventory of every resolved dependency, with its license and source
+(`mzpeak-convert-<version>.cdx.json`, generated from `Cargo.lock` by `tools/gen_sbom.py`), and every
+release archive carries [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 
 ## 13. Troubleshooting
 

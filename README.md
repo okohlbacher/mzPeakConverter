@@ -44,7 +44,7 @@ zero-intensity pad at the scan-window bounds outside the signal span is not stor
   [HUPO-PSI/mzPeak-specification](https://github.com/HUPO-PSI/mzPeak-specification)
   · inspect `.mzpeak` files in your browser at [mzpeak.org/view](https://mzpeak.org/view)
 - 🏗 [Platform support matrix](docs/PLATFORM_SUPPORT.md) · [Backlog](BACKLOG.md)
-- 📦 [SBOM](sbom.cdx.json) (CycloneDX) · [Third-party notices](THIRD-PARTY-NOTICES.md) · [Changelog](CHANGELOG.md)
+- 📦 SBOM (CycloneDX, `mzpeak-convert-<version>.cdx.json` on each [release](https://github.com/okohlbacher/mzPeakConverter/releases)) · [Third-party notices](THIRD-PARTY-NOTICES.md) · [Changelog](CHANGELOG.md)
 
 ## Supported formats & operating systems
 
