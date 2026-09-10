@@ -360,6 +360,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   ims-compact `*_bin` drop, `--aux` on top. **Size:** preserve-by-default includes the raw signal
   files, so a rebuild without `--no-vendor` or an `--aux` drop grows by roughly their size (FM_1-1:
   `analysis.baf` is 714 MB beside a 109 MB archive; S25: `MSProfile.bin` + `MSPeak.bin` are 251 MB).
+  No default drops them, because those lanes do not store all the signal the files hold: BAF reads
+  line arrays first, the MHDAC host asks for profile else peak, and Waters leaves chromatogram-type
+  functions out. The one default drop is baf2sql's `analysis.sqlite`, which the BAF reader itself
+  creates inside the `.d` and which is therefore not a vendor file; the drop is recorded in
+  `vendor_files`, and `--aux 'analysis.sqlite=embed'` keeps it
+  (`the_baf2sql_cache_is_dropped_unless_asked_for`).
   `--aux` on a single-file input now logs that it is inert.
   `every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert` pins both on a synthetic
   Waters-shaped directory and on `tiny.pwiz.1.1.mzML`.
