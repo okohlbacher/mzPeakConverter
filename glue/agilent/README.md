@@ -1,12 +1,25 @@
 # AgilentGlueHost — native Agilent MassHunter (`.d`) reader for mzPeakConverter
 
-A small **.NET Framework 4.8 console EXE** (`AgilentGlueHost.exe`) that lets the Rust `agilent`
-reader read Agilent MassHunter `.d` data through Agilent's **MHDAC** (MassHunter Data Access
-Component) DLLs — **out of process**. The Rust converter spawns it once per `.d`.
+> **Status (0.11.0): wired and verified.** `src/agilent.rs` spawns this EXE once per `.d` and
+> reads its `AGL2` output through the host-testable parser `src/agl.rs`. Verified on the Windows
+> box against the msconvert lane: a 5977B GC-MS run (7,017 scans) is identical spectrum for
+> spectrum, a 6545 Q-TOF profile run (1,502 scans, 181 M points) has the same points, RT and
+> intensities. History: the subprocess reader shipped at cc8245e (2026-06-27), was dropped by
+> merge 5a62b90 the next day, and was restored on 2026-09-06 (owner decision, option A).
+>
+> **Scope guard.** MRM/SIM-only runs (a 6490 dMRM `.d`) are refused by the converter with a
+> pointer to `--via-msconvert`: MHDAC presents each dwell as a one-point "MS2 spectrum" while the
+> data are the transition chromatograms the msconvert lane writes. The host reports MHDAC's
+> `ScanTypes` for exactly that decision.
 
-**Status: Windows-runtime-only; runs.** It *builds* on macOS/Linux/Windows (no Agilent DLLs needed at
-build time — see "Why reflection"), and *runs* on x64 Windows with the MHDAC DLLs present. Verified
-against MHDAC `10.0.1.10305`.
+A small **.NET Framework 4.8 console EXE** (`AgilentGlueHost.exe`) that lets a Rust `agilent`
+reader read Agilent MassHunter `.d` data through Agilent's **MHDAC** (MassHunter Data Access
+Component) DLLs — **out of process**. The Rust side spawns it once per `.d`.
+
+**Status: builds everywhere; runs on Windows (see the banner).** It *builds* on
+macOS/Linux/Windows (no Agilent DLLs needed at build time — see "Why reflection"), and *runs* on x64
+Windows with the MHDAC DLLs present. Reflection names were validated against MHDAC `10.0.1.10305`
+(one version).
 
 ## Why a separate .NET Framework process (and not in-process .NET 8)
 
@@ -26,15 +39,22 @@ the .NET Framework 4.8 runtime ships with Windows, so it just runs. Rust drives 
 AgilentGlueHost.exe  <in.d>  <mhdacDir>  <out.bin>
 ```
 
-It opens the `.d` via MHDAC, reads every MS scan, and writes a little-endian binary file that the
-Rust side (`src/agilent.rs`) reads back:
+It opens the `.d` via MHDAC, reads every MS scan, and writes a little-endian binary file that
+`src/agilent.rs` reads back (`src/agl.rs` is the parser, with tests that run on every host):
 
 ```
-magic "AGL1" (4 bytes) | count u64 | offset[count] u64 (abs file offset of each record)
+magic "AGL2" (4 bytes) | count u64 |
+scanTypes: len u32 + UTF-8   (MSScanFileInformation.ScanTypes, e.g. "Scan" or "MultipleReaction, SelectedIon")
+device:    len u32 + UTF-8   ("<DeviceType>" U+001F "<device name>" U+001F "<serial>", parts empty when unreadable)
+offset[count] u64            (abs file offset of each record)
 then per record:
   rt f64 | msLevel i32 | polarity i32 | isCentroid i32 | scanId i32 |
   nPoints u64 | mz[nPoints] f64 | intensity[nPoints] f64
 ```
+
+`AGL1` (0.9.x) had no strings; a converter given one asks for a rebuilt host. The whole run is
+materialised before the first spectrum is read — 16 B/point, about 3 GB for a 240 MB Q-TOF `.d` —
+and the file is removed when the reader closes.
 
 Exit 0 on success; non-zero with one diagnostic line on **stderr** on failure (and `out.bin` is
 removed). stdout is left clean. The Rust side seeks per-record via the offset table, so spectra are
@@ -67,12 +87,12 @@ ordinary `dotnet` SDK — no Visual Studio / .NET Framework targeting pack requi
 
 | Env var             | Meaning                                                                              |
 |---------------------|--------------------------------------------------------------------------------------|
-| `MZPC_AGILENT_GLUE` | Directory containing `AgilentGlueHost.exe` (the build output above).                  |
-| `MZPC_PWIZ_DIR`     | A ProteoWizard install directory. MHDAC DLLs are loaded from `<MZPC_PWIZ_DIR>/vendor_api/Agilent`. |
+| `MZPC_AGILENT_GLUE` | Directory containing `AgilentGlueHost.exe` (the build output above). |
+| `MZPC_PWIZ_DIR`     | A ProteoWizard install directory. MHDAC DLLs are loaded from `<MZPC_PWIZ_DIR>/vendor_api/Agilent` when that subdirectory exists, else from `<MZPC_PWIZ_DIR>` itself (the 3.0.26175 installer is flat). |
 
-> **Box note.** Some ProteoWizard builds (e.g. the FLASHApp bundle) flatten the Agilent DLLs directly
-> into `pwiz-bin/` instead of a `vendor_api/Agilent/` subdir. In that case create a directory junction
-> `pwiz-bin/vendor_api/Agilent → pwiz-bin` so `<MZPC_PWIZ_DIR>/vendor_api/Agilent` resolves.
+> **Layouts.** Bundled ProteoWizard trees keep `vendor_api/Agilent/`; the standalone installer
+> flattens the DLLs beside `msconvert.exe`. The converter probes both (`pwiz_layout::agilent_dll_dir`)
+> and hands the host the directory that holds `MassSpecDataReader.dll` — no junction needed.
 
 ## Sourcing the MHDAC DLLs (from ProteoWizard)
 

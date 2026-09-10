@@ -104,6 +104,20 @@ internal sealed class WiffSession : IDisposable
     public object Batch = null!;             // Batch
     public List<SpectrumAddress> Index = new();
 
+    // Run-level facts gathered while the index is built (RunInfo / RunString exports).
+    public int SampleCount;
+    public int UnreadableSamples;
+    public int DwellExperiments;             // ExperimentType MRM / SIM: transition dwells, not spectra
+    public int ScanExperiments;
+    public int TotalExperiments;
+    public string ExperimentTypes = string.Empty;   // distinct type names, ';'-joined
+    public string InstrumentName = string.Empty;
+    public string InstrumentSerial = string.Empty;
+    public string SoftwareVersion = string.Empty;
+    public string AcquisitionDateTime = string.Empty; // ISO 8601 round-trip form + "|" + DateTimeKind
+    public string SampleNames = string.Empty;         // '\u001F'-joined, in sample order
+    public string Resolved = string.Empty;            // which Details members answered (diagnostic)
+
     public void Dispose()
     {
         // Clearcore2 providers implement IDisposable; release best-effort.
@@ -228,6 +242,15 @@ internal sealed class Clearcore2Api
     {
         var sampleNames = (Array?)Invoke(session.Batch, "GetSampleNames");
         int sampleCount = sampleNames?.Length ?? 0;
+        session.SampleCount = sampleCount;
+        var names = new List<string>();
+        if (sampleNames != null)
+        {
+            foreach (var n in sampleNames) { names.Add(n?.ToString() ?? string.Empty); }
+        }
+        session.SampleNames = string.Join("\u001F", names);
+        var types = new SortedSet<string>(StringComparer.Ordinal);
+        bool runStringsDone = false;
 
         for (int s = 0; s < sampleCount; s++)
         {
@@ -238,17 +261,28 @@ internal sealed class Clearcore2Api
             }
             catch
             {
-                continue; // skip unreadable samples
+                // An unreadable sample is COUNTED, never silently dropped: a partial archive must be
+                // visible to the caller (RunInfo), which refuses rather than publishing a subset.
+                session.UnreadableSamples++;
+                continue;
             }
             if (sample == null)
             {
+                session.UnreadableSamples++;
                 continue;
             }
 
             var msSample = GetProperty(sample, "MassSpectrometerSample");
             if (msSample == null)
             {
+                session.UnreadableSamples++;
                 continue;
+            }
+
+            if (!runStringsDone)
+            {
+                ReadRunStrings(session, sample, msSample);
+                runStringsDone = true;
             }
 
             int experimentCount = ToInt(GetProperty(msSample, "ExperimentCount"));
@@ -261,6 +295,7 @@ internal sealed class Clearcore2Api
                 }
                 catch
                 {
+                    session.UnreadableSamples++; // an unreadable experiment is a partial sample
                     continue;
                 }
                 if (experiment == null)
@@ -269,6 +304,28 @@ internal sealed class Clearcore2Api
                 }
 
                 var details = GetProperty(experiment, "Details");
+                session.TotalExperiments++;
+                // ExperimentType is an enum (MS, Product, Precursor, NeutralGainOrLoss, SIM, MRM …):
+                // classify by NAME, with the pwiz ordinal (SIM 4, MRM 5) only as a fallback for a
+                // value that renders as a bare number.
+                string typeName = GetProperty(details, "ExperimentType")?.ToString() ?? string.Empty;
+                if (!string.IsNullOrEmpty(typeName)) { types.Add(typeName); }
+                bool dwell;
+                var upper = typeName.ToUpperInvariant();
+                if (upper.Contains("MRM") || upper.Contains("SIM"))
+                {
+                    dwell = true;
+                }
+                else if (int.TryParse(typeName, out int ordinal))
+                {
+                    dwell = ordinal == 4 || ordinal == 5;
+                }
+                else
+                {
+                    dwell = false;
+                }
+                if (dwell) { session.DwellExperiments++; } else { session.ScanExperiments++; }
+
                 int cycleCount = ToInt(GetProperty(details, "NumberOfScans"));
                 for (int c = 0; c < cycleCount; c++)
                 {
@@ -277,6 +334,42 @@ internal sealed class Clearcore2Api
                 }
             }
         }
+        session.ExperimentTypes = string.Join(";", types);
+    }
+
+    /// <summary>
+    /// Run identity from the first readable sample: instrument, serial, acquisition software
+    /// version and acquisition time live on <c>Sample.Details</c> (ProteoWizard's WiffFile.cpp reads
+    /// them there). Every read is best-effort by reflection; which member answered is recorded in
+    /// <c>Resolved</c> so the first Windows run tells us the real member names.
+    /// </summary>
+    private static void ReadRunStrings(WiffSession session, object sample, object msSample)
+    {
+        var resolved = new List<string>();
+        string? First(object? target, string tag, params string[] candidates)
+        {
+            if (target == null) { return null; }
+            foreach (var name in candidates)
+            {
+                object? v;
+                try { v = GetProperty(target, name); } catch { continue; }
+                if (v == null) { continue; }
+                string text = v is DateTime dt
+                    ? dt.ToString("o", System.Globalization.CultureInfo.InvariantCulture) + "|" + dt.Kind
+                    : v.ToString() ?? string.Empty;
+                if (text.Length == 0) { continue; }
+                resolved.Add(tag + "=" + name);
+                return text;
+            }
+            return null;
+        }
+        var details = GetProperty(sample, "Details");
+        var msDetails = GetProperty(msSample, "Details");
+        session.InstrumentName = First(details, "instrument", "InstrumentName") ?? First(msDetails, "instrument", "InstrumentName") ?? string.Empty;
+        session.InstrumentSerial = First(details, "serial", "InstrumentSerialNumber", "SerialNumber") ?? First(msDetails, "serial", "InstrumentSerialNumber", "SerialNumber") ?? string.Empty;
+        session.SoftwareVersion = First(details, "software", "SoftwareVersion") ?? First(msDetails, "software", "SoftwareVersion") ?? string.Empty;
+        session.AcquisitionDateTime = First(details, "time", "AcquisitionDateTime") ?? First(msDetails, "time", "AcquisitionDateTime") ?? string.Empty;
+        session.Resolved = string.Join(";", resolved);
     }
 
     /// <summary>Resolve scalar metadata for one flattened spectrum.</summary>
@@ -842,6 +935,84 @@ public static unsafe class Exports
     }
 
     // ---- diagnostics ----
+
+    /// <summary>
+    /// Run-level counts: [sampleCount, unreadableSamples, dwellExperiments, scanExperiments,
+    /// totalExperiments]. Returns 0 on success (see RunString for the text fields).
+    /// </summary>
+    [UnmanagedCallersOnly(EntryPoint = "RunInfo")]
+    public static int RunInfo(long handle, int* out5)
+    {
+        try
+        {
+            var session = Get(handle);
+            if (session == null || out5 == null)
+            {
+                return 1;
+            }
+            out5[0] = session.SampleCount;
+            out5[1] = session.UnreadableSamples;
+            out5[2] = session.DwellExperiments;
+            out5[3] = session.ScanExperiments;
+            out5[4] = session.TotalExperiments;
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            RecordError(ex);
+            return 3;
+        }
+    }
+
+    /// <summary>
+    /// Run-level text by index: 0 experiment types, 1 instrument name, 2 serial, 3 software
+    /// version, 4 acquisition time ("o" form + "|" + DateTimeKind), 5 sample names
+    /// (U+001F-joined), 6 which Details members resolved. Fill-buffer contract as LastError:
+    /// copies up to <c>cap</c> UTF-16 units and ALWAYS returns the full length; -1 on error.
+    /// </summary>
+    [UnmanagedCallersOnly(EntryPoint = "RunString")]
+    public static int RunString(long handle, int which, ushort* buf, int cap)
+    {
+        try
+        {
+            var session = Get(handle);
+            if (session == null)
+            {
+                return -1;
+            }
+            string msg = which switch
+            {
+                0 => session.ExperimentTypes,
+                1 => session.InstrumentName,
+                2 => session.InstrumentSerial,
+                3 => session.SoftwareVersion,
+                4 => session.AcquisitionDateTime,
+                5 => session.SampleNames,
+                6 => session.Resolved,
+                _ => string.Empty,
+            };
+            int full = msg.Length;
+            if (buf == null || cap <= 0)
+            {
+                return full;
+            }
+            int toCopy = Math.Min(full, cap);
+            for (int i = 0; i < toCopy; i++)
+            {
+                buf[i] = msg[i];
+            }
+            if (toCopy < cap)
+            {
+                buf[toCopy] = 0;
+            }
+            return full;
+        }
+        catch (Exception ex)
+        {
+            RecordError(ex);
+            return -1;
+        }
+    }
 
     [UnmanagedCallersOnly(EntryPoint = "LastError")]
     public static int LastError(ushort* buf, int cap)

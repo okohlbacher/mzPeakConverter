@@ -16,9 +16,9 @@ use arrow::{
 use mzdata::{
     params::Unit,
     prelude::*,
-    spectrum::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray, PeakDataLevel},
+    spectrum::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray},
 };
-use mzpeaks::{CentroidLike, DeconvolutedCentroidLike, coordinate::SimpleInterval};
+use mzpeaks::coordinate::SimpleInterval;
 use parquet::{
     arrow::{
         ProjectionMask,
@@ -41,7 +41,6 @@ use crate::{
     reader::{
         ReaderMetadata,
         index::{PageQuery, SpanDynNumeric, SpectrumQueryIndex},
-        metadata::PeakMetadata,
     },
 };
 
@@ -109,7 +108,18 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
             continue;
         }
         let Some(src) = out.get(&v.array_type) else { continue };
-        let Ok(ks) = src.to_i32() else { continue };
+        // Grid indices are Int32 for flight-time bins (k ≲ 3e5) but Int64 for a fine linear m/z
+        // lattice (Shimadzu `MassHigh` at 1e-9 Da runs to 1.25e12). Read whichever the column is.
+        let ks: Vec<i64> = match src.dtype {
+            BinaryDataArrayType::Int64 => match src.to_i64() {
+                Ok(v) => v.to_vec(),
+                Err(_) => continue,
+            },
+            _ => match src.to_i32() {
+                Ok(v) => v.iter().map(|&k| k as i64).collect(),
+                Err(_) => continue,
+            },
+        };
         let p = v.transform_params.clone().unwrap_or_default();
         let mzs: Vec<f64> = if is_sqrt {
             let c0 = p.first().copied().unwrap_or(0.0);
@@ -122,7 +132,17 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
             ks.iter().map(|&k| { let r = c0 + c1 * k as f64; r * r }).collect()
         } else {
             let s = p.first().copied().unwrap_or(1.0);
-            ks.iter().map(|&k| s * k as f64).collect()
+            // The archive's `mz_calibration` contract is `m/z = tof_index / scale`, and the column
+            // params carry `1/scale`. Multiplying by that reciprocal is NOT the same number: for a
+            // power-of-ten lattice `1e-9` is not exactly 10⁻⁹, so `s · k` differs from the
+            // correctly-rounded `k / 1e9` by one ulp on ~40 % of values (measured: 85,706 of
+            // 216,742 centroids of a LabSolutions mzML), which is exactly the difference between
+            // reproducing the source f64 bit for bit and not. Recover the scale when `s` IS the
+            // correctly-rounded reciprocal of an integer and DIVIDE; otherwise multiply as before.
+            match exact_reciprocal_scale(s) {
+                Some(scale) => ks.iter().map(|&k| k as f64 / scale).collect(),
+                None => ks.iter().map(|&k| s * k as f64).collect(),
+            }
         };
         let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
         if mz_da.update_buffer(mzs.as_slice()).is_ok() {
@@ -133,6 +153,44 @@ pub(crate) fn reconstruct_grid_mz(out: &mut BinaryArrayMap, array_indices: &Arra
     for mz_da in reconstructed {
         out.add(mz_da);
     }
+}
+
+/// The integer `scale` a `LinearMz` params value `s` is the reciprocal of, when it is one exactly
+/// (`1/scale` round-trips back to `s` bit for bit). `1e-9` recovers `1e9`, `1e-5` recovers `1e5`;
+/// an arbitrary non-reciprocal transform recovers nothing and keeps the multiply.
+///
+/// `1.0 / s` alone is not the answer — `1.0 / 1e-9` is 999999999.9999999, not 1e9 — so the
+/// candidate is rounded and then VERIFIED by re-computing the stored reciprocal from it.
+fn exact_reciprocal_scale(s: f64) -> Option<f64> {
+    if !(s > 0.0) || !s.is_finite() {
+        return None;
+    }
+    let candidate = (1.0 / s).round();
+    if candidate.is_finite() && candidate > 0.0 && 1.0 / candidate == s {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Whether a data facet's parquet (arrow) schema declares PER-SPECTRUM grid coefficients: some
+/// field, at any nesting depth, stamped `mzpeak:transform_params_per_spectrum` — the converter
+/// writes it on the grid column (`point.tof` / `chunk.tof_*` on the timsTOF ims-compact exact lane,
+/// `point.tof_index` on the SciEX/Agilent sqrt grids) as its statement that `tof_c0`/`tof_c1`
+/// cells exist for [`reconstruct_per_spectrum_grid_mz`] to use. A legacy chord-only ims-compact
+/// archive carries the `SqrtMzFromTof` transform but no stamp, so a reader keyed on the transform
+/// alone would pay a spectrum-metadata row read per spectrum for no possible change in output.
+/// The schema comes from the facet's parquet footer, already in hand when the facet is opened.
+pub(crate) fn schema_declares_per_spectrum_grid(schema: &arrow::datatypes::Schema) -> bool {
+    fn walk(f: &arrow::datatypes::Field) -> bool {
+        f.metadata().contains_key("mzpeak:transform_params_per_spectrum")
+            || match f.data_type() {
+                DataType::Struct(fields) => fields.iter().any(|c| walk(c)),
+                DataType::List(c) | DataType::LargeList(c) | DataType::FixedSizeList(c, _) => walk(c),
+                _ => false,
+            }
+    }
+    schema.fields().iter().any(|f| walk(f))
 }
 
 /// Per-spectrum sqrt TOF-grid reconstruction (native-SCIEX): overwrite m/z with
@@ -735,31 +793,6 @@ mod async_impl {
             Ok(Some(out))
         }
 
-        pub(crate) async fn get_peak_list_for<
-            C: CentroidLike + BuildFromArrayMap,
-            D: DeconvolutedCentroidLike + BuildFromArrayMap,
-        >(
-            self,
-            index: u64,
-            meta_index: &PeakMetadata,
-        ) -> io::Result<Option<PeakDataLevel<C, D>>> {
-            let out = self
-                .read_points_of(
-                    index,
-                    &meta_index.query_index,
-                    &meta_index.array_indices,
-                    None,
-                )
-                .await?;
-            match out {
-                Some(out) => match PeakDataLevel::try_from(&out) {
-                    Ok(val) => return Ok(Some(val)),
-                    Err(e) => return Err(e.into()),
-                },
-                None => Ok(None),
-            }
-        }
-
         pub(crate) async fn query_points<'a, I: SpectrumQueryIndex + 'a>(
             self,
             index_range: MaskSet,
@@ -1149,29 +1182,6 @@ mod sync_impl {
             Ok(Some(out))
         }
 
-        pub(crate) fn get_peak_list_for<
-            C: CentroidLike + BuildFromArrayMap,
-            D: DeconvolutedCentroidLike + BuildFromArrayMap,
-        >(
-            self,
-            index: u64,
-            meta_index: &PeakMetadata,
-        ) -> io::Result<Option<PeakDataLevel<C, D>>> {
-            let out = self.read_points_of(
-                index,
-                &meta_index.query_index,
-                &meta_index.array_indices,
-                None,
-            )?;
-            match out {
-                Some(out) => match PeakDataLevel::try_from(&out) {
-                    Ok(val) => return Ok(Some(val)),
-                    Err(e) => return Err(e.into()),
-                },
-                None => Ok(None),
-            }
-        }
-
         pub(crate) fn query_points<'a, I: SpectrumQueryIndex + 'a>(
             self,
             index_range: MaskSet,
@@ -1263,3 +1273,52 @@ mod sync_impl {
 }
 
 pub(crate) use sync_impl::*;
+
+#[cfg(test)]
+mod per_spectrum_grid_stamp_tests {
+    use super::schema_declares_per_spectrum_grid;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use std::collections::HashMap;
+
+    fn tof(stamped: bool) -> Field {
+        let mut md = HashMap::from([
+            ("transform".to_string(), "MS:1003825".to_string()),
+            ("mzpeak:transform_params".to_string(), "9.9997,4.91e-5".to_string()),
+        ]);
+        if stamped {
+            md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+        }
+        Field::new("tof", DataType::Int32, true).with_metadata(md)
+    }
+
+    fn point_schema(stamped: bool) -> Schema {
+        let point = Field::new(
+            "point",
+            DataType::Struct(Fields::from(vec![
+                Field::new("spectrum_index", DataType::UInt64, true),
+                tof(stamped),
+                Field::new("intensity", DataType::Float32, true),
+            ])),
+            true,
+        );
+        Schema::new(vec![point])
+    }
+
+    /// The stamp is found on the nested grid column (point layout) and inside a chunk's list column;
+    /// a legacy chord-only facet (transform + run-wide params, no stamp) is NOT per-spectrum.
+    #[test]
+    fn stamp_is_found_nested_and_absent_on_legacy_facets() {
+        assert!(schema_declares_per_spectrum_grid(&point_schema(true)));
+        assert!(!schema_declares_per_spectrum_grid(&point_schema(false)));
+        let chunk = Field::new(
+            "chunk",
+            DataType::Struct(Fields::from(vec![
+                Field::new("spectrum_index", DataType::UInt64, true),
+                Field::new("tof_chunk_values", DataType::List(tof(true).into()), true),
+            ])),
+            true,
+        );
+        assert!(schema_declares_per_spectrum_grid(&Schema::new(vec![chunk])));
+        assert!(!schema_declares_per_spectrum_grid(&Schema::empty()));
+    }
+}

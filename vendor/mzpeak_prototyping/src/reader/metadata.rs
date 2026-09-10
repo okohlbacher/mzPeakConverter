@@ -1158,7 +1158,12 @@ impl PrecursorSelectedIonAssembler {
     }
 
     fn sort_precursors(&mut self) {
-        self.precursors.sort_unstable_by(|a, b| {
+        // STABLE: the key is not unique. A spectrum with several precursors (dia-PASEF writes two
+        // per MS2 frame; SPS-MS3 writes more) has the SAME (source_index, secondary_index) on each,
+        // so an unstable sort reorders them against the row order they were read in — the order the
+        // selected ions are matched against below. Round-tripping a DDA-PASEF archive to mzML showed
+        // the precursors of a frame emitted back to front as a result.
+        self.precursors.sort_by(|a, b| {
             a.source_index()
                 .cmp(&b.source_index())
                 .then(a.secondary_index().cmp(&b.secondary_index()))
@@ -1168,9 +1173,42 @@ impl PrecursorSelectedIonAssembler {
     pub fn build(mut self) -> Vec<DoubleIndexed<Precursor>> {
         self.sort_precursors();
 
+        // The join key `(source_index, precursor_index)` is NOT unique: a spectrum with several
+        // precursors (dia-PASEF writes two per MS2 frame) repeats the same pair on each row, so the
+        // scan below matches the FIRST of them every time and one precursor collected every ion
+        // while its siblings got none. Where a spectrum's precursor and selected-ion counts agree,
+        // one ion per precursor in row order is the only reading the archive supports, so pair them
+        // positionally. Where they differ — one precursor with several ions (SPS-MS3), or ions
+        // missing — nothing is assumed and the original scan runs unchanged.
+        let mut prec_rows: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, (spec_i, _, _)) in self.precursors.iter().enumerate() {
+            prec_rows.entry(*spec_i).or_default().push(i);
+        }
+        let mut ion_counts: HashMap<u64, usize> = HashMap::new();
+        for (spec_i, _, _) in self.selected_ions.iter() {
+            *ion_counts.entry(*spec_i).or_default() += 1;
+        }
+        let paired: HashMap<u64, &Vec<usize>> = prec_rows
+            .iter()
+            .filter(|(spec_i, rows)| rows.len() > 1 && ion_counts.get(spec_i) == Some(&rows.len()))
+            .map(|(spec_i, rows)| (*spec_i, rows))
+            .collect();
+        let mut seen_ions: HashMap<u64, usize> = HashMap::new();
+
         self.last_precursor_i = 0;
         let n = self.precursors.len();
-        for (spec_idx, prec_idx, si) in self.selected_ions {
+        for (spec_idx, prec_idx, si) in self.selected_ions.iter().cloned() {
+            if let Some(rows) = paired.get(&spec_idx) {
+                let slot = seen_ions.entry(spec_idx).or_default();
+                let row = rows[*slot];
+                *slot += 1;
+                if let Some((_, _, prec)) = self.precursors.get_mut(row) {
+                    prec.add_ion(si);
+                    self.last_precursor_i = row;
+                    continue;
+                }
+            }
+            let (spec_idx, prec_idx, si) = (spec_idx, prec_idx, si);
             let mut si = Some(si);
             let mut hit = false;
             self.spec_idx_match = None;

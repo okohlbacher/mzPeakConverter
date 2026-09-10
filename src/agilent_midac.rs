@@ -15,7 +15,8 @@
 //!   * `MZPC_AGILENT_MIDAC_GLUE` — dir with `AgilentMidacGlue.dll` + its runtimeconfig (the
 //!     `dotnet build` output of `glue/agilent_midac/`).
 //!   * `MZPC_PWIZ_DIR` — a ProteoWizard install; the MIDAC DLLs live under
-//!     `<MZPC_PWIZ_DIR>/vendor_api/Agilent` alongside MHDAC.
+//!     `<MZPC_PWIZ_DIR>/vendor_api/Agilent` (or `<MZPC_PWIZ_DIR>` itself on the flattened installer
+//!     layout — `pwiz_layout::agilent_dll_dir`) alongside MHDAC.
 //!
 //! ## C-ABI contract (Rust ⇄ glue, all `[UnmanagedCallersOnly]` on the C# side)
 //! Paths are UTF-16 (`*const u16`) NUL-terminated.
@@ -36,9 +37,7 @@ use netcorehost::hostfxr::AssemblyDelegateLoader;
 use netcorehost::pdcstring::PdCString;
 use netcorehost::{nethost, pdcstr};
 
-use mzdata::curie;
-use mzdata::params::{Param, Unit};
-use mzdata::prelude::ParamDescribed;
+use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -222,18 +221,17 @@ fn to_utf16_nul(path: &Path) -> Result<Vec<u16>> {
 }
 
 fn resolve_dirs() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let glue_dir = std::env::var_os("MZPC_AGILENT_MIDAC_GLUE")
-        .map(std::path::PathBuf::from)
+    let glue_dir = crate::pwiz_layout::glue_dir("MZPC_AGILENT_MIDAC_GLUE", "agilent_midac")
         .ok_or_else(|| {
             anyhow!(
-                "MZPC_AGILENT_MIDAC_GLUE not set — point it at the `dotnet build` output dir of \
-                 glue/agilent_midac/"
+                "MZPC_AGILENT_MIDAC_GLUE not set and no glue/agilent_midac beside the executable — \
+                 point it at the `dotnet build` output dir of glue/agilent_midac/"
             )
         })?;
     let pwiz_dir = std::env::var_os("MZPC_PWIZ_DIR").map(std::path::PathBuf::from).ok_or_else(|| {
-        anyhow!("MZPC_PWIZ_DIR not set — the MIDAC DLLs load from <MZPC_PWIZ_DIR>/vendor_api/Agilent")
+        anyhow!("MZPC_PWIZ_DIR not set — the MIDAC DLLs load from <MZPC_PWIZ_DIR>/vendor_api/Agilent or <MZPC_PWIZ_DIR> itself")
     })?;
-    Ok((glue_dir, pwiz_dir.join("vendor_api").join("Agilent")))
+    Ok((glue_dir, crate::pwiz_layout::agilent_dll_dir(&pwiz_dir)))
 }
 
 /// RAII guard freeing a filled [`FrameOut`]'s unmanaged buffers on drop (panic/early-return path).
@@ -313,10 +311,6 @@ impl AgilentMidacReader {
         self.count
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
     /// Pull one frame's three arrays across the boundary, copy them out, then free.
     fn fetch(&self, i: usize) -> Result<(Vec<f64>, Vec<f32>, Vec<f64>, FrameOut)> {
         let mut out = FrameOut::zeroed();
@@ -356,8 +350,9 @@ impl AgilentMidacReader {
     }
 
     /// Build the mzdata spectrum for frame `i`: Float64 MZArray + Float32 IntensityArray + Float64
-    /// `MeanInverseReducedIonMobilityArray` (the drift dimension MIDAC exposes), plus the
-    /// `MS:1000294 "mass spectrum"` param and a `ScanEvent` with `start_time` in minutes.
+    /// `MeanInverseReducedIonMobilityArray` (the drift dimension MIDAC exposes), plus
+    /// a `ScanEvent` with `start_time` in minutes (no blanket `MS:1000294`; the writer types rows
+    /// from ms_level).
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
         if i >= self.count {
             bail!("Agilent MIDAC frame index {i} out of range (count {})", self.count);
@@ -397,7 +392,10 @@ impl AgilentMidacReader {
             polarity,
             ..Default::default()
         };
-        descr.add_param(Param::builder().name("mass spectrum").curie(curie!(MS:1000294)).build());
+        // No blanket `MS:1000294 "mass spectrum"` here (0.9.13). mzdata's `spectrum_type()` is a first-match
+        // lookup, so that parent term wins over the specific one and the writer's inference
+        // (`writer/visitor.rs`: ms_level 1 -> MS:1000579, else MS:1000580) never runs; with it absent the
+        // writer types each row from `ms_level`, as the mzML, Shimadzu and Bruker-native lanes already do.
         let mut scan = ScanEvent::default();
         scan.start_time = meta.rt_minutes;
         descr.acquisition.scans.push(scan);
@@ -405,22 +403,6 @@ impl AgilentMidacReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        let mut idx = 0usize;
-        for i in 0..self.count {
-            if let Ok((mz, _, _, _)) = self.fetch(i) {
-                if !mz.is_empty() {
-                    idx = i;
-                    break;
-                }
-            }
-        }
-        self.spectrum(idx)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample frame has no arrays"))
-    }
 }
 
 impl Drop for AgilentMidacReader {

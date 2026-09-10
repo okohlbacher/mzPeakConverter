@@ -114,8 +114,9 @@ const _: () = {
     assert!(offset_of!(ShimadzuSpectrumMetaV2, n_points) == offset_of!(ShimadzuSpectrumMeta, n_points));
 };
 
-/// ABI generation this binary requires from the glue DLL. 3 = V2 metadata + MassRange + InstrumentInfo.
-const REQUIRED_ABI_VERSION: i32 = 3;
+/// ABI generation this binary requires from the glue DLL.
+/// 4 = 3 (V2 metadata + MassRange + InstrumentInfo) + `LibraryVersion`.
+const REQUIRED_ABI_VERSION: i32 = 4;
 
 type ShimOpen = extern "system" fn(*const u16, *const u16) -> i64;
 type ShimClose = extern "system" fn(i64);
@@ -125,6 +126,9 @@ type ShimSpectrumMetaV2Fn = extern "system" fn(i64, i64, *mut ShimadzuSpectrumMe
 type ShimAbiVersion = extern "system" fn() -> i32;
 type ShimMassRange = extern "system" fn(i64, i32, i32, *mut f64, *mut f64) -> i32;
 type ShimInstrumentInfo = extern "system" fn(i64, *mut u16, i32) -> i32;
+/// Version of the LOADED `Shimadzu.LabSolutions.IO.IoModule` assembly (buffer convention of
+/// `LastError`: returns the length needed, fills up to `cap`). Process-wide, not per handle.
+type ShimLibraryVersion = extern "system" fn(*mut u16, i32) -> i32;
 /// `which`: 0 = profile, 1 = centroid. Both exist for the same scan; each is fetched separately so
 /// an archive can carry both facets (see `Representation`).
 type ShimSpectrumData =
@@ -138,10 +142,10 @@ struct GlueApi {
     open: ShimOpen,
     close: ShimClose,
     spectrum_count: ShimSpectrumCount,
-    spectrum_meta: ShimSpectrumMetaFn,
     spectrum_meta_v2: ShimSpectrumMetaV2Fn,
     mass_range: ShimMassRange,
     instrument_info: ShimInstrumentInfo,
+    library_version: ShimLibraryVersion,
     spectrum_data: ShimSpectrumData,
     data_free: ShimDataFree,
     last_error: ShimLastError,
@@ -211,7 +215,10 @@ impl GlueApi {
         let spectrum_count = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumCount>(ty, pdcstr!("SpectrumCount"))
             .map_err(|e| anyhow!("resolving glue export SpectrumCount: {e}"))?;
-        let spectrum_meta = *loader
+        // The v1 export is resolved by name (a glue that lost it fails here, and its struct twin
+        // stays part of the pinned ABI — `tests/shimadzu_abi_pin.rs`) but never called: every
+        // metadata read goes through `SpectrumMetaV2`, so nothing keeps the pointer.
+        let _spectrum_meta: ShimSpectrumMetaFn = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumMetaFn>(ty, pdcstr!("SpectrumMeta"))
             .map_err(|e| anyhow!("resolving glue export SpectrumMeta: {e}"))?;
 
@@ -242,6 +249,9 @@ impl GlueApi {
         let instrument_info = *loader
             .get_function_with_unmanaged_callers_only::<ShimInstrumentInfo>(ty, pdcstr!("InstrumentInfo"))
             .map_err(|e| anyhow!("resolving glue export InstrumentInfo: {e}"))?;
+        let library_version = *loader
+            .get_function_with_unmanaged_callers_only::<ShimLibraryVersion>(ty, pdcstr!("LibraryVersion"))
+            .map_err(|e| anyhow!("resolving glue export LibraryVersion: {e}"))?;
         let spectrum_data = *loader
             .get_function_with_unmanaged_callers_only::<ShimSpectrumData>(ty, pdcstr!("SpectrumData"))
             .map_err(|e| anyhow!("resolving glue export SpectrumData: {e}"))?;
@@ -257,14 +267,32 @@ impl GlueApi {
             open,
             close,
             spectrum_count,
-            spectrum_meta,
             spectrum_meta_v2,
             mass_range,
             instrument_info,
+            library_version,
             spectrum_data,
             data_free,
             last_error,
         })
+    }
+
+    /// Version of the vendor assembly the glue actually loaded, e.g. `5.0.0.0`. `None` before the
+    /// first successful open, or when the assembly carries no usable version — an unknown version
+    /// is never treated as a known-bad one.
+    fn library_version(&self) -> Option<String> {
+        let needed = (self.library_version)(std::ptr::null_mut(), 0);
+        if needed <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written = (self.library_version)(buf.as_mut_ptr(), needed);
+        if written <= 0 {
+            return None;
+        }
+        let n = (written as usize).min(buf.len());
+        let v = String::from_utf16_lossy(&buf[..n]).trim().to_string();
+        (!v.is_empty()).then_some(v)
     }
 
     fn last_error(&self) -> Option<String> {
@@ -304,10 +332,12 @@ pub struct ShimadzuInstrumentInfo {
     pub system_name: Option<String>,
     /// e.g. `MSID_QTFL` — the LCMS-9030 Q-TOF.
     pub device_id: Option<String>,
-    /// ISO 8601, local instrument time, no zone.
-    pub analysis_date: Option<String>,
     /// e.g. `ESI`.
     pub ionization: Option<String>,
+    /// `SampleInfo.AnalysisDate` as the DLL rendered it: a naive local time with no zone. Never
+    /// becomes `run.start_time` (that would assert a zone the vendor did not state); preserved
+    /// verbatim in the `acquisition_time` index block by `run_metadata`.
+    pub analysis_date: Option<String>,
 }
 
 pub struct ShimadzuReader {
@@ -319,8 +349,9 @@ pub struct ShimadzuReader {
     /// One-shot latch so the "you asked for X, the file has Y" warning is emitted once per file
     /// rather than once per spectrum.
     fallback_warned: AtomicBool,
-    /// Memoised answer to "does this `.lcd` store profile signal at all?", which decides whether
-    /// the vendor-defect warning applies. `None` until the first centroid fetch probes for it.
+    /// Memoised answer to "does this `.lcd` store profile signal at all?", the second half of the
+    /// vendor-defect predicate (the first is the loaded library version). `None` until the first
+    /// centroid fetch probes for it — and on a current library it is never probed at all.
     stores_profile: std::cell::Cell<Option<bool>>,
     /// One-shot latch for that warning.
     rotation_warned: AtomicBool,
@@ -334,12 +365,12 @@ impl ShimadzuReader {
     }
 
     pub fn open_with(path: &Path, representation: Representation) -> Result<Self> {
-        let glue_dir = std::env::var_os("MZPC_SHIMADZU_GLUE")
-            .map(PathBuf::from)
+        let glue_dir = crate::pwiz_layout::glue_dir("MZPC_SHIMADZU_GLUE", "shimadzu")
             .ok_or_else(|| {
                 anyhow!(
-                    "MZPC_SHIMADZU_GLUE is not set; point it at the directory holding ShimadzuGlue.dll \
-                     (the `dotnet build` output of glue/shimadzu, e.g. .../bin/Release/net8.0)"
+                    "MZPC_SHIMADZU_GLUE is not set and there is no glue/shimadzu beside the executable; \
+                     point it at the directory holding ShimadzuGlue.dll (the `dotnet build` output of \
+                     glue/shimadzu, e.g. .../bin/Release/net8.0)"
                 )
             })?;
         let pwiz_dir = resolve_shimadzu_dll_dir()?;
@@ -392,12 +423,6 @@ impl ShimadzuReader {
     pub fn len(&self) -> usize {
         self.count
     }
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-    pub fn lcd_path(&self) -> &Path {
-        &self.lcd_path
-    }
 
     fn meta(&self, i: usize) -> Result<ShimadzuSpectrumMetaV2> {
         let index = i64::try_from(i).map_err(|_| anyhow!("Shimadzu index {i} does not fit in i64"))?;
@@ -435,23 +460,25 @@ impl ShimadzuReader {
         let text = String::from_utf16_lossy(&buf[..n]);
         let mut fields = text.split('\u{1F}').map(|f| f.trim().to_string());
         let mut next = || fields.next().filter(|f| !f.is_empty());
-        ShimadzuInstrumentInfo {
-            system_name: next(),
-            device_id: next(),
-            analysis_date: next(),
-            ionization: next(),
-        }
+        let system_name = next();
+        let device_id = next();
+        // Slot 3 is `SampleInfo.AnalysisDate`: a naive local time with no zone — kept as text.
+        let analysis_date = next();
+        let ionization = next();
+        ShimadzuInstrumentInfo { system_name, device_id, ionization, analysis_date }
     }
 
     /// Does this `.lcd` store profile signal at all? Probes the head of the run plus a stride
     /// across it, and stops at the first spectrum that yields profile points.
     ///
-    /// This is the discriminator for the A5 gate below: measured against the LabSolutions mzML
-    /// exports, the native centroid lists come back correct on files that carry profile signal
+    /// This is the SECOND condition of the rotation warning below (the first is the vendor library
+    /// version): measured against the LabSolutions mzML exports with the DEFECTIVE 3.8.4.6016, the
+    /// native centroid lists come back correct on files that carry profile signal
     /// (Blind_P1_pos_012: 13,200/13,200 spectra, all 216,742 intensities bit-exact) and rotated —
     /// `[s alien values] + truth[0:n-s]`, plus a clipped final peak — on files that carry none
-    /// (the DIA_Hela pair).
-    fn stores_profile(&self) -> Result<bool> {
+    /// (the DIA_Hela pair). Under 5.0.0.0 both come back correct, so this probe only runs when the
+    /// loaded library is one that can be wrong.
+    pub(crate) fn stores_profile(&self) -> Result<bool> {
         if let Some(known) = self.stores_profile.get() {
             return Ok(known);
         }
@@ -469,9 +496,19 @@ impl ShimadzuReader {
         Ok(found)
     }
 
-    /// Warn — once per file — when this `.lcd` stores no profile signal, because the vendor API
-    /// returns misaligned centroid intensities for exactly those spectra (see
-    /// [`Self::stores_profile`]).
+    /// Warn — once per file — when the centroids this run is about to store are the rotated ones.
+    ///
+    /// TWO conditions, and BOTH must hold:
+    ///   1. the LOADED `Shimadzu.LabSolutions.IO` is a version that carries the defect
+    ///      (< 5.0.0.0 — see [`crate::pwiz_layout::shimadzu_library_status`]), and
+    ///   2. this `.lcd` stores no profile signal (see [`Self::stores_profile`]), which is where
+    ///      that library's centroid lists come back misaligned.
+    ///
+    /// The version is checked FIRST, and it is the condition that was missing: the defect belongs
+    /// to 3.8.4.6016, and 5.0.0.0 reads the very same profile-less file correctly. Warning on the
+    /// file alone raised a false alarm on good data — which trains users to ignore the message on
+    /// the day it is true. It also makes the common case cheap: on a current ProteoWizard nothing
+    /// probes the file at all.
     ///
     /// This converter's job is to STORE what the vendor interface returns, not to correct or
     /// second-guess it, so this does not refuse the conversion and does not alter a single value.
@@ -481,19 +518,54 @@ impl ShimadzuReader {
         if self.rotation_warned.load(Ordering::Relaxed) {
             return;
         }
+        use crate::pwiz_layout::ShimadzuLibrary;
+        let version = self.api.library_version();
+        let status = crate::pwiz_layout::shimadzu_library_status(version.as_deref());
+        if status == ShimadzuLibrary::KnownGood {
+            log::debug!(
+                "Shimadzu.LabSolutions.IO {} has no centroid-alignment defect; not probing {} for \
+                 profile signal",
+                version.as_deref().unwrap_or("(version unknown)"),
+                self.lcd_path.display()
+            );
+            self.rotation_warned.store(true, Ordering::Relaxed);
+            return;
+        }
+        // KnownBad and Unknown both reach the file probe. Unknown must NOT be treated as good: a
+        // stale 3.8.4.6016 whose version string we failed to read would otherwise store rotated
+        // centroids in total silence, which is the failure this check exists to prevent. It gets a
+        // different sentence — "could not check", not "your data is rotated" — so a warning still
+        // reaches the user without accusing a library that may well be fine.
         match self.stores_profile() {
             Ok(false) => {
                 if !self.rotation_warned.swap(true, Ordering::Relaxed) {
-                    log::warn!(
-                        "{} stores no profile signal. For such spectra Shimadzu.LabSolutions.IO \
-                         returns centroid intensities misaligned against their m/z (shifted by 1-7 \
-                         positions, the last peak missing) — a VENDOR-side defect that msconvert \
-                         reproduces byte-identically. These peaks are stored exactly as the vendor \
-                         API returned them, unaltered. For scientifically correct centroids from \
-                         this file use a LabSolutions mzML export, whose exporter takes a different \
-                         internal path and is exact.",
-                        self.lcd_path.display()
-                    );
+                    let ver = version.as_deref().unwrap_or("(version unknown)");
+                    let fix = "FIX: install a current ProteoWizard (3.0.26151 or newer, which \
+                               ships Shimadzu.LabSolutions.IO 5.0.0.0) and point MZPC_PWIZ_DIR at \
+                               it — 5.0.0.0 reads this same file correctly. Run with \
+                               MZPC_SHIMADZU_DEBUG=1 to see which assembly was loaded.";
+                    if status == ShimadzuLibrary::KnownBad {
+                        log::warn!(
+                            "{path} stores no profile signal, and the loaded \
+                             Shimadzu.LabSolutions.IO is {ver} — a version that returns centroid \
+                             intensities misaligned against their m/z for exactly those spectra \
+                             (shifted by 1-7 positions, the last peak missing). The defect is in \
+                             the LIBRARY, not the file: msconvert reproduces it byte-identically \
+                             only because it drives this same DLL. The peaks are stored exactly as \
+                             the vendor API returned them, unaltered. {fix}",
+                            path = self.lcd_path.display(),
+                        );
+                    } else {
+                        log::warn!(
+                            "{path} stores no profile signal, and the loaded \
+                             Shimadzu.LabSolutions.IO did not report a version we can read \
+                             ({ver:?}), so its centroid alignment COULD NOT BE CHECKED. Versions \
+                             before 5.0.0.0 return centroid intensities misaligned against their \
+                             m/z for exactly these spectra (shifted by 1-7 positions, the last \
+                             peak missing), and this archive would carry that silently. {fix}",
+                            path = self.lcd_path.display(),
+                        );
+                    }
                 }
             }
             Ok(true) => {
@@ -594,9 +666,10 @@ impl ShimadzuReader {
         // An explicit `--representation profile` on a file that stores only centroids would otherwise
         // leave both arrays empty and then LABEL that emptiness -- writing a zero-point spectrum
         // tagged as the representation that is absent. Fall back to the representation the file does
-        // have, keep its true label, and say so once. NOTE: on a profile-less file that fallback now
-        // hits the A5 gate and hard-errors instead of quietly emitting rotated centroids — closing
-        // the hole that made `--representation profile` look like a safe lane for those files.
+        // have, keep its true label, and say so once. On a profile-less file read through a
+        // pre-5.0.0.0 library the fallback lands on the rotated centroids, so it also trips
+        // `warn_if_rotated_centroids` (which WARNS — this converter stores what the vendor
+        // returns and never refuses the conversion; see that function's docs).
         if profile.0.is_empty() && centroid.0.is_empty() {
             match self.representation {
                 Representation::Profile => centroid = self.peaks(i, 1)?,
@@ -704,13 +777,25 @@ impl ShimadzuReader {
         // window as a centre (`AcqModeMz`) plus a FULL width (`QTransmissionWidthMz`), so the bounds
         // are half the width either side — that reproduces the mzML lane's ±8.5 from a 17.0 Th
         // window. `precursor_id` names the parent scan so the writer's id→index map can resolve it.
-        if ms_level > 1 && meta.precursor_mz > 0.0 {
+        //
+        // The window is keyed on the vendor's isolation target (`AcqModeMz`), NOT on the selected
+        // ion: `max(target, selected ion)` (pre-0.9.13) silently shifted the window whenever the
+        // selected ion was heavier than the target (target 500, ion 501, width 2 → 500–502 instead
+        // of 499–501). The selected ion only stands in for the target when the vendor reports none,
+        // and a window with a target but no selected ion is still written — preserve what is there.
+        if ms_level > 1 && (meta.isolation_target_mz > 0.0 || meta.precursor_mz > 0.0) {
             let half = (meta.isolation_width_mz / 2.0) as f32;
-            let target = meta.isolation_target_mz.max(meta.precursor_mz) as f32;
-            let ion = SelectedIon {
-                mz: meta.precursor_mz,
-                charge: (meta.precursor_charge != 0).then_some(meta.precursor_charge),
-                ..Default::default()
+            let target_mz =
+                if meta.isolation_target_mz > 0.0 { meta.isolation_target_mz } else { meta.precursor_mz };
+            let target = target_mz as f32;
+            let ions = if meta.precursor_mz > 0.0 {
+                vec![SelectedIon {
+                    mz: meta.precursor_mz,
+                    charge: (meta.precursor_charge != 0).then_some(meta.precursor_charge),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
             };
             let mut activation = Activation::default();
             activation.energy = meta.collision_energy as f32;
@@ -718,7 +803,7 @@ impl ShimadzuReader {
                 .methods_mut()
                 .push(DissociationMethodTerm::CollisionInducedDissociation);
             descr.precursor = vec![Precursor {
-                ions: vec![ion],
+                ions,
                 isolation_window: if half > 0.0 {
                     IsolationWindow {
                         target,
@@ -739,28 +824,6 @@ impl ShimadzuReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), peak_set, None))
     }
 
-    /// A sample spectrum's array map, for deriving the writer's data-facet schema.
-    pub fn sample_arrays(&self) -> Result<BinaryArrayMap> {
-        // Surface the vendor-defect warning up front rather than mid-run.
-        self.warn_if_rotated_centroids();
-        // Look through BOTH representations: on a centroid-only file every `which = 0` fetch comes
-        // back empty, and settling for spectrum 0 would hand the writer an empty schema sample.
-        let mut chosen = 0usize;
-        'outer: for i in 0..self.count {
-            for which in [0, 1] {
-                if let Ok((mz, _)) = self.peaks(i, which) {
-                    if !mz.is_empty() {
-                        chosen = i;
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        self.spectrum(chosen)?
-            .arrays
-            .clone()
-            .ok_or_else(|| anyhow!("sample spectrum has no arrays"))
-    }
 }
 
 impl Drop for ShimadzuReader {

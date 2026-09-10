@@ -37,7 +37,7 @@ use crate::{
     },
     param::ControlledVocabularyEntry,
     peak_series::{ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays},
-    writer::{base::GenericDataArrayWriter, builder::SpectrumFieldVisitors},
+    writer::{base::{GenericDataArrayWriter, centroid_arrays_beyond_peaks}, builder::SpectrumFieldVisitors},
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -81,6 +81,20 @@ struct ArrayTypesSampler<'a> {
     overrides: &'a BufferOverrideTable,
     use_chunked_encoding: Option<ChunkingStrategy>,
     is_profile: i32,
+}
+
+/// Mirrors the routing test in `AbstractMzPeakWriter::write_spectrum`: a non-MS spectrum that carries
+/// the wavelength axis is written to the wavelength facet, whose schema is fixed
+/// (`add_default_fields_for_context`), never to `spectra_data` / `spectra_peaks`. Sampling it against
+/// the m/z main axis finds no axis, spills its intensity array to `auxiliary_arrays`, and trips the
+/// `guard_not_signal_array` debug assertion (a logged BUG per spectrum per pass in release).
+fn is_wavelength_spectrum<C: CentroidLike, D: DeconvolutedCentroidLike>(
+    s: &impl SpectrumLike<C, D>,
+) -> bool {
+    s.spectrum_type().is_some_and(|t| !t.is_mass_spectrum())
+        && s.raw_arrays().is_some_and(|m| {
+            m.has_array(&BufferContext::WavelengthSpectrum.default_sorted_array())
+        })
 }
 
 impl<'a> ArrayTypesSampler<'a> {
@@ -186,11 +200,19 @@ impl<'a> ArrayTypesSampler<'a> {
         prefer_peaks: bool,
     ) -> Option<Vec<FieldRef>> {
         log::trace!("Sampling arrays from {}", s.id());
+        if is_wavelength_spectrum(&s) {
+            return None;
+        }
         if s.signal_continuity() == SignalContinuity::Profile {
             self.is_profile += 1;
         }
 
         if prefer_peaks {
+            // Same rule as the write path: a centroid peak set that is only part of the raw
+            // arrays is sampled from the raw arrays, so the extra dimension gets a column.
+            if let Some(map) = centroid_arrays_beyond_peaks(&s) {
+                return self.from_binary_array_map(map, BufferContext::Spectrum);
+            }
             match s.peaks() {
                 mzdata::spectrum::RefPeakDataLevel::Missing => None,
                 mzdata::spectrum::RefPeakDataLevel::RawData(map) => {
@@ -369,7 +391,7 @@ pub fn sample_array_types_from_spectrum_source<
         );
         let it = (0..n)
             .flat_map(|i| reader.get_spectrum_by_index(i))
-            .filter(|s| !s.peaks().is_empty())
+            .filter(|s| !s.peaks().is_empty() && !is_wavelength_spectrum(s))
             .take(pts.len());
         let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding)
             .sample_spectrum_array_types(it, prefer_peaks);
@@ -435,6 +457,14 @@ fn prune_all_null_dup_point_columns(
         return Ok(peak_file);
     };
     let DataType::Struct(children) = point_field.data_type().clone() else { unreachable!() };
+    // A chunk facet is out of scope: numpress-linear chunks carry an all-null `mz_chunk_values`
+    // beside `mz_numpress_linear_bytes` BY DESIGN (same `array_name`, different buffer format),
+    // and pruning it rewrote every numpress archive — ~1 GB re-encoded for nothing — and left the
+    // array index pointing at a column that no longer existed.
+    if point_field.name() != "point" {
+        peak_file.rewind()?;
+        return Ok(peak_file);
+    }
     let n = children.len();
     let total_rows = pq_meta.file_metadata().num_rows();
 
@@ -501,11 +531,22 @@ fn prune_all_null_dup_point_columns(
         out_schema.clone(),
         ArrowWriterOptions::new().with_properties(props.clone()),
     )?;
+    let dropped: Vec<String> = drop.iter().map(|&i| format!("{}.{}", point_field.name(), children[i].name())).collect();
     if let Some(kvs) = pq_meta.file_metadata().key_value_metadata() {
         for kv in kvs {
-            if kv.key != "ARROW:schema" {
-                w.append_key_value_metadata(kv.clone());
+            if kv.key == "ARROW:schema" {
+                continue;
             }
+            // The array index was written before the prune: drop the entries of the removed
+            // columns or readers resolve a path that no longer exists.
+            if kv.key == "spectrum_array_index" {
+                if let Some(mut idx) = kv.value.as_deref().and_then(|v| serde_json::from_str::<crate::buffer_descriptors::SerializedArrayIndex>(v).ok()) {
+                    idx.entries.retain(|e| !dropped.contains(&e.path));
+                    w.append_key_value_metadata(KeyValue::new(kv.key.clone(), serde_json::to_string(&idx).ok()));
+                    continue;
+                }
+            }
+            w.append_key_value_metadata(kv.clone());
         }
     }
     for batch in builder.build()? {
@@ -966,8 +1007,13 @@ impl<
             buffer_size,
             &encryption_properties,
         )
-        .map_err(|e| log::error!("Failed to open peak writer: {e}"))
-        .ok();
+        // A failed open used to be logged and SWALLOWED: the writer then fell back to a default
+        // (m/z f64, intensity f32) point peak writer, which cannot describe a chunked or grid facet.
+        // On diaPASEF that killed the parallel encoder mid-run ("peak-encode collector died"); on a
+        // DDA `.d` it exited 0 with all-null m/z and the real data dumped into a 163 MB
+        // `auxiliary_arrays` blob. There is no correct archive on this path, so refuse to write one.
+        .unwrap_or_else(|e| panic!("Failed to open peak writer: {e}"));
+        let separate_peak_writer = Some(separate_peak_writer);
 
         let mut this = Self {
             archive_writer: Some(
@@ -1039,6 +1085,24 @@ impl<
         AbstractMzPeakWriter::write_spectrum(self, spectrum)
     }
 
+    /// Write a `spectrum` whose peak-facet rows are supplied as `peak_arrays` — a profile spectrum
+    /// can thereby carry a custom-schema centroid list (integer `tof_index` lattice) in
+    /// `spectra_peaks` while its raw arrays go to `spectra_data`.
+    ///
+    /// # See also
+    /// [`AbstractMzPeakWriter::write_spectrum_with_peak_arrays`]
+    pub fn write_spectrum_with_peak_arrays<
+        A: ToMzPeakDataSeries + CentroidLike,
+        B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        S: SpectrumLike<A, B> + 'static,
+    >(
+        &mut self,
+        spectrum: &S,
+        peak_arrays: &BinaryArrayMap,
+    ) -> io::Result<()> {
+        AbstractMzPeakWriter::write_spectrum_with_peak_arrays(self, spectrum, peak_arrays)
+    }
+
     fn flush_data_arrays(&mut self) -> io::Result<()> {
         for batch in self.spectrum_data_buffers.drain() {
             if let Some(writer) = self.archive_writer.as_mut() {
@@ -1103,16 +1167,19 @@ impl<
     ) -> Result<ZipArchiveWriter<W>, parquet::errors::ParquetError> {
         if self.archive_writer.is_some() {
             self.flush_data_arrays()?;
+            // Per-facet counts (mzPeakConverter issue #1): `spectrum_count` on a DATA facet is the
+            // number of spectra with at least one row in THIS file, and `spectrum_data_point_count`
+            // the points in THIS file — never the run total (which stays on `spectra_metadata`) and
+            // never the sum of both data facets. A centroid-only run therefore declares 0 / 0 on its
+            // empty `spectra_data`, instead of every spectrum and every peak of `spectra_peaks`.
             self.append_key_value_metadata(
                 SPECTRUM_COUNT.into(),
-                Some(self.spectrum_counter().to_string()),
+                Some(self.spectrum_data_buffers.entry_count().to_string()),
             );
-            let n_p = self
-                .spectrum_peak_writer()
-                .map(|v| v.point_count())
-                .unwrap_or_default()
-                + self.spectrum_data_buffers.point_count();
-            self.append_key_value_metadata(SPECTRUM_DATA_POINT_COUNT.into(), Some(n_p.to_string()));
+            self.append_key_value_metadata(
+                SPECTRUM_DATA_POINT_COUNT.into(),
+                Some(self.spectrum_data_buffers.point_count().to_string()),
+            );
 
             let mut writer = self.archive_writer.take().unwrap().into_inner()?;
 
@@ -1256,6 +1323,9 @@ impl<
                     ),
                 )?);
 
+                // Captured BEFORE `finish_spectrum()` drains the builder: the scans facet below
+                // used to read `len()` after the drain and declared 0 on a populated table.
+                let n_wavelength_spectra = self.wavelength_spectrum_metadata_buffer.index_counter();
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_DATA_POINT_COUNT.into(),
                     Some(
@@ -1269,7 +1339,7 @@ impl<
 
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_COUNT.into(),
-                    Some(self.wavelength_spectrum_metadata_buffer.len().to_string()),
+                    Some(n_wavelength_spectra.to_string()),
                 );
 
                 self.append_metadata();
@@ -1302,7 +1372,7 @@ impl<
 
                 self.append_key_value_metadata(
                     WAVELENGTH_SPECTRUM_COUNT.into(),
-                    Some(self.wavelength_spectrum_metadata_buffer.len().to_string()),
+                    Some(n_wavelength_spectra.to_string()),
                 );
 
                 self.append_metadata();
@@ -1354,6 +1424,17 @@ impl<
                         schema,
                         ArrowWriterOptions::new().with_properties(props),
                     )?);
+                    // Same per-facet definition as `spectra_data` / `chromatograms_data`.
+                    self.append_key_value_metadata(
+                        WAVELENGTH_SPECTRUM_COUNT.into(),
+                        Some(
+                            self.wavelength_spectrum_data_buffers
+                                .as_ref()
+                                .unwrap()
+                                .entry_count()
+                                .to_string(),
+                        ),
+                    );
                     self.append_key_value_metadata(
                         WAVELENGTH_SPECTRUM_DATA_POINT_COUNT.into(),
                         Some(
@@ -1467,6 +1548,11 @@ impl<
                 )?);
                 self.flush_chromatogram_data_records()?;
                 self.add_chromatogram_array_metadata();
+                // Per-facet, like `spectra_data`: chromatograms with rows in this file.
+                self.append_key_value_metadata(
+                    CHROMATOGRAM_COUNT.into(),
+                    Some(self.chromatogram_data_buffers.entry_count().to_string()),
+                );
                 self.append_key_value_metadata(
                     CHROMATOGRAM_DATA_POINT_COUNT.into(),
                     Some(self.chromatogram_data_buffers.point_count().to_string()),

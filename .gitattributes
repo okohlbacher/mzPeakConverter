@@ -2,3 +2,8 @@
 # git-bash; CRLF would break the scripts and corrupt manifest URLs read by curl).
 *.sh text eol=lf
 tools/*.tsv text eol=lf
+
+# Test fixtures are byte-exact data: no end-of-line conversion on any platform. With git's autocrlf on a
+# Windows checkout, tiny.pwiz.1.1.mzML would turn CRLF, its indexedmzML byte offsets would go stale, and
+# the reader would lose its chromatograms there and nowhere else.
+tests/fixtures/** -text

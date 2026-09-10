@@ -33,6 +33,39 @@
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <!-- 64-bit only: the Shimadzu native bits are x64. -->
     <Platforms>x64</Platforms>
+    <!-- See the ItemGroup note below. This FIRST-CLASS SDK property is what actually lands in
+         ShimadzuGlue.runtimeconfig.json; a bare RuntimeHostConfigurationOption is overridden by the
+         SDK's own default of false (observed: the generated config still read `false`). -->
+    <EnableUnsafeBinaryFormatterSerialization>true</EnableUnsafeBinaryFormatterSerialization>
+    <!-- ⚠️ ALSO MIRROR THIS in the committed ShimadzuGlue.runtimeconfig.json next to this file. That
+         copy is what the documented DLL-only deployment boots from, and it silently lacked this
+         switch: a deployment assembled from the committed config alone could not load the vendor
+         library at all, while a `dotnet build` output could. -->
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Shimadzu.LabSolutions.IO 5.0.0.0 (the version ProteoWizard 3.0.26151+ ships) deserializes
+         part of the .lcd through BinaryFormatter, which .NET disables by default since .NET 5:
+         `LoadData` then throws NotSupportedException wrapped in a TargetInvocationException and the
+         file looks unreadable. The 3.8.4 DLL did not need it.
+
+         This matters far beyond loading: 3.8.4 returns centroid intensities MISALIGNED against
+         their m/z on profile-less .lcd files (shifted 1-7 positions, last peak dropped) — the
+         long-standing "vendor defect". 5.0.0.0 returns them CORRECTLY: measured on
+         DIA_Hela_20ng.lcd, msconvert driving 5.0.0.0 reproduces the LabSolutions export exactly
+         (612/14,300/13,558/11,361 peaks, max |dintensity| = 0), where 3.8.4 gives n-1 and the
+         rotation. So enabling this switch is what lets the native lane read those files correctly.
+
+         SECURITY: BinaryFormatter is disabled by default because deserializing UNTRUSTED input is
+         unsafe. The input here is a vendor instrument file the user chose to convert, and the same
+         code path is what ProteoWizard itself runs. Do not widen this to other inputs. Note .NET 9
+         REMOVES BinaryFormatter outright, so a future retarget needs Shimadzu to ship a DLL that
+         does not use it. -->
+    <RuntimeHostConfigurationOption
+      Include="System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization"
+      Value="true" Trim="false" />
+  </ItemGroup>
+  <!-- (the PropertyGroup switch above is the one that takes effect; this ItemGroup is kept as
+       documentation of the exact runtime knob being set) -->
 
 </Project>

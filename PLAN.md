@@ -1,5 +1,9 @@
 # mzPeakConverter — Architecture & Plan (draft for adversarial review)
 
+> **SUPERSEDED (2026-09-04):** describes a CLI/design that no longer exists; kept for history.
+> Current status: `docs/PLATFORM_SUPPORT.md` and the review ledger
+> (`scratchpad/review2/review-ledger.html`).
+
 Status: DRAFT v0.2, 2026-06-21. Target output: mzPeak v0.9 (validator profile `mzpeak-0.9`).
 
 ## 0. MVP status (Phase 0 — DONE)

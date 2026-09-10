@@ -113,11 +113,29 @@ def read_facet(archive: Path, member: str) -> dict[int, tuple[np.ndarray, np.nda
                 (mz, np.asarray(intensities[k], dtype=np.float64))
             )
     else:  # point layout: one row per peak
-        mz_all = data.field("mz").to_numpy(zero_copy_only=False)
-        int_all = data.field("intensity").to_numpy(zero_copy_only=False)
-        for s in np.unique(si):
-            sel = si == s
-            out[int(s)] = [(mz_all[sel].astype(np.float64), int_all[sel].astype(np.float64))]
+        names = {f.name for f in data.type}
+        int_all = data.field("intensity").to_numpy(zero_copy_only=False).astype(np.float64)
+        if "tof_index" in names:
+            # Shimadzu lattice centroids (v0.9.5+): `tof_index` Int64 = round(m/z * 1e9) on lattice
+            # rows (`mz` null there), exact f64 `mz` on the rare fallback row (`tof_index` null).
+            idx = data.field("tof_index")
+            k = idx.to_numpy(zero_copy_only=False).astype(np.float64)
+            mz_all = k * 1e-9  # the vendored reader's LinearMz: m/z = params[0] * k
+            if "mz" in names:
+                fb = data.field("mz")
+                if fb.null_count < len(fb):
+                    on_lattice = idx.is_valid().to_numpy(zero_copy_only=False)
+                    fb_vals = fb.to_numpy(zero_copy_only=False)
+                    mz_all = np.where(on_lattice, mz_all, fb_vals)
+        else:
+            mz_all = data.field("mz").to_numpy(zero_copy_only=False).astype(np.float64)
+        # Rows are written grouped by spectrum: slice at the boundaries instead of one boolean mask
+        # per spectrum (280 M rows x 21,500 spectra would never finish).
+        bounds = np.flatnonzero(np.diff(si)) + 1
+        starts = np.concatenate(([0], bounds))
+        ends = np.concatenate((bounds, [len(si)]))
+        for a, b in zip(starts, ends):
+            out.setdefault(int(si[a]), []).append((mz_all[a:b], int_all[a:b]))
     return {
         s: (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]))
         for s, parts in out.items()

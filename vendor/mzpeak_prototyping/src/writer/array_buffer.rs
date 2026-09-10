@@ -221,6 +221,52 @@ pub trait ArrayBufferWriter {
 
     fn point_count(&self) -> u64;
     fn point_count_mut(&mut self) -> &mut u64;
+
+    /// The number of distinct series (spectra / chromatograms) that contributed at least one row
+    /// to THIS buffer over its whole lifetime (drains do not reset it). This is what the facet's
+    /// `<entity>_count` footer key means: entities represented by rows in this file — a
+    /// cardinality, not an index bound (indices may be sparse), and never the run total (that
+    /// lives on the primary metadata facet). See mzPeakConverter issue #1.
+    fn entry_count(&self) -> u64;
+}
+
+/// Tracks [`ArrayBufferWriter::entry_count`]: a series is counted once, on the first call that
+/// stores rows for it. Calls for one series are contiguous (the writers are sequential), so a
+/// last-seen index is enough; a series handed in with zero rows is not an entry.
+#[derive(Debug, Default, Clone)]
+pub struct EntryCounter {
+    count: u64,
+    last: Option<u64>,
+}
+
+impl EntryCounter {
+    fn note(&mut self, series_index: Option<u64>, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+        match series_index {
+            Some(i) if self.last == Some(i) => {}
+            Some(i) => {
+                self.count += 1;
+                self.last = Some(i);
+            }
+            // No index column in the batch (should not happen for a spectrum/chromatogram facet):
+            // count the call rather than silently under-report, and say so.
+            None => {
+                log::debug!("entry_count: batch without an index column — counting the call");
+                self.count += 1;
+            }
+        }
+    }
+}
+
+/// The series index carried by an `add_arrays` batch: the (constant) `<entity>_index` column's
+/// first value. `None` when the column is absent, empty, or null.
+fn series_index_of(fields: &Fields, arrays: &[ArrayRef], index_name: &str) -> Option<u64> {
+    let (i, _) = fields.find(index_name)?;
+    let col = arrays.get(i)?;
+    let col = col.as_any().downcast_ref::<arrow::array::UInt64Array>()?;
+    (!col.is_empty() && !col.is_null(0)).then(|| col.value(0))
 }
 
 /// A data buffer for the `point layout`
@@ -239,6 +285,7 @@ pub struct PointBuffers {
     null_zeros: bool,
     include_time: bool,
     point_count: u64,
+    entries: EntryCounter,
     nullable_targets: Vec<usize>,
     drop_zero_columns: Vec<usize>
 }
@@ -368,6 +415,7 @@ impl PointBuffers {
             }
         }
         self.point_count += n_pts as u64;
+        self.entries.note(Some(series_index), n_pts);
         (Vec::new(), n_pts)
     }
 
@@ -375,10 +423,10 @@ impl PointBuffers {
         &mut self,
         fields: Fields,
         mut arrays: Vec<ArrayRef>,
-        size: usize,
+        _size: usize,
         is_profile: bool,
     ) -> usize {
-
+        let series_index = series_index_of(&fields, &arrays, self.buffer_context.index_name());
         let mut drop_index = None;
         if is_profile && self.drop_zero_intensity() {
             for i in self.drop_zero_columns.iter() {
@@ -434,7 +482,12 @@ impl PointBuffers {
                         .map(|a| a.data_type())
                 }) {
                     filled += 1;
-                    chunk.push(new_null_array(t, size));
+                    // `n`, not `size`: when the zero-intensity-run drop above shortened the present
+                    // arrays, a null column padded to the ORIGINAL point count no longer matches
+                    // them and `drain` panics building the record batch ("all columns in a record
+                    // batch must have the same length"). Reached whenever a facet leaves a column
+                    // absent per spectrum — a gridded profile facet with an f64 fallback column.
+                    chunk.push(new_null_array(t, n));
                 } else {
                     log::error!("Failed to store a value for {f}");
                 }
@@ -448,6 +501,7 @@ impl PointBuffers {
         // trait's increment never ran. `n` is rows actually stored (may be < `size` after the
         // zero-intensity drop).
         self.point_count += n as u64;
+        self.entries.note(series_index, n);
         n
     }
 
@@ -565,6 +619,10 @@ impl ArrayBufferWriter for PointBuffers {
     fn point_count_mut(&mut self) -> &mut u64 {
         &mut self.point_count
     }
+
+    fn entry_count(&self) -> u64 {
+        self.entries.count
+    }
 }
 
 /// A data buffer for the `chunked layout`
@@ -585,6 +643,7 @@ pub struct ChunkBuffers {
     /// GATED ims-chunked: when set, raw-array writes chunk an integer `tof` axis on m/z bins.
     mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
     point_count: u64,
+    entries: EntryCounter,
 }
 
 impl ChunkBuffers {
@@ -616,6 +675,7 @@ impl ChunkBuffers {
             chunking_strategy,
             mz_boundary,
             point_count: 0,
+            entries: EntryCounter::default(),
         }
     }
 
@@ -627,7 +687,7 @@ impl ChunkBuffers {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         let boundary = self.mz_boundary?;
         // The chunk main axis is the integer `tof` flight-time array (replaces m/z for this facet).
         let main_axis = crate::BufferName::new(
@@ -650,7 +710,7 @@ impl ChunkBuffers {
             Some(boundary),
         );
         match res {
-            Ok((chunks, _aux, n_pts)) => {
+            Ok((chunks, aux, n_pts)) => {
                 if let Some(chunks) = chunks {
                     let (fields, cols, _) = chunks.into_parts();
                     self.add_arrays(fields, cols, n_pts, false);
@@ -658,7 +718,7 @@ impl ChunkBuffers {
                     // Empty frame (no points): nothing to buffer, but count the (zero) points.
                     self.point_count += 0;
                 }
-                Some(Ok(n_pts))
+                Some(Ok((aux, n_pts)))
             }
             Err(e) => Some(Err(e)),
         }
@@ -675,7 +735,7 @@ impl ChunkBuffers {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         let series_time = if self.include_time { series_time } else { None };
         let res = ArrowArrayChunk::build(
             series_index,
@@ -689,12 +749,14 @@ impl ChunkBuffers {
             &self.chunk_array_fields,
         );
         match res {
-            Ok((chunks, _aux, n_pts)) => {
+            // An array the chunk schema does not carry comes back as an auxiliary array; hand it
+            // up so it lands in the metadata facet rather than being dropped here.
+            Ok((chunks, aux, n_pts)) => {
                 if let Some(chunks) = chunks {
                     let (fields, cols, _) = chunks.into_parts();
                     self.add_arrays(fields, cols, n_pts, false);
                 }
-                Some(Ok(n_pts))
+                Some(Ok((aux, n_pts)))
             }
             Err(e) => Some(Err(e)),
         }
@@ -728,10 +790,12 @@ impl ArrayBufferWriter for ChunkBuffers {
     }
 
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool) -> usize {
+        let series_index = series_index_of(&fields, &arrays, self.buffer_context.index_name());
         self.chunk_buffer
             .push(StructArray::new(fields, arrays, None));
         self.is_profile_buffer.push(is_profile);
         self.point_count += size as u64;
+        self.entries.note(series_index, size);
         size
     }
 
@@ -804,6 +868,10 @@ impl ArrayBufferWriter for ChunkBuffers {
     fn point_count_mut(&mut self) -> &mut u64 {
         &mut self.point_count
     }
+
+    fn entry_count(&self) -> u64 {
+        self.entries.count
+    }
 }
 
 /// An abstraction over [`ArrayBufferWriter`] types
@@ -855,7 +923,7 @@ impl ArrayBufferWriterVariants {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
                 chunk_buffers.add_raw_mz_boundary(series_index, series_time, arrays)
@@ -872,7 +940,7 @@ impl ArrayBufferWriterVariants {
         series_index: u64,
         series_time: Option<f32>,
         arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<usize, mzdata::spectrum::bindata::ArrayRetrievalError>> {
+    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
                 chunk_buffers.add_raw_chunked(series_index, series_time, arrays)
@@ -1025,6 +1093,13 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
             ArrayBufferWriterVariants::PointBuffers(point_buffers) => {
                 point_buffers.point_count_mut()
             }
+        }
+    }
+
+    fn entry_count(&self) -> u64 {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.entry_count(),
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.entry_count(),
         }
     }
 }
@@ -1486,6 +1561,7 @@ impl ArrayBuffersBuilder {
             null_zeros: self.null_zeros,
             include_time: self.include_time,
             point_count: 0,
+            entries: EntryCounter::default(),
             nullable_targets,
             drop_zero_columns,
         }

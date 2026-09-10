@@ -179,7 +179,7 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
                         self.buffers.add_raw_chunked(spectrum_count, spectrum_time, arrays)
                     })
                 {
-                    let n_peaks = res.map_err(io::Error::other)?;
+                    let (aux, n_peaks) = res.map_err(io::Error::other)?;
                     self.n_points += n_peaks as u64;
                     self.n_entries += 1;
                     if self.buffers.len() >= self.buffer_size
@@ -190,7 +190,7 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
                     }
                     return Ok(EntryMetadataDerivedFromData::new(
                         None,
-                        Some(Vec::new()),
+                        Some(aux),
                         None,
                         Some(n_peaks),
                     ));
@@ -272,7 +272,9 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
     }
 
     pub fn finish(mut self) -> Result<W, ParquetError> {
-        self.append_key_value_metadata("spectrum_count", Some(self.n_entries.to_string()));
+        // Spectra with at least one row in this facet (a zero-peak spectrum handed to this writer
+        // is not an entry) — the same per-facet definition `spectra_data` uses.
+        self.append_key_value_metadata("spectrum_count", Some(self.buffers.entry_count().to_string()));
         self.append_key_value_metadata(
             "spectrum_data_point_count",
             Some(self.n_points.to_string()),

@@ -1,7 +1,7 @@
 //! Regression pin for the compression codec of the spectrum data facets.
 //!
 //! `prune_all_null_dup_point_columns` rewrites the finished peak facet when the schema sampler
-//! left an all-null twin of a populated column. Through 0.9.2 that rewrite built its `ArrowWriter`
+//! left an all-null twin of a populated column. Until 0.9.3 that rewrite built its `ArrowWriter`
 //! with `None` properties, so the survivors were re-encoded with parquet's DEFAULTS: UNCOMPRESSED,
 //! no byte-stream-split, no delta packing, no encryption — and `--zstd-level` had no effect on
 //! them. Numpress-linear always trips it (its schema carries both `mz_numpress_linear_bytes` and

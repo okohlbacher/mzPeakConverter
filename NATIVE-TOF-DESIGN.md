@@ -1,5 +1,9 @@
 # Native integer-TOF reader for Bruker TDF — design (mzdata-upstream-friendly)
 
+> **SUPERSEDED (2026-09-04):** describes a CLI/design that no longer exists; kept for history.
+> Current status: `docs/PLATFORM_SUPPORT.md` and the review ledger
+> (`scratchpad/review2/review-ledger.html`).
+
 Status: DRAFT v0.1, 2026-06-21. Resolves Blocker-1 (ims-compact "lossless" requires native
 integer TOF, which mzdata 0.64 does not expose).
 
