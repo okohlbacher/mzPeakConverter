@@ -145,10 +145,12 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     // A drop glob must not take a core facet with it. Globs match every member, so `*.parquet`, or
     // naming `spectra_peaks.parquet` or a precursor sub-facet, wrote an unreadable archive and exited
     // 0. Proprietary/other spectrum members (the Thermo `vendor_*` facets `--no-vendor` drops) stay
-    // droppable. Checked before anything is written.
+    // droppable, and so do the wavelength (UV/PDA) facets: they reference only each other, so
+    // `--drop-aux 'wavelength_spectra*'` strips the trace and leaves a readable archive, as it always
+    // did. Checked before anything is written.
     for name in member_names.iter().filter(|n| opts.drop_aux.iter().any(|g| glob_match(g, n))) {
         if let Some(fe) = orig_files.get(name).filter(|fe| {
-            matches!(fe.entity_type, EntityType::Spectrum | EntityType::WavelengthSpectrum)
+            matches!(fe.entity_type, EntityType::Spectrum)
                 && !matches!(fe.data_kind, DataKind::Proprietary | DataKind::Other(_))
         }) {
             bail!(

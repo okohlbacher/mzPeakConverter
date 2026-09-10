@@ -5,7 +5,8 @@
 //! the order the rows were read. `sort_unstable_by` on that tied key was free to reorder the
 //! precursors against the selected ions, and did: round-tripping a DDA-PASEF archive emitted a
 //! frame's precursors back to front, with every ion attached to the last one. The sort is stable
-//! now; this pins the observable consequence.
+//! now, and the reader no longer walks the rows in reverse when it attaches them (which kept the
+//! order back to front after the sort was fixed); this pins the observable consequence.
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -79,11 +79,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   between spectrum facets", ~2 s in, on two diaPASEF runs); since 0.9.3 relaxed that check to a
   warning it wrote the mixed archive and warned. The data facet is now declared chunked too, with
   the same chunk-shaped fields as the peak facet, so an empty `spectra_data` still carries a
-  well-formed chunk schema and the archive meets `docs/conformance.md:68` without leaning on the
-  relaxation (which is untouched — dual-representation archives still pick per facet). Verified on
-  PXD059079 `…_2499.d` and a private diaPASEF run: both `spectrum_array_index` footers say `chunk`,
-  `validate_everything.py` passes at max sensitivity (0 errors, 0 warnings), and the archives are
-  7.8 % / 4.3 % smaller than the default layout. The default (point) layout is unchanged.
+  well-formed chunk schema and the entity keeps one layout family (the scope proposed in
+  HUPO-PSI/mzPeak-specification#21) without leaning on the relaxation, which is untouched:
+  dual-representation archives still pick per facet. Only the empty `spectra_data` member changes.
+  Verified on PXD059079 `…_2499.d` and a private diaPASEF run: both `spectrum_array_index` footers
+  say `chunk`, and `validate_everything.py` passes at max sensitivity (0 errors, 0 warnings). The
+  default (point) layout is unchanged.
   Regression test: `ims_chunked_spectrum_facets_share_one_family` (corpus-gated, `--ignored`).
 - **Opening a Bruker TSF `.d` no longer writes into it.** `TsfReader::open` used rusqlite's default
   open, which is read-write and CREATES a missing file, so opening a `.d` that has no `analysis.tsf`
@@ -150,9 +151,10 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 - **`--drop-aux` refuses to remove a core facet.** Drop globs matched every member, so
   `--drop-aux '*.parquet'` wrote an archive holding nothing but its index, and dropping
   `spectra_peaks.parquet` or `spectra_metadata_precursors.parquet` wrote an unreadable one — each
-  with exit 0. A glob that matches a `spectrum` or `wavelength_spectrum` facet whose `data_kind`
-  is not proprietary/other now exits 1 before anything is written. `--no-vendor` still drops the
-  Thermo `vendor_*` facets, which are declared proprietary.
+  with exit 0. A glob that matches a `spectrum` facet whose `data_kind` is not proprietary/other
+  now exits 1 before anything is written. `--no-vendor` still drops the Thermo `vendor_*` facets,
+  which are declared proprietary, and `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA
+  trace: those facets reference only each other.
 - **`--ms-level` and `--rt` fail on a missing or retyped column.** An `ms_level` that was absent
   or not UInt8 read as level 0, and a `time` that was absent or not Float64 as NaN, so a writer
   type change would have made either filter keep 0 spectra and exit 0.
@@ -175,6 +177,14 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   gets its own concurrency group: with cancellation off GitHub still replaces a run *pending* in a
   group, so the middle one of three quick pushes would never run. Pull requests still cancel a
   superseded run.
+- **Reading an archive back keeps each spectrum's precursors in their source order.** The vendored
+  reader attached a spectrum's (and a chromatogram's) precursors in reversed row order, so
+  mzML → mzPeak → mzML turned `[(445.3, 445.34), (645.3, 645.34)]` (isolation target, selected ion)
+  into `[(645.3, 645.34), (445.3, 445.34)]`, and mzdata's `precursor()`, the first, named a
+  different precursor depending on whether the spectrum was read from mzML or from mzPeak. Every
+  `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
+  were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
+  OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
 
 ### Changed
 
@@ -226,7 +236,7 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
 - **The filter lane has tests.** `tests/filter_lane.rs` is the first for `src/filter.rs`: on
   `tiny.pwiz.1.1.mzML` converted in the test, `--ms-level 2` keeps one spectrum and nulls its
-  `precursor_index`; `--rt 0-0.0001` keeps one spectrum, two chromatogram points and matching
+  `precursor_index`; `--rt 0-0.0001` keeps one spectrum, the chromatogram points inside the window and matching
   `number_of_data_points`; both again through `-o f.mzML`; `--rt` open bounds (`10-`, `-30`) and
   refused ranges (`5-1`, `a-b`). It also pins the four filter-lane fixes above: `pda_uv.pwiz.mzML`
   filtered with `--ms-level 1 --sdrf`, and `drop_aux_refuses_to_remove_a_core_facet`. Each test

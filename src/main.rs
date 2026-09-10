@@ -4708,12 +4708,12 @@ where
             .add_field(mob_field),
     };
 
-    // One layout family per entity (`docs/conformance.md:68`, HUPO-PSI/mzPeak-specification#21):
+    // One layout family per entity (the scope HUPO-PSI/mzPeak-specification#21 proposes):
     // `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, so under --ims-chunked
-    // the DATA facet must be declared chunked too — the writer refuses to open a chunked peak facet
-    // beside a point data facet. Centroid-only TDF never writes a row to it, but its schema still
-    // has to be chunk-shaped: an empty chunked builder falls back to point-shaped default fields,
-    // so hand it the same fields the peak facet uses.
+    // the DATA facet is declared chunked too; beside a point data facet the writer only warns and
+    // writes a mixed archive (the base.rs deviation). Centroid-only TDF never writes a row to it, but
+    // its schema still has to be chunk-shaped: an empty chunked builder falls back to point-shaped
+    // default fields, so hand it the same fields the peak facet uses.
     let data_fields = chunk_cfg.map(|_| peak_schema.fields().to_vec()).unwrap_or_default();
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
@@ -8116,7 +8116,7 @@ mod tests {
         let _rm = RmDir(scratch.clone());
         let output = scratch.join("ims_chunked.mzpeak");
 
-        // ims_chunked = true: the exact configuration that failed to open its peak writer.
+        // ims_chunked = true: the configuration that wrote a point data facet beside chunked peaks.
         super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0)
             .expect("--ims-chunked conversion");
 
