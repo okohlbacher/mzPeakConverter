@@ -185,6 +185,18 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
+- **`-v` no longer opens a native vendor reader beside a conversion, and its report cannot fail the
+  run.** The report `-v` prints ran before the lane was chosen and opened the native reader
+  whatever was asked for. `-v --via-msconvert` on a `.wiff`, `.lcd` or Waters `.raw` exited with
+  the native reader's error (no `MZPC_PWIZ_DIR`, no .NET 8, a file Clearcore2 rejects) and wrote
+  nothing. `-v` on a native Agilent conversion ran the MHDAC host over the whole run twice, 2.9 GB of
+  temp file each time for a 242 MB Q-TOF `.d`. On SciEX the second open booted CoreCLR again. With
+  `-o` or `--via-msconvert` the report now gives the format and says the native reader was not
+  opened. A bare inspection still opens it, and a native reader that fails to open there is a
+  `note:` line, as the Agilent one already was. Any other report error under `-o` is a `note:` as
+  well, and the conversion goes ahead. Pinned by `tests/verbose_inspection.rs` (a TSF `.d` whose
+  report fails) and `tests::inspection_opens_a_native_reader_only_when_inspecting_is_the_job`; the
+  Windows branches are compiled only by CI.
 
 ### Changed
 
