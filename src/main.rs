@@ -398,9 +398,11 @@ struct Cli {
     #[arg(long = "drop-aux")]
     drop_aux: Vec<String>,
 
-    /// **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by
-    /// DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) +
-    /// a per-run `{c0,c1}` instead, recovering `m/z = (c0 + c1·tof_index)²`. **Off by default** and
+    /// **Inputs read through mzdata only** (mzML incl. `--via-msconvert`, imzML, Thermo `.raw`, and a
+    /// TDF read as f64 m/z under `--no-ims-compact` or the ims-compact fallback): compactify
+    /// exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z
+    /// and storing `tof_index` (Int32) + a per-run `{c0,c1}` instead, recovering
+    /// `m/z = (c0 + c1·tof_index)²`. **Off by default** and
     /// bounded-lossy (reconstruction within `PPM_TOL`) — it reverse-engineers the grid msconvert
     /// discarded. `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise);
     /// `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF
