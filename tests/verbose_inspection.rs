@@ -10,7 +10,8 @@
 //! trigger for a failing report is a TSF `.d` whose `analysis.tsf` is not SQLite: the report fails
 //! to open it, and so does the conversion, with its own `converting …` context — which can only
 //! appear if the report did not end the run first. The vendor library the report could open on
-//! every platform is Thermo's RawFileReader (`small.RAW`); on Linux, Bruker's baf2sql as well.
+//! every platform is Thermo's RawFileReader (`small.RAW`); on Linux and Windows, Bruker's baf2sql
+//! as well.
 
 use std::path::Path;
 use std::process::Command;
@@ -82,7 +83,7 @@ fn verbose_leaves_the_thermo_reader_to_the_conversion() {
 }
 
 /// Bruker's baf2sql is a vendor library on Linux and Windows. Beside a conversion the report leaves
-/// it closed; before, a missing `libbaf2sql_c.so` was its error. Any non-empty `analysis.baf` makes
+/// it closed; before, a missing baf2sql library was its error. Any non-empty `analysis.baf` makes
 /// the `.d` a BAF run, and nothing here reads it. (The BAF lane, like this test, exists on Linux
 /// and Windows only, so macOS never runs it.)
 #[cfg(any(windows, target_os = "linux"))]
