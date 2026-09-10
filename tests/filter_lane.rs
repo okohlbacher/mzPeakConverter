@@ -133,7 +133,7 @@ fn rt_window_truncates_chromatograms_and_refreshes_point_counts() {
         assert_eq!(n.value(r), left.get(&c).copied().unwrap_or(0), "chromatogram {c}: stale number_of_data_points");
     }
     let total = footer(&out, "chromatograms_metadata.parquet", "chromatogram_data_point_count");
-    assert_eq!(total.as_deref(), Some("2"), "the metadata footer total follows the truncation");
+    assert_eq!(total, Some(want.to_string()), "the metadata footer total follows the truncation");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
