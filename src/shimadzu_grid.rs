@@ -46,7 +46,9 @@ impl SqrtGrid {
 }
 
 /// Reconstruction tolerance in Da: the vendor's own 1e-9 rounding is ±5e-10, plus f64 slack.
-/// Measured worst residuals on exact spectra: 7.2e-10.
+/// Measured worst residuals on exact spectra: 7.2e-10. It is also the bound the archive declares
+/// (`tof_calibration.max_error_da`): a spectrum is gridded only when every point rebuilds within
+/// it, so no smaller number can be claimed.
 pub const TOL: f64 = 1e-9;
 
 /// Least squares of `r` on `k` with centred sums (k reaches 3e5, r is ~8–40).

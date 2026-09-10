@@ -5320,13 +5320,13 @@ fn convert_shimadzu(
                 "lossless": "tof_index",
                 // Within vendor rounding, NOT bit-exact: the axis is the vendor's own sqrt lattice
                 // and the fit is accepted only when it reproduces every m/z to within
-                // `vendor_mz_rounding` below — measured on HEK_PosOAD1, 4,890 of 5,000 gridded
-                // points rebuild to a value off the vendor's 1e-9 lattice by up to 0.5 step
-                // (4.15e-10 Da), inside the vendor's own ±5e-10 rounding. That is accurate to
-                // vendor precision, and "exact" read as bit-exact. Spectra that do not fit are not
-                // gridded at all — they keep f64 m/z in the data facet.
+                // `shimadzu_grid::TOL` (1e-9 Da: the vendor's ±5e-10 rounding plus f64 slack), so
+                // that gate IS the bound. Through 0.11.5 this said 5e-10, which the gate never
+                // enforced: refitting HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points
+                // between 5e-10 and 5.47e-10 Da off. Spectra that do not fit are not gridded at
+                // all — they keep f64 m/z in the data facet.
                 "mz_reconstruction": "within-vendor-rounding",
-                "max_error_da": 5e-10,
+                "max_error_da": shimadzu_grid::TOL,
                 "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
                 "per_spectrum_columns": ["tof_c0", "tof_c1"],
                 "run_wide_c1": step,
