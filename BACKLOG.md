@@ -7,12 +7,11 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Current issues, ranked, with evidence and status:** the *mzPeakConverter Review Ledger*
   (claude.ai artifact, §8 "Measures" carries a Status column: *done* / *open*). Its source is kept
   at `scratchpad/review2/review-ledger.html` in the maintainer's session; ask for the link.
-- **What the ledger says is open** (2026-09-06, after 0.11.0 restored the Agilent lane and swept the
-  Windows dead code): precursors on the seven lanes that write orphan MS2
-  (SCIEX native, Waters, BAF, TSF, Agilent ×3) — first among vendor-API work; then Waters
-  RT/polarity; then a shared .NET host for SCIEX/Agilent/MIDAC; collapse the six archive
-  prologue/epilogue copies; shared constants instead of text pins (M28); per-member SHA-1 for
-  directory inputs; the box harness stamps the *effective* recipe (native-first stays).
+- **What is open** (2026-09-10, re-checked against the tree by the open-issue review): precursors on
+  the SciEX native, BAF and Agilent lanes; the SciEX CoreCLR `OnceLock` and the MIDAC scaffold's
+  deletion; collapsing the archive prologue/epilogue copies (M17); shared constants instead of text
+  pins (M28); a SHA-1 digest for the BAF lane and the M35 route label; the box harness stamping the
+  *effective* recipe.
 - **Run metadata on the native lanes — landed after 0.11.2** (`src/run_metadata.rs`,
   `agilent_meta.rs`, `waters_meta.rs`, Bruker `GlobalMetadata`, SciEX `RunInfo`; CHANGELOG
   Unreleased). Measured against fresh lane pairs: blank1 now carries the vendor serial, sample and
@@ -23,7 +22,8 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     SET_MASS / COLLISION_ENERGY; Capan2's 682 high-energy MSe scans carry a precursor stating the activation, DDA set
     masses a selected ion with a target-only window); SciEX (663k in the corpus; needs the
     `SpectrumMetaV2` glue export — S-P2); Agilent MHDAC (`MSScan.bin` precursor decode; no DDA/QQQ
-    `.d` on host or in the corpus to verify against); BAF (SQL `Steps`/`Variables` tables; box-only).
+    `.d` on host or in the corpus to verify against); BAF (SQL `Steps`/`Variables`; builds and runs
+    on Linux; needs an MSn BAF acquisition).
     Bruker TDF/TSF and Shimadzu carry theirs.
   - **Waters ion mobility — landed 2026-09-09:** HDMSe/HDDDA functions are read bin by bin and written as
     frames (one spectrum per MassLynx scan, per-point `raw_ion_mobility` in ms, sorted by m/z); RT,
@@ -41,8 +41,9 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     DECISION rather than code: (a) RESOLVED 2026-09-09 (research + DLL probe round 23: no window is stated anywhere for MSe — the
     lane now writes the acquisition range as the window with a provenance parameter, as pwiz does); (a2) the PSI DIA recommendation v1.0 (§3.4) marks an MSe/HDMSe window with MS:1003159
     "no isolation" (= "isolation window full range") on the isolation window itself; mzdata's `IsolationWindow`
-    carries no parameter list and the vendored writer appends an empty one, so the term has no home yet — add a
-    window-parameter path (writer + a side channel from the lane), then write MS:1003159 beside the numbers;
+    carries no parameter list and the vendored writer appends an empty one, so the term has no home yet —
+    decided 2026-09-10 (D8), after mzdata 0.66.7: the lane sets `NoIsolation` and the writer writes MS:1003159
+    beside the numbers (see the isolation-window item below);
     likewise `file_description.contents` could state MS:1003226 (HDMSe) / MS:1003227 (MSe). (a3) a `_dda.inf`
     sidecar (Waters post-acquisition tooling; none in the corpus) makes the DLL's DDA processor return real
     quad-isolation offsets (keys 1900/1901) — wire them, with provenance, if such a run ever arrives; the
@@ -51,9 +52,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     bound the real RF-only passband (Waters: low cut ≈ 0.8 × set mass under a Manual profile).
     (b) MS:1000045 on MSe rows is the scan
     item's 4 eV trap energy (pwiz writes the same); the transfer ramp is on MS:1002013/1002014; (c) the
-    synthesized TIC keeps the lock-mass function's frames, as pwiz's does; (d) the mzML twin's isolation
-    window drops the lower offset (mzdata 0.66.6 reads only one; a fix exists on `claude/eager-robinson-83facb`
-    1add0469) — cherry-pick and rebuild the pwiz twins; (e) mzPeakViewer cannot see a Waters frame at all
+    synthesized TIC keeps the lock-mass function's frames, as pwiz's does; (e) mzPeakViewer cannot see a Waters frame at all
     (keys on `ims_calibration` and the 1/K0 array name; needs MS:1003007 + `waters_drift`); (f) non-ASCII
     `.raw` paths go through the narrow-char `createRawReaderFromPath` — untested. Coverage still owed:
     a centroid IMS run, an all-empty frame, a non-IMS `.raw`, a SONAR file, a full uncapped HDDDA
@@ -66,9 +65,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     readable on any host.
   - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
     per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
-  - Shimadzu acquisition-software version (LabSolutions; needs a glue export); Waters per-function
-    polarity / RT / scan windows (W-P2/W-P5: `_FUNCTNS.INF` + `_FUNCnnn.IDX`, same SDK cross-check);
-    `src/agilent_midac.rs` scaffold deletion.
+  - `src/agilent_midac.rs` scaffold deletion (decided 2026-09-10, D10).
 - **Acquisition clocks — every open point in one place (2026-09-09).** `run.start_time` is an RFC 3339
   instant and RFC 3339 cannot say "zone unknown", so the converter's rule (branch
   `feat/native-run-metadata`, `src/run_metadata.rs`) is: a vendor time that STATES its UTC offset is
@@ -99,11 +96,11 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   reproduced by us). (5) Agilent `Contents.xml` without `AcquiredTime` and Waters headers without
   `Acquired Date` are handled (nothing recorded); a vendor time that fails to parse is logged at WARN
   with the raw text and dropped — pinned by `run_metadata::tests::parse_vendor_time`.
-- **SciEX MRM/SIM dwell runs — refused after 0.11.2** (`refuse_if_unsupported`; the box harness
-  routes the refusal to `--via-msconvert`). `En_PPY.wiff` and `IPX0002633001_D-239.wiff` will be
-  rebuilt on the msconvert lane at the next corpus rerun (154,520 / 2,215 one-point "spectra" → 4 /
-  95 SRM chromatograms). Reading the transitions natively (Q1/Q3, compound, CE, RT window — S-P4)
-  stays open; MRM-HR scan runs convert natively as before.
+- **SciEX MRM/SIM dwell runs** are refused natively (`refuse_if_unsupported`) and republished via
+  msconvert; MRM-HR scan runs convert natively. Open: reading the transitions natively (Q1/Q3,
+  compound, CE, RT window — S-P4); the published `En_PPY.mzpeak` carries 1 of its 117 samples. Since
+  PR #18 the msconvert lanes refuse a multi-sample WIFF without `--sample`, so the box fallback, which
+  passes none, now fails on `En_PPY.wiff`; D4 republishes it one archive per sample.
 - **Surfaced by the 0.11.3 corpus rebuild (2026-09-09).** (1) The box relay returns archives through
   one presigned S3 PUT, capped at 5 GB: PXD077098's Waters TWIMS run (15.4 GB `.raw`) now writes a
   9.04 GB frame archive (it was 2.1 GB as drift-summed scans) and was delivered by hand (direct scp
@@ -117,8 +114,9 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   caps at 5 GB, so even a completed multipart object cannot reach its durable corpus key today. An
   scp fallback avoids all three. (2) The frame representation's size cost on big HDMSe runs: Capan2 166 → 531 MB,
   PXD077098 2.1 → 9.0 GB (58 % of the vendor `.raw`; every point of every bin is kept, zero flanks
-  included) — decide whether an opt-out (`--waters-summed`) or a per-bin zero policy is wanted for
-  archival use. (3) ~~The harness's box updater could not fetch the release tag (twice)~~
+  included, 44–46 % of the points) — **accepted 2026-09-10 (D7)**: a per-bin mask that keeps peak
+  boundaries saves nothing (MassLynx returns only flank zeros plus two sentinels per bin), and
+  dropping every zero (about −26 %) could not be undone. (3) ~~The harness's box updater could not fetch the release tag (twice)~~
   — FIXED, and the shallow-clone diagnosis recorded here was wrong: `--tags` fetches `refs/tags/*`
   whatever the configured refspec says, measured on a clone provisioned exactly like the box's
   (`--depth 1 --single-branch`), where a later tag arrives and checks out with the repository staying
@@ -129,57 +127,38 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   make the harness assert the box's version before, not after, the jobs. (4) A long box conversion driven from an interactive SSH session
   is dropped by the gateway (`Connection closed by remote host` after ~25 min of silence) even with
   ServerAlive keepalives — run long box jobs detached and poll a log.
-- **QUESTION for the owner — the isolation-window group's rule and the MS:1003159 marker (2026-09-09).**
-  The mzPeak spec's prose (`docs/schemas/spectra.md:196-201`) says an `isolation_window` group MUST carry
-  at least one MS:1000792 child; its schema rules (`schema/table_rules.json` `precursor_isolationwindow_may`)
-  and the validator say MAY, and spec PR #13 deferred the choice. PSI's DIA recommendation v1.0 (§3.4)
-  wants full-range acquisitions (MSe/HDMSe, AIF, bbCID) marked with MS:1003159 "no isolation" (= "isolation
-  window full range") on the window and no placeholder numbers. The Waters lane now writes conformant
-  numbers under either reading (acquisition range as the window) but cannot place the marker: mzdata's
-  `IsolationWindow` has no parameter list and the vendored writer appends an empty one. Decide: (a) settle
-  MUST vs MAY in the spec, (b) add a window-parameter path (writer side channel + the mzML export) so MSe,
-  Thermo AIF, Bruker bbCID and SciEX MSall rows can carry MS:1003159 beside their numbers.
-- **QUESTION for the owner — how long to carry the mzdata git fork (2026-09-09).** `Cargo.toml` pins
-  `mzdata =0.66.6` to `okohlbacher/mzdata@1d53971` (v0.66.6 + the 7-line isolation-offset reader fix,
-  upstream mobiusklein/mzdata#58 still open). Every fresh build — three CI runners, the vendor jobs, the
-  Flash box — clones the fork over git and the lockfile carries `git+` sources without checksums. Options:
-  nudge #58 and drop the patch on the next mzdata release, or keep the fork branch
-  (`fix/isolation-window-offsets-before-target`) pinned until then and note it in THIRD-PARTY-NOTICES.md
-  (line 26 still says "(crates.io)").
-- **Not in the ledger — temporary `[patch.crates-io]` on mzdata (2026-09-09).** The mzML reader's
-  isolation-window fix ([mobiusklein/mzdata#58](https://github.com/mobiusklein/mzdata/pull/58)) is
-  pinned from our fork at 0.66.6. When upstream releases it: bump the `mzdata` pin, delete the patch
-  block in `Cargo.toml`, keep `tests/isolation_window_offset_order.rs`. Until then every fresh
-  `cargo build` fetches the fork over git (the box included). Which published mzML-lane archives
-  carry a zero lower offset has not been swept; the Waters MSe/HDMSe twins certainly do.
-- **Not in the ledger — the native lanes lose vendor metadata the mzML lane carries (measured
-  2026-09-07 by `tests/lane_metadata_parity.rs`).** The two lanes take metadata from different
-  places: the mzML lane inherits ProteoWizard's finished model via `copy_metadata_from`, the native
-  lanes build an archive from the per-spectrum descriptions plus `VendorHints`, so every field must
-  be plumbed by hand. Measured on four pairs (Shimadzu `.lcd`, Agilent GC-MS `.d`, 2× SciEX `.wiff`),
-  the native side does not carry: the **sample list and the sample name in `run.id`**; the
-  **acquisition start time**; the **instrument serial (MS:1000529)**, the vendor model term and the
-  **instrument components** (only the Shimadzu lane builds components); the **per-member source
-  files and their MS:1000569 checksums** (one synthesised entry instead of 2–24 real ones); the
-  **acquisition software version**; the specific **`file_description.contents`** terms; and the
-  **non-MS device chromatograms**. Cheapest first: the Agilent serial and model are plain XML in
-  `AcqData/Devices.xml`, and per-member hashing of a directory input is the existing backlog item.
-- **Not in the ledger — the SciEX native lane stores MRM/SIM dwells as one-point spectra
-  (2026-09-07).** The same defect class Agilent 0.11.0 fixed by refusing: `En_PPY.wiff` and
-  `IPX0002633001_D-239.wiff` are MRM acquisitions whose PUBLISHED corpus archives are native builds
-  with 154,520 and 2,215 one-point "spectra", 2 chromatograms and **zero transition identity**;
-  msconvert produces 4 and 95 SRM chromatograms carrying compound name, Q1/Q3, collision energy and
-  RT window. SciEX has no `is_dwell_only` equivalent, so nothing routes those runs to msconvert.
-  Decide as for Agilent: refuse and fall back, or read the transitions natively.
+- **Isolation windows and the MS:1003159 marker — decided 2026-09-10 (D8), blocked on mzdata
+  0.66.7.** The mzPeak spec's prose (`docs/schemas/spectra.md`) says an `isolation_window` group MUST
+  carry at least one MS:1000792 child; its schema rules (`schema/table_rules.json`
+  `precursor_isolationwindow_may`) and the validator say MAY. That is the spec's call, and every
+  corpus row conforms under either reading. PSI's DIA recommendation v1.0 (§3.4) marks full-range
+  acquisitions (MSe/HDMSe, AIF, bbCID, MSall) with MS:1003159 "no isolation". Decision: write the
+  marker beside the acquisition-range numbers the lanes already write. mzdata 58e509bc07 (unreleased,
+  0.66.7) adds `IsolationWindowState::NoIsolation`, so no side channel is needed: the vendored writer
+  gains a `NoIsolation` arm that keeps target and offsets and appends MS:1003159 (without it the bump
+  fails E0004 in `writer/visitor.rs`), the reader maps the term back, and the Waters lane sets the
+  flag. Order matters on an mzML round trip: upstream's reader drops offsets that follow the marker.
+- **The mzdata git fork (`[patch.crates-io]`).** `Cargo.toml` pins `mzdata =0.66.6` to
+  `okohlbacher/mzdata@1d53971` (v0.66.6 plus the 7-line isolation-offset reader fix, branch
+  `fix/isolation-window-offsets-before-target`). Upstream merged it as mobiusklein/mzdata#58 on
+  2026-09-10, but crates.io still tops out at 0.66.6, so every fresh build (CI, the vendor jobs, the
+  Flash box) clones the fork and the lockfile carries `git+` sources without checksums. The bump needs
+  the `NoIsolation` arm above; then pin `=0.66.7`, delete the patch block and keep
+  `tests/isolation_window_offset_order.rs`. The zero-lower-offset sweep is done: 0 collapsed offsets
+  in 2,669,071 corpus precursor rows.
+- **Not in the ledger — native-lane metadata parity** (`tests/lane_metadata_parity.rs`). Sample,
+  acquisition time, serial, model, member SHA-1s, software and contents landed in 0.11.3. Still open:
+  the non-MS device chromatograms; the SciEX `run.id` (ProteoWizard names a WIFF run after its
+  sample, the native lane after the file stem); and the BAF lane, which writes no run metadata at all
+  (no sample, software, serial, time or member digest: FM_1-1_01_20254, NreB_PAS_DECONV).
 - **Not in the ledger — Agilent native lane follow-ups (0.11.0, 2026-09-06):** `--tof-grid` on the
   MHDAC lane (the Q-TOF profile points sit on the flight-time lattice — the msconvert+`--tof-grid`
   build of the same run is 200 MB against 245 MB numpress-chunked f64; a SciEX-style per-run fit
   would close that); MRM/SIM transition chromatograms through MHDAC (today refused → msconvert);
   `agilent_midac` is still the in-process net8 design MHDAC cannot run under and has never opened
-  a file — port to the net48 host or delete; the temp-file materialisation (16 B/point, whole run)
+  a file — decided 2026-09-10 (D10): delete; the temp-file materialisation (16 B/point, whole run)
   could stream, and the inspect path (no `-o`) pays it in full just to print a scan count (a host
-  `--count` mode would fix both); the instrument serial number (msconvert records it; the MHDAC member
-  the host tries is not it); no timeout or kill-on-parent-death for the host process (a killed converter
+  `--count` mode would fix both); no timeout or kill-on-parent-death for the host process (a killed converter
   orphans it); per-record scan types in the protocol so a mixed Scan+MRM method can drop the dwell rows
   instead of storing them as one-point spectra (today: a warning).
 - **Not in the ledger — surfaced by the 0.10.2 corpus rebuild (2026-09-06):** a chunk-capable
@@ -187,7 +166,8 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   layout, so a native SCIEX run's off-lattice profile minority is now stored as exact f64 points
   instead of numpress chunks: 9.2 % of the points on MSV000093587 Sample002 (+27 % archive), 3.2 %
   on PXD011326 (+12 %), 1–3 % on three more SWATH runs. A `tof_index` list column beside the chunk
-  encoding (or a per-facet mixed layout) would recover it. Owner's call: fidelity vs size.
+  encoding (or a per-facet mixed layout) would recover it. **Accepted 2026-09-10 (D6):** that size
+  stays; no chunk-capable axis or mixed layout is planned.
 - **Not in the ledger — spec and CV items, all deferred by decision:**
   - PSI-MS term request for the per-window ion-mobility band (currently `MZP:1000006/1000007`).
     *Decision: keep MZP, do not file for now.*
@@ -199,16 +179,30 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     out by chunked-layout.md:62–63; would give ≈ −6 % vs the vendor file); whether the mixed
     layout-family deviation (conformance.md item 4) should be raised with PSI.
   - Upstream mzdata: graceful decode in the sourceFile handler (old #8).
-- **Windows-only dead code surfaced 2026-09-04** by switching the six vendor modules to the
-  `cfg_attr(not(windows), allow(dead_code))` form: `library_path`, `calibration_used`,
-  `spectrum_meta`, `analysis_date`, `lcd_path`, `sample_arrays`, and four `is_empty` methods are
-  never read on the only host that compiles them. Sweep on the box.
-- **`sbom.cdx.json` is tracked but has never been regenerated.** It declares
-  `mzpeak-convert 0.1.0` with 395 components and no timestamp, nothing in `.github/workflows` or the
-  release ritual regenerates it, and the dependency tree has moved a long way since (vendored
-  mzdata and mzpeak_prototyping, the .NET glue). A tracked SBOM that names a version the project
-  has not built for months is worse than none: either regenerate it as a release step, beside the
-  `Cargo.lock` bump the 0.11.4 release added, or stop tracking it and generate on demand.
+- **.NET 8 end of support, 2026-11-10** (the same day as .NET 9; .NET 10 runs to 2028-11-14). The
+  SciEX, Shimadzu and MIDAC glues target net8.0. **Decided 2026-09-10 (D9): stay on net8 for now.**
+  After that date those lanes need an out-of-support runtime, and a host with only .NET 9 or 10 fails
+  framework resolution. A later retarget goes to net10.0: Shimadzu would then lean on Microsoft's
+  unsupported BinaryFormatter compatibility package inside a hostfxr component (unverified), or move
+  out of process on net48 as the Agilent host did.
+- **`--ims-chunked` re-sorts each timsTOF frame by TOF** before chunking, which reorders points across
+  mobility scans, and declares no transformation for it (`docs/USER_MANUAL.md` §8 points here).
+- **Decided 2026-09-10 — D1–D15 of the open-issue review, each by taking the review's recommendation:**
+  - D1: a data facet's `<entity>_count` is max(index)+1 in that file, 0 when empty (`spectra_peaks` of centroid-only runs too).
+  - D2: a secondary facet's `*_count` counts the distinct parents with rows in that file, as the filter lane already writes.
+  - D3: a Thermo window with no `MSn Isolation Width` trailer, or an inverted one, is written target-only, declared and warned once, until thermorawfilereader is fixed upstream.
+  - D4: `En_PPY.wiff` (117 samples) is published as one archive per sample.
+  - D5: `corpus_reconvert.py` no longer writes durable v09 keys; publishing stays with the corpus repository's gated `update.sh`.
+  - D6: the native SciEX archive size is accepted; no chunk-capable integer axis.
+  - D7: the Waters HDMSe frame size is accepted (Capan2 166 → 531 MB).
+  - D8: full-range isolation windows carry MS:1003159 beside their numbers once mzdata 0.66.7 is out; MUST vs MAY stays with the spec.
+  - D9: the in-process glues stay on net8 for now.
+  - D10: the MIDAC scaffold is deleted; IM-QTOF runs stay on `--via-msconvert`.
+  - D11: the unwired `glue/waters` is deleted.
+  - D12: the SBOM is generated for and attached to each release instead of tracked; every release archive ships `THIRD-PARTY-NOTICES.md` with the Apache-2.0 text; the `mzpeak_prototyping` license stays the owner's to settle.
+  - D13: M35 gets a route label (`conversion_route`) only; fallback rows are not re-merged into frames.
+  - D14: ProteoWizard's `_xHHHH_` escapes in `run.id` are decoded when metadata is copied from the mzML lane.
+  - D15: `transformations` keeps its configuration semantics, as the manual documents; the `src/main.rs` comment that promised applied changes is corrected.
 
 ## History
 
