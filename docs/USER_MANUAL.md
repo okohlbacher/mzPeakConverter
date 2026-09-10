@@ -71,6 +71,14 @@ every cask download and macOS kills a quarantined binary that carries no Develop
 so the cask removes that attribute from the file it installs; its caveats say so. Check
 any archive against the `.sha256` published beside it (`shasum -c`).
 
+**Linux and Windows, from a release.** Each release publishes Linux x86_64 and aarch64
+archives (`.tar.gz`, glibc 2.28 or newer, so RHEL/Rocky 8 and 9 clusters included) and Windows
+x86_64 and ARM64 archives (`.zip`), each with a `.sha256` beside it. The Windows folder carries the
+.NET glue for the native SciEX, Shimadzu and Agilent readers under `glue\`, which releases after
+0.11.5 find without any `MZPC_*_GLUE` variable; the vendor DLLs themselves still come from a
+ProteoWizard install (`MZPC_PWIZ_DIR`, §11). The vendor readers are unverified on Windows ARM64,
+where the x64 archive runs under emulation.
+
 **Any platform, from source:**
 
 ```sh

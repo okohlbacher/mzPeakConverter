@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Release archives for Linux and Windows.** Beside the two macOS archives, every release now
+  publishes Linux x86_64 and aarch64 (`.tar.gz`, built in `manylinux_2_28` so they start on glibc
+  2.28 and newer — RHEL/Rocky/Alma 8 and 9, which a build against Ubuntu 22.04's glibc 2.35 would
+  not) and Windows x86_64 and ARM64 (`.zip`, with the .NET glue for the native SciEX, Shimadzu and
+  Agilent readers under `glue\`). Each archive is built natively on its own architecture and
+  verified there — the PE machine field or the glibc floor, a smoke conversion, the Agilent host
+  booting, Shimadzu's BinaryFormatter switch — and published with a `.sha256` sidecar. One job now
+  attaches everything after re-checking every sidecar, so the platform jobs no longer race to create
+  the release, and a platform that fails no longer holds back the others. A pull request that edits
+  the workflow runs the whole matrix as a dry run; `workflow_dispatch` takes `only` to backfill a
+  platform onto an existing tag without rebuilding the archives already published. The vendor
+  readers are unverified on Windows ARM64: the vendor DLLs are x64, so use the x64 archive there.
+- **The converter finds its .NET glue beside the executable.** With `MZPC_SCIEX_GLUE`,
+  `MZPC_SHIMADZU_GLUE`, `MZPC_AGILENT_GLUE` or `MZPC_AGILENT_MIDAC_GLUE` unset it looks in
+  `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
+  unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
+  by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
+
 ## [0.11.5] — 2026-09-09
 
 ### Fixed

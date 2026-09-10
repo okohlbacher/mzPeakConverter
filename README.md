@@ -98,6 +98,24 @@ every cask download, which macOS then refuses to execute — so the cask strips 
 attribute from the executable it installs and says so when it does. Each archive is
 published with a `.sha256` sidecar you can check with `shasum -c`.
 
+**Linux and Windows — release archives.** Every release also publishes a ready-to-run build
+for Linux on x86_64 and aarch64 (glibc 2.28 or newer: RHEL/Rocky/Alma 8 and later, Debian 10+,
+Ubuntu 20.04+) and for Windows on x86_64 and ARM64. Download the archive for your platform from
+[Releases](https://github.com/okohlbacher/mzPeakConverter/releases) and check it against its
+`.sha256`:
+
+```sh
+tar xzf mzpeak-convert-<version>-x86_64-unknown-linux-gnu.tar.gz && ./mzpeak-convert --version
+```
+
+The Windows `.zip` unpacks to a folder holding `mzpeak-convert.exe` and, under `glue\`, the .NET
+glue for the native SciEX, Shimadzu and Agilent readers. Releases after 0.11.5 find that folder by
+themselves; the `MZPC_*_GLUE` variables still override it, and 0.11.5's archive needs them set.
+Those readers also need the vendor's own DLLs, taken from a ProteoWizard install (`MZPC_PWIZ_DIR`):
+they carry vendor licences and are not redistributed. On Windows ARM64 the vendor readers are
+unverified — the vendor DLLs are x64 builds — so for those formats use the x64 archive, which
+Windows 11 runs under emulation. Thermo `.raw` needs a .NET 8+ runtime on every platform.
+
 **From source** (every platform):
 
 ```sh
