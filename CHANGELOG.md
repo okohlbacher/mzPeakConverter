@@ -26,6 +26,19 @@ All notable changes to this project are documented here. The format follows
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
 
+### Fixed
+
+- **Opening a Bruker TSF `.d` no longer writes into it.** `TsfReader::open` used rusqlite's default
+  open, which is read-write and CREATES a missing file, so opening a `.d` that has no `analysis.tsf`
+  left an empty one inside the user's raw data. A normal conversion reaches the TSF reader only for
+  a `.d` with a non-empty `analysis.tsf` and no non-empty `analysis.tdf`, so it never did this; a
+  direct open did, and the corpus still holds one such stub — created 2026-08-10, beside a TDF run's
+  real 192 MB `analysis.tdf` — that had passed for a TSF fixture. Opened read-only now, like the
+  converter's other SQLite opens (timsrust, which the TDF lanes use, still opens an existing
+  `analysis.tdf` read-write, after an existence check). A read-only open of a file with a hot
+  journal now reports SQLite's own error rather than "GlobalMetadata missing/invalid". Pinned by
+  `bruker_tsf::msms_tests::open_never_writes_into_the_input_directory`.
+
 ## [0.11.5] — 2026-09-09
 
 ### Fixed
