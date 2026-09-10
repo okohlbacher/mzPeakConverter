@@ -267,6 +267,8 @@ fn transformations_block_pinned() {
     pinned("\"agilent:drop-zero-samples\"");
     pinned("\"thermo:target-only-isolation-window:{}\"");
     pinned("\"agilent:intensity-f32-rounding\"");
+    pinned("\"bruker:trace-unit-rescale\"");
+    pinned("\"bruker:trace-sort-dedup\"");
     // The entries the reader modules declare from their own counts, pinned in those modules' code
     // (their `#[cfg(test)]` modules cut away, as `code` does for main.rs).
     for (file, source, entries) in [

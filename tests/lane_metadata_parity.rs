@@ -129,7 +129,10 @@ const EXPECTED: &[Expected] = &[
         vendors: None,
         kind: Kind::Defect,
         reason: "ProteoWizard emits the LC device traces (pump pressure, flow, DAD) as chromatograms; \
-                 the native lanes iterate MS scans only and write just the synthesised TIC/BPC.",
+                 the native lanes iterate MS scans only and write just the synthesised TIC/BPC. The \
+                 Bruker lanes are the exception and write HyStar's traces too, but still differ: \
+                 HyStar's MS traces give way to the synthesised pair, and a user-defined pressure or \
+                 flow trace is typed by its unit where ProteoWizard says `chromatogram`.",
     },
     Expected {
         key: "facet.chromatograms_data.parquet.rows",
