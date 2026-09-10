@@ -2103,7 +2103,7 @@ fn convert_to_mzml(
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
     w.copy_metadata_from(&reader);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     let cap = max_spectra();
     let n_spec = cap.map_or_else(|| reader.len(), |m| m.min(reader.len()));
     w.set_spectrum_count(n_spec as u64);
@@ -2216,7 +2216,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
     w.copy_metadata_from(&reader);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     w.set_spectrum_count(survivor_ids.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
     for &i in &survivor_ids {
@@ -2272,7 +2272,7 @@ fn write_native_mzml(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     let n = max_spectra().map_or(len, |m| m.min(len));
     w.set_spectrum_count(n as u64);
     for i in 0..n {
@@ -2307,7 +2307,7 @@ fn write_agilent_profile_mzml(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
     // (matches write_native_mzml, which also uses the reader's record count).
     let cap = max_spectra();
@@ -2605,13 +2605,14 @@ fn convert_file_tof_grid(
     log::info!("TOF-grid wrote {n} spectra: {n_gridded} gridded (tof_index), {n_f64} kept f64 m/z");
     assert_source_complete_tmp(input, n, cap, &tmp)?;
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
-    fixup_run_metadata(&mut writer, input);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
     let mut applied = base_transformations(&[]);
     if n_gridded > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
         .into_iter()
+        .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&applied)))
         .collect();
     finish_tof_grid_archive(writer, tmp_guard, output, input, &grid, vendor, images, sdrf, &index_blocks)
@@ -3228,9 +3229,12 @@ fn convert_agilent_grid(
     }
     let calibrations = reader.calibrations_json();
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
-    fixup_run_metadata(&mut writer, input);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    if let Some((key, block)) = acquisition_block {
+        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
+    }
     // `lossless` (the exactly-stored column) and `mz_reconstruction` (whether m/z is quantized) are
     // stated by EVERY `codec: "tof-grid"` block, so a reader answers both questions from one place
     // regardless of model. This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal
@@ -3778,7 +3782,7 @@ fn convert_file(
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
-    fixup_run_metadata(&mut writer, input);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
 
     // The `mz_calibration` block is what the viewer's `mz-grid` codec (and any conformant reader
     // that would rather not re-derive the scale from the column metadata) gates on.
@@ -3796,6 +3800,7 @@ fn convert_file(
         })
         .into_iter()
         .chain(partial_marker(input, cap, n))
+        .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&[chunk]);
             if resorted {
@@ -4878,7 +4883,7 @@ where
         }
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
-    fixup_run_metadata(&mut writer, input);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
 
     // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename.
     // `tof_encoding` is TRUTHFUL: "absolute" (archive layout + SDK) or "m/z-chunked"
@@ -4943,6 +4948,9 @@ where
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     zip.add_index_metadata("ims_calibration", &cal)
         .context("writing ims_calibration index")?;
+    if let Some((key, block)) = acquisition_block {
+        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
+    }
     let (key, block) = transformations_block(&base_transformations(&[]));
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
     if let Some((key, block)) = partial_marker(input, max_spectra(), n_frames) {
@@ -5831,7 +5839,8 @@ fn convert_sciex_grid(
         m.default_source_file = default_source;
         run_metadata::apply(&mut writer, m)
     });
-    fixup_run_metadata(&mut writer, input);
+    let fixup_block = fixup_run_metadata(&mut writer, input);
+    let acquisition_block = acquisition_block.or(fixup_block);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     if let Some((key, block)) = acquisition_block {
@@ -6329,7 +6338,12 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             index_blocks.push(block);
         }
     }
-    fixup_run_metadata(&mut writer, input);
+    // One `acquisition_time` block per archive: the lane's own hints may already have stated it.
+    if let Some(block) = fixup_run_metadata(&mut writer, input) {
+        if !index_blocks.iter().any(|(key, _)| *key == block.0) {
+            index_blocks.push(block);
+        }
+    }
     let mut applied = base_transformations(&[data_chunk, peaks_chunk]);
     if keep_zero_runs {
         applied.retain(|t| t != "zero-run-mask");
@@ -6642,7 +6656,13 @@ fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> 
     agilent_meta::read(input)
 }
 
-fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
+/// Normalise the run metadata every lane writes and merge in what a vendor directory states.
+/// Returns the `acquisition_time` index block when that directory states only a wall clock without
+/// a zone (`run_metadata::apply`): an archive lane writes it into the index, and an mzML output,
+/// which cannot carry it, says so (`fixup_mzml_run_metadata`). Through 0.11.5 the block was dropped
+/// here, so an unzoned Bruker or Agilent clock left no trace on the lanes that rely on this fixup.
+#[must_use]
+fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) -> Option<(String, serde_json::Value)> {
     // 0. Provenance hygiene on what the reader ALREADY copied. Step 1 below sanitises only the
     // entry it synthesises itself; mzdata's Thermo reader writes the converting machine's parent
     // directory into `location`, and its TDF reader the full `.d` path into `run.id`, so twelve
@@ -6665,9 +6685,7 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     // reader already set. Bruker used to be special-cased here; the same seam now serves every
     // vendor directory the host can read. Only what the file states is asserted: no ion source or
     // detector is guessed (a wrong `MS:1000008` child is worse than an absent one).
-    if let Some(meta) = vendor_dir_metadata(input) {
-        let _naive_time_block = run_metadata::apply(target, meta);
-    }
+    let naive_time_block = vendor_dir_metadata(input).and_then(|meta| run_metadata::apply(target, meta));
 
     // 1b. Ensure at least one source_file (the input itself) so default_source_file_id can resolve
     //     — only when no member was stated above.
@@ -6730,6 +6748,21 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
             Some(id) if instr_ids.contains(&id) => {}
             _ => run.default_instrument_id = first_instr,
         }
+    }
+    naive_time_block
+}
+
+/// [`fixup_run_metadata`] for an mzML output. The run model the mzML writer serialises holds only a
+/// zoned `start_time` (`DateTime<FixedOffset>`), so an unzoned vendor clock cannot be carried: name
+/// the clock that was left out instead of dropping it without a word.
+fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
+    if let Some((_, block)) = fixup_run_metadata(w, input) {
+        log::warn!(
+            "{}: acquisition time {} states no time zone, and the mzML run model holds only zoned \
+             times; it is not written",
+            block["source"].as_str().unwrap_or("vendor file"),
+            block["wall_clock"].as_str().unwrap_or("?")
+        );
     }
 }
 
@@ -6899,7 +6932,7 @@ mod tests {
         }
         assert!(w.instrument_configurations().is_empty());
 
-        super::fixup_run_metadata(&mut w, input);
+        let _ = super::fixup_run_metadata(&mut w, input);
 
         let sfs = &w.file_description().source_files;
         assert_eq!(sfs.len(), 2, "no source file synthesised when the reader supplied some");
@@ -6923,10 +6956,10 @@ mod tests {
         w.instrument_configurations_mut()
             .insert(3, mzdata::meta::InstrumentConfiguration { id: 3, ..Default::default() });
         w.run_description_mut().unwrap().default_instrument_id = Some(7);
-        super::fixup_run_metadata(&mut w, input);
+        let _ = super::fixup_run_metadata(&mut w, input);
         assert_eq!(w.run_description().unwrap().default_instrument_id, Some(3), "dangling 7 clamped to 3");
         w.run_description_mut().unwrap().default_instrument_id = Some(3);
-        super::fixup_run_metadata(&mut w, input);
+        let _ = super::fixup_run_metadata(&mut w, input);
         assert_eq!(w.run_description().unwrap().default_instrument_id, Some(3), "a resolving id is kept");
         assert!(!super::is_path_shaped_run_id("SZB8102938"));
         assert!(super::is_path_shaped_run_id("C:\\data\\run.d"));
@@ -7093,6 +7126,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A Bruker `.d` whose `GlobalMetadata` states an acquisition time WITHOUT an offset. The
+    /// vendor-reader lanes (TSF, BAF, `--bruker-sdk`) see the directory's run metadata only through
+    /// `fixup_run_metadata`, which dropped the naive-time block through 0.11.5: a null
+    /// `run.start_time` and no `acquisition_time` block. The directory is synthetic, an
+    /// `analysis.tsf` SQLite holding just the `GlobalMetadata` table the fixup reads.
+    #[test]
+    fn unzoned_vendor_directory_clock_reaches_the_index() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("unzoned-clock");
+        let dot_d = dir.join("run.d");
+        fs::create_dir_all(&dot_d).unwrap();
+        let db = rusqlite::Connection::open(dot_d.join("analysis.tsf")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('AcquisitionDateTime', '2024-10-09T09:09:26');",
+        )
+        .unwrap();
+        drop(db);
+        let out = dir.join("run.mzpeak");
+        convert_vendor_reader_tallied(&dot_d, &out, None, 1, None, false, VendorHints::default(), 3, |i| {
+            Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
+        })
+        .unwrap();
+        let meta = index_metadata(&out);
+        assert_eq!(meta["run"]["start_time"], serde_json::Value::Null, "a naive clock never becomes an instant");
+        assert_eq!(meta["acquisition_time"]["wall_clock"], "2024-10-09T09:09:26", "{:#}", meta);
+        assert_eq!(meta["acquisition_time"]["zone"], "unstated");
+        assert_eq!(meta["acquisition_time"]["source"], "Bruker GlobalMetadata AcquisitionDateTime");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A converter-owned MZP CURIE — an `Unknown`-CV CURIE, as the vendored crate represents its
     /// provisional terms — must survive the archive writer → reader round trip as `MZP:1000006` on a
     /// selected ion, the archive must list the MZP vocabulary, and the mzML export must demote the
@@ -7134,7 +7199,7 @@ mod tests {
         let mut writer = builder.build(handle, true);
         super::ensure_mzp_cv(&mut writer);
         super::ensure_mzp_cv(&mut writer); // idempotent
-        super::fixup_run_metadata(&mut writer, &path);
+        let _ = super::fixup_run_metadata(&mut writer, &path);
         writer.write_spectrum(&spec).unwrap();
         // The vendored writer copies the run metadata (cv_list included) into the file index only
         // when it finalizes the chromatogram facet, so give it one — every lane writes a TIC anyway.
