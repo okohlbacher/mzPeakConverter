@@ -1518,7 +1518,7 @@ mod tests {
             ("number_of_data_points", Arc::new(arrow::array::Int64Array::from(vec![3i64, 3])) as ArrayRef),
         ])
         .unwrap();
-        let out = refresh_chrom_point_counts(&batch, &HashMap::from([(0u64, 1u64)])).unwrap();
+        let out = refresh_chrom_point_counts(&batch, &HashMap::from([(0u64, vec![true, false, false])])).unwrap();
         let n = out.column_by_name("number_of_data_points").unwrap();
         assert_eq!(n.as_any().downcast_ref::<arrow::array::Int64Array>().map(|a| a.values().to_vec()), Some(vec![1, 0]));
     }
