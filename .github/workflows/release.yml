@@ -10,6 +10,9 @@
 # whole matrix as a DRY RUN: built, verified, kept as workflow artifacts, nothing published — so a
 # broken release job is found before a tag needs it.
 #
+# No Rust cache here: a tag builds once, and the six ~570 MB caches the first dry run saved pushed
+# the repository past GitHub's 10 GB Actions-cache limit, evicting CI's own. Cold builds take 6-13 min.
+#
 # Linux builds in manylinux_2_28, not on the Ubuntu image: a binary linked against Ubuntu 22.04's
 # glibc 2.35 does not start on RHEL/Rocky/Alma 8 or 9, which is what HPC clusters run. Static musl is
 # not an option either — the Thermo reader dlopens the glibc-built .NET host, and BAF its vendor .so.
@@ -69,9 +72,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
 
       - name: The tag and the crate version must agree
         run: |
@@ -147,9 +147,6 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
 
       - name: The tag and the crate version must agree
         shell: bash
@@ -221,9 +218,6 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
