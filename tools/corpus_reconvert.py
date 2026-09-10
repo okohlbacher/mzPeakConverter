@@ -706,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
     if box_rc or undelivered:
         # A unit the box did not deliver is as unbuilt as a FAILED one. Deferred units sit in
         # `skipped`, so the exit code used to say 0 while PXD077098 failed every rebuild at the relay.
-        print(f"\nBOX NOT DELIVERED: {len(undelivered)} unit(s), box_convert exit {box_rc} -- left "
+        print(f"\nBOX NOT DELIVERED: {len(undelivered)} archive(s), box_convert exit {box_rc} -- left "
               f"unstamped, so the next run retries them")
         for name in sorted(undelivered)[:40]:
             print(f"  - {name}")
