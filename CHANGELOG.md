@@ -15,6 +15,11 @@ a `TIC`, which synthesis replaces anyway, and its archive
 other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>`
 (`bruker-microtof-q2`) and imzML.
 
+**Output change.** The m/z columns of point-layout facets are encoded differently, with the values
+unchanged (below). Every native SciEX grid archive changes and gets smaller, as does every archive
+with an m/z-lattice or grid f64 fallback column, or written with `--layout point`. Chunked facets
+keep their bytes.
+
 ### Added
 
 - **Release archives for Linux and Windows.** Beside the two macOS archives, every release now
@@ -262,6 +267,26 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   relay slot, and `--publish-s3` restores the old route. `--no-s3-first` is still accepted and does
   nothing. The release-day sequence is `tools/corpus_reconvert.py --box`, then host validation,
   then publishing from the corpus repository (`scripts/update.sh`).
+- **Float m/z in a point-layout facet is written BYTE_STREAM_SPLIT instead of dictionary-encoded,
+  and reads back bit-identical.** The vendored writer had the switch, `shuffle_mz`, but no lane set
+  it, and it could not have worked: the dictionary is on for every column, and Parquet then uses an
+  explicit column encoding only as the dictionary's fallback. The rule now turns the dictionary off
+  for the column too, and applies only to point facets. The ordinary lane, the mzML `--tof-grid`
+  lane, the native SciEX grid lane and the shared vendor-reader lane (Shimadzu, Waters, Agilent,
+  Bruker BAF/TSF) set it. The native SciEX grid archives gain most, because their off-lattice f64
+  minority is such a column: 409 MB, 42 % of the archive, on MSV000093587 Sample002. Re-encoded
+  whole with pyarrow the way the writer now writes it, that column drops to 298 MB (−111 MB, −11.5 %
+  of the archive), and PXD011326's from 240 to 168 MB (−72 MB, −5.9 %). The native lane itself runs
+  only on Windows, so those sizes await a box conversion. Converted on macOS before and after, the m/z
+  column shrinks 22–48 % under `--layout point` on eight instruments' mzML, Thermo `small.RAW`, a TDF
+  `--no-ims-compact` subset and LA-ESI imzML, 10 % on LTP imzML, 76 % on the example imzML's f32 m/z,
+  and 21 % as the f64 fallback beside the m/z-lattice fixture. No data facet grew, and every Parquet
+  member decoded bit-identical to its predecessor; mzpeakts' parquet-wasm 0.7.1 decodes the new
+  columns bit-identically to pyarrow. Chunk facets — the default layout, and so most of the corpus —
+  keep their bytes: their `mz_chunk_*` boundary columns would shrink by about 1 % of the facet, left
+  for a separate decision. The chunk-capable integer axis that would take the SciEX minority to about
+  2–3 B per point is not built: the remaining size is accepted. Pinned by
+  `point_layout_float_mz_is_byte_stream_split` in `tests/data_facet_compression.rs`.
 - **The ignored tests run, and no test that runs by default passes without asserting.** Of the six
   `#[ignore]`d tests, four now run by default on every platform, on data already in the repository:
   `by_id_reads_the_peaks_facet_on_a_centroid_only_archive` on the committed centroid-only fixture
