@@ -6310,13 +6310,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
                 id: "sourceFile".to_string(),
                 ..Default::default()
             };
-            sf.add_param(
-                Param::builder()
-                    .name("SHA-1")
-                    .curie(curie!(MS:1000569))
-                    .value(mzdata::params::Value::String(hex))
-                    .build(),
-            );
+            sf.add_param(run_metadata::sha1_param(hex));
             writer.file_description_mut().source_files.push(sf);
         }
     }
@@ -6694,13 +6688,7 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         // single byte stream to digest, and hashing one arbitrary member would be a false claim.
         if input.is_file() {
             match embed_aux::sha1_hex(input) {
-                Ok(hex) => sf.add_param(
-                    Param::builder()
-                        .name("SHA-1")
-                        .curie(curie!(MS:1000569))
-                        .value(mzdata::params::Value::String(hex))
-                        .build(),
-                ),
+                Ok(hex) => sf.add_param(run_metadata::sha1_param(hex)),
                 Err(e) => log::warn!("could not digest {}: {e}", input.display()),
             }
         }

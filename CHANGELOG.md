@@ -234,6 +234,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   Windows jobs now share one cache, which only the `windows` job saves.
 - README: run the suite with `cargo test --release`, as CI does; the vendored writer's
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
+- **One builder for the `MS:1000569` SHA-1 source-file param** (`run_metadata::sha1_param`, review
+  M15). `waters_meta.rs` kept a private copy and `main.rs` built the same param inline twice (the
+  Shimadzu pre-open digest and the single-file digest of the run-metadata fixup). The emitted values
+  are unchanged: the index metadata of `tiny.pwiz.1.1.mzML`, `tiny_centroid_only.mzML`, a
+  `sourceFileList`-less mzML (the fixup's own digest) and 2485.d capped at 20 frames (the
+  member digests) is identical before and after.
 - **The filter lane has tests.** `tests/filter_lane.rs` is the first for `src/filter.rs`: on
   `tiny.pwiz.1.1.mzML` converted in the test, `--ms-level 2` keeps one spectrum and nulls its
   `precursor_index`; `--rt 0-0.0001` keeps one spectrum, the chromatogram points inside the window and matching
