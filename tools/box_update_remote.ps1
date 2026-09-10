@@ -21,6 +21,26 @@ $res = [ordered]@{ ok=$false; action='failed'; have=''; want=''; latest=''; exe=
 $lock = Join-Path $env:TEMP 'mzpc-boxupdate.lock'
 $lockHeld = $false
 
+function Invoke-Native([scriptblock]$Cmd) {
+    # PowerShell 5.1 turns a native command's stderr into ErrorRecords when that stderr is
+    # redirected, so under $ErrorActionPreference='Stop' a command that SUCCEEDED still aborts the
+    # script. git reports progress on stderr: `git fetch` prints "From <url>" and "* [new tag] ..."
+    # -- 0 bytes when it has nothing to do, 234 on the day a release lands -- and `git checkout`
+    # prints "Previous HEAD position was ...". That is why the updater worked every ordinary day and
+    # failed only on release day, reporting `failed: From https://github.com/...`, git's own notice,
+    # as the error; twice it left the box on a new tag carrying the OLD exe. Exit codes decide
+    # success here, never stderr.
+    #
+    # $script:, not a plain assignment: the scriptblocks are written at script scope, and only the
+    # script-scoped variable is certain to be the one their native command reads.
+    # A scriptblock (not a name + args) keeps `-f`/`--release` from being bound as PowerShell
+    # parameters. The helper returns the exit code ONLY; every call site redirects its own output.
+    $prev = $script:ErrorActionPreference
+    $script:ErrorActionPreference = 'Continue'
+    try { & $Cmd } finally { $script:ErrorActionPreference = $prev }
+    return $LASTEXITCODE
+}
+
 function Probe([string]$exe) {
     if (-not (Test-Path $exe)) { return '' }
     try { return (((& $exe --version 2>&1) | Select-Object -First 1) -split '\s+')[-1] } catch { return '' }
@@ -68,8 +88,16 @@ try {
         if ($real -gt 0) { $res.action = 'refused-dirty'; throw "$real uncommitted change(s) in $repo" }
     }
 
-    git fetch origin --tags --force *>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "git fetch failed (network/auth?)" }
+    # The box clone is SHALLOW and single-branch (fetch = +refs/heads/main:refs/remotes/origin/main),
+    # which does NOT keep release tags out: `--tags` fetches refs/tags/* in addition to whatever the
+    # configured refspec would fetch. Measured against a clone provisioned the same way -- a tag
+    # pushed after the clone arrives as `* [new tag]`, and `git checkout -f <tag>` succeeds even for
+    # a tag older than the depth-1 window, the repository staying shallow throughout. So neither a
+    # widened refspec nor `--unshallow` is needed here, and neither would have fixed the two missed
+    # releases; the stderr trap above did.
+    if ((Invoke-Native { git fetch origin --tags --force *>&1 | Out-Null }) -ne 0) {
+        throw "git fetch failed (network/auth?)"
+    }
 
     # -v:refname, not -creatordate: same-day releases sort wrongly by date, and plain lexicographic
     # ranks v0.7.9 above v0.7.10.
@@ -86,12 +114,10 @@ try {
     }
     if (-not $job.build) { $res.action = 'behind'; $res.ok = $true; return }
 
-    git checkout -f $want *>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "git checkout $want failed" }
+    if ((Invoke-Native { git checkout -f $want *>&1 | Out-Null }) -ne 0) { throw "git checkout $want failed" }
 
     $buildLog = Join-Path $env:TEMP 'mzpc-boxupdate-build.log'
-    cargo build --release *> $buildLog
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-Native { cargo build --release *> $buildLog }) -ne 0) {
         $res.log = (Get-Content $buildLog -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
         throw "cargo build failed"
     }
