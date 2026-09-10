@@ -74,6 +74,7 @@ mod shimadzu_meta;
 mod vendor;
 mod embed_aux;
 mod filter;
+mod mzml_isolation;
 
 use arrow::datatypes::DataType;
 use mzdata::curie;
@@ -490,15 +491,18 @@ fn has_gz_suffix(p: &Path) -> bool {
 /// The byte sink for an mzML export: the plain file, or a streaming gzip encoder when the requested
 /// name ends in `.gz`. The XML is compressed AS it is written — one pass, no re-read. Both the mzML
 /// writer and the encoder finish on drop (the writer closes the document, the encoder writes the
-/// gzip trailer), which is why the four export sites can let `w` fall out of scope as before.
+/// gzip trailer), which is why the four export sites can let `w` fall out of scope as before. Above
+/// both sits [`mzml_isolation::TargetOnlyWindows`]: mzdata's writer prints an isolation window of
+/// unknown width as offsets of ±target, and that sink leaves it target-only.
 fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
-    Ok(if has_gz_suffix(output) {
+    let sink: Box<dyn Write> = if has_gz_suffix(output) {
         log::info!("output name ends in .gz: gzip-compressing the mzML as it is written");
         Box::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()))
     } else {
         Box::new(file)
-    })
+    };
+    Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(sink)))
 }
 
 /// When to apply the statistically-DETECTED TOF-grid m/z encoding (strategy A). This

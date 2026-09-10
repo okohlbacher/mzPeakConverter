@@ -3,7 +3,8 @@
 //!
 //! * `target_only_window.mzML` — tiny.pwiz with every isolation window reduced to its target: the
 //!   archive must keep the target and NULL offsets. Before the fix the writer turned "width unknown"
-//!   into offsets of ±target (measured on RS080806, Minimal_DDA, En_PPY in the corpus).
+//!   into offsets of ±target (measured on RS080806, Minimal_DDA, En_PPY in the corpus). mzdata's mzML
+//!   writer did the same on `--to mzml`, so the export must be target-only too.
 //! * A Bruker TSF `.d` (set `MZPC_TSF_FIXTURE=/path/to/x.d` and run with `--include-ignored`; the corpus holds no TSF
 //!   acquisition, and `bruker_tsf`'s unit tests pin the FrameMsMsInfo mapping without one): every MS2 frame
 //!   gets its `FrameMsMsInfo` precursor with a resolved parent, the stated charges are carried, and
@@ -73,6 +74,46 @@ fn a_target_only_isolation_window_keeps_null_offsets() {
     assert!(!target.is_null(0), "the stated target is kept");
     assert!(lower.is_null(0) && upper.is_null(0), "an unstated width stays unknown — not ±target");
     let _ = std::fs::remove_file(&archive);
+}
+
+/// The same window through `--to mzml`. mzdata's writer printed it as lower offset 445.3 and upper
+/// offset −445.3, a window from 0 to twice the target, until the export sink blanked that pair in
+/// place (`src/mzml_isolation.rs`); in place means every `<indexList>` offset still finds its element.
+#[test]
+fn a_target_only_isolation_window_exports_to_mzml_target_only() {
+    let fixture = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/target_only_window.mzML"));
+    let mzml = std::env::temp_dir().join(format!("mzpc-runmeta-{}-tow.mzML", std::process::id()));
+    let _ = std::fs::remove_file(&mzml);
+    let status = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&fixture)
+        .arg("-o")
+        .arg(&mzml)
+        .arg("--force")
+        .status()
+        .expect("failed to run mzpeak-convert");
+    assert!(status.success(), "mzML export of {} failed: {status}", fixture.display());
+    let xml = std::fs::read_to_string(&mzml).unwrap();
+    let window = &xml[xml.find("<isolationWindow>").unwrap()..xml.find("</isolationWindow>").unwrap()];
+    assert!(window.contains("\"MS:1000827\""), "the stated target is kept: {window}");
+    assert!(
+        !window.contains("\"MS:1000828\"") && !window.contains("\"MS:1000829\""),
+        "an unstated width is not exported as offsets of ±target: {window}"
+    );
+    let index = &xml[xml.find("<indexList").unwrap()..];
+    let offsets: Vec<usize> = index
+        .split("<offset ")
+        .skip(1)
+        .map(|o| o[o.find('>').unwrap() + 1..o.find("</offset>").unwrap()].parse().unwrap())
+        .collect();
+    assert!(!offsets.is_empty(), "an indexed export");
+    for at in offsets {
+        let element = xml[at..].trim_start();
+        assert!(
+            element.starts_with("<spectrum ") || element.starts_with("<chromatogram "),
+            "offset {at} no longer points at its element"
+        );
+    }
+    let _ = std::fs::remove_file(&mzml);
 }
 
 #[test]
