@@ -232,6 +232,11 @@ pub struct NativeTofReader {
     /// `MzCalibration` row is sqrt-linear (ModelType 1, `C2 = 0`); see [`exact_tof_coeffs`]. A
     /// `None` entry is a frame with a NULL `Frames.T1`, which stays on the chord.
     exact_tof: Option<Vec<Option<(f64, f64)>>>,
+    /// Frames the `--ims-chunked` layout re-ordered: points gathered scan by scan that were not
+    /// already in TOF order when [`Self::ims_compact_spectrum_chunked`] sorted them. Only the write
+    /// loop calls that method (the chunked schema comes from a synthetic sample), so this counts
+    /// written frames, and the finisher declares `sort-by-mz` from it.
+    frames_reordered: std::sync::atomic::AtomicUsize,
 }
 
 /// Per-frame `Frames` columns, ordered by `Id` so position `i` matches timsrust's frame index.
@@ -833,7 +838,7 @@ impl NativeTofReader {
         } else {
             None
         };
-        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows, exact_tof })
+        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows, exact_tof, frames_reordered: Default::default() })
     }
 
     /// Whether the run carries exact `tof_c0`/`tof_c1` params (the writer then declares the
@@ -1149,6 +1154,11 @@ impl NativeTofReader {
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
+    /// Frames [`Self::ims_compact_spectrum_chunked`] has re-ordered so far (see the field).
+    pub fn frames_reordered(&self) -> &std::sync::atomic::AtomicUsize {
+        &self.frames_reordered
+    }
+
     /// GATED `--ims-chunked` variant of [`Self::ims_compact_spectrum`]: emits ABSOLUTE integer `tof`
     /// (no per-scan delta) with the WHOLE FRAME sorted by `tof` (== sorted by m/z, since m/z is
     /// monotonic in tof). The writer then splits these points into true-m/z-bin chunks and
@@ -1183,6 +1193,9 @@ impl NativeTofReader {
                 tof_max = tof_max.max(bin);
                 pts.push((bin, frame.intensity[k], m));
             }
+        }
+        if !pts.is_sorted_by_key(|p| p.0) {
+            self.frames_reordered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         pts.sort_by_key(|p| p.0);
 

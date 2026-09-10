@@ -85,6 +85,8 @@ pub struct AgilentReader {
     /// Scans whose retention time MHDAC could not supply (the host writes NaN); stored as 0.0 and
     /// reported once when the reader closes.
     missing_rt: std::cell::Cell<usize>,
+    /// The value rewrites the host counted and reported on stderr (see [`Self::transformations`]).
+    host_counts: agl::HostCounts,
 }
 
 /// Unique temp filenames without pulling a `tempfile` dep: pid + a process-local counter. (Date/rand
@@ -191,12 +193,14 @@ impl AgilentReader {
                 return Err(e);
             }
         };
-        // A successful host may still have something to say (today: how many NaN/Inf intensities
-        // it stored as 0). That is a transformation the archive would not otherwise record.
+        // A successful host may still have something to say: NaN/Inf intensities it stored as 0,
+        // m/z and intensity arrays it cut to one length. Each is a transformation of the values,
+        // so it is logged here and declared in the archive through `transformations`.
         let host_notes = String::from_utf8_lossy(&out.stderr);
         for line in host_notes.lines().map(str::trim).filter(|l| !l.is_empty()) {
             log::warn!("Agilent host: {line}");
         }
+        let host_counts = agl::host_counts(&host_notes);
         if agl::has_dwell(&index.scan_types) {
             log::warn!(
                 "{} mixes scan spectra with MRM/SIM dwell data (MHDAC scan types: {}); the dwells \
@@ -216,7 +220,13 @@ impl AgilentReader {
             index.device.replace('\u{1F}', " / ")
         );
 
-        Ok(Self { file: RefCell::new(file), index, file_len, tmp_path, missing_rt: std::cell::Cell::new(0) })
+        Ok(Self { file: RefCell::new(file), index, file_len, tmp_path, missing_rt: std::cell::Cell::new(0), host_counts })
+    }
+
+    /// The `transformations` entries for what the host rewrote in this run's values, each declared
+    /// only when the host counted at least one (`agl::HostCounts::transformations`).
+    pub fn transformations(&self) -> Vec<String> {
+        self.host_counts.transformations()
     }
 
     /// MHDAC's `ScanTypes` flags as reported by the host ("Scan", "MultipleReaction, SelectedIon", …;
