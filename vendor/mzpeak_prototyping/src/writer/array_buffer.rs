@@ -1299,11 +1299,6 @@ impl ArrayBuffersBuilder {
         self.array_fields.is_empty()
     }
 
-    /// The array fields registered so far, in insertion order.
-    pub fn fields(&self) -> &[FieldRef] {
-        &self.array_fields
-    }
-
     pub(crate) fn add_default_fields_for_context(mut self, buffer_context: BufferContext) -> Self {
         self = match buffer_context {
             BufferContext::Spectrum => self
