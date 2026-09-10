@@ -64,6 +64,14 @@ keep their bytes.
   it, and the run goes red. The job runs on every dispatch, whatever `only` names. `gen_sbom.py`
   writes no timestamp or serial number, so regenerating from the tag's `Cargo.lock` re-attaches
   the same file.
+- **`metadata.conversion_route` names the timsTOF route that built an archive** (review D13/M35).
+  The default lane falls back to the mzdata reader when timsrust cannot decompress a frame (newer
+  timsTOF, e.g. 5.1.x), with the same recorded command line, so a fallback archive was recognisable
+  only by what it lacks. Both ims-compact lanes now write
+  `{"route": "ims-compact", "reader": "timsrust" | "timsdata"}` and the fallback writes
+  `{"route": "mzdata-fallback", "reader": "mzdata", "reason": <the error>}`.
+  `ims_compact_fallback_arm_records_the_route_it_took` forces the fallback arm with injected errors,
+  and `convert_file_writes_the_route_it_is_handed` pins the block in the archive.
 
 ### Fixed
 
@@ -484,6 +492,71 @@ keep their bytes.
   refuses a second initialisation in one process. It refuses one only after netcorehost has freed
   the library, when the last handle to it dropped, which is why the runtime is cached. (The stale
   "BACKLOG.md #23" and the windows.yml header went with the Windows CI change below.)
+- **The Shimadzu profile grid declares the bound its fit enforces: `max_error_da: 1e-9`, not
+  `5e-10`.** The native `.lcd` lane's `tof_calibration` block has stated 5e-10 Da since 0.9.13, but
+  the fit accepts a spectrum when every point rebuilds within `shimadzu_grid::TOL`, 1e-9 Da.
+  Refitting HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points (0.52 %) between 5e-10 and
+  5.47e-10 Da off, none past 1e-9; the evidence quoted for 5e-10 ("≤ 0.5 step off the lattice")
+  holds for any value by definition. The block now writes the gate itself, and
+  `tests/contract_strings.rs` pins both the emission and `TOL = 1e-9`. The two published archives
+  (HEK_PosOAD1, Blind_P1_pos_012) keep 5e-10 until reconverted. The lane is Windows-only, so the
+  emission is pinned as source text rather than run here.
+- **An unzoned Bruker or Agilent acquisition time reaches the `acquisition_time` index block.**
+  `fixup_run_metadata` reads what a Bruker `.d` (`GlobalMetadata`) or Agilent `.d` (`AcqData`)
+  states for every lane that does not pass it through its own hints: ims-compact, the mzdata lane
+  (with its TDF fallback), `--tof-grid`, `--agilent-grid`, and the TSF, BAF,
+  `--bruker-sdk` and MHDAC vendor-reader lanes. It discarded the block `run_metadata::apply` returns
+  for a clock without an offset, while the log said the clock was recorded, so such an archive had a
+  null `run.start_time` and no block. The fixup now returns the block and each of those lanes writes
+  it; an mzML export, whose run model holds only a zoned `start_time`, names the dropped clock in a
+  warning.
+  `--via-msconvert` is not among them: its fixup sees the intermediate mzML, whose run start is
+  ProteoWizard's. No corpus archive is affected: every Bruker and Agilent clock in it states an
+  offset. Pinned by
+  `unzoned_vendor_directory_clock_reaches_the_index` on a synthetic TSF `.d` through the
+  vendor-reader lane. USER_MANUAL §8 now tells readers to fall back to
+  `acquisition_time.wall_clock` when `run.start_time` is null.
+- **The Bruker BAF lane records its run: member digests, instrument, software and acquisition
+  time.** It passed no run metadata at all, and `fixup_run_metadata` recognised only a non-empty
+  `analysis.tdf`/`.tsf` or an Agilent `AcqData`, so the two corpus BAF archives (FM_1-1_01_20254,
+  NreB_PAS_DECONV) named only the `.d`, with no MS:1000569 digest, no software, no start time, and an
+  instrument configuration holding a valueless `MS:1000031` (the writer's CvMapping placeholder for a
+  configuration with no model term). The directory now yields `analysis.baf`, `analysis.baf_idx` and
+  `analysis.baf_xtr` with their SHA-1s on any host (`vendor::bruker_baf_members`, also behind a 0-byte
+  `analysis.tdf` stub), and the lane reads the baf2sql cache's `Properties` table as ProteoWizard
+  does: the raw `InstrumentFamily` code becomes the PSI-MS series term ProteoWizard arrives at
+  through `translateInstrumentFamily` and then `translateAsInstrumentSeries` (1–2 micrOTOF; 6–8,
+  maXis/impact/compact, maXis series; 512 apex; 513 solarix), plus `InstrumentSerialNumber`,
+  `AcquisitionSoftware` + version and `AcquisitionDateTime` (`vendor::baf_properties_metadata`).
+  Any other family code, and a cache whose `Properties` table is missing or unreadable, gives the
+  generic `MS:1000122` Bruker Daltonics instrument model, so the valueless placeholder is gone
+  either way. Pinned by `baf_directory_members_are_digested`,
+  `baf_properties_state_the_series_their_family_code_names` and
+  `baf_directory_members_are_digested_in_the_archive`. The `Properties` read runs only where
+  baf2sql exists (Windows, Linux) and is unverified against a real cache; CI compiles it.
+- **Every transformation row 23 of the review found undeclared is now declared when it happens,
+  from a count.** `--ims-chunked` sorts each frame's points by TOF across mobility scans and now
+  declares `sort-by-mz` from the native reader's count of frames that sort changed; USER_MANUAL §8
+  had called it undeclared "on purpose", against the owner's no-silent-reorder decision.
+  `--bruker-sdk` re-sorts each mobility-major TDF frame by m/z and declares it from the reader's
+  counter, read over the written spectra only (`reader_counters_count_written_spectra_only`).
+  `--agilent-grid` declares `agilent:drop-zero-samples` only when its reader dropped a zero sample or
+  an all-zero scan, declares a new `agilent:intensity-f32-rounding` when a count above 2^24 was rounded
+  into Float32 (logged only until now), and marks the archive `partial` when `MSProfile.bin` ends
+  before its scan records, also under an `MZPC_MAX_SPECTRA` cap that stopped nothing
+  (`agilent_grid_declares_what_its_reader_counted`). The Agilent MHDAC host
+  counts spectra whose m/z and intensity arrays it cut to one length, reports both that and its
+  NaN/Inf count in a `[count key=value]` tag, and the lane declares `agilent:truncate-unequal-arrays`
+  and `agilent:nonfinite-intensity-to-zero` (`agl::host_counts`, pinned on host). The native Waters
+  lane writes a `waters_functions` block on every run (the skipped, SONAR and collapsed functions and
+  the lock mass lived only in `waters_drift`, which a run without drift bins never gets), counts a
+  function whose scan count MassLynx cannot return among the skipped ones (it was only logged),
+  declares
+  `waters:drop-functions` and `waters:sonar-summed`, and reads `MZPC_WATERS_KEEP_COLLAPSED` once
+  through `env_flag`: with `=0` it used to skip the collapsed functions while reporting them written.
+  A Shimadzu run under `MZPC_SHIMADZU_COARSE_MZ=1` names the coarse `Mass` field in
+  `mz_calibration.source`. The Agilent MHDAC, Waters, Shimadzu and `--bruker-sdk` lanes are
+  Windows/Linux-only: their decision logic is host-tested, their wiring compiles on CI only.
 
 ### Changed
 
@@ -561,6 +634,12 @@ keep their bytes.
   Windows jobs now share one cache, which only the `windows` job saves.
 - README: run the suite with `cargo test --release`, as CI does; the vendored writer's
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
+- **One builder for the `MS:1000569` SHA-1 source-file param** (`run_metadata::sha1_param`, review
+  M15). `waters_meta.rs` kept a private copy and `main.rs` built the same param inline twice (the
+  Shimadzu pre-open digest and the single-file digest of the run-metadata fixup). The emitted values
+  are unchanged: the index metadata of `tiny.pwiz.1.1.mzML`, `tiny_centroid_only.mzML`, a
+  `sourceFileList`-less mzML (the fixup's own digest) and 2485.d capped at 20 frames (the
+  member digests) is identical before and after.
 - **The filter lane has tests.** `tests/filter_lane.rs` is the first for `src/filter.rs`: on
   `tiny.pwiz.1.1.mzML` converted in the test, `--ms-level 2` keeps one spectrum and nulls its
   `precursor_index`; `--rt 0-0.0001` keeps one spectrum, the chromatogram points inside the window and matching
@@ -606,6 +685,55 @@ keep their bytes.
   package, together with the switch, restores a working one. Whether that holds inside a component
   loaded through hostfxr is untested. Decided for now: the SciEX and Shimadzu glues stay on
   `net8.0`, and `docs/PLATFORM_SUPPORT.md` states the date and what it means.
+- **Output change: `transformations` lists what was applied to the archive, not what was
+  configured** (review D15). The writer now counts, per spectrum facet, the spectra its zero-run
+  mask shortened, the chunks it stored with numpress-linear, and the spectra its m/z re-sort
+  backstop reordered (`MzPeakWriterType::spectrum_signal_tally`, a vendored patch), and every lane
+  derives `zero-run-mask`, `numpress-linear` and `sort-by-mz` from those counts. Until now
+  `zero-run-mask` was written on every lane and `numpress-linear` whenever the codec was chosen:
+  103 corpus archives declared the mask with no profile spectrum, and 32 declared numpress with no
+  numpress chunk. The writer's backstop was never declared at all, although every native lane
+  relies on it. On `tiny.pwiz.1.1.mzML` the list is now `["numpress-linear", "sort-by-time"]` (its
+  one profile spectrum holds no zero run; its MS1 spectra arrive out of time order, so the writer
+  re-sorts the synthesized TIC and base-peak traces) and `["sort-by-time"]` with `--no-numpress`;
+  `writer_counters_decide_the_writer_level_transformations` pins the mask, the backstop and the
+  empty list on the vendor-reader seam. The two lane entries still derived from configuration are
+  counted as well. `shimadzu:span-trim` now comes from the gridded spectra whose zero pad the profile
+  route actually left out; it was declared whenever the run-wide grid step was found, even if no
+  spectrum was gridded or padded (`span_trim_is_declared_from_the_written_routes`). A native Waters
+  archive's `sort-by-mz` comes from the reader's count of frames whose interleaved bins the sort
+  moved; it was declared whenever a function had drift bins
+  (`a_frame_counts_as_re_sorted_only_when_its_order_changed`). Its `waters:sonar-summed` comes from
+  the reader's count of written scans read as a SONAR function's bins summed, not from the function
+  table, which declared it for a run cut by `MZPC_MAX_SPECTRA` before any such scan; and the MHDAC
+  host now exports only the scans that cap lets the converter write, so its `[count …]` tags count
+  the rewrites of the archive's spectra (`reader_counters_count_written_spectra_only`,
+  `glue_writes_what_this_parser_reads`). The writer's two other re-sort backstops are counted as
+  well: a chromatogram it re-sorted by time declares the new `sort-by-time`, a wavelength spectrum it
+  re-sorted by wavelength the new `sort-by-wavelength`; both reordered stored data undeclared
+  (`writer_backstops_declare_chromatogram_and_wavelength_re_sorts`). Every entry name is pinned
+  where it is declared (`tests/contract_strings.rs` over `main.rs`, `agl.rs` and `waters.rs`), and so
+  are the `[count …]` tags the Agilent host writes in `Glue.cs`. A rebuilt corpus archive drops the
+  entries that did not happen; the existing entry names are unchanged.
+- **Output change: every vendor directory input embeds its side-files, under one rule**
+  (`embed_vendor_members`). The vendor-reader and mzdata lanes embedded only Bruker TDF/TSF
+  directories while `--agilent-grid` and ims-compact embedded any directory themselves, so a BAF `.d`,
+  an Agilent `.d` on the MHDAC lane and a Waters `.raw` got no `vendor/` members and no
+  `vendor_files` manifest, `--aux` did nothing on them without a word, and USER_MANUAL §8's "embedded
+  by default" was false for BAF (corpus: FM_1-1_01_20254 and the Agilent S25 archive hold 0 vendor
+  members). They now follow the lane's policy like every other directory: preserve by default, the
+  ims-compact `*_bin` drop, `--aux` on top. **Size:** preserve-by-default includes the raw signal
+  files, so a rebuild without `--no-vendor` or an `--aux` drop grows by roughly their size (FM_1-1:
+  `analysis.baf` is 714 MB beside a 109 MB archive; S25: `MSProfile.bin` + `MSPeak.bin` are 251 MB).
+  No default drops them, because those lanes do not store all the signal the files hold: BAF reads
+  line arrays first, the MHDAC host asks for profile else peak, and Waters leaves chromatogram-type
+  functions out. The one default drop is baf2sql's `analysis.sqlite`, which the BAF reader itself
+  creates inside the `.d` and which is therefore not a vendor file; the drop is recorded in
+  `vendor_files`, and `--aux 'analysis.sqlite=embed'` keeps it
+  (`the_baf2sql_cache_is_dropped_unless_asked_for`).
+  `--aux` on a single-file input now logs that it is inert.
+  `every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert` pins both on a synthetic
+  Waters-shaped directory and on `tiny.pwiz.1.1.mzML`.
 
 ### Removed
 

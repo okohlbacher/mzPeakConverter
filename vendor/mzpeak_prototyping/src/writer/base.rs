@@ -231,6 +231,8 @@ impl GenericDataArrayWriter {
                 "{} {series_index} was not sorted, sorting {n_points} values",
                 self.data_buffers.buffer_context().main_struct_name()
             );
+            // VENDORED PATCH (mzPeakConverter D15): counted, so the archive can declare the re-sort.
+            self.data_buffers.tally_mut().resorted += 1;
             binary_array_map.clone_into(&mut tmp_binary_array_map);
             tmp_binary_array_map.sort_by_array(&axis)?;
         }
@@ -601,6 +603,8 @@ pub trait AbstractMzPeakWriter {
                 "Chromatogram {chromatogram_index} ({}) was not sorted, sorting {n_points} values",
                 chromatogram.id()
             );
+            // VENDORED PATCH (mzPeakConverter D15): counted, so the archive can declare the re-sort.
+            self.chromatogram_data_buffer_mut().tally_mut().resorted += 1;
             binary_array_map.clone_into(&mut tmp_binary_array_map);
             tmp_binary_array_map.sort_by_array(&ArrayType::TimeArray)?;
         }
@@ -849,6 +853,8 @@ pub trait AbstractMzPeakWriter {
                 "Spectrum {spectrum_count} ({}) was not sorted, sorting {n_points} values",
                 spectrum.id()
             );
+            // VENDORED PATCH (mzPeakConverter D15): counted, so the archive can declare the re-sort.
+            self.spectrum_data_buffer_mut().tally_mut().resorted += 1;
             binary_array_map.clone_into(&mut tmp_binary_array_map);
             tmp_binary_array_map.sort_by_array(&ArrayType::MZArray)?;
         }
@@ -895,6 +901,12 @@ pub trait AbstractMzPeakWriter {
                 let (fields, arrays, _nulls) = chunks.into_parts();
                 buffer_ref.add_arrays(fields, arrays, size, is_profile);
             }
+            // VENDORED PATCH (mzPeakConverter D15): the zero-run mask is the only step here that
+            // shortens a profile (a missing main axis stores 0 points and is not a mask), so a
+            // shorter non-empty result is a spectrum the mask changed.
+            if is_profile && buffer_ref.drop_zero_intensity() && n_pts > 0 && n_pts < n_points {
+                buffer_ref.tally_mut().zero_runs_masked += 1;
+            }
 
             (delta_model, Some(auxiliary_arrays), n_pts)
         } else {
@@ -926,6 +938,10 @@ pub trait AbstractMzPeakWriter {
             )?;
 
             let pts_written = buffer.add_arrays(fields, data, n_points, is_profile);
+            // VENDORED PATCH (mzPeakConverter D15): as on the chunked path above.
+            if is_profile && buffer.drop_zero_intensity() && pts_written < n_points {
+                buffer.tally_mut().zero_runs_masked += 1;
+            }
             (delta_model, Some(extra_arrays), pts_written)
         };
 
