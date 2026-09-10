@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+**Output change.** An indexed mzML that declares a non-UTF-8 encoding now keeps its source
+chromatograms in both lanes (below). No corpus archive is affected: the one corpus mzML that is
+both indexed and non-UTF-8, `general-ms/thermo-ltq-orbitrap-velos/`
+`TMT_Erwinia_1uLSike_Top10HCD_isol2_45stepped_60min_01-20141210.mzML` (ISO-8859-1), declares only
+a `TIC`, which synthesis replaces anyway, and its archive
+`TMT_Erwinia_1uLSike_Top10HCD_isol2_45stepped_60min_01.mzpeak` is converted from the `.raw`. The
+other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>`
+(`bruker-microtof-q2`) and imzML.
+
 ### Added
 
 - **Release archives for Linux and Windows.** Beside the two macOS archives, every release now
@@ -28,6 +37,55 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
+  mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
+  a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes
+  the five-bytes-shorter `encoding="UTF-8"`, and every high byte becomes two. Every `<offset>` in
+  the copy's `<indexList>`, and its `<indexListOffset>`, then pointed at the wrong byte. mzdata
+  failed to read the index (said only at debug level: `close tag </indexList> does not match any
+  open tag`), fell back to a scan that finds the spectra, and could no longer enumerate the
+  chromatograms, which it reaches only through that index. On `tests/fixtures/tiny.pwiz.1.1.mzML`
+  the mzPeak lane logged `2 synthesized + 0 from source`, and `-o x.mzML` wrote only the writer's
+  own TIC/BPC: the `sic` trace was gone from both. The transcoder now rebuilds the copy's index,
+  each offset from the new position of the `<spectrum`/`<chromatogram` tag carrying its id and
+  `<indexListOffset>` from `<indexList`, and drops its `<fileChecksum>`, which hashes the original
+  bytes and which mzdata never checks. imzML goes through the same transcoder but has no XML offset
+  index (its offsets point into the `.ibd`): a Latin-1 imzML and a same-length UTF-8-declared copy
+  convert identically. The `convert_to_mzml` comment that blamed spectrum iteration for lost
+  chromatograms was describing this failure and is corrected. Pinned by
+  `tests/latin1_indexed_mzml_chromatograms.rs`, including a variant with high bytes.
+- **Reading fewer chromatograms than the source declares is now a warning**, in both lanes and
+  whatever the cause: `<chromatogramList count>` is checked against what the reader yields. The
+  only warning before fired for a non-indexed mzML, so a stale index lost traces in silence.
+- **An indexed mzML with an empty `<referenceableParamGroup id="…"/>` lost all its chromatograms,
+  with exit code 0.** mzdata panics on such a group once it is referenced (ProteomeDiscoverer
+  emits them), so the converter reads a sanitized copy in which each is written as an open/close
+  pair. Only the header before `<spectrumList` changes, but it grows, so every `<offset>` in the
+  copy's `<indexList>`, and its `<indexListOffset>`, pointed short of its element. mzdata failed to
+  read the index (said only at debug level: `close tag </run> does not match any open tag`), fell
+  back to a scan that finds the spectra, and could no longer enumerate the chromatograms, which it
+  reaches only through that index: `tests/fixtures/tiny.pwiz.1.1.mzML` declared UTF-8 with one
+  empty group logged `2 synthesized + 0 from source`, and the `sic` trace was gone from both lanes.
+  The rewrite is header-only, so every indexed element moves by the same number of bytes: the
+  copy's offsets are now shifted by that delta, the body is still streamed, and only the index tail
+  is read into memory. The copy drops its `<fileChecksum>`, which hashes the original bytes and
+  which mzdata never checks. A source whose `<indexListOffset>` does not point at its `<indexList>`
+  is copied as before. No corpus archive is affected: no corpus mzML carries an empty group. Pinned
+  by `tests/empty_param_group_indexed_mzml_chromatograms.rs`.
+- **`--ims-chunked` on timsTOF now writes ONE layout family for the spectrum entity.** The path
+  chunked only the peak facet and left the — empty, centroid-only — data facet at the point default,
+  so every chunked timsTOF archive was point `spectra_data` beside chunk `spectra_peaks`: on 0.9.2
+  the writer's one-family-per-entity check aborted the conversion outright ("layout family mismatch
+  between spectrum facets", ~2 s in, on two diaPASEF runs); since 0.9.3 relaxed that check to a
+  warning it wrote the mixed archive and warned. The data facet is now declared chunked too, with
+  the same chunk-shaped fields as the peak facet, so an empty `spectra_data` still carries a
+  well-formed chunk schema and the entity keeps one layout family (the scope proposed in
+  HUPO-PSI/mzPeak-specification#21) without leaning on the relaxation, which is untouched:
+  dual-representation archives still pick per facet. Only the empty `spectra_data` member changes.
+  Verified on PXD059079 `…_2499.d` and a private diaPASEF run: both `spectrum_array_index` footers
+  say `chunk`, and `validate_everything.py` passes at max sensitivity (0 errors, 0 warnings). The
+  default (point) layout is unchanged.
+  Regression test: `ims_chunked_spectrum_facets_share_one_family` (corpus-gated, `--ignored`).
 - **Opening a Bruker TSF `.d` no longer writes into it.** `TsfReader::open` used rusqlite's default
   open, which is read-write and CREATES a missing file, so opening a `.d` that has no `analysis.tsf`
   left an empty one inside the user's raw data. A normal conversion reaches the TSF reader only for
@@ -38,6 +96,95 @@ All notable changes to this project are documented here. The format follows
   `analysis.tdf` read-write, after an existence check). A read-only open of a file with a hot
   journal now reports SQLite's own error rather than "GlobalMetadata missing/invalid". Pinned by
   `bruker_tsf::msms_tests::open_never_writes_into_the_input_directory`.
+- **`--to mzml` on a SciEX `.wiff` refuses what the mzPeak lane refuses, and honours
+  `--sample`.** The 0.11.3 refusals (MRM/SIM dwell runs, unreadable samples, a multi-sample
+  file without `--sample`) and the sample selection ran on the native mzPeak lane only; the
+  mzML export opened the reader and streamed every spectrum. On Windows,
+  `En_PPY.wiff -o x.mzML` wrote every dwell of all 117 samples as one-point spectra of a
+  single run and exited 0, and `--sample N` was ignored. Both lanes now open the file
+  through `SciexReader::open_run`, and the decision moved out of the Windows-only reader
+  into `src/sciex_run.rs`, whose tests run on every host. The refusal messages are
+  unchanged; a `--sample` above `i32::MAX` is now refused as out of range instead of
+  wrapping past the bound.
+- **`--via-msconvert --to mzml` no longer passes a previous run's mzML off as this run's.**
+  msconvert was handed the final output path as `--outdir`/`--outfile`, and success meant
+  `output.exists()`. Under `--force` a file left by an earlier run satisfied that check, so
+  the command exited 0, logged "wrote …" and left the old mzML in place. Real ProteoWizard
+  gets there with `--force` over an existing `-o x.mzML.gz` (or `.mzml` on Linux), for which it
+  writes a different file name. msconvert now writes into a fresh directory beside the output
+  (not the temp dir, so the rename cannot cross a volume), created exclusively under a hidden
+  `.mzpc-msconvert-<pid>-<clock>-<n>` name and never reused, so neither a same-pid run on shared
+  storage nor a crashed run's leftovers can supply its mzML; only the file it
+  wrote there is renamed into place through `TmpGuard` like every other mzML export, and a
+  `.mzML.gz` output is gzip-compressed from that file rather than left to msconvert's
+  naming. The directory is removed on every error return, taking a crashed msconvert's stray
+  `.partial` with it. The same guard stops the `--via-msconvert` mzPeak lane leaking
+  `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which returned before
+  any cleanup. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
+  the unfixed build, one that exits 0 without writing produced exit 0 and
+  "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
+  byte-identical and nothing beside it. One that writes its mzML must land under the
+  requested name, gzipped for `.mzML.gz`, and reparse.
+- **`--via-msconvert` refuses a multi-sample WIFF without `--sample` instead of keeping its
+  last sample.** With one `--outfile`, msconvert writes every run of a multi-run source onto
+  that path in turn and the last one wins (En_PPY: 117 samples, one survived), under exit 0
+  and without a warning. Only the native SciEX lane refused such a file, and it runs on
+  Windows alone, while the msconvert lanes also run under Wine with a user-supplied msconvert.
+  msconvert prints `writing output file:` once per run before writing it (`processFile` in
+  pwiz's `msconvert.cpp`), so both msconvert lanes, mzPeak and `--to mzml`, now count those
+  lines in the log they already capture and refuse more than one, giving the count for
+  `--sample <1..N>`; the `--to mzml` lane removes the file msconvert left at the output path,
+  and now passes `--sample` on as `--runIndexSet` as well, without which the refusal would
+  have had no way out. Dropping `--outfile` and counting the mzML files instead is not
+  enough: pwiz names each run `<wiff>-<sample name>`, so samples that share a name overwrite
+  each other there too. The refusal comes after msconvert has converted every run, as the
+  truncated conversion did. `--sample 0` is refused for every lane; the msconvert lanes used
+  to turn it into run index 0, sample 1. `tests/msconvert_multi_run.rs` pins both directions
+  with a stand-in msconvert that writes two runs, or one when `--runIndexSet` picks it.
+- **The `.mzpeak` filter lane no longer refuses archives with wavelength spectra.** Every
+  Parquet member is classified, and the UV/PDA scans facet (`entity_type=wavelength_spectrum`,
+  keyed by `source_index`) fell into the "index does not identify its entity" refusal. `--rt`,
+  `--ms-level`, `--drop-aux`, `--no-vendor`, `--sdrf` and `--image` therefore all exited 1 on any
+  archive holding a `wavelength_spectrum` facet — Waters and Agilent PDA/UV runs included — even
+  with no spectrum filter given. Wavelength facets reference only each other and are now copied
+  whole; `--rt` says once that it does not truncate them.
+- **`--drop-aux` refuses to remove a core facet.** Drop globs matched every member, so
+  `--drop-aux '*.parquet'` wrote an archive holding nothing but its index, and dropping
+  `spectra_peaks.parquet` or `spectra_metadata_precursors.parquet` wrote an unreadable one — each
+  with exit 0. A glob that matches a `spectrum` facet whose `data_kind` is not proprietary/other
+  now exits 1 before anything is written. `--no-vendor` still drops the Thermo `vendor_*` facets,
+  which are declared proprietary, and `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA
+  trace: those facets reference only each other.
+- **`--ms-level` and `--rt` fail on a missing or retyped column.** An `ms_level` that was absent
+  or not UInt8 read as level 0, and a `time` that was absent or not Float64 as NaN, so a writer
+  type change would have made either filter keep 0 spectra and exit 0.
+- **`--rt` refreshes chromatogram point counts in current archives.** The refresh knew only the
+  pre-0.7 nested `chromatogram` struct, so the flat `chromatograms_metadata.parquet` the converter
+  writes today was copied verbatim: on `tiny.pwiz.1.1` converted by 0.11.5, `--rt 0-0.0001` left
+  2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
+  of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
+  re-encoded.
+- **A release is built only from a commit that passed CI.** `release.yml` runs no tests, and
+  `windows.yml` cancelled a push's run as soon as the next commit reached `main` — so v0.10.0
+  (85afceb), v0.10.1 (5692603) and v0.11.3 (4ff30a6) were released with their `windows` job
+  cancelled, never having finished a Windows build and test. A first job now reads the commit's
+  check runs and waits, up to 90 minutes, until `build-test (ubuntu-latest)`,
+  `build-test (macos-latest)` and `windows` have concluded; anything but `success`, cancellation
+  included, stops the release before a platform job starts and names the check. The newest run of a
+  job counts, so re-running a cancelled one clears the way — which a backfill of those three tags
+  now needs first. A `workflow_dispatch` checks the commit its tag points at, a pull request's dry
+  run the pull request's head. Pushes to `main` no longer cancel each other's Windows run, and each
+  gets its own concurrency group: with cancellation off GitHub still replaces a run *pending* in a
+  group, so the middle one of three quick pushes would never run. Pull requests still cancel a
+  superseded run.
+- **Reading an archive back keeps each spectrum's precursors in their source order.** The vendored
+  reader attached a spectrum's (and a chromatogram's) precursors in reversed row order, so
+  mzML → mzPeak → mzML turned `[(445.3, 445.34), (645.3, 645.34)]` (isolation target, selected ion)
+  into `[(645.3, 645.34), (445.3, 445.34)]`, and mzdata's `precursor()`, the first, named a
+  different precursor depending on whether the spectrum was read from mzML or from mzPeak. Every
+  `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
+  were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
+  OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
 
 ### Changed
 
@@ -87,6 +234,27 @@ All notable changes to this project are documented here. The format follows
   Windows jobs now share one cache, which only the `windows` job saves.
 - README: run the suite with `cargo test --release`, as CI does; the vendored writer's
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
+- **The filter lane has tests.** `tests/filter_lane.rs` is the first for `src/filter.rs`: on
+  `tiny.pwiz.1.1.mzML` converted in the test, `--ms-level 2` keeps one spectrum and nulls its
+  `precursor_index`; `--rt 0-0.0001` keeps one spectrum, the chromatogram points inside the window and matching
+  `number_of_data_points`; both again through `-o f.mzML`; `--rt` open bounds (`10-`, `-30`) and
+  refused ranges (`5-1`, `a-b`). It also pins the four filter-lane fixes above: `pda_uv.pwiz.mzML`
+  filtered with `--ms-level 1 --sdrf`, and `drop_aux_refuses_to_remove_a_core_facet`. Each test
+  owns its scratch directory, so the `mzpc-test-{pid}` race above cannot recur there.
+- **The Thermo `.raw` lane is tested.** Nothing exercised it before, although CI installs
+  .NET 8 for this reader. The untested parts were the `vendor_scan_trailers`,
+  `vendor_status_log` and `vendor_scan_trailers_wide` facets (`src/thermo_trailers.rs`,
+  `src/thermo_status.rs`), their embedding, and the Thermo-only `DOTNET_ROLL_FORWARD`
+  default (0.9.12). `tests/thermo_raw.rs` converts `tests/data/small.RAW` with the built
+  binary, runs by default and needs no corpus. The file is mzdata's 48-spectrum LTQ FT run
+  (Apache-2.0, 1.5 MB; provenance in `tests/fixtures/README.md`). `DOTNET_ROLL_FORWARD` is
+  removed from the child's environment. The test asserts 48 spectra, trailer ordinals 0–47,
+  a non-empty status log and one wide-trailer row per spectrum. On a host without .NET 8
+  the conversion depends on that default: with `DOTNET_ROLL_FORWARD=Disable` it fails with
+  "It was not possible to find a compatible framework version". With .NET 8 installed, as
+  on CI, that part passes either way.
+  `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
+  column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
 
 ## [0.11.5] — 2026-09-09
 

@@ -19,7 +19,8 @@
 //! Facets are classified by schema INTROSPECTION, not a hard-coded name list (the format is
 //! extensible): a member is per-spectrum if it has `spectrum.index`, a `point`/`chunk.spectrum_index`,
 //! or a top-level `ordinal`; a chromatogram facet if it has `chromatogram.index` /
-//! `chunk.chromatogram_index`; otherwise run-global (copied verbatim). A member that LOOKS
+//! `chunk.chromatogram_index`; otherwise run-global (copied verbatim, as are wavelength-spectrum
+//! facets, which the spectrum filters do not select). A member that LOOKS
 //! per-spectrum-shaped (a top-level `point`/`chunk`/`peak` struct) but carries no key we can map to
 //! survivors is a hard ERROR — we never silently ship a facet that references dropped spectra.
 
@@ -141,6 +142,26 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
 
     let member_names: Vec<String> = zip.file_names().map(str::to_string).collect();
 
+    // A drop glob must not take a core facet with it. Globs match every member, so `*.parquet`, or
+    // naming `spectra_peaks.parquet` or a precursor sub-facet, wrote an unreadable archive and exited
+    // 0. Proprietary/other spectrum members (the Thermo `vendor_*` facets `--no-vendor` drops) stay
+    // droppable, and so do the wavelength (UV/PDA) facets: they reference only each other, so
+    // `--drop-aux 'wavelength_spectra*'` strips the trace and leaves a readable archive, as it always
+    // did. Checked before anything is written.
+    for name in member_names.iter().filter(|n| opts.drop_aux.iter().any(|g| glob_match(g, n))) {
+        if let Some(fe) = orig_files.get(name).filter(|fe| {
+            matches!(fe.entity_type, EntityType::Spectrum)
+                && !matches!(fe.data_kind, DataKind::Proprietary | DataKind::Other(_))
+        }) {
+            bail!(
+                "--drop-aux would remove {name}, a core {:?} {:?} facet the archive cannot be read \
+                 without; narrow the glob to auxiliary members",
+                fe.entity_type,
+                fe.data_kind
+            );
+        }
+    }
+
     // ── survivors ───────────────────────────────────────────────────────────────────────────────
     // Read spectra_metadata once: compute the surviving spectrum-index set + the dangling-precursor
     // count. Metadata is one row per spectrum, so it is small relative to the peak facets.
@@ -190,6 +211,11 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
                 "{dangling} fragment spectra now reference a filtered-out precursor"
             );
         }
+    }
+    if opts.rt.is_some()
+        && orig_files.values().any(|fe| matches!(fe.entity_type, EntityType::WavelengthSpectrum))
+    {
+        log::warn!("--rt does not truncate wavelength spectra; they are copied whole");
     }
 
     // ── chromatogram truncation prepass ─────────────────────────────────────────────────────────
@@ -327,6 +353,21 @@ fn compute_survivors(
         let time = f64_child(spectrum, "time");
         let ms = cv_child(spectrum, "ms_level", "MS_1000511_ms_level")
             .and_then(|c| c.as_any().downcast_ref::<arrow::array::UInt8Array>());
+        // A predicate over a missing or retyped column must fail, not default: read as level 0 / NaN,
+        // `--ms-level` / `--rt` kept no spectra and still exited 0.
+        if opts.rt.is_some() && time.is_none() {
+            bail!(
+                "--rt needs a Float64 `time` column in spectra_metadata, found {}",
+                spectrum.column_by_name("time").map_or("none".into(), |c| c.data_type().to_string())
+            );
+        }
+        if !ms_set.is_empty() && ms.is_none() {
+            bail!(
+                "--ms-level needs a UInt8 `ms_level` column in spectra_metadata, found {}",
+                cv_child(spectrum, "ms_level", "MS_1000511_ms_level")
+                    .map_or("none".into(), |c| c.data_type().to_string())
+            );
+        }
         let precursor = struct_col(&batch, "precursor");
         let pids = precursor.and_then(|p| lstr_child(p, "precursor_id"));
 
@@ -388,7 +429,8 @@ enum Facet {
     /// `spectra_peaks` / `spectra_data`: one top-level struct (`point`/`chunk`) with a
     /// `spectrum_index` child. Carries the struct field name.
     SpectrumData(String),
-    /// `chromatograms_metadata`: top-level `chromatogram` struct keyed by `chromatogram.index`.
+    /// `chromatograms_metadata`: keyed by a top-level `index` (v0.7 split layout) or by
+    /// `chromatogram.index` in a top-level `chromatogram` struct (pre-0.7).
     ChromatogramMeta,
     /// `chromatograms_data`: a top-level struct with a `chromatogram_index` child + a `time` child.
     ChromatogramData(String),
@@ -406,6 +448,12 @@ enum Facet {
 /// Classify a Parquet facet by its arrow schema. Errors when a facet LOOKS per-spectrum-shaped (a
 /// top-level `point`/`chunk`/`peak` struct) but has no key we can map to survivors.
 fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
+    // Wavelength (UV/PDA) facets reference only each other, and the spectrum filters select mass
+    // spectra, so they are copied whole. Their `source_index` scans facet used to reach the "index
+    // does not identify its entity" refusal below and abort every filter, a pure --sdrf included.
+    if matches!(fe.entity_type, EntityType::WavelengthSpectrum) {
+        return Ok(Facet::RunGlobal);
+    }
     // v0.7 split layout: trust the index. Schema sniffing cannot distinguish a spectrum's
     // `precursors` facet from a chromatogram's — they have the same columns — and getting it wrong
     // filters the wrong table.
@@ -430,6 +478,15 @@ fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
         if has_top_level(bytes, "source_index")? {
             return Ok(Facet::SpectrumSecondary);
         }
+    }
+    // Flat chromatogram metadata, what the converter writes today. The schema sniffing below knows
+    // only the nested `chromatogram` struct, so this was copied verbatim and --rt left its point
+    // counts stale.
+    if matches!(fe.entity_type, EntityType::Chromatogram)
+        && matches!(fe.data_kind, DataKind::Metadata)
+        && has_top_level(bytes, "index")?
+    {
+        return Ok(Facet::ChromatogramMeta);
     }
     // A facet keyed by `source_index` whose index entry does not say which entity owns it cannot be
     // filtered safely: spectrum and chromatogram secondaries are schema-identical. Copying it
@@ -596,18 +653,15 @@ fn process_parquet(
             )
         }
         Facet::ChromatogramMeta => {
-            // Only rewrite the per-chromatogram point counts under --rt; else copy through re-encode.
-            let counts = chrom_counts.cloned();
+            // Only --rt changes a chromatogram; otherwise copy verbatim, footer counts included.
+            let Some(counts) = chrom_counts.cloned() else {
+                return Ok(bytes.to_vec());
+            };
+            let total = counts.values().sum();
             reencode(
                 bytes,
-                move |b| {
-                    if let Some(cnts) = &counts {
-                        Ok(Some(refresh_chrom_point_counts(b, cnts)?))
-                    } else {
-                        Ok(Some(b.clone()))
-                    }
-                },
-                CountMode::ChromatogramMeta,
+                move |b| Ok(Some(refresh_chrom_point_counts(b, &counts)?)),
+                CountMode::ChromatogramMeta(total),
             )
         }
     }
@@ -618,7 +672,8 @@ enum CountMode {
     SpectrumMeta,
     SpectrumData(String),
     Vendor,
-    ChromatogramMeta,
+    /// Carries the surviving data-point total, known from the `chromatograms_data` prepass.
+    ChromatogramMeta(u64),
     ChromatogramData(String),
 }
 
@@ -750,7 +805,7 @@ fn accumulate_counts(
                 }
             }
         }
-        CountMode::ChromatogramMeta => {}
+        CountMode::ChromatogramMeta(_) => {}
     }
 }
 
@@ -796,7 +851,10 @@ fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> 
             ("spectrum_data_point_count".into(), points.to_string()),
         ],
         CountMode::Vendor => vec![("spectrum_count".into(), keys.len().to_string())],
-        CountMode::ChromatogramMeta => vec![("chromatogram_count".into(), rows.to_string())],
+        CountMode::ChromatogramMeta(total) => vec![
+            ("chromatogram_count".into(), rows.to_string()),
+            ("chromatogram_data_point_count".into(), total.to_string()),
+        ],
         CountMode::ChromatogramData(_) => vec![
             ("chromatogram_count".into(), keys.len().to_string()),
             ("chromatogram_data_point_count".into(), points.to_string()),
@@ -984,12 +1042,23 @@ fn chromatogram_point_counts(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<HashM
     Ok(counts)
 }
 
-/// Rebuild `chromatograms_metadata` with the `chromatogram.MS_1003060_number_of_data_points` child
-/// refreshed from `counts`.
+/// Rebuild `chromatograms_metadata` with each chromatogram's point count refreshed from `counts`:
+/// the top-level `number_of_data_points` of the flat layout, or the pre-0.7 nested
+/// `chromatogram.MS_1003060_number_of_data_points` child.
 fn refresh_chrom_point_counts(
     batch: &RecordBatch,
     counts: &HashMap<u64, u64>,
 ) -> Result<RecordBatch> {
+    let recount = |idx: &UInt64Array| -> ArrayRef {
+        Arc::new((0..idx.len()).map(|r| counts.get(&idx.value(r)).copied().or(Some(0))).collect::<UInt64Array>())
+    };
+    let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+    if let (Ok(pos), Some(idx)) =
+        (batch.schema().index_of("number_of_data_points"), batch.column_by_name("index").and_then(to_u64))
+    {
+        cols[pos] = recount(&idx);
+        return Ok(RecordBatch::try_new(batch.schema(), cols)?);
+    }
     let field_name = "chromatogram";
     let Some(col_idx) = batch.schema().index_of(field_name).ok() else {
         return Ok(batch.clone());
@@ -1004,12 +1073,7 @@ fn refresh_chrom_point_counts(
     let Some((child_pos, _)) = s.fields().iter().enumerate().find(|(_, f)| f.name() == child) else {
         return Ok(batch.clone());
     };
-    let new_counts: UInt64Array = (0..idx.len())
-        .map(|r| counts.get(&idx.value(r)).copied().or(Some(0)))
-        .collect();
-    let new_struct = replace_struct_child(s, child_pos, Arc::new(new_counts) as ArrayRef)?;
-    let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
-    cols[col_idx] = Arc::new(new_struct);
+    cols[col_idx] = Arc::new(replace_struct_child(s, child_pos, recount(idx))?);
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
 }
 

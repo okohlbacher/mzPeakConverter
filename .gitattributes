@@ -7,3 +7,4 @@ tools/*.tsv text eol=lf
 # Windows checkout, tiny.pwiz.1.1.mzML would turn CRLF, its indexedmzML byte offsets would go stale, and
 # the reader would lose its chromatograms there and nowhere else.
 tests/fixtures/** -text
+tests/data/** -text

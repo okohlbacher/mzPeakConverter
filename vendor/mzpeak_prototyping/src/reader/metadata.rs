@@ -1112,11 +1112,12 @@ impl<'a, T: ReaderFacetMetadataLike + 'a> SpectrumMetadataDecoder<'a, T> {
             }
         }
 
-        // Reversed traversal to guarantee that the lowest order precursor is *last*
+        // Row order: the order the writer was given them in, which is the source's. A reversed
+        // traversal here put each spectrum's precursors back to front, so mzdata's `precursor()`
+        // (the first) named a different precursor than the mzML the archive was written from.
         for (idx, _, precursor) in self
             .precursors
             .into_iter()
-            .rev()
             .map(CompoundIndexVisitor::unpack)
         {
             if let Some(i) = index_map.get(&idx).copied() {
@@ -1161,8 +1162,12 @@ impl PrecursorSelectedIonAssembler {
         // STABLE: the key is not unique. A spectrum with several precursors (dia-PASEF writes two
         // per MS2 frame; SPS-MS3 writes more) has the SAME (source_index, secondary_index) on each,
         // so an unstable sort reorders them against the row order they were read in — the order the
-        // selected ions are matched against below. Round-tripping a DDA-PASEF archive to mzML showed
-        // the precursors of a frame emitted back to front as a result.
+        // selected ions are matched against below. (A DDA-PASEF archive round-tripped to mzML emitted
+        // a frame's precursors back to front; the reversed traversal in `finish` kept doing so after
+        // this sort was made stable, and is gone too.) The secondary key only ties today because
+        // `visit_precursor_index` never stores it (reader/visitor.rs); once it does, this sort can
+        // move a precursor across a sibling with a different parent, and the positional ion pairing
+        // in `build` would follow the new order, not the rows'.
         self.precursors.sort_by(|a, b| {
             a.source_index()
                 .cmp(&b.source_index())
@@ -1450,8 +1455,8 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
         self.precursors =
             PrecursorSelectedIonAssembler::new(self.precursors, self.selected_ions).build();
 
-        // Reversed traversal to guarantee that the lowest order precursor is *last*
-        for (idx, _prec_idx, precursor) in self.precursors.into_iter().rev() {
+        // Row order, as for spectra: the order the writer was given them in.
+        for (idx, _prec_idx, precursor) in self.precursors.into_iter() {
             if let Some(i) = index_map.get(&idx).copied() {
                 self.descriptions[i].precursor.push(precursor);
             }
