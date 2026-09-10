@@ -4019,40 +4019,60 @@ fn gunzip_to_temp(input: &Path) -> Result<Option<GunzipGuard>> {
 /// to two, so every `<offset>` and the `<indexListOffset>` of the copy point at the wrong byte.
 /// mzdata then fails to read the index, falls back to a scan that finds the spectra, and cannot
 /// enumerate the chromatograms, which it reaches only through the index: they were lost with exit
-/// code 0. Each `<offset idRef="…">` is recomputed from the new position of the `<spectrum` /
-/// `<chromatogram` start tag carrying that id (an id not found keeps its value), and
-/// `<indexListOffset>` from the new position of `<indexList`. `None` for a document with no index:
-/// a plain mzML, or an imzML, whose offsets point into the `.ibd` rather than the XML.
+/// code 0. Each `<offset idRef="…">` is recomputed from the new position of the start tag carrying
+/// that id in the list its `<index name="spectrum|chromatogram">` names — mzML ids are unique only
+/// within their list, so a spectrum and a chromatogram may share one — and `<indexListOffset>` from
+/// the new position of `<indexList`. An id not found keeps its value, with a warning. `None` for a
+/// document with no index: a plain mzML, or an imzML, whose offsets point into the `.ibd`.
 fn rebuild_mzml_index(doc: &str) -> Option<String> {
     let list_at = doc
         .rmatch_indices("<indexList")
         .map(|(i, _)| i)
         .find(|&i| !doc[i..].starts_with("<indexListOffset"))?;
-    let mut at = std::collections::HashMap::new();
-    for tag in ["<spectrum", "<chromatogram"] {
-        for (i, _) in doc[..list_at].match_indices(tag) {
+    // `<spectrumList` / `<chromatogramList` / `<indexList` share a prefix: the name must end there.
+    let starts = |at: usize, tag: &str| doc[at + tag.len()..].starts_with(|c: char| c.is_ascii_whitespace());
+    let positions = |tag: &str| {
+        let mut at = std::collections::HashMap::new();
+        for (i, _) in doc[..list_at].match_indices(tag).filter(|&(i, _)| starts(i, tag)) {
             let rest = &doc[i + tag.len()..list_at];
-            // `<spectrumList` / `<chromatogramList` share the prefix: the element name must end here.
-            if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
-                continue;
-            }
             if let Some(id) = rest.find('>').and_then(|gt| xml_attr(&rest[..gt], "id")) {
                 at.insert(id, i);
             }
         }
-    }
+        at
+    };
+    let (spectra, chromatograms) = (positions("<spectrum"), positions("<chromatogram"));
     let mut out = String::with_capacity(doc.len());
     out.push_str(&doc[..list_at]);
     let mut rest = &doc[list_at..];
+    let (mut ids, mut unresolved) = (None, 0usize);
     while let Some(o) = rest.find("<offset") {
         let (Some(gt), Some(close)) = (rest[o..].find('>'), rest[o..].find("</offset>")) else { break };
         let (gt, close) = (o + gt + 1, o + close);
+        // The `<index name="…">` opened since the previous offset, if any, says which list this is.
+        let base = doc.len() - rest.len();
+        if let Some((i, _)) = rest[..o].rmatch_indices("<index").find(|&(i, _)| starts(base + i, "<index")) {
+            ids = match rest[i..o].find('>').and_then(|e| xml_attr(&rest[i..i + e], "name")) {
+                Some("spectrum") => Some(&spectra),
+                Some("chromatogram") => Some(&chromatograms),
+                _ => None,
+            };
+        }
         out.push_str(&rest[..gt]);
-        match xml_attr(&rest[o..gt], "idRef").and_then(|id| at.get(id)) {
+        match xml_attr(&rest[o..gt], "idRef").and_then(|id| ids?.get(id)) {
             Some(pos) => out.push_str(&pos.to_string()),
-            None => out.push_str(&rest[gt..close]),
+            None => {
+                unresolved += 1;
+                out.push_str(&rest[gt..close]);
+            }
         }
         rest = &rest[close..];
+    }
+    if unresolved > 0 {
+        log::warn!(
+            "{unresolved} offset(s) in the source index name an id no element of their list carries; \
+             they keep the value the source wrote, so a reader that follows one may land elsewhere"
+        );
     }
     const OPEN: &str = "<indexListOffset>";
     if let (Some(a), Some(b)) = (rest.find(OPEN), rest.find("</indexListOffset>")) {
@@ -4232,10 +4252,12 @@ fn count_attr(text: &str) -> Option<u64> {
 /// The chromatogram count an mzML declares in `<chromatogramList count="N">`.
 ///
 /// The list follows every spectrum, so it is searched for backwards from the end, a chunk at a
-/// time: a read or two for a spectrum-bearing file however large, and the whole file only when the
-/// chromatograms ARE the file. `None` for another format, or when the list is absent or unreadable.
+/// time, and only as far back as `</spectrumList>`: a read or two for a spectrum-bearing file
+/// however large, with or without the list, and the whole file only when the chromatograms ARE the
+/// file. `None` for another format, or when the list is absent or unreadable.
 fn declared_chromatogram_count(path: &Path) -> Option<u64> {
     const NEEDLE: &[u8] = b"<chromatogramList";
+    const SPECTRA_END: &[u8] = b"</spectrumList>";
     const CHUNK: u64 = 1 << 20;
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mzML")) {
         return None;
@@ -4248,13 +4270,16 @@ fn declared_chromatogram_count(path: &Path) -> Option<u64> {
         buf.resize((end - start) as usize, 0);
         f.seek(SeekFrom::Start(start)).ok()?;
         f.read_exact(&mut buf).ok()?;
-        if let Some(i) = buf.windows(NEEDLE.len()).rposition(|w| w == NEEDLE) {
+        let spectra_end = buf.windows(SPECTRA_END.len()).rposition(|w| w == SPECTRA_END);
+        let from = spectra_end.unwrap_or(0);
+        if let Some(i) = buf[from..].windows(NEEDLE.len()).rposition(|w| w == NEEDLE) {
             let mut tag = [0u8; 256];
-            f.seek(SeekFrom::Start(start + i as u64)).ok()?;
+            f.seek(SeekFrom::Start(start + (from + i) as u64)).ok()?;
             let n = f.read(&mut tag).ok()?;
             return count_attr(&String::from_utf8_lossy(&tag[..n]));
         }
-        if start == 0 {
+        // Past the end of the spectrum list there is nothing left the list could follow.
+        if start == 0 || spectra_end.is_some() {
             return None;
         }
         // Overlap by one byte short of the needle, so a needle the boundary cuts in two is still seen.
@@ -7292,6 +7317,42 @@ mod tests {
         std::fs::write(&path, vec![b' '; (2 << 20) + 5]).unwrap();
         assert_eq!(super::declared_chromatogram_count(&path), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and the scan ends at `</spectrumList>`, which the list must follow, instead of reading a
+    /// list-less file back to its first byte. A decoy tag 2 MiB before the end of the spectra is what
+    /// a scan that went on would find.
+    #[test]
+    fn declared_chromatogram_count_stops_at_the_end_of_the_spectra() {
+        let dir = std::env::temp_dir().join(format!("mzpc-chromcount-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.mzML");
+        let mut doc = br#"<chromatogramList count="7">"#.to_vec();
+        doc.resize(2 << 20, b' ');
+        doc.extend_from_slice(b"</spectrumList>");
+        std::fs::write(&path, [doc.as_slice(), b"</run></mzML>"].concat()).unwrap();
+        assert_eq!(super::declared_chromatogram_count(&path), None, "the decoy before the spectra's end was read");
+        // The real list, in the same chunk as the end of the spectra, is still found.
+        std::fs::write(&path, [doc.as_slice(), br#"<chromatogramList count="3"></chromatogramList></run></mzML>"#].concat()).unwrap();
+        assert_eq!(super::declared_chromatogram_count(&path), Some(3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mzML ids are unique only within their own list, so a spectrum and a chromatogram may share
+    /// one. With a single map for both, the spectrum's index entry was pointed at the chromatogram
+    /// and a Latin-1 input read no spectra ("source declares 4 spectra but only 0 were read").
+    #[test]
+    fn rebuilt_index_resolves_each_section_against_its_own_list() {
+        let body = r#"<mzML><run><spectrumList count="1"><spectrum index="0" id="x"></spectrum></spectrumList><chromatogramList count="1"><chromatogram index="0" id="x"></chromatogram></chromatogramList></run></mzML>"#;
+        let doc = format!(
+            r#"<indexedmzML>{body}<indexList count="2"><index name="spectrum"><offset idRef="x">1</offset></index><index name="chromatogram"><offset idRef="x">2</offset><offset idRef="gone">3</offset></index></indexList><indexListOffset>4</indexListOffset></indexedmzML>"#
+        );
+        let out = super::rebuild_mzml_index(&doc).unwrap();
+        let (spectrum, chromatogram) = (out.find("<spectrum ").unwrap(), out.find("<chromatogram ").unwrap());
+        assert!(out.contains(&format!(r#"<index name="spectrum"><offset idRef="x">{spectrum}<"#)), "{out}");
+        assert!(out.contains(&format!(r#"<index name="chromatogram"><offset idRef="x">{chromatogram}<"#)), "{out}");
+        assert!(out.contains(r#"<offset idRef="gone">3<"#), "an unresolvable id keeps its value: {out}");
+        assert!(out.contains(&format!("<indexListOffset>{}<", out.find("<indexList ").unwrap())), "{out}");
     }
 
     /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);
