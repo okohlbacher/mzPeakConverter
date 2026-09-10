@@ -92,12 +92,16 @@ jobs:
             else
               # The newest run of each job counts, so re-running a cancelled one clears the way. The API
               # lists newest first and a release commit carries ~15 check runs, so one page is plenty.
-              # `$want` is jq's variable, not the shell's.
+              # The first line counts those three jobs' runs alone: on a push or a pull request this
+              # workflow's own jobs, this one included, are check runs on the same commit.
+              # `$gated` and `$want` are jq's variables, not the shell's.
               # shellcheck disable=SC2016
-              call="commits/$sha/check-runs?filter=all&per_page=100" filter='.total_count, (
-                ["build-test (ubuntu-latest)", "build-test (macos-latest)", "windows"][] as $want
-                | ([.check_runs[] | select(.name == $want)] | max_by(.id)) // {status: "not started"}
-                | [$want, .status, .conclusion // ""] | @tsv)'
+              call="commits/$sha/check-runs?filter=all&per_page=100" filter='
+                ["build-test (ubuntu-latest)", "build-test (macos-latest)", "windows"] as $gated
+                | ([.check_runs[] | select(.name | IN($gated[]))] | length),
+                  ($gated[] as $want
+                   | ([.check_runs[] | select(.name == $want)] | max_by(.id)) // {status: "not started"}
+                   | [$want, .status, .conclusion // ""] | @tsv)'
             fi
             if out="$(gh api "repos/$GITHUB_REPOSITORY/$call" --jq "$filter" 2> "$RUNNER_TEMP/gh-api.err")"; then
               refused=0
@@ -117,12 +121,12 @@ jobs:
                 fi
               done <<< "${out#*$'\n'}"
               [ -n "$pending" ] || { echo "build-test (ubuntu-latest), build-test (macos-latest) and windows passed"; exit 0; }
-              # A commit CI never ran on gets no check runs later (one pushed together with a later
+              # A commit CI never ran on gets none of those runs later (one pushed together with a later
               # commit, as v0.7.3 and v0.4.12 were, or a [skip ci] one), so do not wait 90 minutes for
               # it. Ten minutes lets a slow queue start; the age keeps a commit just pushed waiting.
               now=$(date +%s)
               if [ "${out%%$'\n'*}" = 0 ] && [ $(( now - start )) -ge 600 ] && [ $(( now - committed_at )) -ge 10800 ]; then
-                echo "::error::$sha (committed $committed) has no check runs at all: CI never ran on it, so there is nothing to wait for. To release it, $remedy."
+                echo "::error::$sha (committed $committed) has no build-test or windows check run: CI never ran on it, so there is nothing to wait for. To release it, $remedy."
                 exit 1
               fi
               echo "waiting on ${pending%; }"
