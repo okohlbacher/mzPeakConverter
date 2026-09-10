@@ -706,7 +706,11 @@ where
     F: Fn(&RecordBatch) -> Result<Option<RecordBatch>>,
 {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))?;
-    let schema: SchemaRef = builder.schema().clone();
+    // The writer gets the schema without its schema-level metadata. arrow-rs folds the source footer's
+    // key-value pairs into `builder.schema()`, and ArrowWriter serialises that schema into
+    // ARROW:schema, where Arrow C++ and pyarrow read the pre-filter counts back as the schema metadata.
+    // The key-value list preserved below carries everything else.
+    let schema: SchemaRef = Arc::new(builder.schema().as_ref().clone().with_metadata(Default::default()));
     let orig_kv: Vec<KeyValue> = builder
         .metadata()
         .file_metadata()

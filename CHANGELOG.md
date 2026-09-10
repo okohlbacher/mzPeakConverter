@@ -185,6 +185,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   plan from, so both omit the key now, and a rewrite also drops it from an older archive's
   spectrum and chromatogram secondaries. Pinned by `secondary_facets_carry_no_entity_count` and
   `filter::tests::rewrite_leaves_no_entity_count_on_secondaries`.
+- **A rewritten facet no longer embeds the pre-filter counts in `ARROW:schema`.** arrow-rs folds a
+  Parquet file's key-value footer into the schema it reads, and the `.mzpeak` rewrite (`--rt`,
+  `--ms-level`, `--drop-aux`) handed that schema to its writer, which serialises it into the file's
+  `ARROW:schema`. The key-value footer was recomputed, but Arrow C++ and pyarrow return the embedded
+  copy as the schema metadata: after `--ms-level 1` on `tiny.pwiz.1.1` converted by 0.11.5,
+  `spectra_data` said `spectrum_count=1`, `spectrum_data_point_count=10` on 0 rows, and
+  `spectra_metadata` 4 on 3. The writer now gets the schema without its schema-level metadata. That
+  loses nothing: an unfiltered archive embeds none, and every key the rewrite embedded was also in
+  the key-value footer. Pinned by `rewrite_embeds_no_stale_counts_in_the_arrow_schema`.
 - **An archive rewritten with `--ms-level` or `--rt` can be read back.** The rewrite keeps each
   surviving spectrum's original index, but the vendored reader sized its per-spectrum tables (m/z
   models, point, peak and auxiliary-array counts) by the number of rows, so
