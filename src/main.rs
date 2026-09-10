@@ -7558,7 +7558,7 @@ mod tests {
         let mut writer = super::MzPeakWriterType::<std::fs::File>::builder()
             .chromatogram_chunked_encoding(None)
             .build(std::fs::File::create(archive).unwrap(), true);
-        super::fixup_run_metadata(&mut writer, dot_d);
+        let _ = super::fixup_run_metadata(&mut writer, dot_d);
         let ms1 = super::Ms1Chroms { time: vec![2.5], tic: vec![10.0], bpc: vec![4.0], saw_ms1: true, ..Default::default() };
         let applied = super::finish_chromatograms(&mut writer, dot_d, &ms1, std::iter::empty(), true).unwrap();
         writer.finish_parquet().unwrap().finish().unwrap();
@@ -7878,7 +7878,7 @@ mod tests {
             .chromatogram_chunked_encoding(None)
             .sample_array_types_from_chromatograms(from_mzml().map(super::schema_sample_chromatogram))
             .build(std::fs::File::create(&path).unwrap(), true);
-        super::fixup_run_metadata(&mut writer, &dir);
+        let _ = super::fixup_run_metadata(&mut writer, &dir);
         super::finish_chromatograms(&mut writer, &dir, &super::Ms1Chroms::default(), from_mzml(), false).expect("the mzPeak lane writes them");
         writer.finish_parquet().unwrap().finish().unwrap();
         let mut r = MzPeakReader::new(&path).unwrap();
