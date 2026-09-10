@@ -108,6 +108,15 @@ fn rt_window_truncates_chromatograms_and_refreshes_point_counts() {
 
     assert_eq!(table(&out, "spectra_metadata.parquet").num_rows(), 1);
 
+    // What the window must leave, counted in the source archive rather than written down: which
+    // traces start at t = 0 depends on what the converter carries (tiny's own `sic` came back with
+    // the Latin-1 transcode fix).
+    let src_point: StructArray = column(&table(&src, "chromatograms_data.parquet"), "point");
+    let time = arrow::compute::cast(src_point.column_by_name("time").unwrap(), &arrow::datatypes::DataType::Float64).unwrap();
+    let time = time.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+    let want = (0..time.len()).filter(|&r| (0.0..=0.0001).contains(&time.value(r))).count() as u64;
+    assert!(want > 0, "the source holds no chromatogram point inside the window");
+
     let data = table(&out, "chromatograms_data.parquet");
     let point: StructArray = column(&data, "point");
     let idx = UInt64Array::from(point.column_by_name("chromatogram_index").unwrap().to_data());
@@ -115,7 +124,7 @@ fn rt_window_truncates_chromatograms_and_refreshes_point_counts() {
     for r in 0..idx.len() {
         *left.entry(idx.value(r)).or_default() += 1;
     }
-    assert_eq!(left.values().sum::<u64>(), 2, "points left in the window: {left:?}");
+    assert_eq!(left.values().sum::<u64>(), want, "points left in the window: {left:?}");
 
     let meta = table(&out, "chromatograms_metadata.parquet");
     let (index, n) = (column::<UInt64Array>(&meta, "index"), column::<UInt64Array>(&meta, "number_of_data_points"));
@@ -207,5 +216,13 @@ fn drop_aux_refuses_to_remove_a_core_facet() {
     }
     // The refusal is about core facets, not the flag: `--no-vendor` (a `vendor*` drop) still runs.
     ok(&mzpc(&src, &out, &["--no-vendor"]));
+    // Wavelength (UV/PDA) facets reference only each other: stripping all of them stays allowed.
+    let uv_dir = scratch("drop_uv");
+    let uv = convert(PDA_UV, &uv_dir);
+    let stripped = uv_dir.join("f.mzpeak");
+    ok(&mzpc(&uv, &stripped, &["--drop-aux", "wavelength_spectra*"]));
+    let names: Vec<String> = zip::ZipArchive::new(File::open(&stripped).unwrap()).unwrap().file_names().map(str::to_string).collect();
+    assert!(names.iter().all(|n| !n.starts_with("wavelength_spectra")), "UV facets survived: {names:?}");
+    let _ = std::fs::remove_dir_all(&uv_dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
