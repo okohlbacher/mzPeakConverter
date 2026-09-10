@@ -1755,7 +1755,7 @@ mod empty_frame_read_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("point.mzpeak");
-        crate::convert_file(input, &archive, None, 3, None, true, Some(crate::TofGridMode::Off), &[], None, true)
+        crate::convert_file(input, &archive, None, 3, None, true, Some(crate::TofGridMode::Off), &[], None, true, None)
             .expect("convert the fixture to the point layout");
         let mut r = MzPeakReader::new(&archive).expect("open the archive");
         let n = r.len();

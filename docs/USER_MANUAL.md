@@ -606,8 +606,11 @@ whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 
 Not declared today, on purpose and worth knowing: the `--ims-chunked` ims-compact layout sorts each
 frame by TOF before chunking, which re-orders points across scans (an entry of the `sort-by-mz`
-class; tracked in `BACKLOG.md`). Beside `transformations`, two other 0.9.13 index keys let a reader
-audit an archive offline: `metadata.partial` marks a run truncated by `MZPC_MAX_SPECTRA` (§10), and
+class; tracked in `BACKLOG.md`). Beside `transformations`, other index keys let a reader audit an
+archive offline: `metadata.conversion_route` says which timsTOF route built it (`ims-compact` read by
+`timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
+decompress a frame; the recorded command line is the same on both routes), `metadata.partial` marks
+a run truncated by `MZPC_MAX_SPECTRA` (§10), and
 `ims_calibration.chord_source` (`global_metadata` on the native timsrust lane, `sdk_tims_index_to_mz`
 under `--bruker-sdk`) says which of the two (a, b) chords — measured 4.28 ppm apart on 2485.d — an
 ims-compact archive holds.
