@@ -87,3 +87,55 @@ fn via_msconvert_refuses_a_multi_run_wiff_without_sample() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// pwiz skips a sample it cannot open: `Reader_ABI::read` prints `Error opening run <i> in <file>`
+/// and goes on, so msconvert writes the readable runs and exits 0. One line of `writing output
+/// file:` then is not one sample but what was left of two, and `--runIndexSet` counts only the runs
+/// pwiz could open, so `--sample N` names a different sample. Refused on both lanes, either way.
+#[test]
+fn via_msconvert_refuses_when_msconvert_skipped_an_unreadable_sample() {
+    let dir = std::env::temp_dir().join(format!("mzpc-msconvert-unopened-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("multi.wiff");
+    std::fs::copy(FIXTURE, &input).unwrap();
+    let script = dir.join("msconvert");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         in=$1\n\
+         while [ $# -gt 0 ]; do\n\
+         case $1 in --outdir) outdir=$2 ;; --outfile) outfile=$2 ;; esac\n\
+         shift\n\
+         done\n\
+         echo '[Reader_ABI::read] Error opening run 0 in \"multi.wiff\":' >&2\n\
+         echo 'sample data is corrupt' >&2\n\
+         echo \"writing output file: $outdir/$outfile\"\n\
+         cp \"$in\" \"$outdir/$outfile\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    for name in ["out.mzpeak", "out.mzML"] {
+        for extra in [&[][..], &["--sample", "1"][..]] {
+            let output = dir.join(name);
+            let r = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+                .arg(&input)
+                .arg("-o")
+                .arg(&output)
+                .arg("--via-msconvert")
+                .arg("--msconvert-path")
+                .arg(&script)
+                .args(extra)
+                .output()
+                .expect("failed to run mzpeak-convert");
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            assert!(
+                !r.status.success() && stderr.contains("Error opening run 0"),
+                "{name} {extra:?}: a run msconvert skipped must be refused, naming pwiz's line; stderr:\n{stderr}"
+            );
+            assert!(!output.exists(), "{name} {extra:?}: the refusal left an output holding a subset");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
