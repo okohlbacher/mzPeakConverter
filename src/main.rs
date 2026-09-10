@@ -7766,7 +7766,7 @@ mod tests {
         let export = dir.join("run.mzML");
         super::filter_mzpeak_to_mzml(&archive, &export, &super::filter::FilterOpts::default()).unwrap();
         let back = dir.join("back.mzpeak");
-        super::convert_file(&export, &back, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true)
+        super::convert_file(&export, &back, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
             .expect("the export converts back into an archive");
         assert_eq!(of_archive(&back), want, "mzML → mzPeak keeps every trace");
         // Each device value array has no column in the chromatogram facet; it is an auxiliary array
@@ -7797,7 +7797,7 @@ mod tests {
         assert!(!psi.contains("MS:1000786"), "not a non-standard array: {psi}");
         assert_eq!(psi.matches("accession=\"MS:1003019\"").count(), 1, "still a pressure chromatogram, stated once: {psi}");
         let hop_archive = dir.join("hop.mzpeak");
-        super::convert_file(&hop, &hop_archive, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true)
+        super::convert_file(&hop, &hop_archive, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
             .expect("the mzML → mzML output converts too");
         assert_eq!(of_archive(&hop_archive), want, "mzML → mzML keeps every trace");
     }
@@ -9534,7 +9534,7 @@ mod tests {
         descr.add_param(Param::builder().name("tof_calibration_id").curie(super::TOF_CALID_CURIE).value(1i64).build());
         let spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(descr, Some(arrays), None, None);
         writer.write_spectrum(&spec).unwrap();
-        super::finish_chromatograms(&mut writer, &super::Ms1Chroms::default(), std::iter::empty(), false).unwrap();
+        super::finish_chromatograms(&mut writer, &dir, &super::Ms1Chroms::default(), std::iter::empty(), false).unwrap();
         writer.finish_parquet().unwrap().finish().unwrap();
 
         let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
