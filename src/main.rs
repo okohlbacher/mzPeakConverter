@@ -369,7 +369,9 @@ struct Cli {
     #[arg(long)]
     no_chromatograms: bool,
 
-    /// Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`. Highest precedence.
+    /// Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter
+    /// case against a file's name or its `/`-separated path inside the vendor directory. Highest
+    /// precedence.
     #[arg(long)]
     aux: Vec<String>,
 
@@ -5581,8 +5583,9 @@ fn finish_with_vendor_and_aux(
 
 /// The one vendor side-file rule, used by every lane that writes an archive. A vendor DIRECTORY
 /// input (a Bruker `.d` of any kind, an Agilent `.d`, a Waters `.raw`) has its side-files embedded
-/// under `vendor/` as the lane's policy says: preserve by default, the bulk-binary drop the lossless
-/// ims-compact policy adds, and every `--aux` rule on top. A Thermo `.raw` gets its trailer and
+/// under `vendor/` as the lane's policy says: preserve by default except the raw signal files of BAF,
+/// Agilent MassHunter and Waters directories ([`vendor::VendorPolicy::builtin`]), the bulk-binary drop
+/// the lossless ims-compact policy adds, and every `--aux` rule on top. A Thermo `.raw` gets its trailer and
 /// status-log facets. Through 0.11.5 only TDF/TSF directories qualified here while `--agilent-grid`
 /// and ims-compact embedded any directory themselves, so a BAF `.d`, an Agilent `.d` on the MHDAC
 /// lane and a Waters `.raw` embedded nothing and `--aux` did nothing on them, silently. A
@@ -10122,6 +10125,64 @@ mod tests {
         let (ok, _, err) = run_bin(&args, &[]);
         assert!(ok, "{err}");
         assert!(err.contains("--aux is inert"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A default archive of a BAF `.d`, an Agilent MassHunter `.d` or a Waters `.raw` does not embed
+    /// the vendor's raw signal files, which are most of the directory's size (FM_1-1: `analysis.baf`
+    /// is 714 MB beside a 109 MB archive; Capan2: 1.1 GB of `_FUNC*.DAT` and `_func*.cdt`). Each drop
+    /// is recorded in `vendor_files`, everything that describes the run is still embedded, and an
+    /// `--aux` rule spelt as a path inside the directory keeps a file.
+    #[test]
+    fn a_vendor_directorys_signal_files_stay_out_of_a_default_archive() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("signal-files");
+        let layouts: [(&str, &[&str], &[&str]); 3] = [
+            (
+                "run.raw",
+                &["_FUNC001.DAT", "_FUNC001.IDX", "_func001.cdt", "_func001.ind"],
+                &["_HEADER.TXT", "_FUNC001.STS", "_CHRO001.DAT", "_CHROMS.INF"],
+            ),
+            (
+                "baf.d",
+                &["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr", "BackgroundProfNeg.ami"],
+                &["SampleInfo.xml", "results_1.mcf"],
+            ),
+            ("agilent.d", &["AcqData/MSProfile.bin"], &["AcqData/MSScan.bin", "AcqData/MSMassCal.bin", "AcqData/MSPeak.bin"]),
+        ];
+        let policy = crate::vendor::VendorPolicy::load(None, &["AcqData/MSPeak.bin=embed".to_string()]).unwrap();
+        for (name, dropped, kept) in layouts {
+            let input = dir.join(name);
+            for member in dropped.iter().chain(kept) {
+                let path = input.join(member);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, member.as_bytes()).unwrap();
+            }
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(&input, &out, None, 1, Some(&policy), false, VendorHints::default(), 2, |i| {
+                Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
+            })
+            .unwrap();
+            let manifest = index_metadata(&out)["vendor_files"].clone();
+            let action = |member: &str| -> String {
+                let entry = manifest
+                    .as_array()
+                    .expect("a vendor_files manifest")
+                    .iter()
+                    .find(|e| [member.to_string(), format!("vendor/{member}"), format!("vendor/{member}.gz")].contains(&e["path"].as_str().unwrap().to_string()))
+                    .unwrap_or_else(|| panic!("{name}: {member} is not in vendor_files: {manifest:#}"));
+                entry["action"].as_str().unwrap().to_string()
+            };
+            let members = zip_members(&out);
+            for member in dropped.iter().copied() {
+                assert_eq!(action(member), "drop", "{name}: {member}");
+                assert!(!members.iter().any(|m| m.starts_with(&format!("vendor/{member}"))), "{name}: {member} embedded");
+            }
+            for member in kept.iter().copied() {
+                assert_eq!(action(member), "embed", "{name}: {member}");
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -56,30 +56,59 @@ pub struct VendorPolicy {
 }
 
 impl VendorPolicy {
-    /// Built-in **preserve-by-default** policy: embed every side-file (gzip compressible types).
-    /// Nothing the vendor wrote is dropped by default — dropping is opt-in via `--aux glob=drop` or a
-    /// YAML policy.
-    /// Rationale: for the LOSSY paths (mzdata f64 m/z, or the Bruker SDK) `analysis.tdf_bin` is the
-    /// only exact copy of the signal, so it must be preserved; and SQLite rollback journals can be
-    /// needed to recover a DB snapshot. The converter's job is to ADD the mzPeak facets, not to
-    /// decide the raw data is disposable.
+    /// Built-in **preserve-by-default** policy: embed every side-file (gzip compressible types) but the
+    /// files below, each dropped by its name in any letter case and recorded in `vendor_files`. An
+    /// `--aux glob=action` rule (or a YAML policy) comes first, so `--aux '<glob>=embed'` keeps one.
     ///
-    /// The LOSSLESS ims-compact path is different: it encodes the exact integer-TOF + intensity
-    /// signal into the Parquet peak facet, so the raw `*_bin` bulk file is fully redundant (it was
-    /// ~39% of the archive, a verbatim copy). That path uses [`load_lossless`](Self::load_lossless),
-    /// which drops `*_bin` by default. To force-keep it: `--aux 'analysis.tdf_bin=embed'`.
+    /// * **The raw signal files of BAF, Agilent MassHunter and Waters MassLynx directories.** They are
+    ///   nearly all of such a directory and several times its archive (FM_1-1: `analysis.baf` is
+    ///   714 MB beside a 109 MB archive; Capan2: 1.1 GB of `_FUNC*.DAT` and `_func*.cdt` beside
+    ///   531 MB). Through 0.11.5 no default archive of those lanes embedded them, `--agilent-grid`
+    ///   aside, which stores that profile signal itself; one embed rule for every vendor directory
+    ///   must not grow them by the vendor file's size. What they hold beyond the archive — the BAF
+    ///   profile unless `--representation profile`, the MassHunter representation a lane did not
+    ///   read, the Waters functions not written as spectra — stays with the original directory, or
+    ///   in the archive on request. What describes the run is embedded: the Agilent scan records
+    ///   (`MSScan.bin`, whose MSn precursor fields no lane decodes yet) and mass calibration, device
+    ///   traces, DataAnalysis `.mcf` result containers, the Waters scan statistics (`_FUNC*.STS`),
+    ///   analog traces (`_CHRO*`) and `_mob/` projections.
+    /// * **baf2sql's `analysis.sqlite`**: the BAF reader has the library materialize that cache next
+    ///   to `analysis.baf`, inside the `.d`, when it opens the run (`bruker_baf.rs`), so it is this
+    ///   converter's by-product, not a file the vendor wrote.
     ///
-    /// The one default drop is baf2sql's `analysis.sqlite`: the BAF reader has the library
-    /// materialize that cache next to `analysis.baf`, inside the `.d`, when it opens the run
-    /// (`bruker_baf.rs`), so it is this converter's by-product, not a file the vendor wrote. The
-    /// drop is recorded in `vendor_files`; `--aux 'analysis.sqlite=embed'` keeps it.
+    /// The timsTOF `*_bin` is embedded here, as through 0.11.5: for the f64 paths (mzdata's TDF
+    /// reader, the TSF reader, the Bruker SDK) it is, beside the embedded `analysis.tdf` or
+    /// `analysis.tsf`, the exact copy of a signal they store as calibrated f64 m/z, in a format open
+    /// readers decode (timsrust a TDF, this converter a TSF). The LOSSLESS ims-compact path encodes that
+    /// exact integer-TOF + intensity signal into the Parquet peak facet, so the raw `*_bin` bulk file
+    /// is fully redundant there (it was ~39% of the archive, a verbatim copy); that path uses
+    /// [`load_lossless`](Self::load_lossless), which drops it too. SQLite rollback journals stay: they
+    /// can be needed to recover a database snapshot.
     pub fn builtin() -> Self {
-        VendorPolicy {
-            rules: vec![
-                Rule { pat: "analysis.sqlite".to_string(), action: Action::Drop, gzip: Gzip::Auto },
-                Rule { pat: "*".to_string(), action: Action::Embed, gzip: Gzip::Auto },
-            ],
-        }
+        const DROP: &[&str] = &[
+            "analysis.sqlite",
+            // Bruker BAF: the signal and its two indexes, DataAnalysis's cached views, FTMS transients.
+            "analysis.baf",
+            "analysis.baf_idx",
+            "analysis.baf_xtr",
+            "*.ami",
+            "ser",
+            "fid",
+            // Agilent MassHunter: the profile, centroid and ion-mobility frame signal.
+            "MSProfile.bin",
+            "MSPeak.bin",
+            "IMSFrame.bin",
+            // Waters MassLynx: each function's scans and their index, and the compressed ion-mobility
+            // data (`_func001.cdt` beside `_FUNC001.DAT` in one directory; matching ignores case).
+            "_FUNC*.DAT",
+            "_FUNC*.IDX",
+            "_FUNC*.CDT",
+            "_FUNC*.IND",
+        ];
+        let rule = |pat: &str, action| Rule { pat: pat.to_string(), action, gzip: Gzip::Auto };
+        let mut rules: Vec<Rule> = DROP.iter().map(|pat| rule(pat, Action::Drop)).collect();
+        rules.push(rule("*", Action::Embed));
+        VendorPolicy { rules }
     }
 
     /// Load from a YAML file (`rules: [{match, action, gzip}]`), falling back to the built-in
@@ -123,9 +152,13 @@ impl VendorPolicy {
         Ok(policy)
     }
 
-    fn resolve(&self, filename: &str) -> (Action, Gzip) {
+    /// The first rule whose glob matches the member at `rel`, its `/`-joined path inside the
+    /// directory: by its file name, or by that path. Rules were matched against the file name alone,
+    /// so `--aux 'AcqData/MSProfile.bin=drop'`, the spelling the manual gave, matched nothing.
+    fn resolve(&self, rel: &str) -> (Action, Gzip) {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
         for r in &self.rules {
-            if glob_match(&r.pat, filename) {
+            if glob_match(&r.pat, name) || glob_match(&r.pat, rel) {
                 return (r.action, r.gzip);
             }
         }
@@ -156,7 +189,7 @@ pub fn embed_into_archive(
     for rel in files {
         let abs = dot_d.join(&rel);
         let name = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let (action, gzip) = policy.resolve(name);
+        let (action, gzip) = policy.resolve(&rel);
         let src_bytes = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
         if action == Action::Drop {
             log::debug!("vendor: drop {rel} ({src_bytes} bytes)");
@@ -499,17 +532,58 @@ mod tests {
         assert!(safe_relative_member(Path::new("/abs/path")).is_none());
     }
 
-    /// Every vendor directory is embedded under one rule, and a BAF `.d` is one since the BAF reader
-    /// writes its baf2sql cache into it: that cache is dropped by default, and only that file.
+    /// The raw signal files of a BAF, Agilent MassHunter or Waters MassLynx directory, and the
+    /// baf2sql cache the BAF reader writes into the `.d`, are dropped by default: matched on the file
+    /// name in any letter case (one Waters `.raw` holds `_FUNC001.DAT` beside `_func001.cdt`), wherever
+    /// the file sits. What describes the run stays, the Waters analog traces and the Agilent scan
+    /// records among it. An `--aux` rule wins, spelt as the file name or as the path in the directory.
     #[test]
-    fn the_baf2sql_cache_is_dropped_unless_asked_for() {
+    fn vendor_signal_files_are_dropped_unless_asked_for() {
         for pol in [VendorPolicy::load(None, &[]).unwrap(), VendorPolicy::load_lossless(None, &[]).unwrap()] {
-            assert_eq!(pol.resolve("analysis.sqlite").0, Action::Drop);
-            assert_eq!(pol.resolve("analysis.baf").0, Action::Embed);
-            assert_eq!(pol.resolve("analysis.tdf").0, Action::Embed);
+            for dropped in [
+                "analysis.sqlite",
+                "analysis.baf",
+                "analysis.baf_idx",
+                "analysis.baf_xtr",
+                "BackgroundProfNeg.ami",
+                "ser",
+                "fid",
+                "AcqData/MSProfile.bin",
+                "AcqData/MSPeak.bin",
+                "AcqData/IMSFrame.bin",
+                "_FUNC001.DAT",
+                "_FUNC001.IDX",
+                "_func001.cdt",
+                "_func001.ind",
+                "_FUNC010.CDT",
+            ] {
+                assert_eq!(pol.resolve(dropped).0, Action::Drop, "{dropped}");
+            }
+            for kept in [
+                "analysis.tdf",
+                "analysis.tsf",
+                "SampleInfo.xml",
+                "037df41c-54d6-4ec4-a91a-893bcb5caf81_1.mcf",
+                "AcqData/MSScan.bin",
+                "AcqData/MSMassCal.bin",
+                "AcqData/BinPump1.cg",
+                "_FUNC001.STS",
+                "_CHRO001.DAT",
+                "_CHROMS.INF",
+                "_FUNCTNS.INF",
+                "_mob/729441462.1dMZ",
+                "Hystar.Method",
+            ] {
+                assert_eq!(pol.resolve(kept).0, Action::Embed, "{kept}");
+            }
         }
-        let keep = VendorPolicy::load(None, &["analysis.sqlite=embed".to_string()]).unwrap();
-        assert_eq!(keep.resolve("analysis.sqlite").0, Action::Embed);
+        let rules = ["analysis.sqlite=embed", "MSProfile.bin=embed", "AcqData/MSPeak.bin=embed", "AcqData/MSScan.bin=drop"];
+        let asked = VendorPolicy::load(None, &rules.map(String::from)).unwrap();
+        assert_eq!(asked.resolve("analysis.sqlite").0, Action::Embed);
+        assert_eq!(asked.resolve("AcqData/MSProfile.bin").0, Action::Embed, "a file-name rule");
+        assert_eq!(asked.resolve("AcqData/MSPeak.bin").0, Action::Embed, "a path rule");
+        assert_eq!(asked.resolve("AcqData/MSScan.bin").0, Action::Drop);
+        assert_eq!(asked.resolve("Other/MSScan.bin").0, Action::Embed, "a path rule matches that path only");
     }
 
     #[test]

@@ -229,6 +229,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   - D14: ProteoWizard's `_xHHHH_` escapes in `run.id` and the software ids are decoded when the mzML and imzML lanes copy metadata (47 corpus archives); the shared fixup is left alone, so an exported mzML id stays an XML name.
   - D15: `transformations` lists what a conversion applied, counted by the writer, not what it was configured to do (135 corpus archives change on rebuild).
   - Harmonization (2026-09-11): every chromatogram time is stored in minutes, on every lane; a time recorded in seconds or milliseconds (ProteoWizard's mzML chromatograms, HyStar's device traces) is divided into minutes before the schema is sampled and declared as `chromatogram-time-to-minutes`. `--rt` keeps reading a column's declared unit, for the seconds columns of mzML-lane archives built by 0.11.5 and earlier (none published).
+  - Harmonization (2026-09-11): a default archive embeds no raw signal file of a BAF, Agilent MassHunter or Waters MassLynx directory (`analysis.baf*`, `*.ami`, `ser`/`fid`; `MSProfile.bin`, `MSPeak.bin`, `IMSFrame.bin`; `_FUNC*.DAT/.IDX`, `_func*.cdt/.ind`), matched by file name in any case; kept by decision: `MSScan.bin`, `MSMassCal.bin`, `*.mcf`, `_FUNC*.STS`, `_CHRO*`, `_mob/`, and the timsTOF `*_bin` on the f64 TDF/TSF lanes.
 
 ## History
 
