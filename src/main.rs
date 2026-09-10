@@ -65,6 +65,7 @@ mod tof_grid;
 mod tims_mobility;
 mod thermo_status;
 mod thermo_trailers;
+mod thermo_isolation;
 mod run_metadata;
 mod agilent_meta;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -74,6 +75,7 @@ mod shimadzu_meta;
 mod vendor;
 mod embed_aux;
 mod filter;
+mod mzml_isolation;
 
 use arrow::datatypes::DataType;
 use mzdata::curie;
@@ -490,15 +492,18 @@ fn has_gz_suffix(p: &Path) -> bool {
 /// The byte sink for an mzML export: the plain file, or a streaming gzip encoder when the requested
 /// name ends in `.gz`. The XML is compressed AS it is written — one pass, no re-read. Both the mzML
 /// writer and the encoder finish on drop (the writer closes the document, the encoder writes the
-/// gzip trailer), which is why the four export sites can let `w` fall out of scope as before.
+/// gzip trailer), which is why the four export sites can let `w` fall out of scope as before. Above
+/// both sits [`mzml_isolation::TargetOnlyWindows`]: mzdata's writer prints an isolation window of
+/// unknown width as offsets of ±target, and that sink leaves it target-only.
 fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
-    Ok(if has_gz_suffix(output) {
+    let sink: Box<dyn Write> = if has_gz_suffix(output) {
         log::info!("output name ends in .gz: gzip-compressing the mzML as it is written");
         Box::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()))
     } else {
         Box::new(file)
-    })
+    };
+    Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(sink)))
 }
 
 /// When to apply the statistically-DETECTED TOF-grid m/z encoding (strategy A). This
@@ -2102,6 +2107,10 @@ fn convert_to_mzml(
     let source_chroms: Vec<Chromatogram> = reader.iter_chromatograms().collect();
     warn_unread_chromatograms(input, &read_path, source_chroms.len());
     let _ = reader.reset();
+    // The mzPeak lane's rule for Thermo windows without a stated width (`thermo_isolation`). mzML
+    // has no transformations list, so the run's warning is the only declaration here.
+    let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
+        .then(|| thermo_isolation::UnstatedWidthGuard::open(&read_path));
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
     let tmp = mzml_tmp_path(output);
@@ -2118,13 +2127,19 @@ fn convert_to_mzml(
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
 
     let mut written = 0usize;
-    for (i, spec) in reader.iter().enumerate() {
+    for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             break;
+        }
+        if let Some(g) = thermo_windows.as_mut() {
+            g.apply(spec.description_mut());
         }
         SpectrumWriter::write(&mut w, &spec)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
         written += 1;
+    }
+    if let Some(g) = &thermo_windows {
+        g.report();
     }
     // Same truncated-source cross-check the mzPeak lanes make; the `?` drops the writer and then
     // the guard, so a truncated source leaves no half mzML that looks like a successful conversion.
@@ -2594,9 +2609,14 @@ fn convert_file_tof_grid(
     let mut n = 0usize;
     let mut n_gridded = 0usize;
     let mut n_f64 = 0usize;
-    for entry in reader.iter() {
+    let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
+        .then(|| thermo_isolation::UnstatedWidthGuard::open(input));
+    for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
+        }
+        if let Some(g) = thermo_windows.as_mut() {
+            g.apply(entry.description_mut());
         }
         let spec = match tof_grid_spectrum(&entry, &grid)? {
             TofRoute::Gridded(s) => {
@@ -2615,6 +2635,9 @@ fn convert_file_tof_grid(
         n += 1;
     }
     log::info!("TOF-grid wrote {n} spectra: {n_gridded} gridded (tof_index), {n_f64} kept f64 m/z");
+    if let Some(g) = &thermo_windows {
+        g.report();
+    }
     assert_source_complete_tmp(input, n, cap, &tmp)?;
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
     fixup_run_metadata(&mut writer, input);
@@ -2622,6 +2645,7 @@ fn convert_file_tof_grid(
     if n_gridded > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
+    applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
     let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
         .into_iter()
         .chain(std::iter::once(transformations_block(&applied)))
@@ -3684,6 +3708,10 @@ fn convert_file(
     } else {
         None
     };
+    // Thermo precursor windows the reader library computed without a stated width are written
+    // target-only (`thermo_isolation`); the count is declared in `transformations` below.
+    let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
+        .then(|| thermo_isolation::UnstatedWidthGuard::open(read_path));
 
     let mut n = 0usize;
     let cap = max_spectra();
@@ -3735,6 +3763,9 @@ fn convert_file(
         if let Some(r) = &tdf_remap {
             r.apply(entry.description_mut());
         }
+        if let Some(g) = thermo_windows.as_mut() {
+            g.apply(entry.description_mut());
+        }
         if synth_chroms {
             ms1.observe(&entry);
         }
@@ -3760,6 +3791,9 @@ fn convert_file(
         n += 1;
     }
     log::debug!("wrote {n} spectra");
+    if let Some(g) = &thermo_windows {
+        g.report();
+    }
     if let Some(scale) = lattice_scale {
         log::info!(
             "m/z lattice (1/{scale:e}): {} spectra stored as Int64 tof_index, {} kept exact f64 m/z",
@@ -3816,6 +3850,7 @@ fn convert_file(
             if resorted {
                 applied.push("sort-by-mz".to_string());
             }
+            applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
             applied
         })))
         .collect();
@@ -5067,9 +5102,10 @@ fn convert_ims_compact_sdk(
 /// re-ordered at least one out-of-order spectrum), `tof-grid:<ppm>ppm` (a statistically fitted
 /// integer grid replaced f64 m/z within that bound), `shimadzu:span-trim` (the profile sqrt-grid
 /// route stores the signal span only), `agilent:drop-zero-samples` (the profile grid lane stores
-/// a sparse point list), and the native SciEX glue's counted value changes
-/// `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and `sciex:truncate-unequal-arrays`
-/// (`sciex_run::GlueValueChanges`).
+/// a sparse point list), `thermo:target-only-isolation-window:<n>` (`n` Thermo precursor windows the
+/// reader library computed without a stated width were written target-only), and the native SciEX
+/// glue's counted value changes `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and
+/// `sciex:truncate-unequal-arrays` (`sciex_run::GlueValueChanges`).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -5082,6 +5118,13 @@ fn base_transformations(chunks: &[Option<ChunkingStrategy>]) -> Vec<String> {
         applied.push("numpress-linear".to_string());
     }
     applied
+}
+
+/// The `thermo:target-only-isolation-window:<n>` entry, when the Thermo guard rewrote any window.
+fn thermo_window_transformation(guard: Option<&thermo_isolation::UnstatedWidthGuard>) -> Option<String> {
+    guard
+        .filter(|g| g.rewritten() > 0)
+        .map(|g| format!("thermo:target-only-isolation-window:{}", g.rewritten()))
 }
 
 /// Flush Parquet, then stream-embed vendor side-files + vendor metadata into the archive index,
