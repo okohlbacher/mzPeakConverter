@@ -2383,21 +2383,120 @@ fn write_agilent_profile_mzml(
     Ok(())
 }
 
+/// A chromatogram type as the PSI-MS cvParam mzML states it with; `None` for an unknown type.
+/// Written out rather than taken from mzdata's `ChromatogramType::to_curie`, which gives the
+/// selected-ion-monitoring and selected-reaction-monitoring types MS:1000472 and MS:1000473 (two
+/// Agilent instrument models) where its own `from_accession` reads MS:1001472 and MS:1001473.
+fn chromatogram_type_param(kind: ChromatogramType) -> Option<Param> {
+    use ChromatogramType as C;
+    let (name, curie) = match kind {
+        C::TotalIonCurrentChromatogram => ("total ion current chromatogram", curie!(MS:1000235)),
+        C::BasePeakChromatogram => ("basepeak chromatogram", curie!(MS:1000628)),
+        C::SelectedIonCurrentChromatogram => ("selected ion current chromatogram", curie!(MS:1000627)),
+        C::SelectedIonMonitoringChromatogram => ("selected ion monitoring chromatogram", curie!(MS:1001472)),
+        C::SelectedReactionMonitoringChromatogram => ("selected reaction monitoring chromatogram", curie!(MS:1001473)),
+        C::AbsorptionChromatogram => ("absorption chromatogram", curie!(MS:1000812)),
+        C::EmissionChromatogram => ("emission chromatogram", curie!(MS:1000813)),
+        C::ElectromagneticRadiationChromatogram => ("electromagnetic radiation chromatogram", curie!(MS:1000811)),
+        C::FlowRateChromatogram => ("flow rate chromatogram", curie!(MS:1003020)),
+        C::PressureChromatogram => ("pressure chromatogram", curie!(MS:1003019)),
+        C::TemperatureChromatogram => ("temperature chromatogram", curie!(MS:1002715)),
+        C::Unknown => return None,
+    };
+    Some(Param::builder().name(name).curie(curie).build())
+}
+
+/// Give a chromatogram's arrays types a writer can name. mzdata's mzML reader has a case for only
+/// some PSI-MS array types, and none for the `flow rate array` (MS:1000820), `pressure array`
+/// (MS:1000821) and `temperature array` (MS:1000822) that the export of an archive with Bruker
+/// device traces writes: such an array comes back as `ArrayType::Unknown`, its cvParam left among
+/// the array's parameters, and mzdata's mzML writer and the mzPeak writer both panic naming it (exit
+/// 134, nothing written). A type mzdata knows the accession of (`ArrayType::from_accession`) becomes
+/// the array's type, with that parameter's unit. Anything else is kept, with a warning, as a
+/// non-standard data array named after the parameter, or `unknown array` without one; so is an array
+/// whose type the chromatogram already holds, since the map is keyed by type and would lose one.
+/// The reader's map holds one `Unknown` array at most.
+fn readable_chromatogram_arrays(mut chrom: Chromatogram) -> Chromatogram {
+    let Some(mut array) = chrom.arrays.byte_buffer_map.remove(&ArrayType::Unknown) else {
+        return chrom;
+    };
+    let known = |p: &Param| {
+        p.curie()
+            .and_then(ArrayType::from_accession)
+            .filter(|t| !matches!(t, ArrayType::Unknown | ArrayType::NonStandardDataArray { .. }))
+    };
+    let mut params: Vec<Param> = array.params.take().map(|p| *p).unwrap_or_default();
+    let at = params.iter().position(|p| known(p).is_some()).or((!params.is_empty()).then_some(0));
+    let stated = at.map(|i| params.remove(i));
+    if let Some(p) = &stated {
+        if array.unit == Unit::Unknown {
+            array.unit = p.unit;
+        }
+    }
+    let kind = stated.as_ref().and_then(known).filter(|t| !chrom.arrays.has_array(t));
+    match kind {
+        Some(t) => array.name = t,
+        None => {
+            let base = stated.map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "unknown array".to_string());
+            let mut name = base.clone();
+            for k in 2.. {
+                if !chrom.arrays.has_array(&ArrayType::nonstandard(&name)) {
+                    break;
+                }
+                name = format!("{base} {k}");
+            }
+            log::warn!(
+                "chromatogram {:?}: an array of a type mzdata cannot read ({base}) is kept as the non-standard data array {name:?}",
+                chrom.id()
+            );
+            array.name = ArrayType::nonstandard(&name);
+        }
+    }
+    array.params = (!params.is_empty()).then(|| Box::new(params));
+    chrom.arrays.add(array);
+    chrom
+}
+
+/// A chromatogram as the chromatogram facet's schema is sampled from it: without the array
+/// [`readable_chromatogram_arrays`] names, which is then written as that chromatogram's auxiliary
+/// array in its own unit and data type — how the native Bruker lanes store the same device traces,
+/// so an archive converted back from its mzML export stores them alike. Sampled, the arrays of the
+/// first ten chromatograms would become columns and those of every later one auxiliary arrays, and a
+/// later array of a type already a column is written into that column and reads back in its unit.
+fn schema_sample_chromatogram(mut chrom: Chromatogram) -> Chromatogram {
+    chrom.arrays.byte_buffer_map.remove(&ArrayType::Unknown);
+    chrom
+}
+
 /// Pass a source's chromatograms through to an mzML, dropping TIC/base-peak (the mzML writer emits
 /// its own spectrum-derived TIC + base-peak summary at close, so those would duplicate). Everything
 /// else — SRM/SIM/vendor traces — is preserved. Must be called after all spectra (writer state).
 /// The writer puts `<chromatogramList count>` out with the first chromatogram, from a count it
-/// starts at 2 (its own summary pair), so the count is set here first.
+/// starts at 2 (its own summary pair), so the count is set here first. Every array is given a type
+/// the writer can name ([`readable_chromatogram_arrays`]), and every typed chromatogram its type term.
 fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromatogram>>(
     w: &mut mzdata::io::mzml::MzMLWriter<W>,
     source: I,
 ) -> Result<()> {
     let kept: Vec<Chromatogram> = source
+        .map(readable_chromatogram_arrays)
         .filter(|c| {
             !matches!(
                 c.chromatogram_type(),
                 ChromatogramType::TotalIonCurrentChromatogram | ChromatogramType::BasePeakChromatogram
             )
+        })
+        .map(|mut c| {
+            // mzML states a chromatogram's type only as a cvParam. mzdata's mzML reader moves that
+            // cvParam into the typed field and its writer writes the parameters alone, so every
+            // chromatogram of an mzML → mzML conversion lost its type term (tiny.pwiz's selected ion
+            // current trace among them). Put it back unless a parameter still states a type.
+            if !c.params().iter().any(|p| p.curie().and_then(ChromatogramType::from_curie).is_some()) {
+                if let Some(p) = chromatogram_type_param(c.chromatogram_type()) {
+                    c.description_mut().params.insert(0, p);
+                }
+            }
+            c
         })
         .collect();
     w.chromatogram_count = kept.len() as u64 + 2;
@@ -2578,7 +2677,7 @@ fn convert_file_tof_grid(
     // Derive the chromatogram schema (intensity/time dtypes) from the source chromatograms so the
     // facet matches what we write (the synthesized TIC/base-peak are f64 — sampling f64 source
     // chromatograms keeps the schema f64 and avoids an f32/f64 record-batch mismatch).
-    builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
+    builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10).map(schema_sample_chromatogram));
     let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);
     add_processing_metadata(&mut writer);
@@ -3634,7 +3733,7 @@ fn convert_file(
         Some(scale) => builder.store_peaks_and_profiles_apart(Some(mz_lattice::lattice_peak_schema(scale))),
         None => builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader),
     };
-    builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
+    builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10).map(schema_sample_chromatogram));
 
     let mut writer = builder.build(handle, true);
 
@@ -6583,7 +6682,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     let mut n = synthesized;
     let mut applied: Vec<String> = Vec::new();
     let traces = bruker_traces::read(input).into_iter().map(|t| (t.chromatogram, t.rescaled, t.merged));
-    for (chrom, rescaled, merged) in source.map(|c| (c, false, false)).chain(traces) {
+    for (chrom, rescaled, merged) in source.map(|c| (readable_chromatogram_arrays(c), false, false)).chain(traces) {
         if synthesized > 0
             && matches!(
                 chrom.chromatogram_type(),
@@ -7064,6 +7163,251 @@ mod tests {
         };
         assert!(element("Pump HP:Pressure - [bar]").contains("accession=\"MS:1003019\""), "a pressure chromatogram");
         assert!(element("Fraction A - [%]").contains("accession=\"MS:1000625\""), "ProteoWizard's generic chromatogram");
+    }
+
+    /// The mzML export of an archive holding device traces converts back, into an archive and into
+    /// an mzML. mzdata's mzML reader has no case for the `pressure array` (MS:1000821), `flow rate
+    /// array` (MS:1000820) and `temperature array` (MS:1000822) the export writes: each came back
+    /// untyped, and the schema sampler and both writers panicked naming it — exit 134, nothing
+    /// written, on the export of every archive with HyStar traces. Every trace keeps its type, its
+    /// value array's type and unit, and its (time, value) pairs through both hops, a psi and a
+    /// pascal pressure trace side by side; the device arrays stay auxiliary arrays, and the mzML hop
+    /// still states each chromatogram's type.
+    #[test]
+    fn an_mzml_export_of_device_traces_converts_back() {
+        use mzdata::params::Unit;
+        use mzdata::spectrum::ChromatogramType;
+        use mzpeak_prototyping::MzPeakReader;
+
+        let (dir, _cleanup) = trace_scratch("reimport");
+        let seconds = [120.0, 180.0, 240.0];
+        let dot_d = hystar_dot_d(
+            &dir,
+            &[
+                (1, "Pump HP:Pressure - [bar]", 9999, 3, &seconds, &[180.0, 170.02, 160.5]),
+                (2, "Pressure - [psi]", 4, 0, &seconds, &[3785.5, 3783.25, 3779.75]),
+                (3, "Pump HP:Actual flow - [µL/min]", 9999, 2, &seconds, &[4.25, 4.5, 4.75]),
+                (4, "Oven temperature - [°C]", 7, 5, &seconds, &[50.0, 50.5, 51.0]),
+                (5, "Fraction A - [%]", 5, 4, &seconds, &[1.0, 2.0, 3.0]),
+            ],
+        );
+        let value_arrays = [
+            ("Pump HP:Pressure - [bar]", Some(ArrayType::PressureArray)),
+            ("Pressure - [psi]", Some(ArrayType::PressureArray)),
+            ("Pump HP:Actual flow - [µL/min]", Some(ArrayType::FlowRateArray)),
+            ("Oven temperature - [°C]", Some(ArrayType::TemperatureArray)),
+            // mzdata reads a non-standard array itself, so the sampler makes the first one a column,
+            // and the point reader hands a non-standard column back without its name (as it did
+            // before this change): found by kind, its unit and values compared.
+            ("Fraction A - [%]", None),
+        ];
+        // Each trace as its chromatogram type, its value array's unit and its (time, value) pairs.
+        type Trace = (ChromatogramType, Unit, Vec<(f64, f64)>);
+        let of_archive = |archive: &std::path::Path| -> Vec<Trace> {
+            let mut r = MzPeakReader::new(archive).unwrap();
+            let chroms: Vec<_> = (0..r.len_chromatograms()).map(|i| r.get_chromatogram(i).unwrap()).collect();
+            value_arrays
+                .iter()
+                .map(|(id, value_type)| {
+                    let c = chroms.iter().find(|c| c.id() == *id).unwrap_or_else(|| panic!("{}: no chromatogram {id}", archive.display()));
+                    let times = c.arrays.get(&ArrayType::TimeArray).expect("a time array").to_f64().unwrap().to_vec();
+                    let value = match value_type {
+                        Some(t) => c.arrays.get(t),
+                        None => c.arrays.iter().map(|(_, a)| a).find(|a| matches!(a.name, ArrayType::NonStandardDataArray { .. })),
+                    };
+                    let value = value.unwrap_or_else(|| {
+                        let held: Vec<String> = c.arrays.iter().map(|(t, a)| format!("{t:?} in {:?}", a.unit)).collect();
+                        panic!("{}: {id} has no {value_type:?}, only {held:?}", archive.display())
+                    });
+                    let values = value.to_f64().unwrap().to_vec();
+                    assert_eq!(times.len(), values.len(), "{}: {id} pairs its times and values", archive.display());
+                    (c.chromatogram_type(), value.unit, times.into_iter().zip(values).collect())
+                })
+                .collect()
+        };
+
+        let archive = dir.join("run.mzpeak");
+        write_trace_archive(&dot_d, &archive);
+        let want = of_archive(&archive);
+        assert_eq!(
+            want.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(),
+            [
+                (ChromatogramType::PressureChromatogram, Unit::Pascal),
+                (ChromatogramType::PressureChromatogram, Unit::Psi),
+                (ChromatogramType::FlowRateChromatogram, Unit::MicrolitersPerMinute),
+                (ChromatogramType::TemperatureChromatogram, Unit::Celsius),
+                (ChromatogramType::Unknown, Unit::Percent),
+            ],
+            "the source archive holds the traces this test is about"
+        );
+
+        let export = dir.join("run.mzML");
+        super::filter_mzpeak_to_mzml(&archive, &export, &super::filter::FilterOpts::default()).unwrap();
+        let back = dir.join("back.mzpeak");
+        super::convert_file(&export, &back, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true)
+            .expect("the export converts back into an archive");
+        assert_eq!(of_archive(&back), want, "mzML → mzPeak keeps every trace");
+        // Each device value array has no column in the chromatogram facet; it is an auxiliary array
+        // in its own unit and data type, as the native lane stores it.
+        let device_columns = |archive: &std::path::Path, into: &str| -> Vec<String> {
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            let scratch = dir.join(into);
+            std::fs::create_dir_all(&scratch).unwrap();
+            let mut zip = zip::ZipArchive::new(std::fs::File::open(archive).unwrap()).unwrap();
+            let facet = extract_zip_entry(&mut zip, "chromatograms_data.parquet", &scratch);
+            let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&facet).unwrap()).unwrap();
+            leaf_column_names(builder.schema())
+                .into_iter()
+                .filter(|c| ["pressure", "flow", "temperature"].iter().any(|k| c.to_lowercase().contains(k)))
+                .collect()
+        };
+        assert_eq!(device_columns(&back, "back-facet"), Vec::<String>::new(), "no device array is a column");
+
+        let hop = dir.join("hop.mzML");
+        super::convert_to_mzml(&export, &hop, false, None).expect("the export converts into an mzML");
+        let xml = std::fs::read_to_string(&hop).unwrap();
+        let element = |id: &str| {
+            let start = xml.find(&format!("<chromatogram id=\"{id}\"")).unwrap_or_else(|| panic!("no chromatogram {id}"));
+            &xml[start..start + xml[start..].find("</chromatogram>").unwrap()]
+        };
+        let psi = element("Pressure - [psi]");
+        assert!(psi.contains("accession=\"MS:1000821\"") && psi.contains("unitAccession=\"UO:0010052\""), "a pressure array in psi: {psi}");
+        assert!(!psi.contains("MS:1000786"), "not a non-standard array: {psi}");
+        assert_eq!(psi.matches("accession=\"MS:1003019\"").count(), 1, "still a pressure chromatogram, stated once: {psi}");
+        let hop_archive = dir.join("hop.mzpeak");
+        super::convert_file(&hop, &hop_archive, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true)
+            .expect("the mzML → mzML output converts too");
+        assert_eq!(of_archive(&hop_archive), want, "mzML → mzML keeps every trace");
+    }
+
+    /// What mzdata's mzML reader hands over for an array type it has no case for — the array named
+    /// `ArrayType::Unknown`, the type's cvParam among its parameters — through
+    /// [`super::readable_chromatogram_arrays`]: a type mzdata knows becomes the array's type and
+    /// unit; an accession it does not know, a bare userParam or no parameter at all a non-standard
+    /// array; a type the chromatogram already holds does not replace that array. The mzML lane's
+    /// writer and the mzPeak lane's sampler and writer, which each panicked on such an array, take
+    /// all of them.
+    #[test]
+    fn unreadable_chromatogram_arrays_get_names_the_writers_accept() {
+        use mzdata::params::Unit;
+        use mzdata::spectrum::ChromatogramDescription;
+        use mzpeak_prototyping::MzPeakReader;
+
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
+        let chromatogram = |id: &str, typed: Option<ArrayType>, params: Vec<Param>| {
+            let mut arrays = BinaryArrayMap::new();
+            let times: Vec<u8> = [1.0f64, 2.0].iter().flat_map(|x| x.to_ne_bytes()).collect();
+            arrays.add(DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, times));
+            if let Some(t) = typed {
+                arrays.add(DataArray::wrap(&t, BinaryDataArrayType::Float32, bytes(&[7.0, 8.0])));
+            }
+            let mut unknown = DataArray::wrap(&ArrayType::Unknown, BinaryDataArrayType::Float32, bytes(&[1.0, 2.0]));
+            unknown.params = (!params.is_empty()).then(|| Box::new(params));
+            arrays.add(unknown);
+            super::Chromatogram::new(ChromatogramDescription { id: id.to_string(), ..Default::default() }, arrays)
+        };
+        let pressure = || Param::builder().name("pressure array").curie(mzdata::curie!(MS:1000821)).unit(Unit::Psi).build();
+        let raw = || {
+            vec![
+                chromatogram("pressure", None, vec![Param::builder().name("Instrument").value("pump").build(), pressure()]),
+                chromatogram("noise", None, vec![Param::builder().name("noise array").curie(mzdata::curie!(MS:1002742)).build()]),
+                chromatogram("user", None, vec![Param::builder().name("pump speed").build()]),
+                chromatogram("bare", None, vec![]),
+                chromatogram("second pressure", Some(ArrayType::PressureArray), vec![pressure()]),
+            ]
+        };
+        // (array type, unit, values, parameters left) of every array but the times.
+        type Arrays = Vec<(ArrayType, Unit, Vec<f32>, usize)>;
+        let arrays = |c: &super::Chromatogram| -> Arrays {
+            let mut v: Arrays = c
+                .arrays
+                .iter()
+                .filter(|(t, _)| **t != ArrayType::TimeArray)
+                .map(|(t, a)| (t.clone(), a.unit, a.to_f32().unwrap().to_vec(), a.params.as_ref().map_or(0, |p| p.len())))
+                .collect();
+            v.sort_by_key(|a| format!("{:?}", a.0));
+            v
+        };
+        let named: Vec<super::Chromatogram> = raw().into_iter().map(super::readable_chromatogram_arrays).collect();
+        assert_eq!(
+            named.iter().map(arrays).collect::<Vec<_>>(),
+            [
+                vec![(ArrayType::PressureArray, Unit::Psi, vec![1.0, 2.0], 1)],
+                vec![(ArrayType::nonstandard("noise array"), Unit::Unknown, vec![1.0, 2.0], 0)],
+                vec![(ArrayType::nonstandard("pump speed"), Unit::Unknown, vec![1.0, 2.0], 0)],
+                vec![(ArrayType::nonstandard("unknown array"), Unit::Unknown, vec![1.0, 2.0], 0)],
+                vec![(ArrayType::nonstandard("pressure array"), Unit::Psi, vec![1.0, 2.0], 0), (ArrayType::PressureArray, Unit::Unknown, vec![7.0, 8.0], 0)],
+            ]
+        );
+        assert!(named.iter().all(|c| !c.arrays.has_array(&ArrayType::Unknown)));
+
+        let mut mzml = mzdata::io::mzml::MzMLWriter::new(std::io::sink());
+        mzml.set_spectrum_count(0);
+        mzml.start_spectrum_list().unwrap();
+        super::write_source_chromatograms_mzml(&mut mzml, raw().into_iter()).expect("the mzML lane writes them");
+
+        // The mzPeak lane, on what an mzML can hand it: the fifth case's typed pressure array beside
+        // an unreadable one cannot come from mzdata's mzML reader, and sampled into a column it takes
+        // the renamed psi array in, which then reads back without its unit.
+        let from_mzml = || raw().into_iter().take(4);
+        let (dir, _cleanup) = trace_scratch("unknown-arrays");
+        let path = dir.join("unknown.mzpeak");
+        let mut writer = super::MzPeakWriterType::<std::fs::File>::builder()
+            .chromatogram_chunked_encoding(None)
+            .sample_array_types_from_chromatograms(from_mzml().map(super::schema_sample_chromatogram))
+            .build(std::fs::File::create(&path).unwrap(), true);
+        super::fixup_run_metadata(&mut writer, &dir);
+        super::finish_chromatograms(&mut writer, &dir, &super::Ms1Chroms::default(), from_mzml(), false).expect("the mzPeak lane writes them");
+        writer.finish_parquet().unwrap().finish().unwrap();
+        let mut r = MzPeakReader::new(&path).unwrap();
+        let back: Vec<_> = (0..r.len_chromatograms()).map(|i| r.get_chromatogram(i).unwrap()).collect();
+        let array = |id: &str, t: ArrayType| {
+            let a = back.iter().find(|c| c.id() == id).unwrap_or_else(|| panic!("no chromatogram {id}")).arrays.get(&t).unwrap_or_else(|| panic!("{id}: no {t:?}"));
+            (a.unit, a.to_f32().unwrap().to_vec())
+        };
+        assert_eq!(array("pressure", ArrayType::PressureArray), (Unit::Psi, vec![1.0, 2.0]));
+        assert_eq!(array("noise", ArrayType::nonstandard("noise array")), (Unit::Unknown, vec![1.0, 2.0]));
+    }
+
+    /// Each chromatogram type's cvParam is the PSI-MS term `psi-ms.obo` names, and reads back as that
+    /// type — not mzdata's `ChromatogramType::to_curie`, whose selected-ion-monitoring and
+    /// selected-reaction-monitoring accessions are two instrument models.
+    #[test]
+    fn chromatogram_type_params_are_the_psi_ms_terms() {
+        use mzdata::spectrum::ChromatogramType as C;
+        for (kind, name, accession) in [
+            (C::TotalIonCurrentChromatogram, "total ion current chromatogram", "MS:1000235"),
+            (C::BasePeakChromatogram, "basepeak chromatogram", "MS:1000628"),
+            (C::SelectedIonCurrentChromatogram, "selected ion current chromatogram", "MS:1000627"),
+            (C::SelectedIonMonitoringChromatogram, "selected ion monitoring chromatogram", "MS:1001472"),
+            (C::SelectedReactionMonitoringChromatogram, "selected reaction monitoring chromatogram", "MS:1001473"),
+            (C::AbsorptionChromatogram, "absorption chromatogram", "MS:1000812"),
+            (C::EmissionChromatogram, "emission chromatogram", "MS:1000813"),
+            (C::ElectromagneticRadiationChromatogram, "electromagnetic radiation chromatogram", "MS:1000811"),
+            (C::FlowRateChromatogram, "flow rate chromatogram", "MS:1003020"),
+            (C::PressureChromatogram, "pressure chromatogram", "MS:1003019"),
+            (C::TemperatureChromatogram, "temperature chromatogram", "MS:1002715"),
+        ] {
+            let p = super::chromatogram_type_param(kind).unwrap_or_else(|| panic!("no term for {kind:?}"));
+            assert_eq!((p.name.as_str(), p.curie().map(|c| c.to_string())), (name, Some(accession.to_string())), "{kind:?}");
+            assert_eq!(p.curie().and_then(C::from_curie), Some(kind), "{accession} reads back as {kind:?}");
+        }
+        assert!(super::chromatogram_type_param(C::Unknown).is_none());
+    }
+
+    /// mzML → mzML keeps each chromatogram's type term. mzdata's reader moves it into the typed
+    /// field and its writer writes the parameters alone, so tiny.pwiz's selected ion current trace
+    /// came out with none.
+    #[test]
+    fn mzml_to_mzml_keeps_the_chromatogram_type() {
+        let dir = scratch("chromatogram-type");
+        let _cleanup = RmDir(dir.clone());
+        let out = dir.join("tiny.mzML");
+        super::convert_to_mzml(std::path::Path::new(TINY), &out, false, None).expect("tiny.pwiz → mzML");
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let start = xml.find("<chromatogram id=\"sic\"").expect("the sic trace");
+        let sic = &xml[start..start + xml[start..].find("</chromatogram>").unwrap()];
+        assert_eq!(sic.matches("accession=\"MS:1000627\"").count(), 1, "one selected ion current chromatogram term: {sic}");
     }
 
     /// The run-metadata normaliser on what mzdata's readers actually hand over: a Thermo-style

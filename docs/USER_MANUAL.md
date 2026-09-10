@@ -443,10 +443,11 @@ naming the function; a scan without a retention time refuses the conversion.
 the Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF, Shimadzu and Waters have them), and the
 non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz — except on a
 Bruker `.d`: every Bruker lane writes the HyStar traces in its `chromatography-data.sqlite` after
-the TIC/BPC, each value array in the unit HyStar states and each chromatogram type also as a
-parameter, so an mzML export states it (a trace in bar is stated in pascal as 64-bit floats,
-declared `bruker:trace-unit-rescale`; a trace stored in overlapping chunks is written in time order
-with each repeated sample once, declared `bruker:trace-sort-dedup`). HyStar's own MS traces, its
+the TIC/BPC (not `--to mzml` straight from the `.d`, which writes the TIC/BPC pair only), each
+value array in the unit HyStar states and each chromatogram type also as a parameter, so an mzML
+export states it (a trace in bar is stated in pascal as 64-bit floats, declared
+`bruker:trace-unit-rescale`; a trace stored in overlapping chunks is written in time order with
+each repeated sample once, declared `bruker:trace-sort-dedup`). HyStar's own MS traces, its
 MS/MS TIC `TIC,±AllMS/MS` among them, give way to the synthesized TIC/BPC, and a database in WAL
 mode is skipped with a warning, since SQLite cannot read one without writing into the input.
 
