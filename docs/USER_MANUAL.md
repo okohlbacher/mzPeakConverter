@@ -443,8 +443,12 @@ naming the function; a scan without a retention time refuses the conversion.
 the Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF, Shimadzu and Waters have them), and the
 non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz — except on a
 Bruker `.d`: every Bruker lane writes the HyStar traces in its `chromatography-data.sqlite` after
-the TIC/BPC, each value array in the unit HyStar states (a trace in bar is stated in pascal and the
-archive declares `bruker:trace-unit-rescale`).
+the TIC/BPC, each value array in the unit HyStar states and each chromatogram type also as a
+parameter, so an mzML export states it (a trace in bar is stated in pascal as 64-bit floats,
+declared `bruker:trace-unit-rescale`; a trace stored in overlapping chunks is written in time order
+with each repeated sample once, declared `bruker:trace-sort-dedup`). HyStar's own MS traces, its
+MS/MS TIC `TIC,±AllMS/MS` among them, give way to the synthesized TIC/BPC, and a database in WAL
+mode is skipped with a warning, since SQLite cannot read one without writing into the input.
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
 PSI controlled-vocabulary meaning, it is mapped onto the standard
@@ -591,6 +595,8 @@ list of the declared, bounded changes the converter made to the vendor signal on
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `shimadzu:span-trim` | the profile sqrt-grid route stored the signal span only (item 4) | native Shimadzu `.lcd` profile |
 | `agilent:drop-zero-samples` | the profile grid lane stored a sparse point list, dropping zero-intensity samples and all-zero scans | `--agilent-grid` |
+| `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
+| `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
 
 Not declared today, on purpose and worth knowing: the `--ims-chunked` ims-compact layout sorts each
 frame by TOF before chunking, which re-orders points across scans (an entry of the `sort-by-mz`

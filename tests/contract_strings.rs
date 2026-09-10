@@ -257,4 +257,6 @@ fn transformations_block_pinned() {
     pinned("\"tof-grid:{}ppm\"");
     pinned("\"shimadzu:span-trim\"");
     pinned("\"agilent:drop-zero-samples\"");
+    pinned("\"bruker:trace-unit-rescale\"");
+    pinned("\"bruker:trace-sort-dedup\"");
 }
