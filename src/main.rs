@@ -2561,6 +2561,8 @@ fn convert_file_tof_grid(
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
+        // The off-grid f64 m/z of these point facets: BYTE_STREAM_SPLIT, no dictionary.
+        .shuffle_mz(true)
         .store_peaks_and_profiles_apart(Some(tof_index_peak_schema(tof_field.clone())));
     // PER-SPECTRUM ROUTING by the source's own representation: profile spectra go to `spectra_data`
     // (point layout — the builder default here; an integer axis has no chunk encoder), centroid
@@ -3614,7 +3616,10 @@ fn convert_file(
         // is a few thousand points; chunking bought nothing.
         .chromatogram_chunked_encoding(None)
         .buffer_size(buffer_spectra())
-        .compression(Compression::ZSTD(level));
+        .compression(Compression::ZSTD(level))
+        // Float m/z of a point facet (`--layout point`, the lattice's f64 fallback):
+        // BYTE_STREAM_SPLIT, no dictionary. Chunk facets are unaffected.
+        .shuffle_mz(true);
 
     // Derive the data schema from the data actually present (one m/z + one intensity column at
     // their source dtype) so points land in point.mz/point.intensity, not auxiliary_arrays.
@@ -5746,13 +5751,17 @@ fn convert_sciex_grid(
     // PXD053710, 1.6 % on MSV000090684, 1.1 % on PXD065872, 0.07 % on PXD071869 — at 6–9.5 B per f64
     // point, which is +27 %, +12 %, +7 %, +3.5 %, +2.3 % and +0.2 % on the archive. (An earlier
     // version of this comment said "well under 1 %"; it counted chunk ROWS of the old facet, not
-    // points.) A chunk-capable integer axis would recover that; until then the trade is fidelity
-    // for size, declared by `transformations` no longer listing `numpress-linear` here. Under
-    // `--tof-grid off` nothing is gridded, so the facet keeps the requested chunking.
+    // points.) Those figures are the dictionary-encoded column; `shuffle_mz` now writes it
+    // BYTE_STREAM_SPLIT, about 6 B per point on the densest row groups of Sample002 and PXD011326
+    // (−22 % / −25 %). A chunk-capable integer axis (~2–3 B per point) is not built: the remaining
+    // size is accepted, the trade being fidelity for size, declared by `transformations` no longer
+    // listing `numpress-linear` here. Under `--tof-grid off` nothing is gridded, so the facet keeps
+    // the requested chunking.
     let data_chunk = if mode == TofGridMode::Off { chunk } else { None };
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
+        .shuffle_mz(true)
         .chunked_encoding(data_chunk)
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
@@ -6246,6 +6255,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(data_chunk)
         .peaks_chunked_encoding(peaks_chunk)
+        // Float m/z of a point facet (a grid facet's f64 minority, the lattice's f64 fallback):
+        // BYTE_STREAM_SPLIT, no dictionary. Chunk facets are unaffected.
+        .shuffle_mz(true)
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
