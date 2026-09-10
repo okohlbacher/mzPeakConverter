@@ -29,10 +29,17 @@ arrow/parquet/mzdata version graph.
 
 `thermorawfilereader` reads Thermo `.raw` files through a .NET bundle that its
 `dotnetrawfilereader-sys` dependency embeds in the `mzpeak-convert` binary and unpacks at
-runtime: `librawfilereader`, Thermo Fisher Scientific's RawFileReader assemblies
-(`ThermoFisher.CommonCore.*`) and `OpenMcdf`. Both crates declare Apache-2.0 for their own
-sources. The Thermo Fisher Scientific and OpenMcdf assemblies carry their own terms, which
-neither crate states. If you redistribute mzPeakConverter, confirm those terms.
+runtime. The bundle holds code under three licenses:
+
+| Component | License |
+|---|---|
+| `librawfilereader`, the crates' own C# wrapper | Apache-2.0 |
+| Thermo Fisher Scientific RawFileReader (`ThermoFisher.CommonCore.*`) | proprietary: the [RawFileReader license](https://github.com/thermofisherlsms/RawFileReader/blob/main/License.doc), which the `thermorawfilereader` README says users of that library accept |
+| [OpenMcdf](https://github.com/openmcdf/openmcdf) 2.3 | MPL-2.0; its source is available from that repository (tag `v2.3.0.0`) |
+
+> ⚠️ Neither crate ships these license texts. If you redistribute mzPeakConverter, check the
+> RawFileReader license's redistribution terms, and MPL-2.0's conditions for OpenMcdf in executable
+> form.
 
 ## Key runtime dependencies
 
@@ -53,7 +60,8 @@ Every other resolved Cargo dependency declares a permissive license (MIT, Apache
 without the LLVM exception, BSD-2-Clause, BSD-3-Clause, BSD-3-Clause-Clear, ISC, Zlib,
 Unicode-3.0, 0BSD, CC0-1.0, MIT-0, Unlicense, BSL-1.0, bzip2-1.0.6 or CDLA-Permissive-2.0)
 or a dual/triple combination of them; the release SBOM lists each crate's. None declares a
-copyleft license (GPL/AGPL). `r-efi` (two versions resolved), the only crate offering an
+copyleft license (GPL/AGPL); the MPL-2.0 OpenMcdf above arrives inside a crate, not as one.
+`r-efi` (two versions resolved), the only crate offering an
 optional `LGPL-2.1-or-later` alternative, is also offered under `MIT OR Apache-2.0`, which
 this project takes. `mzpeak_prototyping` declares no license (above).
 
