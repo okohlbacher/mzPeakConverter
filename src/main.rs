@@ -4462,6 +4462,13 @@ where
             .add_field(mob_field),
     };
 
+    // One layout family per entity (`docs/conformance.md:68`, HUPO-PSI/mzPeak-specification#21):
+    // `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, so under --ims-chunked
+    // the DATA facet must be declared chunked too — the writer refuses to open a chunked peak facet
+    // beside a point data facet. Centroid-only TDF never writes a row to it, but its schema still
+    // has to be chunk-shaped: an empty chunked builder falls back to point-shaped default fields,
+    // so hand it the same fields the peak facet uses.
+    let data_fields = chunk_cfg.map(|_| peak_schema.fields().to_vec()).unwrap_or_default();
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
         // Per-frame inputs of the vendor's exact TOF→m/z model (`Frames.T1/T2/MzCalibration`) as
@@ -4483,6 +4490,12 @@ where
             DataType::Int64,
         ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
+    if let Some(width_th) = chunk_cfg {
+        builder = builder.chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: width_th }));
+        for f in data_fields {
+            builder = builder.add_spectrum_field(f);
+        }
+    }
     if exact_per_spectrum.is_some() {
         // The exact per-frame `m/z = (tof_c0 + tof_c1·tof)²` coefficients (vendor ModelType 1 with
         // C2 = 0, temperature-corrected with Frames.T1), as Float64 spectra_metadata columns — the
@@ -7726,6 +7739,52 @@ mod tests {
         assert_eq!(
             n_spectra as u64, n_frames,
             "expected one spectrum per TDF frame: {n_spectra} spectra vs {n_frames} frames"
+        );
+    }
+
+    /// Regression: the ims-chunked path only chunked the PEAK facet while leaving the (empty,
+    /// centroid-only) DATA facet at the point default — a mixed layout family for the `spectrum`
+    /// entity (HUPO-PSI/mzPeak-specification#21). On 0.9.2 the writer aborted on it ("layout family
+    /// mismatch between spectrum facets"); since 0.9.3 it only warns and writes the mixed archive.
+    /// Both `spectrum` facets must declare the same family under --ims-chunked either way.
+    /// Corpus-gated like `ims_compact_is_frame_preserving`; run with:
+    ///   `cargo test --release ims_chunked_spectrum_facets_share_one_family -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
+    fn ims_chunked_spectrum_facets_share_one_family() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let Some(input) = crate::corpus_gate::corpus_path(TDF_2485) else { return };
+        let scratch = scratch("ims-chunked-family");
+        let _rm = RmDir(scratch.clone());
+        let output = scratch.join("ims_chunked.mzpeak");
+
+        // ims_chunked = true: the exact configuration that failed to open its peak writer.
+        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0)
+            .expect("--ims-chunked conversion");
+
+        // The family is declared in each facet's footer as `spectrum_array_index.prefix`.
+        let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+        let family_of = |zip: &mut zip::ZipArchive<fs::File>, member: &str| -> (String, i64) {
+            let path = extract_zip_entry(zip, member, &scratch);
+            let reader = SerializedFileReader::new(fs::File::open(&path).unwrap()).unwrap();
+            let meta = reader.metadata().file_metadata();
+            let index = meta
+                .key_value_metadata()
+                .and_then(|kvs| kvs.iter().find(|kv| kv.key == "spectrum_array_index"))
+                .and_then(|kv| kv.value.clone())
+                .unwrap_or_else(|| panic!("{member} has no spectrum_array_index"));
+            let index: serde_json::Value = serde_json::from_str(&index).unwrap();
+            (index["prefix"].as_str().unwrap().to_string(), meta.num_rows())
+        };
+        let (data_family, _) = family_of(&mut zip, "spectra_data.parquet");
+        let (peaks_family, peak_rows) = family_of(&mut zip, "spectra_peaks.parquet");
+        assert!(peak_rows > 0, "spectra_peaks is empty; the fixture carries no signal");
+        assert_eq!(peaks_family, "chunk", "--ims-chunked must write a chunked peak facet");
+        assert_eq!(
+            data_family, peaks_family,
+            "spectra_data ('{data_family}') and spectra_peaks ('{peaks_family}') are both \
+             `entity_type: spectrum` and MUST share one layout family"
         );
     }
 
