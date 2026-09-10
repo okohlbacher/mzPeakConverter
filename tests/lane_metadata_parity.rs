@@ -434,30 +434,6 @@ fn facet_population(archive: &Path, member: &str, dir: &Path, into: &mut Surface
     let _ = std::fs::remove_file(&p);
 }
 
-/// ProteoWizard escapes characters an XML id may not start with or hold as `_xHHHH_` (`_x0032_0181203…`
-/// for a run whose name starts with a digit). The native lane uses the plain stem, and the mzML lane
-/// decodes `run.id` and the software ids on copy (`decode_pwiz_ids` in `src/main.rs`); archives built
-/// before that still carry the escapes, so both keys are compared decoded.
-fn decode_pwiz_id(v: &str) -> String {
-    let mut out = String::new();
-    let mut rest = v;
-    while let Some(i) = rest.find("_x") {
-        let (head, tail) = rest.split_at(i);
-        out.push_str(head);
-        if tail.len() >= 8 && &tail[6..8] == "_" && tail[2..6].chars().all(|c| c.is_ascii_hexdigit()) {
-            if let Some(ch) = u32::from_str_radix(&tail[2..6], 16).ok().and_then(char::from_u32) {
-                out.push(ch);
-                rest = &tail[8..];
-                continue;
-            }
-        }
-        out.push_str("_x");
-        rest = &tail[2..];
-    }
-    out.push_str(rest);
-    out
-}
-
 fn json_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
     let mut cur = v;
     for p in path {
@@ -518,7 +494,7 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
             "run.id".into(),
             run.get("id")
                 .and_then(|v| v.as_str())
-                .map(|v| if v.is_empty() { "empty".into() } else { decode_pwiz_id(v) })
+                .map(|v| if v.is_empty() { "empty".into() } else { pwiz_id::decode(v) })
                 .unwrap_or("absent".into()),
         );
     }
@@ -590,7 +566,7 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
             let mut ids: Vec<String> = arr
                 .iter()
                 .filter_map(|e| {
-                    let id = decode_pwiz_id(e.get("id").and_then(|v| v.as_str())?);
+                    let id = pwiz_id::decode(e.get("id").and_then(|v| v.as_str())?);
                     let version = e.get("version").and_then(|v| v.as_str()).unwrap_or("");
                     Some(if version.is_empty() { id.to_string() } else { format!("{id}@{version}") })
                 })
@@ -662,6 +638,14 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
 
 #[path = "common/corpus.rs"]
 mod corpus;
+
+/// ProteoWizard escapes what an XML id may not start with or hold as `_xHHHH_` (`_x0032_0181203…` for
+/// a run whose name starts with a digit). The native lane uses the plain stem, and the mzML lane
+/// decodes `run.id` and the software ids on copy with this same code; archives built before that
+/// still carry the escapes, so both keys are compared decoded. The copy this test had kept compared
+/// two bytes with `"_"` and so never decoded one.
+#[path = "../src/pwiz_id.rs"]
+mod pwiz_id;
 
 /// `<stem>` for every pair present in `dir`.
 fn pairs(dir: &Path) -> Vec<(String, PathBuf, PathBuf)> {

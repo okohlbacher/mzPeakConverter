@@ -326,19 +326,23 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
 - **mzML-lane archives hold ProteoWizard's ids decoded.** ProteoWizard writes ids as XML names and
-  escapes what a name may not hold as `_xHHHH_`, so `run.id` came into the archive as
+  escapes each byte a name may not hold as `_x00hh_`, so `run.id` came into the archive as
   `Experiment_x0020_1` (`tiny.pwiz.1.1.mzML`), `En_PPY-3_phenylpyruvic_x0020_acid_10NG_10ul` or
   `_x0031_2_80` for a leading digit — 47 of the 201 published archives — and 7 of them carry
   escaped software ids too (ltpmsi-chilli's `MassLynx_x0020_software`, six ProteoWizard Shimadzu
   examples' `Shimadzu_x0020_software`). An mzPeak id is a plain string, and the native lanes write the
-  plain stem. The mzML and imzML lane now decodes `run.id` and the software ids on copy, with the
+  plain stem. The mzML and imzML lanes now decode `run.id` and the software ids on copy, with the
   processing methods and instrument configurations that reference a software id, so every
-  reference still resolves. The mzML exports keep the escaped software ids, which an mzML id (an XML
-  name) needs; mzdata's mzML writer numbers the run itself.
-  `tests/lane_metadata_parity.rs` compares both keys decoded, so archives built before and after
-  compare alike. Pinned by `pwiz_escaped_ids_are_decoded` and
-  `mzml_lane_archive_decodes_pwiz_ids_and_mzml_export_keeps_them`; the published archives change on
-  reconversion.
+  reference still resolves. A non-ASCII name is escaped one UTF-8 byte at a time and decoded as
+  UTF-8: three of those archives' `_x0032_0140312__x00e5__x0085__x00ad_mix_column_1…` becomes
+  `20140312_六mix_column_1 (scheduled) 一个试`, and a run of escapes that is not UTF-8 stays as
+  written. Ids from the Thermo and TDF readers, which name the run after the file, are left alone.
+  The mzML exports keep the escaped software ids, which an mzML id (an XML name) needs; mzdata's mzML
+  writer numbers the run itself. `tests/lane_metadata_parity.rs` compares both keys decoded with the
+  converter's own decoder (`src/pwiz_id.rs`), so archives built before and after compare alike; the
+  copy it had kept never decoded an escape. Pinned by `pwiz_escaped_ids_are_decoded`,
+  `mzml_lane_archive_decodes_pwiz_ids_and_mzml_export_keeps_them` and
+  `a_thermo_run_named_like_an_escape_keeps_its_stem`; the published archives change on reconversion.
 - **The `--ims-chunked` one-family pin also runs without the corpus.** The regression test for the
   data facet's layout family needed the 142 MB 2485.d and so never ran in CI. The family is fixed
   when the writers are built, so `ims_chunked_spectrum_facets_share_one_family_without_the_corpus`
