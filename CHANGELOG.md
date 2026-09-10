@@ -162,6 +162,19 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
   of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
   re-encoded.
+- **A release is built only from a commit that passed CI.** `release.yml` runs no tests, and
+  `windows.yml` cancelled a push's run as soon as the next commit reached `main` — so v0.10.0
+  (85afceb), v0.10.1 (5692603) and v0.11.3 (4ff30a6) were released with their `windows` job
+  cancelled, never having finished a Windows build and test. A first job now reads the commit's
+  check runs and waits, up to 90 minutes, until `build-test (ubuntu-latest)`,
+  `build-test (macos-latest)` and `windows` have concluded; anything but `success`, cancellation
+  included, stops the release before a platform job starts and names the check. The newest run of a
+  job counts, so re-running a cancelled one clears the way — which a backfill of those three tags
+  now needs first. A `workflow_dispatch` checks the commit its tag points at, a pull request's dry
+  run the pull request's head. Pushes to `main` no longer cancel each other's Windows run, and each
+  gets its own concurrency group: with cancellation off GitHub still replaces a run *pending* in a
+  group, so the middle one of three quick pushes would never run. Pull requests still cancel a
+  superseded run.
 
 ### Changed
 

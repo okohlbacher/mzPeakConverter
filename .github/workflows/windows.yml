@@ -25,9 +25,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Pull requests cancel a superseded run; pushes to main never do, and each gets its own group. Even
+# without cancel-in-progress GitHub replaces a run still *pending* in a group with the newer one, so a
+# burst of pushes would skip the middle commits — and release.yml refuses a tag whose commit has no
+# passing `windows` run.
 concurrency:
-  group: windows-${{ github.ref }}
-  cancel-in-progress: true
+  group: windows-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows:
