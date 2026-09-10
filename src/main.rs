@@ -2583,6 +2583,7 @@ fn convert_file_tof_grid(
     builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
     let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);
+    decode_pwiz_ids(&mut writer);
     add_processing_metadata(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
@@ -3649,6 +3650,7 @@ fn convert_file(
     }
 
     writer.copy_metadata_from(&reader);
+    decode_pwiz_ids(&mut writer);
     add_processing_metadata(&mut writer);
 
     // Keep the ion-mobility dimension for TDF (do not flatten 3D frames).
@@ -6743,6 +6745,56 @@ fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> 
     agilent_meta::read(input)
 }
 
+/// ProteoWizard writes ids as XML names and escapes a character a name may not hold as `_xHHHH_`
+/// (`Experiment_x0020_1`, `_x0032_0090101…` for a leading digit). An mzPeak id is a plain string,
+/// so the mzML lane decodes them on copy: `run.id`, and the software ids together with the
+/// processing methods and instrument configurations that name them. Not part of
+/// [`fixup_run_metadata`], which the mzML exports share: an mzML id must stay an XML name, and
+/// ProteoWizard's escaped form is one.
+fn decode_pwiz_ids(target: &mut impl MSDataFileMetadata) {
+    if let Some(run) = target.run_description_mut() {
+        run.id = run.id.as_deref().map(decode_xml_name);
+    }
+    for sw in target.softwares_mut() {
+        sw.id = decode_xml_name(&sw.id);
+    }
+    for dp in target.data_processings_mut() {
+        for m in dp.methods.iter_mut() {
+            m.software_reference = decode_xml_name(&m.software_reference);
+        }
+    }
+    for ic in target.instrument_configurations_mut().values_mut() {
+        ic.software_reference = decode_xml_name(&ic.software_reference);
+    }
+}
+
+/// Undo `_xHHHH_` escaping (.NET `XmlConvert.DecodeName`, which ProteoWizard follows); a sequence
+/// that is not a well-formed escape is left as written.
+fn decode_xml_name(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find("_x") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let decoded = tail
+            .get(2..6)
+            .filter(|hex| hex.chars().all(|c| c.is_ascii_hexdigit()) && tail[6..].starts_with('_'))
+            .and_then(|hex| char::from_u32(u32::from_str_radix(hex, 16).ok()?));
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[7..];
+            }
+            None => {
+                out.push_str("_x");
+                rest = &tail[2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     // 0. Provenance hygiene on what the reader ALREADY copied. Step 1 below sanitises only the
     // entry it synthesises itself; mzdata's Thermo reader writes the converting machine's parent
@@ -8770,6 +8822,66 @@ mod tests {
         fs::write(&cfg, "quiet: true\n").unwrap();
         let cli = Cli::try_parse_from(["mzpeak-convert", TINY, "--config", cfg.to_str().unwrap()]).unwrap();
         assert!(Settings::resolve(&cli).unwrap().quiet);
+    }
+
+    /// ProteoWizard's `_xHHHH_` escapes come off on copy: `run.id`, and the software ids with every
+    /// reference to them still resolving. What only looks like an escape stays as written.
+    #[test]
+    fn pwiz_escaped_ids_are_decoded() {
+        use mzdata::meta::{DataProcessing, InstrumentConfiguration, ProcessingMethod, Software};
+        let mut w = mzdata::io::mzml::MzMLWriter::new(std::io::sink());
+        w.run_description_mut().unwrap().id = Some("_x0032_0090101_x0020_-_x0020_run".into());
+        w.softwares_mut().push(Software { id: "MassLynx_x0020_software".into(), ..Default::default() });
+        let method = ProcessingMethod { software_reference: "MassLynx_x0020_software".into(), ..Default::default() };
+        w.data_processings_mut().push(DataProcessing { id: "dp".into(), methods: vec![method] });
+        w.instrument_configurations_mut()
+            .insert(0, InstrumentConfiguration { software_reference: "MassLynx_x0020_software".into(), ..Default::default() });
+        super::decode_pwiz_ids(&mut w);
+        assert_eq!(w.run_description().unwrap().id.as_deref(), Some("20090101 - run"));
+        assert_eq!(w.softwares()[0].id, "MassLynx software");
+        assert_eq!(w.data_processings()[0].methods[0].software_reference, "MassLynx software");
+        assert_eq!(w.instrument_configurations()[&0].software_reference, "MassLynx software");
+        for kept in ["a_x00zz_b", "_x0041", "x_x_", "scan=19", ""] {
+            assert_eq!(super::decode_xml_name(kept), kept);
+        }
+    }
+
+    /// End to end on the mzML lane: the archive holds the decoded ids, while `-o x.mzML` keeps
+    /// ProteoWizard's escaped ones, which an mzML id (an XML name) needs.
+    #[test]
+    fn mzml_lane_archive_decodes_pwiz_ids_and_mzml_export_keeps_them() {
+        let dir = scratch("pwiz-ids");
+        let src = fs::read(TINY).unwrap();
+        let text = String::from_utf8_lossy(&src).replace(r#"id="CompassXtract""#, r#"id="Compass_x0020_Xtract""#)
+            .replace(r#"softwareRef="CompassXtract""#, r#"softwareRef="Compass_x0020_Xtract""#);
+        assert!(src.is_ascii(), "the fixture must stay byte-for-byte after the lossy round trip");
+        let input = dir.join("escaped.mzML");
+        fs::write(&input, text).unwrap();
+
+        let archive = dir.join("escaped.mzpeak");
+        let args: Vec<&std::ffi::OsStr> = vec![input.as_os_str(), "-o".as_ref(), archive.as_os_str(), "--force".as_ref()];
+        let (ok, _, err) = run_bin(&args, &[]);
+        assert!(ok, "{err}");
+        let md = index_metadata(&archive);
+        assert_eq!(md["run"]["id"], serde_json::json!("Experiment 1"), "{}", md["run"]);
+        let software: Vec<&str> = md["software_list"].as_array().unwrap().iter().filter_map(|s| s["id"].as_str()).collect();
+        assert!(software.contains(&"Compass Xtract"), "{software:?}");
+        let refs: Vec<&str> = md["data_processing_method_list"].as_array().unwrap().iter()
+            .flat_map(|dp| dp["methods"].as_array().unwrap().iter().filter_map(|m| m["software_reference"].as_str()))
+            .collect();
+        assert!(refs.contains(&"Compass Xtract") && !refs.contains(&"Compass_x0020_Xtract"), "{refs:?}");
+
+        let mzml = dir.join("escaped.mzML.out.mzML");
+        let args: Vec<&std::ffi::OsStr> = vec![input.as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()];
+        let (ok, _, err) = run_bin(&args, &[]);
+        assert!(ok, "{err}");
+        let xml = fs::read_to_string(&mzml).unwrap();
+        // mzdata's mzML writer numbers the run itself (`<run id="1"`); the software ids it carries.
+        assert!(
+            xml.contains(r#"<software id="Compass_x0020_Xtract""#) && xml.contains(r#"softwareRef="Compass_x0020_Xtract""#),
+            "mzML software ids must stay escaped"
+        );
+        assert!(!xml.contains("Compass Xtract") && !xml.contains("Experiment 1"), "nothing decoded reaches the mzML");
     }
 
     /// The honoured-flags table is checked against what was GIVEN: a default is never refused,
