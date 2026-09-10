@@ -151,19 +151,24 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 - **`--drop-aux` refuses to remove a core facet.** Drop globs matched every member, so
   `--drop-aux '*.parquet'` wrote an archive holding nothing but its index, and dropping
   `spectra_peaks.parquet` or `spectra_metadata_precursors.parquet` wrote an unreadable one — each
-  with exit 0. A glob that matches a `spectrum` facet whose `data_kind` is not proprietary/other
-  now exits 1 before anything is written. `--no-vendor` still drops the Thermo `vendor_*` facets,
-  which are declared proprietary, and `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA
-  trace: those facets reference only each other.
-- **`--ms-level` and `--rt` fail on a missing or retyped column.** An `ms_level` that was absent
-  or not UInt8 read as level 0, and a `time` that was absent or not Float64 as NaN, so a writer
-  type change would have made either filter keep 0 spectra and exit 0.
+  with exit 0. A glob that matches a `spectrum` or `chromatogram` facet whose `data_kind` is not
+  `proprietary` now exits 1 before anything is written. That includes a kind this build does not
+  know, which the filter treats as a secondary, and `chromatograms_data`, whose removal under `--rt`
+  left metadata point counts refreshed from the facet that was dropped. `--no-vendor` still drops
+  the Thermo `vendor_*` facets, which are declared proprietary, and
+  `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA trace: those facets reference only each
+  other.
+- **`--ms-level` and `--rt` fail on a missing column or one they cannot read losslessly.** An
+  `ms_level` that was absent or not UInt8 read as level 0, and a `time` that was absent or not
+  Float64 as NaN, so a writer type change would have made either filter keep 0 spectra and exit 0.
+  Another integer width for `ms_level`, or float width for `time`, is now cast; an absent column,
+  another kind of type, or an `ms_level` that does not fit UInt8 exits 1.
 - **`--rt` refreshes chromatogram point counts in current archives.** The refresh knew only the
   pre-0.7 nested `chromatogram` struct, so the flat `chromatograms_metadata.parquet` the converter
   writes today was copied verbatim: on `tiny.pwiz.1.1` converted by 0.11.5, `--rt 0-0.0001` left
   2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
-  of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
-  re-encoded.
+  of 6. Both now follow the truncation, and the refreshed `number_of_data_points` keeps the
+  column's own integer type. Without `--rt` the facet is copied verbatim rather than re-encoded.
 - **A data facet's `<entity>_count` is an index bound again.** Since 0.11.2, `spectrum_count` on
   `spectra_data` and `spectra_peaks` (and `chromatogram_count` / `wavelength_spectrum_count` on
   `chromatograms_data` / `wavelength_spectra_data`) was the number of entities with rows in that

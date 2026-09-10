@@ -280,7 +280,7 @@ fn drop_aux_refuses_to_remove_a_core_facet() {
     let dir = scratch("drop_core");
     let src = convert(TINY, &dir);
     let out = dir.join("f.mzpeak");
-    for glob in ["spectra_data.parquet", "spectra_metadata_precursors.parquet", "*.parquet"] {
+    for glob in ["spectra_data.parquet", "spectra_metadata_precursors.parquet", "chromatograms_data.parquet", "chromatograms_metadata.parquet", "*.parquet"] {
         let r = mzpc(&src, &out, &["--drop-aux", glob]);
         let stderr = String::from_utf8_lossy(&r.stderr);
         assert_eq!(r.status.code(), Some(1), "--drop-aux {glob} must be refused; stderr:\n{stderr}");
