@@ -5932,8 +5932,7 @@ fn sciex_grid_spectrum(
 ///
 /// Unlike SciEX/Shimadzu this lane has NO .NET glue in the loop: [`waters::WatersReader`] loads
 /// `MassLynxRaw.dll` directly with `libloading` and calls its C exports. So it needs
-/// `$MZPC_MASSLYNX_DIR` (or `$MZPC_PWIZ_DIR`) at runtime and nothing else — `$MZPC_WATERS_GLUE` and
-/// the `glue/waters/` C# project are not read by any code path here.
+/// `$MZPC_MASSLYNX_DIR` (or `$MZPC_PWIZ_DIR`) at runtime and nothing else.
 #[cfg(windows)]
 fn convert_waters(
     input: &Path,

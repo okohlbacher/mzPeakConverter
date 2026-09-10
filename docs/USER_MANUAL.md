@@ -767,7 +767,7 @@ the requested output missing. Run them without `-o`.
 | Variable | Effect |
 |---|---|
 | `MZPC_PWIZ_DIR` | ProteoWizard install supplying the vendor DLLs at runtime (Agilent MHDAC, SciEX Clearcore2, Shimadzu LabSolutions.IO, Waters MassLynx). Both layouts are probed — `vendor_api/<Vendor>` and flat beside `msconvert.exe` (the 3.0.26175 installer is flat; the Agilent host is handed whichever directory holds `MassSpecDataReader.dll`). **Use a current ProteoWizard** (3.0.26151 / 3.0.26175 verified); see §11 for why an old one silently corrupts Shimadzu centroids |
-| `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` (+ `cdt.dll`) for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback. (`MZPC_WATERS_GLUE` is **not read by any code path** — the Waters lane has no .NET glue; the name survives only in a comment) |
+| `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` (+ `cdt.dll`) for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback. The Waters lane has no .NET glue |
 | `MZPC_AGILENT_GLUE` | Directory holding the built net48 `AgilentGlueHost.exe` (`glue/agilent/bin/Release/net48`); the converter spawns it once per `.d` and reads its `AGL2` output back (§11) |
 | `MZPC_AGILENT_TMPDIR` | Where the Agilent host materialises a run before it is read (16 B/point — about 3 GB for a 240 MB Q-TOF `.d`; removed when the reader closes). Default `%TEMP%`; set it to a disk directory when `TEMP` points at a RAM disk (the box scripts do) |
 | `MZPC_SCIEX_GLUE` | Directory holding the built `SciexGlue.dll` + runtimeconfig |

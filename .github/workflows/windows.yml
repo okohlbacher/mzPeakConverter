@@ -61,10 +61,8 @@ jobs:
         run: cargo test --release --verbose
 
       # Only glues src/ actually loads: SCIEX, Shimadzu and Agilent MHDAC (net48 host).
-      # glue/waters is NOT built here — src/waters.rs drives MassLynxRaw directly and no code path
-      # reads WatersGlue.dll (see the doc comment on the Waters lane in src/main.rs), so asserting
-      # it only verified an artifact nothing ships. Shimadzu WAS missing and it is the one wired
-      # glue with an ABI handshake -- the one that broke at 0.9.11 with CI green.
+      # (The Waters lane has no glue: src/waters.rs calls MassLynxRaw's C exports.) Shimadzu is the
+      # glue with an ABI handshake -- the one that broke at 0.9.11 with CI green, unbuilt here then.
       - name: Build C# interop glues (reflection-only, no vendor DLLs)
         run: |
           dotnet build glue/sciex/SciexGlue.csproj -c Release
