@@ -588,6 +588,9 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
     s
 }
 
+#[path = "common/corpus.rs"]
+mod corpus;
+
 /// `<stem>` for every pair present in `dir`.
 fn pairs(dir: &Path) -> Vec<(String, PathBuf, PathBuf)> {
     let mut out = Vec::new();
@@ -605,22 +608,19 @@ fn pairs(dir: &Path) -> Vec<(String, PathBuf, PathBuf)> {
     out
 }
 
+#[track_caller]
 fn pair_dir() -> Option<PathBuf> {
-    let d = PathBuf::from(std::env::var("MZPC_LANE_PAIRS").ok()?);
-    d.is_dir().then_some(d)
+    let d = corpus::env_path("MZPC_LANE_PAIRS")?;
+    assert!(d.is_dir(), "MZPC_LANE_PAIRS={} is not a directory", d.display());
+    Some(d)
 }
 
 /// The report. Prints the full comparison for every pair, then fails if any difference is not in
 /// [`EXPECTED`].
 #[test]
+#[ignore = "needs lane pairs built on the Windows box (tools/lane_pairs.ps1) via MZPC_LANE_PAIRS"]
 fn native_and_mzml_lanes_carry_the_same_metadata() {
-    let Some(dir) = pair_dir() else {
-        eprintln!(
-            "skipping: set MZPC_LANE_PAIRS to a directory of `<stem>.native.mzpeak` + \
-             `<stem>.mzml.mzpeak` pairs (tools/lane_pairs.ps1 builds them on the Windows box)"
-        );
-        return;
-    };
+    let Some(dir) = pair_dir() else { return };
     let pairs = pairs(&dir);
     assert!(!pairs.is_empty(), "MZPC_LANE_PAIRS={} holds no <stem>.native/.mzml pair", dir.display());
 
@@ -685,15 +685,11 @@ fn native_and_mzml_lanes_carry_the_same_metadata() {
 /// keep the parity — or a rule that never matched anything, which means it is not protecting what
 /// its author thought. Either way it must not sit there implying a difference exists.
 #[test]
+#[ignore = "needs lane pairs built on the Windows box (tools/lane_pairs.ps1) via MZPC_LANE_PAIRS"]
 fn unexpected_and_stale() {
-    let Some(dir) = pair_dir() else {
-        eprintln!("skipping: MZPC_LANE_PAIRS unset");
-        return;
-    };
+    let Some(dir) = pair_dir() else { return };
     let pairs = pairs(&dir);
-    if pairs.is_empty() {
-        return;
-    }
+    assert!(!pairs.is_empty(), "MZPC_LANE_PAIRS={} holds no <stem>.native/.mzml pair", dir.display());
     let scratch = std::env::temp_dir().join(format!("mzpc-lane-stale-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let mut fired: BTreeSet<&'static str> = BTreeSet::new();
