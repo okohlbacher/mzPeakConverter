@@ -46,9 +46,9 @@
 //! The host materialises EVERY scan into one temp file (m/z f64 + intensity f64 per point, i.e.
 //! 16 B/point) under `std::env::temp_dir()` before the first spectrum is read back: a 240 MB
 //! profile Q-TOF `.d` becomes a ~3 GB temp file. The file is removed on `Drop`, on every failure
-//! path, and by the panic hook (`crate::track_tmp_in_flight`); only a Ctrl+C, which ends both
-//! processes, leaves it behind. The host runs in a kill-on-close Job Object
-//! (`agilent_host::job`), so a converter that is killed takes the host with it.
+//! path, and by the panic hook (`crate::track_tmp_in_flight`). A Ctrl+C, which ends both
+//! processes, leaves it behind, and so does a converter killed on its own: the host outlives it (no
+//! Job Object; see `crate::agilent_host`).
 //!
 //! ## Binary protocol (host → us)
 //! `AGL2`, parsed by the host-testable `crate::agl` (which documents the layout). Beyond the
@@ -158,18 +158,11 @@ impl AgilentReader {
         crate::track_tmp_in_flight(&tmp_path);
         crate::track_tmp_in_flight(&part_path);
 
-        // Run the host under its deadline, in a kill-on-close Job Object so that it cannot outlive a
-        // converter that is killed. stderr carries its diagnostics; stdout is unused.
+        // Run the host under its deadline. stderr carries its diagnostics; stdout is unused. Nothing
+        // ends the host if this process is itself killed (no Job Object; see `agilent_host`).
         let mut cmd = Command::new(&host);
         cmd.arg(path).arg(&mhdac_dir).arg(&tmp_path);
-        let mut job: Option<agilent_host::job::KillOnClose> = None;
-        let run = agilent_host::run_with_deadline(&mut cmd, timeout, |child| {
-            match agilent_host::job::kill_on_close(child) {
-                Ok(j) => job = Some(j),
-                Err(e) => log::debug!("Agilent host not in a kill-on-close job ({e}); it could outlive a killed converter"),
-            }
-        });
-        drop(job); // the host has exited or was killed: nothing is left for the job to end
+        let run = agilent_host::run_with_deadline(&mut cmd, timeout);
         let stderr = match run {
             Ok(HostExit::Exited { status, stderr }) if status.success() => stderr,
             outcome => {

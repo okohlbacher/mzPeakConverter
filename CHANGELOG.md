@@ -203,20 +203,19 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   activation, and nothing said so; `docs/PLATFORM_SUPPORT.md` now mentions the warning. The reader
   is Windows-only, so `agl::tests::reader_warns_once_about_ms2_rows_without_precursors` pins the
   warning by its source text.
-- **The Agilent host has a deadline, cannot outlive a killed converter and leaves no temp file after
-  a panic, and a `MZPC_AGILENT_TMPDIR` that names no directory is reported.** The converter ran
-  `AgilentGlueHost.exe` with a bare `Command::output()`. A wedged MHDAC call held the run forever;
-  a converter killed from Task Manager or a harness left the host writing its multi-GB `.part`
-  (Windows does not end children with their parent); and under `panic = "abort"` the `.bin` and
-  `.part` stayed behind. Now the host runs under `MZPC_AGILENT_HOST_TIMEOUT` (seconds, default
-  7200, `0` = none) and past it is killed and its files removed. It runs in a Job Object with
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, declared by hand from kernel32 because windows-sys is in the
-  tree without its JobObjects feature. Both temp files are on the panic-hook sweep, and stderr is
-  drained while waiting, so a talkative host cannot stall. A mistyped `MZPC_AGILENT_TMPDIR` fell
-  back to `%TEMP%` in silence, putting gigabytes on the drive the variable was set to avoid; it now
-  warns. The decisions and the wait live in the host-compiled `src/agilent_host.rs`, with tests (a
-  `sleep` past its deadline, a 1 MiB stderr, the variable parsing). The Job Object and the call
-  site compile only on Windows CI, and a Ctrl+C still leaves the temp file.
+- **The Agilent host has a deadline and leaves no temp file after a panic, and a
+  `MZPC_AGILENT_TMPDIR` that names no directory is reported.** The converter ran
+  `AgilentGlueHost.exe` with a bare `Command::output()`, so a wedged MHDAC call could hold the run
+  forever, and under `panic = "abort"` the `.bin` and `.part` stayed behind. Now the host runs under
+  `MZPC_AGILENT_HOST_TIMEOUT` (seconds, default 7200, `0` = none) and past it is killed and its
+  files removed; both temp files are on the panic-hook sweep; and the new wait drains stderr as
+  `output()` did. A mistyped `MZPC_AGILENT_TMPDIR` fell back to `%TEMP%` in silence, putting
+  gigabytes on the drive the variable was set to avoid; it now warns. The decisions and the wait
+  live in the host-compiled `src/agilent_host.rs`, with tests (a `sleep` past its deadline, a 1 MiB
+  stderr, the variable parsing); the call site compiles only on Windows CI. Not fixed: a converter
+  that is itself killed still leaves the host running (Windows does not end children with their
+  parent), because a kill-on-close Job Object needs windows-sys's `Win32_System_JobObjects`
+  feature, which the dependency tree does not enable; and a Ctrl+C still leaves the temp file.
 - **Documentation that contradicted the code.** `docs/PLATFORM_SUPPORT.md` named the
   `#[cfg(windows)]` modules as Agilent, MIDAC, SciEX and Waters. They are Agilent, SciEX and
   Shimadzu; the Waters reader compiles everywhere and only its dispatch is gated. The page's legend

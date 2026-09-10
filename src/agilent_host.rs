@@ -3,15 +3,19 @@
 //!
 //! Host-independent ON PURPOSE (the `sciex_run` pattern): `agilent.rs` is `#[cfg(windows)]`, so
 //! nothing in it compiles or runs here. It used to spawn the host with a bare `Command::output()`:
-//! no deadline, nothing to stop the host when the converter was killed, and a `MZPC_AGILENT_TMPDIR`
-//! that named no directory ignored in silence. The decisions and the wait live here with tests that
-//! run on every host; only the Job Object at the bottom is Windows code. Standard library only.
+//! no deadline, and a `MZPC_AGILENT_TMPDIR` that named no directory ignored in silence. The
+//! decisions and the wait live here with tests that run on every host. Standard library only.
+//!
+//! Not covered: a converter that is itself killed leaves the host running, writing its temp file
+//! (Windows does not end children with their parent). A kill-on-close Job Object would end it, but
+//! windows-sys is in the tree without its `Win32_System_JobObjects` feature, so that waits for a
+//! dependency change (BACKLOG).
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// The host's deadline when `MZPC_AGILENT_HOST_TIMEOUT` is unset: two hours. The host needs about
@@ -67,17 +71,11 @@ pub enum HostExit {
 
 /// Spawn `cmd` and wait for it, for at most `timeout` (`None` = no deadline). Past the deadline the
 /// child is killed and reaped before this returns, so the caller can remove the files it was
-/// writing. `on_spawn` runs right after the spawn: the Windows lane puts the child into its
-/// kill-on-close Job Object there. stdin and stdout are null (the host reads nothing and prints its
-/// notes to stderr); stderr is drained on a thread, so a host that writes a lot there cannot fill
-/// the pipe and stall until the deadline.
-pub fn run_with_deadline(
-    cmd: &mut Command,
-    timeout: Option<Duration>,
-    on_spawn: impl FnOnce(&Child),
-) -> std::io::Result<HostExit> {
+/// writing. stdin and stdout are null (the host reads nothing and prints its notes to stderr);
+/// stderr is drained on a thread, as `output()` did, so a host that writes a lot there cannot fill
+/// the pipe and stall this wait until the deadline.
+pub fn run_with_deadline(cmd: &mut Command, timeout: Option<Duration>) -> std::io::Result<HostExit> {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
-    on_spawn(&child);
     let mut pipe = child.stderr.take().expect("stderr was piped");
     let drain = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -101,112 +99,6 @@ pub fn run_with_deadline(
                 let _ = child.wait();
                 return other.map(|_| HostExit::TimedOut);
             }
-        }
-    }
-}
-
-/// A Job Object that ends the processes inside it when its last handle closes — which Windows does
-/// for a process that is killed (Task Manager, `Stop-Process`, a harness timeout). Windows does not
-/// end children with their parent, so without it a killed converter left the host running and
-/// writing its multi-GB `.part`.
-///
-/// Four kernel32 calls, declared here: windows-sys is in the tree, but without its
-/// `Win32_System_JobObjects` feature, and these do not justify a dependency change. The layouts
-/// follow windows-sys 0.61's `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` (144 bytes on 64-bit Windows).
-#[cfg(windows)]
-pub mod job {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
-    /// `JOBOBJECTINFOCLASS::JobObjectExtendedLimitInformation`.
-    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-
-    #[repr(C)]
-    #[derive(Default)]
-    #[allow(dead_code)] // filled in for the kernel, never read back
-    struct BasicLimitInformation {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    #[allow(dead_code)]
-    struct IoCounters {
-        read_operation_count: u64,
-        write_operation_count: u64,
-        other_operation_count: u64,
-        read_transfer_count: u64,
-        write_transfer_count: u64,
-        other_transfer_count: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    #[allow(dead_code)]
-    struct ExtendedLimitInformation {
-        basic_limit_information: BasicLimitInformation,
-        io_info: IoCounters,
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    const _: () = assert!(std::mem::size_of::<ExtendedLimitInformation>() == 144);
-    #[cfg(target_pointer_width = "64")]
-    const _: () = assert!(std::mem::offset_of!(BasicLimitInformation, limit_flags) == 16);
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
-        fn SetInformationJobObject(job: *mut c_void, class: i32, info: *const c_void, len: u32) -> i32;
-        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-
-    /// The job's handle; dropping it closes the handle, which ends whatever is still inside.
-    pub struct KillOnClose(*mut c_void);
-
-    impl Drop for KillOnClose {
-        fn drop(&mut self) {
-            // SAFETY: a handle CreateJobObjectW returned, closed exactly once.
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-
-    /// Put `child` into a new kill-on-close job.
-    pub fn kill_on_close(child: &Child) -> std::io::Result<KillOnClose> {
-        // SAFETY: kernel32 calls on the job handle created here (owned by `job`, so every early
-        // return closes it) and on the live child's process handle; `info` outlives the call that
-        // reads it, and `len` is its size.
-        unsafe {
-            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if handle.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-            let job = KillOnClose(handle);
-            let mut info = ExtendedLimitInformation::default();
-            info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let len = std::mem::size_of::<ExtendedLimitInformation>() as u32;
-            let info_ptr = std::ptr::from_ref(&info).cast::<c_void>();
-            if SetInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, info_ptr, len) == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if AssignProcessToJobObject(job.0, child.as_raw_handle().cast()) == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(job)
         }
     }
 }
@@ -245,8 +137,7 @@ mod tests {
     #[test]
     fn a_host_past_its_deadline_is_killed_and_reaped() {
         let started = Instant::now();
-        let exit = run_with_deadline(Command::new("sleep").arg("30"), Some(Duration::from_millis(300)), |_| {})
-            .unwrap();
+        let exit = run_with_deadline(Command::new("sleep").arg("30"), Some(Duration::from_millis(300))).unwrap();
         assert!(matches!(exit, HostExit::TimedOut), "{exit:?}");
         assert!(started.elapsed() < Duration::from_secs(10), "returned after {:?}", started.elapsed());
     }
@@ -257,14 +148,12 @@ mod tests {
         // 1 MiB on stderr, more than a pipe buffer holds: a wait that does not drain it stalls.
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "head -c 1048576 /dev/zero >&2; exit 3"]);
-        let mut spawned = false;
-        match run_with_deadline(&mut cmd, Some(Duration::from_secs(60)), |_| spawned = true).unwrap() {
+        match run_with_deadline(&mut cmd, Some(Duration::from_secs(60))).unwrap() {
             HostExit::Exited { status, stderr } => {
                 assert_eq!(status.code(), Some(3));
                 assert_eq!(stderr.len(), 1 << 20);
             }
             HostExit::TimedOut => panic!("a 1 MiB stderr stalled the wait until the deadline"),
         }
-        assert!(spawned, "on_spawn runs once the child exists");
     }
 }

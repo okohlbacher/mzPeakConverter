@@ -55,9 +55,10 @@ then per record:
 `AGL1` (0.9.x) had no strings; a converter given one asks for a rebuilt host. The whole run is
 materialised before the first spectrum is read — 16 B/point, about 3 GB for a 240 MB Q-TOF `.d` —
 and the file is removed when the reader closes. The converter gives the host a deadline
-(`MZPC_AGILENT_HOST_TIMEOUT`, default two hours) and puts it in a kill-on-close Job Object, so a
-stuck host is killed and a killed converter takes the host with it; its panic hook removes the
-`.bin` and `.part` as well. A Ctrl+C, which ends both processes, still leaves the file behind.
+(`MZPC_AGILENT_HOST_TIMEOUT`, default two hours), so a stuck host is killed; its panic hook removes
+the `.bin` and `.part` as well. A Ctrl+C, which ends both processes, still leaves the file behind,
+and a converter killed on its own leaves the host running (Windows does not end children with their
+parent).
 
 Exit 0 on success; non-zero with one diagnostic line on **stderr** on failure (and `out.bin` is
 removed). stdout is left clean. The Rust side seeks per-record via the offset table, so spectra are
