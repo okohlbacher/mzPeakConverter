@@ -415,9 +415,10 @@ struct Cli {
 
     /// SciEX `.wiff` holding SEVERAL samples: which one to convert (1-based). An archive is ONE
     /// run, so a multi-sample file is refused without this (concatenating the samples under one
-    /// run id, as before 0.12, was a conversion of none of them). The msconvert lane maps it to
-    /// `--runIndexSet <N-1>`; without it that lane silently kept only the LAST sample.
-    #[arg(long, value_name = "N")]
+    /// run id, as before 0.12, was a conversion of none of them). The msconvert lanes map it to
+    /// `--runIndexSet <N-1>` and refuse a multi-run file without it: msconvert writes every run
+    /// onto the one output, so only the LAST would survive.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     sample: Option<u32>,
 
     /// Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from
@@ -1769,6 +1770,35 @@ fn is_wiff(input: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("wiff") || e.eq_ignore_ascii_case("wiff2"))
 }
 
+/// `--sample N` for both msconvert lanes (mzPeak and `--to mzml`). A multi-sample WIFF is several
+/// runs; with one `--outfile` msconvert writes them in turn and the LAST wins (En_PPY: 117
+/// samples, one survived), so the run is picked explicitly.
+fn msconvert_sample_arg(cmd: &mut Command, input: &Path) {
+    if let Some(n) = sciex_sample().filter(|_| is_wiff(input)) {
+        cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
+    }
+}
+
+/// Refuse what `msconvert_sample_arg` could not prevent: several runs written onto one output.
+/// msconvert prints `writing output file: <path>` once per run, before writing it (`processFile`
+/// in pwiz's `msconvert.cpp`), so more than one such line in its log means the output holds only
+/// the last run. Counted from the log rather than from files: without `--outfile` pwiz names a
+/// run `<wiff>-<sample name>`, and samples that share a name overwrite each other there too.
+fn refuse_multi_run(log: &Path) -> Result<()> {
+    // ponytail: read once msconvert has written EVERY run (En_PPY: all 117); tail the log while it
+    // runs and kill it at the second line if that wait matters.
+    let runs = String::from_utf8_lossy(&fs::read(log).unwrap_or_default())
+        .matches("writing output file:")
+        .count();
+    if runs > 1 {
+        bail!(
+            "msconvert wrote {runs} runs onto the one output, so only the last survived; an output \
+             is ONE run — pass --sample <1..{runs}> to choose which to convert"
+        );
+    }
+    Ok(())
+}
+
 /// True for a Waters MassLynx `.raw`. Unlike a Thermo `.raw` (a single FILE), a Waters `.raw` is
 /// a DIRECTORY with a `.raw` extension that holds `_HEADER.TXT` and per-function `_FUNCnnn.DAT`
 /// files. Requiring `is_dir()` keeps it from colliding with the Thermo `.raw` file; the
@@ -1901,14 +1931,7 @@ fn convert_via_msconvert(
         .arg(&tmpdir)
         .arg("--outfile")
         .arg("via_msconvert.mzML");
-    // A multi-sample WIFF is several runs; with one `--outfile` msconvert writes them in turn and
-    // the LAST wins (En_PPY: 117 samples, one survived). `--sample N` picks the run explicitly.
-    if let Some(n) = sciex_sample() {
-        let ext = input.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-        if ext == "wiff" || ext == "wiff2" {
-            cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
-        }
-    }
+    msconvert_sample_arg(&mut cmd, input);
     // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
     // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
     if let Ok(f) = fs::File::create(&mzcvt_log) {
@@ -1945,6 +1968,7 @@ fn convert_via_msconvert(
     if !mzml.exists() {
         bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), msconvert_tail());
     }
+    refuse_multi_run(&mzcvt_log)?;
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
@@ -2404,6 +2428,7 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
         .arg(&tmp.dir)
         .arg("--outfile")
         .arg("via_msconvert.mzML");
+    msconvert_sample_arg(&mut cmd, input);
     if let Ok(f) = fs::File::create(&log_path) {
         if let Ok(f2) = f.try_clone() {
             cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
@@ -2437,6 +2462,7 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
     if !tmp.file.exists() {
         bail!("msconvert reported success but produced no mzML at {}{}", tmp.file.display(), tail());
     }
+    refuse_multi_run(&log_path)?;
     // msconvert's own `--gzip` would pick the file name again; compress what it wrote instead.
     let written = if has_gz_suffix(output) {
         let gz = tmp.dir.join("via_msconvert.mzML.gz");
