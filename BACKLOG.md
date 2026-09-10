@@ -203,6 +203,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   `cfg_attr(not(windows), allow(dead_code))` form: `library_path`, `calibration_used`,
   `spectrum_meta`, `analysis_date`, `lcd_path`, `sample_arrays`, and four `is_empty` methods are
   never read on the only host that compiles them. Sweep on the box.
+- **`sbom.cdx.json` is tracked but has never been regenerated.** It declares
+  `mzpeak-convert 0.1.0` with 395 components and no timestamp, nothing in `.github/workflows` or the
+  release ritual regenerates it, and the dependency tree has moved a long way since (vendored
+  mzdata and mzpeak_prototyping, the .NET glue). A tracked SBOM that names a version the project
+  has not built for months is worse than none: either regenerate it as a release step, beside the
+  `Cargo.lock` bump the 0.11.4 release added, or stop tracking it and generate on demand.
 
 ## History
 
