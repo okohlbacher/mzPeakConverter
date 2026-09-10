@@ -358,8 +358,9 @@ mixed run's `spectra_data` holds only its profile spectra), so an index below th
 no row. The
 **run total** lives on the primary metadata facets (`spectra_metadata`, `chromatograms_metadata`,
 `wavelength_spectra_metadata`), which also repeat the data facets' point totals; the secondaries
-(`_scans`, `_precursors`, `_selected_ions`) carry the run total after a direct conversion (an
-archive rewrite re-stamps them with the entities present in that facet — nothing reads them). To
+(`_scans`, `_precursors`, `_selected_ions`) carry no entity count, and a rewrite does not keep the
+one an older archive has (through 0.11.5 a conversion stamped the run total there, even on a facet
+with no rows, and a rewrite the entities left in that facet). To
 plan reads, use the per-spectrum `number_of_data_points` / `number_of_peaks` columns of
 `spectra_metadata` (the spec's mechanism) or the actual indices in the facet; a facet with
 `num_rows == 0` has nothing to read whatever its footer says. Archives from 0.11.2 to 0.11.5

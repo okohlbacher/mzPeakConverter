@@ -441,6 +441,9 @@ enum Facet {
     /// v0.7 split layout: a per-spectrum secondary facet (scans / precursors / selected_ions),
     /// keyed by a TOP-LEVEL `source_index` referencing `spectra_metadata.index`.
     SpectrumSecondary,
+    /// A chromatogram's precursors / selected ions, keyed by `source_index`. Chromatograms are
+    /// truncated, never dropped, so every row stays; the facet is re-encoded to shed a count key.
+    ChromatogramSecondary,
     /// No spectrum linkage — copy verbatim (run-global vendor status log, etc.).
     RunGlobal,
 }
@@ -487,6 +490,9 @@ fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
         && has_top_level(bytes, "index")?
     {
         return Ok(Facet::ChromatogramMeta);
+    }
+    if matches!(fe.entity_type, EntityType::Chromatogram) && has_top_level(bytes, "source_index")? {
+        return Ok(Facet::ChromatogramSecondary);
     }
     // A facet keyed by `source_index` whose index entry does not say which entity owns it cannot be
     // filtered safely: spectrum and chromatogram secondaries are schema-identical. Copying it
@@ -576,6 +582,7 @@ fn process_parquet(
 ) -> Result<Vec<u8>> {
     match class {
         Facet::RunGlobal => Ok(bytes.to_vec()), // verbatim
+        Facet::ChromatogramSecondary => reencode(bytes, |b| Ok(Some(b.clone())), CountMode::Vendor),
         Facet::SpectrumMeta => {
             if !filtering_spectra {
                 reencode(bytes, |b| Ok(Some(b.clone())), CountMode::SpectrumMeta)
@@ -671,6 +678,9 @@ fn process_parquet(
 enum CountMode {
     SpectrumMeta,
     SpectrumData(String),
+    /// Spectrum and chromatogram secondaries and the vendor facets: no entity count (issue #1,
+    /// decision D2). Neither rows nor parents is a count of such a table, and the key an older
+    /// archive carries (the run total) is not preserved.
     Vendor,
     /// Carries the surviving data-point total, known from the `chromatograms_data` prepass.
     ChromatogramMeta(u64),
@@ -777,20 +787,6 @@ fn accumulate_counts(
                 }
             }
         }
-        CountMode::Vendor => {
-            // `ordinal` on legacy/vendor facets; `source_index` on the v0.7 split secondaries
-            // (spectra_metadata_scans/_precursors/_selected_ions). Counting only `ordinal` wrote
-            // `spectrum_count = 0` into every filtered secondary facet.
-            if let Some(idx) = batch
-                .column_by_name("ordinal")
-                .or_else(|| batch.column_by_name("source_index"))
-                .and_then(|a| to_u64(a))
-            {
-                for r in 0..idx.len() {
-                    keys.insert(idx.value(r));
-                }
-            }
-        }
         CountMode::ChromatogramData(field) => {
             if let Some(s) = struct_col(batch, field) {
                 if let Some(idx) = u64_child(s, "chromatogram_index") {
@@ -805,7 +801,7 @@ fn accumulate_counts(
                 }
             }
         }
-        CountMode::ChromatogramMeta(_) => {}
+        CountMode::Vendor | CountMode::ChromatogramMeta(_) => {}
     }
 }
 
@@ -853,7 +849,7 @@ fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> 
             ("spectrum_count".into(), bound),
             ("spectrum_data_point_count".into(), points.to_string()),
         ],
-        CountMode::Vendor => vec![("spectrum_count".into(), keys.len().to_string())],
+        CountMode::Vendor => vec![],
         CountMode::ChromatogramMeta(total) => vec![
             ("chromatogram_count".into(), rows.to_string()),
             ("chromatogram_data_point_count".into(), total.to_string()),
@@ -1314,4 +1310,44 @@ fn to_u64(a: &ArrayRef) -> Option<UInt64Array> {
     use arrow::compute::cast;
     let out = cast(a, &DataType::UInt64).ok()?;
     out.as_any().downcast_ref::<UInt64Array>().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-memory Parquet holding `columns`, with `kv` in its footer.
+    fn parquet(columns: Vec<(&str, ArrayRef)>, kv: &[(&str, &str)]) -> Vec<u8> {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let kv = kv.iter().map(|(k, v)| KeyValue::new(k.to_string(), v.to_string())).collect();
+        let props = WriterProperties::builder().set_key_value_metadata(Some(kv)).build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        buf
+    }
+
+    fn footer_keys(bytes: &[u8]) -> Vec<String> {
+        let b = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes)).unwrap();
+        b.metadata().file_metadata().key_value_metadata().map_or(vec![], |kvs| kvs.iter().map(|kv| kv.key.clone()).collect())
+    }
+
+    /// Issue #1, decision D2: a rewrite writes no entity count on a secondary and does not carry over
+    /// the run total an older archive stamped there, on spectrum and chromatogram secondaries alike.
+    #[test]
+    fn rewrite_leaves_no_entity_count_on_secondaries() {
+        let source_index: ArrayRef = Arc::new(UInt64Array::from(vec![0u64, 2]));
+        let survivors: BTreeSet<u64> = [2].into();
+        for (name, entity, kind, key) in [
+            ("spectra_metadata_precursors.parquet", EntityType::Spectrum, DataKind::Precursors, "spectrum_count"),
+            ("chromatograms_metadata_precursors.parquet", EntityType::Chromatogram, DataKind::Precursors, "chromatogram_count"),
+        ] {
+            let bytes = parquet(vec![("source_index", source_index.clone())], &[(key, "4")]);
+            let fe = FileEntry::new(name.to_string(), entity, kind);
+            let class = classify_facet(&bytes, &fe).unwrap();
+            let out = process_parquet(&bytes, class, &survivors, true, &FilterOpts::default(), None).unwrap();
+            assert!(!footer_keys(&out).iter().any(|k| k.ends_with("_count")), "{name}: {:?}", footer_keys(&out));
+        }
+    }
 }
