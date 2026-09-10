@@ -20,7 +20,7 @@ use chrono::NaiveDateTime;
 use mzdata::meta::{InstrumentConfiguration, Sample, Software, SourceFile};
 use mzdata::params::{Param, ParamDescribed};
 
-use crate::run_metadata::{read_text_lossy, term, term_str, AcquisitionTime, VendorRunMetadata};
+use crate::run_metadata::{read_text_lossy, sha1_param, term, term_str, AcquisitionTime, VendorRunMetadata};
 
 /// `$$ Key: value` lines → map (first occurrence wins; values trimmed).
 fn header_fields(text: &str) -> BTreeMap<String, String> {
@@ -31,10 +31,6 @@ fn header_fields(text: &str) -> BTreeMap<String, String> {
         out.entry(k.trim().to_string()).or_insert_with(|| v.trim().to_string());
     }
     out
-}
-
-fn sha1_param(hex: String) -> Param {
-    Param::builder().name("SHA-1").curie(mzdata::curie!(MS:1000569)).value(mzdata::params::Value::String(hex)).build()
 }
 
 /// `Some` when `raw/_HEADER.TXT` exists.

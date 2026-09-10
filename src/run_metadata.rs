@@ -215,7 +215,9 @@ pub(crate) struct MemberPolicy<'a> {
     pub default_member: Option<&'a str>,
 }
 
-fn sha1_param(hex: String) -> Param {
+/// The `MS:1000569` SHA-1 param msconvert records on a source file. The one builder: every lane's
+/// digest goes through it, so the name, accession and string value cannot drift apart per lane.
+pub(crate) fn sha1_param(hex: String) -> Param {
     Param::builder()
         .name("SHA-1")
         .curie(curie!(MS:1000569))
