@@ -72,7 +72,9 @@ none of those readers.
   profile-bearing `.d` in the project corpus converts today: one fails LZF decompression of an
   `MSProfile.bin` segment (`LZF: back-reference before output start`), the other has an IM-QTOF
   `MSScan.xsd` with no `SpectrumParamsType`, which the schema walk rejects. Files outside those
-  two shapes are expected to work; there is no corpus coverage proving it.
+  two shapes are expected to work; there is no corpus coverage proving it. Not carried yet:
+  precursor metadata for MS2 scans (`MSScan.bin`'s precursor fields are not decoded; the lane
+  warns once per run when it writes MS2 rows without one).
 
 ## The .NET glue executables (Windows)
 
