@@ -95,10 +95,10 @@ impl AgilentReader {
     /// Open an Agilent `.d` directory: resolve the host EXE (`MZPC_AGILENT_GLUE`) and the MHDAC dir
     /// (`pwiz_layout::agilent_dll_dir`), run the host to write a temp binary, and load its index.
     pub fn open(path: &Path) -> Result<Self> {
-        let glue_dir = std::env::var_os("MZPC_AGILENT_GLUE").map(PathBuf::from).ok_or_else(|| {
+        let glue_dir = crate::pwiz_layout::glue_dir("MZPC_AGILENT_GLUE", "agilent").ok_or_else(|| {
             anyhow!(
-                "MZPC_AGILENT_GLUE not set — point it at the `dotnet build` output dir of \
-                 glue/agilent/ (containing {HOST_EXE})"
+                "MZPC_AGILENT_GLUE not set and no glue/agilent beside the executable — point it at \
+                 the `dotnet build` output dir of glue/agilent/ (containing {HOST_EXE})"
             )
         })?;
         let host = glue_dir.join(HOST_EXE);

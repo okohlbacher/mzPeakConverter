@@ -78,11 +78,49 @@ pub fn shimadzu_library_status(version: Option<&str>) -> ShimadzuLibrary {
     }
 }
 
+/// Directory holding one of the .NET glue builds (`SciexGlue.dll`, `ShimadzuGlue.dll`, ...).
+///
+/// The `MZPC_*_GLUE` variable wins, as it always has. Without it the release archive's own layout
+/// is used: the Windows `.zip` ships each glue under `glue\<name>\` beside `mzpeak-convert.exe`, and
+/// a converter unpacked anywhere should find it without four variables set by hand. A source build
+/// has no such directory, so `None` comes back and the caller's error still names the variable.
+pub fn glue_dir(var: &str, name: &str) -> Option<std::path::PathBuf> {
+    resolve_glue_dir(
+        std::env::var_os(var).map(std::path::PathBuf::from),
+        std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent),
+        name,
+    )
+}
+
+fn resolve_glue_dir(
+    from_env: Option<std::path::PathBuf>,
+    exe_dir: Option<&std::path::Path>,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    from_env.or_else(|| exe_dir.map(|d| d.join("glue").join(name)).filter(|d| d.is_dir()))
+}
+
 #[cfg(test)]
 mod tests {
     /// Both ProteoWizard layouts resolve, and the documented one wins when both exist. Observed on
     /// one machine: the FLASHApp/OpenMS bundle keeps `vendor_api/Agilent`, the 3.0.26151 installer
     /// flattens the same DLLs beside `msconvert.exe`.
+    #[test]
+    fn glue_dir_prefers_the_variable_then_the_release_layout() {
+        let exe_dir = std::env::temp_dir().join(format!("mzpc-glue-{}", std::process::id()));
+        let bundled = exe_dir.join("glue").join("sciex");
+        std::fs::create_dir_all(&bundled).unwrap();
+        let set = std::path::PathBuf::from("/opt/sciex-glue");
+        // Set: used even though a bundled copy exists beside the exe.
+        assert_eq!(super::resolve_glue_dir(Some(set.clone()), Some(&exe_dir), "sciex"), Some(set));
+        // Unset: the release archive's layout.
+        assert_eq!(super::resolve_glue_dir(None, Some(&exe_dir), "sciex"), Some(bundled));
+        // Unset and not bundled: None, so the lane's error still names the variable.
+        assert_eq!(super::resolve_glue_dir(None, Some(&exe_dir), "shimadzu"), None);
+        assert_eq!(super::resolve_glue_dir(None, None, "sciex"), None);
+        std::fs::remove_dir_all(&exe_dir).ok();
+    }
+
     #[test]
     fn resolves_either_proteowizard_layout() {
         let root = std::env::temp_dir().join(format!("mzpc-agdir-{}", std::process::id()));
