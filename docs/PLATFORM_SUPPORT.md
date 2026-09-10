@@ -89,6 +89,11 @@ dotnet build glue/shimadzu/ShimadzuGlue.csproj -c Release   # → ShimadzuGlue.d
 dotnet build glue/agilent/AgilentGlue.csproj   -c Release   # → AgilentGlueHost.exe (net48)
 ```
 
+**In a release archive** these four builds ship under `glue\<name>\` (`sciex`, `shimadzu`,
+`agilent`, `agilent_midac`) beside `mzpeak-convert.exe`, and the converter looks there whenever the
+variable is unset — so an unpacked Windows release needs no glue variables (releases after 0.11.5;
+0.11.5's archive needs them set). The variable, when set, always wins.
+
 The vendor DLLs themselves are sourced at **runtime** from a ProteoWizard install
 (`MZPC_PWIZ_DIR`); both layouts are probed — `<pwiz>/vendor_api/<Vendor>` as the bundled
 builds arrange it, and flat beside `msconvert.exe` as the standalone installer does (Shimadzu's
@@ -109,6 +114,10 @@ The matrix above is exercised by CI (`.github/workflows/`):
   smoke-convert the committed `tests/fixtures/tiny.pwiz.1.1.mzML`. On Linux the BAF/timsdata
   readers compile in; on macOS they're correctly excluded. (Optional licensed-SDK e2e runs
   only when a runner provides the SDK + sample data.)
+- **`release.yml`** — the release archives: macOS arm64 + x86_64, Linux x86_64 + aarch64 in
+  `manylinux_2_28` (the glibc 2.28 floor is asserted on the binary), Windows x86_64 + ARM64 with
+  the glue, each built and smoke-converted natively on its own architecture. A pull request that
+  edits the workflow runs the whole matrix as a dry run.
 - **`windows.yml`** — Windows: build with the native vendor readers, run tests, build the
   **glues `src/` actually loads — `glue/sciex`, `glue/shimadzu`, `glue/agilent_midac`, plus the
   Agilent net48 host so it stays compilable while `BACKLOG.md` #23 is decided** — and verify
