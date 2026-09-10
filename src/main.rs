@@ -702,9 +702,9 @@ impl Settings {
     }
 }
 
-/// The `<out>.mzpeak.tmp` files currently being written, and msconvert's working directories, with
-/// the thread that registered each, for [`install_tmp_panic_hook`].
-static TMP_IN_FLIGHT: std::sync::Mutex<Vec<(std::thread::ThreadId, PathBuf)>> =
+/// The `<out>.mzpeak.tmp` files currently being written, and msconvert's working directories
+/// (`true`), with the thread that registered each, for [`install_tmp_panic_hook`].
+static TMP_IN_FLIGHT: std::sync::Mutex<Vec<(std::thread::ThreadId, PathBuf, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Owns a lane's `<out>.mzpeak.tmp` until the archive is renamed into place, and removes it on
@@ -724,14 +724,16 @@ struct TmpGuard {
 
 impl TmpGuard {
     fn new(path: &Path) -> Self {
-        Self::register(path);
+        Self::register(path, false);
         Self { path: path.to_path_buf() }
     }
 
-    /// Put `path` in the panic hook's sweep. [`msconvert_dir`] registers its directory this way.
-    fn register(path: &Path) {
+    /// Put `path` in the panic hook's sweep; `dir` for a directory to remove with its contents,
+    /// which only [`msconvert_dir`] registers, having just created it. A tmp file path is only ever
+    /// unlinked: a directory already standing at `<out>.mzpeak.tmp` is not this run's to remove.
+    fn register(path: &Path, dir: bool) {
         if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
-            v.push((std::thread::current().id(), path.to_path_buf()));
+            v.push((std::thread::current().id(), path.to_path_buf(), dir));
         }
     }
 
@@ -747,13 +749,13 @@ impl TmpGuard {
 
     fn forget_path(path: &Path) {
         if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
-            v.retain(|(_, p)| p != path);
+            v.retain(|(_, p, _)| p != path);
         }
     }
 
-    fn remove_quietly(path: &Path) {
-        // A registered directory (msconvert's working directory) goes with everything in it.
-        let removed = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    fn remove_quietly(path: &Path, dir: bool) {
+        // Only a directory registered as one (msconvert's working directory) goes with its contents.
+        let removed = if dir { fs::remove_dir_all(path) } else { fs::remove_file(path) };
         match removed {
             Ok(()) => log::warn!("removed incomplete {}", path.display()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -765,7 +767,7 @@ impl TmpGuard {
 impl Drop for TmpGuard {
     fn drop(&mut self) {
         Self::forget_path(&self.path);
-        Self::remove_quietly(&self.path);
+        Self::remove_quietly(&self.path, false);
     }
 }
 
@@ -798,11 +800,11 @@ fn sweep_tmp_in_flight(all: bool) {
         Err(std::sync::TryLockError::WouldBlock) => return,
     };
     let (mine, rest): (Vec<_>, Vec<_>) =
-        std::mem::take(&mut *guard).into_iter().partition(|(t, _)| all || *t == me);
+        std::mem::take(&mut *guard).into_iter().partition(|(t, _, _)| all || *t == me);
     *guard = rest;
     drop(guard);
-    for (_, p) in mine {
-        TmpGuard::remove_quietly(&p);
+    for (_, p, dir) in mine {
+        TmpGuard::remove_quietly(&p, dir);
     }
 }
 
@@ -3893,7 +3895,7 @@ fn msconvert_dir(parent: &Path) -> Result<TranscodeGuard> {
         let dir = parent.join(format!(".mzpc-msconvert-{}-{stamp}-{attempt}", std::process::id()));
         match fs::create_dir(&dir) {
             Ok(()) => {
-                TmpGuard::register(&dir);
+                TmpGuard::register(&dir, true);
                 return Ok(TranscodeGuard { file: dir.join("via_msconvert.mzML"), dir });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -7520,6 +7522,23 @@ mod tests {
         assert!(!tmp.dir.exists(), "{} survived the sweep", tmp.dir.display());
         drop(tmp);
         let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Only that directory goes with its contents. A directory standing at a tmp FILE path (a user's
+    /// `out.mzpeak.tmp/`) survives both the guard's drop and the sweep: neither created it.
+    #[test]
+    fn tmp_guard_leaves_a_directory_at_its_path_alone() {
+        let dir = scratch("tmpguard-dir");
+        let occupant = dir.join("out.mzpeak.tmp").join("user-file.txt");
+        let tmp = occupant.parent().unwrap();
+        fs::create_dir_all(tmp).unwrap();
+        fs::write(&occupant, b"keep").unwrap();
+        drop(super::TmpGuard::new(tmp));
+        assert!(occupant.is_file(), "the guard's drop removed a directory it did not create");
+        std::mem::forget(super::TmpGuard::new(tmp));
+        super::sweep_tmp_in_flight(false);
+        assert!(occupant.is_file(), "the sweep removed a directory it did not create");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);
