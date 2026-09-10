@@ -189,6 +189,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   re-run. Replayed against a stand-in `gh`: no check runs on a six-hour-old commit ends after 10
   simulated minutes (90 before), an unknown SHA after 2 (90 before); a pass, a pending check, a
   cancelled job and two 502s behave as before.
+- **A release archive is checked for what it claims before it is attached.** The macOS job printed
+  `lipo -archs` without asserting it, and the x86_64 binary never runs on the arm64 runner, so
+  nothing stopped an arm64 build shipping under the x86_64 name: both architectures are now
+  asserted. Wherever the binary runs, `--version` must print `mzpeak-convert <version>` for the
+  version the tag carries, and the smoke archive is read back — its inspection report must count the
+  source's spectra and its mzML export must hold them all — where a non-empty file used to pass.
+  Replayed on the macOS and Linux steps: a truncated smoke archive, a wrong `--version` and an arm64
+  binary checked as x86_64 each fail the job now, and each passed before. The Windows step's
+  PowerShell is exercised only by the release dry run.
 - **Reading an archive back keeps each spectrum's precursors in their source order.** The vendored
   reader attached a spectrum's (and a chromatogram's) precursors in reversed row order, so
   mzML → mzPeak → mzML turned `[(445.3, 445.34), (645.3, 645.34)]` (isolation target, selected ion)
