@@ -90,7 +90,7 @@ const SCALARS: &[(&str, &str, usize)] = &[
 ];
 
 /// The struct twins that cross the boundary.
-const STRUCTS: &[&str] = &["SciexSpectrumMeta", "SciexSpectrumMetaV2"];
+const STRUCTS: &[&str] = &["SciexSpectrumMeta", "SciexSpectrumMetaV2", "SciexValueChanges"];
 
 /// The integer literal right after `needle` (`size_of::<X>() == 72` → 72).
 fn literal_after(src: &str, needle: &str, what: &str) -> usize {
@@ -306,7 +306,7 @@ fn struct_layout_attributes_are_sequential() {
 fn every_export_the_loader_resolves_exists_with_the_same_arity() {
     let rust = rust_resolved_exports();
     let cs = cs_exports();
-    assert!(rust.len() >= 11, "sciex.rs: only {} pdcstr! exports found (parser drift?): {rust:?}", rust.len());
+    assert!(rust.len() >= 12, "sciex.rs: only {} pdcstr! exports found (parser drift?): {rust:?}", rust.len());
     for name in &rust {
         let Some((_, cs_arity)) = cs.iter().find(|(n, _)| n == name) else {
             panic!(

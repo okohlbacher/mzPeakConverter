@@ -216,6 +216,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   Sample002 and MRM_03 with their ProteoWizard twins, and the seven archives need a rebuild to gain
   their precursors. `tests/sciex_abi_pin.rs` holds `src/sciex.rs` and `glue/sciex/Glue.cs` to one
   contract (version literal, struct twins, sizes, exports and their arity).
+- **The native SciEX lane declares what its glue changed in the intensities.** Clearcore2 returns
+  intensities as f64 and the glue narrows them to the schema's f32: NaN becomes 0, a value beyond
+  ±f32::MAX (±Inf included) is clamped to it, and an m/z / intensity pair of unequal length is cut
+  to the shorter one. None of it was counted, so no archive could say it had happened. The glue now
+  counts all three per spectrum (`SpectrumDataV2`), and the archive's `transformations` gains
+  `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` or `sciex:truncate-unequal-arrays`
+  for each kind that happened, with a warning giving the counts; `--to mzml`, which has no such
+  list, logs the warning. No corpus data are known to trigger them (sampled row groups of Sample002
+  and PXD011326 hold no non-integer intensity and none above 121,219). Not yet run on a WIFF.
 
 ### Changed
 
