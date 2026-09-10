@@ -5624,9 +5624,9 @@ fn shimadzu_probe(reader: &shimadzu::ShimadzuReader, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Convert a SciEX `.wiff`/`.wiff2` → mzPeak via the Clearcore2 .NET glue (feature `sciex`,
-/// Windows-runtime-only, UNTESTED here). Mirrors `convert_tsf`. Needs `$MZPC_SCIEX_GLUE` +
-/// `$MZPC_PWIZ_DIR` at runtime (see glue/sciex/README.md).
+/// Convert a SciEX `.wiff`/`.wiff2` → mzPeak via the Clearcore2 .NET glue (`src/sciex.rs`, compiled
+/// on Windows only; there is no cargo feature). Mirrors `convert_tsf`. Needs `$MZPC_SCIEX_GLUE` (or
+/// the release layout's `glue\sciex`) and `$MZPC_PWIZ_DIR` at runtime (see glue/sciex/README.md).
 #[cfg(windows)]
 fn convert_sciex(
     input: &Path,
