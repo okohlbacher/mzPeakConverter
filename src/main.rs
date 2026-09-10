@@ -3255,7 +3255,7 @@ fn convert_agilent_grid(
     // This lane never reaches `assert_source_complete` (a `.d` declares no spectrum count we can
     // read back), so a scan the reader declined to yield would otherwise vanish with exit 0. Name
     // the shortfall — a truncated tail in particular means the archive covers only part of the run.
-    if cap.is_none() {
+    if !cap.is_some_and(|m| n >= m) {
         if let Some(what) = reader.skipped().describe() {
             log::warn!("Agilent-grid: {what}");
         }
@@ -3344,14 +3344,15 @@ fn agilent_grid_transformations(zero_samples: usize, all_zero_scans: usize, f32_
 
 /// The `partial` block for an `--agilent-grid` run whose `MSProfile.bin` ends before its scan
 /// records do (an interrupted acquisition: the reader stops at the first segment past the end of
-/// the file). A capped run (`MZPC_MAX_SPECTRA`) never reads that far and has its own marker.
+/// the file). A run the cap (`MZPC_MAX_SPECTRA`) stopped carries the cap's own marker instead; a
+/// cap above the number of readable records stops nothing, and the tail is marked here all the same.
 fn agilent_truncation_marker(
     cap: Option<usize>,
     skipped: agilent_profile::SkipTally,
     scan_records: usize,
     written: usize,
 ) -> Option<(String, serde_json::Value)> {
-    if cap.is_some() || skipped.truncated_tail == 0 {
+    if cap.is_some_and(|m| written >= m) || skipped.truncated_tail == 0 {
         return None;
     }
     Some((
@@ -8959,6 +8960,9 @@ mod tests {
         assert_eq!(block["scan_records_not_read"], 7);
         assert_eq!(block["spectra_written"], 93);
         assert!(agilent_truncation_marker(Some(10), tail, 100, 10).is_none(), "a capped run keeps the cap's marker");
+        // A cap above what the file holds stopped nothing: its truncated tail is partial all the same.
+        let (_, block) = agilent_truncation_marker(Some(1_000_000), tail, 100, 93).expect("a cap that did not bite");
+        assert_eq!(block["scan_records_not_read"], 7);
         assert!(agilent_truncation_marker(None, crate::agilent_profile::SkipTally::default(), 100, 100).is_none());
     }
 
