@@ -205,6 +205,14 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   scanning backwards at `</spectrumList>`, so an mzML without chromatograms is no longer read end to
   end on every conversion. Pinned by `rebuilt_index_resolves_each_section_against_its_own_list` and
   `declared_chromatogram_count_stops_at_the_end_of_the_spectra`.
+- **An archive → mzML export reads each spectrum once.** It first read every spectrum's metadata to
+  find the survivors, then read the survivors again in full, and it did so without a filter too:
+  that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.
+  Without `--rt`/`--ms-level` the survivors are now simply every spectrum (up to
+  `MZPC_MAX_SPECTRA`); with them they come from one scan of `spectra_metadata`'s `time` and
+  `ms_level` columns, the predicate the `.mzpeak` filter lane already applies. The exported mzML is
+  byte-identical, compared before and after on the committed fixtures and on corpus archives,
+  filtered and not.
 
 ### Changed
 
