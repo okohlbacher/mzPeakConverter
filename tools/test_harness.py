@@ -211,7 +211,7 @@ class BoxPhase(Harness):
         })
         rc, out = self.run_main(root, "--box")
         self.assertEqual(rc, 1, out)
-        self.assertIn("BOX NOT DELIVERED: 2 unit(s), box_convert exit 1", out)
+        self.assertIn("BOX NOT DELIVERED: 2 archive(s), box_convert exit 1", out)
         self.assertEqual(out.split("BOX NOT DELIVERED")[1].count("  - "), 2)
         self.assertTrue((root / "general-ms/ok/run.mzpeak.built").exists())
 
