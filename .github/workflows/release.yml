@@ -1,50 +1,71 @@
-# macOS release artifacts + the Homebrew cask that serves them.
+# Release archives for every platform, plus the Homebrew cask that serves the macOS ones.
 #
-# Runs on a `v*` tag, or on demand against a tag that already exists (a release cut
-# before this workflow landed still gets its assets this way). Both architectures are
-# built on the arm64 runner: aarch64 natively, x86_64 cross-compiled against the same
-# SDK — measured at 1m24s for the full dependency tree, and it keeps the workflow off
-# the Intel runner images, which GitHub is retiring.
+#   macOS    aarch64 native + x86_64 cross-compiled, both on the arm64 runner    .tar.gz
+#   Linux    x86_64 + aarch64, each native, inside manylinux_2_28 (glibc 2.28)  .tar.gz
+#   Windows  x86_64 + aarch64, each native (windows-latest / windows-11-arm)     .zip + .NET glue
+#
+# A `v*` tag builds and publishes. `workflow_dispatch` rebuilds an existing tag — `only` limits it to
+# some platforms, so a release cut before a platform existed can be backfilled without rebuilding
+# (and re-hashing) the archives already published. A pull request that touches this file runs the
+# whole matrix as a DRY RUN: built, verified, kept as workflow artifacts, nothing published — so a
+# broken release job is found before a tag needs it.
+#
+# Linux builds in manylinux_2_28, not on the Ubuntu image: a binary linked against Ubuntu 22.04's
+# glibc 2.35 does not start on RHEL/Rocky/Alma 8 or 9, which is what HPC clusters run. Static musl is
+# not an option either — the Thermo reader dlopens the glibc-built .NET host, and BAF its vendor .so.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and attach macOS assets to (e.g. v0.11.3)"
+        description: "Existing tag to build (e.g. v0.11.5)"
         required: true
         type: string
+      only:
+        description: "Platforms, comma separated: macos,linux,windows (blank = all)"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Build and verify only: attach nothing, leave the tap alone"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
 
 jobs:
   macos:
     name: macOS ${{ matrix.arch }}
+    if: ${{ !inputs.only || contains(inputs.only, 'macos') }}
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            arch: arm64
-          - target: x86_64-apple-darwin
-            arch: x86_64
+          - { target: aarch64-apple-darwin, arch: arm64 }
+          - { target: x86_64-apple-darwin, arch: x86_64 }
     env:
-      TAG: ${{ inputs.tag || github.ref_name }}
       # One floor for both architectures, so the cask's `depends_on macos:` is the truth.
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -55,81 +76,299 @@ jobs:
       - name: The tag and the crate version must agree
         run: |
           set -euo pipefail
-          want="${TAG#v}"
           have="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          [ "$want" = "$have" ] || {
-            echo "::error::tag $TAG carries version $want but Cargo.toml says $have — the assets" \
-                 "would be published under a version the binary does not report"; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "${TAG#v}" != "$have" ]; then
+            echo "::error::tag $TAG carries version ${TAG#v} but Cargo.toml says $have — the assets would be published under a version the binary does not report"
+            exit 1
+          fi
+          echo "VERSION=$have" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
-        id: package
         run: |
           set -euo pipefail
-          version="${TAG#v}"
-          stage="$RUNNER_TEMP/stage"
-          mkdir -p "$stage"
+          stage="$RUNNER_TEMP/stage" dist="$RUNNER_TEMP/dist"
+          mkdir -p "$stage" "$dist"
           cp "target/${{ matrix.target }}/release/mzpeak-convert" "$stage/"
           strip -x "$stage/mzpeak-convert"
-          # strip invalidates the linker's signature, and an arm64 binary must carry
-          # one to run at all — re-sign ad-hoc. Replace this with a Developer ID
-          # signature plus `xcrun notarytool submit --wait` when Apple credentials are
-          # configured for this repository; the cask can then drop its quarantine
-          # stanza, because a notarized binary passes Gatekeeper on its own.
-          # Notarization requires --options runtime, and the hardened runtime enforces
-          # library validation — which would break the Thermo reader, since it dlopens
-          # Microsoft's libhostfxr (a different Team ID). Sign with an entitlements
-          # plist granting com.apple.security.cs.disable-library-validation,
-          # .cs.allow-jit and .cs.allow-unsigned-executable-memory, or that path dies
-          # only on signed builds and never in local testing.
+          # strip invalidates the linker's signature, and an arm64 binary must carry one to run at
+          # all — re-sign ad-hoc. Replace with a Developer ID signature plus `xcrun notarytool submit
+          # --wait` once Apple credentials are configured; the cask can then drop its quarantine
+          # stanza. Notarization requires --options runtime, whose library validation would break
+          # the Thermo reader (it dlopens Microsoft's libhostfxr, a different Team ID): sign with an
+          # entitlements plist granting com.apple.security.cs.disable-library-validation, .allow-jit
+          # and .allow-unsigned-executable-memory, or that path dies only on signed builds.
           codesign --force --sign - "$stage/mzpeak-convert"
           cp LICENSE README.md "$stage/"
-          tarball="mzpeak-convert-${version}-${{ matrix.target }}.tar.gz"
-          ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$RUNNER_TEMP/$tarball" \
-              mzpeak-convert LICENSE README.md )
-          # Hash from inside the directory so the sidecar names the bare file and keeps
-          # shasum's own two-space separator — `shasum -c` rejects anything else.
-          ( cd "$RUNNER_TEMP" && shasum -a 256 "$tarball" > "$tarball.sha256" )
-          echo "tarball=$RUNNER_TEMP/$tarball" >> "$GITHUB_OUTPUT"
-          { echo "### ${{ matrix.target }}"; echo '```'; cat "$RUNNER_TEMP/$tarball.sha256"; echo '```'; } \
-            >> "$GITHUB_STEP_SUMMARY"
+          tarball="mzpeak-convert-$VERSION-${{ matrix.target }}.tar.gz"
+          ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$dist/$tarball" mzpeak-convert LICENSE README.md )
+          # Hash from inside the directory so the sidecar names the bare file with shasum's own
+          # two-space separator — `shasum -c` rejects anything else.
+          ( cd "$dist" && shasum -a 256 "$tarball" > "$tarball.sha256" )
+          { echo "### ${{ matrix.target }}"; echo '```'; cat "$dist/$tarball.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify the artifact
+      - name: Verify
         run: |
           set -euo pipefail
-          stage="$RUNNER_TEMP/stage"
-          file "$stage/mzpeak-convert"
-          lipo -archs "$stage/mzpeak-convert"
-          codesign -dvv "$stage/mzpeak-convert" 2>&1 | grep -E "Signature|flags"
+          bin="$RUNNER_TEMP/stage/mzpeak-convert"
+          file "$bin"
+          lipo -archs "$bin"
+          codesign -dvv "$bin" 2>&1 | grep -E "Signature|flags"
+          ( cd "$RUNNER_TEMP/dist" && shasum -a 256 -c ./*.sha256 )
           # Only the native slice can be executed on this runner.
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            "$stage/mzpeak-convert" --version
-            "$stage/mzpeak-convert" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            "$bin" --version
+            "$bin" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
             test -s "$RUNNER_TEMP/smoke.mzpeak"
           fi
 
-      - name: Attach to the release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    if: ${{ !inputs.only || contains(inputs.only, 'linux') }}
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, arch: x86_64, runner: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: The tag and the crate version must agree
+        shell: bash
+        run: |
+          set -euo pipefail
+          have="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "${TAG#v}" != "$have" ]; then
+            echo "::error::tag $TAG carries version ${TAG#v} but Cargo.toml says $have — the assets would be published under a version the binary does not report"
+            exit 1
+          fi
+          echo "VERSION=$have" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage" dist="$RUNNER_TEMP/dist"
+          mkdir -p "$stage" "$dist"
+          cp target/release/mzpeak-convert LICENSE README.md "$stage/"
+          strip "$stage/mzpeak-convert"
+          tarball="mzpeak-convert-$VERSION-${{ matrix.target }}.tar.gz"
+          tar -C "$stage" -czf "$dist/$tarball" mzpeak-convert LICENSE README.md
+          ( cd "$dist" && sha256sum "$tarball" > "$tarball.sha256" )
+          { echo "### ${{ matrix.target }}"; echo '```'; cat "$dist/$tarball.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/stage/mzpeak-convert"
+          file "$bin" 2>/dev/null || true
+          # The glibc floor is the whole reason for the container: a symbol version above 2.28 means
+          # something pulled in a newer libc and the binary will not start on RHEL/Rocky 8.
+          floor="$(grep -ao 'GLIBC_2\.[0-9]*' "$bin" | sort -uV | tail -1)"
+          echo "highest glibc symbol version required: $floor"
+          [ "$(printf '%s\n' "$floor" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
+            || { echo "::error::binary requires $floor, above the manylinux_2_28 floor"; exit 1; }
+          ( cd "$RUNNER_TEMP/dist" && sha256sum -c ./*.sha256 )
+          "$bin" --version
+          "$bin" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
+          test -s "$RUNNER_TEMP/smoke.mzpeak"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    if: ${{ !inputs.only || contains(inputs.only, 'windows') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, arch: x86_64, runner: windows-latest, machine: 0x8664 }
+          - { target: aarch64-pc-windows-msvc, arch: aarch64, runner: windows-11-arm, machine: 0xAA64 }
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # nethost's build script downloads the loader from NuGet over rustls, and ring assembles its
+      # aarch64 sources with clang, which the MSVC toolchain alone does not provide.
+      - name: clang for ring (arm64)
+        if: matrix.arch == 'aarch64'
+        run: |
+          if (Get-Command clang -ErrorAction SilentlyContinue) { clang --version; exit 0 }
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) { Write-Output "::warning::no clang and no choco on this image"; exit 0 }
+          choco install llvm -y --no-progress
+          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: The tag and the crate version must agree
+        run: |
+          $have = ((Get-Content Cargo.toml | Select-String '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value)
+          $want = $env:TAG -replace '^v', ''
+          if ($env:GITHUB_EVENT_NAME -ne 'pull_request' -and $want -ne $have) {
+            Write-Output "::error::tag $env:TAG carries version $want but Cargo.toml says $have — the assets would be published under a version the binary does not report"
+            exit 1
+          }
+          "VERSION=$have" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Reflection-only glue: builds without the vendor DLLs, and is architecture-neutral managed
+      # code (the Agilent host is an x64 net48 exe, which Windows 11 on ARM runs under emulation).
+      - name: Build the .NET glue
+        run: |
+          foreach ($p in 'glue/sciex/SciexGlue.csproj', 'glue/shimadzu/ShimadzuGlue.csproj',
+                         'glue/agilent/AgilentGlue.csproj', 'glue/agilent_midac/AgilentMidacGlue.csproj') {
+            dotnet build $p -c Release
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::dotnet build $p failed"; exit 1 }
+          }
+
+      - name: Package
+        run: |
+          $name  = "mzpeak-convert-$env:VERSION-${{ matrix.target }}"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          $dist  = Join-Path $env:RUNNER_TEMP 'dist'
+          New-Item -ItemType Directory -Force $stage, $dist | Out-Null
+          Copy-Item target/release/mzpeak-convert.exe, LICENSE, README.md $stage
+          # The converter looks for each glue under glue\<name>\ beside the exe when its MZPC_*_GLUE
+          # variable is unset, so this layout is the contract, not a convenience.
+          $glue = [ordered]@{
+            sciex         = 'glue/sciex/bin/Release/net8.0'
+            shimadzu      = 'glue/shimadzu/bin/Release/net8.0'
+            agilent       = 'glue/agilent/bin/Release/net48'
+            agilent_midac = 'glue/agilent_midac/bin/Release/net8.0'
+          }
+          foreach ($k in $glue.Keys) {
+            $d = Join-Path $stage "glue/$k"
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Get-ChildItem $glue[$k] -File | Where-Object Extension -ne '.pdb' | Copy-Item -Destination $d
+          }
+          $zip = Join-Path $dist "$name.zip"
+          Compress-Archive -Path $stage -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$zip.sha256", "$hash  $name.zip`n")
+          "STAGE=$stage" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "### ${{ matrix.target }}`n``````n$hash  $name.zip`n``````" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Verify
+        run: |
+          $exe = Join-Path $env:STAGE 'mzpeak-convert.exe'
+          # The PE machine field, so an x64 build can never ship under the arm64 name or back.
+          $b = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+          Write-Output ("PE machine 0x{0:X4}" -f $machine)
+          if ($machine -ne ${{ matrix.machine }}) { Write-Output "::error::expected machine ${{ matrix.machine }}"; exit 1 }
+
+          $need = 'glue/sciex/SciexGlue.dll', 'glue/sciex/SciexGlue.runtimeconfig.json',
+                  'glue/shimadzu/ShimadzuGlue.dll', 'glue/shimadzu/ShimadzuGlue.runtimeconfig.json',
+                  'glue/agilent/AgilentGlueHost.exe',
+                  'glue/agilent_midac/AgilentMidacGlue.dll', 'glue/agilent_midac/AgilentMidacGlue.runtimeconfig.json'
+          $missing = $need | Where-Object { -not (Test-Path (Join-Path $env:STAGE $_)) }
+          if ($missing) { Write-Output "::error::archive lacks: $($missing -join ', ')"; exit 1 }
+
+          # Shimadzu.LabSolutions.IO 5.0 deserialises through BinaryFormatter, which .NET disables
+          # unless the generated runtimeconfig says otherwise — without it every .lcd looks unreadable.
+          $cfg = Get-Content (Join-Path $env:STAGE 'glue/shimadzu/ShimadzuGlue.runtimeconfig.json') -Raw | ConvertFrom-Json
+          if ($cfg.runtimeOptions.configProperties.'System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization' -ne $true) {
+            Write-Output "::error::ShimadzuGlue.runtimeconfig.json does not enable BinaryFormatter"; exit 1
+          }
+
+          # With no arguments the Agilent host prints its usage and exits 2: proof the exe boots on
+          # this image (under x64 emulation on the arm64 runner). Start-Process, not `& exe 2>&1`,
+          # whose $LASTEXITCODE ended this check with exit 1 and no diagnostic on pwsh 7.6.
+          $p = Start-Process -FilePath (Join-Path $env:STAGE 'glue/agilent/AgilentGlueHost.exe') -NoNewWindow -Wait -PassThru
+          Write-Output "AgilentGlueHost.exe exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 2) { Write-Output "::error::AgilentGlueHost.exe exited $($p.ExitCode), expected 2"; exit 1 }
+
+          $zip = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'dist') -Filter *.zip | Select-Object -First 1
+          $want = (Get-Content "$($zip.FullName).sha256").Split(' ')[0]
+          if ((Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower() -ne $want) { Write-Output "::error::sidecar mismatch"; exit 1 }
+
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $smoke = Join-Path $env:RUNNER_TEMP 'smoke.mzpeak'
+          & $exe tests/fixtures/tiny.pwiz.1.1.mzML -o $smoke --force
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $smoke) -or (Get-Item $smoke).Length -eq 0) { Write-Output "::error::smoke conversion failed"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # One place attaches everything, so the platform jobs no longer race to create the release, and a
+  # platform that failed does not hold back the ones that built — the run still goes red for it.
+  publish:
+    name: Attach to the release
+    needs: [macos, linux, windows]
+    if: ${{ always() && !cancelled() && github.event_name != 'pull_request' && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Check every sidecar, then attach
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A tag pushed without a release yet (or a re-run) should still work. The two
-          # matrix jobs race here; whoever loses simply finds the release already there.
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no platform produced an archive"; exit 1; }
+          # Hashes written on three operating systems, checked on a fourth.
+          ( cd dist && sha256sum -c ./*.sha256 )
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes \
-            || true
-          gh release upload "$TAG" \
-            "${{ steps.package.outputs.tarball }}" \
-            "${{ steps.package.outputs.tarball }}.sha256" \
-            --clobber --repo "$GITHUB_REPOSITORY"
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
+          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          { echo "### attached to $TAG"; ls -l dist | sed 's/^/    /'; } >> "$GITHUB_STEP_SUMMARY"
 
   cask:
     name: Update the Homebrew tap
-    needs: macos
+    needs: [macos, publish]
+    if: ${{ always() && needs.macos.result == 'success' && needs.publish.result == 'success' }}
     runs-on: macos-latest
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,7 +388,7 @@ jobs:
           fi
 
       - name: Point the cask at this release
-        if: steps.guard.outputs.skip != 'true' 
+        if: steps.guard.outputs.skip != 'true'
         run: tools/update_homebrew.sh "$TAG"
 
       - name: Commit
@@ -165,6 +404,6 @@ jobs:
           git commit -m "homebrew: mzpeak-convert $TAG [skip ci]"
           git push || {
             echo "::error::could not push the cask update (protected branch?). Run" \
-                 "\`tools/update_homebrew.sh $TAG\` locally and commit the two files it changes."
+                 "\`tools/update_homebrew.sh $TAG\` locally and commit the file it changes."
             exit 1
           }
