@@ -215,6 +215,15 @@ class BoxPhase(Harness):
         self.assertTrue((root / "general-ms/ok/run.mzpeak.built").exists())
 
 
+class BoxScripts(unittest.TestCase):
+    def test_no_box_script_sets_dotnet_roll_forward(self):
+        # mzpeak-convert sets LatestMajor for Thermo .raw only (src/main.rs). A box-wide export lifts
+        # the Shimadzu and SciEX glues onto whatever newer .NET major sits in the dotnet8 root.
+        for ps1 in sorted(TOOLS.glob("*.ps1")):
+            for n, line in enumerate(ps1.read_text(encoding="utf-8").splitlines(), 1):
+                self.assertNotRegex(line.split("#", 1)[0], r"DOTNET_ROLL_FORWARD\s*=", f"{ps1.name}:{n}")
+
+
 # ---- box_convert.sh ---------------------------------------------------------------------------
 # Its functions run in a bash with every network edge replaced: `box` answers the ssh call with a
 # canned BOXRESULT (and records Remove-Item calls), `relay` stands in for s3_relay.py, and `scp`

@@ -87,7 +87,10 @@ function Open-CacheLock {      # exclusive per-unit lock; $null on timeout (call
 
 # Vendor SDK environment the converter needs for .wiff/.raw/.d (box-specific paths). Override any of
 # these by creating C:\Users\User\box_convert_env.ps1 (dot-sourced last if present).
-$env:DOTNET_ROOT = 'C:\Users\User\dotnet8'; $env:DOTNET_ROLL_FORWARD = 'LatestMajor'
+# No DOTNET_ROLL_FORWARD: mzpeak-convert sets LatestMajor itself, for Thermo .raw only. Exported for
+# every unit it would lift the Shimadzu glue and Clearcore2 onto any newer major installed in this
+# root, where the .lcd lane loses BinaryFormatter and the SciEX lane runs on an unverified runtime.
+$env:DOTNET_ROOT = 'C:\Users\User\dotnet8'
 $cvtRoot = 'C:\Users\User\src\mzPeakConverter'
 # ProteoWizard install that supplies every vendor reader. Switched 2026-09-03 from the FLASHApp
 # bundle to a STANDALONE pwiz: the bundle carries Shimadzu.LabSolutions.IO 3.8.4.6016, which returns

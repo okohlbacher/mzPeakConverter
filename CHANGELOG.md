@@ -211,6 +211,11 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   way. The report now prints `BOX NOT DELIVERED` with the units and `box_convert.sh`'s exit code,
   and either one fails the run. An archive that arrived but was left unstamped counts as not
   delivered.
+- **The box scripts no longer export `DOTNET_ROLL_FORWARD=LatestMajor` for every unit**
+  (`tools/box_convert_remote.ps1`, `tools/box_local_convert.ps1`). The binary sets it itself, for
+  Thermo `.raw` only and only when unset (0.9.12). Exported box-wide, it overrode that scoping.
+  Once a newer .NET major is installed in the box's `dotnet8` root, every `.lcd` would fail on the
+  Shimadzu glue's BinaryFormatter path, and Clearcore2 would run on an unverified runtime.
 
 ### Changed
 
