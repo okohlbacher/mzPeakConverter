@@ -122,9 +122,10 @@ fn data_facet_counts_describe_this_file_not_the_run() {
     assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_count"), 2);
     assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_data_point_count"), 30);
 
-    // chromatograms_data now carries its own entity count, same definition.
-    assert_eq!(declared(&archive, "chromatograms_data.parquet", "chromatogram_count"), 2);
-    assert_eq!(declared(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), 2);
+    // chromatograms_data now carries its own entity count, same definition: the synthesized TIC and
+    // base peak plus the source's `sic` (its `tic` is superseded by the synthesized one).
+    assert_eq!(declared(&archive, "chromatograms_data.parquet", "chromatogram_count"), 3);
+    assert_eq!(declared(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), 3);
 
     let _ = std::fs::remove_file(&archive);
 }
@@ -166,7 +167,8 @@ fn wavelength_facets_carry_their_own_counts() {
 fn chromatogram_data_count_is_zero_when_nothing_was_written() {
     // With synthesis off the fixture's (unindexed, unread) chromatogramList yields a metadata row
     // with no points: the DATA facet must say 0 entities / 0 points, not repeat the metadata's 1.
-    let archive = convert_fixture_with("tiny.pwiz.1.1.mzML", "nochrom", &["--no-chromatograms"]);
+    // Not `tiny.pwiz.1.1.mzML`: that one is indexed, and its `tic` + `sic` are read.
+    let archive = convert_fixture_with("tiny_centroid_only.mzML", "nochrom", &["--no-chromatograms"]);
     assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_count"), (0, 0));
     assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_data_point_count"), (0, 0));
     assert_eq!(declared(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), 1);
