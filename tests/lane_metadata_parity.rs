@@ -154,8 +154,9 @@ const EXPECTED: &[Expected] = &[
         key: "transformations",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "the declared transformation list follows the encoding each lane chose, which is the \
-                 point of declaring it.",
+        reason: "the transformation list states what each lane applied to its stored data (the codec \
+                 it used, the spectra it masked, re-sorted or gridded), which differs by lane by \
+                 construction.",
     },
     Expected {
         key: "facet.spectra_data.parquet.columns",
