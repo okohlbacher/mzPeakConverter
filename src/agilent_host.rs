@@ -82,7 +82,8 @@ pub fn run_with_deadline(cmd: &mut Command, timeout: Option<Duration>) -> std::i
         let _ = pipe.read_to_end(&mut buf);
         buf
     });
-    let deadline = timeout.map(|t| Instant::now() + t);
+    // `Instant + Duration` panics past what the clock can hold: a deadline that far off is none.
+    let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -155,5 +156,15 @@ mod tests {
             }
             HostExit::TimedOut => panic!("a 1 MiB stderr stalled the wait until the deadline"),
         }
+    }
+
+    /// `MZPC_AGILENT_HOST_TIMEOUT` takes any u64, and `Instant::now()` plus 2^64-1 s panics (an
+    /// abort in the release profile): a deadline the clock cannot hold is no deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_past_what_the_clock_holds_is_none() {
+        let timeout = host_timeout(Some("18446744073709551615")).unwrap();
+        let exit = run_with_deadline(&mut Command::new("true"), timeout).unwrap();
+        assert!(matches!(exit, HostExit::Exited { status, .. } if status.success()), "{exit:?}");
     }
 }
