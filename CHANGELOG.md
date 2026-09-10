@@ -127,6 +127,28 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   truncated conversion did. `--sample 0` is refused for every lane; the msconvert lanes used
   to turn it into run index 0, sample 1. `tests/msconvert_multi_run.rs` pins both directions
   with a stand-in msconvert that writes two runs, or one when `--runIndexSet` picks it.
+- **The `.mzpeak` filter lane no longer refuses archives with wavelength spectra.** Every
+  Parquet member is classified, and the UV/PDA scans facet (`entity_type=wavelength_spectrum`,
+  keyed by `source_index`) fell into the "index does not identify its entity" refusal. `--rt`,
+  `--ms-level`, `--drop-aux`, `--no-vendor`, `--sdrf` and `--image` therefore all exited 1 on any
+  archive holding a `wavelength_spectrum` facet — Waters and Agilent PDA/UV runs included — even
+  with no spectrum filter given. Wavelength facets reference only each other and are now copied
+  whole; `--rt` says once that it does not truncate them.
+- **`--drop-aux` refuses to remove a core facet.** Drop globs matched every member, so
+  `--drop-aux '*.parquet'` wrote an archive holding nothing but its index, and dropping
+  `spectra_peaks.parquet` or `spectra_metadata_precursors.parquet` wrote an unreadable one — each
+  with exit 0. A glob that matches a `spectrum` or `wavelength_spectrum` facet whose `data_kind`
+  is not proprietary/other now exits 1 before anything is written. `--no-vendor` still drops the
+  Thermo `vendor_*` facets, which are declared proprietary.
+- **`--ms-level` and `--rt` fail on a missing or retyped column.** An `ms_level` that was absent
+  or not UInt8 read as level 0, and a `time` that was absent or not Float64 as NaN, so a writer
+  type change would have made either filter keep 0 spectra and exit 0.
+- **`--rt` refreshes chromatogram point counts in current archives.** The refresh knew only the
+  pre-0.7 nested `chromatogram` struct, so the flat `chromatograms_metadata.parquet` the converter
+  writes today was copied verbatim: on `tiny.pwiz.1.1` converted by 0.11.5, `--rt 0-0.0001` left
+  2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
+  of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
+  re-encoded.
 
 ### Changed
 
@@ -176,6 +198,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   Windows jobs now share one cache, which only the `windows` job saves.
 - README: run the suite with `cargo test --release`, as CI does; the vendored writer's
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
+- **The filter lane has tests.** `tests/filter_lane.rs` is the first for `src/filter.rs`: on
+  `tiny.pwiz.1.1.mzML` converted in the test, `--ms-level 2` keeps one spectrum and nulls its
+  `precursor_index`; `--rt 0-0.0001` keeps one spectrum, two chromatogram points and matching
+  `number_of_data_points`; both again through `-o f.mzML`; `--rt` open bounds (`10-`, `-30`) and
+  refused ranges (`5-1`, `a-b`). It also pins the four filter-lane fixes above: `pda_uv.pwiz.mzML`
+  filtered with `--ms-level 1 --sdrf`, and `drop_aux_refuses_to_remove_a_core_facet`. Each test
+  owns its scratch directory, so the `mzpc-test-{pid}` race above cannot recur there.
 
 ## [0.11.5] — 2026-09-09
 
