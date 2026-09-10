@@ -115,7 +115,9 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   the body md5 (a multipart object's ETag is md5-of-part-md5s + `-N` — verify the composite from
   per-part md5s the box reports, or the size), and `publish` must stop using `copy_object`, which S3
   caps at 5 GB, so even a completed multipart object cannot reach its durable corpus key today. An
-  scp fallback avoids all three. (2) The frame representation's size cost on big HDMSe runs: Capan2 166 → 531 MB,
+  scp fallback avoids all three, and `box_convert.sh` now takes it for a local target (the default of
+  `corpus_reconvert.py --box`): the box holds the archive and the host pulls it by scp with a size and
+  md5 check; only an `s3://` target still stops at `stage=too-big`. (2) The frame representation's size cost on big HDMSe runs: Capan2 166 → 531 MB,
   PXD077098 2.1 → 9.0 GB (58 % of the vendor `.raw`; every point of every bin is kept, zero flanks
   included) — decide whether an opt-out (`--waters-summed`) or a per-bin zero policy is wanted for
   archival use. (3) ~~The harness's box updater could not fetch the release tag (twice)~~

@@ -34,6 +34,16 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
+- **The corpus harness builds one archive per sample of a multi-sample WIFF.** Both lanes now refuse
+  a multi-sample `.wiff` without `--sample` (see Fixed). At the next rebuild, `En_PPY.wiff`
+  (117 samples) and `IPX0002633001_D-239.wiff` would go from a silent one-sample archive to a
+  failed box job. A descriptor may now list the samples it publishes:
+  `convert: {input: En_PPY.wiff, samples: [1, 2]}`. `tools/corpus_reconvert.py` then builds each
+  sample as `<stem>.sample<N>.mzpeak` with `--sample N`, on the host or as one box job per sample.
+  A unit's former single archive is reported as `SUPERSEDED ON DISK`, and the run exits 1 until
+  it is removed. `box_convert_remote.ps1` keeps `--sample N` on its msconvert fallback, a
+  hand-written box manifest line can carry it, and `tools/lane_pairs.ps1` takes `'En_PPY.wiff@2'`.
+  Which samples to publish is the owner's decision, so no corpus descriptor lists any yet.
 
 ### Fixed
 
@@ -185,9 +195,73 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
+- **`tools/corpus_reconvert.py` builds every described dataset with its `convert.flags`.** The flags
+  were recorded only for a descriptor that pins `convert.input`. A descriptor with `input: auto`, or
+  with no input at all, got a bare host conversion and `--no-vendor` on the box. Three imzML
+  demonstrators were published without their `--image`: ltpmsi-chilli, Test_P15_r2 and
+  180817_NEG_Thaliana. Eleven archives lack their `--zstd-level 12`, and the lane pins of
+  MSV000090203, PXD053710, PXD059353 and PXD073126 never reached the box. Flags are now keyed by
+  dataset directory and found through the unit's parents, so a pinned vendor directory's inner
+  unit gets them too. Those archives need rebuilding. Pinned by `tools/test_harness.py`
+  (`python3 tools/test_harness.py`, offline).
+- **A corpus archive's `.built` stamp names what built it, and a recipe change rebuilds it.**
+  Stamps used to record the host's version string and nothing about the recipe. The box strips lane
+  flags, falls back to `--via-msconvert --tof-grid <mode>`, and under `BOX_AUTOUPDATE=0` skips its
+  version check. On the corpus, all 7 lane-pinned archives carried stamps naming a recipe that did
+  not build them, 5 of them built by a different lane. An edited `convert.flags` stayed "current"
+  until the next converter release. The stamp is now read from the archive's own index: its
+  `mzpeak-convert` version, a recipe line hashing the descriptor's whole `convert` block, and its
+  `conversion options`. An archive another converter version built is left unstamped and reported,
+  and currency needs the recipe to match. Stamps from before this change carry no recipe and count
+  as stale; the next converter release rebuilds the corpus anyway. The box's BENCH row names the
+  options that ran, reported back by `box_convert_remote.ps1`, instead of the request.
+- **`tools/corpus_reconvert.py --box` exits 1 when a box unit did not come back.** Units deferred
+  to the box count as skipped, and the box phase only printed `NOT delivered`, so the run exited 0.
+  PXD077098's 9.04 GB archive, refused by the relay at `stage=too-big`, ended every rebuild that
+  way. The report now prints `BOX NOT DELIVERED` with the units and `box_convert.sh`'s exit code,
+  and either one fails the run. An archive that arrived but was left unstamped counts as not
+  delivered.
+- **The box scripts no longer export `DOTNET_ROLL_FORWARD=LatestMajor` for every unit**
+  (`tools/box_convert_remote.ps1`, `tools/box_local_convert.ps1`). The binary sets it itself, for
+  Thermo `.raw` only and only when unset (0.9.12). Exported box-wide, it overrode that scoping.
+  Once a newer .NET major is installed in the box's `dotnet8` root, every `.lcd` would fail on the
+  Shimadzu glue's BinaryFormatter path, and Clearcore2 would run on an unverified runtime.
+- **A failed box update no longer aborts the corpus run when the box already runs the wanted
+  version.** `box_convert.sh` accepted `have == want` only when the updater was busy or locked. A
+  `failed` update fell through to the `BOX_REQUIRE_VERSION=1` hard stop (exit 3, zero jobs) even
+  with nothing stale. On 2026-09-02, git's own stderr notice did exactly that: the updater fetches
+  before its "current" check. A failure is now accepted when the box reports the wanted version.
+  A refused-dirty tree is not accepted, since its exe may be built from uncommitted code under the
+  same version string.
+- **The box's msconvert fallback keeps a requested `--tof-grid` mode.** `box_convert_remote.ps1`
+  drops `--tof-grid <mode>` from its native attempt, and when that attempt failed it appended
+  `--via-msconvert --tof-grid auto`. A job that asked for `--tof-grid off` (exact f64 m/z) was
+  therefore stored on the bounded-lossy grid whenever the fallback ran. The archive declared this,
+  but the requested fidelity was not honoured. The fallback now passes the requested mode, and
+  `auto` only when the job named none. No corpus descriptor requests `off` or `on`. The script runs
+  only on the box, so this is checked by reading, not run.
+- **A box archive over 5 GiB comes back by scp instead of being discarded.** The box returns
+  archives through one presigned S3 PUT, which stops at 5 GiB. `box_convert_remote.ps1` checked the
+  size only after the whole conversion, then threw the archive away at `stage=too-big`, so
+  PXD077098's 9.04 GB Waters TWIMS archive failed every rebuild and was delivered by hand. For a
+  local target, the default of `tools/corpus_reconvert.py --box`, the host now asks the box to
+  hold such an archive (`hold_oversize`). `box_convert.sh` pulls it through the jump host with
+  `scp`, checks its size and md5 against the box's figures, moves it into place and removes the
+  box copy; the box also sweeps holds older than two days. An `s3://` target still fails at
+  `stage=too-big`, because the `copy_object` publish and the md5 = ETag gate also stop at 5 GB.
+  Multipart upload remains a manual route. `tools/test_harness.py` covers the host half; the box
+  half runs only on the box.
 
 ### Changed
 
+- **`tools/corpus_reconvert.py --box` returns box archives to the host; publishing to S3 is
+  opt-in (`--publish-s3`).** The default named each unit's durable corpus key as the box target,
+  and `box_convert.sh` copied the verified object onto `s3://v09/...`, the public distribution
+  bucket, before any validator had run, always with `--overwrite`. Only a remembered
+  `--no-s3-first` prevented it. Now the archive comes back beside its raw through the transient
+  relay slot, and `--publish-s3` restores the old route. `--no-s3-first` is still accepted and does
+  nothing. The release-day sequence is `tools/corpus_reconvert.py --box`, then host validation,
+  then publishing from the corpus repository (`scripts/update.sh`).
 - **The ignored tests run, and no test that runs by default passes without asserting.** Of the six
   `#[ignore]`d tests, four now run by default on every platform, on data already in the repository:
   `by_id_reads_the_peaks_facet_on_a_centroid_only_archive` on the committed centroid-only fixture
