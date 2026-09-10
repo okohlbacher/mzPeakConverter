@@ -2629,14 +2629,17 @@ fn readable_chromatogram_arrays(mut chrom: Chromatogram) -> Chromatogram {
 
 /// A chromatogram as the chromatogram facet's schema is sampled from it: its time array in minutes,
 /// so the column declares the unit [`finish_chromatograms`] stores (sampled in ProteoWizard's
-/// seconds, the column declared seconds over minutes), and without the array
-/// [`readable_chromatogram_arrays`] names, which is then written as that chromatogram's auxiliary
-/// array in its own unit and data type — how the native Bruker lanes store the same device traces,
-/// so an archive converted back from its mzML export stores them alike. Sampled, the arrays of the
-/// first ten chromatograms would become columns and those of every later one auxiliary arrays, and a
-/// later array of a type already a column is written into that column and reads back in its unit.
+/// seconds, the column declared seconds over minutes), and no array but the time and the intensity.
+/// Every other array — a pressure, flow-rate or temperature array, one [`readable_chromatogram_arrays`]
+/// named, a non-standard data array — is then written as that chromatogram's auxiliary array in its
+/// own unit and data type, under its own name: how the native Bruker lanes store the same device
+/// traces, so an archive converted back from its mzML export stores them alike. Sampled, the arrays of
+/// the first ten chromatograms became columns and those of every later one auxiliary arrays; a later
+/// array of a type already a column was written into that column and read back in its unit; and a
+/// non-standard column read back without its name, went out to mzML as a `non-standard data array`
+/// with no value, and came back as a column named ''.
 fn schema_sample_chromatogram(mut chrom: Chromatogram) -> Chromatogram {
-    chrom.arrays.byte_buffer_map.remove(&ArrayType::Unknown);
+    chrom.arrays.byte_buffer_map.retain(|t, _| matches!(t, ArrayType::TimeArray | ArrayType::IntensityArray));
     // A time array that cannot be read is sampled as it is; writing that chromatogram fails on it.
     let _ = chromatogram_time_to_minutes(&mut chrom.arrays);
     chrom
@@ -7783,14 +7786,12 @@ mod tests {
             ],
         );
         let value_arrays = [
-            ("Pump HP:Pressure - [bar]", Some(ArrayType::PressureArray)),
-            ("Pressure - [psi]", Some(ArrayType::PressureArray)),
-            ("Pump HP:Actual flow - [µL/min]", Some(ArrayType::FlowRateArray)),
-            ("Oven temperature - [°C]", Some(ArrayType::TemperatureArray)),
-            // mzdata reads a non-standard array itself, so the sampler makes the first one a column,
-            // and the point reader hands a non-standard column back without its name (as it did
-            // before this change): found by kind, its unit and values compared.
-            ("Fraction A - [%]", None),
+            ("Pump HP:Pressure - [bar]", ArrayType::PressureArray),
+            ("Pressure - [psi]", ArrayType::PressureArray),
+            ("Pump HP:Actual flow - [µL/min]", ArrayType::FlowRateArray),
+            ("Oven temperature - [°C]", ArrayType::TemperatureArray),
+            // A non-standard array by its name: as a column it read back without one.
+            ("Fraction A - [%]", ArrayType::nonstandard("Fraction A - [%]")),
         ];
         // Each trace as its chromatogram type, its value array's unit and its (time, value) pairs.
         type Trace = (ChromatogramType, Unit, Vec<(f64, f64)>);
@@ -7802,11 +7803,7 @@ mod tests {
                 .map(|(id, value_type)| {
                     let c = chroms.iter().find(|c| c.id() == *id).unwrap_or_else(|| panic!("{}: no chromatogram {id}", archive.display()));
                     let times = c.arrays.get(&ArrayType::TimeArray).expect("a time array").to_f64().unwrap().to_vec();
-                    let value = match value_type {
-                        Some(t) => c.arrays.get(t),
-                        None => c.arrays.iter().map(|(_, a)| a).find(|a| matches!(a.name, ArrayType::NonStandardDataArray { .. })),
-                    };
-                    let value = value.unwrap_or_else(|| {
+                    let value = c.arrays.get(value_type).unwrap_or_else(|| {
                         let held: Vec<String> = c.arrays.iter().map(|(t, a)| format!("{t:?} in {:?}", a.unit)).collect();
                         panic!("{}: {id} has no {value_type:?}, only {held:?}", archive.display())
                     });
@@ -7838,9 +7835,10 @@ mod tests {
         super::convert_file(&export, &back, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
             .expect("the export converts back into an archive");
         assert_eq!(of_archive(&back), want, "mzML → mzPeak keeps every trace");
-        // Each device value array has no column in the chromatogram facet; it is an auxiliary array
-        // in its own unit and data type, as the native lane stores it.
-        let device_columns = |archive: &std::path::Path, into: &str| -> Vec<String> {
+        // No device value array is a column of the chromatogram facet, the non-standard one
+        // included: each is an auxiliary array in its own unit and data type, under its own name, as
+        // the native lane stores it.
+        let other_columns = |archive: &std::path::Path, into: &str| -> Vec<String> {
             use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
             let scratch = dir.join(into);
             std::fs::create_dir_all(&scratch).unwrap();
@@ -7849,10 +7847,20 @@ mod tests {
             let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&facet).unwrap()).unwrap();
             leaf_column_names(builder.schema())
                 .into_iter()
-                .filter(|c| ["pressure", "flow", "temperature"].iter().any(|k| c.to_lowercase().contains(k)))
+                .filter(|c| !["chromatogram_index", "time", "intensity"].contains(&c.as_str()))
                 .collect()
         };
-        assert_eq!(device_columns(&back, "back-facet"), Vec::<String>::new(), "no device array is a column");
+        assert_eq!(other_columns(&back, "back-facet"), Vec::<String>::new(), "no device array is a column");
+        // The archive converted back exports and converts again. A device array sampled into a column
+        // came back from the first hop without its name, went out as a `non-standard data array`
+        // with no value, and came in again as a column named ''.
+        let again = dir.join("back.mzML");
+        super::filter_mzpeak_to_mzml(&back, &again, &super::filter::FilterOpts::default()).unwrap();
+        let back_again = dir.join("back-again.mzpeak");
+        super::convert_file(&again, &back_again, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
+            .expect("the second export converts back too");
+        assert_eq!(of_archive(&back_again), want, "a second round trip keeps every trace");
+        assert_eq!(other_columns(&back_again, "back-again-facet"), Vec::<String>::new(), "no device array is a column");
 
         let hop = dir.join("hop.mzML");
         super::convert_to_mzml(&export, &hop, false, None).expect("the export converts into an mzML");
