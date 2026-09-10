@@ -613,9 +613,11 @@ whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 | `waters:drop-functions` | a MassLynx function was not written as spectra: chromatogram-type (SIR/MRM/NL/NG), not MS (DAD, delay, …), its scan count unreadable (`getScanCount failed`), or a collapsed retention-time summary not kept by `MZPC_WATERS_KEEP_COLLAPSED` | native Waters `.raw` |
 | `waters:sonar-summed` | a SONAR function's quadrupole bins were summed into one scan | native Waters `.raw` |
 
-Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built it (`ims-compact` read by
+Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
-decompress a frame; the recorded command line is the same on both routes), `metadata.partial` marks
+decompress a frame; the recorded command line is the same on both routes). Only those lanes write
+it: a `--no-ims-compact` or f64 `--bruker-sdk` archive has no `conversion_route`, its route being
+the one its command line names. `metadata.partial` marks
 a run truncated by `MZPC_MAX_SPECTRA` (§10) or an `--agilent-grid` run whose `MSProfile.bin` ends
 before its scan records (`cause` says which), and
 `ims_calibration.chord_source` (`global_metadata` on the native timsrust lane, `sdk_tims_index_to_mz`
