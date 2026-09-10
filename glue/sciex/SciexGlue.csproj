@@ -1,8 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    SciexGlue — a thin C# shim that the Rust `sciex` feature hosts in-process (via
-    netcorehost) to read SciEX .wiff/.wiff2 files through the vendor Clearcore2 .NET API.
+    SciexGlue — a thin C# shim that src/sciex.rs (compiled on Windows only; there is no cargo
+    feature) hosts in-process (via netcorehost) to read SciEX .wiff/.wiff2 files through the
+    vendor Clearcore2 .NET API.
 
     KEY DESIGN POINT: there is NO <Reference> / <PackageReference> to any Clearcore2
     assembly. The vendor DLLs are loaded at RUNTIME via System.Reflection
@@ -12,7 +13,8 @@
     possibly Linux) supplies them out of a ProteoWizard install.
 
     ⚠️ The produced DLL only *runs* where the Clearcore2 stack + a compatible .NET runtime
-    exist. It is Windows-runtime-only in practice and currently UNTESTED.
+    exist, which in practice means Windows. It and the converter are one unit: the converter
+    refuses a glue whose SciexAbiVersion differs from its own REQUIRED_ABI_VERSION.
 
     Build:  dotnet build -c Release
     Output: bin/Release/net8.0/SciexGlue.dll  (+ SciexGlue.runtimeconfig.json)
