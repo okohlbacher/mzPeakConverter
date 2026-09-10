@@ -305,6 +305,8 @@ pub(crate) fn bruker_baf_members(dot_d: &Path) -> Option<crate::run_metadata::Ve
 /// `translateAsInstrumentSeries` gives the vendor's `InstrumentFamily` code (`CompassDataEnums.hpp`),
 /// and the generic Bruker model term for a code it does not list — nothing is inferred from a method
 /// or file name. An empty table states nothing, and the configuration is left as it is.
+// Its caller, the BAF reader, builds on Windows and Linux only; the tests here run everywhere.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) fn baf_properties_metadata(
     props: &std::collections::BTreeMap<String, String>,
 ) -> crate::run_metadata::VendorRunMetadata {
