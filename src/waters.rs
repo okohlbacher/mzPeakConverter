@@ -268,6 +268,10 @@ pub struct WatersReader {
     skipped: Vec<(c_int, String)>,
     /// `MZPC_WATERS_KEEP_COLLAPSED`, read once: whether the collapsed functions were written.
     keep_collapsed: bool,
+    /// Frames whose bins came back out of (m/z, drift time) order and were re-sorted by
+    /// [`Self::spectrum`]. Shared with the converter, which counts it over the written spectra only
+    /// (`VendorHints::reorder_counter`) and declares `sort-by-mz` when it moved.
+    resorted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WatersReader {
@@ -670,6 +674,7 @@ impl WatersReader {
             lockmass_function,
             skipped,
             keep_collapsed,
+            resorted: Default::default(),
         };
         Ok(reader)
     }
@@ -738,6 +743,11 @@ impl WatersReader {
         function_transformations(&self.functions, &self.skipped, &self.collapsed, self.keep_collapsed)
     }
 
+    /// The frame re-sort counter, for `VendorHints::reorder_counter` (see [`sort_frame_points`]).
+    pub fn reorder_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.resorted.clone()
+    }
+
     /// Read one spectrum. A function with drift bins yields a FRAME (every bin's points, sorted by
     /// m/z then drift time, with a per-point drift-time array); any other function the summed scan.
     pub fn spectrum(&self, i: usize) -> Result<MultiLayerSpectrum> {
@@ -766,7 +776,9 @@ impl WatersReader {
                 }
                 points.extend(m.into_iter().zip(it).map(|(x, y)| (x, y, dt)));
             }
-            points.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.2.total_cmp(&b.2)));
+            if sort_frame_points(&mut points) {
+                self.resorted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             mz.reserve(points.len());
             intensity.reserve(points.len());
             drift.reserve(points.len());
@@ -1259,6 +1271,19 @@ fn function_transformations(
     out
 }
 
+/// Sort a frame's points by (m/z, drift time), the monotone main axis the chunked layout needs.
+/// `true` when that changed their order (the bins' own m/z axes interleaved), which is what the
+/// archive's `sort-by-mz` declares; a frame with one populated bin is already in order. Free of the
+/// DLL so every host tests it.
+fn sort_frame_points(points: &mut [(f64, f32, f32)]) -> bool {
+    let order = |a: &(f64, f32, f32), b: &(f64, f32, f32)| a.0.total_cmp(&b.0).then(a.2.total_cmp(&b.2));
+    if points.is_sorted_by(|a, b| order(a, b).is_le()) {
+        return false;
+    }
+    points.sort_unstable_by(order);
+    true
+}
+
 fn ms_level_for(f: usize, functions: &[FunctionInfo], lockmass: Option<c_int>) -> u8 {
     let fi = &functions[f];
     match fi.type_code.and_then(FunctionKind::from_code) {
@@ -1434,6 +1459,24 @@ mod tests {
         assert!(function_transformations(&plain, &[], &collapsed, true).is_empty());
         assert_eq!(functions_block(&plain, &[], &collapsed, false, None, false)["collapsed_functions"][0]["written"], false);
         assert_eq!(functions_block(&plain, &[], &collapsed, true, None, false)["collapsed_functions"][0]["written"], true);
+    }
+
+    /// `sort-by-mz` on a frame follows what the sort did: interleaved bins are re-ordered and
+    /// counted, a frame already in (m/z, drift time) order is not. Before, every run with drift bins
+    /// declared it whether or not a frame moved.
+    #[test]
+    fn a_frame_counts_as_re_sorted_only_when_its_order_changed() {
+        let mut one_bin = vec![(100.0, 1.0, 2.0), (200.0, 1.0, 2.0), (300.0, 4.0, 2.0)];
+        assert!(!sort_frame_points(&mut one_bin));
+        let mut interleaved = vec![(100.0, 1.0, 2.0), (300.0, 2.0, 2.0), (150.0, 3.0, 2.5), (250.0, 4.0, 2.5)];
+        assert!(sort_frame_points(&mut interleaved));
+        let order: Vec<(f64, f32)> = interleaved.iter().map(|p| (p.0, p.1)).collect();
+        assert_eq!(order, [(100.0, 1.0), (150.0, 3.0), (250.0, 4.0), (300.0, 2.0)]);
+        // The same m/z in two bins: drift time orders them, and a sorted frame stays unmoved.
+        let mut tie = vec![(100.0, 1.0, 3.0), (100.0, 2.0, 2.0)];
+        assert!(sort_frame_points(&mut tie));
+        assert_eq!(tie[0].2, 2.0);
+        assert!(!sort_frame_points(&mut tie));
     }
 
     #[test]

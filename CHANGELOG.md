@@ -340,8 +340,16 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   relies on it. On `tiny.pwiz.1.1.mzML` the list is now `["numpress-linear"]` (its one profile
   spectrum holds no zero run) and `[]` with `--no-numpress`;
   `writer_counters_decide_the_writer_level_transformations` pins the mask, the backstop and the
-  empty list on the vendor-reader seam. A rebuilt corpus archive drops the entries that did not
-  happen; entry names are unchanged.
+  empty list on the vendor-reader seam. The two lane entries still derived from configuration are
+  counted as well. `shimadzu:span-trim` now comes from the gridded spectra whose zero pad the profile
+  route actually left out; it was declared whenever the run-wide grid step was found, even if no
+  spectrum was gridded or padded (`span_trim_is_declared_from_the_written_routes`). A native Waters
+  archive's `sort-by-mz` comes from the reader's count of frames whose interleaved bins the sort
+  moved; it was declared whenever a function had drift bins
+  (`a_frame_counts_as_re_sorted_only_when_its_order_changed`). Every entry name is pinned where it
+  is declared (`tests/contract_strings.rs` over `main.rs`, `agl.rs` and `waters.rs`), and so are
+  the `[count …]` tags the Agilent host writes in `Glue.cs`. A rebuilt corpus archive drops the
+  entries that did not happen; entry names are unchanged.
 - **Output change: every vendor directory input embeds its side-files, under one rule**
   (`embed_vendor_members`). The vendor-reader and mzdata lanes embedded only Bruker TDF/TSF
   directories while `--agilent-grid` and ims-compact embedded any directory themselves, so a BAF `.d`,

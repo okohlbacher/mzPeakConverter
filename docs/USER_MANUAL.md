@@ -423,7 +423,8 @@ wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram), not a generic `mas
 drift-scan count is read bin by bin and written as one spectrum per MassLynx scan whose points are
 sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1003007, ms) — the
 shape of ProteoWizard's `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane —
-with the frame's drift-time bounds (MS:1003439/1003440), `sort-by-mz` in `transformations`, and a
+with the frame's drift-time bounds (MS:1003439/1003440), `sort-by-mz` in `transformations` when a
+frame's bins came back out of m/z order (counted frame by frame), and a
 `waters_drift` index block holding the run's bin → ms table, the vendor's `mob_cal.csv` CCS
 calibration verbatim, the lock-mass function and the functions not written as spectra. Every Waters
 archive, with drift bins or without, also carries a `waters_functions` block: each function's type,
@@ -604,7 +605,7 @@ whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 | `numpress-linear` | at least one m/z chunk is stored with the lossy codec (item 1) | chunked layout without `--no-numpress` |
 | `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, `--ims-chunked` (each frame by TOF across mobility scans; mobility is stored per point), `--bruker-sdk` TDF (the SDK hands over mobility-major frames), native Waters frames, and any lane whose reader hands over an unsorted spectrum |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
-| `shimadzu:span-trim` | the profile sqrt-grid route stored the signal span only (item 4) | native Shimadzu `.lcd` profile |
+| `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 4) | native Shimadzu `.lcd` profile |
 | `agilent:drop-zero-samples` | the profile grid lane left at least one zero-intensity sample, or an all-zero scan, out of its sparse point lists | `--agilent-grid` |
 | `agilent:intensity-f32-rounding` | an integer count above 2^24 was rounded into the Float32 intensity column | `--agilent-grid` |
 | `agilent:nonfinite-intensity-to-zero` | MHDAC returned a NaN or ±Inf intensity, stored as 0 (counted by the net48 host) | native Agilent (MHDAC) |

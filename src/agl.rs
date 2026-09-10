@@ -346,6 +346,14 @@ mod tests {
         assert!(cs.contains("bw.Write((ulong)n);"), "nPoints u64 after the header");
         assert_eq!(RECORD_HEADER_BYTES, 8 + 4 * 4 + 8);
         assert!(cs.contains("bw.Write((uint)b.Length);"), "strings are len u32 + UTF-8, not BinaryWriter's 7-bit prefix");
+        // The `[count key=value]` tags `host_counts` parses, with the keys it matches on: a renamed
+        // key or a dropped tag would declare nothing, silently.
+        for tag in [
+            "[count nonfinite_intensities=\" + reader.NonFiniteIntensities + \"]",
+            "[count truncated_spectra=\" + reader.TruncatedSpectra + \"]",
+        ] {
+            assert!(cs.contains(tag), "Glue.cs no longer writes the tag {tag}");
+        }
     }
 }
 
