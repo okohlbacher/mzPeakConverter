@@ -223,10 +223,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   configuration with no model term). The directory now yields `analysis.baf`, `analysis.baf_idx` and
   `analysis.baf_xtr` with their SHA-1s on any host (`vendor::bruker_baf_members`, also behind a 0-byte
   `analysis.tdf` stub), and the lane reads the baf2sql cache's `Properties` table as ProteoWizard
-  does: `InstrumentFamily` becomes the PSI-MS series term of ProteoWizard's
-  `translateAsInstrumentSeries` (the generic Bruker model term for an unlisted code), plus
-  `InstrumentSerialNumber`, `AcquisitionSoftware` + version and `AcquisitionDateTime`
-  (`vendor::baf_properties_metadata`). Pinned by `baf_directory_members_are_digested`,
+  does: the raw `InstrumentFamily` code becomes the PSI-MS series term ProteoWizard arrives at
+  through `translateInstrumentFamily` and then `translateAsInstrumentSeries` (1–2 micrOTOF; 6–8,
+  maXis/impact/compact, maXis series; 512 apex; 513 solarix), plus `InstrumentSerialNumber`,
+  `AcquisitionSoftware` + version and `AcquisitionDateTime` (`vendor::baf_properties_metadata`).
+  Any other family code, and a cache whose `Properties` table is missing or unreadable, gives the
+  generic `MS:1000122` Bruker Daltonics instrument model, so the valueless placeholder is gone
+  either way. Pinned by `baf_directory_members_are_digested`,
   `baf_properties_state_the_series_their_family_code_names` and
   `baf_directory_members_are_digested_in_the_archive`. The `Properties` read runs only where
   baf2sql exists (Windows, Linux) and is unverified against a real cache; CI compiles it.

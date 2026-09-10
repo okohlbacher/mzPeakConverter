@@ -451,7 +451,7 @@ struct BafSpectrumRow {
 /// The baf2sql cache's `Properties` table (key → value): the run facts ProteoWizard reads from it
 /// (`Baf2Sql.cpp`, `SELECT Key, Value FROM Properties`). Values are stored as text or as numbers
 /// (`InstrumentFamily` is a code), so each is rendered as text. Best-effort: a cache without the
-/// table yields an empty map, and the archive then states nothing more about the run.
+/// table yields an empty map, and the archive then states only the generic Bruker model term.
 fn read_properties(connection: &Connection) -> std::collections::BTreeMap<String, String> {
     use rusqlite::types::Value;
     let read = || -> rusqlite::Result<std::collections::BTreeMap<String, String>> {
@@ -473,7 +473,8 @@ fn read_properties(connection: &Connection) -> std::collections::BTreeMap<String
     read().unwrap_or_else(|e| {
         log::warn!(
             "BAF SQLite cache: the Properties table is not readable ({e}); the archive states no \
-             instrument, acquisition software or acquisition time for this run"
+             instrument series, serial, acquisition software or acquisition time for this run, \
+             only the generic Bruker model term"
         );
         std::collections::BTreeMap::new()
     })
