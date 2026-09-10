@@ -304,7 +304,7 @@ jobs:
       - name: Build the .NET glue
         run: |
           foreach ($p in 'glue/sciex/SciexGlue.csproj', 'glue/shimadzu/ShimadzuGlue.csproj',
-                         'glue/agilent/AgilentGlue.csproj', 'glue/agilent_midac/AgilentMidacGlue.csproj') {
+                         'glue/agilent/AgilentGlue.csproj') {
             dotnet build $p -c Release
             if ($LASTEXITCODE -ne 0) { Write-Output "::error::dotnet build $p failed"; exit 1 }
           }
@@ -319,10 +319,9 @@ jobs:
           # The converter looks for each glue under glue\<name>\ beside the exe when its MZPC_*_GLUE
           # variable is unset, so this layout is the contract, not a convenience.
           $glue = [ordered]@{
-            sciex         = 'glue/sciex/bin/Release/net8.0'
-            shimadzu      = 'glue/shimadzu/bin/Release/net8.0'
-            agilent       = 'glue/agilent/bin/Release/net48'
-            agilent_midac = 'glue/agilent_midac/bin/Release/net8.0'
+            sciex    = 'glue/sciex/bin/Release/net8.0'
+            shimadzu = 'glue/shimadzu/bin/Release/net8.0'
+            agilent  = 'glue/agilent/bin/Release/net48'
           }
           foreach ($k in $glue.Keys) {
             $d = Join-Path $stage "glue/$k"
@@ -348,8 +347,7 @@ jobs:
 
           $need = 'glue/sciex/SciexGlue.dll', 'glue/sciex/SciexGlue.runtimeconfig.json',
                   'glue/shimadzu/ShimadzuGlue.dll', 'glue/shimadzu/ShimadzuGlue.runtimeconfig.json',
-                  'glue/agilent/AgilentGlueHost.exe',
-                  'glue/agilent_midac/AgilentMidacGlue.dll', 'glue/agilent_midac/AgilentMidacGlue.runtimeconfig.json'
+                  'glue/agilent/AgilentGlueHost.exe'
           $missing = $need | Where-Object { -not (Test-Path (Join-Path $env:STAGE $_)) }
           if ($missing) { Write-Output "::error::archive lacks: $($missing -join ', ')"; exit 1 }
 

@@ -67,8 +67,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
     per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
   - Shimadzu acquisition-software version (LabSolutions; needs a glue export); Waters per-function
-    polarity / RT / scan windows (W-P2/W-P5: `_FUNCTNS.INF` + `_FUNCnnn.IDX`, same SDK cross-check);
-    `src/agilent_midac.rs` scaffold deletion.
+    polarity / RT / scan windows (W-P2/W-P5: `_FUNCTNS.INF` + `_FUNCnnn.IDX`, same SDK cross-check).
 - **Acquisition clocks — every open point in one place (2026-09-09).** `run.start_time` is an RFC 3339
   instant and RFC 3339 cannot say "zone unknown", so the converter's rule (branch
   `feat/native-run-metadata`, `src/run_metadata.rs`) is: a vendor time that STATES its UTC offset is
@@ -175,8 +174,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   MHDAC lane (the Q-TOF profile points sit on the flight-time lattice — the msconvert+`--tof-grid`
   build of the same run is 200 MB against 245 MB numpress-chunked f64; a SciEX-style per-run fit
   would close that); MRM/SIM transition chromatograms through MHDAC (today refused → msconvert);
-  `agilent_midac` is still the in-process net8 design MHDAC cannot run under and has never opened
-  a file — port to the net48 host or delete; the temp-file materialisation (16 B/point, whole run)
+  the temp-file materialisation (16 B/point, whole run)
   could stream, and the inspect path (no `-o`) pays it in full just to print a scan count (a host
   `--count` mode would fix both); the instrument serial number (msconvert records it; the MHDAC member
   the host tries is not it); no timeout or kill-on-parent-death for the host process (a killed converter

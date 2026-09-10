@@ -37,9 +37,6 @@ mod sciex_run;
 mod agilent;
 #[cfg(windows)]
 #[cfg_attr(not(windows), allow(dead_code))]
-mod agilent_midac;
-#[cfg(windows)]
-#[cfg_attr(not(windows), allow(dead_code))]
 mod sciex;
 // Native Shimadzu `.lcd` via the Shimadzu.LabSolutions.IO managed DLL (netcorehost glue, like
 // SciEX). Windows-runtime-only; the `convert_shimadzu` dispatch is `#[cfg(windows)]`.
@@ -2014,8 +2011,8 @@ fn convert_to_mzml(
     if is_agilent_d(input) {
         if is_agilent_ims_d(input) {
             bail!(
-                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the drift dimension \
-                 needs the MIDAC lane, which is not available; export this run with --via-msconvert",
+                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the native lane cannot \
+                 carry its drift dimension; export this run with --via-msconvert",
                 input.display()
             );
         }
@@ -3439,18 +3436,15 @@ fn convert_file(
     }
     #[cfg(windows)]
     if is_agilent_d(input) {
-        // Agilent ion-mobility (6560 IM-QTOF) needs the MIDAC SDK to read the drift dimension;
-        // non-IM Agilent uses MHDAC. The file says which it is (`AcqData/IMSFrame.bin`); the MIDAC
-        // probe only says whether that lane can serve it — and today it cannot (the MIDAC glue is
-        // still the in-process design MHDAC-family DLLs cannot run under), so an IM-QTOF `.d` is
-        // refused here rather than flattened through MHDAC without its drift dimension.
+        // Agilent ion-mobility (6560 IM-QTOF) needs the MIDAC SDK to read the drift dimension, and
+        // this converter has no MIDAC reader; non-IM Agilent uses MHDAC. The file says which it is
+        // (`AcqData/IMSFrame.bin`), so an IM-QTOF `.d` is refused here rather than flattened through
+        // MHDAC without its drift dimension. The box harness routes the refusal to msconvert by
+        // matching "is an Agilent IM-QTOF run".
         if is_agilent_ims_d(input) {
-            if agilent_midac::file_has_ims_data(input) {
-                return convert_agilent_midac(input, output, chunk, zstd_level, vendor, synth_chroms);
-            }
             bail!(
-                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the drift dimension \
-                 needs the MIDAC lane, which is not available; convert this run with --via-msconvert",
+                "{} is an Agilent IM-QTOF run (AcqData/IMSFrame.bin present): the native lane cannot \
+                 carry its drift dimension; convert this run with --via-msconvert",
                 input.display()
             );
         }
@@ -5985,22 +5979,6 @@ fn convert_agilent(
     let reader = agilent::AgilentReader::open(input)?;
     let hints = VendorHints { instrument: reader.instrument(), ..Default::default() };
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
-}
-
-/// Convert a native Agilent **IM-MS** `.d` → mzPeak via the MIDAC .NET glue (Windows-runtime-only,
-/// UNTESTED SCAFFOLD). Each IM frame becomes one spectrum with a mean-inverse-reduced-ion-mobility
-/// array; mirrors `convert_agilent` but through `agilent_midac`.
-#[cfg(windows)]
-fn convert_agilent_midac(
-    input: &Path,
-    output: &Path,
-    chunk: Option<ChunkingStrategy>,
-    zstd_level: i32,
-    vendor: Option<&vendor::VendorPolicy>,
-    synth_chroms: bool,
-) -> Result<()> {
-    let reader = agilent_midac::AgilentMidacReader::open(input)?;
-    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(), reader.len(), |i| reader.spectrum(i))
 }
 
 /// Shared writer wiring for a custom (non-mzdata) reader: probe-derived schema + write loop + empty chromatogram + run-metadata defaults + vendor-embed + atomic rename. Used by

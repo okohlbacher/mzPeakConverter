@@ -109,6 +109,6 @@ siblings resolve from the same directory.
 ## Scope
 
 Non-IM MS only (MS1/MS2, profile or centroid). Agilent ion-mobility (6560 IM-QTOF) requires the
-separate **MIDAC** SDK to read the drift dimension and is **out of scope** here (the MIDAC glue in
-`src/agilent_midac.rs` is still the in-process .NET 8 design and would hit the same `BeginInvoke`
-wall — port it to this out-of-process net48 pattern when IM-MS support is needed).
+separate **MIDAC** SDK to read the drift dimension and is **out of scope** here: the converter
+refuses an IM-QTOF `.d` (`AcqData/IMSFrame.bin`) with a pointer to `--via-msconvert`. Native IM-MS
+support would read MIDAC through this out-of-process net48 pattern.
