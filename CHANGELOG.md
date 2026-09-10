@@ -217,6 +217,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   warns. The decisions and the wait live in the host-compiled `src/agilent_host.rs`, with tests (a
   `sleep` past its deadline, a 1 MiB stderr, the variable parsing). The Job Object and the call
   site compile only on Windows CI, and a Ctrl+C still leaves the temp file.
+- **Documentation that contradicted the code.** `docs/PLATFORM_SUPPORT.md` named the
+  `#[cfg(windows)]` modules as Agilent, MIDAC, SciEX and Waters. They are Agilent, SciEX and
+  Shimadzu; the Waters reader compiles everywhere and only its dispatch is gated. The page's legend
+  also kept a ⛔ symbol that no row uses. The comment on Shimadzu's cached runtime said hostfxr
+  refuses a second initialisation in one process. It refuses one only after netcorehost has freed
+  the library, when the last handle to it dropped, which is why the runtime is cached. (The stale
+  "BACKLOG.md #23" and the windows.yml header went with the Windows CI change below.)
 
 ### Changed
 

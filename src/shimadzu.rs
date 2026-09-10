@@ -153,11 +153,13 @@ struct GlueApi {
 
 /// The CoreCLR runtime, booted ONCE per process.
 ///
-/// `hostfxr` refuses a second `initialize_for_runtime_config` in the same process
+/// A second `initialize_for_runtime_config` in the same process succeeds while hostfxr is still
+/// loaded. But netcorehost frees the library (`FreeLibrary`) when the last `Hostfxr`, context or
+/// delegate loader holding it drops, and the reloaded hostfxr refuses the next initialisation
 /// ("Initialization request is expected to be non-null for requests other than the first one",
-/// 0x80008081). `-v` opens the reader once for the inspection report and again for the conversion,
-/// so a per-open init made the two paths mutually exclusive: verbose conversion always failed.
-/// The delegate loader is cheap to share and the glue is internally locked, so cache it.
+/// 0x80008081). `-v` used to open the reader for the inspection report, drop it and open it again
+/// for the conversion, so a per-open boot made every verbose conversion fail. The delegate loader
+/// is cheap to share and the glue is internally locked, so cache it and keep hostfxr loaded.
 static GLUE: OnceLock<Mutex<Option<GlueApi>>> = OnceLock::new();
 
 impl GlueApi {
