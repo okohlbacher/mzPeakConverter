@@ -38,6 +38,23 @@ All notable changes to this project are documented here. The format follows
   `analysis.tdf` read-write, after an existence check). A read-only open of a file with a hot
   journal now reports SQLite's own error rather than "GlobalMetadata missing/invalid". Pinned by
   `bruker_tsf::msms_tests::open_never_writes_into_the_input_directory`.
+- **`--via-msconvert --to mzml` no longer passes a previous run's mzML off as this run's.**
+  msconvert was handed the final output path as `--outdir`/`--outfile`, and success meant
+  `output.exists()`. Under `--force` a file left by an earlier run satisfied that check, so
+  the command exited 0, logged "wrote …" and left the old mzML in place. Real ProteoWizard
+  gets there reliably with `-o x.mzML.gz` (or `.mzml` on Linux), for which it writes a
+  different file name. msconvert now writes into a fresh `mzpc-msconvert-<pid>` directory
+  beside the output (not the temp dir, so the rename cannot cross a volume), only the file it
+  wrote there is renamed into place through `TmpGuard` like every other mzML export, and a
+  `.mzML.gz` output is gzip-compressed from that file rather than left to msconvert's
+  naming. The directory is removed on every error return, taking a crashed msconvert's stray
+  `.partial` with it. The same guard stops the `--via-msconvert` mzPeak lane leaking
+  `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which returned before
+  any cleanup. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
+  the unfixed build, one that exits 0 without writing produced exit 0 and
+  "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
+  byte-identical and nothing beside it. One that writes its mzML must land under the
+  requested name, gzipped for `.mzML.gz`, and reparse.
 
 ### Changed
 
