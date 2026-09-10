@@ -164,12 +164,28 @@ the independent `mzpeak-validate` tool (the e2e harness in `tests/` calls it).
 ## Tests
 
 ```sh
-cargo test                     # unit tests
-tests/run_corpus_e2e.sh        # convert + mzpeak-validate over tests/corpus.tsv
-tests/run_data_sweep.sh DIR    # full-corpus convert+validate sweep (parallel)
+cargo test --release           # the test suite CI runs
 ```
 
-`tests/corpus.tsv` references real files in sibling data trees (nothing copied).
+Use the release profile, as CI does: the vendored writer carries `debug_assert`s that a plain
+debug `cargo test` can trip on inputs the release build handles. The tests that need data too large
+to commit — real timsTOF runs, a Bruker TSF acquisition, lane pairs built on the Windows box — are
+`#[ignore]`d, so a run without them reports them as not run rather than as passed. With the
+reference corpus:
+
+```sh
+MZPEAK_CORPUS=/path/to/mzpeak-example-data/data MZPC_REQUIRE_CORPUS=1 \
+  cargo test --release -- --include-ignored
+```
+
+`MZPC_REQUIRE_CORPUS=1` turns a missing corpus fixture into a failure instead of a skip
+(`tests/common/corpus.rs`). The TSF and lane-parity pins need inputs no corpus holds — point
+`MZPC_TSF_FIXTURE` at a Bruker TSF `.d` and `MZPC_LANE_PAIRS` at pairs built on the Windows box — and
+without them those three tests still skip, even under `MZPC_REQUIRE_CORPUS=1`. `tests/fixtures/README.md`
+lists where the corpus-derived fixtures come from.
+
+`tests/run_corpus_e2e.sh` (over `tests/corpus.tsv`) and `tests/run_data_sweep.sh` are older
+convert-and-validate harnesses over files in sibling data trees; nothing runs them.
 
 ## License
 

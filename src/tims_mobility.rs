@@ -117,28 +117,34 @@ mod tests {
 #[cfg(test)]
 mod scan_number_precision_tests {
     use super::*;
-    use std::path::Path;
 
     /// The isolation window's integer midpoint is NOT the precursor's mobility: `Precursors.
     /// ScanNumber` is fractional. Pin the size of the error we were making on a real DDA frame.
+    ///
+    /// The calibration is PXD078573 `9629.d`'s `TimsCalibration` row and `OneOverK0AcqRangeLower`,
+    /// loaded through `from_tdf` from in-memory tables holding the columns it reads — so the SQL path
+    /// stays covered and the test runs everywhere, rather than only beside a 1.5 GB corpus run where
+    /// it returned without a word when `MZPEAK_CORPUS` was unset.
     #[test]
-    #[ignore = "needs the reference corpus (MZPEAK_CORPUS)"]
     fn fractional_scan_number_moves_mobility() {
-        let Ok(root) = std::env::var("MZPEAK_CORPUS") else { return };
-        let tdf = Path::new(&root)
-            .join("ims-examples/PXD078573/20250305_AI_Rui_Xlink_F19_Slot1-28_1_9629.d/analysis.tdf");
-        if !tdf.exists() {
-            return;
-        }
-        let cal = TimsMobilityCalibration::from_tdf_path(&tdf).unwrap().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE TimsCalibration (Id INTEGER, ModelType INTEGER, C0 REAL, C1 REAL, C2 REAL, C3 REAL,
+                                           C4 REAL, C5 REAL, C6 REAL, C7 REAL, C8 REAL, C9 REAL);
+             INSERT INTO TimsCalibration VALUES (1, 2, 1, 1509, 187.64779662120463, 78.53435821105788, 0, 0,
+                                                 -0.007497305527082165, 135.44099330647055, 0, 0);
+             CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('OneOverK0AcqRangeLower', '0.6');",
+        )
+        .unwrap();
+        let cal = TimsMobilityCalibration::from_tdf(&conn).unwrap().expect("a ModelType-2 row");
         // Frame 2, first window: ScanNumBegin=735, ScanNumEnd=759 -> old midpoint 747.
         // Precursors.ScanNumber for that precursor = 747.5194174757281.
         let old = cal.one_over_k0(747.0);
         let new = cal.one_over_k0(747.5194174757281);
-        assert!(
-            (new - old).abs() > 1e-5,
-            "fractional scan number must move 1/K0 measurably: {old} vs {new}"
-        );
-        eprintln!("1/K0 midpoint {old} vs ScanNumber {new} (delta {})", new - old);
+        // Exactly what the earlier corpus test printed for the real file, recomputed from the same row.
+        assert_eq!(old, 1.01196127394019);
+        assert_eq!(new, 1.0116795975968043);
+        assert!((new - old).abs() > 1e-5, "fractional scan number must move 1/K0 measurably: {old} vs {new}");
     }
 }
