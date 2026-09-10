@@ -193,6 +193,36 @@ fn rewritten_data_facets_declare_an_index_bound() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A rewritten facet must not embed the pre-filter counts in `ARROW:schema`. arrow-rs folds the source
+/// footer into the schema it reads, the rewrite's writer serialised that schema, and Arrow C++ and
+/// pyarrow return the embedded metadata: after `--ms-level 1`, `spectra_data` said `spectrum_count=1`
+/// on 0 rows.
+#[test]
+fn rewrite_embeds_no_stale_counts_in_the_arrow_schema() {
+    let dir = scratch("arrow_schema");
+    let src = convert(TINY, &dir);
+    let out = dir.join("f.mzpeak");
+    ok(&mzpc(&src, &out, &["--ms-level", "1"]));
+    let names: Vec<String> = zip::ZipArchive::new(File::open(&out).unwrap())
+        .unwrap()
+        .file_names()
+        .filter(|n| n.ends_with(".parquet"))
+        .map(str::to_string)
+        .collect();
+    for name in names {
+        let b = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(member(&out, &name))).unwrap();
+        let meta = b.metadata().file_metadata();
+        let Some(embedded) = meta.key_value_metadata().and_then(|kvs| kvs.iter().find(|kv| kv.key == "ARROW:schema")).cloned() else {
+            continue;
+        };
+        // Given only the ARROW:schema entry, the schema's metadata is exactly what that entry embeds.
+        let schema = parquet::arrow::parquet_to_arrow_schema(meta.schema_descr(), Some(&vec![embedded])).unwrap();
+        let counts: Vec<&String> = schema.metadata().keys().filter(|k| k.ends_with("_count")).collect();
+        assert!(counts.is_empty(), "{name} embeds {counts:?} in ARROW:schema");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// (d) `--rt` parsing, driven through the CLI (the crate has no library target to call into): an
 /// omitted bound is open, and a reversed or non-numeric range exits 1 without writing anything. The
 /// bounds are read back from the filter's data-processing entry. `--rt=` because clap reads a bare

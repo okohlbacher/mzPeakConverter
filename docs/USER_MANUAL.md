@@ -368,7 +368,10 @@ declare on a data facet the number of entities with rows instead, which is not a
 `0..spectrum_count` stops early on a mixed run, around empty spectra, and on any rewritten
 archive. Archives from 0.11.1 and earlier
 declare the run total on `spectra_data` (and the sum of both data facets' points), and on
-`spectra_peaks` the number of centroid spectra handed to it, zero-peak spectra included.
+`spectra_peaks` the number of centroid spectra handed to it, zero-peak spectra included. An archive
+rewritten by 0.11.x (`--rt`, `--ms-level`, `--drop-aux`) also embeds the pre-filter counts in each
+rewritten facet's `ARROW:schema`, which Arrow C++ and pyarrow report as the schema metadata; its
+key-value footer is the one to read.
 
 **The format itself** — rationale, the draft specification, and the controlled
 vocabulary — is documented at:
