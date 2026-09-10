@@ -24,10 +24,11 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | Waters `.raw` (native) | ❌ | ❌ | ✅ | `libloading` → `MassLynxRaw.dll` C exports (no .NET glue) | MassLynx/pwiz DLLs |
 | **anything** via ProteoWizard | ✅ | ✅ | ✅ | `--via-msconvert` subprocess | a ProteoWizard install (Wine off-Windows) |
 
-✅ native on that OS · ⚠️ partial, see the note · ⛔ present in the tree but not connected ·
-❌ not native (use `--via-msconvert`). The compile-time gates are
-`#[cfg(windows)]` (Agilent/SciEX/Waters) and `#[cfg(any(windows, target_os = "linux"))]`
-(BAF, timsdata SDK) in `src/main.rs`; macOS gets none of those.
+✅ native on that OS · ⚠️ partial, see the note · ❌ not native (use `--via-msconvert`). The
+compile-time gates in `src/main.rs` are `#[cfg(windows)]` on the Agilent (MHDAC host), SciEX and
+Shimadzu modules, and `#[cfg(any(windows, target_os = "linux"))]` on BAF and the timsdata SDK. The
+Waters reader (`libloading`) compiles everywhere; only its dispatch is Windows-gated. macOS gets
+none of those readers.
 
 ## Why the platform split
 
