@@ -77,6 +77,11 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   the filter. A chromatogram facet with no time axis to cut on keeps its metadata unchanged, as it
   keeps its data, where its point counts used to be set to 0. Pinned by
   `tests::an_rt_window_cuts_the_device_trace_values_with_their_times`.
+- **An mzML output's `<chromatogramList count>` said 2 whatever followed.** mzdata's writer starts
+  the count at its own TIC/BPC pair and writes it with the first chromatogram, and no lane set it,
+  so every source chromatogram passed through (`.mzpeak` → mzML, mzML → mzML) left it short: 2
+  around 8 chromatograms on a TSF run's archive. It is now the chromatograms written plus that pair.
+  Pinned by `tests::the_mzml_export_counts_and_types_the_device_traces`.
 - **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
   mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
   a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes
