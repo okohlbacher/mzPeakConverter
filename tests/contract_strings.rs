@@ -151,17 +151,23 @@ fn tof_grid_reconstruction_keys_pinned() {
     );
     // The three honest values of `mz_reconstruction`, and the bound that must accompany each
     // inexact one. `exact` is ONE site (Agilent: the vendor's own bin ordinal, re-evaluated through
-    // the vendor's own calibration). The Shimadzu profile lane said `exact` until 0.9.13; measured
-    // on HEK_PosOAD1, 4,890 of 5,000 gridded points rebuild off the vendor's 1e-9 lattice by up to
-    // 0.5 step (4.15e-10 Da) — inside the vendor's ±5e-10 rounding, so accurate to vendor precision,
-    // but "exact" read as bit-exact. It now states the bound.
+    // the vendor's own calibration). The Shimadzu profile lane said `exact` until 0.9.13, then
+    // `max_error_da: 5e-10` — a bound its fit never enforced. The fit accepts a spectrum when every
+    // point rebuilds within `shimadzu_grid::TOL` (1e-9 Da); refitting HEK_PosOAD1's nine f64 spectra
+    // puts 169 of 32,434 points between 5e-10 and 5.47e-10 Da off (none past 1e-9). The earlier
+    // evidence, "≤ 0.5 step off the lattice", holds for any value by definition. The block declares
+    // the gate itself, so the bound and the check cannot diverge again.
     assert_eq!(
         code().matches("\"mz_reconstruction\": \"exact\"").count(),
         1,
         "only the Agilent lane rebuilds m/z exactly; a new `exact` claim needs the same evidence"
     );
     pinned("\"mz_reconstruction\": \"within-vendor-rounding\"");
-    pinned("\"max_error_da\": 5e-10");
+    pinned("\"max_error_da\": shimadzu_grid::TOL");
+    assert!(
+        include_str!("../src/shimadzu_grid.rs").contains("pub const TOL: f64 = 1e-9;"),
+        "the Shimadzu block declares the fit's acceptance gate as its bound: 1e-9 Da"
+    );
     assert_eq!(
         code().matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
         2,

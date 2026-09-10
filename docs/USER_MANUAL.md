@@ -571,10 +571,12 @@ zero differences. Four transforms are **not** bit-exact, and each is named in th
 
 Where the source m/z is on a lattice the archive says how exactly it reconstructs
 (`mz_reconstruction` with its `max_error_da` bound) rather than claiming "exact": the Shimadzu
-profile block says `within-vendor-rounding` with `max_error_da: 5e-10` (measured: 4,890 of 5,000
-gridded points rebuild off the vendor's 1e-9 lattice by ≤ 0.5 step, inside the vendor's own
-rounding), the Agilent file-direct block is the one lane that says `exact`, and the two SCIEX
-lanes say `bounded-lossy` with `roundtrip_tolerance_ppm`.
+profile block says `within-vendor-rounding` with `max_error_da: 1e-9` — the fit's own acceptance
+gate, since a spectrum is gridded only when every point rebuilds within 1e-9 Da of the vendor m/z
+(archives written by 0.11.5 and earlier state 5e-10, which the gate did not enforce: refitting
+HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points between 5e-10 and 5.47e-10 Da off), the
+Agilent file-direct block is the one lane that says `exact`, and the two SCIEX lanes say
+`bounded-lossy` with `roundtrip_tolerance_ppm`.
 
 **The `transformations` index key.** Every mzPeak lane writes `metadata.transformations` — a JSON
 list of the declared, bounded changes the converter made to the vendor signal on its way in

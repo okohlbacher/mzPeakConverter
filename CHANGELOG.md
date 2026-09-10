@@ -185,6 +185,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
+- **The Shimadzu profile grid declares the bound its fit enforces: `max_error_da: 1e-9`, not
+  `5e-10`.** The native `.lcd` lane's `tof_calibration` block has stated 5e-10 Da since 0.9.13, but
+  the fit accepts a spectrum when every point rebuilds within `shimadzu_grid::TOL`, 1e-9 Da.
+  Refitting HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points (0.52 %) between 5e-10 and
+  5.47e-10 Da off, none past 1e-9; the evidence quoted for 5e-10 ("≤ 0.5 step off the lattice")
+  holds for any value by definition. The block now writes the gate itself, and
+  `tests/contract_strings.rs` pins both the emission and `TOL = 1e-9`. The two published archives
+  (HEK_PosOAD1, Blind_P1_pos_012) keep 5e-10 until reconverted. The lane is Windows-only, so the
+  emission is pinned as source text rather than run here.
 
 ### Changed
 
