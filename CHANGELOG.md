@@ -230,6 +230,23 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
 
+- **`--help` and the user manual say what the code does.** `--zstd-level` claimed a default of 3 on
+  every lane, where the timsTOF ims-compact lanes default to 5. `--agilent-grid` claimed a per-run
+  `{c0,c1}` pair, where the lane writes per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id`
+  columns. `--tof-grid` said the native Bruker and Agilent readers take the grid from the vendor
+  calibration, which only the ims-compact lanes and `--agilent-grid` do. In the manual, the §4
+  refusal table listed options that are only warned about as refused and missed six real refusals
+  (four on `--via-msconvert`, `--aux` and `--bruker-sdk` on `--to mzml`); it now has a refused and
+  a warned column, taken from `dropped_flags_for` and `inert_flags_for`. §10 lacked
+  `MZPC_WATERS_KEEP_COLLAPSED`, `MZPC_WATERS_PROBE_QUAD` and `TIMSDATA_LIB_DIR`, claimed a variable
+  count that no longer held, and said every boolean lever goes through `env_flag()`, which the
+  Waters ones do not. Drifted line-number citations now name functions, and §8 names the test and
+  fixture that already check the `C2 = 0` calibration pair against the vendor SDK, instead of a
+  test and fixture that never existed. README and the manual gain the native Waters `.raw` row,
+  and README says the test suite needs a .NET 8+ runtime. `docs/PLATFORM_SUPPORT.md` no longer
+  shows the Agilent IM-QTOF lane as a working scaffold, and gives the right compile gates and TSF
+  reader; it also no longer points at a `BACKLOG.md` #23 that does not exist. The Waters frame
+  size (Capan2 166 → 531 MB) and the native SciEX size are recorded as accepted.
 ### Changed
 
 - **The ignored tests run, and no test that runs by default passes without asserting.** Of the six
@@ -299,6 +316,10 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
+- **The manual is checked against the binary and the tree.** `tests/docs_drift.rs` fails when an
+  option `--help` prints is missing from §4, a `FileConfig` key from §5's example, or an
+  `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` from §10. Against the manual before this
+  change it fails on `MZPC_WATERS_KEEP_COLLAPSED` and `MZPC_WATERS_PROBE_QUAD`.
 
 ## [0.11.5] — 2026-09-09
 
