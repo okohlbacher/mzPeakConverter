@@ -49,6 +49,21 @@ keep their bytes.
   it is removed. `box_convert_remote.ps1` keeps `--sample N` on its msconvert fallback, a
   hand-written box manifest line can carry it, and `tools/lane_pairs.ps1` takes `'En_PPY.wiff@2'`.
   Which samples to publish is the owner's decision, so no corpus descriptor lists any yet.
+- **Every release archive ships `THIRD-PARTY-NOTICES.md`, and every release its own SBOM.** The
+  archives carried only the binary, `LICENSE` and `README.md`, although the binary links about 400
+  crates whose licenses ask for their notices to travel with it. The notices file now goes into all
+  six archives, and each release job checks it is there. A new `sbom` job runs `cargo metadata
+  --locked` through `tools/gen_sbom.py`, refuses an SBOM whose component version is not the tag's,
+  and attaches `mzpeak-convert-<version>.cdx.json` with a `.sha256` sidecar. `gen_sbom.py` now
+  records a git source such as the mzdata fork, which the purl alone passes off as the crates.io
+  release of the same version. The tracked `sbom.cdx.json` is gone: it still described
+  mzpeak-convert 0.1.0 with 395 components (mzdata 0.64.1, arrow 57.0.0), nothing regenerated it,
+  and README and the manual linked it as the inventory. Publishing now needs at least one platform
+  archive, so a run whose platforms all failed cannot publish a release holding only the SBOM. A
+  failed SBOM job is treated like a failed platform: the archives that built are attached without
+  it, and the run goes red. The job runs on every dispatch, whatever `only` names. `gen_sbom.py`
+  writes no timestamp or serial number, so regenerating from the tag's `Cargo.lock` re-attaches
+  the same file.
 
 ### Fixed
 
@@ -263,6 +278,43 @@ keep their bytes.
   gets its own concurrency group: with cancellation off GitHub still replaces a run *pending* in a
   group, so the middle one of three quick pushes would never run. Pull requests still cancel a
   superseded run.
+- **The release gate stops waiting where waiting cannot help, and names the remedy.** A commit CI
+  never ran on — pushed together with a later commit, as v0.7.3 and v0.4.12 were, or a `[skip ci]`
+  one — never gets the `build-test` and `windows` check runs, yet the gate waited the full 90 minutes
+  for it and then blamed a commit that "reached neither" main nor a pull request. When a commit older
+  than three hours still has none of those three ten minutes in, the gate now refuses at once; the
+  Release workflow's own jobs, the gate included, are check runs on the same commit and do not
+  count. It also resolves the commit through the commits API first, which peels an annotated tag,
+  and three HTTP 4xx answers in a row end the gate: every API error used to be retried until the
+  deadline, and the check-runs endpoint answers a tag object's own SHA with 422. A 5xx is still
+  retried. Every refusal and the timeout now name what to run: `gh workflow run ci.yml --ref <tag>`
+  and `gh workflow run windows.yml --ref <tag>`, then a re-run. Replayed against a stand-in `gh`
+  that lists the gate's own running check on a push or a pull request: a six-hour-old commit
+  without CI check runs ends after 10 simulated minutes on a push, a pull request and a dispatch
+  (90 before), an unknown SHA after 2 (90 before); a pass, a pending check, a cancelled job and two
+  502s behave as before.
+- **`THIRD-PARTY-NOTICES.md` states the licenses and sources the build uses.** It listed `mzdata`,
+  `mzpeaks` and `thermorawfilereader` as MIT, where their manifests say Apache-2.0, and `zip` as
+  MIT/Apache-2.0 (it is MIT). It also put `mzdata` under a crates.io heading, although the build pins
+  it from the `okohlbacher/mzdata@1d53971` git fork (0.66.6 plus mobiusklein/mzdata#58, merged
+  upstream and not yet released). The file now carries the Apache License 2.0 text and the NOTICE
+  that `arrow` and `parquet` ship, which section 4(d) of that license requires redistributions to
+  pass on. It names the .NET assemblies `thermorawfilereader` embeds in the binary, which no
+  crate declares: Thermo Fisher Scientific's RawFileReader, under Thermo's proprietary license, and
+  OpenMcdf 2.3, under MPL-2.0. Its
+  vendor-SDK paragraph no longer names the `bruker_sdk` / `agilent` / `sciex` build features, which
+  no longer exist. The license distribution comes from `cargo metadata` at this tree (415
+  dependency packages) instead of the 0.1.0 SBOM; `mzpeak_prototyping` stays "not declared
+  upstream".
+- **A release archive is checked for what it claims before it is attached.** The macOS job printed
+  `lipo -archs` without asserting it, and the x86_64 binary never runs on the arm64 runner, so
+  nothing stopped an arm64 build shipping under the x86_64 name: both architectures are now
+  asserted. Wherever the binary runs, `--version` must print `mzpeak-convert <version>` for the
+  version the tag carries, and the smoke archive is read back — its inspection report must count the
+  source's spectra and its mzML export must hold them all — where a non-empty file used to pass.
+  Replayed on the macOS and Linux steps: a truncated smoke archive, a wrong `--version` and an arm64
+  binary checked as x86_64 each fail the job now, and each passed before. The Windows step's
+  PowerShell is exercised only by the release dry run.
 - **Reading an archive back keeps each spectrum's precursors in their source order.** The vendored
   reader attached a spectrum's (and a chromatogram's) precursors in reversed row order, so
   mzML → mzPeak → mzML turned `[(445.3, 445.34), (645.3, 645.34)]` (isolation target, selected ion)
@@ -367,6 +419,26 @@ keep their bytes.
   for each kind that happened, with a warning giving the counts; `--to mzml`, which has no such
   list, logs the warning. No corpus data are known to trigger them (sampled row groups of Sample002
   and PXD011326 hold no non-integer intensity and none above 121,219). Not yet run on a WIFF.
+- **`--help` and the user manual say what the code does.** `--zstd-level` claimed a default of 3 on
+  every lane, where the timsTOF ims-compact lanes default to 5. `--agilent-grid` claimed a per-run
+  `{c0,c1}` pair, where the lane writes per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id`
+  columns. `--tof-grid` said the native Bruker and Agilent readers take the grid from the vendor
+  calibration, which only the ims-compact lanes and `--agilent-grid` do, and called itself mzML-only,
+  although every input read through mzdata reaches the fit (imzML, Thermo `.raw`, a TDF read as
+  f64). In the manual, the §4 refusal table listed options that are only warned about as refused and
+  missed four real refusals on `--via-msconvert` (`--bruker-sdk --no-ims-compact --ims-chunked
+  --no-tims-recalibration`); it now has a refused and a warned column, taken from
+  `dropped_flags_for` and `inert_flags_for`, and no longer calls the MHDAC lane's `--tof-grid`
+  warning silence. §10 lacked
+  `MZPC_WATERS_KEEP_COLLAPSED`, `MZPC_WATERS_PROBE_QUAD` and `TIMSDATA_LIB_DIR`, claimed a variable
+  count that no longer held, and said every boolean lever goes through `env_flag()`, which the
+  Waters ones do not. Drifted line-number citations now name functions, and §8 names the test and
+  fixture that already check the `C2 = 0` calibration pair against the vendor SDK, instead of a
+  test and fixture that never existed. README and the manual gain the native Waters `.raw` row,
+  and README says the test suite needs a .NET 8+ runtime. `docs/PLATFORM_SUPPORT.md` no longer
+  shows the Agilent IM-QTOF lane as a working scaffold, and gives the right compile gates and TSF
+  reader; it also no longer points at a `BACKLOG.md` #23 that does not exist. The Waters frame
+  size (Capan2 166 → 531 MB) and the native SciEX size are recorded as accepted.
 
 ### Changed
 
@@ -465,6 +537,13 @@ keep their bytes.
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
+- **The manual is checked against the binary and the tree.** `tests/docs_drift.rs` fails in three
+  cases:
+  - an option `--help` prints has no row in §4's option table (a mention in the refusal table or
+    in another row does not count);
+  - a `FileConfig` key is missing from §5's example;
+  - an `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` is missing from §10. Against the manual before this
+  change it fails on `MZPC_WATERS_KEEP_COLLAPSED` and `MZPC_WATERS_PROBE_QUAD`.
 
 ## [0.11.5] — 2026-09-09
 

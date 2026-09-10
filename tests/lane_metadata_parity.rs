@@ -91,8 +91,8 @@ const EXPECTED: &[Expected] = &[
     Expected {
         key: "software.ids",
         vendors: None,
-        kind: Kind::Defect,
-        reason: "the native Shimadzu lane still records no acquisition software (LabSolutions version needs a glue export); elsewhere the difference is ProteoWizard's own entries (pwiz, pwiz_Reader_*) and the vendor's FULL version string the native lane carries (`MassHunter GC/MS Acquisition 10.0.368 …`, `MassLynx 4.1 SCN916`) where pwiz prints `8.0` / `4.1`.",
+        kind: Kind::ByDesign,
+        reason: "ProteoWizard adds its own entries (pwiz, pwiz_Reader_*), and the native lane carries the vendor's FULL version string (`MassHunter GC/MS Acquisition 10.0.368 …`, `MassLynx 4.1 SCN916`, and since 0.11.3 Shimadzu's LabSolutions version read from the `.lcd`) where pwiz prints `8.0` / `4.1`. ProteoWizard's own ids differ on every pair, so this rule never goes stale: re-read it by hand when a lane's software record changes.",
     },
     Expected {
         key: "file_description.source_files.count",
@@ -309,7 +309,7 @@ const EXPECTED: &[Expected] = &[
         key: "spectra_metadata_precursors.*",
         vendors: Some(&[Vendor::Waters]),
         kind: Kind::ByDesign,
-        reason: "follows the two row rules: ×200 rows on the pwiz side; the same acquisition-range MSe window on both, but the mzML twin carries only one offset (mzdata reads the lower one as 0) and the native lane adds the method's transfer-energy ramp (MS:1002013/1002014) and the window-source parameter.",
+        reason: "follows the two row rules: ×200 rows on the pwiz side; the same acquisition-range MSe window on both (the mzML twin has read both offsets since the mzdata reader fix of 0.11.3), and the native lane adds the method's transfer-energy ramp (MS:1002013/1002014) and the window-source parameter.",
     },
     Expected {
         key: "spectra_metadata_selected_ions.*",

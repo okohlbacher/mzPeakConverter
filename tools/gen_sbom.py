@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Generate a CycloneDX 1.5 SBOM from `cargo metadata`.
 
-Usage: cargo metadata --format-version 1 --all-features | python3 tools/gen_sbom.py > sbom.cdx.json
+Usage: cargo metadata --format-version 1 --all-features --locked | python3 tools/gen_sbom.py > out.cdx.json
+
+release.yml runs exactly this for every release and attaches the result as mzpeak-convert-<version>.cdx.json.
 
 Captures every resolved dependency (all features) with name, version, purl, license, and source.
 No third-party deps — pure stdlib so it runs anywhere cargo + python do.
@@ -39,10 +41,13 @@ def main() -> None:
         refs = []
         if pkg.get("repository"):
             refs.append({"type": "vcs", "url": pkg["repository"]})
-        # source: registry => from crates.io; null => path/vendored/local
+        # source: registry => from crates.io; null => path/vendored/local; git+... => a pinned fork,
+        # which the purl alone would pass off as the crates.io release of the same version
         src = pkg.get("source")
         if src is None:
             comp["properties"] = [{"name": "cdx:cargo:source", "value": "local/vendored (path)"}]
+        elif not src.startswith("registry+"):
+            comp["properties"] = [{"name": "cdx:cargo:source", "value": src}]
         if refs:
             comp["externalReferences"] = refs
         components.append(comp)
