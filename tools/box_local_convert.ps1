@@ -5,7 +5,8 @@
 param([Parameter(Mandatory=$true)][string]$InPath, [Parameter(Mandatory=$true)][string]$OutPath)
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
-$env:DOTNET_ROOT = 'C:\Users\User\dotnet8'; $env:DOTNET_ROLL_FORWARD = 'LatestMajor'
+# No DOTNET_ROLL_FORWARD: the binary sets LatestMajor for Thermo .raw only (see box_convert_remote.ps1).
+$env:DOTNET_ROOT = 'C:\Users\User\dotnet8'
 $cvtRoot = 'C:\Users\User\src\mzPeakConverter'
 $pwiz = 'C:/Users/User/AppData/Local/Apps/ProteoWizard 3.0.26175.31fd1ca 64-bit'   # same pin as box_convert_remote.ps1 (flattened layout; MHDAC resolved by agilent_dll_dir)
 if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE  = (Resolve-Path "$cvtRoot\glue\sciex\bin\Release\net8.0").Path }
