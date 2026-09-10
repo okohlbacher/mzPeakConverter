@@ -1510,14 +1510,24 @@ pub trait AbstractMzPeakWriter {
             let colpath = c.path().to_string();
             if (colpath.contains("_mz_") || colpath.contains(".mz"))
                 && shuffle_mz
+                && use_chunked_encoding.is_none()
                 && matches!(
                     c.physical_type(),
                     parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
                 )
             {
                 log::debug!("{}: shuffling", c.path());
-                data_props =
-                    data_props.set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+                // Float m/z in a POINT facet: the flat column the SciEX grid lane keeps its off-lattice
+                // f64 minority in, the m/z-lattice fallback, `--layout point`. The global dictionary
+                // takes precedence over an explicit encoding (see the `_index` rule below), so without
+                // disabling it BYTE_STREAM_SPLIT was only the fallback and the column shipped
+                // dictionary-encoded. Measured with zstd, values bit-identical: −22 % / −25 % on the
+                // m/z of the densest native SciEX row groups, −25 % to −48 % on point-layout
+                // mzML/Thermo m/z. Chunk facets are left as they are, so chunked archives keep their
+                // bytes; their `mz_chunk_*` boundary columns would gain about 1 % of the facet.
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
             }
             if colpath.contains("ion_mobility") {
                 log::debug!(

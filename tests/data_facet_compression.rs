@@ -13,25 +13,36 @@
 //! coalesces precision twins before anything is written. So the CLI test pins that ordinary archives
 //! are compressed, and `pruned_peak_facet_keeps_its_writer_properties` builds, through the writer, the
 //! one input that still triggers the rewrite.
+//!
+//! `point_layout_float_mz_is_byte_stream_split` pins the m/z encoding of point facets.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mzdata::params::Unit;
+use mzdata::prelude::*;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
-use mzdata::spectrum::{Chromatogram, ChromatogramDescription, MultiLayerSpectrum, SignalContinuity, SpectrumDescription};
+use mzdata::spectrum::{
+    Chromatogram, ChromatogramDescription, MultiLayerSpectrum, PeakDataLevel, SignalContinuity, SpectrumDescription,
+};
 use mzpeak_prototyping::peak_series::{INTENSITY_ARRAY, MZ_ARRAY};
 use mzpeak_prototyping::writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, MzPeakWriterType};
-use mzpeak_prototyping::{BufferContext, BufferName};
+use mzpeak_prototyping::{BufferContext, BufferName, MzPeakReader};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
+const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwiz.1.1.mzML");
+
 fn convert_fixture(tag: &str, extra: &[&str]) -> PathBuf {
+    convert(TINY, tag, extra)
+}
+
+fn convert(input: &str, tag: &str, extra: &[&str]) -> PathBuf {
     let out = std::env::temp_dir().join(format!("mzpc-zstd-{}-{tag}.mzpeak", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let status = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwiz.1.1.mzML"))
+        .arg(input)
         .arg("-o")
         .arg(&out)
         .arg("--force")
@@ -185,4 +196,86 @@ fn pruned_peak_facet_keeps_its_writer_properties() {
     );
     let _ = std::fs::remove_file(&facet);
     let _ = std::fs::remove_file(&out);
+}
+
+/// The encodings of `column` in each row group of one facet of the archive.
+fn column_encodings(archive: &Path, member: &str, column: &str) -> Vec<Vec<Encoding>> {
+    let extracted = extract(archive, member);
+    let reader = SerializedFileReader::new(File::open(&extracted).unwrap()).unwrap();
+    let found = reader
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| {
+            let col = rg.columns().iter().find(|c| c.column_path().string() == column);
+            col.unwrap_or_else(|| panic!("{member} has no {column} column")).encodings().collect()
+        })
+        .collect();
+    let _ = std::fs::remove_file(&extracted);
+    found
+}
+
+fn is_dictionary(e: &Encoding) -> bool {
+    matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)
+}
+
+/// Float m/z in a point facet is BYTE_STREAM_SPLIT with the dictionary off. The writer had the switch
+/// (`shuffle_mz`), but no lane set it, and the global dictionary takes precedence over a column
+/// encoding anyway, so every point `mz` column shipped dictionary-encoded: on the native SciEX
+/// Sample002 archive that column is 409 MB, 42 % of the archive. The values must read back
+/// bit-identical, and chunk facets, which the rule leaves alone, keep their dictionary.
+#[test]
+fn point_layout_float_mz_is_byte_stream_split() {
+    let assert_bss = |archive: &Path, member: &str| {
+        let row_groups = column_encodings(archive, member, "point.mz");
+        assert!(!row_groups.is_empty(), "{member} has no row group");
+        for encodings in row_groups {
+            assert!(
+                encodings.contains(&Encoding::BYTE_STREAM_SPLIT) && !encodings.iter().any(is_dictionary),
+                "{member} point.mz must be BYTE_STREAM_SPLIT without a dictionary (encodings: {encodings:?})"
+            );
+        }
+    };
+
+    // `--layout point` on the ordinary lane: profile m/z in spectra_data, centroid m/z in spectra_peaks.
+    let point = convert_fixture("point-mz", &["--layout", "point"]);
+    assert_bss(&point, "spectra_data.parquet");
+    assert_bss(&point, "spectra_peaks.parquet");
+
+    let mut source = mzdata::MZReader::open_path(TINY).unwrap();
+    let mut reader = MzPeakReader::new(&point).unwrap();
+    assert_eq!(reader.len(), source.len());
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (i, spectrum) in source.iter().enumerate() {
+        let want = spectrum.arrays.as_ref().and_then(|a| a.mzs().ok().map(|m| m.to_vec())).unwrap_or_default();
+        // Profile m/z from spectra_data; a spectrum with none there is a centroid one, in spectra_peaks.
+        let profile = reader
+            .get_spectrum_arrays(i as u64)
+            .unwrap()
+            .and_then(|a| a.mzs().ok().map(|m| m.to_vec()))
+            .unwrap_or_default();
+        let got: Vec<f64> = if !profile.is_empty() {
+            profile
+        } else {
+            match reader.get_spectrum_peaks_for(i as u64).unwrap() {
+                Some(PeakDataLevel::Centroid(peaks)) => peaks.iter().map(|p| p.mz).collect(),
+                _ => Vec::new(),
+            }
+        };
+        assert_eq!(bits(&got), bits(&want), "spectrum {i}: m/z must read back bit-identical to the source");
+    }
+    let _ = std::fs::remove_file(&point);
+
+    // The mzML `--tof-grid` lane builds its writer separately: the f64 column beside its gridded centroids.
+    let swath = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
+    let gridded = convert(swath, "tof-grid-mz", &["--tof-grid", "on"]);
+    assert_bss(&gridded, "spectra_peaks.parquet");
+    let _ = std::fs::remove_file(&gridded);
+
+    // Chunk facets are outside the rule, so a chunked archive keeps its bytes.
+    let chunked = convert_fixture("chunk-mz", &[]);
+    for encodings in column_encodings(&chunked, "spectra_data.parquet", "chunk.mz_chunk_start") {
+        assert!(encodings.iter().any(is_dictionary), "chunk.mz_chunk_start changed encoding: {encodings:?}");
+    }
+    let _ = std::fs::remove_file(&chunked);
 }
