@@ -81,6 +81,10 @@ All notable changes to this project are documented here. The format follows
 - **The `FrameMsMsInfo` → precursor mapping behind the 0.11.3 TSF precursors is pinned on an
   in-memory table** (`bruker_tsf::msms_tests`), since no TSF acquisition is available for the
   end-to-end pin.
+- **CI saves Rust caches only from `main`, and the release workflow saves none.** The repository's
+  Actions cache stood at 10.58 GB against GitHub's 10 GB limit, 13 of its 17 entries (7.0 GB) being
+  release-build caches saved by pull-request dry runs, a backfill dispatch and a tag build. The
+  Windows jobs now share one cache, which only the `windows` job saves.
 - README: run the suite with `cargo test --release`, as CI does; the vendored writer's
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
 
