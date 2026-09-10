@@ -1,10 +1,12 @@
 //! Native SciEX (`.wiff` / `.wiff2`) reader → mzdata spectra (PLAN §3.7, native lane).
 //!
-//! ⚠️ WINDOWS-RUNTIME-ONLY AND UNTESTED. This module is verified to *compile* behind the
-//! `sciex` cargo feature on any host, but it can only *run* where the SciEX Clearcore2
-//! managed assemblies are present (sourced from a ProteoWizard install) and a .NET 8
-//! runtime is installed. There is no macOS build of the Clearcore2 stack; do not expect
-//! this to execute on the development box.
+//! ⚠️ WINDOWS-ONLY. `main.rs` compiles this module only under `#[cfg(windows)]` (there is no cargo
+//! feature), and it runs only where the SciEX Clearcore2 managed assemblies (from a ProteoWizard
+//! install) and a .NET 8 runtime are present; there is no macOS or Linux build of that stack. The
+//! lane built the published native SciEX corpus archives. What it decides without the glue lives in
+//! `src/sciex_run.rs`, tested on every host, and `tests/sciex_abi_pin.rs` holds this file and
+//! `glue/sciex/Glue.cs` to one ABI. Not yet run on Windows: the precursor read (glue ABI 2), the
+//! value-change counts (ABI 3), the version handshake and the once-per-process boot.
 //!
 //! ## How it works
 //!
@@ -445,7 +447,7 @@ impl GlueApi {
 /// A native SciEX `.wiff`/`.wiff2` reader yielding one [`MultiLayerSpectrum`] per flattened
 /// (sample, experiment, cycle) spectrum, built the same way the Bruker readers build theirs.
 ///
-/// ⚠️ Windows-runtime-only and untested (see module docs).
+/// ⚠️ Windows-only (see module docs).
 pub struct SciexReader {
     api: GlueApi,
     handle: i64,

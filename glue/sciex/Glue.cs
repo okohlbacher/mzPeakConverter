@@ -4,7 +4,7 @@
 // exposes a tiny C ABI (matching src/sciex.rs) of [UnmanagedCallersOnly] static methods to
 // the Rust host (which boots CoreCLR via netcorehost).
 //
-// ⚠️ WINDOWS-RUNTIME-ONLY AND UNTESTED. This compiles on any platform (no compile-time
+// ⚠️ WINDOWS-RUNTIME-ONLY. This compiles on any platform (no compile-time
 //    reference to Clearcore2 — everything vendor-specific is reached through reflection at
 //    runtime), but it only *runs* where the Clearcore2 DLLs (sourced from a ProteoWizard
 //    install's vendor_api/ABI directory) and a compatible .NET 8 runtime are present.
