@@ -96,6 +96,61 @@ fn failed_mzpeak_filter_and_mzpeak_to_mzml_leave_no_tmp_behind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--via-msconvert --to mzml` trusts only what msconvert wrote in THIS run. It used to hand
+/// msconvert the final path as `--outdir`/`--outfile` and check `output.exists()`, so under
+/// `--force` the previous run's file passed for this run's: exit 0, "wrote …", stale mzML. Real
+/// msconvert gets there for `-o x.mzML.gz`, a name it writes elsewhere. Stand-in scripts play it.
+#[cfg(unix)]
+#[test]
+fn via_msconvert_mzml_export_trusts_only_this_runs_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = scratch("msconvert-bin");
+    let fake = |name: &str, body: &str| {
+        let p = bin.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    let silent = fake("silent", "exit 0");
+    let copying = fake(
+        "copying",
+        "in=$1\nwhile [ $# -gt 0 ]; do case $1 in --outdir) d=$2;; --outfile) f=$2;; esac; shift; done\ncp \"$in\" \"$d/$f\"",
+    );
+    let via = |output: &Path, exe: &Path| {
+        run(&[Path::new(FIXTURE), Path::new("-o"), output, Path::new("--via-msconvert"), Path::new("--msconvert-path"), exe])
+    };
+    let names = |dir: &Path| {
+        let mut v: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    };
+
+    // (a) msconvert exits 0 having written nothing: fail, and leave the previous output alone.
+    let dir = scratch("msconvert");
+    let output = dir.join("out.mzML");
+    std::fs::write(&output, b"a previous run's mzML").unwrap();
+    let r = via(&output, &silent);
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(!r.status.success(), "msconvert wrote nothing, so the export must fail; stderr:\n{stderr}");
+    assert_eq!(std::fs::read(&output).unwrap(), b"a previous run's mzML", "the previous output must be untouched");
+    assert_eq!(names(&dir), ["out.mzML"], "the failed run left something beside the output");
+
+    // (b) msconvert writes its mzML: it lands under the requested name (gzipped for `.gz`) and reparses.
+    for name in ["out.mzML", "out.mzML.gz"] {
+        let output = dir.join(name);
+        let r = via(&output, &copying);
+        assert!(r.status.success(), "{name}: {}", String::from_utf8_lossy(&r.stderr));
+        let inspect = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert")).arg(&output).output().unwrap();
+        let text = String::from_utf8_lossy(&inspect.stdout);
+        assert!(inspect.status.success() && text.contains("spectra:       4"), "{name}: {text}");
+        let gzip = std::fs::read(&output).unwrap().starts_with(&[0x1f, 0x8b]);
+        assert_eq!(gzip, name.ends_with(".gz"), "{name}: gzip magic present = {gzip}");
+    }
+    assert_eq!(names(&dir), ["out.mzML", "out.mzML.gz"], "a successful run left something beside the output");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
 /// The success path: the export lands under the requested name, complete, with no tmp beside it.
 #[test]
 fn successful_mzml_export_is_renamed_into_place() {
