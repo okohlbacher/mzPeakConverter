@@ -277,6 +277,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   glue or a Thermo boot keeps hostfxr loaded and hides the bug, so it is `#[ignore]`d there, and the
   step fails if the test did not run. Only CI can execute it. The workflow header no longer claims
   that native vendor conversion stays out of CI: the manual `sciex-native-zeno` job does it.
+- **The .NET 8 end of support, 2026-11-10, is written down, and the BinaryFormatter note no longer
+  overstates .NET 9.** The Shimadzu glue README and csproj said .NET 9 removes `BinaryFormatter`
+  "outright", so a retarget needs a vendor DLL that does not use it. The in-box implementation does
+  throw on .NET 9 and later, but Microsoft's unsupported `System.Runtime.Serialization.Formatters`
+  package, together with the switch, restores a working one. Whether that holds inside a component
+  loaded through hostfxr is untested. Decided for now: the SciEX and Shimadzu glues stay on
+  `net8.0`, and `docs/PLATFORM_SUPPORT.md` states the date and what it means.
 
 ### Removed
 
