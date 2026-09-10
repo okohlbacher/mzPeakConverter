@@ -205,6 +205,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   scanning backwards at `</spectrumList>`, so an mzML without chromatograms is no longer read end to
   end on every conversion. Pinned by `rebuilt_index_resolves_each_section_against_its_own_list` and
   `declared_chromatogram_count_stops_at_the_end_of_the_spectra`.
+- **`--ims-chunked` is no longer dropped in silence when a timsTOF run falls back to mzdata.** On a
+  TDF timsrust cannot decompress (newer timsTOF, 5.1.x) the ims-compact lane converts through the
+  standard mzdata lane instead, which writes f64 m/z and has no chunked TOF layout; the flags had
+  been checked against the ims-compact lane, which honours `--ims-chunked`, and never again. The
+  fallback now checks them against the standard lane, where `--ims-chunked` is listed as inert, so
+  it is warned about like every other inert flag — as it now also is on a TDF under
+  `--no-ims-compact`, on any other standard-lane input and on the native vendor readers. Pinned by
+  `ims_chunked_is_inert_on_the_standard_lane`; the fallback itself needs a TDF timsrust cannot read,
+  which no committed fixture is.
 - **An archive → mzML export reads each spectrum once.** It first read every spectrum's metadata to
   find the survivors, then read the survivors again in full, and it did so without a filter too:
   that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.

@@ -1233,6 +1233,9 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
                          (f64 m/z, larger; may skip any frame even mzdata can't decode)",
                         cli.input.display()
                     );
+                    // The fallback IS the standard lane: its flags were checked against ims-compact,
+                    // which honours `--ims-chunked`; the standard lane cannot, so say so now.
+                    refuse_unsupported_flags(Lane::Standard, cfg)?;
                     guard_unsupported_vendor(&cli.input)?;
                     convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration)
                         .with_context(|| format!("mzdata-fallback converting {}", cli.input.display()))?;
@@ -1276,7 +1279,8 @@ enum Lane {
     ImsCompact,
     /// `convert_file` routed to a native vendor reader (TSF / BAF / Agilent / wiff / Waters / .lcd).
     VendorReader,
-    /// `convert_file` on the mzdata path (mzML / imzML / Thermo `.raw` / TDF f64): honours everything.
+    /// `convert_file` on the mzdata path (mzML / imzML / Thermo `.raw` / TDF f64): honours everything
+    /// but `--ims-chunked`. Also the ims-compact lane's fallback for a TDF timsrust cannot decompress.
     Standard,
 }
 
@@ -1385,7 +1389,10 @@ fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
         ],
         Lane::AgilentGrid | Lane::SdkImsCompact => &["--layout", "--no-numpress", "--chunk-size"],
         Lane::ImsCompact => &["--layout", "--no-numpress"],
-        Lane::ViaMsconvert | Lane::BrukerSdk | Lane::VendorReader | Lane::Standard => &[],
+        // No chunked TOF layout off the timsTOF ims-compact lane — which falls back to `Standard`
+        // on a TDF timsrust cannot decompress, and checks this list again when it does.
+        Lane::VendorReader | Lane::Standard => &["--ims-chunked"],
+        Lane::ViaMsconvert | Lane::BrukerSdk => &[],
         #[allow(unreachable_patterns)]
         _ => CODEC,
     }
@@ -8737,6 +8744,24 @@ mod tests {
         assert!(s.given.is_empty(), "config-file values must not be 'given': {:?}", s.given);
         assert_eq!(s.zstd_level, 5, "…while still taking effect as the default");
         assert!(refuse_unsupported_flags(Lane::ImsCompact, &s).is_ok(), "a profile's sdrf must not refuse a lane");
+    }
+
+    /// `--ims-chunked` shapes only the timsTOF ims-compact archive. When that lane falls back to the
+    /// mzdata (standard) lane on a TDF timsrust cannot decompress, it re-checks the flags against
+    /// the standard lane, which lists it as inert: a warning, not a refusal, and not silence.
+    #[test]
+    fn ims_chunked_is_inert_on_the_standard_lane() {
+        let cli = Cli::try_parse_from(["mzpeak-convert", TINY, "--ims-chunked"]).unwrap();
+        let s = Settings::resolve(&cli).unwrap();
+        assert!(super::inert_flags_for(Lane::Standard).contains(&"--ims-chunked"), "not listed, so never warned");
+        assert!(refuse_unsupported_flags(Lane::Standard, &s).is_ok(), "inert is a warning, not a refusal");
+
+        let dir = scratch("ims-chunked-standard");
+        let out = dir.join("out.mzpeak");
+        let args: Vec<&std::ffi::OsStr> =
+            vec![TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref(), "--ims-chunked".as_ref()];
+        let (ok, _, err) = run_bin(&args, &[]);
+        assert!(ok && err.contains("--ims-chunked is inert on the standard lane"), "{err}");
     }
 
     /// End to end: a combination that would DROP user data exits non-zero with the flag named and

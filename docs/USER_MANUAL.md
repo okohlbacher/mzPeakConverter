@@ -171,8 +171,8 @@ re-packed verbatim): it is warned about by name and the run goes on. The table:
 | `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-tims-recalibration --layout --no-numpress --chunk-size` |
 | `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-tims-recalibration` |
 | default timsTOF (TDF) ims-compact | `--image --sdrf --layout --no-numpress` |
-| native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` |
-| standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | nothing |
+| native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` (`--ims-chunked` is inert there: warned about, not refused) |
+| standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | nothing (`--ims-chunked` is inert there: warned about, not refused — also when a timsTOF run falls back to this lane because timsrust cannot decompress it) |
 
 Options a lane merely has no use for but that cannot change its output (`--no-vendor` on an mzML
 export, `--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input) are
