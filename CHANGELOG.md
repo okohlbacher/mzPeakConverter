@@ -219,6 +219,14 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 
 ### Changed
 
+- **`tools/corpus_reconvert.py --box` returns box archives to the host; publishing to S3 is
+  opt-in (`--publish-s3`).** The default named each unit's durable corpus key as the box target,
+  and `box_convert.sh` copied the verified object onto `s3://v09/...`, the public distribution
+  bucket, before any validator had run, always with `--overwrite`. Only a remembered
+  `--no-s3-first` prevented it. Now the archive comes back beside its raw through the transient
+  relay slot, and `--publish-s3` restores the old route. `--no-s3-first` is still accepted and does
+  nothing. The release-day sequence is `tools/corpus_reconvert.py --box`, then host validation,
+  then publishing from the corpus repository (`scripts/update.sh`).
 - **The ignored tests run, and no test that runs by default passes without asserting.** Of the six
   `#[ignore]`d tests, four now run by default on every platform, on data already in the repository:
   `by_id_reads_the_peaks_facet_on_a_centroid_only_archive` on the committed centroid-only fixture
