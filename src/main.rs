@@ -2337,6 +2337,8 @@ fn convert_to_mzml(
 ///
 /// The survivors are `filter.rs`'s: `spectrum.time` (stored in **minutes**) ∈ `--rt` AND
 /// `ms_level` ∈ the `--ms-level` set, read from `spectra_metadata` by [`filter::surviving_spectra`].
+/// `--rt` cuts the archive's chromatograms to the same window ([`cut_chromatogram_to_window`]), as
+/// rewriting the archive first and exporting that does; the direct export wrote them whole.
 fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts) -> Result<()> {
     use mzdata::prelude::{MSDataFileMetadata, SpectrumLike, SpectrumSource, SpectrumWriter};
     use mzpeak_prototyping::MzPeakReader;
@@ -2416,6 +2418,9 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
         .map(|mut c| {
             demote_mzp_params_chrom(c.description_mut());
+            if let Some(window) = opts.rt {
+                cut_chromatogram_to_window(&mut c, window);
+            }
             c
         })
         .collect();
@@ -2428,6 +2433,40 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     tmp_guard.finish(output)?;
     log::info!("wrote {}", output.display());
     Ok(())
+}
+
+/// Cut a chromatogram to the `--rt` window `[lo, hi]` (minutes) as the `.mzpeak` filter lane cuts
+/// `chromatograms_data`: a point stays when its time lies in the window, read in the unit its time
+/// array states (an mzML-lane archive built by 0.11.5 or earlier holds seconds), and every other
+/// array keeps the same points. A chromatogram whose arrays cannot be decoded, or differ in length
+/// from its times, is left whole, with a warning.
+fn cut_chromatogram_to_window(chrom: &mut Chromatogram, (lo, hi): (f64, f64)) {
+    let Some(time) = chrom.arrays.get(&ArrayType::TimeArray) else { return };
+    let per_minute = match time.unit {
+        Unit::Second => 60.0,
+        Unit::Millisecond => 60_000.0,
+        _ => 1.0,
+    };
+    let (lo, hi) = (lo * per_minute, hi * per_minute);
+    let keep: Option<Vec<bool>> = time.to_f64().ok().map(|t| t.iter().map(|&v| v >= lo && v <= hi).collect());
+    let id = chrom.id().to_string();
+    let Some(keep) = keep.filter(|keep| {
+        chrom.arrays.iter_mut().all(|(_, a)| {
+            let width = a.dtype.size_of();
+            a.decode_and_store().is_ok() && width > 0 && a.data.len() == keep.len() * width
+        })
+    }) else {
+        log::warn!("chromatogram {id:?}: its arrays cannot be cut to the --rt window; written whole");
+        return;
+    };
+    for (_, array) in chrom.arrays.iter_mut() {
+        let width = array.dtype.size_of();
+        let kept: Vec<u8> = array.data.chunks_exact(width).zip(&keep).filter(|(_, k)| **k).flat_map(|(c, _)| c.iter().copied()).collect();
+        let mut cut = DataArray::wrap(&array.name, array.dtype, kept);
+        cut.unit = array.unit;
+        cut.params = array.params.take();
+        *array = cut;
+    }
 }
 
 /// Write a native reader's spectra (via a `spectrum(i)` closure) to an mzML. Native readers carry no
@@ -7737,6 +7776,48 @@ mod tests {
             values("Fraction A - [%]", ArrayType::nonstandard("Fraction A - [%]")),
             (vec![2.0, 3.0, 4.0], vec![2.0, 3.0, 4.0])
         );
+    }
+
+    /// `x.mzpeak -o y.mzML --rt a-b` cuts the chromatograms to the window, as filtering into an
+    /// archive and exporting that does. The direct export kept the spectra in the window and wrote
+    /// every source chromatogram whole: on a TSF run's archive, TIC and BIC of 15 points beside all six
+    /// HyStar traces uncut (352 points of pressure), where the two-step route wrote none of them.
+    #[test]
+    fn a_filtered_mzml_export_cuts_the_chromatograms_to_the_window() {
+        let (dir, _cleanup) = trace_scratch("rt-mzml");
+        let seconds = [60.0, 120.0, 180.0, 240.0, 300.0, 360.0];
+        let dot_d = hystar_dot_d(
+            &dir,
+            &[
+                (1, "Pump HP:Pressure - [bar]", 9999, 3, &seconds, &[100.0, 110.0, 120.0, 130.0, 140.0, 150.0]),
+                (2, "Fraction A - [%]", 5, 4, &seconds, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ],
+        );
+        let src = dir.join("run.mzpeak");
+        write_trace_archive(&dot_d, &src);
+        let window = super::filter::FilterOpts { rt: Some((2.0, 4.0)), ..Default::default() };
+        let direct = dir.join("direct.mzML");
+        super::filter_mzpeak_to_mzml(&src, &direct, &window).unwrap();
+        let filtered = dir.join("rt.mzpeak");
+        super::filter::run(&src, &filtered, &window).unwrap();
+        let two_step = dir.join("two-step.mzML");
+        super::filter_mzpeak_to_mzml(&filtered, &two_step, &super::filter::FilterOpts::default()).unwrap();
+
+        // Each trace's `defaultArrayLength`, and its time array's first and last value as written.
+        let traces = |mzml: &std::path::Path| -> Vec<(String, usize)> {
+            let xml = std::fs::read_to_string(mzml).unwrap();
+            ["Pump HP:Pressure - [bar]", "Fraction A - [%]"]
+                .iter()
+                .map(|id| {
+                    let start = xml.find(&format!("<chromatogram id=\"{id}\"")).unwrap_or_else(|| panic!("{}: no chromatogram {id}", mzml.display()));
+                    let tag = &xml[start..start + xml[start..].find('>').unwrap()];
+                    let len = tag.split("defaultArrayLength=\"").nth(1).and_then(|v| v.split('"').next()).unwrap().parse().unwrap();
+                    (id.to_string(), len)
+                })
+                .collect()
+        };
+        assert_eq!(traces(&direct), traces(&two_step), "the direct and the two-step export disagree");
+        assert_eq!(traces(&direct).iter().map(|t| t.1).collect::<Vec<_>>(), [3, 3], "2, 3 and 4 min are in the window");
     }
 
     /// The archive → mzML export of device traces: `<chromatogramList count>` is what is written

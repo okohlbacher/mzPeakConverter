@@ -146,6 +146,15 @@ keep their bytes.
   the filter. A chromatogram facet with no time axis to cut on keeps its metadata unchanged, as it
   keeps its data, where its point counts used to be set to 0. Pinned by
   `tests::an_rt_window_cuts_the_device_trace_values_with_their_times`.
+- **`x.mzpeak -o y.mzML --rt a-b` cuts the chromatograms to the window.** The direct export kept
+  the spectra in the window but wrote every stored chromatogram whole, while rewriting the archive
+  with `--rt` first and exporting that cut them: on the private TSF run's archive with `--rt 0-0.03`,
+  15 spectra beside all six HyStar traces uncut (352 points of pressure) one way, none of their points
+  the other; with `--rt 0-0.05`, `tiny.pwiz.1.1`'s `sic` kept all 10 points where the rewrite keeps 4
+  (0.11.5's direct export wrote 10 as well). The export now
+  cuts each chromatogram as the rewrite does, in the unit its time array states, every array to the
+  same points. Pinned by `tests::a_filtered_mzml_export_cuts_the_chromatograms_to_the_window`, which
+  compares both routes.
 - **An mzML output's `<chromatogramList count>` said 2 whatever followed.** mzdata's writer starts
   the count at its own TIC/BPC pair and writes it with the first chromatogram, and no lane set it,
   so every source chromatogram passed through (`.mzpeak` → mzML, mzML → mzML) left it short: 2
