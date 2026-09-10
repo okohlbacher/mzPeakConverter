@@ -4,7 +4,7 @@
 // exposes a tiny C ABI (matching src/sciex.rs) of [UnmanagedCallersOnly] static methods to
 // the Rust host (which boots CoreCLR via netcorehost).
 //
-// ⚠️ WINDOWS-RUNTIME-ONLY AND UNTESTED. This compiles on any platform (no compile-time
+// ⚠️ WINDOWS-RUNTIME-ONLY. This compiles on any platform (no compile-time
 //    reference to Clearcore2 — everything vendor-specific is reached through reflection at
 //    runtime), but it only *runs* where the Clearcore2 DLLs (sourced from a ProteoWizard
 //    install's vendor_api/ABI directory) and a compatible .NET 8 runtime are present.
@@ -33,6 +33,11 @@
 //       MassSpectrum GetMassSpectrum(int cycleIndex0)
 //       MassSpectrumInfo GetMassSpectrumInfo(int cycleIndex0)   // .MSLevel, .StartRT (varies by version)
 //       double GetRTFromExperimentScanIndex(int cycleIndex0)
+//   MassSpectrumInfo (the precursor, as WiffFile.cpp's SpectrumImpl ctor reads it):
+//       bool IsProductSpectrum, double ParentMZ, int ParentChargeState
+//   ExperimentDetails, on a Product / Precursor experiment (WiffFile.cpp getIsolationInfo):
+//       MassRangeInfo[0]      // a FragmentBasedScanMassRange: double IsolationWindow (full width)
+//       Parameters["CE"]      // .Start / .Stop in eV, negative on a negative-polarity method
 //   MassSpectrum:
 //       double[] GetActualXValues()   // m/z
 //       double[] GetActualYValues()   // intensity
@@ -92,6 +97,49 @@ public struct SciexSpectrumMeta
     public int Polarity;           // 0 = positive, 1 = negative, other = unknown
     public int SignalContinuity;   // 0 = profile, 1 = centroid
     public double RetentionTimeSeconds; // seconds at the ABI (see RT UNIT CONTRACT above)
+}
+
+/// <summary>
+/// V2 metadata: <see cref="SciexSpectrumMeta"/> VERBATIM as a prefix, plus what Clearcore2 states about
+/// the precursor, read where ProteoWizard's WiffFile.cpp reads it. Zero means "not stated"; the
+/// precursor is DECIDED on the Rust side (src/sciex_run.rs <c>precursor</c>). Never reorder or resize
+/// the prefix: a binary that predates the handshake still reaches V1 through <c>SpectrumMeta</c>.
+///
+/// ABI CONTRACT: the 32 B prefix + 2 × int32 + 4 × double = 72 bytes, 8-byte aligned, matching
+/// <c>SciexSpectrumMetaV2</c> in src/sciex.rs (asserted in <see cref="Exports"/>'s static ctor).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct SciexSpectrumMetaV2
+{
+    // --- V1 prefix, byte-for-byte (32 B) ---
+    public int Sample;
+    public int Experiment;
+    public int Cycle;
+    public int MsLevel;
+    public int Polarity;
+    public int SignalContinuity;
+    public double RetentionTimeSeconds;
+    // --- V2 additions (40 B) ---
+    public int ExperimentType;          // Details.ExperimentType value: MS 0, Product 1, Precursor 2, NeutralGainOrLoss 3, SIM 4, MRM 5; -1 unreadable
+    public int PrecursorCharge;         // MassSpectrumInfo.ParentChargeState of a product spectrum; 0 = not stated
+    public double ParentMz;             // MassSpectrumInfo.ParentMZ when IsProductSpectrum; 0 = not stated
+    public double IsolationWidth;       // MassRangeInfo[0].IsolationWindow, full width; 0 = not stated
+    public double CollisionEnergyStart; // Details.Parameters["CE"].Start, eV as stored; 0 = not stated
+    public double CollisionEnergyStop;  // Details.Parameters["CE"].Stop, eV as stored; 0 = not stated
+}
+
+/// <summary>
+/// What <c>SpectrumDataV2</c> changed in one spectrum's arrays on their way out: intensity points
+/// mapped from NaN to 0, points clamped to ±float.MaxValue (±Inf included), and points dropped by
+/// cutting an m/z / intensity pair of unequal length to the shorter one. Layout MUST match
+/// <c>SciexValueChanges</c> in src/sciex.rs: 3 × int64 = 24 bytes.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct SciexValueChanges
+{
+    public long NanToZero;
+    public long ClampedToF32;
+    public long TruncatedPoints;
 }
 
 /// <summary>
@@ -372,8 +420,8 @@ internal sealed class Clearcore2Api
         session.Resolved = string.Join(";", resolved);
     }
 
-    /// <summary>Resolve scalar metadata for one flattened spectrum.</summary>
-    public SciexSpectrumMeta GetMeta(WiffSession session, SpectrumAddress addr)
+    /// <summary>Resolve scalar metadata for one flattened spectrum, its precursor facts included.</summary>
+    public SciexSpectrumMetaV2 GetMeta(WiffSession session, SpectrumAddress addr)
     {
         var (experiment, _) = GetExperimentAndSpectrum(session, addr, fetchSpectrum: false);
 
@@ -411,7 +459,29 @@ internal sealed class Clearcore2Api
         var polarity = GetProperty(details, "Polarity");
         polarityCode = MapPolarity(polarity);
 
-        return new SciexSpectrumMeta
+        // Precursor facts, read where ProteoWizard's WiffFile.cpp reads them and left UNDECIDED (the
+        // Rust side builds the precursor): the parent of a product spectrum from its MassSpectrumInfo;
+        // the isolation width and collision energy from the experiment, only on a Product or Precursor
+        // experiment with a mass range (pwiz's getHasIsolationInfo). ExperimentType travels as the
+        // enum's integer value, which pwiz casts straight to its own MS 0 … MRM 5.
+        int experimentType = ToInt(GetProperty(details, "ExperimentType"), -1);
+        int parentCharge = 0;
+        double parentMz = 0.0, isolationWidth = 0.0, ceStart = 0.0, ceStop = 0.0;
+        if (info != null && GetProperty(info, "IsProductSpectrum") is bool isProduct && isProduct)
+        {
+            parentMz = ToDouble(GetProperty(info, "ParentMZ"));
+            parentCharge = ToInt(GetProperty(info, "ParentChargeState"));
+        }
+        if ((experimentType == 1 || experimentType == 2)
+            && GetProperty(details, "MassRangeInfo") is Array ranges && ranges.Length > 0)
+        {
+            isolationWidth = ToDouble(GetProperty(ranges.GetValue(0), "IsolationWindow"));
+            var ce = ParameterNamed(GetProperty(details, "Parameters"), "CE");
+            ceStart = ToDouble(GetProperty(ce, "Start"));
+            ceStop = ToDouble(GetProperty(ce, "Stop"));
+        }
+
+        return new SciexSpectrumMetaV2
         {
             Sample = addr.Sample,
             Experiment = addr.Experiment,
@@ -420,26 +490,35 @@ internal sealed class Clearcore2Api
             Polarity = polarityCode,
             SignalContinuity = continuity,
             RetentionTimeSeconds = rtSeconds,
+            ExperimentType = experimentType,
+            PrecursorCharge = parentCharge,
+            ParentMz = parentMz,
+            IsolationWidth = isolationWidth,
+            CollisionEnergyStart = ceStart,
+            CollisionEnergyStop = ceStop,
         };
     }
 
-    /// <summary>Fetch the (m/z, intensity) double arrays for one flattened spectrum.</summary>
-    public (double[] mz, double[] intensity) GetData(WiffSession session, SpectrumAddress addr)
+    /// <summary>Fetch the (m/z, intensity) double arrays for one flattened spectrum, and how many
+    /// points were dropped to make their lengths agree.</summary>
+    public (double[] mz, double[] intensity, long truncated) GetData(WiffSession session, SpectrumAddress addr)
     {
         var (_, spectrum) = GetExperimentAndSpectrum(session, addr, fetchSpectrum: true);
         if (spectrum == null)
         {
-            return (Array.Empty<double>(), Array.Empty<double>());
+            return (Array.Empty<double>(), Array.Empty<double>(), 0);
         }
 
         var mz = (double[]?)Invoke(spectrum, "GetActualXValues") ?? Array.Empty<double>();
         var intensity = (double[]?)Invoke(spectrum, "GetActualYValues") ?? Array.Empty<double>();
 
-        // Defensive: clamp to the shorter length so we never read past either array.
+        // Defensive: clamp to the shorter length so we never read past either array. The points cut
+        // off are counted, and the archive declares the cut (`sciex:truncate-unequal-arrays`).
         int n = Math.Min(mz.Length, intensity.Length);
+        long truncated = Math.Abs((long)mz.Length - intensity.Length);
         if (mz.Length != n) { Array.Resize(ref mz, n); }
         if (intensity.Length != n) { Array.Resize(ref intensity, n); }
-        return (mz, intensity);
+        return (mz, intensity, truncated);
     }
 
     private (object experiment, object? spectrum) GetExperimentAndSpectrum(
@@ -563,6 +642,27 @@ internal sealed class Clearcore2Api
         return p?.GetValue(target);
     }
 
+    /// <summary><c>parameters[key]</c> on an experiment's <c>Details.Parameters</c> (pwiz: <c>ContainsKey</c>,
+    /// then the indexer), or null when the key or the collection is absent.</summary>
+    private static object? ParameterNamed(object? parameters, string key)
+    {
+        if (parameters == null)
+        {
+            return null;
+        }
+        if (parameters is System.Collections.IDictionary dictionary)
+        {
+            return dictionary.Contains(key) ? dictionary[key] : null;
+        }
+        var type = parameters.GetType();
+        var args = new object?[] { key };
+        if (ResolveMethod(type, "ContainsKey", args)?.Invoke(parameters, args) is not true)
+        {
+            return null;
+        }
+        return type.GetProperty("Item", new[] { typeof(string) })?.GetValue(parameters, args);
+    }
+
     private static int ToInt(object? v, int fallback = 0)
     {
         try { return v == null ? fallback : Convert.ToInt32(v); }
@@ -642,16 +742,37 @@ public static unsafe class Exports
         catch { /* never let diagnostics throw across the boundary */ }
     }
 
-    // ABI layout assertion: 6×int32 + 1×double, naturally aligned == 32 bytes. Drift here would
+    // ABI layout assertions: each struct's size, and the V2 prefix at V1's offsets. Drift here would
     // silently corrupt memory on the Rust side, so fail loudly at type init instead. See finding #11.
+    // They check THIS build's own layout only; agreement with src/sciex.rs is SciexAbiVersion plus
+    // tests/sciex_abi_pin.rs.
     static Exports()
     {
-        int size = Marshal.SizeOf<SciexSpectrumMeta>();
-        if (size != 32)
+        if (Marshal.SizeOf<SciexSpectrumMeta>() != 32)
         {
             throw new InvalidOperationException(
-                $"SciexSpectrumMeta marshals to {size} bytes; the Rust #[repr(C)] mirror expects 32. " +
+                $"SciexSpectrumMeta marshals to {Marshal.SizeOf<SciexSpectrumMeta>()} bytes; src/sciex.rs expects 32. " +
                 "Field order/types drifted — fix both sides in lockstep.");
+        }
+        if (Marshal.SizeOf<SciexSpectrumMetaV2>() != 72)
+        {
+            throw new InvalidOperationException(
+                $"SciexSpectrumMetaV2 marshals to {Marshal.SizeOf<SciexSpectrumMetaV2>()} bytes; src/sciex.rs expects 72. " +
+                "Field order/types drifted — fix both sides in lockstep.");
+        }
+        if (Marshal.SizeOf<SciexValueChanges>() != 24)
+        {
+            throw new InvalidOperationException(
+                $"SciexValueChanges marshals to {Marshal.SizeOf<SciexValueChanges>()} bytes; src/sciex.rs expects 24.");
+        }
+        foreach (var name in new[] { "Sample", "Experiment", "Cycle", "MsLevel", "Polarity", "SignalContinuity", "RetentionTimeSeconds" })
+        {
+            var v1 = Marshal.OffsetOf<SciexSpectrumMeta>(name);
+            var v2 = Marshal.OffsetOf<SciexSpectrumMetaV2>(name);
+            if (v1 != v2)
+            {
+                throw new InvalidOperationException($"SciexSpectrumMetaV2.{name} is at {v2}, SciexSpectrumMeta has it at {v1}");
+            }
         }
     }
 
@@ -768,34 +889,49 @@ public static unsafe class Exports
         }
     }
 
+    // The V1 prefix of SpectrumMetaV2, kept so a binary that predates the handshake still works.
     [UnmanagedCallersOnly(EntryPoint = "SpectrumMeta")]
     public static int SpectrumMeta(long handle, long index, SciexSpectrumMeta* outMeta)
     {
-        try
+        if (outMeta == null)
         {
-            var session = Get(handle);
-            if (session == null || outMeta == null)
-            {
-                return 1;
-            }
-            if (index < 0 || index >= session.Index.Count)
-            {
-                return 2;
-            }
-            var addr = session.Index[(int)index];
-            var api = ApiOrThrow();
-            *outMeta = api.GetMeta(session, addr);
-            return 0;
+            return 1;
         }
-        catch (Exception ex)
+        int rc = FillMeta(handle, index, out var m);
+        if (rc == 0)
         {
-            RecordError(ex);
-            return 3;
+            *outMeta = new SciexSpectrumMeta
+            {
+                Sample = m.Sample,
+                Experiment = m.Experiment,
+                Cycle = m.Cycle,
+                MsLevel = m.MsLevel,
+                Polarity = m.Polarity,
+                SignalContinuity = m.SignalContinuity,
+                RetentionTimeSeconds = m.RetentionTimeSeconds,
+            };
         }
+        return rc;
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "SpectrumMetaV2")]
+    public static int SpectrumMetaV2(long handle, long index, SciexSpectrumMetaV2* outMeta)
+    {
+        if (outMeta == null)
+        {
+            return 1;
+        }
+        int rc = FillMeta(handle, index, out var m);
+        if (rc == 0)
+        {
+            *outMeta = m;
+        }
+        return rc;
     }
 
     // ---- spectrum data (pointer + len + free) ----
 
+    // The V1 export, kept so a binary that predates the handshake still works; it reports no counts.
     [UnmanagedCallersOnly(EntryPoint = "SpectrumData")]
     public static int SpectrumData(
         long handle,
@@ -803,6 +939,37 @@ public static unsafe class Exports
         double** outMzPtr,
         float** outIntPtr,
         long* outLen)
+    {
+        return FillData(handle, index, outMzPtr, outIntPtr, outLen, null);
+    }
+
+    // SpectrumData plus what the glue changed in the arrays (SciexValueChanges), so the archive can
+    // declare it.
+    [UnmanagedCallersOnly(EntryPoint = "SpectrumDataV2")]
+    public static int SpectrumDataV2(
+        long handle,
+        long index,
+        double** outMzPtr,
+        float** outIntPtr,
+        long* outLen,
+        SciexValueChanges* outChanges)
+    {
+        if (outChanges == null)
+        {
+            return 1;
+        }
+        return FillData(handle, index, outMzPtr, outIntPtr, outLen, outChanges);
+    }
+
+    // Shared by SpectrumData and SpectrumDataV2: an [UnmanagedCallersOnly] method cannot be called from
+    // managed code. outChanges is null for the V1 export.
+    private static int FillData(
+        long handle,
+        long index,
+        double** outMzPtr,
+        float** outIntPtr,
+        long* outLen,
+        SciexValueChanges* outChanges)
     {
         // Track pins locally so we can free them if anything throws after allocation but before
         // ownership is transferred to _pins. See findings #1 and #2.
@@ -818,6 +985,10 @@ public static unsafe class Exports
             *outMzPtr = null;
             *outIntPtr = null;
             *outLen = 0;
+            if (outChanges != null)
+            {
+                *outChanges = default;
+            }
 
             var session = Get(handle);
             if (session == null)
@@ -831,11 +1002,16 @@ public static unsafe class Exports
 
             var addr = session.Index[(int)index];
             var api = ApiOrThrow();
-            var (mz, intensityDouble) = api.GetData(session, addr);
+            var (mz, intensityDouble, truncated) = api.GetData(session, addr);
             int n = mz.Length;
+            var changes = new SciexValueChanges { TruncatedPoints = truncated };
 
             if (n == 0)
             {
+                if (outChanges != null)
+                {
+                    *outChanges = changes;
+                }
                 return 0; // empty spectrum: null pointers, zero length
             }
 
@@ -843,7 +1019,7 @@ public static unsafe class Exports
             // here so the pinned buffer we expose is already f32 (matches the Rust ABI type).
             // Guard non-finite / out-of-f32-range values so a corrupt double can't become a NaN
             // or Inf in the output stream: clamp magnitudes beyond float.MaxValue and map any
-            // NaN to 0. See finding #6.
+            // NaN to 0. See finding #6. Each such change is counted so the archive can declare it.
             var intensity = new float[n];
             for (int i = 0; i < n; i++)
             {
@@ -851,14 +1027,17 @@ public static unsafe class Exports
                 if (double.IsNaN(v))
                 {
                     intensity[i] = 0f;
+                    changes.NanToZero++;
                 }
                 else if (v > float.MaxValue)
                 {
                     intensity[i] = float.MaxValue;
+                    changes.ClampedToF32++;
                 }
                 else if (v < -float.MaxValue)
                 {
                     intensity[i] = -float.MaxValue;
+                    changes.ClampedToF32++;
                 }
                 else
                 {
@@ -880,6 +1059,10 @@ public static unsafe class Exports
             }
             ownershipTransferred = true;
 
+            if (outChanges != null)
+            {
+                *outChanges = changes;
+            }
             *outMzPtr = (double*)mzAddr;
             *outIntPtr = (float*)intAddr;
             *outLen = n;
@@ -935,6 +1118,14 @@ public static unsafe class Exports
     }
 
     // ---- diagnostics ----
+
+    /// <summary>ABI generation of this glue build. src/sciex.rs (REQUIRED_ABI_VERSION) resolves it
+    /// OPTIONALLY — a DLL too old to export it counts as version 1 — and refuses any other version with
+    /// a message naming both, because nothing else makes a mismatch visible: exports resolve by name
+    /// and each side asserts only its own struct sizes. A layout change therefore gets a new versioned
+    /// entry point and a bump here, never a wider struct behind an old name.</summary>
+    [UnmanagedCallersOnly(EntryPoint = "SciexAbiVersion")]
+    public static int SciexAbiVersion() => 3;   // 3: + SpectrumDataV2 (value changes); 2: + SpectrumMetaV2; 1: no handshake
 
     /// <summary>
     /// Run-level counts: [sampleCount, unreadableSamples, dwellExperiments, scanExperiments,
@@ -1054,6 +1245,32 @@ public static unsafe class Exports
     }
 
     // ---- internals ----
+
+    // Shared by SpectrumMeta and SpectrumMetaV2: an [UnmanagedCallersOnly] method cannot be called from
+    // managed code. 0 on success; 1 unknown handle, 2 index out of range, 3 exception (see LastError).
+    private static int FillMeta(long handle, long index, out SciexSpectrumMetaV2 meta)
+    {
+        meta = default;
+        try
+        {
+            var session = Get(handle);
+            if (session == null)
+            {
+                return 1;
+            }
+            if (index < 0 || index >= session.Index.Count)
+            {
+                return 2;
+            }
+            meta = ApiOrThrow().GetMeta(session, session.Index[(int)index]);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            RecordError(ex);
+            return 3;
+        }
+    }
 
     private static WiffSession? Get(long handle)
     {

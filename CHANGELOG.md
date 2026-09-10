@@ -299,6 +299,46 @@ keep their bytes.
   `stage=too-big`, because the `copy_object` publish and the md5 = ETag gate also stop at 5 GB.
   Multipart upload remains a manual route. `tools/test_harness.py` covers the host half; the box
   half runs only on the box.
+- **Native SciEX with `-v` no longer fails at its second open (Windows).** `SciexReader::open`
+  booted CoreCLR on every call, and hostfxr cannot be initialised again once the first handle has
+  been freed. `-v` opens the reader for the inspection report, drops it and opens it again for the
+  conversion, so every verbose native `.wiff` conversion and `--to mzml` export should have stopped
+  with `initializing CoreCLR for SciexGlue.runtimeconfig.json` (0x80008081) — the failure the box
+  recorded for Shimadzu before 0446ea3, with the same netcorehost and dlopen2 versions. The glue is
+  now loaded once per process, as the Shimadzu lane does. Not observed (no harness passes `-v`, so
+  no corpus archive is affected) and not yet run on Windows; the shape is pinned host-independently
+  by `tests/sciex_abi_pin.rs`.
+- **The native SciEX lane writes precursors; its MS2 rows are no longer orphans (Windows).** Every
+  MSn row the Clearcore2 lane wrote had no selected ion, isolation window or collision energy:
+  663,350 rows in the seven native corpus archives (PXD053710 81,000; PXD065872 83,100;
+  MSV000090684 51,246; MSV000093587 Sample002 166,040; MSV000095995 MRM_03 15,764; PXD011326
+  119,100; PXD071869 147,100), so every SWATH Q1 window and the MRM-HR Q1 were lost. The glue now
+  reads what ProteoWizard's ABI reader reads (`SpectrumMetaV2`): a product spectrum's parent m/z and
+  charge, and on a Product experiment its isolation width and `CE` parameter. The converter builds
+  the precursor from those (`sciex_run::precursor`, tested on every host) and leaves unset what the
+  file does not state: no charge when none is given, a target-only window when no width is (pwiz
+  writes offsets of 0), and a collision-energy ramp as its two ends (MS:1002013 / MS:1002014) where
+  pwiz writes the midpoint. A precursor-ion scan gets none: its fixed mass is a product, which
+  mzdata cannot carry. The dissociation method is beam-type CID, pwiz's assumption for WIFF
+  instruments, but only where the instrument cannot fragment any other way: a ZenoTOF can also
+  fragment by EAD, which Clearcore2 does not report (pwiz's own `.wiff2` EAD test file states
+  MS:1003294, where its `.wiff` reader would have written CID), so a ZenoTOF's precursors carry no
+  method. The one-shot orphan warning now fires only for an MSn row that states no precursor. The converter and
+  the glue now check each other's ABI version when the glue loads: a `SciexGlue.dll` built before
+  this change is refused with a message naming both versions instead of failing on a missing
+  export, and `RunInfo`/`RunString` are required. **Not yet run on a WIFF**: the box must compare
+  Sample002 and MRM_03 with their ProteoWizard twins, and the seven archives need a rebuild to gain
+  their precursors. `tests/sciex_abi_pin.rs` holds `src/sciex.rs` and `glue/sciex/Glue.cs` to one
+  contract (version literal, struct twins, sizes, exports and their arity).
+- **The native SciEX lane declares what its glue changed in the intensities.** Clearcore2 returns
+  intensities as f64 and the glue narrows them to the schema's f32: NaN becomes 0, a value beyond
+  ±f32::MAX (±Inf included) is clamped to it, and an m/z / intensity pair of unequal length is cut
+  to the shorter one. None of it was counted, so no archive could say it had happened. The glue now
+  counts all three per spectrum (`SpectrumDataV2`), and the archive's `transformations` gains
+  `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` or `sciex:truncate-unequal-arrays`
+  for each kind that happened, with a warning giving the counts; `--to mzml`, which has no such
+  list, logs the warning. No corpus data are known to trigger them (sampled row groups of Sample002
+  and PXD011326 hold no non-integer intensity and none above 121,219). Not yet run on a WIFF.
 
 ### Changed
 

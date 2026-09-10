@@ -448,8 +448,21 @@ include the lock-mass function's frames, as ProteoWizard's do. A function whose 
 count or SONAR flag the DLL cannot report is written as MS1 / summed / drift-on-trust with a warning
 naming the function; a scan without a retention time refuses the conversion.
 
+The native SciEX lane reads each spectrum's precursor where ProteoWizard's ABI reader does. The
+selected ion is a product spectrum's parent m/z, with its charge when one is stated. A Product
+experiment (a DDA or MRM-HR scan, or one SWATH window: each variable window is its own experiment)
+adds the isolation window, parent m/z ± half the experiment's width, target-only when no width is
+stated. The collision energy is the experiment's `CE` when it is one value; a ramp is kept as
+`collision energy ramp start` / `end` (MS:1002013 / MS:1002014) rather than as a midpoint. The
+dissociation method is beam-type CID, as ProteoWizard assumes, on an instrument that can only
+fragment in its collision cell. A ZenoTOF can also fragment by EAD, which Clearcore2 does not report
+per experiment (ProteoWizard reads the mode only through the `.wiff2` API), so its precursors carry
+no method; neither does a file that names no instrument. A precursor-ion scan states no precursor:
+its fixed mass is a product, which the archive has no place for. This has not yet been run on a
+WIFF.
+
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
-the Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF, Shimadzu and Waters have them), and the
+the Agilent-MHDAC and BAF lanes (Bruker TDF/TSF, Shimadzu, Waters and SciEX have them), and the
 non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz.
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
@@ -597,6 +610,9 @@ list of the declared, bounded changes the converter made to the vendor signal on
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `shimadzu:span-trim` | the profile sqrt-grid route stored the signal span only (item 4) | native Shimadzu `.lcd` profile |
 | `agilent:drop-zero-samples` | the profile grid lane stored a sparse point list, dropping zero-intensity samples and all-zero scans | `--agilent-grid` |
+| `sciex:nan-intensity-to-zero` | the glue mapped at least one NaN intensity Clearcore2 returned to 0 (counted per spectrum; a warning gives the total) | native SciEX `.wiff` |
+| `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
+| `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
 
 Not declared today, on purpose and worth knowing: the `--ims-chunked` ims-compact layout sorts each
 frame by TOF before chunking, which re-orders points across scans (an entry of the `sort-by-mz`

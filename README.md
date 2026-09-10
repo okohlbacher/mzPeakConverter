@@ -57,7 +57,7 @@ zero-intensity pad at the scan-window bounds outside the signal span is not stor
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; `libbaf2sql_c` at runtime |
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | out-of-process **net48** host (`glue/agilent`) → MHDAC; since 0.11.0. MRM/SIM-only runs are refused (they are chromatograms) — use `--via-msconvert` for those ([details](docs/PLATFORM_SUPPORT.md)) |
-| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime. MRM/SIM dwell runs are refused (they are chromatograms) — use `--via-msconvert`; multi-sample files take `--sample N` |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime. MSn precursors (selected ion, isolation window, collision energy) are read but not yet run on Windows. MRM/SIM dwell runs are refused (they are chromatograms) — use `--via-msconvert`; multi-sample files take `--sample N` |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/shimadzu`); LabSolutions.IO at runtime — **needs a current ProteoWizard**, see [`glue/shimadzu/README.md`](glue/shimadzu/README.md) |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
 

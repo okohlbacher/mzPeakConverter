@@ -19,7 +19,7 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | Agilent `.d` (non-IM, native) | ❌ | ❌ | ✅ (scan data; MRM/SIM-only runs refused) | out-of-process **net48** host (`AgilentGlueHost.exe`) → MHDAC, `AGL2` file protocol | MHDAC DLLs (ProteoWizard), .NET Framework 4.8 |
 | Agilent `.d` IM-MS (6560, native) | ❌ | ❌ | ⚠️ scaffold | in-process .NET glue → MIDAC | MIDAC DLLs |
 | Agilent `.d` **profile** (`--agilent-grid`) | ⚠️ | ⚠️ | ⚠️ | pure Rust (reads `MSProfile.bin`) | — (two known decode gaps, below) |
-| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`SciexGlue.dll`) → Clearcore2 | Clearcore2 DLLs |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅ (scan data; MSn precursors ⚠️ not yet run on Windows; MRM/SIM dwell runs refused) | in-process .NET glue (`SciexGlue.dll`, ABI-versioned) → Clearcore2 | Clearcore2 DLLs |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`ShimadzuGlue.dll`) → LabSolutions.IO | LabSolutions.IO DLLs from a **current** ProteoWizard |
 | Waters `.raw` (native) | ❌ | ❌ | ✅ | `libloading` → `MassLynxRaw.dll` C exports (no .NET glue) | MassLynx/pwiz DLLs |
 | **anything** via ProteoWizard | ✅ | ✅ | ✅ | `--via-msconvert` subprocess | a ProteoWizard install (Wine off-Windows) |
@@ -38,7 +38,13 @@ ProteoWizard with `--via-msconvert` (all platforms).
 - **Bruker BAF / timsdata SDK** need Bruker's native libraries, which exist for **Linux and
   Windows only** — hence no macOS.
 - **SciEX (Clearcore2)** is a Windows-only managed SDK, hosted **in-process** via a small
-  reflection-only .NET glue (`glue/sciex`).
+  reflection-only .NET glue (`glue/sciex`), booted once per process and checked against the
+  converter's ABI version at load. MSn spectra carry the precursor Clearcore2 states (selected ion
+  and charge, the isolation window of every SWATH window, DDA or MRM-HR scan, collision energy),
+  read the way ProteoWizard's ABI reader reads it. **Unverified at runtime:** the glue and the
+  converter compile, but no Windows CI job or box run has converted a WIFF with them yet. Until
+  the box has compared a converted run with its msconvert twin, treat the precursor columns of a
+  native SciEX archive as unconfirmed; archives from 0.11.5 and earlier have none.
 - **Waters (MassLynx)** needs no glue at all: `MassLynxRaw.dll` exposes a plain C ABI, which
   `src/waters.rs` loads with `libloading` and calls directly. Point `MZPC_MASSLYNX_DIR` (or
   `MZPC_PWIZ_DIR`) at the directory holding that DLL. The `glue/waters` C# project is a

@@ -2003,7 +2003,12 @@ fn convert_to_mzml(
     #[cfg(windows)]
     if is_wiff(input) {
         let r = sciex::SciexReader::open_run(input, sciex_sample())?;
-        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+        write_native_mzml(input, output, r.len(), |i| r.spectrum(i))?;
+        // mzML has no `transformations` list to declare the glue's value changes in: say them.
+        if let Some(msg) = r.take_value_changes().warning() {
+            log::warn!("{msg}; mzML has no transformations list to declare them in");
+        }
+        return Ok(());
     }
     #[cfg(windows)]
     if is_waters_raw(input) {
@@ -5062,7 +5067,9 @@ fn convert_ims_compact_sdk(
 /// re-ordered at least one out-of-order spectrum), `tof-grid:<ppm>ppm` (a statistically fitted
 /// integer grid replaced f64 m/z within that bound), `shimadzu:span-trim` (the profile sqrt-grid
 /// route stores the signal span only), `agilent:drop-zero-samples` (the profile grid lane stores
-/// a sparse point list).
+/// a sparse point list), and the native SciEX glue's counted value changes
+/// `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and `sciex:truncate-unequal-arrays`
+/// (`sciex_run::GlueValueChanges`).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -5627,9 +5634,9 @@ fn shimadzu_probe(reader: &shimadzu::ShimadzuReader, n: usize) -> Result<()> {
     Ok(())
 }
 
-/// Convert a SciEX `.wiff`/`.wiff2` → mzPeak via the Clearcore2 .NET glue (feature `sciex`,
-/// Windows-runtime-only, UNTESTED here). Mirrors `convert_tsf`. Needs `$MZPC_SCIEX_GLUE` +
-/// `$MZPC_PWIZ_DIR` at runtime (see glue/sciex/README.md).
+/// Convert a SciEX `.wiff`/`.wiff2` → mzPeak via the Clearcore2 .NET glue (`src/sciex.rs`, compiled
+/// on Windows only; there is no cargo feature). Mirrors `convert_tsf`. Needs `$MZPC_SCIEX_GLUE` (or
+/// the release layout's `glue\sciex`) and `$MZPC_PWIZ_DIR` at runtime (see glue/sciex/README.md).
 #[cfg(windows)]
 fn convert_sciex(
     input: &Path,
@@ -5747,6 +5754,8 @@ fn convert_sciex_grid(
     if mode == TofGridMode::Off {
         log::info!("--tof-grid off: storing the exact f64 m/z Clearcore2 returned for every spectrum");
     }
+    // The probe reads above went through the glue too: count only what the loop below writes.
+    reader.take_value_changes();
 
     // The data facet holds the integer axis, which has no chunk encoder: point layout whenever the
     // grid is in play (`convert_vendor_reader` makes the same call for the Shimadzu profile grid).
@@ -5837,6 +5846,10 @@ fn convert_sciex_grid(
         "SCIEX per-spectrum grid: wrote {len} spectra ({n_grid} gridded tof_index, {n_f64} kept f64); \
          max round-trip {max_ppm:.4} ppm"
     );
+    let value_changes = reader.take_value_changes();
+    if let Some(msg) = value_changes.warning() {
+        log::warn!("{msg}; declared in `transformations`");
+    }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
     // What the WIFF states about the run (instrument, serial, Analyst version, acquisition time,
     // the sample's name) plus the digested members; a naive acquisition time becomes an index block.
@@ -5876,6 +5889,7 @@ fn convert_sciex_grid(
     if n_grid > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
+    applied.extend(value_changes.transformations());
     let (key, block) = transformations_block(&applied);
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
     if let Some((key, block)) = partial_marker(input, max_spectra(), len) {
@@ -5927,8 +5941,9 @@ fn sciex_grid_spectrum(
     // reconstructed base-peak m/z differ by 4.6 ppm. The summary must be taken here either way,
     // because the output map has no MZArray and would fold to tic = 0 / base peak (0,0) / "m/z 0–0".
     // `debug_assert_eq!` here was a no-op in the shipped release build. The vendor shim clamps a
-    // length disagreement to `Math.Min` before we ever see it, so an unequal pair is a decode
-    // failure that must stop the conversion, not something to summarize half of.
+    // length disagreement to `Math.Min` before we ever see it (counted, and declared as
+    // `sciex:truncate-unequal-arrays`), so an unequal pair here is a decode failure that must stop
+    // the conversion, not something to summarize half of.
     require_aligned_arrays(
         "SCIEX grid",
         spec.description().index,
