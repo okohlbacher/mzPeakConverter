@@ -240,7 +240,7 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   declares `sort-by-mz` from the native reader's count of frames that sort changed; USER_MANUAL §8
   had called it undeclared "on purpose", against the owner's no-silent-reorder decision.
   `--bruker-sdk` re-sorts each mobility-major TDF frame by m/z and declares it from the reader's
-  counter, read over the written spectra only (`reader_reorder_counter_counts_written_spectra_only`).
+  counter, read over the written spectra only (`reader_counters_count_written_spectra_only`).
   `--agilent-grid` declares `agilent:drop-zero-samples` only when its reader dropped a zero sample or
   an all-zero scan, declares a new `agilent:intensity-f32-rounding` when a count above 2^24 was rounded
   into Float32 (logged only until now), and marks the archive `partial` when `MSProfile.bin` ends
@@ -351,10 +351,18 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   spectrum was gridded or padded (`span_trim_is_declared_from_the_written_routes`). A native Waters
   archive's `sort-by-mz` comes from the reader's count of frames whose interleaved bins the sort
   moved; it was declared whenever a function had drift bins
-  (`a_frame_counts_as_re_sorted_only_when_its_order_changed`). Every entry name is pinned where it
-  is declared (`tests/contract_strings.rs` over `main.rs`, `agl.rs` and `waters.rs`), and so are
-  the `[count …]` tags the Agilent host writes in `Glue.cs`. A rebuilt corpus archive drops the
-  entries that did not happen; entry names are unchanged.
+  (`a_frame_counts_as_re_sorted_only_when_its_order_changed`). Its `waters:sonar-summed` comes from
+  the reader's count of written scans read as a SONAR function's bins summed, not from the function
+  table, which declared it for a run cut by `MZPC_MAX_SPECTRA` before any such scan; and the MHDAC
+  host now exports only the scans that cap lets the converter write, so its `[count …]` tags count
+  the rewrites of the archive's spectra (`reader_counters_count_written_spectra_only`,
+  `glue_writes_what_this_parser_reads`). The writer's two other re-sort backstops are counted as
+  well: a chromatogram it re-sorted by time declares the new `sort-by-time`, a wavelength spectrum it
+  re-sorted by wavelength the new `sort-by-wavelength`; both reordered stored data undeclared
+  (`writer_backstops_declare_chromatogram_and_wavelength_re_sorts`). Every entry name is pinned
+  where it is declared (`tests/contract_strings.rs` over `main.rs`, `agl.rs` and `waters.rs`), and so
+  are the `[count …]` tags the Agilent host writes in `Glue.cs`. A rebuilt corpus archive drops the
+  entries that did not happen; the existing entry names are unchanged.
 - **Output change: every vendor directory input embeds its side-files, under one rule**
   (`embed_vendor_members`). The vendor-reader and mzdata lanes embedded only Bruker TDF/TSF
   directories while `--agilent-grid` and ims-compact embedded any directory themselves, so a BAF `.d`,

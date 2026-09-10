@@ -604,14 +604,16 @@ whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 | `zero-run-mask` | the writer's zero-intensity run compaction shortened at least one profile spectrum (item 2) | every lane whose writer masks (not native Waters frames) |
 | `numpress-linear` | at least one m/z chunk is stored with the lossy codec (item 1) | chunked layout without `--no-numpress` |
 | `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, `--ims-chunked` (each frame by TOF across mobility scans; mobility is stored per point), `--bruker-sdk` TDF (the SDK hands over mobility-major frames), native Waters frames, and any lane whose reader hands over an unsorted spectrum |
+| `sort-by-time` | the writer's backstop re-ordered at least one chromatogram into time order before it was stored | any lane that hands the writer a chromatogram out of time order, a source chromatogram or the MS1 TIC/base-peak trace synthesized in spectrum order |
+| `sort-by-wavelength` | the writer's backstop re-ordered at least one wavelength (UV/PDA) spectrum into wavelength order before it was stored | any lane that writes wavelength spectra handed over out of order |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 4) | native Shimadzu `.lcd` profile |
 | `agilent:drop-zero-samples` | the profile grid lane left at least one zero-intensity sample, or an all-zero scan, out of its sparse point lists | `--agilent-grid` |
 | `agilent:intensity-f32-rounding` | an integer count above 2^24 was rounded into the Float32 intensity column | `--agilent-grid` |
-| `agilent:nonfinite-intensity-to-zero` | MHDAC returned a NaN or ±Inf intensity, stored as 0 (counted by the net48 host) | native Agilent (MHDAC) |
-| `agilent:truncate-unequal-arrays` | a spectrum's m/z and intensity arrays differed in length and were cut to the shorter (counted by the net48 host) | native Agilent (MHDAC) |
+| `agilent:nonfinite-intensity-to-zero` | MHDAC returned a NaN or ±Inf intensity, stored as 0 (counted by the net48 host over the scans it exported, which under `MZPC_MAX_SPECTRA` are the written ones) | native Agilent (MHDAC) |
+| `agilent:truncate-unequal-arrays` | a spectrum's m/z and intensity arrays differed in length and were cut to the shorter (counted by the net48 host, as above) | native Agilent (MHDAC) |
 | `waters:drop-functions` | a MassLynx function was not written as spectra: chromatogram-type (SIR/MRM/NL/NG), not MS (DAD, delay, …), its scan count unreadable (`getScanCount failed`), or a collapsed retention-time summary not kept by `MZPC_WATERS_KEEP_COLLAPSED` | native Waters `.raw` |
-| `waters:sonar-summed` | a SONAR function's quadrupole bins were summed into one scan | native Waters `.raw` |
+| `waters:sonar-summed` | at least one written scan is a SONAR function's quadrupole bins summed into one scan (counted as the scans are read) | native Waters `.raw` |
 
 Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not

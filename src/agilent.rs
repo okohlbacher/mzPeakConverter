@@ -144,11 +144,17 @@ impl AgilentReader {
         // `.bin` on every failure path.
         let part_path = PathBuf::from(format!("{}.part", tmp_path.display()));
 
-        // Run the host. Capture stderr for diagnostics; stdout is reserved/empty.
-        let out = Command::new(&host)
-            .arg(path)
-            .arg(&mhdac_dir)
-            .arg(&tmp_path)
+        // Run the host. Capture stderr for diagnostics; stdout is reserved/empty. The host exports
+        // only the scans a `MZPC_MAX_SPECTRA` cap lets the converter write, so the rewrites it counts
+        // (`agl::HostCounts`) are those of the archive's spectra: hand it the cap as parsed here, or
+        // none, so an unparsable value cannot cap the host alone.
+        let mut host_cmd = Command::new(&host);
+        host_cmd.arg(path).arg(&mhdac_dir).arg(&tmp_path);
+        match crate::max_spectra() {
+            Some(n) => host_cmd.env("MZPC_MAX_SPECTRA", n.to_string()),
+            None => host_cmd.env_remove("MZPC_MAX_SPECTRA"),
+        };
+        let out = host_cmd
             .output()
             .with_context(|| format!("spawning {}", host.display()))?;
         if !out.status.success() {

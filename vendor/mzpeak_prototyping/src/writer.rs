@@ -1135,6 +1135,22 @@ impl<
         tally
     }
 
+    /// VENDORED PATCH (mzPeakConverter D15): what the writer has changed in the chromatogram signal
+    /// so far: chromatograms its time re-sort backstop reordered. Read before `finish_parquet`.
+    pub fn chromatogram_signal_tally(&self) -> crate::writer::array_buffer::SignalTally {
+        self.chromatogram_data_buffers.tally()
+    }
+
+    /// VENDORED PATCH (mzPeakConverter D15): what the writer has changed in the wavelength-spectrum
+    /// signal so far: spectra its wavelength re-sort backstop reordered. Zero when no wavelength
+    /// spectrum was written. Read before `finish_parquet`.
+    pub fn wavelength_signal_tally(&self) -> crate::writer::array_buffer::SignalTally {
+        self.wavelength_spectrum_data_buffers
+            .as_ref()
+            .map(|w| w.buffers().tally())
+            .unwrap_or_default()
+    }
+
     /// Get the count of waiting spectrum data rows
     pub fn buffered_spectrum_data(&self) -> usize {
         self.spectrum_data_buffers.len()

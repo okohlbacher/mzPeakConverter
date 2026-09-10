@@ -465,7 +465,7 @@ pub struct TdfSdkReader {
     exact_tof: Option<Vec<Option<(f64, f64)>>>,
     /// Frames whose points the SDK handed over out of m/z order, re-sorted by [`Self::spectrum`].
     /// Shared with the converter, which counts it over the written frames only
-    /// (`VendorHints::reorder_counter`) and declares `sort-by-mz` when it moved.
+    /// (`VendorHints::counters`) and declares `sort-by-mz` when it moved.
     resorted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     _not_thread_safe: PhantomData<*const ()>,
 }
@@ -941,7 +941,7 @@ impl BrukerSdkReader {
         }
     }
 
-    /// The TDF reader's re-sort counter, for `VendorHints::reorder_counter`. A TSF frame's line
+    /// The TDF reader's re-sort counter, for `VendorHints::counters` (as `sort-by-mz`). A TSF frame's line
     /// spectrum is read in m/z order and never re-sorted, so it has none.
     pub fn reorder_counter(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
         match self {
