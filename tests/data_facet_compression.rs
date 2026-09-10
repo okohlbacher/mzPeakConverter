@@ -45,7 +45,9 @@ fn convert_fixture(tag: &str, extra: &[&str]) -> PathBuf {
 /// `member` of `archive`, extracted to a temp file.
 fn extract(archive: &Path, member: &str) -> PathBuf {
     let mut zip = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
-    let extracted = std::env::temp_dir().join(format!("mzpc-zstd-{}-{member}", std::process::id()));
+    // Named for the archive too: tests run in parallel and extract the same member from different archives.
+    let stem = archive.file_stem().unwrap().to_string_lossy();
+    let extracted = std::env::temp_dir().join(format!("mzpc-zstd-{}-{stem}-{member}", std::process::id()));
     let mut src = zip.by_name(member).unwrap_or_else(|_| panic!("{member} missing"));
     let mut dst = File::create(&extracted).unwrap();
     std::io::copy(&mut src, &mut dst).unwrap();

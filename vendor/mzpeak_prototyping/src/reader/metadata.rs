@@ -1164,7 +1164,10 @@ impl PrecursorSelectedIonAssembler {
         // so an unstable sort reorders them against the row order they were read in — the order the
         // selected ions are matched against below. (A DDA-PASEF archive round-tripped to mzML emitted
         // a frame's precursors back to front; the reversed traversal in `finish` kept doing so after
-        // this sort was made stable, and is gone too.)
+        // this sort was made stable, and is gone too.) The secondary key only ties today because
+        // `visit_precursor_index` never stores it (reader/visitor.rs); once it does, this sort can
+        // move a precursor across a sibling with a different parent, and the positional ion pairing
+        // in `build` would follow the new order, not the rows'.
         self.precursors.sort_by(|a, b| {
             a.source_index()
                 .cmp(&b.source_index())
