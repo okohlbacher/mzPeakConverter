@@ -16,16 +16,18 @@
 //! DELTA_BINARY_PACKED, ZSTD, dictionary disabled, with `spectrum_array_index` listing it as
 //! `LinearMz` with params `[1e-9]`.
 //!
-//! The schema builders here MIRROR `src/shimadzu_grid.rs::lattice_peak_schema` and the data-facet
-//! declaration in `convert_shimadzu` (a binary crate has nothing an integration test can import);
-//! a drift between the two is exactly what this pins.
+//! The schema builders here are VERBATIM copies of `src/mz_lattice.rs::lattice_peak_schema` (which
+//! `shimadzu_grid::lattice_peak_schema` binds at 1e-9), `main.rs::tof_index_field` and the grid
+//! coefficient CURIEs — a binary crate has nothing an integration test can import — and
+//! `write_archive` hands them to the writer as `convert_shimadzu` / `convert_vendor_reader` do.
+//! `mirror_is_verbatim` compares each copy with its source byte for byte and pins those call sites,
+//! so drift fails there instead of leaving this test exercising a schema production no longer writes.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use mzdata::params::{ControlledVocabulary, Param, Unit, CURIE};
+use mzdata::params::{Param, Unit};
 use mzdata::prelude::*;
 use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
@@ -58,47 +60,135 @@ const GRID_K: [i32; 4] = [10_000, 10_001, 10_002, 10_003];
 const GRID_C0: f64 = 8.0;
 const GRID_C1: f64 = 0.000_091_602_119_892;
 
-/// `convert_shimadzu`'s per-spectrum grid coefficient CURIEs (main.rs `TOF_C0_CURIE`/`TOF_C1_CURIE`).
-const TOF_C0_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_900);
-const TOF_C1_CURIE: CURIE = CURIE::new(ControlledVocabulary::MS, 4_000_901);
+// ---- MIRROR -------------------------------------------------------------------------------------
+// Every item below is a VERBATIM copy of the production item named above it, and
+// `mirror_is_verbatim` fails the moment one differs. Regenerate by copying the item across; never
+// edit it here. (Until 0.12 this was a hand-written look-alike that had already drifted: it still
+// declared the grid coefficients as `MS:4000900/4000901`, which production left in 0.10.1.)
 
-/// The data facet's grid axis exactly as `convert_shimadzu` declares it: Int32 `tof_index`,
-/// `SqrtMzFromTof` with the `(0,1)` identity placeholder the reader skips, the real grid in the
-/// per-spectrum `tof_c0`/`tof_c1` columns.
-fn profile_tof_index_field() -> Arc<arrow::datatypes::Field> {
+// src/mz_lattice.rs
+pub const LATTICE_SCALE: f64 = 1e9;
+
+// src/mz_lattice.rs
+pub fn transform_params(scale: f64) -> String {
+    let e = scale.log10().round();
+    if scale > 0.0 && (10f64.powf(e) - scale).abs() <= f64::EPSILON * scale {
+        format!("1e-{}", e as i64)
+    } else {
+        format!("{}", 1.0 / scale)
+    }
+}
+
+// src/mz_lattice.rs
+pub fn lattice_tof_index_field(scale: f64) -> std::sync::Arc<arrow::datatypes::Field> {
+    let base = BufferName::new(
+        BufferContext::Spectrum,
+        ArrayType::nonstandard("tof_index"),
+        BinaryDataArrayType::Int64,
+    )
+    .with_transform(Some(BufferTransform::LinearMz))
+    .to_field();
+    let mut md = base.metadata().clone();
+    md.insert("mzpeak:transform_params".to_string(), transform_params(scale));
+    std::sync::Arc::new((*base).clone().with_metadata(md))
+}
+
+// src/mz_lattice.rs
+pub fn lattice_peak_schema(scale: f64) -> ArrayBuffersBuilder {
+    ArrayBuffersBuilder::default()
+        .prefix("point")
+        .with_context(BufferContext::Spectrum)
+        .add_field(BufferContext::Spectrum.index_field())
+        .add_field(lattice_tof_index_field(scale))
+        .add_field(MZ_ARRAY.to_field())
+        .add_field(INTENSITY_ARRAY.to_field())
+}
+
+// src/main.rs
+fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
     let base = BufferName::new(
         BufferContext::Spectrum,
         ArrayType::nonstandard("tof_index"),
         BinaryDataArrayType::Int32,
     )
-    .with_transform(Some(BufferTransform::SqrtMzFromTof))
+    .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
     .to_field();
     let mut md = base.metadata().clone();
-    md.insert("mzpeak:transform_params".to_string(), "0,1".to_string());
-    md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
-    Arc::new((*base).clone().with_metadata(md))
+    md.insert("mzpeak:transform_params".to_string(), format!("{},{}", run_wide.0, run_wide.1));
+    if per_spectrum {
+        md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+    }
+    std::sync::Arc::new((*base).clone().with_metadata(md))
 }
 
-fn lattice_peak_schema() -> ArrayBuffersBuilder {
-    let tof_field = {
-        let base = BufferName::new(
-            BufferContext::Spectrum,
-            ArrayType::nonstandard("tof_index"),
-            BinaryDataArrayType::Int64,
-        )
-        .with_transform(Some(BufferTransform::LinearMz))
-        .to_field();
-        let mut md = base.metadata().clone();
-        md.insert("mzpeak:transform_params".to_string(), "1e-9".to_string());
-        Arc::new((*base).clone().with_metadata(md))
-    };
-    ArrayBuffersBuilder::default()
-        .prefix("point")
-        .with_context(BufferContext::Spectrum)
-        .add_field(BufferContext::Spectrum.index_field())
-        .add_field(tof_field)
-        .add_field(MZ_ARRAY.to_field())
-        .add_field(INTENSITY_ARRAY.to_field())
+// src/main.rs
+pub(crate) const TOF_C0_CURIE: mzdata::params::CURIE =
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_003);
+// src/main.rs
+pub(crate) const TOF_C1_CURIE: mzdata::params::CURIE =
+    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_004);
+// ---- END MIRROR ---------------------------------------------------------------------------------
+
+/// `src` with CRLF folded to LF (the Windows box checks out with `core.autocrlf=true`).
+fn lf(src: &str) -> String {
+    src.replace("\r\n", "\n")
+}
+
+/// The item whose first line starts with `head` at column 0, through its closing `}` (a fn) or `;`
+/// (a const) at the end of a line. Doc comments above the item are not part of it.
+fn item<'a>(src: &'a str, head: &str, what: &str) -> &'a str {
+    let start = src.find(&format!("\n{head}")).unwrap_or_else(|| panic!("{what}: no item `{head}`")) + 1;
+    let rest = &src[start..];
+    let end = if head.contains("fn ") { rest.find("\n}\n").map(|e| e + 2) } else { rest.find(";\n").map(|e| e + 1) };
+    &rest[..end.unwrap_or_else(|| panic!("{what}: `{head}` is unterminated"))]
+}
+
+/// The mirror is worth something only while it IS production: each item byte for byte, and the
+/// `convert_shimadzu` / `convert_vendor_reader` lines that hand those schemas to the writer — which
+/// `write_archive` below reproduces call for call.
+#[test]
+fn mirror_is_verbatim() {
+    let this = lf(include_str!("shimadzu_lattice_peaks.rs"));
+    let lattice = lf(include_str!("../src/mz_lattice.rs"));
+    let grid = lf(include_str!("../src/shimadzu_grid.rs"));
+    let main = lf(include_str!("../src/main.rs"));
+    for (src, what, head) in [
+        (&lattice, "src/mz_lattice.rs", "pub const LATTICE_SCALE: f64"),
+        (&lattice, "src/mz_lattice.rs", "pub fn transform_params("),
+        (&lattice, "src/mz_lattice.rs", "pub fn lattice_tof_index_field("),
+        (&lattice, "src/mz_lattice.rs", "pub fn lattice_peak_schema("),
+        (&main, "src/main.rs", "fn tof_index_field("),
+        (&main, "src/main.rs", "pub(crate) const TOF_C0_CURIE:"),
+        (&main, "src/main.rs", "pub(crate) const TOF_C1_CURIE:"),
+    ] {
+        assert_eq!(
+            item(&this, head, "the mirror"),
+            item(src, head, what),
+            "the mirror of `{head}` differs from {what}: copy the production item over it"
+        );
+    }
+    for (src, what, call) in [
+        (&grid, "src/shimadzu_grid.rs", "pub use crate::mz_lattice::{LatticeOutcome, LATTICE_SCALE};"),
+        (&grid, "src/shimadzu_grid.rs", "crate::mz_lattice::lattice_peak_schema(LATTICE_SCALE)"),
+        (&main, "src/main.rs", "hints.peaks_facet = Some(shimadzu_grid::lattice_peak_schema());"),
+        (&main, "src/main.rs", "let tof_field = tof_index_field((0.0, 1.0), true);"),
+        (
+            &main,
+            "src/main.rs",
+            "hints.data_facet_fields.push(tof_field);\n        \
+             hints.data_facet_fields.push(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field());\n        \
+             hints.data_facet_fields.push(INTENSITY_ARRAY.to_field());\n        \
+             hints.spectrum_param_fields.push((TOF_C0_CURIE, \"tof_c0\"));\n        \
+             hints.spectrum_param_fields.push((TOF_C1_CURIE, \"tof_c1\"));",
+        ),
+        (
+            &main,
+            "src/main.rs",
+            "CustomBuilderFromParameter::from_spec(\n            curie,\n            name,\n            DataType::Float64,\n        )",
+        ),
+    ] {
+        assert!(src.contains(call), "{what} no longer declares `{call}` — `write_archive` mirrors it");
+    }
 }
 
 fn f64_arrays(mz: &[f64], intensity: &[f32]) -> BinaryArrayMap {
@@ -228,8 +318,8 @@ fn write_archive(path: &Path) {
         // from a (gridded) probe AND declared explicitly — the grid axis, the f64 `mz` fallback,
         // the intensity, the per-spectrum coefficients; the peaks facet is the lattice schema.
         .sample_array_types_from_spectra(std::iter::once(dual.clone()))
-        .store_peaks_and_profiles_apart(Some(lattice_peak_schema()))
-        .add_spectrum_field(profile_tof_index_field())
+        .store_peaks_and_profiles_apart(Some(lattice_peak_schema(LATTICE_SCALE)))
+        .add_spectrum_field(tof_index_field((0.0, 1.0), true))
         .add_spectrum_field(MZ_ARRAY.to_field())
         .add_spectrum_field(INTENSITY_ARRAY.to_field())
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
