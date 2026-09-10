@@ -6995,6 +6995,42 @@ mod tests {
         assert_eq!(t.to_f64().unwrap().to_vec(), vec![2.0 / 60.0, 3.0 / 60.0]);
     }
 
+    /// `--rt` on an archive holding device traces. Their values sit in each chromatogram's auxiliary
+    /// arrays, outside the data facet, and the window used to cut only the time rows: a filtered
+    /// trace paired 3 times with 6 values, and an mzML export of it wrote value arrays longer than
+    /// `defaultArrayLength`. The values are cut with their times.
+    #[test]
+    fn an_rt_window_cuts_the_device_trace_values_with_their_times() {
+        use mzpeak_prototyping::MzPeakReader;
+
+        let (dir, _cleanup) = trace_scratch("rt");
+        let seconds = [60.0, 120.0, 180.0, 240.0, 300.0, 360.0];
+        let dot_d = hystar_dot_d(
+            &dir,
+            &[
+                (1, "Pump HP:Pressure - [bar]", 9999, 3, &seconds, &[100.0, 110.0, 120.0, 130.0, 140.0, 150.0]),
+                (2, "Fraction A - [%]", 5, 4, &seconds, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ],
+        );
+        let src = dir.join("run.mzpeak");
+        write_trace_archive(&dot_d, &src);
+        let out = dir.join("rt.mzpeak");
+        super::filter::run(&src, &out, &super::filter::FilterOpts { rt: Some((2.0, 4.0)), ..Default::default() }).unwrap();
+
+        let mut r = MzPeakReader::new(&out).unwrap();
+        let chroms: Vec<_> = (0..r.len_chromatograms()).map(|i| r.get_chromatogram(i).unwrap()).collect();
+        let trace = |id: &str| chroms.iter().find(|c| c.id() == id).unwrap_or_else(|| panic!("no {id}"));
+        let values = |id: &str, array: ArrayType| {
+            let c = trace(id);
+            (c.arrays.get(&ArrayType::TimeArray).unwrap().to_f64().unwrap().to_vec(), c.arrays.get(&array).unwrap().to_f64().unwrap().to_vec())
+        };
+        assert_eq!(values("Pump HP:Pressure - [bar]", ArrayType::PressureArray), (vec![2.0, 3.0, 4.0], vec![110.0e5, 120.0e5, 130.0e5]));
+        assert_eq!(
+            values("Fraction A - [%]", ArrayType::nonstandard("Fraction A - [%]")),
+            (vec![2.0, 3.0, 4.0], vec![2.0, 3.0, 4.0])
+        );
+    }
+
     /// The run-metadata normaliser on what mzdata's readers actually hand over: a Thermo-style
     /// `file:////Users/…` location, a TDF-style full-path `run.id`, and a `default_instrument_id`
     /// of 0 against an EMPTY instrument list (the published-corpus defects M2/M34). The id must come

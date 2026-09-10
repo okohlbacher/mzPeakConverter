@@ -66,6 +66,17 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 
 ### Fixed
 
+- **`--rt` paired a chromatogram's auxiliary values with the wrong times.** A chromatogram array
+  with no column in `chromatograms_data` (a native Bruker archive's device-trace pressure or solvent
+  percentage, above) is stored in `chromatograms_metadata.auxiliary_arrays`, one value per point.
+  The filter cut each chromatogram's time rows and `number_of_data_points` to the window but kept
+  those arrays whole, so a reader paired the kept times with the first values and an mzML export
+  wrote value arrays longer than `defaultArrayLength` (58 times beside 352 pressures on a TSF run
+  filtered to 1–2 min). They are now cut with the same per-point mask as the times; one that cannot
+  be cut value by value (an encoded buffer, a variable-width type, or not one value per point) stops
+  the filter. A chromatogram facet with no time axis to cut on keeps its metadata unchanged, as it
+  keeps its data, where its point counts used to be set to 0. Pinned by
+  `tests::an_rt_window_cuts_the_device_trace_values_with_their_times`.
 - **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
   mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
   a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes
