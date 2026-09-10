@@ -339,6 +339,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   compare alike. Pinned by `pwiz_escaped_ids_are_decoded` and
   `mzml_lane_archive_decodes_pwiz_ids_and_mzml_export_keeps_them`; the published archives change on
   reconversion.
+- **The `--ims-chunked` one-family pin also runs without the corpus.** The regression test for the
+  data facet's layout family needed the 142 MB 2485.d and so never ran in CI. The family is fixed
+  when the writers are built, so `ims_chunked_spectrum_facets_share_one_family_without_the_corpus`
+  drives `write_ims_compact_archive_impl` with two synthetic frames. The data facet takes the peak
+  facet's chunk fields from the existing `ArrayBuffersBuilder::dtype()`, and the `fields()` accessor
+  added to the vendored writer for it is gone again.
 
 ## [0.11.5] — 2026-09-09
 
