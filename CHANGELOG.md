@@ -177,6 +177,18 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   gets its own concurrency group: with cancellation off GitHub still replaces a run *pending* in a
   group, so the middle one of three quick pushes would never run. Pull requests still cancel a
   superseded run.
+- **The release gate stops waiting where waiting cannot help, and names the remedy.** A commit CI
+  never ran on — pushed together with a later commit, as v0.7.3 and v0.4.12 were, or a `[skip ci]`
+  one — never gets check runs, yet the gate waited the full 90 minutes for it and then blamed a
+  commit that "reached neither" main nor a pull request. When a commit older than three hours still
+  has no check runs ten minutes in, the gate now refuses at once. It also resolves the commit through
+  the commits API first, which peels an annotated tag, and three HTTP 4xx answers in a row end the
+  gate: every API error used to be retried until the deadline, and the check-runs endpoint answers a
+  tag object's own SHA with 422. A 5xx is still retried. Every refusal and the timeout now name what
+  to run: `gh workflow run ci.yml --ref <tag>` and `gh workflow run windows.yml --ref <tag>`, then a
+  re-run. Replayed against a stand-in `gh`: no check runs on a six-hour-old commit ends after 10
+  simulated minutes (90 before), an unknown SHA after 2 (90 before); a pass, a pending check, a
+  cancelled job and two 502s behave as before.
 - **Reading an archive back keeps each spectrum's precursors in their source order.** The vendored
   reader attached a spectrum's (and a chromatogram's) precursors in reversed row order, so
   mzML → mzPeak → mzML turned `[(445.3, 445.34), (645.3, 645.34)]` (isolation target, selected ion)
