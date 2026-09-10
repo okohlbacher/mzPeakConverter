@@ -198,8 +198,8 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   Windows a SciEX, Waters or Shimadzu reader that fails to open there is now a `note:` line and the
   inspection exits 0, as the Agilent one already did. Any other report error under `-o` is a
   `note:` as well, and the conversion goes ahead. Pinned by `tests/verbose_inspection.rs` (a TSF
-  `.d` whose report fails, `small.RAW` with and without `-o` and `--via-msconvert`, and on Linux and
-  Windows a BAF `.d`) and
+  `.d` whose report fails, `small.RAW` with and without `-o` and `--via-msconvert`, `small.RAW.gz`
+  under `-o`, and on Linux and Windows a BAF `.d`) and
   `tests::inspection_opens_a_native_reader_only_when_inspecting_is_the_job`; the Windows branches are
   compiled only by CI.
 - **The native Agilent (MHDAC) lane says once when it writes MS2 rows without a precursor**, as the
