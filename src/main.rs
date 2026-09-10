@@ -1194,6 +1194,9 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         Lane::Standard
     };
     refuse_unsupported_flags(lane, cfg)?;
+    if let Some(note) = aux_inert_note(&cli.input, &cfg.given) {
+        log::warn!("{note}");
+    }
 
     match lane {
         Lane::AgilentGrid => {
@@ -3296,10 +3299,7 @@ fn convert_agilent_grid(
     applied.push("agilent:drop-zero-samples".to_string());
     let (key, block) = transformations_block(&applied);
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    // Embed the Agilent vendor side-files (AcqData) per the vendor policy, mirroring the other lanes.
-    if let Some(policy) = vendor {
-        vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
-    }
+    embed_vendor_members(&mut zip, input, vendor)?;
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     tmp_guard.finish(output)?;
     Ok(())
@@ -5006,9 +5006,7 @@ where
             .context("writing vendor_mz_calibration index")?,
         Err(e) => log::warn!("vendor MzCalibration unavailable ({e}); vendor_mz_calibration index block omitted"),
     }
-    if let Some(policy) = vendor {
-        vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
-    }
+    embed_vendor_members(&mut zip, input, vendor)?;
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     tmp_guard.finish(output)?;
     Ok(())
@@ -5159,24 +5157,38 @@ fn finish_with_vendor_and_aux(
     Ok(())
 }
 
-/// Shared vendor-member embed step (Bruker side-files / Thermo trailers), factored out so the
-/// mzML/imzML finish helper and the vendor-reader finish path stay in lockstep.
+/// The one vendor side-file rule, used by every lane that writes an archive. A vendor DIRECTORY
+/// input (a Bruker `.d` of any kind, an Agilent `.d`, a Waters `.raw`) has its side-files embedded
+/// under `vendor/` as the lane's policy says: preserve by default, the bulk-binary drop the lossless
+/// ims-compact policy adds, and every `--aux` rule on top. A Thermo `.raw` gets its trailer and
+/// status-log facets. Through 0.11.5 only TDF/TSF directories qualified here while `--agilent-grid`
+/// and ims-compact embedded any directory themselves, so a BAF `.d`, an Agilent `.d` on the MHDAC
+/// lane and a Waters `.raw` embedded nothing and `--aux` did nothing on them, silently. A
+/// single-file input has no side-files; `run` names `--aux` inert there.
 fn embed_vendor_members(
     zip: &mut ZipArchiveWriter<fs::File>,
     input: &Path,
     vendor: Option<&vendor::VendorPolicy>,
 ) -> Result<()> {
     if let Some(policy) = vendor {
-        let is_bruker_d = input.is_dir()
-            && (input.join("analysis.tsf").exists() || input.join("analysis.tdf").exists());
-        if is_bruker_d {
-            vendor::embed_into_archive(zip, input, policy)
-                .context("embedding vendor files")?;
+        if input.is_dir() {
+            vendor::embed_into_archive(zip, input, policy).context("embedding vendor files")?;
         } else if is_thermo_raw(input) {
             embed_thermo_trailers(zip, input)?;
         }
     }
     Ok(())
+}
+
+/// The warning for `--aux` on an input it cannot act on: side-files are embedded from a vendor
+/// directory only ([`embed_vendor_members`]), so on a single file the rules change nothing.
+fn aux_inert_note(input: &Path, given: &[&'static str]) -> Option<String> {
+    (given.contains(&"--aux") && !input.is_dir()).then(|| {
+        format!(
+            "--aux is inert for {}: only a vendor directory input (a .d or .raw directory) has side-files to embed",
+            input.display()
+        )
+    })
 }
 
 fn is_thermo_raw(input: &Path) -> bool {
@@ -8698,6 +8710,44 @@ mod tests {
         super::convert_file(std::path::Path::new(TINY), &plain, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
             .unwrap();
         assert!(index_metadata(&plain).get("conversion_route").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One embed rule: a vendor directory's side-files go into `vendor/` under the policy on every
+    /// lane (a Waters `.raw` or BAF `.d` embedded nothing through 0.11.5, and `--aux` did nothing on
+    /// them), and `--aux` on a single-file input is named inert instead of passing silently.
+    #[test]
+    fn every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("embed-rule");
+        let raw = dir.join("run.raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("_HEADER.TXT"), "$$ Acquired Name: run\r\n").unwrap();
+        fs::write(raw.join("_extern.inf"), "Created by 4.1\r\n").unwrap();
+        let policy = crate::vendor::VendorPolicy::load(None, &["_extern.inf=drop".to_string()]).unwrap();
+        let out = dir.join("run.mzpeak");
+        convert_vendor_reader_tallied(&raw, &out, None, 1, Some(&policy), false, VendorHints::default(), 2, |i| {
+            Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
+        })
+        .unwrap();
+        let manifest = index_metadata(&out)["vendor_files"].clone();
+        let actions: Vec<(String, String)> = manifest
+            .as_array()
+            .expect("a vendor_files manifest")
+            .iter()
+            .map(|e| (e["path"].as_str().unwrap().to_string(), e["action"].as_str().unwrap().to_string()))
+            .collect();
+        assert!(actions.contains(&("vendor/_HEADER.TXT.gz".to_string(), "embed".to_string())), "{actions:?}");
+        assert!(actions.contains(&("_extern.inf".to_string(), "drop".to_string())), "the --aux rule applies: {actions:?}");
+        assert!(zip_members(&out).iter().any(|m| m == "vendor/_HEADER.TXT.gz"));
+
+        let tiny_out = dir.join("tiny.mzpeak");
+        let args: Vec<&std::ffi::OsStr> =
+            vec![TINY.as_ref(), "-o".as_ref(), tiny_out.as_os_str(), "--force".as_ref(), "--aux".as_ref(), "*=drop".as_ref()];
+        let (ok, _, err) = run_bin(&args, &[]);
+        assert!(ok, "{err}");
+        assert!(err.contains("--aux is inert"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 

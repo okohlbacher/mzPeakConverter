@@ -615,11 +615,15 @@ a run truncated by `MZPC_MAX_SPECTRA` (§10), and
 under `--bruker-sdk`) says which of the two (a, b) chords — measured 4.28 ppm apart on 2485.d — an
 ims-compact archive holds.
 
-**Verbatim vendor side-files (preserved, not interpreted).** For Bruker `.d`, the
-original side-files (methods, calibration, acquisition databases, …) are
-**embedded by default** under `vendor/` in the archive — gzip-compressed and
-declared `proprietary` in the index — so nothing the converter does not yet model
-is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
+**Verbatim vendor side-files (preserved, not interpreted).** For every vendor directory input
+(Bruker `.d` of any kind, Agilent `.d`, Waters `.raw`), the original side-files (methods,
+calibration, acquisition databases, …) are **embedded by default** under `vendor/` in the archive —
+gzip-compressed where they compress and declared `proprietary` in the index — so nothing the
+converter does not yet model is lost; the `vendor_files` manifest records every embed and drop. The
+lossless ims-compact lane drops the bulk `*_bin` by default; every other lane keeps everything,
+including the raw signal files (`analysis.baf`, `AcqData/MSProfile.bin`, `_FUNC*.DAT`), which can
+be several times the archive: drop them with `--aux` or embed nothing with `--no-vendor`. Through
+0.11.5 only TDF/TSF directories, `--agilent-grid` and ims-compact embedded anything. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 …) and status log are captured verbatim into dedicated `vendor_scan_trailers`
 (tall + wide) and `vendor_status_log` facets.
 
@@ -627,7 +631,8 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 
 - `--no-vendor` (or `no_vendor: true`) — embed nothing.
 - `--aux 'glob=drop'` / `--aux 'glob=embed'` — per-glob rule, highest precedence,
-  repeatable. The same rules can be given as the `aux:` list in the config file
+  repeatable. A single-file input (mzML, imzML, Thermo `.raw`, `.wiff`, `.lcd`) has no side-files,
+  so the rules change nothing there and the converter says so. The same rules can be given as the `aux:` list in the config file
   (§5). For example, drop the bulk binaries but keep the method:
   `--aux '*.tdf_bin=drop' --aux '*.method=embed'`.
 
