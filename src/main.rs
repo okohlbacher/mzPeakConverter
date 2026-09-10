@@ -7003,9 +7003,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With `panic = "abort"` no destructor runs, so the panic hook must sweep the in-flight tmp
-    /// files on its own. `mem::forget` keeps `Drop` out of this test: only the hook can remove
-    /// the file here.
+    /// The installed panic hook removes the panicking thread's in-flight tmp. `mem::forget` keeps
+    /// `Drop` out of this test: only the hook can remove the file here. Tests unwind, so this reaches
+    /// the hook's `sweep_tmp_in_flight(false)` branch; the abort branch is the next test.
     #[test]
     fn tmp_panic_hook_sweeps_in_flight_files() {
         use super::{install_tmp_panic_hook, TmpGuard};
@@ -7019,6 +7019,39 @@ mod tests {
         let r = std::panic::catch_unwind(|| panic!("simulated writer-open failure"));
         assert!(r.is_err());
         assert!(!tmp.exists(), "the panic hook must remove the in-flight tmp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The branch the release binary runs (`panic = "abort"`: no destructor follows the hook).
+    /// `sweep_tmp_in_flight(true)` must remove every registered tmp, including one another thread
+    /// registered — the ims-compact writer thread can panic while the main thread holds the guard.
+    /// It runs in a child copy of this test binary, alone: sweeping every tmp in THIS process would
+    /// delete the in-flight output of whichever conversion test runs alongside.
+    #[test]
+    fn tmp_sweep_all_removes_every_threads_files() {
+        use super::{sweep_tmp_in_flight, TmpGuard};
+        const CHILD: &str = "MZPC_TEST_SWEEP_ALL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::tmp_sweep_all_removes_every_threads_files", "--test-threads", "1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("spawning the test binary");
+            let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success() && log.contains("1 passed"), "child run failed or ran nothing:\n{log}");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("mzpc-sweepall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("writer-thread.mzpeak.tmp");
+        std::fs::write(&tmp, b"partial").unwrap();
+        // Registered by another thread, which ends without dropping its guard.
+        let path = tmp.clone();
+        std::thread::spawn(move || std::mem::forget(TmpGuard::new(&path))).join().unwrap();
+        sweep_tmp_in_flight(false);
+        assert!(tmp.exists(), "the unwind branch sweeps only the calling thread's entries");
+        sweep_tmp_in_flight(true);
+        assert!(!tmp.exists(), "the abort branch must sweep every registered tmp, whichever thread registered it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7716,10 +7749,16 @@ mod tests {
 
         // Point layout exercises the full fix chain — #1 coalesce-by-accession (one intensity
         // column), #2 precision coercion (f64 raw intensity cast into the f32 primary, no clash), and
-        // the #3 invariant debug_assert — via the array_map write path in both debug and release.
-        // (The chunked/default path is verified end-to-end via the release CLI; in *debug* it also
-        // trips a separate pre-existing chunk-facet spill `debug_assert`, unrelated to the twin.)
-        let cases: [(&str, Option<ChunkingStrategy>); 1] = [("point", None)];
+        // the #3 invariant debug_assert — via the array_map write path. It cannot see #1 regress on its
+        // own: the post-write prune drops an all-null `point` twin, so a sampler that adds one again
+        // still ends with one column. The chunked layout (the converter's default, numpress-linear at
+        // 50 Th) is outside the prune's scope, so there #1 alone keeps the second 'intensity array'
+        // out. Release profile only: in debug the chunked write trips a separate, pre-existing
+        // chunk-facet spill `debug_assert` unrelated to the twin.
+        let cases: [(&str, Option<ChunkingStrategy>); 2] = [
+            ("point", None),
+            ("chunked", Some(ChunkingStrategy::NumpressLinear { chunk_size: 50.0 })),
+        ];
         for (tag, chunk) in cases {
             let scratch =
                 std::env::temp_dir().join(format!("mzpc-peaks-{tag}-{}", std::process::id()));
@@ -7766,16 +7805,26 @@ mod tests {
 
         super::convert_to_mzml(&input, &out, false, None).expect("mzML conversion");
 
-        // Output is XML mzML (not a zip), and re-reads to the same spectrum count.
+        // Output is XML mzML (not a zip), and re-reads to the same spectra: the count, then each
+        // spectrum's m/z and intensity arrays against the source's.
         let head = fs::read(&out).unwrap();
         let is_mzml = head.starts_with(b"<?xml") || head.windows(5).any(|w| w == b"<mzML");
-        let mut reader =
-            super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(&out)
-                .expect("reopen mzML output");
-        let n = reader.iter().count();
+        fn read_all(p: &std::path::Path) -> Vec<mzdata::spectrum::MultiLayerSpectrum> {
+            super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(p)
+                .unwrap_or_else(|e| panic!("reopen {}: {e}", p.display()))
+                .iter()
+                .collect()
+        }
+        let (source, written) = (read_all(&input), read_all(&out));
         let _ = fs::remove_dir_all(&scratch);
         assert!(is_mzml, "output is not mzML XML");
-        assert_eq!(n, 6, "expected 6 spectra in the mzML output, got {n}");
+        assert_eq!(written.len(), 6, "expected 6 spectra in the mzML output, got {}", written.len());
+        for (s, w) in source.iter().zip(&written) {
+            use mzdata::prelude::SpectrumLike;
+            let (sa, wa) = (s.raw_arrays().expect("source arrays"), w.raw_arrays().expect("written arrays"));
+            assert_eq!(wa.mzs().unwrap(), sa.mzs().unwrap(), "{}: m/z array", s.id());
+            assert_eq!(wa.intensities().unwrap(), sa.intensities().unwrap(), "{}: intensity array", s.id());
+        }
     }
 
     /// The timsTOF fixture of the corpus-gated tests below: the same run tests/tdf_*.rs pin as DOT_D.
@@ -7984,6 +8033,50 @@ mod tests {
         );
         // The peak facet stores integer `tof`, not m/z.
         assert!(cols.iter().any(|n| n == "tof"), "peak facet must have a `tof` column; got {cols:?}");
+        // …and the mobility column is POPULATED, not merely declared: every point carries its scan's
+        // 1/K0, inside the acquisition's mobility range, and the values vary (a constant is a
+        // placeholder, not a mobility).
+        let conn = rusqlite::Connection::open_with_flags(
+            input.join("analysis.tdf"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let global = |k: &str| -> f64 {
+            conn.query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [k], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|e| panic!("GlobalMetadata {k}: {e}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let (lo, hi) = (global("OneOverK0AcqRangeLower"), global("OneOverK0AcqRangeUpper"));
+        let (mut points, mut nulls, mut min, mut max) = (0usize, 0usize, f64::INFINITY, f64::NEG_INFINITY);
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let mobility = batch
+                .columns()
+                .iter()
+                .find_map(|c| {
+                    c.as_any()
+                        .downcast_ref::<arrow::array::StructArray>()?
+                        .column_by_name("mean_inverse_reduced_ion_mobility")
+                        .cloned()
+                })
+                .expect("mean_inverse_reduced_ion_mobility inside the peak struct");
+            let mobility = arrow::compute::cast(&mobility, &arrow::datatypes::DataType::Float64).unwrap();
+            let mobility = mobility.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+            points += mobility.len();
+            nulls += arrow::array::Array::null_count(mobility);
+            for v in mobility.iter().flatten() {
+                min = min.min(v);
+                max = max.max(v);
+            }
+        }
+        assert!(points > 0, "the peak facet holds no points");
+        assert_eq!(nulls, 0, "{nulls} of {points} points carry no 1/K0");
+        assert!(
+            lo - 1e-9 <= min && max <= hi + 1e-9 && min < max,
+            "1/K0 spans {min}..{max}; the acquisition range is {lo}..{hi}, and a real mobility varies"
+        );
 
         // (b) #spectra == #TDF frames (one spectrum per frame).
         let n_frames = {
@@ -8092,6 +8185,31 @@ mod tests {
             assert!(cal.get(key).is_some(), "ims_calibration missing key `{key}`: {cal}");
         }
         assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("ims-compact"));
+        // Present is not the contract; a reader decodes with the VALUES. `(a, b)` is timsrust's
+        // two-point chord through GlobalMetadata — m/z = MzAcqRangeLower at tof 0 and MzAcqRangeUpper
+        // at tof = DigitizerNumSamples — recomputed here from analysis.tdf, not taken from the converter.
+        let conn = rusqlite::Connection::open_with_flags(
+            input.join("analysis.tdf"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let global = |k: &str| -> f64 {
+            conn.query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [k], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|e| panic!("GlobalMetadata {k}: {e}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let a = global("MzAcqRangeLower").sqrt();
+        let b = (global("MzAcqRangeUpper").sqrt() - a) / global("DigitizerNumSamples");
+        let (got_a, got_b) = (cal["a"].as_f64().expect("a is a number"), cal["b"].as_f64().expect("b is a number"));
+        // `b` is recovered as sqrt((a+b)²) − sqrt(a²), a difference of two ~10s: ~1e-10 relative.
+        assert!((got_a - a).abs() <= 1e-12 * a, "ims_calibration.a = {got_a}; the chord's sqrt(MzAcqRangeLower) = {a}");
+        assert!((got_b - b).abs() <= 1e-8 * b, "ims_calibration.b = {got_b}; the chord's slope = {b}");
+        assert_eq!(cal["mz_from_tof"], "(a + b*tof)^2");
+        assert_eq!(cal["lossless"], "tof");
+        assert_eq!(cal["tof_encoding"], "absolute", "the default archive layout stores absolute tof");
+        assert_eq!(cal["chord_source"], "global_metadata", "the native lane's chord comes from GlobalMetadata");
         // The vendor's exact calibration rides beside the two-point chord.
         let vmc = idx
             .get("metadata")
@@ -8103,7 +8221,14 @@ mod tests {
         );
         for key in ["DigitizerNumSamples", "MzAcqRangeLower", "MzAcqRangeUpper"] {
             assert!(vmc["global_metadata"].get(key).is_some(), "global_metadata missing `{key}`: {vmc}");
+            assert_eq!(vmc["global_metadata"][key].as_f64(), Some(global(key)), "global_metadata.{key}: {vmc}");
         }
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM MzCalibration", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            vmc["mz_calibration"].as_array().map(Vec::len),
+            Some(rows as usize),
+            "one entry per MzCalibration row: {vmc}"
+        );
         // … and the per-frame inputs are spectra_metadata columns.
         let meta_path = extract_zip_entry(&mut zip, "spectra_metadata.parquet", scratch);
         let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
@@ -8255,7 +8380,7 @@ mod tests {
         .unwrap()
         .build()
         .unwrap();
-        let mut types: Vec<String> = Vec::new();
+        let (mut types, mut levels): (Vec<String>, Vec<i64>) = (Vec::new(), Vec::new());
         for batch in reader {
             let batch = batch.unwrap();
             let col = batch.column_by_name("spectrum_type").expect("spectrum_type column");
@@ -8264,12 +8389,23 @@ mod tests {
                 .downcast_ref::<arrow::array::StringArray>()
                 .expect("spectrum_type is a string column");
             types.extend(col.iter().map(|v| v.unwrap_or("").to_string()));
+            let level = batch.column_by_name("ms_level").expect("ms_level column");
+            let level = arrow::compute::cast(level, &arrow::datatypes::DataType::Int64).unwrap();
+            let level = level.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+            levels.extend(level.iter().map(|v| v.expect("ms_level is set on every row")));
         }
         assert_eq!(types.len(), 4, "the fixture has four spectra");
         assert!(
             types.iter().all(|t| t == "MS:1000579" || t == "MS:1000580"),
             "every row must carry the MS1/MSn child term: {types:?}"
         );
+        // …and the RIGHT child for the row's level. The fixture holds both levels, so a swapped or a
+        // constant term cannot pass.
+        assert_eq!(levels, [1, 2, 1, 1], "the fixture's MS levels");
+        for (level, t) in levels.iter().zip(&types) {
+            let want = if *level == 1 { "MS:1000579" } else { "MS:1000580" };
+            assert_eq!(t, want, "ms_level {level} must carry {want}; rows {types:?} at levels {levels:?}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -8290,9 +8426,9 @@ mod tests {
             .iter()
             .map(|v| v.as_str().expect("entries are strings"))
             .collect();
-        assert!(applied.contains(&"zero-run-mask"), "{applied:?}");
-        assert!(applied.contains(&"numpress-linear"), "{applied:?}");
-        assert!(!applied.contains(&"sort-by-mz"), "the fixture is in m/z order: {applied:?}");
+        // The whole list — `contains` let through an entry nothing applied, or one listed twice. No
+        // `sort-by-mz`: the fixture is already in m/z order.
+        assert_eq!(applied, ["zero-run-mask", "numpress-linear"], "{applied:?}");
         // The lossless request drops the codec entry — the list follows the choice, not the lane.
         let out2 = dir.join("tiny-delta.mzpeak");
         let args: Vec<&std::ffi::OsStr> = vec![
@@ -8329,6 +8465,38 @@ mod tests {
         assert!(!text.contains("/Users/") && !text.contains("/home/"), "a home directory leaked into the index");
         for sf in index_metadata(&out)["file_description"]["source_files"].as_array().unwrap() {
             assert_eq!(sf["location"].as_str(), Some("file://"), "{sf}");
+        }
+        // The raw-text checks above are blind to a WINDOWS path: JSON escapes its backslashes
+        // (`C:\\Users\\…`), so neither the scratch directory nor a home directory matches the text.
+        // Walk the decoded strings and refuse any backslash or drive letter — the fixture itself
+        // carries `file://F:/data/Exp01` and `file://C:/settings/`, which must not travel either.
+        fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+                serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| {
+                    out.push(k);
+                    strings(x, out)
+                }),
+                _ => {}
+            }
+        }
+        let index: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut decoded = Vec::new();
+        strings(&index, &mut decoded);
+        let dir_slashed = dir_text.replace('\\', "/");
+        for s in decoded {
+            let b = s.as_bytes();
+            let drive = (0..b.len().saturating_sub(2)).any(|i| {
+                b[i].is_ascii_alphabetic()
+                    && b[i + 1] == b':'
+                    && matches!(b[i + 2], b'\\' | b'/')
+                    && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+            });
+            assert!(
+                !s.contains('\\') && !drive && !s.contains(dir_text.as_ref()) && !s.contains(&dir_slashed),
+                "an operator path leaked into the index: {s:?}"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
