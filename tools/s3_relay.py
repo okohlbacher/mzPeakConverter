@@ -15,6 +15,16 @@ Subcommands:
     s3_relay.py delete <key>                                          # delete object (idempotent)
     s3_relay.py md5  <path>                                           # -> md5 of a local file (verify)
 
+Above the 5 GB single-PUT ceiling, MANUAL only (the box harness still refuses at 5 GB — see below):
+    s3_relay.py presign-multipart <key> --parts N [--part-size B] [--expires S]
+                                          # OPENS a multipart upload (server-side state!) and prints
+                                          # {upload_id, part_size, urls:[...]} — one presigned PUT per
+                                          # part. Every path out of it MUST end in complete- or
+                                          # abort-multipart, or the parts sit in the bucket, billed.
+    s3_relay.py complete-multipart <key> --upload-id ID --etags E1,E2,...   # -> assembled size
+    s3_relay.py abort-multipart    <key> --upload-id ID                     # discard the parts
+    s3_relay.py list-multipart     [prefix]                                 # -> open uploads (reap orphans)
+
 Env overrides: S3_BUCKET, S3_ENDPOINT, S3_REGION, AWS_PROFILE.
 """
 import argparse, hashlib, json, os, re, sys
@@ -60,6 +70,15 @@ def main():
     pu = sub.add_parser("put"); pu.add_argument("key"); pu.add_argument("src")
     g = sub.add_parser("get"); g.add_argument("key"); g.add_argument("dest")
     h = sub.add_parser("head"); h.add_argument("key"); h.add_argument("--etag", action="store_true")
+    pmp = sub.add_parser("presign-multipart"); pmp.add_argument("key")
+    pmp.add_argument("--parts", type=int, required=True)
+    pmp.add_argument("--part-size", type=int, default=512 * 1024 * 1024)
+    pmp.add_argument("--expires", type=int, default=21600)
+    cmpm = sub.add_parser("complete-multipart"); cmpm.add_argument("key")
+    cmpm.add_argument("--upload-id", required=True); cmpm.add_argument("--etags", required=True)
+    amp = sub.add_parser("abort-multipart"); amp.add_argument("key")
+    amp.add_argument("--upload-id", required=True)
+    lmp = sub.add_parser("list-multipart"); lmp.add_argument("prefix", nargs="?", default="")
     pun = sub.add_parser("presign-unit"); pun.add_argument("key")
     pun.add_argument("--expires", type=int, default=21600)
     d = sub.add_parser("delete"); d.add_argument("key")
@@ -94,6 +113,49 @@ def main():
         # its durable corpus key, so a corrupt or truncated upload can never appear at the real key.
         s3.copy_object(Bucket=b, Key=a.dst_key, CopySource={"Bucket": b, "Key": a.src_key})
         print(s3.head_object(Bucket=b, Key=a.dst_key)["ContentLength"])
+    elif a.cmd == "presign-multipart":
+        # MANUAL ROUTE for an archive over the 5 GB single-PUT ceiling. The box has no credentials,
+        # so each part needs its own presigned PUT. PXD077098's Waters TWIMS frame archive is
+        # 9.04 GB and stopped the harness at `stage=too-big`; it was delivered by hand.
+        #
+        # This does NOT lift the harness's ceiling, and wiring it into box_convert.sh would not be
+        # enough either: `copy` publishes the staging object with copy_object, which S3 caps at
+        # 5 GB, and the deferred integrity gate compares the ETag against the body md5, which a
+        # multipart object's ETag is not. So a hand-driven upload should address the DURABLE key
+        # directly and be verified by size (see BACKLOG).
+        if not 1 <= a.parts <= 10000:
+            sys.exit("parts must be 1..10000 (S3 multipart limit)")
+        if not 5 * 1024**2 <= a.part_size <= 5 * 1024**3:
+            sys.exit("part-size must be 5 MiB..5 GiB (S3 multipart limits; the last part may be smaller)")
+        r = s3.create_multipart_upload(Bucket=b, Key=a.key)
+        urls = [s3.generate_presigned_url(
+                    "upload_part",
+                    Params={"Bucket": b, "Key": a.key, "UploadId": r["UploadId"], "PartNumber": i + 1},
+                    ExpiresIn=a.expires)
+                for i in range(a.parts)]
+        print(json.dumps({"upload_id": r["UploadId"], "part_size": a.part_size, "urls": urls}))
+    elif a.cmd == "complete-multipart":
+        # ETags arrive in part order, comma separated, exactly as the uploader collected them.
+        # REFUSE a blank field rather than skipping it: dropping one and numbering the rest 1..n
+        # renumbers every following part, and S3 would happily assemble the shifted object.
+        fields = [e.strip().strip('"') for e in a.etags.split(",")]
+        for i, e in enumerate(fields):
+            if not e:
+                sys.exit(f"empty ETag for part {i + 1} of {len(fields)} — refusing to complete")
+        parts = [{"ETag": e, "PartNumber": i + 1} for i, e in enumerate(fields)]
+        s3.complete_multipart_upload(Bucket=b, Key=a.key, UploadId=a.upload_id,
+                                     MultipartUpload={"Parts": parts})
+        r = s3.head_object(Bucket=b, Key=a.key)
+        # ETag of a multipart object is md5-of-part-md5s + "-N", NOT the body md5: check the size.
+        print(json.dumps({"size": r["ContentLength"], "etag": r["ETag"].strip('"'), "parts": len(parts)}))
+    elif a.cmd == "abort-multipart":
+        s3.abort_multipart_upload(Bucket=b, Key=a.key, UploadId=a.upload_id)
+    elif a.cmd == "list-multipart":
+        # An interrupted presign-multipart leaves parts that are invisible to `ls` and still billed.
+        pg = s3.get_paginator("list_multipart_uploads")
+        for page in pg.paginate(Bucket=b, Prefix=a.prefix):
+            for u in page.get("Uploads", []):
+                print(f"{u['Initiated'].isoformat()}\t{u['UploadId']}\t{u['Key']}")
     elif a.cmd == "presign-unit":
         # A vendor unit is rarely one object. It is either a PREFIX of many (.d, Waters .raw) or a
         # primary file plus SIDECARS that hold the actual payload (SCIEX .wiff + .wiff.scan + .wiff2,

@@ -14,6 +14,7 @@ jobs:
   # non-Windows OSes. Each job builds that platform's mzpeak-convert executable, runs the tests, and
   # smoke-converts the committed fixture to prove the produced binary works on that OS. Windows + its
   # vendor-SDK glue executables are covered by windows.yml. Matrix mirrors docs/PLATFORM_SUPPORT.md.
+  # release.yml waits on these check names (and on windows.yml's `windows`) — rename them there too.
   build-test:
     name: build-test (${{ matrix.os }})
     strategy:

@@ -54,92 +54,137 @@ enum Kind {
 struct Expected {
     /// Matched against the fact key: exact, or a `*` suffix for a prefix match.
     key: &'static str,
+    /// The native lanes the difference was measured on; `None` applies on every lane. A `*` rule must
+    /// name them (`wildcard_rules_name_their_vendors`): it accepts every fact under its prefix —
+    /// every column's population — so left open it waves through a loss on a lane nobody measured.
+    vendors: Option<&'static [Vendor]>,
     kind: Kind,
     reason: &'static str,
+}
+
+/// The native lane a pair went through.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+enum Vendor {
+    Agilent,
+    Bruker,
+    Sciex,
+    Shimadzu,
+    Waters,
+}
+
+/// The vendor of a NATIVE archive, from the instrument family term its lane states beside the model
+/// string (`instrument.param_accessions`). `None` when it states none (a Bruker file whose
+/// `InstrumentName` does not say timsTOF): no vendor-scoped rule applies, its differences fail as NEW.
+fn vendor_of(native: &Surface) -> Option<Vendor> {
+    const FAMILY: &[(&str, Vendor)] = &[
+        ("MS:1000490", Vendor::Agilent),
+        ("MS:1003123", Vendor::Bruker),
+        ("MS:1000121", Vendor::Sciex),
+        ("MS:1002998", Vendor::Shimadzu),
+        ("MS:1000126", Vendor::Waters),
+    ];
+    let accs = native.get("instrument.param_accessions")?;
+    FAMILY.iter().find(|(acc, _)| accs.split(',').any(|a| a == *acc)).map(|(_, v)| *v)
 }
 
 const EXPECTED: &[Expected] = &[
     Expected {
         key: "software.ids",
+        vendors: None,
         kind: Kind::Defect,
         reason: "the native Shimadzu lane still records no acquisition software (LabSolutions version needs a glue export); elsewhere the difference is ProteoWizard's own entries (pwiz, pwiz_Reader_*) and the vendor's FULL version string the native lane carries (`MassHunter GC/MS Acquisition 10.0.368 …`, `MassLynx 4.1 SCN916`) where pwiz prints `8.0` / `4.1`.",
     },
     Expected {
         key: "file_description.source_files.count",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "ProteoWizard lists whatever sits in the acquisition directory, AppleDouble `._*` siblings of the box's copy included (blank1: 17 entries, 9 of them `._*` with one shared bogus digest); the native lane lists the vendor's members (Agilent AcqData files, Bruker analysis.tdf/tsf + _bin, Waters _FUNCnnn.DAT and side files, WIFF + WIFF.scan) with their real SHA-1s.",
     },
     Expected {
         key: "file_description.source_files.with_checksum",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "follows source_files.count (every member the native lane lists is digested).",
     },
     Expected {
         key: "file_description.source_files.names",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "follows source_files.count.",
     },
     Expected {
         key: "instrument.components",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the native lanes assert only what the vendor file states — the analyzers a device type implies (Agilent Devices.xml), ESI + quadrupole + TOF from the Shimadzu device id, the TOF of a timsTOF — never a guessed source or detector; ProteoWizard adds hand-tabled sources and detectors per vendor (EI + electron multiplier for a 5977, nanospray + MCP + PMT for a timsTOF).",
     },
     Expected {
         key: "instrument.param_accessions",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the native lanes carry the vendor's model string as the MS:1000031 value beside the family term (MS:1000490 Agilent, MS:1002998 Shimadzu, MS:1000126 Waters, MS:1003123 timsTOF, MS:1000121 SciEX) and the file's model number / instrument name as user params; ProteoWizard maps the string to a specific CV term through a hand-curated table and drops the string.",
     },
     Expected {
         key: "chromatograms.inventory",
+        vendors: None,
         kind: Kind::Defect,
         reason: "ProteoWizard emits the LC device traces (pump pressure, flow, DAD) as chromatograms; \
                  the native lanes iterate MS scans only and write just the synthesised TIC/BPC.",
     },
     Expected {
         key: "facet.chromatograms_data.parquet.rows",
+        vendors: None,
         kind: Kind::Defect,
         reason: "follows chromatograms.inventory: the device traces carry most of the points.",
     },
     Expected {
         key: "data_processing.count",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the mzML lane inherits ProteoWizard's own conversion entry beside ours; a native lane has no such step to inherit.",
     },
     Expected {
         key: "index.metadata.keys",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "codec blocks differ by construction: a lane that grids or lattices its m/z declares \
                  `tof_calibration` / `mz_calibration`, one that chunks does not.",
     },
     Expected {
         key: "transformations",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the declared transformation list follows the encoding each lane chose, which is the \
                  point of declaring it.",
     },
     Expected {
         key: "facet.spectra_data.parquet.columns",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "point versus chunk layout, and the integer-axis columns of a grid/lattice lane.",
     },
     Expected {
         key: "facet.spectra_peaks.parquet.columns",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "point versus chunk layout, and the integer-axis columns of a grid/lattice lane.",
     },
     Expected {
         key: "facet.spectra_data.parquet.rows",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "a chunk row holds a list of points; a point row holds one. Row counts are not \
                  comparable across layouts — the point totals are compared instead.",
     },
     Expected {
         key: "facet.spectra_peaks.parquet.rows",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "same: chunk rows versus point rows.",
     },
     Expected {
         key: "cv.ids",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the native lanes declare the converter's own MZP vocabulary because they emit MZP \
                  terms (grid coefficients, mobility bands); the mzML lane has no MZP params to declare. \
@@ -147,114 +192,139 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         key: "facet.spectra_metadata.parquet.columns",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the grid/lattice native lanes add their per-spectrum coefficient columns \
                  (opt_MZP_1000003_tof_c0 …), which the mzML lane has no equivalent for.",
     },
     Expected {
         key: "spectra_metadata.opt_MZP_*",
+        vendors: Some(&[Vendor::Bruker, Vendor::Sciex, Vendor::Shimadzu]),
         kind: Kind::ByDesign,
         reason: "as above: per-spectrum grid coefficients exist only where a lane grids.",
     },
     Expected {
         key: "run.default_data_processing_id",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "each lane names its own processing entry; both resolve within their archive.",
     },
     Expected {
         key: "run.default_source_file_id",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "each lane names its own source-file entry; both resolve within their archive.",
     },
     Expected {
         key: "run.start_time",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the lanes read different things. A vendor-STATED offset is carried verbatim by the native lane (Agilent Contents.xml 13:11:27-04:00 = 17:11Z) while ProteoWizard shifts the same clock by the CONVERTING host's zone (18:11Z on blank1 — wrong by an hour); a vendor time WITHOUT a zone (Waters _HEADER.TXT, Shimadzu AnalysisDate, SciEX) stays null on the native lane and is preserved verbatim in the acquisition_time index block, while ProteoWizard labels the same wall clock Z (Capan2) — a claim the native lane refuses to make.",
     },
     Expected {
         key: "file_description.contents",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the native lane states what it wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram); ProteoWizard's list is per-vendor and inconsistent — its Waters reader says `MS1 spectrum` only while writing 136,400 MS2 spectra with precursors (Capan2).",
     },
     Expected {
         key: "facet.chromatograms_data.parquet.columns",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the mzML lane's chromatogram points carry an ms_level column its source declared.",
     },
     Expected {
         key: "sample.count",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the native lane carries the vendor's sample (Waters `Acquired Name`, Bruker SampleName, Agilent sample_info.xml, the selected WIFF sample) where ProteoWizard writes none (Waters, Bruker) or an unnamed one (Agilent).",
     },
     Expected {
         key: "run.id",
+        vendors: None,
         kind: Kind::Defect,
         reason: "ProteoWizard names a WIFF run after its SAMPLE (En_PPY: the sample name), the native lane after the file stem; pwiz's XML-id escaping of a leading digit (`_x0032_0181203…`) is decoded before comparing, so only the SciEX naming rule remains.",
     },
     Expected {
         key: "facet.spectra_metadata.parquet.rows",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "Waters ion mobility: the native lane writes one FRAME per MassLynx scan (Capan2: 1,989 rows, each carrying every drift bin's points with a per-point raw_ion_mobility array — verified bin for bin against pwiz), where ProteoWizard writes one spectrum per drift bin (397,800 = 1,989 × 200). Same data, 200× fewer rows.",
     },
     Expected {
         key: "facet.spectra_metadata_scans.parquet.rows",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "follows facet.spectra_metadata.parquet.rows (frames vs drift bins).",
     },
     Expected {
         key: "spectra_metadata.*",
+        vendors: Some(&[Vendor::Waters]),
         kind: Kind::ByDesign,
         reason: "follows facet.spectra_metadata.parquet.rows: every per-row count is 200× smaller on the frame side, and the VALUES agree — Capan2 ms levels 1,307 MS1 / 682 MS2 natively vs 261,400 / 136,400 per bin (× 200 exactly), RT, polarity and scan window now come from the SDK on every row. The SciEX MRM rows this rule was first written for are refused to the msconvert lane.",
     },
     Expected {
         key: "spectra_metadata_scans.*",
+        vendors: Some(&[Vendor::Waters]),
         kind: Kind::ByDesign,
         reason: "follows spectra_metadata.* (frames vs drift bins; RT and scan window present on every native row).",
     },
     Expected {
         key: "instrument.model",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the native lane carries the vendor's model string as the MS:1000031 value (Devices.xml Name, Shimadzu SystemName, Waters _HEADER.TXT Instrument, Clearcore2 InstrumentName); ProteoWizard keeps it in a user param or maps it to a specific term.",
     },
     Expected {
         key: "sample.names",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "follows sample.count: the native lane's sample carries the vendor's name; ProteoWizard's, where it exists, is unnamed.",
     },
     Expected {
         key: "acquisition_time.wall_clock",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "the native lane's record of a vendor wall clock that has no zone; the mzML lane has no such block (it labelled the same clock Z or shifted it).",
     },
     Expected {
         key: "file_description.source_files.digests",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "follows source_files.count: the AppleDouble entries in ProteoWizard's list carry one shared bogus digest; the members both lanes list agree byte for byte (measured on blank1's eight AcqData files).",
     },
     Expected {
         key: "facet.spectra_metadata_precursors.parquet.rows",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "frames vs drift bins: the native Waters lane writes one precursor per MSn FRAME (Capan2: 682, one per elevated-energy MSe scan, from the SDK's scan items SET_MASS / COLLISION_ENERGY), where ProteoWizard writes its MSe placeholder precursor on each of the 136,400 drift-bin spectra it expands them into (682 × 200).",
     },
     Expected {
         key: "facet.spectra_metadata_selected_ions.parquet.rows",
+        vendors: None,
         kind: Kind::ByDesign,
         reason: "an MSe elevated-energy scan selects nothing (SET_MASS = 0): both lanes state the acquisition range as the isolation window (target = midpoint), but the native lane writes no selected ion where ProteoWizard writes a placeholder ion at the midpoint on every drift-bin spectrum. A DDA function (SET_MASS > 0) gets a selected ion and a target-only window on both lanes.",
     },
     Expected {
         key: "spectra_metadata_precursors.*",
+        vendors: Some(&[Vendor::Waters]),
         kind: Kind::ByDesign,
         reason: "follows the two row rules: ×200 rows on the pwiz side; the same acquisition-range MSe window on both, but the mzML twin carries only one offset (mzdata reads the lower one as 0) and the native lane adds the method's transfer-energy ramp (MS:1002013/1002014) and the window-source parameter.",
     },
     Expected {
         key: "spectra_metadata_selected_ions.*",
+        vendors: Some(&[Vendor::Waters]),
         kind: Kind::ByDesign,
         reason: "follows facet.spectra_metadata_selected_ions.parquet.rows.",
     },
 ];
 
-fn expected_rule(key: &str) -> Option<&'static Expected> {
-    EXPECTED.iter().find(|e| e.key.strip_suffix('*').map_or(e.key == key, |p| key.starts_with(p)))
+/// The first rule covering `key` on a pair that came through `vendor`'s native lane.
+fn expected_rule(key: &str, vendor: Option<Vendor>) -> Option<&'static Expected> {
+    EXPECTED.iter().find(|e| {
+        e.key.strip_suffix('*').map_or(e.key == key, |p| key.starts_with(p))
+            && e.vendors.is_none_or(|vs| vendor.is_some_and(|v| vs.contains(&v)))
+    })
 }
 
 /// Long values (a 95-transition chromatogram inventory) make the report unreadable; keep the head.
@@ -632,8 +702,9 @@ fn native_and_mzml_lanes_carry_the_same_metadata() {
 
     for (stem, native, mzml) in &pairs {
         let (a, b) = (surface(native, &scratch), surface(mzml, &scratch));
+        let vendor = vendor_of(&a);
         let (mut by_design, mut defects) = (0usize, 0usize);
-        println!("\n=== {stem} ===");
+        println!("\n=== {stem} (native lane: {vendor:?}) ===");
         println!(
             "  native {:>12} B   mzml {:>12} B",
             std::fs::metadata(native).unwrap().len(),
@@ -647,7 +718,7 @@ fn native_and_mzml_lanes_carry_the_same_metadata() {
                 same += 1;
                 continue;
             }
-            let rule = expected_rule(k);
+            let rule = expected_rule(k, vendor);
             if let Some(r) = rule {
                 fired.insert(r.reason);
             }
@@ -692,19 +763,32 @@ fn unexpected_and_stale() {
     assert!(!pairs.is_empty(), "MZPC_LANE_PAIRS={} holds no <stem>.native/.mzml pair", dir.display());
     let scratch = std::env::temp_dir().join(format!("mzpc-lane-stale-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
-    let mut fired: BTreeSet<&'static str> = BTreeSet::new();
+    let mut fired: BTreeSet<(&'static str, Option<Vendor>)> = BTreeSet::new();
     for (_, native, mzml) in &pairs {
         let (a, b) = (surface(native, &scratch), surface(mzml, &scratch));
+        let vendor = vendor_of(&a);
         for k in a.keys().chain(b.keys()) {
             if a.get(k) != b.get(k) {
-                if let Some(r) = expected_rule(k) {
-                    fired.insert(r.reason);
+                if let Some(r) = expected_rule(k, vendor) {
+                    fired.insert((r.key, vendor));
                 }
             }
         }
     }
     let _ = std::fs::remove_dir_all(&scratch);
-    let stale: Vec<&str> = EXPECTED.iter().map(|e| e.reason).filter(|r| !fired.contains(r)).collect();
+    // A vendor-scoped rule is stale PER VENDOR: every lane it names must still show the difference,
+    // or its list claims a lane it no longer applies to.
+    let stale: Vec<String> = EXPECTED
+        .iter()
+        .flat_map(|e| match e.vendors {
+            None => (!fired.iter().any(|(k, _)| *k == e.key)).then(|| e.key.to_string()).into_iter().collect::<Vec<_>>(),
+            Some(vs) => vs
+                .iter()
+                .filter(|v| !fired.contains(&(e.key, Some(**v))))
+                .map(|v| format!("{} on {v:?}", e.key))
+                .collect(),
+        })
+        .collect();
     // An assertion since 0.12: a rule that fires on no pair either records a loss that has been
     // CLOSED (delete it, the parity is the proof) or never matched anything. Which rules fire does
     // depend on which pairs are present, so the pair set must stay broad (one unit per native lane).
@@ -714,4 +798,25 @@ fn unexpected_and_stale() {
         stale.len(),
         stale.join("\n  - ")
     );
+}
+
+/// Fixture-free, so it runs on every host. A `*` rule accepts every fact under its prefix — every
+/// column's population — so it must name the native lanes it was measured on, and must then match
+/// nobody else's facts.
+#[test]
+fn wildcard_rules_name_their_vendors() {
+    for e in EXPECTED.iter().filter(|e| e.key.ends_with('*')) {
+        assert!(
+            e.vendors.is_some_and(|v| !v.is_empty()),
+            "`{}` accepts its whole prefix on every lane; name the lanes it was measured on",
+            e.key
+        );
+    }
+    let waters: Surface = [("instrument.param_accessions".to_string(), "MS:1000031,MS:1000126".to_string())].into();
+    assert_eq!(vendor_of(&waters), Some(Vendor::Waters));
+    // The frames-vs-drift-bins rule accepts a Waters population difference, and no other lane's.
+    let key = "spectra_metadata.ms_level.nonnull";
+    assert!(expected_rule(key, Some(Vendor::Waters)).is_some());
+    assert!(expected_rule(key, Some(Vendor::Shimadzu)).is_none(), "a Shimadzu population loss must fail as NEW");
+    assert!(expected_rule(key, None).is_none(), "an unidentified lane gets no vendor-scoped rule");
 }

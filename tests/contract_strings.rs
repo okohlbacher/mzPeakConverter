@@ -4,8 +4,9 @@
 //! SciEX `sciex_sqrt_per_spectrum` specifically — ALSO matches the exact `tof_to_mz` formula string
 //! (whitespace-tolerant). A silent reformat of any of these would make the viewer fail-loud and
 //! render empty spectra. These tests assert the literals are still emitted VERBATIM in the converter
-//! source, with no corpus fixture needed (we read `src/main.rs` at compile time and search it — the
-//! needle appearing in this test file is irrelevant, since we search main.rs's content, not ours).
+//! source, with no corpus fixture needed (we read `src/main.rs` at compile time and search its CODE:
+//! comments and the `#[cfg(test)]` module are cut away first, so neither a comment quoting a literal
+//! nor a unit test asserting on it can stand in for the emission site — see [`code`]).
 //!
 //! Changing any pinned string is a BREAKING contract change: bump the version and notify the viewer
 //! team. See the calibration emission sites in `src/main.rs` (ims_calibration / tof_calibration).
@@ -24,9 +25,50 @@ fn src() -> &'static str {
     NORM.get_or_init(|| SRC.replace("\r\n", "\n"))
 }
 
+/// The converter's CODE: `src/main.rs` up to its `#[cfg(test)] mod tests`, every `//` comment cut.
+/// A pin exists to go red when the emission site goes away, and both stand-ins kept pins green: the
+/// `tof_encoding` values are also quoted in a comment beside the call, and `"global_metadata"` in
+/// the test module.
+fn code() -> &'static str {
+    static CODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CODE.get_or_init(|| {
+        let lanes = src().split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        lanes.lines().map(strip_comment).collect::<Vec<_>>().join("\n")
+    })
+}
+
+/// `line` without its `//` comment. A `//` inside a string literal (`"file://"`) is not one; quote
+/// state is per line (a `'"'` char literal does not open a string).
+fn strip_comment(line: &str) -> &str {
+    let b = line.as_bytes();
+    let (mut in_str, mut i) = (false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_str => i += 1,
+            b'\'' if !in_str && b.get(i + 1) == Some(&b'"') && b.get(i + 2) == Some(&b'\'') => i += 2,
+            b'"' => in_str = !in_str,
+            b'/' if !in_str && b.get(i + 1) == Some(&b'/') => return line[..i].trim_end(),
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+#[test]
+fn code_view_drops_comments_and_the_test_module() {
+    assert_eq!(strip_comment(r#"    x("file://"); // "absolute""#), r#"    x("file://");"#);
+    assert_eq!(strip_comment(r#"    // `tof_encoding` is "absolute""#), "");
+    assert_eq!(strip_comment(r#"    s.split('"').next() // "m/z-chunked""#), r#"    s.split('"').next()"#);
+    assert!(code().contains("fn main()"), "the lanes survive");
+    // `mod tests {` occurs in main.rs only where the test module opens (fn corpus_root(), the old
+    // needle, moved to tests/common/corpus.rs, so it could no longer fail).
+    assert!(!code().contains("mod tests {"), "the test module is cut");
+}
+
 fn pinned(needle: &str) {
     assert!(
-        src().contains(needle),
+        code().contains(needle),
         "calibration contract drift: `{needle}` is no longer emitted verbatim in src/main.rs \
          — this is a BREAKING change for mzPeakViewer (fail-loud -> empty spectra). \
          If intentional, update this pin + bump the version + tell the viewer team."
@@ -41,6 +83,7 @@ fn ims_compact_calibration_pinned() {
     // verbatim: "absolute" (archive layout + SDK path) and "m/z-chunked" (--ims-chunked). The third,
     // "per-scan-delta", was REMOVED in v0.7.3 — no reader ever cumsummed it, so it produced wrong
     // m/z. Do not re-add the pin: the label must not reappear in emitted output.
+    pinned("\"tof_encoding\": tof_encoding");
     pinned("\"absolute\"");
     pinned("\"m/z-chunked\"");
     // The chunked-TOF decoding rule the block states. Until 0.9.13 it read "delta-within-chunk;
@@ -92,14 +135,14 @@ fn agilent_and_sciex_global_models_pinned() {
 fn tof_grid_reconstruction_keys_pinned() {
     // One per `codec: "tof-grid"` emission site. Counted against the sites themselves so that
     // adding a fifth lane without its keys fails here rather than in someone's reader.
-    let sites = src().matches("\"codec\": \"tof-grid\"").count();
+    let sites = code().matches("\"codec\": \"tof-grid\"").count();
     assert_eq!(sites, 4, "expected 4 `codec: \"tof-grid\"` emission sites, found {sites}");
     assert_eq!(
-        src().matches("\"lossless\": \"tof_index\"").count(),
+        code().matches("\"lossless\": \"tof_index\"").count(),
         sites,
         "every `codec: \"tof-grid\"` block must name its exactly-stored column with the spec's \
          `lossless` key; found {} of {sites} emission sites",
-        src().matches("\"lossless\": \"tof_index\"").count()
+        code().matches("\"lossless\": \"tof_index\"").count()
     );
     assert!(
         !src().contains("integer_column"),
@@ -113,20 +156,20 @@ fn tof_grid_reconstruction_keys_pinned() {
     // 0.5 step (4.15e-10 Da) — inside the vendor's ±5e-10 rounding, so accurate to vendor precision,
     // but "exact" read as bit-exact. It now states the bound.
     assert_eq!(
-        src().matches("\"mz_reconstruction\": \"exact\"").count(),
+        code().matches("\"mz_reconstruction\": \"exact\"").count(),
         1,
         "only the Agilent lane rebuilds m/z exactly; a new `exact` claim needs the same evidence"
     );
     pinned("\"mz_reconstruction\": \"within-vendor-rounding\"");
     pinned("\"max_error_da\": 5e-10");
     assert_eq!(
-        src().matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
+        code().matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
         2,
         "the run-wide and per-spectrum SCIEX grid lanes are bounded-lossy and must say so \
          (the Agilent lane is exact, the Shimadzu lane within vendor rounding)"
     );
     assert_eq!(
-        src().matches("\"roundtrip_tolerance_ppm\": tof_grid::ppm_tol()").count(),
+        code().matches("\"roundtrip_tolerance_ppm\": tof_grid::ppm_tol()").count(),
         2,
         "a bounded-lossy block must state its bound"
     );
@@ -177,12 +220,12 @@ fn tof_grid_files_by_representation_pinned() {
     pinned(".add_field(tof_field)\n        .add_field(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field())");
     // every lane that declares the peaks schema also declares the axis on the data facet
     assert_eq!(
-        src().matches("tof_index_peak_schema(tof_field.clone())").count(),
+        code().matches("tof_index_peak_schema(tof_field.clone())").count(),
         2,
         "the mzML --tof-grid lane and the native SCIEX lane share one peaks schema"
     );
     assert!(
-        src().matches(".add_spectrum_field(tof_field)").count() >= 3,
+        code().matches(".add_spectrum_field(tof_field)").count() >= 3,
         "mzML tof-grid, Agilent and SCIEX must declare the axis on spectra_data"
     );
     // The four forcing assignments the review found (mzML gridded → Centroid, mzML f64 fallback →

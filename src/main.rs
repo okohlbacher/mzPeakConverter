@@ -9,7 +9,7 @@
 //! Vendor-SDK readers compile in per platform (see the cfg-gated modules below). See PLAN.md.
 
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,6 +31,7 @@ mod bruker_baf;
 mod bruker_sdk;
 mod pwiz_layout;
 mod agl;
+mod sciex_run;
 #[cfg(windows)]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod agilent;
@@ -414,9 +415,10 @@ struct Cli {
 
     /// SciEX `.wiff` holding SEVERAL samples: which one to convert (1-based). An archive is ONE
     /// run, so a multi-sample file is refused without this (concatenating the samples under one
-    /// run id, as before 0.12, was a conversion of none of them). The msconvert lane maps it to
-    /// `--runIndexSet <N-1>`; without it that lane silently kept only the LAST sample.
-    #[arg(long, value_name = "N")]
+    /// run id, as before 0.12, was a conversion of none of them). The msconvert lanes map it to
+    /// `--runIndexSet <N-1>` and refuse a multi-run file without it: msconvert writes every run
+    /// onto the one output, so only the LAST would survive.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     sample: Option<u32>,
 
     /// Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from
@@ -1768,6 +1770,35 @@ fn is_wiff(input: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("wiff") || e.eq_ignore_ascii_case("wiff2"))
 }
 
+/// `--sample N` for both msconvert lanes (mzPeak and `--to mzml`). A multi-sample WIFF is several
+/// runs; with one `--outfile` msconvert writes them in turn and the LAST wins (En_PPY: 117
+/// samples, one survived), so the run is picked explicitly.
+fn msconvert_sample_arg(cmd: &mut Command, input: &Path) {
+    if let Some(n) = sciex_sample().filter(|_| is_wiff(input)) {
+        cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
+    }
+}
+
+/// Refuse what `msconvert_sample_arg` could not prevent: several runs written onto one output.
+/// msconvert prints `writing output file: <path>` once per run, before writing it (`processFile`
+/// in pwiz's `msconvert.cpp`), so more than one such line in its log means the output holds only
+/// the last run. Counted from the log rather than from files: without `--outfile` pwiz names a
+/// run `<wiff>-<sample name>`, and samples that share a name overwrite each other there too.
+fn refuse_multi_run(log: &Path) -> Result<()> {
+    // ponytail: read once msconvert has written EVERY run (En_PPY: all 117); tail the log while it
+    // runs and kill it at the second line if that wait matters.
+    let runs = String::from_utf8_lossy(&fs::read(log).unwrap_or_default())
+        .matches("writing output file:")
+        .count();
+    if runs > 1 {
+        bail!(
+            "msconvert wrote {runs} runs onto the one output, so only the last survived; an output \
+             is ONE run — pass --sample <1..{runs}> to choose which to convert"
+        );
+    }
+    Ok(())
+}
+
 /// True for a Waters MassLynx `.raw`. Unlike a Thermo `.raw` (a single FILE), a Waters `.raw` is
 /// a DIRECTORY with a `.raw` extension that holds `_HEADER.TXT` and per-function `_FUNCnnn.DAT`
 /// files. Requiring `is_dir()` keeps it from colliding with the Thermo `.raw` file; the
@@ -1880,10 +1911,10 @@ fn convert_via_msconvert(
         .or_else(|| std::env::var_os("MSCONVERT_PATH"))
         .unwrap_or_else(|| "msconvert".into());
 
-    // Unique temp dir for the intermediate mzML (process id keeps concurrent runs from colliding).
-    let tmpdir = std::env::temp_dir().join(format!("mzpc-msconvert-{}", std::process::id()));
-    fs::create_dir_all(&tmpdir).with_context(|| format!("creating {}", tmpdir.display()))?;
-    let mzml = tmpdir.join("via_msconvert.mzML");
+    // The intermediate mzML goes to a temp dir the guard removes on every return; "msconvert not
+    // found" used to return through `?` below and leave it behind.
+    let tmp = msconvert_dir(&std::env::temp_dir())?;
+    let (tmpdir, mzml) = (&tmp.dir, &tmp.file);
 
     let mzcvt_log = tmpdir.join("msconvert.log");
     let mut cmd = Command::new(&exe);
@@ -1900,14 +1931,7 @@ fn convert_via_msconvert(
         .arg(&tmpdir)
         .arg("--outfile")
         .arg("via_msconvert.mzML");
-    // A multi-sample WIFF is several runs; with one `--outfile` msconvert writes them in turn and
-    // the LAST wins (En_PPY: 117 samples, one survived). `--sample N` picks the run explicitly.
-    if let Some(n) = sciex_sample() {
-        let ext = input.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-        if ext == "wiff" || ext == "wiff2" {
-            cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
-        }
-    }
+    msconvert_sample_arg(&mut cmd, input);
     // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
     // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
     if let Ok(f) = fs::File::create(&mzcvt_log) {
@@ -1939,29 +1963,24 @@ fn convert_via_msconvert(
             .unwrap_or_default()
     };
     if !status.success() {
-        let t = msconvert_tail();
-        let _ = fs::remove_dir_all(&tmpdir);
-        bail!("msconvert failed (exit {:?}){}", status.code(), t);
+        bail!("msconvert failed (exit {:?}){}", status.code(), msconvert_tail());
     }
     if !mzml.exists() {
-        let t = msconvert_tail();
-        let _ = fs::remove_dir_all(&tmpdir);
-        bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), t);
+        bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), msconvert_tail());
     }
+    refuse_multi_run(&mzcvt_log)?;
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
-    let result = convert_file(&mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true);
-    let _ = fs::remove_dir_all(&tmpdir);
-    result
+    convert_file(mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true)
 }
 
 /// The `--to mzml` lane: convert `input` to a plain **mzML** via the mzdata writer, streaming the
 /// read spectra straight through — no mzPeak encoders (ims-compact / TOF-grid / chunking /
 /// byte-plane / side-file embedding all bypassed). Covers every format the tool reads: the
 /// Windows-native vendor readers (SciEX/Waters/Agilent/Shimadzu, Bruker TSF/BAF) plus everything
-/// mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF). `--via-msconvert` runs msconvert
-/// straight to the output mzML.
+/// mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF). `--via-msconvert` has msconvert
+/// write the mzML instead.
 fn convert_to_mzml(
     input: &Path,
     output: &Path,
@@ -1983,7 +2002,7 @@ fn convert_to_mzml(
     }
     #[cfg(windows)]
     if is_wiff(input) {
-        let r = sciex::SciexReader::open(input)?;
+        let r = sciex::SciexReader::open_run(input, sciex_sample())?;
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
     #[cfg(windows)]
@@ -2071,10 +2090,12 @@ fn convert_to_mzml(
         .with_context(|| format!("opening {}", input.display()))?;
 
     use mzdata::prelude::{ChromatogramSource, MSDataFileMetadata, SpectrumSource, SpectrumWriter};
-    // Collect chromatograms FIRST: iterating the spectra can leave the reader positioned past the
-    // chromatogramList (fatal for a chromatogram-only SRM/MRM file — the mzPeak path samples them
-    // early for the same reason). Then rewind for the spectrum pass.
+    // mzdata reaches chromatograms only by offset through the embedded `<indexList>`, so where the
+    // spectrum pass leaves the reader does not matter. Chromatograms missing here mean that index
+    // was unreadable: a non-indexed mzML, or a rewritten temp copy with stale offsets (the reason
+    // `transcode_to_utf8` rebuilds them).
     let source_chroms: Vec<Chromatogram> = reader.iter_chromatograms().collect();
+    warn_unread_chromatograms(input, &read_path, source_chroms.len());
     let _ = reader.reset();
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
@@ -2380,7 +2401,11 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
     Ok(())
 }
 
-/// Run ProteoWizard `msconvert` to produce the output mzML directly (`--via-msconvert --to mzml`).
+/// Run ProteoWizard `msconvert` for the output mzML (`--via-msconvert --to mzml`). It writes into a
+/// fresh directory BESIDE the output, so the rename into place cannot cross a volume, and only the
+/// file it wrote there is renamed onto `output`. It used to be handed the final path, with
+/// `output.exists()` as the success check, so under `--force` a previous run's file passed for this
+/// run's — which real msconvert produces for `-o x.mzML.gz`, a name it writes under another one.
 fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>) -> Result<()> {
     let exe: std::ffi::OsString = msconvert_path
         .map(|p| p.as_os_str().to_os_string())
@@ -2390,21 +2415,20 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let outfile = output
-        .file_name()
-        .ok_or_else(|| anyhow!("output {} has no file name", output.display()))?;
+    let tmp = msconvert_dir(outdir)?;
     // Capture msconvert's stdout+stderr so a failure carries its real message (unknown-instrument /
     // unsupported-format / missing-sidecar) instead of a bare exit code — same as the mzPeak
     // `convert_via_msconvert` path (commit 57262aa).
-    let log_path = std::env::temp_dir().join(format!("mzpc-msconvert-mzml-{}.log", std::process::id()));
+    let log_path = tmp.dir.join("msconvert.log");
     let mut cmd = Command::new(&exe);
     cmd.arg(input)
         .arg("--mzML")
         .arg("--ignoreUnknownInstrumentError")
         .arg("--outdir")
-        .arg(outdir)
+        .arg(&tmp.dir)
         .arg("--outfile")
-        .arg(outfile);
+        .arg("via_msconvert.mzML");
+    msconvert_sample_arg(&mut cmd, input);
     if let Ok(f) = fs::File::create(&log_path) {
         if let Ok(f2) = f.try_clone() {
             cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
@@ -2433,16 +2457,26 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
             .unwrap_or_default()
     };
     if !status.success() {
-        let t = tail();
-        let _ = fs::remove_file(&log_path);
-        bail!("msconvert failed (exit {:?}){}", status.code(), t);
+        bail!("msconvert failed (exit {:?}){}", status.code(), tail());
     }
-    if !output.exists() {
-        let t = tail();
-        let _ = fs::remove_file(&log_path);
-        bail!("msconvert reported success but produced no mzML at {}{}", output.display(), t);
+    if !tmp.file.exists() {
+        bail!("msconvert reported success but produced no mzML at {}{}", tmp.file.display(), tail());
     }
-    let _ = fs::remove_file(&log_path);
+    refuse_multi_run(&log_path)?;
+    // msconvert's own `--gzip` would pick the file name again; compress what it wrote instead.
+    let written = if has_gz_suffix(output) {
+        let gz = tmp.dir.join("via_msconvert.mzML.gz");
+        let compress = || -> io::Result<()> {
+            let mut enc = flate2::write::GzEncoder::new(fs::File::create(&gz)?, flate2::Compression::default());
+            io::copy(&mut fs::File::open(&tmp.file)?, &mut enc)?;
+            enc.finish().map(drop)
+        };
+        compress().with_context(|| format!("gzip-compressing {}", tmp.file.display()))?;
+        gz
+    } else {
+        tmp.file.clone()
+    };
+    TmpGuard::new(&written).finish(output)?;
     log::info!("wrote {}", output.display());
     Ok(())
 }
@@ -3477,6 +3511,8 @@ fn convert_file(
     let read_path: &Path = read_path.as_path();
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
+    // Here rather than at the chromatogram write, so the TOF-grid writer below is covered too.
+    warn_unread_chromatograms(input, read_path, reader.count_chromatograms());
 
     // TOF-grid m/z encoding (SCIEX / exact-lattice TOF): if requested, sample spectra and try to fit
     // a per-run integer flight-time grid `sqrt(m/z)=c0+c1·k`. When every sampled point reconstructs
@@ -3739,17 +3775,6 @@ fn convert_file(
     // not written, so a partial conversion can never be mistaken for a complete one.
     assert_source_complete_tmp(input, n, cap, &tmp)?;
 
-    // Say so when the source's chromatograms are unreadable, rather than writing an archive that
-    // quietly lacks them. Synthesis regenerates TIC/BPC from MS1 and so hides the loss of anything
-    // else — SIM/SRM traces are exactly what does not come back.
-    if reader.count_chromatograms() == 0 && is_unindexed_mzml(read_path) {
-        log::warn!(
-            "{} is a non-indexed mzML: its chromatogramList cannot be enumerated by this reader, so \
-             any chromatograms it declares (SIM/SRM traces included) are NOT carried into the \
-             archive. Re-index it (msconvert, or `--via-msconvert`) if you need them.",
-            read_path.display()
-        );
-    }
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
@@ -3799,6 +3824,7 @@ impl Drop for SanitizedTemp {
 /// RAII cleanup for a transcoded-to-UTF-8 input. Holds the temp *directory* we created (for imzML
 /// we also place a hardlinked/copied `.ibd` sidecar beside the temp file, so the whole dir must go)
 /// and removes it on drop — covering success, conversion error, and panic-unwind exit paths alike.
+/// [`msconvert_dir`] reuses it for the directory msconvert writes into.
 struct TranscodeGuard {
     dir: PathBuf,
     /// The transcoded UTF-8 file to hand to mzdata, inside `dir`.
@@ -3809,6 +3835,28 @@ impl Drop for TranscodeGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A fresh directory under `parent` for msconvert to write `via_msconvert.mzML` into (`file`),
+/// removed on every return — not on a panic, which aborts the release build. Created exclusively,
+/// under a name no other run holds (pid, clock, attempt), and never reused: the pid alone is shared
+/// by containers whose entrypoint is PID 1 writing to one volume, and a directory a crashed run left
+/// behind must not hand its mzML to this run. Hidden, because it sits beside the user's output.
+fn msconvert_dir(parent: &Path) -> Result<TranscodeGuard> {
+    // msconvert creates a missing --outdir itself; keep that for an output directory that does not exist yet.
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for attempt in 0..100 {
+        let dir = parent.join(format!(".mzpc-msconvert-{}-{stamp}-{attempt}", std::process::id()));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(TranscodeGuard { file: dir.join("via_msconvert.mzML"), dir }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+        }
+    }
+    bail!("could not create a fresh msconvert directory under {}", parent.display())
 }
 
 /// Sniff the XML encoding declared in the first ~200 bytes. Returns the lowercased charset name from
@@ -3965,11 +4013,83 @@ fn gunzip_to_temp(input: &Path) -> Result<Option<GunzipGuard>> {
     Ok(Some(guard))
 }
 
+/// Recompute an `<indexedmzML>`'s byte-offset index after a rewrite changed byte lengths.
+///
+/// The UTF-8 transcode shortens the declaration (`ISO-8859-1` → `UTF-8`) and widens every high byte
+/// to two, so every `<offset>` and the `<indexListOffset>` of the copy point at the wrong byte.
+/// mzdata then fails to read the index, falls back to a scan that finds the spectra, and cannot
+/// enumerate the chromatograms, which it reaches only through the index: they were lost with exit
+/// code 0. Each `<offset idRef="…">` is recomputed from the new position of the `<spectrum` /
+/// `<chromatogram` start tag carrying that id (an id not found keeps its value), and
+/// `<indexListOffset>` from the new position of `<indexList`. `None` for a document with no index:
+/// a plain mzML, or an imzML, whose offsets point into the `.ibd` rather than the XML.
+fn rebuild_mzml_index(doc: &str) -> Option<String> {
+    let list_at = doc
+        .rmatch_indices("<indexList")
+        .map(|(i, _)| i)
+        .find(|&i| !doc[i..].starts_with("<indexListOffset"))?;
+    let mut at = std::collections::HashMap::new();
+    for tag in ["<spectrum", "<chromatogram"] {
+        for (i, _) in doc[..list_at].match_indices(tag) {
+            let rest = &doc[i + tag.len()..list_at];
+            // `<spectrumList` / `<chromatogramList` share the prefix: the element name must end here.
+            if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+                continue;
+            }
+            if let Some(id) = rest.find('>').and_then(|gt| xml_attr(&rest[..gt], "id")) {
+                at.insert(id, i);
+            }
+        }
+    }
+    let mut out = String::with_capacity(doc.len());
+    out.push_str(&doc[..list_at]);
+    let mut rest = &doc[list_at..];
+    while let Some(o) = rest.find("<offset") {
+        let (Some(gt), Some(close)) = (rest[o..].find('>'), rest[o..].find("</offset>")) else { break };
+        let (gt, close) = (o + gt + 1, o + close);
+        out.push_str(&rest[..gt]);
+        match xml_attr(&rest[o..gt], "idRef").and_then(|id| at.get(id)) {
+            Some(pos) => out.push_str(&pos.to_string()),
+            None => out.push_str(&rest[gt..close]),
+        }
+        rest = &rest[close..];
+    }
+    const OPEN: &str = "<indexListOffset>";
+    if let (Some(a), Some(b)) = (rest.find(OPEN), rest.find("</indexListOffset>")) {
+        out.push_str(&rest[..a + OPEN.len()]);
+        out.push_str(&list_at.to_string());
+        rest = &rest[b..];
+    }
+    // ponytail: the checksum hashes the ORIGINAL bytes and mzdata never verifies it, so the reader's
+    // private copy drops it rather than rehashing the whole document.
+    if let (Some(a), Some(b)) = (rest.find("<fileChecksum>"), rest.find("</fileChecksum>")) {
+        out.push_str(&rest[..a]);
+        rest = &rest[b + "</fileChecksum>".len()..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The value of attribute `name` in a start tag's text, as written (entities not expanded).
+fn xml_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    tag.match_indices(name).find_map(|(i, _)| {
+        if !tag[..i].ends_with(|c: char| c.is_ascii_whitespace()) {
+            return None;
+        }
+        let v = tag[i + name.len()..].trim_start().strip_prefix('=')?.trim_start();
+        let q = v.chars().next().filter(|&c| c == '"' || c == '\'')?;
+        let v = &v[1..];
+        v.find(q).map(|end| &v[..end])
+    })
+}
+
 /// If `input` declares a non-UTF-8 XML encoding (ISO-8859-1, latin1, windows-1252, …), transcode it
 /// to UTF-8 in a throwaway temp dir and return a [`TranscodeGuard`] whose `file` is the path to hand
 /// to mzdata. Returns `Ok(None)` (zero overhead) for UTF-8/ASCII inputs or inputs with no XML
-/// declaration. For an imzML, the binary sidecar `<stem>.ibd` is hardlinked (or copied across
-/// filesystems) beside the temp under the SAME basename so mzdata finds it and the UUID matches.
+/// declaration. The transcode changes byte lengths, so an `<indexedmzML>` gets its offset index
+/// rebuilt for the copy ([`rebuild_mzml_index`]). For an imzML, the binary sidecar `<stem>.ibd` is
+/// hardlinked (or copied across filesystems) beside the temp under the SAME basename so mzdata
+/// finds it and the UUID matches.
 fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
     // Sniff only the first chunk — enough for the XML declaration, no full read for the common case.
     let mut f = fs::File::open(input).with_context(|| format!("opening {}", input.display()))?;
@@ -3981,10 +4101,13 @@ fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
     };
     log::info!("input declares {enc} XML encoding; transcoding to UTF-8 for the reader");
 
-    // Read the whole file and transcode. Legacy MS XML files are single-byte charsets.
-    let raw = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    let utf8 = decode_single_byte(&raw, &enc);
-    let utf8 = rewrite_encoding_decl_to_utf8(&utf8);
+    // Read the whole file and transcode. Legacy MS XML files are single-byte charsets. Scoped so the
+    // raw bytes and the pre-rewrite copy are freed before the index rebuild makes one more.
+    let utf8 = {
+        let raw = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+        rewrite_encoding_decl_to_utf8(&decode_single_byte(&raw, &enc))
+    };
+    let utf8 = rebuild_mzml_index(&utf8).unwrap_or(utf8);
 
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("xml");
@@ -4093,14 +4216,73 @@ fn declared_spectrum_count(input: &Path) -> Option<u64> {
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     let n = std::io::Read::read(&mut f, &mut buf).ok()?;
     let head = String::from_utf8_lossy(&buf[..n]);
-    let at = head.find("<spectrumList")?;
-    let rest = &head[at..];
-    let c = rest.find("count=")? + "count=".len();
-    let rest = &rest[c..];
+    count_attr(&head[head.find("<spectrumList")?..])
+}
+
+/// The first `count="N"` in `text`, which starts at a `<…List` start tag.
+fn count_attr(text: &str) -> Option<u64> {
+    let c = text.find("count=")? + "count=".len();
+    let rest = &text[c..];
     let q = rest.chars().next()?;
     let rest = &rest[q.len_utf8()..];
     let end = rest.find(q)?;
     rest[..end].trim().parse().ok()
+}
+
+/// The chromatogram count an mzML declares in `<chromatogramList count="N">`.
+///
+/// The list follows every spectrum, so it is searched for backwards from the end, a chunk at a
+/// time: a read or two for a spectrum-bearing file however large, and the whole file only when the
+/// chromatograms ARE the file. `None` for another format, or when the list is absent or unreadable.
+fn declared_chromatogram_count(path: &Path) -> Option<u64> {
+    const NEEDLE: &[u8] = b"<chromatogramList";
+    const CHUNK: u64 = 1 << 20;
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mzML")) {
+        return None;
+    }
+    let mut f = fs::File::open(path).ok()?;
+    let mut end = f.metadata().ok()?.len();
+    let mut buf = Vec::new();
+    loop {
+        let start = end.saturating_sub(CHUNK);
+        buf.resize((end - start) as usize, 0);
+        f.seek(SeekFrom::Start(start)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        if let Some(i) = buf.windows(NEEDLE.len()).rposition(|w| w == NEEDLE) {
+            let mut tag = [0u8; 256];
+            f.seek(SeekFrom::Start(start + i as u64)).ok()?;
+            let n = f.read(&mut tag).ok()?;
+            return count_attr(&String::from_utf8_lossy(&tag[..n]));
+        }
+        if start == 0 {
+            return None;
+        }
+        // Overlap by one byte short of the needle, so a needle the boundary cuts in two is still seen.
+        end = start + NEEDLE.len() as u64 - 1;
+    }
+}
+
+/// Warn when the reader yields fewer chromatograms than the source's `<chromatogramList count>`
+/// declares, rather than writing an output that quietly lacks them. TIC/BPC synthesis hides the loss
+/// of anything else: SIM/SRM traces are exactly what does not come back. mzdata reaches an mzML's
+/// chromatograms only through its embedded offset index, so a non-indexed file yields none, and a
+/// stale index (a rewritten copy whose offsets were not rebuilt) loses them the same way.
+fn warn_unread_chromatograms(input: &Path, read_path: &Path, got: usize) {
+    let Some(declared) = declared_chromatogram_count(read_path) else { return };
+    if got as u64 >= declared {
+        return;
+    }
+    let why = if is_unindexed_mzml(read_path) {
+        "it is a non-indexed mzML, and this reader enumerates chromatograms only through the index"
+    } else {
+        "its offset index does not lead to them"
+    };
+    log::warn!(
+        "{}: the source declares {declared} chromatograms but only {got} could be read ({why}). \
+         The rest, SIM/SRM traces included, are NOT carried into the output, and synthesized \
+         TIC/BPC do not replace them. Re-index it (msconvert, or `--via-msconvert`) if you need them.",
+        input.display()
+    );
 }
 
 /// Work around an mzdata defect: it `panic!`s when a `<referenceableParamGroupRef>` points at an
@@ -4109,6 +4291,10 @@ fn declared_spectrum_count(input: &Path) -> Option<u64> {
 /// write a sanitized copy where each empty group is rewritten as an explicit open/close pair and
 /// return its path; otherwise return None (convert the original in place). Only the small pre-
 /// `<spectrumList>` header is rewritten; the bulk of the file is streamed through verbatim.
+///
+/// The header grows, so an `<indexedmzML>`'s offsets are shifted by the same delta: left stale,
+/// mzdata cannot read the index, falls back to a scan that finds only spectra, and loses every
+/// chromatogram with exit code 0.
 fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
     let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !ext.eq_ignore_ascii_case("mzml") {
@@ -4129,7 +4315,12 @@ fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
             break;
         }
     }
-    let split = find_subslice(&head, marker).unwrap_or(head.len());
+    // The header never reaches into the index, even in a file with no <spectrumList>, so every
+    // indexed element lies past the rewrite and moves by the same delta.
+    let index_at = index_list_start(input);
+    let split = find_subslice(&head, marker)
+        .unwrap_or(head.len())
+        .min(index_at.map_or(usize::MAX, |at| at as usize));
     let header = match std::str::from_utf8(&head[..split]) {
         Ok(s) => s,
         Err(_) => return Ok(None), // binary in header region: leave it alone
@@ -4146,8 +4337,20 @@ fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
         std::env::temp_dir().join(format!("mzpc-san-{}-{}.mzML", std::process::id(), stem));
     let mut out = BufWriter::new(fs::File::create(&temp)?);
     out.write_all(fixed.as_bytes())?;
-    out.write_all(&head[split..])?; // bytes already read past the header
-    io::copy(&mut f, &mut out)?; // the rest of the file, verbatim
+    f.seek(SeekFrom::Start(split as u64))?;
+    match index_at {
+        Some(at) => {
+            io::copy(&mut f.by_ref().take(at - split as u64), &mut out)?; // the body, verbatim
+            // ponytail: the index tail is read whole, tens of bytes per spectrum (mzdata holds the
+            // parsed index in memory anyway); stream it if a file's index ever outgrows RAM.
+            let mut tail = Vec::new();
+            f.read_to_end(&mut tail)?;
+            out.write_all(&shift_index_tail(tail, (fixed.len() - header.len()) as u64))?;
+        }
+        None => {
+            io::copy(&mut f, &mut out)?; // the rest of the file, verbatim
+        }
+    }
     out.flush()?;
     log::debug!("sanitized empty referenceableParamGroup(s) into {}", temp.display());
     Ok(Some(temp))
@@ -4180,6 +4383,50 @@ fn expand_empty_param_groups(header: &str) -> String {
         }
     }
     out.push_str(rest);
+    out
+}
+
+/// Where an `<indexedmzML>`'s `<indexList>` starts, when its `<indexListOffset>` says so truthfully.
+/// `None` for a plain mzML, and for an index already stale, which no shift repairs.
+fn index_list_start(input: &Path) -> Option<u64> {
+    let mut f = fs::File::open(input).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(4096))).ok()?;
+    let mut end = Vec::new();
+    f.read_to_end(&mut end).ok()?;
+    let end = String::from_utf8_lossy(&end);
+    let value = &end[end.rfind("<indexListOffset>")? + "<indexListOffset>".len()..];
+    let at: u64 = value[..value.find('<')?].trim().parse().ok()?;
+    f.seek(SeekFrom::Start(at)).ok()?;
+    let mut tag = [0u8; 11];
+    f.read_exact(&mut tag).ok()?;
+    (tag.starts_with(b"<indexList") && (tag[10] == b'>' || tag[10].is_ascii_whitespace())).then_some(at)
+}
+
+/// Shift every byte position an `<indexedmzML>` tail (from `<indexList` on) states by `delta`: each
+/// `<offset>` and the `<indexListOffset>`, the only numeric text there. The `<fileChecksum>` is
+/// dropped: it hashes the original bytes and mzdata never verifies it.
+fn shift_index_tail(mut tail: Vec<u8>, delta: u64) -> Vec<u8> {
+    if let (Some(a), Some(b)) = (find_subslice(&tail, b"<fileChecksum>"), find_subslice(&tail, b"</fileChecksum>")) {
+        if a < b {
+            tail.drain(a..b + b"</fileChecksum>".len());
+        }
+    }
+    let mut out = Vec::with_capacity(tail.len() + 64);
+    let mut rest = &tail[..];
+    while let Some(close) = find_subslice(rest, b"</") {
+        let text = rest[..close].iter().rposition(|&b| b == b'>').map_or(0, |gt| gt + 1);
+        match std::str::from_utf8(&rest[text..close]).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+            Some(n) => {
+                out.extend_from_slice(&rest[..text]);
+                out.extend_from_slice((n + delta).to_string().as_bytes());
+            }
+            None => out.extend_from_slice(&rest[..close]),
+        }
+        out.extend_from_slice(b"</");
+        rest = &rest[close + 2..];
+    }
+    out.extend_from_slice(rest);
     out
 }
 
@@ -4462,6 +4709,13 @@ where
             .add_field(mob_field),
     };
 
+    // One layout family per entity (the scope HUPO-PSI/mzPeak-specification#21 proposes):
+    // `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, so under --ims-chunked
+    // the DATA facet is declared chunked too; beside a point data facet the writer only warns and
+    // writes a mixed archive (the base.rs deviation). Centroid-only TDF never writes a row to it, but
+    // its schema still has to be chunk-shaped: an empty chunked builder falls back to point-shaped
+    // default fields, so hand it the same fields the peak facet uses.
+    let data_fields = chunk_cfg.map(|_| peak_schema.fields().to_vec()).unwrap_or_default();
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
         // Per-frame inputs of the vendor's exact TOF→m/z model (`Frames.T1/T2/MzCalibration`) as
@@ -4483,6 +4737,12 @@ where
             DataType::Int64,
         ))
         .store_peaks_and_profiles_apart(Some(peak_schema));
+    if let Some(width_th) = chunk_cfg {
+        builder = builder.chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: width_th }));
+        for f in data_fields {
+            builder = builder.add_spectrum_field(f);
+        }
+    }
     if exact_per_spectrum.is_some() {
         // The exact per-frame `m/z = (tof_c0 + tof_c1·tof)²` coefficients (vendor ModelType 1 with
         // C2 = 0, temperature-corrected with Frames.T1), as Float64 spectra_metadata columns — the
@@ -5427,11 +5687,7 @@ fn convert_sciex_grid(
         },
     );
     let sample = sciex_sample();
-    let mut reader = sciex::SciexReader::open(input)?;
-    reader.refuse_if_unsupported(input, sample)?;
-    if let Some(n) = sample {
-        reader.select_sample(n)?;
-    }
+    let reader = sciex::SciexReader::open_run(input, sample)?;
     let total = reader.len();
     if total == 0 {
         bail!("no spectra in {}", input.display());
@@ -6748,9 +7004,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With `panic = "abort"` no destructor runs, so the panic hook must sweep the in-flight tmp
-    /// files on its own. `mem::forget` keeps `Drop` out of this test: only the hook can remove
-    /// the file here.
+    /// The installed panic hook removes the panicking thread's in-flight tmp. `mem::forget` keeps
+    /// `Drop` out of this test: only the hook can remove the file here. Tests unwind, so this reaches
+    /// the hook's `sweep_tmp_in_flight(false)` branch; the abort branch is the next test.
     #[test]
     fn tmp_panic_hook_sweeps_in_flight_files() {
         use super::{install_tmp_panic_hook, TmpGuard};
@@ -6764,6 +7020,39 @@ mod tests {
         let r = std::panic::catch_unwind(|| panic!("simulated writer-open failure"));
         assert!(r.is_err());
         assert!(!tmp.exists(), "the panic hook must remove the in-flight tmp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The branch the release binary runs (`panic = "abort"`: no destructor follows the hook).
+    /// `sweep_tmp_in_flight(true)` must remove every registered tmp, including one another thread
+    /// registered — the ims-compact writer thread can panic while the main thread holds the guard.
+    /// It runs in a child copy of this test binary, alone: sweeping every tmp in THIS process would
+    /// delete the in-flight output of whichever conversion test runs alongside.
+    #[test]
+    fn tmp_sweep_all_removes_every_threads_files() {
+        use super::{sweep_tmp_in_flight, TmpGuard};
+        const CHILD: &str = "MZPC_TEST_SWEEP_ALL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::tmp_sweep_all_removes_every_threads_files", "--test-threads", "1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("spawning the test binary");
+            let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success() && log.contains("1 passed"), "child run failed or ran nothing:\n{log}");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("mzpc-sweepall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("writer-thread.mzpeak.tmp");
+        std::fs::write(&tmp, b"partial").unwrap();
+        // Registered by another thread, which ends without dropping its guard.
+        let path = tmp.clone();
+        std::thread::spawn(move || std::mem::forget(TmpGuard::new(&path))).join().unwrap();
+        sweep_tmp_in_flight(false);
+        assert!(tmp.exists(), "the unwind branch sweeps only the calling thread's entries");
+        sweep_tmp_in_flight(true);
+        assert!(!tmp.exists(), "the abort branch must sweep every registered tmp, whichever thread registered it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6981,6 +7270,28 @@ mod tests {
         // Same bytes under latin1: 0x80 is a C1 control (identity), 0xE9 is é.
         let lat = decode_single_byte(&raw, "iso-8859-1");
         assert_eq!(lat, "\u{0080}\u{00E9}");
+    }
+
+    /// The backward scan for `<chromatogramList count>` reads 1 MiB chunks from the end: a tag the
+    /// chunk boundary cuts in two must still be found, and a list-less file must end the scan.
+    #[test]
+    fn declared_chromatogram_count_across_a_chunk_boundary() {
+        let dir = std::env::temp_dir().join(format!("mzpc-chromcount-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.mzML");
+        let tag = br#"<chromatogramList count="7">"#;
+        // The first chunk starts 1 MiB before the end and the tag starts `k` bytes before that:
+        // 0 = wholly inside the first chunk, 1..=16 = cut in two, 17 = wholly before it.
+        for k in [0usize, 1, 8, 16, 17] {
+            let mut doc = vec![b' '; 100];
+            doc.extend_from_slice(tag);
+            doc.resize(100 + k + (1 << 20), b' ');
+            std::fs::write(&path, &doc).unwrap();
+            assert_eq!(super::declared_chromatogram_count(&path), Some(7), "tag {k} bytes before the boundary");
+        }
+        std::fs::write(&path, vec![b' '; (2 << 20) + 5]).unwrap();
+        assert_eq!(super::declared_chromatogram_count(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);
@@ -7439,10 +7750,16 @@ mod tests {
 
         // Point layout exercises the full fix chain — #1 coalesce-by-accession (one intensity
         // column), #2 precision coercion (f64 raw intensity cast into the f32 primary, no clash), and
-        // the #3 invariant debug_assert — via the array_map write path in both debug and release.
-        // (The chunked/default path is verified end-to-end via the release CLI; in *debug* it also
-        // trips a separate pre-existing chunk-facet spill `debug_assert`, unrelated to the twin.)
-        let cases: [(&str, Option<ChunkingStrategy>); 1] = [("point", None)];
+        // the #3 invariant debug_assert — via the array_map write path. It cannot see #1 regress on its
+        // own: the post-write prune drops an all-null `point` twin, so a sampler that adds one again
+        // still ends with one column. The chunked layout (the converter's default, numpress-linear at
+        // 50 Th) is outside the prune's scope, so there #1 alone keeps the second 'intensity array'
+        // out. Release profile only: in debug the chunked write trips a separate, pre-existing
+        // chunk-facet spill `debug_assert` unrelated to the twin.
+        let cases: [(&str, Option<ChunkingStrategy>); 2] = [
+            ("point", None),
+            ("chunked", Some(ChunkingStrategy::NumpressLinear { chunk_size: 50.0 })),
+        ];
         for (tag, chunk) in cases {
             let scratch =
                 std::env::temp_dir().join(format!("mzpc-peaks-{tag}-{}", std::process::id()));
@@ -7489,16 +7806,26 @@ mod tests {
 
         super::convert_to_mzml(&input, &out, false, None).expect("mzML conversion");
 
-        // Output is XML mzML (not a zip), and re-reads to the same spectrum count.
+        // Output is XML mzML (not a zip), and re-reads to the same spectra: the count, then each
+        // spectrum's m/z and intensity arrays against the source's.
         let head = fs::read(&out).unwrap();
         let is_mzml = head.starts_with(b"<?xml") || head.windows(5).any(|w| w == b"<mzML");
-        let mut reader =
-            super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(&out)
-                .expect("reopen mzML output");
-        let n = reader.iter().count();
+        fn read_all(p: &std::path::Path) -> Vec<mzdata::spectrum::MultiLayerSpectrum> {
+            super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(p)
+                .unwrap_or_else(|e| panic!("reopen {}: {e}", p.display()))
+                .iter()
+                .collect()
+        }
+        let (source, written) = (read_all(&input), read_all(&out));
         let _ = fs::remove_dir_all(&scratch);
         assert!(is_mzml, "output is not mzML XML");
-        assert_eq!(n, 6, "expected 6 spectra in the mzML output, got {n}");
+        assert_eq!(written.len(), 6, "expected 6 spectra in the mzML output, got {}", written.len());
+        for (s, w) in source.iter().zip(&written) {
+            use mzdata::prelude::SpectrumLike;
+            let (sa, wa) = (s.raw_arrays().expect("source arrays"), w.raw_arrays().expect("written arrays"));
+            assert_eq!(wa.mzs().unwrap(), sa.mzs().unwrap(), "{}: m/z array", s.id());
+            assert_eq!(wa.intensities().unwrap(), sa.intensities().unwrap(), "{}: intensity array", s.id());
+        }
     }
 
     /// The timsTOF fixture of the corpus-gated tests below: the same run tests/tdf_*.rs pin as DOT_D.
@@ -7707,6 +8034,50 @@ mod tests {
         );
         // The peak facet stores integer `tof`, not m/z.
         assert!(cols.iter().any(|n| n == "tof"), "peak facet must have a `tof` column; got {cols:?}");
+        // …and the mobility column is POPULATED, not merely declared: every point carries its scan's
+        // 1/K0, inside the acquisition's mobility range, and the values vary (a constant is a
+        // placeholder, not a mobility).
+        let conn = rusqlite::Connection::open_with_flags(
+            input.join("analysis.tdf"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let global = |k: &str| -> f64 {
+            conn.query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [k], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|e| panic!("GlobalMetadata {k}: {e}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let (lo, hi) = (global("OneOverK0AcqRangeLower"), global("OneOverK0AcqRangeUpper"));
+        let (mut points, mut nulls, mut min, mut max) = (0usize, 0usize, f64::INFINITY, f64::NEG_INFINITY);
+        for batch in builder.build().unwrap() {
+            let batch = batch.unwrap();
+            let mobility = batch
+                .columns()
+                .iter()
+                .find_map(|c| {
+                    c.as_any()
+                        .downcast_ref::<arrow::array::StructArray>()?
+                        .column_by_name("mean_inverse_reduced_ion_mobility")
+                        .cloned()
+                })
+                .expect("mean_inverse_reduced_ion_mobility inside the peak struct");
+            let mobility = arrow::compute::cast(&mobility, &arrow::datatypes::DataType::Float64).unwrap();
+            let mobility = mobility.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+            points += mobility.len();
+            nulls += arrow::array::Array::null_count(mobility);
+            for v in mobility.iter().flatten() {
+                min = min.min(v);
+                max = max.max(v);
+            }
+        }
+        assert!(points > 0, "the peak facet holds no points");
+        assert_eq!(nulls, 0, "{nulls} of {points} points carry no 1/K0");
+        assert!(
+            lo - 1e-9 <= min && max <= hi + 1e-9 && min < max,
+            "1/K0 spans {min}..{max}; the acquisition range is {lo}..{hi}, and a real mobility varies"
+        );
 
         // (b) #spectra == #TDF frames (one spectrum per frame).
         let n_frames = {
@@ -7726,6 +8097,52 @@ mod tests {
         assert_eq!(
             n_spectra as u64, n_frames,
             "expected one spectrum per TDF frame: {n_spectra} spectra vs {n_frames} frames"
+        );
+    }
+
+    /// Regression: the ims-chunked path only chunked the PEAK facet while leaving the (empty,
+    /// centroid-only) DATA facet at the point default — a mixed layout family for the `spectrum`
+    /// entity (HUPO-PSI/mzPeak-specification#21). On 0.9.2 the writer aborted on it ("layout family
+    /// mismatch between spectrum facets"); since 0.9.3 it only warns and writes the mixed archive.
+    /// Both `spectrum` facets must declare the same family under --ims-chunked either way.
+    /// Corpus-gated like `ims_compact_is_frame_preserving`; run with:
+    ///   `cargo test --release ims_chunked_spectrum_facets_share_one_family -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
+    fn ims_chunked_spectrum_facets_share_one_family() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let Some(input) = crate::corpus_gate::corpus_path(TDF_2485) else { return };
+        let scratch = scratch("ims-chunked-family");
+        let _rm = RmDir(scratch.clone());
+        let output = scratch.join("ims_chunked.mzpeak");
+
+        // ims_chunked = true: the configuration that wrote a point data facet beside chunked peaks.
+        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0)
+            .expect("--ims-chunked conversion");
+
+        // The family is declared in each facet's footer as `spectrum_array_index.prefix`.
+        let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+        let family_of = |zip: &mut zip::ZipArchive<fs::File>, member: &str| -> (String, i64) {
+            let path = extract_zip_entry(zip, member, &scratch);
+            let reader = SerializedFileReader::new(fs::File::open(&path).unwrap()).unwrap();
+            let meta = reader.metadata().file_metadata();
+            let index = meta
+                .key_value_metadata()
+                .and_then(|kvs| kvs.iter().find(|kv| kv.key == "spectrum_array_index"))
+                .and_then(|kv| kv.value.clone())
+                .unwrap_or_else(|| panic!("{member} has no spectrum_array_index"));
+            let index: serde_json::Value = serde_json::from_str(&index).unwrap();
+            (index["prefix"].as_str().unwrap().to_string(), meta.num_rows())
+        };
+        let (data_family, _) = family_of(&mut zip, "spectra_data.parquet");
+        let (peaks_family, peak_rows) = family_of(&mut zip, "spectra_peaks.parquet");
+        assert!(peak_rows > 0, "spectra_peaks is empty; the fixture carries no signal");
+        assert_eq!(peaks_family, "chunk", "--ims-chunked must write a chunked peak facet");
+        assert_eq!(
+            data_family, peaks_family,
+            "spectra_data ('{data_family}') and spectra_peaks ('{peaks_family}') are both \
+             `entity_type: spectrum` and MUST share one layout family"
         );
     }
 
@@ -7769,6 +8186,31 @@ mod tests {
             assert!(cal.get(key).is_some(), "ims_calibration missing key `{key}`: {cal}");
         }
         assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("ims-compact"));
+        // Present is not the contract; a reader decodes with the VALUES. `(a, b)` is timsrust's
+        // two-point chord through GlobalMetadata — m/z = MzAcqRangeLower at tof 0 and MzAcqRangeUpper
+        // at tof = DigitizerNumSamples — recomputed here from analysis.tdf, not taken from the converter.
+        let conn = rusqlite::Connection::open_with_flags(
+            input.join("analysis.tdf"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let global = |k: &str| -> f64 {
+            conn.query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [k], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|e| panic!("GlobalMetadata {k}: {e}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let a = global("MzAcqRangeLower").sqrt();
+        let b = (global("MzAcqRangeUpper").sqrt() - a) / global("DigitizerNumSamples");
+        let (got_a, got_b) = (cal["a"].as_f64().expect("a is a number"), cal["b"].as_f64().expect("b is a number"));
+        // `b` is recovered as sqrt((a+b)²) − sqrt(a²), a difference of two ~10s: ~1e-10 relative.
+        assert!((got_a - a).abs() <= 1e-12 * a, "ims_calibration.a = {got_a}; the chord's sqrt(MzAcqRangeLower) = {a}");
+        assert!((got_b - b).abs() <= 1e-8 * b, "ims_calibration.b = {got_b}; the chord's slope = {b}");
+        assert_eq!(cal["mz_from_tof"], "(a + b*tof)^2");
+        assert_eq!(cal["lossless"], "tof");
+        assert_eq!(cal["tof_encoding"], "absolute", "the default archive layout stores absolute tof");
+        assert_eq!(cal["chord_source"], "global_metadata", "the native lane's chord comes from GlobalMetadata");
         // The vendor's exact calibration rides beside the two-point chord.
         let vmc = idx
             .get("metadata")
@@ -7780,7 +8222,14 @@ mod tests {
         );
         for key in ["DigitizerNumSamples", "MzAcqRangeLower", "MzAcqRangeUpper"] {
             assert!(vmc["global_metadata"].get(key).is_some(), "global_metadata missing `{key}`: {vmc}");
+            assert_eq!(vmc["global_metadata"][key].as_f64(), Some(global(key)), "global_metadata.{key}: {vmc}");
         }
+        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM MzCalibration", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            vmc["mz_calibration"].as_array().map(Vec::len),
+            Some(rows as usize),
+            "one entry per MzCalibration row: {vmc}"
+        );
         // … and the per-frame inputs are spectra_metadata columns.
         let meta_path = extract_zip_entry(&mut zip, "spectra_metadata.parquet", scratch);
         let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
@@ -7932,7 +8381,7 @@ mod tests {
         .unwrap()
         .build()
         .unwrap();
-        let mut types: Vec<String> = Vec::new();
+        let (mut types, mut levels): (Vec<String>, Vec<i64>) = (Vec::new(), Vec::new());
         for batch in reader {
             let batch = batch.unwrap();
             let col = batch.column_by_name("spectrum_type").expect("spectrum_type column");
@@ -7941,12 +8390,23 @@ mod tests {
                 .downcast_ref::<arrow::array::StringArray>()
                 .expect("spectrum_type is a string column");
             types.extend(col.iter().map(|v| v.unwrap_or("").to_string()));
+            let level = batch.column_by_name("ms_level").expect("ms_level column");
+            let level = arrow::compute::cast(level, &arrow::datatypes::DataType::Int64).unwrap();
+            let level = level.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+            levels.extend(level.iter().map(|v| v.expect("ms_level is set on every row")));
         }
         assert_eq!(types.len(), 4, "the fixture has four spectra");
         assert!(
             types.iter().all(|t| t == "MS:1000579" || t == "MS:1000580"),
             "every row must carry the MS1/MSn child term: {types:?}"
         );
+        // …and the RIGHT child for the row's level. The fixture holds both levels, so a swapped or a
+        // constant term cannot pass.
+        assert_eq!(levels, [1, 2, 1, 1], "the fixture's MS levels");
+        for (level, t) in levels.iter().zip(&types) {
+            let want = if *level == 1 { "MS:1000579" } else { "MS:1000580" };
+            assert_eq!(t, want, "ms_level {level} must carry {want}; rows {types:?} at levels {levels:?}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -7967,9 +8427,9 @@ mod tests {
             .iter()
             .map(|v| v.as_str().expect("entries are strings"))
             .collect();
-        assert!(applied.contains(&"zero-run-mask"), "{applied:?}");
-        assert!(applied.contains(&"numpress-linear"), "{applied:?}");
-        assert!(!applied.contains(&"sort-by-mz"), "the fixture is in m/z order: {applied:?}");
+        // The whole list — `contains` let through an entry nothing applied, or one listed twice. No
+        // `sort-by-mz`: the fixture is already in m/z order.
+        assert_eq!(applied, ["zero-run-mask", "numpress-linear"], "{applied:?}");
         // The lossless request drops the codec entry — the list follows the choice, not the lane.
         let out2 = dir.join("tiny-delta.mzpeak");
         let args: Vec<&std::ffi::OsStr> = vec![
@@ -8006,6 +8466,38 @@ mod tests {
         assert!(!text.contains("/Users/") && !text.contains("/home/"), "a home directory leaked into the index");
         for sf in index_metadata(&out)["file_description"]["source_files"].as_array().unwrap() {
             assert_eq!(sf["location"].as_str(), Some("file://"), "{sf}");
+        }
+        // The raw-text checks above are blind to a WINDOWS path: JSON escapes its backslashes
+        // (`C:\\Users\\…`), so neither the scratch directory nor a home directory matches the text.
+        // Walk the decoded strings and refuse any backslash or drive letter — the fixture itself
+        // carries `file://F:/data/Exp01` and `file://C:/settings/`, which must not travel either.
+        fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+                serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| {
+                    out.push(k);
+                    strings(x, out)
+                }),
+                _ => {}
+            }
+        }
+        let index: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut decoded = Vec::new();
+        strings(&index, &mut decoded);
+        let dir_slashed = dir_text.replace('\\', "/");
+        for s in decoded {
+            let b = s.as_bytes();
+            let drive = (0..b.len().saturating_sub(2)).any(|i| {
+                b[i].is_ascii_alphabetic()
+                    && b[i + 1] == b':'
+                    && matches!(b[i + 2], b'\\' | b'/')
+                    && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+            });
+            assert!(
+                !s.contains('\\') && !drive && !s.contains(dir_text.as_ref()) && !s.contains(&dir_slashed),
+                "an operator path leaked into the index: {s:?}"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
