@@ -185,6 +185,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
+- **The index rebuild above resolves each `<index>` section against its own list.** It looked ids
+  up in one map for spectra and chromatograms, but mzML ids are unique only within their list: with
+  `tiny.pwiz.1.1.mzML`'s chromatogram `tic` renamed `scan=19`, the spectrum's entry pointed at the
+  chromatogram and both lanes exited 1 with "source declares 4 spectra but only 0 were read", where
+  0.11.5 had lost only the chromatograms. An `<offset>` whose id its list does not carry still keeps
+  the value the source wrote, now with a warning. The `<chromatogramList count>` check also stops
+  scanning backwards at `</spectrumList>`, so an mzML without chromatograms is no longer read end to
+  end on every conversion. Pinned by `rebuilt_index_resolves_each_section_against_its_own_list` and
+  `declared_chromatogram_count_stops_at_the_end_of_the_spectra`.
 
 ### Changed
 
