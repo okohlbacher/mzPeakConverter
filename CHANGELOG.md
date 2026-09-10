@@ -72,6 +72,19 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   which mzdata never checks. A source whose `<indexListOffset>` does not point at its `<indexList>`
   is copied as before. No corpus archive is affected: no corpus mzML carries an empty group. Pinned
   by `tests/empty_param_group_indexed_mzml_chromatograms.rs`.
+- **`--ims-chunked` on timsTOF now writes ONE layout family for the spectrum entity.** The path
+  chunked only the peak facet and left the — empty, centroid-only — data facet at the point default,
+  so every chunked timsTOF archive was point `spectra_data` beside chunk `spectra_peaks`: on 0.9.2
+  the writer's one-family-per-entity check aborted the conversion outright ("layout family mismatch
+  between spectrum facets", ~2 s in, on two diaPASEF runs); since 0.9.3 relaxed that check to a
+  warning it wrote the mixed archive and warned. The data facet is now declared chunked too, with
+  the same chunk-shaped fields as the peak facet, so an empty `spectra_data` still carries a
+  well-formed chunk schema and the archive meets `docs/conformance.md:68` without leaning on the
+  relaxation (which is untouched — dual-representation archives still pick per facet). Verified on
+  PXD059079 `…_2499.d` and a private diaPASEF run: both `spectrum_array_index` footers say `chunk`,
+  `validate_everything.py` passes at max sensitivity (0 errors, 0 warnings), and the archives are
+  7.8 % / 4.3 % smaller than the default layout. The default (point) layout is unchanged.
+  Regression test: `ims_chunked_spectrum_facets_share_one_family` (corpus-gated, `--ignored`).
 - **Opening a Bruker TSF `.d` no longer writes into it.** `TsfReader::open` used rusqlite's default
   open, which is read-write and CREATES a missing file, so opening a `.d` that has no `analysis.tsf`
   left an empty one inside the user's raw data. A normal conversion reaches the TSF reader only for
