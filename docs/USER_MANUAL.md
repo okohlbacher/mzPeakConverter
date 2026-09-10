@@ -645,7 +645,10 @@ list of the declared, bounded changes that were APPLIED to this archive's stored
 least once, counted while the archive was written, never inferred from what the lane was configured
 to do; so an empty list says the signal is stored as it was handed over. Archives written by 0.11.5
 and earlier listed `zero-run-mask` on every lane and `numpress-linear` whenever the codec was chosen,
-whether or not a spectrum was masked or a chunk encoded. The vocabulary:
+whether or not a spectrum was masked or a chunk encoded. An entry names the transformation, never
+how often it was applied: a count goes to the run's warning. `tof-grid:<ppm>ppm` is the one entry
+with a parameter, and it names a bound, the one `tof_calibration.roundtrip_tolerance_ppm` repeats.
+The vocabulary:
 
 | Entry | Written when | Lanes |
 |---|---|---|
@@ -665,7 +668,7 @@ whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 | `sciex:nan-intensity-to-zero` | the glue mapped at least one NaN intensity Clearcore2 returned to 0 (counted per spectrum; a warning gives the total) | native SciEX `.wiff` |
 | `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
-| `thermo:target-only-isolation-window:<n>` | `<n>` precursor isolation windows had no width their scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and were written target-only; thermorawfilereader computes a quarter-width or inverted window for them | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
+| `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
 

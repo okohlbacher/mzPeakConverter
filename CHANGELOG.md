@@ -115,8 +115,8 @@ keep their bytes.
   `SZB8102938` ±0.25 for a method width of 2.00, and `LD401_001fmol_r1` ±0.175 for a Q1 width of
   0.7. A Thermo window now keeps the library's numbers only when its scan's own trailer states a
   positive width and the window is neither empty nor inverted. Any other window keeps its target
-  and gets null offsets, declared as `thermo:target-only-isolation-window:<n>` in `transformations`
-  and warned about once per run. `--to mzml` applies the same rule and writes the target only.
+  and gets null offsets, declared as `thermo:target-only-isolation-window` in `transformations`
+  and warned about once per run with the count. `--to mzml` applies the same rule and writes the target only.
   Windows with a stated width are unchanged (`small.RAW` ±1.0, as ProteoWizard; ec04479's MS2 ±0.25
   for its 0.50 trailer). The four archives above need rebuilding. Pinned by the tests in
   `src/thermo_isolation.rs` and `contract_strings::transformations_block_pinned`.
