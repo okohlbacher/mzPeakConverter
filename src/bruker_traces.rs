@@ -194,16 +194,10 @@ fn chromatogram(s: &Source, unit: Unit, scale: f64, seconds: &[f64], values: &[f
     // mzML states a chromatogram's type only as a cvParam, and mzdata's mzML writer writes the
     // parameters alone, so the type travels as one too (as on the synthesized TIC/BPC). An untyped
     // trace gets ProteoWizard's generic `chromatogram`.
-    let (type_name, type_curie) = match kind {
-        ChromatogramType::TotalIonCurrentChromatogram => ("total ion current chromatogram", mzdata::curie!(MS:1000235)),
-        ChromatogramType::BasePeakChromatogram => ("basepeak chromatogram", mzdata::curie!(MS:1000628)),
-        ChromatogramType::AbsorptionChromatogram => ("absorption chromatogram", mzdata::curie!(MS:1000812)),
-        ChromatogramType::PressureChromatogram => ("pressure chromatogram", mzdata::curie!(MS:1003019)),
-        ChromatogramType::FlowRateChromatogram => ("flow rate chromatogram", mzdata::curie!(MS:1003020)),
-        ChromatogramType::TemperatureChromatogram => ("temperature chromatogram", mzdata::curie!(MS:1002715)),
-        _ => ("chromatogram", mzdata::curie!(MS:1000625)),
-    };
-    descr.add_param(Param::builder().name(type_name).curie(type_curie).build());
+    descr.add_param(
+        crate::chromatogram_type_param(kind)
+            .unwrap_or_else(|| Param::builder().name("chromatogram").curie(mzdata::curie!(MS:1000625)).build()),
+    );
     if !s.description.is_empty() {
         descr.add_param(
             Param::builder().name("chromatogram title").curie(mzdata::curie!(MS:1000809)).value(s.description.clone()).build(),

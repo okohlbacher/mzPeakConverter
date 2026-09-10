@@ -82,6 +82,31 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   so every source chromatogram passed through (`.mzpeak` → mzML, mzML → mzML) left it short: 2
   around 8 chromatograms on a TSF run's archive. It is now the chromatograms written plus that pair.
   Pinned by `tests::the_mzml_export_counts_and_types_the_device_traces`.
+- **The mzML export of an archive with device traces could not be converted again.** mzdata's
+  mzML reader has no case for the `flow rate array` (MS:1000820), `pressure array` (MS:1000821)
+  and `temperature array` (MS:1000822) such an export writes, so each came back untyped, and both
+  `x.mzML -o y.mzpeak` and `x.mzML -o y.mzML` aborted in mzdata's array naming (exit 134, nothing
+  written) on the export of every archive holding HyStar traces, as on any mzML with such an
+  array. An array whose type mzdata knows the accession of now takes that type and the
+  parameter's unit; any other unreadable array is kept, with a warning, as a non-standard data
+  array named after its parameter. The mzPeak lane keeps these arrays out of the sampled
+  chromatogram schema, so they are stored as auxiliary arrays in their own unit and data type, as
+  the native lane stores the same traces. Converted back from their exports, a PXD059079 run's
+  archive (25 traces) and a TSF run's (6) match the exported archives in every trace's (time,
+  value) pairs, and in every pressure, flow-rate and temperature trace's chromatogram type, array,
+  unit and data type; the first non-standard trace becomes a column that reads back without its
+  name, as the first non-standard chromatogram array of any mzML already did (BACKLOG). Pinned by
+  `tests::an_mzml_export_of_device_traces_converts_back` and
+  `tests::unreadable_chromatogram_arrays_get_names_the_writers_accept`.
+- **mzML → mzML dropped every chromatogram's type.** mzdata's mzML reader moves the type cvParam
+  into the typed field and its writer writes the parameters alone, so the output stated no
+  chromatogram type, which mzML requires (tiny.pwiz's selected ion current trace among them, and
+  the device traces above). The term is now written back unless a parameter still states a type,
+  from a table checked against `psi-ms.obo`; mzdata's own maps the selected ion monitoring and
+  selected reaction monitoring types onto two instrument-model accessions. The `.mzpeak` → mzML
+  export of an archive converted from mzML states the type again too. Pinned by
+  `tests::mzml_to_mzml_keeps_the_chromatogram_type` and
+  `tests::chromatogram_type_params_are_the_psi_ms_terms`.
 - **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
   mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
   a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes
