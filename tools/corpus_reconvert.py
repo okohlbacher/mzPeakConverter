@@ -29,6 +29,11 @@ transient S3 relay slot that is verified and deleted; a unit that does not come 
 `--publish-s3` instead copies each box archive onto its durable corpus key (s3://v09/...) before any
 validator has seen it, so it is opt-in.
 
+An archive is ONE run, so a multi-sample SciEX `.wiff` publishes the samples its descriptor lists,
+    convert: {input: En_PPY.wiff, samples: [1, 2]}
+each as `<stem>.sample<N>.mzpeak`, converted with `--sample N`. The unit's former single archive is
+reported as SUPERSEDED ON DISK, failing the run, until it is removed.
+
 Usage:
     tools/corpus_reconvert.py [ROOT] [--clean] [--jobs N] [--dry-run] [--report-only]
                               [--box [--box-jobs N] [--publish-s3]]
@@ -175,10 +180,17 @@ def is_zipped_unit(p: Path) -> bool:
     return not p.with_suffix("").exists()
 
 
-def target_for(unit: Path) -> Path:
+def target_for(unit: Path, sample: int | None = None) -> Path:
+    """`unit`'s archive; with `sample`, that sample's own `<stem>.sample<N>.mzpeak`."""
     if is_zipped_unit(unit):
-        return unit.with_suffix("").with_suffix(".mzpeak")   # X.raw.zip -> X.mzpeak
-    return unit.with_suffix(".mzpeak")
+        out = unit.with_suffix("").with_suffix(".mzpeak")   # X.raw.zip -> X.mzpeak
+    else:
+        out = unit.with_suffix(".mzpeak")
+    return out if sample is None else out.with_name(f"{out.stem}.sample{sample}.mzpeak")
+
+
+def sample_flags(sample: int | None) -> list[str]:
+    return [] if sample is None else ["--sample", str(sample)]
 
 
 # ── descriptor awareness ────────────────────────────────────────────────────────────────────────
@@ -197,6 +209,7 @@ MULTI_UNIT_TILES = {"pwiz-examples"}
 class Recipe(NamedTuple):
     flags: list[str]  # convert.flags, path-valued arguments absolutised
     rid: str          # recipe_id of the descriptor's `convert` block: what a .built stamp must name
+    samples: tuple[int, ...] = ()   # convert.samples: one archive per listed sample of a multi-sample WIFF
 
 
 def recipe_id(cv: dict) -> str:
@@ -239,6 +252,12 @@ def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[
         if cv.get("skip"):
             skipped.add(dd)
             continue
+        samples = cv.get("samples") or []
+        if not isinstance(samples, list) or not all(type(n) is int and n >= 1 for n in samples):
+            print(f"warn      : {desc.relative_to(root)}: convert.samples must list sample numbers >= 1"
+                  f" -- dataset not built")
+            skipped.add(dd)
+            continue
         spec = cv.get("input")
         if spec and spec != "auto":
             pinned[dd] = dd / spec
@@ -247,7 +266,7 @@ def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[
         # demonstrators were published without their `--image`, eleven archives without their
         # `--zstd-level 12`, and four lane pins never reached the box.
         recipes[dd] = Recipe(resolve_flag_paths(shlex.split(str(cv.get("flags") or "")), dd, root.parent, root),
-                             recipe_id(cv))
+                             recipe_id(cv), tuple(sorted(set(samples))))
     return recipes, pinned, skipped, governed
 
 
@@ -332,13 +351,16 @@ def preference(unit: Path) -> tuple[int, str]:
     return (_FORMAT_RANK.get(unit.suffix.lower(), 99), unit.name)
 
 
-def group_by_target(units: list[Path]) -> dict[Path, list[Path]]:
-    """Map each output archive to its candidate units, best-first."""
-    groups: dict[Path, list[Path]] = {}
+def group_by_target(units: list[Path],
+                    recipes: dict[Path, Recipe] | None = None) -> dict[Path, list[tuple[Path, int | None]]]:
+    """Map each output archive to its candidate (unit, sample), best unit first. A unit whose
+    descriptor lists `convert.samples` yields one archive per sample instead of one for the unit."""
+    groups: dict[Path, list[tuple[Path, int | None]]] = {}
     for u in units:
-        groups.setdefault(target_for(u), []).append(u)
+        for n in recipe_for(u, recipes or {}).samples or (None,):
+            groups.setdefault(target_for(u, n), []).append((u, n))
     for t in groups:
-        groups[t].sort(key=preference)
+        groups[t].sort(key=lambda c: preference(c[0]))
     return groups
 
 
@@ -412,14 +434,14 @@ def write_stamp(archive: Path, version: str, rid: str) -> str | None:
     return None
 
 
-def convert(unit: Path, binary: str, version: str, dry: bool,
+def convert(unit: Path, out: Path, binary: str, version: str, dry: bool,
             extra: list[str] | None = None, rid: str = UNDESCRIBED.rid) -> tuple[Path, str, str]:
-    """-> (unit, status, detail). status in {converted, skipped, failed}.
+    """Convert `unit` into `out` (its archive, or one sample's). -> (unit, status, detail), with
+    status in {converted, skipped, failed}.
 
     `extra` carries the descriptor's `convert.flags` (e.g. `--sdrf study.sdrf.tsv`, `--zstd-level 12`)
     so a rebuild reproduces the published archive instead of a bare default conversion.
     """
-    out = target_for(unit)
     if dry:
         return unit, "would-convert", ""
     tmp = out.with_suffix(".mzpeak.partial")
@@ -466,16 +488,17 @@ def s3_target(local: Path) -> str:
     return mod.s3_uri(str(local))
 
 
-def run_box(units: list[Path], root: Path, version: str, jobs: int,
+def run_box(jobs: list[tuple[Path, Path, int | None]], root: Path, version: str, box_jobs: int,
             recipes: dict[Path, Recipe] | None = None, publish_s3: bool = False) -> tuple[int, list[str]]:
-    """Convert host-unsupported units on the box, relaying the archives back.
-    -> (box_convert.sh's exit code, names of the units whose archive did not arrive stamped).
+    """Convert host-unsupported units on the box, relaying the archives back. `jobs` holds one
+    (unit, archive, sample) per archive, so a multi-sample WIFF is one box job per listed sample.
+    -> (box_convert.sh's exit code, names of the archives that did not arrive stamped).
 
     Delegates the transfer to tools/box_convert.sh --local-manifest, which already stages the raw
     through S3, converts in an isolated temp dir on the box, and pulls the .mzpeak back with a
     size+md5 check. Reimplementing that here would fork a second, less-tested transfer path.
     """
-    if not units:
+    if not jobs:
         print("box       : nothing to do")
         return 0, []
     # ONE updater. This harness used to run its own sync_box() (ssh + git checkout + cargo build)
@@ -489,10 +512,10 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     manifest = root.parent / "validator_logs" / "box-jobs.tsv"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("w") as fh:
-        for u in units:
+        for u, t, n in jobs:
             # The descriptor's own flags, so a box-built archive matches its host-built recipe
             # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
-            flags = recipe_for(u, recipes or {}).flags or ['--no-vendor']
+            flags = (recipe_for(u, recipes or {}).flags or ['--no-vendor']) + sample_flags(n)
             # The archive comes back to the host by default: box_convert.sh relays it through a
             # staging key that it verifies and deletes. --publish-s3 names the DURABLE corpus key
             # instead, and box_convert.sh then copies the verified object onto s3://v09/..., the
@@ -500,9 +523,9 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
             # with `--no-s3-first` the one thing standing between a forgotten flag and unvalidated
             # public objects; it is opt-in now. corpus_lib owns the key mapping, so a conversion
             # target and a sync destination can never disagree.
-            out = s3_target(target_for(u)) if publish_s3 else target_for(u)
+            out = s3_target(t) if publish_s3 else t
             fh.write(f"{u}\t{out}\t{' '.join(flags)}\n")
-    print(f"box       : {len(units)} unit(s) -> {manifest}  (box converter pinned to v{want})")
+    print(f"box       : {len(jobs)} job(s) -> {manifest}  (box converter pinned to v{want})")
     # box_convert.sh resolves a boto3-capable interpreter for the S3 relay itself (MZPC_PYTHON
     # overrides); nothing to arrange here.
     env = dict(os.environ)
@@ -513,8 +536,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     # 0.9.0 after box_convert.sh had aborted (exit 3) without converting anything, and then reported
     # "COMPLETENESS 199/199 (100.0%)". Only a CHANGED file may be stamped.
     before = {}
-    for u in units:
-        out = target_for(u)
+    for _, out, _ in jobs:
         try:
             st = out.stat()
             before[out] = (st.st_mtime_ns, st.st_size)
@@ -527,26 +549,25 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
         # the staging key, and the box's work is thrown away -- 19 of 21 units converted and then
         # discarded.
         ["bash", str(TOOLS / "box_convert.sh"), "--overwrite",
-         "--local-manifest", str(manifest), "--jobs", str(jobs)],
+         "--local-manifest", str(manifest), "--jobs", str(box_jobs)],
         text=True, env=env,
     )
     print(f"box       : box_convert exited {proc.returncode}")
     stamped, unchanged = 0, []
-    for u in units:
-        out = target_for(u)
+    for u, out, _ in jobs:
         try:
             st = out.stat()
             now = (st.st_mtime_ns, st.st_size)
         except OSError:
-            unchanged.append(u.name)
+            unchanged.append(out.name)
             continue
         if before.get(out) == now:
-            unchanged.append(u.name)
+            unchanged.append(out.name)
             continue
         why = write_stamp(out, version, recipe_for(u, recipes or {}).rid)
         if why:
             print(f"box       : {out.name} arrived but is left unstamped: {why}")
-            unchanged.append(u.name)
+            unchanged.append(out.name)
         else:
             stamped += 1
     print(f"box       : stamped {stamped} delivered archive(s)")
@@ -556,19 +577,20 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     return proc.returncode, unchanged
 
 
-def convert_target(cands: list[Path], binary: str, version: str, dry: bool, recipes: dict | None = None) -> tuple[Path, str, str]:
+def convert_target(target: Path, cands: list[tuple[Path, int | None]], binary: str, version: str,
+                   dry: bool, recipes: dict | None = None) -> tuple[Path, str, str]:
     """Convert the best candidate for one output archive; fall back on the next if it cannot run.
 
     Only a `skipped` outcome falls through — a genuine `failed` is reported as-is rather than being
     masked by silently converting a lesser source.
     """
     last = None
-    for i, u in enumerate(cands):
+    for i, (u, n) in enumerate(cands):
         r = recipe_for(u, recipes or {})
-        unit, status, detail = convert(u, binary, version, dry, r.flags, r.rid)
+        unit, status, detail = convert(u, target, binary, version, dry, [*r.flags, *sample_flags(n)], r.rid)
         if status != "skipped":
             if i:
-                detail = (detail + " " if detail else "") + f"(fallback from {cands[0].name})"
+                detail = (detail + " " if detail else "") + f"(fallback from {cands[0][0].name})"
             return unit, status, detail
         last = (unit, status, detail)
     return last
@@ -625,14 +647,14 @@ def main(argv: list[str] | None = None) -> int:
             removed += 1
         print(f"cleaned   : {removed} existing archives/stamps removed")
 
-    groups = group_by_target(units)
+    groups = group_by_target(units, recipes)
     dup = {t: c for t, c in groups.items() if len(c) > 1}
     if dup:
         print(f"note      : {len(dup)} target(s) have several source formats; converting the "
               f"native one and skipping the duplicate(s)")
         for t, c in dup.items():
-            print(f"            {t.name}  <- {', '.join(x.name for x in c)}")
-    rid = {t: recipe_for(c[0], recipes).rid for t, c in groups.items()}
+            print(f"            {t.name}  <- {', '.join(x.name for x, _ in c)}")
+    rid = {t: recipe_for(c[0][0], recipes).rid for t, c in groups.items()}
     todo = [t for t in groups if not is_current(t, version, rid[t])]
     fresh = len(groups) - len(todo)
     print(f"archives  : {len(groups)} (from {len(units)} units)\nalready ok: {fresh}\nto convert: {len(todo)}\n")
@@ -640,17 +662,19 @@ def main(argv: list[str] | None = None) -> int:
     results: dict[str, list] = {"converted": [], "skipped": [], "failed": [], "would-convert": []}
     for t in groups:
         if t not in todo:
-            results["converted"].append((groups[t][0], ""))
+            results["converted"].append((groups[t][0][0], "", t))
 
     if not args.report_only and todo:
         started = time.time()
         with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futs = {pool.submit(convert_target, groups[t], binary, version, args.dry_run, recipes): t for t in todo}
+            futs = {pool.submit(convert_target, t, groups[t], binary, version, args.dry_run, recipes): t for t in todo}
             for i, fut in enumerate(cf.as_completed(futs), 1):
                 unit, status, detail = fut.result()
-                results[status].append((unit, detail))
+                t = futs[fut]
+                results[status].append((unit, detail, t))
                 mark = {"converted": "ok", "skipped": "--", "failed": "FAIL", "would-convert": "..."}[status]
                 print(f"  [{i}/{len(todo)}] {mark:4} {unit.relative_to(root)}"
+                      + (f" -> {t.name}" if t != target_for(unit) else "")
                       + (f"  ({detail})" if detail else ""), flush=True)
         print(f"\nelapsed   : {time.time() - started:.0f}s")
 
@@ -660,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
     box_rc, undelivered = 0, []
     if args.box and not (args.report_only or args.dry_run):
         print()
-        deferred = [u for u, d in results["skipped"] if "payload missing" not in d]
+        deferred = [(u, t, dict(groups[t])[u]) for u, d, t in results["skipped"] if "payload missing" not in d]
         # BOX_REQUIRE_VERSION: this harness STAMPS archives with a version string, so converting
         # with a stale box exe would mislabel them. Abort instead.
         os.environ.setdefault("BOX_REQUIRE_VERSION", "1")
@@ -676,8 +700,9 @@ def main(argv: list[str] | None = None) -> int:
         rows = results[key]
         if rows:
             print(f"\n{label}: {len(rows)}")
-            for u, d in sorted(rows)[:40]:
-                print(f"  - {u.relative_to(root)}" + (f"\n      {d}" if d else ""))
+            for u, d, t in sorted(rows)[:40]:
+                print(f"  - {u.relative_to(root)}" + (f" -> {t.name}" if t != target_for(u) else "")
+                      + (f"\n      {d}" if d else ""))
     if box_rc or undelivered:
         # A unit the box did not deliver is as unbuilt as a FAILED one. Deferred units sit in
         # `skipped`, so the exit code used to say 0 while PXD077098 failed every rebuild at the relay.
@@ -704,7 +729,15 @@ def main(argv: list[str] | None = None) -> int:
     # hid two Waters `.raw.zip` units behind a "199/199 (100%)" line -- so it is a hard failure,
     # not a footnote. (An archive missing from disk is already visible in the COMPLETENESS count.)
     on_disk = {a for a in root.rglob("*.mzpeak") if not any(q.suffix == ".mzpeak" for q in a.parents)}
-    unaccounted = sorted(on_disk - set(groups))
+    # A unit whose descriptor lists convert.samples publishes per-sample archives; its former single
+    # archive (En_PPY.mzpeak held 1 of 117 samples) must not stay beside them, publishable, in silence.
+    superseded = sorted(on_disk & {target_for(u) for u in units if recipe_for(u, recipes).samples})
+    if superseded:
+        print(f"\nSUPERSEDED ON DISK: {len(superseded)} archive(s) whose descriptor now lists "
+              f"convert.samples -- remove each, and its stamps, before publishing")
+        for a in superseded[:40]:
+            print(f"  - {a.relative_to(root)}")
+    unaccounted = sorted(on_disk - set(groups) - set(superseded))
     if unaccounted:
         print(f"\nUNACCOUNTED ON DISK: {len(unaccounted)} archive(s) that no recognised raw unit "
               f"produces ({len(on_disk)} archives on disk vs {len(groups)} targets) -- the walk is "
@@ -723,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"              {oldest_p.relative_to(root)}")
         print(f"newest        {fmt(newest_ts)}")
     print("=" * 72)
-    return 1 if results["failed"] or unaccounted or undelivered or box_rc else 0
+    return 1 if results["failed"] or unaccounted or superseded or undelivered or box_rc else 0
 
 
 if __name__ == "__main__":

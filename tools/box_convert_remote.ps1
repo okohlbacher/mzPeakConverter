@@ -423,6 +423,8 @@ try {
                        "or unset MZPC_MZML_TMPDIR so the intermediate goes to disk.")
             }
         }
+        # Everything else in $nativeOpts rides along, `--sample N` included: both lanes refuse a
+        # multi-sample WIFF without it, so a per-sample job (one manifest line per sample) needs it here.
         $native_only = @('--agilent-grid', '--bruker-sdk')   # conflict with / ignored by the mzML lane
         $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', 'auto')
         & $converter $inputPath @fbOpts -o $out --force *>> $log

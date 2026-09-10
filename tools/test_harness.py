@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -66,7 +67,7 @@ FAKE_BOX = """#!/usr/bin/env bash
 while [ "$1" != "--local-manifest" ]; do shift; done
 mf="$2"; cp "$mf" "$FAKE_MANIFEST"; rc=0
 while IFS="$(printf '\\t')" read -r unit out opts; do
-  case "$unit" in *undelivered*) rc=1; continue ;; esac
+  case "$unit$out" in *undelivered*|*s3://*) rc=1; continue ;; esac
   ver="{version}"; case "$unit" in *stale*) ver=0.0.1 ;; esac
   "$MZPEAK_CONVERT" --write-archive "$out" "$ver" "$(basename "$unit") --no-vendor -o out.mzpeak --force"
 done < "$mf"
@@ -226,6 +227,25 @@ class BoxPhase(Harness):
         with mock.patch.object(cr, "s3_target", side_effect=lambda p: f"s3://v09/{p.relative_to(root)}"):
             self.run_main(root, "--box", "--publish-s3")
         self.assertEqual(self.manifest()["run.mzpeak"][0], "s3://v09/general-ms/ds/run.mzpeak")
+
+    def test_convert_samples_builds_one_archive_per_sample(self):
+        sciex = self.tmp / "data/general-ms/sciex"
+        root = make_corpus(self.tmp, {"general-ms/sciex/sciex.yaml": {"convert": {"input": "En_PPY.wiff",
+                                                                                   "samples": [117, 2]}}},
+                           {"general-ms/sciex/En_PPY.wiff": b"x", "general-ms/sciex/En_PPY.wiff.scan": b"x"})
+        with zipfile.ZipFile(sciex / "En_PPY.mzpeak", "w") as z:     # the one-sample-of-117 archive
+            z.writestr(cr.FORMAT_MARKER, b"")
+        rc, out = self.run_main(root, "--box")
+        jobs = self.manifest()
+        self.assertEqual(sorted(jobs), ["En_PPY.sample117.mzpeak", "En_PPY.sample2.mzpeak"])
+        self.assertEqual(jobs["En_PPY.sample2.mzpeak"], (str(sciex / "En_PPY.sample2.mzpeak"), "--no-vendor --sample 2"))
+        self.assertEqual(jobs["En_PPY.sample117.mzpeak"][1], "--no-vendor --sample 117")
+        for n in (2, 117):
+            self.assertTrue((sciex / f"En_PPY.sample{n}.mzpeak.built").exists(), out)
+        # the single archive the samples replace must not stay beside them, publishable, in silence
+        self.assertEqual(rc, 1, out)
+        self.assertIn("SUPERSEDED ON DISK: 1 archive(s)", out)
+        self.assertNotIn("UNACCOUNTED ON DISK", out)
 
 
 class BoxScripts(unittest.TestCase):
