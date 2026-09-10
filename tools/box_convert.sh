@@ -164,6 +164,14 @@ EOF
       fi
       echo "box converter: update $action after ${_bx_try:-1} attempt(s) — using the installed exe" >&2;;
     *)
+      # A FAILED update of a box that already runs the wanted version leaves nothing stale, yet it
+      # fell through to the hard-fail below and aborted whole corpus runs (exit 3, zero jobs): the
+      # updater's fetch runs before its own "current" check, so git's stderr notice failed an
+      # up-to-date box. Only `failed`, as skipped-busy above does: a refused-dirty tree may hold an
+      # exe built from uncommitted code under the same version string.
+      if [ "$action" = failed ] && [ -n "$have" ] && [ -n "${BOX_CONVERTER_VERSION:-}" ] \
+         && [ "$have" = "${BOX_CONVERTER_VERSION#v}" ]; then
+        echo "box converter: update FAILED${err:+ ($err)}, but installed $have is the wanted version" >&2; return 0; fi
       echo "box converter: update FAILED ($action${err:+: $err}) — using the installed exe" >&2;;
   esac
   # Soft by default: an ad-hoc conversion should not die because GitHub was unreachable. Corpus

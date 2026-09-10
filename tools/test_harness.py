@@ -277,14 +277,24 @@ def shell_functions(*names: str) -> str:
     return "\n".join(found)
 
 
-class BoxJob(unittest.TestCase):
+class Shell(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         (self.tmp / "bin").mkdir()
-        (self.tmp / "bin" / "python3").symlink_to(sys.executable)
+        (self.tmp / "bin" / "python3").symlink_to(sys.executable)   # box_convert.sh calls python3
 
+    def bash(self, script: str, **env: str) -> tuple[int, str]:
+        """Run `script`, which ends by echoing rc=$?; -> (that rc, stdout+stderr)."""
+        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env={
+            **os.environ, "PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "T": str(self.tmp), **env})
+        m = re.search(r"^rc=(\d+)$", p.stdout, re.M)
+        self.assertIsNotNone(m, p.stdout + p.stderr)
+        return int(m.group(1)), p.stdout + p.stderr
+
+
+class BoxJob(Shell):
     def run_job(self, result: dict, out: str, opts: str, obj: bytes = b"archive bytes",
                 **env: str) -> tuple[int, str]:
         """Run box_convert.sh's run_job against a box that answers `result`; -> (rc, output)."""
@@ -292,13 +302,8 @@ class BoxJob(unittest.TestCase):
         result = {"stage": "done", "exit": 0, "uploaded": True, "size": len(obj),
                   "md5": hashlib.md5(obj).hexdigest(), "error": "", "note": "", **result}
         script = DRIVER + shell_functions("run_job") + '\nrun_job raw "$OUT" "$OPTS" box-convert/k.mzpeak 0123abcd; echo "rc=$?"\n'
-        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env={
-            **os.environ, **env, "PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "T": str(self.tmp),
-            "FAKE_OBJECT": str(self.tmp / "object"), "OUT": out, "OPTS": opts,
-            "RESULT_B64": base64.b64encode(json.dumps(result).encode()).decode()})
-        m = re.search(r"^rc=(\d+)$", p.stdout, re.M)
-        self.assertIsNotNone(m, p.stdout + p.stderr)
-        return int(m.group(1)), p.stdout + p.stderr
+        return self.bash(script, **env, FAKE_OBJECT=str(self.tmp / "object"), OUT=out, OPTS=opts,
+                         RESULT_B64=base64.b64encode(json.dumps(result).encode()).decode())
 
     def test_the_bench_row_names_the_options_that_ran(self):
         out, bench = self.tmp / "run.mzpeak", self.tmp / "bench.tsv"
@@ -307,6 +312,25 @@ class BoxJob(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertEqual(out.read_bytes(), b"archive bytes")
         self.assertEqual(bench.read_text().splitlines()[1].split("\t")[3], "--no-vendor")
+
+
+class SyncBox(Shell):
+    """sync_box_converter against a stand-in box_update_remote.ps1 reply, as a corpus run calls it."""
+
+    def sync(self, **reply: str) -> tuple[int, str]:
+        stub = r"""ssh_watchdog(){ cat >/dev/null; printf '<<<BOXSYNC\n%s\nBOXSYNC>>>\n' "$REPLY_B64"; }"""
+        script = f"set -uo pipefail\n{stub}\n{shell_functions('sync_box_converter')}\nsync_box_converter; echo \"rc=$?\"\n"
+        return self.bash(script, BOX_CONVERTER_VERSION="v0.11.5", BOX_REQUIRE_VERSION="1",
+                         REPLY_B64=base64.b64encode(json.dumps(reply).encode()).decode())
+
+    def test_a_failed_update_of_a_box_on_the_wanted_version_proceeds(self):
+        rc, out = self.sync(action="failed", have="0.11.5", error="git fetch failed (network/auth?)")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("installed 0.11.5 is the wanted version", out)
+
+    def test_a_stale_or_dirty_box_still_stops_the_run(self):
+        self.assertEqual(self.sync(action="failed", have="0.11.4", error="cargo build failed")[0], 1)
+        self.assertEqual(self.sync(action="refused-dirty", have="0.11.5", error="2 uncommitted change(s)")[0], 1)
 
 
 if __name__ == "__main__":
