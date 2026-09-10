@@ -41,8 +41,7 @@ ProteoWizard with `--via-msconvert` (all platforms).
   reflection-only .NET glue (`glue/sciex`).
 - **Waters (MassLynx)** needs no glue at all: `MassLynxRaw.dll` exposes a plain C ABI, which
   `src/waters.rs` loads with `libloading` and calls directly. Point `MZPC_MASSLYNX_DIR` (or
-  `MZPC_PWIZ_DIR`) at the directory holding that DLL. The `glue/waters` C# project is a
-  never-wired alternative to this lane — no code path reads it or `MZPC_WATERS_GLUE`.
+  `MZPC_PWIZ_DIR`) at the directory holding that DLL.
 - **Agilent (MHDAC) — ✅ out-of-process since 0.11.0.** MHDAC is a **.NET Framework 4.x**
   assembly set whose `OpenDataFile` calls `Delegate.BeginInvoke`, permanently unsupported on
   .NET Core/5+, so it cannot be hosted in-process under .NET 8. The converter therefore spawns
@@ -123,6 +122,4 @@ The matrix above is exercised by CI (`.github/workflows/`):
   each artifact is produced (for Shimadzu also that the generated runtimeconfig carries
   `EnableUnsafeBinaryFormatterSerialization=true`, the switch whose absence broke 0.9.11),
   smoke-convert the fixture, and (separate jobs) exercise the `--via-msconvert` lane and a real
-  timsTOF ion-mobility comparison. The unwired `glue/waters` is deliberately not built or
-  asserted (it was until 2026-09-04; Shimadzu — the one wired glue with an ABI handshake — was
-  not built at all).
+  timsTOF ion-mobility comparison.

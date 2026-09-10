@@ -266,6 +266,9 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   IM-QTOF `.d` (`AcqData/IMSFrame.bin`) gets the same refusal as before, without that boot:
   `is an Agilent IM-QTOF run … convert this run with --via-msconvert`, which the box harness routes
   to msconvert. Native ion mobility would read MIDAC through the out-of-process net48 host pattern.
+- **`glue/waters/`, the C# Waters glue that was never wired (817 lines).** No code path loaded
+  `WatersGlue.dll` or read `MZPC_WATERS_GLUE`: the Waters lane calls `MassLynxRaw.dll`'s C exports
+  through `libloading`. The two box scripts no longer export that inert variable.
 
 ## [0.11.5] — 2026-09-09
 
