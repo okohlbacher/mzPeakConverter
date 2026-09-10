@@ -7698,10 +7698,11 @@ mod tests {
         };
         let input = input.as_path();
 
-        // Never a machine-specific absolute path: this file is committed.
-        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        // A directory of its own. `contract_ims_compact_calibration_keys` converts the same `.d` and extracts the same facet
+        // names; with the one `mzpc-test-{pid}` both used to share, a parallel run let one test
+        // truncate the Parquet file the other had just opened ("Parquet file too small. Size is 0").
+        let scratch = &scratch("ims-frame-preserving");
         let scratch = scratch.as_path();
-        fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
 
@@ -7766,10 +7767,11 @@ mod tests {
             return;
         };
         let input = input.as_path();
-        // Never a machine-specific absolute path: this file is committed.
-        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        // A directory of its own. `ims_compact_is_frame_preserving` converts the same `.d` and extracts the same facet
+        // names; with the one `mzpc-test-{pid}` both used to share, a parallel run let one test
+        // truncate the Parquet file the other had just opened ("Parquet file too small. Size is 0").
+        let scratch = &scratch("ims-calibration-contract");
         let scratch = scratch.as_path();
-        fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_contract.mzpeak");
         let _ = fs::remove_file(&output);
         super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
