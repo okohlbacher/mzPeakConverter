@@ -188,12 +188,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   out of process on net48 as the Agilent host did.
 - **`--ims-chunked` re-sorts each timsTOF frame by TOF** before chunking, which reorders points across
   mobility scans, and declares no transformation for it (`docs/USER_MANUAL.md` §8 points here).
-- **Decided 2026-09-10 — D1–D15 of the open-issue review, by taking the review's recommendations.**
-  D2, D4 and D14 stay open: the review lists their options without recommending one.
+- **Decided 2026-09-10 — D1–D15 of the open-issue review.** Each line is the option the fixes take.
+  Only D4's choice of samples stays with the owner.
   - D1: a data facet's `<entity>_count` is max(index)+1 in that file, 0 when empty (`spectra_peaks` of centroid-only runs too).
-  - D2: open — omit a secondary facet's `*_count`, or keep the distinct parents with rows in that file that the filter lane writes.
+  - D2: the secondary facets (`*_scans`, `*_precursors`, `*_selected_ions`) carry no `spectrum_count`, `chromatogram_count` or `wavelength_spectrum_count`, from the writer or from the filter lane's rewrite.
   - D3: a Thermo window whose scan states no positive `MSn Isolation Width`, or that comes out empty or inverted, is written target-only, declared and warned once, until thermorawfilereader is fixed upstream.
-  - D4: open — `En_PPY.wiff` (117 samples) as one archive per sample, a chosen subset, or not published.
+  - D4: a multi-sample WIFF becomes one archive per chosen sample, with `--sample N` kept through the box fallback; which of `En_PPY.wiff`'s 117 samples to publish stays with the owner.
   - D5: `corpus_reconvert.py` writes the durable v09 keys only behind an opt-in flag; by default a box archive comes back to the host.
   - D6: the native SciEX archive size is accepted; no chunk-capable integer axis.
   - D7: the Waters HDMSe frame size is accepted (Capan2 166 → 531 MB).
@@ -203,7 +203,7 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   - D11: the unwired `glue/waters` is deleted.
   - D12: the SBOM is generated for and attached to each release instead of tracked; every release archive ships `THIRD-PARTY-NOTICES.md` with the Apache-2.0 text; the `mzpeak_prototyping` license stays the owner's to settle.
   - D13: M35 gets a route label (`conversion_route`) only; fallback rows are not re-merged into frames.
-  - D14: open — decode ProteoWizard's `_xHHHH_` escapes in `run.id` when metadata is copied from the mzML lane (47 archives), or keep pwiz's text.
+  - D14: ProteoWizard's `_xHHHH_` escapes in `run.id` and the software ids are decoded when the mzML and imzML lanes copy metadata (47 corpus archives); the shared fixup is left alone, so an exported mzML id stays an XML name.
   - D15: `transformations` lists what a conversion applied, counted by the writer, not what it was configured to do (135 corpus archives change on rebuild).
 
 ## History
