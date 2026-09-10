@@ -772,7 +772,7 @@ the requested output missing. Run them without `-o`.
 | `MZPC_MASSLYNX_DIR` | Directory holding `MassLynxRaw.dll` (+ `cdt.dll`) for the Waters lane. Wins over `MZPC_PWIZ_DIR`, which is the fallback. The Waters lane has no .NET glue |
 | `MZPC_AGILENT_GLUE` | Directory holding the built net48 `AgilentGlueHost.exe` (`glue/agilent/bin/Release/net48`); the converter spawns it once per `.d` and reads its `AGL2` output back (§11) |
 | `MZPC_AGILENT_TMPDIR` | Where the Agilent host materialises a run before it is read (16 B/point — about 3 GB for a 240 MB Q-TOF `.d`; removed when the reader closes, and by the panic hook, but not after a Ctrl+C). Default `%TEMP%`; set it to a disk directory when `TEMP` points at a RAM disk (the box scripts do). A value that is not a directory is warned about, and `%TEMP%` is used |
-| `MZPC_AGILENT_HOST_TIMEOUT` | Seconds the Agilent host may run before the converter kills it and removes its temp file (default `7200`; `0` = no deadline). The host also runs in a kill-on-close Job Object, so killing the converter ends it too |
+| `MZPC_AGILENT_HOST_TIMEOUT` | Seconds the Agilent host may run before the converter kills it and removes its temp file (default `7200`; `0` = no deadline). Killing the converter itself does not end the host: stop `AgilentGlueHost.exe` as well |
 | `MZPC_SCIEX_GLUE` | Directory holding the built `SciexGlue.dll` + runtimeconfig |
 | `MZPC_SHIMADZU_GLUE` | Directory holding the built `ShimadzuGlue.dll` + runtimeconfig |
 
