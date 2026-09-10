@@ -110,3 +110,42 @@ fn failed_conversion_leaves_no_sanitized_copy_behind() {
     assert!(stray.is_empty(), "sanitized copy left in the temp dir: {stray:?}; stderr:\n{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--via-msconvert` with msconvert missing: `Command::status` fails before anything is converted,
+/// and the working directory already created for msconvert must go with the error — in the temp dir
+/// for the mzPeak lane, beside the output for `--to mzml`. The mzPeak lane used to return through
+/// `?` before its cleanup and leave `mzpc-msconvert-<pid>` in `$TMPDIR` on every such run.
+#[test]
+fn msconvert_not_found_leaves_no_working_directory() {
+    let dir = scratch("msconvert-missing");
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    for name in ["out.mzpeak", "out.mzML"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwiz.1.1.mzML"))
+            .arg("-o")
+            .arg(dir.join(name))
+            .arg("--via-msconvert")
+            .arg("--msconvert-path")
+            .arg(dir.join("no-such-msconvert"))
+            // `std::env::temp_dir()` reads TMPDIR on Unix, TMP/TEMP on Windows.
+            .env("TMPDIR", &tmp)
+            .env("TMP", &tmp)
+            .env("TEMP", &tmp)
+            .output()
+            .expect("failed to run mzpeak-convert");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success() && stderr.contains("msconvert not found"),
+            "{name}: expected the missing msconvert to be the failure; stderr:\n{stderr}"
+        );
+        let leftovers: Vec<_> = [&dir, &tmp]
+            .iter()
+            .flat_map(|d| std::fs::read_dir(d).unwrap())
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("mzpc-msconvert"))
+            .collect();
+        assert!(leftovers.is_empty(), "{name}: msconvert working directory left behind: {leftovers:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

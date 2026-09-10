@@ -692,8 +692,8 @@ impl Settings {
     }
 }
 
-/// The `<out>.mzpeak.tmp` files currently being written, with the thread that registered each,
-/// for [`install_tmp_panic_hook`].
+/// The `<out>.mzpeak.tmp` files currently being written, and msconvert's working directories, with
+/// the thread that registered each, for [`install_tmp_panic_hook`].
 static TMP_IN_FLIGHT: std::sync::Mutex<Vec<(std::thread::ThreadId, PathBuf)>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -714,10 +714,15 @@ struct TmpGuard {
 
 impl TmpGuard {
     fn new(path: &Path) -> Self {
+        Self::register(path);
+        Self { path: path.to_path_buf() }
+    }
+
+    /// Put `path` in the panic hook's sweep. [`msconvert_dir`] registers its directory this way.
+    fn register(path: &Path) {
         if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
             v.push((std::thread::current().id(), path.to_path_buf()));
         }
-        Self { path: path.to_path_buf() }
     }
 
     /// Rename the finished tmp onto `output`; on success nothing is left to remove.
@@ -737,7 +742,9 @@ impl TmpGuard {
     }
 
     fn remove_quietly(path: &Path) {
-        match fs::remove_file(path) {
+        // A registered directory (msconvert's working directory) goes with everything in it.
+        let removed = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+        match removed {
             Ok(()) => log::warn!("removed incomplete {}", path.display()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => log::warn!("could not remove incomplete {}: {e}", path.display()),
@@ -3846,15 +3853,18 @@ struct TranscodeGuard {
 
 impl Drop for TranscodeGuard {
     fn drop(&mut self) {
+        TmpGuard::forget_path(&self.dir);
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
 /// A fresh directory under `parent` for msconvert to write `via_msconvert.mzML` into (`file`),
-/// removed on every return — not on a panic, which aborts the release build. Created exclusively,
-/// under a name no other run holds (pid, clock, attempt), and never reused: the pid alone is shared
-/// by containers whose entrypoint is PID 1 writing to one volume, and a directory a crashed run left
-/// behind must not hand its mzML to this run. Hidden, because it sits beside the user's output.
+/// removed on every return, and on a panic by the panic hook's sweep — the release build aborts
+/// without running `Drop`, and this directory sits beside the user's output holding a possibly
+/// multi-GB mzML. Created exclusively, under a name no other run holds (pid, clock, attempt), and
+/// never reused: the pid alone is shared by containers whose entrypoint is PID 1 writing to one
+/// volume, and a directory a crashed run left behind must not hand its mzML to this run. Hidden,
+/// because it sits beside the user's output.
 fn msconvert_dir(parent: &Path) -> Result<TranscodeGuard> {
     // msconvert creates a missing --outdir itself; keep that for an output directory that does not exist yet.
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -3864,7 +3874,10 @@ fn msconvert_dir(parent: &Path) -> Result<TranscodeGuard> {
     for attempt in 0..100 {
         let dir = parent.join(format!(".mzpc-msconvert-{}-{stamp}-{attempt}", std::process::id()));
         match fs::create_dir(&dir) {
-            Ok(()) => return Ok(TranscodeGuard { file: dir.join("via_msconvert.mzML"), dir }),
+            Ok(()) => {
+                TmpGuard::register(&dir);
+                return Ok(TranscodeGuard { file: dir.join("via_msconvert.mzML"), dir });
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
         }
@@ -7366,6 +7379,20 @@ mod tests {
         assert!(out.contains(&format!(r#"<index name="chromatogram"><offset idRef="x">{chromatogram}<"#)), "{out}");
         assert!(out.contains(r#"<offset idRef="gone">3<"#), "an unresolvable id keeps its value: {out}");
         assert!(out.contains(&format!("<indexListOffset>{}<", out.find("<indexList ").unwrap())), "{out}");
+    }
+
+    /// msconvert's working directory sits beside the user's output, and a release-build panic
+    /// aborts without running `Drop`: the panic hook's sweep has to take it, contents and all.
+    #[test]
+    fn msconvert_dir_is_swept_by_the_panic_hook() {
+        let parent = scratch("msconvert-sweep");
+        let tmp = super::msconvert_dir(&parent).unwrap();
+        fs::write(&tmp.file, b"half an mzML").unwrap();
+        // What the hook runs; this thread's entries only, as under `panic = "unwind"`.
+        super::sweep_tmp_in_flight(false);
+        assert!(!tmp.dir.exists(), "{} survived the sweep", tmp.dir.display());
+        drop(tmp);
+        let _ = fs::remove_dir_all(&parent);
     }
 
     /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);
