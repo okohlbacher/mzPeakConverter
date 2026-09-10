@@ -348,21 +348,30 @@ Contents:
 **Footer count keys.** The spectrum, chromatogram and wavelength facets carry `<entity>_count`
 and `<entity>_data_point_count` in their Parquet key–value footers (the `vendor/…` facets carry
 neither). The specification does not define these keys; this converter writes them with one
-definition (since 0.11.2, issue #1): on a **data facet** (`spectra_data`,
-`spectra_peaks`, `chromatograms_data`, `wavelength_spectra_data`) the count is the number of
-entities with at least one row *in that file* and the point count is the points *in that
-file* — so a centroid-only run's empty `spectra_data` says `0 / 0`, and a mixed run's
-`spectra_data` counts only its profile spectra. It is a cardinality, **not an index bound**:
-`spectrum_index` values in a data facet are sparse, so never iterate `0..spectrum_count`. The
+definition (issue #1): on a **data facet** (`spectra_data`, `spectra_peaks`,
+`chromatograms_data`, `wavelength_spectra_data`) the count is one past the largest
+`<entity>_index` with at least one row *in that file*, and `0` when the file has no rows; the
+point count is the points *in that file*. So a centroid-only run's empty `spectra_data` says
+`0 / 0`, and `0..spectrum_count` on either data facet reaches every spectrum stored there. It is
+an **index bound, not the number of spectra in the file**: indices in a data facet are sparse (a
+mixed run's `spectra_data` holds only its profile spectra), so an index below the bound may have
+no row. The
 **run total** lives on the primary metadata facets (`spectra_metadata`, `chromatograms_metadata`,
 `wavelength_spectra_metadata`), which also repeat the data facets' point totals; the secondaries
-(`_scans`, `_precursors`, `_selected_ions`) carry the run total after a direct conversion (an
-archive rewrite re-stamps them with the entities present in that facet — nothing reads them). To
+(`_scans`, `_precursors`, `_selected_ions`) carry no entity count, and a rewrite does not keep the
+one an older archive has (through 0.11.5 a conversion stamped the run total there, even on a facet
+with no rows, and a rewrite the entities left in that facet). To
 plan reads, use the per-spectrum `number_of_data_points` / `number_of_peaks` columns of
 `spectra_metadata` (the spec's mechanism) or the actual indices in the facet; a facet with
-`num_rows == 0` has nothing to read whatever its footer says. Archives from 0.11.1 and earlier
+`num_rows == 0` has nothing to read whatever its footer says. Archives from 0.11.2 to 0.11.5
+declare on a data facet the number of entities with rows instead, which is not a bound: iterating
+`0..spectrum_count` stops early on a mixed run, around empty spectra, and on any rewritten
+archive. Archives from 0.11.1 and earlier
 declare the run total on `spectra_data` (and the sum of both data facets' points), and on
-`spectra_peaks` the number of centroid spectra handed to it, zero-peak spectra included.
+`spectra_peaks` the number of centroid spectra handed to it, zero-peak spectra included. An archive
+rewritten by 0.11.x (`--rt`, `--ms-level`, `--drop-aux`) also embeds the pre-filter counts in each
+rewritten facet's `ARROW:schema`, which Arrow C++ and pyarrow report as the schema metadata; its
+key-value footer is the one to read.
 
 **The format itself** — rationale, the draft specification, and the controlled
 vocabulary — is documented at:

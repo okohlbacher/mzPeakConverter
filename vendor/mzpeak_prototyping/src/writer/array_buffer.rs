@@ -222,21 +222,20 @@ pub trait ArrayBufferWriter {
     fn point_count(&self) -> u64;
     fn point_count_mut(&mut self) -> &mut u64;
 
-    /// The number of distinct series (spectra / chromatograms) that contributed at least one row
-    /// to THIS buffer over its whole lifetime (drains do not reset it). This is what the facet's
-    /// `<entity>_count` footer key means: entities represented by rows in this file — a
-    /// cardinality, not an index bound (indices may be sparse), and never the run total (that
-    /// lives on the primary metadata facet). See mzPeakConverter issue #1.
+    /// One past the largest series (spectrum / chromatogram) index with at least one row in THIS
+    /// buffer over its whole lifetime (drains do not reset it), and 0 when nothing was stored. This
+    /// is what the facet's `<entity>_count` footer key means: an index bound over the rows in this
+    /// file, so `0..count` reaches every entity the file holds even though its indices are sparse
+    /// (a mixed run splits its spectra across two data facets). Never the run total, which lives on
+    /// the primary metadata facet. See mzPeakConverter issue #1.
     fn entry_count(&self) -> u64;
 }
 
-/// Tracks [`ArrayBufferWriter::entry_count`]: a series is counted once, on the first call that
-/// stores rows for it. Calls for one series are contiguous (the writers are sequential), so a
-/// last-seen index is enough; a series handed in with zero rows is not an entry.
+/// Tracks [`ArrayBufferWriter::entry_count`]: one past the largest series index stored with at
+/// least one row. A series handed in with zero rows does not raise it.
 #[derive(Debug, Default, Clone)]
 pub struct EntryCounter {
     count: u64,
-    last: Option<u64>,
 }
 
 impl EntryCounter {
@@ -245,11 +244,7 @@ impl EntryCounter {
             return;
         }
         match series_index {
-            Some(i) if self.last == Some(i) => {}
-            Some(i) => {
-                self.count += 1;
-                self.last = Some(i);
-            }
+            Some(i) => self.count = self.count.max(i + 1),
             // No index column in the batch (should not happen for a spectrum/chromatogram facet):
             // count the call rather than silently under-report, and say so.
             None => {
