@@ -9,7 +9,7 @@
 //! Vendor-SDK readers compile in per platform (see the cfg-gated modules below). See PLAN.md.
 
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -4109,6 +4109,10 @@ fn declared_spectrum_count(input: &Path) -> Option<u64> {
 /// write a sanitized copy where each empty group is rewritten as an explicit open/close pair and
 /// return its path; otherwise return None (convert the original in place). Only the small pre-
 /// `<spectrumList>` header is rewritten; the bulk of the file is streamed through verbatim.
+///
+/// The header grows, so an `<indexedmzML>`'s offsets are shifted by the same delta: left stale,
+/// mzdata cannot read the index, falls back to a scan that finds only spectra, and loses every
+/// chromatogram with exit code 0.
 fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
     let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !ext.eq_ignore_ascii_case("mzml") {
@@ -4129,7 +4133,12 @@ fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
             break;
         }
     }
-    let split = find_subslice(&head, marker).unwrap_or(head.len());
+    // The header never reaches into the index, even in a file with no <spectrumList>, so every
+    // indexed element lies past the rewrite and moves by the same delta.
+    let index_at = index_list_start(input);
+    let split = find_subslice(&head, marker)
+        .unwrap_or(head.len())
+        .min(index_at.map_or(usize::MAX, |at| at as usize));
     let header = match std::str::from_utf8(&head[..split]) {
         Ok(s) => s,
         Err(_) => return Ok(None), // binary in header region: leave it alone
@@ -4146,8 +4155,20 @@ fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
         std::env::temp_dir().join(format!("mzpc-san-{}-{}.mzML", std::process::id(), stem));
     let mut out = BufWriter::new(fs::File::create(&temp)?);
     out.write_all(fixed.as_bytes())?;
-    out.write_all(&head[split..])?; // bytes already read past the header
-    io::copy(&mut f, &mut out)?; // the rest of the file, verbatim
+    f.seek(SeekFrom::Start(split as u64))?;
+    match index_at {
+        Some(at) => {
+            io::copy(&mut f.by_ref().take(at - split as u64), &mut out)?; // the body, verbatim
+            // ponytail: the index tail is read whole, tens of bytes per spectrum (mzdata holds the
+            // parsed index in memory anyway); stream it if a file's index ever outgrows RAM.
+            let mut tail = Vec::new();
+            f.read_to_end(&mut tail)?;
+            out.write_all(&shift_index_tail(tail, (fixed.len() - header.len()) as u64))?;
+        }
+        None => {
+            io::copy(&mut f, &mut out)?; // the rest of the file, verbatim
+        }
+    }
     out.flush()?;
     log::debug!("sanitized empty referenceableParamGroup(s) into {}", temp.display());
     Ok(Some(temp))
@@ -4180,6 +4201,50 @@ fn expand_empty_param_groups(header: &str) -> String {
         }
     }
     out.push_str(rest);
+    out
+}
+
+/// Where an `<indexedmzML>`'s `<indexList>` starts, when its `<indexListOffset>` says so truthfully.
+/// `None` for a plain mzML, and for an index already stale, which no shift repairs.
+fn index_list_start(input: &Path) -> Option<u64> {
+    let mut f = fs::File::open(input).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(4096))).ok()?;
+    let mut end = Vec::new();
+    f.read_to_end(&mut end).ok()?;
+    let end = String::from_utf8_lossy(&end);
+    let value = &end[end.rfind("<indexListOffset>")? + "<indexListOffset>".len()..];
+    let at: u64 = value[..value.find('<')?].trim().parse().ok()?;
+    f.seek(SeekFrom::Start(at)).ok()?;
+    let mut tag = [0u8; 11];
+    f.read_exact(&mut tag).ok()?;
+    (tag.starts_with(b"<indexList") && (tag[10] == b'>' || tag[10].is_ascii_whitespace())).then_some(at)
+}
+
+/// Shift every byte position an `<indexedmzML>` tail (from `<indexList` on) states by `delta`: each
+/// `<offset>` and the `<indexListOffset>`, the only numeric text there. The `<fileChecksum>` is
+/// dropped: it hashes the original bytes and mzdata never verifies it.
+fn shift_index_tail(mut tail: Vec<u8>, delta: u64) -> Vec<u8> {
+    if let (Some(a), Some(b)) = (find_subslice(&tail, b"<fileChecksum>"), find_subslice(&tail, b"</fileChecksum>")) {
+        if a < b {
+            tail.drain(a..b + b"</fileChecksum>".len());
+        }
+    }
+    let mut out = Vec::with_capacity(tail.len() + 64);
+    let mut rest = &tail[..];
+    while let Some(close) = find_subslice(rest, b"</") {
+        let text = rest[..close].iter().rposition(|&b| b == b'>').map_or(0, |gt| gt + 1);
+        match std::str::from_utf8(&rest[text..close]).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+            Some(n) => {
+                out.extend_from_slice(&rest[..text]);
+                out.extend_from_slice((n + delta).to_string().as_bytes());
+            }
+            None => out.extend_from_slice(&rest[..close]),
+        }
+        out.extend_from_slice(b"</");
+        rest = &rest[close + 2..];
+    }
+    out.extend_from_slice(rest);
     out
 }
 
