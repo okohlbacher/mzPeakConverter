@@ -196,6 +196,25 @@ class Stamps(Harness):
         self.assertIn("built by mzpeak-convert 0.0.1", out)
 
 
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class BoxPhase(Harness):
+    def test_a_box_unit_that_did_not_arrive_fails_the_run(self):
+        root = make_corpus(self.tmp, {
+            "general-ms/ok/ok.yaml": {"convert": {"input": "auto"}},
+            "general-ms/lost/lost.yaml": {"convert": {"input": "auto"}},
+            "general-ms/old/old.yaml": {"convert": {"input": "auto"}},
+        }, {
+            "general-ms/ok/run.wiff": b"x",
+            "general-ms/lost/undelivered.wiff": b"x",
+            "general-ms/old/stale.wiff": b"x",
+        })
+        rc, out = self.run_main(root, "--box", "--no-s3-first")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("BOX NOT DELIVERED: 2 unit(s), box_convert exit 1", out)
+        self.assertEqual(out.split("BOX NOT DELIVERED")[1].count("  - "), 2)
+        self.assertTrue((root / "general-ms/ok/run.mzpeak.built").exists())
+
+
 # ---- box_convert.sh ---------------------------------------------------------------------------
 # Its functions run in a bash with every network edge replaced: `box` answers the ssh call with a
 # canned BOXRESULT (and records Remove-Item calls), `relay` stands in for s3_relay.py, and `scp`
