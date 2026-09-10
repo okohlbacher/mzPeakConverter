@@ -173,7 +173,7 @@ MULTI_UNIT_TILES = {"pwiz-examples"}
 
 
 def load_recipes(root: Path) -> tuple[dict[Path, list[str]], dict[Path, Path], set[Path], set[Path]]:
-    """-> (extra flags by unit, pinned unit by dataset dir, skipped dataset dirs, all governed dirs).
+    """-> (extra flags by dataset dir, pinned unit by dataset dir, skipped dataset dirs, all governed dirs).
 
     Missing PyYAML is not fatal: without it we cannot read descriptors, so the caller falls back to
     the every-unit walk rather than silently publishing the wrong set.
@@ -204,11 +204,20 @@ def load_recipes(root: Path) -> tuple[dict[Path, list[str]], dict[Path, Path], s
             continue
         spec = cv.get("input")
         if spec and spec != "auto":
-            unit = dd / spec
-            pinned[dd] = unit
-            if cv.get("flags"):
-                flags[unit] = resolve_flag_paths(shlex.split(str(cv["flags"])), dd, root.parent, root)
+            pinned[dd] = dd / spec
+        # Flags belong to the DATASET, whatever picks its unit. Recorded only beside a pinned
+        # `convert.input`, every `input: auto` or input-less descriptor was built bare: three imzML
+        # demonstrators were published without their `--image`, eleven archives without their
+        # `--zstd-level 12`, and four lane pins never reached the box.
+        if cv.get("flags"):
+            flags[dd] = resolve_flag_paths(shlex.split(str(cv["flags"])), dd, root.parent, root)
     return flags, pinned, skipped, governed
+
+
+def flags_for(unit: Path, recipes: dict[Path, list[str]]) -> list[str] | None:
+    """The `convert.flags` of the described dataset that holds `unit`, looked up through its parents
+    (a pinned vendor directory's inner unit and an `auto` pick belong to the same dataset)."""
+    return next((recipes[d] for d in unit.parents if d in recipes), None)
 
 
 # Flags that name a FILE. A descriptor writes them relative to its own directory
@@ -414,7 +423,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
         for u in units:
             # The descriptor's own flags, so a box-built archive matches its host-built recipe
             # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
-            flags = (recipes or {}).get(u) or ['--no-vendor']
+            flags = flags_for(u, recipes or {}) or ['--no-vendor']
             # S3-FIRST (default): name the FINAL corpus key as the target, so the box PUTs the
             # archive straight to where the corpus publishes it and the host only mirrors it down.
             # Previously the archive came back to the host and needed a separate upload pass, which
@@ -485,7 +494,7 @@ def convert_target(cands: list[Path], binary: str, version: str, dry: bool, reci
     """
     last = None
     for i, u in enumerate(cands):
-        unit, status, detail = convert(u, binary, version, dry, (recipes or {}).get(u))
+        unit, status, detail = convert(u, binary, version, dry, flags_for(u, recipes or {}))
         if status != "skipped":
             if i:
                 detail = (detail + " " if detail else "") + f"(fallback from {cands[0].name})"
@@ -494,7 +503,7 @@ def convert_target(cands: list[Path], binary: str, version: str, dry: bool, reci
     return last
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", nargs="?", default=os.path.expanduser("~/Claude/mzpeak-example-data/data"))
     ap.add_argument("--clean", action="store_true", help="delete every .mzpeak first, then convert all")
@@ -511,7 +520,7 @@ def main() -> int:
                     help="box concurrency (default 3; box_convert.sh caps at MZPC_BOX_JOBS_CAP=4)")
     ap.add_argument("--no-s3-first", action="store_true",
                     help="box returns archives to the host instead of PUTting them to the corpus bucket")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     root = Path(args.root).expanduser()
     if not root.is_dir():

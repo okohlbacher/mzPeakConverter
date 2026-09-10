@@ -185,6 +185,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
+- **`tools/corpus_reconvert.py` builds every described dataset with its `convert.flags`.** The flags
+  were recorded only for a descriptor that pins `convert.input`. A descriptor with `input: auto`, or
+  with no input at all, got a bare host conversion and `--no-vendor` on the box. Three imzML
+  demonstrators were published without their `--image`: ltpmsi-chilli, Test_P15_r2 and
+  180817_NEG_Thaliana. Eleven archives lack their `--zstd-level 12`, and the lane pins of
+  MSV000090203, PXD053710, PXD059353 and PXD073126 never reached the box. Flags are now keyed by
+  dataset directory and found through the unit's parents, so a pinned vendor directory's inner
+  unit gets them too. Those archives need rebuilding. Pinned by `tools/test_harness.py`
+  (`python3 tools/test_harness.py`, offline).
 
 ### Changed
 
