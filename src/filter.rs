@@ -1006,8 +1006,10 @@ fn null_dangling_parent_refs(
 }
 
 /// `--rt` is in minutes, the unit of `spectrum.time`, but a chromatogram time axis declares its own
-/// unit — ProteoWizard's chromatograms, and the TIC/BPC the converter stores beside them, are in
-/// seconds. The factor that takes a window in minutes into the unit of `child`.
+/// unit. The converter stores minutes on every lane, while an mzML-lane archive built by 0.11.5 or
+/// earlier declares ProteoWizard's seconds (and holds its synthesized TIC/BPC in minutes under that
+/// label, which this cannot tell apart). The factor that takes a window in minutes into the unit of
+/// `child`.
 fn minutes_in_axis(s: &StructArray, child: &str) -> f64 {
     let DataType::Struct(fields) = s.data_type() else { return 1.0 };
     match fields.iter().find(|f| f.name() == child).and_then(|f| f.metadata().get("unit")).map(String::as_str) {

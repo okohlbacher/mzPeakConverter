@@ -2627,7 +2627,9 @@ fn readable_chromatogram_arrays(mut chrom: Chromatogram) -> Chromatogram {
     chrom
 }
 
-/// A chromatogram as the chromatogram facet's schema is sampled from it: without the array
+/// A chromatogram as the chromatogram facet's schema is sampled from it: its time array in minutes,
+/// so the column declares the unit [`finish_chromatograms`] stores (sampled in ProteoWizard's
+/// seconds, the column declared seconds over minutes), and without the array
 /// [`readable_chromatogram_arrays`] names, which is then written as that chromatogram's auxiliary
 /// array in its own unit and data type — how the native Bruker lanes store the same device traces,
 /// so an archive converted back from its mzML export stores them alike. Sampled, the arrays of the
@@ -2635,6 +2637,8 @@ fn readable_chromatogram_arrays(mut chrom: Chromatogram) -> Chromatogram {
 /// later array of a type already a column is written into that column and reads back in its unit.
 fn schema_sample_chromatogram(mut chrom: Chromatogram) -> Chromatogram {
     chrom.arrays.byte_buffer_map.remove(&ArrayType::Unknown);
+    // A time array that cannot be read is sampled as it is; writing that chromatogram fails on it.
+    let _ = chromatogram_time_to_minutes(&mut chrom.arrays);
     chrom
 }
 
@@ -5477,6 +5481,8 @@ fn convert_ims_compact_sdk(
 /// `sort-by-mz` (a spectrum was re-ordered, by the lane's reader or by the writer's backstop),
 /// `sort-by-time` (the writer's backstop re-ordered a chromatogram by time), `sort-by-wavelength`
 /// (the writer's backstop re-ordered a wavelength spectrum by wavelength),
+/// `chromatogram-time-to-minutes` (a chromatogram time recorded in seconds or milliseconds was
+/// divided into minutes; `chromatogram_time_to_minutes`),
 /// `tof-grid:<ppm>ppm` (a statistically fitted integer grid replaced f64 m/z within that bound on a
 /// spectrum), `shimadzu:span-trim` (the profile sqrt-grid route left a gridded spectrum's
 /// zero-intensity pad at the scan-window bounds out), `agilent:drop-zero-samples` (the profile grid
@@ -7035,77 +7041,56 @@ impl Ms1Chroms {
         self.time.is_empty()
     }
 
-    /// Write the synthesized TIC + base-peak chromatograms, their times in `unit` (see
-    /// [`finish_chromatograms`]). Returns how many were written (0 or 2).
-    fn write(&self, writer: &mut MzPeakWriterType<fs::File>, unit: Unit) -> Result<usize> {
+    /// Write the synthesized TIC + base-peak chromatograms, their times the spectrum start times in
+    /// minutes. Returns how many were written (0 or 2).
+    fn write(&self, writer: &mut MzPeakWriterType<fs::File>) -> Result<usize> {
         if self.is_empty() {
             return Ok(0);
         }
-        let mut tic = synth_chromatogram(
+        let tic = synth_chromatogram(
             "TIC",
             Param::builder().name("total ion current chromatogram").curie(curie!(MS:1000235)).build(),
             &self.time,
             &self.tic,
         )?;
-        let mut bpc = synth_chromatogram(
+        let bpc = synth_chromatogram(
             "BPC",
             Param::builder().name("basepeak chromatogram").curie(curie!(MS:1000628)).build(),
             &self.time,
             &self.bpc,
         )?;
-        rescale_time(&mut tic.arrays, unit)?;
-        rescale_time(&mut bpc.arrays, unit)?;
         writer.write_chromatogram(&tic)?;
         writer.write_chromatogram(&bpc)?;
         Ok(2)
     }
 }
 
-/// The unit `chromatograms_data`'s time column declares: the source chromatograms' when the writer
-/// sampled its schema from them (ProteoWizard writes seconds), else the writer's default, minutes.
-fn chromatogram_time_unit(writer: &mut MzPeakWriterType<fs::File>) -> Unit {
-    use mzpeak_prototyping::writer::ArrayBufferWriter;
-    let declared = writer
-        .chromatogram_data_buffer_mut()
-        .fields()
-        .iter()
-        .find(|f| f.metadata().get("array_accession").is_some_and(|a| a == "MS:1000595"))
-        .and_then(|f| f.metadata().get("unit").cloned());
-    [Unit::Second, Unit::Millisecond]
-        .into_iter()
-        .find(|u| u.to_curie().is_some_and(|c| Some(c.to_string()) == declared))
-        .unwrap_or(Unit::Minute)
-}
-
-/// Express a chromatogram's time array in `unit`. A no-op when it already is, or when either unit
-/// is not a time.
-fn rescale_time(arrays: &mut BinaryArrayMap, unit: Unit) -> Result<()> {
-    let seconds = |u: Unit| match u {
-        Unit::Minute => Some(60.0),
-        Unit::Second => Some(1.0),
-        Unit::Millisecond => Some(1e-3),
-        _ => None,
+/// Store a chromatogram's time array in minutes, the unit `chromatograms_data` declares on every
+/// lane, and say whether a stored value changed (`chromatogram-time-to-minutes`). The spec leaves a
+/// chromatogram's time unit to the writer and recommends minutes, the unit spectrum and wavelength
+/// times must have; mzPeakViewer reads every stored chromatogram time as minutes without looking at
+/// the declared unit. A time in seconds or milliseconds (ProteoWizard's mzML chromatograms, HyStar's
+/// device traces) is divided into minutes as a 64-bit float, which is not bit-exact. An array in
+/// minutes is left alone, and so is one that states no unit: the writer labels it minutes as given.
+fn chromatogram_time_to_minutes(arrays: &mut BinaryArrayMap) -> Result<bool> {
+    let Some(t) = arrays.get_mut(&ArrayType::TimeArray) else { return Ok(false) };
+    let per_minute = match t.unit {
+        Unit::Second => 60.0,
+        Unit::Millisecond => 60_000.0,
+        _ => return Ok(false),
     };
-    let Some(t) = arrays.get_mut(&ArrayType::TimeArray) else { return Ok(()) };
-    let (Some(from), Some(to)) = (seconds(t.unit), seconds(unit)) else { return Ok(()) };
-    if from == to {
-        return Ok(());
-    }
-    let scaled: Vec<f64> = t
-        .to_f64()
-        .map_err(|e| anyhow::anyhow!("reading chromatogram time: {e}"))?
-        .iter()
-        .map(|v| v * from / to)
-        .collect();
-    let encoded = if t.dtype == BinaryDataArrayType::Float32 {
-        t.update_buffer(&scaled.iter().map(|&v| v as f32).collect::<Vec<_>>())
-    } else {
-        *t = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new());
-        t.update_buffer(&scaled)
+    let (minutes, changed) = {
+        let stored = t.to_f64().map_err(|e| anyhow::anyhow!("reading chromatogram time: {e}"))?;
+        (stored.iter().map(|v| v / per_minute).collect::<Vec<f64>>(), stored.iter().any(|&v| v != 0.0))
     };
-    encoded.map_err(|e| anyhow::anyhow!("encoding chromatogram time: {e}"))?;
-    t.unit = unit;
-    Ok(())
+    // 64-bit whatever the source's width: a quotient rounded back into 32 bits loses digits (a
+    // 32-bit 1 s is 0.016666668 min).
+    let mut converted = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new());
+    converted.update_buffer(&minutes).map_err(|e| anyhow::anyhow!("encoding chromatogram time: {e}"))?;
+    converted.unit = Unit::Minute;
+    converted.params = t.params.take();
+    *t = converted;
+    Ok(changed)
 }
 
 fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f64]) -> Result<Chromatogram> {
@@ -7140,10 +7125,13 @@ fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f6
 /// Write the chromatogram facet: synthesized MS1 TIC + base-peak (when `synth` and there were MS1
 /// spectra), plus any source chromatograms, plus the device traces a Bruker `.d` input records in
 /// `chromatography-data.sqlite` ([`bruker_traces`]) — skipping a source TIC/base-peak (HyStar's
-/// own MS traces included) when we synthesized our own so they don't duplicate. Falls back to one
-/// empty chromatogram if nothing else was written (the reference reader requires the facet to open,
-/// and the writer finalizes index metadata here). Returns the `transformations` entries the written
-/// device traces add, for the lane's index block ([`bruker_traces::Trace`]).
+/// own MS traces included) when we synthesized our own so they don't duplicate. Every time is stored
+/// in minutes ([`chromatogram_time_to_minutes`]; the lanes sample the facet's schema through
+/// [`schema_sample_chromatogram`], so the column declares minutes too). Falls back to one empty
+/// chromatogram if nothing else was written (the reference reader requires the facet to open, and the
+/// writer finalizes index metadata here). Returns the `transformations` entries the written
+/// chromatograms add, for the lane's index block: `chromatogram-time-to-minutes`, and the device
+/// traces' ([`bruker_traces::Trace`]).
 fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     writer: &mut MzPeakWriterType<fs::File>,
     input: &Path,
@@ -7152,12 +7140,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     synth: bool,
 ) -> Result<Vec<String>> {
     set_file_contents(writer, ms1, synth && !ms1.time.is_empty());
-    // `chromatograms_data` declares one time unit, and every stored value must be in it. The
-    // synthesized traces come from spectrum start times in minutes, so on the mzML lane, whose column
-    // takes ProteoWizard's seconds from the source chromatograms, they were stored in minutes under a
-    // seconds declaration. A source trace in another unit than the column is rescaled the same way.
-    let unit = chromatogram_time_unit(writer);
-    let synthesized = if synth { ms1.write(writer, unit)? } else { 0 };
+    let synthesized = if synth { ms1.write(writer)? } else { 0 };
     let mut n = synthesized;
     let mut applied: Vec<String> = Vec::new();
     let traces = bruker_traces::read(input).into_iter().map(|t| (t.chromatogram, t.rescaled, t.merged));
@@ -7170,12 +7153,16 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
         {
             continue; // superseded by our MS1-synthesized version
         }
-        rescale_time(&mut chrom.arrays, unit)?;
+        let to_minutes = chromatogram_time_to_minutes(&mut chrom.arrays)?;
         writer.write_chromatogram(&chrom)?;
         n += 1;
-        for (done, entry) in [(rescaled, "bruker:trace-unit-rescale"), (merged, "bruker:trace-sort-dedup")] {
-            if done && !applied.iter().any(|a| a == entry) {
-                applied.push(entry.to_string());
+        for (done, entry) in [
+            (to_minutes, "chromatogram-time-to-minutes"),
+            (rescaled, "bruker:trace-unit-rescale"),
+            (merged, "bruker:trace-sort-dedup"),
+        ] {
+            if done {
+                declare(&mut applied, entry);
             }
         }
     }
@@ -7577,8 +7564,8 @@ mod tests {
     /// Every Bruker lane ends in `finish_chromatograms`, so this is where a `.d`'s HyStar device
     /// traces join the facet: after the synthesized TIC/BPC, HyStar's own MS trace giving way to
     /// them, a bar trace stated in pascal (64-bit, dividing back to the stored bar exactly) with its
-    /// type also a parameter and the rescale declared — and the input directory left exactly as it
-    /// was.
+    /// type also a parameter and the rescale declared, its times HyStar's seconds stored in minutes
+    /// and that declared too — and the input directory left exactly as it was.
     #[test]
     fn finish_chromatograms_writes_the_bruker_device_traces() {
         use mzdata::params::Unit;
@@ -7607,7 +7594,7 @@ mod tests {
         let path = dir.join("run.mzpeak");
         let applied = write_trace_archive(&dot_d, &path);
         assert_eq!(listing(), before, "reading the device traces changed the input directory");
-        assert_eq!(applied, ["bruker:trace-unit-rescale"]);
+        assert_eq!(applied, ["chromatogram-time-to-minutes", "bruker:trace-unit-rescale"]);
 
         let mut r = MzPeakReader::new(&path).unwrap();
         let chroms: Vec<_> = (0..r.len_chromatograms()).map(|i| r.get_chromatogram(i).unwrap()).collect();
@@ -7620,6 +7607,87 @@ mod tests {
         assert_eq!(p.to_f64().unwrap().iter().map(|pa| (pa / 1e5) as f32).collect::<Vec<_>>(), [180.0, 170.02]);
         let t = pressure.arrays.get(&ArrayType::TimeArray).unwrap();
         assert_eq!(t.to_f64().unwrap().to_vec(), vec![2.0 / 60.0, 3.0 / 60.0]);
+    }
+
+    /// What `chromatogram_time_to_minutes` does to the time units a source states. Seconds and
+    /// milliseconds become 64-bit minutes, a 32-bit source included: the rescale it replaced wrote
+    /// the quotient back into the array's own Float32 (1 s as 0.016666668 min). Minutes, an array that
+    /// states no unit, and seconds that are all zero change no stored value, so nothing is declared.
+    #[test]
+    fn chromatogram_times_are_stored_as_64_bit_minutes() {
+        use mzdata::params::Unit;
+
+        let times = |dtype: BinaryDataArrayType, unit: Unit, values: &[f64]| {
+            let mut t = DataArray::wrap(&ArrayType::TimeArray, dtype, Vec::new());
+            match dtype {
+                BinaryDataArrayType::Float32 => t.update_buffer(&values.iter().map(|&v| v as f32).collect::<Vec<_>>()).unwrap(),
+                _ => t.update_buffer(values).unwrap(),
+            };
+            t.unit = unit;
+            let mut arrays = BinaryArrayMap::new();
+            arrays.add(t);
+            arrays
+        };
+        let stored = |arrays: &BinaryArrayMap| {
+            let t = arrays.get(&ArrayType::TimeArray).unwrap();
+            (t.unit, t.dtype, t.to_f64().unwrap().to_vec())
+        };
+
+        let mut seconds = times(BinaryDataArrayType::Float32, Unit::Second, &[0.0, 1.0, 90.0]);
+        assert!(super::chromatogram_time_to_minutes(&mut seconds).unwrap());
+        assert_eq!(stored(&seconds), (Unit::Minute, BinaryDataArrayType::Float64, vec![0.0, 1.0 / 60.0, 1.5]));
+        let mut milliseconds = times(BinaryDataArrayType::Float64, Unit::Millisecond, &[30_000.0]);
+        assert!(super::chromatogram_time_to_minutes(&mut milliseconds).unwrap());
+        assert_eq!(stored(&milliseconds), (Unit::Minute, BinaryDataArrayType::Float64, vec![0.5]));
+        for (unit, values) in [(Unit::Minute, vec![1.0]), (Unit::Unknown, vec![90.0]), (Unit::Second, vec![0.0])] {
+            let mut same = times(BinaryDataArrayType::Float64, unit, &values);
+            assert!(!super::chromatogram_time_to_minutes(&mut same).unwrap(), "{unit:?}");
+            assert_eq!(stored(&same).2, values, "{unit:?}");
+        }
+    }
+
+    /// An mzML-lane archive built by 0.11.5 or earlier declares its chromatogram times in seconds
+    /// (`UO:0000010`), ProteoWizard's unit. `--rt` is in minutes and converts its window into the
+    /// declared unit, so it cuts such an archive where it says. The converter no longer writes a
+    /// seconds column, so this one is built with the writer.
+    #[test]
+    fn an_rt_window_reads_a_seconds_column_in_its_unit() {
+        use mzdata::params::Unit;
+        use mzdata::spectrum::ChromatogramDescription;
+        use mzpeak_prototyping::writer::AbstractMzPeakWriter;
+        use mzpeak_prototyping::MzPeakReader;
+
+        let (dir, _cleanup) = trace_scratch("seconds-column");
+        let sic = {
+            let mut time = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new());
+            time.update_buffer(&[0.0f64, 1.0, 2.0, 3.0, 4.0, 60.0]).unwrap();
+            time.unit = Unit::Second;
+            let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+            intensity.update_buffer(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+            let mut arrays = BinaryArrayMap::new();
+            arrays.add(time);
+            arrays.add(intensity);
+            super::Chromatogram::new(ChromatogramDescription { id: "sic".to_string(), ..Default::default() }, arrays)
+        };
+        let src = dir.join("seconds.mzpeak");
+        let mut writer = super::MzPeakWriterType::<std::fs::File>::builder()
+            .chromatogram_chunked_encoding(None)
+            .sample_array_types_from_chromatograms(std::iter::once(sic.clone()))
+            .build(std::fs::File::create(&src).unwrap(), true);
+        let _ = super::fixup_run_metadata(&mut writer, &dir);
+        writer.write_chromatogram(&sic).unwrap();
+        writer.finish_parquet().unwrap().finish().unwrap();
+        let declared = |archive: &std::path::Path| {
+            let mut r = MzPeakReader::new(archive).unwrap();
+            let c = r.get_chromatogram(0).unwrap();
+            let t = c.arrays.get(&ArrayType::TimeArray).unwrap();
+            (t.unit, t.to_f64().unwrap().to_vec())
+        };
+        assert_eq!(declared(&src).0, Unit::Second, "the archive under test has a seconds column");
+
+        let out = dir.join("rt.mzpeak");
+        super::filter::run(&src, &out, &super::filter::FilterOpts { rt: Some((0.0, 0.05)), ..Default::default() }).unwrap();
+        assert_eq!(declared(&out), (Unit::Second, vec![0.0, 1.0, 2.0, 3.0]), "0.05 min is 3 s");
     }
 
     /// `--rt` on an archive holding device traces. Their values sit in each chromatogram's auxiliary
@@ -9841,8 +9909,9 @@ mod tests {
             .map(|v| v.as_str().expect("entries are strings"))
             .collect();
         // The whole list — `contains` let through an entry nothing applied, or one listed twice. No
-        // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run.
-        assert_eq!(applied, ["numpress-linear", "sort-by-time"], "{applied:?}");
+        // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run. Its
+        // `sic` is in seconds, stored in minutes.
+        assert_eq!(applied, ["numpress-linear", "sort-by-time", "chromatogram-time-to-minutes"], "{applied:?}");
         // The lossless request drops the codec entry — the list follows the choice, not the lane.
         let out2 = dir.join("tiny-delta.mzpeak");
         let args: Vec<&std::ffi::OsStr> = vec![
@@ -9853,7 +9922,7 @@ mod tests {
         let meta = index_metadata(&out2);
         let applied: Vec<&str> =
             meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(applied, ["sort-by-time"], "{applied:?}");
+        assert_eq!(applied, ["sort-by-time", "chromatogram-time-to-minutes"], "{applied:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

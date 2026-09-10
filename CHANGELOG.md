@@ -82,7 +82,8 @@ keep their bytes.
   generic `chromatogram` (MS:1000625) with a non-standard array named after the trace, each in the
   unit HyStar states. The type is a parameter as well as the typed column, so an mzML export of the
   archive states it. The value arrays are stored as auxiliary arrays, which keep their own unit, and
-  times are minutes like every other chromatogram. HyStar's own MS traces give way to the
+  times are minutes like every other chromatogram: HyStar records seconds, so the archive declares
+  `chromatogram-time-to-minutes` (below). HyStar's own MS traces give way to the
   synthesized TIC/BPC, as a source TIC/BPC always has; that includes its MS/MS TIC
   (`TIC,±AllMS/MS`, on every corpus run), which the spectra still yield. A user-defined trace whose
   unit is a pressure or a flow rate is typed as one (ProteoWizard does that only for a temperature).
@@ -656,25 +657,31 @@ keep their bytes.
   `--no-ims-compact`, on any other standard-lane input and on the native vendor readers. Pinned by
   `ims_chunked_is_inert_on_the_standard_lane`; the fallback itself needs a TDF timsrust cannot read,
   which no committed fixture is.
-- **Synthesized TIC and BPC are stored in the time unit their column declares, and `--rt` cuts
-  chromatograms at the time it names.** `chromatograms_data` declares one unit for `point.time`. The
-  spec leaves it to the writer and recommends minutes; the vendored reader labels every time array
-  with it; the validator does not check it. On the mzML lane the column takes its unit from the
-  source's chromatograms, which ProteoWizard writes in seconds, but the TIC and BPC synthesized
-  beside them were stored in minutes, the unit of the spectrum start times they are built from:
-  `tiny.pwiz.1.1.mzML` declared `UO:0000010` over TIC points at 0.7008 and 5.8905, which read back as
-  seconds. The synthesized traces are now stored in the declared unit (seconds there: 42.05 and
-  353.43), and a source chromatogram in another unit than the column is rescaled the same way; on
-  the native lanes, and wherever no source chromatogram is read, the column is in minutes and
-  nothing changes. The mzML lane's source chromatograms keep their values. `--rt`, a window in
-  minutes like `spectrum.time`, is now converted into each chromatogram column's declared unit
-  before truncating: it had compared minutes with the stored seconds, so `--rt 0-0.05` kept the
-  `sic` points up to 0.05 s instead of 3 s — on archives built before this change too, whose source
-  chromatograms are in seconds. Those archives also hold their synthesized TIC and BPC in minutes
-  under the seconds label, and `--rt` now cuts those two traces at 60 times the times it names
-  (`--rt 0-0.05` on `tiny.pwiz.1.1` converted by 0.11.5 keeps the TIC point at 0.70 min): rebuild an
-  mzML-lane archive before relying on `--rt` to truncate its chromatograms. mzML-lane archives change
-  on reconversion (TIC/BPC times ×60). Pinned by `tests/chromatogram_time_unit.rs`.
+- **Chromatogram times are stored in minutes on every lane, and `--rt` cuts chromatograms at the
+  time it names.** `chromatograms_data` declares one unit for `point.time`. The spec leaves it to the
+  writer and recommends minutes, the unit spectrum and wavelength times must have; the vendored reader
+  labels every time array with it; the validator does not check it; mzPeakViewer reads every stored
+  chromatogram time as minutes without looking at it. On the mzML lane the column took its unit from
+  the source's chromatograms, which ProteoWizard writes in seconds, while the TIC and BPC synthesized
+  beside them were stored in minutes: `tiny.pwiz.1.1.mzML` declared `UO:0000010` over TIC points at
+  0.7008 and 5.8905, and the viewer drew the source's `sic` (0–9 s) as 0–9 min. A chromatogram time
+  in seconds or milliseconds, a source chromatogram's or a HyStar device trace's (below), is now
+  divided into minutes before the facet's schema is sampled and when it is written, so the column
+  declares `UO:0000031` on every lane. The division is a 64-bit float and not bit-exact, so the
+  archive declares `chromatogram-time-to-minutes` in `transformations` when it changed a stored time.
+  A time array that states no unit is stored as given under the minutes label. `--to mzml` from an
+  mzML keeps the source's seconds; an archive → mzML export writes minutes. `--rt`, a window in
+  minutes like `spectrum.time`, is converted into each chromatogram column's declared unit before
+  truncating: it had compared minutes with the stored values, so on a seconds column `--rt 0-0.05`
+  kept the `sic` points up to 0.05 s instead of 3 s. Seconds columns are what mzML-lane archives built
+  by 0.11.5 and earlier have (no published corpus archive: all 201 declare minutes). Those archives
+  also hold their synthesized TIC and BPC in minutes under the seconds label, and `--rt` cuts those
+  two traces at 60 times the times it names (`--rt 0-0.05` on `tiny.pwiz.1.1` converted by 0.11.5
+  keeps the TIC point at 0.70 min): rebuild such an archive before relying on `--rt` to truncate its
+  chromatograms. mzML-lane archives with source chromatograms change on reconversion (their times
+  ÷60, the entry declared). Pinned by `tests/chromatogram_time_unit.rs`,
+  `tests::chromatogram_times_are_stored_as_64_bit_minutes` and
+  `tests::an_rt_window_reads_a_seconds_column_in_its_unit`.
 - **`--sample` is recorded like every other option, warned about where it is inert, and accepted
   by `--config`.** It was copied into the SciEX lanes' setting without being counted as given, so
   `--sample 3` on a Thermo `.raw`, an mzML, a timsTOF run or an archive exited 0 without a word;
@@ -836,9 +843,11 @@ keep their bytes.
   `zero-run-mask` was written on every lane and `numpress-linear` whenever the codec was chosen:
   103 corpus archives declared the mask with no profile spectrum, and 32 declared numpress with no
   numpress chunk. The writer's backstop was never declared at all, although every native lane
-  relies on it. On `tiny.pwiz.1.1.mzML` the list is now `["numpress-linear", "sort-by-time"]` (its
-  one profile spectrum holds no zero run; its MS1 spectra arrive out of time order, so the writer
-  re-sorts the synthesized TIC and base-peak traces) and `["sort-by-time"]` with `--no-numpress`;
+  relies on it. On `tiny.pwiz.1.1.mzML` the list is now
+  `["numpress-linear", "sort-by-time", "chromatogram-time-to-minutes"]` (its one profile spectrum holds
+  no zero run; its MS1 spectra arrive out of time order, so the writer re-sorts the synthesized TIC and
+  base-peak traces; its `sic` is in seconds) and `["sort-by-time", "chromatogram-time-to-minutes"]`
+  with `--no-numpress`;
   `writer_counters_decide_the_writer_level_transformations` pins the mask, the backstop and the
   empty list on the vendor-reader seam. The two lane entries still derived from configuration are
   counted as well. `shimadzu:span-trim` now comes from the gridded spectra whose zero pad the profile
