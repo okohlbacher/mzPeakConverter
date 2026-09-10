@@ -257,4 +257,5 @@ fn transformations_block_pinned() {
     pinned("\"tof-grid:{}ppm\"");
     pinned("\"shimadzu:span-trim\"");
     pinned("\"agilent:drop-zero-samples\"");
+    pinned("\"thermo:target-only-isolation-window:{}\"");
 }

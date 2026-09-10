@@ -588,6 +588,7 @@ list of the declared, bounded changes the converter made to the vendor signal on
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `shimadzu:span-trim` | the profile sqrt-grid route stored the signal span only (item 4) | native Shimadzu `.lcd` profile |
 | `agilent:drop-zero-samples` | the profile grid lane stored a sparse point list, dropping zero-intensity samples and all-zero scans | `--agilent-grid` |
+| `thermo:target-only-isolation-window:<n>` | `<n>` precursor isolation windows had no width their scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and were written target-only; thermorawfilereader computes a quarter-width or inverted window for them | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 
 Not declared today, on purpose and worth knowing: the `--ims-chunked` ims-compact layout sorts each
 frame by TOF before chunking, which re-orders points across scans (an entry of the `sort-by-mz`
