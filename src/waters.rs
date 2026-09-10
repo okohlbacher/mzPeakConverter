@@ -263,8 +263,8 @@ pub struct WatersReader {
     item_ids: ScanItemIds,
     /// The lock-mass reference function, when MassLynx names one.
     lockmass_function: Option<c_int>,
-    /// Functions not written as spectra because they are chromatogram-type or not MS, with the
-    /// reason MassLynx's type code gives.
+    /// Functions not written as spectra, with the reason: chromatogram-type or not MS (MassLynx's
+    /// type code), or a scan count MassLynx could not return.
     skipped: Vec<(c_int, String)>,
     /// `MZPC_WATERS_KEEP_COLLAPSED`, read once: whether the collapsed functions were written.
     keep_collapsed: bool,
@@ -603,6 +603,9 @@ impl WatersReader {
             }
             let Some(n_scans) = int_of(Some(read_scan_count), f).filter(|n| *n >= 0) else {
                 log::warn!("MassLynx getScanCount(function {}) failed; the function is skipped", f + 1);
+                // Recorded like a type-code skip, so `waters_functions` and `waters:drop-functions`
+                // say the archive lacks it.
+                skipped.push((f, "getScanCount failed".to_string()));
                 continue;
             };
             let mut rts: Vec<f32> = Vec::with_capacity(n_scans as usize);
@@ -1252,7 +1255,7 @@ fn functions_block(
 
 /// The `transformations` entries a Waters run declares, each only when it happened:
 /// `waters:drop-functions` when a function was not written as spectra (chromatogram-type or non-MS,
-/// or a collapsed retention-time summary the lever did not keep), and `waters:sonar-summed` when a
+/// its scan count unreadable, or a collapsed retention-time summary the lever did not keep), and `waters:sonar-summed` when a
 /// written SONAR function's quadrupole bins were summed into one scan.
 fn function_transformations(
     functions: &[FunctionInfo],

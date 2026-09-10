@@ -248,7 +248,9 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   NaN/Inf count in a `[count key=value]` tag, and the lane declares `agilent:truncate-unequal-arrays`
   and `agilent:nonfinite-intensity-to-zero` (`agl::host_counts`, pinned on host). The native Waters
   lane writes a `waters_functions` block on every run (the skipped, SONAR and collapsed functions and
-  the lock mass lived only in `waters_drift`, which a run without drift bins never gets), declares
+  the lock mass lived only in `waters_drift`, which a run without drift bins never gets), counts a
+  function whose scan count MassLynx cannot return among the skipped ones (it was only logged),
+  declares
   `waters:drop-functions` and `waters:sonar-summed`, and reads `MZPC_WATERS_KEEP_COLLAPSED` once
   through `env_flag`: with `=0` it used to skip the collapsed functions while reporting them written.
   A Shimadzu run under `MZPC_SHIMADZU_COARSE_MZ=1` names the coarse `Mass` field in
