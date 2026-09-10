@@ -18,6 +18,15 @@ fn run(args: &[&str]) {
     assert!(st.success(), "mzpeak-convert {args:?} failed: {st}");
 }
 
+/// The `value` of the first `<cvParam … accession="{acc}" … value="…"/>` in `xml`.
+fn cv_value(xml: &str, acc: &str) -> f64 {
+    let at = xml.find(&format!("accession=\"{acc}\"")).unwrap_or_else(|| panic!("no {acc} in:\n{xml}"));
+    let tag = &xml[at..at + xml[at..].find('>').unwrap()];
+    let v = tag.split("value=\"").nth(1).and_then(|s| s.split('"').next());
+    let v = v.unwrap_or_else(|| panic!("{acc} carries no value: {tag}"));
+    v.parse().unwrap_or_else(|e| panic!("{acc} value {v:?}: {e}"))
+}
+
 #[test]
 fn two_precursors_on_one_spectrum_keep_one_selected_ion_each() {
     let tmp = std::env::temp_dir().join(format!("mzpc-2prec-{}", std::process::id()));
@@ -46,5 +55,21 @@ fn two_precursors_on_one_spectrum_keep_one_selected_ion_each() {
     for mz in ["445.34", "645.34"] {
         assert!(xml.contains(mz), "selected ion {mz} missing from the round trip");
     }
+    // One ion per block with both values somewhere in the document is also what precursors reversed
+    // against their ions look like. Each block's ion must be ITS precursor's: the window targeting
+    // 445.3 holds 445.34, the one targeting 645.3 holds 645.34, in the fixture's order.
+    let pairs: Vec<(f64, f64)> = blocks
+        .iter()
+        .map(|b| {
+            let upto = b.split("</precursor>").next().unwrap();
+            (cv_value(upto, "MS:1000827"), cv_value(upto, "MS:1000744"))
+        })
+        .collect();
+    let want = [(445.3, 445.34), (645.3, 645.34)];
+    assert!(
+        pairs.len() == want.len()
+            && pairs.iter().zip(&want).all(|(p, w)| (p.0 - w.0).abs() < 1e-6 && (p.1 - w.1).abs() < 1e-6),
+        "(isolation window target, selected ion) per precursor: got {pairs:?}, expected {want:?}"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }

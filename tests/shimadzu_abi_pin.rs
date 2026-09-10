@@ -54,28 +54,55 @@ fn code_part(line: &str) -> &str {
     line.split("//").next().unwrap_or("").trim()
 }
 
-/// Ordered field names of a Rust struct: every `name: Type,` line in its body.
-fn rust_fields(name: &str) -> Vec<String> {
+/// Ordered `(name, type)` of a Rust struct: every `name: Type,` line in its body.
+fn rust_fields(name: &str) -> Vec<(String, String)> {
     let body = block_after(rust(), &format!("struct {name} {{"), "shimadzu.rs");
     body.lines()
         .map(code_part)
         .filter(|l| !l.is_empty())
-        .filter_map(|l| l.split_once(':').map(|(f, _)| f.trim().to_string()))
+        .filter_map(|l| {
+            l.split_once(':')
+                .map(|(f, t)| (f.trim().to_string(), t.trim().trim_end_matches(',').trim().to_string()))
+        })
         .collect()
 }
 
-/// Ordered field names of a C# struct: every `public <type> <Name>;` line in its body. The body
+/// Ordered `(Name, type)` of a C# struct: every `public <type> <Name>;` line in its body. The body
 /// starts at the `{` on the line after the declaration.
-fn cs_fields(name: &str) -> Vec<String> {
+fn cs_fields(name: &str) -> Vec<(String, String)> {
     let body = block_after(glue(), &format!("public struct {name}\n{{"), "Glue.cs");
     body.lines()
         .map(code_part)
         .filter(|l| l.starts_with("public ") && l.ends_with(';'))
         .map(|l| {
-            let l = l.trim_end_matches(';');
-            l.rsplit(char::is_whitespace).next().unwrap().to_string()
+            let words: Vec<&str> = l.trim_end_matches(';').split_whitespace().collect();
+            assert_eq!(words.len(), 3, "Glue.cs: {name}: `{l}` is not `public <type> <Name>;` (parser drift?)");
+            (words[2].to_string(), words[1].to_string())
         })
         .collect()
+}
+
+/// The blittable scalars `#[repr(C)]` and `LayoutKind.Sequential` lay out identically: Rust type, C#
+/// type, size in bytes (= alignment). `bool` and `char` are absent on purpose — they marshal to a
+/// different width than they occupy in Rust.
+const SCALARS: &[(&str, &str, usize)] = &[
+    ("i8", "sbyte", 1),
+    ("u8", "byte", 1),
+    ("i16", "short", 2),
+    ("u16", "ushort", 2),
+    ("i32", "int", 4),
+    ("u32", "uint", 4),
+    ("i64", "long", 8),
+    ("u64", "ulong", 8),
+    ("f32", "float", 4),
+    ("f64", "double", 8),
+];
+
+/// The integer literal right after `needle` (`size_of::<X>() == 48` → 48).
+fn literal_after(src: &str, needle: &str, what: &str) -> usize {
+    let at = src.find(needle).unwrap_or_else(|| panic!("{what}: `{needle}` not found")) + needle.len();
+    let digits: String = src[at..].chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().unwrap_or_else(|_| panic!("{what}: no integer after `{needle}`"))
 }
 
 /// Every literal the Rust loader resolves through `pdcstr!("…")`, minus the managed type name
@@ -176,7 +203,7 @@ fn struct_twins_have_the_same_fields_in_the_same_order() {
         let cs = cs_fields(name);
         assert!(!rust.is_empty(), "shimadzu.rs: {name} has no fields (parser drift?)");
         assert!(!cs.is_empty(), "Glue.cs: {name} has no fields (parser drift?)");
-        for (i, (r, c)) in rust.iter().zip(cs.iter()).enumerate() {
+        for (i, ((r, _), (c, _))) in rust.iter().zip(cs.iter()).enumerate() {
             assert_eq!(
                 norm(r),
                 norm(c),
@@ -190,6 +217,35 @@ fn struct_twins_have_the_same_fields_in_the_same_order() {
             "{name} field count drifted: shimadzu.rs has {} {rust:?}, Glue.cs has {} {cs:?}",
             rust.len(),
             cs.len()
+        );
+    }
+}
+
+/// Names alone let an `i32` face a `long`: same names, same order, and every later field read four
+/// bytes off. Each field's C# type must be the twin of its Rust type, and the size BOTH sides assert
+/// (`size_of` in shimadzu.rs, `Marshal.SizeOf` in the glue's static ctor) must be the sequential
+/// layout those types produce — so a width changed on both sides without the size literals fails too.
+#[test]
+fn struct_twins_have_the_same_field_types_and_size() {
+    for name in ["ShimadzuSpectrumMeta", "ShimadzuSpectrumMetaV2"] {
+        let (rs, cs) = (rust_fields(name), cs_fields(name));
+        assert_eq!(rs.len(), cs.len(), "{name}: field count drifted: {rs:?} vs {cs:?}");
+        let (mut size, mut align) = (0usize, 1usize);
+        for ((r, rt), (c, ct)) in rs.iter().zip(&cs) {
+            let &(_, want, bytes) = SCALARS.iter().find(|(t, _, _)| t == rt).unwrap_or_else(|| {
+                panic!("{name}.{r}: `{rt}` is not a blittable scalar this pin maps (extend SCALARS)")
+            });
+            assert_eq!(ct, want, "{name}.{r}: shimadzu.rs `{rt}` ({bytes} B) faces Glue.cs `{ct} {c}`");
+            size = size.next_multiple_of(bytes) + bytes;
+            align = align.max(bytes);
+        }
+        let size = size.next_multiple_of(align);
+        let rust_says = literal_after(rust(), &format!("size_of::<{name}>() == "), "shimadzu.rs");
+        let cs_says = literal_after(glue(), &format!("Marshal.SizeOf<{name}>() != "), "Glue.cs");
+        assert_eq!(
+            (rust_says, cs_says),
+            (size, size),
+            "{name}: its fields lay out to {size} B; shimadzu.rs asserts {rust_says}, Glue.cs {cs_says}"
         );
     }
 }
