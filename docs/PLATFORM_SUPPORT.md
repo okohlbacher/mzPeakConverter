@@ -116,10 +116,12 @@ The matrix above is exercised by CI (`.github/workflows/`):
   `manylinux_2_28` (the glibc 2.28 floor is asserted on the binary), Windows x86_64 + ARM64 with
   the glue, each built and smoke-converted natively on its own architecture. A pull request that
   edits the workflow runs the whole matrix as a dry run.
-- **`windows.yml`** — Windows: build with the native vendor readers, run tests, build the
-  **glues `src/` actually loads — `glue/sciex`, `glue/shimadzu`, plus the
-  Agilent net48 host so it stays compilable while `BACKLOG.md` #23 is decided** — and verify
-  each artifact is produced (for Shimadzu also that the generated runtimeconfig carries
-  `EnableUnsafeBinaryFormatterSerialization=true`, the switch whose absence broke 0.9.11),
-  smoke-convert the fixture, and (separate jobs) exercise the `--via-msconvert` lane and a real
+- **`windows.yml`** — Windows: build with the native vendor readers; build the glues `src/`
+  loads (`glue/sciex`, `glue/shimadzu` and the Agilent net48 host) and verify each artifact is
+  produced (for Shimadzu also that the generated runtimeconfig carries
+  `EnableUnsafeBinaryFormatterSerialization=true`, the switch whose absence broke 0.9.11); run the
+  tests after the glue builds; open the Shimadzu glue again after a reader was dropped, in a
+  process of its own and without vendor DLLs (hostfxr refuses that second start once the first
+  runtime was freed, which broke every verbose Shimadzu conversion before 0446ea3);
+  smoke-convert the fixture; and (separate jobs) exercise the `--via-msconvert` lane and a real
   timsTOF ion-mobility comparison.

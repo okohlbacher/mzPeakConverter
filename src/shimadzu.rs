@@ -892,3 +892,30 @@ fn path_to_pdcstring(p: &Path) -> Result<PdCString> {
         .parse()
         .map_err(|e| anyhow!("encoding path {} for the .NET host: {e}", p.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// Open a reader, drop it, open another — in ONE process. hostfxr refuses to start a runtime
+    /// again once the first one's last handle was freed ("Initialization request is expected to be
+    /// non-null…", 0x80008081); before 0446ea3 every `-v` conversion did exactly that. No vendor DLL
+    /// is needed: the glue boots first and only then fails in its `Open` (no
+    /// `Shimadzu.LabSolutions.IO` under `MZPC_PWIZ_DIR`, no such `.lcd`), so reaching that error
+    /// twice is the proof. Ignored under `cargo test`, whose single process may already hold
+    /// hostfxr through another glue or a Thermo boot and would hide the bug; windows.yml runs it
+    /// alone with `MZPC_SHIMADZU_GLUE` and `MZPC_PWIZ_DIR` set.
+    #[test]
+    #[ignore = "needs a built glue/shimadzu and a process of its own (windows.yml)"]
+    fn a_reader_opens_again_after_one_was_dropped() {
+        let lcd = Path::new("no-such-run.lcd");
+        for attempt in ["first", "second"] {
+            let err = super::ShimadzuReader::open(lcd).err().expect("there is no .lcd to open");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("Shimadzu glue failed to open"),
+                "the {attempt} open did not get past the glue's boot: {msg}"
+            );
+        }
+    }
+}

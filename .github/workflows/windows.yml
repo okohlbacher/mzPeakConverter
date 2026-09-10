@@ -3,11 +3,13 @@ name: Windows
 # Validates the converter on the real Windows target:
 #  - `windows` job: builds the default configuration — which on Windows compiles every native
 #    vendor reader automatically (Agilent MHDAC host, SciEX Clearcore2, Shimadzu, Bruker BAF FFI;
-#    there are no cargo features) — plus the C# interop glues, runs the tests, boots the Agilent
-#    host, and smoke-converts a tiny bundled mzML.
+#    there are no cargo features) — plus the C# interop glues, then runs the tests, boots the
+#    Agilent host, opens the Shimadzu glue again after a reader was dropped (in a process of its
+#    own), and smoke-converts a tiny bundled mzML.
 #  - `msconvert` job: installs ProteoWizard and exercises the --via-msconvert lane.
-# Runtime conversion of actual Agilent/SciEX/BAF *data* via the native readers
-# still needs the proprietary vendor DLLs + vendor data and stays out of CI.
+# No push or pull-request job converts vendor data through a native reader: that needs the
+# proprietary vendor DLLs. The manual `sciex-native-zeno` job (dispatch target `sciex-native`) does,
+# for two public WIFFs, with the Clearcore2 DLLs of a ProteoWizard build.
 
 on:
   push:
@@ -56,9 +58,6 @@ jobs:
       # build. No system deps to install.
       - name: Build (includes native vendor readers)
         run: cargo build --release --verbose
-
-      - name: Test
-        run: cargo test --release --verbose
 
       # Only glues src/ actually loads: SCIEX, Shimadzu and Agilent MHDAC (net48 host).
       # (The Waters lane has no glue: src/waters.rs calls MassLynxRaw's C exports.) Shimadzu is the
@@ -121,6 +120,31 @@ jobs:
             exit 1
           }
           Write-Host "OK $cfg : $key = true"
+
+      # After the glue builds, so a test can load a glue.
+      - name: Test
+        run: cargo test --release --verbose
+
+      # A glue opened, dropped and opened again in ONE process. hostfxr refuses to initialise once
+      # the first runtime's last handle is freed (0x80008081): before 0446ea3 every verbose Shimadzu
+      # conversion failed that way, with CI green. The boot comes before the glue touches a vendor
+      # DLL, so none is needed — MZPC_PWIZ_DIR names a directory without one, and each open fails
+      # in the glue's Open, past the boot. It needs a process of its own: in the shared `cargo test`
+      # process another glue or Thermo boot keeps hostfxr loaded and hides the bug, so the test is
+      # #[ignore]d there and runs alone here, and the step fails if it did not run.
+      - name: Glue opens again after a reader was dropped (own process)
+        shell: bash
+        env:
+          MZPC_SHIMADZU_GLUE: ${{ github.workspace }}/glue/shimadzu/bin/Release/net8.0
+          MZPC_PWIZ_DIR: ${{ runner.temp }}
+        run: |
+          set +e
+          out=$(cargo test --release --bin mzpeak-convert -- --ignored --exact shimadzu::tests::a_reader_opens_again_after_one_was_dropped 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 0 ]; then echo "::error::glue reopen check failed (exit $code)"; exit 1; fi
+          if ! grep -q "test result: ok. 1 passed" <<<"$out"; then echo "::error::the glue reopen test did not run"; exit 1; fi
 
       # Core convert path, end-to-end on Windows, against a tiny committed mzML.
       - name: Smoke test — convert a tiny mzML
