@@ -613,6 +613,7 @@ list of the declared, bounded changes the converter made to the vendor signal on
 | `sciex:nan-intensity-to-zero` | the glue mapped at least one NaN intensity Clearcore2 returned to 0 (counted per spectrum; a warning gives the total) | native SciEX `.wiff` |
 | `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
+| `thermo:target-only-isolation-window:<n>` | `<n>` precursor isolation windows had no width their scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and were written target-only; thermorawfilereader computes a quarter-width or inverted window for them | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 
 Not declared today, on purpose and worth knowing: the `--ims-chunked` ims-compact layout sorts each
 frame by TOF before chunking, which re-orders points across scans (an entry of the `sort-by-mz`

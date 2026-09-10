@@ -45,7 +45,12 @@ serde_yaml = "0.9"
 # gzip for stream-embedded vendor blobs (miniz_oxide backend — pure Rust, no native lib conflict).
 flate2 = "1"
 # Direct access to Thermo scan-trailer bags (FAIMS CV, injection time, charge, …) which mzdata's
-# spectrum API doesn't surface. Same crate (+ features) mzdata wraps, so it unifies to one copy.
+# spectrum API doesn't surface, including the `MS<n> Isolation Width` that decides whether a precursor
+# window is kept (src/thermo_isolation.rs). NOT the copy mzdata wraps: mzdata 0.66.6 depends on
+# thermorawfilereader 0.8.0 (dotnetrawfilereader-sys 0.8.0), which builds every spectrum and its
+# isolation window, while this pin resolves to 0.7.2 (sys 0.7.3) and serves only the trailer and
+# status-log facets. Cargo.lock holds both, and a Thermo run boots both .NET bundles. The features are
+# the same, so pinning mzdata's version here would make it one copy.
 thermorawfilereader = { version = "=0.7.2", features = ["net8_0", "nethost-download"] }
 
 # Optical-image first-IFD dimension reads (dimensions-only, no codecs) for --image embedding.
