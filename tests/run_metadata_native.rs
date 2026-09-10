@@ -4,7 +4,8 @@
 //! * `target_only_window.mzML` — tiny.pwiz with every isolation window reduced to its target: the
 //!   archive must keep the target and NULL offsets. Before the fix the writer turned "width unknown"
 //!   into offsets of ±target (measured on RS080806, Minimal_DDA, En_PPY in the corpus).
-//! * A Bruker TSF `.d` (set `MZPC_TSF_FIXTURE=/path/to/x.d`; skipped when unset): every MS2 frame
+//! * A Bruker TSF `.d` (set `MZPC_TSF_FIXTURE=/path/to/x.d` and run with `--include-ignored`; the corpus holds no TSF
+//!   acquisition, and `bruker_tsf`'s unit tests pin the FrameMsMsInfo mapping without one): every MS2 frame
 //!   gets its `FrameMsMsInfo` precursor with a resolved parent, the stated charges are carried, and
 //!   the run block carries the zoned start time, serial, model, acquisition software, sample name
 //!   and the two digested members — what the mzML lane inherits from ProteoWizard, read natively.
@@ -13,6 +14,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[path = "common/corpus.rs"]
+mod corpus;
 
 fn convert(input: &Path, tag: &str, extra: &[&str]) -> PathBuf {
     let out = std::env::temp_dir().join(format!("mzpc-runmeta-{}-{tag}.mzpeak", std::process::id()));
@@ -72,13 +76,16 @@ fn a_target_only_isolation_window_keeps_null_offsets() {
 }
 
 #[test]
+#[ignore = "needs a Bruker TSF .d via MZPC_TSF_FIXTURE; the corpus holds no TSF acquisition"]
 fn tsf_frames_carry_their_frame_msms_info_precursors_and_the_run_block() {
     use arrow::array::{Array, AsArray};
-    let Ok(dot_d) = std::env::var("MZPC_TSF_FIXTURE") else {
-        eprintln!("MZPC_TSF_FIXTURE unset — skipping the TSF pin");
-        return;
-    };
-    let archive = convert(Path::new(&dot_d), "tsf", &["--no-vendor"]);
+    let Some(dot_d) = corpus::env_path("MZPC_TSF_FIXTURE") else { return };
+    let dot_d = dot_d.as_path();
+    let nonempty = |name: &str| std::fs::metadata(dot_d.join(name)).is_ok_and(|m| m.len() > 0);
+    // A TDF run with an empty analysis.tsf beside it once passed for a TSF fixture: refuse it.
+    assert!(nonempty("analysis.tsf") && !nonempty("analysis.tdf"),
+        "MZPC_TSF_FIXTURE={} is not a TSF acquisition (needs a non-empty analysis.tsf and no analysis.tdf)", dot_d.display());
+    let archive = convert(dot_d, "tsf", &["--no-vendor"]);
 
     // Every MS2 frame has exactly one precursor whose parent resolved to a spectrum index.
     let meta = table(&archive, "spectra_metadata.parquet");
