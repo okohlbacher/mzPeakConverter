@@ -216,6 +216,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   Thermo `.raw` only and only when unset (0.9.12). Exported box-wide, it overrode that scoping.
   Once a newer .NET major is installed in the box's `dotnet8` root, every `.lcd` would fail on the
   Shimadzu glue's BinaryFormatter path, and Clearcore2 would run on an unverified runtime.
+- **A failed box update no longer aborts the corpus run when the box already runs the wanted
+  version.** `box_convert.sh` accepted `have == want` only when the updater was busy or locked. A
+  `failed` update fell through to the `BOX_REQUIRE_VERSION=1` hard stop (exit 3, zero jobs) even
+  with nothing stale. On 2026-09-02, git's own stderr notice did exactly that: the updater fetches
+  before its "current" check. A failure is now accepted when the box reports the wanted version.
+  A refused-dirty tree is not accepted, since its exe may be built from uncommitted code under the
+  same version string.
 
 ### Changed
 
