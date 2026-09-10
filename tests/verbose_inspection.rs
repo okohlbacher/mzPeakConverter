@@ -1,0 +1,200 @@
+//! `-v` prints the inspection report beside a conversion; the report must never be what fails it,
+//! and it must not open a vendor library that the conversion opens again or does not need.
+//!
+//! The report ran before the lane was chosen, with a bare `?`: `-v --via-msconvert` on a `.wiff`
+//! without the native SciEX stack exited with the native reader's error and wrote nothing. With an
+//! output given, a report error is now a `note:` line and the chosen lane runs; without one the
+//! report is the whole job and its error stays the run's error.
+//!
+//! The Agilent, SciEX, Waters and Shimadzu branches exist only on Windows. The host-runnable
+//! trigger for a failing report is a TSF `.d` whose `analysis.tsf` is not SQLite: the report fails
+//! to open it, and so does the conversion, with its own `converting …` context — which can only
+//! appear if the report did not end the run first. The vendor library the report could open on
+//! every platform is Thermo's RawFileReader (`small.RAW`, plain or gzipped); on Linux and Windows,
+//! Bruker's baf2sql as well.
+//!
+//! Without `-o` nothing is converted and no lane is chosen, so `--via-msconvert` changes nothing
+//! there: the report is the whole job and opens the reader.
+
+use std::path::Path;
+use std::process::Command;
+
+/// What the report prints under `-o` in place of opening a vendor reader.
+const NOT_OPENED: &str = "note:          native reader not opened for this report: the conversion opens it";
+/// What it prints under `-o --via-msconvert`, whose lane needs no vendor reader.
+const NOT_NEEDED: &str = "note:          native reader not opened: --via-msconvert reads this file through ProteoWizard";
+
+#[test]
+fn a_failing_report_under_verbose_is_a_note_not_the_error() {
+    let dir = std::env::temp_dir().join(format!("mzpc-verbose-inspect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = dir.join("broken.d");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("analysis.tsf"), b"this is not an SQLite database").unwrap();
+    let exe = env!("CARGO_BIN_EXE_mzpeak-convert");
+
+    let converting = Command::new(exe)
+        .arg(&run)
+        .arg("-o")
+        .arg(dir.join("out.mzpeak"))
+        .arg("-v")
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let inspecting = Command::new(exe).arg(&run).output().expect("failed to run mzpeak-convert");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&converting.stdout);
+    let stderr = String::from_utf8_lossy(&converting.stderr);
+    assert!(
+        stdout.contains("note:          inspection failed: reading TSF"),
+        "the report's error must be a note; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!converting.status.success(), "the broken run still fails to convert");
+    assert!(stderr.contains("error: converting "), "the lane must run after the report; stderr:\n{stderr}");
+
+    let stdout = String::from_utf8_lossy(&inspecting.stdout);
+    let stderr = String::from_utf8_lossy(&inspecting.stderr);
+    assert!(!inspecting.status.success(), "without an output the report is the job, and it failed");
+    assert!(!stdout.contains("inspection failed"), "no note when the report is the job; stdout:\n{stdout}");
+    assert!(stderr.contains("error: reading TSF"), "stderr:\n{stderr}");
+}
+
+/// mzdata reads a Thermo `.raw` through RawFileReader, an in-process .NET runtime. Beside a
+/// conversion the report leaves it closed (it printed `spectra: 48` from an open of its own), and
+/// the conversion still opens the file and writes the archive.
+#[test]
+fn verbose_leaves_the_thermo_reader_to_the_conversion() {
+    let dir = std::env::temp_dir().join(format!("mzpc-verbose-thermo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("small.mzpeak");
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/small.RAW"))
+        .arg("-o")
+        .arg(&out)
+        .arg("-v")
+        .env_remove("DOTNET_ROLL_FORWARD") // the binary's own Thermo default decides (tests/thermo_raw.rs)
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let converted = out.is_file();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stdout.contains("format:        Thermo .raw"), "stdout:\n{stdout}");
+    assert!(stdout.contains(NOT_OPENED), "the report must leave RawFileReader closed; stdout:\n{stdout}");
+    assert!(!stdout.contains("spectra:"), "a spectrum count means the report opened the file; stdout:\n{stdout}");
+    assert!(run.status.success() && converted, "the conversion still runs; stderr:\n{stderr}");
+}
+
+/// A gzipped Thermo run is read the same way: the report and the conversion each gunzip
+/// `small.RAW.gz` to a plain `small.RAW`, which mzdata opens through RawFileReader. The gate tested
+/// only a plain `.raw` name, so beside a conversion the report still opened it (`spectra: 48`).
+/// The child gets `DOTNET_ROLL_FORWARD=LatestMajor` explicitly: the binary sets that default for a
+/// plain `.raw` name only, and without it a host whose newest runtime is .NET 9 or 10 cannot open
+/// the gunzipped copy in the conversion either.
+#[test]
+fn verbose_leaves_the_thermo_reader_closed_for_a_gzipped_run_too() {
+    let dir = std::env::temp_dir().join(format!("mzpc-verbose-thermo-gz-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let gz = dir.join("small.RAW.gz");
+    let raw = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/small.RAW")).unwrap();
+    let mut enc = flate2::write::GzEncoder::new(std::fs::File::create(&gz).unwrap(), flate2::Compression::default());
+    std::io::Write::write_all(&mut enc, &raw).unwrap();
+    enc.finish().unwrap();
+    let out = dir.join("small.mzpeak");
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&gz)
+        .arg("-o")
+        .arg(&out)
+        .arg("-v")
+        .env("DOTNET_ROLL_FORWARD", "LatestMajor")
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let converted = out.is_file();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stdout.contains("format:        Thermo .raw"), "stdout:\n{stdout}");
+    assert!(stdout.contains(NOT_OPENED), "the report must leave RawFileReader closed; stdout:\n{stdout}");
+    assert!(!stdout.contains("spectra:"), "a spectrum count means the report opened the file; stdout:\n{stdout}");
+    assert!(run.status.success() && converted, "the conversion still runs; stderr:\n{stderr}");
+}
+
+/// Without `-o` the run converts nothing, so `--via-msconvert` (given here, or by a `--config`
+/// profile) chooses no lane: the report is the job and opens the reader. It printed only a note
+/// that ProteoWizard reads the file, which nothing did, and no counts.
+#[test]
+fn an_inspection_opens_the_thermo_reader_under_via_msconvert_too() {
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/small.RAW"))
+        .arg("--via-msconvert")
+        .env_remove("DOTNET_ROLL_FORWARD") // the binary's own Thermo default decides (tests/thermo_raw.rs)
+        .output()
+        .expect("failed to run mzpeak-convert");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stdout.contains("spectra:       48"), "the inspection must open the reader; stdout:\n{stdout}");
+    assert!(!stdout.contains("not opened"), "stdout:\n{stdout}");
+    assert!(run.status.success(), "stderr:\n{stderr}");
+}
+
+/// Beside a `--via-msconvert` conversion the report leaves RawFileReader closed, and the lane runs
+/// after it: a `--msconvert-path` that names no file makes that lane fail at once, with its own
+/// error.
+#[test]
+fn verbose_via_msconvert_leaves_the_thermo_reader_closed() {
+    let dir = std::env::temp_dir().join(format!("mzpc-verbose-msconvert-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/small.RAW"))
+        .arg("-o")
+        .arg(dir.join("small.mzpeak"))
+        .arg("-v")
+        .arg("--via-msconvert")
+        .arg("--msconvert-path")
+        .arg(dir.join("no-such-msconvert"))
+        .env_remove("DOTNET_ROLL_FORWARD")
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stdout.contains(NOT_NEEDED), "stdout:\n{stdout}");
+    assert!(!stdout.contains("spectra:"), "a spectrum count means the report opened the file; stdout:\n{stdout}");
+    assert!(!run.status.success(), "without msconvert nothing is written");
+    assert!(stderr.contains("msconvert not found"), "the lane must run after the report; stderr:\n{stderr}");
+}
+
+/// Bruker's baf2sql is a vendor library on Linux and Windows. Beside a conversion the report leaves
+/// it closed; before, a missing baf2sql library was its error. Any non-empty `analysis.baf` makes
+/// the `.d` a BAF run, and nothing here reads it. (The BAF lane, like this test, exists on Linux
+/// and Windows only, so macOS never runs it.)
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn verbose_leaves_the_baf_reader_to_the_conversion() {
+    let dir = std::env::temp_dir().join(format!("mzpc-verbose-baf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = dir.join("run.d");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("analysis.baf"), b"not a BAF file").unwrap();
+    let converting = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&run)
+        .arg("-o")
+        .arg(dir.join("run.mzpeak"))
+        .arg("-v")
+        .env_remove("TIMSDATA_LIB_DIR")
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&converting.stdout);
+    assert!(stdout.contains("format:        Bruker BAF (.d)"), "stdout:\n{stdout}");
+    assert!(stdout.contains(NOT_OPENED), "the report must leave baf2sql closed; stdout:\n{stdout}");
+    assert!(!stdout.contains("inspection failed"), "the report opened baf2sql; stdout:\n{stdout}");
+}

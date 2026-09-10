@@ -17,19 +17,18 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | `libbaf2sql_c` (native C, in-process) | `libbaf2sql_c` at runtime |
 | Bruker `.d` via **timsdata SDK** (`--bruker-sdk`) | ✅ | ❌ | ✅ | Bruker `timsdata` lib (opt-in) | `libtimsdata.so`/`.dll` via `TIMSDATA_LIB_DIR` |
 | Agilent `.d` (non-IM, native) | ❌ | ❌ | ✅ (scan data; MRM/SIM-only runs refused) | out-of-process **net48** host (`AgilentGlueHost.exe`) → MHDAC, `AGL2` file protocol | MHDAC DLLs (ProteoWizard), .NET Framework 4.8 |
-| Agilent `.d` IM-MS (6560 IM-QTOF) | ❌ | ❌ | ❌ | the drift dimension needs MIDAC. Without the MIDAC glue and DLLs the run is refused; where they load, the in-process scaffold (`glue/agilent_midac`) is dispatched instead and cannot succeed — it has never converted a file, and can end in a CoreCLR error rather than the refusal. Use `--via-msconvert` | — |
+| Agilent `.d` IM-MS (6560 IM-QTOF) | ❌ | ❌ | ❌ (refused: no MIDAC reader) | the drift dimension needs Agilent's MIDAC SDK, which this converter does not read: `--via-msconvert` only | a ProteoWizard install |
 | Agilent `.d` **profile** (`--agilent-grid`) | ⚠️ | ⚠️ | ⚠️ | pure Rust (reads `MSProfile.bin`) | — (two known decode gaps, below) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ (scan data; MSn precursors ⚠️ not yet run on Windows; MRM/SIM dwell runs refused) | in-process .NET glue (`SciexGlue.dll`, ABI-versioned) → Clearcore2 | Clearcore2 DLLs |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`ShimadzuGlue.dll`) → LabSolutions.IO | LabSolutions.IO DLLs from a **current** ProteoWizard |
 | Waters `.raw` (native) | ❌ | ❌ | ✅ | `libloading` → `MassLynxRaw.dll` C exports (no .NET glue) | MassLynx/pwiz DLLs |
 | **anything** via ProteoWizard | ✅ | ✅ | ✅ | `--via-msconvert` subprocess | a ProteoWizard install (Wine off-Windows) |
 
-✅ native on that OS · ⚠️ partial, see the note · ⛔ present in the tree but not connected ·
-❌ not native (use `--via-msconvert`). The compile-time gates in `src/main.rs` are
-`#[cfg(windows)]` on the Agilent, MIDAC, SciEX and Shimadzu modules and on the Waters dispatch
-(`src/waters.rs` itself compiles everywhere, and runs only on Windows), and
-`#[cfg(any(windows, target_os = "linux"))]` on the BAF and timsdata SDK modules; macOS gets none of
-those.
+✅ native on that OS · ⚠️ partial, see the note · ❌ not native (use `--via-msconvert`). The
+compile-time gates in `src/main.rs` are `#[cfg(windows)]` on the Agilent (MHDAC host), SciEX and
+Shimadzu modules, and `#[cfg(any(windows, target_os = "linux"))]` on BAF and the timsdata SDK. The
+Waters reader (`libloading`) compiles everywhere; only its dispatch is Windows-gated. macOS gets
+none of those readers.
 
 ## Why the platform split
 
@@ -49,8 +48,7 @@ those.
   native SciEX archive as unconfirmed; archives from 0.11.5 and earlier have none.
 - **Waters (MassLynx)** needs no glue at all: `MassLynxRaw.dll` exposes a plain C ABI, which
   `src/waters.rs` loads with `libloading` and calls directly. Point `MZPC_MASSLYNX_DIR` (or
-  `MZPC_PWIZ_DIR`) at the directory holding that DLL. The `glue/waters` C# project is a
-  never-wired alternative to this lane — no code path reads it or `MZPC_WATERS_GLUE`.
+  `MZPC_PWIZ_DIR`) at the directory holding that DLL.
 - **Agilent (MHDAC) — ✅ out-of-process since 0.11.0.** MHDAC is a **.NET Framework 4.x**
   assembly set whose `OpenDataFile` calls `Delegate.BeginInvoke`, permanently unsupported on
   .NET Core/5+, so it cannot be hosted in-process under .NET 8. The converter therefore spawns
@@ -67,16 +65,22 @@ those.
   one-point "MS2 spectrum" per dwell (27,674 of them for MTBLS243) while the data are the 113
   transition chromatograms the msconvert lane writes; the guard reads MHDAC's `ScanTypes`, so
   the corpus harness falls back to msconvert for those units. Not carried yet: precursor
-  metadata for MS2 scans, MRM chromatograms (by design), the flight-time grid (`--tof-grid` is
-  not applied on this lane; m/z is the f64 MHDAC returns, numpress-chunked by default).
+  metadata for MS2 scans (the lane warns once per run when it writes MS2 rows without one), MRM
+  chromatograms (by design), the flight-time grid (`--tof-grid` is not applied on this lane; m/z
+  is the f64 MHDAC returns, numpress-chunked by default).
   Cost model: the host materialises the whole run into a temp file at 16 B/point before the
-  first spectrum is read (~3 GB for the 242 MB Q-TOF run), removed on close.
+  first spectrum is read (~3 GB for the 242 MB Q-TOF run), removed on close and by the panic
+  hook (a Ctrl+C, which ends both processes, still leaves it). The host runs under a deadline
+  (`MZPC_AGILENT_HOST_TIMEOUT`, default two hours), so a stuck host is killed; a converter that is
+  itself killed still leaves the host running and its temp file behind.
 
 - **Agilent profile (`--agilent-grid`) — ⚠️ pure Rust, two known decode gaps.** Neither
   profile-bearing `.d` in the project corpus converts today: one fails LZF decompression of an
   `MSProfile.bin` segment (`LZF: back-reference before output start`), the other has an IM-QTOF
   `MSScan.xsd` with no `SpectrumParamsType`, which the schema walk rejects. Files outside those
-  two shapes are expected to work; there is no corpus coverage proving it.
+  two shapes are expected to work; there is no corpus coverage proving it. Not carried yet:
+  precursor metadata for MS2 scans (`MSScan.bin`'s precursor fields are not decoded; the lane
+  warns once per run when it writes MS2 rows without one).
 
 ## The .NET glue executables (Windows)
 
@@ -87,7 +91,6 @@ DLLs**, on any OS with a .NET SDK). Build each once and point the converter at i
 | Glue | Project | Build output | Env var |
 |---|---|---|---|
 | Agilent (MHDAC) | `glue/agilent` (**net48**, out-of-process) | `bin/Release/net48/AgilentGlueHost.exe` | `MZPC_AGILENT_GLUE` |
-| Agilent IM (MIDAC) | `glue/agilent_midac` (net8) | `bin/Release/net8.0/AgilentMidacGlue.dll` | `MZPC_AGILENT_MIDAC_GLUE` |
 | SciEX (Clearcore2) | `glue/sciex` (net8) | `bin/Release/net8.0/SciexGlue.dll` | `MZPC_SCIEX_GLUE` |
 | Shimadzu (LabSolutions.IO) | `glue/shimadzu` (net8) | `bin/Release/net8.0/ShimadzuGlue.dll` | `MZPC_SHIMADZU_GLUE` |
 
@@ -97,10 +100,18 @@ dotnet build glue/shimadzu/ShimadzuGlue.csproj -c Release   # → ShimadzuGlue.d
 dotnet build glue/agilent/AgilentGlue.csproj   -c Release   # → AgilentGlueHost.exe (net48)
 ```
 
-**In a release archive** these four builds ship under `glue\<name>\` (`sciex`, `shimadzu`,
-`agilent`, `agilent_midac`) beside `mzpeak-convert.exe`, and the converter looks there whenever the
+**In a release archive** these three builds ship under `glue\<name>\` (`sciex`, `shimadzu`,
+`agilent`) beside `mzpeak-convert.exe`, and the converter looks there whenever the
 variable is unset — so an unpacked Windows release needs no glue variables (releases after 0.11.5;
 0.11.5's archive needs them set). The variable, when set, always wins.
+
+**.NET 8 support ends on 2026-11-10** (Microsoft's policy; .NET 9 ends the same day, .NET 10 on
+2028-11-14). The SciEX and Shimadzu glues target `net8.0` and stay there for now, so after that date
+they run on an out-of-support runtime. Shimadzu cannot simply move up: its vendor library
+deserialises through `BinaryFormatter`, which throws on .NET 9 and later unless Microsoft's
+unsupported compatibility package is added, untested inside a glue like this one (see
+[`glue/shimadzu/README.md`](../glue/shimadzu/README.md)). The Agilent host is .NET Framework 4.8
+and is not affected.
 
 The vendor DLLs themselves are sourced at **runtime** from a ProteoWizard install
 (`MZPC_PWIZ_DIR`); both layouts are probed — `<pwiz>/vendor_api/<Vendor>` as the bundled
@@ -130,12 +141,12 @@ The matrix above is exercised by CI (`.github/workflows/`):
   whose inspection and mzML export both hold every source spectrum. Every archive ships
   `THIRD-PARTY-NOTICES.md`, and each release a CycloneDX SBOM generated from `Cargo.lock`. A pull
   request that edits the workflow runs the whole matrix as a dry run.
-- **`windows.yml`** — Windows: build with the native vendor readers, run tests, build the
-  **glues `src/` loads — `glue/sciex`, `glue/shimadzu`, `glue/agilent_midac`, and `glue/agilent`,
-  the net48 host the native Agilent lane has spawned since 0.11.0** — and verify
-  each artifact is produced (for Shimadzu also that the generated runtimeconfig carries
-  `EnableUnsafeBinaryFormatterSerialization=true`, the switch whose absence broke 0.9.11),
-  smoke-convert the fixture, and (separate jobs) exercise the `--via-msconvert` lane and a real
-  timsTOF ion-mobility comparison. The unwired `glue/waters` is deliberately not built or
-  asserted (it was until 2026-09-04; Shimadzu — the one wired glue with an ABI handshake — was
-  not built at all).
+- **`windows.yml`** — Windows: build with the native vendor readers; build the glues `src/`
+  loads (`glue/sciex`, `glue/shimadzu` and the Agilent net48 host) and verify each artifact is
+  produced (for Shimadzu also that the generated runtimeconfig carries
+  `EnableUnsafeBinaryFormatterSerialization=true`, the switch whose absence broke 0.9.11); run the
+  tests after the glue builds; open the Shimadzu glue again after a reader was dropped, in a
+  process of its own and without vendor DLLs (hostfxr refuses that second start once the first
+  runtime was freed, which broke every verbose Shimadzu conversion before 0446ea3);
+  smoke-convert the fixture; and (separate jobs) exercise the `--via-msconvert` lane and a real
+  timsTOF ion-mobility comparison.

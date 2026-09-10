@@ -3,11 +3,13 @@ name: Windows
 # Validates the converter on the real Windows target:
 #  - `windows` job: builds the default configuration — which on Windows compiles every native
 #    vendor reader automatically (Agilent MHDAC host, SciEX Clearcore2, Shimadzu, Bruker BAF FFI;
-#    there are no cargo features) — plus the C# interop glues, runs the tests, boots the Agilent
-#    host, and smoke-converts a tiny bundled mzML.
+#    there are no cargo features) — plus the C# interop glues, then runs the tests, boots the
+#    Agilent host, opens the Shimadzu glue again after a reader was dropped (in a process of its
+#    own), and smoke-converts a tiny bundled mzML.
 #  - `msconvert` job: installs ProteoWizard and exercises the --via-msconvert lane.
-# Runtime conversion of actual Agilent/SciEX/BAF *data* via the native readers
-# still needs the proprietary vendor DLLs + vendor data and stays out of CI.
+# No push or pull-request job converts vendor data through a native reader: that needs the
+# proprietary vendor DLLs. The manual `sciex-native-zeno` job (dispatch target `sciex-native`) does,
+# for two public WIFFs, with the Clearcore2 DLLs of a ProteoWizard build.
 
 on:
   push:
@@ -57,25 +59,19 @@ jobs:
       - name: Build (includes native vendor readers)
         run: cargo build --release --verbose
 
-      - name: Test
-        run: cargo test --release --verbose
-
-      # Only glues src/ actually loads: SCIEX, Shimadzu, Agilent MHDAC (net48 host) and MIDAC.
-      # glue/waters is NOT built here — src/waters.rs drives MassLynxRaw directly and no code path
-      # reads WatersGlue.dll (see the doc comment on the Waters lane in src/main.rs), so asserting
-      # it only verified an artifact nothing ships. Shimadzu WAS missing and it is the one wired
-      # glue with an ABI handshake -- the one that broke at 0.9.11 with CI green.
+      # Only glues src/ actually loads: SCIEX, Shimadzu and Agilent MHDAC (net48 host).
+      # (The Waters lane has no glue: src/waters.rs calls MassLynxRaw's C exports.) Shimadzu is the
+      # glue with an ABI handshake -- the one that broke at 0.9.11 with CI green, unbuilt here then.
       - name: Build C# interop glues (reflection-only, no vendor DLLs)
         run: |
           dotnet build glue/sciex/SciexGlue.csproj -c Release
           dotnet build glue/shimadzu/ShimadzuGlue.csproj -c Release
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
-          dotnet build glue/agilent_midac/AgilentMidacGlue.csproj -c Release
 
       # Each native vendor reader needs its glue executable/assembly at runtime — fail the build if
       # any artifact is missing (e.g. a TFM rename or a glue that silently stopped emitting an exe).
-      # Agilent is the net48 AgilentGlueHost.exe (out-of-process); the other three are net8 DLLs.
-      - name: Verify produced executables (converter + 4 glue artifacts)
+      # Agilent is the net48 AgilentGlueHost.exe (out-of-process); the other two are net8 DLLs.
+      - name: Verify produced executables (converter + 3 glue artifacts)
         shell: pwsh
         run: |
           $need = @(
@@ -83,8 +79,7 @@ jobs:
             "glue/agilent/bin/Release/net48/AgilentGlueHost.exe",
             "glue/sciex/bin/Release/net8.0/SciexGlue.dll",
             "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.dll",
-            "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.runtimeconfig.json",
-            "glue/agilent_midac/bin/Release/net8.0/AgilentMidacGlue.dll"
+            "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.runtimeconfig.json"
           )
           $missing = $need | Where-Object { -not (Test-Path $_) }
           if ($missing) { Write-Error "missing build artifacts:`n$($missing -join "`n")"; exit 1 }
@@ -125,6 +120,31 @@ jobs:
             exit 1
           }
           Write-Host "OK $cfg : $key = true"
+
+      # After the glue builds, so a test can load a glue.
+      - name: Test
+        run: cargo test --release --verbose
+
+      # A glue opened, dropped and opened again in ONE process. hostfxr refuses to initialise once
+      # the first runtime's last handle is freed (0x80008081): before 0446ea3 every verbose Shimadzu
+      # conversion failed that way, with CI green. The boot comes before the glue touches a vendor
+      # DLL, so none is needed — MZPC_PWIZ_DIR names a directory without one, and each open fails
+      # in the glue's Open, past the boot. It needs a process of its own: in the shared `cargo test`
+      # process another glue or Thermo boot keeps hostfxr loaded and hides the bug, so the test is
+      # #[ignore]d there and runs alone here, and the step fails if it did not run.
+      - name: Glue opens again after a reader was dropped (own process)
+        shell: bash
+        env:
+          MZPC_SHIMADZU_GLUE: ${{ github.workspace }}/glue/shimadzu/bin/Release/net8.0
+          MZPC_PWIZ_DIR: ${{ runner.temp }}
+        run: |
+          set +e
+          out=$(cargo test --release --bin mzpeak-convert -- --ignored --exact shimadzu::tests::a_reader_opens_again_after_one_was_dropped 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 0 ]; then echo "::error::glue reopen check failed (exit $code)"; exit 1; fi
+          if ! grep -q "test result: ok. 1 passed" <<<"$out"; then echo "::error::the glue reopen test did not run"; exit 1; fi
 
       # Core convert path, end-to-end on Windows, against a tiny committed mzML.
       - name: Smoke test — convert a tiny mzML

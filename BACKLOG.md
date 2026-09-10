@@ -65,7 +65,6 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     readable on any host.
   - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
     per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
-  - `src/agilent_midac.rs` scaffold deletion (decided 2026-09-10, D10).
 - **Acquisition clocks — every open point in one place (2026-09-09).** `run.start_time` is an RFC 3339
   instant and RFC 3339 cannot say "zone unknown", so the converter's rule (branch
   `feat/native-run-metadata`, `src/run_metadata.rs`) is: a vendor time that STATES its UTC offset is
@@ -168,11 +167,13 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   MHDAC lane (the Q-TOF profile points sit on the flight-time lattice — the msconvert+`--tof-grid`
   build of the same run is 200 MB against 245 MB numpress-chunked f64; a SciEX-style per-run fit
   would close that); MRM/SIM transition chromatograms through MHDAC (today refused → msconvert);
-  `agilent_midac` is still the in-process net8 design MHDAC cannot run under and has never opened
-  a file — decided 2026-09-10 (D10): delete; the temp-file materialisation (16 B/point, whole run)
+  the temp-file materialisation (16 B/point, whole run)
   could stream, and the inspect path (no `-o`) pays it in full just to print a scan count (a host
-  `--count` mode would fix both); no timeout or kill-on-parent-death for the host process (a killed converter
-  orphans it); per-record scan types in the protocol so a mixed Scan+MRM method can drop the dwell rows
+  `--count` mode would fix both); no kill-on-parent-death for the host process (a killed converter
+  orphans it, still writing its temp file: a kill-on-close Job Object needs windows-sys's
+  `Win32_System_JobObjects` feature, a dependency change); a Ctrl+C still leaves the host's temp
+  file behind (the deadline and the panic-hook sweep do not cover a console interrupt, which ends
+  both processes); per-record scan types in the protocol so a mixed Scan+MRM method can drop the dwell rows
   instead of storing them as one-point spectra (today: a warning).
 - **Not in the ledger — surfaced by the 0.10.2 corpus rebuild (2026-09-06):** a chunk-capable
   integer axis. M6 put gridded profile spectra into `spectra_data`, which therefore has to be point
