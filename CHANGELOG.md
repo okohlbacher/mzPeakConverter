@@ -283,6 +283,19 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
+- **Output change: `transformations` lists what was applied to the archive, not what was
+  configured** (review D15). The writer now counts, per spectrum facet, the spectra its zero-run
+  mask shortened, the chunks it stored with numpress-linear, and the spectra its m/z re-sort
+  backstop reordered (`MzPeakWriterType::spectrum_signal_tally`, a vendored patch), and every lane
+  derives `zero-run-mask`, `numpress-linear` and `sort-by-mz` from those counts. Until now
+  `zero-run-mask` was written on every lane and `numpress-linear` whenever the codec was chosen:
+  103 corpus archives declared the mask with no profile spectrum, and 32 declared numpress with no
+  numpress chunk. The writer's backstop was never declared at all, although every native lane
+  relies on it. On `tiny.pwiz.1.1.mzML` the list is now `["numpress-linear"]` (its one profile
+  spectrum holds no zero run) and `[]` with `--no-numpress`;
+  `writer_counters_decide_the_writer_level_transformations` pins the mask, the backstop and the
+  empty list on the vendor-reader seam. A rebuilt corpus archive drops the entries that did not
+  happen; entry names are unchanged.
 
 ## [0.11.5] — 2026-09-09
 

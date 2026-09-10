@@ -56,6 +56,7 @@ mod visitor;
 
 pub use array_buffer::{
     ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChunkBuffers, PointBuffers,
+    SignalTally,
 };
 pub use base::AbstractMzPeakWriter;
 pub use builder::{ArrayConversionHelper, MzPeakWriterBuilder, WriteBatchConfig};
@@ -1121,6 +1122,17 @@ impl<
             }
         }
         Ok(())
+    }
+
+    /// VENDORED PATCH (mzPeakConverter D15): what the writer has changed in the spectrum signal so
+    /// far, over both spectrum facets: spectra the zero-run mask shortened, numpress chunks stored,
+    /// and spectra its m/z re-sort backstop reordered. Read before `finish_parquet` consumes it.
+    pub fn spectrum_signal_tally(&self) -> crate::writer::array_buffer::SignalTally {
+        let mut tally = self.spectrum_data_buffers.tally();
+        if let Some(peaks) = self.spectrum_peaks_writer.as_ref() {
+            tally += peaks.buffers().tally();
+        }
+        tally
     }
 
     /// Get the count of waiting spectrum data rows
