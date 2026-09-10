@@ -365,12 +365,12 @@ impl ShimadzuReader {
     }
 
     pub fn open_with(path: &Path, representation: Representation) -> Result<Self> {
-        let glue_dir = std::env::var_os("MZPC_SHIMADZU_GLUE")
-            .map(PathBuf::from)
+        let glue_dir = crate::pwiz_layout::glue_dir("MZPC_SHIMADZU_GLUE", "shimadzu")
             .ok_or_else(|| {
                 anyhow!(
-                    "MZPC_SHIMADZU_GLUE is not set; point it at the directory holding ShimadzuGlue.dll \
-                     (the `dotnet build` output of glue/shimadzu, e.g. .../bin/Release/net8.0)"
+                    "MZPC_SHIMADZU_GLUE is not set and there is no glue/shimadzu beside the executable; \
+                     point it at the directory holding ShimadzuGlue.dll (the `dotnet build` output of \
+                     glue/shimadzu, e.g. .../bin/Release/net8.0)"
                 )
             })?;
         let pwiz_dir = resolve_shimadzu_dll_dir()?;
