@@ -228,8 +228,11 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   minutes like `spectrum.time`, is now converted into each chromatogram column's declared unit
   before truncating: it had compared minutes with the stored seconds, so `--rt 0-0.05` kept the
   `sic` points up to 0.05 s instead of 3 s — on archives built before this change too, whose source
-  chromatograms are in seconds. mzML-lane archives change on reconversion (TIC/BPC times ×60).
-  Pinned by `tests/chromatogram_time_unit.rs`.
+  chromatograms are in seconds. Those archives also hold their synthesized TIC and BPC in minutes
+  under the seconds label, and `--rt` now cuts those two traces at 60 times the times it names
+  (`--rt 0-0.05` on `tiny.pwiz.1.1` converted by 0.11.5 keeps the TIC point at 0.70 min): rebuild an
+  mzML-lane archive before relying on `--rt` to truncate its chromatograms. mzML-lane archives change
+  on reconversion (TIC/BPC times ×60). Pinned by `tests/chromatogram_time_unit.rs`.
 - **`--sample` is recorded like every other option, warned about where it is inert, and accepted
   by `--config`.** It was copied into the SciEX lanes' setting without being counted as given, so
   `--sample 3` on a Thermo `.raw`, an mzML, a timsTOF run or an archive exited 0 without a word;

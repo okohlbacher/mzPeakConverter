@@ -210,7 +210,9 @@ keeping spectra whose retention time is within `--rt MIN-MAX` (same unit as the 
 `--drop-aux <glob>` (`--no-vendor` on this lane is shorthand for `--drop-aux 'vendor*'`). `--rt`
 also truncates the chromatograms, in the same minutes: each chromatogram time axis declares its own
 unit (seconds for ProteoWizard's chromatograms, and for the TIC/BPC stored beside them), and the
-window is converted into it. Parquet
+window is converted into it. An mzML-lane archive converted by 0.11.5 or earlier holds those TIC/BPC
+in minutes under the seconds label, so `--rt` cuts them at 60 times the times it names: rebuild such
+an archive first. Parquet
 facets are copied verbatim, so encoder options are inert here — warned about, not refused (see the
 table above). The same
 lane injects `--image` / `--sdrf` into an existing archive — the documented way to add them to an
