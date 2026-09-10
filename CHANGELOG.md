@@ -26,6 +26,20 @@ All notable changes to this project are documented here. The format follows
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
 
+### Fixed
+
+- **`--via-msconvert --to mzml --sample N` exports sample N, not the last one.** The mzML
+  msconvert lane built its own command line without the `--runIndexSet <N-1>` that the mzPeak
+  msconvert lane passes for a `.wiff`/`.wiff2`, and `run` did not refuse `--sample` there. With
+  one `--outfile`, msconvert writes every run of a multi-sample WIFF in turn and the last one
+  wins (En_PPY: 117 samples, one survived), so the export was the file's last sample under
+  exit 0 whatever `--sample` said. Both msconvert lanes now add the argument through one
+  helper; `tests/mzml_export_atomic.rs` checks it with a stand-in msconvert that records its
+  arguments. The native `--to mzml` SciEX lane (Windows) ignored `--sample` as well and
+  exported every sample of the file as one run. It now calls `refuse_if_unsupported` and
+  `select_sample` like the mzPeak SciEX lane, so there too a multi-sample WIFF needs
+  `--sample`, and MRM/SIM dwell runs and unreadable samples are refused instead of exported.
+
 ## [0.11.5] — 2026-09-09
 
 ### Fixed

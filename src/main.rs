@@ -414,8 +414,8 @@ struct Cli {
 
     /// SciEX `.wiff` holding SEVERAL samples: which one to convert (1-based). An archive is ONE
     /// run, so a multi-sample file is refused without this (concatenating the samples under one
-    /// run id, as before 0.12, was a conversion of none of them). The msconvert lane maps it to
-    /// `--runIndexSet <N-1>`; without it that lane silently kept only the LAST sample.
+    /// run id, as before 0.12, was a conversion of none of them). The msconvert lanes map it to
+    /// `--runIndexSet <N-1>`; without it those lanes silently kept only the LAST sample.
     #[arg(long, value_name = "N")]
     sample: Option<u32>,
 
@@ -1768,6 +1768,15 @@ fn is_wiff(input: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("wiff") || e.eq_ignore_ascii_case("wiff2"))
 }
 
+/// `--sample N` for both msconvert lanes (mzPeak and `--to mzml`). A multi-sample WIFF is several
+/// runs; with one `--outfile` msconvert writes them in turn and the LAST wins (En_PPY: 117
+/// samples, one survived), so the run is picked explicitly.
+fn msconvert_sample_arg(cmd: &mut Command, input: &Path) {
+    if let Some(n) = sciex_sample().filter(|_| is_wiff(input)) {
+        cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
+    }
+}
+
 /// True for a Waters MassLynx `.raw`. Unlike a Thermo `.raw` (a single FILE), a Waters `.raw` is
 /// a DIRECTORY with a `.raw` extension that holds `_HEADER.TXT` and per-function `_FUNCnnn.DAT`
 /// files. Requiring `is_dir()` keeps it from colliding with the Thermo `.raw` file; the
@@ -1900,14 +1909,7 @@ fn convert_via_msconvert(
         .arg(&tmpdir)
         .arg("--outfile")
         .arg("via_msconvert.mzML");
-    // A multi-sample WIFF is several runs; with one `--outfile` msconvert writes them in turn and
-    // the LAST wins (En_PPY: 117 samples, one survived). `--sample N` picks the run explicitly.
-    if let Some(n) = sciex_sample() {
-        let ext = input.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-        if ext == "wiff" || ext == "wiff2" {
-            cmd.arg("--runIndexSet").arg(n.saturating_sub(1).to_string());
-        }
-    }
+    msconvert_sample_arg(&mut cmd, input);
     // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
     // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
     if let Ok(f) = fs::File::create(&mzcvt_log) {
@@ -1983,7 +1985,13 @@ fn convert_to_mzml(
     }
     #[cfg(windows)]
     if is_wiff(input) {
-        let r = sciex::SciexReader::open(input)?;
+        // Same guards as the mzPeak SciEX lane: an mzML is one run too, so a multi-sample WIFF
+        // needs `--sample` and exports only that sample's spectra.
+        let mut r = sciex::SciexReader::open(input)?;
+        r.refuse_if_unsupported(input, sciex_sample())?;
+        if let Some(n) = sciex_sample() {
+            r.select_sample(n)?;
+        }
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
     #[cfg(windows)]
@@ -2405,6 +2413,7 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
         .arg(outdir)
         .arg("--outfile")
         .arg(outfile);
+    msconvert_sample_arg(&mut cmd, input);
     if let Ok(f) = fs::File::create(&log_path) {
         if let Ok(f2) = f.try_clone() {
             cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));

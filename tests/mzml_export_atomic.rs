@@ -110,3 +110,47 @@ fn successful_mzml_export_is_renamed_into_place() {
     assert!(inspect.status.success() && text.contains("spectra:       4"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--via-msconvert --to mzml --sample N` must hand msconvert `--runIndexSet <N-1>`: with one
+/// `--outfile` it writes every run of a multi-sample WIFF in turn and the LAST wins, so without
+/// the argument the export was the last sample under exit 0. The `.wiff` is never opened on the
+/// way to msconvert, so the stand-in only records its arguments and copies its input into place.
+#[cfg(unix)]
+#[test]
+fn via_msconvert_mzml_export_passes_the_sample_as_run_index_set() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("sample");
+    let input = dir.join("multi.wiff");
+    std::fs::copy(FIXTURE, &input).unwrap();
+    let argv = dir.join("argv");
+    let script = dir.join("msconvert");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" > '{argv}'\n\
+             in=$1\n\
+             while [ $# -gt 0 ]; do\n\
+             case $1 in --outdir) outdir=$2 ;; --outfile) outfile=$2 ;; esac\n\
+             shift\n\
+             done\n\
+             cp \"$in\" \"$outdir/$outfile\"\n",
+            argv = argv.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = dir.join("out.mzML");
+    let r = run(&[
+        &input, Path::new("-o"), &output, Path::new("--to"), Path::new("mzml"),
+        Path::new("--via-msconvert"), Path::new("--msconvert-path"), &script,
+        Path::new("--sample"), Path::new("3"),
+    ]);
+    assert!(r.status.success(), "export failed: {}", String::from_utf8_lossy(&r.stderr));
+    let args: Vec<String> = std::fs::read_to_string(&argv).unwrap().lines().map(String::from).collect();
+    assert!(
+        args.windows(2).any(|w| w == ["--runIndexSet", "2"]),
+        "--sample 3 must reach msconvert as `--runIndexSet 2`; it got {args:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
