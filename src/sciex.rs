@@ -96,6 +96,8 @@ use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
 };
 
+use crate::sciex_run::SciexRunInfo;
+
 /// Hard cap on the number of points a single spectrum may report. Guards against a
 /// corrupt/hostile glue or vendor library returning an enormous length that would exhaust
 /// memory before we ever copy it. 100M points * (8 + 4) bytes ≈ 1.2 GiB.
@@ -173,16 +175,6 @@ struct GlueApi {
     /// run-level checks below are skipped with a warning rather than failing the conversion.
     run_info: Option<SciexRunInfoFn>,
     run_string: Option<SciexRunStringFn>,
-}
-
-/// Run-level counts the glue gathered while indexing the file.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SciexRunInfo {
-    pub samples: i32,
-    pub unreadable_samples: i32,
-    pub dwell_experiments: i32,
-    pub scan_experiments: i32,
-    pub total_experiments: i32,
 }
 
 impl GlueApi {
@@ -430,64 +422,28 @@ impl SciexReader {
         String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())])
     }
 
-    /// Refuse what this lane cannot store faithfully, BEFORE any spectrum is written:
-    ///
-    /// * **MRM / SIM experiments.** Clearcore2 hands a dwell out as a one-point "spectrum" whose
-    ///   m/z is the transition ORDINAL — the two published corpus archives built this way carried
-    ///   154,520 and 2,215 such rows with no Q1/Q3, dwell or compound identity (BACKLOG). They are
-    ///   transition chromatograms; msconvert writes them as SRM chromatograms with their identity,
-    ///   so the harness's fallback is the right lane (the message is what
-    ///   `tools/box_convert_remote.ps1` classifies on). A MIXED run is refused as a whole: dropping
-    ///   the dwell experiments would lose channels msconvert keeps.
-    /// * **Several samples without `--sample`.** The archive is one run; concatenating N samples
-    ///   under one run id is not a conversion of any of them (En_PPY: 116 of 117 samples in one
-    ///   archive, the mzML lane keeps only the last).
-    /// * **Unreadable samples.** A partial file must not publish as a complete one.
-    pub fn refuse_if_unsupported(&self, path: &Path, sample: Option<u32>) -> Result<()> {
-        let Some(info) = self.run_info() else { return Ok(()) };
-        if info.dwell_experiments > 0 {
-            bail!(
-                "{}: MRM/SIM dwell data only handled by the msconvert lane — {} of {} experiments are \
-                 MRM/SIM dwells and {} are scans (types: {}); the native reader would store each dwell \
-                 as a one-point spectrum without its transition. Use --via-msconvert, which writes SRM \
-                 chromatograms.",
-                path.display(),
-                info.dwell_experiments,
-                info.total_experiments,
-                info.scan_experiments,
-                self.run_string(0)
-            );
-        }
-        if info.unreadable_samples > 0 {
-            bail!(
-                "{}: {} of {} samples (or their experiments) could not be read by Clearcore2; refusing \
-                 to write a partial archive. Last glue error: {}",
-                path.display(),
-                info.unreadable_samples,
-                info.samples,
-                self.api.last_error().unwrap_or_default()
-            );
-        }
-        if info.samples > 1 && sample.is_none() {
-            bail!(
-                "{}: the WIFF holds {} samples and an archive is ONE run; pass --sample <1..{}> to \
-                 choose which to convert (sample names: {})",
-                path.display(),
-                info.samples,
-                info.samples,
-                self.run_string(5).replace('\u{1F}', " | ")
-            );
-        }
-        if let Some(n) = sample {
-            if n == 0 || n as i32 > info.samples.max(1) {
-                bail!("{}: --sample {n} is out of range (the WIFF holds {} samples)", path.display(), info.samples);
+    /// [`open`](Self::open) for a CONVERSION: refuse what this lane cannot store faithfully
+    /// ([`crate::sciex_run::refusal`]) before any spectrum is written, then restrict the reader to
+    /// `sample`. Both `.wiff` lanes (mzPeak and `--to mzml`) open through here, so they refuse the
+    /// same files. An older glue without `RunInfo` refuses nothing, as before.
+    pub fn open_run(path: &Path, sample: Option<u32>) -> Result<Self> {
+        let mut reader = Self::open(path)?;
+        if let Some(info) = reader.run_info() {
+            // The last error BEFORE the run strings: a string call that throws overwrites it.
+            let last_error = reader.api.last_error().unwrap_or_default();
+            let (types, names) = (reader.run_string(0), reader.run_string(5));
+            if let Some(msg) = crate::sciex_run::refusal(path, &info, sample, &types, &names, &last_error) {
+                bail!(msg);
             }
         }
-        Ok(())
+        if let Some(n) = sample {
+            reader.select_sample(n)?;
+        }
+        Ok(reader)
     }
 
     /// Restrict the reader to sample `n` (1-based). Walks every flattened entry's metadata once.
-    pub fn select_sample(&mut self, n: u32) -> Result<()> {
+    fn select_sample(&mut self, n: u32) -> Result<()> {
         let mut keep = Vec::new();
         for i in 0..self.count {
             let m = self.meta_raw(i)?;
