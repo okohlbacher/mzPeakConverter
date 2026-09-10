@@ -34,6 +34,25 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
+- **Native Bruker archives carry the LC system's device traces.** A timsTOF `.d` records its
+  pumps, column oven and autosampler in HyStar's `chromatography-data.sqlite`, which only the mzML
+  lane (through ProteoWizard) used to read; the native TDF and TSF lanes wrote the synthesized TIC
+  and BPC alone. Every Bruker lane now opens that file read-only and writes each trace after the
+  TIC/BPC, with ProteoWizard's `chromatogram title` and `Instrument` parameters: a pressure,
+  flow-rate or temperature trace as that PSI-MS chromatogram type with a pressure, flow-rate or
+  temperature array, anything else (solvent composition, setpoints, valve angles) as a non-standard
+  array named after the trace, each in the unit HyStar states. The value arrays are stored as
+  auxiliary arrays, which keep their own unit, and times are minutes like every other chromatogram.
+  HyStar's own `TIC,±MS` and `BPC,±MS` traces give way to the synthesized ones, as a source TIC/BPC
+  always has. A user-defined trace whose unit is a pressure or a flow rate is typed as one
+  (ProteoWizard does that only for a temperature). mzdata has no unit for bar, so a trace in bar is
+  stated in pascal, multiplied by exactly 10⁵, and the archive declares `bruker:trace-unit-rescale`
+  in `transformations`. The 32 TDF runs in the corpus hold 698 such traces, 139 of them in bar (25
+  Agilent pump traces on each PXD059079 run); their published archives change only when
+  reconverted. On the TSF run behind ProteoWizard's `timsTOF_autoMSMS_Urine_50s_neg` test file the
+  six Elute traces match its mzML exactly — values, times, chromatogram type and unit. Pinned by `bruker_traces::tests` (an in-memory HyStar database) and
+  `tests::finish_chromatograms_writes_the_bruker_device_traces`, which also checks that the input
+  directory is left untouched.
 
 ### Fixed
 
