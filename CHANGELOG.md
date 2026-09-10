@@ -39,6 +39,51 @@ All notable changes to this project are documented here. The format follows
   journal now reports SQLite's own error rather than "GlobalMetadata missing/invalid". Pinned by
   `bruker_tsf::msms_tests::open_never_writes_into_the_input_directory`.
 
+### Changed
+
+- **The ignored tests run, and no test that runs by default passes without asserting.** Of the six
+  `#[ignore]`d tests, four now run by default on every platform, on data already in the repository:
+  `by_id_reads_the_peaks_facet_on_a_centroid_only_archive` on the committed centroid-only fixture
+  instead of a 59 MB corpus mzML; `random_access_to_empty_spectrum_does_not_abort` converts that
+  fixture's genuinely empty spectrum to the point layout and asserts it comes back found and empty
+  while its neighbours keep their peaks (its corpus walk opened about 3 GB of archives and never
+  checked); `fractional_scan_number_moves_mobility` loads PXD078573 9629.d's calibration row through
+  `from_tdf` from an in-memory table and asserts the 1/K0 values its corpus version printed,
+  exactly; and `mzml_output_preserves_srm_chromatograms` writes its chromatogram-only mzML in the
+  test and checks the selected-ion trace's id, point counts and intensities at each hop, plus
+  exactly one TIC and one base-peak trace in each mzML — it had pinned a corpus archive whose
+  contents had drifted, and compared counts.
+- **Eight tests that printed `skipping`, or nothing at all, and passed wherever the corpus was
+  absent — CI included — now run on 1.3 MB of committed public fixtures** (sources in
+  `tests/fixtures/README.md`): both `gridded_spectrum_summaries` tests and
+  `tof_grid_subpath_embeds_sdrf` (the ProteoWizard SWATH mzML, gzipped), the Agilent scan-record
+  polarity test, and the Waters, Shimadzu and two Agilent run-metadata tests. `tests/fixtures/**` is
+  marked `-text`, so a Windows checkout keeps every fixture byte-identical — git's autocrlf would
+  otherwise rewrite `tiny.pwiz.1.1.mzML` and invalidate its indexedmzML offsets.
+- **The seven tests that genuinely need data too large to commit are `#[ignore]`d, with the
+  reason,** so CI reports them as not run rather than as passed: the two ims-compact tests and the
+  two `tests/tdf_*` tests (2485.d, 142 MB), the TSF pin (the corpus holds no TSF acquisition, and
+  the private runs it was checked against cannot be committed), and the two lane-parity tests (pairs
+  built on the Windows box). The ims-compact pair is pinned to 2485.d — a sorted walk of the corpus
+  had silently switched it to a 1.7 GB run — and now removes its scratch, which left about 5–7 GB in
+  `$TMPDIR` per run; `unexpected_and_stale` no longer passes on an empty or mistyped pair directory;
+  and the TSF pin refuses a directory that is not a TSF run.
+- **One gate for the corpus tests** (`tests/common/corpus.rs`, shared by the unit and integration
+  tests): `MZPEAK_CORPUS`, else `~/Claude/mzpeak-example-data/data`. A missing fixture prints
+  `SKIPPED` straight to stderr, and `MZPC_REQUIRE_CORPUS=1` turns it into a failure. The TSF and
+  lane-parity pins skip the same loud way when their own variable is unset — no corpus can supply
+  those inputs, so they skip even under `MZPC_REQUIRE_CORPUS=1` — and fail on a path that does not
+  exist. The gates had disagreed: some read only `$HOME`, and several returned without a word.
+- **`ims_compact_is_frame_preserving` and `contract_ims_compact_calibration_keys` no longer share a
+  scratch directory.** Both used `mzpc-test-{pid}` and extracted the same facet names, so in a
+  parallel run one truncated the Parquet file the other had just opened ("Parquet file too small.
+  Size is 0"); run one at a time they passed.
+- **The `FrameMsMsInfo` → precursor mapping behind the 0.11.3 TSF precursors is pinned on an
+  in-memory table** (`bruker_tsf::msms_tests`), since no TSF acquisition is available for the
+  end-to-end pin.
+- README: run the suite with `cargo test --release`, as CI does; the vendored writer's
+  `debug_assert`s can fail a plain debug run on inputs the release build handles.
+
 ## [0.11.5] — 2026-09-09
 
 ### Fixed

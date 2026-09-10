@@ -1744,57 +1744,35 @@ mod empty_frame_read_tests {
     /// `panic = "abort"` profile that kills the host on an ordinary read. Exercised end to end: build
     /// an archive containing an empty spectrum and read every spectrum back by index.
     #[test]
-    #[ignore = "needs the reference corpus (MZPEAK_CORPUS)"]
     fn random_access_to_empty_spectrum_does_not_abort() {
         use mzpeak_prototyping::MzPeakReader;
-        let Ok(root) = std::env::var("MZPEAK_CORPUS") else { return };
-        let archive = match std::env::var("MZPEAK_EMPTY_ARCHIVE") {
-            Ok(v) => std::path::PathBuf::from(v),
-            Err(_) => match walk(std::path::Path::new(&root), 6) {
-                Some(p) => p,
-                None => {
-                    eprintln!("skipping: no .mzpeak with an empty spectrum under {root}");
-                    return;
-                }
-            },
-        };
-        let mut r = match MzPeakReader::new(&archive) {
-            Ok(r) => r,
-            Err(e) => { eprintln!("skipping: {}: {e}", archive.display()); return }
-        };
-        let n = r.len().min(500);
-        let mut empties = 0usize;
+        // The committed centroid fixture's spectrum index 1 (scan=21) has defaultArrayLength 0.
+        // Converted to the POINT layout, whose span search was the defect, it gives an archive with
+        // a genuinely empty spectrum. The corpus walk this replaces opened about 3 GB of archives
+        // looking for one, and never checked that it had found one.
+        let input = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny_centroid_only.mzML"));
+        let dir = std::env::temp_dir().join(format!("mzpc-empty-span-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("point.mzpeak");
+        crate::convert_file(input, &archive, None, 3, None, true, Some(crate::TofGridMode::Off), &[], None, true)
+            .expect("convert the fixture to the point layout");
+        let mut r = MzPeakReader::new(&archive).expect("open the archive");
+        let n = r.len();
+        // (found, points) per index. `Ok(None)` would also look empty, so the shape is asserted exactly:
+        // the empty spectrum must come back FOUND and empty, and its neighbours with their points — a
+        // reader that returned nothing for every index passed the old `empties >= 1`.
+        let mut shape = Vec::with_capacity(n);
         for i in 0..n {
             match r.get_spectrum_peaks_for(i as u64) {
-                Ok(peaks) => {
-                    if peaks.map(|p| p.is_empty()).unwrap_or(true) { empties += 1 }
-                }
+                Ok(peaks) => shape.push((peaks.is_some(), peaks.map_or(0, |p| p.len()))),
                 Err(e) => panic!("read of spectrum {i} failed: {e}"),
             }
         }
-        eprintln!("read {n} spectra from {}; {empties} empty", archive.display());
-    }
-
-    /// First archive under `dir` that reports at least one zero-point spectrum.
-    fn walk(dir: &std::path::Path, depth: usize) -> Option<std::path::PathBuf> {
-        if depth == 0 { return None }
-        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
-        entries.sort();
-        for p in &entries {
-            if p.extension().is_some_and(|e| e == "mzpeak") && p.is_file() && has_empty_spectrum(p) {
-                return Some(p.clone());
-            }
-        }
-        entries.into_iter().filter(|p| p.is_dir()).find_map(|p| walk(&p, depth - 1))
-    }
-
-    fn has_empty_spectrum(archive: &std::path::Path) -> bool {
-        let Ok(mut r) = mzpeak_prototyping::MzPeakReader::new(archive) else { return false };
-        use mzdata::prelude::SpectrumLike;
-        (0..r.len().min(4000)).any(|i| {
-            mzdata::prelude::SpectrumSource::get_spectrum_by_index(&mut r, i)
-                .is_some_and(|s| s.peaks().len() == 0)
-        })
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(n, 3, "the fixture's three spectra");
+        assert_eq!(shape[1], (true, 0), "index 1 (scan=21) must be found and empty: {shape:?}");
+        assert!(shape[0].1 > 0 && shape[2].1 > 0, "the spectra around it keep their peaks: {shape:?}");
     }
 }
 

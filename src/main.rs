@@ -6612,6 +6612,10 @@ fn reader_format<R: std::io::Read + std::io::Seek>(reader: &MZReaderType<R>) -> 
 
 
 #[cfg(test)]
+#[path = "../tests/common/corpus.rs"]
+mod corpus_gate;
+
+#[cfg(test)]
 mod tests {
     use super::expand_empty_param_groups;
     use super::{decode_single_byte, rewrite_encoding_decl_to_utf8, sniff_xml_encoding};
@@ -7497,16 +7501,18 @@ mod tests {
         assert_eq!(n, 6, "expected 6 spectra in the mzML output, got {n}");
     }
 
-    /// `--to mzml` chromatogram regression (corpus-gated): a chromatogram-only SRM/MRM mzML (0
-    /// Corpus root for the `--ignored` fixture tests. Override with `MZPEAK_CORPUS`; defaults
-    /// under `$HOME` so the repository carries no absolute operator path.
-    fn corpus_root() -> std::path::PathBuf {
-        std::env::var("MZPEAK_CORPUS")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                    .join("Claude/mzpeak-example-data/data")
-            })
+    /// The timsTOF fixture of the corpus-gated tests below: the same run tests/tdf_*.rs pin as DOT_D.
+    const TDF_2485: &str = "ims-examples/PXD059079/20230830_100SPD_NCI7_0p12ng_HS_01_S1-B1_1_2485.d";
+    /// ProteoWizard's SCIEX SWATH centroid example, gzipped: every spectrum sits on the TOF lattice.
+    const SWATH_GZ: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
+
+    /// Removes a scratch directory when a test ends, pass or fail. The ims-compact pair wrote about
+    /// 1.75 GB per archive into a new pid-named directory on every run and never removed it.
+    struct RmDir(std::path::PathBuf);
+    impl Drop for RmDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     /// A CENTROID-ONLY archive must return its signal through `get_spectrum_by_id`, not just
@@ -7514,23 +7520,16 @@ mod tests {
     /// unconditionally, which reads only the `spectra_data` facet — so every peak living in
     /// `spectra_peaks` was invisible by ID and the call returned an empty spectrum. Centroid-only
     /// archives are the common case for several vendors, so this was a silent hole in the API.
-    /// Run with `cargo test --release by_id -- --ignored`.
+    /// The committed centroid-only fixture exercises exactly this: every spectrum is centroid, so
+    /// `spectra_data` stays empty and all the signal lives in `spectra_peaks`.
     #[test]
-    #[ignore = "needs a centroid mzML corpus fixture; run with --ignored"]
     fn by_id_reads_the_peaks_facet_on_a_centroid_only_archive() {
         use mzdata::io::DetailLevel;
         use mzdata::prelude::SpectrumSource;
         use mzpeak_prototyping::MzPeakReader;
         use std::fs;
 
-        let Some(input) = corpus_find(|p| {
-            p.is_file()
-                && p.file_name().and_then(|n| n.to_str())
-                    == Some("neg_01_Fistax_1-A,2_01_5715.mzML")
-        }) else {
-            eprintln!("corpus fixture not found; skipping");
-            return;
-        };
+        let input = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny_centroid_only.mzML"));
         // Unique per process: this test binary gets run more than once in a single `cargo test`
         // invocation, and a shared fixed path made the two runs delete each other's output mid-write.
         let tmp = std::env::temp_dir().join(format!("mzpc_by_id_test_{}", std::process::id()));
@@ -7568,61 +7567,84 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    /// The sciex-qtrap-6500 corpus archive (a scheduled-MRM run through the native SCIEX lane)
-    /// must reach mzML with its chromatograms intact — through the mzPeak→mzML export and again
-    /// through the mzML→mzML lane (the 0-spectra "Run to Run" writer crash lived there) — and the
-    /// test FAILS, rather than passing vacuously, when the pinned file is missing or carries no
-    /// chromatograms. Until 0.9.13 it picked any `*MRM*.mzML` under the corpus and returned quietly
-    /// when there was none or it had no chromatograms, so it asserted nothing on every host without
-    /// such a file, which was every host. The native lane stores this run's 154,520 transitions as
-    /// spectra, so the chromatograms pinned here are the TIC/BPC pair (a source with vendor SRM
-    /// traces would strengthen the pin), and the spectra are capped with `MZPC_MAX_SPECTRA` — the
-    /// mzPeak reader's per-index access makes a full pass over the archive a matter of hours,
-    /// while the chromatograms are carried whole regardless of the cap. Run with:
-    ///   `cargo test --release mzml_output_preserves_srm -- --ignored --nocapture`
+    /// A chromatogram-only archive (0 spectra) must reach mzML with its quantitative traces intact —
+    /// through the mzPeak→mzML export and again through the mzML→mzML lane, where the 0-spectra
+    /// "Run to Run" writer crash lived. The source is written here by mzdata from the committed
+    /// tiny.pwiz fixture's `sic` trace, so it is a valid indexedmzML — mzdata enumerates chromatograms
+    /// only through that index — and the test runs everywhere. It used to pin a corpus archive whose
+    /// contents had drifted away from this description, and it compared chromatogram COUNTS, which a
+    /// duplicated summary or a blank trace also satisfies. Here the non-summary trace — tiny.pwiz's
+    /// selected-ion current — must keep its id, its point counts and its intensities at each hop, and
+    /// each mzML must carry exactly one TIC and one base-peak trace.
     #[test]
-    #[ignore = "needs the sciex-qtrap-6500 corpus archive; run with --ignored"]
     fn mzml_output_preserves_srm_chromatograms() {
-        use mzdata::prelude::ChromatogramSource;
+        use mzdata::prelude::{ChromatogramLike, ChromatogramSource, MSDataFileMetadata};
 
-        let input = corpus_root().join("general-ms/sciex-qtrap-6500/En_PPY.mzpeak");
-        assert!(
-            input.is_file(),
-            "pinned corpus archive missing: {} (point MZPEAK_CORPUS at the corpus data root)",
-            input.display()
-        );
+        type Reader = super::MZReaderType<std::fs::File, super::CentroidPeak, super::DeconvolutedPeak>;
+        let is_tic = |c: &super::Chromatogram| matches!(c.chromatogram_type(), super::ChromatogramType::TotalIonCurrentChromatogram);
+        let is_bpc = |c: &super::Chromatogram| matches!(c.chromatogram_type(), super::ChromatogramType::BasePeakChromatogram);
+        // (id, time points, intensity points, intensity sum) of every non-summary trace, plus the number
+        // of TIC and base-peak traces.
+        type Trace = (String, usize, usize, f64);
+        let profile = |chroms: Vec<super::Chromatogram>| -> (Vec<Trace>, usize, usize) {
+            let traces = chroms.iter().filter(|c| !is_tic(c) && !is_bpc(c))
+                .map(|c| {
+                    let intensity = c.intensity().map(|v| v.to_vec()).unwrap_or_default();
+                    let sum = intensity.iter().map(|&x| x as f64).sum::<f64>();
+                    (c.id().to_string(), c.time().map(|t| t.len()).unwrap_or(0), intensity.len(), sum)
+                })
+                .collect();
+            (traces, chroms.iter().filter(|c| is_tic(c)).count(), chroms.iter().filter(|c| is_bpc(c)).count())
+        };
+        let of_mzml = |p: &std::path::Path| profile(Reader::open_path(p).expect("reopen mzML").iter_chromatograms().collect());
+
         let dir = scratch("srm");
+        let src = dir.join("chromatograms_only.mzML");
+        {
+            let mut tiny = Reader::open_path(TINY).expect("open tiny.pwiz");
+            let traces: Vec<super::Chromatogram> = tiny.iter_chromatograms().filter(|c| !is_tic(c) && !is_bpc(c)).collect();
+            let mut w = mzdata::io::mzml::MzMLWriter::new(fs::File::create(&src).unwrap());
+            w.copy_metadata_from(&tiny);
+            w.set_spectrum_count(0);
+            w.start_spectrum_list().unwrap();
+            for c in &traces {
+                w.write_chromatogram(c).unwrap();
+            }
+            w.close().unwrap();
+        }
+        let want = of_mzml(&src).0;
+        assert_eq!(want.iter().map(|t| (t.0.as_str(), t.1, t.2)).collect::<Vec<_>>(), [("sic", 10, 10)],
+            "the source carries tiny.pwiz's selected-ion trace and no spectra");
+        assert!(want[0].3 > 0.0, "the trace is not blank");
+        // Ids and point counts exactly; intensities by their sum, within float32 round-off.
+        let same = |got: &[Trace], lane: &str| {
+            assert_eq!(got.len(), want.len(), "{lane}: {got:?} vs {want:?}");
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!((&g.0, g.1, g.2), (&w.0, w.1, w.2), "{lane} keeps the trace's id and point counts");
+                assert!((g.3 - w.3).abs() <= 1e-6 * w.3.abs(), "{lane} keeps its intensities: sum {} vs {}", g.3, w.3);
+            }
+        };
+
+        let archive = dir.join("chromatograms_only.mzpeak");
         let hop1 = dir.join("hop1.mzML");
         let hop2 = dir.join("hop2.mzML");
-
-        let n_src = mzpeak_prototyping::MzPeakReader::new(&input)
-            .expect("open the pinned archive")
-            .count_chromatograms();
-        assert!(n_src > 0, "{} carries no chromatograms: the pin proves nothing", input.display());
-
-        let cap = [("MZPC_MAX_SPECTRA", "2000")];
-        let args: Vec<&std::ffi::OsStr> =
-            vec![input.as_os_str(), "-o".as_ref(), hop1.as_os_str(), "--force".as_ref()];
-        let (ok, _, err) = run_bin(&args, &cap);
-        assert!(ok, "mzPeak → mzML must not fail: {err}");
-        let args: Vec<&std::ffi::OsStr> =
-            vec![hop1.as_os_str(), "-o".as_ref(), hop2.as_os_str(), "--force".as_ref()];
-        let (ok, _, err) = run_bin(&args, &cap);
-        assert!(ok, "mzML → mzML must not fail: {err}");
-
-        let count = |p: &std::path::Path| {
-            let mut reader =
-                super::MZReaderType::<_, super::CentroidPeak, super::DeconvolutedPeak>::open_path(p)
-                    .expect("reopen mzML");
-            reader.iter_chromatograms().count()
+        for (from, to) in [(&src, &archive), (&archive, &hop1), (&hop1, &hop2)] {
+            let args: Vec<&std::ffi::OsStr> = vec![from.as_os_str(), "-o".as_ref(), to.as_os_str(), "--force".as_ref()];
+            let (ok, _, err) = run_bin(&args, &[]);
+            assert!(ok, "{} → {} must not fail: {err}", from.display(), to.display());
+        }
+        let in_archive = {
+            let mut r = mzpeak_prototyping::MzPeakReader::new(&archive).expect("open the archive");
+            let n = r.count_chromatograms();
+            profile((0..n).filter_map(|i| r.get_chromatogram_by_index(i)).collect())
         };
-        let (n_hop1, n_hop2) = (count(&hop1), count(&hop2));
+        let (after_export, after_relay) = (of_mzml(&hop1), of_mzml(&hop2));
         let _ = fs::remove_dir_all(&dir);
-        assert!(
-            n_hop1 >= n_src && n_hop2 >= n_src,
-            "chromatograms must survive both exports: {n_src} in the archive, {n_hop1} after \
-             mzPeak → mzML, {n_hop2} after mzML → mzML"
-        );
+        same(&in_archive.0, "the archive");
+        for (lane, (traces, tic, bpc)) in [("mzPeak → mzML", after_export), ("mzML → mzML", after_relay)] {
+            same(&traces, lane);
+            assert_eq!((tic, bpc), (1, 1), "{lane} writes one TIC and one base-peak trace, never a duplicate");
+        }
     }
 
     /// Flatten a peaks/data schema to the leaf column names — the v0.7 layout nests the signal
@@ -7640,62 +7662,21 @@ mod tests {
             .collect()
     }
 
-    /// First file/dir under the corpus matching `pred`, or `None`.
-    ///
-    /// The reference corpus is reorganised from time to time, so these fixtures are located by
-    /// SEARCH rather than by a pinned path — a moved file should skip the test, not fail it with a
-    /// stale path that says nothing about the code.
-    fn corpus_find(pred: impl Fn(&std::path::Path) -> bool) -> Option<std::path::PathBuf> {
-        fn walk(
-            dir: &std::path::Path,
-            depth: usize,
-            pred: &impl Fn(&std::path::Path) -> bool,
-            out: &mut Option<std::path::PathBuf>,
-        ) {
-            if out.is_some() || depth == 0 {
-                return;
-            }
-            let Ok(rd) = std::fs::read_dir(dir) else { return };
-            let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-            entries.sort();
-            for p in entries {
-                if pred(&p) {
-                    *out = Some(p);
-                    return;
-                }
-                if p.is_dir() {
-                    walk(&p, depth - 1, pred, out);
-                }
-            }
-        }
-        let mut out = None;
-        walk(&corpus_root(), 6, &pred, &mut out);
-        out
-    }
 
-    /// B.4 regression (frame-preserving ims-compact). Corpus-gated: needs the smallest timsTOF `.d`
-    /// (~2 GB), too large to vendor. Convert it and assert the peak facet carries
+    /// B.4 regression (frame-preserving ims-compact). Corpus-gated: needs a real timsTOF `.d`
+    /// (2485.d, 142 MB), too large to vendor. Convert it and assert the peak facet carries
     /// `mean_inverse_reduced_ion_mobility` (MS:1003006) and that #spectra == #TDF frames
     /// (one spectrum per FRAME, not per mobility scan). `#[ignore]` by default; run with:
     ///   `cargo test --release ims_compact_is_frame_preserving -- --ignored --nocapture`
-    /// Corpus path (see MEMORY: smallest timsTOF):
-    ///   $MZPEAK_CORPUS/ims-examples/bruker-timstof-pro/raw/SBA415_Try.d/SBA415(1) Try_Slot1-2_1_8271.d
     #[test]
-    #[ignore = "needs the ~2GB SBA415 timsTOF .d corpus fixture; run with --ignored"]
+    #[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
     fn ims_compact_is_frame_preserving() {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use std::fs;
 
-        let Some(input) = corpus_find(|p| {
-            p.is_dir()
-                && p.extension().is_some_and(|e| e == "d")
-                // Non-empty: the corpus keeps zero-byte `analysis.tdf` stubs in the OUTER `.d`
-                // wrapper directories, whose real acquisition lives one level down.
-                && std::fs::metadata(p.join("analysis.tdf")).is_ok_and(|m| m.len() > 0)
-        }) else {
-            eprintln!("skipping: no TDF .d under {}", corpus_root().display());
-            return;
-        };
+        // Pinned, not searched: a sorted walk of the corpus took whichever TDF sorted first, which had
+        // quietly become a 1.7 GB run rather than the SBA415 this doc used to name.
+        let Some(input) = crate::corpus_gate::corpus_path(TDF_2485) else { return };
         let input = input.as_path();
 
         // A directory of its own. `contract_ims_compact_calibration_keys` converts the same `.d` and extracts the same facet
@@ -7703,7 +7684,8 @@ mod tests {
         // truncate the Parquet file the other had just opened ("Parquet file too small. Size is 0").
         let scratch = &scratch("ims-frame-preserving");
         let scratch = scratch.as_path();
-        let output = scratch.join("sba415_ims_compact.mzpeak");
+        let _rm = RmDir(scratch.to_path_buf());
+        let output = scratch.join("ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
 
         super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
@@ -7751,28 +7733,22 @@ mod tests {
     /// renamed out from under readers. Corpus-gated (`#[ignore]`) because it converts real `.d`
     /// inputs. Run with `cargo test --release contract_ -- --ignored`.
     #[test]
-    #[ignore = "needs the SBA415 timsTOF .d corpus fixture; run with --ignored"]
+    #[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
     fn contract_ims_compact_calibration_keys() {
         use std::fs;
         use std::io::Read;
 
-        let Some(input) = corpus_find(|p| {
-            p.is_dir()
-                && p.extension().is_some_and(|e| e == "d")
-                // Non-empty: the corpus keeps zero-byte `analysis.tdf` stubs in the OUTER `.d`
-                // wrapper directories, whose real acquisition lives one level down.
-                && std::fs::metadata(p.join("analysis.tdf")).is_ok_and(|m| m.len() > 0)
-        }) else {
-            eprintln!("skipping: no TDF .d under {}", corpus_root().display());
-            return;
-        };
+        // Pinned, not searched: a sorted walk of the corpus took whichever TDF sorted first, which had
+        // quietly become a 1.7 GB run rather than the SBA415 this doc used to name.
+        let Some(input) = crate::corpus_gate::corpus_path(TDF_2485) else { return };
         let input = input.as_path();
         // A directory of its own. `ims_compact_is_frame_preserving` converts the same `.d` and extracts the same facet
         // names; with the one `mzpc-test-{pid}` both used to share, a parallel run let one test
         // truncate the Parquet file the other had just opened ("Parquet file too small. Size is 0").
         let scratch = &scratch("ims-calibration-contract");
         let scratch = scratch.as_path();
-        let output = scratch.join("sba415_contract.mzpeak");
+        let _rm = RmDir(scratch.to_path_buf());
+        let output = scratch.join("contract.mzpeak");
         let _ = fs::remove_file(&output);
         super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
             .expect("ims-compact conversion");
@@ -8230,15 +8206,11 @@ mod tests {
     }
 
     /// The mzML TOF-grid sub-path used to drop `--sdrf` (and `--image`) with exit 0 — the same
-    /// command kept or lost the SDRF depending on whether the grid fit passed. Corpus-gated: the
-    /// SWATH centroid mzML is the one ProteoWizard example whose fit is known to pass.
+    /// command kept or lost the SDRF depending on whether the grid fit passed. Runs on the committed
+    /// SWATH centroid mzML, the ProteoWizard example whose fit is known to pass.
     #[test]
     fn tof_grid_subpath_embeds_sdrf() {
-        let src = corpus_root().join("pwiz-examples/ABI/ABI/Reader_ABI_Test.data/swath.api-sample-centroid.mzML");
-        if !src.exists() {
-            eprintln!("skipping: {} not present", src.display());
-            return;
-        }
+        let src = std::path::PathBuf::from(SWATH_GZ);
         let dir = scratch("tofgrid");
         let sdrf = dir.join("s.tsv");
         fs::write(&sdrf, "source name\tcharacteristics[organism]\nrun1\thuman\n").unwrap();
