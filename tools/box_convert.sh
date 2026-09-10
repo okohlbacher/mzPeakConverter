@@ -7,6 +7,8 @@
 #   box_convert.sh --local <local-path> <dst> [-- <opts>]  # always host-stages the raw via S3
 #   box_convert.sh --manifest       jobs.tsv [--jobs N]    # url|s3://<TAB>out<TAB>opts
 #   box_convert.sh --local-manifest jobs.tsv [--jobs N]    # local-path<TAB>out<TAB>opts (corpus use)
+#       one line per archive: a multi-sample SciEX .wiff takes one line per sample, each with its own
+#       out and `--sample N` in opts (the box keeps --sample on the msconvert fallback too)
 #   flags: --local-copy PATH  where an s3:// dst is mirrored locally (default $CORPUS_ROOT/<key>)
 #          --no-fetch         do not mirror an s3:// dst back to the host
 #
@@ -27,7 +29,7 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$here/box.env" ] && . "$here/box.env"
 
-usage(){ sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage(){ sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 : "${BOX_SSH:?set BOX_SSH=user@flash-host (env or tools/box.env)}"
 : "${BOX_JUMP:?set BOX_JUMP=user@jumphost}"

@@ -34,6 +34,16 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
+- **The corpus harness builds one archive per sample of a multi-sample WIFF.** Both lanes now refuse
+  a multi-sample `.wiff` without `--sample` (see Fixed). At the next rebuild, `En_PPY.wiff`
+  (117 samples) and `IPX0002633001_D-239.wiff` would go from a silent one-sample archive to a
+  failed box job. A descriptor may now list the samples it publishes:
+  `convert: {input: En_PPY.wiff, samples: [1, 2]}`. `tools/corpus_reconvert.py` then builds each
+  sample as `<stem>.sample<N>.mzpeak` with `--sample N`, on the host or as one box job per sample.
+  A unit's former single archive is reported as `SUPERSEDED ON DISK`, and the run exits 1 until
+  it is removed. `box_convert_remote.ps1` keeps `--sample N` on its msconvert fallback, a
+  hand-written box manifest line can carry it, and `tools/lane_pairs.ps1` takes `'En_PPY.wiff@2'`.
+  Which samples to publish is the owner's decision, so no corpus descriptor lists any yet.
 
 ### Fixed
 
