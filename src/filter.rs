@@ -12,7 +12,8 @@
 //!     surviving `spectrum.index` set from `spectra_metadata`, then row-filter EVERY per-spectrum
 //!     facet (metadata, peaks/data, vendor trailers) down to that set. Peak columns are row-filtered,
 //!     never re-valued: keeping whole spectra leaves each spectrum's per-scan/per-chunk delta chain
-//!     intact. Chromatograms are truncated to the RT window (else copied). Indices are NEVER
+//!     intact. Chromatograms are truncated to the RT window, their auxiliary arrays with them (else
+//!     copied). Indices are NEVER
 //!     renumbered — surviving spectra keep their original (now-sparse) indices, so every
 //!     `source_index`/`precursor_index` cross-reference stays valid.
 //!
@@ -32,8 +33,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, StructArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float64Array, LargeListArray, LargeListBuilder, StructArray,
+    UInt8Array, UInt8Builder, UInt64Array,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -45,6 +48,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 
 use mzpeak_prototyping::archive::{DataKind, EntityType, FileEntry, ZipArchiveWriter};
+use mzpeak_prototyping::reader::visitor::AnyCURIEArray;
 
 /// Effective filter settings for one `.mzpeak → .mzpeak` run. Built by `main.rs` from the CLI/config.
 #[derive(Debug, Default, Clone)]
@@ -205,13 +209,14 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     }
 
     // ── chromatogram truncation prepass ─────────────────────────────────────────────────────────
-    // Under --rt, learn each chromatogram's surviving point count so we can also refresh the
-    // per-chromatogram number_of_data_points field in chromatograms_metadata.
-    let chrom_counts: Option<HashMap<u64, u64>> = if opts.rt.is_some()
+    // Under --rt, learn which of each chromatogram's points survive, so chromatograms_metadata can
+    // follow the truncation: its number_of_data_points, and its auxiliary arrays (the value arrays
+    // with no data-facet column, one value per point).
+    let chrom_kept: Option<HashMap<u64, Vec<bool>>> = if opts.rt.is_some()
         && member_names.iter().any(|n| n == "chromatograms_data.parquet")
     {
         let cd = read_member(&mut zip, "chromatograms_data.parquet")?;
-        Some(chromatogram_point_counts(&cd, opts.rt.unwrap())?)
+        chromatogram_kept_points(&cd, opts.rt.unwrap())?
     } else {
         None
     };
@@ -258,7 +263,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
                 &survivors,
                 filtering_spectra,
                 opts,
-                chrom_counts.as_ref(),
+                chrom_kept.as_ref(),
             )
             .with_context(|| format!("filtering facet {name}"))?;
             w.start_for_entry(fe)
@@ -605,7 +610,7 @@ fn process_parquet(
     survivors: &BTreeSet<u64>,
     filtering_spectra: bool,
     opts: &FilterOpts,
-    chrom_counts: Option<&HashMap<u64, u64>>,
+    chrom_kept: Option<&HashMap<u64, Vec<bool>>>,
 ) -> Result<Vec<u8>> {
     match class {
         Facet::RunGlobal => Ok(bytes.to_vec()), // verbatim
@@ -688,13 +693,13 @@ fn process_parquet(
         }
         Facet::ChromatogramMeta => {
             // Only --rt changes a chromatogram; otherwise copy verbatim, footer counts included.
-            let Some(counts) = chrom_counts.cloned() else {
+            let Some(kept) = chrom_kept else {
                 return Ok(bytes.to_vec());
             };
-            let total = counts.values().sum();
+            let total = kept.values().map(|points| kept_count(points)).sum();
             reencode(
                 bytes,
-                move |b| Ok(Some(refresh_chrom_point_counts(b, &counts)?)),
+                |b| Ok(Some(refresh_chrom_point_counts(b, kept)?)),
                 CountMode::ChromatogramMeta(total),
             )
         }
@@ -1049,9 +1054,11 @@ fn filter_chromatogram_time(
 // Chromatogram per-chromatogram point-count refresh
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Count each chromatogram's surviving points after the RT window truncation (chromatogram_index →
-/// count). Reads `chromatograms_data` once.
-fn chromatogram_point_counts(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<HashMap<u64, u64>> {
+/// Which of each chromatogram's points survive the RT window truncation: chromatogram_index → one
+/// flag per point, in stored order, decided as [`filter_chromatogram_time`] decides. Reads
+/// `chromatograms_data` once. `None` when the facet has no time axis to cut on: the data are then
+/// copied unchanged, and so is the metadata.
+fn chromatogram_kept_points(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<Option<HashMap<u64, Vec<bool>>>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))?;
     let field = {
         let sch = builder.schema();
@@ -1062,48 +1069,54 @@ fn chromatogram_point_counts(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<HashM
             .ok_or_else(|| anyhow!("chromatograms_data has no chromatogram_index struct"))?
     };
     let reader = builder.build()?;
-    let mut counts: HashMap<u64, u64> = HashMap::new();
+    let mut kept: HashMap<u64, Vec<bool>> = HashMap::new();
     for batch in reader {
         let batch = batch?;
         let s = struct_col(&batch, &field).unwrap();
         let idx = u64_child(s, "chromatogram_index").unwrap();
         if let Some(time) = f64_child(s, "time") {
-            // Point layout: one surviving point per in-window row.
+            // Point layout: one point per row.
             let k = minutes_in_axis(s, "time");
             let (lo, hi) = (lo * k, hi * k);
             for r in 0..idx.len() {
-                if time.value(r) >= lo && time.value(r) <= hi {
-                    *counts.entry(idx.value(r)).or_insert(0) += 1;
-                }
+                let keep = !time.is_null(r) && time.value(r) >= lo && time.value(r) <= hi;
+                kept.entry(idx.value(r)).or_default().push(keep);
             }
         } else if let (Some(start), Some(end)) =
             (f64_child(s, "time_chunk_start"), f64_child(s, "time_chunk_end"))
         {
-            // Chunk layout: a kept (overlapping) chunk contributes its whole intensity-list length.
+            // Chunk layout: a kept (overlapping) chunk keeps its whole intensity list.
             let k = minutes_in_axis(s, "time_chunk_start");
             let (lo, hi) = (lo * k, hi * k);
             for r in 0..idx.len() {
-                if end.value(r) >= lo && start.value(r) <= hi {
-                    *counts.entry(idx.value(r)).or_insert(0) += intensity_row_len(s, r);
-                }
+                let keep = end.value(r) >= lo && start.value(r) <= hi;
+                kept.entry(idx.value(r)).or_default().extend(std::iter::repeat_n(keep, intensity_row_len(s, r) as usize));
             }
+        } else {
+            return Ok(None);
         }
     }
-    Ok(counts)
+    Ok(Some(kept))
 }
 
-/// Rebuild `chromatograms_metadata` with each chromatogram's point count refreshed from `counts`:
-/// the top-level `number_of_data_points` of the flat layout, or the pre-0.7 nested
-/// `chromatogram.MS_1003060_number_of_data_points` child.
+fn kept_count(points: &[bool]) -> u64 {
+    points.iter().filter(|&&keep| keep).count() as u64
+}
+
+/// Rebuild `chromatograms_metadata` for the points `kept` ([`chromatogram_kept_points`]): each
+/// chromatogram's point count — the top-level `number_of_data_points` of the flat layout, or the
+/// pre-0.7 nested `chromatogram.MS_1003060_number_of_data_points` child — and, in the flat layout,
+/// its `auxiliary_arrays` cut to the same points.
 fn refresh_chrom_point_counts(
     batch: &RecordBatch,
-    counts: &HashMap<u64, u64>,
+    kept: &HashMap<u64, Vec<bool>>,
 ) -> Result<RecordBatch> {
     // Built in the column's own type: a UInt64 array under another integer type failed the re-encode.
     // The cast refuses a count that does not fit rather than writing a null.
     let recount = |idx: &UInt64Array, like: &DataType| -> Result<ArrayRef> {
-        let arr: ArrayRef =
-            Arc::new((0..idx.len()).map(|r| counts.get(&idx.value(r)).copied().or(Some(0))).collect::<UInt64Array>());
+        let arr: ArrayRef = Arc::new(
+            (0..idx.len()).map(|r| Some(kept.get(&idx.value(r)).map_or(0, |p| kept_count(p)))).collect::<UInt64Array>(),
+        );
         let opts = arrow::compute::CastOptions { safe: false, ..Default::default() };
         Ok(arrow::compute::cast_with_options(&arr, like, &opts)?)
     };
@@ -1112,6 +1125,9 @@ fn refresh_chrom_point_counts(
         (batch.schema().index_of("number_of_data_points"), batch.column_by_name("index").and_then(to_u64))
     {
         cols[pos] = recount(&idx, batch.column(pos).data_type())?;
+        if let Ok(aux) = batch.schema().index_of("auxiliary_arrays") {
+            cols[aux] = cut_auxiliary_arrays(&cols[aux], &idx, kept)?;
+        }
         return Ok(RecordBatch::try_new(batch.schema(), cols)?);
     }
     let field_name = "chromatogram";
@@ -1130,6 +1146,85 @@ fn refresh_chrom_point_counts(
     };
     cols[col_idx] = Arc::new(replace_struct_child(s, child_pos, recount(idx, s.column(child_pos).data_type())?)?);
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
+}
+
+/// Cut each chromatogram's auxiliary arrays to its kept points. An auxiliary array is a value array
+/// the data facet has no column for (a Bruker device trace's pressure, a solvent percentage), one
+/// value per point in stored order, so the data facet's row mask applies to it value by value. One
+/// that cannot be cut that way — an encoded buffer, a variable-width type, or not one value per
+/// point — stops the filter: kept whole, its values would pair with the wrong times.
+fn cut_auxiliary_arrays(
+    col: &ArrayRef,
+    index: &UInt64Array,
+    kept: &HashMap<u64, Vec<bool>>,
+) -> Result<ArrayRef> {
+    let lists = col
+        .as_any()
+        .downcast_ref::<LargeListArray>()
+        .ok_or_else(|| anyhow!("auxiliary_arrays is {}, not a large list", col.data_type()))?;
+    let offsets = lists.value_offsets();
+    let first = offsets[0];
+    let items_ref = lists.values().slice(first as usize, (offsets[lists.len()] - first) as usize);
+    let items = items_ref
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| anyhow!("auxiliary_arrays items are not structs"))?;
+    let (Some(data), Some(data_type), Some(compression)) =
+        (items.column_by_name("data"), items.column_by_name("data_type"), items.column_by_name("compression"))
+    else {
+        bail!("auxiliary_arrays items lack data, data_type or compression");
+    };
+    let data = data
+        .as_any()
+        .downcast_ref::<LargeListArray>()
+        .ok_or_else(|| anyhow!("auxiliary array data is {}, not a large list", data.data_type()))?;
+    let bytes = data
+        .values()
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| anyhow!("auxiliary array data holds {}, not bytes", data.values().data_type()))?;
+    let data_type = AnyCURIEArray::try_from(data_type).map_err(|_| anyhow!("auxiliary array data_type is not a CURIE"))?;
+    let compression = AnyCURIEArray::try_from(compression).map_err(|_| anyhow!("auxiliary array compression is not a CURIE"))?;
+    let DataType::LargeList(item) = data.data_type() else { unreachable!("downcast to a large list") };
+    let mut cut = LargeListBuilder::new(UInt8Builder::new()).with_field(item.clone());
+    let window = data.value_offsets();
+    for row in 0..lists.len() {
+        let chromatogram = index.value(row);
+        let points = kept.get(&chromatogram).map_or(&[][..], Vec::as_slice);
+        for e in (offsets[row] - first) as usize..(offsets[row + 1] - first) as usize {
+            if data.is_null(e) {
+                cut.append_null();
+                continue;
+            }
+            let values = &bytes.values()[window[e] as usize..window[e + 1] as usize];
+            let width = match data_type.value(e) {
+                Some(t) if t == mzdata::curie!(MS:1000521) || t == mzdata::curie!(MS:1000519) => 4, // 32-bit float, integer
+                Some(t) if t == mzdata::curie!(MS:1000523) || t == mzdata::curie!(MS:1000522) => 8, // 64-bit float, integer
+                _ => 0,
+            };
+            if width == 0 || compression.value(e) != Some(mzdata::curie!(MS:1000576)) || values.len() != points.len() * width {
+                bail!(
+                    "chromatogram {chromatogram}: an auxiliary array ({} bytes, type {:?}, compression {:?}) is not \
+                     one plain value per point of its {} points, so --rt cannot cut it with the times",
+                    values.len(),
+                    data_type.value(e),
+                    compression.value(e),
+                    points.len()
+                );
+            }
+            for (value, keep) in values.chunks_exact(width).zip(points) {
+                if *keep {
+                    cut.values().append_slice(value);
+                }
+            }
+            cut.append(true);
+        }
+    }
+    let pos = items.fields().iter().position(|f| f.name() == "data").unwrap();
+    let items = replace_struct_child(items, pos, Arc::new(cut.finish()))?;
+    let DataType::LargeList(field) = lists.data_type() else { unreachable!("downcast to a large list") };
+    let offsets = OffsetBuffer::new(offsets.iter().map(|o| o - first).collect::<Vec<i64>>().into());
+    Ok(Arc::new(LargeListArray::try_new(field.clone(), offsets, Arc::new(items), lists.nulls().cloned())?))
 }
 
 /// Return a new StructArray with child `pos` replaced (same fields, nulls).

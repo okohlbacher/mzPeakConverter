@@ -72,6 +72,35 @@ keep their bytes.
   `{"route": "mzdata-fallback", "reader": "mzdata", "reason": <the error>}`.
   `ims_compact_fallback_arm_records_the_route_it_took` forces the fallback arm with injected errors,
   and `convert_file_writes_the_route_it_is_handed` pins the block in the archive.
+- **Native Bruker archives carry the LC system's device traces.** A timsTOF `.d` records its
+  pumps, column oven and autosampler in HyStar's `chromatography-data.sqlite`, which only the mzML
+  lane (through ProteoWizard) used to read; the native TDF and TSF lanes wrote the synthesized TIC
+  and BPC alone. Every Bruker lane now opens that file read-only and writes each trace after the
+  TIC/BPC, with ProteoWizard's `chromatogram title` and `Instrument` parameters: a pressure,
+  flow-rate or temperature trace as that PSI-MS chromatogram type with a pressure, flow-rate or
+  temperature array, anything else (solvent composition, setpoints, valve angles) as ProteoWizard's
+  generic `chromatogram` (MS:1000625) with a non-standard array named after the trace, each in the
+  unit HyStar states. The type is a parameter as well as the typed column, so an mzML export of the
+  archive states it. The value arrays are stored as auxiliary arrays, which keep their own unit, and
+  times are minutes like every other chromatogram. HyStar's own MS traces give way to the
+  synthesized TIC/BPC, as a source TIC/BPC always has; that includes its MS/MS TIC
+  (`TIC,±AllMS/MS`, on every corpus run), which the spectra still yield. A user-defined trace whose
+  unit is a pressure or a flow rate is typed as one (ProteoWizard does that only for a temperature).
+  mzdata has no unit for bar, so a trace in bar is stated in pascal, as 64-bit floats that divide
+  back to the stored value exactly, and the archive declares `bruker:trace-unit-rescale` in
+  `transformations`. HyStar stored the four Thermo pump and column-oven traces of PXD079300's
+  `…_27806.d` in overlapping chunks, every sample three times and out of time order (1,079,478
+  points for 359,826 samples on each pressure trace): such a trace is written in time order with
+  each exact (time, value) repeat once, and the archive declares `bruker:trace-sort-dedup`. A
+  database in WAL mode is skipped with a warning, since SQLite cannot open one without creating
+  files beside it; no corpus file is in WAL mode. The 32 corpus runs with the file hold 698 such
+  traces, 139 of them in bar (5 on each of the 27 PXD059079 runs, 2 each on PXD076703 and
+  PXD078573); their published archives change only when reconverted. On the TSF run behind
+  ProteoWizard's `timsTOF_autoMSMS_Urine_50s_neg` test file the six Elute traces match its mzML in
+  values, times, unit and chromatogram type (the two solvent traces through the `chromatogram`
+  parameter; their typed column stays null). Pinned by `bruker_traces::tests` (an in-memory HyStar
+  database) and `tests::finish_chromatograms_writes_the_bruker_device_traces`, which also checks
+  that the input directory is left untouched.
 
 ### Fixed
 
@@ -103,6 +132,47 @@ keep their bytes.
   buffer, so it did not match the file before either. Pinned by
   `run_metadata_native::a_target_only_isolation_window_exports_to_mzml_target_only` and the
   split-write tests in `src/mzml_isolation.rs`.
+- **`--rt` paired a chromatogram's auxiliary values with the wrong times.** A chromatogram array
+  with no column in `chromatograms_data` (a native Bruker archive's device-trace pressure or solvent
+  percentage, above) is stored in `chromatograms_metadata.auxiliary_arrays`, one value per point.
+  The filter cut each chromatogram's time rows and `number_of_data_points` to the window but kept
+  those arrays whole, so a reader paired the kept times with the first values and an mzML export
+  wrote value arrays longer than `defaultArrayLength` (58 times beside 352 pressures on a TSF run
+  filtered to 1–2 min). They are now cut with the same per-point mask as the times; one that cannot
+  be cut value by value (an encoded buffer, a variable-width type, or not one value per point) stops
+  the filter. A chromatogram facet with no time axis to cut on keeps its metadata unchanged, as it
+  keeps its data, where its point counts used to be set to 0. Pinned by
+  `tests::an_rt_window_cuts_the_device_trace_values_with_their_times`.
+- **An mzML output's `<chromatogramList count>` said 2 whatever followed.** mzdata's writer starts
+  the count at its own TIC/BPC pair and writes it with the first chromatogram, and no lane set it,
+  so every source chromatogram passed through (`.mzpeak` → mzML, mzML → mzML) left it short: 2
+  around 8 chromatograms on a TSF run's archive. It is now the chromatograms written plus that pair.
+  Pinned by `tests::the_mzml_export_counts_and_types_the_device_traces`.
+- **The mzML export of an archive with device traces could not be converted again.** mzdata's
+  mzML reader has no case for the `flow rate array` (MS:1000820), `pressure array` (MS:1000821)
+  and `temperature array` (MS:1000822) such an export writes, so each came back untyped, and both
+  `x.mzML -o y.mzpeak` and `x.mzML -o y.mzML` aborted in mzdata's array naming (exit 134, nothing
+  written) on the export of every archive holding HyStar traces, as on any mzML with such an
+  array. An array whose type mzdata knows the accession of now takes that type and the
+  parameter's unit; any other unreadable array is kept, with a warning, as a non-standard data
+  array named after its parameter. The mzPeak lane keeps these arrays out of the sampled
+  chromatogram schema, so they are stored as auxiliary arrays in their own unit and data type, as
+  the native lane stores the same traces. Converted back from their exports, a PXD059079 run's
+  archive (25 traces) and a TSF run's (6) match the exported archives in every trace's (time,
+  value) pairs, and in every pressure, flow-rate and temperature trace's chromatogram type, array,
+  unit and data type; the first non-standard trace becomes a column that reads back without its
+  name, as the first non-standard chromatogram array of any mzML already did (BACKLOG). Pinned by
+  `tests::an_mzml_export_of_device_traces_converts_back` and
+  `tests::unreadable_chromatogram_arrays_get_names_the_writers_accept`.
+- **mzML → mzML dropped every chromatogram's type.** mzdata's mzML reader moves the type cvParam
+  into the typed field and its writer writes the parameters alone, so the output stated no
+  chromatogram type, which mzML requires (tiny.pwiz's selected ion current trace among them, and
+  the device traces above). The term is now written back unless a parameter still states a type,
+  from a table checked against `psi-ms.obo`; mzdata's own maps the selected ion monitoring and
+  selected reaction monitoring types onto two instrument-model accessions. The `.mzpeak` → mzML
+  export of an archive converted from mzML states the type again too. Pinned by
+  `tests::mzml_to_mzml_keeps_the_chromatogram_type` and
+  `tests::chromatogram_type_params_are_the_psi_ms_terms`.
 - **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
   mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
   a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes

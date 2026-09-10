@@ -494,7 +494,15 @@ WIFF.
 
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
 the Agilent-MHDAC and BAF lanes (Bruker TDF/TSF, Shimadzu, Waters and SciEX have them), and the
-non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz.
+non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz — except on a
+Bruker `.d`: every Bruker lane writes the HyStar traces in its `chromatography-data.sqlite` after
+the TIC/BPC (not `--to mzml` straight from the `.d`, which writes the TIC/BPC pair only), each
+value array in the unit HyStar states and each chromatogram type also as a parameter, so an mzML
+export states it (a trace in bar is stated in pascal as 64-bit floats, declared
+`bruker:trace-unit-rescale`; a trace stored in overlapping chunks is written in time order with
+each repeated sample once, declared `bruker:trace-sort-dedup`). HyStar's own MS traces, its
+MS/MS TIC `TIC,±AllMS/MS` among them, give way to the synthesized TIC/BPC, and a database in WAL
+mode is skipped with a warning, since SQLite cannot read one without writing into the input.
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
 PSI controlled-vocabulary meaning, it is mapped onto the standard
@@ -658,6 +666,8 @@ whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 | `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
 | `thermo:target-only-isolation-window:<n>` | `<n>` precursor isolation windows had no width their scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and were written target-only; thermorawfilereader computes a quarter-width or inverted window for them | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
+| `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
+| `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
 
 Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
