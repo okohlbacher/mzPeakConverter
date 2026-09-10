@@ -5212,10 +5212,10 @@ fn convert_baf(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_baf::BafReader::open_with(input, None, representation())?;
-    convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
-        reader.len(), |i| reader.spectrum(i),
-    )
+    // What the baf2sql cache's `Properties` table states (instrument series, serial, software, time).
+    // The digested members come from the directory itself, through `fixup_run_metadata`.
+    let hints = VendorHints { run_metadata: Some(reader.run_metadata()), ..Default::default() };
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Convert a Bruker TDF/TSF `.d` → mzPeak via the official Bruker **timsdata** SDK (opt-in
@@ -6664,14 +6664,20 @@ fn set_file_contents(target: &mut impl MSDataFileMetadata, seen: &Ms1Chroms, tic
 }
 
 /// The run metadata a vendor DIRECTORY input states in its side files, readable on any host:
-/// Bruker `.d` (`GlobalMetadata`), Agilent `.d` (`AcqData` XML). Waters `.raw` is handled by its
-/// lane through `VendorHints` because its naive time needs an index block.
+/// Bruker TDF/TSF `.d` (`GlobalMetadata`), Bruker BAF `.d` (its digested members; the run facts
+/// live in the baf2sql cache and arrive through the lane's hints), Agilent `.d` (`AcqData` XML).
+/// Waters `.raw` is handled by its lane through `VendorHints`.
 fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> {
     if !input.is_dir() {
         return None;
     }
     if vendor::bruker_sqlite(input).is_some() {
         return vendor::bruker_run_metadata(input);
+    }
+    // After the SQLite check: a BAF `.d` can hold a 0-byte `analysis.tdf` stub (NreB_PAS_DECONV),
+    // which `bruker_sqlite` already passes over.
+    if let Some(members) = vendor::bruker_baf_members(input) {
+        return Some(members);
     }
     agilent_meta::read(input)
 }
@@ -7175,6 +7181,48 @@ mod tests {
         assert_eq!(meta["acquisition_time"]["wall_clock"], "2024-10-09T09:09:26", "{:#}", meta);
         assert_eq!(meta["acquisition_time"]["zone"], "unstated");
         assert_eq!(meta["acquisition_time"]["source"], "Bruker GlobalMetadata AcquisitionDateTime");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A Bruker BAF `.d` names its three members, each with its SHA-1, through the fixup every
+    /// vendor-reader lane shares. The BAF lane itself runs only on Windows and Linux, so the seam is
+    /// driven with synthetic spectra. Through 0.11.5 such an archive named only the `.d`, with no
+    /// digest; the 0-byte `analysis.tdf` beside the `.baf` is NreB_PAS_DECONV's layout.
+    #[test]
+    fn baf_directory_members_are_digested_in_the_archive() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("baf-members");
+        let dot_d = dir.join("run.d");
+        fs::create_dir_all(&dot_d).unwrap();
+        for (name, body) in [
+            ("analysis.baf", &b"baf"[..]),
+            ("analysis.baf_idx", b"idx"),
+            ("analysis.baf_xtr", b"xtr"),
+            ("analysis.tdf", b""),
+        ] {
+            fs::write(dot_d.join(name), body).unwrap();
+        }
+        let out = dir.join("run.mzpeak");
+        convert_vendor_reader_tallied(&dot_d, &out, None, 1, None, false, VendorHints::default(), 2, |i| {
+            Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
+        })
+        .unwrap();
+        let meta = index_metadata(&out);
+        let files = meta["file_description"]["source_files"].as_array().unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr"], "{:#}", meta["file_description"]);
+        for f in files {
+            let name = f["name"].as_str().unwrap();
+            let sha = f["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["accession"] == "MS:1000569")
+                .unwrap_or_else(|| panic!("{name} carries no SHA-1"));
+            assert_eq!(sha["value"].as_str().unwrap(), crate::embed_aux::sha1_hex(&dot_d.join(name)).unwrap());
+        }
+        assert_eq!(meta["run"]["default_source_file_id"], "analysis.baf");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -207,6 +207,21 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `unzoned_vendor_directory_clock_reaches_the_index` on a synthetic TSF `.d` through the
   vendor-reader lane. USER_MANUAL §8 now tells readers to fall back to
   `acquisition_time.wall_clock` when `run.start_time` is null.
+- **The Bruker BAF lane records its run: member digests, instrument, software and acquisition
+  time.** It passed no run metadata at all, and `fixup_run_metadata` recognised only a non-empty
+  `analysis.tdf`/`.tsf` or an Agilent `AcqData`, so the two corpus BAF archives (FM_1-1_01_20254,
+  NreB_PAS_DECONV) named only the `.d`, with no MS:1000569 digest, no software, no start time, and an
+  instrument configuration holding a valueless `MS:1000031` (the writer's CvMapping placeholder for a
+  configuration with no model term). The directory now yields `analysis.baf`, `analysis.baf_idx` and
+  `analysis.baf_xtr` with their SHA-1s on any host (`vendor::bruker_baf_members`, also behind a 0-byte
+  `analysis.tdf` stub), and the lane reads the baf2sql cache's `Properties` table as ProteoWizard
+  does: `InstrumentFamily` becomes the PSI-MS series term of ProteoWizard's
+  `translateAsInstrumentSeries` (the generic Bruker model term for an unlisted code), plus
+  `InstrumentSerialNumber`, `AcquisitionSoftware` + version and `AcquisitionDateTime`
+  (`vendor::baf_properties_metadata`). Pinned by `baf_directory_members_are_digested`,
+  `baf_properties_state_the_series_their_family_code_names` and
+  `baf_directory_members_are_digested_in_the_archive`. The `Properties` read runs only where
+  baf2sql exists (Windows, Linux) and is unverified against a real cache; CI compiles it.
 
 ### Changed
 

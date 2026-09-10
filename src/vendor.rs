@@ -276,6 +276,78 @@ pub(crate) fn bruker_run_metadata(dot_d: &Path) -> Option<crate::run_metadata::V
     Some(out)
 }
 
+/// The source members of a Bruker BAF `.d` (`analysis.baf` with its `_idx` and `_xtr` siblings),
+/// each with its MS:1000569 SHA-1 — readable on any host, although the BAF reader itself is not.
+/// `None` when the directory holds no non-empty `analysis.baf`. Through 0.11.5 the BAF lane named
+/// only the `.d` and carried no digest.
+pub(crate) fn bruker_baf_members(dot_d: &Path) -> Option<crate::run_metadata::VendorRunMetadata> {
+    use crate::run_metadata::{source_files_from_members, term, MemberPolicy, Members, VendorRunMetadata};
+
+    if !std::fs::metadata(dot_d.join("analysis.baf")).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        return None;
+    }
+    const MEMBERS: &[&str] = &["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr"];
+    let (files, default) = source_files_from_members(
+        dot_d,
+        &MemberPolicy {
+            members: Members::Explicit(MEMBERS),
+            file_format: Some(term(1000815, "Bruker BAF format")),
+            id_format: Some(term(1000772, "Bruker BAF nativeID format")),
+            default_member: Some(MEMBERS[0]),
+        },
+    );
+    Some(VendorRunMetadata { source_files: files, default_source_file: default, ..Default::default() })
+}
+
+/// What a baf2sql cache's `Properties` table (key → value) states about the run: the instrument,
+/// its serial, the acquisition software and the acquisition time. The keys are the ones
+/// ProteoWizard reads (`Baf2Sql.cpp`). The model is the PSI-MS series term ProteoWizard's
+/// `translateAsInstrumentSeries` gives the vendor's `InstrumentFamily` code (`CompassDataEnums.hpp`),
+/// and the generic Bruker model term for a code it does not list — nothing is inferred from a method
+/// or file name. An empty table states nothing, and the configuration is left as it is.
+pub(crate) fn baf_properties_metadata(
+    props: &std::collections::BTreeMap<String, String>,
+) -> crate::run_metadata::VendorRunMetadata {
+    use crate::run_metadata::{parse_vendor_time, term, term_str, VendorRunMetadata};
+    use mzdata::meta::{InstrumentConfiguration, Software};
+
+    let get = |k: &str| props.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
+    let mut out = VendorRunMetadata::default();
+    if props.is_empty() {
+        return out;
+    }
+    // Every BAF file is a Bruker acquisition, so the generic term is a fact even without a family;
+    // a serial must never stand alone either, or the configuration would carry no model term at all.
+    let (accession, name) = match get("InstrumentFamily").and_then(|v| v.parse::<i64>().ok()) {
+        Some(0) => (1000697, "Bruker Daltonics HCT Series"),
+        Some(1 | 2) => (1001536, "Bruker Daltonics micrOTOF series"),
+        Some(3 | 4) => (1001535, "Bruker Daltonics BioTOF series"),
+        Some(5) => (1001534, "Bruker Daltonics flex series"),
+        Some(6) => (1001556, "Bruker Daltonics apex series"),
+        Some(7 | 90 | 91) => (1001547, "Bruker Daltonics maXis series"),
+        Some(9) => (1003123, "Bruker Daltonics timsTOF series"),
+        Some(92) => (1001548, "Bruker Daltonics solarix series"),
+        _ => (1000122, "Bruker Daltonics instrument model"),
+    };
+    let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+    cfg.params.push(term(accession, name));
+    if let Some(serial) = get("InstrumentSerialNumber") {
+        cfg.params.push(term_str(1000529, "instrument serial number", serial));
+    }
+    out.instrument = Some(cfg);
+    if let Some(name) = get("AcquisitionSoftware") {
+        let version = get("AcquisitionSoftwareVersion").unwrap_or("unknown");
+        out.acquisition_software = Some(Software::new(name.to_string(), version.to_string(), vec![term(1000692, "Bruker software")]));
+    }
+    if let Some(t) = get("AcquisitionDateTime") {
+        match parse_vendor_time(t, "Bruker BAF Properties AcquisitionDateTime") {
+            Ok(at) => out.start_time = Some(at),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
+    out
+}
+
 /// Read run-level `GlobalMetadata` (key/value) from a TSF or TDF SQLite, as a JSON object.
 pub(crate) fn read_global_metadata(dot_d: &Path) -> Option<serde_json::Value> {
     let sql = bruker_sqlite(dot_d)?;
@@ -415,5 +487,77 @@ mod tests {
         assert!(safe_relative_member(Path::new("808.m/Maldi.method")).is_some());
         assert!(safe_relative_member(Path::new("../escape")).is_none());
         assert!(safe_relative_member(Path::new("/abs/path")).is_none());
+    }
+
+    #[test]
+    fn baf_directory_members_are_digested() {
+        let dir = std::env::temp_dir().join(format!("mzpc-baf-members-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A 0-byte `analysis.baf` is no BAF run (NreB_PAS_DECONV.d holds a 0-byte `analysis.tdf`).
+        std::fs::write(dir.join("analysis.baf"), b"").unwrap();
+        assert!(bruker_baf_members(&dir).is_none());
+        for (name, body) in [
+            ("analysis.baf", &b"baf"[..]),
+            ("analysis.baf_idx", b"idx"),
+            ("analysis.baf_xtr", b"xtr"),
+            ("SampleInfo.xml", b"<SampleTable/>"),
+        ] {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        let m = bruker_baf_members(&dir).expect("a non-empty analysis.baf");
+        let names: Vec<&str> = m.source_files.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr"], "the three members, nothing else");
+        for sf in &m.source_files {
+            let sha = sf.params.iter().find(|p| p.accession == Some(1000569)).expect("every member digested");
+            assert_eq!(sha.value.to_string(), crate::embed_aux::sha1_hex(&dir.join(&sf.name)).unwrap());
+            assert_eq!(sf.file_format.as_ref().map(|p| (p.accession, p.name.as_str())), Some((Some(1000815), "Bruker BAF format")));
+            assert_eq!(sf.id_format.as_ref().map(|p| (p.accession, p.name.as_str())), Some((Some(1000772), "Bruker BAF nativeID format")));
+        }
+        assert_eq!(m.default_source_file.as_deref(), Some("analysis.baf"));
+        assert!(m.instrument.is_none() && m.start_time.is_none(), "the directory states no run facts; the baf2sql cache does");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baf_properties_state_the_series_their_family_code_names() {
+        use crate::run_metadata::{AcquisitionTime, VendorRunMetadata};
+        let props = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let model = |m: &VendorRunMetadata| {
+            m.instrument.as_ref().map(|c| c.params.iter().map(|p| (p.accession, p.name.clone())).collect::<Vec<_>>())
+        };
+        // An impact II (family 90) is ProteoWizard's maXis series.
+        let m = baf_properties_metadata(&props(&[
+            ("InstrumentFamily", "90"),
+            ("InstrumentSerialNumber", "1825265.10252"),
+            ("AcquisitionSoftware", "otofControl"),
+            ("AcquisitionSoftwareVersion", "5.2.109"),
+            ("AcquisitionDateTime", "2024-10-09T09:09:26.123-03:00"),
+        ]));
+        assert_eq!(
+            model(&m),
+            Some(vec![
+                (Some(1001547), "Bruker Daltonics maXis series".to_string()),
+                (Some(1000529), "instrument serial number".to_string()),
+            ])
+        );
+        assert_eq!(m.instrument.as_ref().unwrap().params[1].value.to_string(), "1825265.10252");
+        let sw = m.acquisition_software.as_ref().unwrap();
+        assert_eq!((sw.id.as_str(), sw.version.as_str()), ("otofControl", "5.2.109"));
+        assert!(matches!(&m.start_time, Some(AcquisitionTime::Stated(t)) if t.offset().local_minus_utc() == -3 * 3600));
+        // solariX and timsTOF have their own series; an unlisted code, or a serial with no family,
+        // gets the generic Bruker model term — never a configuration without a model term.
+        let first = |pairs: &[(&str, &str)]| model(&baf_properties_metadata(&props(pairs))).unwrap()[0].0;
+        assert_eq!(first(&[("InstrumentFamily", "92")]), Some(1001548));
+        assert_eq!(first(&[("InstrumentFamily", "9")]), Some(1003123));
+        assert_eq!(first(&[("InstrumentFamily", "42")]), Some(1000122));
+        assert_eq!(first(&[("InstrumentSerialNumber", "7")]), Some(1000122));
+        // An unzoned clock stays naive; an empty table states nothing.
+        let naive = baf_properties_metadata(&props(&[("AcquisitionDateTime", "2024-10-09T09:09:26")]));
+        assert!(matches!(naive.start_time, Some(AcquisitionTime::Naive { .. })));
+        let empty = baf_properties_metadata(&props(&[]));
+        assert!(empty.instrument.is_none() && empty.start_time.is_none() && empty.acquisition_software.is_none());
     }
 }

@@ -448,6 +448,37 @@ struct BafSpectrumRow {
     polarity: i64,
 }
 
+/// The baf2sql cache's `Properties` table (key → value): the run facts ProteoWizard reads from it
+/// (`Baf2Sql.cpp`, `SELECT Key, Value FROM Properties`). Values are stored as text or as numbers
+/// (`InstrumentFamily` is a code), so each is rendered as text. Best-effort: a cache without the
+/// table yields an empty map, and the archive then states nothing more about the run.
+fn read_properties(connection: &Connection) -> std::collections::BTreeMap<String, String> {
+    use rusqlite::types::Value;
+    let read = || -> rusqlite::Result<std::collections::BTreeMap<String, String>> {
+        let mut stmt = connection.prepare("SELECT Key, Value FROM Properties")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Value>(1)?)))?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let (key, value) = row?;
+            let text = match value {
+                Value::Text(s) => s,
+                Value::Integer(i) => i.to_string(),
+                Value::Real(r) => r.to_string(),
+                Value::Null | Value::Blob(_) => continue,
+            };
+            out.insert(key, text);
+        }
+        Ok(out)
+    };
+    read().unwrap_or_else(|e| {
+        log::warn!(
+            "BAF SQLite cache: the Properties table is not readable ({e}); the archive states no \
+             instrument, acquisition software or acquisition time for this run"
+        );
+        std::collections::BTreeMap::new()
+    })
+}
+
 fn read_spectrum_rows(connection: &Connection) -> Result<Vec<BafSpectrumRow>> {
     // Finding 5: count the Spectra table up front so we can detect rows the
     // join would otherwise silently drop (missing AcquisitionKey). We use a
@@ -678,6 +709,8 @@ pub struct BafReader {
     /// default to line arrays (finding 2). Set from `--representation profile`
     /// (see `open_with`); every other representation reads line-first.
     prefer_profile: bool,
+    /// The baf2sql cache's `Properties` table, read once at open (see [`read_properties`]).
+    properties: std::collections::BTreeMap<String, String>,
     /// Finding 10: the baf2sql_c storage handle is not known to be thread-safe,
     /// and FFI calls through it must not happen concurrently. A raw-pointer
     /// marker makes `BafReader` neither `Send` nor `Sync`, so the type system
@@ -710,6 +743,7 @@ impl BafReader {
         )
         .with_context(|| format!("opening BAF SQLite cache {}", sqlite_cache.display()))?;
         let rows = read_spectrum_rows(&connection)?;
+        let properties = read_properties(&connection);
         // The connection was only needed to read the metadata rows up front.
         drop(connection);
         // Line-first by default (finding 2), but no longer hardcoded: `--representation profile`
@@ -729,12 +763,20 @@ impl BafReader {
             rows,
             storage,
             prefer_profile,
+            properties,
             _not_thread_safe: PhantomData,
         })
     }
 
     pub fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// What the BAF file states about its run (instrument series, serial, acquisition software and
+    /// time), from the `Properties` table read at open. The source members and their digests come
+    /// from the directory itself (`vendor::bruker_baf_members`, through `fixup_run_metadata`).
+    pub fn run_metadata(&self) -> crate::run_metadata::VendorRunMetadata {
+        crate::vendor::baf_properties_metadata(&self.properties)
     }
 
     /// Choose which `(m/z id, intensity id)` pair and continuity to read for a
