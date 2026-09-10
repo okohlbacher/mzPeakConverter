@@ -6537,27 +6537,77 @@ impl Ms1Chroms {
         self.time.is_empty()
     }
 
-    /// Write the synthesized TIC + base-peak chromatograms. Returns how many were written (0 or 2).
-    fn write(&self, writer: &mut MzPeakWriterType<fs::File>) -> Result<usize> {
+    /// Write the synthesized TIC + base-peak chromatograms, their times in `unit` (see
+    /// [`finish_chromatograms`]). Returns how many were written (0 or 2).
+    fn write(&self, writer: &mut MzPeakWriterType<fs::File>, unit: Unit) -> Result<usize> {
         if self.is_empty() {
             return Ok(0);
         }
-        let tic = synth_chromatogram(
+        let mut tic = synth_chromatogram(
             "TIC",
             Param::builder().name("total ion current chromatogram").curie(curie!(MS:1000235)).build(),
             &self.time,
             &self.tic,
         )?;
-        let bpc = synth_chromatogram(
+        let mut bpc = synth_chromatogram(
             "BPC",
             Param::builder().name("basepeak chromatogram").curie(curie!(MS:1000628)).build(),
             &self.time,
             &self.bpc,
         )?;
+        rescale_time(&mut tic.arrays, unit)?;
+        rescale_time(&mut bpc.arrays, unit)?;
         writer.write_chromatogram(&tic)?;
         writer.write_chromatogram(&bpc)?;
         Ok(2)
     }
+}
+
+/// The unit `chromatograms_data`'s time column declares: the source chromatograms' when the writer
+/// sampled its schema from them (ProteoWizard writes seconds), else the writer's default, minutes.
+fn chromatogram_time_unit(writer: &mut MzPeakWriterType<fs::File>) -> Unit {
+    use mzpeak_prototyping::writer::ArrayBufferWriter;
+    let declared = writer
+        .chromatogram_data_buffer_mut()
+        .fields()
+        .iter()
+        .find(|f| f.metadata().get("array_accession").is_some_and(|a| a == "MS:1000595"))
+        .and_then(|f| f.metadata().get("unit").cloned());
+    [Unit::Second, Unit::Millisecond]
+        .into_iter()
+        .find(|u| u.to_curie().is_some_and(|c| Some(c.to_string()) == declared))
+        .unwrap_or(Unit::Minute)
+}
+
+/// Express a chromatogram's time array in `unit`. A no-op when it already is, or when either unit
+/// is not a time.
+fn rescale_time(arrays: &mut BinaryArrayMap, unit: Unit) -> Result<()> {
+    let seconds = |u: Unit| match u {
+        Unit::Minute => Some(60.0),
+        Unit::Second => Some(1.0),
+        Unit::Millisecond => Some(1e-3),
+        _ => None,
+    };
+    let Some(t) = arrays.get_mut(&ArrayType::TimeArray) else { return Ok(()) };
+    let (Some(from), Some(to)) = (seconds(t.unit), seconds(unit)) else { return Ok(()) };
+    if from == to {
+        return Ok(());
+    }
+    let scaled: Vec<f64> = t
+        .to_f64()
+        .map_err(|e| anyhow::anyhow!("reading chromatogram time: {e}"))?
+        .iter()
+        .map(|v| v * from / to)
+        .collect();
+    let encoded = if t.dtype == BinaryDataArrayType::Float32 {
+        t.update_buffer(&scaled.iter().map(|&v| v as f32).collect::<Vec<_>>())
+    } else {
+        *t = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new());
+        t.update_buffer(&scaled)
+    };
+    encoded.map_err(|e| anyhow::anyhow!("encoding chromatogram time: {e}"))?;
+    t.unit = unit;
+    Ok(())
 }
 
 fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f64]) -> Result<Chromatogram> {
@@ -6600,9 +6650,14 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     synth: bool,
 ) -> Result<()> {
     set_file_contents(writer, ms1, synth && !ms1.time.is_empty());
-    let synthesized = if synth { ms1.write(writer)? } else { 0 };
+    // `chromatograms_data` declares one time unit, and every stored value must be in it. The
+    // synthesized traces come from spectrum start times in minutes, so on the mzML lane, whose column
+    // takes ProteoWizard's seconds from the source chromatograms, they were stored in minutes under a
+    // seconds declaration. A source trace in another unit than the column is rescaled the same way.
+    let unit = chromatogram_time_unit(writer);
+    let synthesized = if synth { ms1.write(writer, unit)? } else { 0 };
     let mut n = synthesized;
-    for chrom in source {
+    for mut chrom in source {
         if synthesized > 0
             && matches!(
                 chrom.chromatogram_type(),
@@ -6611,6 +6666,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
         {
             continue; // superseded by our MS1-synthesized version
         }
+        rescale_time(&mut chrom.arrays, unit)?;
         writer.write_chromatogram(&chrom)?;
         n += 1;
     }

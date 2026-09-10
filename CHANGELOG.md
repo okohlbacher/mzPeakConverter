@@ -214,6 +214,22 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `--no-ims-compact`, on any other standard-lane input and on the native vendor readers. Pinned by
   `ims_chunked_is_inert_on_the_standard_lane`; the fallback itself needs a TDF timsrust cannot read,
   which no committed fixture is.
+- **Synthesized TIC and BPC are stored in the time unit their column declares, and `--rt` cuts
+  chromatograms at the time it names.** `chromatograms_data` declares one unit for `point.time`. The
+  spec leaves it to the writer and recommends minutes; the vendored reader labels every time array
+  with it; the validator does not check it. On the mzML lane the column takes its unit from the
+  source's chromatograms, which ProteoWizard writes in seconds, but the TIC and BPC synthesized
+  beside them were stored in minutes, the unit of the spectrum start times they are built from:
+  `tiny.pwiz.1.1.mzML` declared `UO:0000010` over TIC points at 0.7008 and 5.8905, which read back as
+  seconds. The synthesized traces are now stored in the declared unit (seconds there: 42.05 and
+  353.43), and a source chromatogram in another unit than the column is rescaled the same way; on
+  the native lanes, and wherever no source chromatogram is read, the column is in minutes and
+  nothing changes. The mzML lane's source chromatograms keep their values. `--rt`, a window in
+  minutes like `spectrum.time`, is now converted into each chromatogram column's declared unit
+  before truncating: it had compared minutes with the stored seconds, so `--rt 0-0.05` kept the
+  `sic` points up to 0.05 s instead of 3 s — on archives built before this change too, whose source
+  chromatograms are in seconds. mzML-lane archives change on reconversion (TIC/BPC times ×60).
+  Pinned by `tests/chromatogram_time_unit.rs`.
 - **An archive → mzML export reads each spectrum once.** It first read every spectrum's metadata to
   find the survivors, then read the survivors again in full, and it did so without a filter too:
   that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.
