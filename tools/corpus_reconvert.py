@@ -8,7 +8,16 @@ already current, so re-running converges on a complete corpus instead of redoing
 checkout or a copy:
   * it opens as a zip, and
   * it carries the split-facet marker (`spectra_metadata_scans.parquet`, v0.7.0+), and
-  * its `.built` stamp records the same converter version we are about to run.
+  * its `.built` stamp records the same converter version we are about to run, and
+  * the same recipe: a hash of the descriptor's whole `convert` block, so editing `convert.flags`
+    (or any other `convert.*` key) rebuilds the archive without waiting for a converter release.
+
+The `.built` stamp is read out of the archive it describes, never written from the request:
+    mzpeak-convert <version>     the archive's own software_list entry; another version is refused
+    recipe <hash>                the descriptor recipe it was built under
+    options <argv>               the archive's own `conversion options`, i.e. what actually ran
+The box strips lane flags and may fall back to msconvert, so only the archive knows what built it.
+A stamp from before the recipe line counts as stale.
 
 `--clean` deletes every `.mzpeak` (and stamp) first. It reaches the same end state as the default
 idempotent pass, only slower, so prefer the default unless you specifically want a from-scratch run.
@@ -24,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -32,6 +43,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 # Container directories are units in their own right — never descend into them looking for more.
 DIR_UNIT_SUFFIXES = {".d", ".raw"}
@@ -172,8 +184,23 @@ def target_for(unit: Path) -> Path:
 MULTI_UNIT_TILES = {"pwiz-examples"}
 
 
-def load_recipes(root: Path) -> tuple[dict[Path, list[str]], dict[Path, Path], set[Path], set[Path]]:
-    """-> (extra flags by dataset dir, pinned unit by dataset dir, skipped dataset dirs, all governed dirs).
+class Recipe(NamedTuple):
+    flags: list[str]  # convert.flags, path-valued arguments absolutised
+    rid: str          # recipe_id of the descriptor's `convert` block: what a .built stamp must name
+
+
+def recipe_id(cv: dict) -> str:
+    """Hash of a descriptor's whole `convert` block. The `.built` stamp names the recipe its archive
+    was built under, so editing `convert.flags` (or any `convert.*` key) makes the archive stale, as
+    the corpus repository's `.sig` does, instead of leaving it "current" until the next release."""
+    return hashlib.sha256(json.dumps(cv, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+UNDESCRIBED = Recipe([], recipe_id({}))
+
+
+def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[Path], set[Path]]:
+    """-> (recipe by dataset dir, pinned unit by dataset dir, skipped dataset dirs, all governed dirs).
 
     Missing PyYAML is not fatal: without it we cannot read descriptors, so the caller falls back to
     the every-unit walk rather than silently publishing the wrong set.
@@ -184,7 +211,7 @@ def load_recipes(root: Path) -> tuple[dict[Path, list[str]], dict[Path, Path], s
         print("warn      : PyYAML unavailable — descriptors not read, falling back to every-unit walk")
         return {}, {}, set(), set()
     import shlex  # noqa: PLC0415
-    flags: dict[Path, list[str]] = {}
+    recipes: dict[Path, Recipe] = {}
     pinned: dict[Path, Path] = {}
     skipped: set[Path] = set()
     governed: set[Path] = set()
@@ -209,15 +236,15 @@ def load_recipes(root: Path) -> tuple[dict[Path, list[str]], dict[Path, Path], s
         # `convert.input`, every `input: auto` or input-less descriptor was built bare: three imzML
         # demonstrators were published without their `--image`, eleven archives without their
         # `--zstd-level 12`, and four lane pins never reached the box.
-        if cv.get("flags"):
-            flags[dd] = resolve_flag_paths(shlex.split(str(cv["flags"])), dd, root.parent, root)
-    return flags, pinned, skipped, governed
+        recipes[dd] = Recipe(resolve_flag_paths(shlex.split(str(cv.get("flags") or "")), dd, root.parent, root),
+                             recipe_id(cv))
+    return recipes, pinned, skipped, governed
 
 
-def flags_for(unit: Path, recipes: dict[Path, list[str]]) -> list[str] | None:
-    """The `convert.flags` of the described dataset that holds `unit`, looked up through its parents
-    (a pinned vendor directory's inner unit and an `auto` pick belong to the same dataset)."""
-    return next((recipes[d] for d in unit.parents if d in recipes), None)
+def recipe_for(unit: Path, recipes: dict[Path, Recipe]) -> Recipe:
+    """The recipe of the described dataset that holds `unit`, looked up through its parents (a pinned
+    vendor directory's inner unit and an `auto` pick belong to the same dataset)."""
+    return next((recipes[d] for d in unit.parents if d in recipes), UNDESCRIBED)
 
 
 # Flags that name a FILE. A descriptor writes them relative to its own directory
@@ -332,9 +359,9 @@ def compatible_versions(version: str) -> set[str]:
     return out
 
 
-def is_current(archive: Path, version: str) -> bool:
-    """True when `archive` was produced by `version` (or an output-identical release) AND uses the
-    split-facet layout."""
+def is_current(archive: Path, version: str, rid: str) -> bool:
+    """True when `archive` was produced by `version` (or an output-identical release) under recipe
+    `rid` AND uses the split-facet layout. A stamp with no recipe line predates recipes: stale."""
     if not archive.exists():
         return False
     try:
@@ -344,11 +371,39 @@ def is_current(archive: Path, version: str) -> bool:
     except Exception:
         return False  # unreadable/truncated -> rebuild
     stamp = stamp_for(archive)
-    return stamp.exists() and stamp.read_text().strip() in compatible_versions(version)
+    lines = stamp.read_text().splitlines() if stamp.exists() else []
+    return bool(lines) and lines[0].strip() in compatible_versions(version) and f"recipe {rid}" in lines[1:]
+
+
+def write_stamp(archive: Path, version: str, rid: str) -> str | None:
+    """Stamp `archive` from its OWN index; -> None, or why it was left unstamped.
+
+    What was requested says nothing reliable about what built an archive: the box strips lane flags
+    and may fall back to msconvert, and `BOX_AUTOUPDATE=0` skips its version check, after which the
+    host's version string used to be written beside whatever the box's exe produced. The archive
+    records its converter (software_list) and its argv (`conversion options`), so the stamp copies
+    those, and an archive another converter version built is refused rather than labelled current.
+    """
+    try:
+        with zipfile.ZipFile(archive) as z:
+            if not any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
+                return "no split-facet layout"
+            md = json.loads(z.read("mzpeak_index.json")).get("metadata") or {}
+    except Exception as e:  # truncated zip, no index, unparsable index
+        return f"unreadable archive index ({e})"
+    built = next((s.get("version") for s in md.get("software_list") or []
+                  if s.get("id") == "mzpeak-convert"), None)
+    options = next((p.get("value") for dp in md.get("data_processing_method_list") or []
+                    for m in dp.get("methods") or [] for p in m.get("parameters") or []
+                    if p.get("name") == "conversion options"), None) or ""
+    if built != version.split()[-1]:
+        return f"built by mzpeak-convert {built or '<unrecorded>'}, not {version}"
+    stamp_for(archive).write_text(f"{version}\nrecipe {rid}\noptions {options}\n")
+    return None
 
 
 def convert(unit: Path, binary: str, version: str, dry: bool,
-            extra: list[str] | None = None) -> tuple[Path, str, str]:
+            extra: list[str] | None = None, rid: str = UNDESCRIBED.rid) -> tuple[Path, str, str]:
     """-> (unit, status, detail). status in {converted, skipped, failed}.
 
     `extra` carries the descriptor's `convert.flags` (e.g. `--sdrf study.sdrf.tsv`, `--zstd-level 12`)
@@ -382,7 +437,9 @@ def convert(unit: Path, binary: str, version: str, dry: bool,
             f"exit {proc.returncode}",
         )
         return unit, "failed", first.strip()[:200]
-    stamp_for(out).write_text(version + "\n")
+    why = write_stamp(out, version, rid)
+    if why:
+        return unit, "failed", f"not stamped: {why}"
     return unit, "converted", ""
 
 
@@ -400,7 +457,7 @@ def s3_target(local: Path) -> str:
 
 
 def run_box(units: list[Path], root: Path, version: str, jobs: int,
-            recipes: dict[Path, list[str]] | None = None, s3_first: bool = True) -> None:
+            recipes: dict[Path, Recipe] | None = None, s3_first: bool = True) -> None:
     """Convert host-unsupported units on the box, relaying the archives back.
 
     Delegates the transfer to tools/box_convert.sh --local-manifest, which already stages the raw
@@ -415,7 +472,8 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
     # on 2026-09-03 a box_update_remote.ps1 nobody had asked for sat beside five idle convert
     # workers for 32 minutes. box_convert.sh's updater is the only one now; it is told the exact
     # version to bring the box to, and BOX_REQUIRE_VERSION=1 (set by main) makes it abort instead
-    # of converting with a stale exe, so the stamps written below can never mislabel an archive.
+    # of converting with a stale exe. The stamps written below do not rely on that: each is read
+    # from its archive's own index, so even a BOX_AUTOUPDATE=0 run cannot mislabel an archive.
     want = version.split()[-1]  # "mzpeak-convert 0.9.12" -> "0.9.12"
     manifest = root.parent / "validator_logs" / "box-jobs.tsv"
     manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -423,7 +481,7 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
         for u in units:
             # The descriptor's own flags, so a box-built archive matches its host-built recipe
             # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
-            flags = flags_for(u, recipes or {}) or ['--no-vendor']
+            flags = recipe_for(u, recipes or {}).flags or ['--no-vendor']
             # S3-FIRST (default): name the FINAL corpus key as the target, so the box PUTs the
             # archive straight to where the corpus publishes it and the host only mirrors it down.
             # Previously the archive came back to the host and needed a separate upload pass, which
@@ -471,15 +529,12 @@ def run_box(units: list[Path], root: Path, version: str, jobs: int,
         if before.get(out) == now:
             unchanged.append(u.name)
             continue
-        try:
-            with zipfile.ZipFile(out) as z:
-                if any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
-                    stamp_for(out).write_text(version + "\n")
-                    stamped += 1
-                else:
-                    unchanged.append(u.name)
-        except Exception:
+        why = write_stamp(out, version, recipe_for(u, recipes or {}).rid)
+        if why:
+            print(f"box       : {out.name} arrived but is left unstamped: {why}")
             unchanged.append(u.name)
+        else:
+            stamped += 1
     print(f"box       : stamped {stamped} delivered archive(s)")
     if unchanged:
         print(f"box       : {len(unchanged)} NOT delivered, left unstamped: "
@@ -494,7 +549,8 @@ def convert_target(cands: list[Path], binary: str, version: str, dry: bool, reci
     """
     last = None
     for i, u in enumerate(cands):
-        unit, status, detail = convert(u, binary, version, dry, flags_for(u, recipes or {}))
+        r = recipe_for(u, recipes or {})
+        unit, status, detail = convert(u, binary, version, dry, r.flags, r.rid)
         if status != "skipped":
             if i:
                 detail = (detail + " " if detail else "") + f"(fallback from {cands[0].name})"
@@ -534,14 +590,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"raw units : {len(units)}")
 
     # Honour the descriptors: build what the corpus PUBLISHES, with the recipe it publishes it under.
-    recipe_flags, pinned, desc_skipped, governed = load_recipes(root)
+    recipes, pinned, desc_skipped, governed = load_recipes(root)
     if governed:
         before = len(units)
         units = apply_recipes(units, pinned, desc_skipped, governed)
         dropped = before - len(units)
+        flagged = sum(1 for r in recipes.values() if r.flags)
         print(f"descriptors: {len(pinned)} pinned, {len(desc_skipped)} skipped"
               + (f" -> {dropped} undescribed unit(s) not built" if dropped else "")
-              + (f"; {len(recipe_flags)} carry convert.flags" if recipe_flags else ""))
+              + (f"; {flagged} carry convert.flags" if flagged else ""))
 
     if args.clean and not (args.dry_run or args.report_only):
         removed = 0
@@ -557,7 +614,8 @@ def main(argv: list[str] | None = None) -> int:
               f"native one and skipping the duplicate(s)")
         for t, c in dup.items():
             print(f"            {t.name}  <- {', '.join(x.name for x in c)}")
-    todo = [t for t in groups if not is_current(t, version)]
+    rid = {t: recipe_for(c[0], recipes).rid for t, c in groups.items()}
+    todo = [t for t in groups if not is_current(t, version, rid[t])]
     fresh = len(groups) - len(todo)
     print(f"archives  : {len(groups)} (from {len(units)} units)\nalready ok: {fresh}\nto convert: {len(todo)}\n")
 
@@ -569,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.report_only and todo:
         started = time.time()
         with cf.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futs = {pool.submit(convert_target, groups[t], binary, version, args.dry_run, recipe_flags): t for t in todo}
+            futs = {pool.submit(convert_target, groups[t], binary, version, args.dry_run, recipes): t for t in todo}
             for i, fut in enumerate(cf.as_completed(futs), 1):
                 unit, status, detail = fut.result()
                 results[status].append((unit, detail))
@@ -587,11 +645,11 @@ def main(argv: list[str] | None = None) -> int:
         # BOX_REQUIRE_VERSION: this harness STAMPS archives with a version string, so converting
         # with a stale box exe would mislabel them. Abort instead.
         os.environ.setdefault("BOX_REQUIRE_VERSION", "1")
-        run_box(deferred, root, version, args.box_jobs, recipe_flags,
+        run_box(deferred, root, version, args.box_jobs, recipes,
                 s3_first=not args.no_s3_first)
 
     # ---- report -------------------------------------------------------------
-    have = [t for t in groups if is_current(t, version)]
+    have = [t for t in groups if is_current(t, version, rid[t])]
     print("\n" + "=" * 72)
     print(f"COMPLETENESS  {len(have)}/{len(groups)} archives current"
           f"  ({100.0 * len(have) / max(1, len(groups)):.1f}%)   [from {len(units)} raw units]")

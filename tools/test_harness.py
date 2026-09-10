@@ -2,15 +2,19 @@
 """Offline checks for the corpus harness: tools/corpus_reconvert.py and the host half of
 tools/box_convert.sh.
 
-Nothing here reaches the box, S3 or the published corpus. The converter and box_convert.sh are
-stand-ins, and every corpus is a temporary directory.
+Nothing here reaches the box, S3 or the published corpus. The converter, box_convert.sh, ssh, scp
+and the S3 relay are stand-ins, and every corpus is a temporary directory.
 
     python3 tools/test_harness.py          # the descriptor tests need PyYAML
 """
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,24 +33,44 @@ except ImportError:
 VERSION = "9.9.9"
 
 # Stand-in for mzpeak-convert: logs its argv and writes a split-facet zip whose index records the
-# version and argv, the way the real binary's add_processing_metadata does.
+# version and argv, the way the real binary's add_processing_metadata does. `--write-archive OUT
+# VERSION OPTIONS` writes one directly, for the stand-in box.
 FAKE_CONVERTER = """#!{python}
 import json, os, sys, zipfile
 args = sys.argv[1:]
+
+def archive(out, version, options):
+    index = {{"metadata": {{
+        "software_list": [{{"id": "mzpeak-convert", "version": version}}],
+        "data_processing_method_list": [{{"id": "mzpeak_convert_conversion", "methods": [
+            {{"order": 1, "parameters": [{{"name": "conversion options", "value": options}}]}}]}}]}}}}
+    with zipfile.ZipFile(out, "w") as z:
+        z.writestr("spectra_metadata_scans.parquet", b"")
+        z.writestr("mzpeak_index.json", json.dumps(index))
+
 if args == ["--version"]:
     print("mzpeak-convert {version}"); sys.exit(0)
+if args[0] == "--write-archive":
+    archive(*args[1:4]); sys.exit(0)
 if args[0].endswith(".wiff"):
     print("error: SciEX .wiff input is available only on Windows", file=sys.stderr); sys.exit(1)
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(args) + "\\n")
-out = args[args.index("-o") + 1]
-index = {{"metadata": {{
-    "software_list": [{{"id": "mzpeak-convert", "version": "{version}"}}],
-    "data_processing_method_list": [{{"id": "mzpeak_convert_conversion", "methods": [
-        {{"order": 1, "parameters": [{{"name": "conversion options", "value": " ".join(args)}}]}}]}}]}}}}
-with zipfile.ZipFile(out, "w") as z:
-    z.writestr("spectra_metadata_scans.parquet", b"")
-    z.writestr("mzpeak_index.json", json.dumps(index))
+archive(args[args.index("-o") + 1], "{version}", " ".join(args))
+"""
+
+# Stand-in for `box_convert.sh [--overwrite] --local-manifest MF --jobs N`: keeps the manifest and
+# "converts" every job the way the box does, native first with the lane flags stripped. A unit named
+# *undelivered* never comes back; one named *stale* comes back built by another converter version.
+FAKE_BOX = """#!/usr/bin/env bash
+while [ "$1" != "--local-manifest" ]; do shift; done
+mf="$2"; cp "$mf" "$FAKE_MANIFEST"; rc=0
+while IFS="$(printf '\\t')" read -r unit out opts; do
+  case "$unit" in *undelivered*) rc=1; continue ;; esac
+  ver="{version}"; case "$unit" in *stale*) ver=0.0.1 ;; esac
+  "$MZPEAK_CONVERT" --write-archive "$out" "$ver" "$(basename "$unit") --no-vendor -o out.mzpeak --force"
+done < "$mf"
+exit $rc
 """
 
 
@@ -70,12 +94,18 @@ class Harness(unittest.TestCase):
         fake = self.tmp / "mzpeak-convert"
         fake.write_text(FAKE_CONVERTER.format(python=sys.executable, version=VERSION))
         fake.chmod(0o755)
-        self.env = mock.patch.dict(os.environ, {"MZPEAK_CONVERT": str(fake), "FAKE_LOG": str(self.log)})
-        self.env.start()
-
-    def tearDown(self):
-        self.env.stop()
-        self._tmp.cleanup()
+        self.box_tools = self.tmp / "tools"
+        self.box_tools.mkdir()
+        (self.box_tools / "box_convert.sh").write_text(FAKE_BOX.format(version=VERSION))
+        patches = [
+            mock.patch.dict(os.environ, {"MZPEAK_CONVERT": str(fake), "FAKE_LOG": str(self.log),
+                                         "FAKE_MANIFEST": str(self.tmp / "manifest.tsv")}),
+            mock.patch.object(cr, "TOOLS", self.box_tools),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._tmp.cleanup)
 
     def run_main(self, root: Path, *extra: str) -> tuple[int, str]:
         buf = io.StringIO()
@@ -84,9 +114,17 @@ class Harness(unittest.TestCase):
         return rc, buf.getvalue()
 
     def converted(self) -> dict[str, list[str]]:
-        """Output archive name -> the argv the converter ran it with."""
+        """Output archive name -> the argv the host converter ran it with."""
         runs = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return {Path(a[a.index("-o") + 1]).name: a for a in runs}
+
+    def runs(self) -> int:
+        return len(self.log.read_text().splitlines()) if self.log.exists() else 0
+
+    def manifest(self) -> dict[str, tuple[str, str]]:
+        """Box job output name -> (output as written, opts)."""
+        rows = [line.split("\t") for line in (self.tmp / "manifest.tsv").read_text().splitlines()]
+        return {Path(out).name: (out, opts) for _, out, opts in rows}
 
 
 @unittest.skipIf(yaml is None, "PyYAML not installed")
@@ -114,6 +152,120 @@ class DescriptorFlags(Harness):
         self.assertEqual(argv["a.mzpeak"][-2:], ["--zstd-level", "12"])
         self.assertEqual(argv["run.mzpeak"][-2:], ["--zstd-level", "12"])
         self.assertEqual(argv["b.mzpeak"][-1], "-f")
+
+
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class Stamps(Harness):
+    def test_a_recipe_change_or_a_recipeless_stamp_rebuilds(self):
+        cv = {"input": "auto", "flags": "--zstd-level 12"}
+        root = make_corpus(self.tmp, {"general-ms/ds/ds.yaml": {"convert": cv}}, {"general-ms/ds/a.mzML": b"x"})
+        stamp = root / "general-ms/ds/a.mzpeak.built"
+        self.run_main(root)
+        self.run_main(root)
+        self.assertEqual(self.runs(), 1, "a current archive was rebuilt")
+        lines = stamp.read_text().splitlines()
+        self.assertEqual(lines[:2], [f"mzpeak-convert {VERSION}", f"recipe {cr.recipe_id(cv)}"])
+        self.assertRegex(lines[2], r"^options .* --zstd-level 12$")
+
+        (root / "general-ms/ds/ds.yaml").write_text(json.dumps({"convert": {**cv, "flags": "--zstd-level 9"}}))
+        self.run_main(root)
+        self.assertEqual(self.runs(), 2, "a convert.flags edit did not rebuild the archive")
+
+        stamp.write_text(f"mzpeak-convert {VERSION}\n")   # the stamp format before recipes
+        self.run_main(root)
+        self.assertEqual(self.runs(), 3, "a stamp naming no recipe counted as current")
+
+    def test_box_archives_are_stamped_from_their_own_index(self):
+        lane = {"input": "auto", "flags": "--via-msconvert --tof-grid auto"}
+        root = make_corpus(self.tmp, {
+            "general-ms/sciex/sciex.yaml": {"convert": lane},
+            "general-ms/old/old.yaml": {"convert": {"input": "auto"}},
+        }, {
+            "general-ms/sciex/run.wiff": b"x",
+            "general-ms/sciex/run.wiff.scan": b"x",
+            "general-ms/old/stale.wiff": b"x",
+        })
+        rc, out = self.run_main(root, "--box", "--no-s3-first")
+        self.assertEqual(self.manifest()["run.mzpeak"][1], "--via-msconvert --tof-grid auto")
+        self.assertEqual((root / "general-ms/sciex/run.mzpeak.built").read_text().splitlines(),
+                         [f"mzpeak-convert {VERSION}", f"recipe {cr.recipe_id(lane)}",
+                          "options run.wiff --no-vendor -o out.mzpeak --force"])
+        self.assertTrue((root / "general-ms/old/stale.mzpeak").exists())
+        self.assertFalse((root / "general-ms/old/stale.mzpeak.built").exists(),
+                         "an archive another converter version built was stamped current")
+        self.assertIn("built by mzpeak-convert 0.0.1", out)
+
+
+# ---- box_convert.sh ---------------------------------------------------------------------------
+# Its functions run in a bash with every network edge replaced: `box` answers the ssh call with a
+# canned BOXRESULT (and records Remove-Item calls), `relay` stands in for s3_relay.py, and `scp`
+# copies a local file.
+DRIVER = r"""
+set -uo pipefail
+RELAY=(relay); SSH=(box)
+relay(){
+  case "$1" in
+    presign-put) echo "https://relay.invalid/put" ;;
+    get) cp "$FAKE_OBJECT" "$3" ;;
+    md5) python3 -c 'import hashlib,sys;print(hashlib.md5(open(sys.argv[1],"rb").read()).hexdigest())' "$2" ;;
+    *) return 1 ;;
+  esac
+}
+box(){
+  shift
+  case "$*" in
+    *Remove-Item*) printf '%s\n' "$*" >> "$T/removed" ;;
+    *) cat > "$T/job.json"; printf '<<<BOXRESULT\n%s\nBOXRESULT>>>\n' "$RESULT_B64" ;;
+  esac
+}
+scp(){ printf '%s\n' "${@: -2:1}" >> "$T/scp"; cp "$FAKE_OBJECT" "${@: -1}"; }
+BOX_SSH=user@box BOX_SSH_KEY=/dev/null PROXY=ProxyCommand=true REMOTE_PS='C:\box_convert_remote.ps1'
+ARCHIVE=false PUT_EXPIRES=60 CORPUS_ROOT="$T/corpus" PENDING_DIR="$T/pending" FETCH_LIST="$T/fetch"
+mkdir -p "$PENDING_DIR"
+"""
+
+
+def shell_functions(*names: str) -> str:
+    text = (TOOLS / "box_convert.sh").read_text()
+    found = []
+    for name in names:
+        m = re.search(rf"^{name}\(\)\{{.*?^\}}$", text, re.S | re.M)
+        if not m:
+            raise AssertionError(f"box_convert.sh defines no {name}()")
+        found.append(m.group(0))
+    return "\n".join(found)
+
+
+class BoxJob(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        (self.tmp / "bin").mkdir()
+        (self.tmp / "bin" / "python3").symlink_to(sys.executable)
+
+    def run_job(self, result: dict, out: str, opts: str, obj: bytes = b"archive bytes",
+                **env: str) -> tuple[int, str]:
+        """Run box_convert.sh's run_job against a box that answers `result`; -> (rc, output)."""
+        (self.tmp / "object").write_bytes(obj)
+        result = {"stage": "done", "exit": 0, "uploaded": True, "size": len(obj),
+                  "md5": hashlib.md5(obj).hexdigest(), "error": "", "note": "", **result}
+        script = DRIVER + shell_functions("run_job") + '\nrun_job raw "$OUT" "$OPTS" box-convert/k.mzpeak 0123abcd; echo "rc=$?"\n'
+        p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env={
+            **os.environ, **env, "PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "T": str(self.tmp),
+            "FAKE_OBJECT": str(self.tmp / "object"), "OUT": out, "OPTS": opts,
+            "RESULT_B64": base64.b64encode(json.dumps(result).encode()).decode()})
+        m = re.search(r"^rc=(\d+)$", p.stdout, re.M)
+        self.assertIsNotNone(m, p.stdout + p.stderr)
+        return int(m.group(1)), p.stdout + p.stderr
+
+    def test_the_bench_row_names_the_options_that_ran(self):
+        out, bench = self.tmp / "run.mzpeak", self.tmp / "bench.tsv"
+        rc, log = self.run_job({"argv": "--no-vendor"}, str(out), "--no-vendor --via-msconvert --tof-grid auto",
+                               BENCH_TSV=str(bench))
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(out.read_bytes(), b"archive bytes")
+        self.assertEqual(bench.read_text().splitlines()[1].split("\t")[3], "--no-vendor")
 
 
 if __name__ == "__main__":
