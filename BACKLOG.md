@@ -7,11 +7,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Current issues, ranked, with evidence and status:** the *mzPeakConverter Review Ledger*
   (claude.ai artifact, §8 "Measures" carries a Status column: *done* / *open*). Its source is kept
   at `scratchpad/review2/review-ledger.html` in the maintainer's session; ask for the link.
-- **What is open** (2026-09-10, re-checked against the tree by the open-issue review): precursors on
-  the SciEX native, BAF and Agilent lanes; the SciEX CoreCLR `OnceLock` and the MIDAC scaffold's
-  deletion; collapsing the archive prologue/epilogue copies (M17); shared constants instead of text
-  pins (M28); a SHA-1 digest for the BAF lane and the M35 route label; the box harness stamping the
-  *effective* recipe.
+- **What is open** (2026-09-10, re-checked against the tree by the open-issue review, less what its
+  fixes landed): precursors on the BAF and Agilent lanes; collapsing the archive prologue/epilogue
+  copies (M17); shared constants instead of text pins (M28). Landed with the fixes, their Windows or
+  box half still unconfirmed: SciEX precursors and the CoreCLR `OnceLock`, the MIDAC scaffold's
+  deletion, the BAF lane's member digests, the M35 route label (`conversion_route`), and the box
+  harness stamping the *effective* recipe.
 - **Run metadata on the native lanes — landed after 0.11.2** (`src/run_metadata.rs`,
   `agilent_meta.rs`, `waters_meta.rs`, Bruker `GlobalMetadata`, SciEX `RunInfo`; CHANGELOG
   Unreleased). Measured against fresh lane pairs: blank1 now carries the vendor serial, sample and
@@ -20,8 +21,10 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   clocks are tracked in their own item below. **Still open, by lane:**
   - **Orphan MS2 (precursors):** Waters landed 2026-09-09 (scan items through the MassLynx parameters object:
     SET_MASS / COLLISION_ENERGY; Capan2's 682 high-energy MSe scans carry a precursor stating the activation, DDA set
-    masses a selected ion with a target-only window); SciEX (663k in the corpus; needs the
-    `SpectrumMetaV2` glue export — S-P2); Agilent MHDAC (`MSScan.bin` precursor decode; no DDA/QQQ
+    masses a selected ion with a target-only window); SciEX landed 2026-09-10 (the
+    `SpectrumMetaV2` glue export behind an ABI handshake, S-P2), not yet run on a WIFF: the box has
+    to compare Sample002 and MRM_03 with their ProteoWizard twins, and the seven corpus archives
+    (663k MS2 rows) gain precursors on rebuild; Agilent MHDAC (`MSScan.bin` precursor decode; no DDA/QQQ
     `.d` on host or in the corpus to verify against); BAF (SQL `Steps`/`Variables`; builds and runs
     on Linux; needs an MSn BAF acquisition).
     Bruker TDF/TSF and Shimadzu carry theirs.
@@ -169,9 +172,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   come out at half the method's 2.00, because their filter reports 1.0; msconvert reads the method.
 - **Not in the ledger — native-lane metadata parity** (`tests/lane_metadata_parity.rs`). Sample,
   acquisition time, serial, model, member SHA-1s, software and contents landed in 0.11.3. Still open:
-  the non-MS device chromatograms; the SciEX `run.id` (ProteoWizard names a WIFF run after its
-  sample, the native lane after the file stem); and the BAF lane, which writes no run metadata at all
-  (no sample, software, serial, time or member digest: FM_1-1_01_20254, NreB_PAS_DECONV).
+  the non-MS device chromatograms on the Agilent, SciEX, Waters and Shimadzu native lanes (the Bruker
+  lanes write HyStar's since 2026-09-10); the SciEX `run.id` (ProteoWizard names a WIFF run after its
+  sample, the native lane after the file stem). The BAF lane records its member SHA-1s since
+  2026-09-10, and the instrument series, serial, software and acquisition time the baf2sql
+  Properties table states; CI builds that read on Linux and Windows, but it has never run against a
+  real baf2sql cache, and FM_1-1_01_20254 and NreB_PAS_DECONV gain it only on rebuild.
 - **Not in the ledger — Agilent native lane follow-ups (0.11.0, 2026-09-06):** `--tof-grid` on the
   MHDAC lane (the Q-TOF profile points sit on the flight-time lattice — the msconvert+`--tof-grid`
   build of the same run is 200 MB against 245 MB numpress-chunked f64; a SciEX-style per-run fit
@@ -203,13 +209,11 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     layout-family deviation (conformance.md item 4) should be raised with PSI.
   - Upstream mzdata: graceful decode in the sourceFile handler (old #8).
 - **.NET 8 end of support, 2026-11-10** (the same day as .NET 9; .NET 10 runs to 2028-11-14). The
-  SciEX, Shimadzu and MIDAC glues target net8.0. **Decided 2026-09-10 (D9): stay on net8 for now.**
+  SciEX and Shimadzu glues target net8.0. **Decided 2026-09-10 (D9): stay on net8 for now.**
   After that date those lanes need an out-of-support runtime, and a host with only .NET 9 or 10 fails
   framework resolution. A later retarget goes to net10.0: Shimadzu would then lean on Microsoft's
   unsupported BinaryFormatter compatibility package inside a hostfxr component (unverified), or move
   out of process on net48 as the Agilent host did.
-- **`--ims-chunked` re-sorts each timsTOF frame by TOF** before chunking, which reorders points across
-  mobility scans, and declares no transformation for it (`docs/USER_MANUAL.md` §8 points here).
 - **Decided 2026-09-10 — D1–D15 of the open-issue review.** Each line is the option the fixes take.
   Only D4's choice of samples stays with the owner.
   - D1: a data facet's `<entity>_count` is max(index)+1 in that file, 0 when empty (`spectra_peaks` of centroid-only runs too).
