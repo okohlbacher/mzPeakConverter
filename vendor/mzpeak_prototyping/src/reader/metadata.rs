@@ -1745,12 +1745,10 @@ impl AuxiliaryArrayCountDecoder {
                         } else {
                             continue;
                         };
+                        // Indices can be sparse (an --rt/--ms-level rewrite keeps the originals),
+                        // so the row count that sized the table is not a bound.
                         if i >= self.counts.len() {
-                            panic!(
-                                "Cannot fit {} rows into {} bins",
-                                batch.num_rows(),
-                                self.counts.len()
-                            );
+                            self.counts.resize(i + 1, 0);
                         }
                         self.counts[i] = c.unwrap_or_default() as u32;
                     }
@@ -1813,14 +1811,15 @@ impl<'a> PeakInfoDecoder<'a> {
         }
     }
 
+    /// Grow the tables to hold indices `0..n`; never shrinks.
     pub fn resize(&mut self, n: usize) {
-        if self.has_models {
+        if self.has_models && self.model_parameters.len() < n {
             self.model_parameters.resize(n, None);
         }
-        if self.has_data_point_counts {
+        if self.has_data_point_counts && self.data_point_counts.len() < n {
             self.data_point_counts.resize(n, 0);
         }
-        if self.has_peaks {
+        if self.has_peaks && self.peak_counts.len() < n {
             self.peak_counts.resize(n, 0);
         }
     }
@@ -1889,6 +1888,12 @@ impl<'a> PeakInfoDecoder<'a> {
     pub fn decode_batch(&mut self, batch: &RecordBatch) {
         let root = batch;
         let index_array: &UInt64Array = root.column(0).as_primitive();
+        // The tables are indexed by spectrum index, which is not bounded by the row count: an
+        // archive rewritten with --rt/--ms-level keeps each survivor's original, now sparse, index,
+        // and sizing by rows panicked on read-back.
+        if let Some(max) = index_array.iter().flatten().max() {
+            self.resize(max as usize + 1);
+        }
 
         if self.has_models {
             if let Some(col) = root

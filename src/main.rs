@@ -2193,9 +2193,14 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // dropped spectra are never fully read. Gives an accurate spectrumList `count` attribute + the
     // "keeping X/N" log up front.
     reader.set_detail_level(DetailLevel::MetadataOnly);
+    // The indices the archive holds, ascending — not `0..total`: an archive rewritten with --rt or
+    // --ms-level keeps each survivor's original index, and counting up from 0 asked for spectra
+    // that were filtered out while never reaching the last ones.
+    let mut indices: Vec<usize> = reader.get_index().iter().map(|(_, i)| *i as usize).collect();
+    indices.sort_unstable();
     let mut survivor_ids: Vec<usize> = Vec::new();
-    for i in 0..total {
-        if cap.is_some_and(|m| i >= m) {
+    for (n, &i) in indices.iter().enumerate() {
+        if cap.is_some_and(|m| n >= m) {
             break;
         }
         if let Some(spec) = reader.get_spectrum_by_index(i) {
