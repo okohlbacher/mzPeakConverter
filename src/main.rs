@@ -31,6 +31,7 @@ mod bruker_baf;
 mod bruker_sdk;
 mod pwiz_layout;
 mod agl;
+mod sciex_run;
 #[cfg(windows)]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod agilent;
@@ -1983,7 +1984,7 @@ fn convert_to_mzml(
     }
     #[cfg(windows)]
     if is_wiff(input) {
-        let r = sciex::SciexReader::open(input)?;
+        let r = sciex::SciexReader::open_run(input, sciex_sample())?;
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
     #[cfg(windows)]
@@ -5555,11 +5556,7 @@ fn convert_sciex_grid(
         },
     );
     let sample = sciex_sample();
-    let mut reader = sciex::SciexReader::open(input)?;
-    reader.refuse_if_unsupported(input, sample)?;
-    if let Some(n) = sample {
-        reader.select_sample(n)?;
-    }
+    let reader = sciex::SciexReader::open_run(input, sample)?;
     let total = reader.len();
     if total == 0 {
         bail!("no spectra in {}", input.display());
