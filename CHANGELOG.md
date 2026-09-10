@@ -164,6 +164,19 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
   of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
   re-encoded.
+- **A data facet's `<entity>_count` is an index bound again.** Since 0.11.2, `spectrum_count` on
+  `spectra_data` and `spectra_peaks` (and `chromatogram_count` / `wavelength_spectrum_count` on
+  `chromatograms_data` / `wavelength_spectra_data`) was the number of entities with rows in that
+  file — a cardinality. A data facet's indices are sparse, so readers that bound iteration by the
+  count lost spectra without an error: `090701-LTQVelos-unittest-01` declares 43 on a
+  `spectra_data` whose largest index is 84, and `Hela_QC_PASEF_Slot1-first-6-frames-ms2-centroid`
+  309 on a `spectra_peaks` that reaches index 1,748 — a centroid-only run 0.11.1 still bounded
+  correctly. The count is now one past the largest index with a row in that file, and 0 when the
+  file has none; `<entity>_data_point_count` stays the points in the file, and the primary
+  metadata facets keep the run total. The archive rewrite (`--rt`, `--ms-level`, `--drop-aux`)
+  stamps the same. Pinned by `tests/footer_counts.rs` and
+  `rewritten_data_facets_declare_an_index_bound`. This changes the footers of every archive; the
+  corpus is rebuilt at the next release.
 - **An archive rewritten with `--ms-level` or `--rt` can be read back.** The rewrite keeps each
   surviving spectrum's original index, but the vendored reader sized its per-spectrum tables (m/z
   models, point, peak and auxiliary-array counts) by the number of rows, so

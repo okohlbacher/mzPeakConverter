@@ -176,6 +176,23 @@ fn filtered_archives_read_back() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A rewrite keeps the survivors' original indices, so its data facets are sparse as well: their
+/// `spectrum_count` is one past the largest index left, the bound a reader iterates to, not the
+/// number of spectra left. On tiny, spectrum 1 is the profile spectrum in spectra_data, and
+/// spectra_peaks holds 0 and 3 (2 is an empty centroid spectrum).
+#[test]
+fn rewritten_data_facets_declare_an_index_bound() {
+    let dir = scratch("count_bound");
+    let src = convert(TINY, &dir);
+    let out = dir.join("f.mzpeak");
+    for (args, data, peaks) in [(["--ms-level", "1"], "0", "4"), (["--rt", "0-1"], "0", "4"), (["--ms-level", "2"], "2", "0")] {
+        ok(&mzpc(&src, &out, &args));
+        assert_eq!(footer(&out, "spectra_data.parquet", "spectrum_count").as_deref(), Some(data), "{args:?}: spectra_data");
+        assert_eq!(footer(&out, "spectra_peaks.parquet", "spectrum_count").as_deref(), Some(peaks), "{args:?}: spectra_peaks");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// (d) `--rt` parsing, driven through the CLI (the crate has no library target to call into): an
 /// omitted bound is open, and a reversed or non-numeric range exits 1 without writing anything. The
 /// bounds are read back from the filter's data-processing entry. `--rt=` because clap reads a bare

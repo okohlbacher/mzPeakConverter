@@ -842,12 +842,15 @@ fn intensity_row_len(s: &StructArray, row: usize) -> u64 {
     }
 }
 
-/// The count KV pairs to append to the footer for this facet.
+/// The count KV pairs to append to the footer for this facet. A data facet's entity count is one
+/// past the largest index left in it (0 when empty), as the writer stamps it: the rewrite keeps the
+/// original, sparse indices, and a reader bounding by the number of entities would stop early.
 fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> Vec<(String, String)> {
+    let bound = keys.last().map_or(0, |max| max + 1).to_string();
     match mode {
         CountMode::SpectrumMeta => vec![("spectrum_count".into(), rows.to_string())],
         CountMode::SpectrumData(_) => vec![
-            ("spectrum_count".into(), keys.len().to_string()),
+            ("spectrum_count".into(), bound),
             ("spectrum_data_point_count".into(), points.to_string()),
         ],
         CountMode::Vendor => vec![("spectrum_count".into(), keys.len().to_string())],
@@ -856,7 +859,7 @@ fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> 
             ("chromatogram_data_point_count".into(), total.to_string()),
         ],
         CountMode::ChromatogramData(_) => vec![
-            ("chromatogram_count".into(), keys.len().to_string()),
+            ("chromatogram_count".into(), bound),
             ("chromatogram_data_point_count".into(), points.to_string()),
         ],
     }

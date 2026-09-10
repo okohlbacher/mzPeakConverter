@@ -1167,11 +1167,12 @@ impl<
     ) -> Result<ZipArchiveWriter<W>, parquet::errors::ParquetError> {
         if self.archive_writer.is_some() {
             self.flush_data_arrays()?;
-            // Per-facet counts (mzPeakConverter issue #1): `spectrum_count` on a DATA facet is the
-            // number of spectra with at least one row in THIS file, and `spectrum_data_point_count`
-            // the points in THIS file — never the run total (which stays on `spectra_metadata`) and
-            // never the sum of both data facets. A centroid-only run therefore declares 0 / 0 on its
-            // empty `spectra_data`, instead of every spectrum and every peak of `spectra_peaks`.
+            // Per-facet counts (mzPeakConverter issue #1): `spectrum_count` on a DATA facet is one
+            // past the largest spectrum index with a row in THIS file (0 when it has none), and
+            // `spectrum_data_point_count` the points in THIS file — never the run total (which stays
+            // on `spectra_metadata`) and never the sum of both data facets. A centroid-only run
+            // therefore declares 0 / 0 on its empty `spectra_data`, and a reader bounding by the
+            // count still reaches the last profile spectrum of a mixed run.
             self.append_key_value_metadata(
                 SPECTRUM_COUNT.into(),
                 Some(self.spectrum_data_buffers.entry_count().to_string()),
