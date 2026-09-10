@@ -194,6 +194,17 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   dataset directory and found through the unit's parents, so a pinned vendor directory's inner
   unit gets them too. Those archives need rebuilding. Pinned by `tools/test_harness.py`
   (`python3 tools/test_harness.py`, offline).
+- **A corpus archive's `.built` stamp names what built it, and a recipe change rebuilds it.**
+  Stamps used to record the host's version string and nothing about the recipe. The box strips lane
+  flags, falls back to `--via-msconvert --tof-grid <mode>`, and under `BOX_AUTOUPDATE=0` skips its
+  version check. On the corpus, all 7 lane-pinned archives carried stamps naming a recipe that did
+  not build them, 5 of them built by a different lane. An edited `convert.flags` stayed "current"
+  until the next converter release. The stamp is now read from the archive's own index: its
+  `mzpeak-convert` version, a recipe line hashing the descriptor's whole `convert` block, and its
+  `conversion options`. An archive another converter version built is left unstamped and reported,
+  and currency needs the recipe to match. Stamps from before this change carry no recipe and count
+  as stale; the next converter release rebuilds the corpus anyway. The box's BENCH row names the
+  options that ran, reported back by `box_convert_remote.ps1`, instead of the request.
 
 ### Changed
 

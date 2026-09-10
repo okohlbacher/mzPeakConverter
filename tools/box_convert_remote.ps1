@@ -117,7 +117,7 @@ $job = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $work = Join-Path $env:TEMP ("bxc-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $res = [ordered]@{ stage='init'; exit=1; uploaded=$false; size=0; md5=''; log=''; error=''; note='';
-                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0 }
+                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0; argv='' }
 $cacheLock = $null   # released as soon as the unit is copied out; the `finally` is only a backstop
 
 try {
@@ -370,6 +370,9 @@ try {
     $swcv = [Diagnostics.Stopwatch]::StartNew()
     & $converter $inputPath @nativeOpts -o $out --force *> $log
     $res.exit = $LASTEXITCODE
+    # argv = the options of the run that wrote the archive, NOT the request: the host's BENCH row
+    # names this, since the strip above and the fallback below both change what actually ran.
+    $res.argv = ($nativeOpts -join ' ')
     if ($res.exit -eq 0) {
         $res.note = ((@($res.note, 'path=native') | Where-Object { $_ }) -join ' ')
     } else {
@@ -421,6 +424,7 @@ try {
         $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', 'auto')
         & $converter $inputPath @fbOpts -o $out --force *>> $log
         $res.exit = $LASTEXITCODE
+        $res.argv = ($fbOpts -join ' ')
     }
     $res.conv_s = [math]::Round($swcv.Elapsed.TotalSeconds, 1)
     $ErrorActionPreference = $prevEAP

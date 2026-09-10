@@ -230,13 +230,15 @@ except Exception: print("ERR"); sys.exit()
 c=lambda s:str(s).replace("\t"," ").replace("\n"," ").replace("\r"," ")
 for v in [c(r.get("stage","")),str(r.get("exit","")),"1" if r.get("uploaded") else "0",
           str(r.get("size","")),str(r.get("md5","")),c(r.get("error","")),c(r.get("note","")),
-          str(r.get("conv_s","")),str(r.get("msconv_s","")),str(r.get("dl_s","")),str(r.get("up_s","")),str(r.get("raw_bytes",""))]:
+          str(r.get("conv_s","")),str(r.get("msconv_s","")),str(r.get("dl_s","")),str(r.get("up_s","")),str(r.get("raw_bytes","")),
+          c(r.get("argv",""))]:
     print(v)')"
   [ "$fields" = "ERR" ] && { echo "[$tag] FAIL: unparseable result from box" >&2; return 1; }
-  local R_STAGE R_EXIT R_UP R_SIZE R_MD5 R_ERR R_NOTE R_CONV R_MSCONV R_DL R_UPS R_RAW
+  local R_STAGE R_EXIT R_UP R_SIZE R_MD5 R_ERR R_NOTE R_CONV R_MSCONV R_DL R_UPS R_RAW R_ARGV
   { IFS= read -r R_STAGE; IFS= read -r R_EXIT; IFS= read -r R_UP; IFS= read -r R_SIZE
     IFS= read -r R_MD5;   IFS= read -r R_ERR;  IFS= read -r R_NOTE
-    IFS= read -r R_CONV;  IFS= read -r R_MSCONV; IFS= read -r R_DL; IFS= read -r R_UPS; IFS= read -r R_RAW; } <<EOF
+    IFS= read -r R_CONV;  IFS= read -r R_MSCONV; IFS= read -r R_DL; IFS= read -r R_UPS; IFS= read -r R_RAW
+    IFS= read -r R_ARGV; } <<EOF
 $fields
 EOF
   [ -n "$R_NOTE" ] && echo "[$tag] note: $R_NOTE" >&2
@@ -325,8 +327,10 @@ EOF
           && ln "$_bh" "$BENCH_TSV" 2>/dev/null   # loser: target exists, header already written
         rm -f "$_bh"
       fi
+      # opts = what RAN ($R_ARGV), not what was asked for: the box strips lane flags and may fall
+      # back to msconvert, so the requested $opts named a recipe that did not build the archive.
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tbox\n' \
-        "$(date -u +%FT%TZ)" "$(basename "$out")" "${BOX_CONVERTER:-}" "$opts" \
+        "$(date -u +%FT%TZ)" "$(basename "$out")" "${BOX_CONVERTER:-}" "$R_ARGV" \
         "${R_RAW:-}" "$R_SIZE" "${R_CONV:-}" "${R_MSCONV:-}" "${R_DL:-}" "${R_UPS:-}" >> "$BENCH_TSV"
     fi
     return 0
