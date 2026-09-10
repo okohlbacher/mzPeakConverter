@@ -44,7 +44,11 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   release of the same version. The tracked `sbom.cdx.json` is gone: it still described
   mzpeak-convert 0.1.0 with 395 components (mzdata 0.64.1, arrow 57.0.0), nothing regenerated it,
   and README and the manual linked it as the inventory. Publishing now needs at least one platform
-  archive, so a run whose platforms all failed cannot publish a release holding only the SBOM.
+  archive, so a run whose platforms all failed cannot publish a release holding only the SBOM. A
+  failed SBOM job is treated like a failed platform: the archives that built are attached without
+  it, and the run goes red. The job runs on every dispatch, whatever `only` names. `gen_sbom.py`
+  writes no timestamp or serial number, so regenerating from the tag's `Cargo.lock` re-attaches
+  the same file.
 
 ### Fixed
 
@@ -323,9 +327,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
-- **The manual is checked against the binary and the tree.** `tests/docs_drift.rs` fails when an
-  option `--help` prints is missing from §4, a `FileConfig` key from §5's example, or an
-  `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` from §10. Against the manual before this
+- **The manual is checked against the binary and the tree.** `tests/docs_drift.rs` fails in three
+  cases:
+  - an option `--help` prints has no row in §4's option table (a mention in the refusal table or
+    in another row does not count);
+  - a `FileConfig` key is missing from §5's example;
+  - an `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` is missing from §10. Against the manual before this
   change it fails on `MZPC_WATERS_KEEP_COLLAPSED` and `MZPC_WATERS_PROBE_QUAD`.
 
 ## [0.11.5] — 2026-09-09
