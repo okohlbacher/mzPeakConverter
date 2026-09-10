@@ -184,9 +184,13 @@ keep their bytes.
   wrote there is renamed into place through `TmpGuard` like every other mzML export, and a
   `.mzML.gz` output is gzip-compressed from that file rather than left to msconvert's
   naming. The directory is removed on every error return, taking a crashed msconvert's stray
-  `.partial` with it. The same guard stops the `--via-msconvert` mzPeak lane leaking
-  `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which returned before
-  any cleanup. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
+  `.partial` with it, and on a panic by the panic hook, which sweeps it with the in-flight
+  `.tmp` files: the release build aborts without running destructors, and the directory sits
+  beside the output holding msconvert's whole mzML. The same guard stops the `--via-msconvert`
+  mzPeak lane leaking `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which
+  returned before any cleanup; `tmp_cleanup::msconvert_not_found_leaves_no_working_directory`
+  pins both lanes with `TMPDIR` pointed at a scratch directory, and
+  `msconvert_dir_is_swept_by_the_panic_hook` the sweep. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
   the unfixed build, one that exits 0 without writing produced exit 0 and
   "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
   byte-identical and nothing beside it. One that writes its mzML must land under the
@@ -207,6 +211,13 @@ keep their bytes.
   truncated conversion did. `--sample 0` is refused for every lane; the msconvert lanes used
   to turn it into run index 0, sample 1. `tests/msconvert_multi_run.rs` pins both directions
   with a stand-in msconvert that writes two runs, or one when `--runIndexSet` picks it.
+- **The msconvert lanes also refuse a sample msconvert could not open.** ProteoWizard's WIFF reader
+  catches a sample that throws on open, prints `[Reader_ABI::read] Error opening run <i> in <file>`
+  and goes on with the rest, and msconvert exits 0. The refusal above counted only the runs written,
+  so a two-sample WIFF with one unreadable sample came out as one run, exit 0; and because
+  `--runIndexSet` counts the runs pwiz could open, `--sample 2` of three with sample 1 unreadable
+  converted sample 3. Both lanes now refuse when the captured log holds that line, and quote it.
+  Pinned in `tests/msconvert_multi_run.rs` with a stand-in that reports one unreadable sample.
 - **The `.mzpeak` filter lane no longer refuses archives with wavelength spectra.** Every
   Parquet member is classified, and the UV/PDA scans facet (`entity_type=wavelength_spectrum`,
   keyed by `source_index`) fell into the "index does not identify its entity" refusal. `--rt`,
@@ -557,6 +568,68 @@ keep their bytes.
   A Shimadzu run under `MZPC_SHIMADZU_COARSE_MZ=1` names the coarse `Mass` field in
   `mz_calibration.source`. The Agilent MHDAC, Waters, Shimadzu and `--bruker-sdk` lanes are
   Windows/Linux-only: their decision logic is host-tested, their wiring compiles on CI only.
+- **The index rebuild above resolves each `<index>` section against its own list.** It looked ids
+  up in one map for spectra and chromatograms, but mzML ids are unique only within their list: with
+  `tiny.pwiz.1.1.mzML`'s chromatogram `tic` renamed `scan=19`, the spectrum's entry pointed at the
+  chromatogram and both lanes exited 1 with "source declares 4 spectra but only 0 were read", where
+  0.11.5 had lost only the chromatograms. An `<offset>` whose id its list does not carry still keeps
+  the value the source wrote, now with a warning. The `<chromatogramList count>` check also stops
+  scanning backwards at `</spectrumList>`, so an mzML without chromatograms is no longer read end to
+  end on every conversion. Pinned by `rebuilt_index_resolves_each_section_against_its_own_list` and
+  `declared_chromatogram_count_stops_at_the_end_of_the_spectra`.
+- **`--ims-chunked` is no longer dropped in silence when a timsTOF run falls back to mzdata.** On a
+  TDF timsrust cannot decompress (newer timsTOF, 5.1.x) the ims-compact lane converts through the
+  standard mzdata lane instead, which writes f64 m/z and has no chunked TOF layout; the flags had
+  been checked against the ims-compact lane, which honours `--ims-chunked`, and never again. The
+  fallback now checks them against the standard lane, where `--ims-chunked` is listed as inert, so
+  it is warned about like every other inert flag — as it now also is on a TDF under
+  `--no-ims-compact`, on any other standard-lane input and on the native vendor readers. Pinned by
+  `ims_chunked_is_inert_on_the_standard_lane`; the fallback itself needs a TDF timsrust cannot read,
+  which no committed fixture is.
+- **Synthesized TIC and BPC are stored in the time unit their column declares, and `--rt` cuts
+  chromatograms at the time it names.** `chromatograms_data` declares one unit for `point.time`. The
+  spec leaves it to the writer and recommends minutes; the vendored reader labels every time array
+  with it; the validator does not check it. On the mzML lane the column takes its unit from the
+  source's chromatograms, which ProteoWizard writes in seconds, but the TIC and BPC synthesized
+  beside them were stored in minutes, the unit of the spectrum start times they are built from:
+  `tiny.pwiz.1.1.mzML` declared `UO:0000010` over TIC points at 0.7008 and 5.8905, which read back as
+  seconds. The synthesized traces are now stored in the declared unit (seconds there: 42.05 and
+  353.43), and a source chromatogram in another unit than the column is rescaled the same way; on
+  the native lanes, and wherever no source chromatogram is read, the column is in minutes and
+  nothing changes. The mzML lane's source chromatograms keep their values. `--rt`, a window in
+  minutes like `spectrum.time`, is now converted into each chromatogram column's declared unit
+  before truncating: it had compared minutes with the stored seconds, so `--rt 0-0.05` kept the
+  `sic` points up to 0.05 s instead of 3 s — on archives built before this change too, whose source
+  chromatograms are in seconds. Those archives also hold their synthesized TIC and BPC in minutes
+  under the seconds label, and `--rt` now cuts those two traces at 60 times the times it names
+  (`--rt 0-0.05` on `tiny.pwiz.1.1` converted by 0.11.5 keeps the TIC point at 0.70 min): rebuild an
+  mzML-lane archive before relying on `--rt` to truncate its chromatograms. mzML-lane archives change
+  on reconversion (TIC/BPC times ×60). Pinned by `tests/chromatogram_time_unit.rs`.
+- **`--sample` is recorded like every other option, warned about where it is inert, and accepted
+  by `--config`.** It was copied into the SciEX lanes' setting without being counted as given, so
+  `--sample 3` on a Thermo `.raw`, an mzML, a timsTOF run or an archive exited 0 without a word;
+  on anything but a SciEX `.wiff` it now warns that it cannot change the output. `--config`
+  promises every option but rejected `sample:` as an unknown field since the flag arrived in
+  0.11.3; it is a config key now, merged under the command line like the others, and `sample: 0`
+  is refused as clap refuses `--sample 0`. The `--help` text no longer names an unreleased
+  version. Pinned by `sample_is_warned_inert_off_a_wiff` and the extended
+  `file_config_accepts_the_six_promised_keys`.
+- **`--agilent-grid` declares `spectrum_index` again.** 0.10.1 (5692603) rebuilt the lane's
+  hand-made data schema with `tof_index` and intensity but without the index column every other
+  hand-built TOF schema declares. The writer then routes each batch's index column through
+  `route_unexpected`, which panics on a column no array metadata describes, and the release build
+  aborts: by reading, on the first spectrum of every `--agilent-grid` conversion since 0.10.1 —
+  no corpus `.d` decodes on this lane, so none was ever run. The schema is declared once, in
+  `agilent_grid_writer_builder`, and `agilent_grid_schema_writes_a_gridded_profile_spectrum` writes
+  one gridded profile spectrum through it without a `.d`.
+- **An archive → mzML export reads each spectrum once.** It first read every spectrum's metadata to
+  find the survivors, then read the survivors again in full, and it did so without a filter too:
+  that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.
+  Without `--rt`/`--ms-level` the survivors are now simply every spectrum (up to
+  `MZPC_MAX_SPECTRA`); with them they come from one scan of `spectra_metadata`'s `time` and
+  `ms_level` columns, the predicate the `.mzpeak` filter lane already applies. The exported mzML is
+  byte-identical, compared before and after on the committed fixtures and on corpus archives,
+  filtered and not.
 
 ### Changed
 
@@ -734,6 +807,30 @@ keep their bytes.
   `--aux` on a single-file input now logs that it is inert.
   `every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert` pins both on a synthetic
   Waters-shaped directory and on `tiny.pwiz.1.1.mzML`.
+- **mzML-lane archives hold ProteoWizard's ids decoded.** ProteoWizard writes ids as XML names and
+  escapes each byte a name may not hold as `_x00hh_`, so `run.id` came into the archive as
+  `Experiment_x0020_1` (`tiny.pwiz.1.1.mzML`), `En_PPY-3_phenylpyruvic_x0020_acid_10NG_10ul` or
+  `_x0031_2_80` for a leading digit — 47 of the 201 published archives — and 7 of them carry
+  escaped software ids too (ltpmsi-chilli's `MassLynx_x0020_software`, six ProteoWizard Shimadzu
+  examples' `Shimadzu_x0020_software`). An mzPeak id is a plain string, and the native lanes write the
+  plain stem. The mzML and imzML lanes now decode `run.id` and the software ids on copy, with the
+  processing methods and instrument configurations that reference a software id, so every
+  reference still resolves. A non-ASCII name is escaped one UTF-8 byte at a time and decoded as
+  UTF-8: three of those archives' `_x0032_0140312__x00e5__x0085__x00ad_mix_column_1…` becomes
+  `20140312_六mix_column_1 (scheduled) 一个试`, and a run of escapes that is not UTF-8 stays as
+  written. Ids from the Thermo and TDF readers, which name the run after the file, are left alone.
+  The mzML exports keep the escaped software ids, which an mzML id (an XML name) needs; mzdata's mzML
+  writer numbers the run itself. `tests/lane_metadata_parity.rs` compares both keys decoded with the
+  converter's own decoder (`src/pwiz_id.rs`), so archives built before and after compare alike; the
+  copy it had kept never decoded an escape. Pinned by `pwiz_escaped_ids_are_decoded`,
+  `mzml_lane_archive_decodes_pwiz_ids_and_mzml_export_keeps_them` and
+  `a_thermo_run_named_like_an_escape_keeps_its_stem`; the published archives change on reconversion.
+- **The `--ims-chunked` one-family pin also runs without the corpus.** The regression test for the
+  data facet's layout family needed the 142 MB 2485.d and so never ran in CI. The family is fixed
+  when the writers are built, so `ims_chunked_spectrum_facets_share_one_family_without_the_corpus`
+  drives `write_ims_compact_archive_impl` with two synthetic frames. The data facet takes the peak
+  facet's chunk fields from the existing `ArrayBuffersBuilder::dtype()`, and the `fields()` accessor
+  added to the vendored writer for it is gone again.
 
 ### Removed
 
