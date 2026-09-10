@@ -142,17 +142,11 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
 
     let member_names: Vec<String> = zip.file_names().map(str::to_string).collect();
 
-    // A drop glob must not take a core facet with it. Globs match every member, so `*.parquet`, or
-    // naming `spectra_peaks.parquet` or a precursor sub-facet, wrote an unreadable archive and exited
-    // 0. Proprietary/other spectrum members (the Thermo `vendor_*` facets `--no-vendor` drops) stay
-    // droppable, and so do the wavelength (UV/PDA) facets: they reference only each other, so
-    // `--drop-aux 'wavelength_spectra*'` strips the trace and leaves a readable archive, as it always
-    // did. Checked before anything is written.
+    // A drop glob must not take a core facet (`is_core_facet`) with it. Globs match every member, so
+    // `*.parquet`, or naming `spectra_peaks.parquet` or a precursor sub-facet, wrote an unreadable
+    // archive and exited 0. Checked before anything is written.
     for name in member_names.iter().filter(|n| opts.drop_aux.iter().any(|g| glob_match(g, n))) {
-        if let Some(fe) = orig_files.get(name).filter(|fe| {
-            matches!(fe.entity_type, EntityType::Spectrum)
-                && !matches!(fe.data_kind, DataKind::Proprietary | DataKind::Other(_))
-        }) {
+        if let Some(fe) = orig_files.get(name).filter(|fe| is_core_facet(fe)) {
             bail!(
                 "--drop-aux would remove {name}, a core {:?} {:?} facet the archive cannot be read \
                  without; narrow the glob to auxiliary members",
@@ -314,6 +308,18 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     Ok(())
 }
 
+/// A facet `--drop-aux` must not remove: any spectrum or chromatogram facet that is not proprietary.
+/// The Thermo `vendor_*` facets `--no-vendor` drops are proprietary. A kind this build does not know
+/// (`DataKind::Other`) is core, as `classify_facet` treats it as a secondary to filter rather than an
+/// extra. Chromatogram facets are core too: dropping `chromatograms_data` under `--rt` wrote metadata
+/// point counts refreshed from the facet that was dropped. The wavelength (UV/PDA) facets stay
+/// droppable: they reference only each other, so `--drop-aux 'wavelength_spectra*'` strips the trace
+/// and leaves a readable archive.
+fn is_core_facet(fe: &FileEntry) -> bool {
+    matches!(fe.entity_type, EntityType::Spectrum | EntityType::Chromatogram)
+        && !matches!(fe.data_kind, DataKind::Proprietary)
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // Survivors + dangling precursors
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -350,24 +356,28 @@ fn compute_survivors(
         let index = u64_child(spectrum, "index")
             .ok_or_else(|| anyhow!("spectrum.index missing/!uint64"))?;
         let ids = lstr_child(spectrum, "id");
-        let time = f64_child(spectrum, "time");
-        let ms = cv_child(spectrum, "ms_level", "MS_1000511_ms_level")
-            .and_then(|c| c.as_any().downcast_ref::<arrow::array::UInt8Array>());
-        // A predicate over a missing or retyped column must fail, not default: read as level 0 / NaN,
-        // `--ms-level` / `--rt` kept no spectra and still exited 0.
+        // A predicate over a column that is missing, or that no lossless cast turns into the type it is
+        // compared as, must fail rather than default: read as level 0 / NaN, `--ms-level` / `--rt` kept
+        // no spectra and still exited 0. Another integer width (`ms_level`) or float width (`time`) is
+        // cast; a value that does not fit is refused.
+        let time = lossless(spectrum.column_by_name("time"), DataType::is_floating, &DataType::Float64);
+        let ms_col = cv_child(spectrum, "ms_level", "MS_1000511_ms_level");
+        let ms = lossless(ms_col, DataType::is_integer, &DataType::UInt8);
         if opts.rt.is_some() && time.is_none() {
             bail!(
-                "--rt needs a Float64 `time` column in spectra_metadata, found {}",
+                "--rt needs a floating-point `time` column in spectra_metadata, found {}",
                 spectrum.column_by_name("time").map_or("none".into(), |c| c.data_type().to_string())
             );
         }
         if !ms_set.is_empty() && ms.is_none() {
             bail!(
-                "--ms-level needs a UInt8 `ms_level` column in spectra_metadata, found {}",
-                cv_child(spectrum, "ms_level", "MS_1000511_ms_level")
-                    .map_or("none".into(), |c| c.data_type().to_string())
+                "--ms-level needs an integer `ms_level` column in spectra_metadata whose values fit UInt8, \
+                 found {}",
+                ms_col.map_or("none".into(), |c| c.data_type().to_string())
             );
         }
+        let time = time.as_ref().and_then(|t| t.as_any().downcast_ref::<Float64Array>());
+        let ms = ms.as_ref().and_then(|m| m.as_any().downcast_ref::<arrow::array::UInt8Array>());
         let precursor = struct_col(&batch, "precursor");
         let pids = precursor.and_then(|p| lstr_child(p, "precursor_id"));
 
@@ -441,6 +451,9 @@ enum Facet {
     /// v0.7 split layout: a per-spectrum secondary facet (scans / precursors / selected_ions),
     /// keyed by a TOP-LEVEL `source_index` referencing `spectra_metadata.index`.
     SpectrumSecondary,
+    /// A chromatogram's precursors / selected ions, keyed by `source_index`. Chromatograms are
+    /// truncated, never dropped, so every row stays; the facet is re-encoded to shed a count key.
+    ChromatogramSecondary,
     /// No spectrum linkage — copy verbatim (run-global vendor status log, etc.).
     RunGlobal,
 }
@@ -487,6 +500,9 @@ fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
         && has_top_level(bytes, "index")?
     {
         return Ok(Facet::ChromatogramMeta);
+    }
+    if matches!(fe.entity_type, EntityType::Chromatogram) && has_top_level(bytes, "source_index")? {
+        return Ok(Facet::ChromatogramSecondary);
     }
     // A facet keyed by `source_index` whose index entry does not say which entity owns it cannot be
     // filtered safely: spectrum and chromatogram secondaries are schema-identical. Copying it
@@ -576,6 +592,7 @@ fn process_parquet(
 ) -> Result<Vec<u8>> {
     match class {
         Facet::RunGlobal => Ok(bytes.to_vec()), // verbatim
+        Facet::ChromatogramSecondary => reencode(bytes, |b| Ok(Some(b.clone())), CountMode::Vendor),
         Facet::SpectrumMeta => {
             if !filtering_spectra {
                 reencode(bytes, |b| Ok(Some(b.clone())), CountMode::SpectrumMeta)
@@ -671,6 +688,9 @@ fn process_parquet(
 enum CountMode {
     SpectrumMeta,
     SpectrumData(String),
+    /// Spectrum and chromatogram secondaries and the vendor facets: no entity count (issue #1,
+    /// decision D2). Neither rows nor parents is a count of such a table, and the key an older
+    /// archive carries (the run total) is not preserved.
     Vendor,
     /// Carries the surviving data-point total, known from the `chromatograms_data` prepass.
     ChromatogramMeta(u64),
@@ -696,7 +716,11 @@ where
     F: Fn(&RecordBatch) -> Result<Option<RecordBatch>>,
 {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))?;
-    let schema: SchemaRef = builder.schema().clone();
+    // The writer gets the schema without its schema-level metadata. arrow-rs folds the source footer's
+    // key-value pairs into `builder.schema()`, and ArrowWriter serialises that schema into
+    // ARROW:schema, where Arrow C++ and pyarrow read the pre-filter counts back as the schema metadata.
+    // The key-value list preserved below carries everything else.
+    let schema: SchemaRef = Arc::new(builder.schema().as_ref().clone().with_metadata(Default::default()));
     let orig_kv: Vec<KeyValue> = builder
         .metadata()
         .file_metadata()
@@ -777,20 +801,6 @@ fn accumulate_counts(
                 }
             }
         }
-        CountMode::Vendor => {
-            // `ordinal` on legacy/vendor facets; `source_index` on the v0.7 split secondaries
-            // (spectra_metadata_scans/_precursors/_selected_ions). Counting only `ordinal` wrote
-            // `spectrum_count = 0` into every filtered secondary facet.
-            if let Some(idx) = batch
-                .column_by_name("ordinal")
-                .or_else(|| batch.column_by_name("source_index"))
-                .and_then(|a| to_u64(a))
-            {
-                for r in 0..idx.len() {
-                    keys.insert(idx.value(r));
-                }
-            }
-        }
         CountMode::ChromatogramData(field) => {
             if let Some(s) = struct_col(batch, field) {
                 if let Some(idx) = u64_child(s, "chromatogram_index") {
@@ -805,7 +815,7 @@ fn accumulate_counts(
                 }
             }
         }
-        CountMode::ChromatogramMeta(_) => {}
+        CountMode::Vendor | CountMode::ChromatogramMeta(_) => {}
     }
 }
 
@@ -842,21 +852,24 @@ fn intensity_row_len(s: &StructArray, row: usize) -> u64 {
     }
 }
 
-/// The count KV pairs to append to the footer for this facet.
+/// The count KV pairs to append to the footer for this facet. A data facet's entity count is one
+/// past the largest index left in it (0 when empty), as the writer stamps it: the rewrite keeps the
+/// original, sparse indices, and a reader bounding by the number of entities would stop early.
 fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> Vec<(String, String)> {
+    let bound = keys.last().map_or(0, |max| max + 1).to_string();
     match mode {
         CountMode::SpectrumMeta => vec![("spectrum_count".into(), rows.to_string())],
         CountMode::SpectrumData(_) => vec![
-            ("spectrum_count".into(), keys.len().to_string()),
+            ("spectrum_count".into(), bound),
             ("spectrum_data_point_count".into(), points.to_string()),
         ],
-        CountMode::Vendor => vec![("spectrum_count".into(), keys.len().to_string())],
+        CountMode::Vendor => vec![],
         CountMode::ChromatogramMeta(total) => vec![
             ("chromatogram_count".into(), rows.to_string()),
             ("chromatogram_data_point_count".into(), total.to_string()),
         ],
         CountMode::ChromatogramData(_) => vec![
-            ("chromatogram_count".into(), keys.len().to_string()),
+            ("chromatogram_count".into(), bound),
             ("chromatogram_data_point_count".into(), points.to_string()),
         ],
     }
@@ -1049,14 +1062,19 @@ fn refresh_chrom_point_counts(
     batch: &RecordBatch,
     counts: &HashMap<u64, u64>,
 ) -> Result<RecordBatch> {
-    let recount = |idx: &UInt64Array| -> ArrayRef {
-        Arc::new((0..idx.len()).map(|r| counts.get(&idx.value(r)).copied().or(Some(0))).collect::<UInt64Array>())
+    // Built in the column's own type: a UInt64 array under another integer type failed the re-encode.
+    // The cast refuses a count that does not fit rather than writing a null.
+    let recount = |idx: &UInt64Array, like: &DataType| -> Result<ArrayRef> {
+        let arr: ArrayRef =
+            Arc::new((0..idx.len()).map(|r| counts.get(&idx.value(r)).copied().or(Some(0))).collect::<UInt64Array>());
+        let opts = arrow::compute::CastOptions { safe: false, ..Default::default() };
+        Ok(arrow::compute::cast_with_options(&arr, like, &opts)?)
     };
     let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
     if let (Ok(pos), Some(idx)) =
         (batch.schema().index_of("number_of_data_points"), batch.column_by_name("index").and_then(to_u64))
     {
-        cols[pos] = recount(&idx);
+        cols[pos] = recount(&idx, batch.column(pos).data_type())?;
         return Ok(RecordBatch::try_new(batch.schema(), cols)?);
     }
     let field_name = "chromatogram";
@@ -1073,7 +1091,7 @@ fn refresh_chrom_point_counts(
     let Some((child_pos, _)) = s.fields().iter().enumerate().find(|(_, f)| f.name() == child) else {
         return Ok(batch.clone());
     };
-    cols[col_idx] = Arc::new(replace_struct_child(s, child_pos, recount(idx))?);
+    cols[col_idx] = Arc::new(replace_struct_child(s, child_pos, recount(idx, s.column(child_pos).data_type())?)?);
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
 }
 
@@ -1306,9 +1324,100 @@ fn lstr_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a arrow::array::La
     s.column_by_name(name)?.as_any().downcast_ref::<arrow::array::LargeStringArray>()
 }
 
+/// `col` cast to `to` when its type passes `kind` and every value converts exactly; `None` when the
+/// column is absent, of another kind, or holds a value that does not fit.
+fn lossless(col: Option<&ArrayRef>, kind: fn(&DataType) -> bool, to: &DataType) -> Option<ArrayRef> {
+    let col = col.filter(|c| kind(c.data_type()))?;
+    let opts = arrow::compute::CastOptions { safe: false, ..Default::default() };
+    arrow::compute::cast_with_options(col, to, &opts).ok()
+}
+
 /// Coerce any integer array to a UInt64Array (owned) for uniform key handling.
 fn to_u64(a: &ArrayRef) -> Option<UInt64Array> {
     use arrow::compute::cast;
     let out = cast(a, &DataType::UInt64).ok()?;
     out.as_any().downcast_ref::<UInt64Array>().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-memory Parquet holding `columns`, with `kv` in its footer.
+    fn parquet(columns: Vec<(&str, ArrayRef)>, kv: &[(&str, &str)]) -> Vec<u8> {
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let kv = kv.iter().map(|(k, v)| KeyValue::new(k.to_string(), v.to_string())).collect();
+        let props = WriterProperties::builder().set_key_value_metadata(Some(kv)).build();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        buf
+    }
+
+    fn footer_keys(bytes: &[u8]) -> Vec<String> {
+        let b = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes)).unwrap();
+        b.metadata().file_metadata().key_value_metadata().map_or(vec![], |kvs| kvs.iter().map(|kv| kv.key.clone()).collect())
+    }
+
+    /// #20 review: another integer width for `ms_level` and float width for `time` are cast, not
+    /// refused; an `ms_level` that does not fit UInt8, or a float one, is refused.
+    #[test]
+    fn survivors_cast_retyped_predicate_columns() {
+        let meta = |ms: ArrayRef, time: ArrayRef| {
+            parquet(vec![("index", Arc::new(UInt64Array::from(vec![0u64, 1])) as ArrayRef), ("ms_level", ms), ("time", time)], &[])
+        };
+        let opts = FilterOpts { ms_levels: vec![2], rt: Some((0.0, 1.0)), ..Default::default() };
+        let retyped = meta(Arc::new(arrow::array::Int32Array::from(vec![1, 2])), Arc::new(arrow::array::Float32Array::from(vec![0.5f32, 0.5])));
+        let (survivors, total, _) = compute_survivors(&retyped, &opts).unwrap();
+        assert_eq!((survivors.into_iter().collect::<Vec<_>>(), total), (vec![1], 2));
+        let too_wide = meta(Arc::new(arrow::array::Int32Array::from(vec![1, 300])), Arc::new(Float64Array::from(vec![0.5, 0.5])));
+        assert!(compute_survivors(&too_wide, &opts).is_err(), "an ms_level of 300 does not fit UInt8");
+        let float_level = meta(Arc::new(Float64Array::from(vec![1.0, 2.0])), Arc::new(Float64Array::from(vec![0.5, 0.5])));
+        assert!(compute_survivors(&float_level, &opts).is_err(), "a float ms_level is not cast");
+    }
+
+    /// #20 review: the refreshed `number_of_data_points` keeps the column's type; a UInt64 array under
+    /// an Int64 field failed the re-encode.
+    #[test]
+    fn refreshed_point_counts_keep_the_column_type() {
+        let batch = RecordBatch::try_from_iter(vec![
+            ("index", Arc::new(UInt64Array::from(vec![0u64, 1])) as ArrayRef),
+            ("number_of_data_points", Arc::new(arrow::array::Int64Array::from(vec![3i64, 3])) as ArrayRef),
+        ])
+        .unwrap();
+        let out = refresh_chrom_point_counts(&batch, &HashMap::from([(0u64, 1u64)])).unwrap();
+        let n = out.column_by_name("number_of_data_points").unwrap();
+        assert_eq!(n.as_any().downcast_ref::<arrow::array::Int64Array>().map(|a| a.values().to_vec()), Some(vec![1, 0]));
+    }
+
+    /// #20 review: only a proprietary spectrum or chromatogram facet is droppable; a kind this build
+    /// does not know and the chromatogram metadata and data are core; wavelength facets are not.
+    #[test]
+    fn core_facets_are_the_non_proprietary_spectrum_and_chromatogram_facets() {
+        let fe = |entity, kind| FileEntry::new("f.parquet".to_string(), entity, kind);
+        assert!(is_core_facet(&fe(EntityType::Spectrum, DataKind::Other("future".into()))));
+        assert!(is_core_facet(&fe(EntityType::Chromatogram, DataKind::Metadata)));
+        assert!(is_core_facet(&fe(EntityType::Chromatogram, DataKind::DataArray)));
+        assert!(!is_core_facet(&fe(EntityType::Spectrum, DataKind::Proprietary)));
+        assert!(!is_core_facet(&fe(EntityType::WavelengthSpectrum, DataKind::DataArray)));
+    }
+
+    /// Issue #1, decision D2: a rewrite writes no entity count on a secondary and does not carry over
+    /// the run total an older archive stamped there, on spectrum and chromatogram secondaries alike.
+    #[test]
+    fn rewrite_leaves_no_entity_count_on_secondaries() {
+        let source_index: ArrayRef = Arc::new(UInt64Array::from(vec![0u64, 2]));
+        let survivors: BTreeSet<u64> = [2].into();
+        for (name, entity, kind, key) in [
+            ("spectra_metadata_precursors.parquet", EntityType::Spectrum, DataKind::Precursors, "spectrum_count"),
+            ("chromatograms_metadata_precursors.parquet", EntityType::Chromatogram, DataKind::Precursors, "chromatogram_count"),
+        ] {
+            let bytes = parquet(vec![("source_index", source_index.clone())], &[(key, "4")]);
+            let fe = FileEntry::new(name.to_string(), entity, kind);
+            let class = classify_facet(&bytes, &fe).unwrap();
+            let out = process_parquet(&bytes, class, &survivors, true, &FilterOpts::default(), None).unwrap();
+            assert!(!footer_keys(&out).iter().any(|k| k.ends_with("_count")), "{name}: {:?}", footer_keys(&out));
+        }
+    }
 }

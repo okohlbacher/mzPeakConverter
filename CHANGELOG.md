@@ -166,19 +166,62 @@ keep their bytes.
 - **`--drop-aux` refuses to remove a core facet.** Drop globs matched every member, so
   `--drop-aux '*.parquet'` wrote an archive holding nothing but its index, and dropping
   `spectra_peaks.parquet` or `spectra_metadata_precursors.parquet` wrote an unreadable one — each
-  with exit 0. A glob that matches a `spectrum` facet whose `data_kind` is not proprietary/other
-  now exits 1 before anything is written. `--no-vendor` still drops the Thermo `vendor_*` facets,
-  which are declared proprietary, and `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA
-  trace: those facets reference only each other.
-- **`--ms-level` and `--rt` fail on a missing or retyped column.** An `ms_level` that was absent
-  or not UInt8 read as level 0, and a `time` that was absent or not Float64 as NaN, so a writer
-  type change would have made either filter keep 0 spectra and exit 0.
+  with exit 0. A glob that matches a `spectrum` or `chromatogram` facet whose `data_kind` is not
+  `proprietary` now exits 1 before anything is written. That includes a kind this build does not
+  know, which the filter treats as a secondary, and `chromatograms_data`, whose removal under `--rt`
+  left metadata point counts refreshed from the facet that was dropped. `--no-vendor` still drops
+  the Thermo `vendor_*` facets, which are declared proprietary, and
+  `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA trace: those facets reference only each
+  other.
+- **`--ms-level` and `--rt` fail on a missing column or one they cannot read losslessly.** An
+  `ms_level` that was absent or not UInt8 read as level 0, and a `time` that was absent or not
+  Float64 as NaN, so a writer type change would have made either filter keep 0 spectra and exit 0.
+  Another integer width for `ms_level`, or float width for `time`, is now cast; an absent column,
+  another kind of type, or an `ms_level` that does not fit UInt8 exits 1.
 - **`--rt` refreshes chromatogram point counts in current archives.** The refresh knew only the
   pre-0.7 nested `chromatogram` struct, so the flat `chromatograms_metadata.parquet` the converter
   writes today was copied verbatim: on `tiny.pwiz.1.1` converted by 0.11.5, `--rt 0-0.0001` left
   2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
-  of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
-  re-encoded.
+  of 6. Both now follow the truncation, and the refreshed `number_of_data_points` keeps the
+  column's own integer type. Without `--rt` the facet is copied verbatim rather than re-encoded.
+- **A data facet's `<entity>_count` is an index bound again.** Since 0.11.2, `spectrum_count` on
+  `spectra_data` and `spectra_peaks` (and `chromatogram_count` / `wavelength_spectrum_count` on
+  `chromatograms_data` / `wavelength_spectra_data`) was the number of entities with rows in that
+  file — a cardinality. A data facet's indices are sparse, so readers that bound iteration by the
+  count lost spectra without an error: `090701-LTQVelos-unittest-01` declares 43 on a
+  `spectra_data` whose largest index is 84, and `Hela_QC_PASEF_Slot1-first-6-frames-ms2-centroid`
+  309 on a `spectra_peaks` that reaches index 1,748 — a centroid-only run 0.11.1 still bounded
+  correctly. The count is now one past the largest index with a row in that file, and 0 when the
+  file has none; `<entity>_data_point_count` stays the points in the file, and the primary
+  metadata facets keep the run total. The archive rewrite (`--rt`, `--ms-level`, `--drop-aux`)
+  stamps the same. Pinned by `tests/footer_counts.rs` and
+  `rewritten_data_facets_declare_an_index_bound`. This changes the footers of every archive; the
+  corpus is rebuilt at the next release.
+- **The metadata secondaries no longer carry an entity count.** The writer stamped the run total on
+  `spectra_metadata_scans`, `_precursors`, `_selected_ions`, `wavelength_spectra_metadata_scans`
+  and the chromatogram precursors / selected ions, so an MS1-only run's empty precursors facet
+  declared every spectrum, issue #1's shape; an `--rt` / `--ms-level` rewrite stamped a third
+  meaning there (the distinct `source_index` values left). Neither counts anything a reader can
+  plan from, so both omit the key now, and a rewrite also drops it from an older archive's
+  spectrum and chromatogram secondaries. Pinned by `secondary_facets_carry_no_entity_count` and
+  `filter::tests::rewrite_leaves_no_entity_count_on_secondaries`.
+- **A rewritten facet no longer embeds the pre-filter counts in `ARROW:schema`.** arrow-rs folds a
+  Parquet file's key-value footer into the schema it reads, and the `.mzpeak` rewrite (`--rt`,
+  `--ms-level`, `--drop-aux`) handed that schema to its writer, which serialises it into the file's
+  `ARROW:schema`. The key-value footer was recomputed, but Arrow C++ and pyarrow return the embedded
+  copy as the schema metadata: after `--ms-level 1` on `tiny.pwiz.1.1` converted by 0.11.5,
+  `spectra_data` said `spectrum_count=1`, `spectrum_data_point_count=10` on 0 rows, and
+  `spectra_metadata` 4 on 3. The writer now gets the schema without its schema-level metadata. That
+  loses nothing: an unfiltered archive embeds none, and every key the rewrite embedded was also in
+  the key-value footer. Pinned by `rewrite_embeds_no_stale_counts_in_the_arrow_schema`.
+- **An archive rewritten with `--ms-level` or `--rt` can be read back.** The rewrite keeps each
+  surviving spectrum's original index, but the vendored reader sized its per-spectrum tables (m/z
+  models, point, peak and auxiliary-array counts) by the number of rows, so
+  `mzpeak-convert f.mzpeak -o f.mzML` aborted with an index-out-of-bounds panic whenever the
+  survivors were not `0..n`: on `tiny.pwiz.1.1`, `--ms-level 1`, `--ms-level 2`, `--rt 0-1` and
+  `--rt 0-0.0001` all did. The tables now grow to the largest index, and the export walks the
+  indices the archive holds rather than `0..n`, which asked for filtered-out spectra and never
+  reached the last ones. Pinned by `filtered_archives_read_back` in `tests/filter_lane.rs`.
 - **A release is built only from a commit that passed CI.** `release.yml` runs no tests, and
   `windows.yml` cancelled a push's run as soon as the next commit reached `main` — so v0.10.0
   (85afceb), v0.10.1 (5692603) and v0.11.3 (4ff30a6) were released with their `windows` job
