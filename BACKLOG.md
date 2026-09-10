@@ -61,9 +61,10 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     `ims_calibration` block and the 1/K0 array name; it needs to recognise `raw_ion_mobility` (ms)
     and the `waters_drift` block.
   - **Device chromatograms** (UV, pressure, temperature; B-P3): the mzML lane gets 620 traces on
-    8 Agilent archives and more from pwiz's Waters/SciEX/Thermo readers; the native lanes write
-    TIC/BPC only. Agilent `.cg`/`.cd` layouts unknown; Bruker `chromatography-data.sqlite` is
-    readable on any host.
+    8 Agilent archives and more from pwiz's Waters/SciEX/Thermo readers. The Bruker lanes now read
+    HyStar's `chromatography-data.sqlite` themselves (`src/bruker_traces.rs`; verified on TDF and
+    TSF — the corpus BAF run has no such file); the Agilent, SciEX, Waters and Shimadzu native
+    lanes still write TIC/BPC only. Agilent `.cg`/`.cd` layouts unknown.
   - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
     per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
   - Shimadzu acquisition-software version (LabSolutions; needs a glue export); Waters per-function

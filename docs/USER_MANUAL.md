@@ -441,7 +441,10 @@ naming the function; a scan without a retention time refuses the conversion.
 
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
 the Agilent-MHDAC, BAF and SciEX lanes (Bruker TDF/TSF, Shimadzu and Waters have them), and the
-non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz.
+non-MS device chromatograms (UV, pressure, temperature) the mzML lane gets from pwiz — except on a
+Bruker `.d`: every Bruker lane writes the HyStar traces in its `chromatography-data.sqlite` after
+the TIC/BPC, each value array in the unit HyStar states (a trace in bar is stated in pascal and the
+archive declares `bruker:trace-unit-rescale`).
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
 PSI controlled-vocabulary meaning, it is mapped onto the standard
