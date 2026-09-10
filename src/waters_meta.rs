@@ -169,11 +169,10 @@ mod tests {
 
     #[test]
     fn capan2_states_model_time_and_members() {
-        let raw = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join("Claude/mzpeak-example-data/data/general-ms/waters-synapt-g2si-hdmse/20181203_Capan2_1.raw");
-        if !raw.is_dir() {
-            return;
-        }
+        // MetaboLights MTBLS812's `_HEADER.TXT` and `_extern.inf`, with an empty `_FUNC001.DAT` standing
+        // in for the 1.1 GB of scan data `read` only lists and digests. It used to read the corpus
+        // copy from $HOME and return without a word wherever that was absent, CI included.
+        let raw = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/20181203_Capan2_1.raw"));
         let m = read(&raw).expect("_HEADER.TXT");
         let cfg = m.instrument.expect("instrument");
         assert!(cfg.params.iter().any(|p| p.curie() == Some(mzdata::curie!(MS:1000126))));

@@ -1108,19 +1108,13 @@ mod tests {
     /// nonsense long before the polarity was. Together they say the offsets are aligned against the
     /// file's real layout and not merely self-consistent.
     ///
-    /// Corpus-gated. When the file is absent this test prints a `skipping` line and passes without
-    /// asserting anything, so a green result here is only evidence on a machine that HAS the
-    /// corpus — check the line, not the tick.
+    /// Runs everywhere on the three members it reads — `MSScan.bin`, `MSScan.xsd` and `MSTS.xml` of
+    /// MetaboLights MTBLS14741 `240319-LL-LeeMaire_c18-isoflavone-pos-S25.d`, 432 KB of its 252 MB
+    /// `AcqData`, committed under `tests/fixtures/lee_maire_s25_acqdata`. It used to read them from the
+    /// corpus and pass without asserting anything wherever the corpus was absent, CI included.
     #[test]
-    fn corpus_agilent_scan_records_carry_the_vendor_polarity() {
-        let acq = PathBuf::from(std::env::var("MZPEAK_CORPUS").unwrap_or_else(|_| {
-            format!("{}/Claude/mzpeak-example-data/data", std::env::var("HOME").unwrap_or_default())
-        }))
-        .join("general-ms/agilent-qtof/240319-LL-LeeMaire_c18-isoflavone-pos-S25.d/AcqData");
-        if !acq.join("MSScan.bin").exists() {
-            eprintln!("skipping: no Agilent corpus at {}", acq.display());
-            return;
-        }
+    fn agilent_scan_records_carry_the_vendor_polarity() {
+        let acq = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lee_maire_s25_acqdata"));
         let schema = ScanSchema::parse(&acq.join("MSScan.xsd")).unwrap();
         let scans =
             read_scan_records(&acq.join("MSScan.bin"), &schema, count_scans(&acq)).unwrap();
