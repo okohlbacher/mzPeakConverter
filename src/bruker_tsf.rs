@@ -14,7 +14,7 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use mzdata::meta::DissociationMethodTerm;
 use mzdata::params::Unit;
@@ -51,7 +51,6 @@ struct Frame {
     offset: usize,
 }
 
-/// A TSF `.d` reader yielding one centroid [`MultiLayerSpectrum`] per frame.
 /// One `FrameMsMsInfo` row: what the instrument selected for an MS2 frame.
 #[derive(Debug, Clone, Copy)]
 struct MsMsInfo {
@@ -62,6 +61,48 @@ struct MsMsInfo {
     collision_energy: f64,
 }
 
+/// Precursors: `FrameMsMsInfo(Frame, Parent, TriggerMass, IsolationWidth, PrecursorCharge,
+/// CollisionEnergy)`, one row per MS2 frame (measured: 3,486 rows for 3,486 MsMsType-2 frames, every
+/// Parent an MS1 frame; PrecursorCharge stated on ~28 % of them, NULL elsewhere; CollisionEnergy
+/// signed — negative in negative mode — and stored as stated, like the TDF lane). Keyed by frame; a
+/// file without the table simply has no precursors. A free function so the mapping can be pinned on
+/// an in-memory table: the corpus holds no TSF acquisition to pin it on.
+fn read_msms(conn: &Connection) -> std::collections::HashMap<i64, MsMsInfo> {
+    let mut msms = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT Frame, Parent, TriggerMass, IsolationWidth, PrecursorCharge, CollisionEnergy FROM FrameMsMsInfo",
+    ) else {
+        return msms;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, Option<f64>>(2)?,
+            r.get::<_, Option<f64>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<f64>>(5)?,
+        ))
+    }) else {
+        return msms;
+    };
+    for (frame, parent, trigger, width, charge, ce) in rows.flatten() {
+        let Some(trigger_mass) = trigger.filter(|m| m.is_finite() && *m > 0.0) else { continue };
+        msms.insert(
+            frame,
+            MsMsInfo {
+                parent: parent.filter(|p| *p > 0),
+                trigger_mass,
+                isolation_width: width.filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0),
+                charge: charge.and_then(|c| i32::try_from(c).ok()).filter(|c| *c != 0),
+                collision_energy: ce.filter(|e| e.is_finite()).unwrap_or(0.0),
+            },
+        );
+    }
+    msms
+}
+
+/// A TSF `.d` reader yielding one centroid [`MultiLayerSpectrum`] per frame.
 pub struct TsfReader {
     bin: Vec<u8>,
     frames: Vec<Frame>,
@@ -73,18 +114,19 @@ pub struct TsfReader {
 impl TsfReader {
     pub fn open(dot_d: &Path) -> Result<Self> {
         let tsf = dot_d.join("analysis.tsf");
-        let conn = Connection::open(&tsf).with_context(|| format!("opening {}", tsf.display()))?;
+        // Read-only. A plain `Connection::open` is read-write and CREATES a missing file, so opening a
+        // `.d` that has no TSF left an empty `analysis.tsf` inside the user's raw data — the corpus
+        // still holds one, beside a real TDF, and it had passed for a TSF fixture.
+        let conn = Connection::open_with_flags(&tsf, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_context(|| format!("opening {}", tsf.display()))?;
 
-        // Calibration from GlobalMetadata (best-effort numeric parse).
+        // Calibration from GlobalMetadata. SQLite's own error stays in the chain: a read-only open of a
+        // file with a hot journal fails here, and "missing/invalid" would have misreported it.
         let meta = |key: &str| -> Result<f64> {
-            conn.query_row(
-                "SELECT Value FROM GlobalMetadata WHERE Key = ?1",
-                [key],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .with_context(|| format!("TSF GlobalMetadata missing/invalid {key}"))
+            let v: String = conn
+                .query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [key], |r| r.get(0))
+                .with_context(|| format!("reading TSF GlobalMetadata {key} from {}", tsf.display()))?;
+            v.trim().parse::<f64>().with_context(|| format!("TSF GlobalMetadata {key} is not a number: {v:?}"))
         };
         let mut mz_min = meta("MzAcqRangeLower")?;
         let mut mz_max = meta("MzAcqRangeUpper")?;
@@ -156,41 +198,7 @@ impl TsfReader {
         let bin = std::fs::read(dot_d.join("analysis.tsf_bin"))
             .with_context(|| format!("reading {}", dot_d.join("analysis.tsf_bin").display()))?;
 
-        // Precursors: `FrameMsMsInfo(Frame, Parent, TriggerMass, IsolationWidth, PrecursorCharge,
-        // CollisionEnergy)`, one row per MS2 frame (measured: 3,486 rows for 3,486 MsMsType-2 frames,
-        // every Parent an MS1 frame; PrecursorCharge stated on ~28 % of them, NULL elsewhere;
-        // CollisionEnergy signed — negative in negative mode — and stored as stated, like the TDF
-        // lane). Read once, keyed by frame; a file without the table simply has no precursors.
-        let mut msms = std::collections::HashMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT Frame, Parent, TriggerMass, IsolationWidth, PrecursorCharge, CollisionEnergy FROM FrameMsMsInfo",
-        ) {
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<i64>>(1)?,
-                    r.get::<_, Option<f64>>(2)?,
-                    r.get::<_, Option<f64>>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
-                    r.get::<_, Option<f64>>(5)?,
-                ))
-            });
-            if let Ok(rows) = rows {
-                for (frame, parent, trigger, width, charge, ce) in rows.flatten() {
-                    let Some(trigger_mass) = trigger.filter(|m| m.is_finite() && *m > 0.0) else { continue };
-                    msms.insert(
-                        frame,
-                        MsMsInfo {
-                            parent: parent.filter(|p| *p > 0),
-                            trigger_mass,
-                            isolation_width: width.filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0),
-                            charge: charge.and_then(|c| i32::try_from(c).ok()).filter(|c| *c != 0),
-                            collision_energy: ce.filter(|e| e.is_finite()).unwrap_or(0.0),
-                        },
-                    );
-                }
-            }
-        }
+        let msms = read_msms(&conn);
         Ok(Self { bin, frames, calib, msms })
     }
 
@@ -314,4 +322,59 @@ impl TsfReader {
         }
     }
 
+}
+
+#[cfg(test)]
+mod msms_tests {
+    use super::*;
+
+    fn frame_msms_info(rows: &str) -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE FrameMsMsInfo (Frame INTEGER, Parent INTEGER, TriggerMass REAL, IsolationWidth REAL,
+                                         PrecursorCharge INTEGER, CollisionEnergy REAL); {rows}"
+        ))
+        .unwrap();
+        c
+    }
+
+    /// The mapping the TSF precursors (0.11.3) hang on. The end-to-end pin in
+    /// tests/run_metadata_native.rs needs a TSF acquisition the corpus does not have, so without this
+    /// the feature had no automated check at all.
+    #[test]
+    fn frame_msms_info_becomes_precursors() {
+        let m = read_msms(&frame_msms_info(
+            "INSERT INTO FrameMsMsInfo VALUES (2, 1, 301.5, 2.0, 2, -25.0);
+             INSERT INTO FrameMsMsInfo VALUES (3, 1, 402.25, 3.0, NULL, 30.0);
+             INSERT INTO FrameMsMsInfo VALUES (4, 0, 503.0, 2.0, 0, 30.0);
+             INSERT INTO FrameMsMsInfo VALUES (5, 1, 0.0, 2.0, 2, 30.0);
+             INSERT INTO FrameMsMsInfo VALUES (6, -1, 604.0, NULL, 1, NULL);",
+        ));
+        let p = &m[&2];
+        assert_eq!((p.parent, p.trigger_mass, p.isolation_width, p.charge, p.collision_energy), (Some(1), 301.5, 2.0, Some(2), -25.0),
+            "a stated charge and a signed collision energy are carried as stated");
+        assert_eq!(m[&3].charge, None, "an unstated charge stays unknown, never invented");
+        assert_eq!((m[&4].parent, m[&4].charge), (None, None), "Parent 0 and charge 0 mean unknown");
+        assert!(!m.contains_key(&5), "a row without a trigger mass is no precursor");
+        assert_eq!((m[&6].parent, m[&6].isolation_width, m[&6].collision_energy), (None, 0.0, 0.0));
+        assert_eq!(m.len(), 4);
+    }
+
+    #[test]
+    fn a_file_without_the_table_has_no_precursors() {
+        assert!(read_msms(&Connection::open_in_memory().unwrap()).is_empty());
+    }
+
+    /// Opening a `.d` that has no `analysis.tsf` must fail without creating one in the input.
+    #[test]
+    fn open_never_writes_into_the_input_directory() {
+        let d = std::env::temp_dir().join(format!("mzpc-tsf-nostub-{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let opened = TsfReader::open(&d).is_ok();
+        let created = d.join("analysis.tsf").exists();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!opened, "a directory without analysis.tsf is not a TSF run");
+        assert!(!created, "TsfReader::open created analysis.tsf inside the input directory");
+    }
 }

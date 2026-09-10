@@ -165,12 +165,21 @@ mod tests {
 
     #[test]
     fn blind_states_a_zoned_start_sample_and_labsolutions_version() {
-        let lcd = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join("Claude/mzpeak-example-data/data/general-ms/shimadzu-lcms-9030-qtof/Blind_P1_pos_012.lcd");
-        if !lcd.is_file() {
-            return;
+        // The primary stream `read` prefers — the root `File Property` of MetaboLights MTBLS13204
+        // Blind_P1_pos_012.lcd, 8 KB of the 55 MB file — re-wrapped in a compound file here. It used
+        // to read the corpus copy from $HOME and return silently wherever that was absent.
+        let stream = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/blind_file_property.bin")).unwrap();
+        let lcd = std::env::temp_dir().join(format!("mzpc-blind-{}.lcd", std::process::id()));
+        {
+            let mut comp = cfb::create(&lcd).unwrap();
+            let mut s = comp.create_stream("/File Property").unwrap();
+            std::io::Write::write_all(&mut s, &stream).unwrap();
+            std::io::Write::flush(&mut s).unwrap();
+            drop(s);
+            comp.flush().unwrap();
         }
         let m = read(&lcd).expect("File Property stream");
+        let _ = std::fs::remove_file(&lcd);
         match m.start_time.expect("start time") {
             AcquisitionTime::Stated(t) => assert_eq!(t.to_rfc3339(), "2024-02-15T11:47:18.756221600+01:00"),
             other => panic!("{other:?}"),

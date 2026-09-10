@@ -14,11 +14,12 @@
 //!     `userParam`).
 //!
 //! The tables are read straight from the archive's Parquet members (the per-spectrum reader API
-//! takes ~50 s over the 16k window-spectra of the mzdata lane). Skips (passes) when the reference
-//! `.d` is absent; override the corpus root with `MZPEAK_CORPUS`.
+//! takes ~50 s over the 16k window-spectra of the mzdata lane). Needs 2485.d from the corpus, so it is
+//! `#[ignore]`d: CI reports it as not run rather than as passed. Run with `--include-ignored`
+//! and `MZPEAK_CORPUS`; `MZPC_REQUIRE_CORPUS=1` makes a missing fixture fail instead of skip.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use arrow::array::{Array, ArrayRef, AsArray, LargeListArray, LargeStringArray, ListArray, StringArray};
@@ -26,20 +27,15 @@ use arrow::datatypes::{Float32Type, Float64Type, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+#[path = "common/corpus.rs"]
+mod corpus;
+
 const DOT_D: &str =
     "ims-examples/PXD059079/20230830_100SPD_NCI7_0p12ng_HS_01_S1-B1_1_2485.d";
 const LOWER_NAME: &str = "isolation window inverse reduced ion mobility lower limit";
 /// One selected ion per dia-PASEF window on this file (3,594 MS2 frames × ~4.45 windows).
 const WINDOWS: usize = 15_977;
 
-fn corpus_root() -> PathBuf {
-    std::env::var("MZPEAK_CORPUS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join("Claude/mzpeak-example-data/data")
-        })
-}
 
 fn run(args: &[&str], envs: &[(&str, &str)]) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"));
@@ -230,12 +226,9 @@ fn cv_ids(archive: &Path) -> Vec<String> {
 }
 
 #[test]
+#[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
 fn both_timstof_lanes_carry_the_mzp_band_and_agree_on_precursor_mobility() {
-    let dot_d = corpus_root().join(DOT_D);
-    if !dot_d.join("analysis.tdf").exists() {
-        eprintln!("skipping: {} not present", dot_d.display());
-        return;
-    }
+    let Some(dot_d) = corpus::corpus_path(DOT_D) else { return };
     let tmp = std::env::temp_dir().join(format!("mzpc-imband-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let compact = tmp.join("compact.mzpeak");

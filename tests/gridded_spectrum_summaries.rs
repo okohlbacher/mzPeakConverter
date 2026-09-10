@@ -25,7 +25,7 @@
 //! quantized axis is not available at all. INTENSITY is stored verbatim, so TIC and
 //! `base_peak_intensity` do stay bit-equal between the lanes.
 //!
-//! Skips (passes) when the reference mzML is absent; override the corpus root with `MZPEAK_CORPUS`.
+//! Runs on the committed, gzipped copy under `tests/fixtures`, so it runs in CI too.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,17 +35,11 @@ use arrow::datatypes::{Float32Type, Float64Type};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-/// A SCIEX TripleTOF SWATH sample from the ProteoWizard test set: 201 spectra, every one of which
+/// A SCIEX X500R QTOF SWATH run from the ProteoWizard test set: 201 spectra, every one of which
 /// lands on the integer TOF lattice, so `--tof-grid on` routes all 201 through the grid.
-const MZML: &str = "pwiz-examples/ABI/ABI/Reader_ABI_Test.data/swath.api-sample-centroid.mzML";
+const MZML: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
 const SPECTRA: usize = 201;
 
-fn corpus_root() -> PathBuf {
-    std::env::var("MZPEAK_CORPUS").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join("Claude/mzpeak-example-data/data")
-    })
-}
 
 fn run(args: &[&str]) {
     let st = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
@@ -146,11 +140,7 @@ fn summaries(archive: &Path, dir: &Path) -> Summaries {
 
 #[test]
 fn gridded_archive_summaries_match_the_f64_lane() {
-    let input = corpus_root().join(MZML);
-    if !input.exists() {
-        eprintln!("skipping: {} not present", input.display());
-        return;
-    }
+    let input = PathBuf::from(MZML);
     let dir = std::env::temp_dir().join(format!("mzpc-gridsummary-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let gridded = dir.join("grid.mzpeak");
@@ -236,14 +226,10 @@ fn gridded_archive_summaries_match_the_f64_lane() {
 ///
 /// This is the archive-level half of `contract_strings::tof_grid_reconstruction_keys_pinned`, which
 /// pins the same keys in the source. Both exist because the string pin cannot see whether the block
-/// actually reaches the file, and this one cannot run without the corpus.
+/// actually reaches the file, and this one reads the file itself.
 #[test]
 fn gridded_archive_states_its_reconstruction_contract() {
-    let input = corpus_root().join(MZML);
-    if !input.exists() {
-        eprintln!("skipping: {} not present", input.display());
-        return;
-    }
+    let input = PathBuf::from(MZML);
     let dir = std::env::temp_dir().join(format!("mzpc-gridcal-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let gridded = dir.join("grid.mzpeak");
