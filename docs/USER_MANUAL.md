@@ -44,8 +44,9 @@ It is a **single command**: give it an input and, optionally, an output.
   a report (format, spectrum count, chromatogram count).
 
 Passing `-v` prints that same inspection report *and still performs the conversion*. Beside a
-conversion the report never opens a native vendor reader (the conversion opens its own, and
-`--via-msconvert` needs none), and a report that fails is a `note:` line, not the run's error.
+conversion the report never opens a vendor library — Thermo RawFileReader, Bruker baf2sql, Agilent
+MHDAC, SciEX, Waters or Shimadzu (the conversion opens its own, and `--via-msconvert` needs none) —
+and a report that fails is a `note:` line, not the run's error.
 
 ## 2. Installation & requirements
 

@@ -190,13 +190,16 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   whatever was asked for. `-v --via-msconvert` on a `.wiff`, `.lcd` or Waters `.raw` exited with
   the native reader's error (no `MZPC_PWIZ_DIR`, no .NET 8, a file Clearcore2 rejects) and wrote
   nothing. `-v` on a native Agilent conversion ran the MHDAC host over the whole run twice, 2.9 GB of
-  temp file each time for a 242 MB Q-TOF `.d`. On SciEX the second open booted CoreCLR again. With
-  `-o` or `--via-msconvert` the report now gives the format and says the native reader was not
-  opened. A bare inspection still opens it, and a native reader that fails to open there is a
-  `note:` line, as the Agilent one already was. Any other report error under `-o` is a `note:` as
-  well, and the conversion goes ahead. Pinned by `tests/verbose_inspection.rs` (a TSF `.d` whose
-  report fails) and `tests::inspection_opens_a_native_reader_only_when_inspecting_is_the_job`; the
-  Windows branches are compiled only by CI.
+  temp file each time for a 242 MB Q-TOF `.d`. On SciEX the second open booted CoreCLR again. A
+  Thermo `.raw` or a Bruker BAF `.d` was opened twice as well, or opened for `--via-msconvert`,
+  which needs neither RawFileReader nor baf2sql. With `-o` or `--via-msconvert` the report now
+  gives the format and says the native reader was not opened. A bare inspection still opens it. On
+  Windows a SciEX, Waters or Shimadzu reader that fails to open there is now a `note:` line and the
+  inspection exits 0, as the Agilent one already did. Any other report error under `-o` is a
+  `note:` as well, and the conversion goes ahead. Pinned by `tests/verbose_inspection.rs` (a TSF
+  `.d` whose report fails, `small.RAW`, and on Linux a BAF `.d`) and
+  `tests::inspection_opens_a_native_reader_only_when_inspecting_is_the_job`; the Windows branches are
+  compiled only by CI.
 - **The native Agilent (MHDAC) lane says once when it writes MS2 rows without a precursor**, as the
   SciEX, BAF, TSF, Waters and Agilent-profile lanes already did. The host's `AGL2` output has no
   precursor field, so every MSn row this lane writes lacks a selected ion, isolation window and

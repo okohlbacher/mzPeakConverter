@@ -1587,11 +1587,10 @@ fn native_inspect_skip(output_given: bool, via_msconvert: bool) -> Option<&'stat
 
 /// Print a human report of what a reader sees (format, spectra, chromatograms) without converting —
 /// the behaviour of a no-output run, and the `-v` extra during a conversion. With `skip_native` set
-/// (see [`native_inspect_skip`]) the native vendor readers stay closed; a native reader that fails
-/// to open is a `note:` line, never the run's error.
+/// (see [`native_inspect_skip`]) no vendor library is opened: Thermo's RawFileReader, Bruker's
+/// baf2sql, Agilent MHDAC, SciEX, Waters and Shimadzu. A Windows vendor reader that fails to open
+/// is a `note:` line, never the run's error.
 fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
-    #[cfg(not(windows))]
-    let _ = skip_native;
     // mzPeak archive: mzdata can't open it — report members + spectrum/chromatogram counts instead.
     if filter::is_mzpeak_input(input) {
         return filter::report_inspect(input);
@@ -1605,7 +1604,10 @@ fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
     #[cfg(any(windows, target_os = "linux"))]
     if is_baf_dir(input) {
         println!("format:        Bruker BAF (.d)");
-        println!("spectra:       {}", bruker_baf::BafReader::open(input, None)?.len());
+        match skip_native {
+            Some(why) => println!("note:          {why}"),
+            None => println!("spectra:       {}", bruker_baf::BafReader::open(input, None)?.len()),
+        }
         return Ok(());
     }
     if is_agilent_d(input) {
@@ -1680,6 +1682,13 @@ fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
         }
         #[cfg(not(windows))]
         println!("note:          native Shimadzu reading is Windows-only (Shimadzu.LabSolutions.IO); or use --via-msconvert");
+        return Ok(());
+    }
+    // mzdata reads a Thermo .raw through Thermo's RawFileReader, an in-process .NET runtime: a vendor
+    // library like the ones above, so it stays closed beside a conversion too.
+    if let Some(why) = skip_native.filter(|_| is_thermo_raw(input)) {
+        println!("format:        Thermo .raw");
+        println!("note:          {why}");
         return Ok(());
     }
     let _gz = if input.is_file() { gunzip_to_temp(input)? } else { None };
