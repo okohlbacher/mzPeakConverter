@@ -18,6 +18,11 @@
 # down for local reference. Multi-object units (.d, Waters .raw, .wiff+.scan, .imzML+.ibd) cannot be
 # a single presigned GET, so those fall back to host staging automatically.
 #
+# OVER 5 GiB the S3 relay cannot carry an archive: the box's single presigned PUT, the copy_object
+# publish and the md5==ETag gate all stop at 5 GB. For a LOCAL target the box then holds the archive
+# (C:\Users\User\bxc-hold) and the host pulls it by scp, checks size and md5 and removes the box copy
+# (pull_held). An s3:// target still fails at stage=too-big; multipart stays manual (s3_relay.py).
+#
 # On every invocation the box converter is brought to the newest RELEASE TAG before any job runs
 # (BOX_AUTOUPDATE=1|check|0, BOX_CONVERTER_VERSION=vX.Y.Z, BOX_REQUIRE_VERSION=1 to abort if stale).
 #
@@ -182,21 +187,55 @@ EOF
   [ "${BOX_REQUIRE_VERSION:-0}" = 1 ] && return 1 || return 0
 }
 
+pull_held(){  # tag hold dst size md5 uid -> scp a box-held archive (over 5 GiB) to dst, verified
+  # The S3 relay stops at 5 GiB, and a refused archive used to be discarded after its whole
+  # conversion: PXD077098's 9.04 GB, on every rebuild. For a local target the box now keeps it; this
+  # pulls it through the same jump host, checks size and md5 as the relay path does, and removes the
+  # box copy whatever the outcome (the box also sweeps holds older than two days).
+  local tag="$1" hold="$2" dst="$3" size="$4" md5="$5" uid="$6" part got rc=1
+  # Only the name the box script mints: it is interpolated into a remote PowerShell command below.
+  if ! [[ "$hold" =~ ^C:/Users/User/bxc-hold/bxc-[0-9a-f]{32}\.mzpeak$ ]]; then
+    echo "[$tag] FAIL: unexpected hold path from the box: $hold" >&2; return 1
+  fi
+  part="$dst.$uid.part"
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+  echo "[$tag] $size B is over the 5 GiB S3 relay ceiling -- pulling it by scp" >&2
+  if ! scp -i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+         -o ServerAliveInterval=30 -o ServerAliveCountMax=30 -o "$PROXY" "$BOX_SSH:$hold" "$part" >/dev/null 2>&1; then
+    echo "[$tag] FAIL: scp of $hold" >&2
+  elif got="$(wc -c < "$part" | tr -d ' ')" && [ "$got" != "$size" ]; then
+    echo "[$tag] FAIL: size mismatch (box=$size got=$got)" >&2
+  elif got="$("${RELAY[@]}" md5 "$part")" && [ "$got" != "$md5" ]; then
+    echo "[$tag] FAIL: md5 mismatch (box=$md5 got=$got)" >&2
+  else
+    mv -f "$part" "$dst" && rc=0
+  fi
+  [ "$rc" = 0 ] || rm -f "$part"
+  "${SSH[@]}" "$BOX_SSH" "powershell -NoProfile -Command \"Remove-Item -LiteralPath '$hold' -Force\"" >/dev/null 2>&1 \
+    || echo "[$tag] WARN: could not remove $hold on the box (it sweeps holds older than two days)" >&2
+  return $rc
+}
+
 run_job(){  # raw_url out_path opts key uuid -> converter exit (1 on relay/ssh/verify failure)
   local raw="$1" out="$2" opts="${3:-}" key="$4" uid="$5" tag; tag="$(basename "$out")"
   local put
   put="$("${RELAY[@]}" presign-put "$key" --expires "$PUT_EXPIRES")" \
     || { echo "[$tag] FAIL: presign" >&2; return 1; }
+  # Over 5 GiB only a LOCAL target can take the archive (by scp, pull_held); S3 cannot publish it.
+  local hold=1; case "$out" in s3://*) hold= ;; esac
   # job json built by python so quoting/escaping is correct; URLs passed via ENV (not argv, so they
   # don't show in the host's `ps`) and reach the box only on its STDIN
   local job
   job="$(RAW="$raw" PUT="$put" OPTS="$opts" ARCH="$ARCHIVE" CONV="${BOX_CONVERTER:-}" \
-         DESC="${UNIT_DESC:-}" \
+         DESC="${UNIT_DESC:-}" HOLD="$hold" \
          RCACHE="${MZPC_BOX_RAW_CACHE:-}" RCLOCK="${MZPC_BOX_CACHE_LOCK_WAIT:-}" \
          RCVERIFY="${MZPC_BOX_CACHE_VERIFY:-}" python3 - <<'PY'
 import json,os
 j={"raw_url":os.environ["RAW"],"put_url":os.environ["PUT"],"opts":os.environ["OPTS"],
    "archive":os.environ["ARCH"]=="true","converter":os.environ["CONV"] or None}
+# Asked for, never assumed: a box told nothing discards an archive over 5 GiB, as it always did.
+if os.environ.get("HOLD"):
+    j["hold_oversize"] = True
 # Box raw-cache knobs travel in the JOB JSON, not the environment: this ssh invocation forwards no
 # env (no SendEnv, and Windows sshd does not accept env by default), so a host-side
 # `MZPC_BOX_RAW_CACHE=off box_convert.sh ...` was silently ignored -- the feature's kill-switch was
@@ -241,14 +280,14 @@ c=lambda s:str(s).replace("\t"," ").replace("\n"," ").replace("\r"," ")
 for v in [c(r.get("stage","")),str(r.get("exit","")),"1" if r.get("uploaded") else "0",
           str(r.get("size","")),str(r.get("md5","")),c(r.get("error","")),c(r.get("note","")),
           str(r.get("conv_s","")),str(r.get("msconv_s","")),str(r.get("dl_s","")),str(r.get("up_s","")),str(r.get("raw_bytes","")),
-          c(r.get("argv",""))]:
+          c(r.get("argv","")),c(r.get("hold",""))]:
     print(v)')"
   [ "$fields" = "ERR" ] && { echo "[$tag] FAIL: unparseable result from box" >&2; return 1; }
-  local R_STAGE R_EXIT R_UP R_SIZE R_MD5 R_ERR R_NOTE R_CONV R_MSCONV R_DL R_UPS R_RAW R_ARGV
+  local R_STAGE R_EXIT R_UP R_SIZE R_MD5 R_ERR R_NOTE R_CONV R_MSCONV R_DL R_UPS R_RAW R_ARGV R_HOLD
   { IFS= read -r R_STAGE; IFS= read -r R_EXIT; IFS= read -r R_UP; IFS= read -r R_SIZE
     IFS= read -r R_MD5;   IFS= read -r R_ERR;  IFS= read -r R_NOTE
     IFS= read -r R_CONV;  IFS= read -r R_MSCONV; IFS= read -r R_DL; IFS= read -r R_UPS; IFS= read -r R_RAW
-    IFS= read -r R_ARGV; } <<EOF
+    IFS= read -r R_ARGV;  IFS= read -r R_HOLD; } <<EOF
 $fields
 EOF
   [ -n "$R_NOTE" ] && echo "[$tag] note: $R_NOTE" >&2
@@ -264,7 +303,12 @@ EOF
     *refused-\>msconvert*)
       echo "[$tag] native lane refused this unit by design (MRM/SIM dwell data or an IM-QTOF run); the msconvert archive is the intended output" >&2 ;;
   esac
-  if [ "$R_UP" = "1" ] && [ "$R_EXIT" = "0" ]; then
+  # Over 5 GiB the box refused the PUT (stage=too-big) and, for a local target, held the archive.
+  if [ "$R_UP" != "1" ] && [ "$R_EXIT" = "0" ] && [ "$R_STAGE" = "too-big" ] && [ -n "$R_HOLD" ]; then
+    pull_held "$tag" "$R_HOLD" "$out" "$R_SIZE" "$R_MD5" "$uid" || return 1
+    R_UP=held
+  fi
+  if { [ "$R_UP" = "1" ] || [ "$R_UP" = "held" ]; } && [ "$R_EXIT" = "0" ]; then
     # S3-FIRST: a durable s3:// target is ALREADY the deliverable -- the box PUT it to its final
     # corpus key. Mirror it down for local reference (the corpus keeps a local copy so the
     # descriptor-driven harness can stamp and re-verify it), but never treat the local file as the
@@ -284,7 +328,9 @@ EOF
         else echo "[$tag] durable target $out -> mirroring to $dst" >&2; fi ;;
     esac
 
-    if [ "$defer" = "1" ]; then
+    if [ "$R_UP" = "held" ]; then
+      echo "[$tag] OK exit=0 size=$R_SIZE -> $out (pulled by scp: over the 5 GiB S3 relay ceiling)"
+    elif [ "$defer" = "1" ]; then
       # Verify WITHOUT moving bytes: a single-part PUT's ETag IS the body md5, and the box uploads
       # with one presigned PUT (the 5 GB ceiling enforces single-part), so a HEAD proves the object
       # intact. This KEEPS the pre-publish integrity gate that --no-fetch drops, while the slow local

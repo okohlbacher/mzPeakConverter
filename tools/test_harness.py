@@ -321,7 +321,7 @@ class BoxJob(Shell):
         (self.tmp / "object").write_bytes(obj)
         result = {"stage": "done", "exit": 0, "uploaded": True, "size": len(obj),
                   "md5": hashlib.md5(obj).hexdigest(), "error": "", "note": "", **result}
-        script = DRIVER + shell_functions("run_job") + '\nrun_job raw "$OUT" "$OPTS" box-convert/k.mzpeak 0123abcd; echo "rc=$?"\n'
+        script = DRIVER + shell_functions("pull_held", "run_job") + '\nrun_job raw "$OUT" "$OPTS" box-convert/k.mzpeak 0123abcd; echo "rc=$?"\n'
         return self.bash(script, **env, FAKE_OBJECT=str(self.tmp / "object"), OUT=out, OPTS=opts,
                          RESULT_B64=base64.b64encode(json.dumps(result).encode()).decode())
 
@@ -332,6 +332,34 @@ class BoxJob(Shell):
         self.assertEqual(rc, 0, log)
         self.assertEqual(out.read_bytes(), b"archive bytes")
         self.assertEqual(bench.read_text().splitlines()[1].split("\t")[3], "--no-vendor")
+
+    HOLD = "C:/Users/User/bxc-hold/bxc-" + "0123456789abcdef" * 2 + ".mzpeak"
+    TOO_BIG = {"stage": "too-big", "uploaded": False, "error": "mzpeak 9039127239 B exceeds the 5 GB single-PUT limit"}
+
+    def test_an_archive_over_the_relay_ceiling_comes_back_by_scp(self):
+        out = self.tmp / "corpus/ims/run.mzpeak"
+        rc, log = self.run_job({**self.TOO_BIG, "hold": self.HOLD}, str(out), "--no-vendor")
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(out.read_bytes(), b"archive bytes")
+        self.assertTrue(json.loads((self.tmp / "job.json").read_text())["hold_oversize"])
+        self.assertEqual((self.tmp / "scp").read_text(), f"user@box:{self.HOLD}\n")
+        self.assertIn(self.HOLD, (self.tmp / "removed").read_text())
+        self.assertEqual(list(self.tmp.rglob("*.part")), [])
+
+    def test_a_corrupt_scp_pull_is_refused_and_the_box_copy_still_removed(self):
+        out = self.tmp / "run.mzpeak"
+        rc, log = self.run_job({**self.TOO_BIG, "hold": self.HOLD, "md5": "0" * 32}, str(out), "--no-vendor")
+        self.assertEqual(rc, 1, log)
+        self.assertIn("md5 mismatch", log)
+        self.assertFalse(out.exists())
+        self.assertEqual(list(self.tmp.rglob("*.part")), [])
+        self.assertIn(self.HOLD, (self.tmp / "removed").read_text())
+
+    def test_an_s3_target_asks_the_box_to_hold_nothing(self):
+        rc, log = self.run_job(self.TOO_BIG, "s3://v09/ims/run.mzpeak", "--no-vendor")
+        self.assertEqual(rc, 1, log)
+        self.assertNotIn("hold_oversize", json.loads((self.tmp / "job.json").read_text()))
+        self.assertFalse((self.tmp / "scp").exists())
 
 
 class SyncBox(Shell):

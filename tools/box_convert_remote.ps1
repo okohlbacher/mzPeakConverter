@@ -120,7 +120,7 @@ $job = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $work = Join-Path $env:TEMP ("bxc-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $res = [ordered]@{ stage='init'; exit=1; uploaded=$false; size=0; md5=''; log=''; error=''; note='';
-                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0; argv='' }
+                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0; argv=''; hold='' }
 $cacheLock = $null   # released as soon as the unit is copied out; the `finally` is only a backstop
 
 try {
@@ -441,7 +441,24 @@ try {
     if ($res.exit -eq 0 -and (Test-Path $out)) {
         $res.size = (Get-Item $out).Length
         $res.md5 = (Get-FileHash $out -Algorithm MD5).Hash.ToLower()
-        if ($res.size -gt 5GB) { $res.stage = 'too-big'; throw "mzpeak $($res.size) B exceeds the 5 GB single-PUT limit" }
+        if ($res.size -gt 5GB) {
+            $res.stage = 'too-big'
+            if ($job.hold_oversize) {
+                # The host asked (a LOCAL target): keep the archive outside $work, which `finally`
+                # deletes, for box_convert.sh's pull_held to scp back and then remove. Before this a
+                # 9.04 GB archive was discarded after its whole conversion, on every rebuild. The sweep
+                # clears holds a killed host never collected; no pull takes two days.
+                $holdDir = 'C:\Users\User\bxc-hold'
+                New-Item -ItemType Directory -Force -Path $holdDir | Out-Null
+                Get-ChildItem -LiteralPath $holdDir -Filter 'bxc-*.mzpeak' -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddDays(-2) } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+                $hold = Join-Path $holdDir ((Split-Path -Leaf $work) + '.mzpeak')
+                Move-Item -LiteralPath $out -Destination $hold -Force
+                $res.hold = $hold -replace '\\', '/'
+            }
+            throw "mzpeak $($res.size) B exceeds the 5 GB single-PUT limit"
+        }
         $res.stage = 'upload'
         $upcfg = Join-Path $work 'up.cfg'
         Set-Content -LiteralPath $upcfg -Value ('url = "' + $job.put_url + '"') -Encoding ASCII
