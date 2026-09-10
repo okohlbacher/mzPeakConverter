@@ -334,12 +334,12 @@ impl SciexReader {
     /// `SciexGlue.dll` + `SciexGlue.runtimeconfig.json`; `MZPC_PWIZ_DIR` must point at a
     /// ProteoWizard install whose `vendor_api/ABI` subdirectory holds the Clearcore2 DLLs.
     pub fn open(path: &Path) -> Result<Self> {
-        let glue_dir = std::env::var_os("MZPC_SCIEX_GLUE")
-            .map(PathBuf::from)
+        let glue_dir = crate::pwiz_layout::glue_dir("MZPC_SCIEX_GLUE", "sciex")
             .ok_or_else(|| {
                 anyhow!(
-                    "MZPC_SCIEX_GLUE is not set; point it at the directory holding SciexGlue.dll \
-                     (the `dotnet build` output of glue/sciex, e.g. .../bin/Release/net8.0)"
+                    "MZPC_SCIEX_GLUE is not set and there is no glue/sciex beside the executable; \
+                     point it at the directory holding SciexGlue.dll (the `dotnet build` output of \
+                     glue/sciex, e.g. .../bin/Release/net8.0)"
                 )
             })?;
 

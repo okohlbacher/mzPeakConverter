@@ -221,12 +221,11 @@ fn to_utf16_nul(path: &Path) -> Result<Vec<u16>> {
 }
 
 fn resolve_dirs() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let glue_dir = std::env::var_os("MZPC_AGILENT_MIDAC_GLUE")
-        .map(std::path::PathBuf::from)
+    let glue_dir = crate::pwiz_layout::glue_dir("MZPC_AGILENT_MIDAC_GLUE", "agilent_midac")
         .ok_or_else(|| {
             anyhow!(
-                "MZPC_AGILENT_MIDAC_GLUE not set — point it at the `dotnet build` output dir of \
-                 glue/agilent_midac/"
+                "MZPC_AGILENT_MIDAC_GLUE not set and no glue/agilent_midac beside the executable — \
+                 point it at the `dotnet build` output dir of glue/agilent_midac/"
             )
         })?;
     let pwiz_dir = std::env::var_os("MZPC_PWIZ_DIR").map(std::path::PathBuf::from).ok_or_else(|| {
