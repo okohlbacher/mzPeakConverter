@@ -2166,24 +2166,13 @@ fn convert_to_mzml(
 /// (Sage/MSFragger)" workflow. Aux/vendor embedding does not apply to an mzML output and is
 /// silently ignored.
 ///
-/// The predicate matches `filter.rs`: keep iff `start_time()` (the mzPeak stores `spectrum.time` in
-/// **minutes**, which the reader surfaces directly) ∈ `--rt` AND `ms_level()` ∈ the `--ms-level` set.
+/// The survivors are `filter.rs`'s: `spectrum.time` (stored in **minutes**) ∈ `--rt` AND
+/// `ms_level` ∈ the `--ms-level` set, read from `spectra_metadata` by [`filter::surviving_spectra`].
 fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts) -> Result<()> {
-    use mzdata::io::DetailLevel;
     use mzdata::prelude::{MSDataFileMetadata, SpectrumLike, SpectrumSource, SpectrumWriter};
     use mzpeak_prototyping::MzPeakReader;
 
     let filtering = opts.rt.is_some() || !opts.ms_levels.is_empty();
-    let keep = |ms_level: u8, start_time_min: f64| -> bool {
-        let mut ok = true;
-        if let Some((lo, hi)) = opts.rt {
-            ok &= start_time_min >= lo && start_time_min <= hi;
-        }
-        if !opts.ms_levels.is_empty() {
-            ok &= opts.ms_levels.contains(&ms_level);
-        }
-        ok
-    };
 
     let mut reader =
         MzPeakReader::new(input).with_context(|| format!("opening {} as mzPeak", input.display()))?;
@@ -2209,28 +2198,20 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     }
     let cap = max_spectra();
 
-    // Pass 1 (metadata-only): collect the surviving indices — no peak arrays decoded here, so the
-    // dropped spectra are never fully read. Gives an accurate spectrumList `count` attribute + the
-    // "keeping X/N" log up front.
-    reader.set_detail_level(DetailLevel::MetadataOnly);
-    let mut survivor_ids: Vec<usize> = Vec::new();
-    for i in 0..total {
-        if cap.is_some_and(|m| i >= m) {
-            break;
-        }
-        if let Some(spec) = reader.get_spectrum_by_index(i) {
-            if keep(spec.ms_level(), spec.start_time()) {
-                survivor_ids.push(i);
-            }
-        }
-    }
-    if filtering {
-        log::info!("filter: keeping {}/{} spectra", survivor_ids.len(), total);
-    }
+    // The surviving indices, known up front for the spectrumList `count` attribute. Every index when
+    // nothing filters; otherwise one scan of the `time` / `ms_level` columns. This was a
+    // metadata-only read of every spectrum, filtered or not, before the survivors were read again
+    // in full: 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak` before a first write.
+    let limit = cap.map_or(total, |m| m.min(total));
+    let survivor_ids: Vec<usize> = if filtering {
+        let kept = filter::surviving_spectra(input, opts)?;
+        let ids: Vec<usize> = kept.into_iter().map(|i| i as usize).filter(|&i| i < limit).collect();
+        log::info!("filter: keeping {}/{} spectra", ids.len(), total);
+        ids
+    } else {
+        (0..limit).collect()
+    };
 
-    // Pass 2 (full): decode + write only the survivors.
-    reader.set_detail_level(DetailLevel::Full);
-    reader.reset();
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);

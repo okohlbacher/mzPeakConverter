@@ -166,15 +166,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     // Read spectra_metadata once: compute the surviving spectrum-index set + the dangling-precursor
     // count. Metadata is one row per spectrum, so it is small relative to the peak facets.
     let filtering_spectra = opts.rt.is_some() || !opts.ms_levels.is_empty();
-    // The primary spectrum metadata member, taken from the index rather than assumed: the name is
-    // conventional, not normative, and an archive is free to call it something else.
-    let meta_name = orig_files
-        .values()
-        .find(|fe| {
-            matches!(fe.entity_type, EntityType::Spectrum) && matches!(fe.data_kind, DataKind::Metadata)
-        })
-        .map(|fe| fe.name.clone())
-        .unwrap_or_else(|| "spectra_metadata.parquet".to_string());
+    let meta_name = spectrum_metadata_member(&orig_files);
     let meta_bytes =
         read_member(&mut zip, &meta_name).with_context(|| format!("reading {meta_name}"))?;
 
@@ -317,6 +309,31 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // Survivors + dangling precursors
 // ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The primary spectrum metadata member, taken from the index rather than assumed: the name is
+/// conventional, not normative, and an archive is free to call it something else.
+fn spectrum_metadata_member(files: &HashMap<String, FileEntry>) -> String {
+    files
+        .values()
+        .find(|fe| {
+            matches!(fe.entity_type, EntityType::Spectrum) && matches!(fe.data_kind, DataKind::Metadata)
+        })
+        .map(|fe| fe.name.clone())
+        .unwrap_or_else(|| "spectra_metadata.parquet".to_string())
+}
+
+/// The `spectrum.index` of every spectrum `opts` keeps in `input`, from one scan of its spectrum
+/// metadata — what [`run`] filters by, for the `.mzpeak` → mzML export.
+pub fn surviving_spectra(input: &Path, opts: &FilterOpts) -> Result<BTreeSet<u64>> {
+    let f = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(f))
+        .with_context(|| format!("reading {} as a mzPeak ZIP", input.display()))?;
+    let index: serde_json::Value = serde_json::from_slice(&read_member(&mut zip, "mzpeak_index.json")?)
+        .context("parsing mzpeak_index.json")?;
+    let meta_name = spectrum_metadata_member(&index_file_entries(&index));
+    let meta = read_member(&mut zip, &meta_name).with_context(|| format!("reading {meta_name}"))?;
+    Ok(compute_survivors(&meta, opts).context("computing surviving spectra")?.0)
+}
 
 /// Read `spectra_metadata`, apply the RT / MS-level predicates, and return
 /// `(surviving spectrum.index set, total spectra, dangling-precursor count)`.
