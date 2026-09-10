@@ -972,9 +972,16 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     let verbose = cfg.verbose > 0;
 
     // Inspection report: always when there is no output (the whole job is "inspect"), and also as a
-    // verbose extra during a real conversion.
+    // verbose extra during a real conversion. As an extra it opens no native vendor reader (see
+    // `native_inspect_skip`) and cannot fail the run: its error becomes a `note:` line.
     if verbose || cfg.output.is_none() {
-        report_inspect(&cli.input)?;
+        let skip_native = native_inspect_skip(cfg.output.is_some(), cfg.via_msconvert);
+        if let Err(e) = report_inspect(&cli.input, skip_native) {
+            if cfg.output.is_none() {
+                return Err(e);
+            }
+            println!("note:          inspection failed: {e:#}");
+        }
     }
     let Some(output) = cfg.output.clone() else {
         return Ok(exit::OK); // no --output: nothing written, just the report above
@@ -1553,9 +1560,29 @@ fn dump_im_table(input: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Why the inspection report must leave the native vendor readers closed, or `None` when it may
+/// open one. Only a run whose whole job is the report opens one. Under `-o` the conversion opens
+/// its own: the second open ran the Agilent host over the whole run twice (2.9 GB of temp file each
+/// on a 242 MB Q-TOF `.d`) and booted CoreCLR a second time for SciEX. `--via-msconvert` never uses
+/// the native stack, so a missing one (no `MZPC_PWIZ_DIR`, no .NET 8) must not fail that lane —
+/// it aborted `-v --via-msconvert` on `.wiff`, `.lcd` and Waters `.raw`.
+fn native_inspect_skip(output_given: bool, via_msconvert: bool) -> Option<&'static str> {
+    if via_msconvert {
+        Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
+    } else if output_given {
+        Some("native reader not opened for this report: the conversion opens it")
+    } else {
+        None
+    }
+}
+
 /// Print a human report of what a reader sees (format, spectra, chromatograms) without converting —
-/// the behaviour of a no-output run, and the `-v` extra during a conversion.
-fn report_inspect(input: &Path) -> Result<()> {
+/// the behaviour of a no-output run, and the `-v` extra during a conversion. With `skip_native` set
+/// (see [`native_inspect_skip`]) the native vendor readers stay closed; a native reader that fails
+/// to open is a `note:` line, never the run's error.
+fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
+    #[cfg(not(windows))]
+    let _ = skip_native;
     // mzPeak archive: mzdata can't open it — report members + spectrum/chromatogram counts instead.
     if filter::is_mzpeak_input(input) {
         return filter::report_inspect(input);
@@ -1578,10 +1605,12 @@ fn report_inspect(input: &Path) -> Result<()> {
         {
             if is_agilent_ims_d(input) {
                 println!("note:          IM-QTOF run (AcqData/IMSFrame.bin): the native lane cannot carry the drift dimension; use --via-msconvert");
+            } else if let Some(why) = skip_native {
+                println!("note:          {why}");
             } else {
                 // Inspecting runs the host over the whole file (16 B/point in a temp file), and an
                 // MRM/SIM-only run is refused by design: report either outcome, never fail the
-                // inspection — `-v` calls this before every conversion, whatever lane was asked for.
+                // inspection.
                 match agilent::AgilentReader::open(input) {
                     Ok(r) => {
                         println!("spectra:       {}", r.len());
@@ -1599,7 +1628,15 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_wiff(input) {
         println!("format:        SciEX .wiff");
         #[cfg(windows)]
-        println!("spectra:       {}", sciex::SciexReader::open(input)?.len());
+        {
+            match skip_native {
+                Some(why) => println!("note:          {why}"),
+                None => match sciex::SciexReader::open(input) {
+                    Ok(r) => println!("spectra:       {}", r.len()),
+                    Err(e) => println!("note:          native reader: {e:#}"),
+                },
+            }
+        }
         #[cfg(not(windows))]
         println!("note:          the native SciEX (Clearcore2) reader runs on Windows only; use --via-msconvert here");
         return Ok(());
@@ -1607,7 +1644,15 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_waters_raw(input) {
         println!("format:        Waters MassLynx .raw");
         #[cfg(windows)]
-        println!("spectra:       {}", waters::WatersReader::open(input)?.len());
+        {
+            match skip_native {
+                Some(why) => println!("note:          {why}"),
+                None => match waters::WatersReader::open(input) {
+                    Ok(r) => println!("spectra:       {}", r.len()),
+                    Err(e) => println!("note:          native reader: {e:#}"),
+                },
+            }
+        }
         #[cfg(not(windows))]
         println!("note:          native Waters reading needs the waters feature on Windows (or use --via-msconvert)");
         return Ok(());
@@ -1615,7 +1660,15 @@ fn report_inspect(input: &Path) -> Result<()> {
     if is_lcd(input) {
         println!("format:        Shimadzu LabSolutions .lcd");
         #[cfg(windows)]
-        println!("spectra:       {}", shimadzu::ShimadzuReader::open(input)?.len());
+        {
+            match skip_native {
+                Some(why) => println!("note:          {why}"),
+                None => match shimadzu::ShimadzuReader::open(input) {
+                    Ok(r) => println!("spectra:       {}", r.len()),
+                    Err(e) => println!("note:          native reader: {e:#}"),
+                },
+            }
+        }
         #[cfg(not(windows))]
         println!("note:          native Shimadzu reading is Windows-only (Shimadzu.LabSolutions.IO); or use --via-msconvert");
         return Ok(());
@@ -6979,6 +7032,25 @@ mod tests {
         assert!(!tmp.exists(), "a failed rename must still remove the tmp");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `-v` report opens a native vendor reader only when the report is the whole job: under
+    /// `-o` the conversion opens its own, and `--via-msconvert` must not need the native stack.
+    /// (`report_inspect`'s vendor branches are Windows-only; this is the decision they follow.)
+    #[test]
+    fn inspection_opens_a_native_reader_only_when_inspecting_is_the_job() {
+        use super::native_inspect_skip;
+        assert_eq!(native_inspect_skip(false, false), None, "a bare inspection opens it");
+        assert_eq!(
+            native_inspect_skip(true, false),
+            Some("native reader not opened for this report: the conversion opens it")
+        );
+        for output_given in [false, true] {
+            assert_eq!(
+                native_inspect_skip(output_given, true),
+                Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
+            );
+        }
     }
 
     /// The installed panic hook removes the panicking thread's in-flight tmp. `mem::forget` keeps
