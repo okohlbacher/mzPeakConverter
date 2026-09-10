@@ -168,7 +168,7 @@ impl AgilentReader {
             outcome => {
                 discard_temp(&[&tmp_path, &part_path]);
                 match outcome {
-                    Err(e) => return Err(e).with_context(|| format!("spawning {}", host.display())),
+                    Err(e) => return Err(e).with_context(|| format!("running {}", host.display())),
                     Ok(HostExit::TimedOut) => bail!(
                         "Agilent host did not finish {} within {} s and was killed; raise \
                          MZPC_AGILENT_HOST_TIMEOUT (seconds, 0 = no deadline) if the run is that slow",
