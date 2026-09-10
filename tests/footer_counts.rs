@@ -10,10 +10,13 @@
 //!   A centroid-only run declared every spectrum and every peak on an empty `spectra_data`, and a
 //!   footer-planned reader queried hundreds of thousands of spectra that were not there.
 //!
-//! The definition pinned here: on a DATA facet, `<entity>_count` is the number of entities with at
-//! least one row in THIS file (a cardinality — indices may be sparse — not the run total, which
-//! stays on the primary metadata facet), and `<entity>_data_point_count` is the points in THIS file.
-//! A spectrum handed to a facet with zero points is not an entry.
+//! The definition pinned here: on a DATA facet, `<entity>_count` is one past the largest
+//! `<entity>_index` with at least one row in THIS file, and 0 when the file has no rows — an index
+//! bound, so `0..count` reaches every entity the file holds although its indices are sparse. It is
+//! not the run total, which stays on the primary metadata facet. 0.11.2–0.11.5 stamped the number
+//! of entities with rows instead, and a reader bounding by that stopped early. The
+//! `<entity>_data_point_count` is the points in THIS file. A spectrum handed to a facet with zero
+//! points does not raise the count.
 //!
 //! `tiny.pwiz.1.1.mzML` has 4 spectra: index 1 is profile (10 points, chunk layout), 0 and 3 are
 //! centroid (15 peaks each), 2 is an EMPTY centroid spectrum. `tiny_centroid_only.mzML` is the same
@@ -112,18 +115,19 @@ fn data_facet_counts_describe_this_file_not_the_run() {
     // The run total lives on the primary metadata facet only.
     assert_eq!(facet(&archive, "spectra_metadata.parquet", "spectrum_count"), (4, 4));
 
-    // spectra_data holds ONE profile spectrum (index 1) with 10 points — not 4 / 40 (the run
-    // total and the sum of both data facets' points).
-    assert_eq!(declared(&archive, "spectra_data.parquet", "spectrum_count"), 1);
+    // spectra_data holds ONE profile spectrum, index 1, with 10 points: the bound is 2 — not 4 / 40
+    // (the run total and the sum of both data facets' points), and not the 1 spectrum it holds,
+    // which as a bound would stop before index 1.
+    assert_eq!(declared(&archive, "spectra_data.parquet", "spectrum_count"), 2);
     assert_eq!(declared(&archive, "spectra_data.parquet", "spectrum_data_point_count"), 10);
 
     // spectra_peaks holds indices {0, 3}; the empty centroid spectrum 2 was handed to the peaks
-    // writer but stored no row, so it is not an entry — 2, not 3.
-    assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_count"), 2);
+    // writer but stored no row. The bound is 4: the 2 spectra it holds would stop before index 3.
+    assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_count"), 4);
     assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_data_point_count"), 30);
 
-    // chromatograms_data now carries its own entity count, same definition: the synthesized TIC and
-    // base peak plus the source's `sic` (its `tic` is superseded by the synthesized one).
+    // chromatograms_data carries its own bound, same definition: the synthesized TIC and base peak
+    // plus the source's `sic` (its `tic` is superseded by the synthesized one), indices 0..3.
     assert_eq!(declared(&archive, "chromatograms_data.parquet", "chromatogram_count"), 3);
     assert_eq!(declared(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), 3);
 
@@ -138,8 +142,10 @@ fn empty_data_facet_declares_zero() {
     assert_eq!(facet(&archive, "spectra_data.parquet", "spectrum_count"), (0, 0));
     assert_eq!(facet(&archive, "spectra_data.parquet", "spectrum_data_point_count"), (0, 0));
 
-    // …while the peaks facet and the metadata facet keep their own, correct numbers.
-    assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_count"), 2);
+    // …while the peaks facet and the metadata facet keep their own, correct numbers. The peaks sit at
+    // indices {0, 2} around the empty spectrum 1: the bound is 3, where the 2 spectra with rows —
+    // what 0.11.2–0.11.5 declared on centroid-only runs — would stop before index 2.
+    assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_count"), 3);
     assert_eq!(declared(&archive, "spectra_peaks.parquet", "spectrum_data_point_count"), 30);
     assert_eq!(facet(&archive, "spectra_metadata.parquet", "spectrum_count"), (3, 3));
 
@@ -161,6 +167,35 @@ fn wavelength_facets_carry_their_own_counts() {
     assert_eq!(points, rows);
 
     let _ = std::fs::remove_file(&archive);
+}
+
+/// The library's unpacked (directory) writer, which mzpeak-convert does not use, stamps the same
+/// data-facet counts; its `spectra_data` used to carry none at all.
+#[test]
+fn unpacked_writer_stamps_the_same_data_facet_counts() {
+    use mzdata::prelude::*;
+    let dir = std::env::temp_dir().join(format!("mzpc-footer-{}-unpacked", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let mut reader =
+            mzdata::MZReader::open_path(format!("{}/tests/fixtures/tiny.pwiz.1.1.mzML", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut writer = mzpeak_prototyping::writer::MzPeakWriterBuilder::default().build_unpacked(dir.clone(), false);
+        for spectrum in reader.iter() {
+            writer.write_spectrum(&spectrum).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let kv = |member: &str, key: &str| -> i64 {
+        let reader = SerializedFileReader::new(File::open(dir.join(member)).unwrap()).unwrap();
+        let kvs = reader.metadata().file_metadata().key_value_metadata().cloned().unwrap_or_default();
+        let kv = kvs.iter().find(|kv| kv.key == key).unwrap_or_else(|| panic!("{member} has no {key}"));
+        kv.value.as_ref().unwrap().parse().unwrap()
+    };
+    assert_eq!(kv("spectra_data.parquet", "spectrum_count"), 2);
+    assert_eq!(kv("spectra_data.parquet", "spectrum_data_point_count"), 10);
+    assert_eq!(kv("spectra_peaks.parquet", "spectrum_count"), 4);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
