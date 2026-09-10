@@ -301,10 +301,11 @@ pub(crate) fn bruker_baf_members(dot_d: &Path) -> Option<crate::run_metadata::Ve
 
 /// What a baf2sql cache's `Properties` table (key → value) states about the run: the instrument,
 /// its serial, the acquisition software and the acquisition time. The keys are the ones
-/// ProteoWizard reads (`Baf2Sql.cpp`). The model is the PSI-MS series term ProteoWizard's
-/// `translateAsInstrumentSeries` gives the vendor's `InstrumentFamily` code (`CompassDataEnums.hpp`),
-/// and the generic Bruker model term for a code it does not list — nothing is inferred from a method
-/// or file name. An empty table states nothing, and the configuration is left as it is.
+/// ProteoWizard reads (`Baf2Sql.cpp`). The model is the PSI-MS series term ProteoWizard arrives at
+/// for the raw `InstrumentFamily` code: `translateInstrumentFamily` (`Baf2Sql.cpp`) turns the code
+/// into a family, then `translateAsInstrumentSeries` (`Reader_Bruker_Detail.cpp`) the family into a
+/// series. Any other code, or none, gets the generic Bruker model term — nothing is inferred from a
+/// method or file name.
 // Its caller, the BAF reader, builds on Windows and Linux only; the tests here run everywhere.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) fn baf_properties_metadata(
@@ -315,20 +316,16 @@ pub(crate) fn baf_properties_metadata(
 
     let get = |k: &str| props.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
     let mut out = VendorRunMetadata::default();
-    if props.is_empty() {
-        return out;
-    }
-    // Every BAF file is a Bruker acquisition, so the generic term is a fact even without a family;
-    // a serial must never stand alone either, or the configuration would carry no model term at all.
+    // Every BAF file is a Bruker acquisition, so the generic term is a fact even for an empty or
+    // unreadable table: a configuration without a model term gets the writer's valueless MS:1000031.
+    // A serial never stands alone either. The raw code is not a `CompassDataEnums` value, so it goes
+    // through `translateInstrumentFamily`'s cases first; every code that function does not list is
+    // `InstrumentFamily_Unknown`, which `translateAsInstrumentSeries` makes the generic term.
     let (accession, name) = match get("InstrumentFamily").and_then(|v| v.parse::<i64>().ok()) {
-        Some(0) => (1000697, "Bruker Daltonics HCT Series"),
-        Some(1 | 2) => (1001536, "Bruker Daltonics micrOTOF series"),
-        Some(3 | 4) => (1001535, "Bruker Daltonics BioTOF series"),
-        Some(5) => (1001534, "Bruker Daltonics flex series"),
-        Some(6) => (1001556, "Bruker Daltonics apex series"),
-        Some(7 | 90 | 91) => (1001547, "Bruker Daltonics maXis series"),
-        Some(9) => (1003123, "Bruker Daltonics timsTOF series"),
-        Some(92) => (1001548, "Bruker Daltonics solarix series"),
+        Some(1 | 2) => (1001536, "Bruker Daltonics micrOTOF series"), // OTOF, OTOFQ
+        Some(6..=8) => (1001547, "Bruker Daltonics maXis series"),    // maXis, impact, compact
+        Some(512) => (1001556, "Bruker Daltonics apex series"),       // FTMS
+        Some(513) => (1001548, "Bruker Daltonics solarix series"),    // solariX
         _ => (1000122, "Bruker Daltonics instrument model"),
     };
     let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
@@ -530,9 +527,9 @@ mod tests {
         let model = |m: &VendorRunMetadata| {
             m.instrument.as_ref().map(|c| c.params.iter().map(|p| (p.accession, p.name.clone())).collect::<Vec<_>>())
         };
-        // An impact II (family 90) is ProteoWizard's maXis series.
+        // An impact II (raw family 7, FM_1-1's instrument) is ProteoWizard's maXis series.
         let m = baf_properties_metadata(&props(&[
-            ("InstrumentFamily", "90"),
+            ("InstrumentFamily", "7"),
             ("InstrumentSerialNumber", "1825265.10252"),
             ("AcquisitionSoftware", "otofControl"),
             ("AcquisitionSoftwareVersion", "5.2.109"),
@@ -549,17 +546,27 @@ mod tests {
         let sw = m.acquisition_software.as_ref().unwrap();
         assert_eq!((sw.id.as_str(), sw.version.as_str()), ("otofControl", "5.2.109"));
         assert!(matches!(&m.start_time, Some(AcquisitionTime::Stated(t)) if t.offset().local_minus_utc() == -3 * 3600));
-        // solariX and timsTOF have their own series; an unlisted code, or a serial with no family,
-        // gets the generic Bruker model term — never a configuration without a model term.
+        // The raw code goes through `translateInstrumentFamily` before the series table: 6 is a
+        // maXis (not an FTMS), 8 a compact, 1 and 2 the micrOTOF line, 512 an FTMS (apex series),
+        // 513 a solariX. A code it does not list (0, 9, 90, 92, …), or a serial with no family, is
+        // `InstrumentFamily_Unknown`: the generic Bruker model term, never no model term at all.
         let first = |pairs: &[(&str, &str)]| model(&baf_properties_metadata(&props(pairs))).unwrap()[0].0;
-        assert_eq!(first(&[("InstrumentFamily", "92")]), Some(1001548));
-        assert_eq!(first(&[("InstrumentFamily", "9")]), Some(1003123));
-        assert_eq!(first(&[("InstrumentFamily", "42")]), Some(1000122));
+        assert_eq!(first(&[("InstrumentFamily", "6")]), Some(1001547));
+        assert_eq!(first(&[("InstrumentFamily", "8")]), Some(1001547));
+        assert_eq!(first(&[("InstrumentFamily", "1")]), Some(1001536));
+        assert_eq!(first(&[("InstrumentFamily", "2")]), Some(1001536));
+        assert_eq!(first(&[("InstrumentFamily", "512")]), Some(1001556));
+        assert_eq!(first(&[("InstrumentFamily", "513")]), Some(1001548));
+        for unlisted in ["0", "3", "5", "9", "42", "90", "92"] {
+            assert_eq!(first(&[("InstrumentFamily", unlisted)]), Some(1000122), "family {unlisted}");
+        }
         assert_eq!(first(&[("InstrumentSerialNumber", "7")]), Some(1000122));
-        // An unzoned clock stays naive; an empty table states nothing.
+        // An unzoned clock stays naive. An empty (or unreadable) table states only what every BAF
+        // file is, a Bruker instrument: no software, no time.
         let naive = baf_properties_metadata(&props(&[("AcquisitionDateTime", "2024-10-09T09:09:26")]));
         assert!(matches!(naive.start_time, Some(AcquisitionTime::Naive { .. })));
         let empty = baf_properties_metadata(&props(&[]));
-        assert!(empty.instrument.is_none() && empty.start_time.is_none() && empty.acquisition_software.is_none());
+        assert_eq!(model(&empty), Some(vec![(Some(1000122), "Bruker Daltonics instrument model".to_string())]));
+        assert!(empty.start_time.is_none() && empty.acquisition_software.is_none());
     }
 }

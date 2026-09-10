@@ -7332,11 +7332,24 @@ mod tests {
             fs::write(dot_d.join(name), body).unwrap();
         }
         let out = dir.join("run.mzpeak");
-        convert_vendor_reader_tallied(&dot_d, &out, None, 1, None, false, VendorHints::default(), 2, |i| {
+        // What `convert_baf` hands over for a baf2sql cache whose `Properties` table is missing or
+        // unreadable: still a model term with a name, never the writer's valueless placeholder.
+        let hints = VendorHints {
+            run_metadata: Some(crate::vendor::baf_properties_metadata(&Default::default())),
+            ..VendorHints::default()
+        };
+        convert_vendor_reader_tallied(&dot_d, &out, None, 1, None, false, hints, 2, |i| {
             Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
         })
         .unwrap();
         let meta = index_metadata(&out);
+        let model: Vec<&str> = meta["instrument_configuration_list"][0]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["accession"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(model, ["MS:1000122"], "{:#}", meta["instrument_configuration_list"]);
         let files = meta["file_description"]["source_files"].as_array().unwrap();
         let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr"], "{:#}", meta["file_description"]);
