@@ -118,9 +118,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   wrote there is renamed into place through `TmpGuard` like every other mzML export, and a
   `.mzML.gz` output is gzip-compressed from that file rather than left to msconvert's
   naming. The directory is removed on every error return, taking a crashed msconvert's stray
-  `.partial` with it. The same guard stops the `--via-msconvert` mzPeak lane leaking
-  `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which returned before
-  any cleanup. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
+  `.partial` with it, and on a panic by the panic hook, which sweeps it with the in-flight
+  `.tmp` files: the release build aborts without running destructors, and the directory sits
+  beside the output holding msconvert's whole mzML. The same guard stops the `--via-msconvert`
+  mzPeak lane leaking `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which
+  returned before any cleanup; `tmp_cleanup::msconvert_not_found_leaves_no_working_directory`
+  pins both lanes with `TMPDIR` pointed at a scratch directory, and
+  `msconvert_dir_is_swept_by_the_panic_hook` the sweep. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
   the unfixed build, one that exits 0 without writing produced exit 0 and
   "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
   byte-identical and nothing beside it. One that writes its mzML must land under the
