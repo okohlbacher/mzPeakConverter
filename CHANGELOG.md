@@ -233,6 +233,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   before its "current" check. A failure is now accepted when the box reports the wanted version.
   A refused-dirty tree is not accepted, since its exe may be built from uncommitted code under the
   same version string.
+- **The box's msconvert fallback keeps a requested `--tof-grid` mode.** `box_convert_remote.ps1`
+  drops `--tof-grid <mode>` from its native attempt, and when that attempt failed it appended
+  `--via-msconvert --tof-grid auto`. A job that asked for `--tof-grid off` (exact f64 m/z) was
+  therefore stored on the bounded-lossy grid whenever the fallback ran. The archive declared this,
+  but the requested fidelity was not honoured. The fallback now passes the requested mode, and
+  `auto` only when the job named none. No corpus descriptor requests `off` or `on`. The script runs
+  only on the box, so this is checked by reading, not run.
 
 ### Changed
 

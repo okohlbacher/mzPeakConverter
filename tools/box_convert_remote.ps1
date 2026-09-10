@@ -359,9 +359,9 @@ try {
     # 1242->495 s and 2891->2040 MB; msconvert inflates the mzML round-trip). So the PRIMARY attempt is
     # ALWAYS native: strip the mzML-lane flags (--via-msconvert, --tof-grid <mode>) so even a job that
     # still asks for --via-msconvert is tried native first. msconvert runs ONLY if the native read fails.
-    $nativeOpts = @(); $skipNext = $false
+    $nativeOpts = @(); $skipNext = $false; $tofMode = 'auto'
     foreach ($o in $optList) {
-        if ($skipNext) { $skipNext = $false; continue }
+        if ($skipNext) { $skipNext = $false; $tofMode = $o; continue }   # the mode, kept for the fallback
         if ($o -eq '--via-msconvert') { continue }
         if ($o -eq '--tof-grid') { $skipNext = $true; continue }   # drop the flag AND its mode arg
         $nativeOpts += $o
@@ -426,7 +426,9 @@ try {
         # Everything else in $nativeOpts rides along, `--sample N` included: both lanes refuse a
         # multi-sample WIFF without it, so a per-sample job (one manifest line per sample) needs it here.
         $native_only = @('--agilent-grid', '--bruker-sdk')   # conflict with / ignored by the mzML lane
-        $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', 'auto')
+        # The REQUESTED --tof-grid mode, `auto` only when the job named none: a job asking for `off`
+        # (exact f64 m/z) was stored on the bounded-lossy grid whenever this fallback ran.
+        $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', $tofMode)
         & $converter $inputPath @fbOpts -o $out --force *>> $log
         $res.exit = $LASTEXITCODE
         $res.argv = ($fbOpts -join ' ')
