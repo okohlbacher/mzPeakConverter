@@ -12,12 +12,17 @@
 //! appear if the report did not end the run first. The vendor library the report could open on
 //! every platform is Thermo's RawFileReader (`small.RAW`); on Linux and Windows, Bruker's baf2sql
 //! as well.
+//!
+//! Without `-o` nothing is converted and no lane is chosen, so `--via-msconvert` changes nothing
+//! there: the report is the whole job and opens the reader.
 
 use std::path::Path;
 use std::process::Command;
 
 /// What the report prints under `-o` in place of opening a vendor reader.
 const NOT_OPENED: &str = "note:          native reader not opened for this report: the conversion opens it";
+/// What it prints under `-o --via-msconvert`, whose lane needs no vendor reader.
+const NOT_NEEDED: &str = "note:          native reader not opened: --via-msconvert reads this file through ProteoWizard";
 
 #[test]
 fn a_failing_report_under_verbose_is_a_note_not_the_error() {
@@ -80,6 +85,54 @@ fn verbose_leaves_the_thermo_reader_to_the_conversion() {
     assert!(stdout.contains(NOT_OPENED), "the report must leave RawFileReader closed; stdout:\n{stdout}");
     assert!(!stdout.contains("spectra:"), "a spectrum count means the report opened the file; stdout:\n{stdout}");
     assert!(run.status.success() && converted, "the conversion still runs; stderr:\n{stderr}");
+}
+
+/// Without `-o` the run converts nothing, so `--via-msconvert` (given here, or by a `--config`
+/// profile) chooses no lane: the report is the job and opens the reader. It printed only a note
+/// that ProteoWizard reads the file, which nothing did, and no counts.
+#[test]
+fn an_inspection_opens_the_thermo_reader_under_via_msconvert_too() {
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/small.RAW"))
+        .arg("--via-msconvert")
+        .env_remove("DOTNET_ROLL_FORWARD") // the binary's own Thermo default decides (tests/thermo_raw.rs)
+        .output()
+        .expect("failed to run mzpeak-convert");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stdout.contains("spectra:       48"), "the inspection must open the reader; stdout:\n{stdout}");
+    assert!(!stdout.contains("not opened"), "stdout:\n{stdout}");
+    assert!(run.status.success(), "stderr:\n{stderr}");
+}
+
+/// Beside a `--via-msconvert` conversion the report leaves RawFileReader closed, and the lane runs
+/// after it: a `--msconvert-path` that names no file makes that lane fail at once, with its own
+/// error.
+#[test]
+fn verbose_via_msconvert_leaves_the_thermo_reader_closed() {
+    let dir = std::env::temp_dir().join(format!("mzpc-verbose-msconvert-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/small.RAW"))
+        .arg("-o")
+        .arg(dir.join("small.mzpeak"))
+        .arg("-v")
+        .arg("--via-msconvert")
+        .arg("--msconvert-path")
+        .arg(dir.join("no-such-msconvert"))
+        .env_remove("DOTNET_ROLL_FORWARD")
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stdout.contains(NOT_NEEDED), "stdout:\n{stdout}");
+    assert!(!stdout.contains("spectra:"), "a spectrum count means the report opened the file; stdout:\n{stdout}");
+    assert!(!run.status.success(), "without msconvert nothing is written");
+    assert!(stderr.contains("msconvert not found"), "the lane must run after the report; stderr:\n{stderr}");
 }
 
 /// Bruker's baf2sql is a vendor library on Linux and Windows. Beside a conversion the report leaves
