@@ -74,6 +74,7 @@ mod shimadzu_meta;
 mod vendor;
 mod embed_aux;
 mod filter;
+mod pwiz_id;
 
 use arrow::datatypes::DataType;
 use mzdata::curie;
@@ -2606,7 +2607,9 @@ fn convert_file_tof_grid(
     builder = builder.sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
     let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);
-    decode_pwiz_ids(&mut writer);
+    if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
+        decode_pwiz_ids(&mut writer);
+    }
     add_processing_metadata(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
@@ -3680,7 +3683,9 @@ fn convert_file(
     }
 
     writer.copy_metadata_from(&reader);
-    decode_pwiz_ids(&mut writer);
+    if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
+        decode_pwiz_ids(&mut writer);
+    }
     add_processing_metadata(&mut writer);
 
     // Keep the ion-mobility dimension for TDF (do not flatten 3D frames).
@@ -6778,54 +6783,28 @@ fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> 
     agilent_meta::read(input)
 }
 
-/// ProteoWizard writes ids as XML names and escapes a character a name may not hold as `_xHHHH_`
-/// (`Experiment_x0020_1`, `_x0032_0090101…` for a leading digit). An mzPeak id is a plain string,
-/// so the mzML lane decodes them on copy: `run.id`, and the software ids together with the
-/// processing methods and instrument configurations that name them. Not part of
-/// [`fixup_run_metadata`], which the mzML exports share: an mzML id must stay an XML name, and
-/// ProteoWizard's escaped form is one.
+/// ProteoWizard writes ids as XML names and escapes each byte a name may not hold as `_x00hh_`
+/// ([`pwiz_id`]: `Experiment_x0020_1`, `_x0032_0090101…` for a leading digit). An mzPeak id is a
+/// plain string, so the mzML and imzML lanes decode them on copy: `run.id`, and the software ids
+/// together with the processing methods and instrument configurations that name them. Called for
+/// those readers only: the Thermo and TDF readers name the run after the file, which nothing
+/// escaped. Not part of [`fixup_run_metadata`], which the mzML exports share: an mzML id must stay
+/// an XML name, and ProteoWizard's escaped form is one.
 fn decode_pwiz_ids(target: &mut impl MSDataFileMetadata) {
     if let Some(run) = target.run_description_mut() {
-        run.id = run.id.as_deref().map(decode_xml_name);
+        run.id = run.id.as_deref().map(pwiz_id::decode);
     }
     for sw in target.softwares_mut() {
-        sw.id = decode_xml_name(&sw.id);
+        sw.id = pwiz_id::decode(&sw.id);
     }
     for dp in target.data_processings_mut() {
         for m in dp.methods.iter_mut() {
-            m.software_reference = decode_xml_name(&m.software_reference);
+            m.software_reference = pwiz_id::decode(&m.software_reference);
         }
     }
     for ic in target.instrument_configurations_mut().values_mut() {
-        ic.software_reference = decode_xml_name(&ic.software_reference);
+        ic.software_reference = pwiz_id::decode(&ic.software_reference);
     }
-}
-
-/// Undo `_xHHHH_` escaping (.NET `XmlConvert.DecodeName`, which ProteoWizard follows); a sequence
-/// that is not a well-formed escape is left as written.
-fn decode_xml_name(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    let mut rest = v;
-    while let Some(i) = rest.find("_x") {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        let decoded = tail
-            .get(2..6)
-            .filter(|hex| hex.chars().all(|c| c.is_ascii_hexdigit()) && tail[6..].starts_with('_'))
-            .and_then(|hex| char::from_u32(u32::from_str_radix(hex, 16).ok()?));
-        match decoded {
-            Some(c) => {
-                out.push(c);
-                rest = &tail[7..];
-            }
-            None => {
-                out.push_str("_x");
-                rest = &tail[2..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
@@ -9005,7 +8984,9 @@ mod tests {
     }
 
     /// ProteoWizard's `_xHHHH_` escapes come off on copy: `run.id`, and the software ids with every
-    /// reference to them still resolving. What only looks like an escape stays as written.
+    /// reference to them still resolving. pwiz escapes each byte of a non-ASCII name's UTF-8, so a
+    /// run of byte escapes decodes as UTF-8, and stays as written when it is not UTF-8. What only
+    /// looks like an escape stays as written.
     #[test]
     fn pwiz_escaped_ids_are_decoded() {
         use mzdata::meta::{DataProcessing, InstrumentConfiguration, ProcessingMethod, Software};
@@ -9021,9 +9002,37 @@ mod tests {
         assert_eq!(w.softwares()[0].id, "MassLynx software");
         assert_eq!(w.data_processings()[0].methods[0].software_reference, "MassLynx software");
         assert_eq!(w.instrument_configurations()[&0].software_reference, "MassLynx software");
-        for kept in ["a_x00zz_b", "_x0041", "x_x_", "scan=19", ""] {
-            assert_eq!(super::decode_xml_name(kept), kept);
+
+        use super::pwiz_id::decode;
+        // The run id of pwiz-examples' Shimadzu `20140312_六mix_column_1 (scheduled) 一个试.mzML`.
+        assert_eq!(
+            decode(
+                "_x0032_0140312__x00e5__x0085__x00ad_mix_column_1_x0020__x0028_scheduled_x0029__x0020_\
+                 _x00e4__x00b8__x0080__x00e4__x00b8__x00aa__x00e8__x00af__x0095_"
+            ),
+            "20140312_六mix_column_1 (scheduled) 一个试"
+        );
+        // A byte that is not UTF-8 (a Latin-1 ü) stays escaped; an escape above a byte is its character.
+        assert_eq!(decode("M_x00fc_ller_x0020_1"), "M_x00fc_ller 1");
+        assert_eq!(decode("_x516D_mix"), "六mix");
+        for kept in ["a_x00zz_b", "_x0041", "x_x_", "scan=19", "", "_xD800_", "_x00e5__x0085_"] {
+            assert_eq!(decode(kept), kept);
         }
+    }
+
+    /// Only ids read from an mzML or imzML are ProteoWizard's escaped names. The Thermo reader names
+    /// the run after the file, so a stem that merely looks escaped is kept as it is.
+    #[test]
+    fn a_thermo_run_named_like_an_escape_keeps_its_stem() {
+        let dir = scratch("thermo-stem");
+        let input = dir.join("small_x0041_.RAW");
+        fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/small.RAW"), &input).unwrap();
+        let archive = dir.join("small.mzpeak");
+        let args: Vec<&std::ffi::OsStr> = vec![input.as_os_str(), "-o".as_ref(), archive.as_os_str(), "--force".as_ref()];
+        let (ok, _, err) = run_bin(&args, &[("MZPC_MAX_SPECTRA", "2")]);
+        assert!(ok, "{err}");
+        assert_eq!(index_metadata(&archive)["run"]["id"], serde_json::json!("small_x0041_"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// End to end on the mzML lane: the archive holds the decoded ids, while `-o x.mzML` keeps
