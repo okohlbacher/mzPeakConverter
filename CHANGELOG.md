@@ -37,6 +37,18 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 
 ### Fixed
 
+- **`--to mzml` wrote an isolation window of unknown width as a window from 0 to twice its
+  target.** Every lane holds a window without a stated width as its target with both bounds 0 (a
+  Waters DDA set mass, a TSF trigger mass without a width, mzdata's mzML reader on a target-only
+  window), and the mzPeak writer stores null offsets for it. mzdata 0.66's mzML writer always writes
+  `target − lower bound` and `upper bound − target`, so the export said lower offset +target and
+  upper offset −target: `tests/fixtures/target_only_window.mzML` came out as 445.3 / −445.3. The
+  export sink now blanks exactly that pair with spaces of the same length, which leaves the window
+  target-only, as ProteoWizard writes a window it knows no width for, and keeps every `<indexList>`
+  offset true. The `<fileChecksum>` is left alone: mzdata computes it before flushing its own
+  buffer, so it did not match the file before either. Pinned by
+  `run_metadata_native::a_target_only_isolation_window_exports_to_mzml_target_only` and the
+  split-write tests in `src/mzml_isolation.rs`.
 - **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
   mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
   a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes
