@@ -100,7 +100,8 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   msconvert; MRM-HR scan runs convert natively. Open: reading the transitions natively (Q1/Q3,
   compound, CE, RT window — S-P4); the published `En_PPY.mzpeak` carries 1 of its 117 samples. Since
   PR #18 the msconvert lanes refuse a multi-sample WIFF without `--sample`, so the box fallback, which
-  passes none, now fails on `En_PPY.wiff`; D4 republishes it one archive per sample.
+  passes none, now fails on `En_PPY.wiff`; which of its samples to republish, each as its own
+  archive, is D4 and still open.
 - **Surfaced by the 0.11.3 corpus rebuild (2026-09-09).** (1) The box relay returns archives through
   one presigned S3 PUT, capped at 5 GB: PXD077098's Waters TWIMS run (15.4 GB `.raw`) now writes a
   9.04 GB frame archive (it was 2.1 GB as drift-summed scans) and was delivered by hand (direct scp
@@ -187,12 +188,13 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   out of process on net48 as the Agilent host did.
 - **`--ims-chunked` re-sorts each timsTOF frame by TOF** before chunking, which reorders points across
   mobility scans, and declares no transformation for it (`docs/USER_MANUAL.md` §8 points here).
-- **Decided 2026-09-10 — D1–D15 of the open-issue review, each by taking the review's recommendation:**
+- **Decided 2026-09-10 — D1–D15 of the open-issue review, by taking the review's recommendations.**
+  D2, D4 and D14 stay open: the review lists their options without recommending one.
   - D1: a data facet's `<entity>_count` is max(index)+1 in that file, 0 when empty (`spectra_peaks` of centroid-only runs too).
-  - D2: a secondary facet's `*_count` counts the distinct parents with rows in that file, as the filter lane already writes.
-  - D3: a Thermo window with no `MSn Isolation Width` trailer, or an inverted one, is written target-only, declared and warned once, until thermorawfilereader is fixed upstream.
-  - D4: `En_PPY.wiff` (117 samples) is published as one archive per sample.
-  - D5: `corpus_reconvert.py` no longer writes durable v09 keys; publishing stays with the corpus repository's gated `update.sh`.
+  - D2: open — omit a secondary facet's `*_count`, or keep the distinct parents with rows in that file that the filter lane writes.
+  - D3: a Thermo window whose scan states no positive `MSn Isolation Width`, or that comes out empty or inverted, is written target-only, declared and warned once, until thermorawfilereader is fixed upstream.
+  - D4: open — `En_PPY.wiff` (117 samples) as one archive per sample, a chosen subset, or not published.
+  - D5: `corpus_reconvert.py` writes the durable v09 keys only behind an opt-in flag; by default a box archive comes back to the host.
   - D6: the native SciEX archive size is accepted; no chunk-capable integer axis.
   - D7: the Waters HDMSe frame size is accepted (Capan2 166 → 531 MB).
   - D8: full-range isolation windows carry MS:1003159 beside their numbers once mzdata 0.66.7 is out; MUST vs MAY stays with the spec.
@@ -201,8 +203,8 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   - D11: the unwired `glue/waters` is deleted.
   - D12: the SBOM is generated for and attached to each release instead of tracked; every release archive ships `THIRD-PARTY-NOTICES.md` with the Apache-2.0 text; the `mzpeak_prototyping` license stays the owner's to settle.
   - D13: M35 gets a route label (`conversion_route`) only; fallback rows are not re-merged into frames.
-  - D14: ProteoWizard's `_xHHHH_` escapes in `run.id` are decoded when metadata is copied from the mzML lane.
-  - D15: `transformations` keeps its configuration semantics, as the manual documents; the `src/main.rs` comment that promised applied changes is corrected.
+  - D14: open — decode ProteoWizard's `_xHHHH_` escapes in `run.id` when metadata is copied from the mzML lane (47 archives), or keep pwiz's text.
+  - D15: `transformations` lists what a conversion applied, counted by the writer, not what it was configured to do (135 corpus archives change on rebuild).
 
 ## History
 
