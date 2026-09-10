@@ -231,6 +231,8 @@ impl GenericDataArrayWriter {
                 "{} {series_index} was not sorted, sorting {n_points} values",
                 self.data_buffers.buffer_context().main_struct_name()
             );
+            // VENDORED PATCH (mzPeakConverter D15): counted, so the archive can declare the re-sort.
+            self.data_buffers.tally_mut().resorted += 1;
             binary_array_map.clone_into(&mut tmp_binary_array_map);
             tmp_binary_array_map.sort_by_array(&axis)?;
         }
@@ -601,6 +603,8 @@ pub trait AbstractMzPeakWriter {
                 "Chromatogram {chromatogram_index} ({}) was not sorted, sorting {n_points} values",
                 chromatogram.id()
             );
+            // VENDORED PATCH (mzPeakConverter D15): counted, so the archive can declare the re-sort.
+            self.chromatogram_data_buffer_mut().tally_mut().resorted += 1;
             binary_array_map.clone_into(&mut tmp_binary_array_map);
             tmp_binary_array_map.sort_by_array(&ArrayType::TimeArray)?;
         }

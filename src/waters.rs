@@ -270,8 +270,11 @@ pub struct WatersReader {
     keep_collapsed: bool,
     /// Frames whose bins came back out of (m/z, drift time) order and were re-sorted by
     /// [`Self::spectrum`]. Shared with the converter, which counts it over the written spectra only
-    /// (`VendorHints::reorder_counter`) and declares `sort-by-mz` when it moved.
+    /// (`VendorHints::counters`) and declares `sort-by-mz` when it moved.
     resorted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Scans [`Self::spectrum`] read as a SONAR function's quadrupole bins summed (`readScan`).
+    /// Shared the same way, declaring [`SONAR_SUMMED`].
+    sonar_summed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WatersReader {
@@ -678,6 +681,7 @@ impl WatersReader {
             skipped,
             keep_collapsed,
             resorted: Default::default(),
+            sonar_summed: Default::default(),
         };
         Ok(reader)
     }
@@ -743,12 +747,17 @@ impl WatersReader {
 
     /// The `transformations` entries this run's functions call for (see [`function_transformations`]).
     pub fn transformations(&self) -> Vec<String> {
-        function_transformations(&self.functions, &self.skipped, &self.collapsed, self.keep_collapsed)
+        function_transformations(&self.skipped, &self.collapsed, self.keep_collapsed)
     }
 
-    /// The frame re-sort counter, for `VendorHints::reorder_counter` (see [`sort_frame_points`]).
+    /// The frame re-sort counter, for `VendorHints::counters` (see [`sort_frame_points`]).
     pub fn reorder_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         self.resorted.clone()
+    }
+
+    /// The SONAR summed-scan counter, for `VendorHints::counters` under [`SONAR_SUMMED`].
+    pub fn sonar_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.sonar_summed.clone()
     }
 
     /// Read one spectrum. A function with drift bins yields a FRAME (every bin's points, sorted by
@@ -792,6 +801,11 @@ impl WatersReader {
             }
         } else {
             let (m, it) = self.read_summed(func, scan)?;
+            // A SONAR function has no drift path (its bins are quadrupole positions): this scan IS
+            // its bins summed, which the archive declares.
+            if fi.sonar_bins > 0 {
+                self.sonar_summed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             mz = m;
             intensity = it;
         }
@@ -1253,12 +1267,12 @@ fn functions_block(
     })
 }
 
-/// The `transformations` entries a Waters run declares, each only when it happened:
-/// `waters:drop-functions` when a function was not written as spectra (chromatogram-type or non-MS,
-/// its scan count unreadable, or a collapsed retention-time summary the lever did not keep), and `waters:sonar-summed` when a
-/// written SONAR function's quadrupole bins were summed into one scan.
+/// The `transformations` entry a Waters run's function table declares: `waters:drop-functions` when
+/// a function was not written as spectra (chromatogram-type or non-MS, its scan count unreadable, or
+/// a collapsed retention-time summary the lever did not keep). A SONAR function's summed scans are
+/// counted as they are read instead ([`SONAR_SUMMED`]), so an archive declares the sum only when it
+/// holds such a scan.
 fn function_transformations(
-    functions: &[FunctionInfo],
     skipped: &[(c_int, String)],
     collapsed: &[(c_int, Option<c_int>)],
     keep_collapsed: bool,
@@ -1267,12 +1281,12 @@ fn function_transformations(
     if !skipped.is_empty() || (!collapsed.is_empty() && !keep_collapsed) {
         out.push("waters:drop-functions".to_string());
     }
-    let written = |f: usize| !skipped.iter().any(|(s, _)| *s as usize == f);
-    if functions.iter().enumerate().any(|(f, fi)| fi.sonar_bins > 0 && written(f)) {
-        out.push("waters:sonar-summed".to_string());
-    }
     out
 }
+
+/// The `transformations` entry for a written scan that [`WatersReader::spectrum`] read as a SONAR
+/// function's quadrupole bins summed, declared from [`WatersReader::sonar_counter`].
+pub const SONAR_SUMMED: &str = "waters:sonar-summed";
 
 /// Sort a frame's points by (m/z, drift time), the monotone main axis the chunked layout needs.
 /// `true` when that changed their order (the bins' own m/z axes interleaved), which is what the
@@ -1447,19 +1461,16 @@ mod tests {
         assert_eq!(block["skipped_functions"][0]["reason"], "a chromatogram");
         assert_eq!(block["functions"][2]["sonar_bins_summed"], 200);
         assert_eq!(block["lockmass_function"], 1);
-        assert_eq!(function_transformations(&fs, &skipped, &[], false), ["waters:drop-functions", "waters:sonar-summed"]);
-        // Nothing dropped and nothing summed: no entry.
+        // The function table declares the drop only: a SONAR function's summed scans are counted as
+        // they are read (`sonar_counter`), so a table holding one declares nothing for it.
+        assert_eq!(function_transformations(&skipped, &[], false), ["waters:drop-functions"]);
+        // Nothing dropped: no entry.
         let plain = vec![fi(Some(TOF_MS), 0, None)];
-        assert!(function_transformations(&plain, &[], &[], false).is_empty());
-        // A SONAR function that was itself skipped summed nothing into the archive.
-        let mut skipped_sonar = fs.clone();
-        skipped_sonar[1].sonar_bins = 200;
-        skipped_sonar[2].sonar_bins = 0;
-        assert_eq!(function_transformations(&skipped_sonar, &skipped, &[], false), ["waters:drop-functions"]);
+        assert!(function_transformations(&[], &[], false).is_empty());
         // Collapsed summaries: dropped unless the lever kept them, and `written` says which.
         let collapsed = vec![(3, Some(0))];
-        assert_eq!(function_transformations(&plain, &[], &collapsed, false), ["waters:drop-functions"]);
-        assert!(function_transformations(&plain, &[], &collapsed, true).is_empty());
+        assert_eq!(function_transformations(&[], &collapsed, false), ["waters:drop-functions"]);
+        assert!(function_transformations(&[], &collapsed, true).is_empty());
         assert_eq!(functions_block(&plain, &[], &collapsed, false, None, false)["collapsed_functions"][0]["written"], false);
         assert_eq!(functions_block(&plain, &[], &collapsed, true, None, false)["collapsed_functions"][0]["written"], true);
     }

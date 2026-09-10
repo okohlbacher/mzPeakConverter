@@ -260,6 +260,8 @@ fn transformations_block_pinned() {
     pinned("\"zero-run-mask\"");
     pinned("\"numpress-linear\"");
     pinned("\"sort-by-mz\"");
+    pinned("\"sort-by-time\"");
+    pinned("\"sort-by-wavelength\"");
     pinned("\"tof-grid:{}ppm\"");
     pinned("\"shimadzu:span-trim\"");
     pinned("\"agilent:drop-zero-samples\"");

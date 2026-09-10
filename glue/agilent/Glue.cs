@@ -8,7 +8,8 @@
 // converter (src/agilent.rs) spawns once per .d.
 //
 // PROTOCOL (one-shot, argv in / file out):  AgilentGlueHost <in.d> <mhdacDir> <out.bin>
-// Reads every MS scan via MHDAC and writes this little-endian binary file (the Rust twin of this
+// Reads every MS scan via MHDAC (only the first MZPC_MAX_SPECTRA when the converter sets that cap)
+// and writes this little-endian binary file (the Rust twin of this
 // layout, with tests, is src/agl.rs):
 //     magic "AGL2" (4 bytes) | count u64 |
 //     scanTypes: len u32 + UTF-8 (MHDAC MSScanFileInformation.ScanTypes.ToString(), e.g.
@@ -31,6 +32,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -51,6 +53,13 @@ namespace AgilentGlue
             try
             {
                 int count = reader.Open(dPath, mhdacDir);
+                // MZPC_MAX_SPECTRA (the converter hands over the cap it parsed, or removes the
+                // variable): export only the scans the archive will hold, so the [count ...] tags
+                // below count the rewrites of exactly those scans.
+                long cap;
+                if (long.TryParse(Environment.GetEnvironmentVariable("MZPC_MAX_SPECTRA"), NumberStyles.None, CultureInfo.InvariantCulture, out cap)
+                    && cap > 0 && cap < count)
+                    count = (int)cap;
                 // Write to a .part file and atomically publish only after a fully-successful write +
                 // close. The offset table is back-filled at the end, so a host killed/crashed mid-write
                 // (e.g. a native MHDAC AccessViolation that bypasses catch/finally) would otherwise

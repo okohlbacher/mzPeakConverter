@@ -5160,23 +5160,30 @@ fn convert_ims_compact_sdk(
 /// written when its count is above zero: `zero-run-mask` (the writer's zero-run compaction shortened
 /// a profile spectrum), `numpress-linear` (an m/z chunk is stored with the lossy codec),
 /// `sort-by-mz` (a spectrum was re-ordered, by the lane's reader or by the writer's backstop),
+/// `sort-by-time` (the writer's backstop re-ordered a chromatogram by time), `sort-by-wavelength`
+/// (the writer's backstop re-ordered a wavelength spectrum by wavelength),
 /// `tof-grid:<ppm>ppm` (a statistically fitted integer grid replaced f64 m/z within that bound on a
 /// spectrum), `shimadzu:span-trim` (the profile sqrt-grid route left a gridded spectrum's
 /// zero-intensity pad at the scan-window bounds out), `agilent:drop-zero-samples` (the profile grid
 /// reader left a zero-intensity sample or an all-zero scan out of its sparse point lists),
 /// `agilent:intensity-f32-rounding` (a count above 2^24 was rounded into Float32),
 /// `agilent:nonfinite-intensity-to-zero` and `agilent:truncate-unequal-arrays` (the MHDAC host stored
-/// a NaN/Inf intensity as 0, or cut a spectrum's unequal arrays to one length; `agl::HostCounts`),
-/// `waters:drop-functions` (a MassLynx function was not written as spectra) and `waters:sonar-summed`
-/// (a written SONAR function's quadrupole bins were summed; both `waters::function_transformations`).
+/// a NaN/Inf intensity as 0, or cut a spectrum's unequal arrays to one length; `agl::HostCounts`, over
+/// the scans the host exported, which `MZPC_MAX_SPECTRA` limits to the ones written),
+/// `waters:drop-functions` (a MassLynx function was not written as spectra;
+/// `waters::function_transformations`) and `waters:sonar-summed` (a written scan was a SONAR
+/// function's quadrupole bins summed; counted by `WatersReader::spectrum`).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
 
-/// The entries the writer itself applied, from its own counters (`spectrum_signal_tally`) rather
-/// than its configuration: `zero-run-mask` when the mask shortened a profile spectrum,
-/// `numpress-linear` when a numpress chunk was stored, `sort-by-mz` when the writer's backstop
-/// re-sorted a spectrum the lane handed over out of order. Read before `finish_parquet`.
+/// The entries the writer itself applied, from its own counters rather than its configuration:
+/// `zero-run-mask` when the mask shortened a profile spectrum, `numpress-linear` when a numpress
+/// chunk was stored, `sort-by-mz` when the writer's backstop re-sorted a spectrum the lane handed
+/// over out of m/z order (all three `spectrum_signal_tally`), and `sort-by-time` /
+/// `sort-by-wavelength` when the same backstop re-sorted a chromatogram by time or a wavelength
+/// spectrum by wavelength (`chromatogram_signal_tally`, `wavelength_signal_tally`). Read after the
+/// chromatograms are written and before `finish_parquet`.
 fn base_transformations(writer: &MzPeakWriterType<fs::File>) -> Vec<String> {
     let tally = writer.spectrum_signal_tally();
     let mut applied = Vec::new();
@@ -5188,6 +5195,12 @@ fn base_transformations(writer: &MzPeakWriterType<fs::File>) -> Vec<String> {
     }
     if tally.resorted > 0 {
         applied.push("sort-by-mz".to_string());
+    }
+    if writer.chromatogram_signal_tally().resorted > 0 {
+        applied.push("sort-by-time".to_string());
+    }
+    if writer.wavelength_signal_tally().resorted > 0 {
+        applied.push("sort-by-wavelength".to_string());
     }
     applied
 }
@@ -5353,7 +5366,7 @@ fn convert_bruker_sdk(
 ) -> Result<()> {
     let reader = bruker_sdk::BrukerSdkReader::open(input)?;
     // A TDF frame arrives mobility-major and the reader re-sorts it by m/z; declared from its count.
-    let hints = VendorHints { reorder_counter: reader.reorder_counter(), ..Default::default() };
+    let hints = VendorHints { counters: reader.reorder_counter().map(|c| ("sort-by-mz", c)).into_iter().collect(), ..Default::default() };
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
@@ -6109,10 +6122,13 @@ fn convert_waters(
     // the functions the archive leaves out or sums.
     hints.index_blocks.push(("waters_functions".to_string(), reader.functions_block()));
     hints.transformations.extend(reader.transformations());
+    // A SONAR function's scans are read as its quadrupole bins summed: the reader counts those
+    // scans, and `waters:sonar-summed` is declared from that count over the written spectra.
+    hints.counters.push((waters::SONAR_SUMMED, reader.sonar_counter()));
     // Ion-mobility functions arrive as frames whose bins interleave and are re-sorted by m/z
     // (`waters.rs`): the reader counts the frames that sort moved, and `sort-by-mz` is declared from
     // that count over the written spectra. Readers get the run's drift table + CCS calibration.
-    hints.reorder_counter = Some(reader.reorder_counter());
+    hints.counters.push(("sort-by-mz", reader.reorder_counter()));
     if let Some(block) = reader.drift_block() {
         hints.index_blocks.push(("waters_drift".to_string(), block));
         // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
@@ -6204,11 +6220,13 @@ struct VendorHints {
     /// six-probe stride, so a column only some functions carry (the drift array of a mixed
     /// IMS/non-IMS Waters run) is declared regardless of where those spectra sit.
     probe_indices: Vec<usize>,
-    /// A reader's count of spectra it re-sorted into m/z order itself (the `--bruker-sdk` TDF
-    /// reader: the SDK hands over mobility-major frames; the native Waters reader: a frame's drift
-    /// bins interleave). Read over the written spectra only (the
-    /// schema probes go through the same reader first) and declared as `sort-by-mz`.
-    reorder_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// A reader's own counts, each with the `transformations` entry it declares: the entry is
+    /// written when its counter grew while the spectra were WRITTEN (the schema probes go through the
+    /// same reader first and do not count). `sort-by-mz` for the spectra a reader re-sorted into m/z
+    /// order itself (the `--bruker-sdk` TDF reader: the SDK hands over mobility-major frames; the
+    /// native Waters reader: a frame's drift bins interleave); `waters:sonar-summed` for the scans the
+    /// Waters reader read as a SONAR function's quadrupole bins summed.
+    counters: Vec<(&'static str, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
 }
 
 /// One spectrum from a vendor reader, plus — for a lattice-routed centroid list — the arrays that
@@ -6358,7 +6376,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         run_metadata,
         keep_zero_runs,
         probe_indices,
-        reorder_counter,
+        counters,
     } = hints;
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
@@ -6457,7 +6475,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // Count here, over the written spectra: the probe fetches above went through the same
     // closure and must not show up in the run totals.
     let mut tally = FacetTally::default();
-    let reordered_before = reorder_counter.as_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+    let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
     for i in 0..len {
         let VendorSpectrum { spectrum: spec, peak_arrays, routes } = spectrum(i)?.into();
         tally.record(routes);
@@ -6510,9 +6528,10 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     for entry in transformations {
         declare(&mut applied, entry);
     }
-    if let (Some(counter), Some(before)) = (reorder_counter.as_ref(), reordered_before) {
+    // The reader's own counts, grown over the written spectra only.
+    for ((entry, counter), before) in counters.iter().zip(counted_before) {
         if counter.load(std::sync::atomic::Ordering::Relaxed) > before {
-            declare(&mut applied, "sort-by-mz");
+            declare(&mut applied, *entry);
         }
     }
     // The Shimadzu profile route's pad trim, from the routes of the written spectra.
@@ -8776,6 +8795,65 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The writer's two other re-sort backstops count as well: a chromatogram handed over out of time
+    /// order declares `sort-by-time`, a wavelength spectrum out of wavelength order
+    /// `sort-by-wavelength`, and the same data in order declares neither. Both backstops reordered
+    /// stored data without a declaration before.
+    #[test]
+    fn writer_backstops_declare_chromatogram_and_wavelength_re_sorts() {
+        use mzdata::io::MZReaderType;
+        use mzpeak_prototyping::writer::AbstractMzPeakWriter;
+
+        const PDA_UV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pda_uv.pwiz.mzML");
+        let dir = scratch("backstops");
+        let ms = spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], 0);
+        // A PDA wavelength spectrum of the fixture as pwiz wrote it, and the same one reversed.
+        let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(PDA_UV).unwrap();
+        let uv = reader
+            .iter()
+            .find(|s| s.spectrum_type().is_some_and(|t| !t.is_mass_spectrum()))
+            .expect("a wavelength spectrum in pda_uv.pwiz.mzML");
+        let reversed_uv = {
+            let mut arrays = BinaryArrayMap::new();
+            for (t, a) in uv.raw_arrays().expect("wavelength arrays").iter() {
+                let mut r = DataArray::wrap(t, a.dtype(), Vec::new());
+                match a.dtype() {
+                    BinaryDataArrayType::Float64 => r.update_buffer(&a.to_f64().unwrap().iter().rev().copied().collect::<Vec<_>>()),
+                    BinaryDataArrayType::Float32 => r.update_buffer(&a.to_f32().unwrap().iter().rev().copied().collect::<Vec<_>>()),
+                    other => panic!("unexpected {other:?} array in the fixture"),
+                }
+                .unwrap();
+                r.unit = a.unit;
+                arrays.add(r);
+            }
+            MultiLayerSpectrum::new(uv.description().clone(), Some(arrays), None, None)
+        };
+        let applied = |name: &str, uv: &MultiLayerSpectrum, times: &[f64]| -> Vec<String> {
+            let path = dir.join(format!("{name}.mzpeak"));
+            let mut writer = super::MzPeakWriterType::<fs::File>::builder()
+                .sample_array_types_from_spectra(std::iter::once(ms.clone()))
+                .build(fs::File::create(&path).unwrap(), true);
+            writer.write_spectrum(&ms).unwrap();
+            writer.write_spectrum(uv).unwrap();
+            let tic = super::synth_chromatogram(
+                "TIC",
+                Param::builder().name("total ion current chromatogram").curie(mzdata::curie!(MS:1000235)).build(),
+                times,
+                &[6.0, 7.0, 8.0],
+            )
+            .unwrap();
+            writer.write_chromatogram(&tic).unwrap();
+            let applied = super::base_transformations(&writer);
+            writer.finish_parquet().unwrap().finish().unwrap();
+            applied
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(applied("in-order", &uv, &[0.0, 1.0, 2.0]), none);
+        assert_eq!(applied("time", &uv, &[0.0, 2.0, 1.0]), ["sort-by-time"]);
+        assert_eq!(applied("wavelength", &reversed_uv, &[0.0, 1.0, 2.0]), ["sort-by-wavelength"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// M35: which timsTOF route built an archive. The fallback arm runs only on a native error that
     /// mentions `decompress`, and hands that error to the `conversion_route` block; any other error
     /// keeps the native lane's context, and success needs no fallback. Forced with injected errors:
@@ -8903,25 +8981,31 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A reader that re-sorts spectra itself (the `--bruker-sdk` TDF reader) is declared from its
-    /// counter over the written spectra: re-sorts during the six schema probes do not count.
+    /// A reader's own counts (the `--bruker-sdk` TDF and Waters frame re-sorts, the Waters SONAR
+    /// sums) are declared from their growth over the written spectra: counts during the six schema
+    /// probes do not count, and each counter declares only its own entry.
     #[test]
-    fn reader_reorder_counter_counts_written_spectra_only() {
+    fn reader_counters_count_written_spectra_only() {
         use super::{convert_vendor_reader_tallied, VendorHints};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let dir = scratch("reorder-counter");
+        let dir = scratch("reader-counters");
         const LEN: usize = 20;
-        let declared = |name: &str, bump: &dyn Fn(usize, usize) -> bool| -> Vec<String> {
-            let counter = Arc::new(AtomicUsize::new(0));
+        // `bump(call, index)` names the counter a reader call adds to, if any: 0 is `sort-by-mz`,
+        // 1 is `waters:sonar-summed`.
+        let declared = |name: &str, bump: &dyn Fn(usize, usize) -> Option<usize>| -> Vec<String> {
+            let counters = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
             let calls = std::cell::Cell::new(0usize);
             let out = dir.join(format!("{name}.mzpeak"));
-            let hints = VendorHints { reorder_counter: Some(counter.clone()), ..VendorHints::default() };
+            let hints = VendorHints {
+                counters: vec![("sort-by-mz", counters[0].clone()), ("waters:sonar-summed", counters[1].clone())],
+                ..VendorHints::default()
+            };
             convert_vendor_reader_tallied(std::path::Path::new(TINY), &out, None, 1, None, false, hints, LEN, |i| {
                 calls.set(calls.get() + 1);
-                if bump(calls.get(), i) {
-                    counter.fetch_add(1, Ordering::Relaxed);
+                if let Some(k) = bump(calls.get(), i) {
+                    counters[k].fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], i))
             })
@@ -8933,10 +9017,11 @@ mod tests {
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect()
         };
-        // The probes are fetched first (calls 1..=6, indices 0, 3, …, 15).
-        assert!(declared("probes-only", &|call, _| call <= 6).is_empty());
-        // Index 1 is never probed (stride 3) and is always written.
-        assert_eq!(declared("written", &|call, i| call > 6 && i == 1), ["sort-by-mz"]);
+        // The probes are fetched first (calls 1..=6, indices 0, 3, …, 15), and both counters grow there.
+        assert!(declared("probes-only", &|call, _| (call <= 6).then_some(call % 2)).is_empty());
+        // Indices 1 and 2 are never probed (stride 3) and are always written.
+        assert_eq!(declared("re-sorted", &|call, i| (call > 6 && i == 1).then_some(0)), ["sort-by-mz"]);
+        assert_eq!(declared("sonar-summed", &|call, i| (call > 6 && i == 2).then_some(1)), ["waters:sonar-summed"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

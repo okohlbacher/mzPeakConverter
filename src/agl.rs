@@ -48,8 +48,10 @@ pub struct RecordHeader {
 }
 
 /// What a successful host reported rewriting, read back from the `[count key=value]` tags on its
-/// stderr notes (`Glue.cs`). A host built before the tags existed reports nothing here; its notes
-/// are still logged.
+/// stderr notes (`Glue.cs`). The host counts over the scans it exported, which under
+/// `MZPC_MAX_SPECTRA` are only the ones the converter writes (`agilent.rs` hands it the cap). A host
+/// built before the tags existed reports nothing here, and one built before the cap counts the
+/// whole run; its notes are still logged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostCounts {
     /// Intensities MHDAC returned as NaN or ±Inf, stored as 0.
@@ -354,6 +356,15 @@ mod tests {
         ] {
             assert!(cs.contains(tag), "Glue.cs no longer writes the tag {tag}");
         }
+        // Those tags count the written scans only: the host caps its scan count at the converter's
+        // MZPC_MAX_SPECTRA before it writes that count, and the converter hands it the cap it parsed.
+        let cap = cs.find("GetEnvironmentVariable(\"MZPC_MAX_SPECTRA\")").expect("Glue.cs no longer reads MZPC_MAX_SPECTRA");
+        assert!(cap < count && cs.contains("count = (int)cap;"), "Glue.cs no longer caps the scan count it exports");
+        let spawn = include_str!("agilent.rs").replace("\r\n", "\n");
+        assert!(
+            spawn.contains("host_cmd.env(\"MZPC_MAX_SPECTRA\", n.to_string())") && spawn.contains("host_cmd.env_remove(\"MZPC_MAX_SPECTRA\")"),
+            "agilent.rs no longer hands the host the cap it parsed"
+        );
     }
 }
 
