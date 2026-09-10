@@ -1784,12 +1784,25 @@ fn msconvert_sample_arg(cmd: &mut Command, input: &Path) {
 /// in pwiz's `msconvert.cpp`), so more than one such line in its log means the output holds only
 /// the last run. Counted from the log rather than from files: without `--outfile` pwiz names a
 /// run `<wiff>-<sample name>`, and samples that share a name overwrite each other there too.
+///
+/// Also refused: a sample pwiz could not open. `Reader_ABI::read` catches that, prints
+/// `[Reader_ABI::read] Error opening run <i> in <file>` and goes on with the rest, so the runs it
+/// hands msconvert are a subset, numbered without the gap — `--runIndexSet` then selects a
+/// different sample than `--sample` names, and a two-sample file with one unreadable is one run.
 fn refuse_multi_run(log: &Path) -> Result<()> {
     // ponytail: read once msconvert has written EVERY run (En_PPY: all 117); tail the log while it
     // runs and kill it at the second line if that wait matters.
-    let runs = String::from_utf8_lossy(&fs::read(log).unwrap_or_default())
-        .matches("writing output file:")
-        .count();
+    let log = String::from_utf8_lossy(&fs::read(log).unwrap_or_default()).into_owned();
+    let unopened: Vec<&str> = log.lines().filter(|l| l.contains("Error opening run")).collect();
+    if !unopened.is_empty() {
+        bail!(
+            "msconvert could not open {} of the input's runs and skipped them, so the output would \
+             hold a subset, and --sample would count only the runs it could open:\n{}",
+            unopened.len(),
+            unopened.join("\n")
+        );
+    }
+    let runs = log.matches("writing output file:").count();
     if runs > 1 {
         bail!(
             "msconvert wrote {runs} runs onto the one output, so only the last survived; an output \

@@ -141,6 +141,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   truncated conversion did. `--sample 0` is refused for every lane; the msconvert lanes used
   to turn it into run index 0, sample 1. `tests/msconvert_multi_run.rs` pins both directions
   with a stand-in msconvert that writes two runs, or one when `--runIndexSet` picks it.
+- **The msconvert lanes also refuse a sample msconvert could not open.** ProteoWizard's WIFF reader
+  catches a sample that throws on open, prints `[Reader_ABI::read] Error opening run <i> in <file>`
+  and goes on with the rest, and msconvert exits 0. The refusal above counted only the runs written,
+  so a two-sample WIFF with one unreadable sample came out as one run, exit 0; and because
+  `--runIndexSet` counts the runs pwiz could open, `--sample 2` of three with sample 1 unreadable
+  converted sample 3. Both lanes now refuse when the captured log holds that line, and quote it.
+  Pinned in `tests/msconvert_multi_run.rs` with a stand-in that reports one unreadable sample.
 - **The `.mzpeak` filter lane no longer refuses archives with wavelength spectra.** Every
   Parquet member is classified, and the UV/PDA scans facet (`entity_type=wavelength_spectrum`,
   keyed by `source_index`) fell into the "index does not identify its entity" refusal. `--rt`,
