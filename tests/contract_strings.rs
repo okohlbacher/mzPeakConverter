@@ -61,7 +61,9 @@ fn code_view_drops_comments_and_the_test_module() {
     assert_eq!(strip_comment(r#"    // `tof_encoding` is "absolute""#), "");
     assert_eq!(strip_comment(r#"    s.split('"').next() // "m/z-chunked""#), r#"    s.split('"').next()"#);
     assert!(code().contains("fn main()"), "the lanes survive");
-    assert!(!code().contains("fn corpus_root()"), "the test module is cut");
+    // `mod tests {` occurs in main.rs only where the test module opens (fn corpus_root(), the old
+    // needle, moved to tests/common/corpus.rs, so it could no longer fail).
+    assert!(!code().contains("mod tests {"), "the test module is cut");
 }
 
 fn pinned(needle: &str) {

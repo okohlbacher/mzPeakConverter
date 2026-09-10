@@ -3843,6 +3843,8 @@ impl Drop for TranscodeGuard {
 /// by containers whose entrypoint is PID 1 writing to one volume, and a directory a crashed run left
 /// behind must not hand its mzML to this run. Hidden, because it sits beside the user's output.
 fn msconvert_dir(parent: &Path) -> Result<TranscodeGuard> {
+    // msconvert creates a missing --outdir itself; keep that for an output directory that does not exist yet.
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -4233,7 +4235,6 @@ fn count_attr(text: &str) -> Option<u64> {
 /// time: a read or two for a spectrum-bearing file however large, and the whole file only when the
 /// chromatograms ARE the file. `None` for another format, or when the list is absent or unreadable.
 fn declared_chromatogram_count(path: &Path) -> Option<u64> {
-    use std::io::{Seek, SeekFrom};
     const NEEDLE: &[u8] = b"<chromatogramList";
     const CHUNK: u64 = 1 << 20;
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mzML")) {
