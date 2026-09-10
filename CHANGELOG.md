@@ -242,7 +242,8 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `--agilent-grid` declares `agilent:drop-zero-samples` only when its reader dropped a zero sample or
   an all-zero scan, declares a new `agilent:intensity-f32-rounding` when a count above 2^24 was rounded
   into Float32 (logged only until now), and marks the archive `partial` when `MSProfile.bin` ends
-  before its scan records (`agilent_grid_declares_what_its_reader_counted`). The Agilent MHDAC host
+  before its scan records, also under an `MZPC_MAX_SPECTRA` cap that stopped nothing
+  (`agilent_grid_declares_what_its_reader_counted`). The Agilent MHDAC host
   counts spectra whose m/z and intensity arrays it cut to one length, reports both that and its
   NaN/Inf count in a `[count key=value]` tag, and the lane declares `agilent:truncate-unequal-arrays`
   and `agilent:nonfinite-intensity-to-zero` (`agl::host_counts`, pinned on host). The native Waters
