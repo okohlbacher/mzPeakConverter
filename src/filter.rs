@@ -987,7 +987,19 @@ fn null_dangling_parent_refs(
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
 }
 
-/// Truncate chromatogram data to the RT window [lo, hi]. Two layouts:
+/// `--rt` is in minutes, the unit of `spectrum.time`, but a chromatogram time axis declares its own
+/// unit — ProteoWizard's chromatograms, and the TIC/BPC the converter stores beside them, are in
+/// seconds. The factor that takes a window in minutes into the unit of `child`.
+fn minutes_in_axis(s: &StructArray, child: &str) -> f64 {
+    let DataType::Struct(fields) = s.data_type() else { return 1.0 };
+    match fields.iter().find(|f| f.name() == child).and_then(|f| f.metadata().get("unit")).map(String::as_str) {
+        Some("UO:0000010") => 60.0,
+        Some("UO:0000028") => 60_000.0,
+        _ => 1.0,
+    }
+}
+
+/// Truncate chromatogram data to the RT window [lo, hi] (minutes, see [`minutes_in_axis`]). Two layouts:
 ///   * **point** (`<field>.time` double): keep rows whose time is in the window.
 ///   * **chunk** (`<field>.time_chunk_start`/`_end`): keep whole chunk rows that OVERLAP the window
 ///     (chunk-granularity truncation — we never edit chunk list contents, mirroring the whole-spectrum
@@ -1001,12 +1013,16 @@ fn filter_chromatogram_time(
     let s = struct_col(batch, field)
         .ok_or_else(|| anyhow!("expected `{field}` struct column"))?;
     if let Some(time) = f64_child(s, "time") {
+        let k = minutes_in_axis(s, "time");
+        let (lo, hi) = (lo * k, hi * k);
         let mask: BooleanArray = (0..time.len())
             .map(|r| Some(!time.is_null(r) && time.value(r) >= lo && time.value(r) <= hi))
             .collect();
         return Ok(Some(filter_record_batch(batch, &mask)?));
     }
     if let (Some(start), Some(end)) = (f64_child(s, "time_chunk_start"), f64_child(s, "time_chunk_end")) {
+        let k = minutes_in_axis(s, "time_chunk_start");
+        let (lo, hi) = (lo * k, hi * k);
         let mask: BooleanArray = (0..start.len())
             .map(|r| Some(end.value(r) >= lo && start.value(r) <= hi))
             .collect();
@@ -1040,6 +1056,8 @@ fn chromatogram_point_counts(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<HashM
         let idx = u64_child(s, "chromatogram_index").unwrap();
         if let Some(time) = f64_child(s, "time") {
             // Point layout: one surviving point per in-window row.
+            let k = minutes_in_axis(s, "time");
+            let (lo, hi) = (lo * k, hi * k);
             for r in 0..idx.len() {
                 if time.value(r) >= lo && time.value(r) <= hi {
                     *counts.entry(idx.value(r)).or_insert(0) += 1;
@@ -1049,6 +1067,8 @@ fn chromatogram_point_counts(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<HashM
             (f64_child(s, "time_chunk_start"), f64_child(s, "time_chunk_end"))
         {
             // Chunk layout: a kept (overlapping) chunk contributes its whole intensity-list length.
+            let k = minutes_in_axis(s, "time_chunk_start");
+            let (lo, hi) = (lo * k, hi * k);
             for r in 0..idx.len() {
                 if end.value(r) >= lo && start.value(r) <= hi {
                     *counts.entry(idx.value(r)).or_insert(0) += intensity_row_len(s, r);

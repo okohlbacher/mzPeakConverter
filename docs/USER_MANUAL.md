@@ -207,7 +207,10 @@ When the **input** is a `.mzpeak`, the converter does not re-encode: it re-packs
 keeping spectra whose retention time is within `--rt MIN-MAX` (same unit as the stored
 `spectrum.time`, minutes for every lane this tool writes) and/or whose MS level is in `--ms-level`
 (`--ms-level 1 --ms-level 2` or `--ms-level 1,2`), and dropping archive members that match
-`--drop-aux <glob>` (`--no-vendor` on this lane is shorthand for `--drop-aux 'vendor*'`). Parquet
+`--drop-aux <glob>` (`--no-vendor` on this lane is shorthand for `--drop-aux 'vendor*'`). `--rt`
+also truncates the chromatograms, in the same minutes: each chromatogram time axis declares its own
+unit (seconds for ProteoWizard's chromatograms, and for the TIC/BPC stored beside them), and the
+window is converted into it. Parquet
 facets are copied verbatim, so encoder options are inert here — warned about, not refused (see the
 table above). The same
 lane injects `--image` / `--sdrf` into an existing archive — the documented way to add them to an
