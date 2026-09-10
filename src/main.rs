@@ -8948,7 +8948,7 @@ mod tests {
         // The input is only named: without an analysis.tdf the vendor calibration block is skipped.
         super::write_ims_compact_archive_impl::<_, Parallel>(
             &dir.join("synthetic.d"), &output, 3, None, false, 10.0, 2e-5, "global_metadata", 2,
-            "m/z-chunked", Some(50.0), None, super::Driver::Serial(frame),
+            "m/z-chunked", Some(50.0), None, None, super::Driver::Serial(frame),
         )
         .expect("--ims-chunked write");
 
