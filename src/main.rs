@@ -1880,10 +1880,10 @@ fn convert_via_msconvert(
         .or_else(|| std::env::var_os("MSCONVERT_PATH"))
         .unwrap_or_else(|| "msconvert".into());
 
-    // Unique temp dir for the intermediate mzML (process id keeps concurrent runs from colliding).
-    let tmpdir = std::env::temp_dir().join(format!("mzpc-msconvert-{}", std::process::id()));
-    fs::create_dir_all(&tmpdir).with_context(|| format!("creating {}", tmpdir.display()))?;
-    let mzml = tmpdir.join("via_msconvert.mzML");
+    // The intermediate mzML goes to a temp dir the guard removes on every return; "msconvert not
+    // found" used to return through `?` below and leave it behind.
+    let tmp = msconvert_dir(&std::env::temp_dir())?;
+    let (tmpdir, mzml) = (&tmp.dir, &tmp.file);
 
     let mzcvt_log = tmpdir.join("msconvert.log");
     let mut cmd = Command::new(&exe);
@@ -1939,29 +1939,23 @@ fn convert_via_msconvert(
             .unwrap_or_default()
     };
     if !status.success() {
-        let t = msconvert_tail();
-        let _ = fs::remove_dir_all(&tmpdir);
-        bail!("msconvert failed (exit {:?}){}", status.code(), t);
+        bail!("msconvert failed (exit {:?}){}", status.code(), msconvert_tail());
     }
     if !mzml.exists() {
-        let t = msconvert_tail();
-        let _ = fs::remove_dir_all(&tmpdir);
-        bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), t);
+        bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), msconvert_tail());
     }
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
-    let result = convert_file(&mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true);
-    let _ = fs::remove_dir_all(&tmpdir);
-    result
+    convert_file(mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true)
 }
 
 /// The `--to mzml` lane: convert `input` to a plain **mzML** via the mzdata writer, streaming the
 /// read spectra straight through — no mzPeak encoders (ims-compact / TOF-grid / chunking /
 /// byte-plane / side-file embedding all bypassed). Covers every format the tool reads: the
 /// Windows-native vendor readers (SciEX/Waters/Agilent/Shimadzu, Bruker TSF/BAF) plus everything
-/// mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF). `--via-msconvert` runs msconvert
-/// straight to the output mzML.
+/// mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF). `--via-msconvert` has msconvert
+/// write the mzML instead.
 fn convert_to_mzml(
     input: &Path,
     output: &Path,
@@ -2380,7 +2374,11 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
     Ok(())
 }
 
-/// Run ProteoWizard `msconvert` to produce the output mzML directly (`--via-msconvert --to mzml`).
+/// Run ProteoWizard `msconvert` for the output mzML (`--via-msconvert --to mzml`). It writes into a
+/// fresh directory BESIDE the output, so the rename into place cannot cross a volume, and only the
+/// file it wrote there is renamed onto `output`. It used to be handed the final path, with
+/// `output.exists()` as the success check, so under `--force` a previous run's file passed for this
+/// run's — which real msconvert produces for `-o x.mzML.gz`, a name it writes under another one.
 fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>) -> Result<()> {
     let exe: std::ffi::OsString = msconvert_path
         .map(|p| p.as_os_str().to_os_string())
@@ -2390,21 +2388,19 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let outfile = output
-        .file_name()
-        .ok_or_else(|| anyhow!("output {} has no file name", output.display()))?;
+    let tmp = msconvert_dir(outdir)?;
     // Capture msconvert's stdout+stderr so a failure carries its real message (unknown-instrument /
     // unsupported-format / missing-sidecar) instead of a bare exit code — same as the mzPeak
     // `convert_via_msconvert` path (commit 57262aa).
-    let log_path = std::env::temp_dir().join(format!("mzpc-msconvert-mzml-{}.log", std::process::id()));
+    let log_path = tmp.dir.join("msconvert.log");
     let mut cmd = Command::new(&exe);
     cmd.arg(input)
         .arg("--mzML")
         .arg("--ignoreUnknownInstrumentError")
         .arg("--outdir")
-        .arg(outdir)
+        .arg(&tmp.dir)
         .arg("--outfile")
-        .arg(outfile);
+        .arg("via_msconvert.mzML");
     if let Ok(f) = fs::File::create(&log_path) {
         if let Ok(f2) = f.try_clone() {
             cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
@@ -2433,16 +2429,25 @@ fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>)
             .unwrap_or_default()
     };
     if !status.success() {
-        let t = tail();
-        let _ = fs::remove_file(&log_path);
-        bail!("msconvert failed (exit {:?}){}", status.code(), t);
+        bail!("msconvert failed (exit {:?}){}", status.code(), tail());
     }
-    if !output.exists() {
-        let t = tail();
-        let _ = fs::remove_file(&log_path);
-        bail!("msconvert reported success but produced no mzML at {}{}", output.display(), t);
+    if !tmp.file.exists() {
+        bail!("msconvert reported success but produced no mzML at {}{}", tmp.file.display(), tail());
     }
-    let _ = fs::remove_file(&log_path);
+    // msconvert's own `--gzip` would pick the file name again; compress what it wrote instead.
+    let written = if has_gz_suffix(output) {
+        let gz = tmp.dir.join("via_msconvert.mzML.gz");
+        let compress = || -> io::Result<()> {
+            let mut enc = flate2::write::GzEncoder::new(fs::File::create(&gz)?, flate2::Compression::default());
+            io::copy(&mut fs::File::open(&tmp.file)?, &mut enc)?;
+            enc.finish().map(drop)
+        };
+        compress().with_context(|| format!("gzip-compressing {}", tmp.file.display()))?;
+        gz
+    } else {
+        tmp.file.clone()
+    };
+    TmpGuard::new(&written).finish(output)?;
     log::info!("wrote {}", output.display());
     Ok(())
 }
@@ -3799,6 +3804,7 @@ impl Drop for SanitizedTemp {
 /// RAII cleanup for a transcoded-to-UTF-8 input. Holds the temp *directory* we created (for imzML
 /// we also place a hardlinked/copied `.ibd` sidecar beside the temp file, so the whole dir must go)
 /// and removes it on drop — covering success, conversion error, and panic-unwind exit paths alike.
+/// [`msconvert_dir`] reuses it for the directory msconvert writes into.
 struct TranscodeGuard {
     dir: PathBuf,
     /// The transcoded UTF-8 file to hand to mzdata, inside `dir`.
@@ -3809,6 +3815,17 @@ impl Drop for TranscodeGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A fresh directory under `parent` for msconvert to write `via_msconvert.mzML` into (`file`),
+/// removed on every return — not on a panic, which aborts the release build. The pid keeps
+/// concurrent runs apart; a directory a crashed run left under a recycled pid is cleared first, or
+/// its mzML would pass for this run's.
+fn msconvert_dir(parent: &Path) -> Result<TranscodeGuard> {
+    let dir = parent.join(format!("mzpc-msconvert-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(TranscodeGuard { file: dir.join("via_msconvert.mzML"), dir })
 }
 
 /// Sniff the XML encoding declared in the first ~200 bytes. Returns the lowercased charset name from
