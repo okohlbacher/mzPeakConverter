@@ -26,6 +26,24 @@ All notable changes to this project are documented here. The format follows
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
 
+### Fixed
+
+- **An indexed mzML with an empty `<referenceableParamGroup id="…"/>` lost all its chromatograms,
+  with exit code 0.** mzdata panics on such a group once it is referenced (ProteomeDiscoverer
+  emits them), so the converter reads a sanitized copy in which each is written as an open/close
+  pair. Only the header before `<spectrumList` changes, but it grows, so every `<offset>` in the
+  copy's `<indexList>`, and its `<indexListOffset>`, pointed short of its element. mzdata failed to
+  read the index (said only at debug level: `close tag </run> does not match any open tag`), fell
+  back to a scan that finds the spectra, and could no longer enumerate the chromatograms, which it
+  reaches only through that index: `tests/fixtures/tiny.pwiz.1.1.mzML` declared UTF-8 with one
+  empty group logged `2 synthesized + 0 from source`, and the `sic` trace was gone from both lanes.
+  The rewrite is header-only, so every indexed element moves by the same number of bytes: the
+  copy's offsets are now shifted by that delta, the body is still streamed, and only the index tail
+  is read into memory. The copy drops its `<fileChecksum>`, which hashes the original bytes and
+  which mzdata never checks. A source whose `<indexListOffset>` does not point at its `<indexList>`
+  is copied as before. No corpus archive is affected: no corpus mzML carries an empty group. Pinned
+  by `tests/empty_param_group_indexed_mzml_chromatograms.rs`.
+
 ## [0.11.5] — 2026-09-09
 
 ### Fixed
