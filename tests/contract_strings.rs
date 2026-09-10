@@ -279,3 +279,40 @@ fn transformations_block_pinned() {
         }
     }
 }
+
+/// The native Waters lane's two counted entries, `sort-by-mz` (a frame re-sorted) and
+/// `waters:sonar-summed`, run only where no CI host can: `convert_waters` is `cfg(windows)` and
+/// `WatersReader::spectrum` reads through MassLynxRaw.dll. The host test of the counter seam
+/// (`reader_counters_count_written_spectra_only`) builds its own counters, so deleting the lane's
+/// push or the reader's bump would leave the suite green while the archive stopped declaring what
+/// it did. Both halves are pinned: the reader bumps each counter where the transformation happens
+/// and hands out that same counter, and the lane pairs it with its entry and passes the hints on.
+#[test]
+fn waters_counted_entries_pinned() {
+    /// `text` from `head` up to the first `close` after it: the body of one item.
+    fn body<'a>(text: &'a str, head: &str, close: &str) -> &'a str {
+        let start = text.find(head).unwrap_or_else(|| panic!("`{head}` is gone"));
+        let rest = &text[start..];
+        &rest[..rest.find(close).unwrap_or(rest.len())]
+    }
+    let waters = include_str!("../src/waters.rs").replace("\r\n", "\n");
+    let reader: String =
+        waters.split("\n#[cfg(test)]").next().unwrap().lines().map(strip_comment).collect::<Vec<_>>().join("\n");
+    let spectrum = body(&reader, "pub fn spectrum(&self, i: usize)", "\n    }\n");
+    let lane = body(code(), "fn convert_waters(", "\n}\n");
+    let missing: Vec<&str> = [
+        (spectrum, "if sort_frame_points(&mut points) {\n                self.resorted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);"),
+        (spectrum, "if fi.sonar_bins > 0 {\n                self.sonar_summed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);"),
+        (reader.as_str(), "pub fn reorder_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {\n        self.resorted.clone()"),
+        (reader.as_str(), "pub fn sonar_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {\n        self.sonar_summed.clone()"),
+        (reader.as_str(), "pub const SONAR_SUMMED: &str = \"waters:sonar-summed\";"),
+        (lane, "hints.counters.push((waters::SONAR_SUMMED, reader.sonar_counter()));"),
+        (lane, "hints.counters.push((\"sort-by-mz\", reader.reorder_counter()));"),
+        (lane, "convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))"),
+    ]
+    .into_iter()
+    .filter(|(text, needle)| !text.contains(needle))
+    .map(|(_, needle)| needle)
+    .collect();
+    assert!(missing.is_empty(), "the Waters lane no longer counts what it declares; missing: {missing:#?}");
+}

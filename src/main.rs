@@ -8985,7 +8985,9 @@ mod tests {
 
     /// A reader's own counts (the `--bruker-sdk` TDF and Waters frame re-sorts, the Waters SONAR
     /// sums) are declared from their growth over the written spectra: counts during the six schema
-    /// probes do not count, and each counter declares only its own entry.
+    /// probes do not count, and each counter declares only its own entry. The counters here are the
+    /// test's own; the Waters lane's wiring of its two (MassLynxRaw.dll only) is pinned as source
+    /// text in `tests/contract_strings.rs`, `waters_counted_entries_pinned`.
     #[test]
     fn reader_counters_count_written_spectra_only() {
         use super::{convert_vendor_reader_tallied, VendorHints};
@@ -9024,6 +9026,39 @@ mod tests {
         // Indices 1 and 2 are never probed (stride 3) and are always written.
         assert_eq!(declared("re-sorted", &|call, i| (call > 6 && i == 1).then_some(0)), ["sort-by-mz"]);
         assert_eq!(declared("sonar-summed", &|call, i| (call > 6 && i == 2).then_some(1)), ["waters:sonar-summed"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `sort-by-time` on the vendor-reader lanes: the TIC and base-peak traces are synthesized in
+    /// spectrum order, so a run whose MS1 start times go backwards hands the writer chromatograms out
+    /// of time order, and its backstop re-sorts them. The seam reads the writer's tallies after
+    /// `finish_chromatograms`; read before it, the entry is lost. The same run in time order declares
+    /// nothing. Until now only the mzML lane (the tiny fixture) and the writer seam pinned the entry.
+    #[test]
+    fn vendor_reader_declares_the_time_re_sort_of_its_synthesized_chromatograms() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("vendor-sort-by-time");
+        const LEN: usize = 8;
+        let declared = |name: &str, minutes: &dyn Fn(usize) -> f64| -> Vec<String> {
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(std::path::Path::new(TINY), &out, None, 1, None, true, VendorHints::default(), LEN, |i| {
+                let mut s = spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], i);
+                s.description_mut().ms_level = 1;
+                s.description_mut().acquisition.first_scan_mut().unwrap().start_time = minutes(i);
+                Ok(s)
+            })
+            .unwrap();
+            index_metadata(&out)["transformations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(declared("in-order", &|i| i as f64).is_empty());
+        // Spectrum 2 started before spectrum 1: the traces arrive as 0, 1, 0.5, 3, … minutes.
+        assert_eq!(declared("out-of-order", &|i| if i == 2 { 0.5 } else { i as f64 }), ["sort-by-time"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
