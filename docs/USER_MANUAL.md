@@ -139,7 +139,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's vendor-grade scan→1/K0 recalibration (the `TimsCalibration` ModelType-2 model) and use timsrust's linear approximation. Recalibration is ON by default. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra (synthesis is on by default) |
-| `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`. Highest precedence (§8) |
+| `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
 | `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine. Repeatable. A bad/missing path ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable) (§4.3) |
 | `--sdrf <SDRF>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an SDRF (sample-metadata) TSV VERBATIM as `sample_metadata/sdrf.tsv` with `metadata.study` + `metadata.sample_metadata` back-refs. A missing/unreadable path ERRORS the conversion (§4.3) |
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
@@ -686,30 +686,50 @@ under `--bruker-sdk`) says which of the two (a, b) chords — measured 4.28 ppm 
 ims-compact archive holds.
 
 **Verbatim vendor side-files (preserved, not interpreted).** For every vendor directory input
-(Bruker `.d` of any kind, Agilent `.d`, Waters `.raw`), the original side-files (methods,
-calibration, acquisition databases, …) are **embedded by default** under `vendor/` in the archive —
-gzip-compressed where they compress and declared `proprietary` in the index — so nothing the
-converter does not yet model is lost; the `vendor_files` manifest records every embed and drop. The
-lossless ims-compact lane drops the bulk `*_bin` by default; every other lane keeps everything the
-vendor wrote, including the raw signal files (`analysis.baf`, `AcqData/MSProfile.bin`,
-`_FUNC*.DAT`), which can be several times the archive: drop them with `--aux` or embed nothing with
-`--no-vendor`. No default drops them because those lanes do not store everything the files hold: BAF
-reads line arrays unless `--representation profile`, the Agilent MHDAC host reads profile else peak,
-and native Waters leaves chromatogram-type functions out. The one file dropped by default is
-baf2sql's `analysis.sqlite`, the cache the BAF reader itself creates inside the `.d`
-(`--aux 'analysis.sqlite=embed'` keeps it). Through 0.11.5 only TDF/TSF directories,
-`--agilent-grid` and ims-compact embedded anything. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
-…) and status log are captured verbatim into dedicated `vendor_scan_trailers`
-(tall + wide) and `vendor_status_log` facets.
+(Bruker `.d` of any kind, Agilent `.d`, Waters `.raw`), the side-files that describe the run
+(methods, calibration, acquisition databases, sample and device tables, …) are **embedded by
+default** under `vendor/` in the archive — gzip-compressed where they compress and declared
+`proprietary` in the index — so nothing the converter does not yet model is lost; the
+`vendor_files` manifest records every embed and every drop. `--via-msconvert` embeds none: its
+source is the mzML msconvert wrote. What a default archive leaves out, each file by its name in any
+letter case, wherever it sits in the directory:
+
+- **The raw signal files of BAF, Agilent MassHunter and Waters MassLynx directories**, which are
+  nearly all of such a directory and several times its archive (FM_1-1: `analysis.baf` 714 MB beside
+  a 109 MB archive; Capan2: 1.1 GB of `_FUNC*.DAT` and `_func*.cdt` beside 531 MB): `analysis.baf`,
+  `analysis.baf_idx`, `analysis.baf_xtr`, DataAnalysis's cached `*.ami` views and the FTMS transients
+  `ser` and `fid`; `MSProfile.bin`, `MSPeak.bin` and `IMSFrame.bin`; `_FUNC*.DAT`, `_FUNC*.IDX` and the
+  compressed ion-mobility data `_func*.cdt` and `_func*.ind`. What those files hold beyond the
+  archive is then in no default archive: the BAF profile unless `--representation profile`, the
+  MassHunter representation a lane did not read (the MHDAC host reads profile, else peaks;
+  `--agilent-grid` reads profile), and the Waters functions not written as spectra
+  (`waters:drop-functions`). Kept: the Agilent scan records `MSScan.bin` (per-scan metadata no lane
+  decodes yet, the MSn precursor fields among it; 109 MB on a 1.2 GB-profile run) and
+  `MSMassCal.bin`, the `*.cg`/`*.cd` device traces, DataAnalysis's `*.mcf` result containers, and the
+  Waters `_FUNC*.STS` scan statistics, `_CHRO*` analog traces and `_mob/` projections.
+- **The timsTOF `*_bin`, on the ims-compact lanes only**, which store its exact integer signal
+  themselves. The f64 TDF/TSF lanes (TSF, `--no-ims-compact`, `--bruker-sdk`) keep it, as through
+  0.11.5: beside the embedded `analysis.tdf` or `analysis.tsf` it is the exact copy of a signal those
+  lanes store as calibrated f64 m/z, in a format open readers decode (timsrust a TDF, this converter a
+  TSF), and at 70 % of a TSF archive it is the price of that copy.
+- **baf2sql's `analysis.sqlite`**, the cache the BAF reader itself creates inside the `.d`.
+
+Through 0.11.5 only TDF/TSF directories, `--agilent-grid` and ims-compact embedded anything, and
+`--agilent-grid` embedded `MSProfile.bin` and `MSPeak.bin` beside the grid it stores. For Thermo
+`.raw`, the scan trailers (FAIMS CV, injection time, charge, …) and status log are captured verbatim
+into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` facets.
 
 **Including / excluding.** The embedding is policy-driven (preserve-by-default):
 
 - `--no-vendor` (or `no_vendor: true`) — embed nothing.
-- `--aux 'glob=drop'` / `--aux 'glob=embed'` — per-glob rule, highest precedence,
-  repeatable. A single-file input (mzML, imzML, Thermo `.raw`, `.wiff`, `.lcd`) has no side-files,
-  so the rules change nothing there and the converter says so. The same rules can be given as the `aux:` list in the config file
-  (§5). For example, drop the bulk binaries but keep the method:
-  `--aux '*.tdf_bin=drop' --aux '*.method=embed'`.
+- `--aux 'glob=drop'` / `--aux 'glob=embed'` — per-glob rule, highest precedence, repeatable. A glob
+  matches, in any letter case, a file's name or its path inside the directory with `/` between the
+  parts: `MSProfile.bin` and `AcqData/MSProfile.bin` both name the Agilent profile file, and `*`
+  matches across a `/` too. A single-file input (mzML, imzML, Thermo `.raw`, `.wiff`, `.lcd`) has no
+  side-files, so the rules change nothing there and the converter says so. The same rules can be
+  given as the `aux:` list in the config file (§5). For example, drop the TSF bulk binary but keep
+  the method: `--aux '*.tsf_bin=drop' --aux '*.method=embed'`; keep a BAF run's raw signal:
+  `--aux 'analysis.baf*=embed'`.
 
 ## 9. Compression, layout & ims-compact
 

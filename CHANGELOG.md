@@ -870,25 +870,35 @@ keep their bytes.
   where it is declared (`tests/contract_strings.rs` over `main.rs`, `agl.rs` and `waters.rs`), and so
   are the `[count …]` tags the Agilent host writes in `Glue.cs`. A rebuilt corpus archive drops the
   entries that did not happen; the existing entry names are unchanged.
-- **Output change: every vendor directory input embeds its side-files, under one rule**
-  (`embed_vendor_members`). The vendor-reader and mzdata lanes embedded only Bruker TDF/TSF
-  directories while `--agilent-grid` and ims-compact embedded any directory themselves, so a BAF `.d`,
-  an Agilent `.d` on the MHDAC lane and a Waters `.raw` got no `vendor/` members and no
-  `vendor_files` manifest, `--aux` did nothing on them without a word, and USER_MANUAL §8's "embedded
-  by default" was false for BAF (corpus: FM_1-1_01_20254 and the Agilent S25 archive hold 0 vendor
-  members). They now follow the lane's policy like every other directory: preserve by default, the
-  ims-compact `*_bin` drop, `--aux` on top. **Size:** preserve-by-default includes the raw signal
-  files, so a rebuild without `--no-vendor` or an `--aux` drop grows by roughly their size (FM_1-1:
-  `analysis.baf` is 714 MB beside a 109 MB archive; S25: `MSProfile.bin` + `MSPeak.bin` are 251 MB).
-  No default drops them, because those lanes do not store all the signal the files hold: BAF reads
-  line arrays first, the MHDAC host asks for profile else peak, and Waters leaves chromatogram-type
-  functions out. The one default drop is baf2sql's `analysis.sqlite`, which the BAF reader itself
-  creates inside the `.d` and which is therefore not a vendor file; the drop is recorded in
-  `vendor_files`, and `--aux 'analysis.sqlite=embed'` keeps it
-  (`the_baf2sql_cache_is_dropped_unless_asked_for`).
-  `--aux` on a single-file input now logs that it is inert.
-  `every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert` pins both on a synthetic
-  Waters-shaped directory and on `tiny.pwiz.1.1.mzML`.
+- **Output change: every vendor directory input embeds its side-files, under one rule, without the
+  vendor's raw signal files** (`embed_vendor_members`). The vendor-reader and mzdata lanes embedded
+  only Bruker TDF/TSF directories while `--agilent-grid` and ims-compact embedded any directory
+  themselves, so a BAF `.d`, an Agilent `.d` on the MHDAC lane and a Waters `.raw` got no `vendor/`
+  members and no `vendor_files` manifest, `--aux` did nothing on them without a word, and
+  USER_MANUAL §8's "embedded by default" was false for BAF (corpus: FM_1-1_01_20254 and the Agilent
+  S25 archive hold 0 vendor members). They now follow the lane's policy like every other directory:
+  preserve by default, the ims-compact `*_bin` drop, `--aux` on top. Preserving everything would have
+  grown each rebuilt archive by its vendor directory (FM_1-1 799 MB beside a 109 MB archive, S25
+  253 MB, FM_01_Pos 1.37 GB, Capan2 1.10 GB, sFtsk_2 2.02 GB), so the built-in policy drops the raw
+  signal files, by name in any letter case: BAF `analysis.baf` with `_idx` and `_xtr`, DataAnalysis's
+  `*.ami` views and FTMS `ser`/`fid`; Agilent `MSProfile.bin`, `MSPeak.bin` and `IMSFrame.bin`; Waters
+  `_FUNC*.DAT`, `_FUNC*.IDX` and the compressed ion-mobility `_func*.cdt`/`_func*.ind`. What stays
+  embedded measures 0.38, 1.85, 111.6 (the 109 MB `MSScan.bin`), 0.34 and 2.18 MB on those five, and
+  9.8 MB on NreB_PAS_DECONV (its `*.mcf`). Kept by decision: Agilent `MSScan.bin` (the MSn precursor
+  fields no lane decodes) and `MSMassCal.bin`, `*.cg`/`*.cd`, `*.mcf`, Waters `_FUNC*.STS`, `_CHRO*`
+  analog traces and `_mob/`, and the timsTOF `*_bin` on the f64 TDF/TSF lanes, as through 0.11.5.
+  What the dropped files hold beyond the archive (the BAF profile unless `--representation profile`,
+  the MassHunter representation a lane did not read, the Waters functions not written as spectra) is
+  in no default archive; each drop is recorded in `vendor_files`, and `--aux '<glob>=embed'` keeps a
+  file. `--agilent-grid` archives, which through 0.11.5 embedded `MSProfile.bin` and `MSPeak.bin`
+  beside the grid they store, no longer do. An `--aux` glob now also matches a file's path inside the
+  directory (`AcqData/MSProfile.bin`, the spelling USER_MANUAL §8 gave, which matched nothing). The
+  other default drop is baf2sql's `analysis.sqlite`, which the BAF reader itself creates inside the
+  `.d`. `--aux` on a single-file input now logs that it is inert. Pinned by
+  `vendor::tests::vendor_signal_files_are_dropped_unless_asked_for`,
+  `tests::a_vendor_directorys_signal_files_stay_out_of_a_default_archive` (synthetic Waters, BAF and
+  Agilent directories through the embed) and
+  `every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert`.
 - **mzML-lane archives hold ProteoWizard's ids decoded.** ProteoWizard writes ids as XML names and
   escapes each byte a name may not hold as `_x00hh_`, so `run.id` came into the archive as
   `Experiment_x0020_1` (`tiny.pwiz.1.1.mzML`), `En_PPY-3_phenylpyruvic_x0020_acid_10NG_10ul` or
