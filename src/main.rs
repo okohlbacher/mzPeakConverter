@@ -4784,7 +4784,10 @@ where
     // writes a mixed archive (the base.rs deviation). Centroid-only TDF never writes a row to it, but
     // its schema still has to be chunk-shaped: an empty chunked builder falls back to point-shaped
     // default fields, so hand it the same fields the peak facet uses.
-    let data_fields = chunk_cfg.map(|_| peak_schema.fields().to_vec()).unwrap_or_default();
+    let data_fields: Vec<_> = match (chunk_cfg, peak_schema.dtype()) {
+        (Some(_), DataType::Struct(fields)) => fields.iter().cloned().collect(),
+        _ => Vec::new(),
+    };
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
         // Per-frame inputs of the vendor's exact TOF→m/z model (`Frames.T1/T2/MzCalibration`) as
@@ -8369,6 +8372,74 @@ mod tests {
             "spectra_data ('{data_family}') and spectra_peaks ('{peaks_family}') are both \
              `entity_type: spectrum` and MUST share one layout family"
         );
+    }
+
+    /// The same pin without the corpus. The family is fixed when the writers are built, so two
+    /// synthetic frames through `write_ims_compact_archive_impl` show it: under `--ims-chunked` both
+    /// `spectrum` facets must declare `chunk` (the empty data facet used to be `point`).
+    #[test]
+    fn ims_chunked_spectrum_facets_share_one_family_without_the_corpus() {
+        use mzdata::params::Unit;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let dir = scratch("ims-chunked-synthetic");
+        let output = dir.join("synthetic.mzpeak");
+        // m/z = (10 + 2e-5·tof)² spans 144–256 Th over these bins, so 50-Th chunks split each frame.
+        let frame = |i: usize, int_intensity: bool| -> anyhow::Result<MultiLayerSpectrum> {
+            let mut arrays = BinaryArrayMap::new();
+            let mut tof = DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
+            tof.update_buffer(&[100_000i32, 150_000, 200_000, 300_000]).unwrap();
+            arrays.add(tof);
+            let mut intensity = if int_intensity {
+                let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+                da.update_buffer(&[1i32, 2, 3, 4]).unwrap();
+                da
+            } else {
+                let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+                da.update_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+                da
+            };
+            intensity.unit = Unit::DetectorCounts;
+            arrays.add(intensity);
+            let mut mobility =
+                DataArray::wrap(&ArrayType::MeanInverseReducedIonMobilityArray, BinaryDataArrayType::Float64, Vec::new());
+            mobility.update_buffer(&[1.0f64, 1.05, 1.1, 1.2]).unwrap();
+            arrays.add(mobility);
+            let descr = SpectrumDescription {
+                id: format!("frame={}", i + 1),
+                index: i,
+                ms_level: 1,
+                signal_continuity: mzdata::spectrum::SignalContinuity::Centroid,
+                ..Default::default()
+            };
+            Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
+        };
+        type Parallel = fn(usize, bool) -> anyhow::Result<MultiLayerSpectrum>;
+        // The input is only named: without an analysis.tdf the vendor calibration block is skipped.
+        super::write_ims_compact_archive_impl::<_, Parallel>(
+            &dir.join("synthetic.d"), &output, 3, None, false, 10.0, 2e-5, "global_metadata", 2,
+            "m/z-chunked", Some(50.0), None, super::Driver::Serial(frame),
+        )
+        .expect("--ims-chunked write");
+
+        let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+        let family_of = |zip: &mut zip::ZipArchive<fs::File>, member: &str| -> (String, i64) {
+            let path = extract_zip_entry(zip, member, &dir);
+            let reader = SerializedFileReader::new(fs::File::open(&path).unwrap()).unwrap();
+            let meta = reader.metadata().file_metadata();
+            let index = meta
+                .key_value_metadata()
+                .and_then(|kvs| kvs.iter().find(|kv| kv.key == "spectrum_array_index"))
+                .and_then(|kv| kv.value.clone())
+                .unwrap_or_else(|| panic!("{member} has no spectrum_array_index"));
+            let index: serde_json::Value = serde_json::from_str(&index).unwrap();
+            (index["prefix"].as_str().unwrap().to_string(), meta.num_rows())
+        };
+        let (data_family, _) = family_of(&mut zip, "spectra_data.parquet");
+        let (peaks_family, peak_rows) = family_of(&mut zip, "spectra_peaks.parquet");
+        assert!(peak_rows > 0, "the synthetic frames wrote no peaks");
+        assert_eq!((data_family.as_str(), peaks_family.as_str()), ("chunk", "chunk"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `--agilent-grid` hand-builds its data schema, which lost `spectrum_index` in 0.11.0: the writer
