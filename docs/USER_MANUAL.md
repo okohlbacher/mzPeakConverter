@@ -214,11 +214,12 @@ keeping spectra whose retention time is within `--rt MIN-MAX` (same unit as the 
 `spectrum.time`, minutes for every lane this tool writes) and/or whose MS level is in `--ms-level`
 (`--ms-level 1 --ms-level 2` or `--ms-level 1,2`), and dropping archive members that match
 `--drop-aux <glob>` (`--no-vendor` on this lane is shorthand for `--drop-aux 'vendor*'`). `--rt`
-also truncates the chromatograms, in the same minutes: each chromatogram time axis declares its own
-unit (seconds for ProteoWizard's chromatograms, and for the TIC/BPC stored beside them), and the
-window is converted into it. An mzML-lane archive converted by 0.11.5 or earlier holds those TIC/BPC
-in minutes under the seconds label, so `--rt` cuts them at 60 times the times it names: rebuild such
-an archive first. Parquet
+also truncates the chromatograms, in the same minutes. This converter stores every chromatogram
+time in minutes (§8, `chromatogram-time-to-minutes`), and the window is converted into whatever unit
+a chromatogram time axis declares, so an mzML-lane archive converted by 0.11.5 or earlier, whose
+column declares ProteoWizard's seconds, is cut where the window says too. Such an archive holds its
+synthesized TIC/BPC in minutes under that seconds label, so `--rt` cuts those two traces at 60 times
+the times it names: rebuild it first. No published corpus archive has a seconds column. Parquet
 facets are copied verbatim, so encoder options are inert here — warned about, not refused (see the
 table above). The same
 lane injects `--image` / `--sdrf` into an existing archive — the documented way to add them to an
@@ -657,6 +658,7 @@ The vocabulary:
 | `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, `--ims-chunked` (each frame by TOF across mobility scans; mobility is stored per point), `--bruker-sdk` TDF (the SDK hands over mobility-major frames), native Waters frames, and any lane whose reader hands over an unsorted spectrum |
 | `sort-by-time` | the writer's backstop re-ordered at least one chromatogram into time order before it was stored | any lane that hands the writer a chromatogram out of time order, a source chromatogram or the MS1 TIC/base-peak trace synthesized in spectrum order |
 | `sort-by-wavelength` | the writer's backstop re-ordered at least one wavelength (UV/PDA) spectrum into wavelength order before it was stored | any lane that writes wavelength spectra handed over out of order |
+| `chromatogram-time-to-minutes` | at least one chromatogram time recorded in seconds or milliseconds was divided into minutes, the unit `chromatograms_data` declares on every lane, as a 64-bit float (not bit-exact). A time array that states no unit is stored as given | mzML/imzML with source chromatograms (ProteoWizard writes seconds), Bruker `.d` with `chromatography-data.sqlite` (HyStar records seconds) |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 4) | native Shimadzu `.lcd` profile |
 | `agilent:drop-zero-samples` | the profile grid lane left at least one zero-intensity sample, or an all-zero scan, out of its sparse point lists | `--agilent-grid` |

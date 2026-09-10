@@ -16,7 +16,9 @@
 //!
 //! Each trace becomes one chromatogram whose value array is the one its kind names — pressure,
 //! flow rate or temperature array; the intensity array only when the values are detector counts;
-//! otherwise a non-standard array named after the trace — in the unit HyStar states. The writer
+//! otherwise a non-standard array named after the trace — in the unit HyStar states, and whose times
+//! are HyStar's seconds; `finish_chromatograms` stores them in minutes, as every chromatogram time,
+//! and declares `chromatogram-time-to-minutes`. The writer
 //! stores an array outside the facet's `time`/`intensity` columns as an auxiliary array that keeps
 //! its own unit; an intensity array in percent would instead land in the `intensity` column, which
 //! is declared as detector counts, and silently lose it.
@@ -161,8 +163,9 @@ fn merge_repeats(seconds: &mut Vec<f64>, values: &mut Vec<f32>) -> bool {
     true
 }
 
-/// One trace as a chromatogram: times in minutes (the facet's unit), values multiplied by `scale`
-/// into `unit`, the type as a parameter as well as the typed field, the title and instrument as
+/// One trace as a chromatogram: times in seconds, as HyStar records them (`finish_chromatograms`
+/// stores every chromatogram time in minutes and declares it), values multiplied by `scale` into
+/// `unit`, the type as a parameter as well as the typed field, the title and instrument as
 /// ProteoWizard states them.
 fn chromatogram(s: &Source, unit: Unit, scale: f64, seconds: &[f64], values: &[f32]) -> Chromatogram {
     let kind = chromatogram_type(s);
@@ -175,7 +178,7 @@ fn chromatogram(s: &Source, unit: Unit, scale: f64, seconds: &[f64], values: &[f
         _ => ArrayType::nonstandard(&name),
     };
     // mzdata keeps decoded samples as native-endian bytes.
-    let minutes = seconds.iter().flat_map(|t| (t / 60.0).to_ne_bytes()).collect();
+    let times = seconds.iter().flat_map(|t| t.to_ne_bytes()).collect();
     let mut value = if scale == 1.0 {
         DataArray::wrap(&value_type, BinaryDataArrayType::Float32, values.iter().flat_map(|v| v.to_ne_bytes()).collect())
     } else {
@@ -185,8 +188,8 @@ fn chromatogram(s: &Source, unit: Unit, scale: f64, seconds: &[f64], values: &[f
         DataArray::wrap(&value_type, BinaryDataArrayType::Float64, scaled)
     };
     value.unit = unit;
-    let mut time = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, minutes);
-    time.unit = Unit::Minute;
+    let mut time = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, times);
+    time.unit = Unit::Second;
     let mut arrays = BinaryArrayMap::new();
     arrays.add(time);
     arrays.add(value);
@@ -304,10 +307,12 @@ mod tests {
         c
     }
 
-    /// The value array and the times (minutes) of a trace chromatogram.
+    /// The value array and the times (seconds, as HyStar records them) of a trace chromatogram.
     fn arrays(c: &Chromatogram) -> (&DataArray, Vec<f64>) {
         let value = c.arrays.iter().map(|(_, a)| a).find(|a| a.name != ArrayType::TimeArray).unwrap();
-        (value, c.arrays.get(&ArrayType::TimeArray).unwrap().to_f64().unwrap().to_vec())
+        let time = c.arrays.get(&ArrayType::TimeArray).unwrap();
+        assert_eq!(time.unit, Unit::Second, "{}: times in HyStar's unit", c.id());
+        (value, time.to_f64().unwrap().to_vec())
     }
 
     /// A `.d`-like scratch directory, removed when the test ends, pass or fail.
@@ -403,10 +408,10 @@ mod tests {
                 (ArrayType::nonstandard("Pump A:Setpoint - []"), Unit::Unknown),
             ]
         );
-        let (psi, minutes) = arrays(ch[1]);
+        let (psi, seconds) = arrays(ch[1]);
         assert_eq!(psi.to_f32().unwrap().as_ref(), [3785.5f32, 3783.25, 3779.75], "chunks concatenate in rowid order");
         assert_eq!(psi.dtype, BinaryDataArrayType::Float32, "a value kept as stored stays 32-bit");
-        assert_eq!(minutes, [2.109 / 60.0, 2.5 / 60.0, 3.0 / 60.0]);
+        assert_eq!(seconds, [2.109, 2.5, 3.0]);
         let (bar, _) = arrays(ch[4]);
         assert_eq!(bar.dtype, BinaryDataArrayType::Float64);
         assert_eq!(bar.to_f64().unwrap().as_ref(), [180.0f32 as f64 * 1e5, 170.02f32 as f64 * 1e5], "bar is stated as pascal");
@@ -417,7 +422,7 @@ mod tests {
         );
         assert_eq!(traces.iter().map(|t| t.rescaled).collect::<Vec<_>>(), [false, false, false, false, true, false, false], "the rescale is declared per trace");
         assert!(traces.iter().all(|t| !t.merged), "every trace here is stored in time order");
-        assert_eq!(arrays(ch[5]).1, [(1.75 + 1.5) / 60.0], "TimeOffset is seconds, added before the minute conversion");
+        assert_eq!(arrays(ch[5]).1, [1.75 + 1.5], "TimeOffset is seconds, added to the stored time");
         let title = ch[4].params().iter().find(|p| p.name == "chromatogram title").unwrap();
         assert_eq!((title.curie(), title.value.to_string()), (Some(mzdata::curie!(MS:1000809)), "Pump HP:Pressure - [bar]".to_string()));
         assert!(ch[4].params().iter().any(|p| p.name == "Instrument" && p.value.to_string() == "Agilent ICF System" && p.curie().is_none()));
@@ -527,12 +532,12 @@ mod tests {
             ],
         );
         let traces = read_traces(&c).unwrap();
-        let (flow, minutes) = arrays(&traces[0].chromatogram);
-        assert_eq!(minutes, [1.4 / 60.0, 1.5 / 60.0, 1.6 / 60.0, 1.6 / 60.0, 1.7 / 60.0]);
+        let (flow, seconds) = arrays(&traces[0].chromatogram);
+        assert_eq!(seconds, [1.4, 1.5, 1.6, 1.6, 1.7]);
         assert_eq!(flow.to_f32().unwrap().as_ref(), [300.0f32, 301.0, 302.0, 299.0, 303.0]);
         assert!(traces[0].merged, "the merge is declared");
-        let (temperature, minutes) = arrays(&traces[1].chromatogram);
-        assert_eq!((minutes, temperature.to_f32().unwrap().to_vec()), (vec![1.4 / 60.0, 1.4 / 60.0, 1.5 / 60.0], vec![40.0, 41.0, 42.0]));
+        let (temperature, seconds) = arrays(&traces[1].chromatogram);
+        assert_eq!((seconds, temperature.to_f32().unwrap().to_vec()), (vec![1.4, 1.4, 1.5], vec![40.0, 41.0, 42.0]));
         assert!(!traces[1].merged, "two values at one time are not a repeat, and the order was already right");
     }
 
