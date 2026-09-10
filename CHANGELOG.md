@@ -185,6 +185,15 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
+- **Native SciEX with `-v` no longer fails at its second open (Windows).** `SciexReader::open`
+  booted CoreCLR on every call, and hostfxr cannot be initialised again once the first handle has
+  been freed. `-v` opens the reader for the inspection report, drops it and opens it again for the
+  conversion, so every verbose native `.wiff` conversion and `--to mzml` export should have stopped
+  with `initializing CoreCLR for SciexGlue.runtimeconfig.json` (0x80008081) — the failure the box
+  recorded for Shimadzu before 0446ea3, with the same netcorehost and dlopen2 versions. The glue is
+  now loaded once per process, as the Shimadzu lane does. Not observed (no harness passes `-v`, so
+  no corpus archive is affected) and not yet run on Windows; the shape is pinned host-independently
+  by `tests/sciex_abi_pin.rs`.
 
 ### Changed
 
