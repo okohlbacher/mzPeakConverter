@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change.** An indexed mzML that declares a non-UTF-8 encoding now keeps its source
+chromatograms in both lanes (below). No corpus archive is affected: the one corpus mzML that is
+both indexed and non-UTF-8, `general-ms/thermo-ltq-orbitrap-velos/`
+`TMT_Erwinia_1uLSike_Top10HCD_isol2_45stepped_60min_01-20141210.mzML` (ISO-8859-1), declares only
+a `TIC`, which synthesis replaces anyway, and its archive
+`TMT_Erwinia_1uLSike_Top10HCD_isol2_45stepped_60min_01.mzpeak` is converted from the `.raw`. The
+other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>`
+(`bruker-microtof-q2`) and imzML.
+
+### Fixed
+
+- **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
+  mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
+  a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes
+  the five-bytes-shorter `encoding="UTF-8"`, and every high byte becomes two. Every `<offset>` in
+  the copy's `<indexList>`, and its `<indexListOffset>`, then pointed at the wrong byte. mzdata
+  failed to read the index (said only at debug level: `close tag </indexList> does not match any
+  open tag`), fell back to a scan that finds the spectra, and could no longer enumerate the
+  chromatograms, which it reaches only through that index. On `tests/fixtures/tiny.pwiz.1.1.mzML`
+  the mzPeak lane logged `2 synthesized + 0 from source`, and `-o x.mzML` wrote only the writer's
+  own TIC/BPC: the `sic` trace was gone from both. The transcoder now rebuilds the copy's index,
+  each offset from the new position of the `<spectrum`/`<chromatogram` tag carrying its id and
+  `<indexListOffset>` from `<indexList`, and drops its `<fileChecksum>`, which hashes the original
+  bytes and which mzdata never checks. imzML goes through the same transcoder but has no XML offset
+  index (its offsets point into the `.ibd`): a Latin-1 imzML and a same-length UTF-8-declared copy
+  convert identically. The `convert_to_mzml` comment that blamed spectrum iteration for lost
+  chromatograms was describing this failure and is corrected. Pinned by
+  `tests/latin1_indexed_mzml_chromatograms.rs`, including a variant with high bytes.
+- **Reading fewer chromatograms than the source declares is now a warning**, in both lanes and
+  whatever the cause: `<chromatogramList count>` is checked against what the reader yields. The
+  only warning before fired for a non-indexed mzML, so a stale index lost traces in silence.
+
 ## [0.11.5] — 2026-09-09
 
 ### Fixed
