@@ -264,4 +264,16 @@ fn transformations_block_pinned() {
     pinned("\"shimadzu:span-trim\"");
     pinned("\"agilent:drop-zero-samples\"");
     pinned("\"agilent:intensity-f32-rounding\"");
+    // The entries the reader modules declare from their own counts, pinned in those modules' code
+    // (their `#[cfg(test)]` modules cut away, as `code` does for main.rs).
+    for (file, source, entries) in [
+        ("src/agl.rs", include_str!("../src/agl.rs"), ["\"agilent:nonfinite-intensity-to-zero\"", "\"agilent:truncate-unequal-arrays\""]),
+        ("src/waters.rs", include_str!("../src/waters.rs"), ["\"waters:drop-functions\"", "\"waters:sonar-summed\""]),
+    ] {
+        let source = source.replace("\r\n", "\n");
+        let lanes = source.split("\n#[cfg(test)]").next().unwrap();
+        for entry in entries {
+            assert!(lanes.contains(entry), "{file} no longer declares {entry}");
+        }
+    }
 }

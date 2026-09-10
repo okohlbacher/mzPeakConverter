@@ -5155,13 +5155,19 @@ fn convert_ims_compact_sdk(
 /// declared, bounded change that was APPLIED to this archive's stored data — counted while it was
 /// written, never inferred from what the lane was configured to do — so an empty list says the
 /// signal is stored as handed over, and a reader (or an audit over a corpus) can tell a masked,
-/// re-sorted or grid-quantized archive from a verbatim one without re-deriving it. Entries:
-/// `zero-run-mask` (the writer's zero-run compaction shortened at least one profile spectrum),
-/// `numpress-linear` (at least one m/z chunk is stored with the lossy codec), `sort-by-mz` (at
-/// least one spectrum was re-ordered, by the lane or by the writer's backstop), `tof-grid:<ppm>ppm`
-/// (a statistically fitted integer grid replaced f64 m/z within that bound on at least one
-/// spectrum), `shimadzu:span-trim` (the profile sqrt-grid route stores the signal span only),
-/// `agilent:drop-zero-samples` (the profile grid lane stores a sparse point list).
+/// re-sorted or grid-quantized archive from a verbatim one without re-deriving it. Entries, each
+/// written when its count is above zero: `zero-run-mask` (the writer's zero-run compaction shortened
+/// a profile spectrum), `numpress-linear` (an m/z chunk is stored with the lossy codec),
+/// `sort-by-mz` (a spectrum was re-ordered, by the lane's reader or by the writer's backstop),
+/// `tof-grid:<ppm>ppm` (a statistically fitted integer grid replaced f64 m/z within that bound on a
+/// spectrum), `shimadzu:span-trim` (the profile sqrt-grid route left a gridded spectrum's
+/// zero-intensity pad at the scan-window bounds out), `agilent:drop-zero-samples` (the profile grid
+/// reader left a zero-intensity sample or an all-zero scan out of its sparse point lists),
+/// `agilent:intensity-f32-rounding` (a count above 2^24 was rounded into Float32),
+/// `agilent:nonfinite-intensity-to-zero` and `agilent:truncate-unequal-arrays` (the MHDAC host stored
+/// a NaN/Inf intensity as 0, or cut a spectrum's unequal arrays to one length; `agl::HostCounts`),
+/// `waters:drop-functions` (a MassLynx function was not written as spectra) and `waters:sonar-summed`
+/// (a written SONAR function's quadrupole bins were summed; both `waters::function_transformations`).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -5444,8 +5450,9 @@ fn convert_shimadzu(
         hints.spectrum_param_fields.push((TOF_C1_CURIE, "tof_c1"));
         hints.data_facet_point_layout = true;
         // The profile route stores the signal span only (`shimadzu_grid_route`): the zero pad at
-        // the scan-window bounds is trimmed before the fit and never reaches the archive.
-        hints.transformations.push("shimadzu:span-trim".to_string());
+        // the scan-window bounds is trimmed before the fit and never reaches the archive. Each
+        // gridded spectrum reports whether it had one, and `convert_vendor_reader` declares
+        // `shimadzu:span-trim` from that count.
         hints.index_blocks.push((
             "tof_calibration".to_string(),
             serde_json::json!({
@@ -5501,9 +5508,9 @@ fn convert_shimadzu(
         reader.len(),
         |i| {
             let spec = reader.spectrum(i)?;
-            let (spec, profile_grid) = match grid_step {
+            let (spec, profile_grid, profile_span_trimmed) = match grid_step {
                 Some(step) => shimadzu_grid_route(spec, step),
-                None => (spec, None),
+                None => (spec, None, false),
             };
             let (spec, peak_arrays, outcome) = if lattice_on {
                 shimadzu_grid::lattice_route(spec)
@@ -5513,7 +5520,7 @@ fn convert_shimadzu(
             Ok(VendorSpectrum {
                 spectrum: spec,
                 peak_arrays,
-                routes: FacetRoutes { profile_grid, centroid_lattice: outcome.on_lattice() },
+                routes: FacetRoutes { profile_grid, profile_span_trimmed, centroid_lattice: outcome.on_lattice() },
             })
         },
     );
@@ -5588,18 +5595,19 @@ fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
 
 /// Replace a fitting profile spectrum's f64 m/z with `tof_index` + per-spectrum `tof_c0`/`tof_c1`;
 /// leave anything else (centroid-only spectra, off-grid spectra) untouched. The second value is
-/// the [`FacetRoutes::profile_grid`] outcome: `None` for a spectrum with no profile to route.
+/// the [`FacetRoutes::profile_grid`] outcome: `None` for a spectrum with no profile to route. The
+/// third is [`FacetRoutes::profile_span_trimmed`]: whether a gridded spectrum had a zero pad to trim.
 /// Host-independent (only the `.lcd` reader is Windows-only) so the routing is testable anywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn shimadzu_grid_route(
     spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
     step: f64,
-) -> (MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>, Option<bool>) {
+) -> (MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>, Option<bool>, bool) {
     if spec.signal_continuity() != mzdata::spectrum::SignalContinuity::Profile {
-        return (spec, None);
+        return (spec, None, false);
     }
-    let Some(arrays) = spec.arrays.as_ref() else { return (spec, None) };
-    let (Ok(mz), Ok(inten)) = (arrays.mzs(), arrays.intensities()) else { return (spec, None) };
+    let Some(arrays) = spec.arrays.as_ref() else { return (spec, None, false) };
+    let (Ok(mz), Ok(inten)) = (arrays.mzs(), arrays.intensities()) else { return (spec, None, false) };
     // Unequal source arrays are not this route's to reconcile: `&mz[a..b]` with a span measured on
     // the intensities would PANIC when m/z is the shorter one, and quietly gridding the overlap
     // would drop the tail. Decline the route and let the untouched spectrum take the f64 lane,
@@ -5613,29 +5621,30 @@ fn shimadzu_grid_route(
             mz.len(),
             inten.len()
         );
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     // Fit and store the signal span only: the zero-intensity pad points at the scan-window bounds
     // are off-grid by construction, so a fit over the untrimmed array would reject every spectrum.
     // Trimming here is also what keeps them out of the archive — the writer would keep one of them
     // (its zero-run compaction preserves a boundary zero per run); see `shimadzu_grid::signal_span`.
     let (a, b) = shimadzu_grid::signal_span(&inten);
+    let trimmed = a > 0 || b < inten.len();
     let (mz, inten) = (&mz[a..b], &inten[a..b]);
     let Some((grid, k)) = shimadzu_grid::fit_spectrum(mz, step) else {
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     };
     let intensity: Vec<f32> = inten.to_vec();
     let mut out = BinaryArrayMap::new();
     let mut tof_da =
         DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
     if tof_da.update_buffer(k.as_slice()).is_err() {
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     out.add(tof_da);
     let mut int_da =
         DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
     if int_da.update_buffer(intensity.as_slice()).is_err() {
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     int_da.unit = Unit::DetectorCounts;
     out.add(int_da);
@@ -5677,13 +5686,13 @@ fn shimadzu_grid_route(
             recon.len(),
             inten.len()
         );
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     set_gridded_spectrum_summary(&mut descr, &recon, inten);
     descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
     descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
     let out = MultiLayerSpectrum::new(descr, Some(out), spec.peaks.clone(), spec.deconvoluted_peaks.clone());
-    (out, Some(true))
+    (out, Some(true), trimmed)
 }
 
 /// Instrument configuration from what the vendor API states — and only that. `SystemName()` is the
@@ -6099,10 +6108,11 @@ fn convert_waters(
     // the functions the archive leaves out or sums.
     hints.index_blocks.push(("waters_functions".to_string(), reader.functions_block()));
     hints.transformations.extend(reader.transformations());
-    // Ion-mobility functions arrive as frames whose bins were interleaved and re-sorted by m/z
-    // (`waters.rs`): declare the sort, and hand readers the run's drift table + CCS calibration.
+    // Ion-mobility functions arrive as frames whose bins interleave and are re-sorted by m/z
+    // (`waters.rs`): the reader counts the frames that sort moved, and `sort-by-mz` is declared from
+    // that count over the written spectra. Readers get the run's drift table + CCS calibration.
+    hints.reorder_counter = Some(reader.reorder_counter());
     if let Some(block) = reader.drift_block() {
-        hints.transformations.push("sort-by-mz".to_string());
         hints.index_blocks.push(("waters_drift".to_string(), block));
         // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
         // and the drift column must be declared even if the IMS function is a small part of the run.
@@ -6194,7 +6204,8 @@ struct VendorHints {
     /// IMS/non-IMS Waters run) is declared regardless of where those spectra sit.
     probe_indices: Vec<usize>,
     /// A reader's count of spectra it re-sorted into m/z order itself (the `--bruker-sdk` TDF
-    /// reader: the SDK hands over mobility-major frames). Read over the written spectra only (the
+    /// reader: the SDK hands over mobility-major frames; the native Waters reader: a frame's drift
+    /// bins interleave). Read over the written spectra only (the
     /// schema probes go through the same reader first) and declared as `sort-by-mz`.
     reorder_counter: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -6223,6 +6234,9 @@ impl From<MultiLayerSpectrum> for VendorSpectrum {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FacetRoutes {
     profile_grid: Option<bool>,
+    /// The profile sqrt-grid route left this gridded spectrum's zero-intensity pad at the
+    /// scan-window bounds out (`shimadzu:span-trim`).
+    profile_span_trimmed: bool,
     centroid_lattice: Option<bool>,
 }
 
@@ -6235,6 +6249,8 @@ struct FacetTally {
     /// Profile facet: on the sqrt grid / kept f64 m/z.
     profile_grid: usize,
     profile_f64: usize,
+    /// Gridded profile spectra whose zero pad the route left out: `shimadzu:span-trim`.
+    profile_span_trimmed: usize,
     /// Centroid facet: on the 1e-9 lattice / kept f64 m/z.
     centroid_lattice: usize,
     centroid_f64: usize,
@@ -6242,6 +6258,7 @@ struct FacetTally {
 
 impl FacetTally {
     fn record(&mut self, routes: FacetRoutes) {
+        self.profile_span_trimmed += usize::from(routes.profile_span_trimmed);
         match routes.profile_grid {
             Some(true) => self.profile_grid += 1,
             Some(false) => self.profile_f64 += 1,
@@ -6496,6 +6513,10 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         if counter.load(std::sync::atomic::Ordering::Relaxed) > before {
             declare(&mut applied, "sort-by-mz");
         }
+    }
+    // The Shimadzu profile route's pad trim, from the routes of the written spectra.
+    if tally.profile_span_trimmed > 0 {
+        declare(&mut applied, "shimadzu:span-trim");
     }
     let transformations = transformations_block(&applied);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
@@ -7263,7 +7284,7 @@ mod tests {
                 Ok(VendorSpectrum {
                     spectrum: spec,
                     peak_arrays: None,
-                    routes: FacetRoutes { profile_grid: Some(true), centroid_lattice: Some(i % 2 == 0) },
+                    routes: FacetRoutes { profile_grid: Some(true), profile_span_trimmed: false, centroid_lattice: Some(i % 2 == 0) },
                 })
             },
         )
@@ -7272,7 +7293,7 @@ mod tests {
         assert_eq!(calls.get(), LEN + 6, "closure calls = probes + written");
         assert_eq!(
             tally,
-            FacetTally { profile_grid: LEN, profile_f64: 0, centroid_lattice: LEN / 2, centroid_f64: LEN / 2 },
+            FacetTally { profile_grid: LEN, profile_f64: 0, profile_span_trimmed: 0, centroid_lattice: LEN / 2, centroid_f64: LEN / 2 },
             "tally must count the written spectra only"
         );
         assert!(out.is_file());
@@ -7729,7 +7750,7 @@ mod tests {
             CentroidPeak::new(mz[20], 10.0, 0),
             CentroidPeak::new(mz[42], 20.0, 1),
         ]));
-        let (out, routed) = super::shimadzu_grid_route(spec, c1);
+        let (out, routed, _) = super::shimadzu_grid_route(spec, c1);
         assert_eq!(routed, Some(true));
 
         let mut ms1 = super::Ms1Chroms::default();
@@ -7867,8 +7888,13 @@ mod tests {
         }
         inten[42] = 900.0;
 
-        let (out, routed) = super::shimadzu_grid_route(spec_from(&mz, &inten, 0), c1);
+        let (out, routed, trimmed) = super::shimadzu_grid_route(spec_from(&mz, &inten, 0), c1);
         assert_eq!(routed, Some(true), "an on-grid profile spectrum must route to the grid");
+        assert!(trimmed, "the zero pad at both bounds was left out");
+        // Signal up to both bounds: gridded, and nothing to trim.
+        let (_, routed_unpadded, trimmed_unpadded) =
+            super::shimadzu_grid_route(spec_from(&mz[10..70], &inten[10..70], 1), c1);
+        assert_eq!((routed_unpadded, trimmed_unpadded), (Some(true), false));
 
         // The m/z array is gone, replaced by tof_index — which is exactly why the summary has to be
         // carried as CV terms.
@@ -7927,7 +7953,7 @@ mod tests {
             CentroidPeak::new(mz[42], 20.0, 1),
         ]));
 
-        let (out, routed) = super::shimadzu_grid_route(spec, c1);
+        let (out, routed, _) = super::shimadzu_grid_route(spec, c1);
         assert_eq!(routed, Some(true));
         assert_eq!(
             out.peaks.as_ref().map(|p| p.len()),
@@ -8838,6 +8864,41 @@ mod tests {
         let (ok, _, err) = run_bin(&args, &[]);
         assert!(ok, "{err}");
         assert!(err.contains("--aux is inert"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `shimadzu:span-trim` is declared from the routes of the WRITTEN spectra: a run whose gridded
+    /// spectra had no zero pad, or whose only padded spectra were schema probes, trimmed nothing
+    /// stored. It used to be declared whenever the run-wide grid step was found.
+    #[test]
+    fn span_trim_is_declared_from_the_written_routes() {
+        use super::{convert_vendor_reader_tallied, FacetRoutes, VendorHints, VendorSpectrum};
+
+        let dir = scratch("span-trim");
+        const LEN: usize = 20;
+        let declared = |name: &str, trimmed: &dyn Fn(usize, usize) -> bool| -> Vec<String> {
+            let calls = std::cell::Cell::new(0usize);
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(std::path::Path::new(TINY), &out, None, 1, None, false, VendorHints::default(), LEN, |i| {
+                calls.set(calls.get() + 1);
+                Ok(VendorSpectrum {
+                    spectrum: spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], i),
+                    peak_arrays: None,
+                    routes: FacetRoutes { profile_grid: Some(true), profile_span_trimmed: trimmed(calls.get(), i), centroid_lattice: None },
+                })
+            })
+            .unwrap();
+            index_metadata(&out)["transformations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(declared("no-pad", &|_, _| false).is_empty());
+        // The probes are fetched first (calls 1..=6); a pad only they had is not in the archive.
+        assert!(declared("probes-only", &|call, _| call <= 6).is_empty());
+        assert_eq!(declared("padded", &|call, i| call > 6 && i == 1), ["shimadzu:span-trim"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
