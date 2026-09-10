@@ -91,13 +91,34 @@ fn read_back(path: &Path) -> (usize, usize, usize, Vec<(f64, f32)>) {
     (mz.len(), zeros, ties, mz.iter().zip(&it).map(|(a, b)| (*a, *b)).collect())
 }
 
+/// A numpress-linear m/z is fixed point: at this frame's scale (2³¹ / ~100.4) a decoded value sits
+/// within ~2.3e-8 Th of its source. Delta and basic chunks are lossless and compare exactly.
+const NUMPRESS_MZ_TOL: f64 = 1e-6;
+
 #[test]
 fn a_frame_keeps_every_point_when_the_zero_run_mask_is_off() {
+    let (spec, _) = frame();
+    let arrays = spec.raw_arrays().unwrap();
+    let input: Vec<(f64, f32)> =
+        arrays.mzs().unwrap().iter().zip(arrays.intensities().unwrap().iter()).map(|(a, b)| (*a, *b)).collect();
+    // With the mask on, the six-zero run at m/z 100.33–100.34 (five bins' flanks meeting) keeps its
+    // first and last zero only: four of the five (100.33, 0) points go — the effect the Waters lane
+    // turns the mask off to avoid.
+    let mut flanks = 0;
+    let masked: Vec<(f64, f32)> = input
+        .iter()
+        .copied()
+        .filter(|&(mz, it)| {
+            let flank = it == 0.0 && (mz - 100.33).abs() < 1e-9;
+            flanks += flank as usize;
+            !flank || flanks == 1
+        })
+        .collect();
     let mut failures: Vec<String> = Vec::new();
-    for (label, strategy) in [
-        ("numpress", ChunkingStrategy::NumpressLinear { chunk_size: 50.0 }),
-        ("delta", ChunkingStrategy::Delta { chunk_size: 50.0 }),
-        ("basic", ChunkingStrategy::Basic { chunk_size: 50.0 }),
+    for (label, strategy, tol) in [
+        ("numpress", ChunkingStrategy::NumpressLinear { chunk_size: 50.0 }, NUMPRESS_MZ_TOL),
+        ("delta", ChunkingStrategy::Delta { chunk_size: 50.0 }, 0.0),
+        ("basic", ChunkingStrategy::Basic { chunk_size: 50.0 }, 0.0),
     ] {
         for mask in [false, true] {
             let out = std::env::temp_dir().join(format!("mzpc-frame-zeros-{}-{label}-{mask}.mzpeak", std::process::id()));
@@ -106,15 +127,9 @@ fn a_frame_keeps_every_point_when_the_zero_run_mask_is_off() {
             let (got, zeros, ties, pts) = read_back(&out);
             eprintln!("{label} mask={mask}: wrote {n} points, read {got} ({zeros} zeros, {ties} ties)");
             if mask {
-                // With the mask on, the six-zero run at m/z 100.33–100.34 (five bins' flanks meeting)
-                // keeps its first and last zero only: 4 points fewer — the effect the Waters lane
-                // turns the mask off to avoid.
                 assert_eq!(got, n - 4, "{label}: the mask keeps the first and last zero of the cross-bin run");
             }
             if !mask && got != n {
-                let (spec, _) = frame();
-                let arrays = spec.raw_arrays().unwrap();
-                let input: Vec<(f64, f32)> = arrays.mzs().unwrap().iter().zip(arrays.intensities().unwrap().iter()).map(|(a, b)| (*a, *b)).collect();
                 let mut missing = input.clone();
                 for p in &pts {
                     if let Some(i) = missing.iter().position(|q| (q.0 - p.0).abs() < 1e-3 && q.1 == p.1) {
@@ -122,14 +137,17 @@ fn a_frame_keeps_every_point_when_the_zero_run_mask_is_off() {
                     }
                 }
                 eprintln!("   missing after round trip: {missing:?}");
-                eprintln!("   input : {input:?}");
-                eprintln!("   output: {pts:?}");
-                failures.push(label.to_string());
+            }
+            // The points, not how many: in order, m/z within the codec's precision, intensity exact.
+            let want = if mask { &masked } else { &input };
+            if pts.len() != want.len() || pts.iter().zip(want).any(|(p, w)| (p.0 - w.0).abs() > tol || p.1 != w.1) {
+                eprintln!("   read: {pts:?}\n   want: {want:?}");
+                failures.push(format!("{label} mask={mask}"));
             }
             if std::env::var_os("MZPC_KEEP").is_none() {
                 let _ = std::fs::remove_file(&out);
             }
         }
     }
-    assert!(failures.is_empty(), "points lost with the mask off under: {failures:?}");
+    assert!(failures.is_empty(), "points lost or altered under: {failures:?}");
 }
