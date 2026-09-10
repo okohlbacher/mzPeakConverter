@@ -54,8 +54,16 @@
 //! sciex_spectrum_count(handle: i64) -> i64
 //!     // total flattened spectra across all samples/experiments/cycles, or -1 on error.
 //!
+//! SciexAbiVersion() -> i32
+//!     // the glue's ABI generation. `GlueApi::load` refuses any other than `REQUIRED_ABI_VERSION`
+//!     // (a DLL without the export counts as 1) before it resolves a versioned export.
+//!
 //! sciex_spectrum_meta(handle: i64, index: i64, out: *mut SciexSpectrumMeta) -> i32
-//!     // 0 on success, non-zero on failure. Fills scalar metadata for one spectrum.
+//!     // 0 on success, non-zero on failure. Fills scalar metadata for one spectrum. Kept for a
+//!     // binary that predates the handshake; this one reads `SpectrumMetaV2`.
+//!
+//! sciex_spectrum_meta_v2(handle: i64, index: i64, out: *mut SciexSpectrumMetaV2) -> i32
+//!     // the same, plus what Clearcore2 states about the precursor (0 = not stated).
 //!
 //! sciex_spectrum_data(
 //!     handle: i64, index: i64,
@@ -144,6 +152,56 @@ struct SciexSpectrumMeta {
 const _: () = assert!(std::mem::size_of::<SciexSpectrumMeta>() == 32);
 const _: () = assert!(std::mem::align_of::<SciexSpectrumMeta>() == 8);
 
+/// V2 metadata: the V1 layout verbatim as a prefix, plus what Clearcore2 states about the precursor,
+/// read where ProteoWizard's `WiffFile.cpp` reads it; 0 means "not stated" throughout, and the
+/// precursor is decided in [`crate::sciex_run::precursor`]. Filled by the SEPARATE `SpectrumMetaV2`
+/// export: a wider struct behind the old name would overrun an older binary's buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SciexSpectrumMetaV2 {
+    // V1 prefix, byte-for-byte.
+    sample: i32,
+    experiment: i32,
+    cycle: i32,
+    ms_level: i32,
+    polarity: i32,
+    signal_continuity: i32,
+    retention_time_seconds: f64,
+    // V2 additions.
+    /// `ExperimentDetails.ExperimentType` as its integer value (MS 0, Product 1, Precursor 2,
+    /// NeutralGainOrLoss 3, SIM 4, MRM 5); -1 when unreadable.
+    experiment_type: i32,
+    /// `MassSpectrumInfo.ParentChargeState` of a product spectrum.
+    precursor_charge: i32,
+    /// `MassSpectrumInfo.ParentMZ` when `IsProductSpectrum`.
+    parent_mz: f64,
+    /// `FragmentBasedScanMassRange.IsolationWindow` (the experiment's first mass range), full width,
+    /// on a Product / Precursor experiment.
+    isolation_width: f64,
+    /// `Details.Parameters["CE"]` Start and Stop, eV as stored (negative on a negative-polarity method).
+    collision_energy_start: f64,
+    collision_energy_stop: f64,
+}
+
+// Size AND prefix offsets (the Shimadzu pattern): a size check alone would not catch a reordered
+// prefix. The C# static ctor asserts the same pairs.
+const _: () = assert!(std::mem::size_of::<SciexSpectrumMetaV2>() == 72);
+const _: () = assert!(std::mem::align_of::<SciexSpectrumMetaV2>() == 8);
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(SciexSpectrumMetaV2, sample) == offset_of!(SciexSpectrumMeta, sample));
+    assert!(offset_of!(SciexSpectrumMetaV2, experiment) == offset_of!(SciexSpectrumMeta, experiment));
+    assert!(offset_of!(SciexSpectrumMetaV2, cycle) == offset_of!(SciexSpectrumMeta, cycle));
+    assert!(offset_of!(SciexSpectrumMetaV2, ms_level) == offset_of!(SciexSpectrumMeta, ms_level));
+    assert!(offset_of!(SciexSpectrumMetaV2, polarity) == offset_of!(SciexSpectrumMeta, polarity));
+    assert!(offset_of!(SciexSpectrumMetaV2, signal_continuity) == offset_of!(SciexSpectrumMeta, signal_continuity));
+    assert!(offset_of!(SciexSpectrumMetaV2, retention_time_seconds) == offset_of!(SciexSpectrumMeta, retention_time_seconds));
+};
+
+/// ABI generation this binary requires from the glue DLL. 1 = the glue before the handshake (no
+/// `SciexAbiVersion` export); 2 = + `SpectrumMetaV2` (precursor facts).
+const REQUIRED_ABI_VERSION: i32 = 2;
+
 // Function-pointer signatures for the glue's `[UnmanagedCallersOnly]` exports. The
 // `extern "system"` calling convention matches what `UnmanagedCallersOnly` emits and what
 // netcorehost's `get_function_with_unmanaged_callers_only` expects.
@@ -151,6 +209,8 @@ type SciexOpen = extern "system" fn(*const u16, *const u16) -> i64;
 type SciexClose = extern "system" fn(i64);
 type SciexSpectrumCount = extern "system" fn(i64) -> i64;
 type SciexSpectrumMetaFn = extern "system" fn(i64, i64, *mut SciexSpectrumMeta) -> i32;
+type SciexSpectrumMetaV2Fn = extern "system" fn(i64, i64, *mut SciexSpectrumMetaV2) -> i32;
+type SciexAbiVersion = extern "system" fn() -> i32;
 type SciexSpectrumData =
     extern "system" fn(i64, i64, *mut *const f64, *mut *const f32, *mut i64) -> i32;
 type SciexDataFree = extern "system" fn(i64, *const f64, *const f32);
@@ -170,14 +230,12 @@ struct GlueApi {
     open: SciexOpen,
     close: SciexClose,
     spectrum_count: SciexSpectrumCount,
-    spectrum_meta: SciexSpectrumMetaFn,
+    spectrum_meta_v2: SciexSpectrumMetaV2Fn,
     spectrum_data: SciexSpectrumData,
     data_free: SciexDataFree,
     last_error: SciexLastError,
-    /// Additive exports (glue 2026-09-08): absent on an older SciexGlue.dll, in which case the
-    /// run-level checks below are skipped with a warning rather than failing the conversion.
-    run_info: Option<SciexRunInfoFn>,
-    run_string: Option<SciexRunStringFn>,
+    run_info: SciexRunInfoFn,
+    run_string: SciexRunStringFn,
 }
 
 /// The CoreCLR runtime, booted ONCE per process — as `dotnetrawfilereader-sys` keeps its `BUNDLE` and
@@ -264,12 +322,40 @@ impl GlueApi {
                 pdcstr!("SpectrumCount"),
             )
             .map_err(|e| anyhow!("resolving glue export SpectrumCount: {e}"))?;
-        let spectrum_meta = *loader
+        // The V1 export is resolved by name (a glue that lost it fails here, and its struct twin stays
+        // part of the pinned ABI — `tests/sciex_abi_pin.rs`) but never called: every metadata read
+        // goes through `SpectrumMetaV2`.
+        let _spectrum_meta: SciexSpectrumMetaFn = *loader
             .get_function_with_unmanaged_callers_only::<SciexSpectrumMetaFn>(
                 ty,
                 pdcstr!("SpectrumMeta"),
             )
             .map_err(|e| anyhow!("resolving glue export SpectrumMeta: {e}"))?;
+
+        // ABI handshake (the `src/shimadzu.rs` pattern), before any versioned export is resolved.
+        // Exports resolve by name and each side asserts only its OWN struct sizes, so nothing else
+        // makes a mismatch visible: a stale DLL would fail below on a missing export without saying
+        // why, and a layout change behind an unchanged name would not fail at all. Resolved
+        // OPTIONALLY — absence means a pre-handshake glue, i.e. version 1 — so the error names the
+        // real problem.
+        let abi_version = loader
+            .get_function_with_unmanaged_callers_only::<SciexAbiVersion>(ty, pdcstr!("SciexAbiVersion"))
+            .map(|f| (*f)())
+            .unwrap_or(1);
+        if abi_version != REQUIRED_ABI_VERSION {
+            bail!(
+                "SciexGlue.dll in {} reports ABI version {abi_version}, this binary needs \
+                 {REQUIRED_ABI_VERSION}. The DLL and the executable are one unit — rebuild the glue \
+                 (`dotnet build -c Release` in glue/sciex) from the same commit as this binary.",
+                glue_dir.display()
+            );
+        }
+        let spectrum_meta_v2 = *loader
+            .get_function_with_unmanaged_callers_only::<SciexSpectrumMetaV2Fn>(
+                ty,
+                pdcstr!("SpectrumMetaV2"),
+            )
+            .map_err(|e| anyhow!("resolving glue export SpectrumMetaV2: {e}"))?;
         let spectrum_data = *loader
             .get_function_with_unmanaged_callers_only::<SciexSpectrumData>(
                 ty,
@@ -282,28 +368,20 @@ impl GlueApi {
         let last_error = *loader
             .get_function_with_unmanaged_callers_only::<SciexLastError>(ty, pdcstr!("LastError"))
             .map_err(|e| anyhow!("resolving glue export LastError: {e}"))?;
-        let run_info = loader
+        // Required since the handshake: every glue that passes it has both.
+        let run_info = *loader
             .get_function_with_unmanaged_callers_only::<SciexRunInfoFn>(ty, pdcstr!("RunInfo"))
-            .ok()
-            .map(|f| *f);
-        let run_string = loader
+            .map_err(|e| anyhow!("resolving glue export RunInfo: {e}"))?;
+        let run_string = *loader
             .get_function_with_unmanaged_callers_only::<SciexRunStringFn>(ty, pdcstr!("RunString"))
-            .ok()
-            .map(|f| *f);
-        if run_info.is_none() || run_string.is_none() {
-            log::warn!(
-                "SciexGlue.dll in {} predates the RunInfo/RunString exports: MRM/SIM and multi-sample \
-                 runs cannot be recognised and no run metadata is read — rebuild glue/sciex",
-                glue_dir.display()
-            );
-        }
+            .map_err(|e| anyhow!("resolving glue export RunString: {e}"))?;
 
         Ok(Self {
             _runtime: loader,
             open,
             close,
             spectrum_count,
-            spectrum_meta,
+            spectrum_meta_v2,
             spectrum_data,
             data_free,
             last_error,
@@ -346,6 +424,9 @@ pub struct SciexReader {
     /// When one sample of a multi-sample WIFF is selected: the flattened glue indices that belong
     /// to it, in order. `None` = every index (a single-sample file).
     selected: Option<Vec<usize>>,
+    /// The instrument can fragment only by collision, so a precursor states beam-type CID
+    /// ([`crate::sciex_run::collision_only_instrument`]).
+    collision_only_instrument: bool,
     /// The managed handle / runtime is not known to be thread-safe and FFI calls through it
     /// must not happen concurrently. A raw-pointer marker makes [`SciexReader`] neither `Send`
     /// nor `Sync`, so the type system prevents cross-thread sharing. Sound for the existing
@@ -404,13 +485,23 @@ impl SciexReader {
             }
         };
 
-        Ok(Self {
+        let mut reader = Self {
             api,
             handle,
             count,
             selected: None,
+            collision_only_instrument: false,
             _not_thread_safe: PhantomData,
-        })
+        };
+        let instrument = reader.run_string(1);
+        reader.collision_only_instrument = crate::sciex_run::collision_only_instrument(&instrument);
+        if !reader.collision_only_instrument {
+            log::info!(
+                "SciEX: instrument {instrument:?} may fragment by EAD, which Clearcore2 does not report \
+                 (or is not named); precursors state no dissociation method"
+            );
+        }
+        Ok(reader)
     }
 
     pub fn len(&self) -> usize {
@@ -422,9 +513,9 @@ impl SciexReader {
         self.selected.as_ref().map_or(i, |v| v[i])
     }
 
-    /// Run-level counts, or `None` with an older glue.
+    /// Run-level counts, or `None` when the glue could not produce them.
     pub fn run_info(&self) -> Option<SciexRunInfo> {
-        let f = self.api.run_info?;
+        let f = self.api.run_info;
         let mut out = [0i32; 5];
         if f(self.handle, out.as_mut_ptr()) != 0 {
             log::warn!("SciEX glue RunInfo failed: {}", self.api.last_error().unwrap_or_default());
@@ -441,7 +532,7 @@ impl SciexReader {
 
     /// One of the glue's run strings (see `RunString` in Glue.cs); empty when absent.
     fn run_string(&self, which: i32) -> String {
-        let Some(f) = self.api.run_string else { return String::new() };
+        let f = self.api.run_string;
         let full = f(self.handle, which, std::ptr::null_mut(), 0);
         if full <= 0 {
             return String::new();
@@ -457,7 +548,7 @@ impl SciexReader {
     /// [`open`](Self::open) for a CONVERSION: refuse what this lane cannot store faithfully
     /// ([`crate::sciex_run::refusal`]) before any spectrum is written, then restrict the reader to
     /// `sample`. Both `.wiff` lanes (mzPeak and `--to mzml`) open through here, so they refuse the
-    /// same files. An older glue without `RunInfo` refuses nothing, as before.
+    /// same files.
     pub fn open_run(path: &Path, sample: Option<u32>) -> Result<Self> {
         let mut reader = Self::open(path)?;
         if let Some(info) = reader.run_info() {
@@ -498,7 +589,6 @@ impl SciexReader {
     pub fn run_metadata(&self, sample: Option<u32>) -> Option<crate::run_metadata::VendorRunMetadata> {
         use crate::run_metadata::{term, term_str, AcquisitionTime, VendorRunMetadata};
         use mzdata::meta::{InstrumentConfiguration, Sample, Software};
-        self.api.run_string?;
         let mut out = VendorRunMetadata::default();
         let instrument = self.run_string(1);
         let serial = self.run_string(2);
@@ -549,15 +639,15 @@ impl SciexReader {
     }
 
     /// Fetch one spectrum's scalar metadata via the glue.
-    fn meta(&self, i: usize) -> Result<SciexSpectrumMeta> {
+    fn meta(&self, i: usize) -> Result<SciexSpectrumMetaV2> {
         self.meta_raw(self.raw_index(i))
     }
 
-    fn meta_raw(&self, i: usize) -> Result<SciexSpectrumMeta> {
+    fn meta_raw(&self, i: usize) -> Result<SciexSpectrumMetaV2> {
         let index = i64::try_from(i).map_err(|_| anyhow!("SciEX index {i} does not fit in i64"))?;
-        let mut meta = SciexSpectrumMeta::default();
+        let mut meta = SciexSpectrumMetaV2::default();
         // SAFETY: `meta` is a valid, writable, correctly-laid-out destination for the glue.
-        let rc = (self.api.spectrum_meta)(self.handle, index, &mut meta as *mut _);
+        let rc = (self.api.spectrum_meta_v2)(self.handle, index, &mut meta as *mut _);
         if rc != 0 {
             bail!(
                 "SciEX glue SpectrumMeta failed for index {i} (rc {rc}): {}",
@@ -683,20 +773,6 @@ impl SciexReader {
 
         let ms_level = u8::try_from(meta.ms_level.max(1))
             .map_err(|_| anyhow!("SciEX spectrum {i} reports implausible MS level {}", meta.ms_level))?;
-        // Say it once, loudly: this lane carries no precursor at all (M32). Every MSn row it writes
-        // is an orphan — no selected ion, no isolation window, no activation — and the archive is
-        // otherwise indistinguishable from a complete one. Clearcore2 exposes the precursor per
-        // experiment; the glue does not yet marshal it.
-        if ms_level > 1 {
-            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
-            PRECURSOR_GAP_SAID.call_once(|| {
-                log::warn!(
-                    "SciEX native (Clearcore2): this reader does not yet extract precursors; \
-                     MS2 rows will have none (no selected ion, isolation window or collision energy \
-                     in the archive)"
-                );
-            });
-        }
         let polarity = match meta.polarity {
             0 => ScanPolarity::Positive,
             1 => ScanPolarity::Negative,
@@ -730,6 +806,30 @@ impl SciexReader {
         // `SciexSpectrumMeta` and the matching note in `glue/sciex/Glue.cs`.
         scan.start_time = meta.retention_time_seconds / 60.0;
         descr.acquisition.scans.push(scan);
+
+        // The precursor Clearcore2 states, decided host-independently in `sciex_run::precursor`.
+        descr.precursor.extend(crate::sciex_run::precursor(&crate::sciex_run::PrecursorFacts {
+            experiment_type: meta.experiment_type,
+            parent_mz: meta.parent_mz,
+            charge: meta.precursor_charge,
+            isolation_width: meta.isolation_width,
+            collision_energy: (meta.collision_energy_start, meta.collision_energy_stop),
+            collision_only_instrument: self.collision_only_instrument,
+        }));
+        // An MSn row the file states no precursor for is written as an orphan — no selected ion,
+        // isolation window or activation — and the archive is otherwise indistinguishable from a
+        // complete one: say so once, loudly.
+        if ms_level > 1 && descr.precursor.is_empty() {
+            static PRECURSOR_GAP_SAID: std::sync::Once = std::sync::Once::new();
+            PRECURSOR_GAP_SAID.call_once(|| {
+                log::warn!(
+                    "SciEX native (Clearcore2): {} is MS{ms_level} but states no precursor (no parent \
+                     m/z, or a precursor-ion scan whose fixed mass is a product); such rows are written \
+                     without a precursor",
+                    descr.id
+                );
+            });
+        }
 
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }

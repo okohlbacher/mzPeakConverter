@@ -194,6 +194,28 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   now loaded once per process, as the Shimadzu lane does. Not observed (no harness passes `-v`, so
   no corpus archive is affected) and not yet run on Windows; the shape is pinned host-independently
   by `tests/sciex_abi_pin.rs`.
+- **The native SciEX lane writes precursors; its MS2 rows are no longer orphans (Windows).** Every
+  MSn row the Clearcore2 lane wrote had no selected ion, isolation window or collision energy:
+  663,350 rows in the seven native corpus archives (PXD053710 81,000; PXD065872 83,100;
+  MSV000090684 51,246; MSV000093587 Sample002 166,040; MSV000095995 MRM_03 15,764; PXD011326
+  119,100; PXD071869 147,100), so every SWATH Q1 window and the MRM-HR Q1 were lost. The glue now
+  reads what ProteoWizard's ABI reader reads (`SpectrumMetaV2`): a product spectrum's parent m/z and
+  charge, and on a Product experiment its isolation width and `CE` parameter. The converter builds
+  the precursor from those (`sciex_run::precursor`, tested on every host) and leaves unset what the
+  file does not state: no charge when none is given, a target-only window when no width is (pwiz
+  writes offsets of 0), and a collision-energy ramp as its two ends (MS:1002013 / MS:1002014) where
+  pwiz writes the midpoint. A precursor-ion scan gets none: its fixed mass is a product, which
+  mzdata cannot carry. The dissociation method is beam-type CID, pwiz's assumption for WIFF
+  instruments, but only where the instrument cannot fragment any other way: a ZenoTOF can also
+  fragment by EAD, which Clearcore2 does not report (pwiz's own `.wiff2` EAD test file states
+  MS:1003294, where its `.wiff` reader would have written CID), so a ZenoTOF's precursors carry no
+  method. The one-shot orphan warning now fires only for an MSn row that states no precursor. The converter and
+  the glue now check each other's ABI version when the glue loads: a `SciexGlue.dll` built before
+  this change is refused with a message naming both versions instead of failing on a missing
+  export, and `RunInfo`/`RunString` are required. **Not yet run on a WIFF**: the box must compare
+  Sample002 and MRM_03 with their ProteoWizard twins, and the seven archives need a rebuild to gain
+  their precursors. `tests/sciex_abi_pin.rs` holds `src/sciex.rs` and `glue/sciex/Glue.cs` to one
+  contract (version literal, struct twins, sizes, exports and their arity).
 
 ### Changed
 
