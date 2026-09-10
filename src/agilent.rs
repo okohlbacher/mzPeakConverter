@@ -94,6 +94,8 @@ pub struct AgilentReader {
     /// Scans whose retention time MHDAC could not supply (the host writes NaN); stored as 0.0 and
     /// reported once when the reader closes.
     missing_rt: std::cell::Cell<usize>,
+    /// The value rewrites the host counted and reported on stderr (see [`Self::transformations`]).
+    host_counts: agl::HostCounts,
 }
 
 /// Unique temp filenames without pulling a `tempfile` dep: pid + a process-local counter. (Date/rand
@@ -159,10 +161,17 @@ impl AgilentReader {
         crate::track_tmp_in_flight(&part_path);
 
         // Run the host under its deadline. stderr carries its diagnostics; stdout is unused. Nothing
-        // ends the host if this process is itself killed (no Job Object; see `agilent_host`).
-        let mut cmd = Command::new(&host);
-        cmd.arg(path).arg(&mhdac_dir).arg(&tmp_path);
-        let run = agilent_host::run_with_deadline(&mut cmd, timeout);
+        // ends the host if this process is itself killed (no Job Object; see `agilent_host`). The host
+        // exports only the scans a `MZPC_MAX_SPECTRA` cap lets the converter write, so the rewrites it
+        // counts (`agl::HostCounts`) are those of the archive's spectra: hand it the cap as parsed here,
+        // or none, so an unparsable value cannot cap the host alone.
+        let mut host_cmd = Command::new(&host);
+        host_cmd.arg(path).arg(&mhdac_dir).arg(&tmp_path);
+        match crate::max_spectra() {
+            Some(n) => host_cmd.env("MZPC_MAX_SPECTRA", n.to_string()),
+            None => host_cmd.env_remove("MZPC_MAX_SPECTRA"),
+        };
+        let run = agilent_host::run_with_deadline(&mut host_cmd, timeout);
         let stderr = match run {
             Ok(HostExit::Exited { status, stderr }) if status.success() => stderr,
             outcome => {
@@ -219,12 +228,14 @@ impl AgilentReader {
                 return Err(e);
             }
         };
-        // A successful host may still have something to say (today: how many NaN/Inf intensities
-        // it stored as 0). That is a transformation the archive would not otherwise record.
+        // A successful host may still have something to say: NaN/Inf intensities it stored as 0,
+        // m/z and intensity arrays it cut to one length. Each is a transformation of the values,
+        // so it is logged here and declared in the archive through `transformations`.
         let host_notes = String::from_utf8_lossy(&stderr);
         for line in host_notes.lines().map(str::trim).filter(|l| !l.is_empty()) {
             log::warn!("Agilent host: {line}");
         }
+        let host_counts = agl::host_counts(&host_notes);
         if agl::has_dwell(&index.scan_types) {
             log::warn!(
                 "{} mixes scan spectra with MRM/SIM dwell data (MHDAC scan types: {}); the dwells \
@@ -244,7 +255,13 @@ impl AgilentReader {
             index.device.replace('\u{1F}', " / ")
         );
 
-        Ok(Self { file: RefCell::new(file), index, file_len, tmp_path, missing_rt: std::cell::Cell::new(0) })
+        Ok(Self { file: RefCell::new(file), index, file_len, tmp_path, missing_rt: std::cell::Cell::new(0), host_counts })
+    }
+
+    /// The `transformations` entries for what the host rewrote in this run's values, each declared
+    /// only when the host counted at least one (`agl::HostCounts::transformations`).
+    pub fn transformations(&self) -> Vec<String> {
+        self.host_counts.transformations()
     }
 
     /// MHDAC's `ScanTypes` flags as reported by the host ("Scan", "MultipleReaction, SelectedIon", …;

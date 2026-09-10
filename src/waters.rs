@@ -230,6 +230,8 @@ struct FunctionInfo {
     drift_bins: c_int,
     /// SONAR: the "drift" bins are quadrupole positions, not drift times.
     sonar: bool,
+    /// The bins of a SONAR function that were summed into its `readScan` spectrum; 0 otherwise.
+    sonar_bins: c_int,
     /// `COLLISION_ENERGY` of the function's first scan (eV), when readable.
     collision_energy_0: Option<f64>,
     ms_level: u8,
@@ -261,6 +263,18 @@ pub struct WatersReader {
     item_ids: ScanItemIds,
     /// The lock-mass reference function, when MassLynx names one.
     lockmass_function: Option<c_int>,
+    /// Functions not written as spectra, with the reason: chromatogram-type or not MS (MassLynx's
+    /// type code), or a scan count MassLynx could not return.
+    skipped: Vec<(c_int, String)>,
+    /// `MZPC_WATERS_KEEP_COLLAPSED`, read once: whether the collapsed functions were written.
+    keep_collapsed: bool,
+    /// Frames whose bins came back out of (m/z, drift time) order and were re-sorted by
+    /// [`Self::spectrum`]. Shared with the converter, which counts it over the written spectra only
+    /// (`VendorHints::counters`) and declares `sort-by-mz` when it moved.
+    resorted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Scans [`Self::spectrum`] read as a SONAR function's quadrupole bins summed (`readScan`).
+    /// Shared the same way, declaring [`SONAR_SUMMED`].
+    sonar_summed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WatersReader {
@@ -475,6 +489,7 @@ impl WatersReader {
             if drift_bins > 0 && !sonar && (scan_items.is_none() || item_ids.sonar.is_none()) {
                 sonar_unchecked.push(f + 1);
             }
+            let mut sonar_bins = 0;
             if sonar && drift_bins > 0 {
                 log::warn!(
                     "MassLynx function {}: SONAR — its {} bins are quadrupole positions, not drift times; \
@@ -482,10 +497,11 @@ impl WatersReader {
                     f + 1,
                     drift_bins
                 );
+                sonar_bins = drift_bins;
                 drift_bins = 0;
             }
             let ce_ramp = method_ramps.get(&f).copied();
-            functions.push(FunctionInfo { continuum, type_code, type_string, ion_mode, mass_range, drift_bins, sonar, collision_energy_0, ce_ramp, ms_level: 1 });
+            functions.push(FunctionInfo { continuum, type_code, type_string, ion_mode, mass_range, drift_bins, sonar, sonar_bins, collision_energy_0, ce_ramp, ms_level: 1 });
         }
         if !sonar_unchecked.is_empty() {
             log::warn!(
@@ -502,6 +518,7 @@ impl WatersReader {
         // spectra they would be MS1 rows with no m/z (DAD) or one-point "spectra" without their
         // transition (MRM) — the same defect class the Agilent and SciEX lanes refuse.
         let mut skipped_functions: Vec<c_int> = Vec::new();
+        let mut skipped: Vec<(c_int, String)> = Vec::new();
         for (f, fi) in functions.iter().enumerate() {
             if let Some(kind) = fi.type_code.and_then(FunctionKind::from_code) {
                 if let FunctionKind::Chromatogram(what) | FunctionKind::NotMs(what) = kind {
@@ -511,6 +528,7 @@ impl WatersReader {
                         fi.type_string.as_deref().unwrap_or("?")
                     );
                     skipped_functions.push(f as c_int);
+                    skipped.push((f as c_int, what.to_string()));
                 }
             }
         }
@@ -576,7 +594,10 @@ impl WatersReader {
         // Every scan's retention time (pwiz calls it per scan too); the index is sorted by it.
         let mut index: Vec<(c_int, c_int, f32)> = Vec::new();
         let mut collapsed: Vec<(c_int, Option<c_int>)> = Vec::new();
-        let keep_collapsed = std::env::var_os("MZPC_WATERS_KEEP_COLLAPSED").is_some_and(|v| !v.is_empty() && v != "0");
+        // Read ONCE, the way every on/off lever is read (`crate::env_flag`: empty, 0, false and no are
+        // off). This value decides below AND is what the index blocks report as `written`: the two
+        // used to parse the variable differently, so `=0` skipped the functions yet said written.
+        let keep_collapsed = crate::env_flag("MZPC_WATERS_KEEP_COLLAPSED").unwrap_or(false);
         let mut rt_failures = 0usize;
         let mut acquired_ims_functions: Vec<c_int> = Vec::new();
         for f in 0..n_functions {
@@ -585,6 +606,9 @@ impl WatersReader {
             }
             let Some(n_scans) = int_of(Some(read_scan_count), f).filter(|n| *n >= 0) else {
                 log::warn!("MassLynx getScanCount(function {}) failed; the function is skipped", f + 1);
+                // Recorded like a type-code skip, so `waters_functions` and `waters:drop-functions`
+                // say the archive lacks it.
+                skipped.push((f, "getScanCount failed".to_string()));
                 continue;
             };
             let mut rts: Vec<f32> = Vec::with_capacity(n_scans as usize);
@@ -654,6 +678,10 @@ impl WatersReader {
             scan_items,
             item_ids,
             lockmass_function,
+            skipped,
+            keep_collapsed,
+            resorted: Default::default(),
+            sonar_summed: Default::default(),
         };
         Ok(reader)
     }
@@ -700,9 +728,36 @@ impl WatersReader {
             "drift_time_ms": self.drift_time_ms,
             "sonar_checked": self.scan_items.is_some() && self.item_ids.sonar.is_some(),
             "lockmass_function": self.lockmass_function.map(|f| f + 1),
-            "collapsed_functions": self.collapsed.iter().map(|(f, of)| serde_json::json!({"function": f + 1, "summary_of": of.map(|o| o + 1), "written": std::env::var_os("MZPC_WATERS_KEEP_COLLAPSED").is_some()})).collect::<Vec<_>>(),
+            "collapsed_functions": self.collapsed.iter().map(|(f, of)| serde_json::json!({"function": f + 1, "summary_of": of.map(|o| o + 1), "written": self.keep_collapsed})).collect::<Vec<_>>(),
             "ccs_calibration_mob_cal_csv": ccs,
         }))
+    }
+
+    /// The `waters_functions` index block, written on EVERY Waters archive (see [`functions_block`]).
+    pub fn functions_block(&self) -> serde_json::Value {
+        functions_block(
+            &self.functions,
+            &self.skipped,
+            &self.collapsed,
+            self.keep_collapsed,
+            self.lockmass_function,
+            self.scan_items.is_some() && self.item_ids.sonar.is_some(),
+        )
+    }
+
+    /// The `transformations` entries this run's functions call for (see [`function_transformations`]).
+    pub fn transformations(&self) -> Vec<String> {
+        function_transformations(&self.skipped, &self.collapsed, self.keep_collapsed)
+    }
+
+    /// The frame re-sort counter, for `VendorHints::counters` (see [`sort_frame_points`]).
+    pub fn reorder_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.resorted.clone()
+    }
+
+    /// The SONAR summed-scan counter, for `VendorHints::counters` under [`SONAR_SUMMED`].
+    pub fn sonar_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.sonar_summed.clone()
     }
 
     /// Read one spectrum. A function with drift bins yields a FRAME (every bin's points, sorted by
@@ -733,7 +788,9 @@ impl WatersReader {
                 }
                 points.extend(m.into_iter().zip(it).map(|(x, y)| (x, y, dt)));
             }
-            points.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.2.total_cmp(&b.2)));
+            if sort_frame_points(&mut points) {
+                self.resorted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             mz.reserve(points.len());
             intensity.reserve(points.len());
             drift.reserve(points.len());
@@ -744,6 +801,11 @@ impl WatersReader {
             }
         } else {
             let (m, it) = self.read_summed(func, scan)?;
+            // A SONAR function has no drift path (its bins are quadrupole positions): this scan IS
+            // its bins summed, which the archive declares.
+            if fi.sonar_bins > 0 {
+                self.sonar_summed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             mz = m;
             intensity = it;
         }
@@ -1174,6 +1236,71 @@ impl FunctionKind {
 /// function's type, ion mode and mass range, is not the lock-mass function, and its first scan
 /// carries a collision energy > 0 (pwiz's test; when the energy is unreadable the repeated
 /// type/mode/range decides). Every other MS function (lock-mass reference, auxiliary) is MS1.
+/// What each MassLynx function is and what became of it: the functions not written as spectra
+/// (chromatogram-type or non-MS, and collapsed retention-time summaries with whether the lever wrote
+/// them), SONAR functions written as their drift-summed scan, and the lock-mass reference. Through
+/// 0.11.5 these facts lived only in `waters_drift`, which a run without drift bins never gets, so a
+/// non-IMS archive recorded none of them. Free of the DLL so every host tests it.
+fn functions_block(
+    functions: &[FunctionInfo],
+    skipped: &[(c_int, String)],
+    collapsed: &[(c_int, Option<c_int>)],
+    keep_collapsed: bool,
+    lockmass_function: Option<c_int>,
+    sonar_checked: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "vendor": "waters",
+        "source": "MassLynxRaw getFunctionType / getDriftScanCount / scan item Sonar Enabled / getLockMassFunction",
+        "functions": functions.iter().enumerate().map(|(f, fi)| serde_json::json!({
+            "function": f + 1,
+            "type": fi.type_string,
+            "ms_level": fi.ms_level,
+            "drift_bins": fi.drift_bins,
+            "sonar": fi.sonar,
+            "sonar_bins_summed": fi.sonar_bins,
+        })).collect::<Vec<_>>(),
+        "skipped_functions": skipped.iter().map(|(f, why)| serde_json::json!({"function": f + 1, "reason": why})).collect::<Vec<_>>(),
+        "collapsed_functions": collapsed.iter().map(|(f, of)| serde_json::json!({"function": f + 1, "summary_of": of.map(|o| o + 1), "written": keep_collapsed})).collect::<Vec<_>>(),
+        "lockmass_function": lockmass_function.map(|f| f + 1),
+        "sonar_checked": sonar_checked,
+    })
+}
+
+/// The `transformations` entry a Waters run's function table declares: `waters:drop-functions` when
+/// a function was not written as spectra (chromatogram-type or non-MS, its scan count unreadable, or
+/// a collapsed retention-time summary the lever did not keep). A SONAR function's summed scans are
+/// counted as they are read instead ([`SONAR_SUMMED`]), so an archive declares the sum only when it
+/// holds such a scan.
+fn function_transformations(
+    skipped: &[(c_int, String)],
+    collapsed: &[(c_int, Option<c_int>)],
+    keep_collapsed: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !skipped.is_empty() || (!collapsed.is_empty() && !keep_collapsed) {
+        out.push("waters:drop-functions".to_string());
+    }
+    out
+}
+
+/// The `transformations` entry for a written scan that [`WatersReader::spectrum`] read as a SONAR
+/// function's quadrupole bins summed, declared from [`WatersReader::sonar_counter`].
+pub const SONAR_SUMMED: &str = "waters:sonar-summed";
+
+/// Sort a frame's points by (m/z, drift time), the monotone main axis the chunked layout needs.
+/// `true` when that changed their order (the bins' own m/z axes interleaved), which is what the
+/// archive's `sort-by-mz` declares; a frame with one populated bin is already in order. Free of the
+/// DLL so every host tests it.
+fn sort_frame_points(points: &mut [(f64, f32, f32)]) -> bool {
+    let order = |a: &(f64, f32, f32), b: &(f64, f32, f32)| a.0.total_cmp(&b.0).then(a.2.total_cmp(&b.2));
+    if points.is_sorted_by(|a, b| order(a, b).is_le()) {
+        return false;
+    }
+    points.sort_unstable_by(order);
+    true
+}
+
 fn ms_level_for(f: usize, functions: &[FunctionInfo], lockmass: Option<c_int>) -> u8 {
     let fi = &functions[f];
     match fi.type_code.and_then(FunctionKind::from_code) {
@@ -1316,6 +1443,54 @@ mod tests {
         // No type information: MS1 everywhere (with a warning), never a positional MS2 guess.
         let fs = vec![fi(None, 0, None), fi(None, 0, None), fi(None, 0, None)];
         assert_eq!((0..3).map(|f| ms_level_for(f, &fs, None)).collect::<Vec<_>>(), vec![1, 1, 1]);
+    }
+
+    /// A run without drift bins still records its functions: a skipped SIR function, a SONAR
+    /// function written as its summed scan and the lock mass. Before, all of it sat behind
+    /// `has_drift()` and a non-IMS archive recorded none of it.
+    #[test]
+    fn functions_block_and_entries_do_not_need_drift_bins() {
+        const TOF_MS: c_int = 218;
+        const SIR: c_int = 209;
+        let mut fs = vec![fi(Some(TOF_MS), 0, None), fi(Some(SIR), 0, None), fi(Some(TOF_MS), 0, Some(4.0))];
+        fs[2].sonar = true;
+        fs[2].sonar_bins = 200;
+        let skipped = vec![(1, "a chromatogram".to_string())];
+        let block = functions_block(&fs, &skipped, &[], false, Some(0), true);
+        assert_eq!(block["skipped_functions"][0]["function"], 2);
+        assert_eq!(block["skipped_functions"][0]["reason"], "a chromatogram");
+        assert_eq!(block["functions"][2]["sonar_bins_summed"], 200);
+        assert_eq!(block["lockmass_function"], 1);
+        // The function table declares the drop only: a SONAR function's summed scans are counted as
+        // they are read (`sonar_counter`), so a table holding one declares nothing for it.
+        assert_eq!(function_transformations(&skipped, &[], false), ["waters:drop-functions"]);
+        // Nothing dropped: no entry.
+        let plain = vec![fi(Some(TOF_MS), 0, None)];
+        assert!(function_transformations(&[], &[], false).is_empty());
+        // Collapsed summaries: dropped unless the lever kept them, and `written` says which.
+        let collapsed = vec![(3, Some(0))];
+        assert_eq!(function_transformations(&[], &collapsed, false), ["waters:drop-functions"]);
+        assert!(function_transformations(&[], &collapsed, true).is_empty());
+        assert_eq!(functions_block(&plain, &[], &collapsed, false, None, false)["collapsed_functions"][0]["written"], false);
+        assert_eq!(functions_block(&plain, &[], &collapsed, true, None, false)["collapsed_functions"][0]["written"], true);
+    }
+
+    /// `sort-by-mz` on a frame follows what the sort did: interleaved bins are re-ordered and
+    /// counted, a frame already in (m/z, drift time) order is not. Before, every run with drift bins
+    /// declared it whether or not a frame moved.
+    #[test]
+    fn a_frame_counts_as_re_sorted_only_when_its_order_changed() {
+        let mut one_bin = vec![(100.0, 1.0, 2.0), (200.0, 1.0, 2.0), (300.0, 4.0, 2.0)];
+        assert!(!sort_frame_points(&mut one_bin));
+        let mut interleaved = vec![(100.0, 1.0, 2.0), (300.0, 2.0, 2.0), (150.0, 3.0, 2.5), (250.0, 4.0, 2.5)];
+        assert!(sort_frame_points(&mut interleaved));
+        let order: Vec<(f64, f32)> = interleaved.iter().map(|p| (p.0, p.1)).collect();
+        assert_eq!(order, [(100.0, 1.0), (150.0, 3.0), (250.0, 4.0), (300.0, 2.0)]);
+        // The same m/z in two bins: drift time orders them, and a sorted frame stays unmoved.
+        let mut tie = vec![(100.0, 1.0, 3.0), (100.0, 2.0, 2.0)];
+        assert!(sort_frame_points(&mut tie));
+        assert_eq!(tie[0].2, 2.0);
+        assert!(!sort_frame_points(&mut tie));
     }
 
     #[test]

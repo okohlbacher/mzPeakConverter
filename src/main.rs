@@ -1219,6 +1219,9 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         Lane::Standard
     };
     refuse_unsupported_flags(lane, cfg)?;
+    if let Some(note) = aux_inert_note(&cli.input, &cfg.given) {
+        log::warn!("{note}");
+    }
 
     match lane {
         Lane::AgilentGrid => {
@@ -1243,24 +1246,19 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
             // fall back to the mzdata reader interface (f64 m/z), which decodes those files. mzdata may
             // silently drop a truly-undecodable frame, so the fallback is loud. (Backlog: fix timsrust /
             // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
-            match convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size) {
-                Ok(()) => {}
-                Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
-                    log::warn!(
-                        "native ims-compact failed on {} ({e}); falling back to the mzdata reader \
-                         (f64 m/z, larger; may skip any frame even mzdata can't decode)",
-                        cli.input.display()
-                    );
+            ims_compact_with_fallback(
+                &cli.input,
+                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size),
+                |route| {
                     guard_unsupported_vendor(&cli.input)?;
-                    convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration)
-                        .with_context(|| format!("mzdata-fallback converting {}", cli.input.display()))?;
-                }
-                Err(e) => return Err(e).with_context(|| format!("ims-compact converting {}", cli.input.display())),
-            }
+                    convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration, Some(route))
+                        .with_context(|| format!("mzdata-fallback converting {}", cli.input.display()))
+                },
+            )?;
         }
         Lane::VendorReader | Lane::Standard => {
             guard_unsupported_vendor(&cli.input)?;
-            convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration)
+            convert_file(&cli.input, &output, chunk, cfg.zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tof_grid, &cfg.image, cfg.sdrf.as_deref(), cfg.tims_recalibration, None)
                 .with_context(|| format!("converting {}", cli.input.display()))?;
         }
         // Both were dispatched above, before the raw-format guards.
@@ -1269,6 +1267,41 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
 
     log::info!("wrote {}", output.display());
     Ok(exit::OK)
+}
+
+/// The timsTOF default lane with its fallback. Native ims-compact (direct timsrust) runs first; when
+/// it cannot decompress a frame (newer timsTOF, e.g. 5.1.x, writes a TDF binary timsrust does not
+/// handle) the mzdata reader converts the run instead (f64 m/z), and that archive names its route
+/// in `conversion_route` together with the error that forced it. Any other native error is the
+/// lane's own. The recorded argv is the same on both routes, so until this block a fallback archive
+/// was recognisable only by what it lacks (review M35).
+fn ims_compact_with_fallback(
+    input: &Path,
+    native: impl FnOnce() -> Result<()>,
+    fallback: impl FnOnce((String, serde_json::Value)) -> Result<()>,
+) -> Result<()> {
+    match native() {
+        Ok(()) => Ok(()),
+        Err(e) if format!("{e:#}").to_lowercase().contains("decompress") => {
+            // mzdata may silently drop a truly undecodable frame, so the fallback is loud.
+            log::warn!(
+                "native ims-compact failed on {} ({e}); falling back to the mzdata reader (f64 m/z, larger; may skip any frame even mzdata can't decode)",
+                input.display()
+            );
+            fallback(conversion_route_block("mzdata-fallback", "mzdata", Some(&format!("{e:#}"))))
+        }
+        Err(e) => Err(e).with_context(|| format!("ims-compact converting {}", input.display())),
+    }
+}
+
+/// The `conversion_route` index block: which timsTOF route built the archive (`ims-compact` read by
+/// `timsrust` or `timsdata`, or the `mzdata-fallback`) and, for the fallback, why.
+fn conversion_route_block(route: &str, reader: &str, reason: Option<&str>) -> (String, serde_json::Value) {
+    let mut block = serde_json::json!({"route": route, "reader": reader});
+    if let Some(reason) = reason {
+        block["reason"] = serde_json::json!(reason);
+    }
+    ("conversion_route".to_string(), block)
 }
 
 /// The conversion lane `run` selected, named so [`unsupported_flags_for`] can say which
@@ -2056,7 +2089,7 @@ fn convert_via_msconvert(
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
-    convert_file(mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true)
+    convert_file(mzml, output, chunk, zstd_level, vendor, synth_chroms, tof_grid, images, sdrf, true, None)
 }
 
 /// The `--to mzml` lane: convert `input` to a plain **mzML** via the mzdata writer, streaming the
@@ -2196,7 +2229,7 @@ fn convert_to_mzml(
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
     w.copy_metadata_from(&reader);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     let cap = max_spectra();
     let n_spec = cap.map_or_else(|| reader.len(), |m| m.min(reader.len()));
     w.set_spectrum_count(n_spec as u64);
@@ -2320,7 +2353,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
     w.copy_metadata_from(&reader);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     w.set_spectrum_count(survivor_ids.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
     for &i in &survivor_ids {
@@ -2376,7 +2409,7 @@ fn write_native_mzml(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     let n = max_spectra().map_or(len, |m| m.min(len));
     w.set_spectrum_count(n as u64);
     for i in 0..n {
@@ -2411,7 +2444,7 @@ fn write_agilent_profile_mzml(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
-    fixup_run_metadata(&mut w, input);
+    fixup_mzml_run_metadata(&mut w, input);
     // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
     // (matches write_native_mzml, which also uses the reader's record count).
     let cap = max_spectra();
@@ -2719,14 +2752,15 @@ fn convert_file_tof_grid(
     }
     assert_source_complete_tmp(input, n, cap, &tmp)?;
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
-    fixup_run_metadata(&mut writer, input);
-    let mut applied = base_transformations(&[]);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
+    let mut applied = base_transformations(&writer);
     if n_gridded > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
     let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
         .into_iter()
+        .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&applied)))
         .collect();
     finish_tof_grid_archive(writer, tmp_guard, output, input, &grid, vendor, images, sdrf, &index_blocks)
@@ -3315,12 +3349,12 @@ fn convert_agilent_grid(
     let cap = max_spectra();
     let mut n = 0usize;
     let mut max_ppm = 0.0f64;
-    let mut nonint_intensity = false;
+    let mut f32_rounded = 0usize;
     while let Some(ps) = reader.next_spectrum()? {
         if cap.is_some_and(|m| n >= m) {
             break;
         }
-        let spec = agilent_grid_spectrum(&reader, ps, &mut max_ppm, &mut nonint_intensity)?;
+        let spec = agilent_grid_spectrum(&reader, ps, &mut max_ppm, &mut f32_rounded)?;
         if synth_chroms {
             ms1.observe(&spec);
         }
@@ -3331,21 +3365,25 @@ fn convert_agilent_grid(
         "Agilent-grid: wrote {n} profile spectra of {} scan records; max round-trip m/z error \
          {max_ppm:.6} ppm vs MassHunter (traditional quadratic + polynomial refinement){}",
         reader.len(),
-        if nonint_intensity { " (WARNING: some intensities exceeded f32-exact range)" } else { "" }
+        if f32_rounded > 0 { format!(" (WARNING: {f32_rounded} intensities above 2^24 were rounded to Float32)") } else { String::new() }
     );
     // This lane never reaches `assert_source_complete` (a `.d` declares no spectrum count we can
     // read back), so a scan the reader declined to yield would otherwise vanish with exit 0. Name
     // the shortfall — a truncated tail in particular means the archive covers only part of the run.
-    if cap.is_none() {
+    if !cap.is_some_and(|m| n >= m) {
         if let Some(what) = reader.skipped().describe() {
             log::warn!("Agilent-grid: {what}");
         }
     }
     let calibrations = reader.calibrations_json();
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
-    fixup_run_metadata(&mut writer, input);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
+    let mut applied = base_transformations(&writer);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+    if let Some((key, block)) = acquisition_block {
+        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
+    }
     // `lossless` (the exactly-stored column) and `mz_reconstruction` (whether m/z is quantized) are
     // stated by EVERY `codec: "tof-grid"` block, so a reader answers both questions from one place
     // regardless of model. This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal
@@ -3368,22 +3406,80 @@ fn convert_agilent_grid(
     });
     zip.add_index_metadata("tof_calibration", &cal)
         .context("writing tof_calibration index")?;
-    if let Some((key, block)) = partial_marker(input, cap, n) {
+    // A capped run stops early on request. An uncapped one whose MSProfile.bin ended before its scan
+    // records is partial too, and says so offline instead of only in the log.
+    if let Some((key, block)) =
+        partial_marker(input, cap, n).or_else(|| agilent_truncation_marker(cap, reader.skipped(), reader.len(), n))
+    {
         zip.add_index_metadata(&key, &block).context("writing partial index block")?;
     }
-    // The reader stores a sparse point list: zero-intensity samples of the dense vendor vector are
-    // dropped (`agilent_profile.rs`, `next_spectrum`), which is a transformation to declare.
-    let mut applied = base_transformations(&[]);
-    applied.push("agilent:drop-zero-samples".to_string());
+    // The reader stores a sparse point list (zero-intensity samples of the dense vendor vector left
+    // out, `agilent_profile.rs`) and counts integer intensities into Float32: both declared when they
+    // happened.
+    for entry in agilent_grid_transformations(reader.zero_samples_dropped(), reader.skipped().all_zero, f32_rounded) {
+        declare(&mut applied, entry);
+    }
     let (key, block) = transformations_block(&applied);
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    // Embed the Agilent vendor side-files (AcqData) per the vendor policy, mirroring the other lanes.
-    if let Some(policy) = vendor {
-        vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
-    }
+    embed_vendor_members(&mut zip, input, vendor)?;
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     tmp_guard.finish(output)?;
     Ok(())
+}
+
+/// Integer counts as the Float32 intensity column stores them, counting the values it cannot hold
+/// exactly (above 2^24 an f32 rounds): the `agilent:intensity-f32-rounding` transformation.
+fn intensities_as_f32(values: &[u32], rounded: &mut usize) -> Vec<f32> {
+    values
+        .iter()
+        .map(|&v| {
+            let f = v as f32;
+            if f as f64 != v as f64 {
+                *rounded += 1;
+            }
+            f
+        })
+        .collect()
+}
+
+/// The `--agilent-grid` lane's own `transformations` entries, each only when it happened:
+/// `agilent:drop-zero-samples` when the reader left zero-intensity samples (or a whole all-zero
+/// scan) out of its sparse point lists, `agilent:intensity-f32-rounding` when a count above 2^24
+/// was rounded into the Float32 intensity column.
+fn agilent_grid_transformations(zero_samples: usize, all_zero_scans: usize, f32_rounded: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if zero_samples > 0 || all_zero_scans > 0 {
+        out.push("agilent:drop-zero-samples".to_string());
+    }
+    if f32_rounded > 0 {
+        out.push("agilent:intensity-f32-rounding".to_string());
+    }
+    out
+}
+
+/// The `partial` block for an `--agilent-grid` run whose `MSProfile.bin` ends before its scan
+/// records do (an interrupted acquisition: the reader stops at the first segment past the end of
+/// the file). A run the cap (`MZPC_MAX_SPECTRA`) stopped carries the cap's own marker instead; a
+/// cap above the number of readable records stops nothing, and the tail is marked here all the same.
+fn agilent_truncation_marker(
+    cap: Option<usize>,
+    skipped: agilent_profile::SkipTally,
+    scan_records: usize,
+    written: usize,
+) -> Option<(String, serde_json::Value)> {
+    if cap.is_some_and(|m| written >= m) || skipped.truncated_tail == 0 {
+        return None;
+    }
+    Some((
+        "partial".to_string(),
+        serde_json::json!({
+            "partial": true,
+            "cause": "MSProfile.bin ends before its scan records (interrupted acquisition)",
+            "source_declared": scan_records,
+            "spectra_written": written,
+            "scan_records_not_read": skipped.truncated_tail,
+        }),
+    ))
 }
 
 /// Build one mzPeak spectrum from an Agilent profile spectrum: the integer `tof_index` (Int32) +
@@ -3393,7 +3489,7 @@ fn agilent_grid_spectrum(
     reader: &agilent_profile::AgilentProfileReader,
     ps: agilent_profile::ProfileSpectrum,
     max_ppm: &mut f64,
-    nonint_intensity: &mut bool,
+    f32_rounded: &mut usize,
 ) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
     let grid = ps.grid;
     // Losslessness vs MassHunter. The stored representation is: integer `tof_index = k`, per-spectrum
@@ -3422,16 +3518,7 @@ fn agilent_grid_spectrum(
         }
     }
 
-    let intensity: Vec<f32> = ps
-        .intensity
-        .iter()
-        .map(|&v| {
-            if v > (1 << 24) {
-                *nonint_intensity = true;
-            }
-            v as f32
-        })
-        .collect();
+    let intensity = intensities_as_f32(&ps.intensity, f32_rounded);
 
     let mut out = BinaryArrayMap::new();
     let mut tof_da =
@@ -3522,6 +3609,8 @@ fn convert_file(
     images: &[PathBuf],
     sdrf: Option<&Path>,
     tims_recalibration: bool,
+    // The `conversion_route` block when another lane handed the input over (the timsTOF fallback).
+    route: Option<(String, serde_json::Value)>,
 ) -> Result<()> {
     // --image / --sdrf are only honored on the mzML/imzML reader path below. A vendor-format input
     // (TSF/BAF/Agilent/SciEX/Waters) routes to a dedicated converter that does not embed them — warn
@@ -3903,7 +3992,7 @@ fn convert_file(
     finish_chromatograms(&mut writer, &ms1, reader.iter_chromatograms(), synth_chroms)?;
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
-    fixup_run_metadata(&mut writer, input);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
 
     // The `mz_calibration` block is what the viewer's `mz-grid` codec (and any conformant reader
     // that would rather not re-derive the scale from the column metadata) gates on.
@@ -3921,10 +4010,12 @@ fn convert_file(
         })
         .into_iter()
         .chain(partial_marker(input, cap, n))
+        .chain(acquisition_block)
+        .chain(route)
         .chain(std::iter::once(transformations_block(&{
-            let mut applied = base_transformations(&[chunk]);
+            let mut applied = base_transformations(&writer);
             if resorted {
-                applied.push("sort-by-mz".to_string());
+                declare(&mut applied, "sort-by-mz");
             }
             applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
             applied
@@ -4584,6 +4675,7 @@ fn write_ims_compact_archive<F>(
     tof_encoding: &str,
     chunk_cfg: Option<f64>,
     exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
+    frame_sort: Option<&std::sync::atomic::AtomicUsize>,
     spectrum: F,
 ) -> Result<()>
 where
@@ -4594,7 +4686,7 @@ where
     type ParPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
     write_ims_compact_archive_impl::<F, ParPlaceholder>(
         input, output, zstd_level, vendor, synth_chroms, model_a, model_b, chord_source, n_total,
-        tof_encoding, chunk_cfg, exact_per_spectrum, Driver::Serial(spectrum),
+        tof_encoding, chunk_cfg, exact_per_spectrum, frame_sort, Driver::Serial(spectrum),
     )
 }
 
@@ -4614,6 +4706,7 @@ fn write_ims_compact_archive_parallel<F>(
     tof_encoding: &str,
     chunk_cfg: Option<f64>,
     exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
+    frame_sort: Option<&std::sync::atomic::AtomicUsize>,
     spectrum: F,
 ) -> Result<()>
 where
@@ -4622,7 +4715,7 @@ where
     type SerPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
     write_ims_compact_archive_impl::<SerPlaceholder, F>(
         input, output, zstd_level, vendor, synth_chroms, model_a, model_b, chord_source, n_total,
-        tof_encoding, chunk_cfg, exact_per_spectrum, Driver::Parallel(spectrum),
+        tof_encoding, chunk_cfg, exact_per_spectrum, frame_sort, Driver::Parallel(spectrum),
     )
 }
 
@@ -4754,6 +4847,8 @@ fn write_ims_compact_archive_impl<S, P>(
     // spectra_metadata columns, stamp the `tof` column's per-spectrum transform parameters and say
     // so in `ims_calibration`. `None`: the archive is exactly as before.
     exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
+    // `--ims-chunked`: the reader's count of frames whose points its TOF sort re-ordered.
+    frame_sort: Option<&std::sync::atomic::AtomicUsize>,
     mut driver: Driver<S, P>,
 ) -> Result<()>
 where
@@ -5004,7 +5099,7 @@ where
         }
     }
     finish_chromatograms(&mut writer, &ms1, std::iter::empty(), synth_chroms)?;
-    fixup_run_metadata(&mut writer, input);
+    let acquisition_block = fixup_run_metadata(&mut writer, input);
 
     // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename.
     // `tof_encoding` is TRUTHFUL: "absolute" (archive layout + SDK) or "m/z-chunked"
@@ -5066,10 +5161,26 @@ where
     // `MZPC_BYTE_PLANE_INTENSITY=0` — stated here so a reader (or an offline audit) need not infer
     // it from the Parquet schema.
     cal["intensity_dtype"] = serde_json::json!(if int_intensity { "int32" } else { "float32" });
+    let mut applied = base_transformations(&writer);
+    // `--ims-chunked` sorts each frame's points by TOF across mobility scans. Declared from the
+    // reader's count of frames that sort changed; the order is recoverable, since mobility is
+    // stored per point.
+    if frame_sort.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed) > 0) {
+        declare(&mut applied, "sort-by-mz");
+    }
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     zip.add_index_metadata("ims_calibration", &cal)
         .context("writing ims_calibration index")?;
-    let (key, block) = transformations_block(&base_transformations(&[]));
+    if let Some((key, block)) = acquisition_block {
+        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
+    }
+    let (key, block) = conversion_route_block(
+        "ims-compact",
+        if chord_source == "sdk_tims_index_to_mz" { "timsdata" } else { "timsrust" },
+        None,
+    );
+    zip.add_index_metadata(&key, &block).context("writing conversion_route index block")?;
+    let (key, block) = transformations_block(&applied);
     zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
     if let Some((key, block)) = partial_marker(input, max_spectra(), n_frames) {
         zip.add_index_metadata(&key, &block).context("writing partial index block")?;
@@ -5084,9 +5195,7 @@ where
             .context("writing vendor_mz_calibration index")?,
         Err(e) => log::warn!("vendor MzCalibration unavailable ({e}); vendor_mz_calibration index block omitted"),
     }
-    if let Some(policy) = vendor {
-        vendor::embed_into_archive(&mut zip, input, policy).context("embedding vendor files")?;
-    }
+    embed_vendor_members(&mut zip, input, vendor)?;
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
     tmp_guard.finish(output)?;
     Ok(())
@@ -5113,7 +5222,7 @@ fn convert_ims_compact_archive(
     };
     let exact = reader.exact_tof_per_spectrum();
     // The native reader is Sync (mmap-backed timsrust FrameReader), so decode frames in parallel.
-    write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, "global_metadata", n, tof_encoding, chunk_cfg, exact, move |i, int| {
+    write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, "global_metadata", n, tof_encoding, chunk_cfg, exact, ims_chunked.then(|| reader.frames_reordered()), |i, int| {
         if ims_chunked {
             // Chunked layout: absolute TOF, whole frame sorted by TOF (== sorted by m/z) so the
             // chunker's m/z bins are contiguous. Per-scan delta OFF (chunker deltas per chunk).
@@ -5149,7 +5258,7 @@ fn convert_ims_compact_sdk(
         }
     }
     // The SDK decoder writes absolute TOF (its ims_compact_spectrum has no delta and no chunking).
-    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, "sdk_tims_index_to_mz", n, "absolute", None, exact, |i, int| {
+    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, "sdk_tims_index_to_mz", n, "absolute", None, exact, None, |i, int| {
         reader.ims_compact_spectrum(i, int)
     })
 }
@@ -5170,28 +5279,58 @@ fn convert_ims_compact_sdk(
 
 /// The `transformations` index block — the second half of the fidelity invariant ("preserve as
 /// much as possible; every transformation declared in the archive"). Each entry names one
-/// declared, bounded change the converter made to the vendor signal on its way in; an empty list
-/// is a statement too. Written by every mzPeak lane, so a reader (or an audit over a corpus) can
-/// tell a masked, re-sorted or grid-quantized archive from a verbatim one without re-deriving it.
-/// Entries: `zero-run-mask` (the writer's zero-intensity run compaction, on every lane),
-/// `numpress-linear` (the lossy m/z chunk codec, when chosen), `sort-by-mz` (the generic lane
-/// re-ordered at least one out-of-order spectrum), `tof-grid:<ppm>ppm` (a statistically fitted
-/// integer grid replaced f64 m/z within that bound), `shimadzu:span-trim` (the profile sqrt-grid
-/// route stores the signal span only), `agilent:drop-zero-samples` (the profile grid lane stores
-/// a sparse point list), `thermo:target-only-isolation-window:<n>` (`n` Thermo precursor windows the
-/// reader library computed without a stated width were written target-only), and the native SciEX
-/// glue's counted value changes `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and
+/// declared, bounded change that was APPLIED to this archive's stored data — counted while it was
+/// written, never inferred from what the lane was configured to do — so an empty list says the
+/// signal is stored as handed over, and a reader (or an audit over a corpus) can tell a masked,
+/// re-sorted or grid-quantized archive from a verbatim one without re-deriving it. Entries, each
+/// written when its count is above zero: `zero-run-mask` (the writer's zero-run compaction shortened
+/// a profile spectrum), `numpress-linear` (an m/z chunk is stored with the lossy codec),
+/// `sort-by-mz` (a spectrum was re-ordered, by the lane's reader or by the writer's backstop),
+/// `sort-by-time` (the writer's backstop re-ordered a chromatogram by time), `sort-by-wavelength`
+/// (the writer's backstop re-ordered a wavelength spectrum by wavelength),
+/// `tof-grid:<ppm>ppm` (a statistically fitted integer grid replaced f64 m/z within that bound on a
+/// spectrum), `shimadzu:span-trim` (the profile sqrt-grid route left a gridded spectrum's
+/// zero-intensity pad at the scan-window bounds out), `agilent:drop-zero-samples` (the profile grid
+/// reader left a zero-intensity sample or an all-zero scan out of its sparse point lists),
+/// `agilent:intensity-f32-rounding` (a count above 2^24 was rounded into Float32),
+/// `agilent:nonfinite-intensity-to-zero` and `agilent:truncate-unequal-arrays` (the MHDAC host stored
+/// a NaN/Inf intensity as 0, or cut a spectrum's unequal arrays to one length; `agl::HostCounts`, over
+/// the scans the host exported, which `MZPC_MAX_SPECTRA` limits to the ones written),
+/// `waters:drop-functions` (a MassLynx function was not written as spectra;
+/// `waters::function_transformations`), `waters:sonar-summed` (a written scan was a SONAR
+/// function's quadrupole bins summed; counted by `WatersReader::spectrum`),
+/// `thermo:target-only-isolation-window:<n>` (`n` Thermo precursor windows the reader library
+/// computed without a stated width were written target-only), and the native SciEX glue's counted
+/// value changes `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and
 /// `sciex:truncate-unequal-arrays` (`sciex_run::GlueValueChanges`).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
 
-/// The entries every writer build shares: the zero-run mask (`build(handle, true)` on every lane)
-/// and numpress-linear when any facet's chunk strategy is it.
-fn base_transformations(chunks: &[Option<ChunkingStrategy>]) -> Vec<String> {
-    let mut applied = vec!["zero-run-mask".to_string()];
-    if chunks.iter().any(|c| matches!(c, Some(ChunkingStrategy::NumpressLinear { .. }))) {
+/// The entries the writer itself applied, from its own counters rather than its configuration:
+/// `zero-run-mask` when the mask shortened a profile spectrum, `numpress-linear` when a numpress
+/// chunk was stored, `sort-by-mz` when the writer's backstop re-sorted a spectrum the lane handed
+/// over out of m/z order (all three `spectrum_signal_tally`), and `sort-by-time` /
+/// `sort-by-wavelength` when the same backstop re-sorted a chromatogram by time or a wavelength
+/// spectrum by wavelength (`chromatogram_signal_tally`, `wavelength_signal_tally`). Read after the
+/// chromatograms are written and before `finish_parquet`.
+fn base_transformations(writer: &MzPeakWriterType<fs::File>) -> Vec<String> {
+    let tally = writer.spectrum_signal_tally();
+    let mut applied = Vec::new();
+    if tally.zero_runs_masked > 0 {
+        applied.push("zero-run-mask".to_string());
+    }
+    if tally.numpress_chunks > 0 {
         applied.push("numpress-linear".to_string());
+    }
+    if tally.resorted > 0 {
+        applied.push("sort-by-mz".to_string());
+    }
+    if writer.chromatogram_signal_tally().resorted > 0 {
+        applied.push("sort-by-time".to_string());
+    }
+    if writer.wavelength_signal_tally().resorted > 0 {
+        applied.push("sort-by-wavelength".to_string());
     }
     applied
 }
@@ -5201,6 +5340,15 @@ fn thermo_window_transformation(guard: Option<&thermo_isolation::UnstatedWidthGu
     guard
         .filter(|g| g.rewritten() > 0)
         .map(|g| format!("thermo:target-only-isolation-window:{}", g.rewritten()))
+}
+
+/// Add one entry to a `transformations` list, once: `sort-by-mz` can come both from the lane's own
+/// re-sort and from the writer's backstop.
+fn declare(applied: &mut Vec<String>, entry: impl Into<String>) {
+    let entry = entry.into();
+    if !applied.contains(&entry) {
+        applied.push(entry);
+    }
 }
 
 /// Flush Parquet, then stream-embed vendor side-files + vendor metadata into the archive index,
@@ -5228,24 +5376,38 @@ fn finish_with_vendor_and_aux(
     Ok(())
 }
 
-/// Shared vendor-member embed step (Bruker side-files / Thermo trailers), factored out so the
-/// mzML/imzML finish helper and the vendor-reader finish path stay in lockstep.
+/// The one vendor side-file rule, used by every lane that writes an archive. A vendor DIRECTORY
+/// input (a Bruker `.d` of any kind, an Agilent `.d`, a Waters `.raw`) has its side-files embedded
+/// under `vendor/` as the lane's policy says: preserve by default, the bulk-binary drop the lossless
+/// ims-compact policy adds, and every `--aux` rule on top. A Thermo `.raw` gets its trailer and
+/// status-log facets. Through 0.11.5 only TDF/TSF directories qualified here while `--agilent-grid`
+/// and ims-compact embedded any directory themselves, so a BAF `.d`, an Agilent `.d` on the MHDAC
+/// lane and a Waters `.raw` embedded nothing and `--aux` did nothing on them, silently. A
+/// single-file input has no side-files; `run` names `--aux` inert there.
 fn embed_vendor_members(
     zip: &mut ZipArchiveWriter<fs::File>,
     input: &Path,
     vendor: Option<&vendor::VendorPolicy>,
 ) -> Result<()> {
     if let Some(policy) = vendor {
-        let is_bruker_d = input.is_dir()
-            && (input.join("analysis.tsf").exists() || input.join("analysis.tdf").exists());
-        if is_bruker_d {
-            vendor::embed_into_archive(zip, input, policy)
-                .context("embedding vendor files")?;
+        if input.is_dir() {
+            vendor::embed_into_archive(zip, input, policy).context("embedding vendor files")?;
         } else if is_thermo_raw(input) {
             embed_thermo_trailers(zip, input)?;
         }
     }
     Ok(())
+}
+
+/// The warning for `--aux` on an input it cannot act on: side-files are embedded from a vendor
+/// directory only ([`embed_vendor_members`]), so on a single file the rules change nothing.
+fn aux_inert_note(input: &Path, given: &[&'static str]) -> Option<String> {
+    (given.contains(&"--aux") && !input.is_dir()).then(|| {
+        format!(
+            "--aux is inert for {}: only a vendor directory input (a .d or .raw directory) has side-files to embed",
+            input.display()
+        )
+    })
 }
 
 fn is_thermo_raw(input: &Path) -> bool {
@@ -5329,10 +5491,10 @@ fn convert_baf(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_baf::BafReader::open_with(input, None, representation())?;
-    convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
-        reader.len(), |i| reader.spectrum(i),
-    )
+    // What the baf2sql cache's `Properties` table states (instrument series, serial, software, time).
+    // The digested members come from the directory itself, through `fixup_run_metadata`.
+    let hints = VendorHints { run_metadata: Some(reader.run_metadata()), ..Default::default() };
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
 /// Convert a Bruker TDF/TSF `.d` → mzPeak via the official Bruker **timsdata** SDK (opt-in
@@ -5349,10 +5511,9 @@ fn convert_bruker_sdk(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_sdk::BrukerSdkReader::open(input)?;
-    convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
-        reader.len(), |i| reader.spectrum(i),
-    )
+    // A TDF frame arrives mobility-major and the reader re-sorts it by m/z; declared from its count.
+    let hints = VendorHints { counters: reader.reorder_counter().map(|c| ("sort-by-mz", c)).into_iter().collect(), ..Default::default() };
+    convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -5449,8 +5610,9 @@ fn convert_shimadzu(
         hints.spectrum_param_fields.push((TOF_C1_CURIE, "tof_c1"));
         hints.data_facet_point_layout = true;
         // The profile route stores the signal span only (`shimadzu_grid_route`): the zero pad at
-        // the scan-window bounds is trimmed before the fit and never reaches the archive.
-        hints.transformations.push("shimadzu:span-trim".to_string());
+        // the scan-window bounds is trimmed before the fit and never reaches the archive. Each
+        // gridded spectrum reports whether it had one, and `convert_vendor_reader` declares
+        // `shimadzu:span-trim` from that count.
         hints.index_blocks.push((
             "tof_calibration".to_string(),
             serde_json::json!({
@@ -5465,13 +5627,13 @@ fn convert_shimadzu(
                 "lossless": "tof_index",
                 // Within vendor rounding, NOT bit-exact: the axis is the vendor's own sqrt lattice
                 // and the fit is accepted only when it reproduces every m/z to within
-                // `vendor_mz_rounding` below — measured on HEK_PosOAD1, 4,890 of 5,000 gridded
-                // points rebuild to a value off the vendor's 1e-9 lattice by up to 0.5 step
-                // (4.15e-10 Da), inside the vendor's own ±5e-10 rounding. That is accurate to
-                // vendor precision, and "exact" read as bit-exact. Spectra that do not fit are not
-                // gridded at all — they keep f64 m/z in the data facet.
+                // `shimadzu_grid::TOL` (1e-9 Da: the vendor's ±5e-10 rounding plus f64 slack), so
+                // that gate IS the bound. Through 0.11.5 this said 5e-10, which the gate never
+                // enforced: refitting HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points
+                // between 5e-10 and 5.47e-10 Da off. Spectra that do not fit are not gridded at
+                // all — they keep f64 m/z in the data facet.
                 "mz_reconstruction": "within-vendor-rounding",
-                "max_error_da": 5e-10,
+                "max_error_da": shimadzu_grid::TOL,
                 "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
                 "per_spectrum_columns": ["tof_c0", "tof_c1"],
                 "run_wide_c1": step,
@@ -5496,7 +5658,7 @@ fn convert_shimadzu(
     let lattice_on = mz_lattice_enabled();
     if rep != shimadzu::Representation::Profile && lattice_on {
         hints.peaks_facet = Some(shimadzu_grid::lattice_peak_schema());
-        hints.index_blocks.push(("mz_calibration".to_string(), shimadzu_grid::mz_calibration_block()));
+        hints.index_blocks.push(("mz_calibration".to_string(), shimadzu_grid::mz_calibration_block(shimadzu_grid::coarse_mz_requested())));
     }
     // The per-facet totals ("N spectra on the sqrt grid / on the lattice") are counted by
     // `convert_vendor_reader` over the written spectra and logged there (`FacetTally::report`);
@@ -5506,9 +5668,9 @@ fn convert_shimadzu(
         reader.len(),
         |i| {
             let spec = reader.spectrum(i)?;
-            let (spec, profile_grid) = match grid_step {
+            let (spec, profile_grid, profile_span_trimmed) = match grid_step {
                 Some(step) => shimadzu_grid_route(spec, step),
-                None => (spec, None),
+                None => (spec, None, false),
             };
             let (spec, peak_arrays, outcome) = if lattice_on {
                 shimadzu_grid::lattice_route(spec)
@@ -5518,7 +5680,7 @@ fn convert_shimadzu(
             Ok(VendorSpectrum {
                 spectrum: spec,
                 peak_arrays,
-                routes: FacetRoutes { profile_grid, centroid_lattice: outcome.on_lattice() },
+                routes: FacetRoutes { profile_grid, profile_span_trimmed, centroid_lattice: outcome.on_lattice() },
             })
         },
     );
@@ -5593,18 +5755,19 @@ fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
 
 /// Replace a fitting profile spectrum's f64 m/z with `tof_index` + per-spectrum `tof_c0`/`tof_c1`;
 /// leave anything else (centroid-only spectra, off-grid spectra) untouched. The second value is
-/// the [`FacetRoutes::profile_grid`] outcome: `None` for a spectrum with no profile to route.
+/// the [`FacetRoutes::profile_grid`] outcome: `None` for a spectrum with no profile to route. The
+/// third is [`FacetRoutes::profile_span_trimmed`]: whether a gridded spectrum had a zero pad to trim.
 /// Host-independent (only the `.lcd` reader is Windows-only) so the routing is testable anywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn shimadzu_grid_route(
     spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
     step: f64,
-) -> (MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>, Option<bool>) {
+) -> (MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>, Option<bool>, bool) {
     if spec.signal_continuity() != mzdata::spectrum::SignalContinuity::Profile {
-        return (spec, None);
+        return (spec, None, false);
     }
-    let Some(arrays) = spec.arrays.as_ref() else { return (spec, None) };
-    let (Ok(mz), Ok(inten)) = (arrays.mzs(), arrays.intensities()) else { return (spec, None) };
+    let Some(arrays) = spec.arrays.as_ref() else { return (spec, None, false) };
+    let (Ok(mz), Ok(inten)) = (arrays.mzs(), arrays.intensities()) else { return (spec, None, false) };
     // Unequal source arrays are not this route's to reconcile: `&mz[a..b]` with a span measured on
     // the intensities would PANIC when m/z is the shorter one, and quietly gridding the overlap
     // would drop the tail. Decline the route and let the untouched spectrum take the f64 lane,
@@ -5618,29 +5781,30 @@ fn shimadzu_grid_route(
             mz.len(),
             inten.len()
         );
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     // Fit and store the signal span only: the zero-intensity pad points at the scan-window bounds
     // are off-grid by construction, so a fit over the untrimmed array would reject every spectrum.
     // Trimming here is also what keeps them out of the archive — the writer would keep one of them
     // (its zero-run compaction preserves a boundary zero per run); see `shimadzu_grid::signal_span`.
     let (a, b) = shimadzu_grid::signal_span(&inten);
+    let trimmed = a > 0 || b < inten.len();
     let (mz, inten) = (&mz[a..b], &inten[a..b]);
     let Some((grid, k)) = shimadzu_grid::fit_spectrum(mz, step) else {
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     };
     let intensity: Vec<f32> = inten.to_vec();
     let mut out = BinaryArrayMap::new();
     let mut tof_da =
         DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
     if tof_da.update_buffer(k.as_slice()).is_err() {
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     out.add(tof_da);
     let mut int_da =
         DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
     if int_da.update_buffer(intensity.as_slice()).is_err() {
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     int_da.unit = Unit::DetectorCounts;
     out.add(int_da);
@@ -5682,13 +5846,13 @@ fn shimadzu_grid_route(
             recon.len(),
             inten.len()
         );
-        return (spec, Some(false));
+        return (spec, Some(false), false);
     }
     set_gridded_spectrum_summary(&mut descr, &recon, inten);
     descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
     descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
     let out = MultiLayerSpectrum::new(descr, Some(out), spec.peaks.clone(), spec.deconvoluted_peaks.clone());
-    (out, Some(true))
+    (out, Some(true), trimmed)
 }
 
 /// Instrument configuration from what the vendor API states — and only that. `SystemName()` is the
@@ -5986,7 +6150,9 @@ fn convert_sciex_grid(
         m.default_source_file = default_source;
         run_metadata::apply(&mut writer, m)
     });
-    fixup_run_metadata(&mut writer, input);
+    let fixup_block = fixup_run_metadata(&mut writer, input);
+    let acquisition_block = acquisition_block.or(fixup_block);
+    let mut applied = base_transformations(&writer);
 
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     if let Some((key, block)) = acquisition_block {
@@ -6013,7 +6179,6 @@ fn convert_sciex_grid(
         zip.add_index_metadata("tof_calibration", &cal)
             .context("writing tof_calibration index")?;
     }
-    let mut applied = base_transformations(&[data_chunk]);
     if n_grid > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
@@ -6110,10 +6275,18 @@ fn convert_waters(
     // deliberately NOT used here — it is gated to the mzML path — so `.raw` stores exact f64 m/z.
     let reader = waters::WatersReader::open(input)?;
     let mut hints = VendorHints { run_metadata: waters_meta::read(input), ..Default::default() };
-    // Ion-mobility functions arrive as frames whose bins were interleaved and re-sorted by m/z
-    // (`waters.rs`): declare the sort, and hand readers the run's drift table + CCS calibration.
+    // What each function is and what became of it, on every run with or without drift bins, and
+    // the functions the archive leaves out or sums.
+    hints.index_blocks.push(("waters_functions".to_string(), reader.functions_block()));
+    hints.transformations.extend(reader.transformations());
+    // A SONAR function's scans are read as its quadrupole bins summed: the reader counts those
+    // scans, and `waters:sonar-summed` is declared from that count over the written spectra.
+    hints.counters.push((waters::SONAR_SUMMED, reader.sonar_counter()));
+    // Ion-mobility functions arrive as frames whose bins interleave and are re-sorted by m/z
+    // (`waters.rs`): the reader counts the frames that sort moved, and `sort-by-mz` is declared from
+    // that count over the written spectra. Readers get the run's drift table + CCS calibration.
+    hints.counters.push(("sort-by-mz", reader.reorder_counter()));
     if let Some(block) = reader.drift_block() {
-        hints.transformations.push("sort-by-mz".to_string());
         hints.index_blocks.push(("waters_drift".to_string(), block));
         // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
         // and the drift column must be declared even if the IMS function is a small part of the run.
@@ -6139,7 +6312,8 @@ fn convert_agilent(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = agilent::AgilentReader::open(input)?;
-    let hints = VendorHints { instrument: reader.instrument(), ..Default::default() };
+    // NaN/Inf intensities stored as 0 and arrays cut to one length, as the host counted them.
+    let hints = VendorHints { instrument: reader.instrument(), transformations: reader.transformations(), ..Default::default() };
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
 }
 
@@ -6187,6 +6361,13 @@ struct VendorHints {
     /// six-probe stride, so a column only some functions carry (the drift array of a mixed
     /// IMS/non-IMS Waters run) is declared regardless of where those spectra sit.
     probe_indices: Vec<usize>,
+    /// A reader's own counts, each with the `transformations` entry it declares: the entry is
+    /// written when its counter grew while the spectra were WRITTEN (the schema probes go through the
+    /// same reader first and do not count). `sort-by-mz` for the spectra a reader re-sorted into m/z
+    /// order itself (the `--bruker-sdk` TDF reader: the SDK hands over mobility-major frames; the
+    /// native Waters reader: a frame's drift bins interleave); `waters:sonar-summed` for the scans the
+    /// Waters reader read as a SONAR function's quadrupole bins summed.
+    counters: Vec<(&'static str, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
 }
 
 /// One spectrum from a vendor reader, plus — for a lattice-routed centroid list — the arrays that
@@ -6213,6 +6394,9 @@ impl From<MultiLayerSpectrum> for VendorSpectrum {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FacetRoutes {
     profile_grid: Option<bool>,
+    /// The profile sqrt-grid route left this gridded spectrum's zero-intensity pad at the
+    /// scan-window bounds out (`shimadzu:span-trim`).
+    profile_span_trimmed: bool,
     centroid_lattice: Option<bool>,
 }
 
@@ -6225,6 +6409,8 @@ struct FacetTally {
     /// Profile facet: on the sqrt grid / kept f64 m/z.
     profile_grid: usize,
     profile_f64: usize,
+    /// Gridded profile spectra whose zero pad the route left out: `shimadzu:span-trim`.
+    profile_span_trimmed: usize,
     /// Centroid facet: on the 1e-9 lattice / kept f64 m/z.
     centroid_lattice: usize,
     centroid_f64: usize,
@@ -6232,6 +6418,7 @@ struct FacetTally {
 
 impl FacetTally {
     fn record(&mut self, routes: FacetRoutes) {
+        self.profile_span_trimmed += usize::from(routes.profile_span_trimmed);
         match routes.profile_grid {
             Some(true) => self.profile_grid += 1,
             Some(false) => self.profile_f64 += 1,
@@ -6330,6 +6517,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         run_metadata,
         keep_zero_runs,
         probe_indices,
+        counters,
     } = hints;
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
@@ -6431,6 +6619,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // Count here, over the written spectra: the probe fetches above went through the same
     // closure and must not show up in the run totals.
     let mut tally = FacetTally::default();
+    let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
     for i in 0..len {
         let VendorSpectrum { spectrum: spec, peak_arrays, routes } = spectrum(i)?.into();
         tally.record(routes);
@@ -6453,13 +6642,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
                 id: "sourceFile".to_string(),
                 ..Default::default()
             };
-            sf.add_param(
-                Param::builder()
-                    .name("SHA-1")
-                    .curie(curie!(MS:1000569))
-                    .value(mzdata::params::Value::String(hex))
-                    .build(),
-            );
+            sf.add_param(run_metadata::sha1_param(hex));
             writer.file_description_mut().source_files.push(sf);
         }
     }
@@ -6478,12 +6661,27 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             index_blocks.push(block);
         }
     }
-    fixup_run_metadata(&mut writer, input);
-    let mut applied = base_transformations(&[data_chunk, peaks_chunk]);
-    if keep_zero_runs {
-        applied.retain(|t| t != "zero-run-mask");
+    // One `acquisition_time` block per archive: the lane's own hints may already have stated it.
+    if let Some(block) = fixup_run_metadata(&mut writer, input) {
+        if !index_blocks.iter().any(|(key, _)| *key == block.0) {
+            index_blocks.push(block);
+        }
     }
-    applied.extend(transformations);
+    // A lane that keeps zero runs built the writer with the mask off, so its tally has none to report.
+    let mut applied = base_transformations(&writer);
+    for entry in transformations {
+        declare(&mut applied, entry);
+    }
+    // The reader's own counts, grown over the written spectra only.
+    for ((entry, counter), before) in counters.iter().zip(counted_before) {
+        if counter.load(std::sync::atomic::Ordering::Relaxed) > before {
+            declare(&mut applied, *entry);
+        }
+    }
+    // The Shimadzu profile route's pad trim, from the routes of the written spectra.
+    if tally.profile_span_trimmed > 0 {
+        declare(&mut applied, "shimadzu:span-trim");
+    }
     let transformations = transformations_block(&applied);
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     for (key, block) in index_blocks
@@ -6779,8 +6977,9 @@ fn set_file_contents(target: &mut impl MSDataFileMetadata, seen: &Ms1Chroms, tic
 }
 
 /// The run metadata a vendor DIRECTORY input states in its side files, readable on any host:
-/// Bruker `.d` (`GlobalMetadata`), Agilent `.d` (`AcqData` XML). Waters `.raw` is handled by its
-/// lane through `VendorHints` because its naive time needs an index block.
+/// Bruker TDF/TSF `.d` (`GlobalMetadata`), Bruker BAF `.d` (its digested members; the run facts
+/// live in the baf2sql cache and arrive through the lane's hints), Agilent `.d` (`AcqData` XML).
+/// Waters `.raw` is handled by its lane through `VendorHints`.
 fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> {
     if !input.is_dir() {
         return None;
@@ -6788,10 +6987,21 @@ fn vendor_dir_metadata(input: &Path) -> Option<run_metadata::VendorRunMetadata> 
     if vendor::bruker_sqlite(input).is_some() {
         return vendor::bruker_run_metadata(input);
     }
+    // After the SQLite check: a BAF `.d` can hold a 0-byte `analysis.tdf` stub (NreB_PAS_DECONV),
+    // which `bruker_sqlite` already passes over.
+    if let Some(members) = vendor::bruker_baf_members(input) {
+        return Some(members);
+    }
     agilent_meta::read(input)
 }
 
-fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
+/// Normalise the run metadata every lane writes and merge in what a vendor directory states.
+/// Returns the `acquisition_time` index block when that directory states only a wall clock without
+/// a zone (`run_metadata::apply`): an archive lane writes it into the index, and an mzML output,
+/// which cannot carry it, says so (`fixup_mzml_run_metadata`). Through 0.11.5 the block was dropped
+/// here, so an unzoned Bruker or Agilent clock left no trace on the lanes that rely on this fixup.
+#[must_use]
+fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) -> Option<(String, serde_json::Value)> {
     // 0. Provenance hygiene on what the reader ALREADY copied. Step 1 below sanitises only the
     // entry it synthesises itself; mzdata's Thermo reader writes the converting machine's parent
     // directory into `location`, and its TDF reader the full `.d` path into `run.id`, so twelve
@@ -6814,9 +7024,7 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
     // reader already set. Bruker used to be special-cased here; the same seam now serves every
     // vendor directory the host can read. Only what the file states is asserted: no ion source or
     // detector is guessed (a wrong `MS:1000008` child is worse than an absent one).
-    if let Some(meta) = vendor_dir_metadata(input) {
-        let _naive_time_block = run_metadata::apply(target, meta);
-    }
+    let naive_time_block = vendor_dir_metadata(input).and_then(|meta| run_metadata::apply(target, meta));
 
     // 1b. Ensure at least one source_file (the input itself) so default_source_file_id can resolve
     //     — only when no member was stated above.
@@ -6837,13 +7045,7 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
         // single byte stream to digest, and hashing one arbitrary member would be a false claim.
         if input.is_file() {
             match embed_aux::sha1_hex(input) {
-                Ok(hex) => sf.add_param(
-                    Param::builder()
-                        .name("SHA-1")
-                        .curie(curie!(MS:1000569))
-                        .value(mzdata::params::Value::String(hex))
-                        .build(),
-                ),
+                Ok(hex) => sf.add_param(run_metadata::sha1_param(hex)),
                 Err(e) => log::warn!("could not digest {}: {e}", input.display()),
             }
         }
@@ -6885,6 +7087,21 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) {
             Some(id) if instr_ids.contains(&id) => {}
             _ => run.default_instrument_id = first_instr,
         }
+    }
+    naive_time_block
+}
+
+/// [`fixup_run_metadata`] for an mzML output. The run model the mzML writer serialises holds only a
+/// zoned `start_time` (`DateTime<FixedOffset>`), so an unzoned vendor clock cannot be carried: name
+/// the clock that was left out instead of dropping it without a word.
+fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
+    if let Some((_, block)) = fixup_run_metadata(w, input) {
+        log::warn!(
+            "{}: acquisition time {} states no time zone, and the mzML run model holds only zoned \
+             times; it is not written",
+            block["source"].as_str().unwrap_or("vendor file"),
+            block["wall_clock"].as_str().unwrap_or("?")
+        );
     }
 }
 
@@ -7054,7 +7271,7 @@ mod tests {
         }
         assert!(w.instrument_configurations().is_empty());
 
-        super::fixup_run_metadata(&mut w, input);
+        let _ = super::fixup_run_metadata(&mut w, input);
 
         let sfs = &w.file_description().source_files;
         assert_eq!(sfs.len(), 2, "no source file synthesised when the reader supplied some");
@@ -7078,10 +7295,10 @@ mod tests {
         w.instrument_configurations_mut()
             .insert(3, mzdata::meta::InstrumentConfiguration { id: 3, ..Default::default() });
         w.run_description_mut().unwrap().default_instrument_id = Some(7);
-        super::fixup_run_metadata(&mut w, input);
+        let _ = super::fixup_run_metadata(&mut w, input);
         assert_eq!(w.run_description().unwrap().default_instrument_id, Some(3), "dangling 7 clamped to 3");
         w.run_description_mut().unwrap().default_instrument_id = Some(3);
-        super::fixup_run_metadata(&mut w, input);
+        let _ = super::fixup_run_metadata(&mut w, input);
         assert_eq!(w.run_description().unwrap().default_instrument_id, Some(3), "a resolving id is kept");
         assert!(!super::is_path_shaped_run_id("SZB8102938"));
         assert!(super::is_path_shaped_run_id("C:\\data\\run.d"));
@@ -7309,7 +7526,7 @@ mod tests {
                 Ok(VendorSpectrum {
                     spectrum: spec,
                     peak_arrays: None,
-                    routes: FacetRoutes { profile_grid: Some(true), centroid_lattice: Some(i % 2 == 0) },
+                    routes: FacetRoutes { profile_grid: Some(true), profile_span_trimmed: false, centroid_lattice: Some(i % 2 == 0) },
                 })
             },
         )
@@ -7318,12 +7535,99 @@ mod tests {
         assert_eq!(calls.get(), LEN + 6, "closure calls = probes + written");
         assert_eq!(
             tally,
-            FacetTally { profile_grid: LEN, profile_f64: 0, centroid_lattice: LEN / 2, centroid_f64: LEN / 2 },
+            FacetTally { profile_grid: LEN, profile_f64: 0, profile_span_trimmed: 0, centroid_lattice: LEN / 2, centroid_f64: LEN / 2 },
             "tally must count the written spectra only"
         );
         assert!(out.is_file());
         assert!(!dir.join("tally.mzpeak.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Bruker `.d` whose `GlobalMetadata` states an acquisition time WITHOUT an offset. The
+    /// vendor-reader lanes (TSF, BAF, `--bruker-sdk`) see the directory's run metadata only through
+    /// `fixup_run_metadata`, which dropped the naive-time block through 0.11.5: a null
+    /// `run.start_time` and no `acquisition_time` block. The directory is synthetic, an
+    /// `analysis.tsf` SQLite holding just the `GlobalMetadata` table the fixup reads.
+    #[test]
+    fn unzoned_vendor_directory_clock_reaches_the_index() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("unzoned-clock");
+        let dot_d = dir.join("run.d");
+        fs::create_dir_all(&dot_d).unwrap();
+        let db = rusqlite::Connection::open(dot_d.join("analysis.tsf")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('AcquisitionDateTime', '2024-10-09T09:09:26');",
+        )
+        .unwrap();
+        drop(db);
+        let out = dir.join("run.mzpeak");
+        convert_vendor_reader_tallied(&dot_d, &out, None, 1, None, false, VendorHints::default(), 3, |i| {
+            Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
+        })
+        .unwrap();
+        let meta = index_metadata(&out);
+        assert_eq!(meta["run"]["start_time"], serde_json::Value::Null, "a naive clock never becomes an instant");
+        assert_eq!(meta["acquisition_time"]["wall_clock"], "2024-10-09T09:09:26", "{:#}", meta);
+        assert_eq!(meta["acquisition_time"]["zone"], "unstated");
+        assert_eq!(meta["acquisition_time"]["source"], "Bruker GlobalMetadata AcquisitionDateTime");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A Bruker BAF `.d` names its three members, each with its SHA-1, through the fixup every
+    /// vendor-reader lane shares. The BAF lane itself runs only on Windows and Linux, so the seam is
+    /// driven with synthetic spectra. Through 0.11.5 such an archive named only the `.d`, with no
+    /// digest; the 0-byte `analysis.tdf` beside the `.baf` is NreB_PAS_DECONV's layout.
+    #[test]
+    fn baf_directory_members_are_digested_in_the_archive() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("baf-members");
+        let dot_d = dir.join("run.d");
+        fs::create_dir_all(&dot_d).unwrap();
+        for (name, body) in [
+            ("analysis.baf", &b"baf"[..]),
+            ("analysis.baf_idx", b"idx"),
+            ("analysis.baf_xtr", b"xtr"),
+            ("analysis.tdf", b""),
+        ] {
+            fs::write(dot_d.join(name), body).unwrap();
+        }
+        let out = dir.join("run.mzpeak");
+        // What `convert_baf` hands over for a baf2sql cache whose `Properties` table is missing or
+        // unreadable: still a model term with a name, never the writer's valueless placeholder.
+        let hints = VendorHints {
+            run_metadata: Some(crate::vendor::baf_properties_metadata(&Default::default())),
+            ..VendorHints::default()
+        };
+        convert_vendor_reader_tallied(&dot_d, &out, None, 1, None, false, hints, 2, |i| {
+            Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
+        })
+        .unwrap();
+        let meta = index_metadata(&out);
+        let model: Vec<&str> = meta["instrument_configuration_list"][0]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["accession"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(model, ["MS:1000122"], "{:#}", meta["instrument_configuration_list"]);
+        let files = meta["file_description"]["source_files"].as_array().unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr"], "{:#}", meta["file_description"]);
+        for f in files {
+            let name = f["name"].as_str().unwrap();
+            let sha = f["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["accession"] == "MS:1000569")
+                .unwrap_or_else(|| panic!("{name} carries no SHA-1"));
+            assert_eq!(sha["value"].as_str().unwrap(), crate::embed_aux::sha1_hex(&dot_d.join(name)).unwrap());
+        }
+        assert_eq!(meta["run"]["default_source_file_id"], "analysis.baf");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A converter-owned MZP CURIE — an `Unknown`-CV CURIE, as the vendored crate represents its
@@ -7367,7 +7671,7 @@ mod tests {
         let mut writer = builder.build(handle, true);
         super::ensure_mzp_cv(&mut writer);
         super::ensure_mzp_cv(&mut writer); // idempotent
-        super::fixup_run_metadata(&mut writer, &path);
+        let _ = super::fixup_run_metadata(&mut writer, &path);
         writer.write_spectrum(&spec).unwrap();
         // The vendored writer copies the run metadata (cv_list included) into the file index only
         // when it finalizes the chromatogram facet, so give it one — every lane writes a TIC anyway.
@@ -7688,7 +7992,7 @@ mod tests {
             CentroidPeak::new(mz[20], 10.0, 0),
             CentroidPeak::new(mz[42], 20.0, 1),
         ]));
-        let (out, routed) = super::shimadzu_grid_route(spec, c1);
+        let (out, routed, _) = super::shimadzu_grid_route(spec, c1);
         assert_eq!(routed, Some(true));
 
         let mut ms1 = super::Ms1Chroms::default();
@@ -7826,8 +8130,13 @@ mod tests {
         }
         inten[42] = 900.0;
 
-        let (out, routed) = super::shimadzu_grid_route(spec_from(&mz, &inten, 0), c1);
+        let (out, routed, trimmed) = super::shimadzu_grid_route(spec_from(&mz, &inten, 0), c1);
         assert_eq!(routed, Some(true), "an on-grid profile spectrum must route to the grid");
+        assert!(trimmed, "the zero pad at both bounds was left out");
+        // Signal up to both bounds: gridded, and nothing to trim.
+        let (_, routed_unpadded, trimmed_unpadded) =
+            super::shimadzu_grid_route(spec_from(&mz[10..70], &inten[10..70], 1), c1);
+        assert_eq!((routed_unpadded, trimmed_unpadded), (Some(true), false));
 
         // The m/z array is gone, replaced by tof_index — which is exactly why the summary has to be
         // carried as CV terms.
@@ -7886,7 +8195,7 @@ mod tests {
             CentroidPeak::new(mz[42], 20.0, 1),
         ]));
 
-        let (out, routed) = super::shimadzu_grid_route(spec, c1);
+        let (out, routed, _) = super::shimadzu_grid_route(spec, c1);
         assert_eq!(routed, Some(true));
         assert_eq!(
             out.peaks.as_ref().map(|p| p.len()),
@@ -7990,7 +8299,7 @@ mod tests {
 
             // synth_chroms=true mirrors the CLI default. (An unrelated pre-existing point-layout write
             // clash triggers only with --no-chromatograms + mixed precision; not this test's concern.)
-            super::convert_file(&input, &output, chunk, 3, None, true, Some(super::TofGridMode::Off), &[], None, true)
+            super::convert_file(&input, &output, chunk, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
                 .unwrap_or_else(|e| panic!("[{tag}] conversion failed: {e:#}"));
 
             let f = fs::File::open(&output).unwrap();
@@ -8095,6 +8404,7 @@ mod tests {
             &[],
             None,
             true,
+            None,
         )
         .unwrap();
 
@@ -8631,8 +8941,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The `transformations` index block (invariant: every transformation declared): the generic
-    /// lane on the fixture masks zero runs and numpresses m/z, and re-sorts nothing.
+    /// The `transformations` index block (invariant: every transformation declared) lists what was
+    /// applied, not what was configured. On the fixture the generic lane numpresses m/z and masks
+    /// nothing: its one profile spectrum (scan=20, 10 points) holds no run of zeros, so the mask the
+    /// writer was built with never shortened a spectrum. Its MS1 spectra arrive out of time order
+    /// (scan=19 at 5.89 min, scan=21 with no start time, cycle 22 at 42.05 s), so the synthesized TIC
+    /// and base-peak traces reach the writer unsorted and its backstop re-sorts them by time.
     #[test]
     fn transformations_block_declares_what_the_lane_applied() {
         let dir = scratch("transformations");
@@ -8649,8 +8963,8 @@ mod tests {
             .map(|v| v.as_str().expect("entries are strings"))
             .collect();
         // The whole list — `contains` let through an entry nothing applied, or one listed twice. No
-        // `sort-by-mz`: the fixture is already in m/z order.
-        assert_eq!(applied, ["zero-run-mask", "numpress-linear"], "{applied:?}");
+        // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run.
+        assert_eq!(applied, ["numpress-linear", "sort-by-time"], "{applied:?}");
         // The lossless request drops the codec entry — the list follows the choice, not the lane.
         let out2 = dir.join("tiny-delta.mzpeak");
         let args: Vec<&std::ffi::OsStr> = vec![
@@ -8661,8 +8975,339 @@ mod tests {
         let meta = index_metadata(&out2);
         let applied: Vec<&str> =
             meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(applied, ["zero-run-mask"], "{applied:?}");
+        assert_eq!(applied, ["sort-by-time"], "{applied:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The writer-level entries follow the writer's counters on the vendor-reader seam: a profile
+    /// with no zero run declares nothing, one with a run declares `zero-run-mask`, and a spectrum
+    /// handed over out of m/z order declares `sort-by-mz` — the writer's re-sort backstop, which
+    /// every native lane relies on and which no archive recorded before.
+    #[test]
+    fn writer_counters_decide_the_writer_level_transformations() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("writer-counters");
+        let declared = |name: &str, mzs: &'static [f64], intens: &'static [f32]| -> Vec<String> {
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(
+                std::path::Path::new(TINY),
+                &out,
+                None,
+                1,
+                None,
+                false,
+                VendorHints::default(),
+                4,
+                |i| Ok(spec_from(mzs, intens, i)),
+            )
+            .unwrap();
+            index_metadata(&out)["transformations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(declared("verbatim", &[100.0, 100.5, 101.0, 101.5], &[5.0, 0.0, 7.0, 9.0]), none);
+        assert_eq!(
+            declared("zero-run", &[100.0, 100.5, 101.0, 101.5, 102.0, 102.5], &[5.0, 0.0, 0.0, 0.0, 0.0, 9.0]),
+            ["zero-run-mask"]
+        );
+        assert_eq!(declared("unsorted", &[101.0, 100.0, 102.0, 103.0], &[5.0, 6.0, 7.0, 9.0]), ["sort-by-mz"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The writer's two other re-sort backstops count as well: a chromatogram handed over out of time
+    /// order declares `sort-by-time`, a wavelength spectrum out of wavelength order
+    /// `sort-by-wavelength`, and the same data in order declares neither. Both backstops reordered
+    /// stored data without a declaration before.
+    #[test]
+    fn writer_backstops_declare_chromatogram_and_wavelength_re_sorts() {
+        use mzdata::io::MZReaderType;
+        use mzpeak_prototyping::writer::AbstractMzPeakWriter;
+
+        const PDA_UV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pda_uv.pwiz.mzML");
+        let dir = scratch("backstops");
+        let ms = spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], 0);
+        // A PDA wavelength spectrum of the fixture as pwiz wrote it, and the same one reversed.
+        let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(PDA_UV).unwrap();
+        let uv = reader
+            .iter()
+            .find(|s| s.spectrum_type().is_some_and(|t| !t.is_mass_spectrum()))
+            .expect("a wavelength spectrum in pda_uv.pwiz.mzML");
+        let reversed_uv = {
+            let mut arrays = BinaryArrayMap::new();
+            for (t, a) in uv.raw_arrays().expect("wavelength arrays").iter() {
+                let mut r = DataArray::wrap(t, a.dtype(), Vec::new());
+                match a.dtype() {
+                    BinaryDataArrayType::Float64 => r.update_buffer(&a.to_f64().unwrap().iter().rev().copied().collect::<Vec<_>>()),
+                    BinaryDataArrayType::Float32 => r.update_buffer(&a.to_f32().unwrap().iter().rev().copied().collect::<Vec<_>>()),
+                    other => panic!("unexpected {other:?} array in the fixture"),
+                }
+                .unwrap();
+                r.unit = a.unit;
+                arrays.add(r);
+            }
+            MultiLayerSpectrum::new(uv.description().clone(), Some(arrays), None, None)
+        };
+        let applied = |name: &str, uv: &MultiLayerSpectrum, times: &[f64]| -> Vec<String> {
+            let path = dir.join(format!("{name}.mzpeak"));
+            let mut writer = super::MzPeakWriterType::<fs::File>::builder()
+                .sample_array_types_from_spectra(std::iter::once(ms.clone()))
+                .build(fs::File::create(&path).unwrap(), true);
+            writer.write_spectrum(&ms).unwrap();
+            writer.write_spectrum(uv).unwrap();
+            let tic = super::synth_chromatogram(
+                "TIC",
+                Param::builder().name("total ion current chromatogram").curie(mzdata::curie!(MS:1000235)).build(),
+                times,
+                &[6.0, 7.0, 8.0],
+            )
+            .unwrap();
+            writer.write_chromatogram(&tic).unwrap();
+            let applied = super::base_transformations(&writer);
+            writer.finish_parquet().unwrap().finish().unwrap();
+            applied
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(applied("in-order", &uv, &[0.0, 1.0, 2.0]), none);
+        assert_eq!(applied("time", &uv, &[0.0, 2.0, 1.0]), ["sort-by-time"]);
+        assert_eq!(applied("wavelength", &reversed_uv, &[0.0, 1.0, 2.0]), ["sort-by-wavelength"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M35: which timsTOF route built an archive. The fallback arm runs only on a native error that
+    /// mentions `decompress`, and hands that error to the `conversion_route` block; any other error
+    /// keeps the native lane's context, and success needs no fallback. Forced with injected errors:
+    /// no committed TDF makes timsrust fail that way.
+    #[test]
+    fn ims_compact_fallback_arm_records_the_route_it_took() {
+        use super::ims_compact_with_fallback;
+        let input = std::path::Path::new("run.d");
+        let mut taken = None;
+        ims_compact_with_fallback(input, || Err(anyhow::anyhow!("frame 7: failed to decompress blob")), |route| {
+            taken = Some(route);
+            Ok(())
+        })
+        .unwrap();
+        let (key, block) = taken.expect("a decompress error takes the fallback");
+        assert_eq!(key, "conversion_route");
+        assert_eq!(block["route"], "mzdata-fallback");
+        assert_eq!(block["reader"], "mzdata");
+        assert!(block["reason"].as_str().unwrap().contains("decompress"), "{block}");
+        let mut called = false;
+        let err = ims_compact_with_fallback(input, || Err(anyhow::anyhow!("no frames")), |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!called, "only a decompress error falls back");
+        assert!(format!("{err:#}").contains("ims-compact converting run.d"), "{err:#}");
+        ims_compact_with_fallback(input, || Ok(()), |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!called, "success needs no fallback");
+    }
+
+    /// The route block the fallback hands over reaches the archive index through `convert_file`, and
+    /// the plain mzdata lane states none.
+    #[test]
+    fn convert_file_writes_the_route_it_is_handed() {
+        let dir = scratch("route");
+        let out = dir.join("fallback.mzpeak");
+        let route = super::conversion_route_block("mzdata-fallback", "mzdata", Some("frame 7: failed to decompress blob"));
+        super::convert_file(std::path::Path::new(TINY), &out, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, Some(route))
+            .unwrap();
+        let meta = index_metadata(&out);
+        assert_eq!(meta["conversion_route"]["route"], "mzdata-fallback", "{meta:#}");
+        assert!(meta["conversion_route"]["reason"].as_str().unwrap().contains("decompress"));
+        let plain = dir.join("plain.mzpeak");
+        super::convert_file(std::path::Path::new(TINY), &plain, None, 3, None, true, Some(super::TofGridMode::Off), &[], None, true, None)
+            .unwrap();
+        assert!(index_metadata(&plain).get("conversion_route").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One embed rule: a vendor directory's side-files go into `vendor/` under the policy on every
+    /// lane (a Waters `.raw` or BAF `.d` embedded nothing through 0.11.5, and `--aux` did nothing on
+    /// them), and `--aux` on a single-file input is named inert instead of passing silently.
+    #[test]
+    fn every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("embed-rule");
+        let raw = dir.join("run.raw");
+        fs::create_dir_all(&raw).unwrap();
+        fs::write(raw.join("_HEADER.TXT"), "$$ Acquired Name: run\r\n").unwrap();
+        fs::write(raw.join("_extern.inf"), "Created by 4.1\r\n").unwrap();
+        let policy = crate::vendor::VendorPolicy::load(None, &["_extern.inf=drop".to_string()]).unwrap();
+        let out = dir.join("run.mzpeak");
+        convert_vendor_reader_tallied(&raw, &out, None, 1, Some(&policy), false, VendorHints::default(), 2, |i| {
+            Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))
+        })
+        .unwrap();
+        let manifest = index_metadata(&out)["vendor_files"].clone();
+        let actions: Vec<(String, String)> = manifest
+            .as_array()
+            .expect("a vendor_files manifest")
+            .iter()
+            .map(|e| (e["path"].as_str().unwrap().to_string(), e["action"].as_str().unwrap().to_string()))
+            .collect();
+        assert!(actions.contains(&("vendor/_HEADER.TXT.gz".to_string(), "embed".to_string())), "{actions:?}");
+        assert!(actions.contains(&("_extern.inf".to_string(), "drop".to_string())), "the --aux rule applies: {actions:?}");
+        assert!(zip_members(&out).iter().any(|m| m == "vendor/_HEADER.TXT.gz"));
+
+        let tiny_out = dir.join("tiny.mzpeak");
+        let args: Vec<&std::ffi::OsStr> =
+            vec![TINY.as_ref(), "-o".as_ref(), tiny_out.as_os_str(), "--force".as_ref(), "--aux".as_ref(), "*=drop".as_ref()];
+        let (ok, _, err) = run_bin(&args, &[]);
+        assert!(ok, "{err}");
+        assert!(err.contains("--aux is inert"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `shimadzu:span-trim` is declared from the routes of the WRITTEN spectra: a run whose gridded
+    /// spectra had no zero pad, or whose only padded spectra were schema probes, trimmed nothing
+    /// stored. It used to be declared whenever the run-wide grid step was found.
+    #[test]
+    fn span_trim_is_declared_from_the_written_routes() {
+        use super::{convert_vendor_reader_tallied, FacetRoutes, VendorHints, VendorSpectrum};
+
+        let dir = scratch("span-trim");
+        const LEN: usize = 20;
+        let declared = |name: &str, trimmed: &dyn Fn(usize, usize) -> bool| -> Vec<String> {
+            let calls = std::cell::Cell::new(0usize);
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(std::path::Path::new(TINY), &out, None, 1, None, false, VendorHints::default(), LEN, |i| {
+                calls.set(calls.get() + 1);
+                Ok(VendorSpectrum {
+                    spectrum: spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], i),
+                    peak_arrays: None,
+                    routes: FacetRoutes { profile_grid: Some(true), profile_span_trimmed: trimmed(calls.get(), i), centroid_lattice: None },
+                })
+            })
+            .unwrap();
+            index_metadata(&out)["transformations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(declared("no-pad", &|_, _| false).is_empty());
+        // The probes are fetched first (calls 1..=6); a pad only they had is not in the archive.
+        assert!(declared("probes-only", &|call, _| call <= 6).is_empty());
+        assert_eq!(declared("padded", &|call, i| call > 6 && i == 1), ["shimadzu:span-trim"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A reader's own counts (the `--bruker-sdk` TDF and Waters frame re-sorts, the Waters SONAR
+    /// sums) are declared from their growth over the written spectra: counts during the six schema
+    /// probes do not count, and each counter declares only its own entry. The counters here are the
+    /// test's own; the Waters lane's wiring of its two (MassLynxRaw.dll only) is pinned as source
+    /// text in `tests/contract_strings.rs`, `waters_counted_entries_pinned`.
+    #[test]
+    fn reader_counters_count_written_spectra_only() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = scratch("reader-counters");
+        const LEN: usize = 20;
+        // `bump(call, index)` names the counter a reader call adds to, if any: 0 is `sort-by-mz`,
+        // 1 is `waters:sonar-summed`.
+        let declared = |name: &str, bump: &dyn Fn(usize, usize) -> Option<usize>| -> Vec<String> {
+            let counters = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+            let calls = std::cell::Cell::new(0usize);
+            let out = dir.join(format!("{name}.mzpeak"));
+            let hints = VendorHints {
+                counters: vec![("sort-by-mz", counters[0].clone()), ("waters:sonar-summed", counters[1].clone())],
+                ..VendorHints::default()
+            };
+            convert_vendor_reader_tallied(std::path::Path::new(TINY), &out, None, 1, None, false, hints, LEN, |i| {
+                calls.set(calls.get() + 1);
+                if let Some(k) = bump(calls.get(), i) {
+                    counters[k].fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], i))
+            })
+            .unwrap();
+            index_metadata(&out)["transformations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        // The probes are fetched first (calls 1..=6, indices 0, 3, …, 15), and both counters grow there.
+        assert!(declared("probes-only", &|call, _| (call <= 6).then_some(call % 2)).is_empty());
+        // Indices 1 and 2 are never probed (stride 3) and are always written.
+        assert_eq!(declared("re-sorted", &|call, i| (call > 6 && i == 1).then_some(0)), ["sort-by-mz"]);
+        assert_eq!(declared("sonar-summed", &|call, i| (call > 6 && i == 2).then_some(1)), ["waters:sonar-summed"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `sort-by-time` on the vendor-reader lanes: the TIC and base-peak traces are synthesized in
+    /// spectrum order, so a run whose MS1 start times go backwards hands the writer chromatograms out
+    /// of time order, and its backstop re-sorts them. The seam reads the writer's tallies after
+    /// `finish_chromatograms`; read before it, the entry is lost. The same run in time order declares
+    /// nothing. Until now only the mzML lane (the tiny fixture) and the writer seam pinned the entry.
+    #[test]
+    fn vendor_reader_declares_the_time_re_sort_of_its_synthesized_chromatograms() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+
+        let dir = scratch("vendor-sort-by-time");
+        const LEN: usize = 8;
+        let declared = |name: &str, minutes: &dyn Fn(usize) -> f64| -> Vec<String> {
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(std::path::Path::new(TINY), &out, None, 1, None, true, VendorHints::default(), LEN, |i| {
+                let mut s = spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], i);
+                s.description_mut().ms_level = 1;
+                s.description_mut().acquisition.first_scan_mut().unwrap().start_time = minutes(i);
+                Ok(s)
+            })
+            .unwrap();
+            index_metadata(&out)["transformations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(declared("in-order", &|i| i as f64).is_empty());
+        // Spectrum 2 started before spectrum 1: the traces arrive as 0, 1, 0.5, 3, … minutes.
+        assert_eq!(declared("out-of-order", &|i| if i == 2 { 0.5 } else { i as f64 }), ["sort-by-time"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `--agilent-grid` declarations follow the reader's counts: zero samples or all-zero scans
+    /// dropped, intensities Float32 rounds; a truncated MSProfile.bin marks the archive partial
+    /// unless a cap stopped the run first. The lane needs a decodable profile `.d`, which no
+    /// committed fixture is, so its pure parts are pinned here.
+    #[test]
+    fn agilent_grid_declares_what_its_reader_counted() {
+        use super::{agilent_grid_transformations, agilent_truncation_marker, intensities_as_f32};
+        assert!(agilent_grid_transformations(0, 0, 0).is_empty());
+        assert_eq!(agilent_grid_transformations(12, 0, 0), ["agilent:drop-zero-samples"]);
+        assert_eq!(agilent_grid_transformations(0, 1, 3), ["agilent:drop-zero-samples", "agilent:intensity-f32-rounding"]);
+        let mut rounded = 0;
+        let f = intensities_as_f32(&[1, 1 << 24, (1 << 24) + 1, u32::MAX], &mut rounded);
+        assert_eq!(f[1], 16_777_216.0);
+        assert_eq!(rounded, 2, "2^24 + 1 and u32::MAX have no exact f32");
+        let tail = crate::agilent_profile::SkipTally { truncated_tail: 7, ..Default::default() };
+        let (key, block) = agilent_truncation_marker(None, tail, 100, 93).expect("a truncated tail is partial");
+        assert_eq!(key, "partial");
+        assert_eq!(block["scan_records_not_read"], 7);
+        assert_eq!(block["spectra_written"], 93);
+        assert!(agilent_truncation_marker(Some(10), tail, 100, 10).is_none(), "a capped run keeps the cap's marker");
+        // A cap above what the file holds stopped nothing: its truncated tail is partial all the same.
+        let (_, block) = agilent_truncation_marker(Some(1_000_000), tail, 100, 93).expect("a cap that did not bite");
+        assert_eq!(block["scan_records_not_read"], 7);
+        assert!(agilent_truncation_marker(None, crate::agilent_profile::SkipTally::default(), 100, 100).is_none());
     }
 
     /// M34 on the archive: nothing in `mzpeak_index.json` names the converting machine's

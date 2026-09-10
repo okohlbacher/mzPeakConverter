@@ -401,6 +401,7 @@ serial, a sample or a source (ion source, detector) only where the file says so:
 | Lane | Read from | Instrument | Software | Sample | Time | Source members (each with MS:1000569 SHA-1) |
 |---|---|---|---|---|---|---|
 | Bruker TDF / TSF | `GlobalMetadata` | MS:1003123 timsTOF family + `InstrumentName`, serial, TOF analyzer | `AcquisitionSoftware` + version | `SampleName` | `AcquisitionDateTime` (zoned) | `analysis.tdf`/`.tsf` + `_bin` |
+| Bruker BAF | the baf2sql cache's `Properties` table (Windows/Linux) | the series term ProteoWizard arrives at for the raw `InstrumentFamily` code through `translateInstrumentFamily` and `translateAsInstrumentSeries` (1–2 micrOTOF; 6–8, maXis/impact/compact, maXis series; 512 apex; 513 solarix), MS:1000122 Bruker Daltonics instrument model for any other code or an unreadable table; serial | `AcquisitionSoftware` + version | — (not in `Properties`) | `AcquisitionDateTime` | `analysis.baf` + `_idx` + `_xtr` (any host) |
 | Agilent `.d` | `AcqData/Devices.xml`, `Contents.xml`, `sample_info.xml` (any host) | MS:1000490 + name, model number, serial, analyzers implied by the device type | MassHunter + `AcqSoftwareVersion` | `Sample Name` | `AcquiredTime` (with its offset) | the AcqData files (no exported text, no dot files) |
 | Waters `.raw` | `_HEADER.TXT`, `_extern.inf` (any host); per scan: MassLynxRaw (Windows) | MS:1000126 + model, serial unless `#NotSet` | MassLynx `Created by` version | `Acquired Name` + descriptors | `Acquired Date/Time` (no zone) | `_FUNCnnn.DAT` (Waters nativeID) then the side files |
 | SciEX `.wiff` | Clearcore2 sample/instrument details (Windows) | MS:1000121 + `InstrumentName`, serial | Analyst + `SoftwareVersion` | sample name | `AcquisitionDateTime` (no zone) | `.wiff` + `.wiff.scan`, digested before the library opens them |
@@ -417,6 +418,14 @@ clock WITHOUT one (Waters, SciEX) leaves `run.start_time` null and is preserved 
                      "source": "Waters _HEADER.TXT", "note": "…"}
 ```
 
+**Reading the acquisition time.** Use `run.start_time` when it is set. When it is null, read
+`metadata.acquisition_time.wall_clock`: the vendor's local clock exactly as the file states it,
+zone unstated. Show or compare it as a local wall clock and never attach an offset — neither the
+reader's own nor UTC. An archive with neither states no acquisition time. Bruker and Agilent
+directories follow the same rule: their clocks carry offsets in every file seen so far, and one
+that does not becomes the block too (archives written by 0.11.5 and earlier dropped it on the
+lanes that read those directories).
+
 ProteoWizard resolves the same ambiguity by asserting: it labels an unzoned Waters clock `Z`, and
 its `adjustUnknownTimeZonesToHostTimeZone` default shifts other readers' values by the converting
 host's offset AT CONVERSION TIME (a Shimadzu run that the file states as 10:47:18Z comes out
@@ -429,9 +438,13 @@ wrote (MS1/MSn spectrum, centroid/profile, TIC chromatogram), not a generic `mas
 drift-scan count is read bin by bin and written as one spectrum per MassLynx scan whose points are
 sorted by (m/z, drift time) and carry a per-point `raw ion mobility array` (MS:1003007, ms) — the
 shape of ProteoWizard's `--combineIonMobilitySpectra` output and of the Bruker ims-compact lane —
-with the frame's drift-time bounds (MS:1003439/1003440), `sort-by-mz` in `transformations`, and a
+with the frame's drift-time bounds (MS:1003439/1003440), `sort-by-mz` in `transformations` when a
+frame's bins came back out of m/z order (counted frame by frame), and a
 `waters_drift` index block holding the run's bin → ms table, the vendor's `mob_cal.csv` CCS
-calibration verbatim, the lock-mass function and the functions not written as spectra. Frames keep
+calibration verbatim, the lock-mass function and the functions not written as spectra. Every Waters
+archive, with drift bins or without, also carries a `waters_functions` block: each function's type,
+MS level, drift bins and SONAR flag, the functions skipped with their reason, the collapsed
+functions with whether they were written, and the lock-mass function. Frames keep
 every point MassLynx returns: the writer's zero-run mask is off for them (`zero-run-mask` is absent
 from `transformations`), because a run of zeros in an interleaved frame is several bins' trace
 boundaries meeting. ProteoWizard's default instead writes one spectrum per drift bin (Capan2:
@@ -604,41 +617,66 @@ zero differences. Four transforms are **not** bit-exact, and each is named in th
 
 Where the source m/z is on a lattice the archive says how exactly it reconstructs
 (`mz_reconstruction` with its `max_error_da` bound) rather than claiming "exact": the Shimadzu
-profile block says `within-vendor-rounding` with `max_error_da: 5e-10` (measured: 4,890 of 5,000
-gridded points rebuild off the vendor's 1e-9 lattice by ≤ 0.5 step, inside the vendor's own
-rounding), the Agilent file-direct block is the one lane that says `exact`, and the two SCIEX
-lanes say `bounded-lossy` with `roundtrip_tolerance_ppm`.
+profile block says `within-vendor-rounding` with `max_error_da: 1e-9` — the fit's own acceptance
+gate, since a spectrum is gridded only when every point rebuilds within 1e-9 Da of the vendor m/z
+(archives written by 0.11.5 and earlier state 5e-10, which the gate did not enforce: refitting
+HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points between 5e-10 and 5.47e-10 Da off), the
+Agilent file-direct block is the one lane that says `exact`, and the two SCIEX lanes say
+`bounded-lossy` with `roundtrip_tolerance_ppm`.
 
 **The `transformations` index key.** Every mzPeak lane writes `metadata.transformations` — a JSON
-list of the declared, bounded changes the converter made to the vendor signal on its way in
-(`transformations_block` in `src/main.rs`). An empty list is a statement too. The vocabulary:
+list of the declared, bounded changes that were APPLIED to this archive's stored data on the way in
+(`transformations_block` in `src/main.rs`). Each entry is written only when the change happened at
+least once, counted while the archive was written, never inferred from what the lane was configured
+to do; so an empty list says the signal is stored as it was handed over. Archives written by 0.11.5
+and earlier listed `zero-run-mask` on every lane and `numpress-linear` whenever the codec was chosen,
+whether or not a spectrum was masked or a chunk encoded. The vocabulary:
 
 | Entry | Written when | Lanes |
 |---|---|---|
-| `zero-run-mask` | always — the writer's zero-intensity run compaction (item 2) | every lane |
-| `numpress-linear` | the lossy m/z chunk codec was chosen on any facet (item 1) | chunked layout without `--no-numpress` |
-| `sort-by-mz` | at least one spectrum arrived out of m/z order and was re-sorted (tracked per run, not assumed) | generic mzdata lane |
+| `zero-run-mask` | the writer's zero-intensity run compaction shortened at least one profile spectrum (item 2) | every lane whose writer masks (not native Waters frames) |
+| `numpress-linear` | at least one m/z chunk is stored with the lossy codec (item 1) | chunked layout without `--no-numpress` |
+| `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, `--ims-chunked` (each frame by TOF across mobility scans; mobility is stored per point), `--bruker-sdk` TDF (the SDK hands over mobility-major frames), native Waters frames, and any lane whose reader hands over an unsorted spectrum |
+| `sort-by-time` | the writer's backstop re-ordered at least one chromatogram into time order before it was stored | any lane that hands the writer a chromatogram out of time order, a source chromatogram or the MS1 TIC/base-peak trace synthesized in spectrum order |
+| `sort-by-wavelength` | the writer's backstop re-ordered at least one wavelength (UV/PDA) spectrum into wavelength order before it was stored | any lane that writes wavelength spectra handed over out of order |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
-| `shimadzu:span-trim` | the profile sqrt-grid route stored the signal span only (item 4) | native Shimadzu `.lcd` profile |
-| `agilent:drop-zero-samples` | the profile grid lane stored a sparse point list, dropping zero-intensity samples and all-zero scans | `--agilent-grid` |
+| `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 4) | native Shimadzu `.lcd` profile |
+| `agilent:drop-zero-samples` | the profile grid lane left at least one zero-intensity sample, or an all-zero scan, out of its sparse point lists | `--agilent-grid` |
+| `agilent:intensity-f32-rounding` | an integer count above 2^24 was rounded into the Float32 intensity column | `--agilent-grid` |
+| `agilent:nonfinite-intensity-to-zero` | MHDAC returned a NaN or ±Inf intensity, stored as 0 (counted by the net48 host over the scans it exported, which under `MZPC_MAX_SPECTRA` are the written ones) | native Agilent (MHDAC) |
+| `agilent:truncate-unequal-arrays` | a spectrum's m/z and intensity arrays differed in length and were cut to the shorter (counted by the net48 host, as above) | native Agilent (MHDAC) |
+| `waters:drop-functions` | a MassLynx function was not written as spectra: chromatogram-type (SIR/MRM/NL/NG), not MS (DAD, delay, …), its scan count unreadable (`getScanCount failed`), or a collapsed retention-time summary not kept by `MZPC_WATERS_KEEP_COLLAPSED` | native Waters `.raw` |
+| `waters:sonar-summed` | at least one written scan is a SONAR function's quadrupole bins summed into one scan (counted as the scans are read) | native Waters `.raw` |
 | `sciex:nan-intensity-to-zero` | the glue mapped at least one NaN intensity Clearcore2 returned to 0 (counted per spectrum; a warning gives the total) | native SciEX `.wiff` |
 | `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
 | `thermo:target-only-isolation-window:<n>` | `<n>` precursor isolation windows had no width their scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and were written target-only; thermorawfilereader computes a quarter-width or inverted window for them | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 
-Not declared today, on purpose and worth knowing: the `--ims-chunked` ims-compact layout sorts each
-frame by TOF before chunking, which re-orders points across scans (an entry of the `sort-by-mz`
-class; tracked in `BACKLOG.md`). Beside `transformations`, two other 0.9.13 index keys let a reader
-audit an archive offline: `metadata.partial` marks a run truncated by `MZPC_MAX_SPECTRA` (§10), and
+Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
+`timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
+decompress a frame; the recorded command line is the same on both routes). Only those lanes write
+it: a `--no-ims-compact` or f64 `--bruker-sdk` archive has no `conversion_route`, its route being
+the one its command line names. `metadata.partial` marks
+a run truncated by `MZPC_MAX_SPECTRA` (§10) or an `--agilent-grid` run whose `MSProfile.bin` ends
+before its scan records (`cause` says which), and
 `ims_calibration.chord_source` (`global_metadata` on the native timsrust lane, `sdk_tims_index_to_mz`
 under `--bruker-sdk`) says which of the two (a, b) chords — measured 4.28 ppm apart on 2485.d — an
 ims-compact archive holds.
 
-**Verbatim vendor side-files (preserved, not interpreted).** For Bruker `.d`, the
-original side-files (methods, calibration, acquisition databases, …) are
-**embedded by default** under `vendor/` in the archive — gzip-compressed and
-declared `proprietary` in the index — so nothing the converter does not yet model
-is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
+**Verbatim vendor side-files (preserved, not interpreted).** For every vendor directory input
+(Bruker `.d` of any kind, Agilent `.d`, Waters `.raw`), the original side-files (methods,
+calibration, acquisition databases, …) are **embedded by default** under `vendor/` in the archive —
+gzip-compressed where they compress and declared `proprietary` in the index — so nothing the
+converter does not yet model is lost; the `vendor_files` manifest records every embed and drop. The
+lossless ims-compact lane drops the bulk `*_bin` by default; every other lane keeps everything the
+vendor wrote, including the raw signal files (`analysis.baf`, `AcqData/MSProfile.bin`,
+`_FUNC*.DAT`), which can be several times the archive: drop them with `--aux` or embed nothing with
+`--no-vendor`. No default drops them because those lanes do not store everything the files hold: BAF
+reads line arrays unless `--representation profile`, the Agilent MHDAC host reads profile else peak,
+and native Waters leaves chromatogram-type functions out. The one file dropped by default is
+baf2sql's `analysis.sqlite`, the cache the BAF reader itself creates inside the `.d`
+(`--aux 'analysis.sqlite=embed'` keeps it). Through 0.11.5 only TDF/TSF directories,
+`--agilent-grid` and ims-compact embedded anything. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 …) and status log are captured verbatim into dedicated `vendor_scan_trailers`
 (tall + wide) and `vendor_status_log` facets.
 
@@ -646,7 +684,8 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 
 - `--no-vendor` (or `no_vendor: true`) — embed nothing.
 - `--aux 'glob=drop'` / `--aux 'glob=embed'` — per-glob rule, highest precedence,
-  repeatable. The same rules can be given as the `aux:` list in the config file
+  repeatable. A single-file input (mzML, imzML, Thermo `.raw`, `.wiff`, `.lcd`) has no side-files,
+  so the rules change nothing there and the converter says so. The same rules can be given as the `aux:` list in the config file
   (§5). For example, drop the bulk binaries but keep the method:
   `--aux '*.tdf_bin=drop' --aux '*.method=embed'`.
 
@@ -818,7 +857,8 @@ instead.
 | Variable | Effect | Recorded in the archive? |
 |---|---|---|
 | `MZPC_NO_MZ_LATTICE=1` | Same as `--no-mz-lattice` (§9): store f64 `mz` instead of the fixed-point lattice, on every lane (`env_flag` spellings) | implicitly — the peaks facet has an `mz` column and no `mz_calibration` block |
-| `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | no — `mz_calibration.source` is the same string either way (open item) |
+| `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | yes — `mz_calibration.source` names `Mass (Int32, 1e-4 Da)` instead of `MassHigh (Int64, 1e-9 Da)`; the glue's own automatic fallbacks to `Mass` are not recorded yet |
+| `MZPC_WATERS_KEEP_COLLAPSED` | Native Waters lane: write MassLynx's collapsed retention-time functions (run-summed mobilograms) as spectra instead of leaving them out. On/off lever read through the common rule (empty, `0`, `false`, `no` are off) | yes — `collapsed_functions[].written` in `waters_functions` (and `waters_drift`), and `waters:drop-functions` when they were left out |
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |
 | `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`) | the fitted `{c0,c1}` is stored; the fact that `c1` was forced is not |

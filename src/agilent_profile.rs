@@ -105,6 +105,9 @@ pub struct AgilentProfileReader {
     /// this lane has no `assert_source_complete` cross-check behind it, so without a tally a `.d`
     /// can lose spectra with a clean exit 0. See [`Self::skipped`].
     skipped: SkipTally,
+    /// Zero-intensity samples of the dense vendor vectors left out of the sparse point lists so far,
+    /// all-zero scans included. See [`Self::zero_samples_dropped`].
+    zero_samples_dropped: usize,
 }
 
 /// Scan records the profile reader did not turn into spectra, by cause.
@@ -185,6 +188,7 @@ impl AgilentProfileReader {
             poly_flags,
             cursor: 0,
             skipped: SkipTally::default(),
+            zero_samples_dropped: 0,
         })
     }
 
@@ -198,6 +202,13 @@ impl AgilentProfileReader {
     /// converter reports it then, because this lane has no completeness cross-check of its own.
     pub fn skipped(&self) -> SkipTally {
         self.skipped
+    }
+
+    /// Zero-intensity samples dropped from the sparse point lists so far: what the
+    /// `agilent:drop-zero-samples` transformation removed, so the lane declares it only when this
+    /// (or an all-zero scan) is above zero.
+    pub fn zero_samples_dropped(&self) -> usize {
+        self.zero_samples_dropped
     }
 
     /// Decode the next non-empty profile spectrum, or `None` at end of run. Skips scans whose
@@ -245,6 +256,7 @@ impl AgilentProfileReader {
                     intensity.push(v);
                 }
             }
+            self.zero_samples_dropped += intens.len() - tof_index.len();
             if tof_index.is_empty() {
                 // An all-zero scan. It is a real acquisition with a real retention time, but the
                 // sparse point list this lane stores has nowhere to put "nothing", so the spectrum
