@@ -69,35 +69,72 @@ jobs:
         run: |
           set -euo pipefail
           case "$GITHUB_EVENT_NAME" in
-            pull_request)      sha="$PR_HEAD" ;;  # the dry run waits on the pull request's own CI
-            workflow_dispatch) sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)" ;;
-            *)                 sha="$GITHUB_SHA" ;;
+            pull_request)      ref="$PR_HEAD" ;;  # the dry run waits on the pull request's own CI
+            workflow_dispatch) ref="refs/tags/$TAG" ;;
+            *)                 ref="$GITHUB_SHA" ;;
           esac
-          echo "gating on $sha"
-          pending="the check-runs API" deadline=$(( $(date +%s) + 90 * 60 ))
+          # Both workflows take a dispatch on any ref, and the check runs a dispatch creates count here
+          # like a push's: the remedy for a commit CI never ran on, and for one past GitHub's 30-day
+          # re-run window.
+          on="${GITHUB_HEAD_REF:-$TAG}"
+          remedy="run \`gh workflow run ci.yml --ref $on\` and \`gh workflow run windows.yml --ref $on\`, then re-run this workflow once both have passed"
+          start=$(date +%s)
+          deadline=$(( start + 90 * 60 ))
+          sha="" pending="the commits API" refused=0
           while :; do
-            # The newest run of each job counts, so re-running a cancelled one clears the way. The API
-            # lists newest first and a release commit carries ~15 check runs, so one page is plenty.
-            # `$want` is jq's variable, not the shell's.
-            # shellcheck disable=SC2016
-            if states="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?filter=all&per_page=100" --jq '
+            if [ -z "$sha" ]; then
+              # The commits API peels an annotated tag to its commit and refuses a ref that names none;
+              # check-runs answers a tag object's own SHA with 422, which this loop would wait out.
+              call="commits/$ref" filter='[.sha, .commit.committer.date] | @tsv'
+            else
+              # The newest run of each job counts, so re-running a cancelled one clears the way. The API
+              # lists newest first and a release commit carries ~15 check runs, so one page is plenty.
+              # `$want` is jq's variable, not the shell's.
+              # shellcheck disable=SC2016
+              call="commits/$sha/check-runs?filter=all&per_page=100" filter='.total_count, (
                 ["build-test (ubuntu-latest)", "build-test (macos-latest)", "windows"][] as $want
                 | ([.check_runs[] | select(.name == $want)] | max_by(.id)) // {status: "not started"}
-                | [$want, .status, .conclusion // ""] | @tsv')"; then
+                | [$want, .status, .conclusion // ""] | @tsv)'
+            fi
+            if out="$(gh api "repos/$GITHUB_REPOSITORY/$call" --jq "$filter" 2> "$RUNNER_TEMP/gh-api.err")"; then
+              refused=0
+              if [ -z "$sha" ]; then
+                IFS=$'\t' read -r sha committed <<< "$out"
+                committed_at="$(date -d "$committed" +%s)"
+                echo "gating on $sha, committed $committed"
+                continue
+              fi
               pending=""
               while IFS=$'\t' read -r name status conclusion; do
                 if [ "$status" != completed ]; then
                   pending+="$name ($status); "
                 elif [ "$conclusion" != success ]; then
-                  echo "::error::'$name' concluded '$conclusion' on $sha — nothing is released from a commit whose CI did not pass. Re-run that job, then re-run this workflow."
+                  echo "::error::'$name' concluded '$conclusion' on $sha — nothing is released from a commit whose CI did not pass. Re-run that job, or $remedy."
                   exit 1
                 fi
-              done <<< "$states"
+              done <<< "${out#*$'\n'}"
               [ -n "$pending" ] || { echo "build-test (ubuntu-latest), build-test (macos-latest) and windows passed"; exit 0; }
+              # A commit CI never ran on gets no check runs later (one pushed together with a later
+              # commit, as v0.7.3 and v0.4.12 were, or a [skip ci] one), so do not wait 90 minutes for
+              # it. Ten minutes lets a slow queue start; the age keeps a commit just pushed waiting.
+              now=$(date +%s)
+              if [ "${out%%$'\n'*}" = 0 ] && [ $(( now - start )) -ge 600 ] && [ $(( now - committed_at )) -ge 10800 ]; then
+                echo "::error::$sha (committed $committed) has no check runs at all: CI never ran on it, so there is nothing to wait for. To release it, $remedy."
+                exit 1
+              fi
               echo "waiting on ${pending%; }"
+            else
+              cat "$RUNNER_TEMP/gh-api.err" >&2
+              # An HTTP 4xx three times running is GitHub's answer, not an outage: a ref that names no
+              # commit, or a token without checks: read. A 5xx or a dropped connection is retried.
+              if grep -q 'HTTP 4[0-9][0-9]' "$RUNNER_TEMP/gh-api.err"; then refused=$(( refused + 1 )); else refused=0; fi
+              if [ "$refused" -ge 3 ]; then
+                echo "::error::GitHub refused repos/$GITHUB_REPOSITORY/$call three times running ($(grep -o 'HTTP 4[0-9][0-9]' "$RUNNER_TEMP/gh-api.err" | tail -1)) — nothing is released from a commit whose CI cannot be read"
+                exit 1
+              fi
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::still waiting after 90 min on ${pending%; } for $sha — CI runs on pushes to main and on pull requests, so a commit that reached neither has none to wait for"
+              echo "::error::still waiting after 90 min on ${pending%; } for ${sha:-$ref}. If those checks will never finish, $remedy."
               exit 1
             fi
             sleep 60
