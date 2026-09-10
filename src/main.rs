@@ -7748,7 +7748,8 @@ mod tests {
         let input = input.as_path();
 
         // Never a machine-specific absolute path: this file is committed.
-        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        // Its own directory: the contract test below extracts the same facet names concurrently.
+        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}-frames", std::process::id()));
         let scratch = scratch.as_path();
         fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_ims_compact.mzpeak");
@@ -7860,7 +7861,8 @@ mod tests {
         };
         let input = input.as_path();
         // Never a machine-specific absolute path: this file is committed.
-        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}", std::process::id()));
+        // Its own directory: the frame-preserving test above extracts the same facet names concurrently.
+        let scratch = &std::env::temp_dir().join(format!("mzpc-test-{}-contract", std::process::id()));
         let scratch = scratch.as_path();
         fs::create_dir_all(scratch).unwrap();
         let output = scratch.join("sba415_contract.mzpeak");
