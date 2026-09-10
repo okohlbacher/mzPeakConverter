@@ -55,6 +55,29 @@ fn failed_rename_leaves_no_tmp_behind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A directory already standing where a lane puts its tmp (`<out>.mzpeak.tmp`, `<out>.mzML.tmp`)
+/// makes the conversion fail, and is left as it was: the guard unlinks the tmp FILE it owns and
+/// removes no directory but msconvert's working directory, which it created itself.
+#[test]
+fn a_directory_at_the_tmp_path_is_left_alone() {
+    let dir = scratch("tmp-is-a-dir");
+    for (name, tmp) in [("out.mzpeak", "out.mzpeak.tmp"), ("out.mzML", "out.mzML.tmp")] {
+        let occupant = dir.join(tmp).join("user-file.txt");
+        std::fs::create_dir_all(occupant.parent().unwrap()).unwrap();
+        std::fs::write(&occupant, b"keep").unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwiz.1.1.mzML"))
+            .arg("-o")
+            .arg(dir.join(name))
+            .output()
+            .expect("failed to run mzpeak-convert");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{name}: creating the tmp over a directory must fail; stderr:\n{stderr}");
+        assert!(occupant.is_file(), "{name}: {} was removed; stderr:\n{stderr}", occupant.display());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The other temp file a conversion can create: an mzML with an empty self-closing
 /// `<referenceableParamGroup/>` is converted from a sanitized copy (`mzpc-san-<pid>-<stem>.mzML`
 /// in the temp dir; mzdata panics on the original). It used to be removed only after a successful
