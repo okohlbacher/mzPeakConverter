@@ -2386,18 +2386,23 @@ fn write_agilent_profile_mzml(
 /// Pass a source's chromatograms through to an mzML, dropping TIC/base-peak (the mzML writer emits
 /// its own spectrum-derived TIC + base-peak summary at close, so those would duplicate). Everything
 /// else — SRM/SIM/vendor traces — is preserved. Must be called after all spectra (writer state).
+/// The writer puts `<chromatogramList count>` out with the first chromatogram, from a count it
+/// starts at 2 (its own summary pair), so the count is set here first.
 fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromatogram>>(
     w: &mut mzdata::io::mzml::MzMLWriter<W>,
     source: I,
 ) -> Result<()> {
-    for chrom in source {
-        if matches!(
-            chrom.chromatogram_type(),
-            ChromatogramType::TotalIonCurrentChromatogram | ChromatogramType::BasePeakChromatogram
-        ) {
-            continue;
-        }
-        w.write_chromatogram(&chrom).map_err(|e| anyhow!("writing chromatogram to mzML: {e}"))?;
+    let kept: Vec<Chromatogram> = source
+        .filter(|c| {
+            !matches!(
+                c.chromatogram_type(),
+                ChromatogramType::TotalIonCurrentChromatogram | ChromatogramType::BasePeakChromatogram
+            )
+        })
+        .collect();
+    w.chromatogram_count = kept.len() as u64 + 2;
+    for chrom in &kept {
+        w.write_chromatogram(chrom).map_err(|e| anyhow!("writing chromatogram to mzML: {e}"))?;
     }
     Ok(())
 }
@@ -7029,6 +7034,36 @@ mod tests {
             values("Fraction A - [%]", ArrayType::nonstandard("Fraction A - [%]")),
             (vec![2.0, 3.0, 4.0], vec![2.0, 3.0, 4.0])
         );
+    }
+
+    /// The archive → mzML export of device traces: `<chromatogramList count>` is what is written
+    /// (mzdata's writer said 2, its own TIC/BPC pair, however many source chromatograms followed),
+    /// and each trace states its chromatogram type as a cvParam, the only place mzML has for it.
+    #[test]
+    fn the_mzml_export_counts_and_types_the_device_traces() {
+        let (dir, _cleanup) = trace_scratch("mzml");
+        let dot_d = hystar_dot_d(
+            &dir,
+            &[
+                (1, "Pump HP:Pressure - [bar]", 9999, 3, &[120.0, 180.0], &[100.0, 110.0]),
+                (2, "Fraction A - [%]", 5, 4, &[120.0, 180.0], &[1.0, 2.0]),
+            ],
+        );
+        let src = dir.join("run.mzpeak");
+        write_trace_archive(&dot_d, &src);
+        let out = dir.join("run.mzML");
+        super::filter_mzpeak_to_mzml(&src, &out, &super::filter::FilterOpts::default()).unwrap();
+
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let written = xml.matches("<chromatogram ").count();
+        assert_eq!(written, 4, "the writer's TIC and BPC, and the two traces");
+        assert!(xml.contains(&format!("<chromatogramList count=\"{written}\"")), "a stale chromatogramList count");
+        let element = |id: &str| {
+            let start = xml.find(&format!("<chromatogram id=\"{id}\"")).unwrap_or_else(|| panic!("no chromatogram {id}"));
+            &xml[start..start + xml[start..].find("</chromatogram>").unwrap()]
+        };
+        assert!(element("Pump HP:Pressure - [bar]").contains("accession=\"MS:1003019\""), "a pressure chromatogram");
+        assert!(element("Fraction A - [%]").contains("accession=\"MS:1000625\""), "ProteoWizard's generic chromatogram");
     }
 
     /// The run-metadata normaliser on what mzdata's readers actually hand over: a Thermo-style
