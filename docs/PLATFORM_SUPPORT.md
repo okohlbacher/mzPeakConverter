@@ -12,12 +12,12 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | mzML, `.mzML.gz` | ✅ | ✅ | ✅ | pure Rust | — |
 | imzML (+ `.ibd`) | ✅ | ✅ | ✅ | pure Rust | — |
 | Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | pure Rust (`timsrust`); ims-compact default | — |
-| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | pure Rust (`timsrust`) | — |
-| Thermo `.raw` | ✅ | ✅ | ✅ | `dotnetrawfilereader` (managed, in-process) | **.NET 8+ runtime** |
+| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | pure Rust (`analysis.tsf` SQLite + zstd-chunked `analysis.tsf_bin`) | — |
+| Thermo `.raw` | ✅ | ✅ | ✅ | `thermorawfilereader` (managed, in-process) | **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | `libbaf2sql_c` (native C, in-process) | `libbaf2sql_c` at runtime |
 | Bruker `.d` via **timsdata SDK** (`--bruker-sdk`) | ✅ | ❌ | ✅ | Bruker `timsdata` lib (opt-in) | `libtimsdata.so`/`.dll` via `TIMSDATA_LIB_DIR` |
 | Agilent `.d` (non-IM, native) | ❌ | ❌ | ✅ (scan data; MRM/SIM-only runs refused) | out-of-process **net48** host (`AgilentGlueHost.exe`) → MHDAC, `AGL2` file protocol | MHDAC DLLs (ProteoWizard), .NET Framework 4.8 |
-| Agilent `.d` IM-MS (6560, native) | ❌ | ❌ | ⚠️ scaffold | in-process .NET glue → MIDAC | MIDAC DLLs |
+| Agilent `.d` IM-MS (6560 IM-QTOF) | ❌ | ❌ | ❌ | refused natively: the drift dimension needs MIDAC, whose in-process scaffold (`glue/agilent_midac`) has never converted a file — use `--via-msconvert` | — |
 | Agilent `.d` **profile** (`--agilent-grid`) | ⚠️ | ⚠️ | ⚠️ | pure Rust (reads `MSProfile.bin`) | — (two known decode gaps, below) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`SciexGlue.dll`) → Clearcore2 | Clearcore2 DLLs |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`ShimadzuGlue.dll`) → LabSolutions.IO | LabSolutions.IO DLLs from a **current** ProteoWizard |
@@ -25,9 +25,11 @@ ProteoWizard with `--via-msconvert` (all platforms).
 | **anything** via ProteoWizard | ✅ | ✅ | ✅ | `--via-msconvert` subprocess | a ProteoWizard install (Wine off-Windows) |
 
 ✅ native on that OS · ⚠️ partial, see the note · ⛔ present in the tree but not connected ·
-❌ not native (use `--via-msconvert`). The compile-time gates are
-`#[cfg(windows)]` (Agilent/MIDAC/SciEX/Waters) and `#[cfg(any(windows, target_os = "linux"))]`
-(BAF, timsdata SDK) in `src/main.rs`; macOS gets none of those.
+❌ not native (use `--via-msconvert`). The compile-time gates in `src/main.rs` are
+`#[cfg(windows)]` on the Agilent, MIDAC, SciEX and Shimadzu modules and on the Waters dispatch
+(`src/waters.rs` itself compiles everywhere, and runs only on Windows), and
+`#[cfg(any(windows, target_os = "linux"))]` on the BAF and timsdata SDK modules; macOS gets none of
+those.
 
 ## Why the platform split
 
@@ -114,13 +116,17 @@ The matrix above is exercised by CI (`.github/workflows/`):
   smoke-convert the committed `tests/fixtures/tiny.pwiz.1.1.mzML`. On Linux the BAF/timsdata
   readers compile in; on macOS they're correctly excluded. (Optional licensed-SDK e2e runs
   only when a runner provides the SDK + sample data.)
-- **`release.yml`** — the release archives: macOS arm64 + x86_64, Linux x86_64 + aarch64 in
-  `manylinux_2_28` (the glibc 2.28 floor is asserted on the binary), Windows x86_64 + ARM64 with
-  the glue, each built and smoke-converted natively on its own architecture. A pull request that
-  edits the workflow runs the whole matrix as a dry run.
+- **`release.yml`** — the release archives, built only from a commit whose `build-test` and
+  `windows` checks passed: macOS arm64 + x86_64 (the architecture asserted with `lipo`), Linux
+  x86_64 + aarch64 in `manylinux_2_28` (the glibc 2.28 floor asserted on the binary), Windows
+  x86_64 + ARM64 with the glue (the PE machine asserted). Each binary that can run on its runner
+  (all but macOS x86_64) must report the tag's version and convert the fixture into an archive
+  whose inspection and mzML export both hold every source spectrum. Every archive ships
+  `THIRD-PARTY-NOTICES.md`, and each release a CycloneDX SBOM generated from `Cargo.lock`. A pull
+  request that edits the workflow runs the whole matrix as a dry run.
 - **`windows.yml`** — Windows: build with the native vendor readers, run tests, build the
-  **glues `src/` actually loads — `glue/sciex`, `glue/shimadzu`, `glue/agilent_midac`, plus the
-  Agilent net48 host so it stays compilable while `BACKLOG.md` #23 is decided** — and verify
+  **glues `src/` loads — `glue/sciex`, `glue/shimadzu`, `glue/agilent_midac`, and `glue/agilent`,
+  the net48 host the native Agilent lane has spawned since 0.11.0** — and verify
   each artifact is produced (for Shimadzu also that the generated runtimeconfig carries
   `EnableUnsafeBinaryFormatterSerialization=true`, the switch whose absence broke 0.9.11),
   smoke-convert the fixture, and (separate jobs) exercise the `--via-msconvert` lane and a real

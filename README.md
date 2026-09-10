@@ -59,6 +59,7 @@ zero-intensity pad at the scan-window bounds outside the signal span is not stor
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | out-of-process **net48** host (`glue/agilent`) → MHDAC; since 0.11.0. MRM/SIM-only runs are refused (they are chromatograms) — use `--via-msconvert` for those ([details](docs/PLATFORM_SUPPORT.md)) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime. MRM/SIM dwell runs are refused (they are chromatograms) — use `--via-msconvert`; multi-sample files take `--sample N` |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/shimadzu`); LabSolutions.IO at runtime — **needs a current ProteoWizard**, see [`glue/shimadzu/README.md`](glue/shimadzu/README.md) |
+| Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` called directly, no .NET glue (`MZPC_MASSLYNX_DIR`, else `MZPC_PWIZ_DIR`); HDMSe/HDDDA functions are written as frames with a per-point drift time |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
 
 Thermo `.raw` and Bruker `.d` link their readers in automatically (no build flag).
@@ -168,7 +169,9 @@ cargo test --release           # the test suite CI runs
 ```
 
 Use the release profile, as CI does: the vendored writer carries `debug_assert`s that a plain
-debug `cargo test` can trip on inputs the release build handles. The tests that need data too large
+debug `cargo test` can trip on inputs the release build handles. The suite also needs a **.NET 8+
+runtime**, as Thermo `.raw` conversion does: `tests/thermo_raw.rs` converts the committed
+`tests/data/small.RAW` and fails without one. The tests that need data too large
 to commit — real timsTOF runs, a Bruker TSF acquisition, lane pairs built on the Windows box — are
 `#[ignore]`d, so a run without them reports them as not run rather than as passed. With the
 reference corpus:
