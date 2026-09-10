@@ -3179,7 +3179,7 @@ fn dump_agilent_profile(input: &Path) -> Result<()> {
 }
 
 /// The `--agilent-grid` writer. Its data schema is hand-built, so every column the batches carry
-/// must be declared, `spectrum_index` included: 0.11.0 dropped it (5692603), and the writer then met
+/// must be declared, `spectrum_index` included: 0.10.1 dropped it (5692603), and the writer then met
 /// the batch's index column in `route_unexpected`, which panics on a column no array metadata
 /// describes. The other hand-built TOF schemas declare it too.
 fn agilent_grid_writer_builder(level: ZstdLevel, grid: (f64, f64)) -> mzpeak_prototyping::writer::MzPeakWriterBuilder {
@@ -8440,7 +8440,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `--agilent-grid` hand-builds its data schema, which lost `spectrum_index` in 0.11.0: the writer
+    /// `--agilent-grid` hand-builds its data schema, which lost `spectrum_index` in 0.10.1: the writer
     /// meets the batch's index column in `route_unexpected` and panics, so the release build aborted
     /// on the first spectrum. No profile `.d` in reach decodes, so one gridded profile spectrum,
     /// shaped as `agilent_grid_spectrum` builds it, goes through the lane's own builder.
