@@ -197,6 +197,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   well, and the conversion goes ahead. Pinned by `tests/verbose_inspection.rs` (a TSF `.d` whose
   report fails) and `tests::inspection_opens_a_native_reader_only_when_inspecting_is_the_job`; the
   Windows branches are compiled only by CI.
+- **The native Agilent (MHDAC) lane says once when it writes MS2 rows without a precursor**, as the
+  SciEX, BAF, TSF, Waters and Agilent-profile lanes already did. The host's `AGL2` output has no
+  precursor field, so every MSn row this lane writes lacks a selected ion, isolation window and
+  activation, and nothing said so; `docs/PLATFORM_SUPPORT.md` now mentions the warning. The reader
+  is Windows-only, so `agl::tests::reader_warns_once_about_ms2_rows_without_precursors` pins the
+  warning by its source text.
 
 ### Changed
 

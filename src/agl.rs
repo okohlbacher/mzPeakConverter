@@ -306,4 +306,20 @@ mod tests {
         assert_eq!(RECORD_HEADER_BYTES, 8 + 4 * 4 + 8);
         assert!(cs.contains("bw.Write((uint)b.Length);"), "strings are len u32 + UTF-8, not BinaryWriter's 7-bit prefix");
     }
+
+    /// `agilent.rs` is Windows-only and never compiled here, so its one-shot warning is pinned by
+    /// text: this protocol carries no precursor, every MSn row the MHDAC lane writes is an orphan,
+    /// and the reader must say so once per run, where spectra are built and gated on the MS level —
+    /// as the SciEX, BAF, TSF, Waters and Agilent-profile lanes do.
+    #[test]
+    fn reader_warns_once_about_ms2_rows_without_precursors() {
+        let rs = include_str!("agilent.rs").replace("\r\n", "\n");
+        let spectrum = rs.find("pub fn spectrum(&self, i: usize)").expect("AgilentReader::spectrum");
+        let gate = spectrum + rs[spectrum..].find("if ms_level > 1 {").expect("the warning is gated on the MS level");
+        let once = rs[gate..].find("PRECURSOR_GAP_SAID.call_once(").expect("said once per run");
+        let text = rs[gate..]
+            .find("Agilent native (MHDAC): this reader does not yet extract precursors")
+            .expect("the warning names the lane and the gap");
+        assert!(once < text, "the warning sits inside the call_once");
+    }
 }
