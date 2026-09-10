@@ -24,6 +24,9 @@
 //!   3. `get_delegate_loader_for_assembly(<glue dir>/SciexGlue.dll)`.
 //!   4. `get_function_with_unmanaged_callers_only::<fn ...>(type, method)` per export.
 //!
+//! Like that crate's `BUNDLE`, the loaded glue is kept in a process-wide static (`GLUE`): hostfxr
+//! cannot be initialised again once the first handle is gone, and `-v` opens the reader twice.
+//!
 //! ## Path resolution (env vars)
 //!
 //!   * `MZPC_SCIEX_GLUE` — directory holding `SciexGlue.dll` + `SciexGlue.runtimeconfig.json`.
@@ -82,7 +85,7 @@
 use std::ffi::OsStr;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -177,9 +180,38 @@ struct GlueApi {
     run_string: Option<SciexRunStringFn>,
 }
 
+/// The CoreCLR runtime, booted ONCE per process — as `dotnetrawfilereader-sys` keeps its `BUNDLE` and
+/// `src/shimadzu.rs` its `GLUE`.
+///
+/// A second `initialize_for_runtime_config` succeeds while a handle from the first is still alive,
+/// but not after the last one has been dropped: netcorehost then frees hostfxr, the reloaded copy
+/// takes the first-context path, and hostpolicy (still loaded) rejects it ("Initialization request is
+/// expected to be non-null for requests other than the first one", 0x80008081). `-v` opens a reader
+/// for the inspection report, drops it, and opens another for the conversion, so booting per open
+/// failed every verbose native SciEX conversion and `--to mzml` export on Windows — the failure the
+/// box showed for Shimadzu before it cached its glue (0446ea3). The glue locks its own state, so one
+/// set of exports serves every reader.
+static GLUE: OnceLock<Mutex<Option<GlueApi>>> = OnceLock::new();
+
 impl GlueApi {
+    /// Process-wide, loaded on first use; later calls hand back a clone of the same exports (the first
+    /// caller's glue directory wins).
+    fn shared(glue_dir: &Path) -> Result<Self> {
+        let cell = GLUE.get_or_init(|| Mutex::new(None));
+        let mut slot = cell
+            .lock()
+            .map_err(|_| anyhow!("SciEX glue lock poisoned by an earlier panic"))?;
+        if let Some(api) = slot.as_ref() {
+            return Ok(api.clone());
+        }
+        let api = Self::load(glue_dir)?;
+        *slot = Some(api.clone());
+        Ok(api)
+    }
+
     /// Boot the CoreCLR runtime against `SciexGlue.runtimeconfig.json` in `glue_dir`, load
-    /// `SciexGlue.dll`, and resolve every `[UnmanagedCallersOnly]` export.
+    /// `SciexGlue.dll`, and resolve every `[UnmanagedCallersOnly]` export. Only through
+    /// [`GlueApi::shared`].
     fn load(glue_dir: &Path) -> Result<Self> {
         let runtime_config = glue_dir.join("SciexGlue.runtimeconfig.json");
         let assembly = glue_dir.join("SciexGlue.dll");
@@ -337,7 +369,7 @@ impl SciexReader {
 
         let pwiz_dir = resolve_clearcore2_dir()?;
 
-        let api = GlueApi::load(&glue_dir)?;
+        let api = GlueApi::shared(&glue_dir)?;
 
         let path_utf16 = to_utf16_nul(path.as_os_str())
             .with_context(|| format!("encoding WIFF path {}", path.display()))?;
