@@ -6,11 +6,12 @@
 //!     spectra with exit 1;
 //!   * `--drop-aux` could delete a core facet and exit 0;
 //!   * `--ms-level` / `--rt` defaulted a missing or retyped column (level 0 / NaN) and kept nothing;
-//!   * `--rt` never refreshed `number_of_data_points` in the flat `chromatograms_metadata`.
+//!   * `--rt` never refreshed `number_of_data_points` in the flat `chromatograms_metadata`;
+//!   * an archive it wrote with `--ms-level` / `--rt` could not be read back.
 //!
 //! Each test converts its fixture into a scratch directory that belongs to that test alone.
 
-use arrow::array::{Array, RecordBatch, StructArray, UInt8Array, UInt64Array};
+use arrow::array::{Array, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashMap;
 use std::fs::File;
@@ -147,6 +148,30 @@ fn mzml_output_applies_the_same_filters() {
         ok(&mzpc(&src, &out, &args));
         let xml = std::fs::read_to_string(&out).unwrap();
         assert_eq!(xml.matches("<spectrum ").count(), 1, "{args:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A filtered archive keeps each survivor's original, now sparse, `index`. Reading one back aborted
+/// (the reader sized its per-spectrum tables by row count), and the export walked `0..len`, which
+/// asks for spectra that are gone. Each archive must export exactly the spectra it holds.
+#[test]
+fn filtered_archives_read_back() {
+    let dir = scratch("read_back");
+    let src = convert(TINY, &dir);
+    let (out, mzml) = (dir.join("f.mzpeak"), dir.join("f.mzML"));
+    for args in [["--ms-level", "1"], ["--ms-level", "2"], ["--rt", "0-1"], ["--rt", "0-0.0001"]] {
+        ok(&mzpc(&src, &out, &args));
+        let meta = table(&out, "spectra_metadata.parquet");
+        let (index, id) = (column::<UInt64Array>(&meta, "index"), column::<LargeStringArray>(&meta, "id"));
+        let mut want: Vec<(u64, String)> = (0..meta.num_rows()).map(|r| (index.value(r), id.value(r).to_string())).collect();
+        want.sort();
+        let want: Vec<String> = want.into_iter().map(|(_, id)| id).collect();
+
+        ok(&mzpc(&out, &mzml, &[]));
+        let xml = std::fs::read_to_string(&mzml).unwrap();
+        let got: Vec<&str> = xml.split("<spectrum id=\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
+        assert_eq!(got, want, "{args:?}: the export must hold exactly the archive's spectra");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

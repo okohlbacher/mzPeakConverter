@@ -164,6 +164,14 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
   of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
   re-encoded.
+- **An archive rewritten with `--ms-level` or `--rt` can be read back.** The rewrite keeps each
+  surviving spectrum's original index, but the vendored reader sized its per-spectrum tables (m/z
+  models, point, peak and auxiliary-array counts) by the number of rows, so
+  `mzpeak-convert f.mzpeak -o f.mzML` aborted with an index-out-of-bounds panic whenever the
+  survivors were not `0..n`: on `tiny.pwiz.1.1`, `--ms-level 1`, `--ms-level 2`, `--rt 0-1` and
+  `--rt 0-0.0001` all did. The tables now grow to the largest index, and the export walks the
+  indices the archive holds rather than `0..n`, which asked for filtered-out spectra and never
+  reached the last ones. Pinned by `filtered_archives_read_back` in `tests/filter_lane.rs`.
 - **A release is built only from a commit that passed CI.** `release.yml` runs no tests, and
   `windows.yml` cancelled a push's run as soon as the next commit reached `main` — so v0.10.0
   (85afceb), v0.10.1 (5692603) and v0.11.3 (4ff30a6) were released with their `windows` job
