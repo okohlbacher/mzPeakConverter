@@ -308,7 +308,8 @@ struct Cli {
     #[arg(long)]
     chunk_size: Option<f64>,
 
-    /// Zstd compression level (1–22) [default: 3].
+    /// Zstd compression level (1–22) [default: 3; the timsTOF ims-compact lanes: 5, the measured
+    /// byte-plane plateau]. An explicit value applies to every lane.
     #[arg(long)]
     zstd_level: Option<i32>,
 
@@ -399,13 +400,17 @@ struct Cli {
     #[arg(long = "drop-aux")]
     drop_aux: Vec<String>,
 
-    /// **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by
-    /// DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) +
-    /// a per-run `{c0,c1}` instead, recovering `m/z = (c0 + c1·tof_index)²`. **Off by default** and
+    /// **Inputs read through mzdata only** (mzML incl. `--via-msconvert`, imzML, Thermo `.raw`, and a
+    /// TDF read as f64 m/z under `--no-ims-compact` or the ims-compact fallback): compactify
+    /// exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z
+    /// and storing `tof_index` (Int32) + a per-run `{c0,c1}` instead, recovering
+    /// `m/z = (c0 + c1·tof_index)²`. **Off by default** and
     /// bounded-lossy (reconstruction within `PPM_TOL`) — it reverse-engineers the grid msconvert
     /// discarded. `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise);
-    /// `off` keeps exact f64. Native vendor readers with the true grid (Bruker, Agilent) ignore
-    /// this — they read it from the vendor calibration losslessly (strategy B) and always do so.
+    /// `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF
+    /// ims-compact lanes and `--agilent-grid` store the integer grid of the vendor calibration
+    /// (lossless), and the Bruker TSF/BAF, Agilent MHDAC (with a warning), Waters and Shimadzu lanes
+    /// store the m/z their reader returns.
     ///
     /// **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that
     /// lane also fits the grid statistically. There the default (flag absent) is `auto` — the
@@ -424,8 +429,10 @@ struct Cli {
     sample: Option<u32>,
 
     /// Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from
-    /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + a
-    /// per-run `{c0,c1}` calibration instead of f64 m/z, recovering `m/z = (c0 + c1·tof_index)²`.
+    /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) with
+    /// per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id` columns (the MassHunter calibration drifts
+    /// from scan to scan) instead of f64 m/z, recovering `m/z = (tof_c0 + tof_c1·tof_index)²`, in
+    /// `spectra_data` (it is profile data).
     /// Far smaller than the msconvert lane (≈0.14×). OFF by default; only applies when
     /// `AcqData/MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path).
     #[arg(long)]

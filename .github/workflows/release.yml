@@ -10,6 +10,9 @@
 # whole matrix as a DRY RUN: built, verified, kept as workflow artifacts, nothing published — so a
 # broken release job is found before a tag needs it.
 #
+# Beside the archives each release carries a CycloneDX SBOM generated from Cargo.lock by
+# tools/gen_sbom.py, and every archive ships THIRD-PARTY-NOTICES.md, which holds the Apache-2.0 text.
+#
 # No Rust cache here: a tag builds once, and the six ~570 MB caches the first dry run saved pushed
 # the repository past GitHub's 10 GB Actions-cache limit, evicting CI's own. Cold builds take 6-13 min.
 #
@@ -69,35 +72,76 @@ jobs:
         run: |
           set -euo pipefail
           case "$GITHUB_EVENT_NAME" in
-            pull_request)      sha="$PR_HEAD" ;;  # the dry run waits on the pull request's own CI
-            workflow_dispatch) sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)" ;;
-            *)                 sha="$GITHUB_SHA" ;;
+            pull_request)      ref="$PR_HEAD" ;;  # the dry run waits on the pull request's own CI
+            workflow_dispatch) ref="refs/tags/$TAG" ;;
+            *)                 ref="$GITHUB_SHA" ;;
           esac
-          echo "gating on $sha"
-          pending="the check-runs API" deadline=$(( $(date +%s) + 90 * 60 ))
+          # Both workflows take a dispatch on any ref, and the check runs a dispatch creates count here
+          # like a push's: the remedy for a commit CI never ran on, and for one past GitHub's 30-day
+          # re-run window.
+          on="${GITHUB_HEAD_REF:-$TAG}"
+          remedy="run \`gh workflow run ci.yml --ref $on\` and \`gh workflow run windows.yml --ref $on\`, then re-run this workflow once both have passed"
+          start=$(date +%s)
+          deadline=$(( start + 90 * 60 ))
+          sha="" pending="the commits API" refused=0
           while :; do
-            # The newest run of each job counts, so re-running a cancelled one clears the way. The API
-            # lists newest first and a release commit carries ~15 check runs, so one page is plenty.
-            # `$want` is jq's variable, not the shell's.
-            # shellcheck disable=SC2016
-            if states="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?filter=all&per_page=100" --jq '
-                ["build-test (ubuntu-latest)", "build-test (macos-latest)", "windows"][] as $want
-                | ([.check_runs[] | select(.name == $want)] | max_by(.id)) // {status: "not started"}
-                | [$want, .status, .conclusion // ""] | @tsv')"; then
+            if [ -z "$sha" ]; then
+              # The commits API peels an annotated tag to its commit and refuses a ref that names none;
+              # check-runs answers a tag object's own SHA with 422, which this loop would wait out.
+              call="commits/$ref" filter='[.sha, .commit.committer.date] | @tsv'
+            else
+              # The newest run of each job counts, so re-running a cancelled one clears the way. The API
+              # lists newest first and a release commit carries ~15 check runs, so one page is plenty.
+              # The first line counts those three jobs' runs alone: on a push or a pull request this
+              # workflow's own jobs, this one included, are check runs on the same commit.
+              # `$gated` and `$want` are jq's variables, not the shell's.
+              # shellcheck disable=SC2016
+              call="commits/$sha/check-runs?filter=all&per_page=100" filter='
+                ["build-test (ubuntu-latest)", "build-test (macos-latest)", "windows"] as $gated
+                | ([.check_runs[] | select(.name | IN($gated[]))] | length),
+                  ($gated[] as $want
+                   | ([.check_runs[] | select(.name == $want)] | max_by(.id)) // {status: "not started"}
+                   | [$want, .status, .conclusion // ""] | @tsv)'
+            fi
+            if out="$(gh api "repos/$GITHUB_REPOSITORY/$call" --jq "$filter" 2> "$RUNNER_TEMP/gh-api.err")"; then
+              refused=0
+              if [ -z "$sha" ]; then
+                IFS=$'\t' read -r sha committed <<< "$out"
+                committed_at="$(date -d "$committed" +%s)"
+                echo "gating on $sha, committed $committed"
+                continue
+              fi
               pending=""
               while IFS=$'\t' read -r name status conclusion; do
                 if [ "$status" != completed ]; then
                   pending+="$name ($status); "
                 elif [ "$conclusion" != success ]; then
-                  echo "::error::'$name' concluded '$conclusion' on $sha — nothing is released from a commit whose CI did not pass. Re-run that job, then re-run this workflow."
+                  echo "::error::'$name' concluded '$conclusion' on $sha — nothing is released from a commit whose CI did not pass. Re-run that job, or $remedy."
                   exit 1
                 fi
-              done <<< "$states"
+              done <<< "${out#*$'\n'}"
               [ -n "$pending" ] || { echo "build-test (ubuntu-latest), build-test (macos-latest) and windows passed"; exit 0; }
+              # A commit CI never ran on gets none of those runs later (one pushed together with a later
+              # commit, as v0.7.3 and v0.4.12 were, or a [skip ci] one), so do not wait 90 minutes for
+              # it. Ten minutes lets a slow queue start; the age keeps a commit just pushed waiting.
+              now=$(date +%s)
+              if [ "${out%%$'\n'*}" = 0 ] && [ $(( now - start )) -ge 600 ] && [ $(( now - committed_at )) -ge 10800 ]; then
+                echo "::error::$sha (committed $committed) has no build-test or windows check run: CI never ran on it, so there is nothing to wait for. To release it, $remedy."
+                exit 1
+              fi
               echo "waiting on ${pending%; }"
+            else
+              cat "$RUNNER_TEMP/gh-api.err" >&2
+              # An HTTP 4xx three times running is GitHub's answer, not an outage: a ref that names no
+              # commit, or a token without checks: read. A 5xx or a dropped connection is retried.
+              if grep -q 'HTTP 4[0-9][0-9]' "$RUNNER_TEMP/gh-api.err"; then refused=$(( refused + 1 )); else refused=0; fi
+              if [ "$refused" -ge 3 ]; then
+                echo "::error::GitHub refused repos/$GITHUB_REPOSITORY/$call three times running ($(grep -o 'HTTP 4[0-9][0-9]' "$RUNNER_TEMP/gh-api.err" | tail -1)) — nothing is released from a commit whose CI cannot be read"
+                exit 1
+              fi
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::still waiting after 90 min on ${pending%; } for $sha — CI runs on pushes to main and on pull requests, so a commit that reached neither has none to wait for"
+              echo "::error::still waiting after 90 min on ${pending%; } for ${sha:-$ref}. If those checks will never finish, $remedy."
               exit 1
             fi
             sleep 60
@@ -153,9 +197,9 @@ jobs:
           # entitlements plist granting com.apple.security.cs.disable-library-validation, .allow-jit
           # and .allow-unsigned-executable-memory, or that path dies only on signed builds.
           codesign --force --sign - "$stage/mzpeak-convert"
-          cp LICENSE README.md "$stage/"
+          cp LICENSE README.md THIRD-PARTY-NOTICES.md "$stage/"
           tarball="mzpeak-convert-$VERSION-${{ matrix.target }}.tar.gz"
-          ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$dist/$tarball" mzpeak-convert LICENSE README.md )
+          ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$dist/$tarball" mzpeak-convert LICENSE README.md THIRD-PARTY-NOTICES.md )
           # Hash from inside the directory so the sidecar names the bare file with shasum's own
           # two-space separator — `shasum -c` rejects anything else.
           ( cd "$dist" && shasum -a 256 "$tarball" > "$tarball.sha256" )
@@ -166,14 +210,27 @@ jobs:
           set -euo pipefail
           bin="$RUNNER_TEMP/stage/mzpeak-convert"
           file "$bin"
-          lipo -archs "$bin"
+          # Asserted, not just printed: the x86_64 slice never runs here, so this is what keeps an arm64
+          # build from shipping under the x86_64 name, or back.
+          archs="$(lipo -archs "$bin")"
+          [ "$archs" = "${{ matrix.arch }}" ] || { echo "::error::$bin holds '$archs', expected ${{ matrix.arch }}"; exit 1; }
           codesign -dvv "$bin" 2>&1 | grep -E "Signature|flags"
           ( cd "$RUNNER_TEMP/dist" && shasum -a 256 -c ./*.sha256 )
+          # The licenses travel with the binary: the notices hold the Apache-2.0 text and NOTICE.
+          tar -tzf "$RUNNER_TEMP"/dist/*.tar.gz | grep -x THIRD-PARTY-NOTICES.md > /dev/null || { echo "::error::the archive lacks THIRD-PARTY-NOTICES.md"; exit 1; }
           # Only the native slice can be executed on this runner.
           if [ "${{ matrix.arch }}" = arm64 ]; then
-            "$bin" --version
+            have="$("$bin" --version)"
+            [ "$have" = "mzpeak-convert $VERSION" ] || { echo "::error::--version says '$have', expected mzpeak-convert $VERSION"; exit 1; }
             "$bin" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
-            test -s "$RUNNER_TEMP/smoke.mzpeak"
+            # Read the archive back, so one that is written but unreadable fails here: the inspection
+            # report and the mzML export must both hold every spectrum of the source.
+            n="$(grep -o '<spectrumList count="[0-9]*"' tests/fixtures/tiny.pwiz.1.1.mzML | tr -dc 0-9)"
+            report="$("$bin" "$RUNNER_TEMP/smoke.mzpeak")"
+            grep -Eqx "spectra: +$n" <<< "$report" || { echo "::error::inspecting smoke.mzpeak does not count $n spectra"; echo "$report"; exit 1; }
+            "$bin" "$RUNNER_TEMP/smoke.mzpeak" -o "$RUNNER_TEMP/smoke.mzML" --force
+            m="$(grep -c '<spectrum ' "$RUNNER_TEMP/smoke.mzML" || true)"
+            [ "$m" = "$n" ] || { echo "::error::smoke.mzML holds $m spectra, the source $n"; exit 1; }
           fi
 
       - uses: actions/upload-artifact@v4
@@ -222,10 +279,10 @@ jobs:
           set -euo pipefail
           stage="$RUNNER_TEMP/stage" dist="$RUNNER_TEMP/dist"
           mkdir -p "$stage" "$dist"
-          cp target/release/mzpeak-convert LICENSE README.md "$stage/"
+          cp target/release/mzpeak-convert LICENSE README.md THIRD-PARTY-NOTICES.md "$stage/"
           strip "$stage/mzpeak-convert"
           tarball="mzpeak-convert-$VERSION-${{ matrix.target }}.tar.gz"
-          tar -C "$stage" -czf "$dist/$tarball" mzpeak-convert LICENSE README.md
+          tar -C "$stage" -czf "$dist/$tarball" mzpeak-convert LICENSE README.md THIRD-PARTY-NOTICES.md
           ( cd "$dist" && sha256sum "$tarball" > "$tarball.sha256" )
           { echo "### ${{ matrix.target }}"; echo '```'; cat "$dist/$tarball.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
@@ -242,9 +299,19 @@ jobs:
           [ "$(printf '%s\n' "$floor" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] \
             || { echo "::error::binary requires $floor, above the manylinux_2_28 floor"; exit 1; }
           ( cd "$RUNNER_TEMP/dist" && sha256sum -c ./*.sha256 )
-          "$bin" --version
+          # The licenses travel with the binary: the notices hold the Apache-2.0 text and NOTICE.
+          tar -tzf "$RUNNER_TEMP"/dist/*.tar.gz | grep -x THIRD-PARTY-NOTICES.md > /dev/null || { echo "::error::the archive lacks THIRD-PARTY-NOTICES.md"; exit 1; }
+          have="$("$bin" --version)"
+          [ "$have" = "mzpeak-convert $VERSION" ] || { echo "::error::--version says '$have', expected mzpeak-convert $VERSION"; exit 1; }
           "$bin" tests/fixtures/tiny.pwiz.1.1.mzML -o "$RUNNER_TEMP/smoke.mzpeak" --force
-          test -s "$RUNNER_TEMP/smoke.mzpeak"
+          # Read the archive back, so one that is written but unreadable fails here: the inspection
+          # report and the mzML export must both hold every spectrum of the source.
+          n="$(grep -o '<spectrumList count="[0-9]*"' tests/fixtures/tiny.pwiz.1.1.mzML | tr -dc 0-9)"
+          report="$("$bin" "$RUNNER_TEMP/smoke.mzpeak")"
+          grep -Eqx "spectra: +$n" <<< "$report" || { echo "::error::inspecting smoke.mzpeak does not count $n spectra"; echo "$report"; exit 1; }
+          "$bin" "$RUNNER_TEMP/smoke.mzpeak" -o "$RUNNER_TEMP/smoke.mzML" --force
+          m="$(grep -c '<spectrum ' "$RUNNER_TEMP/smoke.mzML" || true)"
+          [ "$m" = "$n" ] || { echo "::error::smoke.mzML holds $m spectra, the source $n"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -315,7 +382,7 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP $name
           $dist  = Join-Path $env:RUNNER_TEMP 'dist'
           New-Item -ItemType Directory -Force $stage, $dist | Out-Null
-          Copy-Item target/release/mzpeak-convert.exe, LICENSE, README.md $stage
+          Copy-Item target/release/mzpeak-convert.exe, LICENSE, README.md, THIRD-PARTY-NOTICES.md $stage
           # The converter looks for each glue under glue\<name>\ beside the exe when its MZPC_*_GLUE
           # variable is unset, so this layout is the contract, not a convenience.
           $glue = [ordered]@{
@@ -346,7 +413,8 @@ jobs:
           Write-Output ("PE machine 0x{0:X4}" -f $machine)
           if ($machine -ne ${{ matrix.machine }}) { Write-Output "::error::expected machine ${{ matrix.machine }}"; exit 1 }
 
-          $need = 'glue/sciex/SciexGlue.dll', 'glue/sciex/SciexGlue.runtimeconfig.json',
+          $need = 'LICENSE', 'THIRD-PARTY-NOTICES.md',
+                  'glue/sciex/SciexGlue.dll', 'glue/sciex/SciexGlue.runtimeconfig.json',
                   'glue/shimadzu/ShimadzuGlue.dll', 'glue/shimadzu/ShimadzuGlue.runtimeconfig.json',
                   'glue/agilent/AgilentGlueHost.exe',
                   'glue/agilent_midac/AgilentMidacGlue.dll', 'glue/agilent_midac/AgilentMidacGlue.runtimeconfig.json'
@@ -371,11 +439,21 @@ jobs:
           $want = (Get-Content "$($zip.FullName).sha256").Split(' ')[0]
           if ((Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower() -ne $want) { Write-Output "::error::sidecar mismatch"; exit 1 }
 
-          & $exe --version
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $have = & $exe --version
+          if ($LASTEXITCODE -ne 0 -or $have -ne "mzpeak-convert $env:VERSION") { Write-Output "::error::--version says '$have', expected mzpeak-convert $env:VERSION"; exit 1 }
           $smoke = Join-Path $env:RUNNER_TEMP 'smoke.mzpeak'
           & $exe tests/fixtures/tiny.pwiz.1.1.mzML -o $smoke --force
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $smoke) -or (Get-Item $smoke).Length -eq 0) { Write-Output "::error::smoke conversion failed"; exit 1 }
+          # Read the archive back, so one that is written but unreadable fails here: the inspection
+          # report and the mzML export must both hold every spectrum of the source.
+          $n = [regex]::Match((Get-Content tests/fixtures/tiny.pwiz.1.1.mzML -Raw), '<spectrumList count="(\d+)"').Groups[1].Value
+          $report = & $exe $smoke
+          if ($LASTEXITCODE -ne 0 -or -not ($report -match ('^spectra:\s+{0}$' -f $n))) { Write-Output "::error::inspecting smoke.mzpeak does not count $n spectra"; $report; exit 1 }
+          $mzml = Join-Path $env:RUNNER_TEMP 'smoke.mzML'
+          & $exe $smoke -o $mzml --force
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::exporting smoke.mzpeak to mzML failed"; exit 1 }
+          $m = [regex]::Matches((Get-Content $mzml -Raw), '<spectrum ').Count
+          if ($m -ne [int]$n) { Write-Output "::error::smoke.mzML holds $m spectra, the source $n"; exit 1 }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -384,11 +462,49 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # What the binaries link, from the same Cargo.lock the platform jobs build with. Generated per
+  # release rather than tracked: the tracked sbom.cdx.json still described 0.1.0 at 0.11.5.
+  sbom:
+    name: SBOM
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate the CycloneDX SBOM from Cargo.lock
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "${TAG#v}" != "$version" ]; then
+            echo "::error::tag $TAG carries version ${TAG#v} but Cargo.toml says $version"
+            exit 1
+          fi
+          dist="$RUNNER_TEMP/dist"
+          sbom="mzpeak-convert-$version.cdx.json"
+          mkdir -p "$dist"
+          cargo metadata --format-version 1 --all-features --locked | python3 tools/gen_sbom.py > "$dist/$sbom"
+          # `$v` is jq's variable, not the shell's.
+          # shellcheck disable=SC2016
+          jq -e --arg v "$version" '.metadata.component.version == $v' "$dist/$sbom" > /dev/null \
+            || { echo "::error::$sbom does not describe mzpeak-convert $version"; exit 1; }
+          ( cd "$dist" && sha256sum "$sbom" > "$sbom.sha256" )
+          { echo "### SBOM"; jq -r '"\(.components | length) dependency components"' "$dist/$sbom"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-sbom
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   # One place attaches everything, so the platform jobs no longer race to create the release, and a
   # platform that failed does not hold back the ones that built — the run still goes red for it.
   publish:
     name: Attach to the release
-    needs: [ci, macos, linux, windows]
+    needs: [ci, macos, linux, windows, sbom]
     if: ${{ always() && needs.ci.result == 'success' && !cancelled() && github.event_name != 'pull_request' && !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -404,7 +520,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           files=(dist/*)
-          [ ${#files[@]} -gt 0 ] || { echo "::error::no platform produced an archive"; exit 1; }
+          archives=(dist/*.tar.gz dist/*.zip)
+          [ ${#archives[@]} -gt 0 ] || { echo "::error::no platform produced an archive"; exit 1; }
           # Hashes written on three operating systems, checked on a fourth.
           ( cd dist && sha256sum -c ./*.sha256 )
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \

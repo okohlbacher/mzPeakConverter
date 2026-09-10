@@ -113,9 +113,9 @@ mzpeak-convert agilent.d -o out.mzpeak --via-msconvert
 
 `mzpeak-convert [OPTIONS] <INPUT>`
 
-The table is regenerated from `mzpeak-convert --help` of the shipped binary (29 options; the
-wording is the help's own, shortened). `--help` is the long form; `-h` prints a one-line summary
-per option.
+The table follows `mzpeak-convert --help` of the shipped binary (the wording is the help's own,
+shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help` is the long form;
+`-h` prints a one-line summary per option.
 
 | Option | Default | Description |
 |---|---|---|
@@ -132,7 +132,7 @@ per option.
 | `--no-ims-compact` | off | Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and write standard f64 m/z instead |
 | `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum (Shimadzu `.lcd` does). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written. Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) |
 | `--ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: select the **chunked** layout for rapid m/z-range access instead of the default **archive** layout (a flat table of absolute integer TOF bins). Splits each frame's peaks into 50-Th m/z bins (`--chunk-size` overrides), each chunk recording its TOF bounds as page-prunable Parquet columns — XIC / m/z-slice queries ~20× faster at parity-to-+8 % size. TOF is delta-encoded within each chunk: `chunk_start + cumsum(deltas)`, lossless (§9) |
-| `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
+| `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
 | `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's vendor-grade scan→1/K0 recalibration (the `TimsCalibration` ModelType-2 model) and use timsrust's linear approximation. Recalibration is ON by default. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra (synthesis is on by default) |
@@ -142,7 +142,7 @@ per option.
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
 | `--drop-aux <DROP_AUX>` | — | mzPeak input only: drop archive members matching this glob (repeatable) (§4.2) |
-| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **mzML inputs only** (incl. `--via-msconvert`): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. Native readers ignore it: Bruker reads the integer grid from the vendor calibration, and the native Agilent (MHDAC) lane stores the f64 m/z the vendor library returns (a warning names the alternatives: `--via-msconvert --tof-grid`, or `--agilent-grid` for the flight-time grid of a profile `.d`). **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
+| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **Inputs read through mzdata only** (mzML incl. `--via-msconvert`, imzML, Thermo `.raw`, and a TDF read as f64 m/z under `--no-ims-compact` or the ims-compact fallback): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF ims-compact lanes and `--agilent-grid` store the integer grid of the vendor calibration (lossless), and the Bruker TSF/BAF, Agilent MHDAC, Waters and Shimadzu lanes store the m/z their reader returns (on MHDAC a warning names the alternatives: `--via-msconvert --tof-grid`, or `--agilent-grid` for the flight-time grid of a profile `.d`). **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
 | `--agilent-grid` | off | Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id` columns (the MassHunter calibration drifts per scan) instead of f64 m/z — in `spectra_data`, since it is profile data (0.10.1; earlier releases filed it as centroid). Far smaller than the msconvert lane (≈0.14×). Only applies when `MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path) |
 | `--sample <N>` | — | SciEX `.wiff` only: convert sample `N` (1-based) of a multi-sample WIFF. Native lane and both `--via-msconvert` lanes, mzPeak and `--to mzml` (mapped to msconvert's `--runIndexSet N-1`). A multi-sample WIFF without it is refused: the native lane lists its samples, the msconvert lanes give their count once msconvert has written every run. `0`, and a number beyond the file's samples, are refused |
 | `--via-msconvert` | off | Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor path for formats without a native reader in this build (Agilent `.d`, SciEX `.wiff`, …) |
@@ -154,32 +154,34 @@ per option.
 **Options a lane cannot honour are refused, not dropped.** Since 0.9.13 the converter checks the
 options you actually passed **on the command line** — never built-in defaults, and never a
 config-file value (a config is a standing profile: its values take effect as defaults but cannot
-make a lane refuse) — against the lane it selected, *before* any reader is opened, and exits 1
-naming the option, the lane and the remedy, e.g. `--sdrf is not honoured by the timsTOF ims-compact
-lane: the archive would be written WITHOUT it and exit 0. convert first, then add them on the
-archive: …`. Earlier releases wrote the archive without the option and exited 0. The one exception
-is the `.mzpeak` → `.mzpeak` filter lane, where a listed option loses nothing (the members are
-re-packed verbatim): it is warned about by name and the run goes on. The table:
+make a lane refuse) — against the lane it selected, *before* any reader is opened. An option the
+lane would **drop**, so that the output came out without it, exits 1 naming the option, the lane
+and the remedy, e.g. `--sdrf is not honoured by the timsTOF ims-compact lane: the archive would be
+written WITHOUT it and exit 0. convert first, then add them on the archive: …`; earlier releases
+wrote the archive without the option and exited 0. An option that merely **cannot change** the
+lane's output is named in a warning (`--layout is inert on …`) and the run goes on. The two columns
+are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 
-| Lane (how it is selected) | Refused options |
-|---|---|
-| `.mzpeak` → `.mzpeak` filter (§4.2) | **warned, not refused** — every convert-only option: `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --representation --ims-chunked --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` is inert there (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output); the run continues with a warning naming the flag |
-| `.mzpeak` → mzML export (§4.1) | the convert-only options above, plus `--image --sdrf` |
-| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --image --sdrf --tof-grid --agilent-grid` (`--representation` is honoured by BAF for mzPeak output only and is warned about, not refused) |
-| `--agilent-grid` | `--image --sdrf --via-msconvert --layout --no-numpress --chunk-size` |
-| `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded); `--image` / `--sdrf` ARE embedded since 0.9.13 |
-| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-tims-recalibration --layout --no-numpress --chunk-size` |
-| `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-tims-recalibration` |
-| default timsTOF (TDF) ims-compact | `--image --sdrf --layout --no-numpress` |
-| native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` |
-| standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | nothing |
+| Lane (how it is selected) | Refused (exit 1) | Warned; the run goes on |
+|---|---|---|
+| `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --representation --ims-chunked --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output) |
+| `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux` | the filter lane's list without `--aux` |
+| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
+| `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert` | `--layout --no-numpress --chunk-size` |
+| `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
+| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-tims-recalibration` | `--layout --no-numpress --chunk-size` |
+| `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-tims-recalibration` | — |
+| default timsTOF (TDF) ims-compact | `--image --sdrf` | `--layout --no-numpress` |
+| native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` | — |
+| standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | — | — |
 
-Options a lane merely has no use for but that cannot change its output (`--no-vendor` on an mzML
-export, `--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input) are
-deliberately *not* refused, so a shared recipe or config keeps working. Config-file values never
-count as supplied, so a shared profile carrying `zstd_level: 12` or `sdrf:` sets defaults for the
-lanes that use them and is a silent no-op on the lanes that cannot — put such an option on the
-command line when you want the refusal to protect you.
+Options a lane has no use for that appear in neither column (`--no-vendor` on an mzML export,
+`--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input converted to
+mzPeak) are accepted without a refusal, so a shared recipe or config keeps working; of those, only
+`--tof-grid` on the Agilent MHDAC lane logs a warning. Config-file values never count as supplied,
+so a shared profile carrying `zstd_level: 12` or `sdrf:` sets defaults for the lanes that use them
+and is a silent no-op on the lanes that cannot — put such an option on the command line when you
+want the refusal to protect you.
 
 ### 4.1 mzML output (`--to mzml`, `-o x.mzML`, `-o x.mzML.gz`)
 
@@ -315,6 +317,7 @@ take effect because settings are resolved before logging is initialised.
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | net48 `AgilentGlueHost.exe` (§11) → MHDAC, since 0.11.0; **MRM/SIM-only runs are refused** — they are transition chromatograms, use `--via-msconvert` for them |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | auto-built; Clearcore2 DLLs at runtime; **MRM/SIM dwell runs are refused** (they are transition chromatograms — `--via-msconvert` writes them as SRM chromatograms); multi-sample files need `--sample N` |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | LabSolutions.IO DLLs at runtime (§11); profile as a sqrt grid, centroids as an exact lattice (§8, §9) |
+| Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` through its C ABI, no .NET glue (§11); HDMSe/HDDDA functions as frames with a per-point drift time (§8) |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Windows, or Wine elsewhere) |
 
 The native vendor readers are **compiled in automatically on the platforms where
@@ -430,7 +433,12 @@ every point MassLynx returns: the writer's zero-run mask is off for them (`zero-
 from `transformations`), because a run of zeros in an interleaved frame is several bins' trace
 boundaries meeting. ProteoWizard's default instead writes one spectrum per drift bin (Capan2:
 397,800 spectra for 1,989 scans); the two are the same data (verified bin for bin), 531 MB as
-frames against 965 MB as bins. Spectra are in acquisition-time order across functions. The scan
+frames against 965 MB as bins. Keeping every point has a size cost, accepted for per-bin fidelity:
+zero flanks are 44–46 % of the stored points on the corpus HDMSe runs, and a frame archive is about
+3.2× the drift-summed one earlier releases wrote (Capan2 166 → 531 MB, PXD077098 2.1 → 9.0 GB).
+MassLynx returns only flank zeros plus two sentinels per bin, so a mask that keeps peak boundaries
+would save nothing, and dropping every zero could not be undone. Spectra are in acquisition-time
+order across functions. The scan
 row's `ion_mobility_value` stays NULL on purpose: a frame has no single drift time. Retention time,
 polarity, scan window, the MS level (from the function-type code: product-ion types are MS2, the
 second function of an MSe pair is MS2, every other MS function — lock mass, auxiliary — is MS1) and
@@ -519,12 +527,12 @@ pair: its `tof_c0`/`tof_c1` cells are NULL, readers fall back to the chord for t
 and the count appears as `"per_spectrum_chord_frames"` — so `"exact_per_spectrum": true` is a
 per-spectrum statement (a spectrum *with* the pair is on the model). A run with any `C2 ≠ 0`
 row, or a TDF whose `Frames` table lacks `T1`/`MzCalibration` (both lanes), gets no
-`tof_c0`/`tof_c1` columns and no `per_spectrum` keys — nothing changes for it. One caveat: the
-ModelType-1 formula is SDK-verified on `C2 ≠ 0` runs only, so the `C2 = 0` pair reproduces the
-*formula* exactly; `MZPC_TDF_SDK_GOLDEN=<out.json>` (§10) dumps the SDK's own `tims_index_to_mz`
-at up to 240 `(frame, tof)` points during a `--bruker-sdk` conversion, and dropping that dump of
-2485.d in as `tests/fixtures/tdf_calibration_golden_c2zero.json` turns the converter's
-`c2_zero_sdk_goldens_match_the_sqrt_linear_pair` test into the missing vendor check.
+`tof_c0`/`tof_c1` columns and no `per_spectrum` keys — nothing changes for it. The `C2 = 0` pair is
+checked against the vendor too: `MZPC_TDF_SDK_GOLDEN=<out.json>` (§10) dumps the SDK's own
+`tims_index_to_mz` at up to 240 `(frame, tof)` points during a `--bruker-sdk` conversion, and the
+dump of 2485.d, committed as `tests/fixtures/tdf_2485_sdk_golden.json`, is what
+`sqrt_linear_pair_matches_the_vendor_sdk_goldens` (`src/bruker_native.rs`) holds the pair to: it
+reproduces the SDK to 1.0e-7 ppm, where the run-wide chord is 4.28 ppm off.
 
 **Several precursors on one spectrum (timsTOF PASEF).** dia-PASEF writes two precursors
 per MS2 frame and DDA-PASEF several, all with the same `(source_index, precursor_index)`
@@ -600,7 +608,7 @@ lanes say `bounded-lossy` with `roundtrip_tolerance_ppm`.
 
 **The `transformations` index key.** Every mzPeak lane writes `metadata.transformations` — a JSON
 list of the declared, bounded changes the converter made to the vendor signal on its way in
-(`transformations_block`, `src/main.rs:4683`). An empty list is a statement too. The vocabulary:
+(`transformations_block` in `src/main.rs`). An empty list is a statement too. The vocabulary:
 
 | Entry | Written when | Lanes |
 |---|---|---|
@@ -699,7 +707,8 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
   (SCIEX) nothing is gridded and `spectra_data` keeps the requested chunked layout. Size: the
   off-lattice profile minority of a native SCIEX run is now stored as exact f64 points rather than
   numpress chunks — on the corpus that share is 0.07–9.2 % of the points and the archives grew
-  0.2–27 % (see the 0.10.1 changelog for the per-file numbers).
+  0.2–27 % (see the 0.10.1 changelog for the per-file numbers). That size is accepted: no
+  chunk-capable integer axis or mixed layout is planned.
 - **ims-compact TOF layout (two modes)** — the peak facet has two mutually-exclusive layouts,
   recorded in `ims_calibration.tof_encoding`:
   - **Archive** *(default)* — a flat table of **absolute integer TOF bins** (`absolute`). Maximum
@@ -761,24 +770,24 @@ is lost. For Thermo `.raw`, the scan trailers (FAIMS CV, injection time, charge,
 | `DOTNET_ROLL_FORWARD` | set automatically to `LatestMajor` if unset, **for Thermo `.raw` input only** (since 0.9.13 — set for every input it overrode the Shimadzu glue's own `rollForward: LatestMinor`, which on a .NET 9 host hoists the glue onto a runtime without the `BinaryFormatter` path it needs) |
 | `MZDATA_IGNORE_UNKNOWN_INSTRUMENT` | set automatically to `ignore` if unset |
 | `MSCONVERT_PATH` | `msconvert` location for `--via-msconvert` |
+| `TIMSDATA_LIB_DIR` | Windows/Linux: where the Bruker libraries are, as a library file or an SDK root (`win64/`, `linux64/` or flat) — `timsdata.dll` / `libtimsdata.so` for `--bruker-sdk` (without it the loader's search path is tried) and `baf2sql_c.dll` / `libbaf2sql_c.so` for the BAF lane (without it the lane refuses) |
 
 Every `MZPC_*` variable the converter — or the vendored `mzpeak_prototyping` writer it links, or
-the Shimadzu glue it hosts — reads is listed below: 26 names, reconciled against the tree
-(19 read in `src/`, 4 in the vendored writer, 2 in `glue/shimadzu/Glue.cs`, 1 comment-only).
-They fall into three groups: **deployment** (where the vendor libraries and glue live — you will
+the Shimadzu glue it hosts — reads is listed below; `tests/docs_drift.rs` fails when a name quoted in
+`src/`, `vendor/` or `glue/` is missing. They fall into three groups: **deployment** (where the vendor libraries and glue live — you will
 set these on a Windows conversion host), **output-affecting** (they change what is written —
 prefer the equivalent CLI flag where one exists, so the run is reproducible from its command line;
 where an archive can tell, the row says which index key records it) and **performance /
 diagnostic** (they tune or trace, and the dump levers replace the conversion).
 
-**How a boolean lever is read (since 0.9.13).** Every on/off `MZPC_*` lever in `src/` goes through
-one `env_flag()` (`src/main.rs:113`): **unset** → the built-in default; set to the empty string,
+**How a boolean lever is read (since 0.9.13).** Every on/off `MZPC_*` lever in `src/` except the two Waters
+ones goes through one `env_flag()` in `src/main.rs`: **unset** → the built-in default; set to the empty string,
 `0`, `false` or `no` (any case) → **off**; anything else → **on**. So `MZPC_DUMP_IM_TABLE=` (empty)
 is off, and `MZPC_BYTE_PLANE_INTENSITY=` (empty) is the same opt-out as `=0`. Before 0.9.13 each site
 spelt its own rule: the two dump levers fired on mere presence and an empty
 `MZPC_BYTE_PLANE_INTENSITY` silently switched the ims-compact intensity column to Float32. The two
-levers read by the vendored writer (`MZPC_PARALLEL_ENCODE`, `MZPC_TIMING`) and the two read by the
-Shimadzu glue keep their own, narrower spellings, noted in their rows. Numeric levers ignore a value
+levers read by the vendored writer (`MZPC_PARALLEL_ENCODE`, `MZPC_TIMING`), the two read by the
+Shimadzu glue and the two Waters levers keep their own spellings, noted in their rows. Numeric levers ignore a value
 that does not parse (they fall back to the default) — except `MZPC_SHIMADZU_PROBE`, where a
 non-numeric value is an error.
 
@@ -810,6 +819,7 @@ instead.
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |
 | `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`) | the fitted `{c0,c1}` is stored; the fact that `c1` was forced is not |
+| `MZPC_WATERS_KEEP_COLLAPSED=1` | Waters `.raw` (Windows): also write the "collapsed retention time" functions MassLynx appends (one row per drift bin, the run's summed mobilograms), which are otherwise not written as spectra (§8). Its own rule: any value but empty or `0` keeps them (`false` and `no` too) | yes — `waters_drift.collapsed_functions` lists those functions; its `written` flag, however, says `true` whenever the variable is set, `=0` included |
 | `MZPC_MAX_SPECTRA=<n>` | Stop after `n` spectra. **Deliberately truncating**: it also disables the "all source spectra written" completeness check, so the archive is a partial one that exits 0. Diagnostics only; the WARN stays | yes — every mzPeak lane that honours the cap writes `metadata.partial` = `{partial: true, max_spectra, source_declared, spectra_written, cause: "MZPC_MAX_SPECTRA"}` when the cap bit (0.9.13); a cap larger than the file writes no marker |
 
 **Performance / diagnostic.** No effect on the values written (bytes only where noted); zero cost
@@ -826,9 +836,10 @@ when unset.
 | `MZPC_FLUSH_MEM_MB=<MB>` | Vendored writer: flush the in-RAM array buffers once they exceed this many MB (default 128), independent of spectrum or point counts. Changes row-group boundaries on the standard f64 facets, so the bytes — not the values — can differ |
 | `MZPC_TIMING=1` | Log decode-vs-write busy times for the pipelined timsTOF path (`env_flag` in `src/`; the vendored encoder's own timing line uses empty-or-`0` = off) |
 | `MZPC_SHIMADZU_DEBUG=1` | Shimadzu glue: trace scan-count discovery on stderr (read by the C# glue: empty or `0` = off, anything else on) |
-| `MZPC_SHIMADZU_PROBE=<n>` | Shimadzu `.lcd`: print the first `n` spectra as JSON lines and exit **without writing an archive**. Since 0.9.13 it is handled before lane selection (`src/main.rs:917`), so it works without `-o` — it used to live inside the Shimadzu lane, which only runs with `-o`, and therefore always swallowed the requested archive; a value that is not a count (including empty) is an error rather than 10; with `-o` it refuses; on macOS/Linux, where the reader does not exist, it is an error rather than silently ignored |
+| `MZPC_SHIMADZU_PROBE=<n>` | Shimadzu `.lcd`: print the first `n` spectra as JSON lines and exit **without writing an archive**. Since 0.9.13 it is handled before lane selection (in `run`, `src/main.rs`), so it works without `-o` — it used to live inside the Shimadzu lane, which only runs with `-o`, and therefore always swallowed the requested archive; a value that is not a count (including empty) is an error rather than 10; with `-o` it refuses; on macOS/Linux, where the reader does not exist, it is an error rather than silently ignored |
 | `MZPC_DUMP_IM_TABLE=1` | Bruker TDF: dump the scan→1/K0 table (timsrust, and the SDK where available) and exit without converting. Refuses with `-o` |
 | `MZPC_DUMP_AGILENT_PROFILE=1` | Agilent: dump decoded profile spectra (sum, nnz, first/last `(k,v)`, max `v`) and exit without converting. Refuses with `-o` |
+| `MZPC_WATERS_PROBE_QUAD=<level>` | Waters `.raw` (Windows): during the conversion, log at WARN what the MassLynx DLL states about quadrupole isolation for MSe and DDA functions — level 1 the info-reader exports, 2 the DDA processor's parameters, 3 adds its per-scan info for the first scans, 4 the MSe processor, 5 `getAcquisitionInfo`; one level per run. Its own rule: empty or `0` is off. The archive is written as without it |
 | `MZPC_TDF_SDK_GOLDEN=<out.json>` | Bruker TDF, `--bruker-sdk` only (Windows/Linux): diagnostic dump of the SDK's `tims_index_to_mz` at up to 240 `(frame, tof)` points — frame 1, the last frame and 10 evenly spaced frames × 20 tof values over `0..DigitizerNumSamples−1` — as `{file, digitizer_num_samples, mz_calibration, points: [{frame, t1, t2, cal_id, tof, mz_sdk}]}`, the ground truth for the ModelType-1 model and the per-spectrum `tof_c0`/`tof_c1` (§8). An empty value is unset; a bad path or an SDK refusal is logged and never fails the conversion |
 
 The harness under `tools/` reads its own `MZPC_*` names (`MZPC_PYTHON`, `MZPC_BOX_*`,
@@ -837,9 +848,9 @@ the converter binary and are documented in the scripts themselves.
 
 ## 11. Native vendor-SDK readers
 
-The Agilent (MHDAC), SciEX (Clearcore2), Shimadzu (LabSolutions.IO) and Bruker BAF
-(libbaf2sql_c) readers are **compiled in automatically** on the platforms where those
-vendor libraries exist — Windows for all four, Linux also for Bruker BAF. There is **no build flag** and no
+The Agilent (MHDAC), SciEX (Clearcore2), Shimadzu (LabSolutions.IO), Waters (MassLynxRaw) and
+Bruker BAF (libbaf2sql_c) readers are **compiled in automatically** on the platforms where those
+vendor libraries exist — Windows for all five, Linux also for Bruker BAF. There is **no build flag** and no
 opt-in; macOS gets none (no vendor SDKs exist there). The Agilent (MHDAC) one is the odd one
 out: MHDAC needs the .NET **Framework**, so it runs in a separate net48 process
 (`AgilentGlueHost.exe`, spawned once per `.d`; the whole run is materialised into a temp file at
@@ -856,7 +867,9 @@ DLL is loaded from `$MZPC_PWIZ_DIR` by reflection — see `glue/shimadzu/README.
 Both ProteoWizard layouts work: the MHDAC/Clearcore2 assemblies may sit under
 `vendor_api/Agilent` / `vendor_api/ABI` (the bundled builds) or flat beside `msconvert.exe`
 (the standalone installer); the Agilent lane probes both, subdirectory first. Shimadzu's
-`Shimadzu.LabSolutions.IO.IoModule.dll` is always flat.
+`Shimadzu.LabSolutions.IO.IoModule.dll` is always flat. Waters needs no glue: `src/waters.rs` loads
+`MassLynxRaw.dll` (with `cdt.dll`) from `$MZPC_MASSLYNX_DIR`, else `$MZPC_PWIZ_DIR`, and calls its C
+exports directly.
 
 **Which ProteoWizard: use a current one.** 3.0.26151 and 3.0.26175 are verified, and anything that ships
 `Shimadzu.LabSolutions.IO.IoModule.dll` **5.0.0.0** is fine. Older trees ship **3.8.4.6016**,
@@ -877,9 +890,10 @@ a format on the current platform (e.g. Agilent/SciEX on macOS or Linux), use
 Pure Rust plus a small C# interop layer for Thermo/native vendor readers. Core
 crates: `mzdata`, `mzpeaks`, `arrow`/`parquet`, `zip`, `timsrust`,
 `rusqlite`(bundled SQLite)/`zstd`, `flate2`, `clap`, `serde`, `anyhow`. The
-reference writer `mzpeak_prototyping` is vendored under `vendor/`. A complete
-inventory of all transitive dependencies (with licenses) is in
-[`sbom.cdx.json`](../sbom.cdx.json); see [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
+reference writer `mzpeak_prototyping` is vendored under `vendor/`. Each release attaches a
+CycloneDX inventory of every resolved dependency, with its license and source
+(`mzpeak-convert-<version>.cdx.json`, generated from `Cargo.lock` by `tools/gen_sbom.py`), and every
+release archive carries [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 
 ## 13. Troubleshooting
 
