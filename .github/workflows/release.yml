@@ -49,8 +49,60 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # CI does not run on tags: a tagged commit was tested when it reached main, and those check runs sit
+  # on its SHA. Nothing is built until all three passed. windows.yml used to cancel a push's run when the
+  # next push landed, which is how v0.10.0, v0.10.1 and v0.11.3 were released untested on Windows.
+  ci:
+    name: CI passed on the commit
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: Wait for build-test (ubuntu-latest, macos-latest) and windows to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)      sha="$PR_HEAD" ;;  # the dry run waits on the pull request's own CI
+            workflow_dispatch) sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)" ;;
+            *)                 sha="$GITHUB_SHA" ;;
+          esac
+          echo "gating on $sha"
+          pending="the check-runs API" deadline=$(( $(date +%s) + 90 * 60 ))
+          while :; do
+            # The newest run of each job counts, so re-running a cancelled one clears the way. The API
+            # lists newest first and a release commit carries ~15 check runs, so one page is plenty.
+            # `$want` is jq's variable, not the shell's.
+            # shellcheck disable=SC2016
+            if states="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?filter=all&per_page=100" --jq '
+                ["build-test (ubuntu-latest)", "build-test (macos-latest)", "windows"][] as $want
+                | ([.check_runs[] | select(.name == $want)] | max_by(.id)) // {status: "not started"}
+                | [$want, .status, .conclusion // ""] | @tsv')"; then
+              pending=""
+              while IFS=$'\t' read -r name status conclusion; do
+                if [ "$status" != completed ]; then
+                  pending+="$name ($status); "
+                elif [ "$conclusion" != success ]; then
+                  echo "::error::'$name' concluded '$conclusion' on $sha — nothing is released from a commit whose CI did not pass. Re-run that job, then re-run this workflow."
+                  exit 1
+                fi
+              done <<< "$states"
+              [ -n "$pending" ] || { echo "build-test (ubuntu-latest), build-test (macos-latest) and windows passed"; exit 0; }
+              echo "waiting on ${pending%; }"
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::still waiting after 90 min on ${pending%; } for $sha — CI runs on pushes to main and on pull requests, so a commit that reached neither has none to wait for"
+              exit 1
+            fi
+            sleep 60
+          done
+
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: ci
     if: ${{ !inputs.only || contains(inputs.only, 'macos') }}
     runs-on: macos-latest
     strategy:
@@ -133,6 +185,7 @@ jobs:
 
   linux:
     name: Linux ${{ matrix.arch }}
+    needs: ci
     if: ${{ !inputs.only || contains(inputs.only, 'linux') }}
     runs-on: ${{ matrix.runner }}
     container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
@@ -205,6 +258,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.arch }}
+    needs: ci
     if: ${{ !inputs.only || contains(inputs.only, 'windows') }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -340,8 +394,8 @@ jobs:
   # platform that failed does not hold back the ones that built — the run still goes red for it.
   publish:
     name: Attach to the release
-    needs: [macos, linux, windows]
-    if: ${{ always() && !cancelled() && github.event_name != 'pull_request' && !inputs.dry_run }}
+    needs: [ci, macos, linux, windows]
+    if: ${{ always() && needs.ci.result == 'success' && !cancelled() && github.event_name != 'pull_request' && !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
