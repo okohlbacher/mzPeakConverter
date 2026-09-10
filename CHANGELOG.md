@@ -30,7 +30,7 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   platform onto an existing tag without rebuilding the archives already published. The vendor
   readers are unverified on Windows ARM64: the vendor DLLs are x64, so use the x64 archive there.
 - **The converter finds its .NET glue beside the executable.** With `MZPC_SCIEX_GLUE`,
-  `MZPC_SHIMADZU_GLUE`, `MZPC_AGILENT_GLUE` or `MZPC_AGILENT_MIDAC_GLUE` unset it looks in
+  `MZPC_SHIMADZU_GLUE` or `MZPC_AGILENT_GLUE` unset it looks in
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
@@ -255,6 +255,17 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
+
+### Removed
+
+- **The Agilent MIDAC (ion-mobility) scaffold: `src/agilent_midac.rs`, `glue/agilent_midac/` and
+  `MZPC_AGILENT_MIDAC_GLUE`.** It had never opened a file and could not: its probe booted CoreCLR
+  and dropped it, and the reader then booted it again, the reload hostfxr refuses (0x80008081). It
+  was still dispatched for every IM-QTOF `.d`, built and asserted by the Windows CI job, and shipped
+  in the Windows release archive, where the glue beside the executable made the probe run. An
+  IM-QTOF `.d` (`AcqData/IMSFrame.bin`) gets the same refusal as before, without that boot:
+  `is an Agilent IM-QTOF run … convert this run with --via-msconvert`, which the box harness routes
+  to msconvert. Native ion mobility would read MIDAC through the out-of-process net48 host pattern.
 
 ## [0.11.5] — 2026-09-09
 

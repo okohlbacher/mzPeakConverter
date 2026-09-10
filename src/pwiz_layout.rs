@@ -10,7 +10,7 @@
 //! run everywhere and are what actually keeps it honest.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-/// Directory holding the Agilent MHDAC/MIDAC assemblies inside a ProteoWizard install.
+/// Directory holding the Agilent MHDAC assemblies inside a ProteoWizard install.
 ///
 /// ProteoWizard lays these out TWO ways and both are in the wild on the same machine: the installer
 /// build (`ProteoWizard 3.0.x`) FLATTENS every vendor DLL beside `msconvert.exe`, while some bundled
@@ -82,7 +82,7 @@ pub fn shimadzu_library_status(version: Option<&str>) -> ShimadzuLibrary {
 ///
 /// The `MZPC_*_GLUE` variable wins, as it always has. Without it the release archive's own layout
 /// is used: the Windows `.zip` ships each glue under `glue\<name>\` beside `mzpeak-convert.exe`, and
-/// a converter unpacked anywhere should find it without four variables set by hand. A source build
+/// a converter unpacked anywhere should find it without three variables set by hand. A source build
 /// has no such directory, so `None` comes back and the caller's error still names the variable.
 pub fn glue_dir(var: &str, name: &str) -> Option<std::path::PathBuf> {
     resolve_glue_dir(

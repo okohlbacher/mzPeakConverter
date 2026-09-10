@@ -60,7 +60,7 @@ jobs:
       - name: Test
         run: cargo test --release --verbose
 
-      # Only glues src/ actually loads: SCIEX, Shimadzu, Agilent MHDAC (net48 host) and MIDAC.
+      # Only glues src/ actually loads: SCIEX, Shimadzu and Agilent MHDAC (net48 host).
       # glue/waters is NOT built here — src/waters.rs drives MassLynxRaw directly and no code path
       # reads WatersGlue.dll (see the doc comment on the Waters lane in src/main.rs), so asserting
       # it only verified an artifact nothing ships. Shimadzu WAS missing and it is the one wired
@@ -70,12 +70,11 @@ jobs:
           dotnet build glue/sciex/SciexGlue.csproj -c Release
           dotnet build glue/shimadzu/ShimadzuGlue.csproj -c Release
           dotnet build glue/agilent/AgilentGlue.csproj -c Release
-          dotnet build glue/agilent_midac/AgilentMidacGlue.csproj -c Release
 
       # Each native vendor reader needs its glue executable/assembly at runtime — fail the build if
       # any artifact is missing (e.g. a TFM rename or a glue that silently stopped emitting an exe).
-      # Agilent is the net48 AgilentGlueHost.exe (out-of-process); the other three are net8 DLLs.
-      - name: Verify produced executables (converter + 4 glue artifacts)
+      # Agilent is the net48 AgilentGlueHost.exe (out-of-process); the other two are net8 DLLs.
+      - name: Verify produced executables (converter + 3 glue artifacts)
         shell: pwsh
         run: |
           $need = @(
@@ -83,8 +82,7 @@ jobs:
             "glue/agilent/bin/Release/net48/AgilentGlueHost.exe",
             "glue/sciex/bin/Release/net8.0/SciexGlue.dll",
             "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.dll",
-            "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.runtimeconfig.json",
-            "glue/agilent_midac/bin/Release/net8.0/AgilentMidacGlue.dll"
+            "glue/shimadzu/bin/Release/net8.0/ShimadzuGlue.runtimeconfig.json"
           )
           $missing = $need | Where-Object { -not (Test-Path $_) }
           if ($missing) { Write-Error "missing build artifacts:`n$($missing -join "`n")"; exit 1 }
