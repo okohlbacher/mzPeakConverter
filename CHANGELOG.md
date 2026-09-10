@@ -76,7 +76,9 @@ keep their bytes.
   pumps, column oven and autosampler in HyStar's `chromatography-data.sqlite`, which only the mzML
   lane (through ProteoWizard) used to read; the native TDF and TSF lanes wrote the synthesized TIC
   and BPC alone. Every Bruker lane now opens that file read-only and writes each trace after the
-  TIC/BPC, with ProteoWizard's `chromatogram title` and `Instrument` parameters: a pressure,
+  TIC/BPC (`--to mzml` from a `.d` after the spectra, in HyStar's seconds: the TSF run's mzML now has
+  the 8 chromatograms its archive's export has, not 2), with ProteoWizard's `chromatogram title` and
+  `Instrument` parameters: a pressure,
   flow-rate or temperature trace as that PSI-MS chromatogram type with a pressure, flow-rate or
   temperature array, anything else (solvent composition, setpoints, valve angles) as ProteoWizard's
   generic `chromatogram` (MS:1000625) with a non-standard array named after the trace, each in the

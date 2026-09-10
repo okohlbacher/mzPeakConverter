@@ -18,7 +18,7 @@
 //! flow rate or temperature array; the intensity array only when the values are detector counts;
 //! otherwise a non-standard array named after the trace — in the unit HyStar states, and whose times
 //! are HyStar's seconds; `finish_chromatograms` stores them in minutes, as every chromatogram time,
-//! and declares `chromatogram-time-to-minutes`. The writer
+//! and declares `chromatogram-time-to-minutes`, and `--to mzml` writes them as recorded. The writer
 //! stores an array outside the facet's `time`/`intensity` columns as an auxiliary array that keeps
 //! its own unit; an intensity array in percent would instead land in the `intensity` column, which
 //! is declared as detector counts, and silently lose it.

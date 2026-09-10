@@ -2313,8 +2313,10 @@ fn convert_to_mzml(
     assert_source_complete(input, written, cap)?;
     // Pass through the source's chromatograms (SRM/SIM/vendor traces — otherwise silently lost,
     // fatal for MRM data). Drop source TIC/base-peak: the mzML writer emits its own spectrum-derived
-    // TIC + base-peak summary at close, so keeping the source ones would duplicate them.
-    write_source_chromatograms_mzml(&mut w, source_chroms.into_iter())?;
+    // TIC + base-peak summary at close, so keeping the source ones would duplicate them. A Bruker TDF
+    // `.d` adds its HyStar device traces, as its archive does ([`bruker_traces`]).
+    let traces = if input.is_dir() { bruker_traces::read(input) } else { Vec::new() };
+    write_source_chromatograms_mzml(&mut w, source_chroms.into_iter().chain(traces.into_iter().map(|t| t.chromatogram)))?;
 
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
@@ -2454,6 +2456,11 @@ fn write_native_mzml(
         demote_mzp_params(spec.description_mut());
         SpectrumWriter::write(&mut w, &spec)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
+    }
+    // A Bruker `.d`'s HyStar device traces, which its archive carries too ([`bruker_traces`]); no
+    // other input has them. HyStar's own MS traces give way to the writer's TIC/BPC.
+    if input.is_dir() {
+        write_source_chromatograms_mzml(&mut w, bruker_traces::read(input).into_iter().map(|t| t.chromatogram))?;
     }
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
@@ -7760,6 +7767,34 @@ mod tests {
         };
         assert!(element("Pump HP:Pressure - [bar]").contains("accession=\"MS:1003019\""), "a pressure chromatogram");
         assert!(element("Fraction A - [%]").contains("accession=\"MS:1000625\""), "ProteoWizard's generic chromatogram");
+    }
+
+    /// `--to mzml` from a Bruker `.d`. The native TSF and BAF branches write through
+    /// `write_native_mzml`, which wrote no chromatogram but the mzML writer's own TIC/BPC, so a TSF
+    /// run converted straight to mzML had 2 chromatograms where its archive, and that archive's mzML
+    /// export, have 8. The HyStar traces follow the spectra, HyStar's own MS trace giving way to the
+    /// writer's TIC/BPC as it does in the archive.
+    #[test]
+    fn a_native_mzml_export_carries_the_bruker_device_traces() {
+        let (dir, _cleanup) = trace_scratch("native-mzml");
+        let dot_d = hystar_dot_d(
+            &dir,
+            &[
+                (1, "TIC,±MS", 1, 6, &[60.0, 120.0], &[10.0, 20.0]),
+                (2, "Pump HP:Pressure - [bar]", 9999, 3, &[60.0, 120.0], &[100.0, 110.0]),
+                (3, "Fraction A - [%]", 5, 4, &[60.0, 120.0], &[1.0, 2.0]),
+            ],
+        );
+        let out = dir.join("run.mzML");
+        super::write_native_mzml(&dot_d, &out, 2, |i| Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let written = xml.matches("<chromatogram ").count();
+        assert_eq!(written, 4, "the writer's TIC and BPC and the two device traces");
+        assert!(xml.contains(&format!("<chromatogramList count=\"{written}\"")), "a stale chromatogramList count");
+        for id in ["Pump HP:Pressure - [bar]", "Fraction A - [%]"] {
+            assert!(xml.contains(&format!("<chromatogram id=\"{id}\"")), "no chromatogram {id}");
+        }
+        assert!(!xml.contains("<chromatogram id=\"TIC,±MS\""), "HyStar's MS trace gives way to the writer's TIC");
     }
 
     /// The mzML export of an archive holding device traces converts back, into an archive and into
