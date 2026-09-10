@@ -319,6 +319,19 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `writer_counters_decide_the_writer_level_transformations` pins the mask, the backstop and the
   empty list on the vendor-reader seam. A rebuilt corpus archive drops the entries that did not
   happen; entry names are unchanged.
+- **Output change: every vendor directory input embeds its side-files, under one rule**
+  (`embed_vendor_members`). The vendor-reader and mzdata lanes embedded only Bruker TDF/TSF
+  directories while `--agilent-grid` and ims-compact embedded any directory themselves, so a BAF `.d`,
+  an Agilent `.d` on the MHDAC lane and a Waters `.raw` got no `vendor/` members and no
+  `vendor_files` manifest, `--aux` did nothing on them without a word, and USER_MANUAL §8's "embedded
+  by default" was false for BAF (corpus: FM_1-1_01_20254 and the Agilent S25 archive hold 0 vendor
+  members). They now follow the lane's policy like every other directory: preserve by default, the
+  ims-compact `*_bin` drop, `--aux` on top. **Size:** preserve-by-default includes the raw signal
+  files, so a rebuild without `--no-vendor` or an `--aux` drop grows by roughly their size (FM_1-1:
+  `analysis.baf` is 714 MB beside a 109 MB archive; S25: `MSProfile.bin` + `MSPeak.bin` are 251 MB).
+  `--aux` on a single-file input now logs that it is inert.
+  `every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert` pins both on a synthetic
+  Waters-shaped directory and on `tiny.pwiz.1.1.mzML`.
 
 ## [0.11.5] — 2026-09-09
 
