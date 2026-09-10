@@ -1572,16 +1572,18 @@ fn dump_im_table(input: &Path) -> Result<()> {
 /// Why the inspection report must leave the native vendor readers closed, or `None` when it may
 /// open one. Only a run whose whole job is the report opens one. Under `-o` the conversion opens
 /// its own: the second open ran the Agilent host over the whole run twice (2.9 GB of temp file each
-/// on a 242 MB Q-TOF `.d`) and booted CoreCLR a second time for SciEX. `--via-msconvert` never uses
-/// the native stack, so a missing one (no `MZPC_PWIZ_DIR`, no .NET 8) must not fail that lane —
-/// it aborted `-v --via-msconvert` on `.wiff`, `.lcd` and Waters `.raw`.
+/// on a 242 MB Q-TOF `.d`) and booted CoreCLR a second time for SciEX. The `--via-msconvert` lane
+/// never uses the native stack, so a missing one (no `MZPC_PWIZ_DIR`, no .NET 8) must not fail it —
+/// it aborted `-v --via-msconvert` on `.wiff`, `.lcd` and Waters `.raw`. Without `-o` no lane runs,
+/// so `--via-msconvert` (a flag, or a `--config` profile's default) leaves the report the job: it
+/// printed only a note that ProteoWizard reads the file, which nothing did.
 fn native_inspect_skip(output_given: bool, via_msconvert: bool) -> Option<&'static str> {
-    if via_msconvert {
-        Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
-    } else if output_given {
-        Some("native reader not opened for this report: the conversion opens it")
-    } else {
+    if !output_given {
         None
+    } else if via_msconvert {
+        Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
+    } else {
+        Some("native reader not opened for this report: the conversion opens it")
     }
 }
 
@@ -7053,22 +7055,22 @@ mod tests {
     }
 
     /// The `-v` report opens a native vendor reader only when the report is the whole job: under
-    /// `-o` the conversion opens its own, and `--via-msconvert` must not need the native stack.
-    /// (`report_inspect`'s vendor branches are Windows-only; this is the decision they follow.)
+    /// `-o` the conversion opens its own, and the `--via-msconvert` lane must not need the native
+    /// stack. Without `-o` no lane runs, so `--via-msconvert` does not change that.
+    /// (`report_inspect`'s Windows vendor branches follow this decision too.)
     #[test]
     fn inspection_opens_a_native_reader_only_when_inspecting_is_the_job() {
         use super::native_inspect_skip;
         assert_eq!(native_inspect_skip(false, false), None, "a bare inspection opens it");
+        assert_eq!(native_inspect_skip(false, true), None, "so does one that names a lane it never runs");
         assert_eq!(
             native_inspect_skip(true, false),
             Some("native reader not opened for this report: the conversion opens it")
         );
-        for output_given in [false, true] {
-            assert_eq!(
-                native_inspect_skip(output_given, true),
-                Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
-            );
-        }
+        assert_eq!(
+            native_inspect_skip(true, true),
+            Some("native reader not opened: --via-msconvert reads this file through ProteoWizard")
+        );
     }
 
     /// The installed panic hook removes the panicking thread's in-flight tmp. `mem::forget` keeps
