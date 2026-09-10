@@ -23,9 +23,11 @@
 //!     (`get_spectrum_peak_arrays_for` and the collapsed `get_spectrum` peak list) — and therefore
 //!     `mzpeak-convert ARCHIVE -o x.mzML` emit the per-frame m/z, not the chord.
 //!
-//! Skips (passes) when the reference `.d` is absent; override the corpus root with `MZPEAK_CORPUS`.
+//! Needs 2485.d from the corpus, so it is `#[ignore]`d: CI reports it as not run rather than as passed.
+//! Run with `MZPEAK_CORPUS=<data root> cargo test --release --test tdf_exact_tof_calibration -- --include-ignored`;
+//! `MZPC_REQUIRE_CORPUS=1` makes a missing fixture fail instead of skip.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use arrow::array::{Array, AsArray};
@@ -36,16 +38,14 @@ use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType};
 use mzpeak_prototyping::MzPeakReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+#[path = "common/corpus.rs"]
+mod corpus;
+
 const DOT_D: &str = "ims-examples/PXD059079/20230830_100SPD_NCI7_0p12ng_HS_01_S1-B1_1_2485.d";
 const FRAMES: usize = 3_994;
 /// `GlobalMetadata.DigitizerNumSamples` of 2485.d.
 const NUM_SAMPLES: i64 = 636_031;
 
-fn corpus_root() -> PathBuf {
-    std::env::var("MZPEAK_CORPUS").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Claude/mzpeak-example-data/data")
-    })
-}
 
 fn run(args: &[&str], envs: &[(&str, &str)]) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"));
@@ -247,13 +247,10 @@ fn rel(a: f64, b: f64) -> f64 {
 }
 
 #[test]
+#[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
 fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
-    let dot_d = corpus_root().join(DOT_D);
+    let Some(dot_d) = corpus::corpus_path(DOT_D) else { return };
     let tdf = dot_d.join("analysis.tdf");
-    if !tdf.exists() {
-        eprintln!("skipping: {} not present", dot_d.display());
-        return;
-    }
     let tmp = std::env::temp_dir().join(format!("mzpc-exacttof-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let archive = tmp.join("2485.mzpeak");

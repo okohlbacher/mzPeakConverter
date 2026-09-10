@@ -141,17 +141,17 @@ mod tests {
     use super::*;
     use crate::run_metadata::AcquisitionTime;
 
-    fn corpus(rel: &str) -> Option<std::path::PathBuf> {
-        let p = dirs_home().join("Claude/mzpeak-example-data/data").join(rel);
-        p.is_dir().then_some(p)
-    }
-    fn dirs_home() -> std::path::PathBuf {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    /// Metadata-only slices of MetaboLights MTBLS11742 `blank1.D` and MTBLS243: the XML members the tests
+    /// need, empty stand-ins for the binary members `read` only lists and digests, and (in blank1.D) an
+    /// empty AppleDouble `._MSScan.bin`, added for the test, that the member walk must skip. Both tests used to read the corpus from
+    /// $HOME and return without a word wherever it was absent.
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
     }
 
     #[test]
     fn blank1_gc_ms_states_model_serial_time_and_members() {
-        let Some(d) = corpus("general-ms/MTBLS11742/blank1.D") else { return };
+        let d = fixture("blank1.D");
         let m = read(&d).expect("AcqData present");
         let cfg = m.instrument.expect("instrument");
         let serial = cfg.params.iter().find(|p| p.curie() == Some(mzdata::curie!(MS:1000529))).expect("serial");
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn numeric_serial_stays_a_string() {
-        let Some(d) = corpus("general-ms/MTBLS243/03_D24062013T1259_1399CBU_01QC_A3.d") else { return };
+        let d = fixture("mtbls243.d");
         let m = read(&d).expect("AcqData present");
         let cfg = m.instrument.expect("instrument");
         let serial = cfg.params.iter().find(|p| p.curie() == Some(mzdata::curie!(MS:1000529))).expect("serial");
