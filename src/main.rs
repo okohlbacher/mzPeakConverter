@@ -31,6 +31,7 @@ mod bruker_baf;
 mod bruker_sdk;
 mod pwiz_layout;
 mod agl;
+mod agilent_host;
 mod sciex_run;
 #[cfg(windows)]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -689,10 +690,20 @@ impl Settings {
     }
 }
 
-/// The `<out>.mzpeak.tmp` files currently being written, with the thread that registered each,
-/// for [`install_tmp_panic_hook`].
+/// The temp files currently being written — each lane's `<out>.mzpeak.tmp`, and the Agilent host's
+/// `.bin` / `.part` — with the thread that registered each, for [`install_tmp_panic_hook`].
 static TMP_IN_FLIGHT: std::sync::Mutex<Vec<(std::thread::ThreadId, PathBuf)>> =
     std::sync::Mutex::new(Vec::new());
+
+/// Register a temp file with the panic-hook sweep without owning it: the Agilent host's `.bin` and
+/// `.part`, which another process writes and `agilent.rs` removes on every ordinary exit. Under
+/// `panic = "abort"` no `Drop` runs, so the sweep is what removes them — 16 B/point of the run,
+/// gigabytes. [`TmpGuard::forget_path`] unregisters it.
+fn track_tmp_in_flight(path: &Path) {
+    if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
+        v.push((std::thread::current().id(), path.to_path_buf()));
+    }
+}
 
 /// Owns a lane's `<out>.mzpeak.tmp` until the archive is renamed into place, and removes it on
 /// every other exit: an `Err` unwinding out of the lane (the guard's `Drop`), or a panic — the
@@ -711,9 +722,7 @@ struct TmpGuard {
 
 impl TmpGuard {
     fn new(path: &Path) -> Self {
-        if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
-            v.push((std::thread::current().id(), path.to_path_buf()));
-        }
+        track_tmp_in_flight(path);
         Self { path: path.to_path_buf() }
     }
 
@@ -7069,6 +7078,26 @@ mod tests {
         let r = std::panic::catch_unwind(|| panic!("simulated writer-open failure"));
         assert!(r.is_err());
         assert!(!tmp.exists(), "the panic hook must remove the in-flight tmp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A temp file another process writes (the Agilent host's `.bin` / `.part`) is registered with
+    /// the sweep without a guard: the sweep removes it, and once forgotten it is left alone.
+    #[test]
+    fn tracked_host_temp_files_are_swept_until_forgotten() {
+        use super::{sweep_tmp_in_flight, track_tmp_in_flight, TmpGuard};
+        let dir = std::env::temp_dir().join(format!("mzpc-tracked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("mzpc-agilent-1-0.bin");
+        let part = dir.join("mzpc-agilent-1-0.bin.part");
+        for p in [&bin, &part] {
+            std::fs::write(p, b"host output").unwrap();
+            track_tmp_in_flight(p);
+        }
+        TmpGuard::forget_path(&bin);
+        sweep_tmp_in_flight(false);
+        assert!(!part.exists(), "a tracked host file is removed by the sweep");
+        assert!(bin.exists(), "a forgotten one is left alone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
