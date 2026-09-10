@@ -156,15 +156,18 @@ keep their bytes.
   written) on the export of every archive holding HyStar traces, as on any mzML with such an
   array. An array whose type mzdata knows the accession of now takes that type and the
   parameter's unit; any other unreadable array is kept, with a warning, as a non-standard data
-  array named after its parameter. The mzPeak lane keeps these arrays out of the sampled
-  chromatogram schema, so they are stored as auxiliary arrays in their own unit and data type, as
-  the native lane stores the same traces. Converted back from their exports, a PXD059079 run's
-  archive (25 traces) and a TSF run's (6) match the exported archives in every trace's (time,
-  value) pairs, and in every pressure, flow-rate and temperature trace's chromatogram type, array,
-  unit and data type; the first non-standard trace becomes a column that reads back without its
-  name, as the first non-standard chromatogram array of any mzML already did (BACKLOG). Pinned by
-  `tests::an_mzml_export_of_device_traces_converts_back` and
-  `tests::unreadable_chromatogram_arrays_get_names_the_writers_accept`.
+  array named after its parameter. The mzPeak lane samples the chromatogram schema from time and
+  intensity alone, so every other chromatogram array, a non-standard one included, is stored as an
+  auxiliary array in its own unit and data type under its own name, as the native lane stores the
+  same traces. Converted back from their exports, a PXD059079 run's archive (25 traces) and a TSF
+  run's (6) match the exported archives in every trace's (time, value) pairs, and in every pressure,
+  flow-rate and temperature trace's chromatogram type, array, unit and data type. Until then the
+  first ten chromatograms' non-standard arrays became columns (a Bruker export's first one:
+  `Fraction A - [%]` on the TSF run), which read back without their name, went out again as a
+  `non-standard data array` with no value, and came back as a column named ''; any mzML with a
+  non-standard chromatogram array among its first ten chromatograms is now stored the new way.
+  Pinned by `tests::an_mzml_export_of_device_traces_converts_back`, which converts an export twice,
+  and `tests::unreadable_chromatogram_arrays_get_names_the_writers_accept`.
 - **mzML → mzML dropped every chromatogram's type.** mzdata's mzML reader moves the type cvParam
   into the typed field and its writer writes the parameters alone, so the output stated no
   chromatogram type, which mzML requires (tiny.pwiz's selected ion current trace among them, and
