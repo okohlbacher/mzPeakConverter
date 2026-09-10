@@ -402,6 +402,14 @@ clock WITHOUT one (Waters, SciEX) leaves `run.start_time` null and is preserved 
                      "source": "Waters _HEADER.TXT", "note": "…"}
 ```
 
+**Reading the acquisition time.** Use `run.start_time` when it is set. When it is null, read
+`metadata.acquisition_time.wall_clock`: the vendor's local clock exactly as the file states it,
+zone unstated. Show or compare it as a local wall clock and never attach an offset — neither the
+reader's own nor UTC. An archive with neither states no acquisition time. Bruker and Agilent
+directories follow the same rule: their clocks carry offsets in every file seen so far, and one
+that does not becomes the block too (archives written by 0.11.5 and earlier dropped it on the
+lanes that read those directories).
+
 ProteoWizard resolves the same ambiguity by asserting: it labels an unzoned Waters clock `Z`, and
 its `adjustUnknownTimeZonesToHostTimeZone` default shifts other readers' values by the converting
 host's offset AT CONVERSION TIME (a Shimadzu run that the file states as 10:47:18Z comes out
