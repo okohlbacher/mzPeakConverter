@@ -3173,6 +3173,33 @@ fn dump_agilent_profile(input: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The `--agilent-grid` writer. Its data schema is hand-built, so every column the batches carry
+/// must be declared, `spectrum_index` included: 0.11.0 dropped it (5692603), and the writer then met
+/// the batch's index column in `route_unexpected`, which panics on a column no array metadata
+/// describes. The other hand-built TOF schemas declare it too.
+fn agilent_grid_writer_builder(level: ZstdLevel, grid: (f64, f64)) -> mzpeak_prototyping::writer::MzPeakWriterBuilder {
+    let tof_field = tof_index_field(grid, true);
+    MzPeakWriterType::<fs::File>::builder()
+        .buffer_size(buffer_spectra())
+        .compression(Compression::ZSTD(level))
+        .add_spectrum_field(BufferContext::Spectrum.index_field())
+        .add_spectrum_field(tof_field)
+        .add_spectrum_field(INTENSITY_ARRAY.to_field())
+        // Per-spectrum grid coefficients as Float64 spectrum columns (pulled from each spectrum's
+        // params by CURIE). These are the AUTHORITATIVE per-scan calibration for m/z reconstruction.
+        .add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(TOF_C0_CURIE, "tof_c0", DataType::Float64),
+        )
+        .add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(TOF_C1_CURIE, "tof_c1", DataType::Float64),
+        )
+        // Per-spectrum CalibrationID → selects the polynomial refinement in the index block for the
+        // EXACT MassHunter m/z. Per-run-constant in practice, so it compresses to ~nothing.
+        .add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(TOF_CALID_CURIE, "tof_calibration_id", DataType::Int64),
+        )
+}
+
 fn convert_agilent_grid(
     input: &Path,
     output: &Path,
@@ -3201,27 +3228,7 @@ fn convert_agilent_grid(
         probe.next_spectrum()?.map(|s| s.grid)
     };
     let (c0_hint, c1_hint) = first_grid.map(|g| (g.c0, g.c1)).unwrap_or((0.0, 1.0));
-    let tof_field = tof_index_field((c0_hint, c1_hint), true);
-
-    let builder = MzPeakWriterType::<fs::File>::builder()
-        .buffer_size(buffer_spectra())
-        .compression(Compression::ZSTD(level))
-        .add_spectrum_field(tof_field)
-        .add_spectrum_field(INTENSITY_ARRAY.to_field())
-        // Per-spectrum grid coefficients as Float64 spectrum columns (pulled from each spectrum's
-        // params by CURIE). These are the AUTHORITATIVE per-scan calibration for m/z reconstruction.
-        .add_spectrum_param_field(
-            CustomBuilderFromParameter::from_spec(TOF_C0_CURIE, "tof_c0", DataType::Float64),
-        )
-        .add_spectrum_param_field(
-            CustomBuilderFromParameter::from_spec(TOF_C1_CURIE, "tof_c1", DataType::Float64),
-        )
-        // Per-spectrum CalibrationID → selects the polynomial refinement in the index block for the
-        // EXACT MassHunter m/z. Per-run-constant in practice, so it compresses to ~nothing.
-        .add_spectrum_param_field(
-            CustomBuilderFromParameter::from_spec(TOF_CALID_CURIE, "tof_calibration_id", DataType::Int64),
-        );
-    let mut writer = builder.build(handle, true);
+    let mut writer = agilent_grid_writer_builder(level, (c0_hint, c1_hint)).build(handle, true);
     add_processing_metadata(&mut writer);
     // The per-spectrum coefficient columns are MZP terms (`TOF_C0_CURIE` …): declare the CV.
     ensure_mzp_cv(&mut writer);
@@ -8362,6 +8369,58 @@ mod tests {
             "spectra_data ('{data_family}') and spectra_peaks ('{peaks_family}') are both \
              `entity_type: spectrum` and MUST share one layout family"
         );
+    }
+
+    /// `--agilent-grid` hand-builds its data schema, which lost `spectrum_index` in 0.11.0: the writer
+    /// meets the batch's index column in `route_unexpected` and panics, so the release build aborted
+    /// on the first spectrum. No profile `.d` in reach decodes, so one gridded profile spectrum,
+    /// shaped as `agilent_grid_spectrum` builds it, goes through the lane's own builder.
+    #[test]
+    fn agilent_grid_schema_writes_a_gridded_profile_spectrum() {
+        use arrow::array::{Array, Int32Array, StructArray, UInt64Array};
+        use mzdata::params::Unit;
+
+        let dir = scratch("agilent-grid-schema");
+        let path = dir.join("grid.mzpeak");
+        let level = parquet::basic::ZstdLevel::try_new(3).unwrap();
+        let mut writer =
+            super::agilent_grid_writer_builder(level, (0.5, 1e-4)).build(fs::File::create(&path).unwrap(), true);
+        super::ensure_mzp_cv(&mut writer);
+        let mut arrays = BinaryArrayMap::new();
+        let mut tof = DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
+        tof.update_buffer(&[1000i32, 1001, 1002]).unwrap();
+        arrays.add(tof);
+        let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        intensity.update_buffer(&[3.0f32, 7.0, 2.0]).unwrap();
+        intensity.unit = Unit::DetectorCounts;
+        arrays.add(intensity);
+        let mut descr = SpectrumDescription::default();
+        descr.id = "scan=1".into();
+        descr.ms_level = 1;
+        descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
+        descr.add_param(Param::builder().name("tof_c0").curie(super::TOF_C0_CURIE).value(0.5).build());
+        descr.add_param(Param::builder().name("tof_c1").curie(super::TOF_C1_CURIE).value(1e-4).build());
+        descr.add_param(Param::builder().name("tof_calibration_id").curie(super::TOF_CALID_CURIE).value(1i64).build());
+        let spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(descr, Some(arrays), None, None);
+        writer.write_spectrum(&spec).unwrap();
+        super::finish_chromatograms(&mut writer, &super::Ms1Chroms::default(), std::iter::empty(), false).unwrap();
+        writer.finish_parquet().unwrap().finish().unwrap();
+
+        let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+        let data = extract_zip_entry(&mut zip, "spectra_data.parquet", &dir);
+        let batch = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&data).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .expect("spectra_data holds the spectrum")
+            .unwrap();
+        let point = batch.column_by_name("point").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
+        let index = point.column_by_name("spectrum_index").expect("point.spectrum_index");
+        assert_eq!(index.as_any().downcast_ref::<UInt64Array>().unwrap().values().to_vec(), vec![0, 0, 0]);
+        let tof = point.column_by_name("tof_index").expect("point.tof_index");
+        assert_eq!(tof.as_any().downcast_ref::<Int32Array>().unwrap().values().to_vec(), vec![1000, 1001, 1002]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A-contract lock-in. Asserts the calibration index keys + peak/grid column names don't get

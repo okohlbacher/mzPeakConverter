@@ -239,6 +239,14 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   is refused as clap refuses `--sample 0`. The `--help` text no longer names an unreleased
   version. Pinned by `sample_is_warned_inert_off_a_wiff` and the extended
   `file_config_accepts_the_six_promised_keys`.
+- **`--agilent-grid` declares `spectrum_index` again.** 0.11.0 (5692603) rebuilt the lane's
+  hand-made data schema with `tof_index` and intensity but without the index column every other
+  hand-built TOF schema declares. The writer then routes each batch's index column through
+  `route_unexpected`, which panics on a column no array metadata describes, and the release build
+  aborts: by reading, on the first spectrum of every `--agilent-grid` conversion since 0.11.0 —
+  no corpus `.d` decodes on this lane, so none was ever run. The schema is declared once, in
+  `agilent_grid_writer_builder`, and `agilent_grid_schema_writes_a_gridded_profile_spectrum` writes
+  one gridded profile spectrum through it without a `.d`.
 - **An archive → mzML export reads each spectrum once.** It first read every spectrum's metadata to
   find the survivors, then read the survivors again in full, and it did so without a filter too:
   that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.
