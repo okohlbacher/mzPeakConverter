@@ -37,11 +37,18 @@
 //!     `<MZPC_PWIZ_DIR>/vendor_api/Agilent` when that subdirectory exists, else from
 //!     `<MZPC_PWIZ_DIR>` itself (`pwiz_layout::agilent_dll_dir`); the directory is passed to the
 //!     host as `<mhdacDir>`.
+//!   * `MZPC_AGILENT_TMPDIR` — where the host writes its temp file (default `std::env::temp_dir()`;
+//!     a value that names no directory is warned about).
+//!   * `MZPC_AGILENT_HOST_TIMEOUT` — seconds the host may run (default 7200, `0` = no deadline);
+//!     past it the host is killed and its files are removed.
 //!
 //! ## Cost model
 //! The host materialises EVERY scan into one temp file (m/z f64 + intensity f64 per point, i.e.
 //! 16 B/point) under `std::env::temp_dir()` before the first spectrum is read back: a 240 MB
-//! profile Q-TOF `.d` becomes a ~3 GB temp file. The file is removed on `Drop`.
+//! profile Q-TOF `.d` becomes a ~3 GB temp file. The file is removed on `Drop`, on every failure
+//! path, and by the panic hook (`crate::track_tmp_in_flight`); only a Ctrl+C, which ends both
+//! processes, leaves it behind. The host runs in a kill-on-close Job Object
+//! (`agilent_host::job`), so a converter that is killed takes the host with it.
 //!
 //! ## Binary protocol (host → us)
 //! `AGL2`, parsed by the host-testable `crate::agl` (which documents the layout). Beyond the
@@ -71,6 +78,7 @@ use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
 };
 
+use crate::agilent_host::{self, HostExit};
 use crate::agl::{self, RecordHeader};
 
 const HOST_EXE: &str = "AgilentGlueHost.exe";
@@ -131,37 +139,64 @@ impl AgilentReader {
 
         // The whole run lands in this file at 16 B/point (gigabytes for a profile Q-TOF run), so it
         // must never follow a TEMP that was pointed at a RAM disk for msconvert intermediates:
-        // `MZPC_AGILENT_TMPDIR` names a disk location explicitly; `temp_dir()` is the default.
-        let tmp_dir = std::env::var_os("MZPC_AGILENT_TMPDIR")
-            .map(PathBuf::from)
-            .filter(|d| d.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
+        // `MZPC_AGILENT_TMPDIR` names a disk location explicitly; `temp_dir()` is the default, and a
+        // value that names no directory is said rather than silently replaced.
+        let (tmp_dir, tmp_warning) =
+            agilent_host::tmp_dir(std::env::var_os("MZPC_AGILENT_TMPDIR"), std::env::temp_dir());
+        if let Some(warning) = tmp_warning {
+            log::warn!("{warning}");
+        }
+        let timeout_var = std::env::var_os("MZPC_AGILENT_HOST_TIMEOUT").map(|v| v.to_string_lossy().into_owned());
+        let timeout = agilent_host::host_timeout(timeout_var.as_deref()).map_err(|e| anyhow!(e))?;
         let ctr = TMP_CTR.fetch_add(1, Ordering::Relaxed);
         let tmp_path = tmp_dir.join(format!("mzpc-agilent-{}-{}.bin", std::process::id(), ctr));
         // The host writes `<out>.part` and renames on success; a host that dies natively (an MHDAC
         // access violation bypasses its catch/finally) leaves the `.part` — remove it with the
-        // `.bin` on every failure path.
+        // `.bin` on every failure path. Both are on the panic-hook sweep until then: under
+        // `panic = "abort"` neither `Drop` nor those paths run.
         let part_path = PathBuf::from(format!("{}.part", tmp_path.display()));
+        crate::track_tmp_in_flight(&tmp_path);
+        crate::track_tmp_in_flight(&part_path);
 
-        // Run the host. Capture stderr for diagnostics; stdout is reserved/empty.
-        let out = Command::new(&host)
-            .arg(path)
-            .arg(&mhdac_dir)
-            .arg(&tmp_path)
-            .output()
-            .with_context(|| format!("spawning {}", host.display()))?;
-        if !out.status.success() {
-            let _ = std::fs::remove_file(&tmp_path);
-            let _ = std::fs::remove_file(&part_path);
-            let err = String::from_utf8_lossy(&out.stderr);
-            let err = err.trim();
-            bail!(
-                "Agilent host failed to convert {} (exit {}): {}",
-                path.display(),
-                out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
-                if err.is_empty() { "<no stderr>" } else { err }
-            );
-        }
+        // Run the host under its deadline, in a kill-on-close Job Object so that it cannot outlive a
+        // converter that is killed. stderr carries its diagnostics; stdout is unused.
+        let mut cmd = Command::new(&host);
+        cmd.arg(path).arg(&mhdac_dir).arg(&tmp_path);
+        let mut job: Option<agilent_host::job::KillOnClose> = None;
+        let run = agilent_host::run_with_deadline(&mut cmd, timeout, |child| {
+            match agilent_host::job::kill_on_close(child) {
+                Ok(j) => job = Some(j),
+                Err(e) => log::debug!("Agilent host not in a kill-on-close job ({e}); it could outlive a killed converter"),
+            }
+        });
+        drop(job); // the host has exited or was killed: nothing is left for the job to end
+        let stderr = match run {
+            Ok(HostExit::Exited { status, stderr }) if status.success() => stderr,
+            outcome => {
+                discard_temp(&[&tmp_path, &part_path]);
+                match outcome {
+                    Err(e) => return Err(e).with_context(|| format!("spawning {}", host.display())),
+                    Ok(HostExit::TimedOut) => bail!(
+                        "Agilent host did not finish {} within {} s and was killed; raise \
+                         MZPC_AGILENT_HOST_TIMEOUT (seconds, 0 = no deadline) if the run is that slow",
+                        path.display(),
+                        timeout.map_or(0, |t| t.as_secs())
+                    ),
+                    Ok(HostExit::Exited { status, stderr }) => {
+                        let err = String::from_utf8_lossy(&stderr);
+                        let err = err.trim();
+                        bail!(
+                            "Agilent host failed to convert {} (exit {}): {}",
+                            path.display(),
+                            status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                            if err.is_empty() { "<no stderr>" } else { err }
+                        )
+                    }
+                }
+            }
+        };
+        // A successful host renamed its `.part`: nothing is left to sweep under that name.
+        crate::TmpGuard::forget_path(&part_path);
 
         // Parse the index in a closure so EVERY failure path below removes the temp file: until the
         // reader exists nothing owns it, and a 3 GB leftover per failed open is not a diagnostic.
@@ -187,14 +222,13 @@ impl AgilentReader {
         let (file, index, file_len) = match parse() {
             Ok(v) => v,
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                let _ = std::fs::remove_file(&part_path);
+                discard_temp(&[&tmp_path, &part_path]);
                 return Err(e);
             }
         };
         // A successful host may still have something to say (today: how many NaN/Inf intensities
         // it stored as 0). That is a transformation the archive would not otherwise record.
-        let host_notes = String::from_utf8_lossy(&out.stderr);
+        let host_notes = String::from_utf8_lossy(&stderr);
         for line in host_notes.lines().map(str::trim).filter(|l| !l.is_empty()) {
             log::warn!("Agilent host: {line}");
         }
@@ -349,7 +383,15 @@ impl Drop for AgilentReader {
                 self.missing_rt.get()
             );
         }
-        // Remove the temp binary the host wrote. Best-effort.
-        let _ = std::fs::remove_file(&self.tmp_path);
+        // Remove the temp binary the host wrote and take it off the panic-hook sweep. Best-effort.
+        discard_temp(&[&self.tmp_path]);
+    }
+}
+
+/// Remove host temp files and take them off the panic-hook sweep ([`crate::track_tmp_in_flight`]).
+fn discard_temp(paths: &[&Path]) {
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+        crate::TmpGuard::forget_path(p);
     }
 }

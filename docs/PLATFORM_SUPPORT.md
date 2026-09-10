@@ -62,7 +62,10 @@ ProteoWizard with `--via-msconvert` (all platforms).
   chromatograms (by design), the flight-time grid (`--tof-grid` is not applied on this lane; m/z
   is the f64 MHDAC returns, numpress-chunked by default).
   Cost model: the host materialises the whole run into a temp file at 16 B/point before the
-  first spectrum is read (~3 GB for the 242 MB Q-TOF run), removed on close.
+  first spectrum is read (~3 GB for the 242 MB Q-TOF run), removed on close and by the panic
+  hook (a Ctrl+C, which ends both processes, still leaves it). The host runs under a deadline
+  (`MZPC_AGILENT_HOST_TIMEOUT`, default two hours) inside a kill-on-close Job Object, so a stuck
+  host is killed and a killed converter does not leave it running.
 
 - **Agilent profile (`--agilent-grid`) — ⚠️ pure Rust, two known decode gaps.** Neither
   profile-bearing `.d` in the project corpus converts today: one fails LZF decompression of an

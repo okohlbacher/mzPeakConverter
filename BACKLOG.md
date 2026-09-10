@@ -177,8 +177,9 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   the temp-file materialisation (16 B/point, whole run)
   could stream, and the inspect path (no `-o`) pays it in full just to print a scan count (a host
   `--count` mode would fix both); the instrument serial number (msconvert records it; the MHDAC member
-  the host tries is not it); no timeout or kill-on-parent-death for the host process (a killed converter
-  orphans it); per-record scan types in the protocol so a mixed Scan+MRM method can drop the dwell rows
+  the host tries is not it); a Ctrl+C still leaves the host's temp file behind (the host's deadline,
+  its kill-on-close Job Object and the panic-hook sweep do not cover a console interrupt, which ends
+  both processes); per-record scan types in the protocol so a mixed Scan+MRM method can drop the dwell rows
   instead of storing them as one-point spectra (today: a warning).
 - **Not in the ledger — surfaced by the 0.10.2 corpus rebuild (2026-09-06):** a chunk-capable
   integer axis. M6 put gridded profile spectra into `spectra_data`, which therefore has to be point
