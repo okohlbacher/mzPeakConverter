@@ -130,11 +130,12 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-numpress` | off | Lossless delta m/z chunking instead of the default lossy numpress-linear |
 | `--no-mz-lattice` | off | Disable the fixed-point m/z **lattice** for centroid peaks and store f64 `mz` instead — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the archive is destined for a reader that does not know the `mz-grid` codec (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
-| `--zstd-level <ZSTD_LEVEL>` | `3` (timsTOF ims-compact lanes: `5`) | Zstd compression level (1–22). The ims-compact lanes default to 5, the measured byte-plane plateau; an explicit value applies to both (§9) |
+| `--zstd-level <ZSTD_LEVEL>` | `3` (timsTOF ims-compact lanes: `22`) | Zstd compression level (1–22). The ims-compact lanes default to 22: their archives are written once and read many times, and 22 is 1.4 % smaller than 5 on PXD059079's 2485.d. An explicit value applies to every lane (§9) |
 | `-f, --force` | off | Overwrite the output if it already exists |
 | `--no-ims-compact` | off | Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and write standard f64 m/z instead |
 | `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum (Shimadzu `.lcd` does). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written. Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) |
-| `--ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: select the **chunked** layout for rapid m/z-range access instead of the default **archive** layout (a flat table of absolute integer TOF bins). Splits each frame's peaks into 50-Th m/z bins (`--chunk-size` overrides), each chunk recording its TOF bounds as page-prunable Parquet columns — XIC / m/z-slice queries ~20× faster at parity-to-+8 % size. TOF is delta-encoded within each chunk: `chunk_start + cumsum(deltas)`, lossless (§9) |
+| `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: the **chunked** layout, the default since 0.12.1 — passing the flag is inert and says so. Splits each frame's peaks into 50-Th m/z bins (`--chunk-size` overrides), each chunk recording its TOF bounds as page-prunable Parquet columns — XIC / m/z-slice queries ~20× faster. TOF is delta-encoded within each chunk: `chunk_start + cumsum(deltas)`, lossless (§9). It is also **smaller**: 7.8 % on 2485.d, because chunk-relative TOF costs a quarter of absolute TOF, which more than pays for the mobility column losing its run-length ordering. The archive then holds a CHUNK `spectra_peaks` facet beside a POINT `spectra_data` facet — the mixed layout-family deviation (§9) |
+| `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: write the flat **archive** layout instead — one table of ABSOLUTE integer TOF bins, no m/z index, no mixed layout family, ~8 % more bytes. This was the default through 0.12.0 |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
 | `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's vendor-grade scan→1/K0 recalibration (the `TimsCalibration` ModelType-2 model) and use timsrust's linear approximation. Recalibration is ON by default. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
@@ -169,14 +170,14 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 |---|---|---|
 | `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --representation --ims-chunked --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output) |
 | `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux` | the filter lane's list without `--aux` |
-| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
+| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
 | `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert` | `--layout --no-numpress --chunk-size` |
-| `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
-| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-tims-recalibration` | `--layout --no-numpress --chunk-size` |
-| `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-tims-recalibration` | — |
+| `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-ims-chunked --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
+| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | `--layout --no-numpress --chunk-size` |
+| `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | — |
 | default timsTOF (TDF) ims-compact | `--image --sdrf` | `--layout --no-numpress` |
-| native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` | `--ims-chunked` |
-| standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | — | `--ims-chunked` (also when a timsTOF run falls back to this lane because timsrust cannot decompress it) |
+| native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` | `--ims-chunked --no-ims-chunked` |
+| standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | — | `--ims-chunked --no-ims-chunked` (also when a timsTOF run falls back to this lane because timsrust cannot decompress it) |
 
 Options a lane has no use for that appear in neither column (`--no-vendor` on an mzML export,
 `--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input converted to
@@ -278,7 +279,8 @@ chunk_size: 50
 zstd_level: 9
 force: true
 no_ims_compact: false      # TDF: keep the lossless ims-compact default
-ims_chunked: false
+ims_chunked: true          # the default since 0.12.1
+no_ims_chunked: false      # opt back out to the flat archive layout
 bruker_sdk: false
 no_tims_recalibration: false
 no_vendor: false
