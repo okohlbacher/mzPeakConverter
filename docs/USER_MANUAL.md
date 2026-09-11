@@ -39,7 +39,7 @@ It is a **single command**: give it an input and, optionally, an output.
   archive (a STORED ZIP of Apache Parquet facets + a JSON index) that is columnar and
   analysis-ready, preserves vendor metadata and ion-mobility structure, and preserves the
   vendor's signal **to a stated fidelity with every applied transformation declared** in the
-  index (`transformations`) — see §8 for the four transforms that are not bit-exact.
+  index (`transformations`) — see §8 for what is not bit-exact and the entry that names each change.
 - **Without `--output`** — writes nothing; it just **inspects** the input and prints
   a report (format, spectrum count, chromatogram count).
 
@@ -180,9 +180,10 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 
 Options a lane has no use for that appear in neither column (`--no-vendor` on an mzML export,
 `--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input converted to
-mzPeak, `--sample` on anything but a SciEX `.wiff`) are accepted without a refusal, so a shared
-recipe or config keeps working; of those, `--tof-grid` on the Agilent MHDAC lane and `--sample`
-log a warning. Config-file values never count as supplied, so a shared profile carrying
+mzPeak, `--sample` on anything but a SciEX `.wiff`, `--aux` on a single-file input) are accepted
+without a refusal, so a shared recipe or config keeps working; of those, `--tof-grid` on the Agilent
+MHDAC lane, `--sample` and `--aux` log a warning. Config-file values never count as supplied, so a
+shared profile carrying
 `zstd_level: 12` or `sdrf:` sets defaults for the lanes that use them
 and is a silent no-op on the lanes that cannot — put such an option on the command line when you
 want the refusal to protect you.
@@ -614,13 +615,15 @@ converted from a profile-less `.lcd` before v0.9.9 carry the misaligned intensit
 be reconverted. See `glue/shimadzu/README.md` for the measurements and for how to check the
 installed version.
 
-**Fidelity: what is preserved, and the four declared transforms.** The project invariant
+**Fidelity: what is preserved, and the declared transforms.** The project invariant
 (decided 2026-09-04) is that the archive preserves the vendor's signal **as much as possible, to a
 stated fidelity, with every transformation declared** in the index's `transformations` list — so a
 reader can tell from the archive alone what was done to the data. Retention time, precursor m/z
 and charge, centroid m/z (f64, or the bit-exact fixed-point lattice of §9) and integer TOF
 round-trip bit-for-bit; verified against mzdata's own mzML output on a 4,880-spectrum DDA run with
-zero differences. Four transforms are **not** bit-exact, and each is named in the archive:
+zero differences. Four general signal transforms are **not** bit-exact, and each is named in the
+archive; the lane-specific changes, each declared when it happens, are in the table under
+**The `transformations` index key** below:
 
 1. **numpress-linear** (`numpress-linear`) — the *default* chunk encoding of profile m/z on the `chunked` layout is
    lossy (§9); `--no-numpress` selects the lossless delta encoding.
@@ -955,7 +958,8 @@ They load the proprietary vendor DLLs at **runtime**, sourced from a ProteoWizar
 install: point `$MZPC_PWIZ_DIR` at it, and for the .NET glues set `$MZPC_AGILENT_GLUE` /
 `$MZPC_SCIEX_GLUE` / `$MZPC_SHIMADZU_GLUE` to the built C# glue dir (`dotnet build
 glue/agilent/AgilentGlue.csproj`, likewise `glue/shimadzu/ShimadzuGlue.csproj`; the Shimadzu
-DLL is loaded from `$MZPC_PWIZ_DIR` by reflection — see `glue/shimadzu/README.md`).
+DLL is loaded from `$MZPC_PWIZ_DIR` by reflection — see `glue/shimadzu/README.md`). With a glue
+variable unset, a release uses the glue it ships under `glue\` beside the executable (§2).
 Both ProteoWizard layouts work: the MHDAC/Clearcore2 assemblies may sit under
 `vendor_api/Agilent` / `vendor_api/ABI` (the bundled builds) or flat beside `msconvert.exe`
 (the standalone installer); the Agilent lane probes both, subdirectory first. Shimadzu's
