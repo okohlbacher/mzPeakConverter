@@ -221,6 +221,11 @@ fn ims_compact_per_spectrum_exact_pinned() {
 #[test]
 fn tof_grid_files_by_representation_pinned() {
     pinned("fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool)");
+    // One axis definition, two column names, and which lane uses which is the pin: the sqrt-grid
+    // lanes store `tof_index`, ims-compact stores `tof` (and its index block says `"lossless": "tof"`
+    // to match). Swapping them would leave a reader looking for a column that is not there.
+    pinned("tof_axis_field(\"tof_index\", run_wide, per_spectrum)");
+    pinned("tof_axis_field(\"tof\", (model_a, model_b), exact_per_spectrum.is_some())");
     pinned("fn tof_index_peak_schema(tof_field: std::sync::Arc<arrow::datatypes::Field>)");
     // the peaks schema carries the f64 fallback beside the axis, like the mz-grid lattice facet
     pinned(".add_field(tof_field)\n        .add_field(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field())");

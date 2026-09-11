@@ -499,6 +499,24 @@ fn has_gz_suffix(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("gz"))
 }
 
+/// **The one mzML epilogue**, for all four export lanes ([`convert_to_mzml`],
+/// [`filter_mzpeak_to_mzml`], [`write_native_mzml`], `write_agilent_profile_mzml`): close the writer,
+/// drop the sink, rename the temporary onto `output`.
+///
+/// Taking `w` BY VALUE is the point. A `.mzML.gz` sink writes its gzip trailer only when the encoder
+/// drops, so the sink must be closed before the rename or the renamed file is a truncated gzip. That
+/// order used to be carried by a comment beside a hand-written `drop(w)` in four places; here it is
+/// structural — the writer cannot outlive the call, and no caller can forget the drop.
+fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: TmpGuard, output: &Path) -> Result<()> {
+    use mzdata::prelude::SpectrumWriter;
+    SpectrumWriter::close(&mut w)
+        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
+    drop(w);
+    tmp_guard.finish(output)?;
+    log::info!("wrote {}", output.display());
+    Ok(())
+}
+
 /// The byte sink for an mzML export: the plain file, or a streaming gzip encoder when the requested
 /// name ends in `.gz`. The XML is compressed AS it is written — one pass, no re-read. Both the mzML
 /// writer and the encoder finish on drop (the writer closes the document, the encoder writes the
@@ -2058,6 +2076,78 @@ fn guard_unsupported_vendor(input: &Path) -> Result<()> {
     Ok(())
 }
 
+/// **The one `msconvert` invocation.** Resolve the executable (`--msconvert-path`, else
+/// `$MSCONVERT_PATH`, else `msconvert` on PATH), run it into a fresh directory under `outdir` with
+/// its stdout+stderr captured, and hand back the guard owning that directory and the mzML inside it.
+///
+/// Both lanes that shell out to ProteoWizard — `--via-msconvert` (→ mzPeak) and
+/// `--via-msconvert --to mzml` — ran their own copy of these twelve steps, identical down to both
+/// `bail!` strings, and differing only in where the temporary directory goes and in how helpful the
+/// "not found" message was. `outdir` is now the one real difference: the `--to mzml` lane passes the
+/// output's own directory so the rename cannot cross a volume, the mzPeak lane passes the system
+/// temp dir because it only reads the file in place.
+///
+/// `--ignoreUnknownInstrumentError` is passed unconditionally: newer SCIEX instruments (ZenoTOF
+/// 7600, newer TripleTOF) report a model string ProteoWizard's hand-curated `Reader_ABI` map does
+/// not know, and without the flag the reader THROWS and writes no mzML — msconvert itself recommends
+/// exactly this flag, and it is benign on recognised instruments. The captured log is what makes a
+/// failure self-diagnosing (unknown instrument / unsupported format / missing sidecar) instead of a
+/// bare exit code, and it is also what [`refuse_multi_run`] reads to catch a multi-run input.
+fn run_msconvert(input: &Path, outdir: &Path, msconvert_path: Option<&Path>) -> Result<TranscodeGuard> {
+    let exe: std::ffi::OsString = msconvert_path
+        .map(|p| p.as_os_str().to_os_string())
+        .or_else(|| std::env::var_os("MSCONVERT_PATH"))
+        .unwrap_or_else(|| "msconvert".into());
+    // The intermediate mzML goes to a temp dir the guard removes on every return; "msconvert not
+    // found" used to return through `?` below and leave it behind.
+    let tmp = msconvert_dir(outdir)?;
+    let log_path = tmp.dir.join("msconvert.log");
+    let mut cmd = Command::new(&exe);
+    cmd.arg(input)
+        .arg("--mzML")
+        .arg("--ignoreUnknownInstrumentError")
+        .arg("--outdir")
+        .arg(&tmp.dir)
+        .arg("--outfile")
+        .arg("via_msconvert.mzML");
+    msconvert_sample_arg(&mut cmd, input);
+    if let Ok(f) = fs::File::create(&log_path) {
+        if let Ok(f2) = f.try_clone() {
+            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
+        }
+    }
+    let status = cmd.status().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "msconvert not found ({}). Install ProteoWizard and put msconvert on PATH, or pass \
+                 --msconvert-path / set $MSCONVERT_PATH. (Windows, or Wine.)",
+                exe.to_string_lossy()
+            )
+        } else {
+            anyhow!("running msconvert: {e}")
+        }
+    })?;
+    let tail = || -> String {
+        fs::read_to_string(&log_path)
+            .ok()
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                lines[lines.len().saturating_sub(15)..].join("\n")
+            })
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
+            .unwrap_or_default()
+    };
+    if !status.success() {
+        bail!("msconvert failed (exit {:?}){}", status.code(), tail());
+    }
+    if !tmp.file.exists() {
+        bail!("msconvert reported success but produced no mzML at {}{}", tmp.file.display(), tail());
+    }
+    refuse_multi_run(&log_path)?;
+    Ok(tmp)
+}
+
 /// Interim cross-vendor lane (PLAN §3.7): run ProteoWizard `msconvert` to produce an mzML, then
 /// convert that mzML to mzPeak through the existing path. Reuses everything downstream of the reader,
 /// `--image` / `--sdrf` included (they used to be hard-coded away here, so the same command kept or
@@ -2078,69 +2168,8 @@ fn convert_via_msconvert(
     images: &[PathBuf],
     sdrf: Option<&Path>,
 ) -> Result<()> {
-    let exe: std::ffi::OsString = msconvert_path
-        .map(|p| p.as_os_str().to_os_string())
-        .or_else(|| std::env::var_os("MSCONVERT_PATH"))
-        .unwrap_or_else(|| "msconvert".into());
-
-    // The intermediate mzML goes to a temp dir the guard removes on every return; "msconvert not
-    // found" used to return through `?` below and leave it behind.
-    let tmp = msconvert_dir(&std::env::temp_dir())?;
-    let (tmpdir, mzml) = (&tmp.dir, &tmp.file);
-
-    let mzcvt_log = tmpdir.join("msconvert.log");
-    let mut cmd = Command::new(&exe);
-    cmd.arg(input)
-        .arg("--mzML")
-        // #1: newer SCIEX (ZenoTOF 7600, newer TripleTOF) report an instrument-model string that
-        // ProteoWizard's hand-curated `Reader_ABI` model map doesn't recognize yet; without this the
-        // reader THROWS on the run and no mzML is written (msconvert may still exit 0 → we'd bail
-        // "produced no mzML", or exit 1). msconvert itself recommends this exact flag ("use the
-        // ignoreUnknownInstrumentError flag"). Benign on recognized instruments (they don't hit the
-        // fallback), so it's safe to pass unconditionally.
-        .arg("--ignoreUnknownInstrumentError")
-        .arg("--outdir")
-        .arg(&tmpdir)
-        .arg("--outfile")
-        .arg("via_msconvert.mzML");
-    msconvert_sample_arg(&mut cmd, input);
-    // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
-    // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
-    if let Ok(f) = fs::File::create(&mzcvt_log) {
-        if let Ok(f2) = f.try_clone() {
-            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
-        }
-    }
-    let status = cmd.status().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!(
-                "msconvert not found ({}). Install ProteoWizard and put msconvert on PATH, or pass \
-                 --msconvert-path / set $MSCONVERT_PATH. (Windows, or Wine.)",
-                exe.to_string_lossy()
-            )
-        } else {
-            anyhow::anyhow!("running msconvert: {e}")
-        }
-    })?;
-    // #3: on any failure, include the tail of msconvert's own output so the error is self-diagnosing.
-    let msconvert_tail = || -> String {
-        fs::read_to_string(&mzcvt_log)
-            .ok()
-            .map(|s| {
-                let lines: Vec<&str> = s.lines().collect();
-                lines[lines.len().saturating_sub(15)..].join("\n")
-            })
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
-            .unwrap_or_default()
-    };
-    if !status.success() {
-        bail!("msconvert failed (exit {:?}){}", status.code(), msconvert_tail());
-    }
-    if !mzml.exists() {
-        bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), msconvert_tail());
-    }
-    refuse_multi_run(&mzcvt_log)?;
+    let tmp = run_msconvert(input, &std::env::temp_dir(), msconvert_path)?;
+    let mzml = &tmp.file;
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
@@ -2280,6 +2309,12 @@ fn convert_to_mzml(
         .then(|| thermo_isolation::UnstatedWidthGuard::open(&read_path));
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2318,13 +2353,7 @@ fn convert_to_mzml(
     let traces = if input.is_dir() { bruker_traces::read(input) } else { Vec::new() };
     write_source_chromatograms_mzml(&mut w, source_chroms.into_iter().chain(traces.into_iter().map(|t| t.chromatogram)))?;
 
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// The mzPeak-INPUT filter path with an mzML output. Reads the `.mzpeak` with the sync `MzPeakReader`
@@ -2389,6 +2418,12 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     };
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2426,13 +2461,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         .collect();
     write_source_chromatograms_mzml(&mut w, chroms.into_iter())?;
 
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// Cut a chromatogram to the `--rt` window `[lo, hi]` (minutes) as the `.mzpeak` filter lane cuts
@@ -2483,6 +2512,12 @@ fn write_native_mzml(
         bail!("no spectra in {}", input.display());
     }
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2501,13 +2536,7 @@ fn write_native_mzml(
     if input.is_dir() {
         write_source_chromatograms_mzml(&mut w, bruker_traces::read(input).into_iter().map(|t| t.chromatogram))?;
     }
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// Write an Agilent **profile** `.d` (`AcqData/MSProfile.bin`) to mzML on any platform, using the
@@ -2523,6 +2552,12 @@ fn write_agilent_profile_mzml(
 ) -> Result<()> {
     use mzdata::prelude::SpectrumWriter;
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2592,13 +2627,7 @@ fn write_agilent_profile_mzml(
     if out_index == 0 {
         bail!("no profile spectra in {}", input.display());
     }
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// A chromatogram type as the PSI-MS cvParam mzML states it with; `None` for an unknown type.
@@ -2737,62 +2766,12 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
 /// `output.exists()` as the success check, so under `--force` a previous run's file passed for this
 /// run's — which real msconvert produces for `-o x.mzML.gz`, a name it writes under another one.
 fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>) -> Result<()> {
-    let exe: std::ffi::OsString = msconvert_path
-        .map(|p| p.as_os_str().to_os_string())
-        .or_else(|| std::env::var_os("MSCONVERT_PATH"))
-        .unwrap_or_else(|| "msconvert".into());
+    // Beside the OUTPUT, so the rename into place cannot cross a volume.
     let outdir = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let tmp = msconvert_dir(outdir)?;
-    // Capture msconvert's stdout+stderr so a failure carries its real message (unknown-instrument /
-    // unsupported-format / missing-sidecar) instead of a bare exit code — same as the mzPeak
-    // `convert_via_msconvert` path (commit 57262aa).
-    let log_path = tmp.dir.join("msconvert.log");
-    let mut cmd = Command::new(&exe);
-    cmd.arg(input)
-        .arg("--mzML")
-        .arg("--ignoreUnknownInstrumentError")
-        .arg("--outdir")
-        .arg(&tmp.dir)
-        .arg("--outfile")
-        .arg("via_msconvert.mzML");
-    msconvert_sample_arg(&mut cmd, input);
-    if let Ok(f) = fs::File::create(&log_path) {
-        if let Ok(f2) = f.try_clone() {
-            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
-        }
-    }
-    let status = cmd.status().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow!(
-                "msconvert not found ({}); install ProteoWizard or set --msconvert-path / \
-                 $MSCONVERT_PATH",
-                exe.to_string_lossy()
-            )
-        } else {
-            anyhow!("running msconvert: {e}")
-        }
-    })?;
-    let tail = || -> String {
-        fs::read_to_string(&log_path)
-            .ok()
-            .map(|s| {
-                let lines: Vec<&str> = s.lines().collect();
-                lines[lines.len().saturating_sub(15)..].join("\n")
-            })
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
-            .unwrap_or_default()
-    };
-    if !status.success() {
-        bail!("msconvert failed (exit {:?}){}", status.code(), tail());
-    }
-    if !tmp.file.exists() {
-        bail!("msconvert reported success but produced no mzML at {}{}", tmp.file.display(), tail());
-    }
-    refuse_multi_run(&log_path)?;
+    let tmp = run_msconvert(input, outdir, msconvert_path)?;
     // msconvert's own `--gzip` would pick the file name again; compress what it wrote instead.
     let written = if has_gz_suffix(output) {
         let gz = tmp.dir.join("via_msconvert.mzML.gz");
@@ -2983,9 +2962,18 @@ fn convert_file_tof_grid(
 /// Until 0.10.1 gridded spectra were forced to Centroid to reach the only facet that knew the axis,
 /// which labelled every gridded profile a centroid spectrum in `spectra_metadata`.
 fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
+    tof_axis_field("tof_index", run_wide, per_spectrum)
+}
+
+/// The integer flight-time axis column itself, for both names it goes by: `tof_index` on the
+/// sqrt-grid lanes ([`tof_index_field`]) and `tof` on ims-compact, whose index block likewise says
+/// `"lossless": "tof"`. The two names are a published format difference and stay; the field around
+/// them — Int32, the `SqrtMzFromTof` transform CURIE, `mzpeak:transform_params` = "c0,c1" and the
+/// per-spectrum key — is one definition, so a third key added for one lane cannot miss the other.
+fn tof_axis_field(axis: &str, run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
     let base = BufferName::new(
         BufferContext::Spectrum,
-        ArrayType::nonstandard("tof_index"),
+        ArrayType::nonstandard(axis),
         BinaryDataArrayType::Int32,
     )
     .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
@@ -5078,26 +5066,9 @@ where
     // (SqrtMzFromTof) rides via the BufferName, and the [a, b] coefficients via the field metadata
     // (`mzpeak:transform_params`), so a conformant reader recovers m/z = (a + b·tof)² generically
     // from the column metadata — not only from the index `ims_calibration` block (still written).
-    let tof_field = {
-        let base = BufferName::new(
-            BufferContext::Spectrum,
-            ArrayType::nonstandard("tof"),
-            BinaryDataArrayType::Int32,
-        )
-        .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
-        .to_field();
-        let mut md = base.metadata().clone();
-        md.insert(
-            "mzpeak:transform_params".to_string(),
-            format!("{},{}", model_a, model_b),
-        );
-        // Exact per-frame coefficients override the run-wide chord in the reader (the same
-        // per-spectrum contract as the sqrt-grid lanes; `reconstruct_per_spectrum_grid_mz`).
-        if exact_per_spectrum.is_some() {
-            md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
-        }
-        std::sync::Arc::new((*base).clone().with_metadata(md))
-    };
+    // Exact per-frame coefficients override the run-wide chord in the reader (the same per-spectrum
+    // contract as the sqrt-grid lanes; `reconstruct_per_spectrum_grid_mz`).
+    let tof_field = tof_axis_field("tof", (model_a, model_b), exact_per_spectrum.is_some());
     let mob_field = BufferName::new(
         BufferContext::Spectrum,
         ArrayType::MeanInverseReducedIonMobilityArray,
