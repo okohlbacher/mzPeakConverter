@@ -102,7 +102,7 @@ fn ims_compact_calibration_pinned() {
 #[test]
 fn sciex_per_spectrum_tof_grid_pinned() {
     // The SciEX encoding actually present across the corpus. The viewer matches BOTH the model
-    // string AND this exact tof_to_mz formula, so both are load-bearing. Since 0.11.6 the model and
+    // string AND this exact tof_to_mz formula, so both are load-bearing. Since 0.12.0 the model and
     // the reconstruction claim reach the block through `tof_grid_block`, so the pin is the CALL —
     // both lanes that use this model string (native SciEX, and the Shimadzu profile grid, which
     // shares the formula family).
@@ -149,7 +149,7 @@ fn agilent_and_sciex_global_models_pinned() {
 /// asserted three. Hence: assert the number of sites, not merely the presence of a string.
 #[test]
 fn tof_grid_reconstruction_keys_pinned() {
-    // Since 0.11.6 the shared keys are written once, by `tof_grid_block`, and every lane builds its
+    // Since 0.12.0 the shared keys are written once, by `tof_grid_block`, and every lane builds its
     // block through it — so `codec`, `lossless` and `mz_reconstruction` are guaranteed to agree by
     // construction and what is worth counting is the CALL SITES. A fifth lane that hand-rolls its
     // own JSON instead of calling the builder is the failure this catches.
@@ -158,7 +158,7 @@ fn tof_grid_reconstruction_keys_pinned() {
     // Counted on the VALUE literal, not on a `"codec": "tof-grid",` spelling: a hand-rolled block
     // with the key last (no trailing comma), or with no space after the colon, or built through
     // `serde_json::Map::insert`, would slip past a spelling-sensitive guard — two of those four
-    // spellings slipped past the pre-0.11.6 site count too. `"--tof-grid"` and `"tof-grid:{}ppm"`
+    // spellings slipped past the pre-0.12.0 site count too. `"--tof-grid"` and `"tof-grid:{}ppm"`
     // do not contain the quoted token, so the only match is the builder's own.
     assert_eq!(
         code().matches("\"tof-grid\"").count(),

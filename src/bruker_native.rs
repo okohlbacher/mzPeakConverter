@@ -49,7 +49,7 @@ pub(crate) enum ImsIntensity<'a> {
 /// unit: the two native builders, the SDK builder, and the synthetic two-point sample
 /// `ims_chunked_peak_schema` runs through the chunker to materialise the write-time schema. A
 /// mismatch there does not fail loudly — the arrays spill into `auxiliary_arrays` and the peaks
-/// facet is written with the wrong columns. Until 0.11.6 the agreement was a comment.
+/// facet is written with the wrong columns. Until 0.12.0 the agreement was a comment.
 pub(crate) fn ims_compact_arrays(
     tof: &[i32],
     intensity: ImsIntensity<'_>,

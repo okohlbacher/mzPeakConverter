@@ -282,7 +282,7 @@ fn gridded_archive_states_its_reconstruction_contract() {
         );
     }
     // Storing a quantized axis IS a transformation, and `transformations` lists what a conversion
-    // APPLIED (0.11.6). An archive that quietly re-encoded m/z without saying so is the failure.
+    // APPLIED (0.12.0). An archive that quietly re-encoded m/z without saying so is the failure.
     let applied = idx
         .get("metadata")
         .and_then(|m| m.get("transformations"))
