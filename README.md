@@ -28,13 +28,17 @@ preserves vendor metadata and ion-mobility structure.
 
 **Fidelity.** The archive preserves the vendor's signal **to a stated fidelity, and
 declares every transformation it applied** in the index (`transformations`). Most lanes
-are bit-exact (integer TOF, the fixed-point m/z lattice, centroid m/z). Four transforms
-are not, and each is named in the archive with its bound: the default **numpress-linear**
-chunk encoding of profile m/z (`--no-numpress` for lossless delta), **zero-run
-compaction** of profile baselines (consecutive zeros collapse to one at each peak
-boundary), the **`--tof-grid` sqrt grid**, accepted only within a ppm bound
+are bit-exact (integer TOF, the fixed-point m/z lattice, centroid m/z). Four general
+signal transforms are not, and each is named in the archive with its bound: the default
+**numpress-linear** chunk encoding of profile m/z (`--no-numpress` for lossless delta),
+**zero-run compaction** of profile baselines (consecutive zeros collapse to one at each
+peak boundary), the **`--tof-grid` sqrt grid**, accepted only within a ppm bound
 (`MZPC_TOF_GRID_PPM`, default 5), and the **Shimadzu profile pad trim** (the
 zero-intensity pad at the scan-window bounds outside the signal span is not stored).
+Beside them, a lane declares each change of its own when it makes one (a vendor
+library's NaN intensity stored as 0, a Thermo isolation window of unstated width written
+target-only, chromatogram times in seconds stored in minutes, …); the user manual's §8
+table lists every entry.
 
 ## Documentation
 
@@ -44,7 +48,7 @@ zero-intensity pad at the scan-window bounds outside the signal span is not stor
   [HUPO-PSI/mzPeak-specification](https://github.com/HUPO-PSI/mzPeak-specification)
   · inspect `.mzpeak` files in your browser at [mzpeak.org/view](https://mzpeak.org/view)
 - 🏗 [Platform support matrix](docs/PLATFORM_SUPPORT.md) · [Backlog](BACKLOG.md)
-- 📦 [SBOM](sbom.cdx.json) (CycloneDX) · [Third-party notices](THIRD-PARTY-NOTICES.md) · [Changelog](CHANGELOG.md)
+- 📦 SBOM (CycloneDX, `mzpeak-convert-<version>.cdx.json` on each [release](https://github.com/okohlbacher/mzPeakConverter/releases)) · [Third-party notices](THIRD-PARTY-NOTICES.md) · [Changelog](CHANGELOG.md)
 
 ## Supported formats & operating systems
 
@@ -57,8 +61,9 @@ zero-intensity pad at the scan-window bounds outside the signal span is not stor
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; `libbaf2sql_c` at runtime |
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | out-of-process **net48** host (`glue/agilent`) → MHDAC; since 0.11.0. MRM/SIM-only runs are refused (they are chromatograms) — use `--via-msconvert` for those ([details](docs/PLATFORM_SUPPORT.md)) |
-| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime. MRM/SIM dwell runs are refused (they are chromatograms) — use `--via-msconvert`; multi-sample files take `--sample N` |
+| SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime. MSn precursors (selected ion, isolation window, collision energy) are read but not yet run on Windows. MRM/SIM dwell runs are refused (they are chromatograms) — use `--via-msconvert`; multi-sample files take `--sample N` |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/shimadzu`); LabSolutions.IO at runtime — **needs a current ProteoWizard**, see [`glue/shimadzu/README.md`](glue/shimadzu/README.md) |
+| Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` called directly, no .NET glue (`MZPC_MASSLYNX_DIR`, else `MZPC_PWIZ_DIR`); HDMSe/HDDDA functions are written as frames with a per-point drift time |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
 
 Thermo `.raw` and Bruker `.d` link their readers in automatically (no build flag).
@@ -168,7 +173,9 @@ cargo test --release           # the test suite CI runs
 ```
 
 Use the release profile, as CI does: the vendored writer carries `debug_assert`s that a plain
-debug `cargo test` can trip on inputs the release build handles. The tests that need data too large
+debug `cargo test` can trip on inputs the release build handles. The suite also needs a **.NET 8+
+runtime**, as Thermo `.raw` conversion does: `tests/thermo_raw.rs` converts the committed
+`tests/data/small.RAW` and fails without one. The tests that need data too large
 to commit — real timsTOF runs, a Bruker TSF acquisition, lane pairs built on the Windows box — are
 `#[ignore]`d, so a run without them reports them as not run rather than as passed. With the
 reference corpus:

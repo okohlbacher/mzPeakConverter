@@ -8,7 +8,8 @@
 // converter (src/agilent.rs) spawns once per .d.
 //
 // PROTOCOL (one-shot, argv in / file out):  AgilentGlueHost <in.d> <mhdacDir> <out.bin>
-// Reads every MS scan via MHDAC and writes this little-endian binary file (the Rust twin of this
+// Reads every MS scan via MHDAC (only the first MZPC_MAX_SPECTRA when the converter sets that cap)
+// and writes this little-endian binary file (the Rust twin of this
 // layout, with tests, is src/agl.rs):
 //     magic "AGL2" (4 bytes) | count u64 |
 //     scanTypes: len u32 + UTF-8 (MHDAC MSScanFileInformation.ScanTypes.ToString(), e.g.
@@ -31,6 +32,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -51,6 +53,13 @@ namespace AgilentGlue
             try
             {
                 int count = reader.Open(dPath, mhdacDir);
+                // MZPC_MAX_SPECTRA (the converter hands over the cap it parsed, or removes the
+                // variable): export only the scans the archive will hold, so the [count ...] tags
+                // below count the rewrites of exactly those scans.
+                long cap;
+                if (long.TryParse(Environment.GetEnvironmentVariable("MZPC_MAX_SPECTRA"), NumberStyles.None, CultureInfo.InvariantCulture, out cap)
+                    && cap > 0 && cap < count)
+                    count = (int)cap;
                 // Write to a .part file and atomically publish only after a fully-successful write +
                 // close. The offset table is back-filled at the end, so a host killed/crashed mid-write
                 // (e.g. a native MHDAC AccessViolation that bypasses catch/finally) would otherwise
@@ -88,10 +97,13 @@ namespace AgilentGlue
                 }
                 if (File.Exists(outPath)) File.Delete(outPath);
                 File.Move(partPath, outPath);                              // atomic publish
-                // A rewrite the archive would otherwise not know about: say so (the converter logs
-                // a non-empty stderr of a successful host at warn level).
+                // Rewrites the archive would otherwise not know about: say so. The converter logs
+                // every stderr line of a successful host, and reads the bracketed counts back
+                // (`agl::host_counts`) to declare each rewrite in the archive's `transformations`.
                 if (reader.NonFiniteIntensities > 0)
-                    Console.Error.WriteLine("AgilentGlueHost: " + reader.NonFiniteIntensities + " intensity value(s) were NaN/Inf and were stored as 0");
+                    Console.Error.WriteLine("AgilentGlueHost: " + reader.NonFiniteIntensities + " intensity value(s) were NaN/Inf and were stored as 0 [count nonfinite_intensities=" + reader.NonFiniteIntensities + "]");
+                if (reader.TruncatedSpectra > 0)
+                    Console.Error.WriteLine("AgilentGlueHost: " + reader.TruncatedSpectra + " spectrum/spectra had m/z and intensity arrays of different lengths and were cut to the shorter (" + reader.TruncatedPoints + " point(s) dropped) [count truncated_spectra=" + reader.TruncatedSpectra + "]");
                 return 0;
             }
             catch (Exception ex)
@@ -148,6 +160,10 @@ namespace AgilentGlue
 
         /// <summary>Points whose MHDAC intensity was NaN/Inf and were stored as 0 — reported on stderr at exit.</summary>
         public long NonFiniteIntensities { get; private set; }
+        /// <summary>Spectra whose m/z and intensity arrays differed in length and were cut to the shorter one — reported on stderr at exit.</summary>
+        public long TruncatedSpectra { get; private set; }
+        /// <summary>The points that cut dropped, over all <see cref="TruncatedSpectra"/>.</summary>
+        public long TruncatedPoints { get; private set; }
         /// <summary>MHDAC <c>MSScanFileInformation.ScanTypes</c> as its flags string; "" when unreadable.</summary>
         public string ScanTypes { get; private set; } = "";
         /// <summary>DeviceType, device name and serial joined by U+001F; each part "" when unreadable.</summary>
@@ -248,7 +264,13 @@ namespace AgilentGlue
             double[] x = (double[])_api.SpecXArray.GetValue(spec);
             Array yRaw = (Array)_api.SpecYArray.GetValue(spec);   // float[] in MHDAC; widen to double
             int n = x.Length;
-            if (yRaw.Length < n) n = yRaw.Length;                 // defensive: use the shorter length
+            if (yRaw.Length != n)
+            {
+                // Cut to the shorter array, and count the cut: the archive declares it.
+                TruncatedSpectra++;
+                TruncatedPoints += Math.Abs((long)yRaw.Length - n);
+                n = Math.Min(n, yRaw.Length);
+            }
 
             var s = new Spec { Mz = new double[n], Intensity = new double[n] };
             for (int i = 0; i < n; i++)

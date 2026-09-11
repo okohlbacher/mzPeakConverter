@@ -6,11 +6,12 @@
 //!     spectra with exit 1;
 //!   * `--drop-aux` could delete a core facet and exit 0;
 //!   * `--ms-level` / `--rt` defaulted a missing or retyped column (level 0 / NaN) and kept nothing;
-//!   * `--rt` never refreshed `number_of_data_points` in the flat `chromatograms_metadata`.
+//!   * `--rt` never refreshed `number_of_data_points` in the flat `chromatograms_metadata`;
+//!   * an archive it wrote with `--ms-level` / `--rt` could not be read back.
 //!
 //! Each test converts its fixture into a scratch directory that belongs to that test alone.
 
-use arrow::array::{Array, RecordBatch, StructArray, UInt8Array, UInt64Array};
+use arrow::array::{Array, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashMap;
 use std::fs::File;
@@ -151,6 +152,77 @@ fn mzml_output_applies_the_same_filters() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A filtered archive keeps each survivor's original, now sparse, `index`. Reading one back aborted
+/// (the reader sized its per-spectrum tables by row count), and the export walked `0..len`, which
+/// asks for spectra that are gone. Each archive must export exactly the spectra it holds.
+#[test]
+fn filtered_archives_read_back() {
+    let dir = scratch("read_back");
+    let src = convert(TINY, &dir);
+    let (out, mzml) = (dir.join("f.mzpeak"), dir.join("f.mzML"));
+    for args in [["--ms-level", "1"], ["--ms-level", "2"], ["--rt", "0-1"], ["--rt", "0-0.0001"]] {
+        ok(&mzpc(&src, &out, &args));
+        let meta = table(&out, "spectra_metadata.parquet");
+        let (index, id) = (column::<UInt64Array>(&meta, "index"), column::<LargeStringArray>(&meta, "id"));
+        let mut want: Vec<(u64, String)> = (0..meta.num_rows()).map(|r| (index.value(r), id.value(r).to_string())).collect();
+        want.sort();
+        let want: Vec<String> = want.into_iter().map(|(_, id)| id).collect();
+
+        ok(&mzpc(&out, &mzml, &[]));
+        let xml = std::fs::read_to_string(&mzml).unwrap();
+        let got: Vec<&str> = xml.split("<spectrum id=\"").skip(1).map(|s| s.split('"').next().unwrap()).collect();
+        assert_eq!(got, want, "{args:?}: the export must hold exactly the archive's spectra");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rewrite keeps the survivors' original indices, so its data facets are sparse as well: their
+/// `spectrum_count` is one past the largest index left, the bound a reader iterates to, not the
+/// number of spectra left. On tiny, spectrum 1 is the profile spectrum in spectra_data, and
+/// spectra_peaks holds 0 and 3 (2 is an empty centroid spectrum).
+#[test]
+fn rewritten_data_facets_declare_an_index_bound() {
+    let dir = scratch("count_bound");
+    let src = convert(TINY, &dir);
+    let out = dir.join("f.mzpeak");
+    for (args, data, peaks) in [(["--ms-level", "1"], "0", "4"), (["--rt", "0-1"], "0", "4"), (["--ms-level", "2"], "2", "0")] {
+        ok(&mzpc(&src, &out, &args));
+        assert_eq!(footer(&out, "spectra_data.parquet", "spectrum_count").as_deref(), Some(data), "{args:?}: spectra_data");
+        assert_eq!(footer(&out, "spectra_peaks.parquet", "spectrum_count").as_deref(), Some(peaks), "{args:?}: spectra_peaks");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rewritten facet must not embed the pre-filter counts in `ARROW:schema`. arrow-rs folds the source
+/// footer into the schema it reads, the rewrite's writer serialised that schema, and Arrow C++ and
+/// pyarrow return the embedded metadata: after `--ms-level 1`, `spectra_data` said `spectrum_count=1`
+/// on 0 rows.
+#[test]
+fn rewrite_embeds_no_stale_counts_in_the_arrow_schema() {
+    let dir = scratch("arrow_schema");
+    let src = convert(TINY, &dir);
+    let out = dir.join("f.mzpeak");
+    ok(&mzpc(&src, &out, &["--ms-level", "1"]));
+    let names: Vec<String> = zip::ZipArchive::new(File::open(&out).unwrap())
+        .unwrap()
+        .file_names()
+        .filter(|n| n.ends_with(".parquet"))
+        .map(str::to_string)
+        .collect();
+    for name in names {
+        let b = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(member(&out, &name))).unwrap();
+        let meta = b.metadata().file_metadata();
+        let Some(embedded) = meta.key_value_metadata().and_then(|kvs| kvs.iter().find(|kv| kv.key == "ARROW:schema")).cloned() else {
+            continue;
+        };
+        // Given only the ARROW:schema entry, the schema's metadata is exactly what that entry embeds.
+        let schema = parquet::arrow::parquet_to_arrow_schema(meta.schema_descr(), Some(&vec![embedded])).unwrap();
+        let counts: Vec<&String> = schema.metadata().keys().filter(|k| k.ends_with("_count")).collect();
+        assert!(counts.is_empty(), "{name} embeds {counts:?} in ARROW:schema");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// (d) `--rt` parsing, driven through the CLI (the crate has no library target to call into): an
 /// omitted bound is open, and a reversed or non-numeric range exits 1 without writing anything. The
 /// bounds are read back from the filter's data-processing entry. `--rt=` because clap reads a bare
@@ -208,7 +280,7 @@ fn drop_aux_refuses_to_remove_a_core_facet() {
     let dir = scratch("drop_core");
     let src = convert(TINY, &dir);
     let out = dir.join("f.mzpeak");
-    for glob in ["spectra_data.parquet", "spectra_metadata_precursors.parquet", "*.parquet"] {
+    for glob in ["spectra_data.parquet", "spectra_metadata_precursors.parquet", "chromatograms_data.parquet", "chromatograms_metadata.parquet", "*.parquet"] {
         let r = mzpc(&src, &out, &["--drop-aux", glob]);
         let stderr = String::from_utf8_lossy(&r.stderr);
         assert_eq!(r.status.code(), Some(1), "--drop-aux {glob} must be refused; stderr:\n{stderr}");

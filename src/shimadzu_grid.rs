@@ -46,7 +46,9 @@ impl SqrtGrid {
 }
 
 /// Reconstruction tolerance in Da: the vendor's own 1e-9 rounding is ±5e-10, plus f64 slack.
-/// Measured worst residuals on exact spectra: 7.2e-10.
+/// Measured worst residuals on exact spectra: 7.2e-10. It is also the bound the archive declares
+/// (`tof_calibration.max_error_da`): a spectrum is gridded only when every point rebuilds within
+/// it, so no smaller number can be claimed.
 pub const TOL: f64 = 1e-9;
 
 /// Least squares of `r` on `k` with centred sums (k reaches 3e5, r is ~8–40).
@@ -158,12 +160,31 @@ pub fn lattice_peak_schema() -> mzpeak_prototyping::writer::ArrayBuffersBuilder 
     crate::mz_lattice::lattice_peak_schema(LATTICE_SCALE)
 }
 
-/// The `mz_calibration` index block for this lane, naming the Shimadzu source fields.
-pub fn mz_calibration_block() -> serde_json::Value {
+/// Whether the glue reads the coarse `Mass` field for this run. `Glue.cs` (`DecideMassScale`)
+/// compares `MZPC_SHIMADZU_COARSE_MZ` to the literal `"1"`, and the archive must name the field the
+/// glue actually read, so this applies the same test rather than `crate::env_flag`'s spellings.
+pub fn coarse_mz_requested() -> bool {
+    coarse_mz_lever(std::env::var("MZPC_SHIMADZU_COARSE_MZ").ok().as_deref())
+}
+
+fn coarse_mz_lever(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// The `mz_calibration` index block for this lane, naming the field its centroid m/z came from:
+/// `MassHigh` (1e-9 Da), or with `coarse` (`MZPC_SHIMADZU_COARSE_MZ=1`) the coarse `Mass`
+/// (1e-4 Da). Both lie on the same 1e-9 lattice, so through 0.11.5 an archive could not tell them
+/// apart. The glue's own per-file and per-spectrum fallbacks to `Mass` do not cross the ABI and are
+/// not recorded here.
+pub fn mz_calibration_block(coarse: bool) -> serde_json::Value {
     crate::mz_lattice::mz_calibration_block(
         LATTICE_SCALE,
         "shimadzu",
-        "MassHigh (Int64, 1e-9 Da); Mass (Int32, 1e-4 Da) under MZPC_SHIMADZU_COARSE_MZ=1 lies on the same lattice",
+        if coarse {
+            "Mass (Int32, 1e-4 Da), selected by MZPC_SHIMADZU_COARSE_MZ=1; on the 1e-9 lattice as multiples of 1e5"
+        } else {
+            "MassHigh (Int64, 1e-9 Da)"
+        },
     )
 }
 
@@ -300,11 +321,19 @@ mod lattice_tests {
             Some(LATTICE_TRANSFORM_PARAMS)
         );
         // The index block names this lane and its scale.
-        let b = mz_calibration_block();
+        let b = mz_calibration_block(false);
         assert_eq!(b["codec"], "mz-grid");
         assert_eq!(b["vendor"], "shimadzu");
         assert_eq!(b["scale"].as_f64(), Some(1e9));
-        assert!(b["source"].as_str().unwrap().contains("MassHigh"));
+        assert!(b["source"].as_str().unwrap().starts_with("MassHigh"), "{b}");
+        // The coarse field names itself: the lattice is identical, so the source is the only record.
+        let coarse = mz_calibration_block(true);
+        assert!(coarse["source"].as_str().unwrap().starts_with("Mass (Int32"), "{coarse}");
+        // Decided the way the glue decides: only the literal "1" selects Mass.
+        assert!(coarse_mz_lever(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some(" 1")] {
+            assert!(!coarse_mz_lever(off), "{off:?}");
+        }
     }
 
     #[test]

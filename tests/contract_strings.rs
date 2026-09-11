@@ -151,17 +151,23 @@ fn tof_grid_reconstruction_keys_pinned() {
     );
     // The three honest values of `mz_reconstruction`, and the bound that must accompany each
     // inexact one. `exact` is ONE site (Agilent: the vendor's own bin ordinal, re-evaluated through
-    // the vendor's own calibration). The Shimadzu profile lane said `exact` until 0.9.13; measured
-    // on HEK_PosOAD1, 4,890 of 5,000 gridded points rebuild off the vendor's 1e-9 lattice by up to
-    // 0.5 step (4.15e-10 Da) — inside the vendor's ±5e-10 rounding, so accurate to vendor precision,
-    // but "exact" read as bit-exact. It now states the bound.
+    // the vendor's own calibration). The Shimadzu profile lane said `exact` until 0.9.13, then
+    // `max_error_da: 5e-10` — a bound its fit never enforced. The fit accepts a spectrum when every
+    // point rebuilds within `shimadzu_grid::TOL` (1e-9 Da); refitting HEK_PosOAD1's nine f64 spectra
+    // puts 169 of 32,434 points between 5e-10 and 5.47e-10 Da off (none past 1e-9). The earlier
+    // evidence, "≤ 0.5 step off the lattice", holds for any value by definition. The block declares
+    // the gate itself, so the bound and the check cannot diverge again.
     assert_eq!(
         code().matches("\"mz_reconstruction\": \"exact\"").count(),
         1,
         "only the Agilent lane rebuilds m/z exactly; a new `exact` claim needs the same evidence"
     );
     pinned("\"mz_reconstruction\": \"within-vendor-rounding\"");
-    pinned("\"max_error_da\": 5e-10");
+    pinned("\"max_error_da\": shimadzu_grid::TOL");
+    assert!(
+        include_str!("../src/shimadzu_grid.rs").contains("pub const TOL: f64 = 1e-9;"),
+        "the Shimadzu block declares the fit's acceptance gate as its bound: 1e-9 Da"
+    );
     assert_eq!(
         code().matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
         2,
@@ -254,7 +260,64 @@ fn transformations_block_pinned() {
     pinned("\"zero-run-mask\"");
     pinned("\"numpress-linear\"");
     pinned("\"sort-by-mz\"");
+    pinned("\"sort-by-time\"");
+    pinned("\"sort-by-wavelength\"");
+    pinned("\"chromatogram-time-to-minutes\"");
     pinned("\"tof-grid:{}ppm\"");
     pinned("\"shimadzu:span-trim\"");
     pinned("\"agilent:drop-zero-samples\"");
+    // A fixed identifier: how many windows were rewritten goes to the run's warning.
+    pinned("\"thermo:target-only-isolation-window\"");
+    pinned("\"agilent:intensity-f32-rounding\"");
+    pinned("\"bruker:trace-unit-rescale\"");
+    pinned("\"bruker:trace-sort-dedup\"");
+    // The entries the reader modules declare from their own counts, pinned in those modules' code
+    // (their `#[cfg(test)]` modules cut away, as `code` does for main.rs).
+    for (file, source, entries) in [
+        ("src/agl.rs", include_str!("../src/agl.rs"), ["\"agilent:nonfinite-intensity-to-zero\"", "\"agilent:truncate-unequal-arrays\""]),
+        ("src/waters.rs", include_str!("../src/waters.rs"), ["\"waters:drop-functions\"", "\"waters:sonar-summed\""]),
+    ] {
+        let source = source.replace("\r\n", "\n");
+        let lanes = source.split("\n#[cfg(test)]").next().unwrap();
+        for entry in entries {
+            assert!(lanes.contains(entry), "{file} no longer declares {entry}");
+        }
+    }
+}
+
+/// The native Waters lane's two counted entries, `sort-by-mz` (a frame re-sorted) and
+/// `waters:sonar-summed`, run only where no CI host can: `convert_waters` is `cfg(windows)` and
+/// `WatersReader::spectrum` reads through MassLynxRaw.dll. The host test of the counter seam
+/// (`reader_counters_count_written_spectra_only`) builds its own counters, so deleting the lane's
+/// push or the reader's bump would leave the suite green while the archive stopped declaring what
+/// it did. Both halves are pinned: the reader bumps each counter where the transformation happens
+/// and hands out that same counter, and the lane pairs it with its entry and passes the hints on.
+#[test]
+fn waters_counted_entries_pinned() {
+    /// `text` from `head` up to the first `close` after it: the body of one item.
+    fn body<'a>(text: &'a str, head: &str, close: &str) -> &'a str {
+        let start = text.find(head).unwrap_or_else(|| panic!("`{head}` is gone"));
+        let rest = &text[start..];
+        &rest[..rest.find(close).unwrap_or(rest.len())]
+    }
+    let waters = include_str!("../src/waters.rs").replace("\r\n", "\n");
+    let reader: String =
+        waters.split("\n#[cfg(test)]").next().unwrap().lines().map(strip_comment).collect::<Vec<_>>().join("\n");
+    let spectrum = body(&reader, "pub fn spectrum(&self, i: usize)", "\n    }\n");
+    let lane = body(code(), "fn convert_waters(", "\n}\n");
+    let missing: Vec<&str> = [
+        (spectrum, "if sort_frame_points(&mut points) {\n                self.resorted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);"),
+        (spectrum, "if fi.sonar_bins > 0 {\n                self.sonar_summed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);"),
+        (reader.as_str(), "pub fn reorder_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {\n        self.resorted.clone()"),
+        (reader.as_str(), "pub fn sonar_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {\n        self.sonar_summed.clone()"),
+        (reader.as_str(), "pub const SONAR_SUMMED: &str = \"waters:sonar-summed\";"),
+        (lane, "hints.counters.push((waters::SONAR_SUMMED, reader.sonar_counter()));"),
+        (lane, "hints.counters.push((\"sort-by-mz\", reader.reorder_counter()));"),
+        (lane, "convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))"),
+    ]
+    .into_iter()
+    .filter(|(text, needle)| !text.contains(needle))
+    .map(|(_, needle)| needle)
+    .collect();
+    assert!(missing.is_empty(), "the Waters lane no longer counts what it declares; missing: {missing:#?}");
 }

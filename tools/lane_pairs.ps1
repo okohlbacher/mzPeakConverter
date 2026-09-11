@@ -6,7 +6,12 @@
 # harness) or from any directory you name.
 #
 #   powershell -NoProfile -File lane_pairs.ps1
-#   powershell -NoProfile -File lane_pairs.ps1 -Units 'Blind_P1_pos_012.lcd','En_PPY.wiff' -OutDir D:\pairs
+#   powershell -NoProfile -File lane_pairs.ps1 -Units 'Blind_P1_pos_012.lcd,En_PPY.wiff@2' -OutDir D:\pairs
+#
+# A multi-sample SciEX .wiff is refused by BOTH lanes without `--sample` (an archive is one run), so
+# name the sample with an `@N` suffix (1-based, as `--sample N`): 'En_PPY.wiff@2' builds
+# `En_PPY.sample2.native.mzpeak` and `En_PPY.sample2.mzml.mzpeak` from sample 2. Under -File an array
+# argument arrives as ONE string, so -Units is also split on commas.
 #
 # Then copy the `<stem>.native.mzpeak` / `<stem>.mzml.mzpeak` files to the host and point the test
 # at their directory:
@@ -17,7 +22,7 @@
 # dominate the transfer. A lane that REFUSES a unit by design (Agilent MRM/SIM dwell data, an
 # IM-QTOF run) is reported and leaves no archive — that unit simply has no pair, which is correct.
 param(
-    [string[]]$Units  = @('Blind_P1_pos_012.lcd', 'En_PPY.wiff', 'IPX0002633001_D-239.wiff', 'blank1.D'),
+    [string[]]$Units  = @('Blind_P1_pos_012.lcd', 'En_PPY.wiff@1', 'IPX0002633001_D-239.wiff@1', 'blank1.D'),
     [string]  $OutDir = 'C:\Users\User\lane-pairs',
     [string]  $Cache  = 'C:\Users\User\rawcache\units',
     [string[]]$AlsoSearch = @('C:\Users\User\mzpc-agilent-gate'),
@@ -42,8 +47,12 @@ $env:MZPC_AGILENT_TMPDIR = $env:TEMP
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 & $conv --version
 
-foreach ($want in $Units) {
+$Units = @($Units | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+foreach ($spec in $Units) {
+    $want = $spec; $sample = ''
+    if ($spec -match '^(.+)@(\d+)$') { $want = $Matches[1]; $sample = $Matches[2] }
     $stem = [IO.Path]::GetFileNameWithoutExtension($want)
+    if ($sample) { $stem = "$stem.sample$sample" }
     $unit = $null
     # The cache names each unit '<truncated-name>-<sha1[:12]>', so match on a prefix, then find the
     # member that IS the unit (a .d/.raw directory, or a .lcd/.wiff file).
@@ -72,6 +81,7 @@ foreach ($want in $Units) {
         # string (@opts) passes it one CHARACTER per argument ("unexpected argument '-'").
         [string[]]$opts = @()
         if ($lane -eq 'mzml') { $opts = [string[]]@('--via-msconvert') }
+        if ($sample) { $opts += @('--sample', $sample) }
         $sw = [Diagnostics.Stopwatch]::StartNew()
         & $conv $unit.FullName @opts --no-vendor -o $out --force *> $log
         $rc = $LASTEXITCODE

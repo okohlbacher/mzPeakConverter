@@ -272,8 +272,9 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
     }
 
     pub fn finish(mut self) -> Result<W, ParquetError> {
-        // Spectra with at least one row in this facet (a zero-peak spectrum handed to this writer
-        // is not an entry) — the same per-facet definition `spectra_data` uses.
+        // One past the largest spectrum index with a row in this facet (a zero-peak spectrum
+        // handed to this writer does not raise it) — the same per-facet definition `spectra_data`
+        // uses, and on a centroid-only run a bound that reaches its last non-empty spectrum.
         self.append_key_value_metadata("spectrum_count", Some(self.buffers.entry_count().to_string()));
         self.append_key_value_metadata(
             "spectrum_data_point_count",

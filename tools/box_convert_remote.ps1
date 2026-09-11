@@ -87,7 +87,10 @@ function Open-CacheLock {      # exclusive per-unit lock; $null on timeout (call
 
 # Vendor SDK environment the converter needs for .wiff/.raw/.d (box-specific paths). Override any of
 # these by creating C:\Users\User\box_convert_env.ps1 (dot-sourced last if present).
-$env:DOTNET_ROOT = 'C:\Users\User\dotnet8'; $env:DOTNET_ROLL_FORWARD = 'LatestMajor'
+# No DOTNET_ROLL_FORWARD: mzpeak-convert sets LatestMajor itself, for Thermo .raw only. Exported for
+# every unit it would lift the Shimadzu glue and Clearcore2 onto any newer major installed in this
+# root, where the .lcd lane loses BinaryFormatter and the SciEX lane runs on an unverified runtime.
+$env:DOTNET_ROOT = 'C:\Users\User\dotnet8'
 $cvtRoot = 'C:\Users\User\src\mzPeakConverter'
 # ProteoWizard install that supplies every vendor reader. Switched 2026-09-03 from the FLASHApp
 # bundle to a STANDALONE pwiz: the bundle carries Shimadzu.LabSolutions.IO 3.8.4.6016, which returns
@@ -103,7 +106,6 @@ $cvtRoot = 'C:\Users\User\src\mzPeakConverter'
 # Pinned to 3.0.26175 (owner decision 2026-09-04); 3.0.26151 remains installed beside it with the same Shimadzu.LabSolutions.IO 5.0.0.0.
 $pwiz = 'C:/Users/User/AppData/Local/Apps/ProteoWizard 3.0.26175.31fd1ca 64-bit'
 if (Test-Path "$cvtRoot\glue\sciex\bin\Release\net8.0")  { $env:MZPC_SCIEX_GLUE  = (Resolve-Path "$cvtRoot\glue\sciex\bin\Release\net8.0").Path }
-if (Test-Path "$cvtRoot\glue\waters\bin\Release\net8.0") { $env:MZPC_WATERS_GLUE = (Resolve-Path "$cvtRoot\glue\waters\bin\Release\net8.0").Path }
 if (Test-Path "$cvtRoot\glue\agilent\bin\Release\net48") { $env:MZPC_AGILENT_GLUE = (Resolve-Path "$cvtRoot\glue\agilent\bin\Release\net48").Path }  # net48 AgilentGlueHost.exe (MHDAC needs .NET FW)
 if (Test-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0") { $env:MZPC_SHIMADZU_GLUE = (Resolve-Path "$cvtRoot\glue\shimadzu\bin\Release\net8.0").Path }  # native Shimadzu .lcd (LabSolutions.IO)
 $env:MZPC_PWIZ_DIR = $pwiz; $env:MZPC_MASSLYNX_DIR = $pwiz   # MHDAC for Agilent: $pwiz/vendor_api/Agilent or $pwiz itself (agilent_dll_dir probes both; 26175 is flat)
@@ -117,7 +119,7 @@ $job = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $work = Join-Path $env:TEMP ("bxc-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $res = [ordered]@{ stage='init'; exit=1; uploaded=$false; size=0; md5=''; log=''; error=''; note='';
-                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0 }
+                   dl_s=0; msconv_s=0; conv_s=0; up_s=0; raw_bytes=0; argv=''; hold='' }
 $cacheLock = $null   # released as soon as the unit is copied out; the `finally` is only a backstop
 
 try {
@@ -356,9 +358,9 @@ try {
     # 1242->495 s and 2891->2040 MB; msconvert inflates the mzML round-trip). So the PRIMARY attempt is
     # ALWAYS native: strip the mzML-lane flags (--via-msconvert, --tof-grid <mode>) so even a job that
     # still asks for --via-msconvert is tried native first. msconvert runs ONLY if the native read fails.
-    $nativeOpts = @(); $skipNext = $false
+    $nativeOpts = @(); $skipNext = $false; $tofMode = 'auto'
     foreach ($o in $optList) {
-        if ($skipNext) { $skipNext = $false; continue }
+        if ($skipNext) { $skipNext = $false; $tofMode = $o; continue }   # the mode, kept for the fallback
         if ($o -eq '--via-msconvert') { continue }
         if ($o -eq '--tof-grid') { $skipNext = $true; continue }   # drop the flag AND its mode arg
         $nativeOpts += $o
@@ -370,6 +372,9 @@ try {
     $swcv = [Diagnostics.Stopwatch]::StartNew()
     & $converter $inputPath @nativeOpts -o $out --force *> $log
     $res.exit = $LASTEXITCODE
+    # argv = the options of the run that wrote the archive, NOT the request: the host's BENCH row
+    # names this, since the strip above and the fallback below both change what actually ran.
+    $res.argv = ($nativeOpts -join ' ')
     if ($res.exit -eq 0) {
         $res.note = ((@($res.note, 'path=native') | Where-Object { $_ }) -join ' ')
     } else {
@@ -417,10 +422,15 @@ try {
                        "or unset MZPC_MZML_TMPDIR so the intermediate goes to disk.")
             }
         }
+        # Everything else in $nativeOpts rides along, `--sample N` included: both lanes refuse a
+        # multi-sample WIFF without it, so a per-sample job (one manifest line per sample) needs it here.
         $native_only = @('--agilent-grid', '--bruker-sdk')   # conflict with / ignored by the mzML lane
-        $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', 'auto')
+        # The REQUESTED --tof-grid mode, `auto` only when the job named none: a job asking for `off`
+        # (exact f64 m/z) was stored on the bounded-lossy grid whenever this fallback ran.
+        $fbOpts = @($nativeOpts | Where-Object { $native_only -notcontains $_ }) + @('--via-msconvert', '--tof-grid', $tofMode)
         & $converter $inputPath @fbOpts -o $out --force *>> $log
         $res.exit = $LASTEXITCODE
+        $res.argv = ($fbOpts -join ' ')
     }
     $res.conv_s = [math]::Round($swcv.Elapsed.TotalSeconds, 1)
     $ErrorActionPreference = $prevEAP
@@ -430,7 +440,24 @@ try {
     if ($res.exit -eq 0 -and (Test-Path $out)) {
         $res.size = (Get-Item $out).Length
         $res.md5 = (Get-FileHash $out -Algorithm MD5).Hash.ToLower()
-        if ($res.size -gt 5GB) { $res.stage = 'too-big'; throw "mzpeak $($res.size) B exceeds the 5 GB single-PUT limit" }
+        if ($res.size -gt 5GB) {
+            $res.stage = 'too-big'
+            if ($job.hold_oversize) {
+                # The host asked (a LOCAL target): keep the archive outside $work, which `finally`
+                # deletes, for box_convert.sh's pull_held to scp back and then remove. Before this a
+                # 9.04 GB archive was discarded after its whole conversion, on every rebuild. The sweep
+                # clears holds a killed host never collected; no pull takes two days.
+                $holdDir = 'C:\Users\User\bxc-hold'
+                New-Item -ItemType Directory -Force -Path $holdDir | Out-Null
+                Get-ChildItem -LiteralPath $holdDir -Filter 'bxc-*.mzpeak' -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddDays(-2) } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+                $hold = Join-Path $holdDir ((Split-Path -Leaf $work) + '.mzpeak')
+                Move-Item -LiteralPath $out -Destination $hold -Force
+                $res.hold = $hold -replace '\\', '/'
+            }
+            throw "mzpeak $($res.size) B exceeds the 5 GB single-PUT limit"
+        }
         $res.stage = 'upload'
         $upcfg = Join-Path $work 'up.cfg'
         Set-Content -LiteralPath $upcfg -Value ('url = "' + $job.put_url + '"') -Encoding ASCII
