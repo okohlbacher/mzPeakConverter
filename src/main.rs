@@ -2469,9 +2469,9 @@ fn cut_chromatogram_to_window(chrom: &mut Chromatogram, (lo, hi): (f64, f64)) {
     }
 }
 
-/// Write a native reader's spectra (via a `spectrum(i)` closure) to an mzML. Native readers carry no
-/// vendor chromatograms; the mzML writer emits its own TIC + base-peak summary at close (matching the
-/// mzPeak path's synthesized TIC/BPC).
+/// Write a native reader's spectra (via a `spectrum(i)` closure) to an mzML. The mzML writer emits its
+/// own TIC + base-peak summary at close (matching the mzPeak path's synthesized TIC/BPC); the only
+/// vendor chromatograms written beside them are a Bruker `.d`'s HyStar device traces.
 fn write_native_mzml(
     input: &Path,
     output: &Path,
