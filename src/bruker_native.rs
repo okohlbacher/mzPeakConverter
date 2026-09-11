@@ -34,8 +34,6 @@ use timsrust::converters::{ConvertableDomain, Scan2ImConverter, Tof2MzConverter}
 use timsrust::readers::{FrameReader, MetadataReader};
 use timsrust::MSLevel;
 
-/// The TOF→m/z calibration model: `m/z = (a + b·tof)²`. `a = √(mz_min)`, `b = (√(mz_max)−a)/tof_max`.
-#[derive(Debug, Clone, Copy)]
 /// The intensity column of an ims-compact spectrum, in the dtype the archive stores: Int32 native
 /// counts by default (the writer BYTE_STREAM_SPLITs the column, ~-16 %, lossless), Float32 under
 /// `MZPC_BYTE_PLANE_INTENSITY=0`.
@@ -85,6 +83,8 @@ pub(crate) fn ims_compact_arrays(
     Ok(arrays)
 }
 
+/// The TOF→m/z calibration model: `m/z = (a + b·tof)²`. `a = √(mz_min)`, `b = (√(mz_max)−a)/tof_max`.
+#[derive(Debug, Clone, Copy)]
 pub struct TofMzModel {
     pub a: f64,
     pub b: f64,

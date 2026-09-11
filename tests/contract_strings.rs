@@ -108,8 +108,20 @@ fn sciex_per_spectrum_tof_grid_pinned() {
     // shares the formula family).
     pinned("tof_grid_block(\"sciex_sqrt_per_spectrum\", MzReconstruction::BoundedLossyPpm");
     pinned("\"sciex_sqrt_per_spectrum\",\n            MzReconstruction::WithinVendorRoundingDa(shimadzu_grid::TOL),");
-    pinned("serde_json::json!(\"mz = (tof_c0 + tof_c1*tof_index)^2\")");
-    pinned("serde_json::json!([\"tof_c0\", \"tof_c1\"])");
+    // KEY AND VALUE, and counted: both lanes that state this formula must keep the key too. A pin on
+    // the value alone would stay green through a rename of the key the viewer matches on.
+    for (needle, what) in [
+        ("cal.insert(\"tof_to_mz\".to_string(), serde_json::json!(\"mz = (tof_c0 + tof_c1*tof_index)^2\"));", "tof_to_mz"),
+        ("cal.insert(\"per_spectrum_columns\".to_string(), serde_json::json!([\"tof_c0\", \"tof_c1\"]));", "per_spectrum_columns"),
+    ] {
+        assert_eq!(
+            code().matches(needle).count(),
+            2,
+            "both per-spectrum sqrt lanes (native SciEX, Shimadzu profile grid) must emit `{what}` \
+             verbatim; found {} of 2",
+            code().matches(needle).count()
+        );
+    }
 }
 
 #[test]
@@ -143,9 +155,16 @@ fn tof_grid_reconstruction_keys_pinned() {
     // own JSON instead of calling the builder is the failure this catches.
     let sites = code().matches("tof_grid_block(").count() - 1; // less the definition
     assert_eq!(sites, 4, "expected 4 `tof_grid_block(` call sites, found {sites}");
-    assert!(
-        !code().contains("\"codec\": \"tof-grid\","),
-        "a lane is hand-writing a `codec: \"tof-grid\"` block again instead of calling `tof_grid_block`"
+    // Counted on the VALUE literal, not on a `"codec": "tof-grid",` spelling: a hand-rolled block
+    // with the key last (no trailing comma), or with no space after the colon, or built through
+    // `serde_json::Map::insert`, would slip past a spelling-sensitive guard — two of those four
+    // spellings slipped past the pre-0.11.6 site count too. `"--tof-grid"` and `"tof-grid:{}ppm"`
+    // do not contain the quoted token, so the only match is the builder's own.
+    assert_eq!(
+        code().matches("\"tof-grid\"").count(),
+        1,
+        "only `tof_grid_block` may write the `codec: \"tof-grid\"` value; found {}",
+        code().matches("\"tof-grid\"").count()
     );
     pinned("block.insert(\"codec\".to_string(), serde_json::json!(\"tof-grid\"));");
     pinned("block.insert(\"lossless\".to_string(), serde_json::json!(\"tof_index\"));");
