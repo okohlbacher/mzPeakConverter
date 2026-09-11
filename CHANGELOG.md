@@ -20,6 +20,13 @@ unchanged (below). Every native SciEX grid archive changes and gets smaller, as 
 with an m/z-lattice or grid f64 fallback column, or written with `--layout point`. Chunked facets
 keep their bytes.
 
+**Output change.** Rebuilt archives also change in these ways, each described in its entry below: a
+data facet's footer count is an index bound and the secondary facets carry none; `transformations`
+lists what a conversion applied; chromatogram times are minutes on every lane; native Bruker
+archives carry HyStar device traces, and ims-compact archives a `conversion_route`; BAF archives
+record their members and run; mzML-lane archives hold ProteoWizard's run and software ids decoded;
+and a vendor directory embeds its side-files under one rule, without its raw signal files.
+
 ### Added
 
 - **Release archives for Linux and Windows.** Beside the two macOS archives, every release now
@@ -108,7 +115,8 @@ keep their bytes.
 ### Fixed
 
 - **Thermo isolation windows that the reader library computed are written target-only.**
-  thermorawfilereader (0.8.0, the copy mzdata wraps, and 0.7.3 alike) takes a precursor's isolation
+  thermorawfilereader (0.8.0, the copy mzdata wraps, and 0.7.2 alike, their .NET bundles
+  dotnetrawfilereader-sys 0.8.0 and 0.7.3) takes a precursor's isolation
   width from the scan's `MS<n> Isolation Width` trailer. For a scan without that trailer it takes the
   scan filter's width and halves it, and the window constructor halves it again; a negative filter
   width inverts the window. mzdata copies those bounds as stated. The published archives therefore
@@ -275,11 +283,11 @@ keep their bytes.
   mzPeak lane leaking `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which
   returned before any cleanup; `tmp_cleanup::msconvert_not_found_leaves_no_working_directory`
   pins both lanes with `TMPDIR` pointed at a scratch directory, and
-  `msconvert_dir_is_swept_by_the_panic_hook` the sweep. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
-  the unfixed build, one that exits 0 without writing produced exit 0 and
-  "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
-  byte-identical and nothing beside it. One that writes its mzML must land under the
-  requested name, gzipped for `.mzML.gz`, and reparse.
+  `msconvert_dir_is_swept_by_the_panic_hook` the sweep. `tests/mzml_export_atomic.rs` drives the
+  lane with stand-in scripts: against the unfixed build, one that exits 0 without writing produced
+  exit 0 and "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
+  byte-identical and nothing beside it. One that writes its mzML must land under the requested
+  name, gzipped for `.mzML.gz`, and reparse.
 - **`--via-msconvert` refuses a multi-sample WIFF without `--sample` instead of keeping its
   last sample.** With one `--outfile`, msconvert writes every run of a multi-run source onto
   that path in turn and the last one wins (En_PPY: 117 samples, one survived), under exit 0
@@ -530,20 +538,22 @@ keep their bytes.
   calibration, which only the ims-compact lanes and `--agilent-grid` do, and called itself mzML-only,
   although every input read through mzdata reaches the fit (imzML, Thermo `.raw`, a TDF read as
   f64), and named its bound `PPM_TOL`, a constant in the source, instead of `MZPC_TOF_GRID_PPM`
-  (`docs_drift::help_names_the_variable_not_the_constant`). In the manual, the §4 refusal table listed options that are only warned about as refused and
-  missed four real refusals on `--via-msconvert` (`--bruker-sdk --no-ims-compact --ims-chunked
-  --no-tims-recalibration`); it now has a refused and a warned column, taken from
-  `dropped_flags_for` and `inert_flags_for`, and no longer calls the MHDAC lane's `--tof-grid`
-  warning silence. §10 lacked
+  (`docs_drift::help_names_the_variable_not_the_constant`). In the manual, the §4 refusal table
+  listed options that are only warned about as refused and missed four real refusals on
+  `--via-msconvert` (`--bruker-sdk --no-ims-compact --ims-chunked --no-tims-recalibration`); it now
+  has a refused and a warned column, taken from `dropped_flags_for` and `inert_flags_for`, and no
+  longer calls the MHDAC lane's `--tof-grid` warning silence. §10 lacked
   `MZPC_WATERS_KEEP_COLLAPSED`, `MZPC_WATERS_PROBE_QUAD` and `TIMSDATA_LIB_DIR`, claimed a variable
   count that no longer held, and said every boolean lever goes through `env_flag()`, which the
-  Waters probe lever does not. Drifted line-number citations now name functions, and §8 names the test and
-  fixture that already check the `C2 = 0` calibration pair against the vendor SDK, instead of a
-  test and fixture that never existed. README and the manual gain the native Waters `.raw` row,
-  and README says the test suite needs a .NET 8+ runtime. `docs/PLATFORM_SUPPORT.md` no longer
-  shows the Agilent IM-QTOF lane as a working scaffold, and gives the right compile gates and TSF
-  reader; it also no longer points at a `BACKLOG.md` #23 that does not exist. The Waters frame
-  size (Capan2 166 → 531 MB) and the native SciEX size are recorded as accepted.
+  Waters probe lever does not; merged, it listed `MZPC_WATERS_KEEP_COLLAPSED` twice, once with a
+  rule the code does not apply (`docs_drift::every_variable_has_one_row_in_section_10`). Drifted
+  line-number citations now name functions, and §8 names the test and fixture that already check
+  the `C2 = 0` calibration pair against the vendor SDK, instead of a test and fixture that never
+  existed. README and the manual gain the native Waters `.raw` row, and README says the test suite
+  needs a .NET 8+ runtime. `docs/PLATFORM_SUPPORT.md` no longer shows the Agilent IM-QTOF lane as a
+  working scaffold and names the right TSF reader (its compile gates: below); it also no longer
+  points at a `BACKLOG.md` #23 that does not exist. The Waters frame size (Capan2 166 → 531 MB) and
+  the native SciEX size are recorded as accepted.
 - **`-v` no longer opens a native vendor reader beside a conversion, and its report cannot fail the
   run.** The report `-v` prints ran before the lane was chosen and opened the native reader
   whatever was asked for. `-v --via-msconvert` on a `.wiff`, `.lcd` or Waters `.raw` exited with
@@ -587,8 +597,7 @@ keep their bytes.
   Shimadzu; the Waters reader compiles everywhere and only its dispatch is gated. The page's legend
   also kept a ⛔ symbol that no row uses. The comment on Shimadzu's cached runtime said hostfxr
   refuses a second initialisation in one process. It refuses one only after netcorehost has freed
-  the library, when the last handle to it dropped, which is why the runtime is cached. (The stale
-  "BACKLOG.md #23" and the windows.yml header went with the Windows CI change below.)
+  the library, when the last handle to it dropped, which is why the runtime is cached.
 - **The Shimadzu profile grid declares the bound its fit enforces: `max_error_da: 1e-9`, not
   `5e-10`.** The native `.lcd` lane's `tof_calibration` block has stated 5e-10 Da since 0.9.13, but
   the fit accepts a spectrum when every point rebuilds within `shimadzu_grid::TOL`, 1e-9 Da.
@@ -719,9 +728,10 @@ keep their bytes.
   that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.
   Without `--rt`/`--ms-level` the survivors are now simply every spectrum (up to
   `MZPC_MAX_SPECTRA`); with them they come from one scan of `spectra_metadata`'s `time` and
-  `ms_level` columns, the predicate the `.mzpeak` filter lane already applies. The exported mzML is
-  byte-identical, compared before and after on the committed fixtures and on corpus archives,
-  filtered and not.
+  `ms_level` columns, the predicate the `.mzpeak` filter lane already applies. The export was
+  compared byte for byte before and after that change, on the committed fixtures and on corpus
+  archives, filtered and not; entries above change what an export writes (a filtered one cuts its
+  chromatograms to `--rt`, every one states chromatogram times in minutes).
 
 ### Changed
 
@@ -772,10 +782,11 @@ keep their bytes.
   polarity test, and the Waters, Shimadzu and two Agilent run-metadata tests. `tests/fixtures/**` is
   marked `-text`, so a Windows checkout keeps every fixture byte-identical — git's autocrlf would
   otherwise rewrite `tiny.pwiz.1.1.mzML` and invalidate its indexedmzML offsets.
-- **The seven tests that genuinely need data too large to commit are `#[ignore]`d, with the
-  reason,** so CI reports them as not run rather than as passed: the two ims-compact tests and the
-  two `tests/tdf_*` tests (2485.d, 142 MB), the TSF pin (the corpus holds no TSF acquisition, and
-  the private runs it was checked against cannot be committed), and the two lane-parity tests (pairs
+- **The eight tests that genuinely need data too large to commit are `#[ignore]`d, with the
+  reason,** so CI reports them as not run rather than as passed: the two ims-compact tests, the
+  `--ims-chunked` family test and the two `tests/tdf_*` tests (2485.d, 142 MB), the TSF pin (the
+  corpus holds no TSF acquisition, and the private runs it was checked against cannot be committed),
+  and the two lane-parity tests (pairs
   built on the Windows box). The ims-compact pair is pinned to 2485.d — a sorted walk of the corpus
   had silently switched it to a 1.7 GB run — and now removes its scratch, which left about 5–7 GB in
   `$TMPDIR` per run; `unexpected_and_stale` no longer passes on an empty or mistyped pair directory;
@@ -826,13 +837,15 @@ keep their bytes.
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
-- **The manual is checked against the binary and the tree.** `tests/docs_drift.rs` fails in three
+- **The manual is checked against the binary and the tree.** `tests/docs_drift.rs` fails in five
   cases:
   - an option `--help` prints has no row in §4's option table (a mention in the refusal table or
     in another row does not count);
   - a `FileConfig` key is missing from §5's example;
-  - an `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` is missing from §10. Against the manual before this
-  change it fails on `MZPC_WATERS_KEEP_COLLAPSED` and `MZPC_WATERS_PROBE_QUAD`.
+  - an `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` is missing from §10 (against the
+    manual before this change it fails on `MZPC_WATERS_KEEP_COLLAPSED` and `MZPC_WATERS_PROBE_QUAD`);
+  - a variable has more than one row in §10;
+  - `--help` names the internal `PPM_TOL` rather than `MZPC_TOF_GRID_PPM`.
 - **Windows CI builds the .NET glues before it runs the tests, and opens a glue again after a
   reader was dropped, in a process of its own.** `cargo test` ran before `dotnet build`, so no test
   could load a glue, and no push or pull-request job ever started one: the `-v` double boot that
@@ -916,13 +929,16 @@ keep their bytes.
   `Experiment_x0020_1` (`tiny.pwiz.1.1.mzML`), `En_PPY-3_phenylpyruvic_x0020_acid_10NG_10ul` or
   `_x0031_2_80` for a leading digit — 47 of the 201 published archives — and 7 of them carry
   escaped software ids too (ltpmsi-chilli's `MassLynx_x0020_software`, six ProteoWizard Shimadzu
-  examples' `Shimadzu_x0020_software`). An mzPeak id is a plain string, and the native lanes write the
-  plain stem. The mzML and imzML lanes now decode `run.id` and the software ids on copy, with the
-  processing methods and instrument configurations that reference a software id, so every
+  examples' `Shimadzu_x0020_software`). A run or software id in an mzPeak index is a plain string,
+  and the native lanes write the plain stem. The mzML and imzML lanes now decode `run.id` and the
+  software ids on copy, with the processing methods and instrument configurations that reference a
+  software id, so every
   reference still resolves. A non-ASCII name is escaped one UTF-8 byte at a time and decoded as
   UTF-8: three of those archives' `_x0032_0140312__x00e5__x0085__x00ad_mix_column_1…` becomes
   `20140312_六mix_column_1 (scheduled) 一个试`, and a run of escapes that is not UTF-8 stays as
-  written. Ids from the Thermo and TDF readers, which name the run after the file, are left alone.
+  written. Ids from the Thermo and TDF readers, which name the run after the file, are left alone,
+  and so are an mzML-lane archive's other ids: its sample, scan-settings and data-processing ids keep
+  ProteoWizard's escapes (`tiny_x0020_scan_x0020_settings`).
   The mzML exports keep the escaped software ids, which an mzML id (an XML name) needs; mzdata's mzML
   writer numbers the run itself. `tests/lane_metadata_parity.rs` compares both keys decoded with the
   converter's own decoder (`src/pwiz_id.rs`), so archives built before and after compare alike; the

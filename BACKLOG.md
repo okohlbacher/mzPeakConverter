@@ -102,10 +102,10 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   the Agilent +1 h is not yet pinned to it. Open, in order: (1) **Shimadzu — resolved 2026-09-09** by
   reading the file (option c); the DLL-side emptiness is still being analysed (Codex's leading
   hypothesis: the 1252 code page has no decoder in .NET 8 unless the provider is registered — the glue
-  now registers it; on the next Blind run the debug dump that fires on an empty date no longer fired). (2) **Consumer
-  guidance + validator rule:** readers must fall back to `acquisition_time.wall_clock` when
-  `run.start_time` is null; the validator should flag a null `run.start_time` WITHOUT the block on a
-  vendor-derived archive, and never flag the block itself (handoff to mzPeakValidator pending). (3)
+  now registers it; on the next Blind run the debug dump that fires on an empty date no longer fired). (2) **Validator
+  rule:** the validator should flag a null `run.start_time` WITHOUT the block on a vendor-derived
+  archive, and never flag the block itself (handoff to mzPeakValidator pending). The reader guidance,
+  fall back to `acquisition_time.wall_clock` when `run.start_time` is null, is in USER_MANUAL §8. (3)
   **Decision recorded, revisit only on request:** we do NOT assert a zone for an unzoned wall clock for
   consumer compatibility — pwiz's `Z`/host-offset labels are exactly the false precision the rule avoids.
   (4) **Upstream:** the Agilent +1 h and the SciEX current-offset shifts are ProteoWizard behaviours worth
@@ -176,6 +176,29 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   entry. Rebuild `ec04479_qy_4cell_SanJose_A1`, `2013_30_Amrutha_050713_1`, `SZB8102938` and
   `LD401_001fmol_r1` now and again then. Even with the upstream fix, the LTQ XL and LCQ windows would
   come out at half the method's 2.00, because their filter reports 1.0; msconvert reads the method.
+- **Not in the ledger — found by the 2026-09-11 harmonization reviews, not fixed there:**
+  - SciEX glue reopen check in its own process: `GlueApi::shared` (the `OnceLock`) has landed, but
+    windows.yml runs the reopen test for Shimadzu only. A twin
+    (`sciex::tests::a_reader_opens_again_after_one_was_dropped`, `MZPC_SCIEX_GLUE` and
+    `MZPC_PWIZ_DIR=${{ runner.temp }}`, the same `1 passed` guard) needs glue/sciex `Glue.cs`
+    `Open` to catch and return 0 as Shimadzu's does; confirm that first.
+  - An archive → mzML export drops the archive's stored TIC/BPC and writes a TIC and BIC the
+    vendored exporter derives from the spectra in spectrum order, so a run whose spectra are not in
+    time order gets an unsorted time array (`tiny.pwiz.1.1`: 5.8905, 5.9905, 0.0, 0.7008). Export the
+    stored pair, or sort.
+  - The archive route loses `tiny.pwiz.1.1`'s two target-only precursors on its `cycle=22`
+    spectrum (no `spectrumRef`): the archive holds one precursor row, and its export shows a window
+    of target 0, while `--to mzml` keeps 456.7 and 678.9. Same on 0.11.5; a precursor-storage item.
+  - A filtered archive → mzML export (`-o x.mzML --rt`/`--ms-level`) keeps a precursor's
+    `spectrumRef` to a spectrum it filtered out, which the rewrite route nulls (small.RAW
+    `scan=9`); it also parses the archive index twice (duplicated reader warnings).
+  - `transcode_to_utf8` names its temp copy `.mzpc-utf8-<pid>-<stem>`, so two conversions of files
+    with one stem in one process collide ("writing transcoded …: Invalid argument"). The CLI converts
+    one input per process; in-process tests converting `tiny.pwiz.1.1.mzML` in parallel flaked on it
+    once (`convert_file_writes_the_route_it_is_handed`).
+  - The HUPO python reader sizes its spectrum iterator by row count and indexes by spectrum index,
+    so a `--rt`/`--ms-level` rewrite, whose survivors keep their sparse original indices, raises
+    KeyError (also on 0.11.5). File it with the footer-count definition, or renumber survivors.
 - **Not in the ledger — native-lane metadata parity** (`tests/lane_metadata_parity.rs`). Sample,
   acquisition time, serial, model, member SHA-1s, software and contents landed in 0.11.3. Still open:
   the non-MS device chromatograms on the Agilent, SciEX, Waters and Shimadzu native lanes (the Bruker

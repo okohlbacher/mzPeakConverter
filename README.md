@@ -28,13 +28,17 @@ preserves vendor metadata and ion-mobility structure.
 
 **Fidelity.** The archive preserves the vendor's signal **to a stated fidelity, and
 declares every transformation it applied** in the index (`transformations`). Most lanes
-are bit-exact (integer TOF, the fixed-point m/z lattice, centroid m/z). Four transforms
-are not, and each is named in the archive with its bound: the default **numpress-linear**
-chunk encoding of profile m/z (`--no-numpress` for lossless delta), **zero-run
-compaction** of profile baselines (consecutive zeros collapse to one at each peak
-boundary), the **`--tof-grid` sqrt grid**, accepted only within a ppm bound
+are bit-exact (integer TOF, the fixed-point m/z lattice, centroid m/z). Four general
+signal transforms are not, and each is named in the archive with its bound: the default
+**numpress-linear** chunk encoding of profile m/z (`--no-numpress` for lossless delta),
+**zero-run compaction** of profile baselines (consecutive zeros collapse to one at each
+peak boundary), the **`--tof-grid` sqrt grid**, accepted only within a ppm bound
 (`MZPC_TOF_GRID_PPM`, default 5), and the **Shimadzu profile pad trim** (the
 zero-intensity pad at the scan-window bounds outside the signal span is not stored).
+Beside them, a lane declares each change of its own when it makes one (a vendor
+library's NaN intensity stored as 0, a Thermo isolation window of unstated width written
+target-only, chromatogram times in seconds stored in minutes, …); the user manual's §8
+table lists every entry.
 
 ## Documentation
 
