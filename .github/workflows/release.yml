@@ -465,6 +465,8 @@ jobs:
   sbom:
     name: SBOM
     needs: ci
+    # A backfill (`only`) re-attaches no asset already published, the SBOM included.
+    if: ${{ !inputs.only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
