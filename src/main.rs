@@ -3002,32 +3002,73 @@ fn tof_index_peak_schema(tof_field: std::sync::Arc<arrow::datatypes::Field>) -> 
         .add_field(INTENSITY_ARRAY.to_field())
 }
 
+/// What a `codec: "tof-grid"` block claims about the m/z a reader REBUILDS from the stored integer
+/// axis — and, for the two inexact claims, the bound that claim is worth nothing without.
+///
+/// The bound lives inside the variant on purpose. Through 0.9.13 the Shimadzu profile lane's block
+/// carried a `max_error_da` its fit never enforced, and for one release it carried neither
+/// `lossless` nor `mz_reconstruction` at all while sharing its `model` string with the per-spectrum
+/// SCIEX lane — so a reader keying off the model got one answer there and null here. A test counting
+/// strings caught that after the fact; this cannot be written down wrong in the first place.
+#[derive(Clone, Copy)]
+enum MzReconstruction {
+    /// The vendor's OWN bin ordinal, re-evaluated through the vendor's OWN calibration: exact by
+    /// construction rather than by measurement (the `--agilent-grid` lane).
+    Exact,
+    /// A fit accepted only while every point rebuilds within this many ppm (both SCIEX lanes).
+    BoundedLossyPpm(f64),
+    /// Within the vendor's own rounding of the m/z it handed over, in Da — the fit's acceptance gate
+    /// itself, so the bound and the check cannot diverge (the Shimadzu profile grid).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WithinVendorRoundingDa(f64),
+}
+
+/// The keys EVERY `codec: "tof-grid"` block carries: which column is stored exactly, and whether the
+/// m/z rebuilt from it is. One builder for all four lanes so a reader answers both questions from one
+/// place regardless of model, and a fifth lane cannot ship a block that answers neither. Lanes extend
+/// the returned map with their own keys — the reconstruction formula, the per-spectrum columns, the
+/// vendor's calibration table.
+///
+/// `lossless` is the SPEC's key and its value is a COLUMN NAME — "the exactly-preserved stored
+/// column". Do not "fix" it by renaming: it was once read as a fidelity claim, judged
+/// self-contradictory beside a ppm bound, and renamed to a synonym — which broke nothing at runtime
+/// but diverged from the spec and from the 11 published archives carrying it (the synonym is banned
+/// by name in tests/contract_strings.rs, so this comment cannot spell it). The genuinely new
+/// information, whether the m/z you REBUILD is exact, is `mz_reconstruction` beside it.
+fn tof_grid_block(model: &str, reconstruction: MzReconstruction) -> serde_json::Map<String, serde_json::Value> {
+    let mut block = serde_json::Map::new();
+    block.insert("codec".to_string(), serde_json::json!("tof-grid"));
+    block.insert("model".to_string(), serde_json::json!(model));
+    block.insert("lossless".to_string(), serde_json::json!("tof_index"));
+    match reconstruction {
+        MzReconstruction::Exact => {
+            block.insert("mz_reconstruction".to_string(), serde_json::json!("exact"));
+        }
+        MzReconstruction::BoundedLossyPpm(ppm) => {
+            block.insert("mz_reconstruction".to_string(), serde_json::json!("bounded-lossy"));
+            block.insert("roundtrip_tolerance_ppm".to_string(), serde_json::json!(ppm));
+        }
+        MzReconstruction::WithinVendorRoundingDa(da) => {
+            block.insert("mz_reconstruction".to_string(), serde_json::json!("within-vendor-rounding"));
+            block.insert("max_error_da".to_string(), serde_json::json!(da));
+        }
+    }
+    block
+}
+
 /// The `tof_calibration` block of the run-wide sqrt grid (`--tof-grid`, and the native SCIEX lane's
 /// run-wide fit): how a reader recovers `m/z = (c0 + c1·tof_index)²` from the stored integer axis.
 fn tof_grid_calibration_block(grid: &tof_grid::TofGrid) -> (String, serde_json::Value) {
-    // TWO DIFFERENT CLAIMS, one key each. `lossless` is the SPEC's key and its value is a COLUMN
-    // NAME — "the exactly-preserved stored column" (mzPeak-specification schema/mzpeak_index.json).
-    // `tof_index` is exactly that: an integer we store and read back bit-for-bit. What is NOT exact
-    // is the m/z you RECONSTRUCT from it, because the run-wide grid accepts a point landing within
-    // `tof_grid::ppm_tol()` of the source (an exact-fit-or-nothing rule would refuse almost every
-    // real spectrum). So `mz_reconstruction` states that separately, with the bound.
-    //
-    // Do not "fix" this by renaming `lossless`: it was read once as a fidelity claim, judged
-    // self-contradictory next to a 4.99 ppm bound, and renamed — which broke nothing at runtime but
-    // diverged from the spec and from the 11 published archives that carry it. The per-spectrum
-    // summaries describe the RECONSTRUCTED coordinates, so metadata and data agree inside the
-    // archive; it is the relation to the SOURCE that is bounded. (Intensity is stored verbatim.)
-    let cal = serde_json::json!({
-        "codec": "tof-grid",
-        "model": "sciex_sqrt",
-        "lossless": "tof_index",
-        "mz_reconstruction": "bounded-lossy",
-        "roundtrip_tolerance_ppm": tof_grid::ppm_tol(),
-        "mz_from_tof_index": "(c0 + c1*tof_index)^2",
-        "c0": grid.c0,
-        "c1": grid.c1,
-    });
-    ("tof_calibration".to_string(), cal)
+    // The run-wide grid accepts a point landing within `tof_grid::ppm_tol()` of the source (an
+    // exact-fit-or-nothing rule would refuse almost every real spectrum), so the axis is stored
+    // exactly and the m/z rebuilt from it is bounded. The per-spectrum summaries describe the
+    // RECONSTRUCTED coordinates, so metadata and data agree inside the archive; it is the relation
+    // to the SOURCE that is bounded. (Intensity is stored verbatim.)
+    let mut cal = tof_grid_block("sciex_sqrt", MzReconstruction::BoundedLossyPpm(tof_grid::ppm_tol()));
+    cal.insert("mz_from_tof_index".to_string(), serde_json::json!("(c0 + c1*tof_index)^2"));
+    cal.insert("c0".to_string(), serde_json::json!(grid.c0));
+    cal.insert("c1".to_string(), serde_json::json!(grid.c1));
+    ("tof_calibration".to_string(), cal.into())
 }
 
 /// Per-spectrum routing decision for the TOF-grid path. Neither variant changes the spectrum's
@@ -3555,26 +3596,23 @@ fn convert_agilent_grid(
         declare(&mut applied, entry);
     }
     applied.extend(chromatogram_transforms);
-    // `lossless` (the exactly-stored column) and `mz_reconstruction` (whether m/z is quantized) are
-    // stated by EVERY `codec: "tof-grid"` block, so a reader answers both questions from one place
-    // regardless of model. This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal
-    // and a conformant reader re-evaluates the vendor's OWN calibration (`calibrations` below), so
-    // reconstruction is exact by construction rather than by measurement — note `max_roundtrip_ppm`
-    // here compares two evaluations of the same formula and is therefore necessarily ~0, a
-    // consistency check and not evidence of anything.
-    let cal = serde_json::json!({
-        "codec": "tof-grid",
-        "model": "agilent_sqrt_poly",
-        "lossless": "tof_index",
-        "mz_reconstruction": "exact",
-        // Per-spectrum (tof_c0, tof_c1) + per-spectrum tof_calibration_id select a row in
-        // `calibrations`; reconstruction: t = base + (tof_c0 + tof_c1*tof_index)/coeff;
-        // m/z = (coeff*(t-base))^2 - poly(clip(t,left,right)), poly orders set by use_flags.
-        "tof_to_mz": "t = base + (tof_c0 + tof_c1*tof_index)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))",
-        "per_spectrum_columns": ["tof_c0", "tof_c1", "tof_calibration_id"],
-        "calibrations": calibrations,
-        "max_roundtrip_ppm": max_ppm,
-    });
+    // This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal and a conformant reader
+    // re-evaluates the vendor's OWN calibration (`calibrations` below), so reconstruction is exact by
+    // construction rather than by measurement — note `max_roundtrip_ppm` here compares two
+    // evaluations of the same formula and is therefore necessarily ~0, a consistency check and not
+    // evidence of anything.
+    let mut cal = tof_grid_block("agilent_sqrt_poly", MzReconstruction::Exact);
+    // Per-spectrum (tof_c0, tof_c1) + per-spectrum tof_calibration_id select a row in
+    // `calibrations`; reconstruction: t = base + (tof_c0 + tof_c1*tof_index)/coeff;
+    // m/z = (coeff*(t-base))^2 - poly(clip(t,left,right)), poly orders set by use_flags.
+    cal.insert(
+        "tof_to_mz".to_string(),
+        serde_json::json!("t = base + (tof_c0 + tof_c1*tof_index)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))"),
+    );
+    cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1", "tof_calibration_id"]));
+    cal.insert("calibrations".to_string(), calibrations);
+    cal.insert("max_roundtrip_ppm".to_string(), serde_json::json!(max_ppm));
+    let cal = serde_json::Value::from(cal);
     // A capped run stops early on request. An uncapped one whose MSProfile.bin ended before its scan
     // records is partial too, and says so offline instead of only in the log.
     let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
@@ -5819,33 +5857,24 @@ fn convert_shimadzu(
         // the scan-window bounds is trimmed before the fit and never reaches the archive. Each
         // gridded spectrum reports whether it had one, and `convert_vendor_reader` declares
         // `shimadzu:span-trim` from that count.
-        hints.index_blocks.push((
-            "tof_calibration".to_string(),
-            serde_json::json!({
-                "codec": "tof-grid",
-                // The model string names the FORMULA family the viewer reconstructs with
-                // (per-spectrum sqrt); the instrument is a Shimadzu Q-TOF, recorded beside it.
-                "model": "sciex_sqrt_per_spectrum",
-                "vendor": "shimadzu",
-                // Same key set as the other three tof-grid blocks. This one shipped with NEITHER
-                // key for one release: it shares its `model` string with the per-spectrum SCIEX
-                // lane, so a reader keying off the model got one answer there and null here.
-                "lossless": "tof_index",
-                // Within vendor rounding, NOT bit-exact: the axis is the vendor's own sqrt lattice
-                // and the fit is accepted only when it reproduces every m/z to within
-                // `shimadzu_grid::TOL` (1e-9 Da: the vendor's ±5e-10 rounding plus f64 slack), so
-                // that gate IS the bound. Through 0.11.5 this said 5e-10, which the gate never
-                // enforced: refitting HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points
-                // between 5e-10 and 5.47e-10 Da off. Spectra that do not fit are not gridded at
-                // all — they keep f64 m/z in the data facet.
-                "mz_reconstruction": "within-vendor-rounding",
-                "max_error_da": shimadzu_grid::TOL,
-                "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
-                "per_spectrum_columns": ["tof_c0", "tof_c1"],
-                "run_wide_c1": step,
-                "vendor_mz_rounding": 1e-9,
-            }),
-        ));
+        // The model string names the FORMULA family the viewer reconstructs with (per-spectrum
+        // sqrt); the instrument is a Shimadzu Q-TOF, recorded beside it. Within vendor rounding,
+        // NOT bit-exact: the axis is the vendor's own sqrt lattice and the fit is accepted only
+        // when it reproduces every m/z to within `shimadzu_grid::TOL` (1e-9 Da: the vendor's
+        // ±5e-10 rounding plus f64 slack), so that gate IS the bound. Through 0.11.5 this said
+        // 5e-10, which the gate never enforced: refitting HEK_PosOAD1's nine f64 spectra puts 169
+        // of 32,434 points between 5e-10 and 5.47e-10 Da off. Spectra that do not fit are not
+        // gridded at all — they keep f64 m/z in the data facet.
+        let mut cal = tof_grid_block(
+            "sciex_sqrt_per_spectrum",
+            MzReconstruction::WithinVendorRoundingDa(shimadzu_grid::TOL),
+        );
+        cal.insert("vendor".to_string(), serde_json::json!("shimadzu"));
+        cal.insert("tof_to_mz".to_string(), serde_json::json!("mz = (tof_c0 + tof_c1*tof_index)^2"));
+        cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1"]));
+        cal.insert("run_wide_c1".to_string(), serde_json::json!(step));
+        cal.insert("vendor_mz_rounding".to_string(), serde_json::json!(1e-9));
+        hints.index_blocks.push(("tof_calibration".to_string(), cal.into()));
         log::info!(
             "Shimadzu profile axis is an exact sqrt grid (run-wide c1 = {step:.15}); storing tof_index + per-spectrum tof_c0/tof_c1"
         );
@@ -6364,16 +6393,11 @@ fn convert_sciex_grid(
     // from it — see `tof_grid_calibration_block`. `max_roundtrip_ppm` is the measured worst case over
     // this run (it has run at ~5 ppm on the published MSV000095995 archive), and
     // `roundtrip_tolerance_ppm` is the bound the per-spectrum fit was accepted under.
-    let cal = serde_json::json!({
-        "codec": "tof-grid",
-        "model": "sciex_sqrt_per_spectrum",
-        "lossless": "tof_index",
-        "mz_reconstruction": "bounded-lossy",
-        "roundtrip_tolerance_ppm": tof_grid::ppm_tol(),
-        "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
-        "per_spectrum_columns": ["tof_c0", "tof_c1"],
-        "max_roundtrip_ppm": max_ppm,
-    });
+    let mut cal = tof_grid_block("sciex_sqrt_per_spectrum", MzReconstruction::BoundedLossyPpm(tof_grid::ppm_tol()));
+    cal.insert("tof_to_mz".to_string(), serde_json::json!("mz = (tof_c0 + tof_c1*tof_index)^2"));
+    cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1"]));
+    cal.insert("max_roundtrip_ppm".to_string(), serde_json::json!(max_ppm));
+    let cal = serde_json::Value::from(cal);
     applied.extend(chromatogram_transforms);
     if n_grid > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
