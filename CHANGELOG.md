@@ -529,7 +529,8 @@ keep their bytes.
   columns. `--tof-grid` said the native Bruker and Agilent readers take the grid from the vendor
   calibration, which only the ims-compact lanes and `--agilent-grid` do, and called itself mzML-only,
   although every input read through mzdata reaches the fit (imzML, Thermo `.raw`, a TDF read as
-  f64). In the manual, the §4 refusal table listed options that are only warned about as refused and
+  f64), and named its bound `PPM_TOL`, a constant in the source, instead of `MZPC_TOF_GRID_PPM`
+  (`docs_drift::help_names_the_variable_not_the_constant`). In the manual, the §4 refusal table listed options that are only warned about as refused and
   missed four real refusals on `--via-msconvert` (`--bruker-sdk --no-ims-compact --ims-chunked
   --no-tims-recalibration`); it now has a refused and a warned column, taken from
   `dropped_flags_for` and `inert_flags_for`, and no longer calls the MHDAC lane's `--tof-grid`

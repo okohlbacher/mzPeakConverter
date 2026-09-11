@@ -407,7 +407,7 @@ struct Cli {
     /// exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z
     /// and storing `tof_index` (Int32) + a per-run `{c0,c1}` instead, recovering
     /// `m/z = (c0 + c1·tof_index)²`. **Off by default** and
-    /// bounded-lossy (reconstruction within `PPM_TOL`) — it reverse-engineers the grid msconvert
+    /// bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`, default 5 ppm) — it reverse-engineers the grid msconvert
     /// discarded. `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise);
     /// `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF
     /// ims-compact lanes and `--agilent-grid` store the integer grid of the vendor calibration
@@ -518,7 +518,7 @@ fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
 
 /// When to apply the statistically-DETECTED TOF-grid m/z encoding (strategy A). This
 /// reverse-engineers an integer flight-time grid from already-decoded f64 m/z, so it is
-/// bounded-lossy (reconstruction within `PPM_TOL`). It applies on the mzML path (default `off`) and
+/// bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`, default 5 ppm). It applies on the mzML path (default `off`) and
 /// on the native SCIEX lane, whose vendor library also returns only decoded f64 (default `auto`
 /// there — see `Cli::tof_grid`); the lane reads the resolved `Option<TofGridMode>` so it can tell
 /// "not given" from an explicit `off`. Native readers with the true grid (Bruker, `--agilent-grid`) do NOT
@@ -529,7 +529,7 @@ enum TofGridMode {
     /// Never apply the detected grid; keep exact f64 m/z. (default — exact is the safe choice)
     #[default]
     Off,
-    /// Apply only when a strict grid fit passes (within `PPM_TOL`); otherwise keep f64 m/z.
+    /// Apply only when a strict grid fit passes (within `MZPC_TOF_GRID_PPM`); otherwise keep f64 m/z.
     Auto,
     /// Require the grid fit; error if the input is not griddable.
     On,
