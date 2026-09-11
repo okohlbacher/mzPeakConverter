@@ -463,6 +463,10 @@ pub struct TdfSdkReader {
     /// (`crate::bruker_native::exact_tof_coeffs`), so both lanes write the same columns. A `None`
     /// entry is a frame with a NULL `Frames.T1`, which stays on the chord.
     exact_tof: Option<Vec<Option<(f64, f64)>>>,
+    /// Frames whose points the SDK handed over out of m/z order, re-sorted by [`Self::spectrum`].
+    /// Shared with the converter, which counts it over the written frames only
+    /// (`VendorHints::counters`) and declares `sort-by-mz` when it moved.
+    resorted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     _not_thread_safe: PhantomData<*const ()>,
 }
 
@@ -493,7 +497,7 @@ impl TdfSdkReader {
         } else {
             None
         };
-        Ok(Self { api, handle, frames, windows, dir, exact_tof, _not_thread_safe: PhantomData })
+        Ok(Self { api, handle, frames, windows, dir, exact_tof, resorted: Default::default(), _not_thread_safe: PhantomData })
     }
 
     pub fn len(&self) -> usize {
@@ -662,6 +666,9 @@ impl TdfSdkReader {
         let mut triples: Vec<(f64, f32, f64)> = (0..peaks.len())
             .map(|k| (mz[k], peaks[k].intensity as f32, mobility[k]))
             .collect();
+        if !triples.is_sorted_by(|a, b| a.0.total_cmp(&b.0).is_le()) {
+            self.resorted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         triples.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mz: Vec<f64> = triples.iter().map(|t| t.0).collect();
         let intensity: Vec<f32> = triples.iter().map(|t| t.1).collect();
@@ -931,6 +938,15 @@ impl BrukerSdkReader {
         match self {
             Self::Tsf(r) => r.spectrum(i),
             Self::Tdf(r) => r.spectrum(i),
+        }
+    }
+
+    /// The TDF reader's re-sort counter, for `VendorHints::counters` (as `sort-by-mz`). A TSF frame's line
+    /// spectrum is read in m/z order and never re-sorted, so it has none.
+    pub fn reorder_counter(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        match self {
+            Self::Tsf(_) => None,
+            Self::Tdf(r) => Some(r.resorted.clone()),
         }
     }
 }

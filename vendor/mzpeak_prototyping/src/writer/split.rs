@@ -402,6 +402,15 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             "spectrum_data_point_count",
             Some(self.spectrum_data_point_counter.to_string()),
         );
+        // The data facet's own counts, as the packed writer stamps them: one past the largest
+        // spectrum index with a row in THIS file (0 when it has none), and the points it holds.
+        for (key, value) in [
+            ("spectrum_count", self.spectrum_buffers.entry_count()),
+            ("spectrum_data_point_count", self.spectrum_buffers.point_count()),
+        ] {
+            self.spectrum_data_writer
+                .append_key_value_metadata(KeyValue::new(key.to_string(), value.to_string()));
+        }
         self.spectrum_data_writer.finish()?;
         self.file_index.push(MzPeakArchiveType::SpectrumDataArrays.into());
         self.file_index.push(MzPeakArchiveType::SpectrumMetadata.into());

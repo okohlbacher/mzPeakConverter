@@ -222,21 +222,20 @@ pub trait ArrayBufferWriter {
     fn point_count(&self) -> u64;
     fn point_count_mut(&mut self) -> &mut u64;
 
-    /// The number of distinct series (spectra / chromatograms) that contributed at least one row
-    /// to THIS buffer over its whole lifetime (drains do not reset it). This is what the facet's
-    /// `<entity>_count` footer key means: entities represented by rows in this file — a
-    /// cardinality, not an index bound (indices may be sparse), and never the run total (that
-    /// lives on the primary metadata facet). See mzPeakConverter issue #1.
+    /// One past the largest series (spectrum / chromatogram) index with at least one row in THIS
+    /// buffer over its whole lifetime (drains do not reset it), and 0 when nothing was stored. This
+    /// is what the facet's `<entity>_count` footer key means: an index bound over the rows in this
+    /// file, so `0..count` reaches every entity the file holds even though its indices are sparse
+    /// (a mixed run splits its spectra across two data facets). Never the run total, which lives on
+    /// the primary metadata facet. See mzPeakConverter issue #1.
     fn entry_count(&self) -> u64;
 }
 
-/// Tracks [`ArrayBufferWriter::entry_count`]: a series is counted once, on the first call that
-/// stores rows for it. Calls for one series are contiguous (the writers are sequential), so a
-/// last-seen index is enough; a series handed in with zero rows is not an entry.
+/// Tracks [`ArrayBufferWriter::entry_count`]: one past the largest series index stored with at
+/// least one row. A series handed in with zero rows does not raise it.
 #[derive(Debug, Default, Clone)]
 pub struct EntryCounter {
     count: u64,
-    last: Option<u64>,
 }
 
 impl EntryCounter {
@@ -245,11 +244,7 @@ impl EntryCounter {
             return;
         }
         match series_index {
-            Some(i) if self.last == Some(i) => {}
-            Some(i) => {
-                self.count += 1;
-                self.last = Some(i);
-            }
+            Some(i) => self.count = self.count.max(i + 1),
             // No index column in the batch (should not happen for a spectrum/chromatogram facet):
             // count the call rather than silently under-report, and say so.
             None => {
@@ -257,6 +252,27 @@ impl EntryCounter {
                 self.count += 1;
             }
         }
+    }
+}
+
+/// VENDORED PATCH (mzPeakConverter D15): what a buffer's writes changed in the signal they were
+/// handed, so a converter declares the transformations that happened (`transformations` in the
+/// archive index) rather than the ones it configured. Counted over the buffer's lifetime.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SignalTally {
+    /// Series whose zero-intensity runs were compacted: at least one point dropped.
+    pub zero_runs_masked: u64,
+    /// Chunk rows stored with the lossy numpress-linear codec.
+    pub numpress_chunks: u64,
+    /// Series that arrived out of main-axis order and were re-sorted before they were stored.
+    pub resorted: u64,
+}
+
+impl std::ops::AddAssign for SignalTally {
+    fn add_assign(&mut self, rhs: Self) {
+        self.zero_runs_masked += rhs.zero_runs_masked;
+        self.numpress_chunks += rhs.numpress_chunks;
+        self.resorted += rhs.resorted;
     }
 }
 
@@ -286,6 +302,7 @@ pub struct PointBuffers {
     include_time: bool,
     point_count: u64,
     entries: EntryCounter,
+    tally: SignalTally,
     nullable_targets: Vec<usize>,
     drop_zero_columns: Vec<usize>
 }
@@ -644,6 +661,7 @@ pub struct ChunkBuffers {
     mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
     point_count: u64,
     entries: EntryCounter,
+    tally: SignalTally,
 }
 
 impl ChunkBuffers {
@@ -676,6 +694,7 @@ impl ChunkBuffers {
             mz_boundary,
             point_count: 0,
             entries: EntryCounter::default(),
+            tally: SignalTally::default(),
         }
     }
 
@@ -791,6 +810,12 @@ impl ArrayBufferWriter for ChunkBuffers {
 
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool) -> usize {
         let series_index = series_index_of(&fields, &arrays, self.buffer_context.index_name());
+        // VENDORED PATCH (mzPeakConverter D15): every chunked write lands here. The float m/z path
+        // encodes each chunk with this buffer's strategy; the ims-chunked `tof` boundary path is
+        // an integer axis and is never numpress.
+        if matches!(self.chunking_strategy, ChunkingStrategy::NumpressLinear { .. }) && self.mz_boundary.is_none() {
+            self.tally.numpress_chunks += arrays.first().map_or(0, |a| a.len()) as u64;
+        }
         self.chunk_buffer
             .push(StructArray::new(fields, arrays, None));
         self.is_profile_buffer.push(is_profile);
@@ -912,6 +937,21 @@ impl ArrayBufferWriterVariants {
                 Some(&chunk_buffers.chunking_strategy)
             }
             ArrayBufferWriterVariants::PointBuffers(_) => None,
+        }
+    }
+
+    /// VENDORED PATCH (mzPeakConverter D15): what this buffer's writes changed ([`SignalTally`]).
+    pub fn tally(&self) -> SignalTally {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.tally,
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.tally,
+        }
+    }
+
+    pub fn tally_mut(&mut self) -> &mut SignalTally {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => &mut chunk_buffers.tally,
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => &mut point_buffers.tally,
         }
     }
 
@@ -1259,11 +1299,6 @@ impl ArrayBuffersBuilder {
         self.array_fields.is_empty()
     }
 
-    /// The array fields registered so far, in insertion order.
-    pub fn fields(&self) -> &[FieldRef] {
-        &self.array_fields
-    }
-
     pub(crate) fn add_default_fields_for_context(mut self, buffer_context: BufferContext) -> Self {
         self = match buffer_context {
             BufferContext::Spectrum => self
@@ -1567,6 +1602,7 @@ impl ArrayBuffersBuilder {
             include_time: self.include_time,
             point_count: 0,
             entries: EntryCounter::default(),
+            tally: SignalTally::default(),
             nullable_targets,
             drop_zero_columns,
         }

@@ -20,12 +20,20 @@ mzPeakConverter (Rust, src/sciex.rs — Windows build, no feature flag)
         ▼
 SciexGlue.dll  (this project)   ── reflection (Assembly.LoadFrom) ──►  Clearcore2*.dll
         ▲                                                                   (from pwiz)
-        │  C ABI: Open / Close / SpectrumCount / SpectrumMeta / SpectrumData / DataFree
+        │  C ABI: SciexAbiVersion / Open / Close / SpectrumCount / SpectrumMetaV2 /
+        │         SpectrumDataV2 / DataFree / RunInfo / RunString / LastError
         └─ [UnmanagedCallersOnly] static exports in SciexGlue.Exports
 ```
 
 `src/sciex.rs` is the Rust side; it documents the exact ABI. `Glue.cs` is the managed side;
-its `Exports` class implements that ABI, and `Clearcore2Api` does the reflection.
+its `Exports` class implements that ABI, and `Clearcore2Api` does the reflection. The V1
+`SpectrumMeta` / `SpectrumData` exports stay for binaries that predate the handshake.
+
+**The DLL and the executable are one unit.** `SciexAbiVersion` must equal `REQUIRED_ABI_VERSION`
+in `src/sciex.rs`; the converter refuses a glue from another commit with a message naming both
+versions (a glue without the export counts as version 1). `tests/sciex_abi_pin.rs` holds the two
+sources to one contract on every host: the version literal, the struct twins, their sizes and the
+exports.
 
 ## Building
 
@@ -82,11 +90,18 @@ binaries.
   (candidate-name fallbacks) and may need adjustment against a Clearcore2 version other than the
   one ProteoWizard 3.0.26151 bundles. Compare against ProteoWizard's
   `pwiz_aux/msrc/utility/vendor_api/ABI/WiffFile.cpp`.
-- **Known gaps (2026-09-04 review):** MS2 rows carry no precursor / isolation window / CE across
-  this ABI (ledger M32), every spectrum is typed `MS:1000294` (M33), out-of-range values are
-  clamped and NaN mapped to zero in `Glue.cs` (M9), and `--tof-grid off` does not reach the
-  native lane (M3) — all tracked in the review ledger.
-- Intensities are narrowed from Clearcore2 `double` to `float` to match the mzPeak schema.
+- **Precursors** (M32) are read where ProteoWizard's ABI reader reads them — a product spectrum's
+  `ParentMZ` / `ParentChargeState`, and on a Product experiment `MassRangeInfo[0].IsolationWindow`
+  and `Parameters["CE"]` — and the precursor is built on the Rust side (`sciex_run::precursor`).
+  Not yet run against a WIFF. Clearcore2 reports no fragmentation mode: the method is beam-type CID
+  (pwiz's assumption) on instruments that can only fragment by collision, and unstated on a ZenoTOF,
+  which can also fragment by EAD. A precursor-ion scan's fixed mass, a product, is not carried.
+- Intensities are narrowed from Clearcore2 `double` to `float` to match the mzPeak schema. On the
+  way, NaN becomes 0 and a value beyond ±`float.MaxValue` (±Inf included) is clamped to it, and an
+  m/z / intensity pair of unequal length is cut to the shorter one (M9). Each is counted per
+  spectrum (`SpectrumDataV2`) and, when it happened, declared in the archive's `transformations`
+  as `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` or
+  `sciex:truncate-unequal-arrays`; `--to mzml` logs it instead.
 - Retention time from Clearcore2 is in **minutes**; the glue converts to seconds at the ABI,
   and the Rust side converts back to minutes for mzdata. (Net: mzdata gets minutes.)
 - Polarity is mapped 0 = positive, 1 = negative, other = unknown.

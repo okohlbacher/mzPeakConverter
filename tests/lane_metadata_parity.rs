@@ -91,8 +91,8 @@ const EXPECTED: &[Expected] = &[
     Expected {
         key: "software.ids",
         vendors: None,
-        kind: Kind::Defect,
-        reason: "the native Shimadzu lane still records no acquisition software (LabSolutions version needs a glue export); elsewhere the difference is ProteoWizard's own entries (pwiz, pwiz_Reader_*) and the vendor's FULL version string the native lane carries (`MassHunter GC/MS Acquisition 10.0.368 …`, `MassLynx 4.1 SCN916`) where pwiz prints `8.0` / `4.1`.",
+        kind: Kind::ByDesign,
+        reason: "ProteoWizard adds its own entries (pwiz, pwiz_Reader_*), and the native lane carries the vendor's FULL version string (`MassHunter GC/MS Acquisition 10.0.368 …`, `MassLynx 4.1 SCN916`, and since 0.11.3 Shimadzu's LabSolutions version read from the `.lcd`) where pwiz prints `8.0` / `4.1`. ProteoWizard's own ids differ on every pair, so this rule never goes stale: re-read it by hand when a lane's software record changes.",
     },
     Expected {
         key: "file_description.source_files.count",
@@ -129,7 +129,10 @@ const EXPECTED: &[Expected] = &[
         vendors: None,
         kind: Kind::Defect,
         reason: "ProteoWizard emits the LC device traces (pump pressure, flow, DAD) as chromatograms; \
-                 the native lanes iterate MS scans only and write just the synthesised TIC/BPC.",
+                 the native lanes iterate MS scans only and write just the synthesised TIC/BPC. The \
+                 Bruker lanes are the exception and write HyStar's traces too, but still differ: \
+                 HyStar's MS traces give way to the synthesised pair, and a user-defined pressure or \
+                 flow trace is typed by its unit where ProteoWizard says `chromatogram`.",
     },
     Expected {
         key: "facet.chromatograms_data.parquet.rows",
@@ -154,8 +157,9 @@ const EXPECTED: &[Expected] = &[
         key: "transformations",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "the declared transformation list follows the encoding each lane chose, which is the \
-                 point of declaring it.",
+        reason: "the transformation list states what each lane applied to its stored data (the codec \
+                 it used, the spectra it masked, re-sorted or gridded), which differs by lane by \
+                 construction.",
     },
     Expected {
         key: "facet.spectra_data.parquet.columns",
@@ -243,7 +247,7 @@ const EXPECTED: &[Expected] = &[
         key: "run.id",
         vendors: None,
         kind: Kind::Defect,
-        reason: "ProteoWizard names a WIFF run after its SAMPLE (En_PPY: the sample name), the native lane after the file stem; pwiz's XML-id escaping of a leading digit (`_x0032_0181203…`) is decoded before comparing, so only the SciEX naming rule remains.",
+        reason: "ProteoWizard names a WIFF run after its SAMPLE (En_PPY: the sample name), the native lane after the file stem; pwiz's XML-id escaping (`_x0032_0181203…` for a leading digit, `_x0020_` for a space) is decoded before comparing — the mzML lane decodes it on copy now, but archives built before that carry it — so only the SciEX naming rule remains.",
     },
     Expected {
         key: "facet.spectra_metadata.parquet.rows",
@@ -309,7 +313,7 @@ const EXPECTED: &[Expected] = &[
         key: "spectra_metadata_precursors.*",
         vendors: Some(&[Vendor::Waters]),
         kind: Kind::ByDesign,
-        reason: "follows the two row rules: ×200 rows on the pwiz side; the same acquisition-range MSe window on both, but the mzML twin carries only one offset (mzdata reads the lower one as 0) and the native lane adds the method's transfer-energy ramp (MS:1002013/1002014) and the window-source parameter.",
+        reason: "follows the two row rules: ×200 rows on the pwiz side; the same acquisition-range MSe window on both (the mzML twin has read both offsets since the mzdata reader fix of 0.11.3), and the native lane adds the method's transfer-energy ramp (MS:1002013/1002014) and the window-source parameter.",
     },
     Expected {
         key: "spectra_metadata_selected_ions.*",
@@ -434,28 +438,6 @@ fn facet_population(archive: &Path, member: &str, dir: &Path, into: &mut Surface
     let _ = std::fs::remove_file(&p);
 }
 
-/// ProteoWizard escapes characters an XML id may not start with as `_xHHHH_` (`_x0032_0181203…`
-/// for a run whose name starts with a digit). The native lane uses the plain stem.
-fn decode_pwiz_id(v: &str) -> String {
-    let mut out = String::new();
-    let mut rest = v;
-    while let Some(i) = rest.find("_x") {
-        let (head, tail) = rest.split_at(i);
-        out.push_str(head);
-        if tail.len() >= 8 && &tail[6..8] == "_" && tail[2..6].chars().all(|c| c.is_ascii_hexdigit()) {
-            if let Some(ch) = u32::from_str_radix(&tail[2..6], 16).ok().and_then(char::from_u32) {
-                out.push(ch);
-                rest = &tail[8..];
-                continue;
-            }
-        }
-        out.push_str("_x");
-        rest = &tail[2..];
-    }
-    out.push_str(rest);
-    out
-}
-
 fn json_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
     let mut cur = v;
     for p in path {
@@ -516,7 +498,7 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
             "run.id".into(),
             run.get("id")
                 .and_then(|v| v.as_str())
-                .map(|v| if v.is_empty() { "empty".into() } else { decode_pwiz_id(v) })
+                .map(|v| if v.is_empty() { "empty".into() } else { pwiz_id::decode(v) })
                 .unwrap_or("absent".into()),
         );
     }
@@ -588,7 +570,7 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
             let mut ids: Vec<String> = arr
                 .iter()
                 .filter_map(|e| {
-                    let id = e.get("id").and_then(|v| v.as_str())?;
+                    let id = pwiz_id::decode(e.get("id").and_then(|v| v.as_str())?);
                     let version = e.get("version").and_then(|v| v.as_str()).unwrap_or("");
                     Some(if version.is_empty() { id.to_string() } else { format!("{id}@{version}") })
                 })
@@ -660,6 +642,14 @@ fn surface(archive: &Path, dir: &Path) -> Surface {
 
 #[path = "common/corpus.rs"]
 mod corpus;
+
+/// ProteoWizard escapes what an XML id may not start with or hold as `_xHHHH_` (`_x0032_0181203…` for
+/// a run whose name starts with a digit). The native lane uses the plain stem, and the mzML lane
+/// decodes `run.id` and the software ids on copy with this same code; archives built before that
+/// still carry the escapes, so both keys are compared decoded. The copy this test had kept compared
+/// two bytes with `"_"` and so never decoded one.
+#[path = "../src/pwiz_id.rs"]
+mod pwiz_id;
 
 /// `<stem>` for every pair present in `dir`.
 fn pairs(dir: &Path) -> Vec<(String, PathBuf, PathBuf)> {

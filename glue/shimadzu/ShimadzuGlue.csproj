@@ -58,9 +58,11 @@
 
          SECURITY: BinaryFormatter is disabled by default because deserializing UNTRUSTED input is
          unsafe. The input here is a vendor instrument file the user chose to convert, and the same
-         code path is what ProteoWizard itself runs. Do not widen this to other inputs. Note .NET 9
-         REMOVES BinaryFormatter outright, so a future retarget needs Shimadzu to ship a DLL that
-         does not use it. -->
+         code path is what ProteoWizard itself runs. Do not widen this to other inputs. Note that on
+         .NET 9+ the in-box BinaryFormatter always throws; only Microsoft's unsupported
+         System.Runtime.Serialization.Formatters package plus this switch restores it, untested
+         inside a hostfxr-loaded component like this glue. A retarget needs that verified, an
+         out-of-process net48 host, or a vendor DLL that does not use it (see README.md). -->
     <RuntimeHostConfigurationOption
       Include="System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization"
       Value="true" Trim="false" />

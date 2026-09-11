@@ -15,6 +15,18 @@ a `TIC`, which synthesis replaces anyway, and its archive
 other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>`
 (`bruker-microtof-q2`) and imzML.
 
+**Output change.** The m/z columns of point-layout facets are encoded differently, with the values
+unchanged (below). Every native SciEX grid archive changes and gets smaller, as does every archive
+with an m/z-lattice or grid f64 fallback column, or written with `--layout point`. Chunked facets
+keep their bytes.
+
+**Output change.** Rebuilt archives also change in these ways, each described in its entry below: a
+data facet's footer count is an index bound and the secondary facets carry none; `transformations`
+lists what a conversion applied; chromatogram times are minutes on every lane; native Bruker
+archives carry HyStar device traces, and ims-compact archives a `conversion_route`; BAF archives
+record their members and run; mzML-lane archives hold ProteoWizard's run and software ids decoded;
+and a vendor directory embeds its side-files under one rule, without its raw signal files.
+
 ### Added
 
 - **Release archives for Linux and Windows.** Beside the two macOS archives, every release now
@@ -30,13 +42,160 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   platform onto an existing tag without rebuilding the archives already published. The vendor
   readers are unverified on Windows ARM64: the vendor DLLs are x64, so use the x64 archive there.
 - **The converter finds its .NET glue beside the executable.** With `MZPC_SCIEX_GLUE`,
-  `MZPC_SHIMADZU_GLUE`, `MZPC_AGILENT_GLUE` or `MZPC_AGILENT_MIDAC_GLUE` unset it looks in
+  `MZPC_SHIMADZU_GLUE` or `MZPC_AGILENT_GLUE` unset it looks in
   `glue\<name>\` next to `mzpeak-convert.exe` — the Windows release archive's layout — so an
   unpacked release needs none of them; a variable that is set still wins. Pinned host-independently
   by `pwiz_layout::tests::glue_dir_prefers_the_variable_then_the_release_layout`.
+- **The corpus harness builds one archive per sample of a multi-sample WIFF.** Both lanes now refuse
+  a multi-sample `.wiff` without `--sample` (see Fixed). At the next rebuild, `En_PPY.wiff`
+  (117 samples) and `IPX0002633001_D-239.wiff` would go from a silent one-sample archive to a
+  failed box job. A descriptor may now list the samples it publishes:
+  `convert: {input: En_PPY.wiff, samples: [1, 2]}`. `tools/corpus_reconvert.py` then builds each
+  sample as `<stem>.sample<N>.mzpeak` with `--sample N`, on the host or as one box job per sample.
+  A unit's former single archive is reported as `SUPERSEDED ON DISK`, and the run exits 1 until
+  it is removed. `box_convert_remote.ps1` keeps `--sample N` on its msconvert fallback, a
+  hand-written box manifest line can carry it, and `tools/lane_pairs.ps1` takes `'En_PPY.wiff@2'`.
+  Which samples to publish is the owner's decision, so no corpus descriptor lists any yet.
+- **Every release archive ships `THIRD-PARTY-NOTICES.md`, and every release its own SBOM.** The
+  archives carried only the binary, `LICENSE` and `README.md`, although the binary links about 400
+  crates whose licenses ask for their notices to travel with it. The notices file now goes into all
+  six archives, and each release job checks it is there. A new `sbom` job runs `cargo metadata
+  --locked` through `tools/gen_sbom.py`, refuses an SBOM whose component version is not the tag's,
+  and attaches `mzpeak-convert-<version>.cdx.json` with a `.sha256` sidecar. `gen_sbom.py` now
+  records a git source such as the mzdata fork, which the purl alone passes off as the crates.io
+  release of the same version. The tracked `sbom.cdx.json` is gone: it still described
+  mzpeak-convert 0.1.0 with 395 components (mzdata 0.64.1, arrow 57.0.0), nothing regenerated it,
+  and README and the manual linked it as the inventory. Publishing now needs at least one platform
+  archive, so a run whose platforms all failed cannot publish a release holding only the SBOM. A
+  failed SBOM job is treated like a failed platform: the archives that built are attached without
+  it, and the run goes red. The job runs on every dispatch, whatever `only` names. `gen_sbom.py`
+  writes no timestamp or serial number, so regenerating from the tag's `Cargo.lock` re-attaches
+  the same file.
+- **`metadata.conversion_route` names the timsTOF route that built an archive** (review D13/M35).
+  The default lane falls back to the mzdata reader when timsrust cannot decompress a frame (newer
+  timsTOF, e.g. 5.1.x), with the same recorded command line, so a fallback archive was recognisable
+  only by what it lacks. Both ims-compact lanes now write
+  `{"route": "ims-compact", "reader": "timsrust" | "timsdata"}` and the fallback writes
+  `{"route": "mzdata-fallback", "reader": "mzdata", "reason": <the error>}`.
+  `ims_compact_fallback_arm_records_the_route_it_took` forces the fallback arm with injected errors,
+  and `convert_file_writes_the_route_it_is_handed` pins the block in the archive.
+- **Native Bruker archives carry the LC system's device traces.** A timsTOF `.d` records its
+  pumps, column oven and autosampler in HyStar's `chromatography-data.sqlite`, which only the mzML
+  lane (through ProteoWizard) used to read; the native TDF and TSF lanes wrote the synthesized TIC
+  and BPC alone. Every Bruker lane now opens that file read-only and writes each trace after the
+  TIC/BPC (`--to mzml` from a `.d` after the spectra, in HyStar's seconds: the TSF run's mzML now has
+  the 8 chromatograms its archive's export has, not 2), with ProteoWizard's `chromatogram title` and
+  `Instrument` parameters: a pressure,
+  flow-rate or temperature trace as that PSI-MS chromatogram type with a pressure, flow-rate or
+  temperature array, anything else (solvent composition, setpoints, valve angles) as ProteoWizard's
+  generic `chromatogram` (MS:1000625) with a non-standard array named after the trace, each in the
+  unit HyStar states. The type is a parameter as well as the typed column, so an mzML export of the
+  archive states it. The value arrays are stored as auxiliary arrays, which keep their own unit, and
+  times are minutes like every other chromatogram: HyStar records seconds, so the archive declares
+  `chromatogram-time-to-minutes` (below). HyStar's own MS traces give way to the
+  synthesized TIC/BPC, as a source TIC/BPC always has; that includes its MS/MS TIC
+  (`TIC,±AllMS/MS`, on every corpus run), which the spectra still yield. A user-defined trace whose
+  unit is a pressure or a flow rate is typed as one (ProteoWizard does that only for a temperature).
+  mzdata has no unit for bar, so a trace in bar is stated in pascal, as 64-bit floats that divide
+  back to the stored value exactly, and the archive declares `bruker:trace-unit-rescale` in
+  `transformations`. HyStar stored the four Thermo pump and column-oven traces of PXD079300's
+  `…_27806.d` in overlapping chunks, every sample three times and out of time order (1,079,478
+  points for 359,826 samples on each pressure trace): such a trace is written in time order with
+  each exact (time, value) repeat once, and the archive declares `bruker:trace-sort-dedup`. A
+  database in WAL mode is skipped with a warning, since SQLite cannot open one without creating
+  files beside it; no corpus file is in WAL mode. The 32 corpus runs with the file hold 698 such
+  traces, 139 of them in bar (5 on each of the 27 PXD059079 runs, 2 each on PXD076703 and
+  PXD078573); their published archives change only when reconverted. On the TSF run behind
+  ProteoWizard's `timsTOF_autoMSMS_Urine_50s_neg` test file the six Elute traces match its mzML in
+  values, times, unit and chromatogram type (the two solvent traces through the `chromatogram`
+  parameter; their typed column stays null). Pinned by `bruker_traces::tests` (an in-memory HyStar
+  database) and `tests::finish_chromatograms_writes_the_bruker_device_traces`, which also checks
+  that the input directory is left untouched.
 
 ### Fixed
 
+- **Thermo isolation windows that the reader library computed are written target-only.**
+  thermorawfilereader (0.8.0, the copy mzdata wraps, and 0.7.2 alike, their .NET bundles
+  dotnetrawfilereader-sys 0.8.0 and 0.7.3) takes a precursor's isolation
+  width from the scan's `MS<n> Isolation Width` trailer. For a scan without that trailer it takes the
+  scan filter's width and halves it, and the window constructor halves it again; a negative filter
+  width inverts the window. mzdata copies those bounds as stated. The published archives therefore
+  carry 13,004 MS3 windows at −0.25/−0.25, with the lower bound above the upper
+  (`ec04479_qy_4cell_SanJose_A1`), and 26,487 MS2 and SRM windows a quarter or half of the method's
+  width: `2013_30_Amrutha_050713_1` ±0.25 where its method says 2.00 and ProteoWizard ±1.0,
+  `SZB8102938` ±0.25 for a method width of 2.00, and `LD401_001fmol_r1` ±0.175 for a Q1 width of
+  0.7. A Thermo window now keeps the library's numbers only when its scan's own trailer states a
+  positive width and the window is neither empty nor inverted. Any other window keeps its target
+  and gets null offsets, declared as `thermo:target-only-isolation-window` in `transformations`
+  and warned about once per run with the count. `--to mzml` applies the same rule and writes the target only.
+  Windows with a stated width are unchanged (`small.RAW` ±1.0, as ProteoWizard; ec04479's MS2 ±0.25
+  for its 0.50 trailer). The four archives above need rebuilding. Pinned by the tests in
+  `src/thermo_isolation.rs` and `contract_strings::transformations_block_pinned`.
+- **`--to mzml` wrote an isolation window of unknown width as a window from 0 to twice its
+  target.** Every lane holds a window without a stated width as its target with both bounds 0 (a
+  Waters DDA set mass, a TSF trigger mass without a width, mzdata's mzML reader on a target-only
+  window), and the mzPeak writer stores null offsets for it. mzdata 0.66's mzML writer always writes
+  `target − lower bound` and `upper bound − target`, so the export said lower offset +target and
+  upper offset −target: `tests/fixtures/target_only_window.mzML` came out as 445.3 / −445.3. The
+  export sink now blanks exactly that pair with spaces of the same length, which leaves the window
+  target-only, as ProteoWizard writes a window it knows no width for, and keeps every `<indexList>`
+  offset true. The `<fileChecksum>` is left alone: mzdata computes it before flushing its own
+  buffer, so it did not match the file before either. Pinned by
+  `run_metadata_native::a_target_only_isolation_window_exports_to_mzml_target_only` and the
+  split-write tests in `src/mzml_isolation.rs`.
+- **`--rt` paired a chromatogram's auxiliary values with the wrong times.** A chromatogram array
+  with no column in `chromatograms_data` (a native Bruker archive's device-trace pressure or solvent
+  percentage, above) is stored in `chromatograms_metadata.auxiliary_arrays`, one value per point.
+  The filter cut each chromatogram's time rows and `number_of_data_points` to the window but kept
+  those arrays whole, so a reader paired the kept times with the first values and an mzML export
+  wrote value arrays longer than `defaultArrayLength` (58 times beside 352 pressures on a TSF run
+  filtered to 1–2 min). They are now cut with the same per-point mask as the times; one that cannot
+  be cut value by value (an encoded buffer, a variable-width type, or not one value per point) stops
+  the filter. A chromatogram facet with no time axis to cut on keeps its metadata unchanged, as it
+  keeps its data, where its point counts used to be set to 0. Pinned by
+  `tests::an_rt_window_cuts_the_device_trace_values_with_their_times`.
+- **`x.mzpeak -o y.mzML --rt a-b` cuts the chromatograms to the window.** The direct export kept
+  the spectra in the window but wrote every stored chromatogram whole, while rewriting the archive
+  with `--rt` first and exporting that cut them: on the private TSF run's archive with `--rt 0-0.03`,
+  15 spectra beside all six HyStar traces uncut (352 points of pressure) one way, none of their points
+  the other; with `--rt 0-0.05`, `tiny.pwiz.1.1`'s `sic` kept all 10 points where the rewrite keeps 4
+  (0.11.5's direct export wrote 10 as well). The export now
+  cuts each chromatogram as the rewrite does, in the unit its time array states, every array to the
+  same points. Pinned by `tests::a_filtered_mzml_export_cuts_the_chromatograms_to_the_window`, which
+  compares both routes.
+- **An mzML output's `<chromatogramList count>` said 2 whatever followed.** mzdata's writer starts
+  the count at its own TIC/BPC pair and writes it with the first chromatogram, and no lane set it,
+  so every source chromatogram passed through (`.mzpeak` → mzML, mzML → mzML) left it short: 2
+  around 8 chromatograms on a TSF run's archive. It is now the chromatograms written plus that pair.
+  Pinned by `tests::the_mzml_export_counts_and_types_the_device_traces`.
+- **The mzML export of an archive with device traces could not be converted again.** mzdata's
+  mzML reader has no case for the `flow rate array` (MS:1000820), `pressure array` (MS:1000821)
+  and `temperature array` (MS:1000822) such an export writes, so each came back untyped, and both
+  `x.mzML -o y.mzpeak` and `x.mzML -o y.mzML` aborted in mzdata's array naming (exit 134, nothing
+  written) on the export of every archive holding HyStar traces, as on any mzML with such an
+  array. An array whose type mzdata knows the accession of now takes that type and the
+  parameter's unit; any other unreadable array is kept, with a warning, as a non-standard data
+  array named after its parameter. The mzPeak lane samples the chromatogram schema from time and
+  intensity alone, so every other chromatogram array, a non-standard one included, is stored as an
+  auxiliary array in its own unit and data type under its own name, as the native lane stores the
+  same traces. Converted back from their exports, a PXD059079 run's archive (25 traces) and a TSF
+  run's (6) match the exported archives in every trace's (time, value) pairs, and in every pressure,
+  flow-rate and temperature trace's chromatogram type, array, unit and data type. Until then the
+  first ten chromatograms' non-standard arrays became columns (a Bruker export's first one:
+  `Fraction A - [%]` on the TSF run), which read back without their name, went out again as a
+  `non-standard data array` with no value, and came back as a column named ''; any mzML with a
+  non-standard chromatogram array among its first ten chromatograms is now stored the new way.
+  Pinned by `tests::an_mzml_export_of_device_traces_converts_back`, which converts an export twice,
+  and `tests::unreadable_chromatogram_arrays_get_names_the_writers_accept`.
+- **mzML → mzML dropped every chromatogram's type.** mzdata's mzML reader moves the type cvParam
+  into the typed field and its writer writes the parameters alone, so the output stated no
+  chromatogram type, which mzML requires (tiny.pwiz's selected ion current trace among them, and
+  the device traces above). The term is now written back unless a parameter still states a type,
+  from a table checked against `psi-ms.obo`; mzdata's own maps the selected ion monitoring and
+  selected reaction monitoring types onto two instrument-model accessions. The `.mzpeak` → mzML
+  export of an archive converted from mzML states the type again too. Pinned by
+  `tests::mzml_to_mzml_keeps_the_chromatogram_type` and
+  `tests::chromatogram_type_params_are_the_psi_ms_terms`.
 - **An indexed mzML declaring a non-UTF-8 encoding lost all its chromatograms, with exit code 0.**
   mzdata's reader is UTF-8 only, so an ISO-8859-1 / latin1 / windows-1252 input is transcoded into
   a UTF-8 temp copy first, and that rewrite changes byte lengths: `encoding="ISO-8859-1"` becomes
@@ -118,13 +277,17 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   wrote there is renamed into place through `TmpGuard` like every other mzML export, and a
   `.mzML.gz` output is gzip-compressed from that file rather than left to msconvert's
   naming. The directory is removed on every error return, taking a crashed msconvert's stray
-  `.partial` with it. The same guard stops the `--via-msconvert` mzPeak lane leaking
-  `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which returned before
-  any cleanup. `tests/mzml_export_atomic.rs` drives the lane with stand-in scripts: against
-  the unfixed build, one that exits 0 without writing produced exit 0 and
-  "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
-  byte-identical and nothing beside it. One that writes its mzML must land under the
-  requested name, gzipped for `.mzML.gz`, and reparse.
+  `.partial` with it, and on a panic by the panic hook, which sweeps it with the in-flight
+  `.tmp` files: the release build aborts without running destructors, and the directory sits
+  beside the output holding msconvert's whole mzML. The same guard stops the `--via-msconvert`
+  mzPeak lane leaking `mzpc-msconvert-<pid>` in the temp dir when msconvert is not found, which
+  returned before any cleanup; `tmp_cleanup::msconvert_not_found_leaves_no_working_directory`
+  pins both lanes with `TMPDIR` pointed at a scratch directory, and
+  `msconvert_dir_is_swept_by_the_panic_hook` the sweep. `tests/mzml_export_atomic.rs` drives the
+  lane with stand-in scripts: against the unfixed build, one that exits 0 without writing produced
+  exit 0 and "wrote …/out.mzML" over the untouched previous file; it must now fail with that file
+  byte-identical and nothing beside it. One that writes its mzML must land under the requested
+  name, gzipped for `.mzML.gz`, and reparse.
 - **`--via-msconvert` refuses a multi-sample WIFF without `--sample` instead of keeping its
   last sample.** With one `--outfile`, msconvert writes every run of a multi-run source onto
   that path in turn and the last one wins (En_PPY: 117 samples, one survived), under exit 0
@@ -141,6 +304,13 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   truncated conversion did. `--sample 0` is refused for every lane; the msconvert lanes used
   to turn it into run index 0, sample 1. `tests/msconvert_multi_run.rs` pins both directions
   with a stand-in msconvert that writes two runs, or one when `--runIndexSet` picks it.
+- **The msconvert lanes also refuse a sample msconvert could not open.** ProteoWizard's WIFF reader
+  catches a sample that throws on open, prints `[Reader_ABI::read] Error opening run <i> in <file>`
+  and goes on with the rest, and msconvert exits 0. The refusal above counted only the runs written,
+  so a two-sample WIFF with one unreadable sample came out as one run, exit 0; and because
+  `--runIndexSet` counts the runs pwiz could open, `--sample 2` of three with sample 1 unreadable
+  converted sample 3. Both lanes now refuse when the captured log holds that line, and quote it.
+  Pinned in `tests/msconvert_multi_run.rs` with a stand-in that reports one unreadable sample.
 - **The `.mzpeak` filter lane no longer refuses archives with wavelength spectra.** Every
   Parquet member is classified, and the UV/PDA scans facet (`entity_type=wavelength_spectrum`,
   keyed by `source_index`) fell into the "index does not identify its entity" refusal. `--rt`,
@@ -151,19 +321,62 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
 - **`--drop-aux` refuses to remove a core facet.** Drop globs matched every member, so
   `--drop-aux '*.parquet'` wrote an archive holding nothing but its index, and dropping
   `spectra_peaks.parquet` or `spectra_metadata_precursors.parquet` wrote an unreadable one — each
-  with exit 0. A glob that matches a `spectrum` facet whose `data_kind` is not proprietary/other
-  now exits 1 before anything is written. `--no-vendor` still drops the Thermo `vendor_*` facets,
-  which are declared proprietary, and `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA
-  trace: those facets reference only each other.
-- **`--ms-level` and `--rt` fail on a missing or retyped column.** An `ms_level` that was absent
-  or not UInt8 read as level 0, and a `time` that was absent or not Float64 as NaN, so a writer
-  type change would have made either filter keep 0 spectra and exit 0.
+  with exit 0. A glob that matches a `spectrum` or `chromatogram` facet whose `data_kind` is not
+  `proprietary` now exits 1 before anything is written. That includes a kind this build does not
+  know, which the filter treats as a secondary, and `chromatograms_data`, whose removal under `--rt`
+  left metadata point counts refreshed from the facet that was dropped. `--no-vendor` still drops
+  the Thermo `vendor_*` facets, which are declared proprietary, and
+  `--drop-aux 'wavelength_spectra*'` still strips a UV/PDA trace: those facets reference only each
+  other.
+- **`--ms-level` and `--rt` fail on a missing column or one they cannot read losslessly.** An
+  `ms_level` that was absent or not UInt8 read as level 0, and a `time` that was absent or not
+  Float64 as NaN, so a writer type change would have made either filter keep 0 spectra and exit 0.
+  Another integer width for `ms_level`, or float width for `time`, is now cast; an absent column,
+  another kind of type, or an `ms_level` that does not fit UInt8 exits 1.
 - **`--rt` refreshes chromatogram point counts in current archives.** The refresh knew only the
   pre-0.7 nested `chromatogram` struct, so the flat `chromatograms_metadata.parquet` the converter
   writes today was copied verbatim: on `tiny.pwiz.1.1` converted by 0.11.5, `--rt 0-0.0001` left
   2 points in `chromatograms_data` while the metadata still declared `[3, 3]` and a footer total
-  of 6. Both now follow the truncation. Without `--rt` the facet is copied verbatim rather than
-  re-encoded.
+  of 6. Both now follow the truncation, and the refreshed `number_of_data_points` keeps the
+  column's own integer type. Without `--rt` the facet is copied verbatim rather than re-encoded.
+- **A data facet's `<entity>_count` is an index bound again.** Since 0.11.2, `spectrum_count` on
+  `spectra_data` and `spectra_peaks` (and `chromatogram_count` / `wavelength_spectrum_count` on
+  `chromatograms_data` / `wavelength_spectra_data`) was the number of entities with rows in that
+  file — a cardinality. A data facet's indices are sparse, so readers that bound iteration by the
+  count lost spectra without an error: `090701-LTQVelos-unittest-01` declares 43 on a
+  `spectra_data` whose largest index is 84, and `Hela_QC_PASEF_Slot1-first-6-frames-ms2-centroid`
+  309 on a `spectra_peaks` that reaches index 1,748 — a centroid-only run 0.11.1 still bounded
+  correctly. The count is now one past the largest index with a row in that file, and 0 when the
+  file has none; `<entity>_data_point_count` stays the points in the file, and the primary
+  metadata facets keep the run total. The archive rewrite (`--rt`, `--ms-level`, `--drop-aux`)
+  stamps the same. Pinned by `tests/footer_counts.rs` and
+  `rewritten_data_facets_declare_an_index_bound`. This changes the footers of every archive; the
+  corpus is rebuilt at the next release.
+- **The metadata secondaries no longer carry an entity count.** The writer stamped the run total on
+  `spectra_metadata_scans`, `_precursors`, `_selected_ions`, `wavelength_spectra_metadata_scans`
+  and the chromatogram precursors / selected ions, so an MS1-only run's empty precursors facet
+  declared every spectrum, issue #1's shape; an `--rt` / `--ms-level` rewrite stamped a third
+  meaning there (the distinct `source_index` values left). Neither counts anything a reader can
+  plan from, so both omit the key now, and a rewrite also drops it from an older archive's
+  spectrum and chromatogram secondaries. Pinned by `secondary_facets_carry_no_entity_count` and
+  `filter::tests::rewrite_leaves_no_entity_count_on_secondaries`.
+- **A rewritten facet no longer embeds the pre-filter counts in `ARROW:schema`.** arrow-rs folds a
+  Parquet file's key-value footer into the schema it reads, and the `.mzpeak` rewrite (`--rt`,
+  `--ms-level`, `--drop-aux`) handed that schema to its writer, which serialises it into the file's
+  `ARROW:schema`. The key-value footer was recomputed, but Arrow C++ and pyarrow return the embedded
+  copy as the schema metadata: after `--ms-level 1` on `tiny.pwiz.1.1` converted by 0.11.5,
+  `spectra_data` said `spectrum_count=1`, `spectrum_data_point_count=10` on 0 rows, and
+  `spectra_metadata` 4 on 3. The writer now gets the schema without its schema-level metadata. That
+  loses nothing: an unfiltered archive embeds none, and every key the rewrite embedded was also in
+  the key-value footer. Pinned by `rewrite_embeds_no_stale_counts_in_the_arrow_schema`.
+- **An archive rewritten with `--ms-level` or `--rt` can be read back.** The rewrite keeps each
+  surviving spectrum's original index, but the vendored reader sized its per-spectrum tables (m/z
+  models, point, peak and auxiliary-array counts) by the number of rows, so
+  `mzpeak-convert f.mzpeak -o f.mzML` aborted with an index-out-of-bounds panic whenever the
+  survivors were not `0..n`: on `tiny.pwiz.1.1`, `--ms-level 1`, `--ms-level 2`, `--rt 0-1` and
+  `--rt 0-0.0001` all did. The tables now grow to the largest index, and the export walks the
+  indices the archive holds rather than `0..n`, which asked for filtered-out spectra and never
+  reached the last ones. Pinned by `filtered_archives_read_back` in `tests/filter_lane.rs`.
 - **A release is built only from a commit that passed CI.** `release.yml` runs no tests, and
   `windows.yml` cancelled a push's run as soon as the next commit reached `main` — so v0.10.0
   (85afceb), v0.10.1 (5692603) and v0.11.3 (4ff30a6) were released with their `windows` job
@@ -177,6 +390,43 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   gets its own concurrency group: with cancellation off GitHub still replaces a run *pending* in a
   group, so the middle one of three quick pushes would never run. Pull requests still cancel a
   superseded run.
+- **The release gate stops waiting where waiting cannot help, and names the remedy.** A commit CI
+  never ran on — pushed together with a later commit, as v0.7.3 and v0.4.12 were, or a `[skip ci]`
+  one — never gets the `build-test` and `windows` check runs, yet the gate waited the full 90 minutes
+  for it and then blamed a commit that "reached neither" main nor a pull request. When a commit older
+  than three hours still has none of those three ten minutes in, the gate now refuses at once; the
+  Release workflow's own jobs, the gate included, are check runs on the same commit and do not
+  count. It also resolves the commit through the commits API first, which peels an annotated tag,
+  and three HTTP 4xx answers in a row end the gate: every API error used to be retried until the
+  deadline, and the check-runs endpoint answers a tag object's own SHA with 422. A 5xx is still
+  retried. Every refusal and the timeout now name what to run: `gh workflow run ci.yml --ref <tag>`
+  and `gh workflow run windows.yml --ref <tag>`, then a re-run. Replayed against a stand-in `gh`
+  that lists the gate's own running check on a push or a pull request: a six-hour-old commit
+  without CI check runs ends after 10 simulated minutes on a push, a pull request and a dispatch
+  (90 before), an unknown SHA after 2 (90 before); a pass, a pending check, a cancelled job and two
+  502s behave as before.
+- **`THIRD-PARTY-NOTICES.md` states the licenses and sources the build uses.** It listed `mzdata`,
+  `mzpeaks` and `thermorawfilereader` as MIT, where their manifests say Apache-2.0, and `zip` as
+  MIT/Apache-2.0 (it is MIT). It also put `mzdata` under a crates.io heading, although the build pins
+  it from the `okohlbacher/mzdata@1d53971` git fork (0.66.6 plus mobiusklein/mzdata#58, merged
+  upstream and not yet released). The file now carries the Apache License 2.0 text and the NOTICE
+  that `arrow` and `parquet` ship, which section 4(d) of that license requires redistributions to
+  pass on. It names the .NET assemblies `thermorawfilereader` embeds in the binary, which no
+  crate declares: Thermo Fisher Scientific's RawFileReader, under Thermo's proprietary license, and
+  OpenMcdf 2.3, under MPL-2.0. Its
+  vendor-SDK paragraph no longer names the `bruker_sdk` / `agilent` / `sciex` build features, which
+  no longer exist. The license distribution comes from `cargo metadata` at this tree (415
+  dependency packages) instead of the 0.1.0 SBOM; `mzpeak_prototyping` stays "not declared
+  upstream".
+- **A release archive is checked for what it claims before it is attached.** The macOS job printed
+  `lipo -archs` without asserting it, and the x86_64 binary never runs on the arm64 runner, so
+  nothing stopped an arm64 build shipping under the x86_64 name: both architectures are now
+  asserted. Wherever the binary runs, `--version` must print `mzpeak-convert <version>` for the
+  version the tag carries, and the smoke archive is read back — its inspection report must count the
+  source's spectra and its mzML export must hold them all — where a non-empty file used to pass.
+  Replayed on the macOS and Linux steps: a truncated smoke archive, a wrong `--version` and an arm64
+  binary checked as x86_64 each fail the job now, and each passed before. The Windows step's
+  PowerShell is exercised only by the release dry run.
 - **Reading an archive back keeps each spectrum's precursors in their source order.** The vendored
   reader attached a spectrum's (and a chromatogram's) precursors in reversed row order, so
   mzML → mzPeak → mzML turned `[(445.3, 445.34), (645.3, 645.34)]` (isolation target, selected ion)
@@ -185,9 +435,334 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   `-o x.mzML` export of a multi-precursor spectrum (PASEF, SPS-MS3, MSX) was affected; the archives
   were written in source order and do not change, and mzpeakts, the HUPO-PSI python reader and
   OpenMS read them in that order. Found by the strengthened `tests/multi_precursor_roundtrip.rs`.
+- **`tools/corpus_reconvert.py` builds every described dataset with its `convert.flags`.** The flags
+  were recorded only for a descriptor that pins `convert.input`. A descriptor with `input: auto`, or
+  with no input at all, got a bare host conversion and `--no-vendor` on the box. Three imzML
+  demonstrators were published without their `--image`: ltpmsi-chilli, Test_P15_r2 and
+  180817_NEG_Thaliana. Eleven archives lack their `--zstd-level 12`, and the lane pins of
+  MSV000090203, PXD053710, PXD059353 and PXD073126 never reached the box. Flags are now keyed by
+  dataset directory and found through the unit's parents, so a pinned vendor directory's inner
+  unit gets them too. Those archives need rebuilding. Pinned by `tools/test_harness.py`
+  (`python3 tools/test_harness.py`, offline).
+- **A corpus archive's `.built` stamp names what built it, and a recipe change rebuilds it.**
+  Stamps used to record the host's version string and nothing about the recipe. The box strips lane
+  flags, falls back to `--via-msconvert --tof-grid <mode>`, and under `BOX_AUTOUPDATE=0` skips its
+  version check. On the corpus, all 7 lane-pinned archives carried stamps naming a recipe that did
+  not build them, 5 of them built by a different lane. An edited `convert.flags` stayed "current"
+  until the next converter release. The stamp is now read from the archive's own index: its
+  `mzpeak-convert` version, a recipe line hashing the descriptor's whole `convert` block, and its
+  `conversion options`. An archive another converter version built is left unstamped and reported,
+  and currency needs the recipe to match. Stamps from before this change carry no recipe and count
+  as stale; the next converter release rebuilds the corpus anyway. The box's BENCH row names the
+  options that ran, reported back by `box_convert_remote.ps1`, instead of the request.
+- **`tools/corpus_reconvert.py --box` exits 1 when a box unit did not come back.** Units deferred
+  to the box count as skipped, and the box phase only printed `NOT delivered`, so the run exited 0.
+  PXD077098's 9.04 GB archive, refused by the relay at `stage=too-big`, ended every rebuild that
+  way. The report now prints `BOX NOT DELIVERED` with the units and `box_convert.sh`'s exit code,
+  and either one fails the run. An archive that arrived but was left unstamped counts as not
+  delivered.
+- **The box scripts no longer export `DOTNET_ROLL_FORWARD=LatestMajor` for every unit**
+  (`tools/box_convert_remote.ps1`, `tools/box_local_convert.ps1`). The binary sets it itself, for
+  Thermo `.raw` only and only when unset (0.9.12). Exported box-wide, it overrode that scoping.
+  Once a newer .NET major is installed in the box's `dotnet8` root, every `.lcd` would fail on the
+  Shimadzu glue's BinaryFormatter path, and Clearcore2 would run on an unverified runtime.
+- **A failed box update no longer aborts the corpus run when the box already runs the wanted
+  version.** `box_convert.sh` accepted `have == want` only when the updater was busy or locked. A
+  `failed` update fell through to the `BOX_REQUIRE_VERSION=1` hard stop (exit 3, zero jobs) even
+  with nothing stale. On 2026-09-02, git's own stderr notice did exactly that: the updater fetches
+  before its "current" check. A failure is now accepted when the box reports the wanted version.
+  A refused-dirty tree is not accepted, since its exe may be built from uncommitted code under the
+  same version string.
+- **The box's msconvert fallback keeps a requested `--tof-grid` mode.** `box_convert_remote.ps1`
+  drops `--tof-grid <mode>` from its native attempt, and when that attempt failed it appended
+  `--via-msconvert --tof-grid auto`. A job that asked for `--tof-grid off` (exact f64 m/z) was
+  therefore stored on the bounded-lossy grid whenever the fallback ran. The archive declared this,
+  but the requested fidelity was not honoured. The fallback now passes the requested mode, and
+  `auto` only when the job named none. No corpus descriptor requests `off` or `on`. The script runs
+  only on the box, so this is checked by reading, not run.
+- **A box archive over 5 GiB comes back by scp instead of being discarded.** The box returns
+  archives through one presigned S3 PUT, which stops at 5 GiB. `box_convert_remote.ps1` checked the
+  size only after the whole conversion, then threw the archive away at `stage=too-big`, so
+  PXD077098's 9.04 GB Waters TWIMS archive failed every rebuild and was delivered by hand. For a
+  local target, the default of `tools/corpus_reconvert.py --box`, the host now asks the box to
+  hold such an archive (`hold_oversize`). `box_convert.sh` pulls it through the jump host with
+  `scp`, checks its size and md5 against the box's figures, moves it into place and removes the
+  box copy; the box also sweeps holds older than two days. An `s3://` target still fails at
+  `stage=too-big`, because the `copy_object` publish and the md5 = ETag gate also stop at 5 GB.
+  Multipart upload remains a manual route. `tools/test_harness.py` covers the host half; the box
+  half runs only on the box.
+- **Native SciEX with `-v` no longer fails at its second open (Windows).** `SciexReader::open`
+  booted CoreCLR on every call, and hostfxr cannot be initialised again once the first handle has
+  been freed. `-v` opens the reader for the inspection report, drops it and opens it again for the
+  conversion, so every verbose native `.wiff` conversion and `--to mzml` export should have stopped
+  with `initializing CoreCLR for SciexGlue.runtimeconfig.json` (0x80008081) — the failure the box
+  recorded for Shimadzu before 0446ea3, with the same netcorehost and dlopen2 versions. The glue is
+  now loaded once per process, as the Shimadzu lane does. Not observed (no harness passes `-v`, so
+  no corpus archive is affected) and not yet run on Windows; the shape is pinned host-independently
+  by `tests/sciex_abi_pin.rs`.
+- **The native SciEX lane writes precursors; its MS2 rows are no longer orphans (Windows).** Every
+  MSn row the Clearcore2 lane wrote had no selected ion, isolation window or collision energy:
+  663,350 rows in the seven native corpus archives (PXD053710 81,000; PXD065872 83,100;
+  MSV000090684 51,246; MSV000093587 Sample002 166,040; MSV000095995 MRM_03 15,764; PXD011326
+  119,100; PXD071869 147,100), so every SWATH Q1 window and the MRM-HR Q1 were lost. The glue now
+  reads what ProteoWizard's ABI reader reads (`SpectrumMetaV2`): a product spectrum's parent m/z and
+  charge, and on a Product experiment its isolation width and `CE` parameter. The converter builds
+  the precursor from those (`sciex_run::precursor`, tested on every host) and leaves unset what the
+  file does not state: no charge when none is given, a target-only window when no width is (pwiz
+  writes offsets of 0), and a collision-energy ramp as its two ends (MS:1002013 / MS:1002014) where
+  pwiz writes the midpoint. A precursor-ion scan gets none: its fixed mass is a product, which
+  mzdata cannot carry. The dissociation method is beam-type CID, pwiz's assumption for WIFF
+  instruments, but only where the instrument cannot fragment any other way: a ZenoTOF can also
+  fragment by EAD, which Clearcore2 does not report (pwiz's own `.wiff2` EAD test file states
+  MS:1003294, where its `.wiff` reader would have written CID), so a ZenoTOF's precursors carry no
+  method. The one-shot orphan warning now fires only for an MSn row that states no precursor. The converter and
+  the glue now check each other's ABI version when the glue loads: a `SciexGlue.dll` built before
+  this change is refused with a message naming both versions instead of failing on a missing
+  export, and `RunInfo`/`RunString` are required. **Not yet run on a WIFF**: the box must compare
+  Sample002 and MRM_03 with their ProteoWizard twins, and the seven archives need a rebuild to gain
+  their precursors. `tests/sciex_abi_pin.rs` holds `src/sciex.rs` and `glue/sciex/Glue.cs` to one
+  contract (version literal, struct twins, sizes, exports and their arity).
+- **The native SciEX lane declares what its glue changed in the intensities.** Clearcore2 returns
+  intensities as f64 and the glue narrows them to the schema's f32: NaN becomes 0, a value beyond
+  ±f32::MAX (±Inf included) is clamped to it, and an m/z / intensity pair of unequal length is cut
+  to the shorter one. None of it was counted, so no archive could say it had happened. The glue now
+  counts all three per spectrum (`SpectrumDataV2`), and the archive's `transformations` gains
+  `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` or `sciex:truncate-unequal-arrays`
+  for each kind that happened, with a warning giving the counts; `--to mzml`, which has no such
+  list, logs the warning. No corpus data are known to trigger them (sampled row groups of Sample002
+  and PXD011326 hold no non-integer intensity and none above 121,219). Not yet run on a WIFF.
+- **`--help` and the user manual say what the code does.** `--zstd-level` claimed a default of 3 on
+  every lane, where the timsTOF ims-compact lanes default to 5. `--agilent-grid` claimed a per-run
+  `{c0,c1}` pair, where the lane writes per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id`
+  columns. `--tof-grid` said the native Bruker and Agilent readers take the grid from the vendor
+  calibration, which only the ims-compact lanes and `--agilent-grid` do, and called itself mzML-only,
+  although every input read through mzdata reaches the fit (imzML, Thermo `.raw`, a TDF read as
+  f64), and named its bound `PPM_TOL`, a constant in the source, instead of `MZPC_TOF_GRID_PPM`
+  (`docs_drift::help_names_the_variable_not_the_constant`). In the manual, the §4 refusal table
+  listed options that are only warned about as refused and missed four real refusals on
+  `--via-msconvert` (`--bruker-sdk --no-ims-compact --ims-chunked --no-tims-recalibration`); it now
+  has a refused and a warned column, taken from `dropped_flags_for` and `inert_flags_for`, and no
+  longer calls the MHDAC lane's `--tof-grid` warning silence. §10 lacked
+  `MZPC_WATERS_KEEP_COLLAPSED`, `MZPC_WATERS_PROBE_QUAD` and `TIMSDATA_LIB_DIR`, claimed a variable
+  count that no longer held, and said every boolean lever goes through `env_flag()`, which the
+  Waters probe lever does not; merged, it listed `MZPC_WATERS_KEEP_COLLAPSED` twice, once with a
+  rule the code does not apply (`docs_drift::every_variable_has_one_row_in_section_10`). Drifted
+  line-number citations now name functions, and §8 names the test and fixture that already check
+  the `C2 = 0` calibration pair against the vendor SDK, instead of a test and fixture that never
+  existed. README and the manual gain the native Waters `.raw` row, and README says the test suite
+  needs a .NET 8+ runtime. `docs/PLATFORM_SUPPORT.md` no longer shows the Agilent IM-QTOF lane as a
+  working scaffold and names the right TSF reader (its compile gates: below); it also no longer
+  points at a `BACKLOG.md` #23 that does not exist. The Waters frame size (Capan2 166 → 531 MB) and
+  the native SciEX size are recorded as accepted.
+- **`-v` no longer opens a native vendor reader beside a conversion, and its report cannot fail the
+  run.** The report `-v` prints ran before the lane was chosen and opened the native reader
+  whatever was asked for. `-v --via-msconvert` on a `.wiff`, `.lcd` or Waters `.raw` exited with
+  the native reader's error (no `MZPC_PWIZ_DIR`, no .NET 8, a file Clearcore2 rejects) and wrote
+  nothing. `-v` on a native Agilent conversion ran the MHDAC host over the whole run twice, 2.9 GB of
+  temp file each time for a 242 MB Q-TOF `.d`. On SciEX the second open booted CoreCLR again. A
+  Thermo `.raw` or a Bruker BAF `.d` was opened twice as well, or opened for `--via-msconvert`,
+  which needs neither RawFileReader nor baf2sql. Beside a conversion, through any lane, the report
+  now gives the format and says the native reader was not opened. A run without `-o` is only the
+  report and still opens it, even under `--via-msconvert`, since no lane runs. On
+  Windows a SciEX, Waters or Shimadzu reader that fails to open there is now a `note:` line and the
+  inspection exits 0, as the Agilent one already did. Any other report error under `-o` is a
+  `note:` as well, and the conversion goes ahead. Pinned by `tests/verbose_inspection.rs` (a TSF
+  `.d` whose report fails, `small.RAW` with and without `-o` and `--via-msconvert`, `small.RAW.gz`
+  under `-o`, and on Linux and Windows a BAF `.d`) and
+  `tests::inspection_opens_a_native_reader_only_when_inspecting_is_the_job`; the Windows branches are
+  compiled only by CI.
+- **The native Agilent (MHDAC) lane says once when it writes MS2 rows without a precursor**, as the
+  SciEX, BAF, TSF, Waters and Agilent-profile lanes already did. The host's `AGL2` output has no
+  precursor field, so every MSn row this lane writes lacks a selected ion, isolation window and
+  activation, and nothing said so. `docs/PLATFORM_SUPPORT.md` now states the gap and the warning for
+  both Agilent lanes; the profile (`--agilent-grid`) lane already warned, but the page did not say
+  so. The MHDAC reader is Windows-only, so
+  `agl::tests::reader_warns_once_about_ms2_rows_without_precursors` pins the warning by its source
+  text.
+- **The Agilent host has a deadline and leaves no temp file after a panic, and a
+  `MZPC_AGILENT_TMPDIR` that names no directory is reported.** The converter ran
+  `AgilentGlueHost.exe` with a bare `Command::output()`, so a wedged MHDAC call could hold the run
+  forever, and under `panic = "abort"` the `.bin` and `.part` stayed behind. Now the host runs under
+  `MZPC_AGILENT_HOST_TIMEOUT` (seconds, default 7200, `0` = none) and past it is killed and its
+  files removed; both temp files are on the panic-hook sweep; and the new wait drains stderr as
+  `output()` did. A mistyped `MZPC_AGILENT_TMPDIR` fell back to `%TEMP%` in silence, putting
+  gigabytes on the drive the variable was set to avoid; it now warns. The decisions and the wait
+  live in the host-compiled `src/agilent_host.rs`, with tests (a `sleep` past its deadline, a 1 MiB
+  stderr, the variable parsing); the call site compiles only on Windows CI. Not fixed: a converter
+  that is itself killed still leaves the host running (Windows does not end children with their
+  parent), because a kill-on-close Job Object needs windows-sys's `Win32_System_JobObjects`
+  feature, which the dependency tree does not enable; and a Ctrl+C still leaves the temp file.
+- **Documentation that contradicted the code.** `docs/PLATFORM_SUPPORT.md` named the
+  `#[cfg(windows)]` modules as Agilent, MIDAC, SciEX and Waters. They are Agilent, SciEX and
+  Shimadzu; the Waters reader compiles everywhere and only its dispatch is gated. The page's legend
+  also kept a ⛔ symbol that no row uses. The comment on Shimadzu's cached runtime said hostfxr
+  refuses a second initialisation in one process. It refuses one only after netcorehost has freed
+  the library, when the last handle to it dropped, which is why the runtime is cached.
+- **The Shimadzu profile grid declares the bound its fit enforces: `max_error_da: 1e-9`, not
+  `5e-10`.** The native `.lcd` lane's `tof_calibration` block has stated 5e-10 Da since 0.9.13, but
+  the fit accepts a spectrum when every point rebuilds within `shimadzu_grid::TOL`, 1e-9 Da.
+  Refitting HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points (0.52 %) between 5e-10 and
+  5.47e-10 Da off, none past 1e-9; the evidence quoted for 5e-10 ("≤ 0.5 step off the lattice")
+  holds for any value by definition. The block now writes the gate itself, and
+  `tests/contract_strings.rs` pins both the emission and `TOL = 1e-9`. The two published archives
+  (HEK_PosOAD1, Blind_P1_pos_012) keep 5e-10 until reconverted. The lane is Windows-only, so the
+  emission is pinned as source text rather than run here.
+- **An unzoned Bruker or Agilent acquisition time reaches the `acquisition_time` index block.**
+  `fixup_run_metadata` reads what a Bruker `.d` (`GlobalMetadata`) or Agilent `.d` (`AcqData`)
+  states for every lane that does not pass it through its own hints: ims-compact, the mzdata lane
+  (with its TDF fallback), `--tof-grid`, `--agilent-grid`, and the TSF, BAF,
+  `--bruker-sdk` and MHDAC vendor-reader lanes. It discarded the block `run_metadata::apply` returns
+  for a clock without an offset, while the log said the clock was recorded, so such an archive had a
+  null `run.start_time` and no block. The fixup now returns the block and each of those lanes writes
+  it; an mzML export, whose run model holds only a zoned `start_time`, names the dropped clock in a
+  warning.
+  `--via-msconvert` is not among them: its fixup sees the intermediate mzML, whose run start is
+  ProteoWizard's. No corpus archive is affected: every Bruker and Agilent clock in it states an
+  offset. Pinned by
+  `unzoned_vendor_directory_clock_reaches_the_index` on a synthetic TSF `.d` through the
+  vendor-reader lane. USER_MANUAL §8 now tells readers to fall back to
+  `acquisition_time.wall_clock` when `run.start_time` is null.
+- **The Bruker BAF lane records its run: member digests, instrument, software and acquisition
+  time.** It passed no run metadata at all, and `fixup_run_metadata` recognised only a non-empty
+  `analysis.tdf`/`.tsf` or an Agilent `AcqData`, so the two corpus BAF archives (FM_1-1_01_20254,
+  NreB_PAS_DECONV) named only the `.d`, with no MS:1000569 digest, no software, no start time, and an
+  instrument configuration holding a valueless `MS:1000031` (the writer's CvMapping placeholder for a
+  configuration with no model term). The directory now yields `analysis.baf`, `analysis.baf_idx` and
+  `analysis.baf_xtr` with their SHA-1s on any host (`vendor::bruker_baf_members`, also behind a 0-byte
+  `analysis.tdf` stub), and the lane reads the baf2sql cache's `Properties` table as ProteoWizard
+  does: the raw `InstrumentFamily` code becomes the PSI-MS series term ProteoWizard arrives at
+  through `translateInstrumentFamily` and then `translateAsInstrumentSeries` (1–2 micrOTOF; 6–8,
+  maXis/impact/compact, maXis series; 512 apex; 513 solarix), plus `InstrumentSerialNumber`,
+  `AcquisitionSoftware` + version and `AcquisitionDateTime` (`vendor::baf_properties_metadata`).
+  Any other family code, and a cache whose `Properties` table is missing or unreadable, gives the
+  generic `MS:1000122` Bruker Daltonics instrument model, so the valueless placeholder is gone
+  either way. Pinned by `baf_directory_members_are_digested`,
+  `baf_properties_state_the_series_their_family_code_names` and
+  `baf_directory_members_are_digested_in_the_archive`. The `Properties` read runs only where
+  baf2sql exists (Windows, Linux) and is unverified against a real cache; CI compiles it.
+- **Every transformation row 23 of the review found undeclared is now declared when it happens,
+  from a count.** `--ims-chunked` sorts each frame's points by TOF across mobility scans and now
+  declares `sort-by-mz` from the native reader's count of frames that sort changed; USER_MANUAL §8
+  had called it undeclared "on purpose", against the owner's no-silent-reorder decision.
+  `--bruker-sdk` re-sorts each mobility-major TDF frame by m/z and declares it from the reader's
+  counter, read over the written spectra only (`reader_counters_count_written_spectra_only`).
+  `--agilent-grid` declares `agilent:drop-zero-samples` only when its reader dropped a zero sample or
+  an all-zero scan, declares a new `agilent:intensity-f32-rounding` when a count above 2^24 was rounded
+  into Float32 (logged only until now), and marks the archive `partial` when `MSProfile.bin` ends
+  before its scan records, also under an `MZPC_MAX_SPECTRA` cap that stopped nothing
+  (`agilent_grid_declares_what_its_reader_counted`). The Agilent MHDAC host
+  counts spectra whose m/z and intensity arrays it cut to one length, reports both that and its
+  NaN/Inf count in a `[count key=value]` tag, and the lane declares `agilent:truncate-unequal-arrays`
+  and `agilent:nonfinite-intensity-to-zero` (`agl::host_counts`, pinned on host). The native Waters
+  lane writes a `waters_functions` block on every run (the skipped, SONAR and collapsed functions and
+  the lock mass lived only in `waters_drift`, which a run without drift bins never gets), counts a
+  function whose scan count MassLynx cannot return among the skipped ones (it was only logged),
+  declares
+  `waters:drop-functions` and `waters:sonar-summed`, and reads `MZPC_WATERS_KEEP_COLLAPSED` once
+  through `env_flag`: with `=0` it used to skip the collapsed functions while reporting them written.
+  A Shimadzu run under `MZPC_SHIMADZU_COARSE_MZ=1` names the coarse `Mass` field in
+  `mz_calibration.source`. The Agilent MHDAC, Waters, Shimadzu and `--bruker-sdk` lanes are
+  Windows/Linux-only: their decision logic is host-tested, their wiring compiles on CI only.
+- **The index rebuild above resolves each `<index>` section against its own list.** It looked ids
+  up in one map for spectra and chromatograms, but mzML ids are unique only within their list: with
+  `tiny.pwiz.1.1.mzML`'s chromatogram `tic` renamed `scan=19`, the spectrum's entry pointed at the
+  chromatogram and both lanes exited 1 with "source declares 4 spectra but only 0 were read", where
+  0.11.5 had lost only the chromatograms. An `<offset>` whose id its list does not carry still keeps
+  the value the source wrote, now with a warning. The `<chromatogramList count>` check also stops
+  scanning backwards at `</spectrumList>`, so an mzML without chromatograms is no longer read end to
+  end on every conversion. Pinned by `rebuilt_index_resolves_each_section_against_its_own_list` and
+  `declared_chromatogram_count_stops_at_the_end_of_the_spectra`.
+- **`--ims-chunked` is no longer dropped in silence when a timsTOF run falls back to mzdata.** On a
+  TDF timsrust cannot decompress (newer timsTOF, 5.1.x) the ims-compact lane converts through the
+  standard mzdata lane instead, which writes f64 m/z and has no chunked TOF layout; the flags had
+  been checked against the ims-compact lane, which honours `--ims-chunked`, and never again. The
+  fallback now checks them against the standard lane, where `--ims-chunked` is listed as inert, so
+  it is warned about like every other inert flag — as it now also is on a TDF under
+  `--no-ims-compact`, on any other standard-lane input and on the native vendor readers. Pinned by
+  `ims_chunked_is_inert_on_the_standard_lane`; the fallback itself needs a TDF timsrust cannot read,
+  which no committed fixture is.
+- **Chromatogram times are stored in minutes on every lane, and `--rt` cuts chromatograms at the
+  time it names.** `chromatograms_data` declares one unit for `point.time`. The spec leaves it to the
+  writer and recommends minutes, the unit spectrum and wavelength times must have; the vendored reader
+  labels every time array with it; the validator does not check it; mzPeakViewer reads every stored
+  chromatogram time as minutes without looking at it. On the mzML lane the column took its unit from
+  the source's chromatograms, which ProteoWizard writes in seconds, while the TIC and BPC synthesized
+  beside them were stored in minutes: `tiny.pwiz.1.1.mzML` declared `UO:0000010` over TIC points at
+  0.7008 and 5.8905, and the viewer drew the source's `sic` (0–9 s) as 0–9 min. A chromatogram time
+  in seconds or milliseconds, a source chromatogram's or a HyStar device trace's (below), is now
+  divided into minutes before the facet's schema is sampled and when it is written, so the column
+  declares `UO:0000031` on every lane. The division is a 64-bit float and not bit-exact, so the
+  archive declares `chromatogram-time-to-minutes` in `transformations` when it changed a stored time.
+  A time array that states no unit is stored as given under the minutes label. `--to mzml` from an
+  mzML keeps the source's seconds; an archive → mzML export writes minutes. `--rt`, a window in
+  minutes like `spectrum.time`, is converted into each chromatogram column's declared unit before
+  truncating: it had compared minutes with the stored values, so on a seconds column `--rt 0-0.05`
+  kept the `sic` points up to 0.05 s instead of 3 s. Seconds columns are what mzML-lane archives built
+  by 0.11.5 and earlier have (no published corpus archive: all 201 declare minutes). Those archives
+  also hold their synthesized TIC and BPC in minutes under the seconds label, and `--rt` cuts those
+  two traces at 60 times the times it names (`--rt 0-0.05` on `tiny.pwiz.1.1` converted by 0.11.5
+  keeps the TIC point at 0.70 min): rebuild such an archive before relying on `--rt` to truncate its
+  chromatograms. mzML-lane archives with source chromatograms change on reconversion (their times
+  ÷60, the entry declared). Pinned by `tests/chromatogram_time_unit.rs`,
+  `tests::chromatogram_times_are_stored_as_64_bit_minutes` and
+  `tests::an_rt_window_reads_a_seconds_column_in_its_unit`.
+- **`--sample` is recorded like every other option, warned about where it is inert, and accepted
+  by `--config`.** It was copied into the SciEX lanes' setting without being counted as given, so
+  `--sample 3` on a Thermo `.raw`, an mzML, a timsTOF run or an archive exited 0 without a word;
+  on anything but a SciEX `.wiff` it now warns that it cannot change the output. `--config`
+  promises every option but rejected `sample:` as an unknown field since the flag arrived in
+  0.11.3; it is a config key now, merged under the command line like the others, and `sample: 0`
+  is refused as clap refuses `--sample 0`. The `--help` text no longer names an unreleased
+  version. Pinned by `sample_is_warned_inert_off_a_wiff` and the extended
+  `file_config_accepts_the_six_promised_keys`.
+- **`--agilent-grid` declares `spectrum_index` again.** 0.10.1 (5692603) rebuilt the lane's
+  hand-made data schema with `tof_index` and intensity but without the index column every other
+  hand-built TOF schema declares. The writer then routes each batch's index column through
+  `route_unexpected`, which panics on a column no array metadata describes, and the release build
+  aborts: by reading, on the first spectrum of every `--agilent-grid` conversion since 0.10.1 —
+  no corpus `.d` decodes on this lane, so none was ever run. The schema is declared once, in
+  `agilent_grid_writer_builder`, and `agilent_grid_schema_writes_a_gridded_profile_spectrum` writes
+  one gridded profile spectrum through it without a `.d`.
+- **An archive → mzML export reads each spectrum once.** It first read every spectrum's metadata to
+  find the survivors, then read the survivors again in full, and it did so without a filter too:
+  that first pass alone took 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak`.
+  Without `--rt`/`--ms-level` the survivors are now simply every spectrum (up to
+  `MZPC_MAX_SPECTRA`); with them they come from one scan of `spectra_metadata`'s `time` and
+  `ms_level` columns, the predicate the `.mzpeak` filter lane already applies. The export was
+  compared byte for byte before and after that change, on the committed fixtures and on corpus
+  archives, filtered and not; entries above change what an export writes (a filtered one cuts its
+  chromatograms to `--rt`, every one states chromatogram times in minutes).
 
 ### Changed
 
+- **`tools/corpus_reconvert.py --box` returns box archives to the host; publishing to S3 is
+  opt-in (`--publish-s3`).** The default named each unit's durable corpus key as the box target,
+  and `box_convert.sh` copied the verified object onto `s3://v09/...`, the public distribution
+  bucket, before any validator had run, always with `--overwrite`. Only a remembered
+  `--no-s3-first` prevented it. Now the archive comes back beside its raw through the transient
+  relay slot, and `--publish-s3` restores the old route. `--no-s3-first` is still accepted and does
+  nothing. The release-day sequence is `tools/corpus_reconvert.py --box`, then host validation,
+  then publishing from the corpus repository (`scripts/update.sh`).
+- **Float m/z in a point-layout facet is written BYTE_STREAM_SPLIT instead of dictionary-encoded,
+  and reads back bit-identical.** The vendored writer had the switch, `shuffle_mz`, but no lane set
+  it, and it could not have worked: the dictionary is on for every column, and Parquet then uses an
+  explicit column encoding only as the dictionary's fallback. The rule now turns the dictionary off
+  for the column too, and applies only to point facets. The ordinary lane, the mzML `--tof-grid`
+  lane, the native SciEX grid lane and the shared vendor-reader lane (Shimadzu, Waters, Agilent,
+  Bruker BAF/TSF) set it. The native SciEX grid archives gain most, because their off-lattice f64
+  minority is such a column: 409 MB, 42 % of the archive, on MSV000093587 Sample002. Re-encoded
+  whole with pyarrow the way the writer now writes it, that column drops to 298 MB (−111 MB, −11.5 %
+  of the archive), and PXD011326's from 240 to 168 MB (−72 MB, −5.9 %). The native lane itself runs
+  only on Windows, so those sizes await a box conversion. Converted on macOS before and after, the m/z
+  column shrinks 22–48 % under `--layout point` on eight instruments' mzML, Thermo `small.RAW`, a TDF
+  `--no-ims-compact` subset and LA-ESI imzML, 10 % on LTP imzML, 76 % on the example imzML's f32 m/z,
+  and 21 % as the f64 fallback beside the m/z-lattice fixture. No data facet grew, and every Parquet
+  member decoded bit-identical to its predecessor; mzpeakts' parquet-wasm 0.7.1 decodes the new
+  columns bit-identically to pyarrow. Chunk facets — the default layout, and so most of the corpus —
+  keep their bytes: their `mz_chunk_*` boundary columns would shrink by about 1 % of the facet, left
+  for a separate decision. The chunk-capable integer axis that would take the SciEX minority to about
+  2–3 B per point is not built: the remaining size is accepted. Pinned by
+  `point_layout_float_mz_is_byte_stream_split` in `tests/data_facet_compression.rs`.
 - **The ignored tests run, and no test that runs by default passes without asserting.** Of the six
   `#[ignore]`d tests, four now run by default on every platform, on data already in the repository:
   `by_id_reads_the_peaks_facet_on_a_centroid_only_archive` on the committed centroid-only fixture
@@ -207,10 +782,11 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   polarity test, and the Waters, Shimadzu and two Agilent run-metadata tests. `tests/fixtures/**` is
   marked `-text`, so a Windows checkout keeps every fixture byte-identical — git's autocrlf would
   otherwise rewrite `tiny.pwiz.1.1.mzML` and invalidate its indexedmzML offsets.
-- **The seven tests that genuinely need data too large to commit are `#[ignore]`d, with the
-  reason,** so CI reports them as not run rather than as passed: the two ims-compact tests and the
-  two `tests/tdf_*` tests (2485.d, 142 MB), the TSF pin (the corpus holds no TSF acquisition, and
-  the private runs it was checked against cannot be committed), and the two lane-parity tests (pairs
+- **The eight tests that genuinely need data too large to commit are `#[ignore]`d, with the
+  reason,** so CI reports them as not run rather than as passed: the two ims-compact tests, the
+  `--ims-chunked` family test and the two `tests/tdf_*` tests (2485.d, 142 MB), the TSF pin (the
+  corpus holds no TSF acquisition, and the private runs it was checked against cannot be committed),
+  and the two lane-parity tests (pairs
   built on the Windows box). The ims-compact pair is pinned to 2485.d — a sorted walk of the corpus
   had silently switched it to a 1.7 GB run — and now removes its scratch, which left about 5–7 GB in
   `$TMPDIR` per run; `unexpected_and_stale` no longer passes on an empty or mistyped pair directory;
@@ -234,6 +810,12 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   Windows jobs now share one cache, which only the `windows` job saves.
 - README: run the suite with `cargo test --release`, as CI does; the vendored writer's
   `debug_assert`s can fail a plain debug run on inputs the release build handles.
+- **One builder for the `MS:1000569` SHA-1 source-file param** (`run_metadata::sha1_param`, review
+  M15). `waters_meta.rs` kept a private copy and `main.rs` built the same param inline twice (the
+  Shimadzu pre-open digest and the single-file digest of the run-metadata fixup). The emitted values
+  are unchanged: the index metadata of `tiny.pwiz.1.1.mzML`, `tiny_centroid_only.mzML`, a
+  `sourceFileList`-less mzML (the fixup's own digest) and 2485.d capped at 20 frames (the
+  member digests) is identical before and after.
 - **The filter lane has tests.** `tests/filter_lane.rs` is the first for `src/filter.rs`: on
   `tiny.pwiz.1.1.mzML` converted in the test, `--ms-level 2` keeps one spectrum and nulls its
   `precursor_index`; `--rt 0-0.0001` keeps one spectrum, the chromatogram points inside the window and matching
@@ -255,6 +837,134 @@ other non-UTF-8 XML sources are a non-indexed mzML without a `<chromatogramList>
   on CI, that part passes either way.
   `thermo_status::tests::sanitize_label_collapses_runs_and_trims` pins the wide facet's
   column names (`Ion Injection Time (ms):` → `Ion_Injection_Time_ms`, `::` → `col`).
+- **The manual is checked against the binary and the tree.** `tests/docs_drift.rs` fails in five
+  cases:
+  - an option `--help` prints has no row in §4's option table (a mention in the refusal table or
+    in another row does not count);
+  - a `FileConfig` key is missing from §5's example;
+  - an `"MZPC_…"` name quoted in `src/`, `vendor/` or `glue/` is missing from §10 (against the
+    manual before this change it fails on `MZPC_WATERS_KEEP_COLLAPSED` and `MZPC_WATERS_PROBE_QUAD`);
+  - a variable has more than one row in §10;
+  - `--help` names the internal `PPM_TOL` rather than `MZPC_TOF_GRID_PPM`.
+- **Windows CI builds the .NET glues before it runs the tests, and opens a glue again after a
+  reader was dropped, in a process of its own.** `cargo test` ran before `dotnet build`, so no test
+  could load a glue, and no push or pull-request job ever started one: the `-v` double boot that
+  broke every verbose Shimadzu conversion before 0446ea3 shipped with CI green. The new step runs
+  `shimadzu::tests::a_reader_opens_again_after_one_was_dropped` alone, with `MZPC_SHIMADZU_GLUE`
+  set and no vendor DLL: each open boots the glue and then fails in its `Open`, so reaching that
+  error twice proves the second start. It cannot share the `cargo test` process, where another
+  glue or a Thermo boot keeps hostfxr loaded and hides the bug, so it is `#[ignore]`d there, and the
+  step fails if the test did not run. Only CI can execute it. The workflow header no longer claims
+  that native vendor conversion stays out of CI: the manual `sciex-native-zeno` job does it.
+- **The .NET 8 end of support, 2026-11-10, is written down, and the BinaryFormatter note no longer
+  overstates .NET 9.** The Shimadzu glue README and csproj said .NET 9 removes `BinaryFormatter`
+  "outright", so a retarget needs a vendor DLL that does not use it. The in-box implementation does
+  throw on .NET 9 and later, but Microsoft's unsupported `System.Runtime.Serialization.Formatters`
+  package, together with the switch, restores a working one. Whether that holds inside a component
+  loaded through hostfxr is untested. Decided for now: the SciEX and Shimadzu glues stay on
+  `net8.0`, and `docs/PLATFORM_SUPPORT.md` states the date and what it means.
+- **Output change: `transformations` lists what was applied to the archive, not what was
+  configured** (review D15). The writer now counts, per spectrum facet, the spectra its zero-run
+  mask shortened, the chunks it stored with numpress-linear, and the spectra its m/z re-sort
+  backstop reordered (`MzPeakWriterType::spectrum_signal_tally`, a vendored patch), and every lane
+  derives `zero-run-mask`, `numpress-linear` and `sort-by-mz` from those counts. Until now
+  `zero-run-mask` was written on every lane and `numpress-linear` whenever the codec was chosen:
+  103 corpus archives declared the mask with no profile spectrum, and 32 declared numpress with no
+  numpress chunk. The writer's backstop was never declared at all, although every native lane
+  relies on it. On `tiny.pwiz.1.1.mzML` the list is now
+  `["numpress-linear", "sort-by-time", "chromatogram-time-to-minutes"]` (its one profile spectrum holds
+  no zero run; its MS1 spectra arrive out of time order, so the writer re-sorts the synthesized TIC and
+  base-peak traces; its `sic` is in seconds) and `["sort-by-time", "chromatogram-time-to-minutes"]`
+  with `--no-numpress`;
+  `writer_counters_decide_the_writer_level_transformations` pins the mask, the backstop and the
+  empty list on the vendor-reader seam. The two lane entries still derived from configuration are
+  counted as well. `shimadzu:span-trim` now comes from the gridded spectra whose zero pad the profile
+  route actually left out; it was declared whenever the run-wide grid step was found, even if no
+  spectrum was gridded or padded (`span_trim_is_declared_from_the_written_routes`). A native Waters
+  archive's `sort-by-mz` comes from the reader's count of frames whose interleaved bins the sort
+  moved; it was declared whenever a function had drift bins
+  (`a_frame_counts_as_re_sorted_only_when_its_order_changed`). Its `waters:sonar-summed` comes from
+  the reader's count of written scans read as a SONAR function's bins summed, not from the function
+  table, which declared it for a run cut by `MZPC_MAX_SPECTRA` before any such scan; and the MHDAC
+  host now exports only the scans that cap lets the converter write, so its `[count …]` tags count
+  the rewrites of the archive's spectra (`reader_counters_count_written_spectra_only`,
+  `glue_writes_what_this_parser_reads`). The writer's two other re-sort backstops are counted as
+  well: a chromatogram it re-sorted by time declares the new `sort-by-time`, a wavelength spectrum it
+  re-sorted by wavelength the new `sort-by-wavelength`; both reordered stored data undeclared
+  (`writer_backstops_declare_chromatogram_and_wavelength_re_sorts`). Every entry name is pinned
+  where it is declared (`tests/contract_strings.rs` over `main.rs`, `agl.rs` and `waters.rs`), and so
+  are the `[count …]` tags the Agilent host writes in `Glue.cs`. A rebuilt corpus archive drops the
+  entries that did not happen; the existing entry names are unchanged.
+- **Output change: every vendor directory input embeds its side-files, under one rule, without the
+  vendor's raw signal files** (`embed_vendor_members`). The vendor-reader and mzdata lanes embedded
+  only Bruker TDF/TSF directories while `--agilent-grid` and ims-compact embedded any directory
+  themselves, so a BAF `.d`, an Agilent `.d` on the MHDAC lane and a Waters `.raw` got no `vendor/`
+  members and no `vendor_files` manifest, `--aux` did nothing on them without a word, and
+  USER_MANUAL §8's "embedded by default" was false for BAF (corpus: FM_1-1_01_20254 and the Agilent
+  S25 archive hold 0 vendor members). They now follow the lane's policy like every other directory:
+  preserve by default, the ims-compact `*_bin` drop, `--aux` on top. Preserving everything would have
+  grown each rebuilt archive by its vendor directory (FM_1-1 799 MB beside a 109 MB archive, S25
+  253 MB, FM_01_Pos 1.37 GB, Capan2 1.10 GB, sFtsk_2 2.02 GB), so the built-in policy drops the raw
+  signal files, by name in any letter case: BAF `analysis.baf` with `_idx` and `_xtr`, DataAnalysis's
+  `*.ami` views and FTMS `ser`/`fid`; Agilent `MSProfile.bin`, `MSPeak.bin` and `IMSFrame.bin`; Waters
+  `_FUNC*.DAT`, `_FUNC*.IDX` and the compressed ion-mobility `_func*.cdt`/`_func*.ind`. What stays
+  embedded measures 0.38, 1.85, 111.6 (the 109 MB `MSScan.bin`), 0.34 and 2.18 MB on those five, and
+  9.8 MB on NreB_PAS_DECONV (its `*.mcf`). Kept by decision: Agilent `MSScan.bin` (the MSn precursor
+  fields no lane decodes) and `MSMassCal.bin`, `*.cg`/`*.cd`, `*.mcf`, Waters `_FUNC*.STS`, `_CHRO*`
+  analog traces and `_mob/`, and the timsTOF `*_bin` on the f64 TDF/TSF lanes, as through 0.11.5.
+  What the dropped files hold beyond the archive (the BAF profile unless `--representation profile`,
+  the MassHunter representation a lane did not read, the Waters functions not written as spectra) is
+  in no default archive; each drop is recorded in `vendor_files`, and `--aux '<glob>=embed'` keeps a
+  file. `--agilent-grid` archives, which through 0.11.5 embedded `MSProfile.bin` and `MSPeak.bin`
+  beside the grid they store, no longer do. An `--aux` glob now also matches a file's path inside the
+  directory (`AcqData/MSProfile.bin`, the spelling USER_MANUAL §8 gave, which matched nothing). The
+  other default drop is baf2sql's `analysis.sqlite`, which the BAF reader itself creates inside the
+  `.d`. `--aux` on a single-file input now logs that it is inert. Pinned by
+  `vendor::tests::vendor_signal_files_are_dropped_unless_asked_for`,
+  `tests::a_vendor_directorys_signal_files_stay_out_of_a_default_archive` (synthetic Waters, BAF and
+  Agilent directories through the embed) and
+  `every_vendor_directory_embeds_its_side_files_and_aux_on_a_file_is_inert`.
+- **mzML-lane archives hold ProteoWizard's ids decoded.** ProteoWizard writes ids as XML names and
+  escapes each byte a name may not hold as `_x00hh_`, so `run.id` came into the archive as
+  `Experiment_x0020_1` (`tiny.pwiz.1.1.mzML`), `En_PPY-3_phenylpyruvic_x0020_acid_10NG_10ul` or
+  `_x0031_2_80` for a leading digit — 47 of the 201 published archives — and 7 of them carry
+  escaped software ids too (ltpmsi-chilli's `MassLynx_x0020_software`, six ProteoWizard Shimadzu
+  examples' `Shimadzu_x0020_software`). A run or software id in an mzPeak index is a plain string,
+  and the native lanes write the plain stem. The mzML and imzML lanes now decode `run.id` and the
+  software ids on copy, with the processing methods and instrument configurations that reference a
+  software id, so every
+  reference still resolves. A non-ASCII name is escaped one UTF-8 byte at a time and decoded as
+  UTF-8: three of those archives' `_x0032_0140312__x00e5__x0085__x00ad_mix_column_1…` becomes
+  `20140312_六mix_column_1 (scheduled) 一个试`, and a run of escapes that is not UTF-8 stays as
+  written. Ids from the Thermo and TDF readers, which name the run after the file, are left alone,
+  and so are an mzML-lane archive's other ids: its sample, scan-settings and data-processing ids keep
+  ProteoWizard's escapes (`tiny_x0020_scan_x0020_settings`).
+  The mzML exports keep the escaped software ids, which an mzML id (an XML name) needs; mzdata's mzML
+  writer numbers the run itself. `tests/lane_metadata_parity.rs` compares both keys decoded with the
+  converter's own decoder (`src/pwiz_id.rs`), so archives built before and after compare alike; the
+  copy it had kept never decoded an escape. Pinned by `pwiz_escaped_ids_are_decoded`,
+  `mzml_lane_archive_decodes_pwiz_ids_and_mzml_export_keeps_them` and
+  `a_thermo_run_named_like_an_escape_keeps_its_stem`; the published archives change on reconversion.
+- **The `--ims-chunked` one-family pin also runs without the corpus.** The regression test for the
+  data facet's layout family needed the 142 MB 2485.d and so never ran in CI. The family is fixed
+  when the writers are built, so `ims_chunked_spectrum_facets_share_one_family_without_the_corpus`
+  drives `write_ims_compact_archive_impl` with two synthetic frames. The data facet takes the peak
+  facet's chunk fields from the existing `ArrayBuffersBuilder::dtype()`, and the `fields()` accessor
+  added to the vendored writer for it is gone again.
+
+### Removed
+
+- **The Agilent MIDAC (ion-mobility) scaffold: `src/agilent_midac.rs`, `glue/agilent_midac/` and
+  `MZPC_AGILENT_MIDAC_GLUE`.** It had never opened a file and could not: its probe booted CoreCLR
+  and dropped it, and the reader then booted it again, the reload hostfxr refuses (0x80008081). It
+  was still dispatched for every IM-QTOF `.d`, built and asserted by the Windows CI job, and shipped
+  in the Windows release archive, where the glue beside the executable made the probe run. An
+  IM-QTOF `.d` (`AcqData/IMSFrame.bin`) gets the same refusal as before, without that boot:
+  `is an Agilent IM-QTOF run … convert this run with --via-msconvert`, which the box harness routes
+  to msconvert. Native ion mobility would read MIDAC through the out-of-process net48 host pattern.
+- **`glue/waters/`, the C# Waters glue that was never wired (817 lines).** No code path loaded
+  `WatersGlue.dll` or read `MZPC_WATERS_GLUE`: the Waters lane calls `MassLynxRaw.dll`'s C exports
+  through `libloading`. The two box scripts no longer export that inert variable.
 
 ## [0.11.5] — 2026-09-09
 

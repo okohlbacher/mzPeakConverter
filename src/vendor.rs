@@ -56,19 +56,59 @@ pub struct VendorPolicy {
 }
 
 impl VendorPolicy {
-    /// Built-in **preserve-by-default** policy: embed every side-file (gzip compressible types).
-    /// Nothing is dropped by default — dropping is opt-in via `--aux glob=drop` or a YAML policy.
-    /// Rationale: for the LOSSY paths (mzdata f64 m/z, or the Bruker SDK) `analysis.tdf_bin` is the
-    /// only exact copy of the signal, so it must be preserved; and SQLite rollback journals can be
-    /// needed to recover a DB snapshot. The converter's job is to ADD the mzPeak facets, not to
-    /// decide the raw data is disposable.
+    /// Built-in **preserve-by-default** policy: embed every side-file (gzip compressible types) but the
+    /// files below, each dropped by its name in any letter case and recorded in `vendor_files`. An
+    /// `--aux glob=action` rule (or a YAML policy) comes first, so `--aux '<glob>=embed'` keeps one.
     ///
-    /// The LOSSLESS ims-compact path is different: it encodes the exact integer-TOF + intensity
-    /// signal into the Parquet peak facet, so the raw `*_bin` bulk file is fully redundant (it was
-    /// ~39% of the archive, a verbatim copy). That path uses [`load_lossless`](Self::load_lossless),
-    /// which drops `*_bin` by default. To force-keep it: `--aux 'analysis.tdf_bin=embed'`.
+    /// * **The raw signal files of BAF, Agilent MassHunter and Waters MassLynx directories.** They are
+    ///   nearly all of such a directory and several times its archive (FM_1-1: `analysis.baf` is
+    ///   714 MB beside a 109 MB archive; Capan2: 1.1 GB of `_FUNC*.DAT` and `_func*.cdt` beside
+    ///   531 MB). Through 0.11.5 no default archive of those lanes embedded them, `--agilent-grid`
+    ///   aside, which stores that profile signal itself; one embed rule for every vendor directory
+    ///   must not grow them by the vendor file's size. What they hold beyond the archive — the BAF
+    ///   profile unless `--representation profile`, the MassHunter representation a lane did not
+    ///   read, the Waters functions not written as spectra — stays with the original directory, or
+    ///   in the archive on request. What describes the run is embedded: the Agilent scan records
+    ///   (`MSScan.bin`, whose MSn precursor fields no lane decodes yet) and mass calibration, device
+    ///   traces, DataAnalysis `.mcf` result containers, the Waters scan statistics (`_FUNC*.STS`),
+    ///   analog traces (`_CHRO*`) and `_mob/` projections.
+    /// * **baf2sql's `analysis.sqlite`**: the BAF reader has the library materialize that cache next
+    ///   to `analysis.baf`, inside the `.d`, when it opens the run (`bruker_baf.rs`), so it is this
+    ///   converter's by-product, not a file the vendor wrote.
+    ///
+    /// The timsTOF `*_bin` is embedded here, as through 0.11.5: for the f64 paths (mzdata's TDF
+    /// reader, the TSF reader, the Bruker SDK) it is, beside the embedded `analysis.tdf` or
+    /// `analysis.tsf`, the exact copy of a signal they store as calibrated f64 m/z, in a format open
+    /// readers decode (timsrust a TDF, this converter a TSF). The LOSSLESS ims-compact path encodes that
+    /// exact integer-TOF + intensity signal into the Parquet peak facet, so the raw `*_bin` bulk file
+    /// is fully redundant there (it was ~39% of the archive, a verbatim copy); that path uses
+    /// [`load_lossless`](Self::load_lossless), which drops it too. SQLite rollback journals stay: they
+    /// can be needed to recover a database snapshot.
     pub fn builtin() -> Self {
-        VendorPolicy { rules: vec![Rule { pat: "*".to_string(), action: Action::Embed, gzip: Gzip::Auto }] }
+        const DROP: &[&str] = &[
+            "analysis.sqlite",
+            // Bruker BAF: the signal and its two indexes, DataAnalysis's cached views, FTMS transients.
+            "analysis.baf",
+            "analysis.baf_idx",
+            "analysis.baf_xtr",
+            "*.ami",
+            "ser",
+            "fid",
+            // Agilent MassHunter: the profile, centroid and ion-mobility frame signal.
+            "MSProfile.bin",
+            "MSPeak.bin",
+            "IMSFrame.bin",
+            // Waters MassLynx: each function's scans and their index, and the compressed ion-mobility
+            // data (`_func001.cdt` beside `_FUNC001.DAT` in one directory; matching ignores case).
+            "_FUNC*.DAT",
+            "_FUNC*.IDX",
+            "_FUNC*.CDT",
+            "_FUNC*.IND",
+        ];
+        let rule = |pat: &str, action| Rule { pat: pat.to_string(), action, gzip: Gzip::Auto };
+        let mut rules: Vec<Rule> = DROP.iter().map(|pat| rule(pat, Action::Drop)).collect();
+        rules.push(rule("*", Action::Embed));
+        VendorPolicy { rules }
     }
 
     /// Load from a YAML file (`rules: [{match, action, gzip}]`), falling back to the built-in
@@ -112,9 +152,13 @@ impl VendorPolicy {
         Ok(policy)
     }
 
-    fn resolve(&self, filename: &str) -> (Action, Gzip) {
+    /// The first rule whose glob matches the member at `rel`, its `/`-joined path inside the
+    /// directory: by its file name, or by that path. Rules were matched against the file name alone,
+    /// so `--aux 'AcqData/MSProfile.bin=drop'`, the spelling the manual gave, matched nothing.
+    fn resolve(&self, rel: &str) -> (Action, Gzip) {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
         for r in &self.rules {
-            if glob_match(&r.pat, filename) {
+            if glob_match(&r.pat, name) || glob_match(&r.pat, rel) {
                 return (r.action, r.gzip);
             }
         }
@@ -145,7 +189,7 @@ pub fn embed_into_archive(
     for rel in files {
         let abs = dot_d.join(&rel);
         let name = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let (action, gzip) = policy.resolve(name);
+        let (action, gzip) = policy.resolve(&rel);
         let src_bytes = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
         if action == Action::Drop {
             log::debug!("vendor: drop {rel} ({src_bytes} bytes)");
@@ -274,6 +318,77 @@ pub(crate) fn bruker_run_metadata(dot_d: &Path) -> Option<crate::run_metadata::V
     out.source_files = files;
     out.default_source_file = default;
     Some(out)
+}
+
+/// The source members of a Bruker BAF `.d` (`analysis.baf` with its `_idx` and `_xtr` siblings),
+/// each with its MS:1000569 SHA-1 — readable on any host, although the BAF reader itself is not.
+/// `None` when the directory holds no non-empty `analysis.baf`. Through 0.11.5 the BAF lane named
+/// only the `.d` and carried no digest.
+pub(crate) fn bruker_baf_members(dot_d: &Path) -> Option<crate::run_metadata::VendorRunMetadata> {
+    use crate::run_metadata::{source_files_from_members, term, MemberPolicy, Members, VendorRunMetadata};
+
+    if !std::fs::metadata(dot_d.join("analysis.baf")).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        return None;
+    }
+    const MEMBERS: &[&str] = &["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr"];
+    let (files, default) = source_files_from_members(
+        dot_d,
+        &MemberPolicy {
+            members: Members::Explicit(MEMBERS),
+            file_format: Some(term(1000815, "Bruker BAF format")),
+            id_format: Some(term(1000772, "Bruker BAF nativeID format")),
+            default_member: Some(MEMBERS[0]),
+        },
+    );
+    Some(VendorRunMetadata { source_files: files, default_source_file: default, ..Default::default() })
+}
+
+/// What a baf2sql cache's `Properties` table (key → value) states about the run: the instrument,
+/// its serial, the acquisition software and the acquisition time. The keys are the ones
+/// ProteoWizard reads (`Baf2Sql.cpp`). The model is the PSI-MS series term ProteoWizard arrives at
+/// for the raw `InstrumentFamily` code: `translateInstrumentFamily` (`Baf2Sql.cpp`) turns the code
+/// into a family, then `translateAsInstrumentSeries` (`Reader_Bruker_Detail.cpp`) the family into a
+/// series. Any other code, or none, gets the generic Bruker model term — nothing is inferred from a
+/// method or file name.
+// Its caller, the BAF reader, builds on Windows and Linux only; the tests here run everywhere.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub(crate) fn baf_properties_metadata(
+    props: &std::collections::BTreeMap<String, String>,
+) -> crate::run_metadata::VendorRunMetadata {
+    use crate::run_metadata::{parse_vendor_time, term, term_str, VendorRunMetadata};
+    use mzdata::meta::{InstrumentConfiguration, Software};
+
+    let get = |k: &str| props.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
+    let mut out = VendorRunMetadata::default();
+    // Every BAF file is a Bruker acquisition, so the generic term is a fact even for an empty or
+    // unreadable table: a configuration without a model term gets the writer's valueless MS:1000031.
+    // A serial never stands alone either. The raw code is not a `CompassDataEnums` value, so it goes
+    // through `translateInstrumentFamily`'s cases first; every code that function does not list is
+    // `InstrumentFamily_Unknown`, which `translateAsInstrumentSeries` makes the generic term.
+    let (accession, name) = match get("InstrumentFamily").and_then(|v| v.parse::<i64>().ok()) {
+        Some(1 | 2) => (1001536, "Bruker Daltonics micrOTOF series"), // OTOF, OTOFQ
+        Some(6..=8) => (1001547, "Bruker Daltonics maXis series"),    // maXis, impact, compact
+        Some(512) => (1001556, "Bruker Daltonics apex series"),       // FTMS
+        Some(513) => (1001548, "Bruker Daltonics solarix series"),    // solariX
+        _ => (1000122, "Bruker Daltonics instrument model"),
+    };
+    let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
+    cfg.params.push(term(accession, name));
+    if let Some(serial) = get("InstrumentSerialNumber") {
+        cfg.params.push(term_str(1000529, "instrument serial number", serial));
+    }
+    out.instrument = Some(cfg);
+    if let Some(name) = get("AcquisitionSoftware") {
+        let version = get("AcquisitionSoftwareVersion").unwrap_or("unknown");
+        out.acquisition_software = Some(Software::new(name.to_string(), version.to_string(), vec![term(1000692, "Bruker software")]));
+    }
+    if let Some(t) = get("AcquisitionDateTime") {
+        match parse_vendor_time(t, "Bruker BAF Properties AcquisitionDateTime") {
+            Ok(at) => out.start_time = Some(at),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
+    out
 }
 
 /// Read run-level `GlobalMetadata` (key/value) from a TSF or TDF SQLite, as a JSON object.
@@ -415,5 +530,141 @@ mod tests {
         assert!(safe_relative_member(Path::new("808.m/Maldi.method")).is_some());
         assert!(safe_relative_member(Path::new("../escape")).is_none());
         assert!(safe_relative_member(Path::new("/abs/path")).is_none());
+    }
+
+    /// The raw signal files of a BAF, Agilent MassHunter or Waters MassLynx directory, and the
+    /// baf2sql cache the BAF reader writes into the `.d`, are dropped by default: matched on the file
+    /// name in any letter case (one Waters `.raw` holds `_FUNC001.DAT` beside `_func001.cdt`), wherever
+    /// the file sits. What describes the run stays, the Waters analog traces and the Agilent scan
+    /// records among it. An `--aux` rule wins, spelt as the file name or as the path in the directory.
+    #[test]
+    fn vendor_signal_files_are_dropped_unless_asked_for() {
+        for pol in [VendorPolicy::load(None, &[]).unwrap(), VendorPolicy::load_lossless(None, &[]).unwrap()] {
+            for dropped in [
+                "analysis.sqlite",
+                "analysis.baf",
+                "analysis.baf_idx",
+                "analysis.baf_xtr",
+                "BackgroundProfNeg.ami",
+                "ser",
+                "fid",
+                "AcqData/MSProfile.bin",
+                "AcqData/MSPeak.bin",
+                "AcqData/IMSFrame.bin",
+                "_FUNC001.DAT",
+                "_FUNC001.IDX",
+                "_func001.cdt",
+                "_func001.ind",
+                "_FUNC010.CDT",
+            ] {
+                assert_eq!(pol.resolve(dropped).0, Action::Drop, "{dropped}");
+            }
+            for kept in [
+                "analysis.tdf",
+                "analysis.tsf",
+                "SampleInfo.xml",
+                "037df41c-54d6-4ec4-a91a-893bcb5caf81_1.mcf",
+                "AcqData/MSScan.bin",
+                "AcqData/MSMassCal.bin",
+                "AcqData/BinPump1.cg",
+                "_FUNC001.STS",
+                "_CHRO001.DAT",
+                "_CHROMS.INF",
+                "_FUNCTNS.INF",
+                "_mob/729441462.1dMZ",
+                "Hystar.Method",
+            ] {
+                assert_eq!(pol.resolve(kept).0, Action::Embed, "{kept}");
+            }
+        }
+        let rules = ["analysis.sqlite=embed", "MSProfile.bin=embed", "AcqData/MSPeak.bin=embed", "AcqData/MSScan.bin=drop"];
+        let asked = VendorPolicy::load(None, &rules.map(String::from)).unwrap();
+        assert_eq!(asked.resolve("analysis.sqlite").0, Action::Embed);
+        assert_eq!(asked.resolve("AcqData/MSProfile.bin").0, Action::Embed, "a file-name rule");
+        assert_eq!(asked.resolve("AcqData/MSPeak.bin").0, Action::Embed, "a path rule");
+        assert_eq!(asked.resolve("AcqData/MSScan.bin").0, Action::Drop);
+        assert_eq!(asked.resolve("Other/MSScan.bin").0, Action::Embed, "a path rule matches that path only");
+    }
+
+    #[test]
+    fn baf_directory_members_are_digested() {
+        let dir = std::env::temp_dir().join(format!("mzpc-baf-members-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A 0-byte `analysis.baf` is no BAF run (NreB_PAS_DECONV.d holds a 0-byte `analysis.tdf`).
+        std::fs::write(dir.join("analysis.baf"), b"").unwrap();
+        assert!(bruker_baf_members(&dir).is_none());
+        for (name, body) in [
+            ("analysis.baf", &b"baf"[..]),
+            ("analysis.baf_idx", b"idx"),
+            ("analysis.baf_xtr", b"xtr"),
+            ("SampleInfo.xml", b"<SampleTable/>"),
+        ] {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        let m = bruker_baf_members(&dir).expect("a non-empty analysis.baf");
+        let names: Vec<&str> = m.source_files.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["analysis.baf", "analysis.baf_idx", "analysis.baf_xtr"], "the three members, nothing else");
+        for sf in &m.source_files {
+            let sha = sf.params.iter().find(|p| p.accession == Some(1000569)).expect("every member digested");
+            assert_eq!(sha.value.to_string(), crate::embed_aux::sha1_hex(&dir.join(&sf.name)).unwrap());
+            assert_eq!(sf.file_format.as_ref().map(|p| (p.accession, p.name.as_str())), Some((Some(1000815), "Bruker BAF format")));
+            assert_eq!(sf.id_format.as_ref().map(|p| (p.accession, p.name.as_str())), Some((Some(1000772), "Bruker BAF nativeID format")));
+        }
+        assert_eq!(m.default_source_file.as_deref(), Some("analysis.baf"));
+        assert!(m.instrument.is_none() && m.start_time.is_none(), "the directory states no run facts; the baf2sql cache does");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baf_properties_state_the_series_their_family_code_names() {
+        use crate::run_metadata::{AcquisitionTime, VendorRunMetadata};
+        let props = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let model = |m: &VendorRunMetadata| {
+            m.instrument.as_ref().map(|c| c.params.iter().map(|p| (p.accession, p.name.clone())).collect::<Vec<_>>())
+        };
+        // An impact II (raw family 7, FM_1-1's instrument) is ProteoWizard's maXis series.
+        let m = baf_properties_metadata(&props(&[
+            ("InstrumentFamily", "7"),
+            ("InstrumentSerialNumber", "1825265.10252"),
+            ("AcquisitionSoftware", "otofControl"),
+            ("AcquisitionSoftwareVersion", "5.2.109"),
+            ("AcquisitionDateTime", "2024-10-09T09:09:26.123-03:00"),
+        ]));
+        assert_eq!(
+            model(&m),
+            Some(vec![
+                (Some(1001547), "Bruker Daltonics maXis series".to_string()),
+                (Some(1000529), "instrument serial number".to_string()),
+            ])
+        );
+        assert_eq!(m.instrument.as_ref().unwrap().params[1].value.to_string(), "1825265.10252");
+        let sw = m.acquisition_software.as_ref().unwrap();
+        assert_eq!((sw.id.as_str(), sw.version.as_str()), ("otofControl", "5.2.109"));
+        assert!(matches!(&m.start_time, Some(AcquisitionTime::Stated(t)) if t.offset().local_minus_utc() == -3 * 3600));
+        // The raw code goes through `translateInstrumentFamily` before the series table: 6 is a
+        // maXis (not an FTMS), 8 a compact, 1 and 2 the micrOTOF line, 512 an FTMS (apex series),
+        // 513 a solariX. A code it does not list (0, 9, 90, 92, …), or a serial with no family, is
+        // `InstrumentFamily_Unknown`: the generic Bruker model term, never no model term at all.
+        let first = |pairs: &[(&str, &str)]| model(&baf_properties_metadata(&props(pairs))).unwrap()[0].0;
+        assert_eq!(first(&[("InstrumentFamily", "6")]), Some(1001547));
+        assert_eq!(first(&[("InstrumentFamily", "8")]), Some(1001547));
+        assert_eq!(first(&[("InstrumentFamily", "1")]), Some(1001536));
+        assert_eq!(first(&[("InstrumentFamily", "2")]), Some(1001536));
+        assert_eq!(first(&[("InstrumentFamily", "512")]), Some(1001556));
+        assert_eq!(first(&[("InstrumentFamily", "513")]), Some(1001548));
+        for unlisted in ["0", "3", "5", "9", "42", "90", "92"] {
+            assert_eq!(first(&[("InstrumentFamily", unlisted)]), Some(1000122), "family {unlisted}");
+        }
+        assert_eq!(first(&[("InstrumentSerialNumber", "7")]), Some(1000122));
+        // An unzoned clock stays naive. An empty (or unreadable) table states only what every BAF
+        // file is, a Bruker instrument: no software, no time.
+        let naive = baf_properties_metadata(&props(&[("AcquisitionDateTime", "2024-10-09T09:09:26")]));
+        assert!(matches!(naive.start_time, Some(AcquisitionTime::Naive { .. })));
+        let empty = baf_properties_metadata(&props(&[]));
+        assert_eq!(model(&empty), Some(vec![(Some(1000122), "Bruker Daltonics instrument model".to_string())]));
+        assert!(empty.start_time.is_none() && empty.acquisition_software.is_none());
     }
 }
