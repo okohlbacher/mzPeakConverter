@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.12.0] — 2026-09-11
 
 **Output change.** An indexed mzML that declares a non-UTF-8 encoding now keeps its source
 chromatograms in both lanes (below). No corpus archive is affected: the one corpus mzML that is
