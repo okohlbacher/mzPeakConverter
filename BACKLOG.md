@@ -72,6 +72,15 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     2026-09-11); a non-standard column had read back nameless and came back from a second round
     trip as a column named ''. The vendored point reader still hands a non-standard `chromatograms_data`
     column back without its name, which an archive built before that (or by another writer) shows.
+    Consumers (2026-09-11): mzPeakViewer plots a stored chromatogram's `time array` against its
+    `intensity array` only (`packages/core/src/reader/explorer/browse.ts`, `getStoredChromatogram`),
+    so a device trace, whose values are auxiliary arrays over a null `intensity` column, draws as a
+    flat line at zero (25 of 27 chromatograms on a 2485.d archive); and it takes a chromatogram's
+    type from a promoted `MS_1000626_chromatogram_type` column or six fixed accessions
+    (`engine/chrom.ts`), so pressure (MS:1003019) and flow-rate (MS:1003020) traces get no label
+    although the flat `chromatogram_type` column carries them. Both are viewer changes (take the
+    first auxiliary array, with its name and unit, when `intensity` is absent or all null; read the
+    flat column); USER_MANUAL §7 says where the values are.
   - **Instrument components on non-Bruker lanes:** pwiz asserts hand-tabled sources and detectors
     per model; the native lanes state only what the file says (do-not-guess) — a decision, not a gap.
 - **Acquisition clocks — every open point in one place (2026-09-09).** `run.start_time` is an RFC 3339
