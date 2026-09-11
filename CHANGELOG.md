@@ -735,6 +735,38 @@ and a vendor directory embeds its side-files under one rule, without its raw sig
 
 ### Changed
 
+- **One archive epilogue, one mzML epilogue, one `msconvert` invocation, one TOF axis field, one
+  `codec: "tof-grid"` block builder and one ims-compact array constructor (M17, M28).** Six copies
+  of "flush Parquet, write the index blocks, embed the vendor side-files, embed images/SDRF, close
+  the ZIP, rename the temporary" had drifted apart — one lane dropped the `acquisition_time` block,
+  another applied a different vendor-embed rule, and `--sdrf` on `--tof-grid` silently embedded
+  nothing until 0.9.13. Those data defects were fixed in the same cycle; this removes the copies
+  that produced them. A lane now chooses only what genuinely differs: its ordered index blocks,
+  whether a vendor policy applies, and whether it takes `--image`/`--sdrf` (an `Option`, because
+  `embed_into_archive` also auto-discovers an `<input-stem>-opticalimage.*` sibling, so an empty
+  list on the lanes that refuse both flags would start embedding files they never embedded). The
+  four mzML export lanes end in `finish_mzml`, which takes the writer BY VALUE, so "close the sink
+  before the rename" — a `.mzML.gz` writes its gzip trailer when the encoder drops — is structural
+  instead of a comment beside a hand-written `drop(w)`. The four `codec: "tof-grid"` blocks are
+  built by `tof_grid_block(model, MzReconstruction)`, whose enum carries the bound
+  (`BoundedLossyPpm`, `WithinVendorRoundingDa`), so a bounded claim can no longer be written
+  without the number that makes it mean something — the Shimadzu profile lane once shipped with
+  neither `lossless` nor `mz_reconstruction`, and later with a `max_error_da` its fit never
+  enforced. The three real ims-compact builders and the synthetic sample that materialises the
+  `--ims-chunked` schema now share one array constructor, so the "same ArrayType + dtype + unit or
+  the arrays spill to `auxiliary_arrays`" contract is compiler-enforced rather than a comment.
+  **No archive byte, no exported-mzML byte, no index block and no exit code changes**: the mzML,
+  Thermo, `--tof-grid`, m/z-lattice, PDA/UV, ims-compact, `--ims-chunked`, TDF-as-f64, filter and
+  native-TSF lanes were all compared against 0.11.5 output and are equivalent. The one
+  user-visible difference is a message: `--via-msconvert --to mzml` now prints the fuller
+  "msconvert not found … Install ProteoWizard and put msconvert on PATH … (Windows, or Wine.)"
+  the mzPeak lane already used. Not collapsed, because the copies are not the same thing: the four
+  mzML prologues (they differ in whether they copy the reader's metadata, whether they open the
+  spectrumList, and whether the count is exact or an upper bound), the three ims-compact spectrum
+  builders, and the seven probe/observe loops (caps of 6/16/64, different filters, one two-phase,
+  one undoing a side effect of probing). The `--agilent-grid` and native-SCIEX epilogues cannot run
+  on a host without Windows or an Agilent profile `.d`: CI compiles them, the box runs them.
+
 - **`tools/corpus_reconvert.py --box` returns box archives to the host; publishing to S3 is
   opt-in (`--publish-s3`).** The default named each unit's durable corpus key as the box target,
   and `box_convert.sh` copied the verified object onto `s3://v09/...`, the public distribution
@@ -954,6 +986,10 @@ and a vendor directory embeds its side-files under one rule, without its raw sig
 
 ### Removed
 
+- **`finish_with_vendor_and_aux` and `finish_tof_grid_archive`,** the two half-shared archive
+  finishers, folded into `finish_archive` with the four inline copies (above). The TOF-grid one's
+  calibration half survives as `tof_grid_calibration_block`, keeping the `lossless` /
+  `mz_reconstruction` rationale beside the JSON it explains.
 - **The Agilent MIDAC (ion-mobility) scaffold: `src/agilent_midac.rs`, `glue/agilent_midac/` and
   `MZPC_AGILENT_MIDAC_GLUE`.** It had never opened a file and could not: its probe booted CoreCLR
   and dropped it, and the reader then booted it again, the reload hostfxr refuses (0x80008081). It

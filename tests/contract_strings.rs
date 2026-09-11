@@ -102,17 +102,33 @@ fn ims_compact_calibration_pinned() {
 #[test]
 fn sciex_per_spectrum_tof_grid_pinned() {
     // The SciEX encoding actually present across the corpus. The viewer matches BOTH the model
-    // string AND this exact tof_to_mz formula, so both are load-bearing.
-    pinned("\"model\": \"sciex_sqrt_per_spectrum\"");
-    pinned("\"tof_to_mz\": \"mz = (tof_c0 + tof_c1*tof_index)^2\"");
-    pinned("\"per_spectrum_columns\": [\"tof_c0\", \"tof_c1\"]");
+    // string AND this exact tof_to_mz formula, so both are load-bearing. Since 0.11.6 the model and
+    // the reconstruction claim reach the block through `tof_grid_block`, so the pin is the CALL —
+    // both lanes that use this model string (native SciEX, and the Shimadzu profile grid, which
+    // shares the formula family).
+    pinned("tof_grid_block(\"sciex_sqrt_per_spectrum\", MzReconstruction::BoundedLossyPpm");
+    pinned("\"sciex_sqrt_per_spectrum\",\n            MzReconstruction::WithinVendorRoundingDa(shimadzu_grid::TOL),");
+    // KEY AND VALUE, and counted: both lanes that state this formula must keep the key too. A pin on
+    // the value alone would stay green through a rename of the key the viewer matches on.
+    for (needle, what) in [
+        ("cal.insert(\"tof_to_mz\".to_string(), serde_json::json!(\"mz = (tof_c0 + tof_c1*tof_index)^2\"));", "tof_to_mz"),
+        ("cal.insert(\"per_spectrum_columns\".to_string(), serde_json::json!([\"tof_c0\", \"tof_c1\"]));", "per_spectrum_columns"),
+    ] {
+        assert_eq!(
+            code().matches(needle).count(),
+            2,
+            "both per-spectrum sqrt lanes (native SciEX, Shimadzu profile grid) must emit `{what}` \
+             verbatim; found {} of 2",
+            code().matches(needle).count()
+        );
+    }
 }
 
 #[test]
 fn agilent_and_sciex_global_models_pinned() {
-    pinned("\"model\": \"agilent_sqrt_poly\"");
+    pinned("tof_grid_block(\"agilent_sqrt_poly\", MzReconstruction::Exact)");
     // The global-coefficient mzML `--tof-grid` path (distinct from the per-spectrum SciEX encoding).
-    pinned("\"model\": \"sciex_sqrt\"");
+    pinned("tof_grid_block(\"sciex_sqrt\", MzReconstruction::BoundedLossyPpm");
 }
 
 /// Every `codec: "tof-grid"` block must name its integer axis and say whether m/z survives the
@@ -133,17 +149,25 @@ fn agilent_and_sciex_global_models_pinned() {
 /// asserted three. Hence: assert the number of sites, not merely the presence of a string.
 #[test]
 fn tof_grid_reconstruction_keys_pinned() {
-    // One per `codec: "tof-grid"` emission site. Counted against the sites themselves so that
-    // adding a fifth lane without its keys fails here rather than in someone's reader.
-    let sites = code().matches("\"codec\": \"tof-grid\"").count();
-    assert_eq!(sites, 4, "expected 4 `codec: \"tof-grid\"` emission sites, found {sites}");
+    // Since 0.11.6 the shared keys are written once, by `tof_grid_block`, and every lane builds its
+    // block through it — so `codec`, `lossless` and `mz_reconstruction` are guaranteed to agree by
+    // construction and what is worth counting is the CALL SITES. A fifth lane that hand-rolls its
+    // own JSON instead of calling the builder is the failure this catches.
+    let sites = code().matches("tof_grid_block(").count() - 1; // less the definition
+    assert_eq!(sites, 4, "expected 4 `tof_grid_block(` call sites, found {sites}");
+    // Counted on the VALUE literal, not on a `"codec": "tof-grid",` spelling: a hand-rolled block
+    // with the key last (no trailing comma), or with no space after the colon, or built through
+    // `serde_json::Map::insert`, would slip past a spelling-sensitive guard — two of those four
+    // spellings slipped past the pre-0.11.6 site count too. `"--tof-grid"` and `"tof-grid:{}ppm"`
+    // do not contain the quoted token, so the only match is the builder's own.
     assert_eq!(
-        code().matches("\"lossless\": \"tof_index\"").count(),
-        sites,
-        "every `codec: \"tof-grid\"` block must name its exactly-stored column with the spec's \
-         `lossless` key; found {} of {sites} emission sites",
-        code().matches("\"lossless\": \"tof_index\"").count()
+        code().matches("\"tof-grid\"").count(),
+        1,
+        "only `tof_grid_block` may write the `codec: \"tof-grid\"` value; found {}",
+        code().matches("\"tof-grid\"").count()
     );
+    pinned("block.insert(\"codec\".to_string(), serde_json::json!(\"tof-grid\"));");
+    pinned("block.insert(\"lossless\".to_string(), serde_json::json!(\"tof_index\"));");
     assert!(
         !src().contains("integer_column"),
         "`integer_column` is a synonym for the spec's `lossless` and was reverted; two keys naming \
@@ -158,27 +182,28 @@ fn tof_grid_reconstruction_keys_pinned() {
     // evidence, "≤ 0.5 step off the lattice", holds for any value by definition. The block declares
     // the gate itself, so the bound and the check cannot diverge again.
     assert_eq!(
-        code().matches("\"mz_reconstruction\": \"exact\"").count(),
-        1,
+        code().matches("MzReconstruction::Exact").count(),
+        2, // the variant's own arm in `tof_grid_block`, and the one lane that claims it
         "only the Agilent lane rebuilds m/z exactly; a new `exact` claim needs the same evidence"
     );
-    pinned("\"mz_reconstruction\": \"within-vendor-rounding\"");
-    pinned("\"max_error_da\": shimadzu_grid::TOL");
+    pinned("block.insert(\"mz_reconstruction\".to_string(), serde_json::json!(\"exact\"));");
+    pinned("block.insert(\"mz_reconstruction\".to_string(), serde_json::json!(\"within-vendor-rounding\"));");
+    pinned("block.insert(\"max_error_da\".to_string(), serde_json::json!(da));");
+    pinned("MzReconstruction::WithinVendorRoundingDa(shimadzu_grid::TOL)");
     assert!(
         include_str!("../src/shimadzu_grid.rs").contains("pub const TOL: f64 = 1e-9;"),
         "the Shimadzu block declares the fit's acceptance gate as its bound: 1e-9 Da"
     );
     assert_eq!(
-        code().matches("\"mz_reconstruction\": \"bounded-lossy\"").count(),
+        code().matches("MzReconstruction::BoundedLossyPpm(tof_grid::ppm_tol())").count(),
         2,
         "the run-wide and per-spectrum SCIEX grid lanes are bounded-lossy and must say so \
          (the Agilent lane is exact, the Shimadzu lane within vendor rounding)"
     );
-    assert_eq!(
-        code().matches("\"roundtrip_tolerance_ppm\": tof_grid::ppm_tol()").count(),
-        2,
-        "a bounded-lossy block must state its bound"
-    );
+    // A bounded claim cannot be written without its bound any more: the bound is the variant's
+    // payload, and the builder writes the key from it. This pins that it still does.
+    pinned("block.insert(\"mz_reconstruction\".to_string(), serde_json::json!(\"bounded-lossy\"));");
+    pinned("block.insert(\"roundtrip_tolerance_ppm\".to_string(), serde_json::json!(ppm));");
     // `lossless` means the same thing in every block that carries it — the name of the exactly
     // stored column — so the `mz-grid` lattice (src/mz_lattice.rs) and `ims-compact` blocks spell
     // it identically. One archive can carry it twice, once per facet, without ambiguity.
@@ -221,6 +246,11 @@ fn ims_compact_per_spectrum_exact_pinned() {
 #[test]
 fn tof_grid_files_by_representation_pinned() {
     pinned("fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool)");
+    // One axis definition, two column names, and which lane uses which is the pin: the sqrt-grid
+    // lanes store `tof_index`, ims-compact stores `tof` (and its index block says `"lossless": "tof"`
+    // to match). Swapping them would leave a reader looking for a column that is not there.
+    pinned("tof_axis_field(\"tof_index\", run_wide, per_spectrum)");
+    pinned("tof_axis_field(\"tof\", (model_a, model_b), exact_per_spectrum.is_some())");
     pinned("fn tof_index_peak_schema(tof_field: std::sync::Arc<arrow::datatypes::Field>)");
     // the peaks schema carries the f64 fallback beside the axis, like the mz-grid lattice facet
     pinned(".add_field(tof_field)\n        .add_field(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field())");

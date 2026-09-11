@@ -7,12 +7,24 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Current issues, ranked, with evidence and status:** the *mzPeakConverter Review Ledger*
   (claude.ai artifact, §8 "Measures" carries a Status column: *done* / *open*). Its source is kept
   at `scratchpad/review2/review-ledger.html` in the maintainer's session; ask for the link.
-- **What is open** (2026-09-10, re-checked against the tree by the open-issue review, less what its
-  fixes landed): precursors on the BAF and Agilent lanes; collapsing the archive prologue/epilogue
-  copies (M17); shared constants instead of text pins (M28). Landed with the fixes, their Windows or
-  box half still unconfirmed: SciEX precursors and the CoreCLR `OnceLock`, the MIDAC scaffold's
-  deletion, the BAF lane's member digests, the M35 route label (`conversion_route`), and the box
-  harness stamping the *effective* recipe.
+- **What is open** (2026-09-11): precursors on the BAF and Agilent lanes (neither has an MSn
+  acquisition to verify against, here or in the corpus); device chromatograms beyond Bruker; the
+  "no isolation" marker, which waits on mzdata 0.66.7; a shared `.NET` host for the four glue lanes
+  (`dotnet_host.rs`), which only the Windows box can verify and which the SciEX `OnceLock` already
+  removed the live defect from. Landed with the fixes, their Windows or box half still unconfirmed:
+  SciEX precursors and that `OnceLock`, the MIDAC scaffold's deletion, the BAF lane's member
+  digests, the M35 route label (`conversion_route`), and the box harness stamping the *effective*
+  recipe.
+- **M17 and M28 are closed** (2026-09-11, CHANGELOG Unreleased): the six archive-epilogue copies,
+  the four mzML epilogues, the two `msconvert` invocations, the two TOF axis fields, the four
+  hand-written `codec: "tof-grid"` blocks and the four ims-compact array triples are each one
+  definition now, with no archive or exported-mzML byte changing. Two judgements inside them are
+  deliberate and should not be re-litigated without new evidence: the four mzML PROLOGUES, the
+  three ims-compact spectrum BUILDERS and the seven probe/observe loops stay separate because the
+  copies differ (the reasons are in the code beside each); and `tests/contract_strings.rs` stays a
+  source pin rather than becoming shared constants, because the two lanes whose strings it guards
+  are `#[cfg(windows)]` — a readback test would assert nothing on every host that runs CI. What
+  M28 asked for, a spelling that cannot drift between lanes, is the `tof_grid_block` builder.
 - **Run metadata on the native lanes — landed after 0.11.2** (`src/run_metadata.rs`,
   `agilent_meta.rs`, `waters_meta.rs`, Bruker `GlobalMetadata`, SciEX `RunInfo`; CHANGELOG
   Unreleased). Measured against fresh lane pairs: blank1 now carries the vendor serial, sample and
