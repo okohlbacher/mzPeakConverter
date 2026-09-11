@@ -356,7 +356,13 @@ Contents:
 - `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point): profile
   spectra in `spectra_data`, centroid spectra in `spectra_peaks`, by the representation the source
   declares — since 0.10.1 for grid-encoded TOF axes too (§9).
-- `chromatograms.parquet` — TIC/BPC/SRM and other chromatograms.
+- `chromatograms_metadata.parquet` / `chromatograms_data.parquet` — TIC/BPC/SRM and other
+  chromatograms: one metadata row each, and their points, times in minutes. A value that is not an
+  intensity, such as a Bruker device trace's pressure, flow rate, temperature or solvent percentage,
+  has no column of its own: it is stored in that chromatogram's `auxiliary_arrays` in
+  `chromatograms_metadata`, under its name and in its unit, and the trace's `intensity` values in
+  `chromatograms_data` are null. A reader that plots `intensity` alone shows such a trace as empty
+  or as zeros (mzPeakViewer does, so far); its values are in the auxiliary array.
 - `vendor/…` — embedded original side-files (optional, see §8).
 
 **Footer count keys.** The spectrum, chromatogram and wavelength facets carry `<entity>_count`
