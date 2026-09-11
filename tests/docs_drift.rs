@@ -70,6 +70,17 @@ fn every_long_option_of_help_has_a_row_in_section_4() {
     assert!(missing.is_empty(), "options `--help` prints that have no row in USER_MANUAL.md §4's option table: {missing:?}");
 }
 
+/// `--help` names what a user can set. The `--tof-grid` bound printed as `PPM_TOL`, a constant in
+/// the source, where the manual names the variable that sets it.
+#[test]
+fn help_names_the_variable_not_the_constant() {
+    let out = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert")).arg("--help").output().unwrap();
+    assert!(out.status.success(), "--help failed");
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(!mentions(&help, "PPM_TOL"), "--help names the internal constant PPM_TOL:\n{help}");
+    assert!(mentions(&help, "MZPC_TOF_GRID_PPM"), "--help no longer names the --tof-grid bound's variable:\n{help}");
+}
+
 #[test]
 fn a_flag_named_only_outside_the_option_table_has_no_row() {
     let section = "## 4. Command-line options\n\n\
