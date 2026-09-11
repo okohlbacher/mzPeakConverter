@@ -724,28 +724,15 @@ impl TdfSdkReader {
             }
         }
 
-        let mut arrays = BinaryArrayMap::new();
-        let mut tof_da = DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
-        tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow!("encoding tof: {e}"))?;
-        arrays.add(tof_da);
-        let mut int_da = if int_intensity {
-            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
-            da.update_buffer(int_i32.as_slice()).map_err(|e| anyhow!("encoding intensity: {e}"))?;
-            da
-        } else {
-            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-            da.update_buffer(int_f32.as_slice()).map_err(|e| anyhow!("encoding intensity: {e}"))?;
-            da
-        };
-        int_da.unit = Unit::DetectorCounts;
-        arrays.add(int_da);
-        let mut mob_da = DataArray::wrap(
-            &ArrayType::MeanInverseReducedIonMobilityArray,
-            BinaryDataArrayType::Float64,
-            Vec::new(),
-        );
-        mob_da.update_buffer(mobility.as_slice()).map_err(|e| anyhow!("encoding mobility: {e}"))?;
-        arrays.add(mob_da);
+        let arrays = crate::bruker_native::ims_compact_arrays(
+            &tof,
+            if int_intensity {
+                crate::bruker_native::ImsIntensity::Counts(&int_i32)
+            } else {
+                crate::bruker_native::ImsIntensity::Float(&int_f32)
+            },
+            &mobility,
+        )?;
 
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
         if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
