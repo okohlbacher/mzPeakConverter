@@ -4979,31 +4979,18 @@ fn ims_chunked_peak_schema(
     let strategy = ChunkingStrategy::Delta { chunk_size: width_th };
 
     // Synthetic sample: two points far enough apart to land in different m/z bins (=> >=1 chunk).
-    let mut arrays = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(&[100_000i32, 300_000i32]).expect("sample tof");
-    arrays.add(tof_da);
-    let mut int_da = if int_intensity {
-        let mut da =
-            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
-        da.update_buffer(&[1i32, 1i32]).expect("sample intensity");
-        da
-    } else {
-        let mut da =
-            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        da.update_buffer(&[1.0f32, 1.0f32]).expect("sample intensity");
-        da
-    };
-    int_da.unit = Unit::DetectorCounts;
-    arrays.add(int_da);
-    let mut mob_da = DataArray::wrap(
-        &ArrayType::MeanInverseReducedIonMobilityArray,
-        BinaryDataArrayType::Float64,
-        Vec::new(),
-    );
-    mob_da.update_buffer(&[1.0f64, 1.0f64]).expect("sample mobility");
-    arrays.add(mob_da);
+    // Built through the SAME constructor as a real ims-compact spectrum, so the write-time schema
+    // cannot drift from the runtime chunk struct.
+    let arrays = bruker_native::ims_compact_arrays(
+        &[100_000i32, 300_000i32],
+        if int_intensity {
+            bruker_native::ImsIntensity::Counts(&[1i32, 1i32])
+        } else {
+            bruker_native::ImsIntensity::Float(&[1.0f32, 1.0f32])
+        },
+        &[1.0f64, 1.0f64],
+    )
+    .expect("materialize the ims-chunked sample arrays");
 
     // Register the TOF→m/z reconstruction on the chunk axis, exactly as the archive path does for
     // `point.tof`. Without it the chunked array index carries `transform: null` on every entry and
