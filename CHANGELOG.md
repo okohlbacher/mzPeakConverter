@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change, timsTOF only.** Every Bruker TDF archive changes; no other lane does.
+
+### Changed
+
+- **The chunked layout and zstd 22 are the timsTOF ims-compact defaults** (`--no-ims-chunked`
+  returns the flat one). The flat "archive" layout stored ABSOLUTE integer TOF, which cost 64.7 % of
+  the peaks facet on PXD059079's 2485.d — 2.19 B/peak. The chunked layout stores TOF relative to each
+  50-Th chunk's start, a quarter of that (23.2 %), and pays for it in the mobility column, which
+  loses its run-length ordering (7.3 % → 44.9 %). The trade is favourable: measured on that file,
+  126.35 MiB → 116.45 MiB at zstd 5, and **114.79 MiB at zstd 22 (−9.1 %)**, taking raw/mzpeak from
+  1.085× to 1.194×. The m/z axis becomes page-prunable at the same time, so XIC and m/z-slice queries
+  are ~20× faster — previously that speed cost size, and now it does not.
+  Level 22 rather than 5 because these archives are written once and distributed: it is 1.4 % smaller
+  than 5 and costs ~6× the encode time (5.2 s vs 0.83 s on 2485.d). `--zstd-level` overrides it.
+  The encodings were re-measured on the real columns before changing anything and are unchanged:
+  BYTE_STREAM_SPLIT beats DELTA_BINARY_PACKED by 8.7 % on `tof` and 24.8 % on `intensity`, because
+  the TOF axis is sparse — 8.4 peaks per mobility scan, median consecutive delta 2,668 of 636,030.
+  **The deviation this makes default:** the archive now holds a CHUNK `spectra_peaks` facet beside a
+  POINT `spectra_data` facet, which conformance.md item 4 records as a deliberate mixed-layout-family
+  deviation from the spec. A reader that assumes one layout family per entity must be able to read
+  both facets of a timsTOF archive; the vendored reader, mzPeakViewer and speXtract already do.
+
 ## [0.12.0] — 2026-09-11
 
 **Output change.** An indexed mzML that declares a non-UTF-8 encoding now keeps its source

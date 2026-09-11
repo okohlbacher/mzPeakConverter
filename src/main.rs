@@ -334,17 +334,25 @@ struct Cli {
     #[arg(long, value_enum)]
     representation: Option<RepresentationArg>,
 
-    /// Bruker timsTOF (TDF) ims-compact only — select the CHUNKED layout for rapid m/z-range access.
-    /// OFF BY DEFAULT. When absent, timsTOF data is written in the ARCHIVE layout (the default): a flat
-    /// table of absolute integer TOF bins — maximum compression and fast whole-spectrum access, but no
-    /// m/z index. `--ims-chunked` instead splits each frame's peaks into true m/z 50-Th bins (override
-    /// width with `--chunk-size`, in Th); every chunk records its main-axis (TOF) bounds
-    /// (`chunk_start`/`chunk_end`) as Parquet columns WITH page statistics, so the m/z axis becomes
-    /// page-prunable — XIC / m/z-slice queries are ~20x faster — at roughly parity-to-+8% file size.
+    /// Bruker timsTOF (TDF) ims-compact only — the CHUNKED layout, **ON BY DEFAULT**. Each frame's
+    /// peaks are split into true m/z 50-Th bins (override width with `--chunk-size`, in Th); every
+    /// chunk records its main-axis (TOF) bounds (`chunk_start`/`chunk_end`) as Parquet columns WITH
+    /// page statistics, so the m/z axis is page-prunable — XIC / m/z-slice queries are ~20x faster.
     /// TOF is delta-encoded within each chunk (start point excluded; cumulative-sum from
-    /// `chunk_start` to reconstruct, lossless).
+    /// `chunk_start` to reconstruct, lossless). Measured on PXD059079's 2485.d it is also 7.8%
+    /// SMALLER than the flat layout: chunk-relative TOF costs a quarter of what absolute TOF does,
+    /// which more than pays for the mobility column losing its run-length ordering. Accepting the
+    /// flag explicitly is inert and says so. Note the deviation this layout carries: the archive
+    /// then holds a CHUNK `spectra_peaks` facet beside a POINT `spectra_data` facet, which
+    /// conformance.md lists as a deliberate mixed-layout-family deviation.
     #[arg(long)]
     ims_chunked: bool,
+
+    /// Bruker timsTOF (TDF) ims-compact only: write the flat ARCHIVE layout instead of the chunked
+    /// one — a single table of ABSOLUTE integer TOF bins, no m/z index and no mixed layout family,
+    /// at ~8% more bytes. This was the default through 0.12.0.
+    #[arg(long)]
+    no_ims_chunked: bool,
 
     /// Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default
     /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). On a TDF `.d` this
@@ -568,6 +576,7 @@ struct FileConfig {
     force: Option<bool>,
     no_ims_compact: Option<bool>,
     ims_chunked: Option<bool>,
+    no_ims_chunked: Option<bool>,
     bruker_sdk: Option<bool>,
     no_tims_recalibration: Option<bool>,
     no_vendor: Option<bool>,
@@ -675,6 +684,7 @@ impl Settings {
         note(cli.no_ims_compact, "--no-ims-compact");
         note(cli.representation.is_some(), "--representation");
         note(cli.ims_chunked, "--ims-chunked");
+        note(cli.no_ims_chunked, "--no-ims-chunked");
         note(cli.bruker_sdk, "--bruker-sdk");
         note(cli.no_tims_recalibration, "--no-tims-recalibration");
         note(cli.no_vendor, "--no-vendor");
@@ -702,10 +712,16 @@ impl Settings {
             no_mz_lattice: cli.no_mz_lattice || fc.no_mz_lattice.unwrap_or(false),
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
             zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(3),
-            ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(5),
+            // 22, not 5: the chunked timsTOF layout is written once and read many times, and the
+            // measured gain over level 5 (1.4% on 2485.d) is worth the encode time on a corpus that
+            // is distributed. `--zstd-level` still overrides it for every lane.
+            ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(22),
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
-            ims_chunked: cli.ims_chunked || fc.ims_chunked.unwrap_or(false),
+            // Chunked is the default since 0.12.1. `--no-ims-chunked` (or `no_ims_chunked: true`,
+            // or the older `ims_chunked: false`) goes back to the flat layout.
+            ims_chunked: !(cli.no_ims_chunked || fc.no_ims_chunked.unwrap_or(false))
+                && fc.ims_chunked.unwrap_or(true),
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             tims_recalibration: !(cli.no_tims_recalibration
                 || fc.no_tims_recalibration.unwrap_or(false)),
@@ -1459,9 +1475,9 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
         Lane::AgilentGrid => &["--image", "--sdrf", "--via-msconvert"],
         // Lane selection puts msconvert before every native backend, so these four would be
         // silently overridden — the user chose a reader and gets a different one.
-        Lane::ViaMsconvert => &["--aux", "--bruker-sdk", "--no-ims-compact", "--ims-chunked", "--no-tims-recalibration"],
-        Lane::SdkImsCompact => &["--image", "--sdrf", "--ims-chunked", "--no-tims-recalibration"],
-        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-tims-recalibration"],
+        Lane::ViaMsconvert => &["--aux", "--bruker-sdk", "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
+        Lane::SdkImsCompact => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
+        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
         Lane::ImsCompact => &["--image", "--sdrf"],
         Lane::VendorReader => &["--image", "--sdrf"],
         Lane::Standard => &[],
@@ -1476,26 +1492,26 @@ fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
     match lane {
         Lane::Filter => &[
             "--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level",
-            "--no-ims-compact", "--representation", "--ims-chunked", "--bruker-sdk",
+            "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--aux", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
         ],
         Lane::FilterToMzml => &[
             "--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level",
-            "--no-ims-compact", "--representation", "--ims-chunked", "--bruker-sdk",
+            "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
         ],
         Lane::MzmlExport => &[
             "--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level",
-            "--no-ims-compact", "--ims-chunked", "--no-tims-recalibration", "--no-chromatograms",
+            "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration", "--no-chromatograms",
             "--tof-grid", "--agilent-grid",
         ],
         Lane::AgilentGrid | Lane::SdkImsCompact => &["--layout", "--no-numpress", "--chunk-size"],
         Lane::ImsCompact => &["--layout", "--no-numpress"],
         // No chunked TOF layout off the timsTOF ims-compact lane — which falls back to `Standard`
         // on a TDF timsrust cannot decompress, and checks this list again when it does.
-        Lane::VendorReader | Lane::Standard => &["--ims-chunked"],
+        Lane::VendorReader | Lane::Standard => &["--ims-chunked", "--no-ims-chunked"],
         Lane::ViaMsconvert | Lane::BrukerSdk => &[],
         #[allow(unreachable_patterns)]
         _ => CODEC,
