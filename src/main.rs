@@ -5573,7 +5573,7 @@ struct AuxInputs<'a> {
 /// `metadata.study` / `metadata.sample_metadata` blocks — close the ZIP, and only then rename the
 /// temporary onto `output`.
 ///
-/// Until 0.11.5 there were six copies of this sequence (M17), and they had drifted: one lane dropped
+/// Through 0.11.5 there were six copies of this sequence (M17), and they had drifted: one lane dropped
 /// the `acquisition_time` block, another applied a different vendor-embed rule, and `--sdrf` on
 /// `--tof-grid` silently embedded nothing until 0.9.13. The lane-specific part is now exactly the
 /// three arguments that differ — the ordered `index_blocks`, whether a vendor policy applies, and
