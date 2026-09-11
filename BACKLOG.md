@@ -15,6 +15,20 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   SciEX precursors and that `OnceLock`, the MIDAC scaffold's deletion, the BAF lane's member
   digests, the M35 route label (`conversion_route`), and the box harness stamping the *effective*
   recipe.
+- **Measured 2026-09-11, corpus-wide (report in `~/Claude/mzPeak/data/open-issues-fixes-2026-09-10/`):**
+  156 mzML round trips over 227,979 spectra carry the **total intensity exactly** — every m/z
+  difference is inside the `numpress-linear` bound the archive declares, ids/order/MS level/
+  representation all preserved. Two gaps came out of it and are open:
+  - **`--to mzml` does not write the wavelength (UV/PDA) facet.** The archives store it correctly
+    (520 rows on `TOFsulfas…DADSpectra…`, 8 on `QC_LCMS2-2_23_268-1-1`), so a round trip through
+    mzML silently drops the UV spectra. The review listed this export as never examined.
+  - **539 named source chromatograms** (mostly SRM/SIM traces) never reach an archive; 34 of the 37
+    affected files have a **non-indexed** source mzML, which mzdata cannot enumerate chromatograms
+    from. The conversion warns at the time, so this is a documented limit rather than silent loss —
+    but it is 143 traces on each Shimadzu scheduled-MRM file and 40 on ABI's pressure-trace file.
+  - Not a defect, worth knowing: a native SciEX archive stores spectra **experiment-major**, so
+    retention time is not monotonic in spectrum index there, while ProteoWizard writes acquisition
+    order. Same 168,412 spectra, same ids.
 - **M17 and M28 are closed** (2026-09-11, CHANGELOG Unreleased): the six archive-epilogue copies,
   the four mzML epilogues, the two `msconvert` invocations, the two TOF axis fields, the four
   hand-written `codec: "tof-grid"` blocks and the four ims-compact array triples are each one
