@@ -2957,12 +2957,13 @@ fn convert_file_tof_grid(
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
-    let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
-        .into_iter()
+    // `tof_calibration` first, as this lane has written it since 0.9.11.
+    let index_blocks: Vec<(String, serde_json::Value)> = std::iter::once(tof_grid_calibration_block(&grid))
+        .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&applied)))
         .collect();
-    finish_tof_grid_archive(writer, tmp_guard, output, input, &grid, vendor, images, sdrf, &index_blocks)
+    finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
 }
 
 /// The integer flight-time axis column of every TOF-grid lane: `tof_index` (Int32) carrying the
@@ -3013,25 +3014,9 @@ fn tof_index_peak_schema(tof_field: std::sync::Arc<arrow::datatypes::Field>) -> 
         .add_field(INTENSITY_ARRAY.to_field())
 }
 
-/// Finalize a TOF-grid archive: write the `tof_calibration` index block (so readers recover
-/// `m/z = (c0 + c1·tof_index)²`) plus any extra `index_blocks`, embed vendor members, optical
-/// images and the SDRF exactly as `finish_with_vendor_and_aux` does, finish the ZIP, and rename the
-/// temp into place. Shared by the mzML and native-vendor TOF-grid paths. (Until 0.9.13 this
-/// finisher took no images/SDRF, so `--tof-grid on --sdrf s.tsv` wrote an archive whose only
-/// non-Parquet member was the index, while the same command without `--tof-grid` embedded the SDRF.)
-#[allow(clippy::too_many_arguments)]
-fn finish_tof_grid_archive(
-    writer: MzPeakWriterType<fs::File>,
-    tmp_guard: TmpGuard,
-    output: &Path,
-    input: &Path,
-    grid: &tof_grid::TofGrid,
-    vendor: Option<&vendor::VendorPolicy>,
-    images: &[PathBuf],
-    sdrf: Option<&Path>,
-    index_blocks: &[(String, serde_json::Value)],
-) -> Result<()> {
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
+/// The `tof_calibration` block of the run-wide sqrt grid (`--tof-grid`, and the native SCIEX lane's
+/// run-wide fit): how a reader recovers `m/z = (c0 + c1·tof_index)²` from the stored integer axis.
+fn tof_grid_calibration_block(grid: &tof_grid::TofGrid) -> (String, serde_json::Value) {
     // TWO DIFFERENT CLAIMS, one key each. `lossless` is the SPEC's key and its value is a COLUMN
     // NAME — "the exactly-preserved stored column" (mzPeak-specification schema/mzpeak_index.json).
     // `tof_index` is exactly that: an integer we store and read back bit-for-bit. What is NOT exact
@@ -3054,18 +3039,7 @@ fn finish_tof_grid_archive(
         "c0": grid.c0,
         "c1": grid.c1,
     });
-    zip.add_index_metadata("tof_calibration", &cal)
-        .context("writing tof_calibration index")?;
-    for (key, block) in index_blocks {
-        zip.add_index_metadata(key, block)
-            .with_context(|| format!("writing {key} index block"))?;
-    }
-    embed_vendor_members(&mut zip, input, vendor)?;
-    embed_aux::embed_into_archive(&mut zip, input, images, sdrf)
-        .context("embedding optical images / SDRF")?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    ("tof_calibration".to_string(), cal)
 }
 
 /// Per-spectrum routing decision for the TOF-grid path. Neither variant changes the spectrum's
@@ -3586,10 +3560,13 @@ fn convert_agilent_grid(
     let acquisition_block = fixup_run_metadata(&mut writer, input);
     let mut applied = base_transformations(&writer);
 
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    if let Some((key, block)) = acquisition_block {
-        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
+    // The reader stores a sparse point list (zero-intensity samples of the dense vendor vector left
+    // out, `agilent_profile.rs`) and counts integer intensities into Float32: both declared when they
+    // happened.
+    for entry in agilent_grid_transformations(reader.zero_samples_dropped(), reader.skipped().all_zero, f32_rounded) {
+        declare(&mut applied, entry);
     }
+    applied.extend(chromatogram_transforms);
     // `lossless` (the exactly-stored column) and `mz_reconstruction` (whether m/z is quantized) are
     // stated by EVERY `codec: "tof-grid"` block, so a reader answers both questions from one place
     // regardless of model. This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal
@@ -3610,28 +3587,16 @@ fn convert_agilent_grid(
         "calibrations": calibrations,
         "max_roundtrip_ppm": max_ppm,
     });
-    zip.add_index_metadata("tof_calibration", &cal)
-        .context("writing tof_calibration index")?;
     // A capped run stops early on request. An uncapped one whose MSProfile.bin ended before its scan
     // records is partial too, and says so offline instead of only in the log.
-    if let Some((key, block)) =
-        partial_marker(input, cap, n).or_else(|| agilent_truncation_marker(cap, reader.skipped(), reader.len(), n))
-    {
-        zip.add_index_metadata(&key, &block).context("writing partial index block")?;
-    }
-    // The reader stores a sparse point list (zero-intensity samples of the dense vendor vector left
-    // out, `agilent_profile.rs`) and counts integer intensities into Float32: both declared when they
-    // happened.
-    for entry in agilent_grid_transformations(reader.zero_samples_dropped(), reader.skipped().all_zero, f32_rounded) {
-        declare(&mut applied, entry);
-    }
-    applied.extend(chromatogram_transforms);
-    let (key, block) = transformations_block(&applied);
-    zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    embed_vendor_members(&mut zip, input, vendor)?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
+        .into_iter()
+        .chain(std::iter::once(("tof_calibration".to_string(), cal)))
+        .chain(partial_marker(input, cap, n).or_else(|| agilent_truncation_marker(cap, reader.skipped(), reader.len(), n)))
+        .chain(std::iter::once(transformations_block(&applied)))
+        .collect();
+    // No aux: this lane has no `--image`/`--sdrf` parameters (`run` refuses both here).
+    finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
 }
 
 /// Integer counts as the Float32 intensity column stores them, counting the values it cannot hold
@@ -4232,9 +4197,7 @@ fn convert_file(
             applied
         })))
         .collect();
-    finish_with_vendor_and_aux(writer, input, vendor, images, sdrf, &index_blocks)?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
 }
 
 /// RAII cleanup for the sanitized copy [`sanitize_param_groups`] may write (an mzML with empty
@@ -5414,37 +5377,30 @@ where
         declare(&mut applied, "sort-by-mz");
     }
     applied.extend(chromatogram_transforms);
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    zip.add_index_metadata("ims_calibration", &cal)
-        .context("writing ims_calibration index")?;
-    if let Some((key, block)) = acquisition_block {
-        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
-    }
-    let (key, block) = conversion_route_block(
-        "ims-compact",
-        if chord_source == "sdk_tims_index_to_mz" { "timsdata" } else { "timsrust" },
-        None,
-    );
-    zip.add_index_metadata(&key, &block).context("writing conversion_route index block")?;
-    let (key, block) = transformations_block(&applied);
-    zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    if let Some((key, block)) = partial_marker(input, max_spectra(), n_frames) {
-        zip.add_index_metadata(&key, &block).context("writing partial index block")?;
-    }
     // The vendor's exact calibration, verbatim, so the archive is self-sufficient without the
     // embedded `vendor/analysis.tdf.gz` (`--no-vendor`). Best-effort: a TDF without the table is
     // still a valid ims-compact archive on the two-point model above.
     let tdf = if input.is_dir() { input.join("analysis.tdf") } else { input.to_path_buf() };
-    match bruker_native::vendor_mz_calibration(&tdf) {
-        Ok(v) => zip
-            .add_index_metadata("vendor_mz_calibration", &v)
-            .context("writing vendor_mz_calibration index")?,
-        Err(e) => log::warn!("vendor MzCalibration unavailable ({e}); vendor_mz_calibration index block omitted"),
-    }
-    embed_vendor_members(&mut zip, input, vendor)?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    let vendor_calibration = match bruker_native::vendor_mz_calibration(&tdf) {
+        Ok(v) => Some(("vendor_mz_calibration".to_string(), v)),
+        Err(e) => {
+            log::warn!("vendor MzCalibration unavailable ({e}); vendor_mz_calibration index block omitted");
+            None
+        }
+    };
+    let index_blocks: Vec<(String, serde_json::Value)> = std::iter::once(("ims_calibration".to_string(), cal))
+        .chain(acquisition_block)
+        .chain(std::iter::once(conversion_route_block(
+            "ims-compact",
+            if chord_source == "sdk_tims_index_to_mz" { "timsdata" } else { "timsrust" },
+            None,
+        )))
+        .chain(std::iter::once(transformations_block(&applied)))
+        .chain(partial_marker(input, max_spectra(), n_frames))
+        .chain(vendor_calibration)
+        .collect();
+    // No aux: `--image`/`--sdrf` are refused on the ims-compact lane (`run`).
+    finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
 }
 
 /// Native (timsrust) ims-compact: pure-Rust decoder, default for Bruker TDF.
@@ -5604,17 +5560,39 @@ fn declare(applied: &mut Vec<String>, entry: impl Into<String>) {
     }
 }
 
-/// Flush Parquet, then stream-embed vendor side-files + vendor metadata into the archive index,
-/// optical images (`--image` + sibling discovery) and an SDRF (`--sdrf`) BEFORE `zip.finish()`,
-/// adding the `metadata.imaging` / `metadata.study` / `metadata.sample_metadata` index blocks.
-/// `index_blocks` carries any extra reader-side calibration the lane produced (today: the
-/// `mz_calibration` block of the fixed-point m/z lattice); pass `&[]` when there is none.
-fn finish_with_vendor_and_aux(
+/// What `--image` and `--sdrf` gave the lane, for the lanes that accept them.
+///
+/// `None` in [`finish_archive`] means "this lane embeds no aux", which is NOT the same as an empty
+/// `Some`: [`embed_aux::embed_into_archive`] also auto-discovers an `<input-stem>-opticalimage.*`
+/// sibling, so an empty `Some` on the ims-compact, `--agilent-grid`, native-vendor or native-SCIEX
+/// lanes — all of which REFUSE both flags (`run`) — would start embedding files they never embedded.
+struct AuxInputs<'a> {
+    images: &'a [PathBuf],
+    sdrf: Option<&'a Path>,
+}
+
+/// **The one archive epilogue.** Every lane that writes an `.mzpeak` ends here: flush Parquet, write
+/// the lane's index blocks IN ORDER, stream-embed vendor side-files + vendor metadata, then optical
+/// images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding the `metadata.imaging` /
+/// `metadata.study` / `metadata.sample_metadata` blocks — close the ZIP, and only then rename the
+/// temporary onto `output`.
+///
+/// Until 0.11.5 there were six copies of this sequence (M17), and they had drifted: one lane dropped
+/// the `acquisition_time` block, another applied a different vendor-embed rule, and `--sdrf` on
+/// `--tof-grid` silently embedded nothing until 0.9.13. The lane-specific part is now exactly the
+/// three arguments that differ — the ordered `index_blocks`, whether a vendor policy applies, and
+/// whether the lane takes aux — so a new lane cannot forget a step, only choose one.
+///
+/// `index_blocks` is written in the given order, so a lane that wants its calibration block first
+/// puts it first. The rename is last: a failure anywhere above leaves `output` untouched and the
+/// `TmpGuard` removes the partial file.
+fn finish_archive(
     writer: MzPeakWriterType<fs::File>,
+    tmp_guard: TmpGuard,
+    output: &Path,
     input: &Path,
     vendor: Option<&vendor::VendorPolicy>,
-    images: &[PathBuf],
-    sdrf: Option<&Path>,
+    aux: Option<AuxInputs<'_>>,
     index_blocks: &[(String, serde_json::Value)],
 ) -> Result<()> {
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
@@ -5623,9 +5601,12 @@ fn finish_with_vendor_and_aux(
             .with_context(|| format!("writing {key} index block"))?;
     }
     embed_vendor_members(&mut zip, input, vendor)?;
-    embed_aux::embed_into_archive(&mut zip, input, images, sdrf)
-        .context("embedding optical images / SDRF")?;
+    if let Some(aux) = aux {
+        embed_aux::embed_into_archive(&mut zip, input, aux.images, aux.sdrf)
+            .context("embedding optical images / SDRF")?;
+    }
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
+    tmp_guard.finish(output)?;
     Ok(())
 }
 
@@ -6408,12 +6389,8 @@ fn convert_sciex_grid(
     let acquisition_block = acquisition_block.or(fixup_block);
     let mut applied = base_transformations(&writer);
 
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    if let Some((key, block)) = acquisition_block {
-        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
-    }
     // `lossless` names the exactly-stored column, `mz_reconstruction` rates the m/z you rebuild
-    // from it — see `finish_tof_grid_archive`. `max_roundtrip_ppm` is the measured worst case over
+    // from it — see `tof_grid_calibration_block`. `max_roundtrip_ppm` is the measured worst case over
     // this run (it has run at ~5 ppm on the published MSV000095995 archive), and
     // `roundtrip_tolerance_ppm` is the bound the per-spectrum fit was accepted under.
     let cal = serde_json::json!({
@@ -6426,26 +6403,24 @@ fn convert_sciex_grid(
         "per_spectrum_columns": ["tof_c0", "tof_c1"],
         "max_roundtrip_ppm": max_ppm,
     });
-    // No block under `off`: nothing was transformed, and a `codec: tof-grid` block on an archive
-    // whose every spectrum sits in the f64 data facet would tell readers to look for a facet that
-    // holds nothing.
-    if mode != TofGridMode::Off {
-        zip.add_index_metadata("tof_calibration", &cal)
-            .context("writing tof_calibration index")?;
-    }
     applied.extend(chromatogram_transforms);
     if n_grid > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     applied.extend(value_changes.transformations());
-    let (key, block) = transformations_block(&applied);
-    zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    if let Some((key, block)) = partial_marker(input, max_spectra(), len) {
-        zip.add_index_metadata(&key, &block).context("writing partial index block")?;
-    }
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    // No block under `off`: nothing was transformed, and a `codec: tof-grid` block on an archive
+    // whose every spectrum sits in the f64 data facet would tell readers to look for a facet that
+    // holds nothing.
+    let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
+        .into_iter()
+        .chain((mode != TofGridMode::Off).then(|| ("tof_calibration".to_string(), cal)))
+        .chain(std::iter::once(transformations_block(&applied)))
+        .chain(partial_marker(input, max_spectra(), len))
+        .collect();
+    // A `.wiff` is a FILE: `vendor::embed_into_archive` walks a vendor DIRECTORY, so this lane has
+    // no side-files to embed and passes no policy (hence the `_vendor` parameter). No aux either —
+    // `--image`/`--sdrf` are refused on the native lanes (`run`).
+    finish_archive(writer, tmp_guard, output, input, None, None, &index_blocks)
 }
 
 /// Build a gridded SCIEX spectrum: `tof_index` (Int32) + intensity (f32) + per-spectrum tof_c0/tof_c1.
@@ -6938,19 +6913,10 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         declare(&mut applied, "shimadzu:span-trim");
     }
     applied.extend(chromatogram_transforms);
-    let transformations = transformations_block(&applied);
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    for (key, block) in index_blocks
-        .iter()
-        .chain(partial_marker(input, max_spectra(), len).iter())
-        .chain(std::iter::once(&transformations))
-    {
-        zip.add_index_metadata(key, block)
-            .with_context(|| format!("writing {key} index block"))?;
-    }
-    embed_vendor_members(&mut zip, input, vendor)?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
+    index_blocks.extend(partial_marker(input, max_spectra(), len));
+    index_blocks.push(transformations_block(&applied));
+    // No aux: `--image`/`--sdrf` are refused on the native vendor lanes (`run`).
+    finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)?;
     Ok(tally)
 }
 
