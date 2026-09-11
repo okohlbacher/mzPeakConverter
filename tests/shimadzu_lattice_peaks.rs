@@ -106,9 +106,14 @@ pub fn lattice_peak_schema(scale: f64) -> ArrayBuffersBuilder {
 
 // src/main.rs
 fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
+    tof_axis_field("tof_index", run_wide, per_spectrum)
+}
+
+// src/main.rs
+fn tof_axis_field(axis: &str, run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
     let base = BufferName::new(
         BufferContext::Spectrum,
-        ArrayType::nonstandard("tof_index"),
+        ArrayType::nonstandard(axis),
         BinaryDataArrayType::Int32,
     )
     .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
@@ -158,6 +163,7 @@ fn mirror_is_verbatim() {
         (&lattice, "src/mz_lattice.rs", "pub fn lattice_tof_index_field("),
         (&lattice, "src/mz_lattice.rs", "pub fn lattice_peak_schema("),
         (&main, "src/main.rs", "fn tof_index_field("),
+        (&main, "src/main.rs", "fn tof_axis_field("),
         (&main, "src/main.rs", "pub(crate) const TOF_C0_CURIE:"),
         (&main, "src/main.rs", "pub(crate) const TOF_C1_CURIE:"),
     ] {

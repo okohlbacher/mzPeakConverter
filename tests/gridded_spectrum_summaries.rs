@@ -268,6 +268,31 @@ fn gridded_archive_states_its_reconstruction_contract() {
         cal.get("integer_column").is_none(),
         "`integer_column` duplicated the spec's `lossless`; got {cal}"
     );
+    // The formula itself, with the coefficients it names. A reader that has the column and the
+    // bound still cannot rebuild m/z without these three.
+    assert_eq!(
+        cal.get("mz_from_tof_index").and_then(|v| v.as_str()),
+        Some("(c0 + c1*tof_index)^2"),
+        "the block must state the reconstruction formula; got {cal}"
+    );
+    for k in ["c0", "c1"] {
+        assert!(
+            cal.get(k).and_then(|v| v.as_f64()).is_some(),
+            "the formula names {k}, so the block must carry it; got {cal}"
+        );
+    }
+    // Storing a quantized axis IS a transformation, and `transformations` lists what a conversion
+    // APPLIED (0.11.6). An archive that quietly re-encoded m/z without saying so is the failure.
+    let applied = idx
+        .get("metadata")
+        .and_then(|m| m.get("transformations"))
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        applied.iter().any(|e| e.starts_with("tof-grid:") && e.ends_with("ppm")),
+        "a gridded archive must declare the grid in `transformations`; got {applied:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

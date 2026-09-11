@@ -34,6 +34,55 @@ use timsrust::converters::{ConvertableDomain, Scan2ImConverter, Tof2MzConverter}
 use timsrust::readers::{FrameReader, MetadataReader};
 use timsrust::MSLevel;
 
+/// The intensity column of an ims-compact spectrum, in the dtype the archive stores: Int32 native
+/// counts by default (the writer BYTE_STREAM_SPLITs the column, ~-16 %, lossless), Float32 under
+/// `MZPC_BYTE_PLANE_INTENSITY=0`.
+pub(crate) enum ImsIntensity<'a> {
+    Counts(&'a [i32]),
+    Float(&'a [f32]),
+}
+
+/// **The three arrays of an ims-compact spectrum**: integer `tof` in place of m/z, intensity in
+/// detector counts, and per-point 1/K0.
+///
+/// One constructor because four places build this triple and they MUST agree on ArrayType + dtype +
+/// unit: the two native builders, the SDK builder, and the synthetic two-point sample
+/// `ims_chunked_peak_schema` runs through the chunker to materialise the write-time schema. A
+/// mismatch there does not fail loudly — the arrays spill into `auxiliary_arrays` and the peaks
+/// facet is written with the wrong columns. Until 0.11.6 the agreement was a comment.
+pub(crate) fn ims_compact_arrays(
+    tof: &[i32],
+    intensity: ImsIntensity<'_>,
+    mobility: &[f64],
+) -> anyhow::Result<BinaryArrayMap> {
+    let mut arrays = BinaryArrayMap::new();
+    let mut tof_da = DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
+    tof_da.update_buffer(tof).map_err(|e| anyhow::anyhow!("encoding tof: {e}"))?;
+    arrays.add(tof_da);
+    let mut int_da = match intensity {
+        ImsIntensity::Counts(v) => {
+            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+            da.update_buffer(v).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+            da
+        }
+        ImsIntensity::Float(v) => {
+            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+            da.update_buffer(v).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+            da
+        }
+    };
+    int_da.unit = Unit::DetectorCounts;
+    arrays.add(int_da);
+    let mut mob_da = DataArray::wrap(
+        &ArrayType::MeanInverseReducedIonMobilityArray,
+        BinaryDataArrayType::Float64,
+        Vec::new(),
+    );
+    mob_da.update_buffer(mobility).map_err(|e| anyhow::anyhow!("encoding mobility: {e}"))?;
+    arrays.add(mob_da);
+    Ok(arrays)
+}
+
 /// The TOF→m/z calibration model: `m/z = (a + b·tof)²`. `a = √(mz_min)`, `b = (√(mz_max)−a)/tof_max`.
 #[derive(Debug, Clone, Copy)]
 pub struct TofMzModel {
@@ -1094,28 +1143,11 @@ impl NativeTofReader {
             }
         }
 
-        let mut arrays = BinaryArrayMap::new();
-        let mut tof_da = DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
-        tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof: {e}"))?;
-        arrays.add(tof_da);
-        let mut int_da = if int_intensity {
-            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
-            da.update_buffer(intensity_i32.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-            da
-        } else {
-            let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-            da.update_buffer(intensity_f32.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-            da
-        };
-        int_da.unit = Unit::DetectorCounts;
-        arrays.add(int_da);
-        let mut mob_da = DataArray::wrap(
-            &ArrayType::MeanInverseReducedIonMobilityArray,
-            BinaryDataArrayType::Float64,
-            Vec::new(),
-        );
-        mob_da.update_buffer(mobility.as_slice()).map_err(|e| anyhow::anyhow!("encoding mobility: {e}"))?;
-        arrays.add(mob_da);
+        let arrays = ims_compact_arrays(
+            &tof,
+            if int_intensity { ImsIntensity::Counts(&intensity_i32) } else { ImsIntensity::Float(&intensity_f32) },
+            &mobility,
+        )?;
 
         let mut descr = SpectrumDescription {
             id: format!("frame={}", frame.index),
@@ -1218,37 +1250,11 @@ impl NativeTofReader {
             mobility.push(m);
         }
 
-        let mut arrays = BinaryArrayMap::new();
-        let mut tof_da =
-            DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
-        tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof: {e}"))?;
-        arrays.add(tof_da);
-        let mut int_da = if int_intensity {
-            let mut da =
-                DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
-            da.update_buffer(intensity_i32.as_slice())
-                .map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-            da
-        } else {
-            let mut da = DataArray::wrap(
-                &ArrayType::IntensityArray,
-                BinaryDataArrayType::Float32,
-                Vec::new(),
-            );
-            da.update_buffer(intensity_f32.as_slice())
-                .map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-            da
-        };
-        int_da.unit = Unit::DetectorCounts;
-        arrays.add(int_da);
-        let mut mob_da = DataArray::wrap(
-            &ArrayType::MeanInverseReducedIonMobilityArray,
-            BinaryDataArrayType::Float64,
-            Vec::new(),
-        );
-        mob_da.update_buffer(mobility.as_slice())
-            .map_err(|e| anyhow::anyhow!("encoding mobility: {e}"))?;
-        arrays.add(mob_da);
+        let arrays = ims_compact_arrays(
+            &tof,
+            if int_intensity { ImsIntensity::Counts(&intensity_i32) } else { ImsIntensity::Float(&intensity_f32) },
+            &mobility,
+        )?;
 
         let mut descr = SpectrumDescription {
             id: format!("frame={}", frame.index),

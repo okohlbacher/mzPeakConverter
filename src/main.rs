@@ -499,6 +499,24 @@ fn has_gz_suffix(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("gz"))
 }
 
+/// **The one mzML epilogue**, for all four export lanes ([`convert_to_mzml`],
+/// [`filter_mzpeak_to_mzml`], [`write_native_mzml`], `write_agilent_profile_mzml`): close the writer,
+/// drop the sink, rename the temporary onto `output`.
+///
+/// Taking `w` BY VALUE is the point. A `.mzML.gz` sink writes its gzip trailer only when the encoder
+/// drops, so the sink must be closed before the rename or the renamed file is a truncated gzip. That
+/// order used to be carried by a comment beside a hand-written `drop(w)` in four places; here it is
+/// structural — the writer cannot outlive the call, and no caller can forget the drop.
+fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: TmpGuard, output: &Path) -> Result<()> {
+    use mzdata::prelude::SpectrumWriter;
+    SpectrumWriter::close(&mut w)
+        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
+    drop(w);
+    tmp_guard.finish(output)?;
+    log::info!("wrote {}", output.display());
+    Ok(())
+}
+
 /// The byte sink for an mzML export: the plain file, or a streaming gzip encoder when the requested
 /// name ends in `.gz`. The XML is compressed AS it is written — one pass, no re-read. Both the mzML
 /// writer and the encoder finish on drop (the writer closes the document, the encoder writes the
@@ -2058,6 +2076,78 @@ fn guard_unsupported_vendor(input: &Path) -> Result<()> {
     Ok(())
 }
 
+/// **The one `msconvert` invocation.** Resolve the executable (`--msconvert-path`, else
+/// `$MSCONVERT_PATH`, else `msconvert` on PATH), run it into a fresh directory under `outdir` with
+/// its stdout+stderr captured, and hand back the guard owning that directory and the mzML inside it.
+///
+/// Both lanes that shell out to ProteoWizard — `--via-msconvert` (→ mzPeak) and
+/// `--via-msconvert --to mzml` — ran their own copy of these twelve steps, identical down to both
+/// `bail!` strings, and differing only in where the temporary directory goes and in how helpful the
+/// "not found" message was. `outdir` is now the one real difference: the `--to mzml` lane passes the
+/// output's own directory so the rename cannot cross a volume, the mzPeak lane passes the system
+/// temp dir because it only reads the file in place.
+///
+/// `--ignoreUnknownInstrumentError` is passed unconditionally: newer SCIEX instruments (ZenoTOF
+/// 7600, newer TripleTOF) report a model string ProteoWizard's hand-curated `Reader_ABI` map does
+/// not know, and without the flag the reader THROWS and writes no mzML — msconvert itself recommends
+/// exactly this flag, and it is benign on recognised instruments. The captured log is what makes a
+/// failure self-diagnosing (unknown instrument / unsupported format / missing sidecar) instead of a
+/// bare exit code, and it is also what [`refuse_multi_run`] reads to catch a multi-run input.
+fn run_msconvert(input: &Path, outdir: &Path, msconvert_path: Option<&Path>) -> Result<TranscodeGuard> {
+    let exe: std::ffi::OsString = msconvert_path
+        .map(|p| p.as_os_str().to_os_string())
+        .or_else(|| std::env::var_os("MSCONVERT_PATH"))
+        .unwrap_or_else(|| "msconvert".into());
+    // The intermediate mzML goes to a temp dir the guard removes on every return; "msconvert not
+    // found" used to return through `?` below and leave it behind.
+    let tmp = msconvert_dir(outdir)?;
+    let log_path = tmp.dir.join("msconvert.log");
+    let mut cmd = Command::new(&exe);
+    cmd.arg(input)
+        .arg("--mzML")
+        .arg("--ignoreUnknownInstrumentError")
+        .arg("--outdir")
+        .arg(&tmp.dir)
+        .arg("--outfile")
+        .arg("via_msconvert.mzML");
+    msconvert_sample_arg(&mut cmd, input);
+    if let Ok(f) = fs::File::create(&log_path) {
+        if let Ok(f2) = f.try_clone() {
+            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
+        }
+    }
+    let status = cmd.status().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "msconvert not found ({}). Install ProteoWizard and put msconvert on PATH, or pass \
+                 --msconvert-path / set $MSCONVERT_PATH. (Windows, or Wine.)",
+                exe.to_string_lossy()
+            )
+        } else {
+            anyhow!("running msconvert: {e}")
+        }
+    })?;
+    let tail = || -> String {
+        fs::read_to_string(&log_path)
+            .ok()
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                lines[lines.len().saturating_sub(15)..].join("\n")
+            })
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
+            .unwrap_or_default()
+    };
+    if !status.success() {
+        bail!("msconvert failed (exit {:?}){}", status.code(), tail());
+    }
+    if !tmp.file.exists() {
+        bail!("msconvert reported success but produced no mzML at {}{}", tmp.file.display(), tail());
+    }
+    refuse_multi_run(&log_path)?;
+    Ok(tmp)
+}
+
 /// Interim cross-vendor lane (PLAN §3.7): run ProteoWizard `msconvert` to produce an mzML, then
 /// convert that mzML to mzPeak through the existing path. Reuses everything downstream of the reader,
 /// `--image` / `--sdrf` included (they used to be hard-coded away here, so the same command kept or
@@ -2078,69 +2168,8 @@ fn convert_via_msconvert(
     images: &[PathBuf],
     sdrf: Option<&Path>,
 ) -> Result<()> {
-    let exe: std::ffi::OsString = msconvert_path
-        .map(|p| p.as_os_str().to_os_string())
-        .or_else(|| std::env::var_os("MSCONVERT_PATH"))
-        .unwrap_or_else(|| "msconvert".into());
-
-    // The intermediate mzML goes to a temp dir the guard removes on every return; "msconvert not
-    // found" used to return through `?` below and leave it behind.
-    let tmp = msconvert_dir(&std::env::temp_dir())?;
-    let (tmpdir, mzml) = (&tmp.dir, &tmp.file);
-
-    let mzcvt_log = tmpdir.join("msconvert.log");
-    let mut cmd = Command::new(&exe);
-    cmd.arg(input)
-        .arg("--mzML")
-        // #1: newer SCIEX (ZenoTOF 7600, newer TripleTOF) report an instrument-model string that
-        // ProteoWizard's hand-curated `Reader_ABI` model map doesn't recognize yet; without this the
-        // reader THROWS on the run and no mzML is written (msconvert may still exit 0 → we'd bail
-        // "produced no mzML", or exit 1). msconvert itself recommends this exact flag ("use the
-        // ignoreUnknownInstrumentError flag"). Benign on recognized instruments (they don't hit the
-        // fallback), so it's safe to pass unconditionally.
-        .arg("--ignoreUnknownInstrumentError")
-        .arg("--outdir")
-        .arg(&tmpdir)
-        .arg("--outfile")
-        .arg("via_msconvert.mzML");
-    msconvert_sample_arg(&mut cmd, input);
-    // #3: capture msconvert's own stdout+stderr to a log so a failure carries its real message
-    // (unknown-instrument / unsupported-format / missing-sidecar) instead of a bare exit code.
-    if let Ok(f) = fs::File::create(&mzcvt_log) {
-        if let Ok(f2) = f.try_clone() {
-            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
-        }
-    }
-    let status = cmd.status().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!(
-                "msconvert not found ({}). Install ProteoWizard and put msconvert on PATH, or pass \
-                 --msconvert-path / set $MSCONVERT_PATH. (Windows, or Wine.)",
-                exe.to_string_lossy()
-            )
-        } else {
-            anyhow::anyhow!("running msconvert: {e}")
-        }
-    })?;
-    // #3: on any failure, include the tail of msconvert's own output so the error is self-diagnosing.
-    let msconvert_tail = || -> String {
-        fs::read_to_string(&mzcvt_log)
-            .ok()
-            .map(|s| {
-                let lines: Vec<&str> = s.lines().collect();
-                lines[lines.len().saturating_sub(15)..].join("\n")
-            })
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
-            .unwrap_or_default()
-    };
-    if !status.success() {
-        bail!("msconvert failed (exit {:?}){}", status.code(), msconvert_tail());
-    }
-    if !mzml.exists() {
-        bail!("msconvert reported success but produced no mzML at {}{}", mzml.display(), msconvert_tail());
-    }
-    refuse_multi_run(&mzcvt_log)?;
+    let tmp = run_msconvert(input, &std::env::temp_dir(), msconvert_path)?;
+    let mzml = &tmp.file;
 
     // msconvert produces SCIEX/Agilent mzML; the (detected, bounded-lossy) TOF-grid is opt-in and
     // OFF by default — pass the caller's mode through (this is the mzML path strategy A applies to).
@@ -2280,6 +2309,12 @@ fn convert_to_mzml(
         .then(|| thermo_isolation::UnstatedWidthGuard::open(&read_path));
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2318,13 +2353,7 @@ fn convert_to_mzml(
     let traces = if input.is_dir() { bruker_traces::read(input) } else { Vec::new() };
     write_source_chromatograms_mzml(&mut w, source_chroms.into_iter().chain(traces.into_iter().map(|t| t.chromatogram)))?;
 
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// The mzPeak-INPUT filter path with an mzML output. Reads the `.mzpeak` with the sync `MzPeakReader`
@@ -2389,6 +2418,12 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     };
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2426,13 +2461,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         .collect();
     write_source_chromatograms_mzml(&mut w, chroms.into_iter())?;
 
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// Cut a chromatogram to the `--rt` window `[lo, hi]` (minutes) as the `.mzpeak` filter lane cuts
@@ -2483,6 +2512,12 @@ fn write_native_mzml(
         bail!("no spectra in {}", input.display());
     }
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2501,13 +2536,7 @@ fn write_native_mzml(
     if input.is_dir() {
         write_source_chromatograms_mzml(&mut w, bruker_traces::read(input).into_iter().map(|t| t.chromatogram))?;
     }
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// Write an Agilent **profile** `.d` (`AcqData/MSProfile.bin`) to mzML on any platform, using the
@@ -2523,6 +2552,12 @@ fn write_agilent_profile_mzml(
 ) -> Result<()> {
     use mzdata::prelude::SpectrumWriter;
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
+    // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
+    // `filter_mzpeak_to_mzml`, `write_native_mzml`, `write_agilent_profile_mzml`. They are NOT one
+    // helper on purpose: the four differ in whether they copy the reader's metadata, whether they
+    // open the spectrumList here, and whether the count is exact or an upper bound, so a shared
+    // prologue would take more parameters than the copies have lines. The EPILOGUE is shared
+    // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
@@ -2592,13 +2627,7 @@ fn write_agilent_profile_mzml(
     if out_index == 0 {
         bail!("no profile spectra in {}", input.display());
     }
-    SpectrumWriter::close(&mut w)
-        .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
-    // The gzip trailer is written when the encoder drops: close the sink BEFORE the rename.
-    drop(w);
-    tmp_guard.finish(output)?;
-    log::info!("wrote {}", output.display());
-    Ok(())
+    finish_mzml(w, tmp_guard, output)
 }
 
 /// A chromatogram type as the PSI-MS cvParam mzML states it with; `None` for an unknown type.
@@ -2737,62 +2766,12 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
 /// `output.exists()` as the success check, so under `--force` a previous run's file passed for this
 /// run's — which real msconvert produces for `-o x.mzML.gz`, a name it writes under another one.
 fn msconvert_to_mzml(input: &Path, output: &Path, msconvert_path: Option<&Path>) -> Result<()> {
-    let exe: std::ffi::OsString = msconvert_path
-        .map(|p| p.as_os_str().to_os_string())
-        .or_else(|| std::env::var_os("MSCONVERT_PATH"))
-        .unwrap_or_else(|| "msconvert".into());
+    // Beside the OUTPUT, so the rename into place cannot cross a volume.
     let outdir = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let tmp = msconvert_dir(outdir)?;
-    // Capture msconvert's stdout+stderr so a failure carries its real message (unknown-instrument /
-    // unsupported-format / missing-sidecar) instead of a bare exit code — same as the mzPeak
-    // `convert_via_msconvert` path (commit 57262aa).
-    let log_path = tmp.dir.join("msconvert.log");
-    let mut cmd = Command::new(&exe);
-    cmd.arg(input)
-        .arg("--mzML")
-        .arg("--ignoreUnknownInstrumentError")
-        .arg("--outdir")
-        .arg(&tmp.dir)
-        .arg("--outfile")
-        .arg("via_msconvert.mzML");
-    msconvert_sample_arg(&mut cmd, input);
-    if let Ok(f) = fs::File::create(&log_path) {
-        if let Ok(f2) = f.try_clone() {
-            cmd.stdout(std::process::Stdio::from(f)).stderr(std::process::Stdio::from(f2));
-        }
-    }
-    let status = cmd.status().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow!(
-                "msconvert not found ({}); install ProteoWizard or set --msconvert-path / \
-                 $MSCONVERT_PATH",
-                exe.to_string_lossy()
-            )
-        } else {
-            anyhow!("running msconvert: {e}")
-        }
-    })?;
-    let tail = || -> String {
-        fs::read_to_string(&log_path)
-            .ok()
-            .map(|s| {
-                let lines: Vec<&str> = s.lines().collect();
-                lines[lines.len().saturating_sub(15)..].join("\n")
-            })
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| format!("\n--- msconvert output (tail) ---\n{s}"))
-            .unwrap_or_default()
-    };
-    if !status.success() {
-        bail!("msconvert failed (exit {:?}){}", status.code(), tail());
-    }
-    if !tmp.file.exists() {
-        bail!("msconvert reported success but produced no mzML at {}{}", tmp.file.display(), tail());
-    }
-    refuse_multi_run(&log_path)?;
+    let tmp = run_msconvert(input, outdir, msconvert_path)?;
     // msconvert's own `--gzip` would pick the file name again; compress what it wrote instead.
     let written = if has_gz_suffix(output) {
         let gz = tmp.dir.join("via_msconvert.mzML.gz");
@@ -2957,12 +2936,13 @@ fn convert_file_tof_grid(
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
-    let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
-        .into_iter()
+    // `tof_calibration` first, as this lane has written it since 0.9.11.
+    let index_blocks: Vec<(String, serde_json::Value)> = std::iter::once(tof_grid_calibration_block(&grid))
+        .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&applied)))
         .collect();
-    finish_tof_grid_archive(writer, tmp_guard, output, input, &grid, vendor, images, sdrf, &index_blocks)
+    finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
 }
 
 /// The integer flight-time axis column of every TOF-grid lane: `tof_index` (Int32) carrying the
@@ -2982,9 +2962,18 @@ fn convert_file_tof_grid(
 /// Until 0.10.1 gridded spectra were forced to Centroid to reach the only facet that knew the axis,
 /// which labelled every gridded profile a centroid spectrum in `spectra_metadata`.
 fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
+    tof_axis_field("tof_index", run_wide, per_spectrum)
+}
+
+/// The integer flight-time axis column itself, for both names it goes by: `tof_index` on the
+/// sqrt-grid lanes ([`tof_index_field`]) and `tof` on ims-compact, whose index block likewise says
+/// `"lossless": "tof"`. The two names are a published format difference and stay; the field around
+/// them — Int32, the `SqrtMzFromTof` transform CURIE, `mzpeak:transform_params` = "c0,c1" and the
+/// per-spectrum key — is one definition, so a third key added for one lane cannot miss the other.
+fn tof_axis_field(axis: &str, run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
     let base = BufferName::new(
         BufferContext::Spectrum,
-        ArrayType::nonstandard("tof_index"),
+        ArrayType::nonstandard(axis),
         BinaryDataArrayType::Int32,
     )
     .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
@@ -3013,59 +3002,73 @@ fn tof_index_peak_schema(tof_field: std::sync::Arc<arrow::datatypes::Field>) -> 
         .add_field(INTENSITY_ARRAY.to_field())
 }
 
-/// Finalize a TOF-grid archive: write the `tof_calibration` index block (so readers recover
-/// `m/z = (c0 + c1·tof_index)²`) plus any extra `index_blocks`, embed vendor members, optical
-/// images and the SDRF exactly as `finish_with_vendor_and_aux` does, finish the ZIP, and rename the
-/// temp into place. Shared by the mzML and native-vendor TOF-grid paths. (Until 0.9.13 this
-/// finisher took no images/SDRF, so `--tof-grid on --sdrf s.tsv` wrote an archive whose only
-/// non-Parquet member was the index, while the same command without `--tof-grid` embedded the SDRF.)
-#[allow(clippy::too_many_arguments)]
-fn finish_tof_grid_archive(
-    writer: MzPeakWriterType<fs::File>,
-    tmp_guard: TmpGuard,
-    output: &Path,
-    input: &Path,
-    grid: &tof_grid::TofGrid,
-    vendor: Option<&vendor::VendorPolicy>,
-    images: &[PathBuf],
-    sdrf: Option<&Path>,
-    index_blocks: &[(String, serde_json::Value)],
-) -> Result<()> {
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    // TWO DIFFERENT CLAIMS, one key each. `lossless` is the SPEC's key and its value is a COLUMN
-    // NAME — "the exactly-preserved stored column" (mzPeak-specification schema/mzpeak_index.json).
-    // `tof_index` is exactly that: an integer we store and read back bit-for-bit. What is NOT exact
-    // is the m/z you RECONSTRUCT from it, because the run-wide grid accepts a point landing within
-    // `tof_grid::ppm_tol()` of the source (an exact-fit-or-nothing rule would refuse almost every
-    // real spectrum). So `mz_reconstruction` states that separately, with the bound.
-    //
-    // Do not "fix" this by renaming `lossless`: it was read once as a fidelity claim, judged
-    // self-contradictory next to a 4.99 ppm bound, and renamed — which broke nothing at runtime but
-    // diverged from the spec and from the 11 published archives that carry it. The per-spectrum
-    // summaries describe the RECONSTRUCTED coordinates, so metadata and data agree inside the
-    // archive; it is the relation to the SOURCE that is bounded. (Intensity is stored verbatim.)
-    let cal = serde_json::json!({
-        "codec": "tof-grid",
-        "model": "sciex_sqrt",
-        "lossless": "tof_index",
-        "mz_reconstruction": "bounded-lossy",
-        "roundtrip_tolerance_ppm": tof_grid::ppm_tol(),
-        "mz_from_tof_index": "(c0 + c1*tof_index)^2",
-        "c0": grid.c0,
-        "c1": grid.c1,
-    });
-    zip.add_index_metadata("tof_calibration", &cal)
-        .context("writing tof_calibration index")?;
-    for (key, block) in index_blocks {
-        zip.add_index_metadata(key, block)
-            .with_context(|| format!("writing {key} index block"))?;
+/// What a `codec: "tof-grid"` block claims about the m/z a reader REBUILDS from the stored integer
+/// axis — and, for the two inexact claims, the bound that claim is worth nothing without.
+///
+/// The bound lives inside the variant on purpose. Through 0.9.13 the Shimadzu profile lane's block
+/// carried a `max_error_da` its fit never enforced, and for one release it carried neither
+/// `lossless` nor `mz_reconstruction` at all while sharing its `model` string with the per-spectrum
+/// SCIEX lane — so a reader keying off the model got one answer there and null here. A test counting
+/// strings caught that after the fact; this cannot be written down wrong in the first place.
+#[derive(Clone, Copy)]
+enum MzReconstruction {
+    /// The vendor's OWN bin ordinal, re-evaluated through the vendor's OWN calibration: exact by
+    /// construction rather than by measurement (the `--agilent-grid` lane).
+    Exact,
+    /// A fit accepted only while every point rebuilds within this many ppm (both SCIEX lanes).
+    BoundedLossyPpm(f64),
+    /// Within the vendor's own rounding of the m/z it handed over, in Da — the fit's acceptance gate
+    /// itself, so the bound and the check cannot diverge (the Shimadzu profile grid).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WithinVendorRoundingDa(f64),
+}
+
+/// The keys EVERY `codec: "tof-grid"` block carries: which column is stored exactly, and whether the
+/// m/z rebuilt from it is. One builder for all four lanes so a reader answers both questions from one
+/// place regardless of model, and a fifth lane cannot ship a block that answers neither. Lanes extend
+/// the returned map with their own keys — the reconstruction formula, the per-spectrum columns, the
+/// vendor's calibration table.
+///
+/// `lossless` is the SPEC's key and its value is a COLUMN NAME — "the exactly-preserved stored
+/// column". Do not "fix" it by renaming: it was once read as a fidelity claim, judged
+/// self-contradictory beside a ppm bound, and renamed to a synonym — which broke nothing at runtime
+/// but diverged from the spec and from the 11 published archives carrying it (the synonym is banned
+/// by name in tests/contract_strings.rs, so this comment cannot spell it). The genuinely new
+/// information, whether the m/z you REBUILD is exact, is `mz_reconstruction` beside it.
+fn tof_grid_block(model: &str, reconstruction: MzReconstruction) -> serde_json::Map<String, serde_json::Value> {
+    let mut block = serde_json::Map::new();
+    block.insert("codec".to_string(), serde_json::json!("tof-grid"));
+    block.insert("model".to_string(), serde_json::json!(model));
+    block.insert("lossless".to_string(), serde_json::json!("tof_index"));
+    match reconstruction {
+        MzReconstruction::Exact => {
+            block.insert("mz_reconstruction".to_string(), serde_json::json!("exact"));
+        }
+        MzReconstruction::BoundedLossyPpm(ppm) => {
+            block.insert("mz_reconstruction".to_string(), serde_json::json!("bounded-lossy"));
+            block.insert("roundtrip_tolerance_ppm".to_string(), serde_json::json!(ppm));
+        }
+        MzReconstruction::WithinVendorRoundingDa(da) => {
+            block.insert("mz_reconstruction".to_string(), serde_json::json!("within-vendor-rounding"));
+            block.insert("max_error_da".to_string(), serde_json::json!(da));
+        }
     }
-    embed_vendor_members(&mut zip, input, vendor)?;
-    embed_aux::embed_into_archive(&mut zip, input, images, sdrf)
-        .context("embedding optical images / SDRF")?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    block
+}
+
+/// The `tof_calibration` block of the run-wide sqrt grid (`--tof-grid`, and the native SCIEX lane's
+/// run-wide fit): how a reader recovers `m/z = (c0 + c1·tof_index)²` from the stored integer axis.
+fn tof_grid_calibration_block(grid: &tof_grid::TofGrid) -> (String, serde_json::Value) {
+    // The run-wide grid accepts a point landing within `tof_grid::ppm_tol()` of the source (an
+    // exact-fit-or-nothing rule would refuse almost every real spectrum), so the axis is stored
+    // exactly and the m/z rebuilt from it is bounded. The per-spectrum summaries describe the
+    // RECONSTRUCTED coordinates, so metadata and data agree inside the archive; it is the relation
+    // to the SOURCE that is bounded. (Intensity is stored verbatim.)
+    let mut cal = tof_grid_block("sciex_sqrt", MzReconstruction::BoundedLossyPpm(tof_grid::ppm_tol()));
+    cal.insert("mz_from_tof_index".to_string(), serde_json::json!("(c0 + c1*tof_index)^2"));
+    cal.insert("c0".to_string(), serde_json::json!(grid.c0));
+    cal.insert("c1".to_string(), serde_json::json!(grid.c1));
+    ("tof_calibration".to_string(), cal.into())
 }
 
 /// Per-spectrum routing decision for the TOF-grid path. Neither variant changes the spectrum's
@@ -3586,39 +3589,6 @@ fn convert_agilent_grid(
     let acquisition_block = fixup_run_metadata(&mut writer, input);
     let mut applied = base_transformations(&writer);
 
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    if let Some((key, block)) = acquisition_block {
-        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
-    }
-    // `lossless` (the exactly-stored column) and `mz_reconstruction` (whether m/z is quantized) are
-    // stated by EVERY `codec: "tof-grid"` block, so a reader answers both questions from one place
-    // regardless of model. This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal
-    // and a conformant reader re-evaluates the vendor's OWN calibration (`calibrations` below), so
-    // reconstruction is exact by construction rather than by measurement — note `max_roundtrip_ppm`
-    // here compares two evaluations of the same formula and is therefore necessarily ~0, a
-    // consistency check and not evidence of anything.
-    let cal = serde_json::json!({
-        "codec": "tof-grid",
-        "model": "agilent_sqrt_poly",
-        "lossless": "tof_index",
-        "mz_reconstruction": "exact",
-        // Per-spectrum (tof_c0, tof_c1) + per-spectrum tof_calibration_id select a row in
-        // `calibrations`; reconstruction: t = base + (tof_c0 + tof_c1*tof_index)/coeff;
-        // m/z = (coeff*(t-base))^2 - poly(clip(t,left,right)), poly orders set by use_flags.
-        "tof_to_mz": "t = base + (tof_c0 + tof_c1*tof_index)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))",
-        "per_spectrum_columns": ["tof_c0", "tof_c1", "tof_calibration_id"],
-        "calibrations": calibrations,
-        "max_roundtrip_ppm": max_ppm,
-    });
-    zip.add_index_metadata("tof_calibration", &cal)
-        .context("writing tof_calibration index")?;
-    // A capped run stops early on request. An uncapped one whose MSProfile.bin ended before its scan
-    // records is partial too, and says so offline instead of only in the log.
-    if let Some((key, block)) =
-        partial_marker(input, cap, n).or_else(|| agilent_truncation_marker(cap, reader.skipped(), reader.len(), n))
-    {
-        zip.add_index_metadata(&key, &block).context("writing partial index block")?;
-    }
     // The reader stores a sparse point list (zero-intensity samples of the dense vendor vector left
     // out, `agilent_profile.rs`) and counts integer intensities into Float32: both declared when they
     // happened.
@@ -3626,12 +3596,33 @@ fn convert_agilent_grid(
         declare(&mut applied, entry);
     }
     applied.extend(chromatogram_transforms);
-    let (key, block) = transformations_block(&applied);
-    zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    embed_vendor_members(&mut zip, input, vendor)?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    // This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal and a conformant reader
+    // re-evaluates the vendor's OWN calibration (`calibrations` below), so reconstruction is exact by
+    // construction rather than by measurement — note `max_roundtrip_ppm` here compares two
+    // evaluations of the same formula and is therefore necessarily ~0, a consistency check and not
+    // evidence of anything.
+    let mut cal = tof_grid_block("agilent_sqrt_poly", MzReconstruction::Exact);
+    // Per-spectrum (tof_c0, tof_c1) + per-spectrum tof_calibration_id select a row in
+    // `calibrations`; reconstruction: t = base + (tof_c0 + tof_c1*tof_index)/coeff;
+    // m/z = (coeff*(t-base))^2 - poly(clip(t,left,right)), poly orders set by use_flags.
+    cal.insert(
+        "tof_to_mz".to_string(),
+        serde_json::json!("t = base + (tof_c0 + tof_c1*tof_index)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))"),
+    );
+    cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1", "tof_calibration_id"]));
+    cal.insert("calibrations".to_string(), calibrations);
+    cal.insert("max_roundtrip_ppm".to_string(), serde_json::json!(max_ppm));
+    let cal = serde_json::Value::from(cal);
+    // A capped run stops early on request. An uncapped one whose MSProfile.bin ended before its scan
+    // records is partial too, and says so offline instead of only in the log.
+    let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
+        .into_iter()
+        .chain(std::iter::once(("tof_calibration".to_string(), cal)))
+        .chain(partial_marker(input, cap, n).or_else(|| agilent_truncation_marker(cap, reader.skipped(), reader.len(), n)))
+        .chain(std::iter::once(transformations_block(&applied)))
+        .collect();
+    // No aux: this lane has no `--image`/`--sdrf` parameters (`run` refuses both here).
+    finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
 }
 
 /// Integer counts as the Float32 intensity column stores them, counting the values it cannot hold
@@ -4232,9 +4223,7 @@ fn convert_file(
             applied
         })))
         .collect();
-    finish_with_vendor_and_aux(writer, input, vendor, images, sdrf, &index_blocks)?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
 }
 
 /// RAII cleanup for the sanitized copy [`sanitize_param_groups`] may write (an mzML with empty
@@ -4990,31 +4979,18 @@ fn ims_chunked_peak_schema(
     let strategy = ChunkingStrategy::Delta { chunk_size: width_th };
 
     // Synthetic sample: two points far enough apart to land in different m/z bins (=> >=1 chunk).
-    let mut arrays = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(&[100_000i32, 300_000i32]).expect("sample tof");
-    arrays.add(tof_da);
-    let mut int_da = if int_intensity {
-        let mut da =
-            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
-        da.update_buffer(&[1i32, 1i32]).expect("sample intensity");
-        da
-    } else {
-        let mut da =
-            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        da.update_buffer(&[1.0f32, 1.0f32]).expect("sample intensity");
-        da
-    };
-    int_da.unit = Unit::DetectorCounts;
-    arrays.add(int_da);
-    let mut mob_da = DataArray::wrap(
-        &ArrayType::MeanInverseReducedIonMobilityArray,
-        BinaryDataArrayType::Float64,
-        Vec::new(),
-    );
-    mob_da.update_buffer(&[1.0f64, 1.0f64]).expect("sample mobility");
-    arrays.add(mob_da);
+    // Built through the SAME constructor as a real ims-compact spectrum, so the write-time schema
+    // cannot drift from the runtime chunk struct.
+    let arrays = bruker_native::ims_compact_arrays(
+        &[100_000i32, 300_000i32],
+        if int_intensity {
+            bruker_native::ImsIntensity::Counts(&[1i32, 1i32])
+        } else {
+            bruker_native::ImsIntensity::Float(&[1.0f32, 1.0f32])
+        },
+        &[1.0f64, 1.0f64],
+    )
+    .expect("materialize the ims-chunked sample arrays");
 
     // Register the TOF→m/z reconstruction on the chunk axis, exactly as the archive path does for
     // `point.tof`. Without it the chunked array index carries `transform: null` on every entry and
@@ -5115,26 +5091,9 @@ where
     // (SqrtMzFromTof) rides via the BufferName, and the [a, b] coefficients via the field metadata
     // (`mzpeak:transform_params`), so a conformant reader recovers m/z = (a + b·tof)² generically
     // from the column metadata — not only from the index `ims_calibration` block (still written).
-    let tof_field = {
-        let base = BufferName::new(
-            BufferContext::Spectrum,
-            ArrayType::nonstandard("tof"),
-            BinaryDataArrayType::Int32,
-        )
-        .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
-        .to_field();
-        let mut md = base.metadata().clone();
-        md.insert(
-            "mzpeak:transform_params".to_string(),
-            format!("{},{}", model_a, model_b),
-        );
-        // Exact per-frame coefficients override the run-wide chord in the reader (the same
-        // per-spectrum contract as the sqrt-grid lanes; `reconstruct_per_spectrum_grid_mz`).
-        if exact_per_spectrum.is_some() {
-            md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
-        }
-        std::sync::Arc::new((*base).clone().with_metadata(md))
-    };
+    // Exact per-frame coefficients override the run-wide chord in the reader (the same per-spectrum
+    // contract as the sqrt-grid lanes; `reconstruct_per_spectrum_grid_mz`).
+    let tof_field = tof_axis_field("tof", (model_a, model_b), exact_per_spectrum.is_some());
     let mob_field = BufferName::new(
         BufferContext::Spectrum,
         ArrayType::MeanInverseReducedIonMobilityArray,
@@ -5414,37 +5373,30 @@ where
         declare(&mut applied, "sort-by-mz");
     }
     applied.extend(chromatogram_transforms);
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    zip.add_index_metadata("ims_calibration", &cal)
-        .context("writing ims_calibration index")?;
-    if let Some((key, block)) = acquisition_block {
-        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
-    }
-    let (key, block) = conversion_route_block(
-        "ims-compact",
-        if chord_source == "sdk_tims_index_to_mz" { "timsdata" } else { "timsrust" },
-        None,
-    );
-    zip.add_index_metadata(&key, &block).context("writing conversion_route index block")?;
-    let (key, block) = transformations_block(&applied);
-    zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    if let Some((key, block)) = partial_marker(input, max_spectra(), n_frames) {
-        zip.add_index_metadata(&key, &block).context("writing partial index block")?;
-    }
     // The vendor's exact calibration, verbatim, so the archive is self-sufficient without the
     // embedded `vendor/analysis.tdf.gz` (`--no-vendor`). Best-effort: a TDF without the table is
     // still a valid ims-compact archive on the two-point model above.
     let tdf = if input.is_dir() { input.join("analysis.tdf") } else { input.to_path_buf() };
-    match bruker_native::vendor_mz_calibration(&tdf) {
-        Ok(v) => zip
-            .add_index_metadata("vendor_mz_calibration", &v)
-            .context("writing vendor_mz_calibration index")?,
-        Err(e) => log::warn!("vendor MzCalibration unavailable ({e}); vendor_mz_calibration index block omitted"),
-    }
-    embed_vendor_members(&mut zip, input, vendor)?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    let vendor_calibration = match bruker_native::vendor_mz_calibration(&tdf) {
+        Ok(v) => Some(("vendor_mz_calibration".to_string(), v)),
+        Err(e) => {
+            log::warn!("vendor MzCalibration unavailable ({e}); vendor_mz_calibration index block omitted");
+            None
+        }
+    };
+    let index_blocks: Vec<(String, serde_json::Value)> = std::iter::once(("ims_calibration".to_string(), cal))
+        .chain(acquisition_block)
+        .chain(std::iter::once(conversion_route_block(
+            "ims-compact",
+            if chord_source == "sdk_tims_index_to_mz" { "timsdata" } else { "timsrust" },
+            None,
+        )))
+        .chain(std::iter::once(transformations_block(&applied)))
+        .chain(partial_marker(input, max_spectra(), n_frames))
+        .chain(vendor_calibration)
+        .collect();
+    // No aux: `--image`/`--sdrf` are refused on the ims-compact lane (`run`).
+    finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
 }
 
 /// Native (timsrust) ims-compact: pure-Rust decoder, default for Bruker TDF.
@@ -5604,17 +5556,39 @@ fn declare(applied: &mut Vec<String>, entry: impl Into<String>) {
     }
 }
 
-/// Flush Parquet, then stream-embed vendor side-files + vendor metadata into the archive index,
-/// optical images (`--image` + sibling discovery) and an SDRF (`--sdrf`) BEFORE `zip.finish()`,
-/// adding the `metadata.imaging` / `metadata.study` / `metadata.sample_metadata` index blocks.
-/// `index_blocks` carries any extra reader-side calibration the lane produced (today: the
-/// `mz_calibration` block of the fixed-point m/z lattice); pass `&[]` when there is none.
-fn finish_with_vendor_and_aux(
+/// What `--image` and `--sdrf` gave the lane, for the lanes that accept them.
+///
+/// `None` in [`finish_archive`] means "this lane embeds no aux", which is NOT the same as an empty
+/// `Some`: [`embed_aux::embed_into_archive`] also auto-discovers an `<input-stem>-opticalimage.*`
+/// sibling, so an empty `Some` on the ims-compact, `--agilent-grid`, native-vendor or native-SCIEX
+/// lanes — all of which REFUSE both flags (`run`) — would start embedding files they never embedded.
+struct AuxInputs<'a> {
+    images: &'a [PathBuf],
+    sdrf: Option<&'a Path>,
+}
+
+/// **The one archive epilogue.** Every lane that writes an `.mzpeak` ends here: flush Parquet, write
+/// the lane's index blocks IN ORDER, stream-embed vendor side-files + vendor metadata, then optical
+/// images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding the `metadata.imaging` /
+/// `metadata.study` / `metadata.sample_metadata` blocks — close the ZIP, and only then rename the
+/// temporary onto `output`.
+///
+/// Through 0.11.5 there were six copies of this sequence (M17), and they had drifted: one lane dropped
+/// the `acquisition_time` block, another applied a different vendor-embed rule, and `--sdrf` on
+/// `--tof-grid` silently embedded nothing until 0.9.13. The lane-specific part is now exactly the
+/// three arguments that differ — the ordered `index_blocks`, whether a vendor policy applies, and
+/// whether the lane takes aux — so a new lane cannot forget a step, only choose one.
+///
+/// `index_blocks` is written in the given order, so a lane that wants its calibration block first
+/// puts it first. The rename is last: a failure anywhere above leaves `output` untouched and the
+/// `TmpGuard` removes the partial file.
+fn finish_archive(
     writer: MzPeakWriterType<fs::File>,
+    tmp_guard: TmpGuard,
+    output: &Path,
     input: &Path,
     vendor: Option<&vendor::VendorPolicy>,
-    images: &[PathBuf],
-    sdrf: Option<&Path>,
+    aux: Option<AuxInputs<'_>>,
     index_blocks: &[(String, serde_json::Value)],
 ) -> Result<()> {
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
@@ -5623,9 +5597,12 @@ fn finish_with_vendor_and_aux(
             .with_context(|| format!("writing {key} index block"))?;
     }
     embed_vendor_members(&mut zip, input, vendor)?;
-    embed_aux::embed_into_archive(&mut zip, input, images, sdrf)
-        .context("embedding optical images / SDRF")?;
+    if let Some(aux) = aux {
+        embed_aux::embed_into_archive(&mut zip, input, aux.images, aux.sdrf)
+            .context("embedding optical images / SDRF")?;
+    }
     zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
+    tmp_guard.finish(output)?;
     Ok(())
 }
 
@@ -5867,33 +5844,24 @@ fn convert_shimadzu(
         // the scan-window bounds is trimmed before the fit and never reaches the archive. Each
         // gridded spectrum reports whether it had one, and `convert_vendor_reader` declares
         // `shimadzu:span-trim` from that count.
-        hints.index_blocks.push((
-            "tof_calibration".to_string(),
-            serde_json::json!({
-                "codec": "tof-grid",
-                // The model string names the FORMULA family the viewer reconstructs with
-                // (per-spectrum sqrt); the instrument is a Shimadzu Q-TOF, recorded beside it.
-                "model": "sciex_sqrt_per_spectrum",
-                "vendor": "shimadzu",
-                // Same key set as the other three tof-grid blocks. This one shipped with NEITHER
-                // key for one release: it shares its `model` string with the per-spectrum SCIEX
-                // lane, so a reader keying off the model got one answer there and null here.
-                "lossless": "tof_index",
-                // Within vendor rounding, NOT bit-exact: the axis is the vendor's own sqrt lattice
-                // and the fit is accepted only when it reproduces every m/z to within
-                // `shimadzu_grid::TOL` (1e-9 Da: the vendor's ±5e-10 rounding plus f64 slack), so
-                // that gate IS the bound. Through 0.11.5 this said 5e-10, which the gate never
-                // enforced: refitting HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points
-                // between 5e-10 and 5.47e-10 Da off. Spectra that do not fit are not gridded at
-                // all — they keep f64 m/z in the data facet.
-                "mz_reconstruction": "within-vendor-rounding",
-                "max_error_da": shimadzu_grid::TOL,
-                "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
-                "per_spectrum_columns": ["tof_c0", "tof_c1"],
-                "run_wide_c1": step,
-                "vendor_mz_rounding": 1e-9,
-            }),
-        ));
+        // The model string names the FORMULA family the viewer reconstructs with (per-spectrum
+        // sqrt); the instrument is a Shimadzu Q-TOF, recorded beside it. Within vendor rounding,
+        // NOT bit-exact: the axis is the vendor's own sqrt lattice and the fit is accepted only
+        // when it reproduces every m/z to within `shimadzu_grid::TOL` (1e-9 Da: the vendor's
+        // ±5e-10 rounding plus f64 slack), so that gate IS the bound. Through 0.11.5 this said
+        // 5e-10, which the gate never enforced: refitting HEK_PosOAD1's nine f64 spectra puts 169
+        // of 32,434 points between 5e-10 and 5.47e-10 Da off. Spectra that do not fit are not
+        // gridded at all — they keep f64 m/z in the data facet.
+        let mut cal = tof_grid_block(
+            "sciex_sqrt_per_spectrum",
+            MzReconstruction::WithinVendorRoundingDa(shimadzu_grid::TOL),
+        );
+        cal.insert("vendor".to_string(), serde_json::json!("shimadzu"));
+        cal.insert("tof_to_mz".to_string(), serde_json::json!("mz = (tof_c0 + tof_c1*tof_index)^2"));
+        cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1"]));
+        cal.insert("run_wide_c1".to_string(), serde_json::json!(step));
+        cal.insert("vendor_mz_rounding".to_string(), serde_json::json!(1e-9));
+        hints.index_blocks.push(("tof_calibration".to_string(), cal.into()));
         log::info!(
             "Shimadzu profile axis is an exact sqrt grid (run-wide c1 = {step:.15}); storing tof_index + per-spectrum tof_c0/tof_c1"
         );
@@ -6408,44 +6376,33 @@ fn convert_sciex_grid(
     let acquisition_block = acquisition_block.or(fixup_block);
     let mut applied = base_transformations(&writer);
 
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    if let Some((key, block)) = acquisition_block {
-        zip.add_index_metadata(&key, &block).context("writing acquisition_time index block")?;
-    }
     // `lossless` names the exactly-stored column, `mz_reconstruction` rates the m/z you rebuild
-    // from it — see `finish_tof_grid_archive`. `max_roundtrip_ppm` is the measured worst case over
+    // from it — see `tof_grid_calibration_block`. `max_roundtrip_ppm` is the measured worst case over
     // this run (it has run at ~5 ppm on the published MSV000095995 archive), and
     // `roundtrip_tolerance_ppm` is the bound the per-spectrum fit was accepted under.
-    let cal = serde_json::json!({
-        "codec": "tof-grid",
-        "model": "sciex_sqrt_per_spectrum",
-        "lossless": "tof_index",
-        "mz_reconstruction": "bounded-lossy",
-        "roundtrip_tolerance_ppm": tof_grid::ppm_tol(),
-        "tof_to_mz": "mz = (tof_c0 + tof_c1*tof_index)^2",
-        "per_spectrum_columns": ["tof_c0", "tof_c1"],
-        "max_roundtrip_ppm": max_ppm,
-    });
-    // No block under `off`: nothing was transformed, and a `codec: tof-grid` block on an archive
-    // whose every spectrum sits in the f64 data facet would tell readers to look for a facet that
-    // holds nothing.
-    if mode != TofGridMode::Off {
-        zip.add_index_metadata("tof_calibration", &cal)
-            .context("writing tof_calibration index")?;
-    }
+    let mut cal = tof_grid_block("sciex_sqrt_per_spectrum", MzReconstruction::BoundedLossyPpm(tof_grid::ppm_tol()));
+    cal.insert("tof_to_mz".to_string(), serde_json::json!("mz = (tof_c0 + tof_c1*tof_index)^2"));
+    cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1"]));
+    cal.insert("max_roundtrip_ppm".to_string(), serde_json::json!(max_ppm));
+    let cal = serde_json::Value::from(cal);
     applied.extend(chromatogram_transforms);
     if n_grid > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     applied.extend(value_changes.transformations());
-    let (key, block) = transformations_block(&applied);
-    zip.add_index_metadata(&key, &block).context("writing transformations index block")?;
-    if let Some((key, block)) = partial_marker(input, max_spectra(), len) {
-        zip.add_index_metadata(&key, &block).context("writing partial index block")?;
-    }
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
-    Ok(())
+    // No block under `off`: nothing was transformed, and a `codec: tof-grid` block on an archive
+    // whose every spectrum sits in the f64 data facet would tell readers to look for a facet that
+    // holds nothing.
+    let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
+        .into_iter()
+        .chain((mode != TofGridMode::Off).then(|| ("tof_calibration".to_string(), cal)))
+        .chain(std::iter::once(transformations_block(&applied)))
+        .chain(partial_marker(input, max_spectra(), len))
+        .collect();
+    // A `.wiff` is a FILE: `vendor::embed_into_archive` walks a vendor DIRECTORY, so this lane has
+    // no side-files to embed and passes no policy (hence the `_vendor` parameter). No aux either —
+    // `--image`/`--sdrf` are refused on the native lanes (`run`).
+    finish_archive(writer, tmp_guard, output, input, None, None, &index_blocks)
 }
 
 /// Build a gridded SCIEX spectrum: `tof_index` (Int32) + intensity (f32) + per-spectrum tof_c0/tof_c1.
@@ -6938,19 +6895,10 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         declare(&mut applied, "shimadzu:span-trim");
     }
     applied.extend(chromatogram_transforms);
-    let transformations = transformations_block(&applied);
-    let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    for (key, block) in index_blocks
-        .iter()
-        .chain(partial_marker(input, max_spectra(), len).iter())
-        .chain(std::iter::once(&transformations))
-    {
-        zip.add_index_metadata(key, block)
-            .with_context(|| format!("writing {key} index block"))?;
-    }
-    embed_vendor_members(&mut zip, input, vendor)?;
-    zip.finish().map_err(|e| anyhow::anyhow!("finalizing archive: {e}"))?;
-    tmp_guard.finish(output)?;
+    index_blocks.extend(partial_marker(input, max_spectra(), len));
+    index_blocks.push(transformations_block(&applied));
+    // No aux: `--image`/`--sdrf` are refused on the native vendor lanes (`run`).
+    finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)?;
     Ok(tally)
 }
 
