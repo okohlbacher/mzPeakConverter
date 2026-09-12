@@ -23,30 +23,29 @@ cask "mzpeak-convert" do
 
   binary "mzpeak-convert"
 
-  # The released binaries are ad-hoc signed, not notarized by Apple. Homebrew marks
-  # every cask download with com.apple.quarantine, and macOS kills a quarantined
-  # binary that carries no Developer ID the moment it is executed ("killed: 9",
-  # measured 2026-09-09 on macOS 26.5). Removing the attribute from the one file
-  # this cask installs is what makes it runnable; the caveats say so out loud.
-  # Delete this stanza once the release workflow signs and notarizes the binaries.
-  postflight_steps do
-    run "/usr/bin/xattr",
-        args:           ["-dr", "com.apple.quarantine", "mzpeak-convert"],
-        chdir:          ".",
-        writable_paths: ["mzpeak-convert"]
-  end
+  # No quarantine stanza since 0.12.2. Through 0.12.1 the binaries were ad-hoc signed,
+  # and macOS killed a quarantined binary carrying no Developer ID the moment it was
+  # executed ("killed: 9", measured 2026-09-09 on macOS 26.5) — so this cask stripped
+  # com.apple.quarantine from the one file it installs. They are now signed with a
+  # Developer ID certificate and notarized, which is what that attribute exists to
+  # test, so there is nothing left to strip. release.yml refuses to update this tap
+  # from a release whose macOS binaries are not signed, because that state plus this
+  # file would install a tool macOS kills, with every check green.
 
   caveats do
     <<~EOS
-      mzpeak-convert ships as an ad-hoc signed binary, not notarized by Apple, so
-      this cask removes the download-quarantine attribute from the executable it
-      installs. Without that, macOS kills the tool the first time it runs.
+      mzpeak-convert is signed with a Developer ID certificate and notarized by Apple.
+      A .tar.gz cannot carry a stapled ticket — no archive format can — so the first
+      run after installation checks with Apple over the network; every run after that
+      is offline. On a machine with no network at install time, that first run may
+      pause briefly.
 
       Homebrew checked the downloaded archive against the digest in this cask, which
       is the one published as a .sha256 file beside the archive on the releases page.
       To look at the signature yourself:
 
         codesign -dvv "$(brew --prefix)/bin/mzpeak-convert"
+        spctl -a -vv "$(brew --prefix)/bin/mzpeak-convert"
 
       On macOS this reads mzML, imzML and Bruker .d (TDF/TSF); Thermo .raw needs a
       .NET 8+ runtime as well. The Bruker BAF, Waters, SciEX, Agilent and Shimadzu

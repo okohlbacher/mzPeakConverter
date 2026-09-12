@@ -69,10 +69,11 @@ trust it, and a tap whose repository is not called `homebrew-mzpeak` needs the U
 spelled out. This installs the published binary for the machine's architecture, so no
 Rust toolchain is needed.
 
-The released binaries are ad-hoc signed and not notarized by Apple. Homebrew quarantines
-every cask download and macOS kills a quarantined binary that carries no Developer ID,
-so the cask removes that attribute from the file it installs; its caveats say so. Check
-any archive against the `.sha256` published beside it (`shasum -c`).
+Since 0.12.2 the released macOS binaries are signed with a Developer ID certificate and
+notarized by Apple, so the cask no longer has to strip Homebrew's download quarantine.
+A `.tar.gz` cannot carry a stapled ticket — no archive format can — so the first run
+checks with Apple over the network and every run after that is offline. Check any archive
+against the `.sha256` published beside it (`shasum -c`).
 
 **Linux and Windows, from a release.** Each release publishes Linux x86_64 and aarch64
 archives (`.tar.gz`, glibc 2.28 or newer, so RHEL/Rocky 8 and 9 clusters included) and Windows

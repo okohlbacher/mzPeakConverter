@@ -152,6 +152,10 @@ jobs:
     needs: ci
     if: ${{ !inputs.only || contains(inputs.only, 'macos') }}
     runs-on: macos-latest
+    outputs:
+      # Both legs set the same value, so which one lands last does not matter. The cask job
+      # refuses to publish without it — see there for why.
+      signed: ${{ steps.sign.outputs.sign }}
     strategy:
       fail-fast: false
       matrix:
@@ -179,6 +183,104 @@ jobs:
           fi
           echo "VERSION=$have" >> "$GITHUB_ENV"
 
+      # ---------------------------------------------------------------------
+      # Developer ID signing and notarization. Optional by construction: with no
+      # MACOS_CERTIFICATE_BASE64 secret every step here is skipped, the binaries
+      # stay ad-hoc signed exactly as they were, and the release still ships — so
+      # a fork, and a pull request from one, still builds the whole matrix.
+      #
+      # The seven secret names are BALL's and FASTag's, not this repo's invention:
+      # one Developer ID Application certificate covers every app on the team and
+      # ~/Documents/Admin/Software Signing pushes the same values to each repo.
+      # Diverging here would mean a second set of names for one identity.
+      #
+      # What it buys: Homebrew marks every cask download with com.apple.quarantine
+      # and macOS kills a quarantined binary carrying no Developer ID the moment it
+      # runs ("killed: 9"). Through 0.12.1 the cask worked around that by stripping
+      # the attribute; a notarized binary needs no such stanza, and since 0.12.2 it
+      # has none — which is why the cask job below refuses to run unsigned.
+      # ---------------------------------------------------------------------
+      - name: Decide whether to sign
+        id: sign
+        # Mapped into env and gated on a step OUTPUT below. `secrets.*` inside an
+        # `if:` is not merely ignored — it makes the whole workflow invalid, and
+        # every push then returns a 0-job startup_failure.
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          NOTARY: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          NOTARY_ID: ${{ secrets.MACOS_APPLE_ID }}
+          NOTARY_TEAM: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CERT" ]; then
+            echo "::notice::no MACOS_CERTIFICATE_BASE64 — macOS binaries stay ad-hoc signed"
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            echo "notarize=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "sign=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$NOTARY" ] && [ -n "$NOTARY_ID" ] && [ -n "$NOTARY_TEAM" ]; then
+            echo "notarize=true" >> "$GITHUB_OUTPUT"
+          else
+            [ -z "$NOTARY" ] || echo "::warning::MACOS_NOTARY_PASSWORD is set but MACOS_APPLE_ID/MACOS_TEAM_ID are not"
+            # Worth saying out loud: Gatekeeper refuses a signed-but-unnotarized
+            # build exactly as it refuses an unsigned one, so this half-state buys
+            # nothing beyond a named author.
+            echo "::warning::signing without notarizing — Gatekeeper still refuses these"
+            echo "notarize=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import the Developer ID certificate
+        if: steps.sign.outputs.sign == 'true'
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # The secret if it is there; otherwise generated, because it protects only
+          # a keychain that lives for one job on a runner that is then destroyed,
+          # and an empty password is worse than a random one.
+          KCPW="${MACOS_KEYCHAIN_PASSWORD:-$(uuidgen)}"
+          echo "::add-mask::$KCPW"
+          # An ephemeral keychain, never the runner's login keychain: that one is
+          # locked, and importing into it waits on a prompt nobody can answer.
+          KC="$RUNNER_TEMP/mzpeak-signing.keychain-db"
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without the partition list codesign blocks on a GUI prompt and the job
+          # sits there producing no output until the timeout.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KCPW" "$KC" > /dev/null
+          security list-keychain -d user -s "$KC" \
+            $(security list-keychains -d user | tr -d '"' | xargs)
+          security default-keychain -d user -s "$KC"
+
+          # Read back what was actually imported and hold the secret to it. A
+          # MACOS_SIGNING_IDENTITY that disagrees with the certificate otherwise
+          # fails later, inside codesign, with a message that names neither.
+          IDENT=$(security find-identity -p codesigning -v "$KC" \
+                    | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)
+          [ -n "$IDENT" ] || {
+            security find-identity -p codesigning -v "$KC"
+            echo "::error::no Developer ID Application identity in the imported certificate"
+            echo "::error::Apple Development and Apple Distribution certificates sit next to it in the portal and cannot sign for distribution outside the App Store"
+            exit 1
+          }
+          if [ -n "$MACOS_SIGNING_IDENTITY" ] && [ "$MACOS_SIGNING_IDENTITY" != "$IDENT" ]; then
+            echo "::error::MACOS_SIGNING_IDENTITY does not match the imported certificate ($IDENT)"
+            exit 1
+          fi
+          echo "MACOS_SIGN_IDENTITY=$IDENT" >> "$GITHUB_ENV"
+          echo "MACOS_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+          echo "signing as: $IDENT"
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -190,13 +292,39 @@ jobs:
           cp "target/${{ matrix.target }}/release/mzpeak-convert" "$stage/"
           strip -x "$stage/mzpeak-convert"
           # strip invalidates the linker's signature, and an arm64 binary must carry one to run at
-          # all — re-sign ad-hoc. Replace with a Developer ID signature plus `xcrun notarytool submit
-          # --wait` once Apple credentials are configured; the cask can then drop its quarantine
-          # stanza. Notarization requires --options runtime, whose library validation would break
-          # the Thermo reader (it dlopens Microsoft's libhostfxr, a different Team ID): sign with an
-          # entitlements plist granting com.apple.security.cs.disable-library-validation, .allow-jit
-          # and .allow-unsigned-executable-memory, or that path dies only on signed builds.
-          codesign --force --sign - "$stage/mzpeak-convert"
+          # all — so a signature here is not cleanup, it is what makes the thing runnable.
+          #
+          # With a Developer ID imported it is also the real one: --options runtime and a timestamp
+          # are both required for notarization.
+          #
+          # The entitlements are what keep the hardened runtime from killing the Thermo reader: it
+          # dlopens Microsoft's libhostfxr, whose Team ID is not ours, and library validation —
+          # which the hardened runtime turns on — refuses to map it. Measured one entitlement at a
+          # time on macOS 26.5 / arm64 / .NET 10 against tests/data/small.RAW (2026-09-12):
+          #
+          #   hardened runtime, no entitlements ......... dlopen refused, different Team IDs
+          #   + disable-library-validation .............. loads, then coreclr_initialize fails
+          #   + disable-library-validation, allow-jit ... works
+          #   all three ................................. works
+          #
+          # So the plist keeps a third, allow-unsigned-executable-memory, that arm64 does not need:
+          # the x86_64 slice is cross-compiled and never executed on this runner, .NET's x64 JIT
+          # does not take the MAP_JIT path allow-jit covers, and guessing wrong there breaks Thermo
+          # for Intel users on signed builds only — the one configuration nothing tests. It concedes
+          # nothing disable-library-validation has not already conceded. Every other lane (mzML,
+          # imzML, Bruker .d) runs hardened with no entitlements at all.
+          #
+          # The plist carries no XML comments, which is why this is here: codesign hands it to AMFI,
+          # whose parser rejects them ("Failed to parse entitlements: AMFIUnserializeXML: syntax
+          # error"), although plutil -lint accepts them happily.
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+            codesign --force --timestamp --options runtime \
+              --entitlements .github/mzpeak-convert.entitlements \
+              --keychain "$MACOS_KEYCHAIN" --sign "$MACOS_SIGN_IDENTITY" "$stage/mzpeak-convert"
+          else
+            codesign --force --sign - "$stage/mzpeak-convert"
+          fi
+          codesign --verify --strict --verbose=2 "$stage/mzpeak-convert"
           cp LICENSE README.md THIRD-PARTY-NOTICES.md "$stage/"
           tarball="mzpeak-convert-$VERSION-${{ matrix.target }}.tar.gz"
           ( cd "$stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "$dist/$tarball" mzpeak-convert LICENSE README.md THIRD-PARTY-NOTICES.md )
@@ -204,6 +332,29 @@ jobs:
           # two-space separator — `shasum -c` rejects anything else.
           ( cd "$dist" && shasum -a 256 "$tarball" > "$tarball.sha256" )
           { echo "### ${{ matrix.target }}"; echo '```'; cat "$dist/$tarball.sha256"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      # notarytool takes a .zip, a .dmg or a .pkg and not a .tar.gz, so the staged tree is zipped for
+      # SUBMISSION only. That is not a workaround: notarization registers the code-directory hash of
+      # each signed binary with Apple, and the ticket then applies to that binary in whatever
+      # container it arrives in — the tarball published below holds the very bytes submitted here.
+      #
+      # What a .tar.gz cannot carry is a STAPLED ticket. No archive format can: stapling writes the
+      # ticket into a bundle or an image, and there is neither here. The consequence is one online
+      # check against Apple the first time a quarantined copy runs, and nothing else.
+      - name: Notarize
+        if: steps.sign.outputs.notarize == 'true'
+        timeout-minutes: 60
+        env:
+          MACOS_APPLE_ID: ${{ secrets.MACOS_APPLE_ID }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "$RUNNER_TEMP/stage" "$RUNNER_TEMP/notarize.zip"
+          # Through .github/notarize.sh, which fetches `notarytool log` when Apple says Invalid —
+          # otherwise a rejection is a submission id and nothing else, and the reason costs another
+          # twenty-minute round trip to find.
+          bash .github/notarize.sh "$RUNNER_TEMP/notarize.zip"
 
       - name: Verify
         run: |
@@ -214,7 +365,21 @@ jobs:
           # build from shipping under the x86_64 name, or back.
           archs="$(lipo -archs "$bin")"
           [ "$archs" = "${{ matrix.arch }}" ] || { echo "::error::$bin holds '$archs', expected ${{ matrix.arch }}"; exit 1; }
-          codesign -dvv "$bin" 2>&1 | grep -E "Signature|flags"
+          # Assert the signature the job intended, not merely that one exists: a Developer ID
+          # certificate present but unused, or a hardened runtime silently missing, would otherwise
+          # surface as a notarization rejection twenty minutes later — or not at all, on a build
+          # where notarization is off.
+          info="$(codesign -dvv --entitlements - "$bin" 2>&1)"
+          printf '%s\n' "$info" | grep -E "Authority|Signature|flags|TeamIdentifier"
+          if [ "${{ steps.sign.outputs.sign }}" = true ]; then
+            grep -q "Authority=Developer ID Application" <<< "$info" \
+              || { echo "::error::$bin is not signed by a Developer ID Application certificate"; exit 1; }
+            grep -Eq "flags=.*runtime" <<< "$info" \
+              || { echo "::error::$bin lacks the hardened runtime, which notarization requires"; exit 1; }
+            # Without this the Thermo lane dies at dlopen on every signed build, and only there.
+            grep -q "com.apple.security.cs.disable-library-validation" <<< "$info" \
+              || { echo "::error::$bin carries no library-validation entitlement — the .NET reader would not load"; exit 1; }
+          fi
           ( cd "$RUNNER_TEMP/dist" && shasum -a 256 -c ./*.sha256 )
           # The licenses travel with the binary: the notices hold the Apache-2.0 text and NOTICE.
           tar -tzf "$RUNNER_TEMP"/dist/*.tar.gz | grep -x THIRD-PARTY-NOTICES.md > /dev/null || { echo "::error::the archive lacks THIRD-PARTY-NOTICES.md"; exit 1; }
@@ -538,6 +703,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
+
+      # The cask no longer strips com.apple.quarantine, because it no longer has to — which means
+      # it now DEPENDS on the binaries being notarized. Signing is optional in the macOS job (a
+      # fork with no certificate still builds), so the one state that must never reach the tap is
+      # a release whose assets are ad-hoc signed described by a cask that assumes they are not:
+      # Homebrew would install them and macOS would kill them on first run, silently, with the
+      # workflow all green. Deleting the certificate secret is the realistic way to get there.
+      - name: The cask promises a notarized binary
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.macos.outputs.signed }}" != true ]; then
+            echo "::error::the macOS binaries of $TAG are ad-hoc signed, and this cask tells Homebrew they are notarized"
+            echo "::error::set MACOS_CERTIFICATE_BASE64 (see .github/workflows/release.yml) and re-run, or restore the cask's quarantine stanza"
+            exit 1
+          fi
 
       # A dispatch that backfills an OLDER tag must not walk the tap backwards.
       - name: Only the newest release owns the tap
