@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.12.1] — 2026-09-12
 
 **Output change, timsTOF only.** Every Bruker TDF archive changes; no other lane does.
 
