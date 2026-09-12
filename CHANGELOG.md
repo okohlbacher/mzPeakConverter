@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.12.2] — 2026-09-12
+
+**Packaging only.** The binaries are unchanged; what changes is who signed them.
+
+### Changed
+
+- **The macOS binaries are signed with a Developer ID certificate and notarized by Apple.**
+  Until now they were ad-hoc signed, which macOS treats as unsigned: a quarantined copy — and
+  Homebrew marks every cask download as quarantined — was killed the moment it ran. The release
+  workflow now signs with `Developer ID Application: Oliver Kohlbacher (9WF4NVY9MY)` under the
+  hardened runtime and submits each build to `notarytool`, failing the release if Apple refuses.
+  Signing is optional by construction: with no certificate secret the binaries stay ad-hoc signed
+  and the release still ships, so a fork still builds the whole matrix.
+  **A `.tar.gz` cannot carry a stapled ticket** — no archive format can, since stapling writes into
+  a bundle or a disk image and there is neither here. The ticket is registered against the binary
+  itself, so the first run of a quarantined copy checks with Apple over the network and every run
+  after that is offline. Nothing else differs.
+  **Why the hardened runtime needed entitlements:** it enforces library validation, and the Thermo
+  reader dlopens Microsoft's `libhostfxr`, whose Team ID is not ours — a hardened build with no
+  entitlements dies at `dlopen` before reading a byte. Measured one entitlement at a time on
+  macOS 26.5 / arm64: `disable-library-validation` alone gets past `dlopen` and then fails in
+  `coreclr_initialize`; adding `allow-jit` works. `.github/mzpeak-convert.entitlements` keeps a
+  third, `allow-unsigned-executable-memory`, for the cross-compiled x86_64 slice, whose JIT path
+  this runner cannot exercise. Every other lane runs hardened with no entitlements at all.
+
 ## [0.12.1] — 2026-09-12
 
 **Output change, timsTOF only.** Every Bruker TDF archive changes; no other lane does.

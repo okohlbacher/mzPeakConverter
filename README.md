@@ -98,10 +98,10 @@ whose repository is not named `homebrew-mzpeak`. You get `mzpeak-convert` for yo
 architecture, Apple silicon or Intel; `brew upgrade --cask okohlbacher/mzpeak/mzpeak-convert`
 follows later releases and `brew uninstall --cask` removes it.
 
-The binaries are ad-hoc signed rather than notarized by Apple, and Homebrew quarantines
-every cask download, which macOS then refuses to execute — so the cask strips that
-attribute from the executable it installs and says so when it does. Each archive is
-published with a `.sha256` sidecar you can check with `shasum -c`.
+The binaries are signed with a Developer ID certificate and notarized by Apple, so Homebrew's
+download quarantine is no longer something the cask has to work around. A `.tar.gz` cannot carry
+a stapled ticket, so the first run checks with Apple over the network and every run after that is
+offline. Each archive is published with a `.sha256` sidecar you can check with `shasum -c`.
 
 **Linux and Windows — release archives.** Every release also publishes a ready-to-run build
 for Linux on x86_64 and aarch64 (glibc 2.28 or newer: RHEL/Rocky/Alma 8 and later, Debian 10+,
