@@ -115,12 +115,12 @@ fn latin1_high_bytes_keep_the_chromatograms_and_decode() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A reader that yields fewer chromatograms than `<chromatogramList count>` declares must say so.
-/// UTF-8 declared (no transcode, so nothing rebuilds the index) with `<indexListOffset>` five bytes
-/// late: the exact stale index the transcode used to leave behind.
+/// A stale `<indexListOffset>` (UTF-8 declared, so no transcode rebuilds the index) made mzdata discard
+/// the whole index and read no chromatogram: the exact stale index the transcode used to leave behind.
+/// The chromatogramList is scanned instead (`recover_chromatogram_index`), and both lanes keep `sic`.
 #[test]
-fn unreadable_chromatograms_are_reported() {
-    let dir = scratch("warn");
+fn a_stale_index_list_offset_is_recovered() {
+    let dir = scratch("stale");
     let src = String::from_utf8(std::fs::read(FIXTURE).unwrap()).unwrap();
     let broken = src
         .replacen(r#"encoding="ISO-8859-1"?>"#, r#"encoding="UTF-8"     ?>"#, 1)
@@ -129,13 +129,6 @@ fn unreadable_chromatograms_are_reported() {
     assert_ne!(broken, src, "fixture declaration or index offset moved");
     let input = dir.join("tiny-staleindex.mzML");
     std::fs::write(&input, broken).unwrap();
-
-    for out in ["out.mzpeak", "out.mzML"] {
-        let log = convert(&input, &dir.join(out));
-        assert!(
-            log.contains("declares 2 chromatograms but only 0"),
-            "{out}: no warning for the unread chromatograms\n{log}"
-        );
-    }
+    assert_sic_survives(&input, &dir);
     let _ = std::fs::remove_dir_all(&dir);
 }

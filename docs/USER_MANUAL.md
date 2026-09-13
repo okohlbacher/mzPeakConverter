@@ -236,6 +236,11 @@ mzpeak-convert run.mzpeak -o slim.mzpeak --drop-aux 'vendor/*.tdf_bin'
 mzpeak-convert run.mzpeak -o annotated.mzpeak --sdrf run.sdrf.tsv
 ```
 
+Wavelength (UV/PDA) spectra have no MS level, so `--ms-level` leaves them out, their facets with
+them, and `--rt` keeps those whose time lies in the window. The archive → mzML export (§4.1) takes the
+same two rules, so filtering into an archive and exporting that writes the spectra a filtered export
+does. The export places them among the mass spectra by retention time.
+
 ### 4.3 Embedding sample metadata and images (`--sdrf`, `--image`)
 
 `--sdrf <file.tsv>` embeds an SDRF verbatim as `sample_metadata/sdrf.tsv` and adds
@@ -1006,4 +1011,4 @@ release archive carries [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 | Agilent `.d`: `output is the AGL1 format of an older AgilentGlueHost.exe` | rebuild `glue/agilent` (`dotnet build -c Release`) so the host and the converter agree |
 | Nothing was written | give `-o/--output`; without it the run only inspects |
 | Output exists error | pass `--force` to overwrite |
-| UV/PDA spectra missing | non-MS spectra are not yet carried (known limitation) |
+| UV/PDA spectra missing after `--ms-level` | a wavelength spectrum has no MS level, so `--ms-level` leaves them out, of an archive and of an mzML export alike, and says so (§4.2) |

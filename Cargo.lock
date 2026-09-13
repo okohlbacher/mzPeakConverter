@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "mzpeak-convert"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2274,6 +2274,7 @@ dependencies = [
  "mzpeaks",
  "netcorehost",
  "parquet 59.1.0",
+ "quick-xml",
  "rayon",
  "rusqlite",
  "serde",

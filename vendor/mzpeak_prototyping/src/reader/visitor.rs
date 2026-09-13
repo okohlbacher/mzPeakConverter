@@ -2625,8 +2625,14 @@ impl<'a> MzChromatogramBuilder<'a> {
                 continue;
             }
             let chromatogram_type_curie = spec_type_array.value(i).unwrap();
-            let chromatogram_type =
-                ChromatogramType::from_accession(chromatogram_type_curie.accession);
+            // VENDORED PATCH: an archive written before the writer's SIM/SRM patch stores those
+            // chromatograms under mzdata's instrument terms MS:1000472/MS:1000473, which
+            // `from_accession` does not know; read them as the chromatograms they were written for.
+            let chromatogram_type = match chromatogram_type_curie.accession {
+                1000472 => Some(ChromatogramType::SelectedIonMonitoringChromatogram),
+                1000473 => Some(ChromatogramType::SelectedReactionMonitoringChromatogram),
+                accession => ChromatogramType::from_accession(accession),
+            };
             if let Some(chromatogram_type) = chromatogram_type {
                 descr.chromatogram_type = chromatogram_type;
             }

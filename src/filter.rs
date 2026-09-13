@@ -202,11 +202,34 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
             );
         }
     }
-    if opts.rt.is_some()
-        && orig_files.values().any(|fe| matches!(fe.entity_type, EntityType::WavelengthSpectrum))
-    {
-        log::warn!("--rt does not truncate wavelength spectra; they are copied whole");
-    }
+    // Wavelength (UV/PDA) spectra take the rules of the mzML export (`exported_wavelength_spectra` in
+    // main.rs), so filtering into an archive and exporting that writes the spectra a filtered export
+    // does: `--ms-level` leaves them all out, since they have no MS level, and `--rt` keeps those inside
+    // the window. `None` copies their facets as they are.
+    const WAVELENGTH_METADATA: &str = "wavelength_spectra_metadata.parquet";
+    let has_wavelength = orig_files.values().any(|fe| matches!(fe.entity_type, EntityType::WavelengthSpectrum));
+    let wavelength_rows = if has_wavelength && filtering_spectra && member_names.iter().any(|n| n == WAVELENGTH_METADATA) {
+        let bytes = read_member(&mut zip, WAVELENGTH_METADATA).with_context(|| format!("reading {WAVELENGTH_METADATA}"))?;
+        Some(index_times(&bytes, WAVELENGTH_METADATA)?)
+    } else {
+        None
+    };
+    let wavelength_survivors: Option<BTreeSet<u64>> = if !has_wavelength || !filtering_spectra {
+        None
+    } else if !opts.ms_levels.is_empty() {
+        log::warn!(
+            "--ms-level leaves out the {} wavelength (UV/PDA) spectra, which have no MS level",
+            wavelength_rows.as_ref().map_or(0, Vec::len)
+        );
+        Some(BTreeSet::new())
+    } else if let (Some(rows), Some((lo, hi))) = (&wavelength_rows, opts.rt) {
+        let kept: BTreeSet<u64> = rows.iter().filter(|(_, t)| t.is_some_and(|t| t >= lo && t <= hi)).map(|(i, _)| *i).collect();
+        log::info!("filter: keeping {}/{} wavelength spectra", kept.len(), rows.len());
+        Some(kept)
+    } else {
+        log::warn!("--rt: without {WAVELENGTH_METADATA} the wavelength spectra have no times to filter by; their facets are copied as they are");
+        None
+    };
 
     // ── chromatogram truncation prepass ─────────────────────────────────────────────────────────
     // Under --rt, learn which of each chromatogram's points survive, so chromatograms_metadata can
@@ -252,6 +275,12 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
             .get(name)
             .cloned()
             .unwrap_or_else(|| synthesize_entry(name));
+        // No wavelength spectrum survives: their facets go, as `--drop-aux 'wavelength_spectra*'` takes them.
+        if wavelength_survivors.as_ref().is_some_and(BTreeSet::is_empty)
+            && matches!(fe.entity_type, EntityType::WavelengthSpectrum)
+        {
+            continue;
+        }
 
         if name.ends_with(".parquet") {
             let bytes = read_member(&mut zip, name)?;
@@ -264,6 +293,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
                 filtering_spectra,
                 opts,
                 chrom_kept.as_ref(),
+                wavelength_survivors.as_ref(),
             )
             .with_context(|| format!("filtering facet {name}"))?;
             w.start_for_entry(fe)
@@ -331,6 +361,58 @@ fn spectrum_metadata_member(files: &HashMap<String, FileEntry>) -> String {
         })
         .map(|fe| fe.name.clone())
         .unwrap_or_else(|| "spectra_metadata.parquet".to_string())
+}
+
+/// `(index, time)` of every row of an archive's spectrum metadata facet (`wavelength` false) or its
+/// wavelength-spectrum one, in stored order, with `None` for a row that states no time. `None` when
+/// the archive has no such facet. The 64-bit `time` column, not a reader's description, whose time
+/// comes from the scans facet and is 0.0, a real time, where that facet has no row.
+pub(crate) fn metadata_index_times(input: &Path, wavelength: bool) -> Result<Option<Vec<(u64, Option<f64>)>>> {
+    let f = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(f))
+        .with_context(|| format!("reading {} as a mzPeak ZIP", input.display()))?;
+    let member = if wavelength {
+        "wavelength_spectra_metadata.parquet".to_string()
+    } else {
+        let index: serde_json::Value = serde_json::from_slice(&read_member(&mut zip, "mzpeak_index.json")?)
+            .context("parsing mzpeak_index.json")?;
+        spectrum_metadata_member(&index_file_entries(&index))
+    };
+    if !zip.file_names().any(|n| n == member) {
+        return Ok(None);
+    }
+    let bytes = read_member(&mut zip, &member)?;
+    Ok(Some(index_times(&bytes, &member)?))
+}
+
+/// `(index, time)` of every row of a metadata facet's bytes, in stored order ([`metadata_index_times`]).
+fn index_times(bytes: &[u8], member: &str) -> Result<Vec<(u64, Option<f64>)>> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))
+        .with_context(|| format!("opening {member}"))?
+        .build()?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let view = facet_view(&batch, "spectrum")
+            .ok_or_else(|| anyhow!("{member} has neither a `spectrum` struct nor an `index` column"))?;
+        let index = lossless(view.column_by_name("index"), DataType::is_integer, &DataType::UInt64)
+            .ok_or_else(|| anyhow!("{member} has no unsigned integer `index` column"))?;
+        let index = index.as_any().downcast_ref::<UInt64Array>().expect("cast to UInt64");
+        let time = lossless(view.column_by_name("time"), DataType::is_floating, &DataType::Float64);
+        let time = time.as_ref().and_then(|t| t.as_any().downcast_ref::<Float64Array>());
+        for row in 0..batch.num_rows() {
+            rows.push((index.value(row), time.filter(|t| t.is_valid(row)).map(|t| t.value(row))));
+        }
+    }
+    Ok(rows)
+}
+
+/// Whether the archive holds a member called `name`.
+pub(crate) fn archive_has_member(input: &Path, name: &str) -> Result<bool> {
+    let f = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let zip = zip::ZipArchive::new(BufReader::new(f))
+        .with_context(|| format!("reading {} as a mzPeak ZIP", input.display()))?;
+    Ok(zip.file_names().any(|n| n == name))
 }
 
 /// The `spectrum.index` of every spectrum `opts` keeps in `input`, from one scan of its spectrum
@@ -478,15 +560,31 @@ enum Facet {
     ChromatogramSecondary,
     /// No spectrum linkage — copy verbatim (run-global vendor status log, etc.).
     RunGlobal,
+    /// `wavelength_spectra_metadata`: keyed by a top-level `index`.
+    WavelengthMeta,
+    /// `wavelength_spectra_metadata_scans`: keyed by a top-level `source_index`.
+    WavelengthSecondary,
+    /// `wavelength_spectra_data`: a top-level struct with a `wavelength_spectrum_index` child. Carries the
+    /// struct field name.
+    WavelengthData(String),
 }
 
 /// Classify a Parquet facet by its arrow schema. Errors when a facet LOOKS per-spectrum-shaped (a
 /// top-level `point`/`chunk`/`peak` struct) but has no key we can map to survivors.
 fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
-    // Wavelength (UV/PDA) facets reference only each other, and the spectrum filters select mass
-    // spectra, so they are copied whole. Their `source_index` scans facet used to reach the "index
-    // does not identify its entity" refusal below and abort every filter, a pure --sdrf included.
+    // Wavelength (UV/PDA) facets reference only each other, and are filtered against the surviving
+    // wavelength spectra (`run`). Their `source_index` scans facet used to reach the "index does not
+    // identify its entity" refusal below and abort every filter, a pure --sdrf included.
     if matches!(fe.entity_type, EntityType::WavelengthSpectrum) {
+        if matches!(fe.data_kind, DataKind::Metadata) && has_top_level(bytes, "index")? {
+            return Ok(Facet::WavelengthMeta);
+        }
+        if has_top_level(bytes, "source_index")? {
+            return Ok(Facet::WavelengthSecondary);
+        }
+        if let Some(field) = struct_with_child(bytes, "wavelength_spectrum_index")? {
+            return Ok(Facet::WavelengthData(field));
+        }
         return Ok(Facet::RunGlobal);
     }
     // v0.7 split layout: trust the index. Schema sniffing cannot distinguish a spectrum's
@@ -546,6 +644,15 @@ fn classify_facet(bytes: &[u8], fe: &FileEntry) -> Result<Facet> {
 /// facet's columns at the root; pre-0.7 nested them inside a struct).
 fn has_top_level(bytes: &[u8], name: &str) -> Result<bool> {
     Ok(parquet_schema(bytes)?.column_with_name(name).is_some())
+}
+
+/// The name of the top-level struct column that has a `child`, if any.
+fn struct_with_child(bytes: &[u8], child: &str) -> Result<Option<String>> {
+    Ok(parquet_schema(bytes)?
+        .fields()
+        .iter()
+        .find(|f| matches!(f.data_type(), DataType::Struct(children) if children.iter().any(|c| c.name() == child)))
+        .map(|f| f.name().clone()))
 }
 
 fn classify_facet_by_schema(bytes: &[u8]) -> Result<Facet> {
@@ -611,9 +718,30 @@ fn process_parquet(
     filtering_spectra: bool,
     opts: &FilterOpts,
     chrom_kept: Option<&HashMap<u64, Vec<bool>>>,
+    wavelength_survivors: Option<&BTreeSet<u64>>,
 ) -> Result<Vec<u8>> {
     match class {
         Facet::RunGlobal => Ok(bytes.to_vec()), // verbatim
+        Facet::WavelengthMeta | Facet::WavelengthSecondary | Facet::WavelengthData(_) if wavelength_survivors.is_none() => {
+            Ok(bytes.to_vec())
+        }
+        Facet::WavelengthMeta => {
+            let surv = wavelength_survivors.cloned().unwrap_or_default();
+            reencode(bytes, move |b| filter_by_top_key(b, "index", &surv), CountMode::WavelengthMeta)
+        }
+        Facet::WavelengthSecondary => {
+            let surv = wavelength_survivors.cloned().unwrap_or_default();
+            reencode(bytes, move |b| filter_by_top_key(b, "source_index", &surv), CountMode::Vendor)
+        }
+        Facet::WavelengthData(field) => {
+            let surv = wavelength_survivors.cloned().unwrap_or_default();
+            let f2 = field.clone();
+            reencode(
+                bytes,
+                move |b| filter_by_struct_key(b, &f2, "wavelength_spectrum_index", &surv, false),
+                CountMode::WavelengthData(field),
+            )
+        }
         Facet::ChromatogramSecondary => reencode(bytes, |b| Ok(Some(b.clone())), CountMode::Vendor),
         Facet::SpectrumMeta => {
             if !filtering_spectra {
@@ -717,6 +845,9 @@ enum CountMode {
     /// Carries the surviving data-point total, known from the `chromatograms_data` prepass.
     ChromatogramMeta(u64),
     ChromatogramData(String),
+    /// One row per wavelength spectrum; its points are the rows' `number_of_data_points`.
+    WavelengthMeta,
+    WavelengthData(String),
 }
 
 /// Stream a Parquet facet through `map` (batch → optional filtered batch), re-encoding to zstd with
@@ -752,7 +883,14 @@ where
     let reader = builder.build()?;
 
     // Preserve original KV except ARROW:schema (regenerated) and the count keys we recompute.
-    let count_keys = ["spectrum_count", "spectrum_data_point_count", "chromatogram_count", "chromatogram_data_point_count"];
+    let count_keys = [
+        "spectrum_count",
+        "spectrum_data_point_count",
+        "chromatogram_count",
+        "chromatogram_data_point_count",
+        "wavelength_spectrum_count",
+        "wavelength_spectrum_data_point_count",
+    ];
     let preserved: Vec<KeyValue> = orig_kv
         .into_iter()
         .filter(|kv| kv.key != "ARROW:schema" && !count_keys.contains(&kv.key.as_str()))
@@ -837,6 +975,24 @@ fn accumulate_counts(
                 }
             }
         }
+        CountMode::WavelengthMeta => {
+            if let Some(n) = batch.column_by_name("number_of_data_points").and_then(to_u64) {
+                *points += (0..n.len()).filter(|&r| n.is_valid(r)).map(|r| n.value(r)).sum::<u64>();
+            }
+        }
+        CountMode::WavelengthData(field) => {
+            if let Some(s) = struct_col(batch, field) {
+                if let Some(idx) = u64_child(s, "wavelength_spectrum_index") {
+                    for r in 0..idx.len() {
+                        keys.insert(idx.value(r));
+                    }
+                }
+                match intensity_list_len(s) {
+                    Some(n) => *points += n,
+                    None => *points += batch.num_rows() as u64,
+                }
+            }
+        }
         CountMode::Vendor | CountMode::ChromatogramMeta(_) => {}
     }
 }
@@ -884,6 +1040,14 @@ fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> 
         CountMode::SpectrumData(_) => vec![
             ("spectrum_count".into(), bound),
             ("spectrum_data_point_count".into(), points.to_string()),
+        ],
+        CountMode::WavelengthMeta => vec![
+            ("wavelength_spectrum_count".into(), rows.to_string()),
+            ("wavelength_spectrum_data_point_count".into(), points.to_string()),
+        ],
+        CountMode::WavelengthData(_) => vec![
+            ("wavelength_spectrum_count".into(), bound),
+            ("wavelength_spectrum_data_point_count".into(), points.to_string()),
         ],
         CountMode::Vendor => vec![],
         CountMode::ChromatogramMeta(total) => vec![
@@ -1550,7 +1714,7 @@ mod tests {
             let bytes = parquet(vec![("source_index", source_index.clone())], &[(key, "4")]);
             let fe = FileEntry::new(name.to_string(), entity, kind);
             let class = classify_facet(&bytes, &fe).unwrap();
-            let out = process_parquet(&bytes, class, &survivors, true, &FilterOpts::default(), None).unwrap();
+            let out = process_parquet(&bytes, class, &survivors, true, &FilterOpts::default(), None, None).unwrap();
             assert!(!footer_keys(&out).iter().any(|k| k.ends_with("_count")), "{name}: {:?}", footer_keys(&out));
         }
     }

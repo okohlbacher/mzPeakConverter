@@ -194,6 +194,11 @@ pub(crate) async fn load_indices_from<T: AsyncArchiveSource>(
         log::trace!("Loading wavelength spectrum metadata");
         this.visit_wavelength_spectrum_metadata_reader(dat)?;
     }
+    // VENDORED PATCH: the wavelength scans facet was never indexed, so every wavelength
+    // spectrum was read without its scan.
+    if let Some(Ok(scans)) = handle.wavelength_spectrum_metadata_scans().await {
+        this.visit_wavelength_spectrum_metadata_scans_reader(scans)?;
+    }
 
     this.spectra.id_index = spectrum_id_index;
 

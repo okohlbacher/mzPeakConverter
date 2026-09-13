@@ -1833,6 +1833,17 @@ impl QueryIndex {
         self.wavelength_spectrum_index = Some(wavelength_index);
     }
 
+    /// VENDORED PATCH: the wavelength scans facet's `source_index` page index. It was never read, so
+    /// `WavelengthSpectrumIndex::scan_index` stayed empty, `row_selection_contains` selected no row, and
+    /// every wavelength spectrum came back without a scan: its time, and every value its scan states.
+    pub fn populate_wavelength_spectrum_scan_indices<T>(&mut self, scans_reader: &ArrowReaderBuilder<T>) {
+        let pq_schema = scans_reader.parquet_schema();
+        let mut wavelength_index = self.wavelength_spectrum_index.take().unwrap_or_default();
+        wavelength_index.scan_index =
+            read_u64_page_index_from(scans_reader.metadata(), pq_schema, "source_index").unwrap_or_default();
+        self.wavelength_spectrum_index = Some(wavelength_index);
+    }
+
     /// Populate the indices for spectrum signal data
     pub fn populate_spectrum_data_indices<T>(
         &mut self,
