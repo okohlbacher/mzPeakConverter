@@ -599,6 +599,16 @@ impl ParquetIndexExtractor {
         Ok(())
     }
 
+    /// VENDORED PATCH: index the wavelength scans facet too (`populate_wavelength_spectrum_scan_indices`).
+    pub(crate) fn visit_wavelength_spectrum_metadata_scans_reader<T>(
+        &mut self,
+        wavelength_spectrum_metadata_scans_reader: ArrowReaderBuilder<T>,
+    ) -> io::Result<()> {
+        self.query_index
+            .populate_wavelength_spectrum_scan_indices(&wavelength_spectrum_metadata_scans_reader);
+        Ok(())
+    }
+
     pub(crate) fn visit_chromatogram_metadata_reader<T>(
         &mut self,
         chromatogram_metadata_reader: ArrowReaderBuilder<T>,
@@ -703,6 +713,11 @@ pub(crate) fn load_indices_from<T: ArchiveSource>(
     if let Some(Ok(dat)) = handle.wavelength_spectrum_metadata() {
         log::trace!("Loading wavelength spectrum metadata");
         this.visit_wavelength_spectrum_metadata_reader(dat)?;
+    }
+    // VENDORED PATCH: the wavelength scans facet was never indexed, so every wavelength
+    // spectrum was read without its scan.
+    if let Some(Ok(scans)) = handle.wavelength_spectrum_metadata_scans() {
+        this.visit_wavelength_spectrum_metadata_scans_reader(scans)?;
     }
 
     this.spectra.id_index = spectrum_id_index;

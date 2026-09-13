@@ -74,7 +74,7 @@ impl<W: Write> Drop for TargetOnlyWindows<W> {
     }
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let mut from = 0;
     while let Some(i) = hay[from..].iter().position(|&b| b == needle[0]) {
         let at = from + i;

@@ -218,10 +218,25 @@ fn unpacked_writer_stamps_the_same_data_facet_counts() {
 
 #[test]
 fn chromatogram_data_count_is_zero_when_nothing_was_written() {
-    // With synthesis off the fixture's (unindexed, unread) chromatogramList yields a metadata row
-    // with no points: the DATA facet must say 0 entities / 0 points, not repeat the metadata's 1.
-    // Not `tiny.pwiz.1.1.mzML`: that one is indexed, and its `tic` + `sic` are read.
-    let archive = convert_fixture_with("tiny_centroid_only.mzML", "nochrom", &["--no-chromatograms"]);
+    // With synthesis off and no source chromatogram, the only chromatogram row is the empty one the
+    // writer needs: the DATA facet must say 0 entities / 0 points, not repeat the metadata's 1. The
+    // fixture's chromatogramList is cut out of a copy, since a non-indexed file's list is read now.
+    let src = std::fs::read_to_string(format!("{}/tests/fixtures/tiny_centroid_only.mzML", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let from = src.find("<chromatogramList").expect("the fixture has a chromatogramList");
+    let to = src.find("</chromatogramList>").unwrap() + "</chromatogramList>".len();
+    let input = std::env::temp_dir().join(format!("mzpc-footer-{}-nochrom-source.mzML", std::process::id()));
+    std::fs::write(&input, format!("{}{}", &src[..from], &src[to..])).unwrap();
+    let archive = std::env::temp_dir().join(format!("mzpc-footer-{}-nochrom.mzpeak", std::process::id()));
+    let status = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&input)
+        .arg("--no-chromatograms")
+        .arg("-o")
+        .arg(&archive)
+        .arg("--force")
+        .status()
+        .expect("failed to run mzpeak-convert");
+    assert!(status.success(), "conversion failed: {status}");
+    let _ = std::fs::remove_file(&input);
     assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_count"), (0, 0));
     assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_data_point_count"), (0, 0));
     assert_eq!(declared(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), 1);

@@ -21,7 +21,7 @@ use arrow::array::{Array, Float64Array, StructArray, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwiz.1.1.mzML");
-/// Non-indexed, so its chromatograms are not read: only the synthesized TIC and BPC, from minutes.
+/// Three MS1 spectra, and a chromatogramList in seconds (non-indexed, which the converter now reads too).
 const CENTROID_ONLY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny_centroid_only.mzML");
 const TO_MINUTES: &str = "chromatogram-time-to-minutes";
 
@@ -97,12 +97,18 @@ fn the_mzml_lane_stores_chromatogram_times_in_minutes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Where no source chromatogram is read, nothing is converted and nothing is declared.
+/// Where there is no source chromatogram, nothing is converted and nothing is declared: a copy of the
+/// fixture without its chromatogramList (in seconds) leaves the TIC and BPC synthesized in minutes.
 #[test]
 fn minutes_stay_minutes() {
     let dir = scratch("minutes");
+    let src = std::fs::read_to_string(CENTROID_ONLY).unwrap();
+    let from = src.find("<chromatogramList").expect("the fixture has a chromatogramList");
+    let to = src.find("</chromatogramList>").unwrap() + "</chromatogramList>".len();
+    let input = dir.join("centroid_only.mzML");
+    std::fs::write(&input, format!("{}{}", &src[..from], &src[to..])).unwrap();
     let archive = dir.join("centroid_only.mzpeak");
-    mzpc(Path::new(CENTROID_ONLY), &archive, &[]);
+    mzpc(&input, &archive, &[]);
     let (unit, times) = chromatogram_times(&archive, &dir);
     assert_eq!(unit, "UO:0000031");
     let tic = &times[&0];

@@ -2627,7 +2627,15 @@ impl ChromatogramDetailsBuilder {
         // The column must hold a CHILD of MS:1000626, never the abstract parent itself. mzdata maps
         // an unknown chromatogram type onto the parent term, so write null rather than a value the
         // `chromatogram_must` placement rule rejects.
-        let ctype = item.chromatogram_type().to_curie();
+        // VENDORED PATCH: mzdata 0.66's `to_curie` writes the selected ion monitoring and selected
+        // reaction monitoring chromatograms as MS:1000472 and MS:1000473, which PSI-MS defines as
+        // two Agilent instruments; the chromatogram terms are MS:1001472 and MS:1001473, the ones its
+        // own `from_accession` reads back. Every SIM/SRM trace was stored under an instrument name.
+        let ctype = match item.chromatogram_type() {
+            mzdata::spectrum::ChromatogramType::SelectedIonMonitoringChromatogram => mzdata::curie!(MS:1001472),
+            mzdata::spectrum::ChromatogramType::SelectedReactionMonitoringChromatogram => mzdata::curie!(MS:1001473),
+            other => other.to_curie(),
+        };
         if ctype == mzdata::curie!(MS:1000626) {
             self.chromatogram_type.append_null();
         } else {

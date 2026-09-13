@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.12.3] — 2026-09-13
+
+**Output change.** Archives of an mzML whose chromatograms had no usable index gain them (68 of the
+corpus's 141 non-indexed mzML sources; 136 declare a chromatogram list), and SIM and SRM
+chromatograms change type accession. An mzML written from an archive that holds wavelength spectra
+gains those, and filtering such an archive treats them as the export does.
+
+### Fixed
+
+- **A non-indexed mzML's chromatograms are read.** mzdata reaches an mzML's chromatograms only
+  through the `<indexList>` of an `<indexedmzML>`, so a plain `<mzML>` gave none: 614 chromatograms
+  over 68 corpus archives, among them the Shimadzu scheduled-MRM run's 143 SRM traces and all 41 of
+  the ABI pressure-trace run's. The conversion wrote synthesized TIC/BPC in their place, exit 0 behind
+  a warning. The converter now scans the `<chromatogramList>` with the tokenizer mzdata reads it
+  with, starting at the list so the spectra before it cost nothing, and gives mzdata the index the
+  file lacks. The same check repairs an index that parses but points at the wrong bytes (a silent
+  loss in the mzPeak lanes until now) and keeps one that points at the indentation before each
+  element, as ThermoRawFileParser and mzdata's own writer record it; it never replaces an index with
+  a scan that finds fewer chromatograms. More losses on that path are closed: one chromatogram that
+  fails to parse no longer hides every one after it; two chromatograms with one id are both stored; a
+  `count="0"` over real chromatograms is not believed; a file cut off inside the list keeps what came
+  before the cut; and an element whose `index` attribute is not an integer, which mzdata `expect`s
+  under `panic = "abort"`, costs that chromatogram instead of the whole conversion.
+- **SIM and SRM chromatograms are stored under their chromatogram terms.** mzdata writes them as
+  MS:1000472 and MS:1000473, which PSI-MS defines as two Agilent instruments, and reads those back as
+  no type at all, so the archive → mzML export wrote every SRM trace untyped. They are MS:1001472 and
+  MS:1001473 now, and an archive written before reads its SIM and SRM traces as such (vendored writer
+  and reader patches).
+- **A chromatogram-only mzML keeps its own TIC on the mzML lane.** With no spectrum written, the
+  writer's TIC and base-peak chromatograms were written empty (`defaultArrayLength="0"`), and the
+  source's real ones had been dropped for them. A source TIC or BPC that a synthesized one does
+  replace is now named in the log, and the archive's empty placeholder chromatogram is no longer
+  exported as one.
+- **The `.mzpeak → .mzML` export writes the wavelength (UV/PDA) spectra**, with what their scans
+  state (the vendored reader never read the wavelength scans facet). It read the mass-spectrum facets
+  only, so a PDA run's archive came out without its UV spectra, silently. They are placed among the
+  mass spectra by retention time.
+- **Filters treat wavelength spectra alike in both routes.** `--ms-level` leaves them out, with a
+  warning: a wavelength spectrum has no MS level, and in a search engine's MS2 slice it reads as MS1
+  profile data. `--rt` keeps those inside the window. Filtering into an archive used to copy them
+  whole under both, so it and a filtered export disagreed; now filtering into an archive and exporting
+  that writes the spectra a filtered export does, and the wavelength facets' footer counts follow.
+- **A wavelength spectrum no longer lands in an mzML's TIC**, on the export and on `--to mzml` from
+  an mzML source. mzdata's writer sums every spectrum it writes, so a PDA run's absorbance, negative
+  values included, sat in the mass spectrometer's TIC and base-peak chromatogram. Nor does such a
+  spectrum carry what that writer invents for it (`ms level` 0; `positive scan`, which pyOpenMS read
+  back as the polarity; a second copy of its type term; an `ion injection time` of 0): a byte sink
+  blanks those in place, as the one for unknown isolation windows does. The export also leaves out
+  the total ion current, base peak and lambda max the archive computed from the arrays, and of the
+  observed wavelength range keeps only what a source stated. Import still replaces a wavelength
+  spectrum's stated TIC and base peak with computed ones, so the archive of ProteoWizard's Waters PDA
+  file does not hold them to export.
+
 ## [0.12.2] — 2026-09-12
 
 **Packaging only.** The binaries are unchanged; what changes is who signed them.

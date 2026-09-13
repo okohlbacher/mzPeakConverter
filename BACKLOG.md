@@ -18,14 +18,38 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Measured 2026-09-11, corpus-wide (report in `~/Claude/mzPeak/data/open-issues-fixes-2026-09-10/`):**
   156 mzML round trips over 227,979 spectra carry the **total intensity exactly** — every m/z
   difference is inside the `numpress-linear` bound the archive declares, ids/order/MS level/
-  representation all preserved. Two gaps came out of it and are open:
-  - **`--to mzml` does not write the wavelength (UV/PDA) facet.** The archives store it correctly
-    (520 rows on `TOFsulfas…DADSpectra…`, 8 on `QC_LCMS2-2_23_268-1-1`), so a round trip through
-    mzML silently drops the UV spectra. The review listed this export as never examined.
-  - **539 named source chromatograms** (mostly SRM/SIM traces) never reach an archive; 34 of the 37
-    affected files have a **non-indexed** source mzML, which mzdata cannot enumerate chromatograms
-    from. The conversion warns at the time, so this is a documented limit rather than silent loss —
-    but it is 143 traces on each Shimadzu scheduled-MRM file and 40 on ABI's pressure-trace file.
+  representation all preserved. Two gaps came out of it; both are fixed in 0.12.3: the archive →
+  mzML export dropped the wavelength spectra (`--to mzml` from an mzML source wrote them all along),
+  and a non-indexed mzML's chromatograms were never read. Decided 2026-09-13: the order of mass and
+  wavelength spectra in an export does not matter (time order stays), and filtering into an archive
+  takes the export's wavelength rules. Two adversarial reviews of those fixes left these open:
+  - **Device-trace units are relabelled detector counts.** A pressure (psi), temperature (°C), flow
+    (µL/min) or percent chromatogram is stored under the intensity column's single unit and written
+    back to mzML the same way, on every lane; indexed sources too.
+  - **SRM product windows (Q3) have no place in the archive.** mzML → mzPeak keeps a chromatogram's
+    precursor and drops its `<product>`, so the export writes none.
+  - **mzdata's writer wraps a chromatogram's precursor and product in list elements** the mzML 1.1
+    schema rejects (`<precursorList>` inside `<chromatogram>`): 143 xmllint errors on the Shimadzu MRM
+    file's mzML-lane output.
+  - **Import recomputes a wavelength spectrum's TIC, base peak and lambda max** over what the source
+    stated (ProteoWizard's Waters PDA spectra state them; the archive keeps only computed values).
+  - **On an MS2-only mzML the mzML lane replaces the source TIC/BPC** with the writer's pair summed
+    over the MS2 spectra, and loses a second source BPC (`BPC,±MS` on a timsTOF file), where the
+    archive keeps them.
+  - **The UV byte sink cannot tell an invented term from a stated one**: a wavelength spectrum that
+    states `positive scan` or an `ion injection time` of 0 loses it (none in the corpus).
+  - **A repeated chromatogram id** is stored twice, but an mzML written from it indexes the id once
+    (mzdata's `OffsetIndex` is a map), so a re-read keeps one. None in the corpus.
+  - **Chromatogram recovery is keyed on the `.mzML` extension**, as the declared-count check always
+    was; mzML content under another name is not scanned. And a literal `</spectrumList>` after the
+    `<chromatogramList` tag (in a comment) hides the list from the backwards search.
+  - **An exported mzML states no file content, software or data processing**, and so no
+    `defaultDataProcessingRef`, which the schema requires on both lists.
+  - **`--drop-aux` on the archive → mzML lane** is neither honoured, refused nor reported inert.
+  - **A gzip mzML export can end truncated with exit 0** if the encoder's final write fails at close:
+    flate2 discards that error in `Drop`, and `mzml_sink` hands out no handle to finish it.
+  - ponytail: the export reads each wavelength spectrum's arrays with a per-spectrum facet lookup,
+    O(N²) in their number; fine at 520, slow at 20,000.
   - Not a defect, worth knowing: a native SciEX archive stores spectra **experiment-major**, so
     retention time is not monotonic in spectrum index there, while ProteoWizard writes acquisition
     order. Same 168,412 spectra, same ids.
