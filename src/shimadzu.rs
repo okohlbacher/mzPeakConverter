@@ -44,8 +44,8 @@ use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::meta::DissociationMethodTerm;
 use mzdata::spectrum::{
-    Activation, IsolationWindow, IsolationWindowState, MultiLayerSpectrum, Precursor, ScanEvent,
-    ScanPolarity, SelectedIon, SignalContinuity, SpectrumDescription,
+    Activation, Chromatogram, ChromatogramType, IsolationWindow, IsolationWindowState, MultiLayerSpectrum,
+    Precursor, ScanEvent, ScanPolarity, SelectedIon, SignalContinuity, SpectrumDescription,
 };
 
 /// Hard cap on points per spectrum (guards a corrupt/hostile length). ≈1.2 GiB at the max.
@@ -114,9 +114,28 @@ const _: () = {
     assert!(offset_of!(ShimadzuSpectrumMetaV2, n_points) == offset_of!(ShimadzuSpectrumMeta, n_points));
 };
 
+/// One vendor chromatogram — the TIC (`kind` 0) or base-peak trace (`kind` 1) of one acquisition
+/// event, the pair LabSolutions itself exports as `TIC<n>`/`BPC<n>`. Filled by `ChromatogramMeta`;
+/// `[StructLayout]` twin in `glue/shimadzu/Glue.cs`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ShimadzuChromatogramMeta {
+    segment_no: i32,
+    event_no: i32,
+    kind: i32,
+    ms_level: i32,
+    polarity: i32,
+    reserved: i32,
+    n_points: i64,
+}
+
+const _: () = assert!(std::mem::size_of::<ShimadzuChromatogramMeta>() == 32);
+const _: () = assert!(std::mem::align_of::<ShimadzuChromatogramMeta>() == 8);
+
 /// ABI generation this binary requires from the glue DLL.
-/// 4 = 3 (V2 metadata + MassRange + InstrumentInfo) + `LibraryVersion`.
-const REQUIRED_ABI_VERSION: i32 = 4;
+/// 5 = 4 (V2 metadata + MassRange + InstrumentInfo + `LibraryVersion`) + the per-event chromatograms
+/// (`ChromatogramCount`, `ChromatogramMeta`, `ChromatogramData`).
+const REQUIRED_ABI_VERSION: i32 = 5;
 
 type ShimOpen = extern "system" fn(*const u16, *const u16) -> i64;
 type ShimClose = extern "system" fn(i64);
@@ -135,6 +154,11 @@ type ShimSpectrumData =
     extern "system" fn(i64, i64, i32, *mut *const f64, *mut *const f32, *mut i64) -> i32;
 type ShimDataFree = extern "system" fn(i64, *const f64, *const f32);
 type ShimLastError = extern "system" fn(*mut u16, i32) -> i32;
+/// Two chromatograms per acquisition event (its TIC, then its base-peak trace); -1 on error.
+type ShimChromatogramCountFn = extern "system" fn(i64) -> i64;
+type ShimChromatogramMetaFn = extern "system" fn(i64, i64, *mut ShimadzuChromatogramMeta) -> i32;
+/// Time in SECONDS and intensity in counts, pinned until `DataFree` (the time pointer in the m/z slot).
+type ShimChromatogramDataFn = extern "system" fn(i64, i64, *mut *const f64, *mut *const f32, *mut i64) -> i32;
 
 #[derive(Clone)]
 struct GlueApi {
@@ -149,6 +173,9 @@ struct GlueApi {
     spectrum_data: ShimSpectrumData,
     data_free: ShimDataFree,
     last_error: ShimLastError,
+    chromatogram_count: ShimChromatogramCountFn,
+    chromatogram_meta: ShimChromatogramMetaFn,
+    chromatogram_data: ShimChromatogramDataFn,
 }
 
 /// The CoreCLR runtime, booted ONCE per process.
@@ -260,6 +287,15 @@ impl GlueApi {
         let data_free = *loader
             .get_function_with_unmanaged_callers_only::<ShimDataFree>(ty, pdcstr!("DataFree"))
             .map_err(|e| anyhow!("resolving glue export DataFree: {e}"))?;
+        let chromatogram_count = *loader
+            .get_function_with_unmanaged_callers_only::<ShimChromatogramCountFn>(ty, pdcstr!("ChromatogramCount"))
+            .map_err(|e| anyhow!("resolving glue export ChromatogramCount: {e}"))?;
+        let chromatogram_meta = *loader
+            .get_function_with_unmanaged_callers_only::<ShimChromatogramMetaFn>(ty, pdcstr!("ChromatogramMeta"))
+            .map_err(|e| anyhow!("resolving glue export ChromatogramMeta: {e}"))?;
+        let chromatogram_data = *loader
+            .get_function_with_unmanaged_callers_only::<ShimChromatogramDataFn>(ty, pdcstr!("ChromatogramData"))
+            .map_err(|e| anyhow!("resolving glue export ChromatogramData: {e}"))?;
         let last_error = *loader
             .get_function_with_unmanaged_callers_only::<ShimLastError>(ty, pdcstr!("LastError"))
             .map_err(|e| anyhow!("resolving glue export LastError: {e}"))?;
@@ -276,6 +312,9 @@ impl GlueApi {
             spectrum_data,
             data_free,
             last_error,
+            chromatogram_count,
+            chromatogram_meta,
+            chromatogram_data,
         })
     }
 
@@ -583,18 +622,66 @@ impl ShimadzuReader {
             self.warn_if_rotated_centroids();
         }
         let index = i64::try_from(i).map_err(|_| anyhow!("Shimadzu index {i} does not fit in i64"))?;
+        self.pinned_pair(&format!("spectrum {i}"), "SpectrumData", |mz, int, len| {
+            (self.api.spectrum_data)(self.handle, index, which, mz, int, len)
+        })
+    }
+
+    /// The chromatograms the vendor library derives per acquisition event — a TIC and a base-peak
+    /// trace each, as LabSolutions' own mzML export writes them: `TIC<n>`/`BPC<n>` with the event
+    /// number (`TIC<segment>-<event>` when the run has several segments, so no two ids collide). Times
+    /// arrive in seconds (the vendor's ms / 1000) and are stored in minutes by `finish_chromatograms`,
+    /// which declares the conversion. Empty when the library states no events.
+    pub fn chromatograms(&self) -> Result<Vec<Chromatogram>> {
+        let n = (self.api.chromatogram_count)(self.handle);
+        if n < 0 {
+            bail!("Shimadzu glue ChromatogramCount failed: {}", self.api.last_error().unwrap_or_default());
+        }
+        let mut metas = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let mut meta = ShimadzuChromatogramMeta::default();
+            let rc = (self.api.chromatogram_meta)(self.handle, i, &mut meta);
+            if rc != 0 {
+                bail!(
+                    "Shimadzu glue ChromatogramMeta failed for chromatogram {i} (rc {rc}): {}",
+                    self.api.last_error().unwrap_or_default()
+                );
+            }
+            metas.push(meta);
+        }
+        let segmented = metas.iter().any(|m| m.segment_no != metas[0].segment_no);
+        let mut out = Vec::with_capacity(metas.len());
+        for (i, meta) in metas.iter().enumerate() {
+            let (time, intensity) = self.pinned_pair(&format!("chromatogram {i}"), "ChromatogramData", |t, int, len| {
+                (self.api.chromatogram_data)(self.handle, i as i64, t, int, len)
+            })?;
+            if time.is_empty() {
+                continue; // an event without a trace
+            }
+            let (prefix, kind) = match meta.kind {
+                0 => ("TIC", ChromatogramType::TotalIonCurrentChromatogram),
+                _ => ("BPC", ChromatogramType::BasePeakChromatogram),
+            };
+            let id = if segmented { format!("{prefix}{}-{}", meta.segment_no, meta.event_no) } else { format!("{prefix}{}", meta.event_no) };
+            out.push(crate::source_chromatogram(&id, kind, &time, &intensity)?);
+        }
+        Ok(out)
+    }
+
+    /// A `(f64, f32)` array pair the glue pins for us — a spectrum's m/z + intensity, a
+    /// chromatogram's time + intensity — copied out and released again through `DataFree`, on every
+    /// path. `call` performs the export with the three out-pointers.
+    fn pinned_pair(
+        &self,
+        what: &str,
+        export: &str,
+        call: impl FnOnce(*mut *const f64, *mut *const f32, *mut i64) -> i32,
+    ) -> Result<(Vec<f64>, Vec<f32>)> {
         let mut mz_ptr: *const f64 = std::ptr::null();
         let mut int_ptr: *const f32 = std::ptr::null();
         let mut len: i64 = 0;
 
-        let rc = (self.api.spectrum_data)(
-            self.handle,
-            index,
-            which,
-            &mut mz_ptr as *mut _,
-            &mut int_ptr as *mut _,
-            &mut len as *mut _,
-        );
+        let rc = call(&mut mz_ptr as *mut _, &mut int_ptr as *mut _, &mut len as *mut _);
         // RAII guard: DataFree must release the managed pins even on a panic/early bail.
         // Armed BEFORE the rc check: a partially-successful call can have pinned one array and then
         // failed, and bailing straight out of here would strand that pin for the process lifetime.
@@ -622,16 +709,16 @@ impl ShimadzuReader {
 
         if rc != 0 {
             bail!(
-                "Shimadzu glue SpectrumData failed for index {i} (rc {rc}): {}",
+                "Shimadzu glue {export} failed for {what} (rc {rc}): {}",
                 self.api.last_error().unwrap_or_default()
             );
         }
         if len < 0 {
-            bail!("Shimadzu spectrum {i} reports negative length {len}");
+            bail!("Shimadzu {what} reports negative length {len}");
         }
         if len > MAX_SHIMADZU_SPECTRUM_POINTS {
             bail!(
-                "Shimadzu spectrum {i} reports {len} points, exceeding safety limit \
+                "Shimadzu {what} reports {len} points, exceeding safety limit \
                  {MAX_SHIMADZU_SPECTRUM_POINTS}"
             );
         }
@@ -640,7 +727,7 @@ impl ShimadzuReader {
             return Ok((Vec::new(), Vec::new()));
         }
         if mz_ptr.is_null() || int_ptr.is_null() {
-            bail!("Shimadzu spectrum {i} reports {n} points but a data pointer is null");
+            bail!("Shimadzu {what} reports {n} points but a data pointer is null");
         }
         // SAFETY: the glue guarantees both arrays hold `n` elements, pinned until `data_free`.
         let mz = unsafe { std::slice::from_raw_parts(mz_ptr, n) }.to_vec();

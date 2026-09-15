@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change (Shimadzu `.lcd`, native lane).** Every archive gains the vendor's own chromatograms
+and the instrument's serial number; the glue ABI is 5 (rebuild `glue/shimadzu` with the binary).
+
+### Fixed
+
+- **The native Shimadzu lane stores the vendor's per-event TIC and base-peak chromatograms.** The
+  glue read spectra, precursors, scan windows and the instrument, never a chromatogram, so a
+  native archive held only the two run-wide traces summed from its MS1 spectra while LabSolutions'
+  own mzML export of the same run carries one TIC/BPC pair per acquisition event (`TIC1` … `BPC25`
+  on a 25-event DIA method) — the rule that the source's chromatograms are kept and a summed one
+  added only where none exists (0.12.4) was not reachable from this lane. The glue now asks
+  `MassChromatogramMng` for each event's traces (`ChromatogramCount` / `ChromatogramMeta` /
+  `ChromatogramData`, ABI 5), through the two calls whose values equal the export exactly:
+  `GetChromatogrambyEventWithoutSmoothing` — `GetTICChromatogram` and the smoothing variant hand
+  back a SMOOTHED trace on a profile-bearing file (12968, 13014, 13054 … for the export's 12877,
+  13109, 12673 …) — and `GetBasePeakChromatogram(0, 0, transition)`, whose two integers are a
+  retention-time window in ms. Ids follow the export (`TIC<event>`/`BPC<event>`; `TIC<segment>-<event>`
+  on a multi-segment run), times arrive in seconds and are stored in minutes with
+  `chromatogram-time-to-minutes` declared, as the mzML lane does. Measured on Blind_P1_pos_012 and
+  the two DIA_Hela runs.
+- **The instrument's serial number and model are read from the `.lcd` itself.** The vendor library
+  states neither (`SystemName()` is the operator's name for the whole system, `neo-ms`); the file's
+  `GUMM_Information/GUMMSubStg/SystemInformation` stream lists every unit of the system
+  configuration, and the MS unit's `<USBSN>` is exactly the `instrument serial number` LabSolutions
+  exports (`O12035900220JA` for Blind, `O12035600067JA` for the DIA runs), its `<IN>` the model
+  (`LCMS-9030`). Read by `shimadzu_meta` on any host; `instrument model` is now the model, the
+  system name a user param beside it. The configuration also states what ProteoWizard's
+  Reader_Shimadzu states for the family: two quadrupoles and the TOF, and a microchannel-plate
+  detector counting pulses. The `sourceFile` entry carries ProteoWizard's `Shimadzu Biotech LCD
+  format` and `Shimadzu Biotech QTOF nativeID format` terms beside the SHA-1.
+
 ## [0.12.4] — 2026-09-15
 
 **Output change.** An archive of a source that carries its own TIC or base-peak chromatograms —

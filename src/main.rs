@@ -6180,7 +6180,37 @@ fn convert_shimadzu(
         }
         parsed.map(|t| run_metadata::VendorRunMetadata { start_time: Some(t), ..Default::default() })
     }));
-    let mut hints = VendorHints { instrument: shimadzu_instrument(&info), source_sha1, run_metadata: run_meta, ..Default::default() };
+    // The MS unit's model and serial come from the file's system configuration (`shimadzu_meta`);
+    // the model names the instrument, the vendor library's `SystemName()` is the operator's name for
+    // the whole system.
+    let stated_model = run_meta
+        .as_ref()
+        .and_then(|m| m.instrument.as_ref())
+        .and_then(|ic| ic.params.iter().find(|p| p.curie() == Some(curie!(MS:1000031))))
+        .map(|p| p.value.to_string());
+    let mut hints = VendorHints {
+        instrument: shimadzu_instrument(&info, stated_model.as_deref()),
+        source_sha1,
+        run_metadata: run_meta,
+        // The terms ProteoWizard's Reader_Shimadzu states on the source file; ids here are `scan=N`.
+        source_file_params: vec![
+            run_metadata::term(1003009, "Shimadzu Biotech LCD format"),
+            run_metadata::term(1002898, "Shimadzu Biotech QTOF nativeID format"),
+        ],
+        ..Default::default()
+    };
+    // The vendor's own chromatograms — one TIC/base-peak pair per acquisition event, as LabSolutions
+    // exports them. A failure here is said out loud rather than silently costing them.
+    hints.chromatograms = match reader.chromatograms() {
+        Ok(c) => {
+            log::info!("Shimadzu: {} chromatogram(s) from the vendor library", c.len());
+            c
+        }
+        Err(e) => {
+            log::warn!("the vendor's chromatograms could not be read and are NOT stored: {e}");
+            Vec::new()
+        }
+    };
     // Profile facet as an exact sqrt grid (see `shimadzu_grid`): probe dense profile spectra across
     // the run for the run-wide step; if the fit holds, the profile of every spectrum that fits is
     // stored as `tof_index` + per-spectrum `tof_c0`/`tof_c1`, and any that does not keeps f64 m/z.
@@ -6440,12 +6470,22 @@ fn shimadzu_grid_route(
 /// model; `DeviceID = MSID_QTFL` names the Q-TOF family, so the quadrupole + TOF analysers are not
 /// in doubt; the ion source is asserted only when the spectra say `ESI`. No detector is invented.
 #[cfg(windows)]
-fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo) -> Option<InstrumentConfiguration> {
-    let model = info.system_name.clone()?;
+/// The instrument configuration of a `.lcd`: the family term ProteoWizard states, the model — the MS
+/// unit's name from the file's system configuration (`LCMS-9030`) when `stated_model` has it, else the
+/// vendor library's `SystemName()`, which is the operator's name for the whole system (`neo-ms`) and is
+/// then kept as a user param — and the components ProteoWizard's Reader_Shimadzu states for the QTFL
+/// family: an ESI source when the library says so, two quadrupoles and the TOF, and a microchannel-plate
+/// detector counting pulses. The vendor API states only the device family (`DeviceID`) and the
+/// ionization; the serial number comes in through `run_metadata` (merged, never overriding).
+fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo, stated_model: Option<&str>) -> Option<InstrumentConfiguration> {
+    let system_name = info.system_name.clone();
+    let model = stated_model.map(str::to_string).or_else(|| system_name.clone())?;
     let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
-    // The family term ProteoWizard states, plus the vendor's own system name as the model value.
     cfg.params.push(run_metadata::term(1002998, "Shimadzu instrument model"));
-    cfg.params.push(Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model).build());
+    cfg.params.push(Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model.clone()).build());
+    if let Some(name) = system_name.filter(|n| *n != model) {
+        cfg.params.push(Param::new_key_value("system name", name));
+    }
     let mut order = 1;
     if info.ionization.as_deref() == Some("ESI") {
         cfg.components.push(Component {
@@ -6456,7 +6496,7 @@ fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo) -> Option<Instru
         order += 1;
     }
     if info.device_id.as_deref().is_some_and(|d| d.contains("QTFL")) {
-        for (name, curie) in [("quadrupole", curie!(MS:1000081)), ("time-of-flight", curie!(MS:1000084))] {
+        for (name, curie) in [("quadrupole", curie!(MS:1000081)), ("quadrupole", curie!(MS:1000081)), ("time-of-flight", curie!(MS:1000084))] {
             cfg.components.push(Component {
                 component_type: ComponentType::Analyzer,
                 order,
@@ -6464,6 +6504,14 @@ fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo) -> Option<Instru
             });
             order += 1;
         }
+        cfg.components.push(Component {
+            component_type: ComponentType::Detector,
+            order,
+            params: vec![
+                Param::builder().name("microchannel plate detector").curie(curie!(MS:1000114)).build(),
+                Param::builder().name("pulse counting").curie(curie!(MS:1000118)).build(),
+            ],
+        });
     }
     Some(cfg)
 }
@@ -6924,6 +6972,13 @@ struct VendorHints {
     /// What the vendor file states about the run (sample, time, instrument, software, members):
     /// merged field by field before `fixup_run_metadata` — see `run_metadata`.
     run_metadata: Option<run_metadata::VendorRunMetadata>,
+    /// The chromatograms the vendor library hands over (the Shimadzu per-event TIC and base-peak
+    /// traces), stored as they are; `finish_chromatograms` sums a TIC or base-peak chromatogram only
+    /// for the kind missing here.
+    chromatograms: Vec<Chromatogram>,
+    /// Terms for the `sourceFile` entry beside its SHA-1: the file-format and nativeID-format terms
+    /// ProteoWizard states for this reader.
+    source_file_params: Vec<Param>,
     /// Keep zero-intensity runs (the writer's zero-run mask OFF). Set by lanes whose spectra
     /// interleave several traces in one array — Waters drift frames: masked across bins, the
     /// mask deleted 3–6 % of the per-bin trace boundaries (review 2026-09-09).
@@ -7089,6 +7144,8 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         keep_zero_runs,
         probe_indices,
         counters,
+        chromatograms,
+        source_file_params,
     } = hints;
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
@@ -7204,7 +7261,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             None => writer.write_spectrum(&spec)?,
         }
     }
-    let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, std::iter::empty(), synth_chroms)?;
+    let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, chromatograms.into_iter(), synth_chroms)?;
     if let Some(hex) = source_sha1 {
         if writer.file_description().source_files.is_empty() {
             let mut sf = SourceFile {
@@ -7213,6 +7270,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
                 id: "sourceFile".to_string(),
                 ..Default::default()
             };
+            for p in source_file_params {
+                sf.add_param(p);
+            }
             sf.add_param(run_metadata::sha1_param(hex));
             writer.file_description_mut().source_files.push(sf);
         }
@@ -7487,6 +7547,27 @@ fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f6
         };
     }
     descr.add_param(type_param);
+    Ok(Chromatogram::new(descr, arrays))
+}
+
+/// A chromatogram a vendor library hands over: id and type as the vendor names them, times in
+/// SECONDS — the unit the vendor states; `finish_chromatograms` stores minutes and declares the
+/// conversion — and intensities in detector counts. Its caller is the Shimadzu lane (Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn source_chromatogram(id: &str, kind: ChromatogramType, time_seconds: &[f64], intensity: &[f32]) -> Result<Chromatogram> {
+    let mut arrays = BinaryArrayMap::new();
+    let mut t = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new());
+    t.update_buffer(time_seconds).map_err(|e| anyhow::anyhow!("encoding chromatogram time: {e}"))?;
+    t.unit = Unit::Second;
+    arrays.add(t);
+    let mut i = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    i.update_buffer(intensity).map_err(|e| anyhow::anyhow!("encoding chromatogram intensity: {e}"))?;
+    i.unit = Unit::DetectorCounts;
+    arrays.add(i);
+    let mut descr = ChromatogramDescription { id: id.to_string(), chromatogram_type: kind, ..Default::default() };
+    if let Some(p) = chromatogram_type_param(kind) {
+        descr.add_param(p);
+    }
     Ok(Chromatogram::new(descr, arrays))
 }
 
@@ -8045,6 +8126,38 @@ mod tests {
             "a source without them gets both"
         );
         assert_eq!(written("off", pairs(), false).len(), 4, "--no-chromatograms stores the source's and synthesizes nothing");
+    }
+
+    /// A vendor chromatogram is built with the vendor's id, type term and seconds, and the facet
+    /// stores it in minutes with the conversion declared — the Shimadzu per-event pair, here the
+    /// first values LabSolutions exports for Blind_P1_pos_012's `TIC1`.
+    #[test]
+    fn a_vendor_chromatogram_keeps_its_id_and_type_and_lands_in_minutes() {
+        use mzdata::params::Unit;
+        use mzdata::spectrum::ChromatogramType;
+        use mzpeak_prototyping::MzPeakReader;
+
+        let tic = super::source_chromatogram("TIC1", ChromatogramType::TotalIonCurrentChromatogram, &[0.0, 0.1, 0.2], &[12877.0, 13109.0, 12673.0]).unwrap();
+        assert_eq!(tic.id(), "TIC1");
+        assert_eq!(tic.arrays.get(&ArrayType::TimeArray).unwrap().unit, Unit::Second);
+        assert!(tic.params().iter().any(|p| p.curie() == Some(mzdata::curie!(MS:1000235))), "the type term is a parameter too");
+
+        let (dir, _cleanup) = trace_scratch("vendor-chromatogram");
+        let path = dir.join("run.mzpeak");
+        let mut writer = super::MzPeakWriterType::<std::fs::File>::builder()
+            .chromatogram_chunked_encoding(None)
+            .build(std::fs::File::create(&path).unwrap(), true);
+        let _ = super::fixup_run_metadata(&mut writer, &dir);
+        let ms1 = super::Ms1Chroms { time: vec![2.5], tic: vec![10.0], bpc: vec![4.0], saw_ms1: true, ..Default::default() };
+        let applied = super::finish_chromatograms(&mut writer, &dir, &ms1, std::iter::once(tic), true).unwrap();
+        writer.finish_parquet().unwrap().finish().unwrap();
+        assert_eq!(applied, ["chromatogram-time-to-minutes"], "seconds were stored as minutes, and said so");
+        let mut r = MzPeakReader::new(&path).unwrap();
+        let chroms: Vec<_> = (0..r.len_chromatograms()).map(|i| r.get_chromatogram(i).unwrap()).collect();
+        assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["BPC", "TIC1"], "the vendor's TIC stays; only the base-peak trace is summed");
+        let t = chroms[1].arrays.get(&ArrayType::TimeArray).unwrap();
+        assert_eq!((t.unit, t.to_f64().unwrap().to_vec()), (Unit::Minute, vec![0.0, 0.1 / 60.0, 0.2 / 60.0]));
+        assert_eq!(chroms[1].arrays.get(&ArrayType::IntensityArray).unwrap().to_f32().unwrap().to_vec(), [12877.0, 13109.0, 12673.0]);
     }
 
     /// What `chromatogram_time_to_minutes` does to the time units a source states. Seconds and
