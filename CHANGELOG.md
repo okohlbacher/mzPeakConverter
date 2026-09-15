@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.12.4] — 2026-09-15
 
 **Output change.** An archive of a source that carries its own TIC or base-peak chromatograms —
 most mzML files do — now stores them, and a summed one is added only for the kind the source lacks;
