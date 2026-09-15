@@ -7,7 +7,7 @@
 //!     (`cv/mzpeak.obo`), unit MS:1002814, with `lower <= ion_mobility_value <= upper`, and list
 //!     the MZP vocabulary in the archive's `cv_list`;
 //!   * agree on the selected ion's 1/K0 and band for the same window. They used to differ by
-//!     0.015 Vs/cm² (1.332429 vs 1.317349 on frame 2 / m/z 1276.05 of this file): mzdata's
+//!     0.015 Vs/cm² (1.332387 vs 1.317349 on frame 2 / m/z 1276.05 of this file): mzdata's
 //!     precursor params are timsrust-linear while its arrays — and the native lane — use the
 //!     vendor ModelType-2 model;
 //!   * export the archive to mzML without panicking on the non-PSI accession (it becomes a
@@ -258,8 +258,10 @@ fn both_timstof_lanes_carry_the_mzp_band_and_agree_on_precursor_mobility() {
     // The regression: frame 2, isolation m/z 1276.05 (first window of the first MS2 frame) on the
     // vendor ModelType-2 model at the window midpoint — not timsrust's linear 1.317349.
     let (im, lo, hi) = a[&(2, 1_276_051)];
-    assert!((im - 1.332429).abs() < 1e-6, "ModelType-2 midpoint expected, got {im}");
-    assert!((lo - 1.305633).abs() < 1e-6 && (hi - 1.359207).abs() < 1e-6, "band {lo}..{hi}");
+    // (0.12.5: the exact vendor model; the anchored approximation before it gave 1.332429, band
+    // 1.305633..1.359207. The band's upper edge is Bruker's own invK0Begin for this window.)
+    assert!((im - 1.332387).abs() < 1e-6, "ModelType-2 midpoint expected, got {im}");
+    assert!((lo - 1.305615).abs() < 1e-6 && (hi - 1.359142).abs() < 1e-6, "band {lo}..{hi}");
 
     // `--no-tims-recalibration` must keep the lanes together too: both then write timsrust's
     // linear value for the same window (1.317349), not one lane linear and the other ModelType-2.

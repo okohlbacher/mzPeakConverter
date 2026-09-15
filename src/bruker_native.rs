@@ -747,47 +747,8 @@ pub(crate) fn sdk_golden_sample_plan(n_frames: usize, num_samples: i64) -> (Vec<
 pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
     let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening {}", tdf.display()))?;
-    let mut stmt = conn
-        .prepare("SELECT * FROM MzCalibration ORDER BY Id")
-        .context("querying MzCalibration")?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
-    let mut rows_out = Vec::new();
-    let mut rows = stmt.query([]).context("reading MzCalibration")?;
-    while let Some(row) = rows.next().context("reading MzCalibration")? {
-        let mut obj = serde_json::Map::new();
-        for (k, name) in cols.iter().enumerate() {
-            let v = match row.get_ref(k).context("MzCalibration cell")? {
-                ValueRef::Null => serde_json::Value::Null,
-                ValueRef::Integer(i) => i.into(),
-                ValueRef::Real(f) => f.into(),
-                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned().into(),
-                ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()).into(),
-            };
-            obj.insert(name.clone(), v);
-        }
-        rows_out.push(serde_json::Value::Object(obj));
-    }
-    if rows_out.is_empty() {
-        bail!("MzCalibration has no rows");
-    }
-    let mut global = serde_json::Map::new();
-    for key in ["DigitizerNumSamples", "MzAcqRangeLower", "MzAcqRangeUpper"] {
-        let v: Option<String> = conn
-            .query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [key], |r| r.get(0))
-            .optional()
-            .with_context(|| format!("reading GlobalMetadata.{key}"))?;
-        // GlobalMetadata values are TEXT; store the ones that parse as numbers.
-        let v = match v {
-            Some(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(serde_json::Value::from)
-                .or_else(|_| s.trim().parse::<f64>().map(serde_json::Value::from))
-                .unwrap_or(serde_json::Value::String(s)),
-            None => serde_json::Value::Null,
-        };
-        global.insert(key.to_string(), v);
-    }
+    let rows_out = table_rows_json(&conn, "MzCalibration")?;
+    let global = global_metadata_json(&conn, &["DigitizerNumSamples", "MzAcqRangeLower", "MzAcqRangeUpper"])?;
     // The exact spectra_metadata column names the writer derives for the per-frame params.
     let per_frame_columns: Vec<String> = [
         (TDF_T1_CURIE, "tdf_t1"),
@@ -806,6 +767,75 @@ pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
         "model_type_1": "t_ns = tof*DigitizerTimebase + DigitizerDelay; C1_eff = C1*(1 + dC1*(T1 - tdf_t1)/1e6); t_ns = C0 + (1e6/sqrt(C1_eff))*sqrt(mz) + C2*mz, solve for sqrt(mz) (C2 = 0: mz = ((t_ns - C0)*sqrt(C1_eff)/1e6)^2)",
         "model_type_1_verified": "2.5e-5 ppm vs Bruker timsdata SDK (speXtract v0.2.0); dC2 = 0 on every file seen, T2 role unverified",
     }))
+}
+
+/// The vendor's scan→1/K0 calibration, verbatim — every `TimsCalibration` row and the nominal
+/// acquisition range — with the ModelType-2 expression the ims-compact lane evaluates for
+/// `mean_inverse_reduced_ion_mobility` ([`crate::tims_mobility`]), so a reader can go from a stored
+/// 1/K0 back to the vendor's scan coordinate without the SDK. Best-effort like the m/z block.
+pub fn vendor_tims_calibration(tdf: &Path) -> Result<serde_json::Value> {
+    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening {}", tdf.display()))?;
+    let rows_out = table_rows_json(&conn, "TimsCalibration")?;
+    let global = global_metadata_json(&conn, &["OneOverK0AcqRangeLower", "OneOverK0AcqRangeUpper"])?;
+    Ok(serde_json::json!({
+        "source": "analysis.tdf",
+        "tims_calibration": rows_out,
+        "global_metadata": global,
+        "model_type_2": "W = C2 + (C3 - C2)*(scan - C4 - C0)/C1; 1/K0 = W/(C7 + C6*W); scan 0-based (C5, C8, C9 do not enter; C0 = C5 = 1 on every file seen)",
+        "model_type_2_verified": "6.7e-16 vs Bruker timsdata SDK tims_scannum_to_oneoverk0 on every scan of seven corpus runs, timsControl 4.0.5-6.2 (2026-09-15); the nominal OneOverK0AcqRange is not the model's value at the first/last scan",
+        "applies_to": "mean_inverse_reduced_ion_mobility of every point and the 1/K0 of every precursor/isolation band, unless --no-tims-recalibration (then timsrust's linear map of the nominal range)",
+    }))
+}
+
+/// Every row of a `.tdf` table as JSON objects keyed by column name (blobs as a size note).
+fn table_rows_json(conn: &rusqlite::Connection, table: &str) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT * FROM {table} ORDER BY Id"))
+        .with_context(|| format!("querying {table}"))?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let mut rows_out = Vec::new();
+    let mut rows = stmt.query([]).with_context(|| format!("reading {table}"))?;
+    while let Some(row) = rows.next().with_context(|| format!("reading {table}"))? {
+        let mut obj = serde_json::Map::new();
+        for (k, name) in cols.iter().enumerate() {
+            let v = match row.get_ref(k).with_context(|| format!("{table} cell"))? {
+                ValueRef::Null => serde_json::Value::Null,
+                ValueRef::Integer(i) => i.into(),
+                ValueRef::Real(f) => f.into(),
+                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned().into(),
+                ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()).into(),
+            };
+            obj.insert(name.clone(), v);
+        }
+        rows_out.push(serde_json::Value::Object(obj));
+    }
+    if rows_out.is_empty() {
+        bail!("{table} has no rows");
+    }
+    Ok(rows_out)
+}
+
+/// Selected `GlobalMetadata` keys; the values are TEXT, stored as numbers where they parse.
+fn global_metadata_json(conn: &rusqlite::Connection, keys: &[&str]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut global = serde_json::Map::new();
+    for key in keys {
+        let v: Option<String> = conn
+            .query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [key], |r| r.get(0))
+            .optional()
+            .with_context(|| format!("reading GlobalMetadata.{key}"))?;
+        let v = match v {
+            Some(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(serde_json::Value::from)
+                .or_else(|_| s.trim().parse::<f64>().map(serde_json::Value::from))
+                .unwrap_or(serde_json::Value::String(s)),
+            None => serde_json::Value::Null,
+        };
+        global.insert(key.to_string(), v);
+    }
+    Ok(global)
 }
 
 /// One quadrupole isolation window within an MS2 frame.
@@ -1600,8 +1630,8 @@ mod isolation_mobility_band_tests {
         // SBA415: nominal 1/K0 range 0.600..1.600 over 909 scans; ModelType-2 row from its TDF.
         let linear = Scan2ImConverter::from_boundaries(0.600, 1.600, 909);
         let recal = crate::tims_mobility::TimsMobilityCalibration::new(
-            1.0, 909.0, 211.45198604901222, 73.95258004355563, 0.00492817555366883,
-            131.11541877221117, 0.600,
+            1.0, 909.0, 211.45198604901222, 73.95258004355563, 32.72727272727273,
+            0.00492817555366883, 131.11541877221117,
         );
         let remap = TdfMobilityRemap::new(linear, Some(recal));
         let (sb, se) = (100u32, 160u32);

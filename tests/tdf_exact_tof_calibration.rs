@@ -198,33 +198,14 @@ fn ms1_summary_columns(archive: &Path, dir: &Path) -> Vec<(Option<f32>, Option<f
     rows
 }
 
-/// The intensity trace of the chromatogram whose `chromatogram_type` is `accession`
-/// (MS:1000235 = TIC, MS:1000628 = BPC), from `chromatograms_metadata` + `chromatograms_data`.
-fn chromatogram_trace(archive: &Path, accession: &str, dir: &Path) -> Vec<f32> {
-    let mut idx = None;
+/// The `id` of every chromatogram in `chromatograms_metadata`.
+fn chromatogram_ids(archive: &Path, dir: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
     for b in member_batches(archive, "chromatograms_metadata.parquet", dir) {
-        let index = b.column_by_name("index").unwrap().as_primitive::<arrow::datatypes::UInt64Type>();
-        let ty = b.column_by_name("chromatogram_type").unwrap().as_string::<i32>();
-        for i in 0..b.num_rows() {
-            if !ty.is_null(i) && ty.value(i) == accession {
-                assert!(idx.is_none(), "several {accession} chromatograms");
-                idx = Some(index.value(i));
-            }
-        }
+        let id = b.column_by_name("id").unwrap();
+        ids.extend((0..b.num_rows()).map(|i| arrow::util::display::array_value_to_string(id, i).unwrap()));
     }
-    let idx = idx.unwrap_or_else(|| panic!("no {accession} chromatogram in chromatograms_metadata"));
-    let mut trace = Vec::new();
-    for b in member_batches(archive, "chromatograms_data.parquet", dir) {
-        let point = b.column_by_name("point").unwrap().as_struct();
-        let ci = point.column_by_name("chromatogram_index").unwrap().as_primitive::<arrow::datatypes::UInt64Type>();
-        let inten = point.column_by_name("intensity").unwrap().as_primitive::<arrow::datatypes::Float32Type>();
-        for i in 0..b.num_rows() {
-            if ci.value(i) == idx {
-                trace.push(inten.value(i));
-            }
-        }
-    }
-    trace
+    ids
 }
 
 /// The integer `tof` array of a decoded spectrum. The reader hands the ims-compact grid column
@@ -270,9 +251,7 @@ fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
     // `lossless` must name the exactly-stored integer column — the reader's contract for "what in
     // this archive is the data and what is a reconstruction". Every MS1 row must carry a real TIC
     // and base-peak intensity: the published corpus shipped `total_ion_current = 0` on every
-    // gridded spectrum (mzdata derives both from an m/z array the integer-axis lane does not have),
-    // and the synthesized BPC must be the SAME numbers as the `base_peak_intensity` column — the
-    // published 2485 archive had a BPC that was zero at all 400 points beside a correct column.
+    // gridded spectrum (mzdata derives both from an m/z array the integer-axis lane does not have).
     assert_eq!(cal["lossless"], "tof", "ims_calibration must name `tof` as the exactly-stored column: {cal}");
     let ms1 = ms1_summary_columns(&archive, &tmp);
     assert!(!ms1.is_empty(), "no MS1 rows in spectra_metadata");
@@ -280,17 +259,19 @@ fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
         assert!(tic.is_some_and(|v| v > 0.0), "MS1 row {i}: total_ion_current is {tic:?}, expected > 0");
         assert!(bpi.is_some_and(|v| v > 0.0), "MS1 row {i}: base_peak_intensity is {bpi:?}, expected > 0");
     }
-    let bpc = chromatogram_trace(&archive, "MS:1000628", &tmp);
-    let tic = chromatogram_trace(&archive, "MS:1000235", &tmp);
-    assert_eq!(bpc.len(), ms1.len(), "BPC has one point per MS1 spectrum");
-    assert_eq!(tic.len(), ms1.len(), "TIC has one point per MS1 spectrum");
-    // Bit-equal, not approximately: both are the same fold of the same intensities (see
-    // `chromatogram_summary` in main.rs), and "agreement with the column" is the contract.
-    for (i, ((col_tic, col_bpi), (c_tic, c_bpc))) in ms1.iter().zip(tic.iter().zip(bpc.iter())).enumerate() {
-        assert_eq!(Some(*c_bpc), *col_bpi, "MS1 row {i}: BPC point != base_peak_intensity column");
-        assert_eq!(Some(*c_tic), *col_tic, "MS1 row {i}: TIC point != total_ion_current column");
+    // Since 0.12.4 the run's own traces are stored and a summed TIC/BPC is added only for a kind the
+    // source lacks. 2485.d carries both (`TIC,±MS`, `TIC,±AllMS/MS`, `BPC,±MS` from its chromatogram
+    // tables), so nothing is synthesized here — and a summed trace next to them would be the
+    // regression. The column contract above is what guards the grid-summary defect on this file.
+    let ids = chromatogram_ids(&archive, &tmp);
+    for want in ["TIC,±MS", "BPC,±MS"] {
+        assert!(ids.iter().any(|i| i == want), "the source's {want} trace is missing: {ids:?}");
     }
-    eprintln!("archive: {} MS1 rows with TIC/base peak > 0; BPC and TIC bit-equal to the columns", ms1.len());
+    assert!(
+        !ids.iter().any(|i| i == "TIC" || i == "BPC"),
+        "a summed TIC/BPC was added although the source carries both kinds: {ids:?}"
+    );
+    eprintln!("archive: {} MS1 rows with TIC/base peak > 0; the source's TIC/BPC traces kept, none summed", ms1.len());
 
     let (a, b) = (cal["a"].as_f64().unwrap(), cal["b"].as_f64().unwrap());
     let chord = |tof: f64| (a + b * tof).powi(2);

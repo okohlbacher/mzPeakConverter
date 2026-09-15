@@ -8,8 +8,36 @@ All notable changes to this project are documented here. The format follows
 
 **Output change (Shimadzu `.lcd`, native lane).** Every archive gains the vendor's own chromatograms
 and the instrument's serial number; the glue ABI is 5 (rebuild `glue/shimadzu` with the binary).
+**Output change (Bruker TDF, ims-compact).** Every stored 1/K0 moves onto the vendor's exact model
+(by up to 1.7e-3 Vs·s/cm²), and the archive declares that model.
 
 ### Fixed
+
+- **The timsTOF scan→1/K0 model is now the Bruker SDK's, exactly.** Since 0.9.6 the ims-compact lane
+  evaluated the `TimsCalibration` ModelType-2 rational on a ramp `C2 + (C3−C2)(scan−C0)/(C1−C0)`
+  with an offset anchored on `OneOverK0AcqRangeLower` — reverse-engineered to 1.4e-3 median /
+  2.8e-3 worst against the SDK, never closer. Pairing the points of `--bruker-sdk` archives (which
+  store the SDK's own 1/K0) with the native lane's exactly, one SDK value per scan, showed the SDK's
+  curve is a three-parameter rational of the scan (residual 2e-15) and pinned the closed form:
+  `W = C2 + (C3−C2)·(scan − C4 − C0)/C1`, `1/K0 = W/(C7 + C6·W)` — the ramp starts `C4 + C0` scans
+  in (`C0 = 1` on every file seen), and there is no offset. mzdata 0.66's `TimsCalibrationModel2`,
+  which the `--no-ims-compact` lane's signal arrays already went through, evaluates the same
+  expression — the two lanes now agree on every point. It reproduces `tims_scannum_to_oneoverk0` to **6.7e-16** on every
+  scan of all seven corpus timsTOF runs (PXD059079 2485, bruker-timstof-pro SBA415, MSV000099123
+  8225, MSV000092457 13373, PXD078573 9629, PXD076703 2095, PXD079300 27806; timsControl 4.0.5 –
+  6.2, `C6` of either sign), the three `CalibrationInfo` reference ions exactly, and does not move
+  with `Frames.Pressure`. The old form was off by up to 1.7e-3 (one to three scan steps: 5.0e-4 on
+  2485, 1.1e-3 on SBA415, 8.4e-4 on 8225, 1.7e-3 on 13373, 5.4e-4 on 9629, 8.9e-4 on 2095, 7.6e-4
+  on 27806). `src/tims_mobility.rs`,
+  `docs/tims_mobility_recalibration.rs` (reader-side reference) and the goldens in their tests
+  carry the new model; `TimsMobilityCalibration::new` takes `(C0, C1, C2, C3, C4, C6, C7)` and no longer
+  reads `OneOverK0AcqRangeLower`, whose nominal bounds are not the model's end values (SBA415:
+  0.6012 / 1.6383 for a nominal 0.6 / 1.6 — the SDK agrees).
+- **The archive declares the vendor's mobility model.** A `vendor_tims_calibration` index block
+  beside `vendor_mz_calibration`: every `TimsCalibration` row verbatim, the nominal acquisition
+  range, and the ModelType-2 expression the stored `mean_inverse_reduced_ion_mobility` evaluates —
+  so a reader can go from a stored 1/K0 back to the vendor's scan coordinate without the SDK
+  (before, the archive said nowhere how its 1/K0 was made).
 
 - **The native Shimadzu lane stores the vendor's per-event TIC and base-peak chromatograms.** The
   glue read spectra, precursors, scan windows and the instrument, never a chromatogram, so a

@@ -1,35 +1,32 @@
-//! Vendor-grade Bruker timsTOF mobility recalibration: mobility scan -> 1/K0.
+//! Bruker timsTOF mobility calibration: mobility scan -> 1/K0, exactly as the vendor SDK.
 //!
 //! Drop-in for the reader side (mzdata's `io::tdf`, or any TDF reader). timsrust/mzdata currently
 //! approximate 1/K0 by linearly interpolating the *nominal* acquisition range, which is ~0.03
 //! Vs·s/cm² off at the high-mobility edge vs Bruker's `timsdata` SDK. This evaluates the actual
-//! `ModelType = 2` calibration stored in `analysis.tdf`.
-//!
-//! Model (reverse-engineered from the Bruker SDK, see derivation below):
+//! `ModelType = 2` calibration stored in `analysis.tdf` (`TimsCalibration` table):
 //!
 //! ```text
-//!   V(scan) = C2 + (C3 - C2) * (scan - C0) / (C1 - C0)     // linear TIMS voltage ramp
-//!   1/K0    = (V + delta) / (C7 + C6 * V)                  // vendor rational model
+//!   W(scan) = C2 + (C3 - C2) * (scan - C4 - C0) / C1    // TIMS ramp voltage; the ramp starts C4 + C0 scans in
+//!   1/K0    = W / (C7 + C6 * W)                          // rational voltage -> mobility model
 //! ```
 //!
-//! `C0..C9` are the `TimsCalibration` columns. The offset `delta` is anchored so the lowest-mobility
-//! scan (V = C3) reproduces `GlobalMetadata.OneOverK0AcqRangeLower`.
+//! `scan` is 0-based (the SDK's `tims_scannum_to_oneoverk0` convention). `C0` and `C5` are 1 in every
+//! file seen (161 PRIDE timsTOF datasets); `C5`, `C8` and `C9` do not enter. mzdata 0.66's
+//! `TimsCalibrationModel2` (`io/tdf/calibration.rs`) evaluates the same expression as
+//! `1/(C6 + C7/(offset + slope*scan))`, `slope = (C3 - C2)/C1`, `offset = C2 - slope*(C4 + C0)`.
 //!
-//! Validation: reverse-engineered and checked against the Bruker SDK's `tims_scannum_to_oneoverk0`
-//! over **68 PRIDE timsTOF datasets** (nscans 473..2831, many instruments/methods). Per-dataset
-//! max error: **median 1.4e-3, worst 2.8e-3** Vs·s/cm² — vs ~3.0e-2 for the linear approximation
-//! (and the unanchored rational, or naive reference-ion anchoring, are no better than linear).
+//! Validation (2026-09-15): identified by exact point pairing against `--bruker-sdk` archives (the
+//! SDK's own 1/K0 per point) of all seven corpus timsTOF runs — PXD059079 2485, bruker-timstof-pro
+//! SBA415, MSV000099123 8225, MSV000092457 13373, PXD078573 9629, PXD076703 2095, PXD079300 27806
+//! (timsControl 4.0.5 – 6.2, 902–1552 scans, C6 of either sign): max |Δ1/K0| **6.7e-16** over every
+//! scan of every run. It also reproduces the three `CalibrationInfo` reference
+//! ions (`MeasuredTimsVoltages` -> `MobilitiesCorrectedCalibration`) exactly, and the SDK values do
+//! not change with `Frames.Pressure` (checked at the run's min/max pressure frames). The earlier
+//! reverse-engineered form (ramp `(scan - C0)/(C1 - C0)`, offset anchored on
+//! `GlobalMetadata.OneOverK0AcqRangeLower`) was off by up to 1.7e-3 — one to three scan steps.
 //!
-//! Coefficient laws confirmed across all 68 datasets:
-//!   * linear term  = 1/C7        (b·C7 = 0.997 ± 0.002)
-//!   * quadratic    = -C6/C7^2    (factor 0.990 ± 0.006)
-//!   * cubic        = +C6^2/C7^3  (factor 0.91 ± 0.08)
-//! i.e. the Taylor series of the rational `(V + delta)/(C7 + C6·V)`.
-//!
-//! Known limits: `delta`'s closed form in the coefficients alone is not fully pinned (it ties the
-//! ramp-voltage scale to the measured-voltage scale), so we anchor it on the acq-range lower bound;
-//! and `C9` (the residual ~9% on the cubic term) is not yet incorporated — both only matter below
-//! ~1e-3, well under timsTOF mobility resolution.
+//! Note the nominal `OneOverK0AcqRangeLower/Upper` are NOT what the model returns at the first/last
+//! scan (SBA415: 0.6012 / 1.6383 for a nominal 0.6 / 1.6); the SDK agrees with the model.
 
 /// Bruker timsTOF `ModelType = 2` mobility calibration: mobility scan index -> 1/K0 (Vs·s/cm²).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,39 +35,33 @@ pub struct TimsMobilityCalibration {
     c1: f64,
     c2: f64,
     c3: f64,
+    c4: f64,
     c6: f64,
     c7: f64,
-    /// Voltage offset, anchored so V = C3 maps to `OneOverK0AcqRangeLower`.
-    delta: f64,
 }
 
 impl TimsMobilityCalibration {
-    /// Build from the raw `TimsCalibration` coefficients (only C0–C3, C6, C7 are used by ModelType 2)
-    /// plus `GlobalMetadata.OneOverK0AcqRangeLower`, which anchors the offset at the last scan.
-    pub fn new(c0: f64, c1: f64, c2: f64, c3: f64, c6: f64, c7: f64, one_over_k0_lower: f64) -> Self {
-        // Anchor: at the lowest-mobility scan V = C3, so
-        //   one_over_k0_lower = (C3 + delta) / (C7 + C6*C3)  =>  delta = lower*(C7 + C6*C3) - C3.
-        let delta = one_over_k0_lower * (c7 + c6 * c3) - c3;
-        Self { c0, c1, c2, c3, c6, c7, delta }
+    /// Build from the raw `TimsCalibration` coefficients that enter ModelType 2.
+    pub fn new(c0: f64, c1: f64, c2: f64, c3: f64, c4: f64, c6: f64, c7: f64) -> Self {
+        Self { c0, c1, c2, c3, c4, c6, c7 }
     }
 
-    /// TIMS ramp voltage at a (possibly fractional) mobility scan index.
+    /// TIMS ramp voltage at a (possibly fractional) 0-based mobility scan index.
     #[inline]
     pub fn voltage(&self, scan: f64) -> f64 {
-        // C1 == C0 only for a degenerate single-scan frame; guard to avoid NaN.
-        let span = self.c1 - self.c0;
-        if span == 0.0 {
+        // C1 == 0 only for a degenerate single-scan frame; guard to avoid NaN.
+        if self.c1 == 0.0 {
             return self.c2;
         }
-        self.c2 + (self.c3 - self.c2) * (scan - self.c0) / span
+        self.c2 + (self.c3 - self.c2) * (scan - self.c4 - self.c0) / self.c1
     }
 
     /// Inverse reduced ion mobility 1/K0 (Vs·s/cm²) for a mobility scan index (0-based; fractional
     /// indices interpolate, matching the SDK).
     #[inline]
     pub fn one_over_k0(&self, scan: f64) -> f64 {
-        let v = self.voltage(scan);
-        (v + self.delta) / (self.c7 + self.c6 * v)
+        let w = self.voltage(scan);
+        w / (self.c7 + self.c6 * w)
     }
 }
 
@@ -82,27 +73,19 @@ impl TimsMobilityCalibration {
     ///
     /// Returns `Ok(None)` when there is **no `ModelType = 2` row** — this model is type-2-specific
     /// (the C-columns mean different things for other model types), so the caller MUST fall back to
-    /// the existing linear approximation rather than misapplying this rational. Across 74 sampled
+    /// the existing linear approximation rather than misapplying this rational. Across 161 sampled
     /// timsTOF datasets every row was ModelType 2, but older/legacy acquisitions may differ.
     pub fn from_tdf(conn: &rusqlite::Connection) -> rusqlite::Result<Option<Self>> {
         use rusqlite::OptionalExtension;
         let row = conn
             .query_row(
-                "SELECT C0, C1, C2, C3, C6, C7 FROM TimsCalibration WHERE ModelType = 2 ORDER BY Id LIMIT 1",
+                "SELECT C0, C1, C2, C3, C4, C6, C7 FROM TimsCalibration WHERE ModelType = 2 ORDER BY Id LIMIT 1",
                 [],
-                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?,
-                        r.get::<_, f64>(3)?, r.get::<_, f64>(4)?, r.get::<_, f64>(5)?)),
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?,
+                        r.get::<_, f64>(4)?, r.get::<_, f64>(5)?, r.get::<_, f64>(6)?)),
             )
             .optional()?;
-        let Some((c0, c1, c2, c3, c6, c7)) = row else {
-            return Ok(None); // not ModelType 2 -> caller keeps the linear path
-        };
-        let lower: f64 = conn.query_row(
-            "SELECT CAST(Value AS REAL) FROM GlobalMetadata WHERE Key = 'OneOverK0AcqRangeLower'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(Some(Self::new(c0, c1, c2, c3, c6, c7, lower)))
+        Ok(row.map(|(c0, c1, c2, c3, c4, c6, c7)| Self::new(c0, c1, c2, c3, c4, c6, c7)))
     }
 }
 
@@ -110,19 +93,25 @@ impl TimsMobilityCalibration {
 mod tests {
     use super::*;
 
-    // SBA415 (PXD bruker-timstof-pro) TimsCalibration row + acq-range lower, with the SDK's 1/K0
-    // ground truth at the two endpoints (scan 0 and scan 909 of 910).
+    // SDK goldens (`tims_scannum_to_oneoverk0` at whole scans) from `--bruker-sdk` archives.
     #[test]
-    fn reproduces_vendor_sdk_at_endpoints() {
+    fn reproduces_vendor_sdk_per_scan() {
+        // PXD059079 2485.d: 1552 scans, nominal range 0.70..1.45.
         let cal = TimsMobilityCalibration::new(
-            1.0, 909.0, 211.45198604901222, 73.95258004355563, 0.00492817555366883,
-            131.11541877221117, 0.600,
+            1.0, 1551.0, 254.40951107260733, 118.71749047939912, 33.64485981308411,
+            0.012463618472198826, 172.2839721407802,
         );
-        // last scan (V = C3) anchored exactly to the acq-range lower bound
-        assert!((cal.one_over_k0(909.0) - 0.600).abs() < 1e-9);
-        // first scan: SDK = 1.638 (vs the linear approximation's 1.600 — a 0.038 error)
-        assert!((cal.one_over_k0(0.0) - 1.6385).abs() < 1e-3);
-        // monotonic decreasing in scan
-        assert!(cal.one_over_k0(100.0) > cal.one_over_k0(800.0));
+        for (scan, sdk) in [(34.0, 1.4503157332197063), (500.0, 1.221493245336357), (1000.0, 0.9744927134550074), (1551.0, 0.7005033292661802)] {
+            assert!((cal.one_over_k0(scan) - sdk).abs() < 1e-12);
+        }
+        // bruker-timstof-pro SBA415: 910 scans, nominal range 0.6..1.6.
+        let cal = TimsMobilityCalibration::new(
+            1.0, 909.0, 211.45198604901222, 73.95258004355563, 32.72727272727273,
+            0.00492817555366883, 131.11541877221117,
+        );
+        for (scan, sdk) in [(188.0, 1.4246626738807122), (500.0, 1.0691266948698679), (700.0, 0.8405583294217701), (868.0, 0.6481604756745163)] {
+            assert!((cal.one_over_k0(scan) - sdk).abs() < 1e-12);
+        }
+        assert!(cal.one_over_k0(100.0) > cal.one_over_k0(800.0)); // monotonic decreasing in scan
     }
 }
