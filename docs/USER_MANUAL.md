@@ -140,7 +140,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
 | `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's vendor-grade scan→1/K0 recalibration (the `TimsCalibration` ModelType-2 model) and use timsrust's linear approximation. Recalibration is ON by default. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
-| `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra (synthesis is on by default) |
+| `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
 | `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine. Repeatable. A bad/missing path ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable) (§4.3) |
 | `--sdrf <SDRF>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an SDRF (sample-metadata) TSV VERBATIM as `sample_metadata/sdrf.tsv` with `metadata.study` + `metadata.sample_metadata` back-refs. A missing/unreadable path ERRORS the conversion (§4.3) |
@@ -366,7 +366,10 @@ Contents:
   spectra in `spectra_data`, centroid spectra in `spectra_peaks`, by the representation the source
   declares — since 0.10.1 for grid-encoded TOF axes too (§9).
 - `chromatograms_metadata.parquet` / `chromatograms_data.parquet` — TIC/BPC/SRM and other
-  chromatograms: one metadata row each, and their points, times in minutes. A value that is not an
+  chromatograms: one metadata row each, and their points, times in minutes. Every chromatogram the
+  source carries is stored (a LabSolutions export's TIC/BPC pair per acquisition event, a Bruker `.d`'s
+  HyStar traces); a TIC and a base-peak chromatogram are summed over the MS1 spectra only for the kind
+  the source lacks, and lead the facet (`--no-chromatograms` synthesizes none). A value that is not an
   intensity, such as a Bruker device trace's pressure, flow rate, temperature or solvent percentage,
   has no column of its own: it is stored in that chromatogram's `auxiliary_arrays` in
   `chromatograms_metadata`, under its name and in its unit, and the trace's `intensity` values in
