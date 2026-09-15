@@ -336,7 +336,7 @@ take effect because settings are resolved before logging is initialised.
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; needs `libbaf2sql_c` at runtime |
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | net48 `AgilentGlueHost.exe` (§11) → MHDAC, since 0.11.0; **MRM/SIM-only runs are refused** — they are transition chromatograms, use `--via-msconvert` for them |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | auto-built; Clearcore2 DLLs at runtime; **MRM/SIM dwell runs are refused** (they are transition chromatograms — `--via-msconvert` writes them as SRM chromatograms); multi-sample files need `--sample N` |
-| Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | LabSolutions.IO DLLs at runtime (§11); profile as a sqrt grid, centroids as an exact lattice (§8, §9) |
+| Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | LabSolutions.IO DLLs at runtime (§11); profile as a sqrt grid, centroids as an exact lattice (§8, §9); the vendor's per-event TIC/BPC chromatograms, the serial number and model from the file's system configuration |
 | Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` through its C ABI, no .NET glue (§11); HDMSe/HDDDA functions as frames with a per-point drift time (§8) |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Windows, or Wine elsewhere) |
 

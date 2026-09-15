@@ -20,10 +20,10 @@ use std::io::Read;
 use std::path::Path;
 
 use chrono::{DateTime, FixedOffset, Utc};
-use mzdata::meta::{Sample, Software};
+use mzdata::meta::{InstrumentConfiguration, Sample, Software};
 use mzdata::params::Param;
 
-use crate::run_metadata::{term, xml_text, AcquisitionTime, VendorRunMetadata};
+use crate::run_metadata::{term, term_str, xml_text, AcquisitionTime, VendorRunMetadata};
 
 /// The XML documents of the `File Property` stream, as `(root tag, document text)`.
 fn property_documents(lcd: &Path) -> Option<Vec<(String, String)>> {
@@ -98,12 +98,59 @@ fn gmt_diff(v: &str) -> Option<FixedOffset> {
     FixedOffset::east_opt(sign * ((h * 3600 + m * 60) as i32))
 }
 
-/// `Some` when the file carries a `File Property` stream with anything usable in it.
+/// The mass spectrometer's model and serial number from the `GUMM_Information/GUMMSubStg/SystemInformation`
+/// stream: a UTF-16 `<GUD Type="SI">` document listing every unit the system configuration knows, one
+/// `<GUM IT="…">` each with its own XML escaped inside. The MS unit is the one typed `<IT>LCMS</IT>` — for
+/// an LCMS-9030 `<IN>LCMS-9030</IN>` with `<USBSN>` its serial number, `<USBPN>` its USB product name —
+/// and its serial is exactly what LabSolutions' own mzML export states as `instrument serial number`
+/// (Blind_P1_pos_012: `O12035900220JA`; the DIA_Hela runs: `O12035600067JA`). The vendor library exposes
+/// neither: `SystemName()` is the operator's name for the whole system (`neo-ms`, `LCMS-9030 wo PDA`).
+fn system_information(lcd: &Path) -> Option<(String, String)> {
+    let mut comp = cfb::open(lcd).ok()?;
+    let mut bytes = Vec::new();
+    comp.open_stream("/GUMM_Information/GUMMSubStg/SystemInformation").ok()?.read_to_end(&mut bytes).ok()?;
+    let text = if bytes.len() >= 2 && bytes[1] == 0 {
+        String::from_utf16_lossy(&bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>())
+    } else {
+        bytes.iter().map(|&b| b as char).collect()
+    };
+    let unescape = |s: &str| s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&amp;", "&");
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("<GUM IT=\"") {
+        let after = &rest[start..];
+        let Some(end) = after.find("</GUM>") else { break };
+        let unit = unescape(&after[..end]);
+        rest = &after[end + "</GUM>".len()..];
+        if xml_text(&unit, "IT").as_deref() != Some("LCMS") {
+            continue;
+        }
+        let serial = xml_text(&unit, "USBSN").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let model = xml_text(&unit, "IN").or_else(|| xml_text(&unit, "USBPN")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if let (Some(model), Some(serial)) = (model, serial) {
+            return Some((model, serial));
+        }
+    }
+    None
+}
+
+/// `Some` when the file carries a `File Property` stream or a system configuration with anything usable.
 pub(crate) fn read(lcd: &Path) -> Option<VendorRunMetadata> {
-    let docs = property_documents(lcd)?;
+    let docs = property_documents(lcd).unwrap_or_default();
     let doc = |root: &str| docs.iter().find(|(r, _)| r == root).map(|(_, d)| d.as_str());
     let mut meta = VendorRunMetadata::default();
     let mut any = false;
+
+    if let Some((model, serial)) = system_information(lcd) {
+        meta.instrument = Some(InstrumentConfiguration {
+            id: 0,
+            params: vec![
+                term_str(1000031, "instrument model", &model),
+                term_str(1000529, "instrument serial number", &serial),
+            ],
+            ..Default::default()
+        });
+        any = true;
+    }
 
     let offset = doc("FileProperty")
         .and_then(|d| xml_text(d, "szLocGMTDiffGenDateTime"))
@@ -189,5 +236,33 @@ mod tests {
         assert!(m.samples[0].params.iter().any(|p| p.name == "injection volume (uL)" && p.value.to_string() == "5"));
         let sw = m.acquisition_software.expect("software");
         assert_eq!((sw.id.as_str(), sw.version.as_str()), ("LabSolutions", "5.114"));
+        assert!(m.instrument.is_none(), "no system configuration stream in this fixture");
+    }
+
+    #[test]
+    fn blind_states_its_mass_spectrometer_model_and_serial() {
+        // Blind_P1_pos_012.lcd's `GUMM_Information/GUMMSubStg/SystemInformation` stream (21 KB), re-wrapped
+        // in a compound file with the same storage path; the value it must yield is the serial LabSolutions'
+        // own mzML export of the run states.
+        let stream = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/blind_system_information.bin")).unwrap();
+        let lcd = std::env::temp_dir().join(format!("mzpc-blind-si-{}.lcd", std::process::id()));
+        {
+            let mut comp = cfb::create(&lcd).unwrap();
+            comp.create_storage("/GUMM_Information").unwrap();
+            comp.create_storage("/GUMM_Information/GUMMSubStg").unwrap();
+            let mut s = comp.create_stream("/GUMM_Information/GUMMSubStg/SystemInformation").unwrap();
+            std::io::Write::write_all(&mut s, &stream).unwrap();
+            std::io::Write::flush(&mut s).unwrap();
+            drop(s);
+            comp.flush().unwrap();
+        }
+        assert_eq!(system_information(&lcd), Some(("LCMS-9030".to_string(), "O12035900220JA".to_string())));
+        let m = read(&lcd).expect("the system configuration alone is worth a record");
+        let _ = std::fs::remove_file(&lcd);
+        let cfg = m.instrument.expect("instrument");
+        let value = |c: mzdata::params::CURIE| cfg.params.iter().find(|p| p.curie() == Some(c)).map(|p| p.value.to_string());
+        assert_eq!(value(mzdata::curie!(MS:1000031)).as_deref(), Some("LCMS-9030"));
+        assert_eq!(value(mzdata::curie!(MS:1000529)).as_deref(), Some("O12035900220JA"));
+        assert!(m.start_time.is_none() && m.samples.is_empty(), "nothing else is invented");
     }
 }
