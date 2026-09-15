@@ -94,6 +94,21 @@ public struct ShimadzuSpectrumMetaV2
     public int EventNo;
 }
 
+/// <summary>One vendor chromatogram: the TIC (`Kind` 0) or the base-peak trace (`Kind` 1) of one
+/// acquisition event — the pair LabSolutions itself exports as `TIC&lt;n&gt;`/`BPC&lt;n&gt;`. Filled by
+/// `ChromatogramMeta`; `#[repr(C)]` twin in `src/shimadzu.rs`.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct ShimadzuChromatogramMeta
+{
+    public int SegmentNo;
+    public int EventNo;
+    public int Kind;            // 0 = total ion current, 1 = base peak
+    public int MsLevel;         // 1 = an MS event, 2 = an MS/MS event, 0 = not stated
+    public int Polarity;        // 0 = positive, 1 = negative, 2 = unknown
+    public int Reserved;        // keeps NPoints 8-byte aligned; always 0
+    public long NPoints;
+}
+
 /// <summary>One opened .lcd reader: the managed DataObject tree + resolved reflection handles.</summary>
 internal sealed class ShimadzuData
 {
@@ -116,6 +131,11 @@ internal sealed class ShimadzuData
     public required MethodInfo GetSpectrumByScan;
     public object? ParametersObj;   // .MS.Parameters — GetMassRawRange(seg, event) is the scan window
     public object? SampleInfoObj;   // .SampleInfo  — AnalysisDate is the run start time
+    public object? ChromatogramObj; // .MS.Chromatogram — the per-event TIC and base-peak traces
+    /// The vendor's acquisition events (`MassParametersObject.GetEventInfo`), fetched once on first use.
+    public List<object>? Events;
+    /// Chromatogram arrays by ABI index (two per event: the TIC, then the base-peak trace), each fetched once.
+    public Dictionary<long, (double[] time, float[] intensity)> Chromatograms = new();
     /// Divisor for the point's `MassHigh` (Int64) field (`MassUnit * R`, both exact integers), or
     /// 0 to read the coarse `Mass` (Int32) instead. Decided ONCE per file at open (see
     /// `Api.DecideMassScale`); never mixed within a file.
@@ -497,6 +517,7 @@ public static class Api
             GetSpectrumByScan = getByScan,
             ParametersObj = parameters,
             SampleInfoObj = Reflect.GetProp(data, "SampleInfo"),
+            ChromatogramObj = chromatogram,
         };
         DecideMassScale(reader);
         return reader;
@@ -879,6 +900,8 @@ public static class Api
             throw new Exception($"ShimadzuSpectrumMeta must be 48 bytes, is {Marshal.SizeOf<ShimadzuSpectrumMeta>()}");
         if (Marshal.SizeOf<ShimadzuSpectrumMetaV2>() != 88)
             throw new Exception($"ShimadzuSpectrumMetaV2 must be 88 bytes, is {Marshal.SizeOf<ShimadzuSpectrumMetaV2>()}");
+        if (Marshal.SizeOf<ShimadzuChromatogramMeta>() != 32)
+            throw new Exception($"ShimadzuChromatogramMeta must be 32 bytes, is {Marshal.SizeOf<ShimadzuChromatogramMeta>()}");
         // The V1 prefix must stay byte-identical, or `SpectrumMeta` and `SpectrumMetaV2` would
         // disagree about where the shared fields live.
         foreach (var name in new[] { "ScanNumber", "MsLevel", "Polarity", "SignalContinuity",
@@ -942,7 +965,162 @@ public static class Api
     /// which is why every layout change gets a new versioned entry point rather than a wider
     /// struct behind the old name.</summary>
     [UnmanagedCallersOnly(EntryPoint = "ShimadzuAbiVersion")]
-    public static int ShimadzuAbiVersion() => 4;   // 4: + LibraryVersion (3: + MassRange, InstrumentInfo)
+    public static int ShimadzuAbiVersion() => 5;   // 5: + the per-event chromatograms (4: + LibraryVersion; 3: + MassRange, InstrumentInfo)
+
+    // --- chromatograms: the per-event TIC and base-peak traces --------------------------------
+
+    /// <summary>The vendor's acquisition events, fetched once. Empty when the parameters object or
+    /// `GetEventInfo` is missing.</summary>
+    private static List<object> EventsOf(ShimadzuData d)
+    {
+        if (d.Events != null) return d.Events;
+        var events = new List<object>();
+        var m = d.ParametersObj == null ? null : Reflect.Method(d.ParametersObj.GetType(), "GetEventInfo", 1);
+        if (m != null)
+        {
+            var args = new object?[] { null };
+            var st = Reflect.InvokeCoerced(m, d.ParametersObj!, args);
+            if (Reflect.Ok(st) && args[0] is IEnumerable list)
+            {
+                foreach (var e in list) if (e != null) events.Add(e);
+            }
+            else Dbg.Say($"GetEventInfo -> {st}: no events");
+        }
+        else Dbg.Say("GetEventInfo missing: no chromatograms");
+        d.Events = events;
+        return events;
+    }
+
+    /// <summary>Time (seconds) and intensity of chromatogram `index` — two per event: its TIC, then its
+    /// base-peak trace — through the two vendor calls whose values equal LabSolutions' own mzML export
+    /// (measured on Blind_P1_pos_012 and the DIA_Hela runs, 2026-09-15): `GetChromatogrambyEventWithoutSmoothing`
+    /// — `GetTICChromatogram` and the smoothing variant return a SMOOTHED trace on a profile-bearing file
+    /// (12968, 13014, 13054 … where the export has 12877, 13109, 12673 …) — and `GetBasePeakChromatogram(0, 0,
+    /// transition)`, whose two integers are a retention-time window in ms (0, 0 = the whole run; passing
+    /// (segment, event) there gave an empty trace). The event's `MzTransition` carries segment, event and
+    /// mass range. Retention times arrive in ms and are handed over in seconds; intensities are counts.</summary>
+    private static (double[] time, float[] intensity) ChromFor(ShimadzuData d, long index)
+    {
+        if (d.Chromatograms.TryGetValue(index, out var cached)) return cached;
+        var events = EventsOf(d);
+        var ev = events[(int)(index / 2)];
+        var chrom = d.ChromatogramObj ?? throw new Exception("MS.Chromatogram missing");
+        var trType = ev.GetType().Assembly.GetType("Shimadzu.LabSolutions.IO.Generic.MzTransition")
+            ?? throw new Exception("type Shimadzu.LabSolutions.IO.Generic.MzTransition not found");
+        var tr = Activator.CreateInstance(trType, ev) ?? throw new Exception("could not construct MzTransition");
+        object?[] args;
+        object? st;
+        if (index % 2 == 0)
+        {
+            var m = Reflect.Method(chrom.GetType(), "GetChromatogrambyEventWithoutSmoothing", 4)
+                ?? throw new Exception("GetChromatogrambyEventWithoutSmoothing(4 args) missing");
+            args = new object?[] { null, tr, false, false };
+            st = Reflect.InvokeCoerced(m, chrom, args);
+        }
+        else
+        {
+            var m = Reflect.Method(chrom.GetType(), "GetBasePeakChromatogram", 4)
+                ?? throw new Exception("GetBasePeakChromatogram(4 args) missing");
+            args = new object?[] { null, 0, 0, tr };
+            st = Reflect.InvokeCoerced(m, chrom, args);
+        }
+        var result = args[0];
+        if (!Reflect.Ok(st) || result == null)
+            throw new Exception($"chromatogram {index} (event {Reflect.GetProp(ev, "Event")}): vendor status {st}");
+        var rt = Reflect.GetProp(result, "RetTimeList") as int[] ?? Array.Empty<int>();
+        var counts = Reflect.GetProp(result, "ChromIntList") as int[] ?? Array.Empty<int>();
+        // One length for both arrays, as SpectrumData insists: the Rust side reads them with one count.
+        if (rt.Length != counts.Length)
+            throw new Exception($"chromatogram {index}: {rt.Length} retention times but {counts.Length} intensities");
+        var time = new double[rt.Length];
+        var inten = new float[rt.Length];
+        for (int i = 0; i < rt.Length; i++)
+        {
+            time[i] = rt[i] / ShimadzuData.MillisecondsPerSecond;
+            inten[i] = counts[i];
+        }
+        d.Chromatograms[index] = (time, inten);
+        return (time, inten);
+    }
+
+    /// <summary>Number of vendor chromatograms: two per acquisition event (its TIC, then its base-peak
+    /// trace). 0 when the library states no events; -1 on error (`LastError` says why).</summary>
+    [UnmanagedCallersOnly(EntryPoint = "ChromatogramCount")]
+    public static long ChromatogramCount(long handle)
+    {
+        try
+        {
+            ShimadzuData? d;
+            lock (Gate) { Readers.TryGetValue(handle, out d); }
+            if (d == null) { _lastError = "unknown handle"; return -1; }
+            return 2L * EventsOf(d).Count;
+        }
+        catch (Exception e) { _lastError = e.ToString(); return -1; }
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "ChromatogramMeta")]
+    public static unsafe int ChromatogramMeta(long handle, long index, ShimadzuChromatogramMeta* outMeta)
+    {
+        try
+        {
+            ShimadzuData? d;
+            lock (Gate) { Readers.TryGetValue(handle, out d); }
+            if (d == null) { _lastError = "unknown handle"; return 1; }
+            var events = EventsOf(d);
+            if (index < 0 || index >= 2L * events.Count) { _lastError = $"chromatogram index {index} out of range ({2L * events.Count})"; return 1; }
+            var ev = events[(int)(index / 2)];
+            var (time, _) = ChromFor(d, index);
+            var mode = Reflect.GetProp(ev, "AnalysisMode")?.ToString() ?? "";
+            var polarity = Reflect.GetProp(ev, "Polarity")?.ToString() ?? "";
+            *outMeta = new ShimadzuChromatogramMeta
+            {
+                SegmentNo = Convert.ToInt32(Reflect.GetProp(ev, "Segment") ?? 0, CultureInfo.InvariantCulture),
+                EventNo = Convert.ToInt32(Reflect.GetProp(ev, "Event") ?? 0, CultureInfo.InvariantCulture),
+                Kind = (int)(index % 2),
+                // `QtflMs` / `QtflMsMs` (and the `Qlm…` family alike): the event's MS level is its acquisition mode's.
+                MsLevel = mode.EndsWith("MsMs", StringComparison.OrdinalIgnoreCase) ? 2
+                        : mode.EndsWith("Ms", StringComparison.OrdinalIgnoreCase) ? 1 : 0,
+                Polarity = polarity.Equals("Positive", StringComparison.OrdinalIgnoreCase) ? 0
+                         : polarity.Equals("Negative", StringComparison.OrdinalIgnoreCase) ? 1 : 2,
+                Reserved = 0,
+                NPoints = time.Length,
+            };
+            return 0;
+        }
+        catch (Exception e) { _lastError = e.ToString(); return 1; }
+    }
+
+    /// <summary>The arrays of chromatogram `index`, pinned until `DataFree(handle, time, intensity)`
+    /// (the time pointer takes the m/z slot of the same pin registry).</summary>
+    [UnmanagedCallersOnly(EntryPoint = "ChromatogramData")]
+    public static unsafe int ChromatogramData(long handle, long index, double** timeOut, float** intOut, long* nOut)
+    {
+        try
+        {
+            ShimadzuData? d;
+            lock (Gate) { Readers.TryGetValue(handle, out d); }
+            if (d == null) { _lastError = "unknown handle"; return 1; }
+            if (index < 0 || index >= 2L * EventsOf(d).Count) { _lastError = $"chromatogram index {index} out of range"; return 1; }
+            var (time, inten) = ChromFor(d, index);
+            if (time.Length == 0)
+            {
+                *timeOut = null;
+                *intOut = null;
+                *nOut = 0;
+                return 0;
+            }
+            var tH = GCHandle.Alloc(time, GCHandleType.Pinned);
+            var iH = GCHandle.Alloc(inten, GCHandleType.Pinned);
+            var tP = (double*)tH.AddrOfPinnedObject();
+            var iP = (float*)iH.AddrOfPinnedObject();
+            lock (Gate) { Pins[(handle, (IntPtr)tP)] = (tH, iH); }
+            *timeOut = tP;
+            *intOut = iP;
+            *nOut = time.Length;
+            return 0;
+        }
+        catch (Exception e) { _lastError = e.ToString(); return 1; }
+    }
 
     /// <summary>Version string of the LOADED `Shimadzu.LabSolutions.IO.IoModule` assembly, e.g.
     /// "5.0.0.0"; empty before the first successful `Open`, or when the assembly carries no usable

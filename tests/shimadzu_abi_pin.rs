@@ -196,9 +196,12 @@ fn abi_version_literal_agrees() {
     );
 }
 
+/// Every `#[repr(C)]` / `[StructLayout]` twin the ABI carries.
+const STRUCTS: [&str; 3] = ["ShimadzuSpectrumMeta", "ShimadzuSpectrumMetaV2", "ShimadzuChromatogramMeta"];
+
 #[test]
 fn struct_twins_have_the_same_fields_in_the_same_order() {
-    for name in ["ShimadzuSpectrumMeta", "ShimadzuSpectrumMetaV2"] {
+    for name in STRUCTS {
         let rust = rust_fields(name);
         let cs = cs_fields(name);
         assert!(!rust.is_empty(), "shimadzu.rs: {name} has no fields (parser drift?)");
@@ -227,7 +230,7 @@ fn struct_twins_have_the_same_fields_in_the_same_order() {
 /// layout those types produce — so a width changed on both sides without the size literals fails too.
 #[test]
 fn struct_twins_have_the_same_field_types_and_size() {
-    for name in ["ShimadzuSpectrumMeta", "ShimadzuSpectrumMetaV2"] {
+    for name in STRUCTS {
         let (rs, cs) = (rust_fields(name), cs_fields(name));
         assert_eq!(rs.len(), cs.len(), "{name}: field count drifted: {rs:?} vs {cs:?}");
         let (mut size, mut align) = (0usize, 1usize);
@@ -267,7 +270,7 @@ fn v2_struct_starts_with_the_v1_layout_on_both_sides() {
 /// struct, which is why V2 may omit it.)
 #[test]
 fn struct_layout_attributes_are_sequential() {
-    for name in ["ShimadzuSpectrumMeta", "ShimadzuSpectrumMetaV2"] {
+    for name in STRUCTS {
         let decl = glue().find(&format!("public struct {name}\n")).unwrap();
         let prev = glue()[..decl].trim_end().rsplit('\n').next().unwrap().trim();
         if prev.starts_with("[StructLayout(") {
