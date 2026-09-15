@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.12.5] — 2026-09-15
 
 **Output change (Shimadzu `.lcd`, native lane).** Every archive gains the vendor's own chromatograms
 and the instrument's serial number; the glue ABI is 5 (rebuild `glue/shimadzu` with the binary).
