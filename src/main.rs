@@ -5743,6 +5743,15 @@ where
             None
         }
     };
+    // Likewise the vendor's scan→1/K0 model (TimsCalibration ModelType 2), which is what the stored
+    // `mean_inverse_reduced_ion_mobility` evaluates, so a reader can go back to the scan coordinate.
+    let vendor_tims = match bruker_native::vendor_tims_calibration(&tdf) {
+        Ok(v) => Some(("vendor_tims_calibration".to_string(), v)),
+        Err(e) => {
+            log::warn!("vendor TimsCalibration unavailable ({e}); vendor_tims_calibration index block omitted");
+            None
+        }
+    };
     let index_blocks: Vec<(String, serde_json::Value)> = std::iter::once(("ims_calibration".to_string(), cal))
         .chain(acquisition_block)
         .chain(std::iter::once(conversion_route_block(
@@ -5753,6 +5762,7 @@ where
         .chain(std::iter::once(transformations_block(&applied)))
         .chain(partial_marker(input, max_spectra(), n_frames))
         .chain(vendor_calibration)
+        .chain(vendor_tims)
         .collect();
     // No aux: `--image`/`--sdrf` are refused on the ims-compact lane (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
