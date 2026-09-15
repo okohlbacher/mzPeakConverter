@@ -374,7 +374,9 @@ struct Cli {
     #[arg(long)]
     no_vendor: bool,
 
-    /// Do not synthesize TIC + base-peak chromatograms from the MS1 spectra (synthesis is on by default).
+    /// Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak
+    /// chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that
+    /// kind; every chromatogram the source carries is stored in any case
     #[arg(long)]
     no_chromatograms: bool,
 
@@ -2299,7 +2301,6 @@ fn convert_to_mzml(
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
 
     let mut written = 0usize;
-    let mut ms_written = 0usize;
     for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             break;
@@ -2314,7 +2315,6 @@ fn convert_to_mzml(
         } else {
             SpectrumWriter::write(&mut w, &spec)
                 .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
-            ms_written += 1;
         }
         written += 1;
     }
@@ -2325,11 +2325,11 @@ fn convert_to_mzml(
     // the guard, so a truncated source leaves no half mzML that looks like a successful conversion.
     assert_source_complete(input, written, cap)?;
     // Pass through the source's chromatograms (SRM/SIM/vendor traces — otherwise silently lost,
-    // fatal for MRM data). Drop source TIC/base-peak: the mzML writer emits its own spectrum-derived
-    // TIC + base-peak summary at close, so keeping the source ones would duplicate them. A Bruker TDF
-    // `.d` adds its HyStar device traces, as its archive does ([`bruker_traces`]).
+    // fatal for MRM data), its own TIC/base-peak included; the writer's spectrum-derived summary is
+    // added only for the kind the source lacks. A Bruker TDF `.d` adds its HyStar device traces, as
+    // its archive does ([`bruker_traces`]).
     let traces = if input.is_dir() { bruker_traces::read(input) } else { Vec::new() };
-    write_source_chromatograms_mzml(&mut w, source_chroms.into_iter().chain(traces.into_iter().map(|t| t.chromatogram)), ms_written > 0)?;
+    write_source_chromatograms_mzml(&mut w, source_chroms.into_iter().chain(traces.into_iter().map(|t| t.chromatogram)))?;
 
     finish_mzml(w, tmp_guard, output)
 }
@@ -2484,7 +2484,8 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // synthesized TIC/base-peak summary: on a 300-chromatogram SIM/SRM run, 299 quantitative traces
     // vanished on export even though they were stored intact in `chromatograms_data.parquet`. The
     // convert lane has always done this (`write_source_chromatograms_mzml`); this one never did.
-    // TIC/base-peak are skipped there because the writer regenerates them at close.
+    // The archive's own TIC/base-peak go across too; the writer's summary is added only for the
+    // kind the archive lacks.
     let n_chrom = mzdata::prelude::ChromatogramSource::count_chromatograms(&reader);
     let chroms: Vec<Chromatogram> = (0..n_chrom)
         .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
@@ -2496,7 +2497,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
             c
         })
         .collect();
-    write_source_chromatograms_mzml(&mut w, chroms.into_iter(), total > 0)?;
+    write_source_chromatograms_mzml(&mut w, chroms.into_iter())?;
 
     finish_mzml(w, tmp_guard, output)
 }
@@ -2649,9 +2650,10 @@ fn write_native_mzml(
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
     }
     // A Bruker `.d`'s HyStar device traces, which its archive carries too ([`bruker_traces`]); no
-    // other input has them. HyStar's own MS traces give way to the writer's TIC/BPC.
+    // other input has them. HyStar's own MS trace is kept, and the writer's TIC/BPC pair is added
+    // only for the kind it does not cover.
     if input.is_dir() {
-        write_source_chromatograms_mzml(&mut w, bruker_traces::read(input).into_iter().map(|t| t.chromatogram), true)?;
+        write_source_chromatograms_mzml(&mut w, bruker_traces::read(input).into_iter().map(|t| t.chromatogram))?;
     }
     finish_mzml(w, tmp_guard, output)
 }
@@ -2839,18 +2841,20 @@ fn schema_sample_chromatogram(mut chrom: Chromatogram) -> Chromatogram {
     chrom
 }
 
-/// Pass a source's chromatograms through to an mzML. Where mass spectra were written (`summarized`),
-/// the source's TIC/base-peak give way to the summary the mzML writer sums over them at close, which
-/// they would duplicate; with none written they are kept, and the writer writes no summary of its
-/// own. Everything else — SRM/SIM/vendor traces — is preserved. Must be called after all spectra
-/// (writer state).
+/// Pass a source's chromatograms through to an mzML — every one of them, its TIC and base-peak
+/// chromatograms included — then the TIC and the base-peak chromatogram the mzML writer sums over
+/// the mass spectra written so far, each only when the source carries no chromatogram of that kind:
+/// a LabSolutions export's pair per acquisition event and an archive's own pair reach the mzML, and
+/// neither is doubled. The writer used to add its pair whenever a mass spectrum had been written and
+/// the source's pair was dropped for it. A chromatogramList must hold a chromatogram, so with nothing
+/// kept the writer's pair is written even when no spectrum was (empty, `defaultArrayLength` 0). Must
+/// be called after all spectra (the summaries are what has been written; writer state too).
 /// The writer puts `<chromatogramList count>` out with the first chromatogram, from a count it
 /// starts at 2 (its own summary pair), so the count is set here first. Every array is given a type
 /// the writer can name ([`readable_chromatogram_arrays`]), and every typed chromatogram its type term.
 fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromatogram>>(
     w: &mut mzdata::io::mzml::MzMLWriter<W>,
     source: I,
-    summarized: bool,
 ) -> Result<()> {
     let kept: Vec<Chromatogram> = source
         .map(readable_chromatogram_arrays)
@@ -2863,19 +2867,6 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
                 log::warn!("chromatogram {:?} has no time array and is not written", c.id());
             }
             timed
-        })
-        .filter(|c| {
-            let summary = matches!(
-                c.chromatogram_type(),
-                ChromatogramType::TotalIonCurrentChromatogram | ChromatogramType::BasePeakChromatogram
-            );
-            if summary && summarized {
-                log::info!(
-                    "source chromatogram {:?} is not written: the TIC/BPC the writer sums over the written mass spectra takes its place",
-                    c.id()
-                );
-            }
-            !(summary && summarized)
         })
         .map(|mut c| {
             // mzML states a chromatogram's type only as a cvParam. mzdata's mzML reader moves that
@@ -2890,16 +2881,35 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
             c
         })
         .collect();
-    // With no mass spectrum written, the writer's own TIC and base-peak chromatograms are empty
-    // (`defaultArrayLength` 0): a chromatogram-only SRM file had its real TIC dropped for one. They are
-    // still written when nothing else is, because a chromatogramList must hold a chromatogram.
-    let summaries = summarized || kept.is_empty();
-    if !summaries {
-        w.wrote_summaries = true;
+    // The writer's own summaries, the ones `write_summary_chromatograms` would add at close, for the
+    // kinds the source lacks. One summed over no mass spectrum is empty, and is written only when
+    // nothing else is (a chromatogramList must hold a chromatogram): a chromatogram-only file with
+    // its own TIC gains no empty base-peak trace.
+    let carried = |kind: ChromatogramType| kept.iter().any(|c| c.chromatogram_type() == kind);
+    let mut summaries: Vec<Chromatogram> = [
+        (ChromatogramType::TotalIonCurrentChromatogram, &w.tic_collector),
+        (ChromatogramType::BasePeakChromatogram, &w.bic_collector),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| !carried(*kind))
+    .map(|(_, collector)| collector.to_chromatogram())
+    .collect();
+    if !kept.is_empty() {
+        summaries.retain(|c| c.arrays.get(&ArrayType::TimeArray).and_then(|t| t.data_len().ok()).unwrap_or(0) > 0);
     }
-    w.chromatogram_count = kept.len() as u64 + if summaries { 2 } else { 0 };
-    for chrom in &kept {
-        w.write_chromatogram(chrom).map_err(|e| anyhow!("writing chromatogram to mzML: {e}"))?;
+    w.chromatogram_count = (kept.len() + summaries.len()) as u64;
+    for chrom in kept.iter().chain(&summaries) {
+        w.write_chromatogram(chrom).map_err(|e| anyhow!("writing chromatogram {:?} to mzML: {e}", chrom.id()))?;
+    }
+    w.wrote_summaries = true;
+    if !kept.is_empty() {
+        log::info!(
+            "chromatograms: {} from source, {} summed over the mass spectra ({})",
+            kept.len(),
+            summaries.len(),
+            if summaries.is_empty() { "the source carries its own TIC and base-peak chromatograms".to_string() }
+            else { summaries.iter().map(|c| c.id().to_string()).collect::<Vec<_>>().join(", ") }
+        );
     }
     Ok(())
 }
@@ -7392,27 +7402,34 @@ impl Ms1Chroms {
         self.time.is_empty()
     }
 
-    /// Write the synthesized TIC + base-peak chromatograms, their times the spectrum start times in
-    /// minutes. Returns how many were written (0 or 2).
-    fn write(&self, writer: &mut MzPeakWriterType<fs::File>) -> Result<usize> {
+    /// Write the synthesized TIC and/or base-peak chromatogram — the kinds asked for — their times the
+    /// spectrum start times in minutes. Returns how many were written (0 without an MS1 spectrum).
+    fn write(&self, writer: &mut MzPeakWriterType<fs::File>, tic: bool, bpc: bool) -> Result<usize> {
         if self.is_empty() {
             return Ok(0);
         }
-        let tic = synth_chromatogram(
-            "TIC",
-            Param::builder().name("total ion current chromatogram").curie(curie!(MS:1000235)).build(),
-            &self.time,
-            &self.tic,
-        )?;
-        let bpc = synth_chromatogram(
-            "BPC",
-            Param::builder().name("basepeak chromatogram").curie(curie!(MS:1000628)).build(),
-            &self.time,
-            &self.bpc,
-        )?;
-        writer.write_chromatogram(&tic)?;
-        writer.write_chromatogram(&bpc)?;
-        Ok(2)
+        let mut n = 0;
+        if tic {
+            let tic = synth_chromatogram(
+                "TIC",
+                Param::builder().name("total ion current chromatogram").curie(curie!(MS:1000235)).build(),
+                &self.time,
+                &self.tic,
+            )?;
+            writer.write_chromatogram(&tic)?;
+            n += 1;
+        }
+        if bpc {
+            let bpc = synth_chromatogram(
+                "BPC",
+                Param::builder().name("basepeak chromatogram").curie(curie!(MS:1000628)).build(),
+                &self.time,
+                &self.bpc,
+            )?;
+            writer.write_chromatogram(&bpc)?;
+            n += 1;
+        }
+        Ok(n)
     }
 }
 
@@ -7473,16 +7490,20 @@ fn synth_chromatogram(id: &str, type_param: Param, time: &[f64], intensity: &[f6
     Ok(Chromatogram::new(descr, arrays))
 }
 
-/// Write the chromatogram facet: synthesized MS1 TIC + base-peak (when `synth` and there were MS1
-/// spectra), plus any source chromatograms, plus the device traces a Bruker `.d` input records in
-/// `chromatography-data.sqlite` ([`bruker_traces`]) — skipping a source TIC/base-peak (HyStar's
-/// own MS traces included) when we synthesized our own so they don't duplicate. Every time is stored
-/// in minutes ([`chromatogram_time_to_minutes`]; the lanes sample the facet's schema through
-/// [`schema_sample_chromatogram`], so the column declares minutes too). Falls back to one empty
-/// chromatogram if nothing else was written (the reference reader requires the facet to open, and the
-/// writer finalizes index metadata here). Returns the `transformations` entries the written
-/// chromatograms add, for the lane's index block: `chromatogram-time-to-minutes`, and the device
-/// traces' ([`bruker_traces::Trace`]).
+/// Write the chromatogram facet: every chromatogram the source carries — the device traces a Bruker
+/// `.d` input records in `chromatography-data.sqlite` ([`bruker_traces`]) among them — and, when
+/// `synth` and there were MS1 spectra, a TIC and a base-peak chromatogram summed over those spectra,
+/// each only when the source carries no chromatogram of that kind. The source's are never replaced:
+/// a LabSolutions mzML export carries one TIC/BPC pair per acquisition event, HyStar its own MS
+/// trace, and the run-wide pair that used to stand in for them cannot give them back. The
+/// synthesized ones lead the facet, so a source without them reads as before; the source is read in
+/// full first, since what it carries decides what is synthesized (a run's chromatograms are small
+/// beside its spectra). Every time is stored in minutes ([`chromatogram_time_to_minutes`]; the lanes
+/// sample the facet's schema through [`schema_sample_chromatogram`], so the column declares minutes
+/// too). Falls back to one empty chromatogram if nothing else was written (the reference reader
+/// requires the facet to open, and the writer finalizes index metadata here). Returns the
+/// `transformations` entries the written chromatograms add, for the lane's index block:
+/// `chromatogram-time-to-minutes`, and the device traces' ([`bruker_traces::Trace`]).
 fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     writer: &mut MzPeakWriterType<fs::File>,
     input: &Path,
@@ -7490,24 +7511,18 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     source: I,
     synth: bool,
 ) -> Result<Vec<String>> {
-    set_file_contents(writer, ms1, synth && !ms1.time.is_empty());
-    let synthesized = if synth { ms1.write(writer)? } else { 0 };
+    let traces = bruker_traces::read(input).into_iter().map(|t| (t.chromatogram, t.rescaled, t.merged));
+    let source: Vec<(Chromatogram, bool, bool)> =
+        source.map(|c| (readable_chromatogram_arrays(c), false, false)).chain(traces).collect();
+    let carried = |kind: ChromatogramType| source.iter().filter(|(c, _, _)| c.chromatogram_type() == kind).count();
+    let (source_tic, source_bpc) =
+        (carried(ChromatogramType::TotalIonCurrentChromatogram), carried(ChromatogramType::BasePeakChromatogram));
+    let (want_tic, want_bpc) = (synth && source_tic == 0, synth && source_bpc == 0);
+    set_file_contents(writer, ms1, source_tic > 0 || (want_tic && !ms1.is_empty()));
+    let synthesized = ms1.write(writer, want_tic, want_bpc)?;
     let mut n = synthesized;
     let mut applied: Vec<String> = Vec::new();
-    let traces = bruker_traces::read(input).into_iter().map(|t| (t.chromatogram, t.rescaled, t.merged));
-    for (mut chrom, rescaled, merged) in source.map(|c| (readable_chromatogram_arrays(c), false, false)).chain(traces) {
-        if synthesized > 0
-            && matches!(
-                chrom.chromatogram_type(),
-                ChromatogramType::TotalIonCurrentChromatogram | ChromatogramType::BasePeakChromatogram
-            )
-        {
-            log::info!(
-                "source chromatogram {:?} is not stored: the TIC/BPC synthesized from the MS1 spectra takes its place",
-                chrom.id()
-            );
-            continue;
-        }
+    for (mut chrom, rescaled, merged) in source {
         let to_minutes = chromatogram_time_to_minutes(&mut chrom.arrays)?;
         writer.write_chromatogram(&chrom)?;
         n += 1;
@@ -7521,7 +7536,12 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
             }
         }
     }
-    log::info!("chromatograms: {synthesized} synthesized + {} from source = {n}", n - synthesized);
+    let carried_note = if synth && !ms1.is_empty() && source_tic + source_bpc > 0 {
+        format!("; the source carries {source_tic} TIC and {source_bpc} base-peak chromatogram(s), stored as they are")
+    } else {
+        String::new()
+    };
+    log::info!("chromatograms: {synthesized} synthesized + {} from source = {n}{carried_note}", n - synthesized);
     if n == 0 {
         write_empty_chromatogram(writer)?;
     }
@@ -7917,10 +7937,11 @@ mod tests {
     }
 
     /// Every Bruker lane ends in `finish_chromatograms`, so this is where a `.d`'s HyStar device
-    /// traces join the facet: after the synthesized TIC/BPC, HyStar's own MS trace giving way to
-    /// them, a bar trace stated in pascal (64-bit, dividing back to the stored bar exactly) with its
-    /// type also a parameter and the rescale declared, its times HyStar's seconds stored in minutes
-    /// and that declared too — and the input directory left exactly as it was.
+    /// traces join the facet: HyStar's own MS trace kept as the run's TIC (so only the base-peak
+    /// chromatogram is synthesized, ahead of it), a bar trace stated in pascal (64-bit, dividing back
+    /// to the stored bar exactly) with its type also a parameter and the rescale declared, its times
+    /// HyStar's seconds stored in minutes and that declared too — and the input directory left
+    /// exactly as it was.
     #[test]
     fn finish_chromatograms_writes_the_bruker_device_traces() {
         use mzdata::params::Unit;
@@ -7953,7 +7974,14 @@ mod tests {
 
         let mut r = MzPeakReader::new(&path).unwrap();
         let chroms: Vec<_> = (0..r.len_chromatograms()).map(|i| r.get_chromatogram(i).unwrap()).collect();
-        assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["TIC", "BPC", "Pump HP:Pressure - [bar]"]);
+        assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["BPC", "TIC,±MS", "Pump HP:Pressure - [bar]"]);
+        let hystar_tic = &chroms[1];
+        assert_eq!(hystar_tic.chromatogram_type(), ChromatogramType::TotalIonCurrentChromatogram);
+        assert_eq!(
+            hystar_tic.arrays.get(&ArrayType::IntensityArray).unwrap().to_f32().unwrap().to_vec(),
+            [180.0, 170.02],
+            "HyStar's trace is stored as it is, not replaced by a summed one"
+        );
         let pressure = &chroms[2];
         assert_eq!(pressure.chromatogram_type(), ChromatogramType::PressureChromatogram);
         assert!(pressure.params().iter().any(|p| p.curie() == Some(mzdata::curie!(MS:1003019))), "the type is a parameter too");
@@ -7962,6 +7990,61 @@ mod tests {
         assert_eq!(p.to_f64().unwrap().iter().map(|pa| (pa / 1e5) as f32).collect::<Vec<_>>(), [180.0, 170.02]);
         let t = pressure.arrays.get(&ArrayType::TimeArray).unwrap();
         assert_eq!(t.to_f64().unwrap().to_vec(), vec![2.0 / 60.0, 3.0 / 60.0]);
+    }
+
+    /// What a source carries is stored, and the MS1-summed TIC and base-peak chromatograms are added
+    /// only for the kind it lacks: a LabSolutions export's per-event pairs (`TIC1`/`BPC1`, …) all stay
+    /// and nothing is synthesized beside them; a source with a TIC alone gains the base-peak
+    /// chromatogram, ahead of it; a source without either gets both; `--no-chromatograms` synthesizes
+    /// nothing and stores the source's either way.
+    #[test]
+    fn source_tic_and_base_peak_chromatograms_are_kept() {
+        use mzdata::spectrum::ChromatogramType::{self, BasePeakChromatogram as Bpc, TotalIonCurrentChromatogram as Tic};
+        use mzpeak_prototyping::MzPeakReader;
+
+        let (dir, _cleanup) = trace_scratch("keep-source");
+        let tic = |id: &str, v: &[f64]| {
+            super::synth_chromatogram(id, Param::builder().name("total ion current chromatogram").curie(mzdata::curie!(MS:1000235)).build(), &[1.0, 2.0], v).unwrap()
+        };
+        let bpc = |id: &str, v: &[f64]| {
+            super::synth_chromatogram(id, Param::builder().name("basepeak chromatogram").curie(mzdata::curie!(MS:1000628)).build(), &[1.0, 2.0], v).unwrap()
+        };
+        let ms1 = super::Ms1Chroms { time: vec![2.5], tic: vec![10.0], bpc: vec![4.0], saw_ms1: true, ..Default::default() };
+        let written = |name: &str, source: Vec<super::Chromatogram>, synth: bool| -> Vec<(String, ChromatogramType, Vec<f32>)> {
+            let path = dir.join(format!("{name}.mzpeak"));
+            let mut writer = super::MzPeakWriterType::<std::fs::File>::builder()
+                .chromatogram_chunked_encoding(None)
+                .build(std::fs::File::create(&path).unwrap(), true);
+            let _ = super::fixup_run_metadata(&mut writer, &dir);
+            super::finish_chromatograms(&mut writer, &dir, &ms1, source.into_iter(), synth).unwrap();
+            writer.finish_parquet().unwrap().finish().unwrap();
+            let mut r = MzPeakReader::new(&path).unwrap();
+            (0..r.len_chromatograms())
+                .map(|i| {
+                    let c = r.get_chromatogram(i).unwrap();
+                    let intensity = c.arrays.get(&ArrayType::IntensityArray).unwrap().to_f32().unwrap().to_vec();
+                    (c.id().to_string(), c.chromatogram_type(), intensity)
+                })
+                .collect()
+        };
+        let pairs = || vec![tic("TIC1", &[5.0, 6.0]), bpc("BPC1", &[1.0, 2.0]), tic("TIC2", &[7.0, 8.0]), bpc("BPC2", &[3.0, 4.0])];
+        let row = |id: &str, kind: ChromatogramType, v: &[f32]| (id.to_string(), kind, v.to_vec());
+        assert_eq!(
+            written("pairs", pairs(), true),
+            [row("TIC1", Tic, &[5.0, 6.0]), row("BPC1", Bpc, &[1.0, 2.0]), row("TIC2", Tic, &[7.0, 8.0]), row("BPC2", Bpc, &[3.0, 4.0])],
+            "every per-event pair is stored and none is synthesized beside them"
+        );
+        assert_eq!(
+            written("tic-only", vec![tic("TIC1", &[5.0, 6.0])], true),
+            [row("BPC", Bpc, &[4.0]), row("TIC1", Tic, &[5.0, 6.0])],
+            "only the kind the source lacks is synthesized, ahead of the source's"
+        );
+        assert_eq!(
+            written("none", Vec::new(), true),
+            [row("TIC", Tic, &[10.0]), row("BPC", Bpc, &[4.0])],
+            "a source without them gets both"
+        );
+        assert_eq!(written("off", pairs(), false).len(), 4, "--no-chromatograms stores the source's and synthesizes nothing");
     }
 
     /// What `chromatogram_time_to_minutes` does to the time units a source states. Seconds and
@@ -8176,8 +8259,8 @@ mod tests {
     /// `--to mzml` from a Bruker `.d`. The native TSF and BAF branches write through
     /// `write_native_mzml`, which wrote no chromatogram but the mzML writer's own TIC/BPC, so a TSF
     /// run converted straight to mzML had 2 chromatograms where its archive, and that archive's mzML
-    /// export, have 8. The HyStar traces follow the spectra, HyStar's own MS trace giving way to the
-    /// writer's TIC/BPC as it does in the archive.
+    /// export, have 8. The HyStar traces follow the spectra, HyStar's own MS trace kept as the TIC, so
+    /// the writer adds only its base-peak summary — as in the archive.
     #[test]
     fn a_native_mzml_export_carries_the_bruker_device_traces() {
         let (dir, _cleanup) = trace_scratch("native-mzml");
@@ -8193,12 +8276,12 @@ mod tests {
         super::write_native_mzml(&dot_d, &out, 2, |i| Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))).unwrap();
         let xml = std::fs::read_to_string(&out).unwrap();
         let written = xml.matches("<chromatogram ").count();
-        assert_eq!(written, 4, "the writer's TIC and BPC and the two device traces");
+        assert_eq!(written, 4, "HyStar's MS trace, the writer's base-peak summary and the two device traces");
         assert!(xml.contains(&format!("<chromatogramList count=\"{written}\"")), "a stale chromatogramList count");
-        for id in ["Pump HP:Pressure - [bar]", "Fraction A - [%]"] {
+        for id in ["TIC,±MS", "BIC", "Pump HP:Pressure - [bar]", "Fraction A - [%]"] {
             assert!(xml.contains(&format!("<chromatogram id=\"{id}\"")), "no chromatogram {id}");
         }
-        assert!(!xml.contains("<chromatogram id=\"TIC,±MS\""), "HyStar's MS trace gives way to the writer's TIC");
+        assert!(!xml.contains("<chromatogram id=\"TIC\""), "HyStar's MS trace is the TIC; the writer adds none");
     }
 
     /// The mzML export of an archive holding device traces converts back, into an archive and into
@@ -8385,7 +8468,7 @@ mod tests {
         let mut mzml = mzdata::io::mzml::MzMLWriter::new(std::io::sink());
         mzml.set_spectrum_count(0);
         mzml.start_spectrum_list().unwrap();
-        super::write_source_chromatograms_mzml(&mut mzml, raw().into_iter(), true).expect("the mzML lane writes them");
+        super::write_source_chromatograms_mzml(&mut mzml, raw().into_iter()).expect("the mzML lane writes them");
 
         // The mzPeak lane, on what an mzML can hand it: the fifth case's typed pressure array beside
         // an unreadable one cannot come from mzdata's mzML reader, and sampled into a column it takes

@@ -77,9 +77,10 @@ fn close(a: &[f64], b: &[f64]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-9 * y.abs().max(1.0))
 }
 
-/// The mzML lane: `tiny.pwiz.1.1.mzML`'s `sic` (chromatogram 2) is in seconds, so it is stored
-/// divided by 60, the column declares minutes, the synthesized TIC and BPC (0 and 1) keep the
-/// spectrum start times they are built from, and the conversion is declared.
+/// The mzML lane: `tiny.pwiz.1.1.mzML`'s `tic` (0-14 s) and `sic` (0-9 s) are in seconds, so they
+/// are stored divided by 60 (chromatograms 1 and 2), the column declares minutes, the synthesized BPC
+/// (0; the source carries its own TIC, so none is synthesized) keeps the spectrum start times it is
+/// built from, and the conversion is declared.
 #[test]
 fn the_mzml_lane_stores_chromatogram_times_in_minutes() {
     let dir = scratch("mzml-lane");
@@ -88,11 +89,10 @@ fn the_mzml_lane_stores_chromatogram_times_in_minutes() {
     let (unit, times) = chromatogram_times(&archive, &dir);
     assert_eq!(unit, "UO:0000031", "the column declares minutes, whatever unit the source's chromatograms state");
     let ms1_minutes = [0.0, 0.7008333333333333, 5.8905];
-    for c in [0, 1] {
-        assert!(close(&times[&c], &ms1_minutes), "chromatogram {c} is not in minutes: {:?}", times[&c]);
-    }
-    let sic_minutes: Vec<f64> = (0..10).map(|s| f64::from(s) / 60.0).collect();
-    assert!(close(&times[&2], &sic_minutes), "the source's sic, 0-9 s, in minutes: {:?}", times[&2]);
+    assert!(close(&times[&0], &ms1_minutes), "the synthesized BPC is not in minutes: {:?}", times[&0]);
+    let seconds_in_minutes = |n: i32| (0..n).map(|s| f64::from(s) / 60.0).collect::<Vec<f64>>();
+    assert!(close(&times[&1], &seconds_in_minutes(15)), "the source's tic, 0-14 s, in minutes: {:?}", times[&1]);
+    assert!(close(&times[&2], &seconds_in_minutes(10)), "the source's sic, 0-9 s, in minutes: {:?}", times[&2]);
     assert!(transformations(&archive).iter().any(|t| t == TO_MINUTES), "{:?}", transformations(&archive));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -118,7 +118,7 @@ fn minutes_stay_minutes() {
 }
 
 /// `--rt` is in minutes, and so is every column the converter writes now: `--rt 0-0.05` keeps the
-/// source's `sic` up to 3 s.
+/// source's `tic` and `sic` up to 3 s, and the synthesized BPC's first spectrum.
 #[test]
 fn rt_window_is_minutes() {
     let dir = scratch("rt");
@@ -129,6 +129,6 @@ fn rt_window_is_minutes() {
     let (unit, times) = chromatogram_times(&filtered, &dir);
     assert_eq!(unit, "UO:0000031");
     let kept: BTreeMap<u64, usize> = times.iter().map(|(c, t)| (*c, t.len())).collect();
-    assert_eq!(kept, BTreeMap::from([(0, 1), (1, 1), (2, 4)]), "sic must keep 0, 1, 2 and 3 s: {times:?}");
+    assert_eq!(kept, BTreeMap::from([(0, 1), (1, 4), (2, 4)]), "tic and sic must keep 0, 1, 2 and 3 s: {times:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

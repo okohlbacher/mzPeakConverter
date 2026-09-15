@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change.** An archive of a source that carries its own TIC or base-peak chromatograms —
+most mzML files do — now stores them, and a summed one is added only for the kind the source lacks;
+an mzML written from such a source likewise.
+
+### Fixed
+
+- **A source's TIC and base-peak chromatograms are stored; a TIC or a base-peak chromatogram is
+  summed over the MS1 spectra only when the source carries none of that kind.** The converter
+  synthesized a run-wide TIC/BPC pair and then dropped every source chromatogram of those two types
+  as a duplicate, one INFO line each. A LabSolutions mzML export of a Shimadzu LCMS-9030 run carries
+  one pair per acquisition event — `TIC1` … `BPC25` on a 25-event DIA method — and the archive held
+  none of them, only the run-wide pair, which cannot give them back; a Bruker `.d`'s HyStar MS trace
+  went the same way. Every source chromatogram is now written (`finish_chromatograms`), and of the
+  synthesized pair only the kind the source lacks, ahead of the source's as before, so an archive of
+  a source without them is unchanged. `--to mzml` and the `.mzpeak` → mzML export do the same: the
+  source's TIC and base-peak traces are written, and the pair mzdata's writer sums over the written
+  mass spectra is added only for the kind missing (before, both source traces were dropped whenever a
+  mass spectrum had been written). One log line states what was stored and what was summed.
+  `--no-chromatograms` still synthesizes nothing.
+
 ## [0.12.3] — 2026-09-13
 
 **Output change.** Archives of an mzML whose chromatograms had no usable index gain them (68 of the
