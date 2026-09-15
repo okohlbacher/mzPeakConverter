@@ -67,6 +67,23 @@ LabSolutions export to the last f64 digit, every spectrum on its grid, and archi
 configuration and the source SHA-1 (digested before the DLL locks the file) ride in
 `spectra_metadata` / the index as for every other lane.
 
+**Chromatograms (ABI 5).** The vendor's own traces, one TIC/base-peak pair per acquisition event —
+what LabSolutions' mzML export writes as `TIC<n>`/`BPC<n>` — come through `ChromatogramCount` /
+`ChromatogramMeta` / `ChromatogramData` (the arrays pinned and released like a spectrum's). The two
+vendor calls were chosen by measurement against the export (2026-09-15): the TIC is
+`MassChromatogramMng.GetChromatogrambyEventWithoutSmoothing(ref obj, new MzTransition(eventInfo),
+false, false)` — `GetTICChromatogram(segment, event)` and the smoothing variant return a SMOOTHED trace
+on a profile-bearing file (Blind: 12968, 13014, 13054 … where the export has 12877, 13109, 12673 …;
+identical on the centroid-only DIA runs) — and the base-peak trace is
+`GetBasePeakChromatogram(ref obj, 0, 0, transition)`, whose two integers are a retention-time window
+in ms (0, 0 = the whole run; `(segment, event)` there yields an empty object). Events come from
+`MassParametersObject.GetEventInfo` (`Segment`/`Event` as the vendor numbers them, from 1;
+`MassChromatogramMng.GetEventNo` returned 0 for the first event and `GetTICChromatogram` then failed
+with `E_INVALIDARG`). `RetTimeList` is ms, `ChromIntList` counts; the archive stores minutes and
+declares `chromatogram-time-to-minutes`. The instrument's serial number and model are NOT in this
+API — the Rust side reads them from the `.lcd`'s `GUMM_Information/GUMMSubStg/SystemInformation`
+stream (`src/shimadzu_meta.rs`).
+
 ## Stale-library defect: misaligned centroids from `Shimadzu.LabSolutions.IO` **3.8.4.6016**
 
 **This is a bug in one version of the vendor library, and the remedy is a current ProteoWizard —
