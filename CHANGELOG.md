@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+No archive changes: reader only.
+
+### Fixed
+
+- **m/z range queries through the vendored reader (`extract_signal`, `query_peaks`) on grid-encoded
+  archives.** They now return exactly the points of a full read filtered in memory; before, they
+  returned nothing, the wrong points, or points without an m/z axis:
+  - *point layout with an integer grid column beside an all-NULL `point.mz`* (Shimadzu, SCIEX,
+    Agilent, the mzML lattice lane): **zero points for every gridded spectrum, silently.** The m/z
+    predicate pushed into Parquet drops NULLs, the grid column was never projected, and on a facet
+    with off-lattice spectra the m/z page index — built from the few pages that do hold real m/z —
+    skipped every other page. Only off-lattice spectra survived.
+  - *timsTOF `--no-ims-chunked`* (no m/z column at all): the m/z window was ignored; every point of
+    the time slice came back, with `tof` and no m/z.
+  - *timsTOF ims-chunked, the 0.12.x default* (`tof_chunk_*`, TOF-bin bounds): the window selected
+    rows by comparing m/z with TOF bins and filtered points by comparing m/z with integer TOF values.
+  The fix is decode-then-filter: on a grid facet the window is not pushed down; the grid column is
+  projected, m/z is reconstructed per row with the same arithmetic as a full read (the spectrum's
+  own `tof_c0`/`tof_c1` pair when it has one — loaded once, on the first such query — else the
+  run-wide parameters; a row that carries real m/z keeps it), and the window is applied to the
+  decoded points. Results carry index, m/z and the other arrays, as a non-grid facet's do; the grid
+  column is consumed. The async reader is not built by the converter and is unchanged.
+- **The chunk page index never existed.** The reader looked the m/z bounds columns up as
+  `<path of the m/z entry>_chunk_start`, i.e. `chunk.mz_chunk_values_chunk_start`, which no archive
+  has; the index stayed empty and m/z windows were never pruned at page level (the row predicate
+  did all the work, correctly). The bounds are found through their own array-index entries now.
+- **`RangeIndex` paired the start and end columns' pages by position** and applied the start page's
+  row count. Two columns need not paginate alike: with 100 chunk rows, starts in one page and ends
+  in two (rows 0–49 ending at 200, rows 50–99 at 1000), a query at m/z 500 was compared with
+  [100, 200] and all 100 rows were skipped. Each column now gives its own conservative mask
+  (`min(start) <= query.end`, `max(end) >= query.start`), the masks are intersected row-wise, and
+  rows no page covers are kept. This also protects the chromatogram and wavelength chunk indices,
+  which used the same code and were already live.
+
+### Tests
+
+- `tests/mz_range_queries.rs` and one more case in `tests/tof_grid_facets.rs`: a window query must
+  equal the filtered full read bit for bit — on the sqrt-grid fixture (profile and peaks facets,
+  gridded and off-lattice rows), the 1e-9 lattice fixture, a delta-chunked fixture, and the
+  pagination example above. Three of them fail on the 0.12.5 reader. Corpus-gated (`#[ignore]`):
+  the Shimadzu archive the defect was reported on, the chunked and the flat timsTOF form of
+  PXD059079 2485, and a 70 MB Q Exactive archive on which the repaired page index prunes for real.
+
 ## [0.12.5] — 2026-09-15
 
 **Output change (Shimadzu `.lcd`, native lane).** Every archive gains the vendor's own chromatograms

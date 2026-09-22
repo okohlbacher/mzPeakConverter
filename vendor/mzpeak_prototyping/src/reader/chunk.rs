@@ -328,6 +328,10 @@ trait ChunkQuerySource {
             }
         }
 
+        // A grid main axis (0.12.x timsTOF ims-chunked: `tof_chunk_*`) has TOF-bin bounds; an m/z
+        // window means nothing against them. Select by spectrum only — the scan decoder reconstructs
+        // m/z and applies the window to the decoded points.
+        let query_range = if super::point::chunk_grid_axis_entry(array_indices).is_some() { None } else { query_range };
         if let Some(query_range) = query_range.as_ref() {
             let chunk_range_idx = RangeIndex::new(
                 &query_indices.chunk_start_index(),
@@ -1193,16 +1197,34 @@ impl<'a> ChunkScanDecoder<'a> {
                 })
             });
         let axis = data_array_to_arrow_array(&buffer_name, &axis).unwrap();
+        let entity_idx = UInt64Array::from(entity_idx_acc);
 
         let mut fields = Vec::with_capacity(self.buffers.len() + 1);
         fields.push(buffer_name.context.index_field());
-        fields.push(Arc::new(
-            Arc::unwrap_or_clone(buffer_name.to_field())
-                .with_name(buffer_name.to_string().replace("_chunk_values", "")),
-        ));
+        // Grid main axis: hand back m/z, reconstructed per point, so the window below filters m/z
+        // and not TOF bins (the integer axis compared against an m/z window selected garbage).
+        let axis = match super::point::chunk_grid_axis_entry(self.array_indices()) {
+            Some(grid) => {
+                let mz = super::point::GridModel::new(grid).reconstruct(
+                    &axis,
+                    &entity_idx,
+                    None,
+                    self.metadata.spectra.grid_coefficients.as_ref(),
+                )?;
+                fields.push(Arc::new(Field::new("mz", DataType::Float64, true)));
+                Arc::new(mz) as ArrayRef
+            }
+            None => {
+                fields.push(Arc::new(
+                    Arc::unwrap_or_clone(buffer_name.to_field())
+                        .with_name(buffer_name.to_string().replace("_chunk_values", "")),
+                ));
+                axis
+            }
+        };
 
         let mut arrays = Vec::with_capacity(self.buffers.len() + 1);
-        arrays.push(Arc::new(UInt64Array::from(entity_idx_acc)) as ArrayRef);
+        arrays.push(Arc::new(entity_idx) as ArrayRef);
         arrays.push(axis);
 
         for (name, chunks) in self.buffers.drain() {
