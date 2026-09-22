@@ -6,10 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-No archive changes: reader only.
+No archive changes: reader and formula text only.
 
 ### Fixed
 
+- **The timsTOF ModelType-1 TOF→m/z evaluation was missing Bruker's `C4` term and the temperature
+  scaling of `C2`.** `TdfMzCalibrationRow::tof_to_mz` computed `u²` where the vendor computes `u² − C4`
+  (a constant m/z shift), and used `C2` where the vendor uses `C2/cf` with the same temperature factor as
+  `C1`. Found by sampling the Bruker SDK on a file with `C4 = −0.068565` (mzdata's `diaPASEF.d`, via
+  Joshua Klein's grid-encoding test files): 40–720 ppm, then 1e-4 ppm, now 1e-9 ppm. No archive changed:
+  a row with `C2`, `C3` or `C4` never takes the exact per-frame pair and stays on the declared run-wide
+  chord (the only corpus file with such a row is MSV000092457, row 2). What was wrong was the formula
+  published in every timsTOF archive's `vendor_mz_calibration.model_type_1` — corrected — and its
+  "verified" claim, which rested on goldens that all had `C4 = 0`. New fixture
+  `tests/fixtures/tdf_diapasef_sdk_golden.json` and test
+  `full_model_type_1_matches_the_vendor_sdk_on_a_c4_file`.
 - **m/z range queries through the vendored reader (`extract_signal`, `query_peaks`) on grid-encoded
   archives.** They now return exactly the points of a full read filtered in memory; before, they
   returned nothing, the wrong points, or points without an m/z axis:
