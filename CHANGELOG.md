@@ -37,7 +37,7 @@ limits in order and on the vendor mobility model; an archive → mzML carries ea
   `FileInfo` refuses the 0.12.5 export and reads this one; OpenSWATH assigns its precursors. This
   is the processing requirement, not full XSD validity: mzdata's writer still gives the run the id
   `1` (not an NCName), writes an empty `precursorList` and an empty `softwareRef` where a source
-  states nothing, as 0.12.5 did.
+  states nothing, as 0.13.0 does.
 - **A timsTOF `.d` → mzML writes each diaPASEF window's 1/K0 limits in order, on the vendor
   model, bracketing the window's own peaks.** `--to mzml` wrote mzdata's TDF params as they come:
   the spectrum-level `ion mobility lower limit` from the window's first scan, the larger 1/K0
@@ -68,8 +68,9 @@ limits in order and on the vendor mobility model; an archive → mzML carries ea
   diaPASEF window and now exports like the `.d`. An ims-compact archive holds whole frames: each is
   exported as one spectrum, with every window's precursor and no mobility limits of its own, and
   the export warns that a reader assigning precursors by mobility window (OpenSWATH's diaPASEF
-  mode) needs the `.d` exported with `--to mzml`, or a `--no-ims-compact` archive. 0.12.5 wrote the
-  same frames without mobility, and OpenMS refused them for want of a default processing.
+  mode) needs the `.d` exported with `--to mzml`, or a `--no-ims-compact` archive. Through 0.13.0
+  the export wrote the same frames without mobility, and OpenMS refused them for want of a default
+  processing.
 - **A file name that is not Unicode no longer aborts a conversion.** The recorded `conversion
   options` came from `std::env::args`, which panics on such an argument (a Latin-1 name on Linux):
   every archive conversion of the file aborted, and recording the mzML step would have aborted every
@@ -92,6 +93,100 @@ limits in order and on the vendor mobility model; an archive → mzML carries ea
   lane's per-spectrum step through the mzML writer; the remap bit for bit against mzdata's model at
   every scan of two runs; the recorded command line. The mzML reader they share is
   `tests/common/mzml_meta.rs`.
+
+## [0.13.0] — 2026-09-22
+
+**Output change (Bruker TDF, ims-compact chunked layout — every timsTOF archive).** The peaks facet
+moves to the **grid layout**; readers before this release cannot open it (the 0.12.x layout stays
+readable). Every other archive is unchanged.
+
+### Added
+
+- **The grid layout for the timsTOF chunked facet** (`src/tdf_grid.rs`; the reference
+  implementation's layout, mzpeak_prototyping `e62e18c`, Joshua Klein 2026-09-21): chunk bounds are
+  REAL m/z, `mz_chunk_values` is null, `chunk_encoding` is `MS:1003826` (coordinate grid encoding),
+  and each dimension's coordinates are integer grid indices in a struct column that also carries the
+  model — `mz_grid {grid_type, parameters, indices}` with the frame's `MzCalibration` row as
+  `[C0, 1e6/√(C1·cf), C2/cf, C3, C4, timebase, delay]` and `[first TOF bin, deltas…]`, and
+  `mean_inverse_reduced_ion_mobility_grid` with the `TimsCalibration` row as `[C6, C7, offset, slope]`
+  and the TIMS scan number. Both are registered in the array index as `chunk_transform` /
+  `MS:1003826` with the decoded type. Consequences: an m/z range query prunes chunk rows by m/z
+  (the TOF-bin bounds never matched a window), the run-wide chord and the `mzpeak:transform_params*`
+  field metadata are gone from the facet, every frame is exact — including frames whose calibration
+  row has `C2` or `C4`, which the per-frame `tof_c0`/`tof_c1` pair could not express and left on the
+  chord — and the ion mobility column shrinks (scan numbers with byte-stream-split beat dictionary
+  float64 by 7.5 %). Bounds are evaluated exactly as the reference implementation decodes
+  (`mzdata::io::tdf::MzCalibrationModel2::convert_f64`, fused multiply-add and all), so a bound and
+  the decoded value agree bit for bit across both readers. The `tof_c0`/`tof_c1` and
+  `tdf_t1`/`tdf_t2`/`tdf_mz_calibration_id` spectra_metadata columns stay as provenance; the
+  `ims_calibration` index block describes the new layout and no longer carries the chord.
+  Implemented as a rewrite of the finished 0.12.x facet (the native lane converts, then rewrites its
+  own output); `mzpeak-convert old.mzpeak -o new.mzpeak --ims-grid` upgrades an existing archive
+  (needs the `vendor_tims_calibration` block, written since 0.12.5). `--no-ims-grid` keeps the 0.12.x
+  layout, and so does `--no-tims-recalibration` (with a warning: timsrust's linear 1/K0 is not on the
+  vendor's scan grid); `--grid-encoding plain` writes Parquet's default encodings instead of
+  byte-stream-split.
+  Measured on PXD059079 2485 (3,994 frames, 37.8 M points): peaks facet 115.9 MB → **112.4 MB
+  (−3.0 %)**, plain 124.3 MB (+7.3 %); every TOF bin and intensity identical, m/z within 1.1e-9 ppm of
+  the 0.12.5 archive through the reader and through the mzML export, 1/K0 within 2.2 ulp (the
+  reference implementation's rational form vs the closed form). Validator: PASS, 0 warnings.
+- **The vendored reader decodes grid rows** (`MS:1003826`; `grid.rs`): the four grid models of the
+  reference implementation (linear, square-root, the two Bruker placeholders `MS:9999001/2`), the
+  struct columns on the main axis (delta-coded indices) and on secondary arrays, in both chunk
+  decoders and the range-scan path. Joshua Klein's `diaPASEF.grid.mzpeak` exports to mzML with the
+  same 291,453 points as his reference file (intensities identical, m/z within 1 ulp).
+
+### Fixed
+
+- **The timsTOF ModelType-1 TOF→m/z evaluation was missing Bruker's `C4` term and the temperature
+  scaling of `C2`.** `TdfMzCalibrationRow::tof_to_mz` computed `u²` where the vendor computes `u² − C4`
+  (a constant m/z shift), and used `C2` where the vendor uses `C2/cf` with the same temperature factor as
+  `C1`. Found by sampling the Bruker SDK on a file with `C4 = −0.068565` (mzdata's `diaPASEF.d`, via
+  Joshua Klein's grid-encoding test files): 40–720 ppm, then 1e-4 ppm, now 1e-9 ppm. No archive changed:
+  a row with `C2`, `C3` or `C4` never takes the exact per-frame pair and stays on the declared run-wide
+  chord (the only corpus file with such a row is MSV000092457, row 2). What was wrong was the formula
+  published in every timsTOF archive's `vendor_mz_calibration.model_type_1` — corrected — and its
+  "verified" claim, which rested on goldens that all had `C4 = 0`. New fixture
+  `tests/fixtures/tdf_diapasef_sdk_golden.json` and test
+  `full_model_type_1_matches_the_vendor_sdk_on_a_c4_file`.
+- **m/z range queries through the vendored reader (`extract_signal`, `query_peaks`) on grid-encoded
+  archives.** They now return exactly the points of a full read filtered in memory; before, they
+  returned nothing, the wrong points, or points without an m/z axis:
+  - *point layout with an integer grid column beside an all-NULL `point.mz`* (Shimadzu, SCIEX,
+    Agilent, the mzML lattice lane): **zero points for every gridded spectrum, silently.** The m/z
+    predicate pushed into Parquet drops NULLs, the grid column was never projected, and on a facet
+    with off-lattice spectra the m/z page index — built from the few pages that do hold real m/z —
+    skipped every other page. Only off-lattice spectra survived.
+  - *timsTOF `--no-ims-chunked`* (no m/z column at all): the m/z window was ignored; every point of
+    the time slice came back, with `tof` and no m/z.
+  - *timsTOF ims-chunked, the 0.12.x default* (`tof_chunk_*`, TOF-bin bounds): the window selected
+    rows by comparing m/z with TOF bins and filtered points by comparing m/z with integer TOF values.
+  The fix is decode-then-filter: on a grid facet the window is not pushed down; the grid column is
+  projected, m/z is reconstructed per row with the same arithmetic as a full read (the spectrum's
+  own `tof_c0`/`tof_c1` pair when it has one — loaded once, on the first such query — else the
+  run-wide parameters; a row that carries real m/z keeps it), and the window is applied to the
+  decoded points. Results carry index, m/z and the other arrays, as a non-grid facet's do; the grid
+  column is consumed. The async reader is not built by the converter and is unchanged.
+- **The chunk page index never existed.** The reader looked the m/z bounds columns up as
+  `<path of the m/z entry>_chunk_start`, i.e. `chunk.mz_chunk_values_chunk_start`, which no archive
+  has; the index stayed empty and m/z windows were never pruned at page level (the row predicate
+  did all the work, correctly). The bounds are found through their own array-index entries now.
+- **`RangeIndex` paired the start and end columns' pages by position** and applied the start page's
+  row count. Two columns need not paginate alike: with 100 chunk rows, starts in one page and ends
+  in two (rows 0–49 ending at 200, rows 50–99 at 1000), a query at m/z 500 was compared with
+  [100, 200] and all 100 rows were skipped. Each column now gives its own conservative mask
+  (`min(start) <= query.end`, `max(end) >= query.start`), the masks are intersected row-wise, and
+  rows no page covers are kept. This also protects the chromatogram and wavelength chunk indices,
+  which used the same code and were already live.
+
+### Tests
+
+- `tests/mz_range_queries.rs` and one more case in `tests/tof_grid_facets.rs`: a window query must
+  equal the filtered full read bit for bit — on the sqrt-grid fixture (profile and peaks facets,
+  gridded and off-lattice rows), the 1e-9 lattice fixture, a delta-chunked fixture, and the
+  pagination example above. Three of them fail on the 0.12.5 reader. Corpus-gated (`#[ignore]`):
+  the Shimadzu archive the defect was reported on, the chunked and the flat timsTOF form of
+  PXD059079 2485, and a 70 MB Q Exactive archive on which the repaired page index prunes for real.
 
 ## [0.12.5] — 2026-09-15
 

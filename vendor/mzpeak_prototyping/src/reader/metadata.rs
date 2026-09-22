@@ -75,6 +75,10 @@ pub struct SpectrumMetadataFacet {
     pub(crate) peak_indices: Option<PeakMetadata>,
     pub(crate) data_point_counts: Vec<u64>,
     pub(crate) peak_counts: Vec<u64>,
+    /// Per-spectrum sqrt-grid pairs (`tof_c0`, `tof_c1`) keyed by spectrum index, loaded on the
+    /// first range query over a grid-encoded point facet (`None` = not loaded yet). Range queries
+    /// reconstruct m/z batch-wise and cannot fetch one metadata row per spectrum.
+    pub(crate) grid_coefficients: Option<HashMap<u64, (f64, f64)>>,
 }
 
 impl ReaderFacetMetadataLike for SpectrumMetadataFacet {
@@ -133,6 +137,7 @@ impl SpectrumMetadataFacet {
             peak_indices,
             data_point_counts,
             peak_counts,
+            grid_coefficients: None,
         }
     }
 

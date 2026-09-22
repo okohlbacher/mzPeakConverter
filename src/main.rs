@@ -62,6 +62,7 @@ mod bruker_tsf;
 mod bruker_traces;
 mod tof_grid;
 mod tims_mobility;
+mod tdf_grid;
 mod thermo_status;
 mod thermo_trailers;
 mod thermo_isolation;
@@ -355,6 +356,29 @@ struct Cli {
     #[arg(long)]
     no_ims_chunked: bool,
 
+    /// Bruker timsTOF (TDF) ims-compact, chunked layout: keep the 0.12.x TOF layout (integer TOF
+    /// bounds, `tof_chunk_values` deltas, `tof_c0`/`tof_c1` per spectrum) instead of the GRID layout
+    /// that is the default since 0.13.0: real m/z chunk bounds, `mz_chunk_values` null, chunk
+    /// encoding MS:1003826, and one struct column per dimension (`mz_grid`,
+    /// `mean_inverse_reduced_ion_mobility_grid`: grid type, the vendor's calibration parameters,
+    /// integer indices) — the layout of the reference implementation (mzpeak_prototyping
+    /// `e62e18c`). Every frame is exact, including those whose calibration row has `C2`/`C4`.
+    #[arg(long)]
+    no_ims_grid: bool,
+
+    /// On a `.mzpeak` input: rewrite a 0.12.x ims-chunked timsTOF archive into the grid layout,
+    /// every other member copied byte for byte. On a `.d` input the grid layout is the default and
+    /// this flag is inert.
+    #[arg(long)]
+    ims_grid: bool,
+
+    /// Parquet encoding of the grid layout's index lists and bounds: `bss` (byte-stream-split; the
+    /// measured best, −2.3 % on PXD059079 2485 against the 0.12.5 layout) or `plain` (Parquet's
+    /// default — dictionary, then plain — as the reference implementation's files are encoded;
+    /// +8.1 % on the same run).
+    #[arg(long, default_value = "bss", value_parser = ["bss", "plain"])]
+    grid_encoding: String,
+
     /// Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default
     /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). On a TDF `.d` this
     /// still writes the lossless integer-TOF ims-compact layout — the SDK exposes the raw TOF index
@@ -585,6 +609,7 @@ struct FileConfig {
     no_ims_compact: Option<bool>,
     ims_chunked: Option<bool>,
     no_ims_chunked: Option<bool>,
+    no_ims_grid: Option<bool>,
     bruker_sdk: Option<bool>,
     no_tims_recalibration: Option<bool>,
     no_vendor: Option<bool>,
@@ -626,6 +651,10 @@ struct Settings {
     no_ims_compact: bool,
     /// OPT-IN chunked integer-TOF ims-compact layout (m/z-boundary chunks). Default false.
     ims_chunked: bool,
+    /// Grid layout for the chunked timsTOF facet (`--no-ims-grid` keeps the 0.12.x TOF layout).
+    ims_grid: bool,
+    /// Byte-stream-split on the grid layout's index lists and bounds (`--grid-encoding plain` off).
+    grid_bss: bool,
     bruker_sdk: bool,
     tims_recalibration: bool,
     no_vendor: bool,
@@ -693,6 +722,8 @@ impl Settings {
         note(cli.representation.is_some(), "--representation");
         note(cli.ims_chunked, "--ims-chunked");
         note(cli.no_ims_chunked, "--no-ims-chunked");
+        note(cli.no_ims_grid, "--no-ims-grid");
+        note(cli.ims_grid, "--ims-grid");
         note(cli.bruker_sdk, "--bruker-sdk");
         note(cli.no_tims_recalibration, "--no-tims-recalibration");
         note(cli.no_vendor, "--no-vendor");
@@ -730,6 +761,8 @@ impl Settings {
             // or the older `ims_chunked: false`) goes back to the flat layout.
             ims_chunked: !(cli.no_ims_chunked || fc.no_ims_chunked.unwrap_or(false))
                 && fc.ims_chunked.unwrap_or(true),
+            ims_grid: !(cli.no_ims_grid || fc.no_ims_grid.unwrap_or(false)),
+            grid_bss: cli.grid_encoding != "plain",
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             tims_recalibration: !(cli.no_tims_recalibration
                 || fc.no_tims_recalibration.unwrap_or(false)),
@@ -1148,6 +1181,17 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         // cumulatively summed it — every TOF bin after the first in a scan decodes as a tiny bin and
         // squares to a nonsense m/z. Refuse rather than emit silently wrong masses.
         reject_legacy_tof_delta(&cli.input)?;
+        // `--ims-grid` on an archive: the 0.12.x ims-chunked facet is rewritten into the grid
+        // layout; nothing else is filtered or touched.
+        if cli.ims_grid {
+            let report = tdf_grid::rewrite_archive(&cli.input, &output, cfg.ims_zstd_level, cfg.grid_bss)
+                .with_context(|| format!("rewriting {} into the grid layout", cli.input.display()))?;
+            log::info!(
+                "wrote {} ({} frames, {} points; peaks facet {} -> {} bytes)",
+                output.display(), report.frames, report.points, report.peaks_bytes_before, report.peaks_bytes_after
+            );
+            return Ok(exit::OK);
+        }
         // `--no-vendor` strips the embedded vendor data on the filter path too — same effect as
         // `--drop-aux 'vendor*'` (the glob's `*` spans `/`, so it also catches `vendor/…` side-files).
         // (It is moot for mzML output — vendor facets aren't carried into mzML at all.)
@@ -1327,7 +1371,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
             // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
             ims_compact_with_fallback(
                 &cli.input,
-                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size),
+                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size, cfg.ims_grid, cfg.grid_bss),
                 |route| {
                     // The fallback IS the standard lane: its flags were checked against ims-compact,
                     // which honours `--ims-chunked`; the standard lane cannot, so say so now.
@@ -2290,7 +2334,7 @@ fn convert_to_mzml(
     let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
         .then(|| thermo_isolation::UnstatedWidthGuard::open(&read_path));
     // A TDF gets the `--no-ims-compact` archive lane's mobility remap (`convert_file`). Through
-    // 0.12.5 this lane wrote mzdata's params as they come: every diaPASEF MS2 spectrum's
+    // 0.13.0 this lane wrote mzdata's params as they come: every diaPASEF MS2 spectrum's
     // `ion mobility lower limit` ABOVE its `upper limit` (1.3674 / 1.1931), which OpenSWATH's strict
     // `lower < IM < upper` precursor test then matched against nothing, and on timsrust's linear
     // map while the spectrum's mobility array is on mzdata's ModelType-2 calibration. Always on
@@ -2469,7 +2513,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
     // A timsTOF archive keeps each peak's 1/K0 in its peak facet (`mean_inverse_reduced_ion_mobility`),
-    // and the reader's peak list has no room for it: through 0.12.5 every such spectrum was exported
+    // and the reader's peak list has no room for it: through 0.13.0 every such spectrum was exported
     // with m/z and intensity only. Such a spectrum is exported from the facet's arrays instead.
     let peak_mobility = reader.metadata.peak_array_indices().is_some_and(|a| a.has_ion_mobility());
     // MS2 spectra that are whole frames (an ims-compact archive): precursors, but no window limits
@@ -5883,6 +5927,8 @@ fn convert_ims_compact_archive(
     tims_recalibration: bool,
     ims_chunked: bool,
     chunk_size_th: f64,
+    ims_grid: bool,
+    grid_bss: bool,
 ) -> Result<()> {
     let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
     let (a, b, n) = (reader.model.a, reader.model.b, reader.len());
@@ -5902,7 +5948,28 @@ fn convert_ims_compact_archive(
         } else {
             reader.ims_compact_spectrum(i, int)
         }
-    })
+    })?;
+    if ims_chunked && ims_grid && !tims_recalibration {
+        // The grid stores ion mobility as TIMS scan numbers under the vendor's exact model; timsrust's
+        // linear approximation is not on that grid, so the archive keeps the TOF layout.
+        log::warn!("--no-tims-recalibration: the 1/K0 values are timsrust's linear approximation, which the grid layout cannot express; the archive keeps the 0.12.x TOF layout");
+    }
+    if ims_chunked && ims_grid && tims_recalibration {
+        // The grid layout is a second pass over the finished archive (`tdf_grid`): the 0.12.x
+        // archive moves aside and is removed once the rewrite has replaced it — also on failure, so
+        // no `.tmp` is left behind.
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let pre = output.with_extension("mzpeak.pre-grid.tmp");
+        fs::rename(output, &pre).with_context(|| format!("staging {}", pre.display()))?;
+        let _guard = RemoveOnDrop(pre.clone());
+        tdf_grid::rewrite_archive(&pre, output, zstd_level, grid_bss).context("grid layout rewrite")?;
+    }
+    Ok(())
 }
 
 /// Bruker-SDK ims-compact: same integer-tof layout, but decoded via the official `timsdata` library
@@ -7962,7 +8029,7 @@ fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
 /// `spectrumList` and `chromatogramList` must name one in `defaultDataProcessingRef`. mzdata's
 /// writer names the list's FIRST entry there, and writes the attribute only when the list is not
 /// empty — and only an mzML source brings entries (the vendored archive reader restores none of
-/// the lists an archive's index holds). Through 0.12.5 every export of a raw file (Bruker
+/// the lists an archive's index holds). Through 0.13.0 every export of a raw file (Bruker
 /// TDF/TSF/BAF, Thermo, the Windows vendor readers, Agilent profile) and of an archive came out
 /// with `<dataProcessingList count="0">` and no default, which OpenMS 3.5 refuses ("Required
 /// attribute 'defaultDataProcessingRef' not present!").
@@ -7974,7 +8041,7 @@ fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
 /// then this conversion one `order` later, and goes FIRST, so the writer makes it the default. Just
 /// appending the step would leave it referenced by nothing, and would not keep the source's
 /// default either: mzdata's writer ignores the default a source declares and names the first
-/// entry, so through 0.12.5 an mzML's spectra silently moved to whatever processing came first
+/// entry, so through 0.13.0 an mzML's spectra silently moved to whatever processing came first
 /// (`tiny.pwiz.1.1.mzML`: from `pwiz_processing` to `CompassXtract_x0020_processing`). The
 /// source's entries stay in the list, after the step, for the elements that name one themselves;
 /// `run.default_data_processing_id` goes on naming the source's default, because the writer uses
@@ -8124,7 +8191,7 @@ fn demote_mzp_in_precursor(prec: &mut mzdata::spectrum::Precursor) {
 /// order), as mzML's `ParamGroup` requires: mzdata writes a list in the order it holds it, a demoted
 /// MZP term can sit before a PSI one, and mzdata's TDF reader gives every diaPASEF scan its
 /// `window group` userParam before its MS:1002815 cvParam — one XSD error per MS2 `<scan>` of a
-/// timsTOF export through 0.12.5.
+/// timsTOF export through 0.13.0.
 fn demote_mzp_in(params: &mut [Param]) {
     for p in params.iter_mut() {
         if p.controlled_vocabulary == Some(ControlledVocabulary::Unknown) {
@@ -8156,7 +8223,7 @@ fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
 fn conversion_options_param() -> Param {
     // `args_os`, not `args`: `std::env::args` panics on an argument that is not valid Unicode (a
     // Latin-1 file name on Linux), which aborted every archive conversion of such a file through
-    // 0.12.5 — and, once the mzML lanes record their step too, every mzML export of one.
+    // 0.13.0 — and, once the mzML lanes record their step too, every mzML export of one.
     Param::new_key_value("conversion options", conversion_options(std::env::args_os().skip(1)))
 }
 
@@ -9427,7 +9494,7 @@ mod tests {
     }
 
     /// mzML 1.1 requires a non-empty `dataProcessingList` and a `defaultDataProcessingRef` on
-    /// `spectrumList` and `chromatogramList`; through 0.12.5 an export of a raw file had neither
+    /// `spectrumList` and `chromatogramList`; through 0.13.0 an export of a raw file had neither
     /// (OpenMS 3.5: "Required attribute 'defaultDataProcessingRef' not present!"). The prologue all
     /// four mzML lanes share now puts this tool's `Conversion to mzML` step first, so it is the
     /// default of both lists: alone for a source without processing; after the methods of the
@@ -9542,7 +9609,7 @@ mod tests {
 
     /// A diaPASEF window spectrum as mzdata's TDF reader spells it — `ion mobility lower limit` from
     /// the window's first scan, i.e. the LARGER 1/K0 (1.3674 over an upper 1.1931 on a real run),
-    /// on timsrust's linear map — written by the `--to mzml` lane. Through 0.12.5 the lane wrote the
+    /// on timsrust's linear map — written by the `--to mzml` lane. Through 0.13.0 the lane wrote the
     /// pair as it came, and OpenSWATH's strict `lower < IM < upper` matched no precursor. It must
     /// come out ordered, on the ModelType-2 model the spectrum's mobility array uses — bit for bit
     /// the array values of the window's end scans — with the window band on the selected ion as
@@ -10491,8 +10558,7 @@ mod tests {
         let output = scratch.join("ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
 
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
-            .expect("ims-compact conversion");
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0, false, true).expect("ims-compact conversion");
 
         // Crack the zip archive and extract facets to scratch files (File: ChunkReader).
         let f = fs::File::open(&output).unwrap();
@@ -10594,8 +10660,7 @@ mod tests {
         let output = scratch.join("ims_chunked.mzpeak");
 
         // ims_chunked = true: the configuration that wrote a point data facet beside chunked peaks.
-        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0)
-            .expect("--ims-chunked conversion");
+        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0, false, true).expect("--ims-chunked conversion");
 
         // The family is declared in each facet's footer as `spectrum_array_index.prefix`.
         let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
@@ -10763,8 +10828,7 @@ mod tests {
         let _rm = RmDir(scratch.to_path_buf());
         let output = scratch.join("contract.mzpeak");
         let _ = fs::remove_file(&output);
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
-            .expect("ims-compact conversion");
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0, false, true).expect("ims-compact conversion");
 
         let f = fs::File::open(&output).unwrap();
         let mut zip = zip::ZipArchive::new(f).unwrap();
