@@ -235,7 +235,10 @@ fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
     let tmp = std::env::temp_dir().join(format!("mzpc-exacttof-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let archive = tmp.join("2485.mzpeak");
-    run(&[dot_d.to_str().unwrap(), "-o", archive.to_str().unwrap(), "--force", "--no-vendor"], &[]);
+    // This pins the 0.12.x TOF layout's contract (the per-frame pair beside the run-wide chord); the
+    // grid layout that is the default since 0.13.0 carries the same frames' exactness in the chunk
+    // rows themselves and is pinned by `tests/tdf_grid_layout.rs`.
+    run(&[dot_d.to_str().unwrap(), "-o", archive.to_str().unwrap(), "--force", "--no-vendor", "--no-ims-grid"], &[]);
 
     // ims_calibration: per-spectrum declared, legacy chord kept.
     let cal = ims_calibration(&archive);
@@ -393,7 +396,7 @@ fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
     // reader branch of the per-spectrum fixup) reconstructs from it too.
     let chunked = tmp.join("2485.chunked.mzpeak");
     run(
-        &[dot_d.to_str().unwrap(), "-o", chunked.to_str().unwrap(), "--force", "--no-vendor", "--ims-chunked"],
+        &[dot_d.to_str().unwrap(), "-o", chunked.to_str().unwrap(), "--force", "--no-vendor", "--ims-chunked", "--no-ims-grid"],
         &[],
     );
     let cal = ims_calibration(&chunked);

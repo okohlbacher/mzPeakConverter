@@ -6,7 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-No archive changes: reader and formula text only.
+**Output change (Bruker TDF, ims-compact chunked layout — every timsTOF archive).** The peaks facet
+moves to the **grid layout**; readers before this release cannot open it (the 0.12.x layout stays
+readable). Every other archive is unchanged.
+
+### Added
+
+- **The grid layout for the timsTOF chunked facet** (`src/tdf_grid.rs`; the reference
+  implementation's layout, mzpeak_prototyping `e62e18c`, Joshua Klein 2026-09-21): chunk bounds are
+  REAL m/z, `mz_chunk_values` is null, `chunk_encoding` is `MS:1003826` (coordinate grid encoding),
+  and each dimension's coordinates are integer grid indices in a struct column that also carries the
+  model — `mz_grid {grid_type, parameters, indices}` with the frame's `MzCalibration` row as
+  `[C0, 1e6/√(C1·cf), C2/cf, C3, C4, timebase, delay]` and `[first TOF bin, deltas…]`, and
+  `mean_inverse_reduced_ion_mobility_grid` with the `TimsCalibration` row as `[C6, C7, offset, slope]`
+  and the TIMS scan number. Both are registered in the array index as `chunk_transform` /
+  `MS:1003826` with the decoded type. Consequences: an m/z range query prunes chunk rows by m/z
+  (the TOF-bin bounds never matched a window), the run-wide chord and the `mzpeak:transform_params*`
+  field metadata are gone from the facet, every frame is exact — including frames whose calibration
+  row has `C2` or `C4`, which the per-frame `tof_c0`/`tof_c1` pair could not express and left on the
+  chord — and the ion mobility column shrinks (scan numbers with byte-stream-split beat dictionary
+  float64 by 7.5 %). Bounds are evaluated exactly as the reference implementation decodes
+  (`mzdata::io::tdf::MzCalibrationModel2::convert_f64`, fused multiply-add and all), so a bound and
+  the decoded value agree bit for bit across both readers. The `tof_c0`/`tof_c1` and
+  `tdf_t1`/`tdf_t2`/`tdf_mz_calibration_id` spectra_metadata columns stay as provenance; the
+  `ims_calibration` index block describes the new layout and no longer carries the chord.
+  Implemented as a rewrite of the finished 0.12.x facet (the native lane converts, then rewrites its
+  own output); `mzpeak-convert old.mzpeak -o new.mzpeak --ims-grid` upgrades an existing archive
+  (needs the `vendor_tims_calibration` block, written since 0.12.5). `--no-ims-grid` keeps the 0.12.x
+  layout, and so does `--no-tims-recalibration` (with a warning: timsrust's linear 1/K0 is not on the
+  vendor's scan grid); `--grid-encoding plain` writes Parquet's default encodings instead of
+  byte-stream-split.
+  Measured on PXD059079 2485 (3,994 frames, 37.8 M points): peaks facet 115.9 MB → **112.4 MB
+  (−3.0 %)**, plain 124.3 MB (+7.3 %); every TOF bin and intensity identical, m/z within 1.1e-9 ppm of
+  the 0.12.5 archive through the reader and through the mzML export, 1/K0 within 2.2 ulp (the
+  reference implementation's rational form vs the closed form). Validator: PASS, 0 warnings.
+- **The vendored reader decodes grid rows** (`MS:1003826`; `grid.rs`): the four grid models of the
+  reference implementation (linear, square-root, the two Bruker placeholders `MS:9999001/2`), the
+  struct columns on the main axis (delta-coded indices) and on secondary arrays, in both chunk
+  decoders and the range-scan path. Joshua Klein's `diaPASEF.grid.mzpeak` exports to mzML with the
+  same 291,453 points as his reference file (intensities identical, m/z within 1 ulp).
 
 ### Fixed
 

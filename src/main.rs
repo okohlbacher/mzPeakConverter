@@ -62,6 +62,7 @@ mod bruker_tsf;
 mod bruker_traces;
 mod tof_grid;
 mod tims_mobility;
+mod tdf_grid;
 mod thermo_status;
 mod thermo_trailers;
 mod thermo_isolation;
@@ -355,6 +356,29 @@ struct Cli {
     #[arg(long)]
     no_ims_chunked: bool,
 
+    /// Bruker timsTOF (TDF) ims-compact, chunked layout: keep the 0.12.x TOF layout (integer TOF
+    /// bounds, `tof_chunk_values` deltas, `tof_c0`/`tof_c1` per spectrum) instead of the GRID layout
+    /// that is the default since 0.13.0: real m/z chunk bounds, `mz_chunk_values` null, chunk
+    /// encoding MS:1003826, and one struct column per dimension (`mz_grid`,
+    /// `mean_inverse_reduced_ion_mobility_grid`: grid type, the vendor's calibration parameters,
+    /// integer indices) — the layout of the reference implementation (mzpeak_prototyping
+    /// `e62e18c`). Every frame is exact, including those whose calibration row has `C2`/`C4`.
+    #[arg(long)]
+    no_ims_grid: bool,
+
+    /// On a `.mzpeak` input: rewrite a 0.12.x ims-chunked timsTOF archive into the grid layout,
+    /// every other member copied byte for byte. On a `.d` input the grid layout is the default and
+    /// this flag is inert.
+    #[arg(long)]
+    ims_grid: bool,
+
+    /// Parquet encoding of the grid layout's index lists and bounds: `bss` (byte-stream-split; the
+    /// measured best, −2.3 % on PXD059079 2485 against the 0.12.5 layout) or `plain` (Parquet's
+    /// default — dictionary, then plain — as the reference implementation's files are encoded;
+    /// +8.1 % on the same run).
+    #[arg(long, default_value = "bss", value_parser = ["bss", "plain"])]
+    grid_encoding: String,
+
     /// Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default
     /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). On a TDF `.d` this
     /// still writes the lossless integer-TOF ims-compact layout — the SDK exposes the raw TOF index
@@ -582,6 +606,7 @@ struct FileConfig {
     no_ims_compact: Option<bool>,
     ims_chunked: Option<bool>,
     no_ims_chunked: Option<bool>,
+    no_ims_grid: Option<bool>,
     bruker_sdk: Option<bool>,
     no_tims_recalibration: Option<bool>,
     no_vendor: Option<bool>,
@@ -623,6 +648,10 @@ struct Settings {
     no_ims_compact: bool,
     /// OPT-IN chunked integer-TOF ims-compact layout (m/z-boundary chunks). Default false.
     ims_chunked: bool,
+    /// Grid layout for the chunked timsTOF facet (`--no-ims-grid` keeps the 0.12.x TOF layout).
+    ims_grid: bool,
+    /// Byte-stream-split on the grid layout's index lists and bounds (`--grid-encoding plain` off).
+    grid_bss: bool,
     bruker_sdk: bool,
     tims_recalibration: bool,
     no_vendor: bool,
@@ -690,6 +719,8 @@ impl Settings {
         note(cli.representation.is_some(), "--representation");
         note(cli.ims_chunked, "--ims-chunked");
         note(cli.no_ims_chunked, "--no-ims-chunked");
+        note(cli.no_ims_grid, "--no-ims-grid");
+        note(cli.ims_grid, "--ims-grid");
         note(cli.bruker_sdk, "--bruker-sdk");
         note(cli.no_tims_recalibration, "--no-tims-recalibration");
         note(cli.no_vendor, "--no-vendor");
@@ -727,6 +758,8 @@ impl Settings {
             // or the older `ims_chunked: false`) goes back to the flat layout.
             ims_chunked: !(cli.no_ims_chunked || fc.no_ims_chunked.unwrap_or(false))
                 && fc.ims_chunked.unwrap_or(true),
+            ims_grid: !(cli.no_ims_grid || fc.no_ims_grid.unwrap_or(false)),
+            grid_bss: cli.grid_encoding != "plain",
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             tims_recalibration: !(cli.no_tims_recalibration
                 || fc.no_tims_recalibration.unwrap_or(false)),
@@ -1143,6 +1176,17 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         // cumulatively summed it — every TOF bin after the first in a scan decodes as a tiny bin and
         // squares to a nonsense m/z. Refuse rather than emit silently wrong masses.
         reject_legacy_tof_delta(&cli.input)?;
+        // `--ims-grid` on an archive: the 0.12.x ims-chunked facet is rewritten into the grid
+        // layout; nothing else is filtered or touched.
+        if cli.ims_grid {
+            let report = tdf_grid::rewrite_archive(&cli.input, &output, cfg.ims_zstd_level, cfg.grid_bss)
+                .with_context(|| format!("rewriting {} into the grid layout", cli.input.display()))?;
+            log::info!(
+                "wrote {} ({} frames, {} points; peaks facet {} -> {} bytes)",
+                output.display(), report.frames, report.points, report.peaks_bytes_before, report.peaks_bytes_after
+            );
+            return Ok(exit::OK);
+        }
         // `--no-vendor` strips the embedded vendor data on the filter path too — same effect as
         // `--drop-aux 'vendor*'` (the glob's `*` spans `/`, so it also catches `vendor/…` side-files).
         // (It is moot for mzML output — vendor facets aren't carried into mzML at all.)
@@ -1322,7 +1366,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
             // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
             ims_compact_with_fallback(
                 &cli.input,
-                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size),
+                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size, cfg.ims_grid, cfg.grid_bss),
                 |route| {
                     // The fallback IS the standard lane: its flags were checked against ims-compact,
                     // which honours `--ims-chunked`; the standard lane cannot, so say so now.
@@ -5778,6 +5822,8 @@ fn convert_ims_compact_archive(
     tims_recalibration: bool,
     ims_chunked: bool,
     chunk_size_th: f64,
+    ims_grid: bool,
+    grid_bss: bool,
 ) -> Result<()> {
     let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
     let (a, b, n) = (reader.model.a, reader.model.b, reader.len());
@@ -5797,7 +5843,28 @@ fn convert_ims_compact_archive(
         } else {
             reader.ims_compact_spectrum(i, int)
         }
-    })
+    })?;
+    if ims_chunked && ims_grid && !tims_recalibration {
+        // The grid stores ion mobility as TIMS scan numbers under the vendor's exact model; timsrust's
+        // linear approximation is not on that grid, so the archive keeps the TOF layout.
+        log::warn!("--no-tims-recalibration: the 1/K0 values are timsrust's linear approximation, which the grid layout cannot express; the archive keeps the 0.12.x TOF layout");
+    }
+    if ims_chunked && ims_grid && tims_recalibration {
+        // The grid layout is a second pass over the finished archive (`tdf_grid`): the 0.12.x
+        // archive moves aside and is removed once the rewrite has replaced it — also on failure, so
+        // no `.tmp` is left behind.
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let pre = output.with_extension("mzpeak.pre-grid.tmp");
+        fs::rename(output, &pre).with_context(|| format!("staging {}", pre.display()))?;
+        let _guard = RemoveOnDrop(pre.clone());
+        tdf_grid::rewrite_archive(&pre, output, zstd_level, grid_bss).context("grid layout rewrite")?;
+    }
+    Ok(())
 }
 
 /// Bruker-SDK ims-compact: same integer-tof layout, but decoded via the official `timsdata` library
@@ -10028,8 +10095,7 @@ mod tests {
         let output = scratch.join("ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
 
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
-            .expect("ims-compact conversion");
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0, false, true).expect("ims-compact conversion");
 
         // Crack the zip archive and extract facets to scratch files (File: ChunkReader).
         let f = fs::File::open(&output).unwrap();
@@ -10131,8 +10197,7 @@ mod tests {
         let output = scratch.join("ims_chunked.mzpeak");
 
         // ims_chunked = true: the configuration that wrote a point data facet beside chunked peaks.
-        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0)
-            .expect("--ims-chunked conversion");
+        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0, false, true).expect("--ims-chunked conversion");
 
         // The family is declared in each facet's footer as `spectrum_array_index.prefix`.
         let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
@@ -10300,8 +10365,7 @@ mod tests {
         let _rm = RmDir(scratch.to_path_buf());
         let output = scratch.join("contract.mzpeak");
         let _ = fs::remove_file(&output);
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0)
-            .expect("ims-compact conversion");
+        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0, false, true).expect("ims-compact conversion");
 
         let f = fs::File::open(&output).unwrap();
         let mut zip = zip::ZipArchive::new(f).unwrap();
