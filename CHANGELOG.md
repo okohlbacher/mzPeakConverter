@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change (mzML).** Every mzML the tool writes records its conversion in
+`dataProcessingList`, which makes the export of a raw file or an archive valid mzML 1.1 — stock
+OpenMS 3.5.0 refused every one of them. A timsTOF `.d` → mzML writes its diaPASEF window limits in
+order and on the vendor mobility model.
+
+### Fixed
+
+- **An mzML export of a raw file or an archive is valid mzML 1.1.** mzML requires at least one
+  `dataProcessing` and a `defaultDataProcessingRef` on `spectrumList` and `chromatogramList`;
+  mzdata's writer names the list's first entry there and writes the attribute only when the list is
+  not empty, and only an mzML source brings entries (the archive reader restores none of the
+  archive's lists). So every export of a Bruker TDF/TSF/BAF, Thermo `.raw`, Agilent profile `.d`,
+  Windows vendor file or `.mzpeak` came out with `<dataProcessingList count="0">` and no default —
+  an archive's export with `<softwareList count="0">` as well — and OpenMS 3.5.0 `FileInfo` /
+  `SwathFile::loadMzML` stop at "Required attribute 'defaultDataProcessingRef' not present!" (found
+  by DIALibGen's identification on timsTOF diaPASEF runs). The prologue all four mzML lanes share
+  (`fixup_mzml_run_metadata`) now appends `mzpeak_convert_to_mzml`: software `mzpeak-convert`
+  (this version) doing MS:1000544 `Conversion to mzML`, with the path-free `conversion options`
+  the archive lanes record. Appended on every export, not only to an empty list: the tool did write
+  the file, and an mzML source's list states how THAT file was made (msconvert's own conversion, a
+  peak picker) — the archive lanes append their step after the copied list the same way. A
+  source's own first entry stays first and so stays the default; a re-export of this tool's own
+  mzML reuses its software entry and gives the step a fresh id (`mzpeak_convert_to_mzml_2`), since
+  an mzML id occurs once. On a timsTOF diaPASEF run capped at 20,000 spectra, `FileInfo` refuses the
+  0.12.5 export and reads this one.
+- **A timsTOF `.d` → mzML writes each diaPASEF window's 1/K0 limits in order, on the vendor
+  model.** `--to mzml` wrote mzdata's TDF params as they come: the spectrum-level `ion mobility
+  lower limit` from the window's first scan, the larger 1/K0 (1.3674 over an upper limit of 1.1931),
+  on every MS2 spectrum — OpenSWATH assigns precursors with a strict `lower < IM < upper` and matched
+  none — and on timsrust's linear map, while the spectrum's mobility array is on mzdata's
+  ModelType-2 calibration. The lane now applies `bruker_native::TdfMobilityRemap`, as the
+  `--no-ims-compact` archive lane has since 0.9.6: the pair ordered, it and the scan and
+  selected-ion 1/K0 on the ModelType-2 model (1.305615 < 1.332387 < 1.359142 for the first window
+  of PXD059079 2485.d, the ims-compact lane's values), and the window band on the selected ion as
+  `userParam`s. Ordering alone would not have done: on the run above, 8.9% of the MS2 peaks of the
+  first 2,000 window spectra (63,483 of 712,976) carry a 1/K0 outside their window's linear limits
+  even once the pair is ordered, and none outside the remapped ones; 19,692/19,692 MS2 spectra had
+  `lower > upper` before, none now. `--no-tims-recalibration` now applies to these params on this
+  lane too (timsrust's linear 1.291012 < 1.317349 < 1.343686; the arrays stay on mzdata's model,
+  and the warning says so) and is no longer listed as inert for `--to mzml`.
+- `tests/mzml_data_processing.rs`: the processing contract (non-empty list, every `softwareRef`
+  resolving, this version's `Conversion to mzML`, both list defaults naming an existing entry,
+  unique ids) on the `--to mzml` export of an mzML, of that export again, of a Thermo `.raw`, and on
+  an archive's export; corpus-gated, a 2485.d export with and without `--no-tims-recalibration`
+  (every MS2 window ordered and equal to its band, the first window pinned). Unit tests: the
+  prologue on a source with no processing, with its own, and with this tool's step already in it;
+  a mzdata-spelled inverted window through the lane's per-spectrum step and the mzML writer
+  (`main.rs`). The mzML reader they share is `tests/common/mzml_meta.rs`.
+
 ## [0.12.5] — 2026-09-15
 
 **Output change (Shimadzu `.lcd`, native lane).** Every archive gains the vendor's own chromatograms

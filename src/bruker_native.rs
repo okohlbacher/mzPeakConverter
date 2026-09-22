@@ -188,7 +188,7 @@ impl TdfMobilityRemap {
 
     /// For tests: a remap over explicit models.
     #[cfg(test)]
-    fn new(linear: Scan2ImConverter, recal: Option<crate::tims_mobility::TimsMobilityCalibration>) -> Self {
+    pub(crate) fn new(linear: Scan2ImConverter, recal: Option<crate::tims_mobility::TimsMobilityCalibration>) -> Self {
         Self { linear, recal }
     }
 
