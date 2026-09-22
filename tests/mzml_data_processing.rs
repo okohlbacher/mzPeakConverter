@@ -3,7 +3,7 @@
 //! export carries each diaPASEF window's 1/K0 limits in order, on the vendor model its mobility
 //! arrays use, bracketing them exactly; and an archive exports each peak's ion mobility.
 //!
-//! Through 0.12.5 the export of a raw file or an archive wrote `<dataProcessingList count="0">` and no
+//! Through 0.13.0 the export of a raw file or an archive wrote `<dataProcessingList count="0">` and no
 //! `defaultDataProcessingRef`, which stock OpenMS 3.5 refuses ("Required attribute
 //! 'defaultDataProcessingRef' not present!"); an mzML source's spectra moved to whatever processing
 //! came first; a TDF export wrote every MS2 spectrum's `ion mobility lower limit` above its
@@ -68,7 +68,7 @@ fn methods(m: &mzml_meta::Mzml, id: &str) -> Vec<(String, Option<i64>)> {
 }
 
 /// An mzML source: the step extends the processing the source's spectra point at by default
-/// (`pwiz_processing`, the SECOND entry of tiny.pwiz.1.1.mzML — 0.12.5 moved them to the first,
+/// (`pwiz_processing`, the SECOND entry of tiny.pwiz.1.1.mzML — 0.13.0 moved them to the first,
 /// `CompassXtract_x0020_processing`) and becomes the default of both lists; the source's entries stay,
 /// after it, and every element-level reference still resolves. Exporting that export again extends
 /// the chain under a fresh id and reuses the software entry.
@@ -104,7 +104,7 @@ fn an_mzml_source_s_default_processing_is_extended_by_the_step() {
 }
 
 /// The archive export (`filter_mzpeak_to_mzml`). The vendored archive reader restores none of the
-/// lists the archive's index holds (software, processing, instruments), so 0.12.5 wrote
+/// lists the archive's index holds (software, processing, instruments), so 0.13.0 wrote
 /// `<softwareList count="0">` and `<dataProcessingList count="0">` here too; the export's own step
 /// fills both, as the only entry.
 #[test]
@@ -133,7 +133,7 @@ fn array(spec: &mzdata::spectrum::MultiLayerSpectrum, kind: &mzdata::spectrum::A
 
 /// An archive whose peak facet holds a 1/K0 per peak (a PASEF frame combined across its mobility
 /// scans, here; every timsTOF archive) exports it as MS:1003006, value for value. The reader's peak
-/// list has no room for it, and through 0.12.5 the export wrote m/z and intensity only.
+/// list has no room for it, and through 0.13.0 the export wrote m/z and intensity only.
 #[test]
 fn an_archive_export_keeps_the_peak_mobility_array() {
     use mzdata::spectrum::ArrayType;
@@ -162,7 +162,7 @@ fn an_archive_export_keeps_the_peak_mobility_array() {
 }
 
 /// A file whose name is not Unicode converts. `std::env::args`, which the recorded command line
-/// was read through, panics on such an argument: 0.12.5 aborted every archive conversion of the
+/// was read through, panics on such an argument: 0.13.0 aborted every archive conversion of the
 /// file, and recording the step in every mzML would have aborted those too.
 #[cfg(target_os = "linux")]
 #[test]
@@ -264,7 +264,7 @@ fn a_timstof_export_orders_its_window_limits_on_the_vendor_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Both kinds of timsTOF archive export each peak's 1/K0 (0.12.5: none). A `--no-ims-compact`
+/// Both kinds of timsTOF archive export each peak's 1/K0 (0.13.0: none). A `--no-ims-compact`
 /// archive holds one spectrum per diaPASEF window, so its export meets the `--to mzml` lane's window
 /// contract; an ims-compact archive holds whole frames, which are exported as such, with a warning
 /// that a reader assigning precursors by mobility window needs the `.d` exported instead.

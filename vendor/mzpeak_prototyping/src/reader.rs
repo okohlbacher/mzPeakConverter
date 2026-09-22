@@ -651,6 +651,7 @@ impl<
         BatchIterator<'_>,
         HashMap<u64, f64, BuildIdentityHasher<u64>>,
     )> {
+        self.ensure_grid_coefficients()?;
         let (time_index, index_range) =
             self.get_spectrum_index_range_for_time_range(time_range, ms_level_range)?;
         let builder = self.handle.spectrum_data()?;
@@ -1033,6 +1034,7 @@ impl<
         BatchIterator<'_>,
         HashMap<u64, f64, BuildIdentityHasher<u64>>,
     )> {
+        self.ensure_grid_coefficients()?;
         let builder = self.handle.spectrum_peaks()?;
         let meta_index = self
             .metadata
@@ -1441,6 +1443,40 @@ impl<
             .row_selection_contains(index);
 
         load_auxiliary_arrays_for_from(Some(rows), builder, index)
+    }
+
+    /// Load every spectrum's sqrt-grid pair (`tof_c0`/`tof_c1`, looked up by NAME like
+    /// [`point::reconstruct_per_spectrum_grid_mz`]) once, so a range query over a grid-encoded point
+    /// facet can reconstruct m/z per row. A no-op for archives without a sqrt grid; an archive whose
+    /// spectra carry no pair gets an empty table and stays on the run-wide parameters.
+    fn ensure_grid_coefficients(&mut self) -> io::Result<()> {
+        if self.metadata.spectra.grid_coefficients.is_some() {
+            return Ok(());
+        }
+        let is_sqrt = |ai: &crate::peak_series::ArrayIndex| {
+            ai.iter().any(|v| {
+                matches!(v.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof))
+            })
+        };
+        let needed = is_sqrt(self.metadata.spectrum_array_indices())
+            || self.metadata.spectra.peak_indices.as_ref().is_some_and(|p| is_sqrt(&p.array_indices));
+        let mut table = HashMap::new();
+        if needed {
+            // ponytail: reads every spectrum description once (cached by the reader afterwards);
+            // project the two columns directly if this ever shows up in a profile.
+            if let Some(descriptions) = self.load_all_spectrum_metadata()? {
+                for d in descriptions {
+                    let coeff = |needle: &str| {
+                        d.params().iter().find(|p| p.name.contains(needle)).and_then(|p| p.to_f64().ok())
+                    };
+                    if let (Some(c0), Some(c1)) = (coeff("tof_c0"), coeff("tof_c1")) {
+                        table.insert(d.index as u64, (c0, c1));
+                    }
+                }
+            }
+        }
+        self.metadata.spectra.grid_coefficients = Some(table);
+        Ok(())
     }
 
     /// Load m/z spacing model parameters column if it is present, as well as peak and point counts.

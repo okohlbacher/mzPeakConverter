@@ -577,27 +577,33 @@ impl<'a, T: HasProximity + Debug> RangeIndex<'a, T> {
         }
     }
 
-    pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = T>) -> RowSelection {
+    /// One column's conservative row mask: pages passing `keep`, plus every row no page covers.
+    fn page_mask(index: &PageIndex<T>, keep: impl Fn(&PageIndexEntry<T>) -> bool) -> RowSelection {
         let mut selectors = Vec::new();
         let mut last_row = 0;
-        for (start_page, end_page) in self.start_index.iter().zip(self.end_index.iter()) {
-            if start_page.start_row() != last_row {
-                selectors.push(RowSelector::skip(
-                    (start_page.start_row() - last_row) as usize,
-                ));
+        for page in index.iter() {
+            if page.start_row != last_row {
+                selectors.push(RowSelector::select((page.start_row - last_row) as usize));
             }
-
-            let overlaps = start_page.contains(&query.start())
-                || end_page.contains(&query.end())
-                || SimpleInterval::new(start_page.start(), end_page.end()).overlaps(query);
-            if overlaps {
-                selectors.push(RowSelector::select(start_page.row_len() as usize));
-            } else {
-                selectors.push(RowSelector::skip(start_page.row_len() as usize))
-            }
-            last_row = start_page.end_row();
+            let n = page.row_len() as usize;
+            selectors.push(if keep(page) { RowSelector::select(n) } else { RowSelector::skip(n) });
+            last_row = page.end_row;
         }
         selectors.into()
+    }
+
+    /// Rows whose chunk `[start, end]` MAY overlap `query`: `start <= query.end && end >= query.start`.
+    ///
+    /// The two bounds columns are paginated independently, so each gives its own conservative mask
+    /// (a start page can hold a match iff its minimum is `<= query.end`, an end page iff its maximum
+    /// is `>= query.start`) and the masks are intersected row-wise. Pairing start and end pages by
+    /// position, as this used to, skipped matching rows whenever the page boundaries differed. Rows
+    /// outside every indexed page are kept: no statistics, no ground to exclude them.
+    pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = T>) -> RowSelection {
+        let (lo, hi) = (query.start(), query.end());
+        let starts = Self::page_mask(self.start_index, |p| p.min <= hi);
+        let ends = Self::page_mask(self.end_index, |p| p.max >= lo);
+        starts.intersection(&ends)
     }
 }
 
@@ -835,21 +841,22 @@ impl SpectrumChunkIndex {
             &format!("{}.spectrum_time", spectrum_array_indices.prefix),
         );
 
+        // The bounds columns are array-index entries of their own (`chunk.mz_chunk_start` /
+        // `chunk.mz_chunk_end`). This used to append `_chunk_start` to the path of EVERY m/z entry —
+        // `chunk.mz_chunk_values_chunk_start` — which names no column, so the index was always empty
+        // and m/z windows were never pruned at page level. Only true m/z bounds qualify: a grid main
+        // axis (`tof_chunk_*`, TOF bins) is not an `MZArray` and stays unindexed.
         for entry in spectrum_array_indices.iter() {
-            if matches!(entry.array_type, ArrayType::MZArray) {
-                this.start_mz_index = read_f64_page_index_from(
-                    spectrum_data_reader.metadata(),
-                    pq_schema,
-                    &format!("{}_chunk_start", entry.path),
-                )
-                .unwrap_or_default();
-                this.end_mz_index = read_f64_page_index_from(
-                    spectrum_data_reader.metadata(),
-                    pq_schema,
-                    &format!("{}_chunk_end", entry.path),
-                )
-                .unwrap_or_default();
+            if !matches!(entry.array_type, ArrayType::MZArray) {
+                continue;
             }
+            let target = match entry.buffer_format {
+                BufferFormat::ChunkBoundsStart => &mut this.start_mz_index,
+                BufferFormat::ChunkBoundsEnd => &mut this.end_mz_index,
+                _ => continue,
+            };
+            *target = read_f64_page_index_from(spectrum_data_reader.metadata(), pq_schema, &entry.path)
+                .unwrap_or_default();
         }
         this
     }
