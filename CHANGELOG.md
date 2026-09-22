@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.13.0] — 2026-09-22
 
 **Output change (Bruker TDF, ims-compact chunked layout — every timsTOF archive).** The peaks facet
 moves to the **grid layout**; readers before this release cannot open it (the 0.12.x layout stays
