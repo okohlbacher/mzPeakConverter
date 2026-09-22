@@ -29,6 +29,9 @@ use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum, SignalContinuity, SpectrumDescription};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+#[path = "common/range_query.rs"]
+mod range_query;
+
 const C0: f64 = 10.0;
 // Coarse enough that the half-step quantization at m/z ~137 exceeds the 5 ppm bound, so the
 // off-lattice spectra really are off the lattice (at a fine step any m/z snaps within tolerance).
@@ -218,5 +221,52 @@ fn facet_follows_the_declared_representation_and_the_export_is_clean() {
         seen += 1;
     }
     assert_eq!(seen, N_TOTAL);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An m/z range query over a grid facet hands back exactly the points of a full read filtered in
+/// memory. Until 0.12.5 it handed back NOTHING for every gridded spectrum: the facet's `mz` column is
+/// NULL on those rows, the m/z predicate pushed into Parquet dropped every NULL, and `tof_index` was
+/// never projected — only the off-lattice spectra (real `mz`) survived. Both facets, both row kinds.
+#[test]
+fn an_mz_window_over_a_grid_facet_returns_what_a_full_read_filtered_in_memory_does() {
+    let dir = std::env::temp_dir().join(format!("mzpc-tofgrid-range-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("synthetic.mzML");
+    let archive = dir.join("synthetic.mzpeak");
+    write_mzml(&src);
+    run(&[&src, Path::new("-o"), &archive, Path::new("--tof-grid"), Path::new("on")], &[("MZPC_TOF_GRID_C1", "1e-4")]);
+
+    let mut reader = mzpeak_prototyping::MzPeakReader::new(&archive).unwrap();
+    let everything = || mzdata::mzpeaks::coordinate::SimpleInterval::new(-1.0, 1.0e9);
+
+    // Profile facet: a window that cuts through the gridded spectra (m/z 196-225).
+    for window in [Some((200.0, 215.0)), None] {
+        let mut want = Vec::new();
+        for i in 0..N_PROFILE as u64 {
+            range_query::expected(i, &reader.get_spectrum_arrays(i).unwrap().expect("profile arrays"), window, &mut want);
+        }
+        want.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(want.len() > 100, "the window must select a real share of the profile points, got {}", want.len());
+        let (it, _) = reader.extract_signal(everything(), window.map(|(lo, hi)| mzdata::mzpeaks::coordinate::SimpleInterval::new(lo, hi)), None, None).unwrap();
+        assert_eq!(range_query::rows(it), want, "profile facet, window {window:?}");
+    }
+
+    // Peaks facet: one window over the off-lattice spectra (real m/z, 137-141) AND the gridded one
+    // (201.6-203.2), cutting through both.
+    for window in [Some((138.0, 202.5)), None] {
+        let mut want = Vec::new();
+        let (mut gridded, mut plain) = (0, 0);
+        for i in CENTROID_ON as u64..N_TOTAL as u64 {
+            let before = want.len();
+            range_query::expected(i, &reader.get_spectrum_peak_arrays_for(i).unwrap().expect("peak arrays"), window, &mut want);
+            if i == CENTROID_ON as u64 { gridded += want.len() - before } else { plain += want.len() - before }
+        }
+        want.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(gridded > 0 && plain > 0, "the window must hit both row kinds (gridded {gridded}, plain {plain})");
+        let (it, _) = reader.query_peaks(everything(), window.map(|(lo, hi)| mzdata::mzpeaks::coordinate::SimpleInterval::new(lo, hi)), None, None).unwrap();
+        assert_eq!(range_query::rows(it), want, "peaks facet, window {window:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

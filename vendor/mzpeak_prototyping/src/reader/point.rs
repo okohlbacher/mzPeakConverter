@@ -226,6 +226,192 @@ pub(crate) fn reconstruct_per_spectrum_grid_mz(
     }
 }
 
+/// The integer grid column of a point facet whose m/z is NOT stored (`point.tof_index` / `point.tof`
+/// carrying a `SqrtMzFromTof` or `LinearMz` transform), if the facet has one.
+pub(crate) fn grid_axis_entry(array_indices: &ArrayIndex) -> Option<&crate::buffer_descriptors::ArrayIndexEntry> {
+    use crate::buffer_descriptors::{BufferFormat, BufferTransform};
+    array_indices.iter().find(|v| {
+        matches!(v.buffer_format, BufferFormat::Point)
+            && matches!(v.transform, Some(BufferTransform::SqrtMzFromTof | BufferTransform::LinearMz))
+    })
+}
+
+/// The main axis of a CHUNKED facet when it is a grid index rather than m/z (the 0.12.x timsTOF
+/// ims-chunked archives: `chunk.tof_chunk_*`, whose bounds are TOF bins, not m/z).
+pub(crate) fn chunk_grid_axis_entry(array_indices: &ArrayIndex) -> Option<&crate::buffer_descriptors::ArrayIndexEntry> {
+    use crate::buffer_descriptors::{BufferFormat, BufferTransform};
+    array_indices.iter().find(|v| {
+        matches!(v.buffer_format, BufferFormat::Chunk)
+            && matches!(v.transform, Some(BufferTransform::SqrtMzFromTof | BufferTransform::LinearMz))
+    })
+}
+
+/// Grid index → m/z for a whole column, with the same arithmetic as [`reconstruct_grid_mz`] /
+/// [`reconstruct_per_spectrum_grid_mz`]: the spectrum's own sqrt pair when it has one, else the
+/// run-wide parameters; the run-wide `(0,1)` sqrt placeholder reconstructs nothing (NULL); a row that
+/// already carries a real m/z (`stored`, the per-spectrum fallback) keeps it.
+pub(crate) struct GridModel {
+    sqrt: bool,
+    params: Vec<f64>,
+}
+
+impl GridModel {
+    pub(crate) fn new(grid: &crate::buffer_descriptors::ArrayIndexEntry) -> Self {
+        Self {
+            sqrt: matches!(grid.transform, Some(crate::buffer_descriptors::BufferTransform::SqrtMzFromTof)),
+            params: grid.transform_params.clone().unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn reconstruct(
+        &self,
+        grid: &ArrayRef,
+        index: &UInt64Array,
+        stored: Option<&Float64Array>,
+        per_spectrum: Option<&HashMap<u64, (f64, f64)>>,
+    ) -> Result<Float64Array, ArrowError> {
+        let ks: Vec<Option<i64>> = match grid.data_type() {
+            DataType::Int64 => grid.as_primitive::<arrow::datatypes::Int64Type>().iter().collect(),
+            DataType::Int32 => grid.as_primitive::<arrow::datatypes::Int32Type>().iter().map(|k| k.map(i64::from)).collect(),
+            other => return Err(ArrowError::SchemaError(format!("grid column has type {other:?}"))),
+        };
+        let (c0, c1) = (self.params.first().copied().unwrap_or(0.0), self.params.get(1).copied().unwrap_or(1.0));
+        let run_wide_sqrt = (!(c0 == 0.0 && c1 == 1.0)).then_some((c0, c1));
+        let s = self.params.first().copied().unwrap_or(1.0);
+        let scale = exact_reciprocal_scale(s);
+        Ok(ks
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                if let Some(v) = stored.filter(|a| a.is_valid(i)) {
+                    return Some(v.value(i));
+                }
+                let k = (*k)? as f64;
+                if self.sqrt {
+                    let pair = per_spectrum.and_then(|m| m.get(&index.value(i)).copied()).or(run_wide_sqrt);
+                    pair.map(|(c0, c1)| {
+                        let r = c0 + c1 * k;
+                        r * r
+                    })
+                } else {
+                    Some(match scale {
+                        Some(scale) => k / scale,
+                        None => s * k,
+                    })
+                }
+            })
+            .collect())
+    }
+}
+
+/// Range queries over a GRID-ENCODED point facet: decode, then filter.
+///
+/// Such a facet stores an integer grid index beside an all-NULL (or absent) m/z column, so an m/z
+/// predicate pushed into Parquet sees only NULLs and drops every gridded row, and the grid column
+/// was never projected. This wraps the unfiltered batches instead: m/z is reconstructed per row with
+/// the same arithmetic as [`reconstruct_grid_mz`] / [`reconstruct_per_spectrum_grid_mz`] (the
+/// spectrum's own pair when it has one, else the run-wide parameters; the run-wide `(0,1)` sqrt
+/// placeholder reconstructs nothing), a row that carries a real m/z (the per-spectrum fallback) keeps
+/// it, and only then is the m/z window applied. The batches it yields have the layout a non-grid
+/// facet gives: index, m/z, the other projected arrays — the grid column is consumed.
+pub(crate) struct GridMzFilterIter<'a, I: Iterator<Item = Result<RecordBatch, ArrowError>>> {
+    source: I,
+    coordinate_range: Option<SimpleInterval<f64>>,
+    per_spectrum: Option<&'a HashMap<u64, (f64, f64)>>,
+    index_name: &'static str,
+    grid_name: String,
+    mz_name: String,
+    model: GridModel,
+}
+
+impl<'a, I: Iterator<Item = Result<RecordBatch, ArrowError>>> GridMzFilterIter<'a, I> {
+    pub(crate) fn new(
+        source: I,
+        grid: &crate::buffer_descriptors::ArrayIndexEntry,
+        mz_path: Option<&str>,
+        context: BufferContext,
+        coordinate_range: Option<SimpleInterval<f64>>,
+        per_spectrum: Option<&'a HashMap<u64, (f64, f64)>>,
+    ) -> Self {
+        let leaf = |path: &str| path.rsplit('.').next().unwrap_or(path).to_string();
+        Self {
+            source,
+            coordinate_range,
+            per_spectrum,
+            index_name: context.index_name(),
+            grid_name: leaf(&grid.path),
+            mz_name: mz_path.map(leaf).unwrap_or_else(|| "mz".to_string()),
+            model: GridModel::new(grid),
+        }
+    }
+
+    fn process(&self, batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+        let root = batch.column(0).as_struct();
+        let (Some(grid), Some(index)) = (root.column_by_name(&self.grid_name), root.column_by_name(self.index_name)) else {
+            return Ok(batch);
+        };
+        let index: &UInt64Array = index.as_primitive();
+        let stored: Option<&Float64Array> = root
+            .column_by_name(&self.mz_name)
+            .filter(|c| matches!(c.data_type(), DataType::Float64))
+            .map(|c| c.as_primitive());
+        let mz = self.model.reconstruct(grid, index, stored, self.per_spectrum)?;
+        let mz: ArrayRef = Arc::new(mz);
+        let keep = self.coordinate_range.as_ref().map(|r| r.contains_dy(&mz));
+
+        // index, m/z, then everything else that was projected except the consumed grid column.
+        let mut fields = Vec::with_capacity(root.num_columns());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(root.num_columns());
+        let mz_field = Arc::new(arrow::datatypes::Field::new(&self.mz_name, DataType::Float64, true));
+        let mut placed = false;
+        for (f, c) in root.fields().iter().zip(root.columns()) {
+            if f.name() == &self.grid_name {
+                continue;
+            }
+            if f.name() == &self.mz_name {
+                fields.push(mz_field.clone());
+                columns.push(mz.clone());
+                placed = true;
+                continue;
+            }
+            fields.push(f.clone());
+            columns.push(c.clone());
+            if f.name() == self.index_name && stored.is_none() && root.column_by_name(&self.mz_name).is_none() {
+                fields.push(mz_field.clone());
+                columns.push(mz.clone());
+                placed = true;
+            }
+        }
+        if !placed {
+            fields.push(mz_field);
+            columns.push(mz);
+        }
+        let new_root = StructArray::new(fields.into(), columns, root.nulls().cloned());
+        let root_field = arrow::datatypes::Field::new(batch.schema().field(0).name(), new_root.data_type().clone(), false);
+        let out = RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(vec![root_field])), vec![Arc::new(new_root)])?;
+        match keep {
+            Some(keep) => arrow::compute::filter_record_batch(&out, &keep),
+            None => Ok(out),
+        }
+    }
+}
+
+impl<'a, I: Iterator<Item = Result<RecordBatch, ArrowError>>> Iterator for GridMzFilterIter<'a, I> {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.source.next()? {
+                Ok(batch) => match self.process(batch) {
+                    Ok(out) if out.num_rows() == 0 => continue,
+                    other => return Some(other),
+                },
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
 /// An internal shared behavior set for reading point-layout data
 pub(crate) trait PointDataArrayReader {
     /// Read a [`StructArray`] of parallel array values into a map of [`DataArray`] instances.
@@ -623,7 +809,14 @@ trait PointQuerySource {
         query_index: &'a I,
         array_indices: &'a ArrayIndex,
         query: Option<PageQuery>,
+        decode_grid: bool,
     ) -> Option<(RowSelection, Vec<usize>, ProjectionMask, RowFilter)> {
+        // A grid-encoded facet has no m/z to push a window into: its m/z column is all NULL (or
+        // absent), so the page index built from it covers only the pages of fallback rows — every
+        // other page would be SKIPPED — and the row predicate drops every NULL. The caller applies
+        // the window after reconstruction instead (`GridMzFilterIter`).
+        let grid = if decode_grid { grid_axis_entry(array_indices) } else { None };
+        let coordinate_range = if grid.is_some() { None } else { coordinate_range };
         let mut rows = query_index.index_overlaps(&index_range.index_range);
 
         let query = query.unwrap_or_else(|| query_index.query_pages_overlaps(&index_range));
@@ -673,6 +866,10 @@ trait PointQuerySource {
                 fields.push(v.path.to_string());
                 break;
             }
+        }
+
+        if let Some(grid) = grid {
+            fields.push(grid.path.to_string());
         }
 
         let proj =
@@ -788,6 +985,9 @@ mod async_impl {
                 query_index,
                 array_indices,
                 None,
+                // The async reader does not decode grid facets yet (it is not built by the
+                // converter); its behaviour is left exactly as it was.
+                false,
             ) {
                 let schema = self.0.schema().clone();
                 let (_, subset) = schema.column_with_name(&array_indices.prefix).unwrap();
@@ -1179,6 +1379,7 @@ mod sync_impl {
                 query_index,
                 array_indices,
                 query,
+                true,
             ) {
                 let schema = self.0.schema();
                 let (_, subset) = schema.column_with_name(&array_indices.prefix).unwrap();
@@ -1214,6 +1415,18 @@ mod sync_impl {
                     .with_row_filter(predicate)
                     .with_batch_size(10_000)
                     .build()?;
+
+                // Grid-encoded facet: reconstruct m/z from the grid column, THEN apply the window.
+                if let Some(grid) = grid_axis_entry(array_indices) {
+                    return Ok(Box::new(GridMzFilterIter::new(
+                        it,
+                        grid,
+                        array_indices.get(&context.default_sorted_array()).map(|e| e.path.as_str()),
+                        context,
+                        coordinate_range,
+                        metadata.spectra.grid_coefficients.as_ref(),
+                    )));
+                }
 
                 // We don't have spectra in this reader, or we do but they don't have an m/z axis
                 if !matches!(context, BufferContext::Spectrum)
