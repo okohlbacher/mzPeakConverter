@@ -434,10 +434,18 @@ impl TdfMzCalibrationRow {
         self.c1 * (1.0 + self.dc1 * (self.t1 - t1_frame) / 1e6)
     }
 
-    /// Exact ModelType-1 m/z for a (possibly fractional) TOF index at frame temperature `t1_frame`.
-    /// The quadratic is solved in its cancellation-free form `u = 2(t − C0)/(b + sqrt(disc))`, as
-    /// in the reference. Out-of-model inputs (`t < C0`, negative discriminant, `C1_eff ≤ 0`) yield
-    /// NaN, never a plausible-looking m/z. `C2 = 0` takes the linear branch `u = (t − C0)/b`.
+    /// Exact ModelType-1 m/z for a (possibly fractional) TOF index at frame temperature `t1_frame`:
+    /// `t = C0 + b·u + (C2/cf)·u²` with `u = sqrt(m/z + C4)`, `cf = 1 + dC1·(T1 − t1_frame)/1e6`,
+    /// `b = 1e6/sqrt(C1·cf)`, solved for `u`, then `m/z = u² − C4`. The quadratic is solved in its
+    /// cancellation-free form `u = 2(t − C0)/(b + sqrt(disc))`. Out-of-model inputs (`t < C0`,
+    /// negative discriminant, `C1_eff ≤ 0`) yield NaN, never a plausible-looking m/z. `C2 = 0` takes
+    /// the linear branch `u = (t − C0)/b`.
+    ///
+    /// The `− C4` term (a constant m/z shift; Bruker's "reduced mass" m0) and the temperature scaling
+    /// of `C2` were missing until 0.12.5: on a file with `C4 = −0.0686` that was 40–720 ppm, hidden
+    /// because every SDK golden so far had `C4 = 0`, and because `C4 ≠ 0` rows never take the exact
+    /// per-frame pair anyway ([`Self::is_sqrt_linear`]). Verified to 1e-9 ppm against the SDK on
+    /// such a file (`tests/fixtures/tdf_diapasef_sdk_golden.json`).
     pub fn tof_to_mz(&self, tof: f64, t1_frame: f64) -> f64 {
         let t = tof * self.digitizer_timebase + self.digitizer_delay;
         let c1_eff = self.c1_eff(t1_frame);
@@ -445,10 +453,12 @@ impl TdfMzCalibrationRow {
             return f64::NAN;
         }
         let b = 1e6 / c1_eff.sqrt();
-        let u = if self.c2 == 0.0 {
+        // C2 carries the same temperature factor as C1 (rustims / mzdata; SDK-verified).
+        let c2 = if self.c1 != 0.0 { self.c2 / (c1_eff / self.c1) } else { self.c2 };
+        let u = if c2 == 0.0 {
             (t - self.c0) / b
         } else {
-            let disc = b * b - 4.0 * self.c2 * (self.c0 - t);
+            let disc = b * b - 4.0 * c2 * (self.c0 - t);
             if !(disc >= 0.0) {
                 return f64::NAN;
             }
@@ -458,7 +468,7 @@ impl TdfMzCalibrationRow {
             }
             2.0 * (t - self.c0) / denom
         };
-        u * u
+        u * u - self.c4
     }
 
     /// Whether the row is EXACTLY `m/z = (c0 + c1·tof)²`: ModelType 1 with no quadratic or
@@ -764,8 +774,8 @@ pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
         "global_metadata": global,
         "per_frame_columns": per_frame_columns,
         "per_frame_columns_note": "spectra_metadata columns holding Frames.T1, Frames.T2, Frames.MzCalibration per spectrum (in this order); the id selects the mz_calibration row by Id",
-        "model_type_1": "t_ns = tof*DigitizerTimebase + DigitizerDelay; C1_eff = C1*(1 + dC1*(T1 - tdf_t1)/1e6); t_ns = C0 + (1e6/sqrt(C1_eff))*sqrt(mz) + C2*mz, solve for sqrt(mz) (C2 = 0: mz = ((t_ns - C0)*sqrt(C1_eff)/1e6)^2)",
-        "model_type_1_verified": "2.5e-5 ppm vs Bruker timsdata SDK (speXtract v0.2.0); dC2 = 0 on every file seen, T2 role unverified",
+        "model_type_1": "t_ns = tof*DigitizerTimebase + DigitizerDelay; cf = 1 + dC1*(T1 - tdf_t1)/1e6 (+ dC2*(T2 - tdf_t2)/1e6, dC2 = 0 on every file seen); u = sqrt(mz + C4); t_ns = C0 + (1e6/sqrt(C1*cf))*u + (C2/cf)*u^2, solve for u; mz = u^2 - C4 (C2 = 0: mz = ((t_ns - C0)*sqrt(C1*cf)/1e6)^2 - C4)",
+        "model_type_1_verified": "1e-9 ppm vs Bruker timsdata SDK on a C2 != 0, C4 != 0 file (mzdata diaPASEF.d, 2026-09-22); 2.5e-5 ppm on speXtract S30/S08/S23 (C4 = 0); 1e-7 ppm on PXD059079 2485 (C2 = C4 = 0)",
     }))
 }
 
@@ -1827,6 +1837,54 @@ mod empty_frame_read_tests {
 
 #[cfg(test)]
 mod exact_tof_calibration_tests {
+
+    /// The FULL model against the SDK on a file with `C2 ≠ 0`, `C4 ≠ 0` and a real temperature
+    /// offset (mzdata's `diaPASEF.d`: C2 = 0.002115, C4 = −0.068565, dC1 = 27, frame T1 − row T1 =
+    /// +0.056; `MZPC_TDF_SDK_GOLDEN` on the Flash box, 2026-09-22; 100 points on 5 frames). Without
+    /// `− C4` the error is 40–720 ppm; without the temperature scaling of `C2` it is 1e-4 ppm.
+    #[test]
+    fn full_model_type_1_matches_the_vendor_sdk_on_a_c4_file() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tdf_diapasef_sdk_golden.json")).unwrap();
+        let g: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let rows: Vec<super::TdfMzCalibrationRow> = g["mz_calibration"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let f = |k: &str| r[k].as_f64().unwrap_or(0.0);
+                super::TdfMzCalibrationRow {
+                    id: r["Id"].as_i64().unwrap(),
+                    model_type: r["ModelType"].as_i64().unwrap(),
+                    digitizer_timebase: f("DigitizerTimebase"),
+                    digitizer_delay: f("DigitizerDelay"),
+                    t1: f("T1"),
+                    dc1: f("dC1"),
+                    dc2: f("dC2"),
+                    c0: f("C0"),
+                    c1: f("C1"),
+                    c2: f("C2"),
+                    c3: f("C3"),
+                    c4: f("C4"),
+                    quadratic_terms_stored: true,
+                }
+            })
+            .collect();
+        assert!(rows.iter().any(|r| r.c2 != 0.0 && r.c4 != 0.0), "the fixture must exercise C2 and C4");
+        let pts = g["points"].as_array().unwrap();
+        assert!(pts.len() >= 100, "fixture has {} points", pts.len());
+        let mut worst_ppm: f64 = 0.0;
+        for p in pts {
+            let sdk = p["mz_sdk"].as_f64().unwrap();
+            if !(sdk > 0.0) {
+                continue;
+            }
+            let row = rows.iter().find(|r| r.id == p["cal_id"].as_i64().unwrap()).expect("calibration row for the point");
+            assert!(!row.is_sqrt_linear(), "a C2/C4 row must not be offered as an exact sqrt-linear pair");
+            let mz = row.tof_to_mz(p["tof"].as_f64().unwrap(), p["t1"].as_f64().unwrap());
+            worst_ppm = worst_ppm.max(((mz - sdk) / sdk).abs() * 1e6);
+        }
+        assert!(worst_ppm < 1e-6, "full ModelType-1 vs SDK: worst {worst_ppm:.2e} ppm");
+    }
 
     /// The C2 = 0 branch against Bruker's OWN `tims_index_to_mz` (timsdata SDK on the Flash box,
     /// `MZPC_TDF_SDK_GOLDEN`, 2026-09-03): 240 (frame, tof) points on 12 frames of PXD059079 2485.d,
