@@ -137,8 +137,11 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum (Shimadzu `.lcd` does). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written. Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) |
 | `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: the **chunked** layout, the default since 0.12.1 — passing the flag is inert and says so. Splits each frame's peaks into 50-Th m/z bins (`--chunk-size` overrides), each chunk recording its TOF bounds as page-prunable Parquet columns — XIC / m/z-slice queries ~20× faster. TOF is delta-encoded within each chunk: `chunk_start + cumsum(deltas)`, lossless (§9). It is also **smaller**: 7.8 % on 2485.d, because chunk-relative TOF costs a quarter of absolute TOF, which more than pays for the mobility column losing its run-length ordering. The archive then holds a CHUNK `spectra_peaks` facet beside a POINT `spectra_data` facet — the mixed layout-family deviation (§9) |
 | `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: write the flat **archive** layout instead — one table of ABSOLUTE integer TOF bins, no m/z index, no mixed layout family, ~8 % more bytes. This was the default through 0.12.0 |
+| `--no-ims-grid` | off | Bruker timsTOF (TDF) ims-compact, chunked layout: keep the 0.12.x **TOF layout** (integer TOF chunk bounds, `tof_chunk_values` deltas, `tof_c0`/`tof_c1` per spectrum) instead of the **grid layout** that is the default since 0.13.0: real m/z chunk bounds, `mz_chunk_values` null, `chunk_encoding` MS:1003826 ("coordinate grid encoding"), and one struct column per dimension — `mz_grid` and `mean_inverse_reduced_ion_mobility_grid`, each `{grid_type, parameters, indices}` — carrying the vendor's own calibration model for that frame (the `MzCalibration` row as `[C0, 1e6/√(C1·cf), C2/cf, C3, C4, timebase, delay]`, the `TimsCalibration` row as `[C6, C7, offset, slope]`) and the integer TOF bins / TIMS scan numbers. This is the layout of the reference implementation (mzpeak_prototyping `e62e18c`); its m/z model reproduces the Bruker SDK to 1e-9 ppm, including frames whose calibration row has `C2`/`C4`, which the TOF layout could only put on the run-wide chord. Readers before 0.13.0 cannot open it; the 0.12.x layout stays readable. Measured on PXD059079 2485: peaks facet −3.0 % (§9) |
+| `--ims-grid` | off | On a `.mzpeak` input: rewrite a 0.12.x ims-chunked timsTOF archive into the grid layout, every other member copied byte for byte (`mzpeak-convert old.mzpeak -o new.mzpeak --ims-grid`). On a `.d` input the grid layout is the default and the flag is inert |
+| `--grid-encoding` | `bss` | Parquet encoding of the grid layout's index lists and chunk bounds: `bss` (byte-stream-split, dictionary off — the measured best) or `plain` (Parquet's default, dictionary then plain, as the reference implementation's files are encoded). On 2485: `bss` −3.0 %, `plain` +7.3 % against the 0.12.5 facet |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
-| `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
+| `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. With the grid layout (default since 0.13.0, §9) this flag also keeps the 0.12.x TOF layout, with a warning: the grid stores 1/K0 as TIMS scan numbers under the exact model, which the linear approximation is not on. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
@@ -169,12 +172,12 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 
 | Lane (how it is selected) | Refused (exit 1) | Warned; the run goes on |
 |---|---|---|
-| `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --representation --ims-chunked --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output) |
+| `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --no-mz-lattice --chunk-size --no-ims-compact --representation --ims-chunked --no-ims-grid --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output). `--ims-grid` is NOT a filter: it rewrites the timsTOF peaks facet into the grid layout (`--zstd-level` and `--grid-encoding` apply to that facet) and copies everything else |
 | `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux` | the filter lane's list without `--aux` |
-| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
+| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --ims-grid --grid-encoding --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
 | `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert` | `--layout --no-numpress --chunk-size` |
-| `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-ims-chunked --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
-| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | `--layout --no-numpress --chunk-size` |
+| `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --grid-encoding --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
+| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-ims-chunked --no-ims-grid --grid-encoding --no-tims-recalibration` (the SDK lane writes the flat layout, which the grid rewrite does not apply to) | `--layout --no-numpress --chunk-size` |
 | `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | — |
 | default timsTOF (TDF) ims-compact | `--image --sdrf` | `--layout --no-numpress` |
 | native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` | `--ims-chunked --no-ims-chunked` |
@@ -287,6 +290,7 @@ force: true
 no_ims_compact: false      # TDF: keep the lossless ims-compact default
 ims_chunked: true          # the default since 0.12.1
 no_ims_chunked: false      # opt back out to the flat archive layout
+no_ims_grid: false         # keep the 0.12.x TOF layout instead of the grid layout (§9)
 bruker_sdk: false
 no_tims_recalibration: false
 no_vendor: false
@@ -834,6 +838,31 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
     (−8 % on a DDA run): TOF deltas shrink to a fifth, but the per-peak `1/K0` column becomes half the
     table — sorting each frame by TOF scrambles the scan id, ~1.2 B/peak of irreducible entropy — so a
     per-scan mobility representation would not help here either.
+  - **Grid** *(the default since 0.13.0; `--no-ims-grid` keeps the TOF layout above)* — the chunked
+    facet in the layout of the reference implementation: the chunk bounds are **real m/z**
+    (`mz_chunk_start`/`mz_chunk_end`, so an m/z window prunes rows without any model), `mz_chunk_values`
+    is null, `chunk_encoding` is `MS:1003826` ("coordinate grid encoding"), and each dimension's
+    coordinates are integer indices in a struct column that carries the model with them:
+    `mz_grid {grid_type, parameters, indices}` holds `[first TOF bin, deltas…]` (cumulative sum to
+    reconstruct; the first point IS in the list) with the frame's `MzCalibration` row as
+    `[C0, 1e6/√(C1·cf), C2/cf, C3, C4, DigitizerTimebase, DigitizerDelay]`
+    (`cf = 1 + (dC1·(T1 − Frames.T1) + dC2·(T2 − Frames.T2))/1e6`), and
+    `mean_inverse_reduced_ion_mobility_grid` holds the TIMS scan numbers with the `TimsCalibration` row
+    as `[C6, C7, offset, slope]`. Decoding: `t = bin·timebase + delay`, solve
+    `t = C0 + β·u + C2·u² (+ C3·u³)` for `u`, `m/z = u² − C4`; `1/K0 = 1/(C6 + C7/(offset + slope·scan))` —
+    exactly as `mzdata::io::tdf::MzCalibrationModel2::convert_f64` / `TimsCalibrationModel2::convert`
+    evaluate them, which is how the bounds were computed, so a bound and its decoded point agree bit
+    for bit. Both columns are array-index entries of `buffer_format: chunk_transform`,
+    `transform: MS:1003826`, with the DECODED type. Every frame is exact (SDK-verified to 1e-9 ppm;
+    frames whose row has `C2`/`C4`, which the TOF layout left on the chord, included), no run-wide chord
+    and no `mzpeak:transform_params*` metadata remain, and the `tof_c0`/`tof_c1`,
+    `tdf_t1`/`tdf_t2`/`tdf_mz_calibration_id` columns stay as provenance only. Size on 2485: **−3.0 %**
+    against the TOF layout with the default byte-stream-split encoding (`--grid-encoding bss`), +7.3 %
+    with Parquet's default encodings (`--grid-encoding plain`); the gain is the ion mobility column
+    (scan numbers, byte-stream-split, beat dictionary-coded float64 by 7.5 %). Written as a rewrite of
+    the finished TOF-layout facet; `mzpeak-convert old.mzpeak -o new.mzpeak --ims-grid` upgrades a
+    0.12.5 archive in place of a reconversion. The models' placeholder terms `MS:9999001/2` are the
+    reference implementation's until PSI-MS assigns them.
 - **Shimadzu `.lcd` (two integer axes, one per facet)** — the native lane stores each facet on
   the exact integer grid the vendor data sits on; both are lossless and reproduce the vendor's
   m/z to the last digit.

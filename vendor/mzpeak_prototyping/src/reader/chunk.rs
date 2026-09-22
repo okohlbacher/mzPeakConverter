@@ -32,7 +32,7 @@ use mzpeaks::coordinate::SimpleInterval;
 use crate::{
     BufferContext, BufferName,
     chunk_series::{
-        BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR,
+        BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR, GRID_ENCODING,
     },
     filter::RegressionDeltaModel,
     peak_series::{ArrayIndex, ArrayIndexEntry, BufferFormat, data_array_to_arrow_array},
@@ -638,6 +638,12 @@ impl<'a> ChunkDecoder<'a> {
                     Self::unpack_secondary_arrays(arr, &name, &mut store, &decoder);
                 } else if let Some(arr) = arr.as_list_opt::<i32>() {
                     Self::unpack_secondary_arrays(arr, &name, &mut store, &decoder);
+                } else if arr.as_struct_opt().is_some() {
+                    // A secondary grid (`<array>_grid` struct rows): decode every row through the
+                    // transform into the array's own type.
+                    if let Some(decoder) = &decoder {
+                        extend_from_decoded(&mut store, &decoder.decode(&name, &arr));
+                    }
                 } else {
                     panic!(
                         "Unsupported data type {:?} for secondary chunk collection for name {name:?}",
@@ -752,6 +758,11 @@ impl<'a> ChunkDecoder<'a> {
             } else if let Some(view_rows) = view.as_list_opt::<i32>() {
                 for (i, row) in view_rows.iter().enumerate() {
                     rows[i].push((name.clone(), row));
+                }
+            } else if view.as_struct_opt().is_some() {
+                // A grid struct column (`<array>_grid`): one struct row per chunk row.
+                for i in 0..view.len() {
+                    rows[i].push((name.clone(), (!view.is_null(i)).then(|| view.slice(i, 1))));
                 }
             } else {
                 panic!(
@@ -882,6 +893,9 @@ impl<'a> ChunkDecoder<'a> {
                                         self.delta_model,
                                     );
                             }
+                            GRID_ENCODING => {
+                                decode_grid_row(&chunk_vals, self.main_axis.as_mut().unwrap());
+                            }
                             _ => {
                                 unimplemented!("{encoding}")
                             }
@@ -923,6 +937,8 @@ impl<'a> ChunkDecoder<'a> {
                     NUMPRESS_LINEAR => {
                         // This chunk is never empty if it is valid
                     }
+                    // A grid row always holds its first index, so it is never empty either.
+                    GRID_ENCODING => {}
                     _ => {
                         unimplemented!("{encoding}")
                     }
@@ -979,9 +995,21 @@ impl<'a> ChunkScanDecoder<'a> {
         };
         rows.resize(n_rows, Vec::new());
         for (name, view) in self.main_axis_buffers.drain(..) {
-            let view_rows = view.as_list::<i64>();
-            for (i, row) in view_rows.iter().enumerate() {
-                rows[i].push((name.clone(), row));
+            if let Some(view_rows) = view.as_list_opt::<i64>() {
+                for (i, row) in view_rows.iter().enumerate() {
+                    rows[i].push((name.clone(), row));
+                }
+            } else if let Some(view_rows) = view.as_list_opt::<i32>() {
+                for (i, row) in view_rows.iter().enumerate() {
+                    rows[i].push((name.clone(), row));
+                }
+            } else if view.as_struct_opt().is_some() {
+                // A grid struct column (`<array>_grid`): one struct row per chunk row.
+                for i in 0..view.len() {
+                    rows[i].push((name.clone(), (!view.is_null(i)).then(|| view.slice(i, 1))));
+                }
+            } else {
+                panic!("Unsupported data type {:?} for main sequence array {name}", view.data_type());
             }
         }
         return rows;
@@ -1129,6 +1157,10 @@ impl<'a> ChunkScanDecoder<'a> {
                                 entity_idx_acc
                                     .extend(std::iter::repeat_n(entity_index, n_points_added));
                             }
+                            GRID_ENCODING => {
+                                let n = decode_grid_row(&chunk_vals, self.main_axis.as_mut().unwrap());
+                                entity_idx_acc.extend(std::iter::repeat_n(entity_index, n));
+                            }
                             _ => {
                                 unimplemented!("{encoding}")
                             }
@@ -1168,7 +1200,7 @@ impl<'a> ChunkScanDecoder<'a> {
                         None,
                     ),
                     // Never legitimately empty.
-                    NUMPRESS_LINEAR => 0,
+                    NUMPRESS_LINEAR | GRID_ENCODING => 0,
                     _ => {
                         unimplemented!("{encoding}")
                     }
@@ -1233,10 +1265,16 @@ impl<'a> ChunkScanDecoder<'a> {
                 Some(decoder) => {
                     let chunks: Vec<ArrayRef> = chunks
                         .iter()
-                        .flat_map(|a| {
-                            a.as_list::<i64>()
-                                .iter()
-                                .map(|b| decoder.decode(&name, b.as_ref().unwrap()))
+                        .flat_map(|a| -> Vec<ArrayRef> {
+                            if a.as_struct_opt().is_some() {
+                                // A secondary grid struct: all of its rows at once.
+                                vec![decoder.decode(&name, a)]
+                            } else {
+                                a.as_list::<i64>()
+                                    .iter()
+                                    .map(|b| decoder.decode(&name, b.as_ref().unwrap()))
+                                    .collect()
+                            }
                         })
                         .collect();
                     let chunks: Vec<&dyn Array> = chunks.iter().map(|a| a as &dyn Array).collect();
@@ -1293,7 +1331,14 @@ impl<'a> ChunkScanDecoder<'a> {
                 }
             };
             arrays.push(chunks);
-            fields.push(name.to_field());
+            // A decoded grid column goes out under the array's own name and type
+            // (`mean_inverse_reduced_ion_mobility`, float64), not the struct column's.
+            let out_name = if matches!(name.transform, Some(crate::buffer_descriptors::BufferTransform::GridEncoding)) {
+                (*name).clone().with_format(BufferFormat::ChunkSecondary).with_transform(None)
+            } else {
+                (*name).clone()
+            };
+            fields.push(out_name.to_field());
         }
 
         let fields: Fields = fields.into();
@@ -1611,4 +1656,28 @@ pub(crate) fn make_ion_mobility_filter<'a>(
         arrow::compute::filter_record_batch(&bat, &mask)
     });
     Box::new(it)
+}
+
+
+/// Decode one grid-encoded chunk row (a one-row slice of the `<array>_grid` struct column; the
+/// index list is `[first, deltas…]`) into the main-axis accumulator. Returns the point count.
+fn decode_grid_row(chunk_vals: &ArrayRef, accumulator: &mut DataArray) -> usize {
+    let rows = chunk_vals.as_struct();
+    let values = crate::grid::decode_rows(rows, true).unwrap_or_else(|e| panic!("grid chunk row: {e}"));
+    let n = values.len();
+    extend_from_decoded(accumulator, &(Arc::new(arrow::array::Float64Array::from(values)) as ArrayRef));
+    n
+}
+
+/// Append a decoded float64 grid column to a store of the array's own type.
+fn extend_from_decoded(store: &mut DataArray, decoded: &ArrayRef) {
+    let vals = decoded.as_primitive::<Float64Type>();
+    match store.dtype {
+        mzdata::spectrum::BinaryDataArrayType::Float64 => store.extend(vals.values()).unwrap(),
+        mzdata::spectrum::BinaryDataArrayType::Float32 => {
+            let v: Vec<f32> = vals.values().iter().map(|v| *v as f32).collect();
+            store.extend(&v).unwrap()
+        }
+        other => panic!("cannot store a decoded grid into a {other:?} array"),
+    }
 }

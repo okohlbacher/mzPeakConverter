@@ -512,6 +512,11 @@ pub enum BufferTransform {
     /// interpolation" (MS:1003824), `x = f(b + i·a)` with `f` = identity, `b` = 0, `a` = scale.
     /// Used for uniform m/z grids (e.g. SWATH MS2) off the flight-time lattice.
     LinearMz,
+    /// PSI-MS "coordinate grid encoding" (MS:1003826): a `chunk_transform` STRUCT column
+    /// `<array>_grid { grid_type, parameters, indices }` carries integer grid indices plus the model
+    /// that maps them back to coordinates, per chunk row (see [`crate::grid`]). Its array-index entry
+    /// names the DECODED array (type, name, unit, float64), as every transform column does.
+    GridEncoding,
 }
 
 // NOTE: upstream (and docs/layouts/signal-data.md) assign MS:1003901 = zero intensity point
@@ -527,6 +532,7 @@ const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003902);
 // polynomial, the TIMS mobility model) awaits a PSI recalibration-function term (BACKLOG.md #1).
 const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003825);
 const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003824);
+const GRID_ENCODING: CURIE = mzdata::curie!(MS:1003826);
 // (MS:1003826 "coordinate grid encoding" would additionally mark the grid-index column, but the
 // array index `transform` field holds a single CURIE — already the spacing model — so there is no
 // slot for it; revisit if the spec adds a dedicated grid-encoding marker field.)
@@ -588,6 +594,7 @@ impl BufferTransform {
             x if x == LINEAR_MZ || x == LINEAR_LEGACY_MS || x == LINEAR_LEGACY_MZP => {
                 Some(Self::LinearMz)
             }
+            x if x == GRID_ENCODING => Some(Self::GridEncoding),
             _ => None,
         }
     }
@@ -603,6 +610,7 @@ impl BufferTransform {
             // a re-encoding, so it does not rename the column.
             BufferTransform::SqrtMzFromTof => None,
             BufferTransform::LinearMz => None,
+            BufferTransform::GridEncoding => Some("grid"),
         }
     }
 
@@ -627,6 +635,7 @@ impl BufferTransform {
             BufferTransform::NullZero => NULL_ZERO,
             BufferTransform::SqrtMzFromTof => SQRT_MZ_FROM_TOF,
             BufferTransform::LinearMz => LINEAR_MZ,
+            BufferTransform::GridEncoding => GRID_ENCODING,
         }
     }
 }
@@ -989,6 +998,13 @@ impl Display for BufferName {
                     .replace("array", "_array"),
             ),
         };
+        // A grid struct column is `<array>_grid` whatever the unit or priority (`mz_grid`,
+        // `mean_inverse_reduced_ion_mobility_grid`): the names the reference implementation writes.
+        if matches!(self.buffer_format, BufferFormat::ChunkTransform)
+            && matches!(self.transform, Some(BufferTransform::GridEncoding))
+        {
+            return write!(f, "{tp_name}_grid");
+        }
         if self.buffer_priority == Some(BufferPriority::Primary) {
             return match self.buffer_format {
                 BufferFormat::Point | BufferFormat::ChunkSecondary => {

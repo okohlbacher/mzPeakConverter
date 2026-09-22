@@ -71,6 +71,7 @@ pub const NO_COMPRESSION: CURIE = mzdata::curie!(MS:1000576);
 pub const DELTA_ENCODE: CURIE = mzdata::curie!(MS:1003089);
 pub const NUMPRESS_LINEAR: CURIE = mzdata::curie!(MS:1002312);
 pub const NUMPRESS_SLOF: CURIE = mzdata::curie!(MS:1002314);
+pub use crate::grid::GRID_ENCODING;
 
 /// Different methods for encoding chunks along a coordinate dimension
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -430,7 +431,8 @@ impl TryFrom<BufferTransform> for BufferTransformEncoder {
             BufferTransform::NullInterpolate
             | BufferTransform::NullZero
             | BufferTransform::SqrtMzFromTof
-            | BufferTransform::LinearMz => Err(format!("{value:?} does not have an encoder")),
+            | BufferTransform::LinearMz
+            | BufferTransform::GridEncoding => Err(format!("{value:?} does not have an encoder")),
         }
     }
 }
@@ -588,6 +590,14 @@ impl BufferTransformDecoder {
             BufferTransform::NumpressPIC => {
                 decoder!(numpress_rs::decode_pic);
             }
+            // A SECONDARY grid (e.g. ion mobility as TIMS scan numbers): every row of the struct
+            // column, indices stored as they are. The main-axis grid is decoded by the chunk
+            // decoders' `GRID_ENCODING` arm, where the row's bounds and delta coding apply.
+            BufferTransform::GridEncoding => {
+                let rows = array.as_struct();
+                return crate::grid::decode_rows_arrow(rows, false)
+                    .unwrap_or_else(|e| panic!("grid column {buffer_name}: {e}"));
+            }
             _ => unimplemented!("{:?} does not have a decoder", self.0),
         }
     }
@@ -616,6 +626,7 @@ impl TryFrom<BufferTransform> for BufferTransformDecoder {
             | BufferTransform::NullZero
             | BufferTransform::SqrtMzFromTof
             | BufferTransform::LinearMz => Err(format!("{value:?} does not have a decoder")),
+            BufferTransform::GridEncoding => Ok(Self(value)),
         }
     }
 }
