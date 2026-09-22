@@ -490,12 +490,24 @@ fn ensure_cv_term_if_bare(params: &mut Vec<MetaParam>, accession: CURIE, name: &
     });
 }
 
+// VENDORED PATCH: `#[serde(default)]` on the fields below and on those of the structs that follow
+// — every list, the instrument's software reference, a sample's name — so an index that leaves one
+// out still parses.
+//
+// These structs are the on-disk shape of `mzpeak_index.json` → `metadata`, which the reader now
+// reads back (`ParquetIndexExtractor::load_file_metadata_from_index`) on all-or-none terms: one
+// field missing anywhere discarded the whole run-level metadata — instrument, source files and
+// processing history together — over an empty `parameters` array that an older or a foreign writer
+// did not bother to emit. A missing list is an empty list, which is what the writer would have
+// written; all-or-none is left where it belongs, on an index whose types are actually wrong.
+
 /// An adaptation of [`mzdata::meta::SourceFile`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SourceFile {
     pub id: String,
     pub location: String,
     pub name: String,
+    #[serde(default)]
     pub parameters: Vec<MetaParam>,
 }
 
@@ -592,10 +604,13 @@ pub struct ScanSettings {
     /// A unique identifier
     pub id: String,
     /// List with the source files containing the acquisition settings
+    #[serde(default)]
     pub source_file_refs: Vec<String>,
     /// Target list (or 'inclusion list') configured prior to the run
+    #[serde(default)]
     pub targets: Vec<ScanTarget>,
     /// The controlled vocabulary and user parameters of the settings
+    #[serde(default)]
     pub parameters: Vec<MetaParam>,
 }
 
@@ -651,7 +666,9 @@ pub struct Contact {
 /// An adaptation of [`mzdata::meta::FileDescription`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileDescription {
+    #[serde(default)]
     pub contents: Vec<MetaParam>,
+    #[serde(default)]
     pub source_files: Vec<SourceFile>,
 }
 
@@ -706,6 +723,7 @@ pub struct Software {
     /// A string denoting a particular software version, but does no guarantee is given for its format
     pub version: String,
     /// Any associated vocabulary terms, including actual software name and type
+    #[serde(default)]
     pub parameters: Vec<MetaParam>,
 }
 
@@ -738,6 +756,7 @@ impl From<&mzdata::meta::Software> for Software {
 pub struct ProcessingMethod {
     pub order: i8,
     pub software_reference: String,
+    #[serde(default)]
     pub parameters: Vec<MetaParam>,
 }
 
@@ -771,6 +790,7 @@ impl From<&mzdata::meta::ProcessingMethod> for ProcessingMethod {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DataProcessing {
     pub id: String,
+    #[serde(default)]
     pub methods: Vec<ProcessingMethod>,
 }
 
@@ -813,6 +833,7 @@ pub struct Component {
     pub component_type: ComponentType,
     /// The order in the sequence of components that the analytes interact with
     pub order: u8,
+    #[serde(default)]
     pub parameters: Vec<MetaParam>,
 }
 
@@ -858,10 +879,13 @@ impl From<&mzdata::meta::Component> for Component {
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentConfiguration {
     /// The set of components involved
+    #[serde(default)]
     pub components: Vec<Component>,
     /// A set of parameters that describe the instrument such as the model name or serial number
+    #[serde(default)]
     pub parameters: Vec<MetaParam>,
     /// A reference to the data acquisition software involved in processing this configuration
+    #[serde(default)]
     pub software_reference: String,
     /// A unique identifier translated to an ordinal identifying this configuration
     pub id: u32,
@@ -898,7 +922,9 @@ impl From<&mzdata::meta::InstrumentConfiguration> for InstrumentConfiguration {
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     pub id: String,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub parameters: Vec<MetaParam>,
 }
 

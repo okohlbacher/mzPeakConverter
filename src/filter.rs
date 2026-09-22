@@ -1496,6 +1496,11 @@ fn carry_index_metadata(
 /// `mzpeak_convert_filter`, and an archive written by another tool has no `mzpeak-convert` entry for
 /// the step to name. An archive that states no processing list is left alone: the `filter`
 /// provenance block records the run there.
+///
+/// A step per pass, kept: two filters leave `mzpeak_convert_filter` and `mzpeak_convert_filter_2`,
+/// as a processing list records each pass. An archive an OLDER version wrote gets a SECOND software
+/// entry (`mzpeak-convert_2`) rather than a changed one — the version in the inherited entry states
+/// what did that earlier work, and this step did not.
 fn record_filter_step(meta: &mut serde_json::Map<String, serde_json::Value>, opts: &FilterOpts) {
     const SOFTWARE: &str = "mzpeak-convert";
     if !meta.get("data_processing_method_list").is_some_and(|v| v.is_array()) {

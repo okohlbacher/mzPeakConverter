@@ -2477,12 +2477,28 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // instrument configuration and the archive as its source): the source's entries, then those
     // of the conversion that wrote the archive. Its source files name the original source, and
     // `fixup_run_metadata` adds the archive itself only when it states none, as it adds any input.
-    // The software ids an mzML or imzML lane decoded are escaped again ([`encode_pwiz_ids`]), and
-    // each list is put in mzML's parameter order ([`order_params_cv_first`]).
+    // Every id is escaped back into an XML name ([`encode_pwiz_ids`]), the entries the archive's
+    // run block names are moved to the front of their lists so the writer states them
+    // ([`front_run_defaults`]), and each list is put in mzML's parameter order
+    // ([`order_params_cv_first`]). What mzdata's mzML writer cannot hold it drops: the scan
+    // settings, and everything in the run block but the two defaults and the instrument.
     w.copy_metadata_from(&reader);
     encode_pwiz_ids(&mut w);
+    front_run_defaults(&mut w);
     order_params_cv_first(&mut w);
     fixup_mzml_run_metadata(&mut w, input);
+    // Every scan states `instrumentConfigurationRef="IC{id+1}"`, unconditionally, from the id the
+    // archive stored for it — and that id is now checked against a RESTORED list instead of the
+    // single blank configuration this lane used to mint, which answered to everything. An archive
+    // whose list does not cover what its spectra carry would state a reference to nothing.
+    let instruments: std::collections::HashSet<u32> = w.instrument_configurations().keys().copied().collect();
+    let default_instrument = w
+        .run_description()
+        .and_then(|r| r.default_instrument_id)
+        .filter(|id| instruments.contains(id))
+        .or_else(|| instruments.iter().copied().min())
+        .unwrap_or_default();
+    let mut said_so = false;
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
     for item in &items {
@@ -2492,6 +2508,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
                 demote_mzp_params(spec.description_mut());
+                resolve_instrument_refs(spec.description_mut(), &instruments, default_instrument, &mut said_so);
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
                 }
@@ -2507,6 +2524,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 }
                 let descr = spec.description_mut();
                 demote_mzp_params(descr);
+                resolve_instrument_refs(descr, &instruments, default_instrument, &mut said_so);
                 // The archive's summary columns are computed from the arrays when it is written, and its
                 // reader hands each back as a parameter. Import drops what a source stated for the total
                 // ion current, base peak and lambda max (the archive of ProteoWizard's Waters PDA file no
@@ -7802,13 +7820,84 @@ fn decode_pwiz_ids(target: &mut impl MSDataFileMetadata) {
 }
 
 /// [`decode_pwiz_ids`] undone for the `.mzpeak` → mzML export ([`filter_mzpeak_to_mzml`]), now that
-/// the archive's lists reach it: an archive holds the decoded software ids (`MassLynx software`,
-/// from ProteoWizard's `MassLynx_x0020_software`), and an mzML id must be an XML name, so each is
-/// escaped again ([`pwiz_id::encode`]) with every processing method and instrument configuration
-/// that names it. An id that is an XML name already comes back unchanged. `run.id` stays as it is:
-/// mzdata's mzML writer does not write it (its run is always `1`).
+/// the archive's lists reach it: an mzML id is an `xs:ID` and so an XML name, and an mzPeak id is a
+/// plain string, so EVERY id this export carries out of an index is escaped ([`pwiz_id::encode`])
+/// with every reference to it. An id that is an XML name already comes back unchanged, which is
+/// most of them — but not all: an archive holds the software ids the mzML and imzML lanes decoded
+/// (`MassLynx software`, from ProteoWizard's `MassLynx_x0020_software`), and the native SCIEX,
+/// Waters and Bruker lanes name a source file after a file on disk
+/// ([`run_metadata::source_files_from_members`]), where `20230830 sample.wiff` is ordinary. Those
+/// ids reached no mzML while this lane synthesised its lists; now that it carries them, four
+/// `xs:ID` kinds do — software, source files, data processings, samples — and an unescaped one is
+/// an invalid document (`value '20230830 sample.wiff' is invalid NCName`, and the
+/// `defaultSourceFileRef` that names it with it). `run.id` stays as it is: mzdata's mzML writer
+/// does not write it (its run is always `1`).
 fn encode_pwiz_ids(target: &mut impl MSDataFileMetadata) {
     rename_software_ids(target, pwiz_id::encode);
+    for sample in target.samples_mut() {
+        sample.id = pwiz_id::encode(&sample.id);
+    }
+    for sf in target.file_description_mut().source_files.iter_mut() {
+        sf.id = pwiz_id::encode(&sf.id);
+    }
+    if let Some(settings) = target.scan_settings_mut() {
+        for s in settings.iter_mut() {
+            s.id = pwiz_id::encode(&s.id);
+            for r in s.source_file_refs.iter_mut() {
+                *r = pwiz_id::encode(r);
+            }
+        }
+    }
+    for dp in target.data_processings_mut() {
+        dp.id = pwiz_id::encode(&dp.id);
+    }
+    if let Some(run) = target.run_description_mut() {
+        run.default_source_file_id = run.default_source_file_id.as_deref().map(pwiz_id::encode);
+        run.default_data_processing_id = run.default_data_processing_id.as_deref().map(pwiz_id::encode);
+    }
+}
+
+/// State what the archive's run block states, in the only way mzdata's mzML writer lets this lane
+/// state it: by ORDER. The writer takes `spectrumList/@defaultDataProcessingRef` from
+/// `data_processings.first()` and `run/@defaultSourceFileRef` from `source_files.first()`
+/// (`mzml/writer.rs`: `start_run`, `start_spectrum_list`) and never looks at the run block's own
+/// `default_data_processing_id` / `default_source_file_id`. An index holds its lists in the order
+/// they were stored — the oldest step first — so an export that just copied them claimed the
+/// spectra were the output of the FIRST processing the source ever recorded: for
+/// `tiny.pwiz.1.1.mzML` the vendor's `CompassXtract_x0020_processing` (deisotoping, charge
+/// deconvolution, peak picking) rather than the `pwiz_processing` the source and the archive both
+/// declare. A claim about how the data was made, and the wrong one — and converting that export
+/// back wrote it into the next archive's run block as its own.
+///
+/// So the entry the run block names is moved to the front of its list. A name that no entry
+/// carries is dropped (it would resolve to nothing), and [`fixup_run_metadata`] then fills the
+/// field from the list as it does for any input that states no default.
+fn front_run_defaults(target: &mut impl MSDataFileMetadata) {
+    let (source_file, data_processing) = match target.run_description() {
+        Some(run) => (run.default_source_file_id.clone(), run.default_data_processing_id.clone()),
+        None => return,
+    };
+    /// Move the entry `named` to the front; whether it was found.
+    fn front<T>(list: &mut Vec<T>, named: Option<&String>, id: impl Fn(&T) -> &str) -> bool {
+        let Some(name) = named else { return false };
+        match list.iter().position(|e| id(e) == name.as_str()) {
+            Some(at) => {
+                list[..=at].rotate_right(1);
+                true
+            }
+            None => false,
+        }
+    }
+    let kept_sf = front(&mut target.file_description_mut().source_files, source_file.as_ref(), |sf| &sf.id);
+    let kept_dp = front(target.data_processings_mut(), data_processing.as_ref(), |dp| &dp.id);
+    if let Some(run) = target.run_description_mut() {
+        if !kept_sf {
+            run.default_source_file_id = None;
+        }
+        if !kept_dp {
+            run.default_data_processing_id = None;
+        }
+    }
 }
 
 /// Put every run-level parameter list this export writes in mzML's order — `cvParam`s, then
@@ -7844,6 +7933,11 @@ fn order_params_cv_first(target: &mut impl MSDataFileMetadata) {
             order(&mut c.params);
         }
     }
+    // A no-op on the one lane that calls this: mzdata's `impl_metadata_trait!` gives its mzML
+    // writer no `scan_settings_mut`, so `copy_metadata_from` never hands it any (it logs "Cannot
+    // store scan settings on this type of data file" and drops them) and no `<scanSettingsList>`
+    // is written. Kept because this walks an `MSDataFileMetadata`, and a target that does hold
+    // them wants them ordered like every other list.
     if let Some(settings) = target.scan_settings_mut() {
         for s in settings.iter_mut() {
             order(&mut s.params);
@@ -8007,6 +8101,43 @@ fn demote_mzp_params(descr: &mut mzdata::spectrum::SpectrumDescription) {
     }
 }
 
+/// Point every scan of `descr` at an instrument configuration the document declares.
+///
+/// mzdata's mzML writer emits `instrumentConfigurationRef="IC{id+1}"` on every scan, from the id
+/// the spectrum carries, with nothing checking that the list holds one — and it only started to
+/// matter when the list stopped being this lane's own invention: an export used to mint a single
+/// blank configuration `0`, which every spectrum's stored id (`0`, unless an archive says
+/// otherwise) resolved to. A restored list states what the archive states, and an archive whose
+/// spectra name an id it does not declare — an older writer's, a hand-edited index — would put a
+/// dangling `IDREF` on every scan. The run's own default is preferred over the lowest id, so a
+/// spectrum lands on the instrument the archive calls the run's; `said_so` keeps it to one warning
+/// per export rather than one per spectrum.
+fn resolve_instrument_refs(
+    descr: &mut mzdata::spectrum::SpectrumDescription,
+    declared: &std::collections::HashSet<u32>,
+    default: u32,
+    said_so: &mut bool,
+) {
+    for scan in descr.acquisition.scans.iter_mut() {
+        if !declared.contains(&scan.instrument_configuration_id) {
+            if !*said_so {
+                log::warn!(
+                    "the archive's spectra name instrument configuration {} but its index declares \
+                     only {:?}; the export states {default} for them",
+                    scan.instrument_configuration_id,
+                    {
+                        let mut ids: Vec<u32> = declared.iter().copied().collect();
+                        ids.sort_unstable();
+                        ids
+                    }
+                );
+                *said_so = true;
+            }
+            scan.instrument_configuration_id = default;
+        }
+    }
+}
+
 /// Drop the archive's integer grid axis (`tof_index` / `tof`, or the nameless non-standard array
 /// the point reader hands back for it) from a spectrum that already carries the m/z reconstructed
 /// from it. The vendored reader rebuilds `m/z array` from the axis but leaves the axis in the map
@@ -8063,6 +8194,10 @@ fn demote_mzp_in(params: &mut [Param]) {
 /// already holds a `mzpeak-convert` and a `mzpeak_convert_conversion`, and converting it back
 /// appended a second entry under each id. This version's own software entry is reused where the
 /// source has one, and any id in use gets a numeric suffix ([`run_metadata::unused_id`]).
+///
+/// A step per pass, kept: three round trips leave `mzpeak_convert_conversion`, `…_2`, `…_3`, which
+/// is what a processing list IS — msconvert appends its own on every pass too. The suffix keeps
+/// them apart; nothing prunes them.
 fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
     let version = env!("CARGO_PKG_VERSION");
     let mut taken = run_metadata::processing_ids(writer);

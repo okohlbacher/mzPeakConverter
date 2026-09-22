@@ -189,6 +189,25 @@ impl Ids {
         self.declared.get(element).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// The value of the first `<element attribute=…>` reference in the document.
+    fn reference(&self, element: &str, attribute: &str) -> Option<&str> {
+        self.references.iter().find(|(e, a, _)| e == element && a == attribute).map(|(_, _, v)| v.as_str())
+    }
+
+    /// Every declared id is an XML name, as an `xs:ID` is. `run` is passed over: mzdata's writer
+    /// hardcodes `<run id="1">`, which is not one, on every lane it writes — pre-existing, and not
+    /// this change's to fix.
+    fn are_xml_names(&self, what: &str) {
+        for (element, ids) in self.declared.iter().filter(|(e, _)| e.as_str() != "run") {
+            for id in ids {
+                let mut bytes = id.bytes();
+                let ok = bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                    && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.');
+                assert!(ok, "{what}: <{element} id={id:?}> is not an XML name");
+            }
+        }
+    }
+
     /// Every declared id is unique in the document and every reference names one of them. An EMPTY
     /// reference is passed over: mzdata's writer emits `<softwareRef ref=""/>` for an instrument
     /// configuration whose acquisition software nobody stated, on every lane, and that is not this
@@ -242,6 +261,39 @@ fn with_edited_index(archive: &Path, out: &Path, edit: impl FnOnce(&mut serde_js
     zout.write_all(serde_json::to_string(&index).unwrap().as_bytes()).unwrap();
     zout.finish().unwrap();
 }
+
+/// Of the processing entries an ARCHIVE brought into an export, the one its run block declares
+/// comes first, and no other of the archive's entries is named as a list's default.
+///
+/// That is the whole of what `front_run_defaults` promises, and it is stated this way on purpose:
+/// mzdata's writer reads `defaultDataProcessingRef` off `data_processings.first()`, so a lane that
+/// records a step of ITS OWN puts that step at the head and states it — which is a different claim
+/// ("this export converted the file"), not a wrong one. `origin/fix/mzml-dataprocessing-im-order`
+/// does exactly that (`add_mzml_conversion_step` inserts `mzpeak_convert_to_mzml` at index 0), and
+/// what must not happen either way is the export naming one of the ARCHIVE's own steps that the
+/// archive does not call its default — the vendor's extraction step standing in for the conversion.
+fn the_archives_default_comes_first(ids: &Ids, declared: &str, from_the_archive: &[&str]) {
+    let first = ids.of("dataProcessing").iter().find(|id| from_the_archive.contains(&id.as_str()));
+    assert_eq!(
+        first.map(String::as_str),
+        Some(declared),
+        "of the entries the archive brought, the one it declares comes first: {:?}",
+        ids.of("dataProcessing")
+    );
+    for list in ["spectrumList", "chromatogramList"] {
+        if let Some(named) = ids.reference(list, "defaultDataProcessingRef") {
+            assert!(
+                named == declared || !from_the_archive.contains(&named),
+                "<{list} defaultDataProcessingRef={named:?}> is one of the archive's entries, and \
+                 not the one the archive declares ({declared:?})"
+            );
+        }
+    }
+}
+
+/// The entries the archive of `tiny.pwiz.1.1.mzML` brings to an export: the source's two, and the
+/// step of the conversion that wrote the archive.
+const FROM_THE_ARCHIVE: [&str; 3] = ["pwiz_processing", "CompassXtract_x0020_processing", "mzpeak_convert_conversion"];
 
 // ── the lanes ───────────────────────────────────────────────────────────────────────────────────
 
@@ -438,4 +490,205 @@ fn an_unreadable_index_leaves_the_export_as_it_was() {
     assert_eq!(ids.of("instrumentConfiguration").len(), 1, "the synthesised instrument configuration");
     assert_eq!(ids.of("sourceFile"), ["sourceFile"], "the archive itself, as any input with no stated source");
     ids.unique_and_resolving("the export of an archive whose index states no metadata");
+}
+
+/// An id an archive holds is a plain string; an mzML id is an `xs:ID`. The native SCIEX, Waters
+/// and Bruker lanes name a source file after a file on disk, so `20230830 sample.wiff` — a space
+/// and a leading digit, ordinary Analyst naming — is a source file id in any archive one of them
+/// wrote. Those ids reached no mzML while this lane synthesised its own single `<sourceFile>`;
+/// carrying them across means escaping them, with the run's default that names one.
+#[test]
+fn an_id_that_is_no_xml_name_is_escaped_on_the_way_out() {
+    let dir = scratch("xmlnames");
+    let archive = run(Path::new(TINY), &dir.join("tiny.mzpeak"), &[]);
+    let sciex = dir.join("sciex_ids.mzpeak");
+    with_edited_index(&archive, &sciex, |index| {
+        let meta = &mut index["metadata"];
+        meta["file_description"]["source_files"][0]["id"] = serde_json::json!("20230830 sample.wiff");
+        meta["file_description"]["source_files"][0]["name"] = serde_json::json!("20230830 sample.wiff");
+        meta["file_description"]["source_files"][1]["id"] = serde_json::json!("20230830 sample.wiff.scan");
+        meta["run"]["default_source_file_id"] = serde_json::json!("20230830 sample.wiff");
+        // A sample and a processing step named the same way, for the other two id kinds this lane
+        // now carries out of an index.
+        meta["sample_list"][0]["id"] = serde_json::json!("Sample 1 (a)");
+        meta["data_processing_method_list"][0]["id"] = serde_json::json!("1st processing");
+        meta["run"]["default_data_processing_id"] = serde_json::json!("1st processing");
+    });
+
+    let mzml = run(&sciex, &dir.join("sciex_ids.mzML"), &["--to", "mzml"]);
+    let ids = read_ids(&mzml);
+    ids.are_xml_names("the export of an archive with vendor-named source files");
+    ids.unique_and_resolving("the export of an archive with vendor-named source files");
+    assert!(
+        ids.of("sourceFile").contains(&"_x0032_0230830_x0020_sample.wiff".to_string()),
+        "the source file id is escaped, not dropped: {:?}",
+        ids.of("sourceFile")
+    );
+    assert_eq!(
+        ids.reference("run", "defaultSourceFileRef"),
+        Some("_x0032_0230830_x0020_sample.wiff"),
+        "the run's default names the escaped id"
+    );
+    assert!(
+        ids.of("dataProcessing").contains(&"_x0031_st_x0020_processing".to_string()),
+        "the data processing id is escaped, not dropped: {:?}",
+        ids.of("dataProcessing")
+    );
+    the_archives_default_comes_first(
+        &ids,
+        "_x0031_st_x0020_processing",
+        &["_x0031_st_x0020_processing", "pwiz_processing", "mzpeak_convert_conversion"],
+    );
+    // The NAME stays as the archive states it — only the id is an XML name.
+    let text = std::fs::read_to_string(&mzml).unwrap();
+    assert!(text.contains("name=\"20230830 sample.wiff\""), "the file's own name is untouched");
+}
+
+/// An export states what the ARCHIVE calls its defaults. mzdata's writer takes
+/// `defaultDataProcessingRef` and `defaultSourceFileRef` from the first entry of their list and
+/// never reads the run block, and an index holds its lists oldest-first — so an export that only
+/// copied them claimed the spectra came out of the first processing the source ever recorded
+/// (`CompassXtract_x0020_processing`: deisotoping, charge deconvolution, peak picking) instead of
+/// the `pwiz_processing` the source declares. Asserted three times: on the archive as written, on
+/// one whose run block names a different entry (so this pins the run block being honoured and not
+/// an accident of order), and on one whose run block names nothing that is there.
+#[test]
+fn the_export_states_the_defaults_the_archive_declares() {
+    let dir = scratch("defaults");
+    let archive = run(Path::new(TINY), &dir.join("tiny.mzpeak"), &[]);
+    let meta = index_metadata(&archive);
+    assert_eq!(
+        meta["run"]["default_data_processing_id"].as_str(),
+        Some("pwiz_processing"),
+        "the archive keeps the source's default"
+    );
+    assert_ne!(
+        ids_of(&meta, "data_processing_method_list").first().map(String::as_str),
+        Some("pwiz_processing"),
+        "…and does not hold it first, or this test would pass on the order alone"
+    );
+
+    let mzml = run(&archive, &dir.join("tiny.mzML"), &["--to", "mzml"]);
+    let ids = read_ids(&mzml);
+    the_archives_default_comes_first(&ids, "pwiz_processing", &FROM_THE_ARCHIVE);
+    assert_eq!(ids.reference("run", "defaultSourceFileRef"), Some("tiny1.yep"));
+    ids.unique_and_resolving("an export that states the archive's defaults");
+
+    // The run block, not the order: name the last entry of each list instead.
+    let moved = dir.join("moved.mzpeak");
+    with_edited_index(&archive, &moved, |index| {
+        index["metadata"]["run"]["default_data_processing_id"] = serde_json::json!("mzpeak_convert_conversion");
+        index["metadata"]["run"]["default_source_file_id"] = serde_json::json!("sf_parameters");
+    });
+    let ids = read_ids(&run(&moved, &dir.join("moved.mzML"), &["--to", "mzml"]));
+    the_archives_default_comes_first(&ids, "mzpeak_convert_conversion", &FROM_THE_ARCHIVE);
+    assert_eq!(ids.reference("run", "defaultSourceFileRef"), Some("sf_parameters"));
+    ids.unique_and_resolving("an export whose archive names other defaults");
+
+    // A default that names nothing is dropped rather than written: the lane fills it from the list,
+    // as it does for an input that states none.
+    let dangling = dir.join("dangling.mzpeak");
+    with_edited_index(&archive, &dangling, |index| {
+        index["metadata"]["run"]["default_data_processing_id"] = serde_json::json!("no_such_processing");
+        index["metadata"]["run"]["default_source_file_id"] = serde_json::json!("no_such_file");
+    });
+    let ids = read_ids(&run(&dangling, &dir.join("dangling.mzML"), &["--to", "mzml"]));
+    ids.unique_and_resolving("an export whose archive names a default that is not there");
+}
+
+/// An index that PARSES but does not hold together is dropped whole, like one that does not parse:
+/// `as_file_metadata` reads the keys that are there, one at a time, so an index missing its
+/// `software_list` hands back the processing methods and the instrument configuration that name
+/// its entries — the half-read state the all-or-none rule exists to prevent. Three shapes, each of
+/// which put a dangling `IDREF` or a repeated `xs:ID` in the mzML before this check: no
+/// `software_list`, an empty one, and a `data_processing_method_list` holding an entry twice.
+#[test]
+fn an_index_that_does_not_hold_together_leaves_the_export_as_it_was() {
+    let dir = scratch("inconsistent");
+    let archive = run(Path::new(TINY), &dir.join("tiny.mzpeak"), &[]);
+
+    let breakages: [(&str, fn(&mut serde_json::Value)); 3] = [
+        ("no_software", |index| {
+            index["metadata"].as_object_mut().unwrap().remove("software_list");
+        }),
+        ("empty_software", |index| {
+            index["metadata"]["software_list"] = serde_json::json!([]);
+        }),
+        ("repeated_processing", |index| {
+            let first = index["metadata"]["data_processing_method_list"][0].clone();
+            index["metadata"]["data_processing_method_list"].as_array_mut().unwrap().push(first);
+        }),
+    ];
+    for (name, edit) in breakages {
+        let broken = dir.join(format!("{name}.mzpeak"));
+        with_edited_index(&archive, &broken, edit);
+        let out = dir.join(format!("{name}.mzML"));
+        let r = mzpc(&broken, &out, &["--to", "mzml"]);
+        assert!(r.status.success(), "{name}: an inconsistent index must not fail the export:\n{}", String::from_utf8_lossy(&r.stderr));
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        assert!(stderr.contains("mzpeak_index.json"), "{name}: the export says why it read none of it:\n{stderr}");
+
+        let ids = read_ids(&out);
+        let restored: Vec<&String> = ids
+            .of("software")
+            .iter()
+            .chain(ids.of("dataProcessing"))
+            .filter(|id| ["Bioworks", "pwiz", "CompassXtract", "pwiz_processing", "CompassXtract_x0020_processing"].contains(&id.as_str()))
+            .collect();
+        assert!(restored.is_empty(), "{name}: nothing is restored from an index that does not hold together: {restored:?}");
+        assert_eq!(ids.of("sourceFile"), ["sourceFile"], "{name}: the archive itself, as for any input with no stated source");
+        ids.unique_and_resolving(&format!("the export of an archive whose index is inconsistent ({name})"));
+    }
+}
+
+/// One list left out of an index costs that list, not the run-level metadata entire. The structs
+/// the index parses into take a missing field as an empty one (`#[serde(default)]`), so an older or
+/// foreign writer that omitted an empty `parameters` array keeps its instrument, its source files
+/// and its processing history; all-or-none is for an index whose types are wrong.
+#[test]
+fn a_list_left_out_of_an_index_costs_only_that_list() {
+    let dir = scratch("sparse");
+    let archive = run(Path::new(TINY), &dir.join("tiny.mzpeak"), &[]);
+    let sparse = dir.join("sparse.mzpeak");
+    with_edited_index(&archive, &sparse, |index| {
+        for entry in index["metadata"]["software_list"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("parameters");
+        }
+        index["metadata"]["file_description"].as_object_mut().unwrap().remove("contents");
+    });
+
+    let mzml = run(&sparse, &dir.join("sparse.mzML"), &["--to", "mzml"]);
+    let ids = read_ids(&mzml);
+    for want in ["Bioworks", "pwiz", "CompassXtract"] {
+        assert!(ids.of("software").contains(&want.to_string()), "software {want} survives a missing field: {:?}", ids.of("software"));
+    }
+    assert!(ids.of("dataProcessing").contains(&"pwiz_processing".to_string()), "and so does the processing list");
+    ids.unique_and_resolving("the export of an archive whose index leaves a list out");
+}
+
+/// Every scan states `instrumentConfigurationRef="IC{id+1}"` from the id its spectrum carries —
+/// which only had to resolve against a list this lane invented (one blank configuration `0`, which
+/// answered to every spectrum). Against a RESTORED list it has to resolve against what the archive
+/// declares, and an archive whose spectra name a configuration its index does not hold would put a
+/// dangling reference on every scan.
+#[test]
+fn a_spectrum_naming_an_undeclared_instrument_still_resolves() {
+    let dir = scratch("instrument");
+    let archive = run(Path::new(TINY), &dir.join("tiny.mzpeak"), &[]);
+    let shifted = dir.join("shifted.mzpeak");
+    // The spectra are untouched, so they still carry configuration 0.
+    with_edited_index(&archive, &shifted, |index| {
+        index["metadata"]["instrument_configuration_list"][0]["id"] = serde_json::json!(3);
+        index["metadata"]["run"]["default_instrument_id"] = serde_json::json!(3);
+    });
+
+    let mzml = run(&shifted, &dir.join("shifted.mzML"), &["--to", "mzml"]);
+    let ids = read_ids(&mzml);
+    assert_eq!(ids.of("instrumentConfiguration"), ["IC4"], "the archive's own configuration, under the id it states");
+    for (element, attribute, value) in ids.references.iter() {
+        if attribute.contains("nstrumentConfiguration") {
+            assert_eq!(value, "IC4", "<{element} {attribute}> states the one configuration there is");
+        }
+    }
+    ids.unique_and_resolving("the export of an archive whose spectra name an undeclared instrument");
 }

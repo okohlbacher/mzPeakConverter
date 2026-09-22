@@ -546,15 +546,27 @@ impl ParquetIndexExtractor {
     ///
     /// Absent or malformed metadata never refuses an archive whose spectra can be read. An index
     /// that holds none of these blocks (an older archive, or another writer's) leaves the metadata
-    /// empty, as the reader has always returned it, and so does one that does not parse: the blocks
-    /// reference one another — a processing method and an instrument configuration each name a
-    /// software entry, a scan settings entry names a source file — so half of them, read while the
-    /// rest was dropped, would state references that resolve to nothing. It is all of it or none,
-    /// and the warning names what failed; every export that worked without any of this metadata
-    /// still works. The sync and the async reader both call this.
+    /// empty, as the reader has always returned it; so does one that does not parse, and so does
+    /// one that parses into blocks that do not agree ([`index_metadata_is_consistent`]). The
+    /// blocks reference one another — a processing method and an instrument configuration each
+    /// name a software entry, a scan settings entry names a source file — and an mzML turns each
+    /// of those into an `IDREF` that has to resolve, so half of them, read while the rest was
+    /// dropped, would state references to nothing. It is all of it or none, the warning names what
+    /// failed, and every export that worked without any of this metadata still works.
+    ///
+    /// What a consumer does with it is the consumer's: mzdata's mzML writer, for one, holds no
+    /// scan settings (`impl_metadata_trait!` gives it no `scan_settings_mut`) and writes nothing of
+    /// the run block but its default source file and instrument configuration, so an mzML export
+    /// shows less of this than the archive holds. The sync and the async reader both call this.
     pub(crate) fn load_file_metadata_from_index(&mut self, file_index: &FileIndex) {
         match file_index.as_file_metadata() {
-            Ok(metadata) => self.mz_metadata = metadata,
+            Ok(metadata) => match index_metadata_is_consistent(&metadata) {
+                Ok(()) => self.mz_metadata = metadata,
+                Err(what) => log::warn!(
+                    "the run-level metadata in mzpeak_index.json does not hold together ({what}); \
+                     this archive is opened without it"
+                ),
+            },
             Err(e) => log::warn!(
                 "the run-level metadata in mzpeak_index.json cannot be read ({e}); this archive is \
                  opened without it"
@@ -687,6 +699,78 @@ impl ParquetIndexExtractor {
         self.spectra.peak_indices = PeakMetadata::from_metadata(&spectrum_peaks_data_reader);
         Ok(())
     }
+}
+
+/// VENDORED PATCH: whether the run-level metadata an index parsed into holds together — every id
+/// it declares used once, and every reference it makes naming one of them. See
+/// [`ParquetIndexExtractor::load_file_metadata_from_index`], which drops the lot when this fails.
+///
+/// `as_file_metadata` reads the blocks that are THERE, one key at a time, so an index missing
+/// `software_list` (or holding an empty one) still hands back the processing and instrument lists
+/// that name its entries. That is the half-read state the all-or-none rule exists to prevent, and
+/// only a check across the blocks catches it — a repeated id and a reference to nothing are the
+/// two things an mzML may not hold, and the export copies these lists into one verbatim.
+///
+/// mzML's `xs:ID` is one namespace over the whole document, so the four id-bearing lists are
+/// checked together. An EMPTY reference states no software, as a great many instrument
+/// configurations do, and is not one to resolve.
+fn index_metadata_is_consistent(metadata: &meta::FileMetadataConfig) -> Result<(), String> {
+    let mut declared: HashSet<&str> = HashSet::new();
+    let ids = metadata
+        .softwares()
+        .iter()
+        .map(|s| ("software", s.id.as_str()))
+        .chain(metadata.data_processings().iter().map(|d| ("dataProcessing", d.id.as_str())))
+        .chain(metadata.samples().iter().map(|s| ("sample", s.id.as_str())))
+        .chain(
+            metadata
+                .file_description()
+                .source_files
+                .iter()
+                .map(|f| ("sourceFile", f.id.as_str())),
+        )
+        .chain(
+            metadata
+                .scan_settings()
+                .into_iter()
+                .flatten()
+                .map(|s| ("scanSettings", s.id.as_str())),
+        );
+    for (list, id) in ids {
+        if !declared.insert(id) {
+            return Err(format!("{list} {id:?} repeats an id another entry already uses"));
+        }
+    }
+    let softwares: HashSet<&str> = metadata.softwares().iter().map(|s| s.id.as_str()).collect();
+    let source_files: HashSet<&str> = metadata
+        .file_description()
+        .source_files
+        .iter()
+        .map(|f| f.id.as_str())
+        .collect();
+    let references = metadata
+        .data_processings()
+        .iter()
+        .flat_map(|d| d.methods.iter().map(|m| ("a processing method", m.software_reference.as_str(), &softwares)))
+        .chain(
+            metadata
+                .instrument_configurations()
+                .values()
+                .map(|ic| ("an instrument configuration", ic.software_reference.as_str(), &softwares)),
+        )
+        .chain(
+            metadata
+                .scan_settings()
+                .into_iter()
+                .flatten()
+                .flat_map(|s| s.source_file_refs.iter().map(|r| ("a scan settings entry", r.as_str(), &source_files))),
+        );
+    for (who, reference, known) in references {
+        if !reference.is_empty() && !known.contains(reference) {
+            return Err(format!("{who} names {reference:?}, which no entry declares"));
+        }
+    }
+    Ok(())
 }
 
 /// Load the various metadata, indices and reference data

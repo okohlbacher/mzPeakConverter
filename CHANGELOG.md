@@ -24,10 +24,25 @@ All notable changes to this project are documented here. The format follows
   VENDORED PATCH in `vendor/mzpeak_prototyping/src/reader/metadata.rs`, called from the sync
   (`load_indices_from`) and the async (`reader/object_store_async.rs`) loader alike — the async
   reader is not built by the converter and does not compile in this tree, so that call is
-  source-only. The metadata is read as a whole: its blocks name one another (a processing method
-  and an instrument configuration each name a software entry), so an index that does not parse —
-  an older archive, another writer's — leaves it empty with a warning, and the export that worked
-  before goes on working, rather than restoring a half that states references resolving to nothing.
+  source-only. What a consumer can then show is the consumer's: mzdata's mzML writer holds no scan
+  settings at all (`impl_metadata_trait!` gives it no `scan_settings_mut`) and writes nothing of
+  the run block but its two defaults and its instrument, so an mzML export shows less of this than
+  the archive holds, and the exported parameters are the archive's normalised ones — the mzPeak
+  writer adds the terms its CvMapping rules require (MS:1000530 *file format conversion* on a
+  processing method, MS:1000799 on a software entry that states nothing else), and those now travel
+  out with the rest.
+- **An index read in half would have stated references to nothing.** The blocks name one another —
+  a processing method and an instrument configuration each name a software entry, a scan settings
+  entry names a source file — and an mzML turns each of those into an `IDREF` that has to resolve,
+  so the metadata is read as a whole or not at all. An index that does not parse leaves it empty
+  with a warning, and so does one that parses into blocks that disagree: `as_file_metadata` reads
+  the keys that are THERE, one at a time, so an index missing its `software_list` (or holding an
+  empty one) handed back the processing methods and the instrument configuration that name its
+  entries, and a list holding an entry twice handed back a repeated `xs:ID`. Both are now checked
+  across the blocks before any of it is kept (`index_metadata_is_consistent`), and the export that
+  worked before any of this was read goes on working. A missing FIELD is not a missing block: the
+  structs the index parses into take one as empty (`#[serde(default)]`), so an older or foreign
+  writer that omitted an empty `parameters` array keeps its instrument and its source files.
 - **The ids a conversion adds could collide with the ones it now inherits.** `mzpeak-convert`'s own
   software entry and its `mzpeak_convert_conversion` processing had fixed ids, and an mzML exported
   from an archive carries both: converting it back appended a second entry under each id, and an
@@ -35,12 +50,34 @@ All notable changes to this project are documented here. The format follows
   already holds it, and an id in use gets a numeric suffix (`run_metadata::unused_id`). The
   `.mzpeak` → `.mzpeak` filter does the same for its `mzpeak_convert_filter` step — filtering a
   filtered archive repeated that id — and adds the `software_list` entry the step names when the
-  archive holds none (on an archive from another writer it named nothing).
-- **A ProteoWizard-escaped software id came back out of an export unescaped.** The mzML and imzML
-  lanes decode those ids on the way in (`MassLynx_x0020_software` → `MassLynx software`; an mzPeak
-  id is a plain string), and now that the export carries the software list it escapes them again
-  (`pwiz_id::encode`), with every processing method and instrument configuration that names one, so
-  the mzML ids stay XML names and the references keep resolving.
+  archive holds none (on an archive from another writer it named nothing). A pass still adds a
+  step, every time, as a processing history records each pass; only the ids are kept apart.
+- **An id an archive holds is a plain string, and an mzML id is an `xs:ID`.** Every id this export
+  now carries out of an index is escaped back into an XML name (`pwiz_id::encode`) together with
+  every reference to it: the software ids the mzML and imzML lanes decode on the way in
+  (`MassLynx_x0020_software` → `MassLynx software`), and the source file, sample and data
+  processing ids, which no lane decodes but which the native SCIEX, Waters and Bruker lanes name
+  after a file on disk. A run called `20230830 sample.wiff` — a space and a leading digit, ordinary
+  Analyst naming — gave a `<sourceFile id="20230830 sample.wiff">` and a `defaultSourceFileRef`
+  naming it, three XSD errors that could not happen while the lane synthesised its own single
+  `sourceFile`.
+- **The export named the wrong processing as the one the spectra came out of.** mzdata's mzML
+  writer takes `spectrumList/@defaultDataProcessingRef` from `data_processings.first()` and
+  `run/@defaultSourceFileRef` from `source_files.first()`, never from the run block's own
+  `default_data_processing_id` / `default_source_file_id` — and an index holds its lists in the
+  order they were stored, oldest first. So the export of `tiny.pwiz.1.1.mzML`'s archive claimed its
+  spectra were the output of `CompassXtract_x0020_processing` (deisotoping, charge deconvolution,
+  peak picking) where the source and the archive both declare `pwiz_processing`, and converting
+  that export back wrote the wrong answer into the next archive's run block. The entry the archive
+  names is now moved to the front of its list so the writer states it; a name no entry carries is
+  dropped and filled from the list, as for any input that declares no default.
+- **A spectrum could name an instrument configuration the document no longer declared.** Every scan
+  is written `instrumentConfigurationRef="IC{id+1}"` from the id its spectrum carries, and that
+  only had to resolve while this lane invented the list: one blank configuration `0`, which
+  answered to every spectrum. Against the archive's own list it has to resolve against what the
+  archive declares, and a spectrum naming a configuration the index does not hold put a dangling
+  reference on every scan. Such a spectrum is now written against the run's default configuration,
+  with one warning naming what the index declares.
 - **A restored list could put a `userParam` before a `cvParam`.** mzML's `ParamGroup` takes its
   `cvParam`s first, and an archive keeps a list in the order its writer stored it — this tool's own
   processing step records the `conversion options` userParam before the MS:1000530 cvParam the
@@ -52,10 +89,12 @@ All notable changes to this project are documented here. The format follows
   remains is the writer's own (`run id="1"` is not an NCName, empty `precursor` /
   `binaryDataArray` content, `precursorList` inside a chromatogram) and is there on 0.13.0 too.
 - New `tests/archive_run_metadata.rs`: an export carries the source's software, processing methods,
-  instrument configuration and source files; an escaped id survives the round trip; every id in an
+  instrument configuration and source files; an escaped id survives the round trip, and one that is
+  no XML name comes out as one; the export states the defaults the archive declares; every id in an
   mzML is unique and every reference resolves, after a re-conversion and after two filter passes as
-  well; the `.mzpeak` → `.mzpeak` filter keeps the index's lists; and an unreadable or absent index
-  leaves the export as it was.
+  well; the `.mzpeak` → `.mzpeak` filter keeps the index's lists; a spectrum naming an undeclared
+  instrument still resolves; and an index that is absent, unreadable or internally inconsistent
+  leaves the export as it was, while one merely missing a field does not.
 
 ## [0.13.0] — 2026-09-22
 
