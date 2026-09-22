@@ -17,9 +17,10 @@ pub const BAND_LOWER: &str = "isolation window inverse reduced ion mobility lowe
 /// … and MZP:1000007.
 pub const BAND_UPPER: &str = "isolation window inverse reduced ion mobility upper limit";
 
-/// One `processingMethod`: its `softwareRef` and the accessions of its `cvParam`s.
+/// One `processingMethod`: its `order`, its `softwareRef` and the accessions of its `cvParam`s.
 #[derive(Debug, Default, Clone)]
 pub struct Method {
+    pub order: Option<i64>,
     pub software_ref: String,
     pub accessions: Vec<String>,
 }
@@ -53,6 +54,9 @@ pub struct Mzml {
     /// whether the list is there at all.
     pub spectrum_list_default: Option<Option<String>>,
     pub chromatogram_list_default: Option<Option<String>>,
+    /// Every element-level `dataProcessingRef` (on a spectrum, a chromatogram, a
+    /// `binaryDataArray`), with the element's name.
+    pub data_processing_refs: Vec<(String, String)>,
     pub spectra: Vec<Spectrum>,
 }
 
@@ -96,6 +100,9 @@ pub fn read(path: &Path) -> Mzml {
         buf.clear();
         let Some((tag, empty)) = open else { continue };
         let name = tag.name().as_ref().to_vec();
+        if let Some(r) = attr(&tag, b"dataProcessingRef") {
+            out.data_processing_refs.push((String::from_utf8_lossy(&name).into_owned(), r));
+        }
         let parent = stack.last().map(Vec::as_slice);
         let in_ion = stack.iter().any(|n| n == b"selectedIon");
         match name.as_slice() {
@@ -103,7 +110,11 @@ pub fn read(path: &Path) -> Mzml {
             b"dataProcessingList" => out.data_processing_count = attr(&tag, b"count").and_then(|c| c.parse().ok()),
             b"dataProcessing" => out.data_processings.push((attr(&tag, b"id").unwrap_or_default(), Vec::new())),
             b"processingMethod" => {
-                let m = Method { software_ref: attr(&tag, b"softwareRef").unwrap_or_default(), accessions: Vec::new() };
+                let m = Method {
+                    order: attr(&tag, b"order").and_then(|o| o.parse().ok()),
+                    software_ref: attr(&tag, b"softwareRef").unwrap_or_default(),
+                    accessions: Vec::new(),
+                };
                 out.data_processings.last_mut().expect("processingMethod outside dataProcessing").1.push(m);
             }
             b"spectrumList" => out.spectrum_list_default = Some(attr(&tag, b"defaultDataProcessingRef")),
@@ -141,10 +152,11 @@ pub fn read(path: &Path) -> Mzml {
 /// `dataProcessing` holding that step. Panics, naming `what`, unless:
 /// * `dataProcessingList` holds at least one `dataProcessing`, as many as its `count` says;
 /// * every `processingMethod`'s `softwareRef` names a `software` of `softwareList`;
-/// * one `dataProcessing` has a method that does MS:1000544 `Conversion to mzML` with the
-///   software `mzpeak-convert` of this very version;
-/// * `spectrumList` and `chromatogramList` are there and each names an existing `dataProcessing` in
-///   `defaultDataProcessingRef`;
+/// * `spectrumList` and `chromatogramList` are there and name the same `dataProcessing` in
+///   `defaultDataProcessingRef`, one whose LAST method does MS:1000544 `Conversion to mzML` with
+///   the software `mzpeak-convert` of this very version — the export is the last step of the
+///   default processing;
+/// * every element-level `dataProcessingRef` names an existing `dataProcessing`;
 /// * no id is used twice among the `software` and `dataProcessing` entries.
 pub fn assert_processing_contract(m: &Mzml, what: &str) -> String {
     let n = m.data_processings.len();
@@ -157,28 +169,30 @@ pub fn assert_processing_contract(m: &Mzml, what: &str) -> String {
             assert!(sw.contains_key(meth.software_ref.as_str()), "{what}: {id:?} names software {:?}, not in softwareList {sw:?}", meth.software_ref);
         }
     }
-    let ours: Vec<&str> = m
-        .data_processings
-        .iter()
-        .filter(|(_, methods)| {
-            methods.iter().any(|meth| {
-                meth.accessions.iter().any(|a| a == "MS:1000544")
-                    && meth.software_ref.starts_with("mzpeak-convert")
-                    && sw.get(meth.software_ref.as_str()) == Some(&env!("CARGO_PKG_VERSION"))
-            })
-        })
-        .map(|(id, _)| id.as_str())
-        .collect();
-    assert!(!ours.is_empty(), "{what}: no dataProcessing records mzpeak-convert {}'s Conversion to mzML: {:?}", env!("CARGO_PKG_VERSION"), m.data_processings);
     let dp_ids: BTreeSet<&str> = m.data_processings.iter().map(|(id, _)| id.as_str()).collect();
+    let mut defaults = Vec::new();
     for (list, default) in [("spectrumList", &m.spectrum_list_default), ("chromatogramList", &m.chromatogram_list_default)] {
         let default = default.as_ref().unwrap_or_else(|| panic!("{what}: no {list}"));
         let default = default.as_deref().unwrap_or_else(|| panic!("{what}: {list} has no defaultDataProcessingRef"));
         assert!(dp_ids.contains(default), "{what}: {list} defaultDataProcessingRef {default:?} is not a dataProcessing id {dp_ids:?}");
+        defaults.push(default);
+    }
+    assert_eq!(defaults[0], defaults[1], "{what}: the two lists' default processing");
+    let (ours, methods) = m.data_processings.iter().find(|(id, _)| id == defaults[0]).unwrap();
+    let last = methods.iter().max_by_key(|meth| meth.order).unwrap();
+    assert!(
+        last.accessions.iter().any(|a| a == "MS:1000544")
+            && last.software_ref.starts_with("mzpeak-convert")
+            && sw.get(last.software_ref.as_str()) == Some(&env!("CARGO_PKG_VERSION")),
+        "{what}: the default processing {ours:?} does not end in mzpeak-convert {}'s Conversion to mzML: {methods:?}",
+        env!("CARGO_PKG_VERSION")
+    );
+    for (element, r) in &m.data_processing_refs {
+        assert!(dp_ids.contains(r.as_str()), "{what}: a {element}'s dataProcessingRef {r:?} is not a dataProcessing id {dp_ids:?}");
     }
     let mut seen = BTreeSet::new();
     for id in m.softwares.iter().map(|(i, _)| i).chain(m.data_processings.iter().map(|(i, _)| i)) {
         assert!(seen.insert(id.as_str()), "{what}: id {id:?} used twice");
     }
-    ours.last().unwrap().to_string()
+    ours.clone()
 }
