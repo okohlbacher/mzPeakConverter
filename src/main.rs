@@ -365,9 +365,11 @@ struct Cli {
     /// Bruker timsTOF (TDF): disable this converter's vendor-grade scan→1/K0 recalibration (the
     /// `TimsCalibration` ModelType-2 model) and use timsrust's linear approximation.
     /// Recalibration is ON by default. The ims-compact path applies the choice to arrays and
-    /// params alike. `--no-ims-compact` and `--to mzml` take their mobility ARRAYS from mzdata's
-    /// TDF reader, which (since mzdata 0.66) applies the same ModelType-2 calibration itself,
-    /// unconditionally, so there the flag switches only the precursor/scan/window-limit params.
+    /// params alike. `--no-ims-compact` takes its mobility ARRAYS from mzdata's TDF reader, which
+    /// (since mzdata 0.66) applies the same ModelType-2 calibration itself, unconditionally, so
+    /// there the flag switches only the precursor/scan/window-limit params. INERT with `--to mzml`:
+    /// that export keeps every 1/K0 on the model its mobility arrays use, so each window's limits
+    /// bracket its own peaks.
     #[arg(long)]
     no_tims_recalibration: bool,
 
@@ -938,20 +940,19 @@ fn main() {
         );
     }
     // Partial-flag honesty for the TDF mobility knob: the ims-compact reader (`bruker_native`)
-    // honours it for arrays and params alike, and the two lanes through mzdata's TDF reader — the
-    // lossy `--no-ims-compact` archive and the `--to mzml` export — honour it for the
-    // precursor/scan/window-limit PARAMS (`bruker_native::TdfMobilityRemap`, so every lane writes
-    // the same selected-ion 1/K0 either way) — but their mobility ARRAYS come from mzdata's TDF
-    // reader, whose own ModelType-2 tims calibration is unconditional (`im_enabled` is hard-coded
-    // true in mzdata 0.66's CalibrationParameters::from_sql) and cannot be switched.
-    let mzdata_tdf_lane = cfg.no_ims_compact
-        || (cfg.output_format == OutputFormat::Mzml && !cfg.via_msconvert && is_tdf_dir(&cli.input));
-    if !cfg.tims_recalibration && mzdata_tdf_lane {
+    // honours it for arrays and params alike, and the lossy `--no-ims-compact` path honours it for
+    // the precursor/scan/window-limit PARAMS (`bruker_native::TdfMobilityRemap`, so both lanes
+    // write the same selected-ion 1/K0 either way) — but that path's mobility ARRAYS come from
+    // mzdata's TDF reader, whose own ModelType-2 tims calibration is unconditional (`im_enabled` is
+    // hard-coded true in mzdata 0.66's CalibrationParameters::from_sql) and cannot be switched.
+    // An mzML output is another matter: both flags are inert there, and the lane says so
+    // (`inert_flags_for`).
+    if !cfg.tims_recalibration && cfg.no_ims_compact && cfg.output_format != OutputFormat::Mzml {
         log::warn!(
-            "--no-tims-recalibration through mzdata's TDF reader (--no-ims-compact, --to mzml): \
-             precursor/scan/window 1/K0 params stay on timsrust's linear approximation (as in the \
-             ims-compact lane), but the mobility arrays still come from mzdata's own ModelType-2 \
-             calibration — the flag cannot switch those"
+            "--no-tims-recalibration with --no-ims-compact: precursor/scan/window 1/K0 params stay \
+             on timsrust's linear approximation (as in the ims-compact lane), but the mobility \
+             arrays still come from mzdata's own ModelType-2 calibration — the flag cannot switch \
+             those"
         );
     }
 
@@ -1238,7 +1239,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     // to the output path in that case.
     if cfg.output_format == OutputFormat::Mzml {
         refuse_unsupported_flags(Lane::MzmlExport, cfg)?;
-        convert_to_mzml(&cli.input, &output, cfg.via_msconvert, cfg.msconvert_path.as_deref(), cfg.tims_recalibration)
+        convert_to_mzml(&cli.input, &output, cfg.via_msconvert, cfg.msconvert_path.as_deref())
             .with_context(|| format!("converting {} to mzML", cli.input.display()))?;
         return Ok(exit::OK);
     }
@@ -1511,11 +1512,14 @@ fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
             "--no-tims-recalibration", "--no-chromatograms", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
         ],
-        // `--no-tims-recalibration` is not here: a TDF's mobility params follow it on this lane too
-        // (`tdf_mzml_description`), and `main` warns about the arrays it cannot switch.
+        // `--no-tims-recalibration` stays inert here although a TDF's mobility params go through the
+        // same remap as the `--no-ims-compact` archive's (`tdf_mzml_description`): the arrays come
+        // from mzdata's model whatever the flag says, and an mzML whose window limits sat on
+        // timsrust's linear map would contradict its own arrays (9 % of the MS2 peaks of a
+        // diaPASEF run outside their window), which a precursor-assigning reader cannot see.
         Lane::MzmlExport => &[
             "--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level",
-            "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-chromatograms",
+            "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration", "--no-chromatograms",
             "--tof-grid", "--agilent-grid",
         ],
         Lane::AgilentGrid | Lane::SdkImsCompact => &["--layout", "--no-numpress", "--chunk-size"],
@@ -2160,14 +2164,12 @@ fn convert_via_msconvert(
 /// byte-plane / side-file embedding all bypassed). Covers every format the tool reads: the
 /// Windows-native vendor readers (SciEX/Waters/Agilent/Shimadzu, Bruker TSF/BAF) plus everything
 /// mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF). `--via-msconvert` has msconvert
-/// write the mzML instead. `tims_recalibration` is `--no-tims-recalibration`'s choice for a TDF's
-/// mobility params ([`tdf_mzml_description`]).
+/// write the mzML instead.
 fn convert_to_mzml(
     input: &Path,
     output: &Path,
     via_msconvert: bool,
     msconvert_path: Option<&Path>,
-    tims_recalibration: bool,
 ) -> Result<()> {
     if via_msconvert {
         return msconvert_to_mzml(input, output, msconvert_path);
@@ -2291,9 +2293,11 @@ fn convert_to_mzml(
     // 0.12.5 this lane wrote mzdata's params as they come: every diaPASEF MS2 spectrum's
     // `ion mobility lower limit` ABOVE its `upper limit` (1.3674 / 1.1931), which OpenSWATH's strict
     // `lower < IM < upper` precursor test then matched against nothing, and on timsrust's linear
-    // map while the spectrum's mobility array is on mzdata's ModelType-2 calibration.
+    // map while the spectrum's mobility array is on mzdata's ModelType-2 calibration. Always on
+    // that model here, whatever `--no-tims-recalibration` says (inert on this lane): the arrays
+    // cannot leave it, and the limits must bracket them.
     let tdf_remap = if matches!(reader, MZReaderType::BrukerTDF(_)) {
-        match bruker_native::TdfMobilityRemap::open_with(input, tims_recalibration) {
+        match bruker_native::TdfMobilityRemap::open_with(input, true) {
             Ok(r) => Some(r),
             Err(e) => {
                 log::warn!(
@@ -2367,7 +2371,8 @@ fn convert_to_mzml(
 
 /// The mzPeak-INPUT filter path with an mzML output. Reads the `.mzpeak` with the sync `MzPeakReader`
 /// — which decodes every buffer transform (delta chains, numpress, and the timsTOF `SqrtMzFromTof`
-/// tof→m/z), so iterated spectra carry real m/z (+ ion mobility), not raw tof — keeps the spectra
+/// tof→m/z), so iterated spectra carry real m/z, not raw tof, and (from the peak facet's arrays,
+/// [`with_peak_facet_arrays`]) ion mobility — keeps the spectra
 /// passing the RT / MS-level predicate, and writes them to a real mzML via the mzdata writer. This is
 /// the "slice a mzPeak to a narrow RT window, then hand the small mzML to a search engine
 /// (Sage/MSFragger)" workflow. Aux/vendor embedding does not apply to an mzML output and is
@@ -2463,12 +2468,25 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     fixup_mzml_run_metadata(&mut w, input);
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
+    // A timsTOF archive keeps each peak's 1/K0 in its peak facet (`mean_inverse_reduced_ion_mobility`),
+    // and the reader's peak list has no room for it: through 0.12.5 every such spectrum was exported
+    // with m/z and intensity only. Such a spectrum is exported from the facet's arrays instead.
+    let peak_mobility = reader.metadata.peak_array_indices().is_some_and(|a| a.has_ion_mobility());
+    // MS2 spectra that are whole frames (an ims-compact archive): precursors, but no window limits
+    // of their own. Counted, and named once the export is done.
+    let mut whole_frames = 0usize;
     for item in &items {
         match *item {
             ExportItem::Mass(i) => {
                 let mut spec = reader
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
+                if peak_mobility && with_peak_facet_arrays(&mut reader, i, &mut spec)? {
+                    let d = spec.description();
+                    if !d.precursor.is_empty() && !d.params.iter().any(|p| p.name == "ion mobility lower limit") {
+                        whole_frames += 1;
+                    }
+                }
                 demote_mzp_params(spec.description_mut());
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
@@ -2510,6 +2528,15 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
             }
         }
     }
+    if whole_frames > 0 {
+        log::warn!(
+            "{whole_frames} MS2 spectra are whole timsTOF frames (an ims-compact archive): each is \
+             written as ONE spectrum, with the precursor of every isolation window the frame holds \
+             and a mobility array over the whole frame, but no ion mobility limits of its own. A \
+             reader that assigns precursors by mobility window (OpenSWATH's diaPASEF mode) needs one \
+             spectrum per window: convert the .d with --to mzml, or export a --no-ims-compact archive"
+        );
+    }
 
     // Carry the archive's chromatograms across. Without this the lane emitted ONLY the writer's
     // synthesized TIC/base-peak summary: on a 300-chromatogram SIM/SRM run, 299 quantitative traces
@@ -2531,6 +2558,53 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     write_source_chromatograms_mzml(&mut w, chroms.into_iter())?;
 
     finish_mzml(w, tmp_guard, output)
+}
+
+/// Give a spectrum read from an archive's peak facet that facet's ARRAYS in place of the reader's
+/// peak list when they hold each peak's ion mobility, which the list (`CentroidPeak`: m/z,
+/// intensity) has no room for. Returns whether the spectrum's signal was replaced. The arrays come
+/// back in the facet's own order and types: they are put in m/z order, as the peak list was, and a
+/// TOF lane's integer intensities become the 32-bit floats the peak list held; the m/z array is the
+/// one the reader rebuilds from the TOF axis (with the spectrum's own `tof_c0`/`tof_c1`), as for
+/// the peak list.
+fn with_peak_facet_arrays(
+    reader: &mut mzpeak_prototyping::MzPeakReader,
+    index: usize,
+    spec: &mut MultiLayerSpectrum,
+) -> Result<bool> {
+    if spec.peaks.is_none() || spec.arrays.as_ref().is_some_and(|a| !a.is_empty()) {
+        return Ok(false);
+    }
+    let Some(mut arrays) = reader
+        .get_spectrum_peak_arrays_for(index as u64)
+        .with_context(|| format!("reading the peak arrays of spectrum {index}"))?
+    else {
+        return Ok(false);
+    };
+    if !arrays.has_ion_mobility() || !arrays.has_array(&ArrayType::MZArray) {
+        return Ok(false);
+    }
+    strip_grid_axis(&mut arrays);
+    if let Some(intensity) = arrays.get_mut(&ArrayType::IntensityArray)
+        && matches!(intensity.dtype, BinaryDataArrayType::Int32 | BinaryDataArrayType::Int64)
+    {
+        intensity
+            .store_as(BinaryDataArrayType::Float32)
+            .map_err(|e| anyhow!("spectrum {index}: intensity array: {e}"))?;
+    }
+    let sorted = arrays
+        .mzs()
+        .map_err(|e| anyhow!("spectrum {index}: m/z array: {e}"))?
+        .windows(2)
+        .all(|w| w[0] <= w[1]);
+    if !sorted {
+        arrays
+            .sort_by_array(&ArrayType::MZArray)
+            .map_err(|e| anyhow!("spectrum {index}: sorting by m/z: {e}"))?;
+    }
+    spec.peaks = None;
+    spec.arrays = Some(arrays);
+    Ok(true)
 }
 
 /// Summary values the vendored writer computes for every wavelength spectrum from its arrays, and its
@@ -7879,9 +7953,10 @@ fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
     }
 }
 
-/// Record the step that wrote this mzML: a `dataProcessing` whose one method is software
-/// `mzpeak-convert` (this version) doing MS:1000544 `Conversion to mzML`, with the path-free
-/// `conversion options` the archive lanes record ([`conversion_options_param`]).
+/// Record the step that wrote this mzML as the default processing of both lists: a
+/// `dataProcessing` (`mzpeak_convert_to_mzml`) whose last method is software `mzpeak-convert` (this
+/// version) doing MS:1000544 `Conversion to mzML`, with the path-free `conversion options` the
+/// archive lanes record ([`conversion_options_param`]).
 ///
 /// mzML 1.1 requires one: `dataProcessingList` holds at least one `dataProcessing`, and
 /// `spectrumList` and `chromatogramList` must name one in `defaultDataProcessingRef`. mzdata's
@@ -7892,16 +7967,22 @@ fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
 /// with `<dataProcessingList count="0">` and no default, which OpenMS 3.5 refuses ("Required
 /// attribute 'defaultDataProcessingRef' not present!").
 ///
-/// APPENDED on every export, not added only to an empty list. This tool did write the file, so
-/// the step belongs in the history whatever came before it: an mzML source's list states how THAT
-/// file was made (msconvert's own `Conversion to mzML`, a peak picker), and with only-when-empty
-/// the re-written file would claim to be the source untouched. It is also the archive lanes' rule
-/// (`add_processing_metadata` appends after the copied list). Appending cannot change what the
-/// spectra point at: the source's own first entry stays first and so stays the default
-/// (`fixup_run_metadata` defaults to the first entry too); where nothing came before, this step is
-/// the default. Ids must be unique in an mzML, and a source written by this tool can already hold
-/// `mzpeak-convert` (another version, maybe) and this very step, so an id in use gets a numeric
-/// suffix; the same version's software entry is reused.
+/// Recorded on every export, not only to an empty list: this tool did write the file, and an mzML
+/// source's list states how THAT file was made (msconvert's own `Conversion to mzML`, a peak
+/// picker). The step EXTENDS the source's default, as msconvert does when it re-writes an mzML:
+/// the new entry holds the methods of the processing the source's spectra point at by default,
+/// then this conversion one `order` later, and goes FIRST, so the writer makes it the default. Just
+/// appending the step would leave it referenced by nothing, and would not keep the source's
+/// default either: mzdata's writer ignores the default a source declares and names the first
+/// entry, so through 0.12.5 an mzML's spectra silently moved to whatever processing came first
+/// (`tiny.pwiz.1.1.mzML`: from `pwiz_processing` to `CompassXtract_x0020_processing`). The
+/// source's entries stay in the list, after the step, for the elements that name one themselves;
+/// `run.default_data_processing_id` goes on naming the source's default, because the writer uses
+/// it only to leave out a `binaryDataArray`'s `dataProcessingRef` equal to it, and such an array
+/// then inherits the new default, which extends that very entry. Where the source states no
+/// processing, the step is the only entry. Ids must be unique in an mzML, and a source written by
+/// this tool already holds `mzpeak-convert` (another version, maybe) and this very step, so an id
+/// in use gets a numeric suffix; the same version's software entry is reused.
 fn add_mzml_conversion_step(target: &mut impl MSDataFileMetadata) {
     const SOFTWARE_ID: &str = "mzpeak-convert";
     let version = env!("CARGO_PKG_VERSION");
@@ -7936,27 +8017,38 @@ fn add_mzml_conversion_step(target: &mut impl MSDataFileMetadata) {
             id
         }
     };
-    let id = fresh("mzpeak_convert_to_mzml");
-    target.data_processings_mut().push(DataProcessing {
-        id,
-        methods: vec![ProcessingMethod {
-            order: 1,
-            software_reference: software,
-            // cvParams before userParams: the schema's order inside a processingMethod.
-            params: vec![
-                Param::builder().name("Conversion to mzML").curie(curie!(MS:1000544)).build(),
-                conversion_options_param(),
-            ],
-        }],
+    // The source's default: the entry its run names (an mzML source's `defaultDataProcessingRef`,
+    // as mzdata's reader hands it over), else, when it names none or one not in the list, the first.
+    let named = target.run_description().and_then(|r| r.default_data_processing_id.clone());
+    let source_default = named
+        .as_deref()
+        .and_then(|id| target.data_processings().iter().find(|dp| dp.id == id))
+        .or_else(|| target.data_processings().first())
+        .cloned();
+    let mut methods = source_default.as_ref().map(|dp| dp.methods.clone()).unwrap_or_default();
+    let order = methods.iter().map(|m| m.order).max().map_or(1, |o| o.saturating_add(1));
+    methods.push(ProcessingMethod {
+        order,
+        software_reference: software,
+        // cvParams before userParams: the schema's order inside a processingMethod.
+        params: vec![
+            Param::builder().name("Conversion to mzML").curie(curie!(MS:1000544)).build(),
+            conversion_options_param(),
+        ],
     });
+    let id = fresh("mzpeak_convert_to_mzml");
+    target.data_processings_mut().insert(0, DataProcessing { id, methods });
+    if let (Some(dp), Some(run)) = (source_default, target.run_description_mut()) {
+        run.default_data_processing_id = Some(dp.id);
+    }
 }
 
 /// A TDF spectrum from mzdata's reader on its way into an mzML, as the `--to mzml` lane sends each
 /// one: [`bruker_native::TdfMobilityRemap`] puts the `ion mobility lower/upper limit` pair in order
-/// and, with it the scan and selected-ion 1/K0, on the model its mobility array uses (or, under
-/// `--no-tims-recalibration`, leaves them on timsrust's linear map, as every TDF lane does), and
-/// adds the window's MZP:1000006/7 band to the selected ion; [`demote_mzp_params`] then makes that
-/// band a `userParam`, as mzML has no home for a non-PSI accession.
+/// and, with it the scan and selected-ion 1/K0, on the model its mobility array uses, evaluated as
+/// mzdata evaluates the array (so a window's limits bracket its own peaks exactly), and adds the
+/// window's MZP:1000006/7 band to the selected ion; [`demote_mzp_params`] then makes that band a
+/// `userParam`, as mzML has no home for a non-PSI accession, and puts each list's `cvParam`s first.
 fn tdf_mzml_description(remap: &bruker_native::TdfMobilityRemap, descr: &mut mzdata::spectrum::SpectrumDescription) {
     remap.apply(descr);
     demote_mzp_params(descr);
@@ -8028,6 +8120,11 @@ fn demote_mzp_in_precursor(prec: &mut mzdata::spectrum::Precursor) {
     }
 }
 
+/// Also puts the list's `cvParam`s before its `userParam`s (a stable sort: each kind keeps its own
+/// order), as mzML's `ParamGroup` requires: mzdata writes a list in the order it holds it, a demoted
+/// MZP term can sit before a PSI one, and mzdata's TDF reader gives every diaPASEF scan its
+/// `window group` userParam before its MS:1002815 cvParam — one XSD error per MS2 `<scan>` of a
+/// timsTOF export through 0.12.5.
 fn demote_mzp_in(params: &mut [Param]) {
     for p in params.iter_mut() {
         if p.controlled_vocabulary == Some(ControlledVocabulary::Unknown) {
@@ -8035,6 +8132,7 @@ fn demote_mzp_in(params: &mut [Param]) {
             p.accession = None;
         }
     }
+    params.sort_by_key(|p| !p.is_controlled());
 }
 
 fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
@@ -8056,27 +8154,42 @@ fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
 /// The `conversion options` param every conversion records (the archive lanes'
 /// [`add_processing_metadata`], the mzML lanes' [`add_mzml_conversion_step`]): this command line.
 fn conversion_options_param() -> Param {
-    Param::new_key_value(
-        "conversion options",
-        // Provenance without leaking the operator's filesystem: flags are kept verbatim, but
-        // any path-shaped argument is reduced to its basename. The raw command line would
-        // otherwise embed absolute input/output paths — home directory, scratch dirs — in
-        // every distributed archive.
-        std::env::args()
-            .skip(1)
-            .map(|a| {
-                if a.contains(std::path::MAIN_SEPARATOR) {
-                    Path::new(&a)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or(a)
-                } else {
-                    a
-                }
-            })
-            .collect::<Vec<String>>()
-            .join(" "),
-    )
+    // `args_os`, not `args`: `std::env::args` panics on an argument that is not valid Unicode (a
+    // Latin-1 file name on Linux), which aborted every archive conversion of such a file through
+    // 0.12.5 — and, once the mzML lanes record their step too, every mzML export of one.
+    Param::new_key_value("conversion options", conversion_options(std::env::args_os().skip(1)))
+}
+
+/// The command line (`args`, without the program name) as [`conversion_options_param`] records it:
+/// provenance without leaking the operator's filesystem. Flags are kept verbatim, but any
+/// path-shaped argument is reduced to its last component — for `--flag=path`, the value only, so
+/// the option's name stays. The raw command line would otherwise embed absolute input/output
+/// paths — home directory, scratch dirs — in every distributed file. `/` counts as a separator
+/// everywhere, as Windows takes `C:/Users/…/run.wiff` as readily as `C:\Users\…\run.wiff`, which
+/// once kept its full path because only the platform's own separator was looked for.
+fn conversion_options(args: impl IntoIterator<Item = std::ffi::OsString>) -> String {
+    fn last_component(a: &str) -> String {
+        if !(a.contains('/') || a.contains(std::path::MAIN_SEPARATOR)) {
+            return a.to_string();
+        }
+        // `components`, not `file_name`: a path ending in `..` has no file name, and the whole
+        // path must not come back in its place.
+        Path::new(a)
+            .components()
+            .next_back()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+    args.into_iter()
+        .map(|a| {
+            let a = a.to_string_lossy();
+            match a.split_once('=') {
+                Some((flag, value)) if flag.starts_with("--") => format!("{flag}={}", last_component(value)),
+                _ => last_component(&a),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
 }
 
 fn reader_format<R: std::io::Read + std::io::Seek>(reader: &MZReaderType<R>) -> &'static str {
@@ -8638,7 +8751,7 @@ mod tests {
         assert_eq!(other_columns(&back_again, "back-again-facet"), Vec::<String>::new(), "no device array is a column");
 
         let hop = dir.join("hop.mzML");
-        super::convert_to_mzml(&export, &hop, false, None, true).expect("the export converts into an mzML");
+        super::convert_to_mzml(&export, &hop, false, None).expect("the export converts into an mzML");
         let xml = std::fs::read_to_string(&hop).unwrap();
         let element = |id: &str| {
             let start = xml.find(&format!("<chromatogram id=\"{id}\"")).unwrap_or_else(|| panic!("no chromatogram {id}"));
@@ -8777,7 +8890,7 @@ mod tests {
         let dir = scratch("chromatogram-type");
         let _cleanup = RmDir(dir.clone());
         let out = dir.join("tiny.mzML");
-        super::convert_to_mzml(std::path::Path::new(TINY), &out, false, None, true).expect("tiny.pwiz → mzML");
+        super::convert_to_mzml(std::path::Path::new(TINY), &out, false, None).expect("tiny.pwiz → mzML");
         let xml = std::fs::read_to_string(&out).unwrap();
         let start = xml.find("<chromatogram id=\"sic\"").expect("the sic trace");
         let sic = &xml[start..start + xml[start..].find("</chromatogram>").unwrap()];
@@ -9285,12 +9398,13 @@ mod tests {
     }
 
     /// Write `spec` through the mzML lanes' prologue (`fixup_mzml_run_metadata`) onto a writer that
-    /// already holds `softwares` / `processings` — what `copy_metadata_from` hands over — and read
-    /// the file back.
+    /// already holds `softwares` / `processings` and the run's `default` processing — what
+    /// `copy_metadata_from` hands over — and read the file back.
     fn mzml_through_the_lane_prologue(
         name: &str,
         softwares: Vec<mzdata::meta::Software>,
         processings: Vec<mzdata::meta::DataProcessing>,
+        default: Option<&str>,
         spec: &MultiLayerSpectrum,
     ) -> (super::mzml_meta::Mzml, String) {
         let dir = std::env::temp_dir().join(format!("mzpc-mzml-dp-{}-{name}", std::process::id()));
@@ -9300,6 +9414,7 @@ mod tests {
             let mut w = mzdata::io::mzml::MzMLWriter::new(std::fs::File::create(&path).unwrap());
             *w.softwares_mut() = softwares;
             *w.data_processings_mut() = processings;
+            w.run_description_mut().unwrap().default_data_processing_id = default.map(str::to_string);
             super::fixup_mzml_run_metadata(&mut w, std::path::Path::new("run.d"));
             w.set_spectrum_count(1);
             SpectrumWriter::write(&mut w, spec).unwrap();
@@ -9314,70 +9429,126 @@ mod tests {
     /// mzML 1.1 requires a non-empty `dataProcessingList` and a `defaultDataProcessingRef` on
     /// `spectrumList` and `chromatogramList`; through 0.12.5 an export of a raw file had neither
     /// (OpenMS 3.5: "Required attribute 'defaultDataProcessingRef' not present!"). The prologue all
-    /// four mzML lanes share now appends this tool's `Conversion to mzML` step: the only, hence
-    /// default, entry of a source without processing; after a source's own entries, which keep the
-    /// default, otherwise; and under fresh ids where a source written by this tool already holds
-    /// `mzpeak-convert` and the step.
+    /// four mzML lanes share now puts this tool's `Conversion to mzML` step first, so it is the
+    /// default of both lists: alone for a source without processing; after the methods of the
+    /// processing a source names as its default — whichever entry that is, not the source's first
+    /// — with the source's own entries kept after it; and under fresh ids where a source written by
+    /// this tool already holds `mzpeak-convert` and the step.
     #[test]
     fn mzml_prologue_records_the_conversion_step_on_every_source() {
         use mzdata::meta::{DataProcessing, ProcessingMethod, Software};
         let version = env!("CARGO_PKG_VERSION");
-        let conversion = |id: &str, software: &str| DataProcessing {
+        let step = |id: &str, software: &str, order: i8, accession: mzdata::params::CURIE| DataProcessing {
             id: id.to_string(),
             methods: vec![ProcessingMethod {
-                order: 1,
+                order,
                 software_reference: software.to_string(),
-                params: vec![Param::builder().name("Conversion to mzML").curie(mzdata::curie!(MS:1000544)).build()],
+                params: vec![Param::builder().name("a step").curie(accession).build()],
             }],
+        };
+        let conversion = |id: &str, software: &str| step(id, software, 1, mzdata::curie!(MS:1000544));
+        let refs = |m: &super::mzml_meta::Mzml, id: &str| -> Vec<(String, Option<i64>)> {
+            let (_, methods) = m.data_processings.iter().find(|(i, _)| i == id).unwrap_or_else(|| panic!("no {id}"));
+            methods.iter().map(|meth| (meth.software_ref.clone(), meth.order)).collect()
         };
         let spec = spec_from(&[100.0, 200.0], &[1.0, 2.0], 0);
 
         // Nothing from the source (a TDF, a Thermo file, every native reader): the step is the
         // only entry and the default of both lists.
-        let (m, xml) = mzml_through_the_lane_prologue("empty", Vec::new(), Vec::new(), &spec);
+        let (m, xml) = mzml_through_the_lane_prologue("empty", Vec::new(), Vec::new(), None, &spec);
         let ours = super::mzml_meta::assert_processing_contract(&m, "empty source");
         assert_eq!(ours, "mzpeak_convert_to_mzml");
         assert_eq!(m.data_processings.len(), 1);
         assert_eq!(m.softwares, vec![("mzpeak-convert".to_string(), version.to_string())]);
+        assert_eq!(refs(&m, &ours), [("mzpeak-convert".to_string(), Some(1))]);
         assert_eq!(m.spectrum_list_default, Some(Some(ours.clone())));
         assert_eq!(m.chromatogram_list_default, Some(Some(ours)));
         assert!(xml.contains("name=\"conversion options\""), "the conversion options userParam");
 
-        // A source with its own processing keeps it, first and default; the step comes after.
-        let pwiz = Software::new("pwiz".into(), "3.0".into(), vec![]);
-        let (m, _) = mzml_through_the_lane_prologue("sourced", vec![pwiz.clone()], vec![conversion("pwiz_conversion", "pwiz")], &spec);
+        // A source naming its SECOND entry as the default (tiny.pwiz.1.1.mzML's shape): the step
+        // extends that one, not the first, and leads; both source entries stay, in their order.
+        let (pwiz, bruker) = (
+            Software::new("pwiz".into(), "3.0".into(), vec![]),
+            Software::new("CompassXtract".into(), "2.0".into(), vec![]),
+        );
+        let source = vec![step("CompassXtract_processing", "CompassXtract", 1, mzdata::curie!(MS:1000035)), step("pwiz_processing", "pwiz", 2, mzdata::curie!(MS:1000544))];
+        let (m, _) = mzml_through_the_lane_prologue("sourced", vec![bruker, pwiz.clone()], source, Some("pwiz_processing"), &spec);
         let ours = super::mzml_meta::assert_processing_contract(&m, "source with processing");
         let ids: Vec<&str> = m.data_processings.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, ["pwiz_conversion", ours.as_str()]);
-        assert_eq!(m.spectrum_list_default, Some(Some("pwiz_conversion".to_string())));
+        assert_eq!(ids, [ours.as_str(), "CompassXtract_processing", "pwiz_processing"]);
+        assert_eq!(m.spectrum_list_default, Some(Some(ours.clone())));
+        assert_eq!(refs(&m, &ours), [("pwiz".to_string(), Some(2)), ("mzpeak-convert".to_string(), Some(3))]);
+        // No default named: the first entry is the one extended.
+        let (m, _) = mzml_through_the_lane_prologue("unnamed", vec![pwiz.clone()], vec![conversion("pwiz_conversion", "pwiz")], None, &spec);
+        let ours = super::mzml_meta::assert_processing_contract(&m, "source naming no default");
+        assert_eq!(refs(&m, &ours), [("pwiz".to_string(), Some(1)), ("mzpeak-convert".to_string(), Some(2))]);
 
         // A source written by this tool: another version's `mzpeak-convert` and this very step are
-        // already there, so both ids are taken and the new entries get fresh ones.
+        // already there, so both ids are taken and the new entries get fresh ones; the chain grows.
         let older = Software::new("mzpeak-convert".into(), "0.0.1".into(), vec![]);
+        let earlier = DataProcessing {
+            id: "mzpeak_convert_to_mzml".into(),
+            methods: [conversion("", "pwiz").methods, step("", "mzpeak-convert", 2, mzdata::curie!(MS:1000544)).methods].concat(),
+        };
         let (m, _) = mzml_through_the_lane_prologue(
             "reexport",
             vec![pwiz.clone(), older],
-            vec![conversion("pwiz_conversion", "pwiz"), conversion("mzpeak_convert_to_mzml", "mzpeak-convert")],
+            vec![earlier, conversion("pwiz_conversion", "pwiz")],
+            Some("mzpeak_convert_to_mzml"),
             &spec,
         );
         let ours = super::mzml_meta::assert_processing_contract(&m, "re-export");
         assert_eq!(ours, "mzpeak_convert_to_mzml_2");
         assert!(m.softwares.contains(&("mzpeak-convert_2".to_string(), version.to_string())), "{:?}", m.softwares);
-        assert_eq!(m.data_processings[2].1[0].software_ref, "mzpeak-convert_2");
+        assert_eq!(
+            refs(&m, &ours),
+            [("pwiz".to_string(), Some(1)), ("mzpeak-convert".to_string(), Some(2)), ("mzpeak-convert_2".to_string(), Some(3))]
+        );
 
         // … and this version's own entry is reused, not repeated.
         let same = Software::new("mzpeak-convert".into(), version.into(), vec![]);
-        let (m, _) = mzml_through_the_lane_prologue("same-version", vec![same], vec![], &spec);
+        let (m, _) = mzml_through_the_lane_prologue("same-version", vec![same], vec![], None, &spec);
         super::mzml_meta::assert_processing_contract(&m, "same version");
         assert_eq!(m.softwares.len(), 1, "{:?}", m.softwares);
+    }
+
+    /// The `conversion options` param keeps flags and reduces every path to its last component:
+    /// `/` counts as a separator on every platform (Windows takes `C:/Users/…`), `--flag=path`
+    /// keeps its flag, a trailing `..` does not bring the path back, and an argument that is not
+    /// Unicode (a Latin-1 file name on Linux) is recorded lossily instead of aborting the run, as
+    /// `std::env::args` did.
+    #[test]
+    fn conversion_options_keep_flags_and_file_names_only() {
+        use std::ffi::OsString;
+        let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            super::conversion_options(args(&["/home/alice/runs/a.d", "-o", "/scratch/alice/a.mzML", "--to", "mzml", "--rt=10,20"])),
+            "a.d -o a.mzML --to mzml --rt=10,20"
+        );
+        assert_eq!(
+            super::conversion_options(args(&["--output=/home/alice/eq.mzML", "../../x/in.mzML", "/home/alice/..", "-o/abs/att.mzML"])),
+            "--output=eq.mzML in.mzML .. att.mzML"
+        );
+        assert_eq!(super::conversion_options(args(&["C:/Users/alice/run.wiff"])), "run.wiff");
+        #[cfg(windows)]
+        assert_eq!(super::conversion_options(args(&[r"C:\Users\alice\run.wiff", r"--output=C:\out\x.mzML"])), "run.wiff --output=x.mzML");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let latin1 = OsString::from_vec(b"/scratch/alice/lat\xe9n.d".to_vec());
+            assert_eq!(super::conversion_options(vec![latin1, OsString::from("--force")]), "lat\u{FFFD}n.d --force");
+        }
     }
 
     /// A diaPASEF window spectrum as mzdata's TDF reader spells it — `ion mobility lower limit` from
     /// the window's first scan, i.e. the LARGER 1/K0 (1.3674 over an upper 1.1931 on a real run),
     /// on timsrust's linear map — written by the `--to mzml` lane. Through 0.12.5 the lane wrote the
     /// pair as it came, and OpenSWATH's strict `lower < IM < upper` matched no precursor. It must
-    /// come out ordered, on the ModelType-2 model the spectrum's mobility array uses, with the
-    /// window band on the selected ion as `userParam`s and no MZP accession.
+    /// come out ordered, on the ModelType-2 model the spectrum's mobility array uses — bit for bit
+    /// the array values of the window's end scans — with the window band on the selected ion as
+    /// `userParam`s, no MZP accession, and the scan's `window group` userParam after its cvParams
+    /// (mzdata's reader puts it first, which the mzML schema forbids). Without a ModelType-2 row the
+    /// values stay linear, and are still put in order.
     #[test]
     fn tdf_window_limits_leave_the_mzml_lane_ordered_on_the_vendor_model() {
         use mzdata::spectrum::{Precursor, SelectedIon};
@@ -9413,25 +9584,39 @@ mod tests {
             let mut prec = Precursor { ions: vec![ion], ..Default::default() };
             prec.isolation_window.target = 500.0;
             d.precursor.push(prec);
+            // mzdata's order for a merged diaPASEF window: the window group first, then the 1/K0.
+            if d.acquisition.scans.is_empty() {
+                d.acquisition.scans.push(Default::default());
+            }
+            let scan = &mut d.acquisition.scans[0];
+            scan.add_param(Param::new_key_value("window group", 3i64));
+            scan.add_param(im_param(linear.convert(mid)));
         }
 
-        for (label, recalibrate) in [("model", true), ("linear", false)] {
+        for (label, recalibrate) in [("model", true), ("no ModelType-2 row", false)] {
             let remap = crate::bruker_native::TdfMobilityRemap::new(linear, recalibrate.then_some(recal));
             let mut s = spec.clone();
             super::tdf_mzml_description(&remap, s.description_mut());
-            let (m, xml) = mzml_through_the_lane_prologue(&format!("tdf-{label}"), Vec::new(), Vec::new(), &s);
+            let (m, xml) = mzml_through_the_lane_prologue(&format!("tdf-{}", recalibrate), Vec::new(), Vec::new(), None, &s);
             super::mzml_meta::assert_processing_contract(&m, label);
             assert!(!xml.contains("MZP:"), "{label}: an MZP accession leaked into mzML");
             let back = &m.spectra[0];
             let (lo, hi) = (back.im_lower.unwrap(), back.im_upper.unwrap());
-            let at = |scan: f64| if recalibrate { recal.one_over_k0(scan) } else { linear.convert(scan) };
-            let tol = 1e-9;
+            // On the model: exactly what mzdata's reader writes into the arrays of the window's
+            // last (scan end, exclusive) and first scans.
+            let at = |scan: f64| if recalibrate { recal.one_over_k0_as_mzdata(scan) } else { linear.convert(scan) };
             assert!(lo <= hi, "{label}: written window limits {lo} > {hi}");
-            assert!((lo - at(se as f64)).abs() < tol && (hi - at(sb as f64)).abs() < tol, "{label}: limits {lo}..{hi}");
-            assert!((back.band_lower.unwrap() - lo).abs() < tol && (back.band_upper.unwrap() - hi).abs() < tol, "{label}: band vs limits");
+            assert_eq!((lo, hi), (at(se as f64), at(sb as f64)), "{label}: limits");
+            assert_eq!((back.band_lower, back.band_upper), (Some(lo), Some(hi)), "{label}: band vs limits");
             let im = back.ion_mobility.unwrap();
-            assert!((im - at(mid)).abs() < tol, "{label}: selected-ion 1/K0 {im}");
+            assert!((im - at(mid)).abs() < 1e-12, "{label}: selected-ion 1/K0 {im}");
             assert!(lo < im && im < hi, "{label}: OpenSWATH's strict test {lo} < {im} < {hi}");
+            // The scan's own params: from `<scan>` to its `scanWindowList` (whose cvParams are
+            // allowed after the scan's userParams).
+            let scan_xml = &xml[xml.find("<scan>").or_else(|| xml.find("<scan ")).unwrap()..xml.find("</scan>").unwrap()];
+            let scan_xml = &scan_xml[..scan_xml.find("<scanWindowList").unwrap_or(scan_xml.len())];
+            let (cv, user) = (scan_xml.rfind("<cvParam").unwrap(), scan_xml.find("<userParam").unwrap());
+            assert!(cv < user, "{label}: a cvParam after a userParam in <scan>: {scan_xml}");
         }
     }
 
@@ -10094,7 +10279,7 @@ mod tests {
         fs::create_dir_all(&scratch).unwrap();
         let out = scratch.join("out.mzML");
 
-        super::convert_to_mzml(&input, &out, false, None, true).expect("mzML conversion");
+        super::convert_to_mzml(&input, &out, false, None).expect("mzML conversion");
 
         // Output is XML mzML (not a zip), and re-reads to the same spectra: the count, then each
         // spectrum's m/z and intensity arrays against the source's.

@@ -138,7 +138,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: the **chunked** layout, the default since 0.12.1 — passing the flag is inert and says so. Splits each frame's peaks into 50-Th m/z bins (`--chunk-size` overrides), each chunk recording its TOF bounds as page-prunable Parquet columns — XIC / m/z-slice queries ~20× faster. TOF is delta-encoded within each chunk: `chunk_start + cumsum(deltas)`, lossless (§9). It is also **smaller**: 7.8 % on 2485.d, because chunk-relative TOF costs a quarter of absolute TOF, which more than pays for the mobility column losing its run-length ordering. The archive then holds a CHUNK `spectra_peaks` facet beside a POINT `spectra_data` facet — the mixed layout-family deviation (§9) |
 | `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: write the flat **archive** layout instead — one table of ABSOLUTE integer TOF bins, no m/z index, no mixed layout family, ~8 % more bytes. This was the default through 0.12.0 |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
-| `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. The ims-compact path applies the choice to arrays and params alike; `--no-ims-compact` and `--to mzml` take their mobility ARRAYS from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally, so there the flag switches only the precursor/scan/window-limit 1/K0 params (and warns that the arrays stay on the model) |
+| `--no-tims-recalibration` | off | Bruker timsTOF (TDF): disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. The ims-compact path applies the choice to arrays and params alike; `--no-ims-compact` takes its mobility ARRAYS from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally, so there the flag switches only the precursor/scan/window-limit 1/K0 params (and warns that the arrays stay on the model). INERT with `--to mzml`, and says so: that export keeps every 1/K0 on the model its mobility arrays use, so each diaPASEF window's limits bracket its own peaks (on timsrust's linear map they would miss 9 % of them) |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
@@ -171,7 +171,7 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 |---|---|---|
 | `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --representation --ims-chunked --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output) |
 | `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux` | the filter lane's list without `--aux` |
-| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-chromatograms --tof-grid --agilent-grid` |
+| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
 | `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert` | `--layout --no-numpress --chunk-size` |
 | `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-ims-chunked --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
 | `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | `--layout --no-numpress --chunk-size` |
@@ -204,16 +204,25 @@ also be exported to mzML (`mzpeak-convert a.mzpeak -o a.mzML`), optionally throu
 renamed into place only on success, so a failed run never leaves a partial `.mzML` and never
 destroys a previous output under `--force`.
 
-Every mzML the tool writes itself records the conversion: a `dataProcessing`
-(`mzpeak_convert_to_mzml`) whose method is software `mzpeak-convert` doing MS:1000544 `Conversion
-to mzML`, with the command line (paths reduced to their file names) as a `conversion options`
-userParam. It is appended after whatever processing the source states, whose first entry stays the
-`defaultDataProcessingRef` of `spectrumList` and `chromatogramList`; a source that states none (every
-raw vendor format) gets this step as the default. A timsTOF `.d` is exported with its mobility params
-as the archive lanes write them: each diaPASEF spectrum's `ion mobility lower limit` / `upper limit`
-pair in order (mzdata's reader emits it inverted) and, with the precursor and scan 1/K0, on the
-vendor's ModelType-2 model that its mobility array uses (`--no-tims-recalibration`: on timsrust's
-linear map), and the window's band as `userParam`s on the selected ion.
+Every mzML the tool writes itself records the conversion as the default processing of its
+`spectrumList` and `chromatogramList` (`defaultDataProcessingRef`), which mzML 1.1 requires and
+stock OpenMS 3.5 needs to read the file: a `dataProcessing` (`mzpeak_convert_to_mzml`) whose last
+method is software `mzpeak-convert` doing MS:1000544 `Conversion to mzML`, with the command line
+(paths reduced to their file names) as a `conversion options` userParam. For a source that states
+processing of its own (an mzML), the entry first repeats the methods of the processing the source's
+spectra point at by default, as msconvert does, and the source's entries follow it unchanged; a
+source that states none (every raw vendor format, an archive) gets the step alone. A timsTOF `.d` is
+exported with its mobility params as the archive lanes write them: each diaPASEF spectrum's
+`ion mobility lower limit` / `upper limit` pair in order (mzdata's reader emits it inverted) and,
+with the precursor and scan 1/K0, on the vendor's ModelType-2 model that its mobility array uses,
+evaluated as mzdata evaluates the array, so each window's limits bracket its own peaks exactly;
+and the window's band as `userParam`s on the selected ion. `--no-tims-recalibration` is inert here.
+An archive's export (`a.mzpeak -o a.mzML`) carries each peak's ion mobility where the archive holds
+it (every timsTOF archive). A `--no-ims-compact` archive holds one spectrum per diaPASEF window, and
+exports like the `.d`. An ims-compact archive holds whole frames: each is exported as one spectrum,
+with every window's precursor and no mobility limits of its own, and the export says so. A reader
+that assigns precursors by mobility window (OpenSWATH's diaPASEF mode) needs the `.d` exported with
+`--to mzml`, or a `--no-ims-compact` archive.
 
 ```sh
 mzpeak-convert run.raw -o run.mzML            # Thermo → mzML

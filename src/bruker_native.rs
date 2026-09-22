@@ -146,9 +146,10 @@ impl MobilityCal {
 /// goes through timsrust's LINEAR nominal-range interpolation (`metadata.im_converter`). On
 /// PXD059079 2485.d that put the `--no-ims-compact` selected ion at 1.317349 against the ims-compact
 /// lane's 1.332429 for the same window (0.015 Vs/cm², up to ~0.03 at the high-mobility edge). The
-/// linear map is exactly invertible, so this recovers the scan position and re-evaluates the same
-/// ModelType-2 model the native lane uses ([`crate::tims_mobility`]); with no ModelType-2 row the
-/// values are left as they are (the native lane falls back to the same linear map then).
+/// linear map is invertible, so this recovers the scan position and re-evaluates the same
+/// ModelType-2 model the native lane uses ([`crate::tims_mobility`]), in the arithmetic of mzdata's
+/// arrays ([`TdfMobilityRemap::remap`]); with no ModelType-2 row the values are left as they are
+/// (the native lane falls back to the same linear map then).
 ///
 /// It also attaches the window's 1/K0 band to each selected ion as MZP:1000006/7, from mzdata's
 /// spectrum-level `ion mobility lower/upper limit` (that spelling is kept), so both lanes spell the
@@ -192,11 +193,19 @@ impl TdfMobilityRemap {
         Self { linear, recal }
     }
 
-    /// A 1/K0 produced by timsrust's linear converter → the same scan position on the vendor model.
+    /// A 1/K0 produced by timsrust's linear converter → the same scan position on the vendor model,
+    /// evaluated as mzdata evaluates its mobility arrays
+    /// ([`one_over_k0_as_mzdata`](crate::tims_mobility::TimsMobilityCalibration::one_over_k0_as_mzdata)).
+    /// The linear round trip does not give the scan back exactly (a few 1e-13 off), so a position
+    /// that close to the half-scan grid every param here comes from — window bounds are whole
+    /// scans, midpoints half ones — is put back on it first. Together these make a window's limits
+    /// the very values its first and last scan's peaks carry: through 0.12.5 (SDK-order arithmetic
+    /// on the unsnapped position) the upper limit often came out a bit or two below the array value
+    /// of its own first scan, and those peaks lay outside their window.
     #[inline]
     pub fn remap(&self, im: f64) -> f64 {
         match &self.recal {
-            Some(c) => c.one_over_k0(self.linear.invert(im)),
+            Some(c) => c.one_over_k0_as_mzdata(snap_to_half_scan(self.linear.invert(im))),
             None => im,
         }
     }
@@ -261,6 +270,14 @@ impl TdfMobilityRemap {
             }
         }
     }
+}
+
+/// A scan position recovered through timsrust's linear map, put back on the half-scan grid when it
+/// lies within 1e-6 scans of it (the round trip is off by ~1e-13); any other position — a DDA
+/// precursor's fractional `ScanNumber` — as it is.
+fn snap_to_half_scan(scan: f64) -> f64 {
+    let grid = (scan * 2.0).round() / 2.0;
+    if (scan - grid).abs() < 1e-6 { grid } else { scan }
 }
 
 /// Native integer-TOF reader over a Bruker `.d` (TDF). The mzdata-integration seam: a future
@@ -1735,6 +1752,43 @@ mod isolation_mobility_band_tests {
         none.apply(&mut d);
         assert_eq!(im(d.get_param_by_name("ion mobility lower limit").unwrap()), 0.9);
         assert_eq!(im(d.get_param_by_name("ion mobility upper limit").unwrap()), 1.1);
+    }
+
+    /// The remapped value of a whole scan is BIT FOR BIT the 1/K0 mzdata's TDF reader writes into
+    /// the mobility array for a peak of that scan, and a half scan (a window's midpoint) is mzdata's
+    /// model there too. Through 0.12.5 the remap used the SDK-order arithmetic on the unsnapped
+    /// round-trip position, and a window's upper limit came out a bit or two below the array value
+    /// of its own first scan at about half of all scans: 1.5 million peaks of a diaPASEF run lay
+    /// just outside their window. A DDA precursor's fractional position is not moved.
+    #[test]
+    fn remap_is_mzdatas_array_value_at_every_scan() {
+        use timsrust::converters::ConvertableDomain;
+        // (nominal range, scans, ModelType-2 row): SBA415 and PXD059079 2485.d.
+        for (lo, hi, n, c) in [
+            (0.600, 1.600, 909u32, [1.0, 909.0, 211.45198604901222, 73.95258004355563, 32.72727272727273, 0.00492817555366883, 131.11541877221117]),
+            (0.700, 1.450, 1551, [1.0, 1551.0, 254.40951107260733, 118.71749047939912, 33.64485981308411, 0.012463618472198826, 172.2839721407802]),
+        ] {
+            let linear = Scan2ImConverter::from_boundaries(lo, hi, n);
+            let recal = crate::tims_mobility::TimsMobilityCalibration::new(c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+            let row = mzdata::io::tdf::TimsCalibration::new(
+                1, 2, Some(c[0]), Some(c[1]), Some(c[2]), Some(c[3]), Some(c[4]), Some(c[5]), Some(c[6]),
+            );
+            let array = mzdata::io::tdf::TimsCalibrationModel2::try_from(&row).unwrap();
+            let remap = TdfMobilityRemap::new(linear, Some(recal));
+            let mut inexact = 0;
+            for s in 0..=n {
+                inexact += usize::from(linear.invert(linear.convert(s)) != s as f64);
+                let got = remap.remap(linear.convert(s));
+                assert_eq!(got.to_bits(), array.convert(s).to_bits(), "scan {s}: {got} vs mzdata's array {}", array.convert(s));
+                let mid = s as f64 + 0.5;
+                assert_eq!(remap.remap(linear.convert(mid)).to_bits(), array.convert(mid).to_bits(), "scan {mid}");
+            }
+            // The premise: the linear round trip alone does not give every scan back.
+            assert!(inexact > 0, "{n} scans: the linear round trip was exact everywhere");
+            // A fractional DDA position stays where it is.
+            let frac = 747.5194174757281;
+            assert!((remap.remap(linear.convert(frac)) - recal.one_over_k0(frac)).abs() < 1e-12);
+        }
     }
 }
 
