@@ -368,6 +368,46 @@ fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
+// ---------------------------------------------------------------------------------------------
+// Ids of the entries a conversion adds to the lists it inherits
+// ---------------------------------------------------------------------------------------------
+
+/// `base`, or the first of `base_2`, `base_3`, … that `taken` does not hold; the id returned joins
+/// `taken`. Every conversion adds a software entry and a processing step to lists it inherited, and
+/// those lists now come back: an archive's index carries them, the reader restores them, and the
+/// mzML export writes them, where an id must be unique in the document. Converting an exported mzML
+/// back would otherwise mint a second `mzpeak-convert` / `mzpeak_convert_conversion`, and filtering
+/// a filtered archive a second `mzpeak_convert_filter`.
+pub(crate) fn unused_id(base: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let id = std::iter::once(base.to_string())
+        .chain((2u32..).map(|n| format!("{base}_{n}")))
+        .find(|id| !taken.contains(id))
+        .expect("an unbounded sequence holds a free id");
+    taken.insert(id.clone());
+    id
+}
+
+/// Whether `id` is one [`unused_id`] hands out for `base` — so an entry this tool added earlier can
+/// be recognised whichever suffix it ended up with.
+pub(crate) fn is_id_for(id: &str, base: &str) -> bool {
+    id == base
+        || id
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n >= 2))
+}
+
+/// The software and data-processing ids `target` holds: what [`unused_id`] must steer clear of when
+/// a conversion adds an entry to either list.
+pub(crate) fn processing_ids(target: &impl MSDataFileMetadata) -> std::collections::HashSet<String> {
+    target
+        .softwares()
+        .iter()
+        .map(|s| s.id.clone())
+        .chain(target.data_processings().iter().map(|dp| dp.id.clone()))
+        .collect()
+}
+
 /// Read a small text file as UTF-8, tolerating a BOM and Latin-1 bytes (Waters headers).
 pub(crate) fn read_text_lossy(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;

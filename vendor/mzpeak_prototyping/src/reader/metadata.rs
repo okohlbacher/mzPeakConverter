@@ -535,6 +535,33 @@ impl ParquetIndexExtractor {
         }
     }
 
+    /// VENDORED PATCH: load the run-level metadata the index holds (`mzpeak_index.json` →
+    /// `metadata`: `file_description`, `instrument_configuration_list`,
+    /// `data_processing_method_list`, `software_list`, `sample_list`, `scan_settings_list`, `run`)
+    /// into `mz_metadata`. The writer stores it there (`copy_metadata_to_index`) and
+    /// [`FileIndex::as_file_metadata`] converts it back, but nothing called that, so `mz_metadata`
+    /// stayed `Default` and every `MSDataFileMetadata` consumer of the reader saw empty lists:
+    /// mzpeak-convert's `.mzpeak` → mzML export (`copy_metadata_from`) wrote no software, no data
+    /// processing, a blank instrument configuration, and the archive as the only source file.
+    ///
+    /// Absent or malformed metadata never refuses an archive whose spectra can be read. An index
+    /// that holds none of these blocks (an older archive, or another writer's) leaves the metadata
+    /// empty, as the reader has always returned it, and so does one that does not parse: the blocks
+    /// reference one another — a processing method and an instrument configuration each name a
+    /// software entry, a scan settings entry names a source file — so half of them, read while the
+    /// rest was dropped, would state references that resolve to nothing. It is all of it or none,
+    /// and the warning names what failed; every export that worked without any of this metadata
+    /// still works. The sync and the async reader both call this.
+    pub(crate) fn load_file_metadata_from_index(&mut self, file_index: &FileIndex) {
+        match file_index.as_file_metadata() {
+            Ok(metadata) => self.mz_metadata = metadata,
+            Err(e) => log::warn!(
+                "the run-level metadata in mzpeak_index.json cannot be read ({e}); this archive is \
+                 opened without it"
+            ),
+        }
+    }
+
     pub(crate) fn visit_spectrum_data_reader<T>(
         &mut self,
         spectrum_data_reader: ArrowReaderBuilder<T>,
@@ -671,6 +698,8 @@ pub(crate) fn load_indices_from<T: ArchiveSource>(
 
     let mut this = ParquetIndexExtractor::default();
     this.load_metadata_mapping_from_index(handle.file_index());
+    // VENDORED PATCH: the index's run-level metadata was never loaded (see the method).
+    this.load_file_metadata_from_index(handle.file_index());
 
     log::trace!("Loading spectrum metadata indices");
     let spectrum_metadata_reader = handle.spectrum_metadata()?;

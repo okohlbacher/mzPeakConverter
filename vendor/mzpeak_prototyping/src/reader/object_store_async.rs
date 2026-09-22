@@ -143,6 +143,9 @@ pub(crate) async fn load_indices_from<T: AsyncArchiveSource>(
     let mut this = ParquetIndexExtractor::default();
 
     this.load_metadata_mapping_from_index(&handle.file_index());
+    // VENDORED PATCH: the index's run-level metadata was never loaded, here as on the sync path
+    // (`ParquetIndexExtractor::load_file_metadata_from_index`).
+    this.load_file_metadata_from_index(&handle.file_index());
     if let Ok(reader) = handle.spectrum_metadata().await {
         this.query_index.populate_spectrum_metadata_indices(&reader);
     }

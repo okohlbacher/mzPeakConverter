@@ -25,7 +25,7 @@
 //! per-spectrum-shaped (a top-level `point`/`chunk`/`peak` struct) but carries no key we can map to
 //! survivors is a hard ERROR — we never silently ship a facet that references dropped spectra.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -1465,17 +1465,12 @@ fn carry_index_metadata(
     injected: &[String],
 ) -> Result<()> {
     if let Some(meta) = index.get("metadata").and_then(|m| m.as_object()) {
-        for (k, v) in meta {
-            // data_processing_method_list gets an appended entry; everything else verbatim.
-            if k == "data_processing_method_list" {
-                let mut list = v.clone();
-                if let Some(arr) = list.as_array_mut() {
-                    arr.push(filter_processing_entry(opts));
-                }
-                w.add_index_metadata(k, &list).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
-            } else {
-                w.add_index_metadata(k, v).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
-            }
+        // data_processing_method_list (and, where the step needs one, software_list) gets an
+        // appended entry; everything else verbatim.
+        let mut meta = meta.clone();
+        record_filter_step(&mut meta, opts);
+        for (k, v) in &meta {
+            w.add_index_metadata(k, v).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
         }
     }
     let provenance = serde_json::json!({
@@ -1491,8 +1486,64 @@ fn carry_index_metadata(
     Ok(())
 }
 
+/// Record this filter run in the index metadata `meta` the output archive inherits: a
+/// `data_processing_method_list` entry ([`filter_processing_entry`]) naming a `software_list` entry
+/// for this version of the tool.
+///
+/// Both ids must be unique and the reference must resolve — the reader restores these lists now, so
+/// what an archive holds reaches an mzML export, where an id is unique in the document and a
+/// `softwareRef` must name one. Filtering a filtered archive appended a second
+/// `mzpeak_convert_filter`, and an archive written by another tool has no `mzpeak-convert` entry for
+/// the step to name. An archive that states no processing list is left alone: the `filter`
+/// provenance block records the run there.
+fn record_filter_step(meta: &mut serde_json::Map<String, serde_json::Value>, opts: &FilterOpts) {
+    const SOFTWARE: &str = "mzpeak-convert";
+    if !meta.get("data_processing_method_list").is_some_and(|v| v.is_array()) {
+        return;
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    // The ids in use, and this version's own software entry when the archive already holds one,
+    // read before anything is appended.
+    let (mut taken, own): (HashSet<String>, Option<String>) = {
+        let list_of = |key: &str| -> &[serde_json::Value] {
+            meta.get(key).and_then(|v| v.as_array()).map(Vec::as_slice).unwrap_or(&[])
+        };
+        let id_of = |e: &serde_json::Value| e.get("id").and_then(|v| v.as_str()).map(str::to_string);
+        let taken = list_of("software_list")
+            .iter()
+            .chain(list_of("data_processing_method_list").iter())
+            .filter_map(id_of)
+            .collect();
+        let own = list_of("software_list")
+            .iter()
+            .find(|e| {
+                e.get("version").and_then(|v| v.as_str()) == Some(version)
+                    && id_of(e).is_some_and(|id| crate::run_metadata::is_id_for(&id, SOFTWARE))
+            })
+            .and_then(|e| id_of(e));
+        (taken, own)
+    };
+    let software = own.unwrap_or_else(|| {
+        let id = crate::run_metadata::unused_id(SOFTWARE, &mut taken);
+        let entry = mzpeak_prototyping::param::Software::from(&mzdata::meta::Software::new(
+            id.clone(),
+            version.to_string(),
+            vec![mzdata::meta::custom_software_name(SOFTWARE)],
+        ));
+        let list = meta.entry("software_list").or_insert_with(|| serde_json::json!([]));
+        if let Some(arr) = list.as_array_mut() {
+            arr.push(serde_json::to_value(entry).expect("a software entry serializes"));
+        }
+        id
+    });
+    let step = filter_processing_entry(opts, &crate::run_metadata::unused_id("mzpeak_convert_filter", &mut taken), &software);
+    if let Some(arr) = meta.get_mut("data_processing_method_list").and_then(|v| v.as_array_mut()) {
+        arr.push(step);
+    }
+}
+
 /// An mzML-style data_processing method entry describing this filter operation.
-fn filter_processing_entry(opts: &FilterOpts) -> serde_json::Value {
+fn filter_processing_entry(opts: &FilterOpts, id: &str, software: &str) -> serde_json::Value {
     let mut desc = String::from("mzpeak-convert filter");
     if let Some((a, b)) = opts.rt {
         desc.push_str(&format!(" rt={a}-{b}"));
@@ -1504,10 +1555,10 @@ fn filter_processing_entry(opts: &FilterOpts) -> serde_json::Value {
         desc.push_str(&format!(" drop_aux={:?}", opts.drop_aux));
     }
     serde_json::json!({
-        "id": "mzpeak_convert_filter",
+        "id": id,
         "methods": [{
             "order": 1,
-            "software_reference": "mzpeak-convert",
+            "software_reference": software,
             "parameters": [
                 {"accession": null, "name": "filter options", "unit": null, "value": desc},
                 {"accession": "MS:1001486", "name": "data filtering", "unit": null, "value": null}

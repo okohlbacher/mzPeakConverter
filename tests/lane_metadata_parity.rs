@@ -647,8 +647,9 @@ mod corpus;
 /// a run whose name starts with a digit). The native lane uses the plain stem, and the mzML lane
 /// decodes `run.id` and the software ids on copy with this same code; archives built before that
 /// still carry the escapes, so both keys are compared decoded. The copy this test had kept compared
-/// two bytes with `"_"` and so never decoded one.
+/// two bytes with `"_"` and so never decoded one. (`encode`, the mzML export's, is not needed here.)
 #[path = "../src/pwiz_id.rs"]
+#[allow(dead_code)]
 mod pwiz_id;
 
 /// `<stem>` for every pair present in `dir`.

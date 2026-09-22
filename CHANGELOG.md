@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A `.mzpeak` export carried none of the archive's run-level metadata.** The index
+  (`mzpeak_index.json` → `metadata`) holds `software_list`, `data_processing_method_list`,
+  `instrument_configuration_list`, `file_description`, `sample_list`, `scan_settings_list` and
+  `run`, and the vendored reader read none of it back: `ParquetIndexExtractor::mz_metadata` stayed
+  `Default` because nothing ever called `FileIndex::as_file_metadata`, the conversion the writer's
+  `copy_metadata_to_index` pairs with. So `w.copy_metadata_from(&reader)` copied empty lists, and
+  `mzpeak-convert run.mzpeak -o run.mzML` (`filter_mzpeak_to_mzml`) wrote
+  `<softwareList count="0">`, `<dataProcessingList count="0">`, one blank instrument configuration
+  (`IC1`, `<softwareRef ref=""/>`) and the `.mzpeak` itself as its only `sourceFile` — while the
+  archive of `tests/fixtures/tiny.pwiz.1.1.mzML` states Bioworks, pwiz, CompassXtract and
+  mzpeak-convert, the CompassXtract and pwiz processings, an LCQ Deca with its serial, and the
+  source's own three members. The export now carries all of it, its source files naming the
+  original source (the archive is recorded only where the input states none, as on every lane).
+  VENDORED PATCH in `vendor/mzpeak_prototyping/src/reader/metadata.rs`, called from the sync
+  (`load_indices_from`) and the async (`reader/object_store_async.rs`) loader alike — the async
+  reader is not built by the converter and does not compile in this tree, so that call is
+  source-only. The metadata is read as a whole: its blocks name one another (a processing method
+  and an instrument configuration each name a software entry), so an index that does not parse —
+  an older archive, another writer's — leaves it empty with a warning, and the export that worked
+  before goes on working, rather than restoring a half that states references resolving to nothing.
+- **The ids a conversion adds could collide with the ones it now inherits.** `mzpeak-convert`'s own
+  software entry and its `mzpeak_convert_conversion` processing had fixed ids, and an mzML exported
+  from an archive carries both: converting it back appended a second entry under each id, and an
+  mzML id is unique in its document. This version's software entry is reused where the source
+  already holds it, and an id in use gets a numeric suffix (`run_metadata::unused_id`). The
+  `.mzpeak` → `.mzpeak` filter does the same for its `mzpeak_convert_filter` step — filtering a
+  filtered archive repeated that id — and adds the `software_list` entry the step names when the
+  archive holds none (on an archive from another writer it named nothing).
+- **A ProteoWizard-escaped software id came back out of an export unescaped.** The mzML and imzML
+  lanes decode those ids on the way in (`MassLynx_x0020_software` → `MassLynx software`; an mzPeak
+  id is a plain string), and now that the export carries the software list it escapes them again
+  (`pwiz_id::encode`), with every processing method and instrument configuration that names one, so
+  the mzML ids stay XML names and the references keep resolving.
+- **A restored list could put a `userParam` before a `cvParam`.** mzML's `ParamGroup` takes its
+  `cvParam`s first, and an archive keeps a list in the order its writer stored it — this tool's own
+  processing step records the `conversion options` userParam before the MS:1000530 cvParam the
+  vendored writer appends behind it. The export sorts each list it restores (`cvParam`s, then
+  `userParam`s, each kind keeping its own order). Measured with OpenMS `FileInfo -v` (mzML 1.1 XSD)
+  on `tiny.pwiz.1.1.mzML` → `.mzpeak` → `.mzML`: 14 validation errors before this release's fixes,
+  8 after — gone are the empty software list, the empty component list, the empty `softwareRef`
+  attribute, the empty dataProcessing list and the two missing `defaultDataProcessingRef`s; what
+  remains is the writer's own (`run id="1"` is not an NCName, empty `precursor` /
+  `binaryDataArray` content, `precursorList` inside a chromatogram) and is there on 0.13.0 too.
+- New `tests/archive_run_metadata.rs`: an export carries the source's software, processing methods,
+  instrument configuration and source files; an escaped id survives the round trip; every id in an
+  mzML is unique and every reference resolves, after a re-conversion and after two filter passes as
+  well; the `.mzpeak` → `.mzpeak` filter keeps the index's lists; and an unreadable or absent index
+  leaves the export as it was.
+
 ## [0.13.0] — 2026-09-22
 
 **Output change (Bruker TDF, ims-compact chunked layout — every timsTOF archive).** The peaks facet

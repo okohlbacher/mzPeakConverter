@@ -2472,7 +2472,16 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    // The archive's run-level lists, from its index (the vendored reader loaded none of them
+    // through 0.13.0, and this export wrote empty software and processing lists, a blank
+    // instrument configuration and the archive as its source): the source's entries, then those
+    // of the conversion that wrote the archive. Its source files name the original source, and
+    // `fixup_run_metadata` adds the archive itself only when it states none, as it adds any input.
+    // The software ids an mzML or imzML lane decoded are escaped again ([`encode_pwiz_ids`]), and
+    // each list is put in mzML's parameter order ([`order_params_cv_first`]).
     w.copy_metadata_from(&reader);
+    encode_pwiz_ids(&mut w);
+    order_params_cv_first(&mut w);
     fixup_mzml_run_metadata(&mut w, input);
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
@@ -7789,16 +7798,75 @@ fn decode_pwiz_ids(target: &mut impl MSDataFileMetadata) {
     if let Some(run) = target.run_description_mut() {
         run.id = run.id.as_deref().map(pwiz_id::decode);
     }
+    rename_software_ids(target, pwiz_id::decode);
+}
+
+/// [`decode_pwiz_ids`] undone for the `.mzpeak` → mzML export ([`filter_mzpeak_to_mzml`]), now that
+/// the archive's lists reach it: an archive holds the decoded software ids (`MassLynx software`,
+/// from ProteoWizard's `MassLynx_x0020_software`), and an mzML id must be an XML name, so each is
+/// escaped again ([`pwiz_id::encode`]) with every processing method and instrument configuration
+/// that names it. An id that is an XML name already comes back unchanged. `run.id` stays as it is:
+/// mzdata's mzML writer does not write it (its run is always `1`).
+fn encode_pwiz_ids(target: &mut impl MSDataFileMetadata) {
+    rename_software_ids(target, pwiz_id::encode);
+}
+
+/// Put every run-level parameter list this export writes in mzML's order — `cvParam`s, then
+/// `userParam`s (a stable sort: each kind keeps its own order) — as `ParamGroup` requires. An
+/// archive holds each list in the order its writer stored it, and this tool's own processing step
+/// records the `conversion options` userParam first, with the MS:1000530 cvParam the vendored
+/// writer adds behind it; mzdata's mzML writer writes a list as it holds it, so the restored step
+/// came out `userParam` before `cvParam` — one XSD error per such method
+/// (`element 'cvParam' is not allowed for content model
+/// '(referenceableParamGroupRef*,cvParam*,userParam*)'`).
+fn order_params_cv_first(target: &mut impl MSDataFileMetadata) {
+    fn order(params: &mut [Param]) {
+        params.sort_by_key(|p| !p.is_controlled());
+    }
+    order(&mut target.file_description_mut().contents);
+    for sf in target.file_description_mut().source_files.iter_mut() {
+        order(&mut sf.params);
+    }
     for sw in target.softwares_mut() {
-        sw.id = pwiz_id::decode(&sw.id);
+        order(&mut sw.params);
+    }
+    for sample in target.samples_mut() {
+        order(&mut sample.params);
     }
     for dp in target.data_processings_mut() {
         for m in dp.methods.iter_mut() {
-            m.software_reference = pwiz_id::decode(&m.software_reference);
+            order(&mut m.params);
         }
     }
     for ic in target.instrument_configurations_mut().values_mut() {
-        ic.software_reference = pwiz_id::decode(&ic.software_reference);
+        order(&mut ic.params);
+        for c in ic.components.iter_mut() {
+            order(&mut c.params);
+        }
+    }
+    if let Some(settings) = target.scan_settings_mut() {
+        for s in settings.iter_mut() {
+            order(&mut s.params);
+            for t in s.targets.iter_mut() {
+                order(t);
+            }
+        }
+    }
+}
+
+/// Rename every software entry with `rename`, and every reference to one (processing methods,
+/// instrument configurations) with it, so the references keep resolving.
+fn rename_software_ids(target: &mut impl MSDataFileMetadata, rename: fn(&str) -> String) {
+    for sw in target.softwares_mut() {
+        sw.id = rename(&sw.id);
+    }
+    for dp in target.data_processings_mut() {
+        for m in dp.methods.iter_mut() {
+            m.software_reference = rename(&m.software_reference);
+        }
+    }
+    for ic in target.instrument_configurations_mut().values_mut() {
+        ic.software_reference = rename(&ic.software_reference);
     }
 }
 
@@ -7987,17 +8055,36 @@ fn demote_mzp_in(params: &mut [Param]) {
     }
 }
 
+/// Record this conversion in the archive: the `mzpeak-convert` software entry and a processing
+/// method that names it, holding the path-free command line.
+///
+/// The ids must not collide with the source's. They could not before — an mzML export carried no
+/// lists at all — but the reader now restores an archive's, so an mzML this tool exported from one
+/// already holds a `mzpeak-convert` and a `mzpeak_convert_conversion`, and converting it back
+/// appended a second entry under each id. This version's own software entry is reused where the
+/// source has one, and any id in use gets a numeric suffix ([`run_metadata::unused_id`]).
 fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
-    writer.softwares_mut().push(Software::new(
-        "mzpeak-convert".into(),
-        env!("CARGO_PKG_VERSION").into(),
-        vec![custom_software_name("mzpeak-convert")],
-    ));
+    let version = env!("CARGO_PKG_VERSION");
+    let mut taken = run_metadata::processing_ids(writer);
+    let own = writer
+        .softwares()
+        .iter()
+        .find(|s| s.version == version && run_metadata::is_id_for(&s.id, "mzpeak-convert"))
+        .map(|s| s.id.clone());
+    let software = own.unwrap_or_else(|| {
+        let id = run_metadata::unused_id("mzpeak-convert", &mut taken);
+        writer.softwares_mut().push(Software::new(
+            id.clone(),
+            version.into(),
+            vec![custom_software_name("mzpeak-convert")],
+        ));
+        id
+    });
     writer.data_processings_mut().push(DataProcessing {
-        id: "mzpeak_convert_conversion".to_string(),
+        id: run_metadata::unused_id("mzpeak_convert_conversion", &mut taken),
         methods: vec![ProcessingMethod {
             order: 1,
-            software_reference: "mzpeak-convert".to_string(),
+            software_reference: software,
             params: vec![Param::new_key_value(
                 "conversion options",
                 // Provenance without leaking the operator's filesystem: flags are kept verbatim, but

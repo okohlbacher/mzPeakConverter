@@ -4,6 +4,24 @@
 //! escape (六 is `_x00e5__x0085__x00ad_`). `tests/lane_metadata_parity.rs` includes this file by
 //! `#[path]`, so the converter and that test cannot decode differently.
 
+/// Escape `v` as ProteoWizard does, so an id decoded on the way into an archive is an XML name
+/// again on the way out to mzML: every byte an NCName may not hold becomes `_x00hh_`. That is a
+/// first character other than an ASCII letter or `_`, any later one other than an ASCII letter,
+/// digit, `_`, `-` or `.`, and each byte of a non-ASCII character. An XML name comes back
+/// unchanged, ProteoWizard's escaped form included; [`decode`] undoes the rest.
+pub fn encode(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for (i, b) in v.bytes().enumerate() {
+        let name_byte = b.is_ascii_alphabetic() || b == b'_' || (i > 0 && (b.is_ascii_digit() || b == b'-' || b == b'.'));
+        if name_byte {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("_x{b:04x}_"));
+        }
+    }
+    out
+}
+
 /// Undo the escaping. A run of adjacent byte escapes is decoded as UTF-8, and left as written when
 /// it is not UTF-8 (decoding each byte as a character of its own turns 六 into `å`, U+0085, U+00AD).
 /// An escape above a byte is that character, as .NET's `XmlConvert.EncodeName` writes one UTF-16
