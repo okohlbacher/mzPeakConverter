@@ -314,8 +314,45 @@ macro_rules! read_numeric_page_index {
         let column_ix = parquet_column($pq_schema, $column_path)?;
 
         let rg_meta = $metadata.row_groups();
-        let column_offset_index = $metadata.offset_index()?;
-        let column_index = $metadata.column_index()?;
+        let (Some(column_offset_index), Some(column_index)) =
+            ($metadata.offset_index(), $metadata.column_index())
+        else {
+            // No Parquet page index — a writer other than parquet-rs (pyarrow by default) omits it.
+            // Returning `None` here made every lookup an EMPTY row selection, and the reader handed
+            // back empty spectra with exit 0 (2026-09-23, a pyarrow-written chunk facet). Fall back
+            // to one entry per ROW GROUP from the column-chunk statistics: every query stays correct,
+            // only the pruning is coarser. A chunk without statistics selects everything.
+            let mut total_rows: i64 = 0;
+            let mut pages = Vec::new();
+            for (i, rg) in rg_meta.iter().enumerate() {
+                use parquet::file::statistics::Statistics as S;
+                let (min, max) = match rg.column(column_ix).statistics() {
+                    Some(S::Int32(s)) if s.min_opt().is_some() && s.max_opt().is_some() => {
+                        (*s.min_opt().unwrap() as $type, *s.max_opt().unwrap() as $type)
+                    }
+                    Some(S::Int64(s)) if s.min_opt().is_some() && s.max_opt().is_some() => {
+                        (*s.min_opt().unwrap() as $type, *s.max_opt().unwrap() as $type)
+                    }
+                    Some(S::Float(s)) if s.min_opt().is_some() && s.max_opt().is_some() => {
+                        (*s.min_opt().unwrap() as $type, *s.max_opt().unwrap() as $type)
+                    }
+                    Some(S::Double(s)) if s.min_opt().is_some() && s.max_opt().is_some() => {
+                        (*s.min_opt().unwrap() as $type, *s.max_opt().unwrap() as $type)
+                    }
+                    _ => (<$type>::MIN, <$type>::MAX),
+                };
+                pages.push(PageIndexEntry::<$type> {
+                    row_group_i: i,
+                    page_i: 0,
+                    min,
+                    max,
+                    start_row: total_rows,
+                    end_row: total_rows + rg.num_rows(),
+                });
+                total_rows += rg.num_rows();
+            }
+            return Some(PageIndex(pages));
+        };
 
         let mut total_rows = 0;
         let mut pages = Vec::new();
@@ -559,7 +596,7 @@ impl<T: PartialEq + PartialOrd + HasProximity> SpanDynNumeric for SimpleInterval
 {
 }
 impl<T: PartialEq + PartialOrd + HasProximity> SpanDynNumeric for CoordinateRange<T> where
-    <mzpeaks::coordinate::CoordinateRange<T> as mzdata::prelude::Span1D>::DimType:
+    for<'trivial_bound> <mzpeaks::coordinate::CoordinateRange<T> as mzdata::prelude::Span1D>::DimType:
         num_traits::NumCast
 {
 }

@@ -67,6 +67,15 @@ impl TimsMobilityCalibration {
         w / (self.c7 + self.c6 * w)
     }
 
+    /// The reference implementation's 4 parameters of this model (`TimsTofTimsLinearGrid2`, mzdata
+    /// `TimsCalibrationModel2`): `[C6, C7, offset, slope]` with `slope = (C3 − C2)/C1` and
+    /// `offset = C2 − slope·(C4 + C0)`, so that `1/K0 = 1/(C6 + C7/(offset + slope·scan))` — the
+    /// same rational as [`Self::one_over_k0`] in the other form (equal to within 1 ulp).
+    pub fn grid_parameters(&self) -> [f64; 4] {
+        let slope = if self.c1 == 0.0 { 0.0 } else { (self.c3 - self.c2) / self.c1 };
+        [self.c6, self.c7, self.c2 - slope * (self.c4 + self.c0), slope]
+    }
+
     /// Load from an open `analysis.tdf` connection. `Ok(None)` when there is no `ModelType = 2` row
     /// (caller must fall back to the linear approximation — this model is type-2-specific).
     pub fn from_tdf(conn: &Connection) -> Result<Option<Self>> {

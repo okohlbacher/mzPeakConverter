@@ -310,12 +310,12 @@ impl TsfReader {
         activation.methods_mut().push(DissociationMethodTerm::CollisionInducedDissociation);
         Precursor {
             ions: vec![ion],
-            isolation_window: IsolationWindow {
+            isolation_window: IsolationWindow::new(
                 target,
-                lower_bound: if half > 0.0 { target - half } else { 0.0 },
-                upper_bound: if half > 0.0 { target + half } else { 0.0 },
-                flags: IsolationWindowState::Complete,
-            },
+                if half > 0.0 { target - half } else { 0.0 },
+                if half > 0.0 { target + half } else { 0.0 },
+                IsolationWindowState::Complete,
+            ),
             activation,
             precursor_id: m.parent.map(|p| format!("frame={p}")),
             ..Default::default()

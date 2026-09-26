@@ -65,11 +65,15 @@ rayon = "1"
 env_logger = "0.11.8"
 itertools = "0.14.0"
 log = "0.4.27"
-mzdata = { version = "0.66.6", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress", "imzml"] }
+mzdata = { version = "0.67.1", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress", "imzml", "cv"] }
 serde = { version = "1.0.219", features = ["derive"] }
 mzpeaks = "1.0.9"
 num-traits = "0.2.19"
 serde_json = "1.0.140"
+sha2 = "0.11.0"
+# `ConvertableDomain` for the timsTOF grid models (grid.rs); the version mzdata links.
+timsrust = { version = "0.4.1", default-features = false, features = ["tdf"] }
+hex = "0.4.3"
 serde_with = "3.12.0"
 zip = "4.1.0"
 bytes = "1.10.1"
