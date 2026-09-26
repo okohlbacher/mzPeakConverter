@@ -24,12 +24,22 @@ use parquet::{
 };
 
 use crate::{
-    BufferContext, ToMzPeakDataSeries, archive::{FileEntry, MzPeakArchiveType}, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, constants::{
-        CV_LIST_KEY, DATA_PROCESSING_METHOD_LIST_KEY, FILE_DESCRIPTION_KEY, INSTRUMENT_CONFIGURATION_LIST_KEY, MS_RUN_KEY, MZPEAK_VERSION, SAMPLE_LIST_KEY, SCAN_SETTINGS_LIST_KEY, SOFTWARE_LIST_KEY, VERSION_KEY
-    }, filter::select_delta_model, param::ControlledVocabularyEntry, peak_series::{INTENSITY_ARRAY, WAVELENGTH_ARRAY, array_map_to_schema_arrays_and_excess}, spectrum::AuxiliaryArray, writer::{
+    BufferContext, ToMzPeakDataSeries,
+    archive::{FileEntry, MzPeakArchiveType},
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
+    constants::{
+        CV_LIST_KEY, DATA_PROCESSING_METHOD_LIST_KEY, FILE_DESCRIPTION_KEY,
+        INSTRUMENT_CONFIGURATION_LIST_KEY, MS_RUN_KEY, MZPEAK_VERSION, SAMPLE_LIST_KEY,
+        SCAN_SETTINGS_LIST_KEY, SOFTWARE_LIST_KEY, VERSION_KEY,
+    },
+    filter::select_delta_model,
+    param::ControlledVocabularyEntry,
+    peak_series::{INTENSITY_ARRAY, WAVELENGTH_ARRAY, array_map_to_schema_arrays_and_excess},
+    spectrum::AuxiliaryArray,
+    writer::{
         ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChromatogramBuilder,
         MiniPeakWriterType, SpectrumBuilder, WavelengthSpectrumBuilder, WriteBatchConfig,
-    }
+    },
 };
 
 macro_rules! implement_mz_metadata {
@@ -248,7 +258,7 @@ impl GenericDataArrayWriter {
         };
 
         let (extra_arrays, n_points) =
-            if let Some(chunk_encoding) = self.use_chunked_encoding().copied() {
+            if let Some(chunk_encoding) = self.use_chunked_encoding().cloned() {
                 let buffer = &mut self.data_buffers;
 
                 let (chunks, auxiliary_arrays, n_pts) = ArrowArrayChunk::build(
@@ -260,11 +270,12 @@ impl GenericDataArrayWriter {
                     } else {
                         &tmp_binary_array_map
                     },
-                    chunk_encoding,
+                    &chunk_encoding,
                     buffer.overrides(),
                     buffer.drop_zero_intensity(),
                     buffer.nullify_zero_intensity(),
                     buffer.fields(),
+                    buffer.grid_policies(),
                 )?;
 
                 if let Some(chunks) = chunks {
@@ -313,7 +324,7 @@ impl GenericDataArrayWriter {
         series_time: Option<f32>,
     ) -> Result<EntryMetadataDerivedFromData, ArrayRetrievalError> {
         let ctx = self.buffers().buffer_context();
-        if let Some(encoding) = self.use_chunked_encoding().copied() {
+        if let Some(encoding) = self.use_chunked_encoding().cloned() {
             let arrays = C::as_arrays(peaks);
             let buffer_ref = &mut self.data_buffers;
 
@@ -322,11 +333,12 @@ impl GenericDataArrayWriter {
                 series_time,
                 ctx,
                 &arrays,
-                encoding,
+                &encoding,
                 buffer_ref.overrides(),
                 buffer_ref.drop_zero_intensity(),
                 buffer_ref.nullify_zero_intensity(),
                 buffer_ref.fields(),
+                buffer_ref.grid_policies(),
             )?;
             if let Some(chunks) = chunks {
                 let size = n_pts;
@@ -609,7 +621,7 @@ pub trait AbstractMzPeakWriter {
             tmp_binary_array_map.sort_by_array(&ArrayType::TimeArray)?;
         }
         let (extra_arrays, n_points) =
-            if let Some(chunking) = self.use_chromatogram_chunked_encoding().copied() {
+            if let Some(chunking) = self.use_chromatogram_chunked_encoding().cloned() {
                 let buffer_ref = self.chromatogram_data_buffer_mut();
                 let (chunks, auxiliary_arrays, n_pts) = ArrowArrayChunk::build(
                     chromatogram_index,
@@ -620,11 +632,12 @@ pub trait AbstractMzPeakWriter {
                     } else {
                         &tmp_binary_array_map
                     },
-                    chunking,
+                    &chunking,
                     buffer_ref.overrides(),
                     buffer_ref.drop_zero_intensity(),
                     buffer_ref.nullify_zero_intensity(),
                     buffer_ref.fields(),
+                    buffer_ref.grid_policies(),
                 )?;
 
                 if let Some(chunks) = chunks {
@@ -722,68 +735,6 @@ pub trait AbstractMzPeakWriter {
         Ok(())
     }
 
-    /// Write a `spectrum` whose PEAK-facet rows are supplied explicitly as `peak_arrays` instead
-    /// of being derived from `spectrum.peaks()`.
-    ///
-    /// [`write_spectrum`](Self::write_spectrum) serializes a peak SET as `CentroidPeak` columns
-    /// (f64 m/z + f32 intensity), so a custom peak schema that replaces m/z with an integer axis is
-    /// only reachable by a Centroid spectrum carrying raw arrays — never by a Profile spectrum that
-    /// ALSO has a centroid list (a Shimadzu dual `.lcd`: profile in the data facet, centroids in the
-    /// peaks facet). This entry point decouples the two facets: the profile signal (`raw_arrays()`
-    /// of a Profile spectrum) goes to `spectra_data` exactly as before, and `peak_arrays` goes to
-    /// `spectra_peaks` through the peak writer's raw-array path, so the peak schema decides the
-    /// columns (an absent column is null-filled). The metadata row — counts, TIC, base peak, m/z
-    /// range — is still derived from the spectrum itself, so leave its peak set / raw arrays on
-    /// it: a Profile spectrum's `number_of_peaks` is its peak set's length, and a Centroid
-    /// spectrum's counts fall back to the number of peak rows written here.
-    fn write_spectrum_with_peak_arrays<
-        C: ToMzPeakDataSeries + CentroidLike,
-        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
-        S: SpectrumLike<C, D> + 'static,
-    >(
-        &mut self,
-        spectrum: &S,
-        peak_arrays: &BinaryArrayMap,
-    ) -> io::Result<()> {
-        log::trace!("Writing spectrum {} with explicit peak arrays", spectrum.id());
-        let spectrum_index = self.spectrum_counter();
-        let spectrum_time = if self.spectrum_data_buffer_mut().include_time() {
-            Some(spectrum.start_time() as f32)
-        } else {
-            None
-        };
-        // Unknown continuity is routed with Profile, as `write_spectrum_data` does: the metadata
-        // side already assumes profile for Unknown, so the raw signal belongs in `spectra_data`.
-        let mut entry_derived = match spectrum.raw_arrays() {
-            Some(raw)
-                if matches!(
-                    spectrum.signal_continuity(),
-                    SignalContinuity::Profile | SignalContinuity::Unknown
-                ) =>
-            {
-                log::trace!("Writing profile signal beside explicit peak arrays for {spectrum_index}");
-                self.write_spectrum_binary_array_map(spectrum, spectrum_index, raw)?
-            }
-            _ => EntryMetadataDerivedFromData::default(),
-        };
-        let from_peaks = self.get_or_create_spectrum_peak_writer()?.write_peaks(
-            spectrum_index,
-            spectrum_time,
-            RefPeakDataLevel::<C, D>::RawData(peak_arrays),
-        )?;
-        entry_derived.peak_count = from_peaks.peak_count;
-        if let Some(aux) = from_peaks.auxiliary_arrays {
-            entry_derived
-                .auxiliary_arrays
-                .get_or_insert_with(Vec::new)
-                .extend(aux);
-        }
-        self.spectrum_entry_buffer_mut()
-            .append_value(spectrum, entry_derived);
-        self.check_data_buffer()?;
-        Ok(())
-    }
-
     /// Fit an [`MZDeltaModel`] instance on the provided (sparse) spectrum signal, and return the parameter
     /// buffer.
     ///
@@ -861,7 +812,7 @@ pub trait AbstractMzPeakWriter {
 
         log::trace!("Writing {n_points} points for {spectrum_count}");
         let (delta_params, extra_arrays, n_pts) = if let Some(chunking) =
-            self.use_chunked_encoding().copied()
+            self.use_chunked_encoding().cloned()
         {
             // If we use the chunked encoding, we pre-encode everything
             let nullify_zero_intensity = self.spectrum_data_buffer_mut().nullify_zero_intensity();
@@ -885,7 +836,7 @@ pub trait AbstractMzPeakWriter {
                 } else {
                     &tmp_binary_array_map
                 },
-                chunking,
+                &chunking,
                 buffer_ref.overrides(),
                 // The zero-run mask applies to profile signal AND only when the writer was built
                 // with it on: `is_profile` alone masked every chunked profile spectrum whatever the
@@ -894,6 +845,7 @@ pub trait AbstractMzPeakWriter {
                 is_profile && buffer_ref.drop_zero_intensity(),
                 nullify_zero_intensity,
                 buffer_ref.fields(),
+                buffer_ref.grid_policies(),
             )?;
 
             if let Some(chunks) = chunks {
@@ -964,7 +916,7 @@ pub trait AbstractMzPeakWriter {
         if !include_time {
             spectrum_time = None;
         }
-        if let Some(encoding) = self.use_chunked_encoding().copied() {
+        if let Some(encoding) = self.use_chunked_encoding().cloned() {
             let arrays = C::as_arrays(peaks);
             let buffer_ref = self.spectrum_data_buffer_mut();
 
@@ -973,11 +925,12 @@ pub trait AbstractMzPeakWriter {
                 spectrum_time,
                 BufferContext::Spectrum,
                 &arrays,
-                encoding,
+                &encoding,
                 buffer_ref.overrides(),
                 false,
                 false,
                 buffer_ref.fields(),
+                buffer_ref.grid_policies(),
             )?;
 
             if let Some(chunks) = chunks {
@@ -1047,6 +1000,90 @@ pub trait AbstractMzPeakWriter {
             .ok_or_else(|| io::Error::other("Cannot create peak writer"))
     }
 
+    fn configure_spectrum_grids_from<
+        CI: ToMzPeakDataSeries + CentroidLike,
+        DI: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+    >(&mut self, spectrum: &impl SpectrumLike<CI, DI>) {
+        if self.spectrum_data_buffer_mut().grid_policies().is_some()
+            || self
+                .get_or_create_spectrum_peak_writer()
+                .ok()
+                .and_then(|v| v.grid_policies())
+                .is_some()
+        {
+            let mut policy_targets = Vec::new();
+            self.spectrum_data_buffer_mut().clear_current_grids();
+            if let Some(w) = self.spectrum_peak_writer() {
+                w.clear_current_grids();
+            }
+
+            if let Some(policies) = self.spectrum_data_buffer_mut().grid_policies_mut() {
+                for (_, policy) in policies.iter_mut() {
+                    let grid = spectrum
+                        .raw_arrays()
+                        .and_then(|a| policy.model_from_array_map(a, Some(5e-4)));
+                    if grid.is_some() {
+                        policy_targets.push((policy.array_type.clone(), grid.clone()));
+                        policy.set_current_grid(grid);
+                        log::trace!(
+                            "Set grid to {grid:?} @ {:?} for {}",
+                            policy.array_type,
+                            spectrum.id()
+                        );
+                    } else {
+                        let grid = policy.model_from_peaks(spectrum.peaks(), Some(5e-4));
+                        log::trace!(
+                            "Set grid to {grid:?} @ {:?} for {} from peaks",
+                            policy.array_type,
+                            spectrum.id()
+                        );
+                        policy.set_current_grid(grid);
+                        policy_targets.push((policy.array_type.clone(), grid.clone()));
+                    }
+                }
+            }
+
+            if let Some(peak_policies) = self
+                .spectrum_peak_writer()
+                .and_then(|w| w.grid_policies_mut())
+            {
+                for (_, policy) in peak_policies.iter_mut() {
+                    if let Some((_, grid)) = policy_targets
+                        .iter()
+                        .find(|pair| pair.0 == policy.array_type)
+                    {
+                        log::trace!(
+                            "Set peak grid to {grid:?} @ {:?} for {} from primary arrays (reuse)",
+                            policy.array_type,
+                            spectrum.id()
+                        );
+                        policy.set_current_grid(grid.clone());
+                    } else {
+                        let grid = spectrum
+                            .raw_arrays()
+                            .and_then(|a| policy.model_from_array_map(a, Some(5e-4)));
+                        if grid.is_some() {
+                            policy.set_current_grid(grid);
+                            log::trace!(
+                                "Set peak grid to {grid:?} @ {:?} for {} from primary arrays",
+                                policy.array_type,
+                                spectrum.id()
+                            );
+                        } else {
+                            let grid = policy.model_from_peaks(spectrum.peaks(), Some(5e-4));
+                            log::trace!(
+                                "Set peak grid to {grid:?} @ {:?} for {} from peaks",
+                                policy.array_type,
+                                spectrum.id()
+                            );
+                            policy.set_current_grid(grid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Write the spectrum data of any dimensions to the data buffer.
     ///
     /// Uses [`SpectrumLike::peaks`] to decide which kind of data to write.
@@ -1067,6 +1104,8 @@ pub trait AbstractMzPeakWriter {
             None
         };
 
+        self.configure_spectrum_grids_from(spectrum);
+
         // A centroid peak set that is only PART of the raw arrays (per-peak ion mobility left
         // behind in `raw_arrays()`): write the raw arrays, so every dimension reaches the peak
         // facet instead of being silently dropped. See `centroid_arrays_beyond_peaks`.
@@ -1074,7 +1113,6 @@ pub trait AbstractMzPeakWriter {
             Some(raw) => RefPeakDataLevel::RawData(raw),
             None => peaks,
         };
-
         let entry_derived = if matches!(
             spectrum.peaks(),
             RefPeakDataLevel::Centroid(_) | RefPeakDataLevel::Deconvoluted(_)
@@ -1161,19 +1199,18 @@ pub trait AbstractMzPeakWriter {
         buffer_size: usize,
         encryption_properties: &HashMap<String, Arc<FileEncryptionProperties>>,
     ) -> io::Result<MiniPeakWriterType<S>> {
-        // GATED ims-chunked: when the peak facet builder carries a chunking strategy (only set on
-        // the timsTOF `--ims-chunked` path), build a ChunkBuffers so raw arrays are stored as m/z
-        // chunks; otherwise the default point layout (all other facets/formats — unchanged).
-        let peak_buffer_builder = peak_buffer_builder.include_time(include_time);
-        let peak_buffer: ArrayBufferWriterVariants = if peak_buffer_builder.has_chunking() {
-            peak_buffer_builder
-                .build_chunked(Arc::new(Schema::empty()), BufferContext::Spectrum, false)
-                .into()
-        } else {
-            peak_buffer_builder
-                .build(Arc::new(Schema::empty()), BufferContext::Spectrum, false)
-                .into()
-        };
+        let peak_buffer: ArrayBufferWriterVariants =
+            if peak_buffer_builder.use_chunked_encoding().is_some() {
+                peak_buffer_builder
+                    .include_time(include_time)
+                    .build_chunked(Arc::new(Schema::empty()), BufferContext::Spectrum, false)
+                    .into()
+            } else {
+                peak_buffer_builder
+                    .include_time(include_time)
+                    .build(Arc::new(Schema::empty()), BufferContext::Spectrum, false)
+                    .into()
+            };
 
         // ENFORCE the layout-family invariant, at the one choke point every peak writer is born
         // through. `spectra_data` and `spectra_peaks` are both `entity_type: spectrum` and share one
@@ -1208,12 +1245,11 @@ pub trait AbstractMzPeakWriter {
             .cloned();
         let is_encrypted = peak_encrytion_props.is_some();
 
-        let peak_chunk_encoding = peak_buffer.chunking_strategy().copied();
         let peak_data_props = Self::spectrum_data_writer_props(
             &peak_buffer,
             peak_buffer.index_path(),
             shuffle_mz,
-            &peak_chunk_encoding,
+            peak_buffer.chunking_strategy(),
             compression,
             write_batch_config,
             peak_encrytion_props,
@@ -1304,10 +1340,8 @@ pub trait AbstractMzPeakWriter {
 
         for c in parquet_schema.columns().iter() {
             if c.name().ends_with("index") {
-                builder = builder.set_column_encoding(
-                    c.path().clone(),
-                    Encoding::DELTA_BINARY_PACKED
-                );
+                builder =
+                    builder.set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
             }
         }
 
@@ -1325,7 +1359,7 @@ pub trait AbstractMzPeakWriter {
     fn generic_data_writer_props(
         data_buffer: &impl ArrayBufferWriter,
         index_path: String,
-        use_chunked_encoding: &Option<ChunkingStrategy>,
+        use_chunked_encoding: Option<&ChunkingStrategy>,
         compression: Compression,
         byte_shuffle_needles: &[&str],
         encryption_properties: Option<Arc<FileEncryptionProperties>>,
@@ -1433,7 +1467,7 @@ pub trait AbstractMzPeakWriter {
     fn chromatogram_data_writer_props(
         data_buffer: &impl ArrayBufferWriter,
         index_path: String,
-        use_chunked_encoding: &Option<ChunkingStrategy>,
+        use_chunked_encoding: Option<&ChunkingStrategy>,
         compression: Compression,
         encryption_properties: Option<Arc<FileEncryptionProperties>>,
     ) -> WriterProperties {
@@ -1459,7 +1493,7 @@ pub trait AbstractMzPeakWriter {
         data_buffer: &impl ArrayBufferWriter,
         index_path: String,
         shuffle_mz: bool,
-        use_chunked_encoding: &Option<ChunkingStrategy>,
+        use_chunked_encoding: Option<&ChunkingStrategy>,
         compression: Compression,
         write_batch_config: WriteBatchConfig,
         encryption_properties: Option<Arc<FileEncryptionProperties>>,
@@ -1553,10 +1587,12 @@ pub trait AbstractMzPeakWriter {
                 data_props = data_props
                     .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
             }
+            let colpath = c.path().string();
             if (c.name() == "intensity"
                 || c.name() == "tof"
-                || c.path().string().ends_with("intensity.list.item")
-                || c.path().string().ends_with("tof_chunk_values.list.item"))
+                || colpath.ends_with("intensity.list.item")
+                || colpath.ends_with("tof_chunk_values.list.item")
+                || (colpath.contains("_grid") && colpath.contains("indices")))
                 && matches!(
                     c.physical_type(),
                     parquet::basic::Type::DOUBLE
@@ -1568,15 +1604,20 @@ pub trait AbstractMzPeakWriter {
                 log::debug!("{}: byte-stream-split", c.path());
                 // MS intensities (detector counts / peak areas) are integer-valued or similar-
                 // magnitude floats whose byte planes are highly redundant, so byte-stream-split +
-                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). The integer TOF
-                // axis has the same byte-plane redundancy (its high bytes are near-constant across a
-                // frame), so byte-stream-split beats delta-packing there too. Disable the dictionary
-                // for these columns so the BSS encoding actually applies.
+                // zstd beats dictionary encoding (measured: SBA415 −4%, SWATH −13%). Integer axes —
+                // the TOF column, and a grid's `[first, deltas…]` index list — have the same
+                // byte-plane redundancy, so BSS beats delta-packing there too (grid indices: BSS
+                // −9.6 % vs dictionary, DELTA_BINARY_PACKED +21 %, measured on PXD059079 2485).
+                // Chunk BOUNDS stay dictionary-encoded here on purpose: `tests/data_facet_compression.rs`
+                // pins that chunked archives keep their bytes. Dictionary encoding is enabled globally and takes
+                // precedence over a column encoding, so it is disabled for these columns explicitly.
+                // DELIBERATE DEVIATION from upstream, which requests DELTA for grid indices but leaves
+                // the dictionary on (so its files are RLE_DICTIONARY throughout).
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
             }
-            if c.name().ends_with("_index") {
+            if colpath.ends_with("_index") {
                 log::debug!("{}: delta binary packing", c.path());
                 // Dictionary encoding is enabled globally and TAKES PRECEDENCE over an explicit
                 // column encoding — so a high-cardinality monotone index (e.g. a `tof_index` TOF

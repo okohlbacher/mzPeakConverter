@@ -10,7 +10,7 @@ use arrow::array::{
     Int32Builder, Int64Builder,
 };
 use mzdata::params::{ParamDescribed, ParamLike, Unit};
-use parquet::arrow::{ProjectionMask, arrow_reader::ArrowReaderBuilder};
+use parquet::{arrow::{ProjectionMask, arrow_reader::ArrowReaderBuilder}, file::metadata::ParquetMetaData};
 use serde::{Deserialize, Serialize, ser::SerializeSeq};
 
 /// A list of ion mobility point measures for scans
@@ -1007,6 +1007,165 @@ where
     }
 }
 
+pub(crate) fn translate_parquet_statistics(column_index: usize, meta: &ParquetMetaData) -> (Option<ArrayRef>, Option<ArrayRef>) {
+    let mut min_builder: Option<Box<dyn ArrayBuilder>> = None;
+    let mut max_builder: Option<Box<dyn ArrayBuilder>> = None;
+    for rg in meta.row_groups() {
+        let col_meta = rg.column(column_index);
+        if let Some(stats) = col_meta.statistics() {
+            match stats {
+                parquet::file::statistics::Statistics::Boolean(value_statistics) => {
+                    if min_builder.is_none() {
+                        min_builder = Some(Box::new(BooleanBuilder::new()));
+                        max_builder = Some(Box::new(BooleanBuilder::new()));
+                    }
+                    min_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<BooleanBuilder>()
+                        .unwrap()
+                        .append_option(value_statistics.min_opt().copied());
+                    max_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<BooleanBuilder>()
+                        .unwrap()
+                        .append_option(value_statistics.max_opt().copied());
+                }
+                parquet::file::statistics::Statistics::Int32(value_statistics) => {
+                    if min_builder.is_none() {
+                        min_builder = Some(Box::new(Int32Builder::new()));
+                        max_builder = Some(Box::new(Int32Builder::new()));
+                    }
+                    min_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Int32Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.min_opt().copied());
+                    max_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Int32Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.max_opt().copied());
+                }
+                parquet::file::statistics::Statistics::Int64(value_statistics) => {
+                    if min_builder.is_none() {
+                        min_builder = Some(Box::new(Int64Builder::new()));
+                        max_builder = Some(Box::new(Int64Builder::new()));
+                    }
+                    min_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Int64Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.min_opt().copied());
+                    max_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Int64Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.max_opt().copied());
+                }
+                parquet::file::statistics::Statistics::Int96(_value_statistics) => todo!(),
+                parquet::file::statistics::Statistics::Float(value_statistics) => {
+                    if min_builder.is_none() {
+                        min_builder = Some(Box::new(Float32Builder::new()));
+                        max_builder = Some(Box::new(Float32Builder::new()));
+                    }
+                    min_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Float32Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.min_opt().copied());
+                    max_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Float32Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.max_opt().copied());
+                }
+                parquet::file::statistics::Statistics::Double(value_statistics) => {
+                    if min_builder.is_none() {
+                        min_builder = Some(Box::new(Float64Builder::new()));
+                        max_builder = Some(Box::new(Float64Builder::new()));
+                    }
+                    min_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Float64Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.min_opt().copied());
+                    max_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<Float64Builder>()
+                        .unwrap()
+                        .append_option(value_statistics.max_opt().copied());
+                }
+                parquet::file::statistics::Statistics::ByteArray(value_statistics) => {
+                    if min_builder.is_none() {
+                        min_builder = Some(Box::new(BinaryBuilder::new()));
+                        max_builder = Some(Box::new(BinaryBuilder::new()));
+                    }
+                    min_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<BinaryBuilder>()
+                        .unwrap()
+                        .append_option(value_statistics.min_opt());
+                    max_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<BinaryBuilder>()
+                        .unwrap()
+                        .append_option(value_statistics.max_opt());
+                }
+                parquet::file::statistics::Statistics::FixedLenByteArray(
+                    value_statistics,
+                ) => {
+                    if min_builder.is_none() {
+                        min_builder = Some(Box::new(BinaryBuilder::new()));
+                        max_builder = Some(Box::new(BinaryBuilder::new()));
+                    }
+                    min_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<BinaryBuilder>()
+                        .unwrap()
+                        .append_option(value_statistics.min_opt());
+                    max_builder
+                        .as_mut()
+                        .unwrap()
+                        .as_any_mut()
+                        .downcast_mut::<BinaryBuilder>()
+                        .unwrap()
+                        .append_option(value_statistics.max_opt());
+                }
+            }
+        }
+    }
+    (
+        min_builder.map(|mut v| v.finish()),
+        max_builder.map(|mut v| v.finish()),
+    )
+}
+
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataColumn {
     /// A human-readable name for the parameter
@@ -1027,16 +1186,35 @@ pub struct MetadataColumn {
         default
     )]
     pub unit: PathOrCURIE,
+
+    #[serde(default, skip_serializing_if="core::ops::Not::not")]
+    pub term_marker: bool,
 }
+
 
 impl MetadataColumn {
     pub fn new(name: String, path: Vec<String>, accession: Option<CURIE>) -> Self {
+        Self::create(name, path, accession)
+    }
+
+    pub fn named(name: impl Into<String>, unit: impl Into<PathOrCURIE>) -> Self {
+        let this = Self::new(name.into(), vec![], None);
+        this.with_unit(unit.into())
+    }
+
+    pub const fn create(name: String, path: Vec<String>, accession: Option<CURIE>) -> Self {
         Self {
             name,
             path,
             accession,
             unit: PathOrCURIE::None,
+            term_marker: false,
         }
+    }
+
+    pub const fn with_term_marker(mut self, value: bool) -> Self {
+        self.term_marker = value;
+        self
     }
 
     /// Specify the unit definition
@@ -1072,177 +1250,32 @@ impl MetadataColumn {
         ProjectionMask::columns(&schema, cols.iter().map(|s| s.as_str()))
     }
 
-    /// Retrieve Parquet metadata statistics from an [`ArrowReaderBuilder`]
+    /// Retrieve Parquet metadata min and max statistics from an [`ArrowReaderBuilder`]
     pub fn parquet_statistics<T>(
         &self,
         builder: &ArrowReaderBuilder<T>,
     ) -> (Option<ArrayRef>, Option<ArrayRef>) {
         let meta = builder.metadata();
         let schema = builder.parquet_schema();
-        let mut min_builder: Option<Box<dyn ArrayBuilder>> = None;
-        let mut max_builder: Option<Box<dyn ArrayBuilder>> = None;
-
         if let Some((i, _col)) = schema
             .columns()
             .iter()
             .enumerate()
-            .find(|(_, v)| v.path().parts() == self.path.as_slice())
+            .find(|(_, v)| {
+                v.path().parts() == self.path.as_slice()
+            })
         {
-            for rg in meta.row_groups() {
-                let col_meta = rg.column(i);
-                if let Some(stats) = col_meta.statistics() {
-                    match stats {
-                        parquet::file::statistics::Statistics::Boolean(value_statistics) => {
-                            if min_builder.is_none() {
-                                min_builder = Some(Box::new(BooleanBuilder::new()));
-                                max_builder = Some(Box::new(BooleanBuilder::new()));
-                            }
-                            min_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<BooleanBuilder>()
-                                .unwrap()
-                                .append_option(value_statistics.min_opt().copied());
-                            max_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<BooleanBuilder>()
-                                .unwrap()
-                                .append_option(value_statistics.max_opt().copied());
-                        }
-                        parquet::file::statistics::Statistics::Int32(value_statistics) => {
-                            if min_builder.is_none() {
-                                min_builder = Some(Box::new(Int32Builder::new()));
-                                max_builder = Some(Box::new(Int32Builder::new()));
-                            }
-                            min_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Int32Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.min_opt().copied());
-                            max_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Int32Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.max_opt().copied());
-                        }
-                        parquet::file::statistics::Statistics::Int64(value_statistics) => {
-                            if min_builder.is_none() {
-                                min_builder = Some(Box::new(Int64Builder::new()));
-                                max_builder = Some(Box::new(Int64Builder::new()));
-                            }
-                            min_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Int64Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.min_opt().copied());
-                            max_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Int64Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.max_opt().copied());
-                        }
-                        parquet::file::statistics::Statistics::Int96(_value_statistics) => todo!(),
-                        parquet::file::statistics::Statistics::Float(value_statistics) => {
-                            if min_builder.is_none() {
-                                min_builder = Some(Box::new(Float32Builder::new()));
-                                max_builder = Some(Box::new(Float32Builder::new()));
-                            }
-                            min_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Float32Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.min_opt().copied());
-                            max_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Float32Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.max_opt().copied());
-                        }
-                        parquet::file::statistics::Statistics::Double(value_statistics) => {
-                            if min_builder.is_none() {
-                                min_builder = Some(Box::new(Float64Builder::new()));
-                                max_builder = Some(Box::new(Float64Builder::new()));
-                            }
-                            min_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Float64Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.min_opt().copied());
-                            max_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<Float64Builder>()
-                                .unwrap()
-                                .append_option(value_statistics.max_opt().copied());
-                        }
-                        parquet::file::statistics::Statistics::ByteArray(value_statistics) => {
-                            if min_builder.is_none() {
-                                min_builder = Some(Box::new(BinaryBuilder::new()));
-                                max_builder = Some(Box::new(BinaryBuilder::new()));
-                            }
-                            min_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<BinaryBuilder>()
-                                .unwrap()
-                                .append_option(value_statistics.min_opt());
-                            max_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<BinaryBuilder>()
-                                .unwrap()
-                                .append_option(value_statistics.max_opt());
-                        }
-                        parquet::file::statistics::Statistics::FixedLenByteArray(
-                            value_statistics,
-                        ) => {
-                            if min_builder.is_none() {
-                                min_builder = Some(Box::new(BinaryBuilder::new()));
-                                max_builder = Some(Box::new(BinaryBuilder::new()));
-                            }
-                            min_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<BinaryBuilder>()
-                                .unwrap()
-                                .append_option(value_statistics.min_opt());
-                            max_builder
-                                .as_mut()
-                                .unwrap()
-                                .as_any_mut()
-                                .downcast_mut::<BinaryBuilder>()
-                                .unwrap()
-                                .append_option(value_statistics.max_opt());
-                        }
-                    }
-                }
-            }
+            return translate_parquet_statistics(i, meta)
         }
-        (
-            min_builder.map(|mut v| v.finish()),
-            max_builder.map(|mut v| v.finish()),
-        )
+        else if let Some((i, _col)) = schema.columns().iter().enumerate().find(|(_, v)| {
+            let path = v.path();
+            let tokens = path.parts();
+            tokens.starts_with(&self.path[..self.path.len() - 1]) && tokens.last().map(|s| s.as_str()) == self.leaf()
+        }) {
+            return translate_parquet_statistics(i, meta);
+        } else {
+            (None, None)
+        }
     }
 }
 

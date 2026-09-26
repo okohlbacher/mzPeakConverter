@@ -4,6 +4,159 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] — 2026-09-24
+
+**Output change (data facets of every grid lane, timsTOF included).** The converter's own point-layout grid — an
+integer `tof_index` column tagged `MS:1003824`/`MS:1003825` with `mzpeak:transform_params`,
+per-spectrum `tof_c0`/`tof_c1` columns and `tof_calibration` / `mz_calibration` index blocks, written
+since 0.9 by the mzML `--tof-grid` lane, the native SCIEX lane, the Shimadzu `.lcd` lane,
+`--agilent-grid` and (as the Int64 lattice) the generic mzML lane on lattice input — is retired for
+the reference implementation's **chunk grid** (vendoring exit, item 1; owner decision 2026-09-23:
+converge on upstream). Every such archive changes layout; archives of the old layout still read
+(the vendored reader keeps that decode path for this release). Details under **Changed**.
+
+**Output change (metadata facets, every archive).** The vendored reference implementation is
+re-based on upstream `mobiusklein/mzpeak_prototyping@eb08ba0` (18 commits: term markers, SHA512
+file-index checksums, index-range queries, the grid encoding and its `GridPolicy`, the #34 fix), and
+mzdata moves to 0.67.1. Every DATA facet is byte-identical to 0.13.0 (verified on the mzML, imzML,
+Thermo RAW and timsTOF lanes, every spectrum bit-identical through the reader); three METADATA
+facets change shape:
+
+- `spectra_metadata_precursors` / `chromatograms_metadata_precursors`: the `activation` struct gains
+  `dissociation_method` (a CURIE string, e.g. `MS:1000133`) and `collision_energy` (float32, null
+  when the source states none) as columns; both leave `activation.parameters`, which is now empty
+  for the common case. −12 … −62 % on that facet.
+- `spectra_metadata_scans.scan_start_time` is float64 (the exact minute value) instead of float32.
+- `mzpeak_index.json`: every file entry carries a `checksum` (SHA512 of the member). Readers that
+  ignore unknown keys are unaffected; `FileEntry` has no `deny_unknown_fields`.
+
+### Changed
+
+- **The sqrt-grid lanes write the reference implementation's chunk grid.** mzML `--tof-grid`, the
+  native SCIEX `.wiff` lane and the Shimadzu `.lcd` profile facet now hand the writer the grid VALUES
+  `(c0 + c1·k)²` as f64 m/z with the exact per-spectrum model attached to the array as the PSI-MS
+  term `MS:1003825 [c0, c1, 1]` — mzdata's own parameter convention — and upstream's `GridPolicy`
+  turns each spectrum back into the same integer bins (`round((√mz − c0)/c1) == k` on every point,
+  measured on Blind/HEK): one `MS:1003826` chunk row per spectrum, `mz_grid {grid_type, parameters,
+  indices}`, real m/z bounds; a spectrum that did not fit is a raw `MS:1000576` row with its exact
+  f64 m/z. One chunk per spectrum (`GRID_CHUNK_TH`): −7.5 … +6 % against the point layout, where
+  upstream's 50-Th default cost +13 … +30 %. A run-wide fit's anchor `c0²` can lie above a spectrum's
+  lowest m/z; such a spectrum is re-anchored (`c0' = c0 + c1·k_min`) because upstream's `to_index`
+  clamps negative indices to 0 silently — on the SWATH fixture 20 of 201 spectra would have lost
+  their three lowest points to 57.076 Th. Verified against 0.13.0 through the reader: 201/201
+  spectra, intensities exact, worst m/z difference 6.4e-10 ppm (the re-anchoring's rounding).
+  `--agilent-grid` writes the same rows from the vendor's own bin ordinals; MassHunter's polynomial
+  refinement (not a sqrt grid; up to ~7.5 ppm) rides verbatim in a new `agilent_calibration` index
+  block (`calibrations`, the refined-m/z formula, `max_bare_grid_ppm`), selected per spectrum by an
+  `agilent_calibration_id` parameter — the bare grid every reader decodes is what the reference
+  reader decoded from the 0.13 archives too. The `transformations` entries are unchanged
+  (`tof-grid:<ppm>ppm`, `shimadzu:span-trim`); the `tof_calibration` block, the `tof_index`
+  columns and the MZP `tof_c0`/`tof_c1` columns of these lanes are gone (the timsTOF lanes keep
+  theirs, item 2).
+- **Fixed-point-lattice centroids take upstream's fitted linear grid.** The Int64 `point.tof_index`
+  lattice (0.9.7–0.13: `k = round(m/z·scale)`, exact, with an `mz_calibration` block) is the one
+  representation the chunk grid cannot hold — 2³² steps of 1e-9 Da is 4.29 Th per chunk (DIA
+  20 ng +18.7 %, sparse Blind +126 %). When the probe centroids sit on a lattice (Shimadzu
+  `MassHigh`, the LabSolutions mzML export), the peaks facet is now what upstream's
+  `--peak-encoding grid` writes: 50-Th chunk-grid rows under a per-spectrum `MS:1003824` model
+  fitted over 2³² slots of the spectrum's padded range and accepted only within 1e-6 Da (≤ 3e-7 Da
+  in practice), declared as `grid-fit:1e-6Da` in `transformations`; −10.6 % against the lattice on
+  DIA_Hela_20ng, −6.4 % on HEK, +56 % on the sparse Blind run. The native Shimadzu `.lcd` centroids
+  take the same route; `MZPC_SHIMADZU_COARSE_MZ=1` is declared as `shimadzu:coarse-mz` instead of in
+  a block. `--no-mz-lattice` / `MZPC_NO_MZ_LATTICE=1` keep the exact f64 m/z on every lane, as before.
+  The summary columns are derived from the source arrays on both lanes and are identical with the
+  grid on and off (`tests/mz_lattice_mzml.rs`).
+- **The timsTOF ims-compact lanes write the chunk grid natively.** Both the native (timsrust) and
+  the `--bruker-sdk` lane hand the writer each frame's m/z and 1/K0 evaluated through the vendor's
+  own models — the frame's `MzCalibration` row as the reference implementation's `MS:9999002`
+  7-parameter model at the frame's `T1`/`T2`, the `TimsCalibration` row as its `MS:9999001` model —
+  attached to the arrays as Params, and upstream's `GridPolicy` turns them back into the integer TOF
+  bins and scan numbers (`round(invert(convert(k))) == k` for every one of 2485.d's 636,031 bins,
+  `src/bruker_native.rs`). The facet is 0.13.0's grid layout (`tof_encoding: grid`; the corpus
+  archive's TOF bins reproduce frame for frame), now produced in one pass: the 0.12.x TOF-boundary
+  layout (integer TOF bounds, `tof_chunk_values` deltas, the per-frame `opt_MZP_1000003_tof_c0` /
+  `opt_MZP_1000004_tof_c1` columns and `ims_calibration.per_spectrum`), the flat point table of
+  absolute bins (`--no-ims-chunked`) and the second-pass rewrite (`src/tdf_grid.rs`) are gone, and
+  with them `--no-ims-grid`, `--ims-grid` and `--grid-encoding`. `--no-ims-chunked` now means one
+  chunk per frame; the `--bruker-sdk` lane honours `--ims-chunked` / `--no-ims-chunked` /
+  `--chunk-size` like the native one. `ims_calibration` says `exact: true` and keeps the two-point
+  chord only under `chord`, as the model of a frame without a usable calibration row (an
+  `MS:1003825` sqrt model); every frame carries the vendor model, `C2 ≠ 0` rows included. Two
+  differences from the 0.13.0 rewrite: chunk boundaries are upstream's (real-m/z 50-Th bins on the
+  vendor model rather than the 0.12.x chord bins — 127,811 chunk rows vs 127,869 on 2485, the same
+  points per frame), and the chunk bounds keep Parquet's dictionary encoding like every other chunk
+  facet (the rewrite byte-stream-split them). Under `--no-tims-recalibration` 1/K0 is stored as
+  plain values (`ion_mobility_grid.column: null`) instead of falling back to the TOF layout.
+- **Vendored `mzpeak_prototyping` re-based on upstream `eb08ba0`** (was `589d6e3`, 18 commits behind).
+  Of our local delta, everything upstream had meanwhile done or made obsolete was dropped (our
+  grid-decode module, the grid struct handling in the chunk readers, reader visitors made public,
+  parquet-57 renames, an async-reader reversion, rustfmt churn); every bug fix and feature of ours
+  was kept (`delta-categorization.md` in the 2026-09-23 vendor audit lists them). Two things worth
+  knowing: grid index lists get byte-stream-split with the dictionary off (upstream requests
+  `DELTA_BINARY_PACKED` but leaves the dictionary on, so its own files are dictionary-encoded; we
+  measured DELTA at +21 % and BSS at −9.6 % on PXD059079 2485), and a stray `eprintln!` upstream
+  left in the grid decode path is not carried. `src/tdf_grid.rs` now evaluates the timsTOF models
+  through upstream's `TimsTofMzGrid2` / `TimsTofTimsLinearGrid2` (mzdata's own arithmetic); the
+  2485 peaks facet is byte-identical to 0.13.0's.
+- Dependencies refreshed (`cargo update`, 2026-09-24): 77 lockfile bumps within the existing pins
+  (arrow/parquet sub-crates 59.2 → 59.3, clap 4.6.7, rayon/crossbeam, icu, …). `arrow`/`parquet`
+  stay pinned at 59.1.0 (upstream mzpeak_prototyping pins 57; 60.0.0 exists and is a separate
+  decision), `mzdata` at 0.67.1 (the latest release), upstream `mzpeak_prototyping` at `eb08ba0`
+  (its head).
+- **mzdata comes from crates.io again: `=0.67.1`** (with the `cv` feature upstream needs). The
+  `[patch.crates-io]` git fork (`okohlbacher/mzdata@1d53971`, 0.66.6 plus the isolation-window
+  reader fix) is gone — upstream released that fix as mobiusklein/mzdata#58 in 0.66.7.
+  `tests/isolation_window_offset_order.rs` pins it against the released crate. 0.66.7 added
+  `IsolationWindowState::NoIsolation` ("all ions were fragmented on purpose"); the vendored writer
+  writes it as a window with null target and offsets, the same arm as `Unknown`, as upstream does.
+  0.67.1 made `IsolationWindow`'s fields private: the lanes construct it with `IsolationWindow::new`.
+
+### Removed
+
+- The 0.12.x timsTOF TOF layout and its rewrite pass: `src/tdf_grid.rs`, `ims_chunked_peak_schema`,
+  `tof_axis_field`, the exact per-frame pair machinery (`exact_tof_coeffs*`, `ExactTofSummary`,
+  `add_exact_tof_params`, `TOF_C0_CURIE`/`TOF_C1_CURIE`), the flags `--no-ims-grid`, `--ims-grid`,
+  `--grid-encoding` (config `no_ims_grid`). `tests/tdf_exact_tof_calibration.rs` now pins the grid
+  rows against the vendor formula at each frame's own temperature instead of the pair columns.
+- The point-layout grid writers: `tof_index_field`, `tof_index_peak_schema`, `tof_grid_block` and
+  its `MzReconstruction`, the lattice half of `src/mz_lattice.rs` and `src/shimadzu_grid.rs`
+  (`lattice_route`, `lattice_peak_schema`, `mz_calibration_block`), the `VendorHints` point-layout
+  fields and the vendored writer's `write_spectrum_with_peak_arrays`; `tests/shimadzu_lattice_peaks.rs`
+  (it pinned that layout). The detector (`fixed_point_lattice_scale`) and the vendor-lattice fits
+  (`tof_grid.rs`, `shimadzu_grid::fit_spectrum`) stay: they are what makes the indices the vendor's
+  own small integers rather than upstream's 2³²-slot spread (+52 … +94 % on profile facets).
+
+### Fixed
+
+- **timsTOF runs with a ModelType-2 m/z calibration were written with m/z an order of magnitude too
+  low.** 0.13.0 (and mzdata 0.67.1's own TDF reader) read every `MzCalibration` row as ModelType 1.
+  In a ModelType-2 row `C3`/`C4` repeat `C0`/`C2`, so they became a cubic term and an m/z shift: on
+  the corpus's SBA415 timsTOF Pro run m/z 270.18 was stored as 21.03, chunk bounds included, with
+  `ims_calibration.exact: true`. Reported by the mzPeak Viewer side (2026-09-26). The ModelType-2
+  formula is now pinned against Bruker's library to 1e-9 ppm (ten SDK values from OpenTIMS's
+  `test.d`, `tests/fixtures/tdf_modeltype2_sdk_golden.json`): the ModelType-1 quadratic on `C0`–`C2`
+  minus a calibrant polynomial (`C8`…, `C7` coefficients) inside `[C5, C6]`, nothing outside. The
+  reference implementation's `MS:9999002` model cannot express the polynomial, so a ModelType-2 run's
+  rows carry the quadratic (`C3 = C4 = 0`; TOF bins exact) and the archive declares it:
+  `exact: false`, `approximation`, `max_error_ppm` (0.66 ppm on SBA415) and
+  `bruker:mz-calibrant-omitted`. A row of any other model type puts its frames on the chord
+  (`bruker:mz-calibration-chord`). The mzdata lanes (`--no-ims-compact`, the fallback) switch mzdata's
+  m/z model off for such files and read them on timsrust's chord, declared the same way. Only one of
+  33 corpus TDFs is ModelType 2; its 0.13.0 archive must be reconverted (the published 0.12.5 one used
+  the chord and is approximate, not wrong).
+- **A data facet without a Parquet page index read back as empty spectra — exit 0, no error.** The
+  vendored reader located a spectrum's rows only through the offset/column index that parquet-rs always
+  writes; a facet from another writer (pyarrow omits it by default) made every lookup an empty row
+  selection. The reader now falls back to one entry per row group built from the column-chunk
+  statistics — every query stays correct, the pruning is just coarser. `tests/reader_without_page_index.rs`
+  rewrites both facets of a small archive without the index and compares every spectrum.
+- **`tools/box_convert.sh` silently dropped every manifest job after the first one that took the
+  scp path.** `run_pool` feeds its loop from the manifest file, and a job over the 5 GiB S3 relay
+  ceiling runs `scp`/`ssh`, which inherit that file as stdin and drain it; the loop then ends
+  normally and reports `0 job(s) failed`. On 2026-09-23 the 8.6 GB PXD077098 unit sat 12th of 22 and
+  the 10 jobs behind it were never dispatched. Jobs now get `</dev/null`. A corpus box pass that
+  reports success with fewer archives than jobs is the signature of this bug.
+
 ## [0.13.0] — 2026-09-22
 
 **Output change (Bruker TDF, ims-compact chunked layout — every timsTOF archive).** The peaks facet

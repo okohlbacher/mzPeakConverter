@@ -30,13 +30,9 @@ use mzdata::{
 use mzpeaks::coordinate::SimpleInterval;
 
 use crate::{
-    BufferContext, BufferName,
-    chunk_series::{
-        BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR, GRID_ENCODING,
-    },
-    filter::RegressionDeltaModel,
-    peak_series::{ArrayIndex, ArrayIndexEntry, BufferFormat, data_array_to_arrow_array},
-    reader::{
+    BufferContext, BufferName, buffer_descriptors::{BufferTransform, GRID_ENCODING}, chunk_series::{
+        BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR,
+    }, filter::RegressionDeltaModel, peak_series::{ArrayIndex, ArrayIndexEntry, BufferFormat, data_array_to_arrow_array}, reader::{
         ReaderMetadata,
         index::{BasicChunkQueryIndex, PageQuery, RangeIndex, SpanDynNumeric},
         point::binary_search_arrow_index,
@@ -638,13 +634,16 @@ impl<'a> ChunkDecoder<'a> {
                     Self::unpack_secondary_arrays(arr, &name, &mut store, &decoder);
                 } else if let Some(arr) = arr.as_list_opt::<i32>() {
                     Self::unpack_secondary_arrays(arr, &name, &mut store, &decoder);
-                } else if arr.as_struct_opt().is_some() {
-                    // A secondary grid (`<array>_grid` struct rows): decode every row through the
-                    // transform into the array's own type.
+                }  else if let Some(arr) = arr.as_struct_opt() {
                     if let Some(decoder) = &decoder {
-                        extend_from_decoded(&mut store, &decoder.decode(&name, &arr));
+                        if decoder.method() == BufferTransform::GridEncoding {
+                            Self::unpack_secondary_grid(arr, &name, &mut store, decoder);
+                        } else {
+                            panic!("Unsupported data type {:?} for secondary chunk collection for name {name:?}", arr.data_type())
+                        }
                     }
-                } else {
+                }
+                else {
                     panic!(
                         "Unsupported data type {:?} for secondary chunk collection for name {name:?}",
                         arr.data_type()
@@ -667,6 +666,29 @@ impl<'a> ChunkDecoder<'a> {
         // asks for m/z — including the mzML writer — sees an empty spectrum.
         crate::reader::point::reconstruct_grid_mz(&mut self.bin_map, self.array_indices);
         Ok(self.bin_map)
+    }
+
+    fn unpack_secondary_grid(arr: &StructArray, _name: &BufferName, store: &mut DataArray, _decoder: &BufferTransformDecoder) {
+        if arr.is_empty() {
+            return;
+        }
+        for i in 0..arr.len() {
+            let block = BufferTransformDecoder::grid_decode_at(arr, i, false);
+            let block: &Float64Array = block.as_primitive();
+            if block.null_count() > 0 {
+                match store.dtype() {
+                    mzdata::spectrum::BinaryDataArrayType::Float64 => store.extend_iter(block.iter().map(|v| v.unwrap_or_default())).unwrap(),
+                    mzdata::spectrum::BinaryDataArrayType::Float32 => store.extend_iter(block.iter().map(|v| v.unwrap_or_default() as f32)).unwrap(),
+                    _ => unimplemented!("Storage {:?} for grid is not implemented", store.dtype)
+                }
+            } else {
+                match store.dtype() {
+                    mzdata::spectrum::BinaryDataArrayType::Float64 => store.extend(block.values()).unwrap(),
+                    mzdata::spectrum::BinaryDataArrayType::Float32 => store.extend_iter(block.values().iter().map(|v| *v as f32)).unwrap(),
+                    _ => unimplemented!("Storage {:?} for grid is not implemented", store.dtype)
+                }
+            };
+        }
     }
 
     fn unpack_secondary_arrays<T: arrow::array::OffsetSizeTrait>(
@@ -892,9 +914,15 @@ impl<'a> ChunkDecoder<'a> {
                                         self.main_axis.as_mut().unwrap(),
                                         self.delta_model,
                                     );
-                            }
+                            },
                             GRID_ENCODING => {
-                                decode_grid_row(&chunk_vals, self.main_axis.as_mut().unwrap());
+                                (ChunkingStrategy::Grid { chunk_size: 50.0, grid: None }).decode_arrow(
+                                    &chunk_vals,
+                                    start as f64,
+                                    end  as f64,
+                                    self.main_axis.as_mut().unwrap(),
+                                    self.delta_model
+                                );
                             }
                             _ => {
                                 unimplemented!("{encoding}")
@@ -1158,8 +1186,18 @@ impl<'a> ChunkScanDecoder<'a> {
                                     .extend(std::iter::repeat_n(entity_index, n_points_added));
                             }
                             GRID_ENCODING => {
-                                let n = decode_grid_row(&chunk_vals, self.main_axis.as_mut().unwrap());
-                                entity_idx_acc.extend(std::iter::repeat_n(entity_index, n));
+                                let delta_model = delta_model_cache.get(entity_index, || {
+                                    self.metadata.model_deltas_for(entity_index as usize)
+                                });
+                                let n_points_added = (ChunkingStrategy::Grid { chunk_size: 50.0, grid: None }).decode_arrow(
+                                    &chunk_vals,
+                                    start as f64,
+                                    end  as f64,
+                                    self.main_axis.as_mut().unwrap(),
+                                    delta_model.as_ref()
+                                );
+                                entity_idx_acc
+                                    .extend(std::iter::repeat_n(entity_index, n_points_added));
                             }
                             _ => {
                                 unimplemented!("{encoding}")
@@ -1659,25 +1697,4 @@ pub(crate) fn make_ion_mobility_filter<'a>(
 }
 
 
-/// Decode one grid-encoded chunk row (a one-row slice of the `<array>_grid` struct column; the
-/// index list is `[first, deltas…]`) into the main-axis accumulator. Returns the point count.
-fn decode_grid_row(chunk_vals: &ArrayRef, accumulator: &mut DataArray) -> usize {
-    let rows = chunk_vals.as_struct();
-    let values = crate::grid::decode_rows(rows, true).unwrap_or_else(|e| panic!("grid chunk row: {e}"));
-    let n = values.len();
-    extend_from_decoded(accumulator, &(Arc::new(arrow::array::Float64Array::from(values)) as ArrayRef));
-    n
-}
 
-/// Append a decoded float64 grid column to a store of the array's own type.
-fn extend_from_decoded(store: &mut DataArray, decoded: &ArrayRef) {
-    let vals = decoded.as_primitive::<Float64Type>();
-    match store.dtype {
-        mzdata::spectrum::BinaryDataArrayType::Float64 => store.extend(vals.values()).unwrap(),
-        mzdata::spectrum::BinaryDataArrayType::Float32 => {
-            let v: Vec<f32> = vals.values().iter().map(|v| *v as f32).collect();
-            store.extend(&v).unwrap()
-        }
-        other => panic!("cannot store a decoded grid into a {other:?} array"),
-    }
-}

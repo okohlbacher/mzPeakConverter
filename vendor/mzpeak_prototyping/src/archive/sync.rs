@@ -19,7 +19,7 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 
-use crate::archive::{FileEntry, FileIndex};
+use crate::archive::{DataKind, EntityType, FileEntry, FileIndex};
 use crate::constants::{
     CHROMATOGRAM_DATA_ARRAYS_NAME, CHROMATOGRAM_METADATA_NAME,
     CHROMATOGRAM_METADATA_PRECURSORS_NAME, CHROMATOGRAM_METADATA_PRODUCTS_NAME,
@@ -29,6 +29,7 @@ use crate::constants::{
     WAVELENGTH_SPECTRUM_DATA_ARRAYS_NAME, WAVELENGTH_SPECTRUM_METADATA_NAME,
     WAVELENGTH_SPECTRUM_METADATA_SCANS_NAME,
 };
+use crate::validation::{self, DigestSummary, SHA512HashingStream};
 
 /// Create a single shared [`FileDecryptionProperties`] that is used for all [`MzPeakArchiveType`] members,
 /// even those not found in an archive.
@@ -249,7 +250,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         read: &mut impl io::Read,
         name: Option<&S>,
         entry: Option<FileEntry>,
-    ) -> io::Result<()> {
+    ) -> io::Result<DigestSummary> {
         if let Some(entry) = entry {
             self.start_for_entry(entry)?
         } else {
@@ -264,16 +265,21 @@ archive, nor was one given via the file index entry"#,
             }
         }
 
+        let mut buf_writer = SHA512HashingStream::new(self);
         let mut buffer = [0u8; 65536];
         loop {
             let z = read.read(&mut buffer)?;
             if z == 0 {
                 break;
             }
-            self.write_all(&buffer[0..z])?;
+            buf_writer.write_all(&buffer[0..z])?;
         }
-
-        Ok(())
+        let digest = buf_writer.digest();
+        let inner = buf_writer.into_inner();
+        if let Some(e) = inner.index.last_entry_mut() {
+            e.checksum = Some(digest.digest.clone());
+        }
+        Ok(digest)
     }
 
     fn write_index(&mut self) -> ZipResult<()> {
@@ -820,7 +826,7 @@ pub struct MzPeakArchiveEntry {
 }
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct SchemaMetadataManager {
+pub struct SchemaMetadataManager {
     pub(crate) spectrum_metadata: Option<MzPeakArchiveEntry>,
     pub(crate) spectrum_scan_metadata: Option<MzPeakArchiveEntry>,
     pub(crate) spectrum_precursor_metadata: Option<MzPeakArchiveEntry>,
@@ -842,6 +848,41 @@ pub(crate) struct SchemaMetadataManager {
 }
 
 impl SchemaMetadataManager {
+    pub fn find_entry_for(
+        &self,
+        entity_type: &EntityType,
+        data_kind: &DataKind,
+    ) -> Option<&MzPeakArchiveEntry> {
+        match entity_type {
+            EntityType::Spectrum => match data_kind {
+                DataKind::DataArray => self.spectrum_data_arrays.as_ref(),
+                DataKind::Peaks => self.peaks_data_arrays.as_ref(),
+                DataKind::Metadata => self.spectrum_metadata.as_ref(),
+                DataKind::Scans => self.spectrum_scan_metadata.as_ref(),
+                DataKind::Precursors => self.spectrum_precursor_metadata.as_ref(),
+                DataKind::SelectedIons => self.spectrum_selected_ion_metadata.as_ref(),
+                _ => None,
+            },
+            EntityType::Chromatogram => match data_kind {
+                DataKind::DataArray => self.chromatogram_data_arrays.as_ref(),
+                DataKind::Metadata => self.chromatogram_metadata.as_ref(),
+                DataKind::Precursors => self.chromatogram_precursor_metadata.as_ref(),
+                DataKind::SelectedIons => self.chromatogram_selected_ion_metadata.as_ref(),
+                DataKind::Products => self.chromatogram_product_metadata.as_ref(),
+                _ => None,
+            },
+            EntityType::WavelengthSpectrum => match data_kind {
+                DataKind::DataArray => self.wavelength_data_arrays.as_ref(),
+                DataKind::Metadata => self.wavelength_metadata.as_ref(),
+                DataKind::Scans => self.wavelength_scan_metadata.as_ref(),
+                _ => None,
+            },
+            EntityType::Other(_) => None,
+        }
+    }
+}
+
+impl SchemaMetadataManager {
     pub(crate) fn add_entry(&mut self, entry: MzPeakArchiveEntry) {
         match entry.entry_type {
             MzPeakArchiveType::SpectrumMetadata => {
@@ -850,12 +891,8 @@ impl SchemaMetadataManager {
             MzPeakArchiveType::SpectrumDataArrays => {
                 self.spectrum_data_arrays = Some(entry);
             }
-            MzPeakArchiveType::SpectrumPeakDataArrays => {
-                self.peaks_data_arrays = Some(entry)
-            }
-            MzPeakArchiveType::ChromatogramMetadata => {
-                self.chromatogram_metadata = Some(entry)
-            }
+            MzPeakArchiveType::SpectrumPeakDataArrays => self.peaks_data_arrays = Some(entry),
+            MzPeakArchiveType::ChromatogramMetadata => self.chromatogram_metadata = Some(entry),
             MzPeakArchiveType::ChromatogramDataArrays => {
                 self.chromatogram_data_arrays = Some(entry)
             }
@@ -866,9 +903,7 @@ impl SchemaMetadataManager {
                 self.wavelength_data_arrays = Some(entry);
             }
             MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary => {}
-            MzPeakArchiveType::SpectrumMetadataScans => {
-                self.spectrum_scan_metadata = Some(entry)
-            }
+            MzPeakArchiveType::SpectrumMetadataScans => self.spectrum_scan_metadata = Some(entry),
             MzPeakArchiveType::SpectrumMetadataPrecursors => {
                 self.spectrum_precursor_metadata = Some(entry)
             }
@@ -953,7 +988,10 @@ pub trait ArchiveSource: Sized + 'static {
     fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
         let handle = self.open_entry_by_index(index)?;
 
-        let mut opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+        // `Optional`, not `Required`: a facet written without a page index (pyarrow's default) must
+        // still open — the reader's indices fall back to row-group statistics (reader/index.rs).
+        // Upstream (parquet 57) is the lenient `with_page_index(true)`.
+        let mut opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
         if let Some(enc) = self.decryption_properties_for_index(index) {
             opts = opts.with_file_decryption_properties(enc);
         }
@@ -1187,7 +1225,9 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn chromatograms_metadata_precursors(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn chromatograms_metadata_precursors(
+        &self,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_precursor_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
@@ -1199,7 +1239,9 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn chromatograms_metadata_selected_ions(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn chromatograms_metadata_selected_ions(
+        &self,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_selected_ion_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
@@ -1271,7 +1313,9 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn spectrum_metadata_precursors(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn spectrum_metadata_precursors(
+        &self,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_precursor_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
@@ -1283,7 +1327,9 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn spectrum_metadata_selected_ions(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn spectrum_metadata_selected_ions(
+        &self,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_selected_ion_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
@@ -1321,10 +1367,14 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn wavelength_spectrum_metadata_scans(&self) -> Option<io::Result<ParquetRecordBatchReaderBuilder<T::File>>> {
+    pub fn wavelength_spectrum_metadata_scans(
+        &self,
+    ) -> Option<io::Result<ParquetRecordBatchReaderBuilder<T::File>>> {
         if let Some(meta) = self.members.wavelength_scan_metadata.as_ref() {
-            Some(self.archive
-                 .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap())))
+            Some(
+                self.archive
+                    .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap())),
+            )
         } else {
             None
         }
@@ -1338,6 +1388,73 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     /// Open a raw readable stream for the requested file name
     pub fn open_stream(&self, name: &str) -> Result<<T as ArchiveSource>::File, io::Error> {
         self.archive.open_stream(name)
+    }
+
+    /// Check if an entry's checksum matches the checksum stored in the file index.
+    ///
+    /// Returns `Some` when `entry.checksum` is `Some`, `None` otherwise
+    pub fn check_entry_integrity(&self, entry: &FileEntry) -> io::Result<Option<bool>> {
+        let stream = self.open_stream(&entry.name)?;
+        let chksm = validation::checksum_stream(&mut stream.get_read(0)?)?;
+        Ok(entry.checksum.as_ref().map(|v| *v == chksm))
+    }
+
+    /// Check if all the entries in the archive match their checksums.
+    ///
+    /// ## Returns
+    /// - The main status flag: `Some` if all entries have a checksum recorded. `None` otherwise.
+    /// - Each failed entry and its computed checksum if it was resolved, None otherwise.
+    pub fn check_archive_integrity(&self) -> io::Result<(Option<bool>, Vec<(FileEntry, Option<String>)>)> {
+        let mut failed = Vec::new();
+        let mut valid = Some(true);
+        for e in self.file_index().iter() {
+            let state = self.check_entry_integrity(e)?;
+            match state {
+                Some(true) => continue,
+                Some(false) => {
+                    failed.push((
+                        e.clone(),
+                        self.open_stream(&e.name)
+                            .and_then(|v| v.get_read(0).map_err(|e| io::Error::other(e)))
+                            .and_then(|mut v| validation::checksum_stream(&mut v))
+                            .ok(),
+                    ));
+                    valid = valid.map(|v| v && false);
+                }
+                None => {
+                    failed.push((
+                        e.clone(),
+                        self.open_stream(&e.name)
+                            .and_then(|v| v.get_read(0).map_err(|e| io::Error::other(e)))
+                            .and_then(|mut v| validation::checksum_stream(&mut v))
+                            .ok(),
+                    ));
+                    valid = None;
+                }
+            }
+        }
+        Ok((valid, failed))
+    }
+
+    pub fn read_entry(
+        &self,
+        entity_type: &EntityType,
+        data_kind: &DataKind,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+        if let Some(entry) = self.members.find_entry_for(entity_type, data_kind) {
+            return self
+                .archive
+                .read_index(entry.entry_index, entry.metadata.clone());
+        }
+        if let Some(entry) = self.file_index().find_entry(entity_type, data_kind) {
+            let handle = self.open_stream(&entry.name)?;
+            return ParquetRecordBatchReaderBuilder::try_new(handle).map_err(|e| e.into());
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{entity_type:?} {data_kind:?} not found"),
+            ));
+        }
     }
 }
 
@@ -1465,7 +1582,10 @@ impl MemoryMapZipArchiveReader {
 mod test {
     use super::*;
 
-    fn test_archive_inner<T: ArchiveSource>(arch: &ArchiveReader<T>) -> io::Result<()> where T::File: io::Seek {
+    fn test_archive_inner<T: ArchiveSource>(arch: &ArchiveReader<T>) -> io::Result<()>
+    where
+        T::File: io::Seek,
+    {
         let handle = arch.spectrum_metadata()?;
         let reader = handle.with_limit(5).build()?;
         for batch in reader {

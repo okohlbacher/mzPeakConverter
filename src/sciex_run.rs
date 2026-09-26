@@ -152,14 +152,11 @@ pub fn precursor(f: &PrecursorFacts) -> Option<Precursor> {
     let target = f.parent_mz as f32;
     let half = (f.isolation_width / 2.0) as f32;
     let isolation_window = match f.experiment_type {
-        PRODUCT_EXPERIMENT if half.is_finite() && half > 0.0 => IsolationWindow {
-            target,
-            lower_bound: target - half,
-            upper_bound: target + half,
-            flags: IsolationWindowState::Complete,
-        },
+        PRODUCT_EXPERIMENT if half.is_finite() && half > 0.0 => {
+            IsolationWindow::new(target, target - half, target + half, IsolationWindowState::Complete)
+        }
         PRODUCT_EXPERIMENT => {
-            IsolationWindow { target, flags: IsolationWindowState::Complete, ..Default::default() }
+            IsolationWindow::new(target, 0.0, 0.0, IsolationWindowState::Complete)
         }
         _ => IsolationWindow::default(),
     };

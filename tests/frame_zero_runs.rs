@@ -123,7 +123,7 @@ fn a_frame_keeps_every_point_when_the_zero_run_mask_is_off() {
         for mask in [false, true] {
             let out = std::env::temp_dir().join(format!("mzpc-frame-zeros-{}-{label}-{mask}.mzpeak", std::process::id()));
             let _ = std::fs::remove_file(&out);
-            let n = write(&out, strategy, mask);
+            let n = write(&out, strategy.clone(), mask);
             let (got, zeros, ties, pts) = read_back(&out);
             eprintln!("{label} mask={mask}: wrote {n} points, read {got} ({zeros} zeros, {ties} ties)");
             if mask {

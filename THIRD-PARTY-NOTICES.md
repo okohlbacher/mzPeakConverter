@@ -45,7 +45,7 @@ runtime. The bundle holds code under three licenses:
 
 | Crate | Role | License | Source |
 |---|---|---|---|
-| [`mzdata`](https://github.com/mobiusklein/mzdata) | format readers (mzML/imzML/Thermo/TDF) | Apache-2.0 | **git fork** [`okohlbacher/mzdata@1d53971`](https://github.com/okohlbacher/mzdata/commit/1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db), pinned through `[patch.crates-io]`: 0.66.6 plus the isolation-window reader fix of [mobiusklein/mzdata#58](https://github.com/mobiusklein/mzdata/pull/58), merged upstream and not yet released |
+| [`mzdata`](https://github.com/mobiusklein/mzdata) | format readers (mzML/imzML/Thermo/TDF) | Apache-2.0 | crates.io, pinned `=0.67.1` (with the `cv` feature the vendored reference implementation needs; 0.66.7 was the first release carrying the isolation-window reader fix of [mobiusklein/mzdata#58](https://github.com/mobiusklein/mzdata/pull/58), which 0.12.4–0.13.0 linked as a git fork of 0.66.6 through `[patch.crates-io]`) |
 | [`mzpeaks`](https://github.com/mobiusklein/mzpeaks) | peak/centroid models | Apache-2.0 | crates.io |
 | [`arrow`](https://github.com/apache/arrow-rs), [`parquet`](https://github.com/apache/arrow-rs) | columnar storage | Apache-2.0 | crates.io |
 | [`timsrust`](https://github.com/MannLabs/timsrust) | native Bruker TDF integer-TOF | Apache-2.0 | crates.io |

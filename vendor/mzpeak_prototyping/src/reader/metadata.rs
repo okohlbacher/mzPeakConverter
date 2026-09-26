@@ -6,20 +6,12 @@ use std::{
 };
 
 use crate::{
-    BufferContext,
-    archive::{ArchiveReader, ArchiveSource, DataKind, FileIndex},
-    buffer_descriptors::{ArrayIndex, SerializedArrayIndex, arrow_to_array_type},
-    constants::{
+    BufferContext, archive::{ArchiveReader, ArchiveSource, DataKind, FileIndex}, buffer_descriptors::{ArrayIndex, SerializedArrayIndex, arrow_to_array_type}, constants::{
         CHROMATOGRAM, CHROMATOGRAM_ARRAY_INDEX, INDEX,
         PRECURSOR, SCAN, SELECTED_ION, SOURCE_INDEX, SPECTRUM,
         SPECTRUM_ARRAY_INDEX, SPECTRUM_INDEX, WAVELENGTH_SPECTRUM_ARRAY_INDEX,
-    },
-    filter::RegressionDeltaModel,
-    param::MetadataMapping,
-    reader::{
-        index::{QueryIndex, SpectrumDataIndex, SpectrumMetadataIndexLike, SpectrumPointIndex},
-        utils::MaskSet,
-        visitor::{
+    }, filter::RegressionDeltaModel, param::MetadataMapping, peak_series::BufferFormat, reader::{
+        index::{QueryIndex, SpectrumChunkIndex, SpectrumDataIndex, SpectrumMetadataIndexLike, SpectrumPointIndex}, utils::MaskSet, visitor::{
             CompoundIndexVisitor, DoubleIndexed, Indexed, MzChromatogramBuilder,
             MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor, MzSpectrumVisitor,
         },
@@ -407,15 +399,20 @@ impl PeakMetadata {
             }
         }
         if has_arrays {
-            // Pick the index variant from the facet's OWN layout prefix, mirroring the data facet
-            // (`populate_spectrum_data_indices`). This used to hardcode Point, so a chunked peaks
-            // facet — what --ims-chunked writes — was indexed as if it were point data and decoded
-            // to nothing.
-            this.query_index = if crate::peak_series::BufferFormat::Chunk.prefix() == this.array_indices.prefix {
-                SpectrumDataIndex::Chunk(super::index::SpectrumChunkIndex::from_reader(reader, &this.array_indices))
+            let index = if BufferFormat::Point.prefix() == this.array_indices.prefix {
+                SpectrumDataIndex::Point(SpectrumPointIndex::from_reader(
+                    reader,
+                    &this.array_indices,
+                ))
+            } else if BufferFormat::Chunk.prefix() == this.array_indices.prefix {
+                SpectrumDataIndex::Chunk(SpectrumChunkIndex::from_reader(
+                    reader,
+                    &this.array_indices,
+                ))
             } else {
-                SpectrumDataIndex::Point(SpectrumPointIndex::from_reader(reader, &this.array_indices))
+                panic!("Prefix {} not recognized", this.array_indices.prefix)
             };
+            this.query_index = index;
             Some(this)
         } else {
             None
@@ -899,7 +896,7 @@ impl<'a, T: ReaderFacetMetadataLike + 'a> SpectrumMetadataDecoder<'a, T> {
     fn load_precursors_from(
         &self,
         precursor_arr: &StructArray,
-        acc: &mut Vec<(u64, Option<u64>, Precursor)>,
+        acc: &mut Vec<DoubleIndexed<Precursor>>,
     ) {
         let n = precursor_arr
             .column_by_name(SPECTRUM_INDEX)
@@ -921,7 +918,7 @@ impl<'a, T: ReaderFacetMetadataLike + 'a> SpectrumMetadataDecoder<'a, T> {
     fn load_selected_ions_from(
         &self,
         si_arr: &StructArray,
-        acc: &mut Vec<(u64, Option<u64>, SelectedIon)>,
+        acc: &mut Vec<DoubleIndexed<SelectedIon>>,
     ) {
         let metacols = self
             .metadata
@@ -943,7 +940,7 @@ impl<'a, T: ReaderFacetMetadataLike + 'a> SpectrumMetadataDecoder<'a, T> {
     fn load_scan_events_from(
         &self,
         scan_arr: &StructArray,
-        scan_accumulator: &mut Vec<(u64, ScanEvent)>,
+        scan_accumulator: &mut Vec<Indexed<ScanEvent>>,
     ) {
         let metacols = self.metadata.scan_metadata_map().unwrap_or(&self.empty_map);
         let n = scan_arr
@@ -1124,7 +1121,7 @@ impl<'a, T: ReaderFacetMetadataLike + 'a> SpectrumMetadataDecoder<'a, T> {
         self.precursors =
             PrecursorSelectedIonAssembler::new(self.precursors, self.selected_ions).build();
 
-        for (idx, scan) in self.scan_events {
+        for Indexed(idx, scan) in self.scan_events {
             if let Some(i) = index_map.get(&idx).copied() {
                 if let Some(spec) = self.descriptions.get_mut(i) {
                     spec.acquisition.scans.push(scan);
@@ -1206,11 +1203,11 @@ impl PrecursorSelectedIonAssembler {
         // positionally. Where they differ — one precursor with several ions (SPS-MS3), or ions
         // missing — nothing is assumed and the original scan runs unchanged.
         let mut prec_rows: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (i, (spec_i, _, _)) in self.precursors.iter().enumerate() {
+        for (i, DoubleIndexed(spec_i, _, _)) in self.precursors.iter().enumerate() {
             prec_rows.entry(*spec_i).or_default().push(i);
         }
         let mut ion_counts: HashMap<u64, usize> = HashMap::new();
-        for (spec_i, _, _) in self.selected_ions.iter() {
+        for DoubleIndexed(spec_i, _, _) in self.selected_ions.iter() {
             *ion_counts.entry(*spec_i).or_default() += 1;
         }
         let paired: HashMap<u64, &Vec<usize>> = prec_rows
@@ -1222,12 +1219,12 @@ impl PrecursorSelectedIonAssembler {
 
         self.last_precursor_i = 0;
         let n = self.precursors.len();
-        for (spec_idx, prec_idx, si) in self.selected_ions.iter().cloned() {
+        for DoubleIndexed(spec_idx, prec_idx, si) in self.selected_ions.iter().cloned() {
             if let Some(rows) = paired.get(&spec_idx) {
                 let slot = seen_ions.entry(spec_idx).or_default();
                 let row = rows[*slot];
                 *slot += 1;
-                if let Some((_, _, prec)) = self.precursors.get_mut(row) {
+                if let Some(DoubleIndexed(_, _, prec)) = self.precursors.get_mut(row) {
                     prec.add_ion(si);
                     self.last_precursor_i = row;
                     continue;
@@ -1238,7 +1235,7 @@ impl PrecursorSelectedIonAssembler {
             let mut hit = false;
             self.spec_idx_match = None;
             for precursor_i in self.last_precursor_i..n {
-                if let Some((precursor_rec_spec_i, precursor_rec_prec_i, prec)) =
+                if let Some(DoubleIndexed(precursor_rec_spec_i, precursor_rec_prec_i, prec)) =
                     self.precursors.get_mut(precursor_i)
                 {
                     if *precursor_rec_spec_i == spec_idx {
@@ -1255,7 +1252,7 @@ impl PrecursorSelectedIonAssembler {
                                 "Fallback assignment of selected ion {spec_idx}:{prec_idx:?}:{si:?}"
                             );
                             if let Some(spec_idx_match) = self.spec_idx_match {
-                                if let Some((_, _, prec)) = self.precursors.get_mut(spec_idx_match)
+                                if let Some(DoubleIndexed(_, _, prec)) = self.precursors.get_mut(spec_idx_match)
                                 {
                                     prec.add_ion(si.take().unwrap());
                                     self.last_precursor_i = spec_idx_match;
@@ -1272,7 +1269,7 @@ impl PrecursorSelectedIonAssembler {
                     log::debug!(
                         "Fallback assignment of selected ion {spec_idx}:{prec_idx:?}:{si:?}"
                     );
-                    if let Some((_, _, prec)) = self.precursors.get_mut(spec_idx_match) {
+                    if let Some(DoubleIndexed(_, _, prec)) = self.precursors.get_mut(spec_idx_match) {
                         prec.add_ion(si.take().unwrap());
                         self.last_precursor_i = spec_idx_match;
                     }
@@ -1342,7 +1339,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
     fn load_precursors_from(
         &self,
         precursor_arr: &StructArray,
-        acc: &mut Vec<(u64, Option<u64>, Precursor)>,
+        acc: &mut Vec<DoubleIndexed<Precursor>>,
     ) {
         let n = precursor_arr
             .column_by_name(SOURCE_INDEX)
@@ -1361,7 +1358,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
     fn load_selected_ions_from(
         &self,
         si_arr: &StructArray,
-        acc: &mut Vec<(u64, Option<u64>, SelectedIon)>,
+        acc: &mut Vec<DoubleIndexed<SelectedIon>>,
     ) {
         let empty = MetadataMapping::default();
         let metacols = self
@@ -1476,7 +1473,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
             PrecursorSelectedIonAssembler::new(self.precursors, self.selected_ions).build();
 
         // Row order, as for spectra: the order the writer was given them in.
-        for (idx, _prec_idx, precursor) in self.precursors.into_iter() {
+        for DoubleIndexed(idx, _prec_idx, precursor) in self.precursors.into_iter() {
             if let Some(i) = index_map.get(&idx).copied() {
                 self.descriptions[i].precursor.push(precursor);
             }
