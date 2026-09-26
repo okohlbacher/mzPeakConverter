@@ -28,6 +28,7 @@ use libloading::Library;
 use rusqlite::{Connection, OpenFlags};
 
 use mzdata::params::Unit;
+use mzpeak_prototyping::grid::GridModelLike;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
