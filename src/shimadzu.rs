@@ -893,15 +893,14 @@ impl ShimadzuReader {
                 .push(DissociationMethodTerm::CollisionInducedDissociation);
             descr.precursor = vec![Precursor {
                 ions,
+                // mzdata 0.67 made `IsolationWindow` non-exhaustive (a private `unit`): build it
+                // through its constructor / public fields rather than a struct literal.
                 isolation_window: if half > 0.0 {
-                    IsolationWindow {
-                        target,
-                        lower_bound: target - half,
-                        upper_bound: target + half,
-                        flags: IsolationWindowState::Complete,
-                    }
+                    IsolationWindow::new(target, target - half, target + half, IsolationWindowState::Complete)
                 } else {
-                    IsolationWindow { target, ..Default::default() }
+                    let mut window = IsolationWindow::default();
+                    window.target = target;
+                    window
                 },
                 activation,
                 precursor_id: (meta.precursor_scan_number > 0)
