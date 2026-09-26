@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, prelude::*},
     marker::PhantomData,
@@ -24,7 +24,7 @@ use mzdata::{
     meta::{FileMetadataConfig, MSDataFileMetadata},
     params::ControlledVocabulary,
     prelude::*,
-    spectrum::{BinaryArrayMap, Chromatogram, MultiLayerSpectrum, SignalContinuity},
+    spectrum::{ArrayType, BinaryArrayMap, Chromatogram, MultiLayerSpectrum, SignalContinuity},
 };
 
 use crate::{
@@ -35,8 +35,10 @@ use crate::{
         CHROMATOGRAM_COUNT, CHROMATOGRAM_DATA_POINT_COUNT, SPECTRUM_COUNT,
         SPECTRUM_DATA_POINT_COUNT, WAVELENGTH_SPECTRUM_COUNT, WAVELENGTH_SPECTRUM_DATA_ARRAYS_NAME,
     },
+    grid::GridPolicyTable,
     param::ControlledVocabularyEntry,
     peak_series::{ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays},
+    validation::DigestSummary,
     writer::{base::{GenericDataArrayWriter, centroid_arrays_beyond_peaks}, builder::SpectrumFieldVisitors},
 };
 use crate::{
@@ -45,6 +47,7 @@ use crate::{
         CHROMATOGRAM_ARRAY_INDEX, SPECTRUM_ARRAY_INDEX, WAVELENGTH_SPECTRUM_ARRAY_INDEX,
         WAVELENGTH_SPECTRUM_DATA_POINT_COUNT,
     },
+    validation::SHA512HashingStream,
 };
 
 mod array_buffer;
@@ -64,10 +67,11 @@ pub use split::UnpackedMzPeakWriterType;
 
 pub use visitor::{
     ActivationBuilder, AuxiliaryArrayBuilder, CURIEBuilder, ChromatogramBuilder,
-    ChromatogramDetailsBuilder, CustomBuilderFromParameter, IsolationWindowBuilder, ParamBuilder,
-    ParamListBuilder, ParamValueBuilder, PrecursorBuilder, ScanBuilder, ScanWindowBuilder,
-    SelectedIonBuilder, SpectrumBuilder, SpectrumDetailsBuilder, SpectrumVisitor, StructVisitor,
-    StructVisitorBuilder, VisitorBase, WavelengthSpectrumBuilder, inflect_cv_term_to_column_name,
+    ChromatogramDetailsBuilder, CustomBuilderFromParameter, CustomBuilderFromParameterDerived,
+    IsolationWindowBuilder, ParamBuilder, ParamListBuilder, ParamValueBuilder, PrecursorBuilder,
+    ScanBuilder, ScanWindowBuilder, SelectedIonBuilder, SpectrumBuilder, SpectrumDetailsBuilder,
+    SpectrumVisitor, StructVisitor, StructVisitorBuilder, VisitorBase, WavelengthSpectrumBuilder,
+    inflect_cv_term_to_column_name,
 };
 
 pub(crate) use base::implement_mz_metadata;
@@ -80,8 +84,9 @@ construct a Parquet schema.
 */
 struct ArrayTypesSampler<'a> {
     overrides: &'a BufferOverrideTable,
-    use_chunked_encoding: Option<ChunkingStrategy>,
+    use_chunked_encoding: Option<&'a ChunkingStrategy>,
     is_profile: i32,
+    grid_policy: Option<&'a GridPolicyTable>,
 }
 
 /// Mirrors the routing test in `AbstractMzPeakWriter::write_spectrum`: a non-MS spectrum that carries
@@ -101,12 +106,14 @@ fn is_wavelength_spectrum<C: CentroidLike, D: DeconvolutedCentroidLike>(
 impl<'a> ArrayTypesSampler<'a> {
     fn new(
         overrides: &'a BufferOverrideTable,
-        use_chunked_encoding: Option<ChunkingStrategy>,
+        use_chunked_encoding: Option<&'a ChunkingStrategy>,
+        grid_policy: Option<&'a GridPolicyTable>,
     ) -> Self {
         Self {
             overrides,
             use_chunked_encoding,
             is_profile: 0,
+            grid_policy,
         }
     }
 
@@ -117,6 +124,20 @@ impl<'a> ArrayTypesSampler<'a> {
     ) -> Option<Vec<FieldRef>> {
         // generate a schema for this chunked
         if let Some(use_chunked_encoding) = self.use_chunked_encoding {
+            let local_policy: Option<GridPolicyTable> = self.grid_policy.map(|policies| {
+                policies
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut local_v = v.clone();
+                        local_v.maximum_error_tolerance = None;
+                        local_v.set_current_grid(local_v.model_from_array_map(map, None));
+                        if local_v.current_grid().is_none() {
+                            log::error!("Failed to produce a grid for {k} from {:?}", map.get(k));
+                        }
+                        (k.clone(), local_v)
+                    })
+                    .collect()
+            });
             ArrowArrayChunk::from_arrays(
                 0,
                 None,
@@ -128,6 +149,7 @@ impl<'a> ArrayTypesSampler<'a> {
                 false,
                 None,
                 None,
+                local_policy.as_ref(),
             )
             .ok()
             .and_then(|(chunks, _aux_arrays, _)| {
@@ -135,7 +157,7 @@ impl<'a> ArrayTypesSampler<'a> {
                     c.to_schema(
                         context,
                         &[
-                            use_chunked_encoding,
+                            use_chunked_encoding.clone(),
                             ChunkingStrategy::Basic { chunk_size: 50.0 },
                         ],
                         false,
@@ -170,7 +192,7 @@ impl<'a> ArrayTypesSampler<'a> {
                 BufferContext::Spectrum,
             )
         } else {
-            let fields = T::to_fields()
+            let fields: Vec<Arc<Field>> = T::to_fields()
                 .into_iter()
                 .cloned()
                 .map(|field| {
@@ -296,9 +318,10 @@ impl<'a> ArrayTypesSampler<'a> {
 pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
     iter: I,
     overrides: &BufferOverrideTable,
-    use_chunked_encoding: Option<ChunkingStrategy>,
+    use_chunked_encoding: Option<&ChunkingStrategy>,
 ) -> Vec<Arc<Field>> {
-    ArrayTypesSampler::new(overrides, use_chunked_encoding).sample_chromatogram_array_types(iter)
+    ArrayTypesSampler::new(overrides, use_chunked_encoding, None)
+        .sample_chromatogram_array_types(iter)
 }
 
 /// Collect arrays fields from spectra in a [`StreamingSpectrumIterator`] to prepare
@@ -317,13 +340,14 @@ pub fn sample_array_types_from_spectrum_stream<
 >(
     reader: &mut StreamingSpectrumIterator<C, D, MultiLayerSpectrum<C, D>, I>,
     overrides: &BufferOverrideTable,
-    use_chunked_encoding: Option<ChunkingStrategy>,
+    use_chunked_encoding: Option<&ChunkingStrategy>,
+    grid_policies: Option<&GridPolicyTable>,
 ) -> Vec<Arc<Field>>
 where
     MultiLayerSpectrum<C, D>: Clone,
 {
     reader.populate_buffer(10);
-    let mut sampler = ArrayTypesSampler::new(overrides, use_chunked_encoding);
+    let mut sampler = ArrayTypesSampler::new(overrides, use_chunked_encoding, grid_policies);
     sampler.sample_spectrum_array_types(reader.iter_buffer().cloned(), false)
 }
 
@@ -350,8 +374,9 @@ pub fn sample_array_types_from_spectrum_source<
 >(
     reader: &mut R,
     overrides: &BufferOverrideTable,
-    use_chunked_encoding: Option<ChunkingStrategy>,
+    use_chunked_encoding: Option<&ChunkingStrategy>,
     prefer_peaks: bool,
+    grid_policies: Option<&GridPolicyTable>,
 ) -> Vec<Arc<Field>> {
     let n = reader.len();
     if n == 0 {
@@ -364,7 +389,7 @@ pub fn sample_array_types_from_spectrum_source<
         let it = pts
             .into_iter()
             .flat_map(|i| reader.get_spectrum_by_index(i));
-        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding)
+        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding, grid_policies)
             .sample_spectrum_array_types(it, prefer_peaks);
         if !fields.is_empty() {
             return fields;
@@ -394,7 +419,7 @@ pub fn sample_array_types_from_spectrum_source<
             .flat_map(|i| reader.get_spectrum_by_index(i))
             .filter(|s| !s.peaks().is_empty() && !is_wavelength_spectrum(s))
             .take(pts.len());
-        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding)
+        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding, grid_policies)
             .sample_spectrum_array_types(it, prefer_peaks);
         if fields.is_empty() {
             // The file genuinely has no signal anywhere. No chunk batch is ever produced, so the
@@ -405,7 +430,7 @@ pub fn sample_array_types_from_spectrum_source<
     } else {
         log::trace!("{n} spectra detected, sampling arrays from all entries");
         let it = reader.iter();
-        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding)
+        let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding, grid_policies)
             .sample_spectrum_array_types(it, prefer_peaks);
         reader.reset();
         fields
@@ -574,6 +599,28 @@ fn prune_all_null_dup_point_columns(
 
 /// Array type inference from inputs
 impl MzPeakWriterBuilder {
+
+    /// Check the kinds of arrays to expect from sampled spectra *without* updating any configurations.
+    ///
+    /// This is useful for planning how to extract certain higher order configuration states like grid
+    /// encoding policies.
+    pub fn check_spectrum_array_types<
+        C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+        D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+        R: RandomAccessSpectrumSource<C, D, MultiLayerSpectrum<C, D>>,
+    >(
+        &self,
+        reader: &mut R,
+    ) -> HashSet<ArrayType> {
+        let fields =
+            sample_array_types_from_spectrum_source(reader, &Default::default(), None, false, None);
+        fields
+            .into_iter()
+            .flat_map(|f| BufferName::from_field(BufferContext::Spectrum, f))
+            .map(|b| b.array_type)
+            .collect()
+    }
+
     /// Collect arrays fields from spectra in a [`RandomAccessSpectrumSource`] to prepare
     /// the data file schema.
     ///
@@ -597,11 +644,13 @@ impl MzPeakWriterBuilder {
         let fields = sample_array_types_from_spectrum_source(
             reader,
             &self.spectrum_overrides(),
-            self.chunked_encoding,
+            self.chunked_encoding.as_ref(),
             false,
+            self.spectrum_arrays.grid_policies_ref(),
         );
 
         for f in fields {
+            log::debug!("Adding field spectrum array field {f:?}");
             self = self.add_spectrum_field(f);
         }
 
@@ -621,7 +670,7 @@ impl MzPeakWriterBuilder {
         mut self,
         spectra: I,
     ) -> Self {
-        let fields = ArrayTypesSampler::new(&self.spectrum_overrides(), self.chunked_encoding)
+        let fields = ArrayTypesSampler::new(&self.spectrum_overrides(), self.chunked_encoding.as_ref(), self.spectrum_arrays.grid_policies_ref())
             .sample_spectrum_array_types(spectra, false);
         for f in fields {
             self = self.add_spectrum_field(f);
@@ -650,7 +699,7 @@ impl MzPeakWriterBuilder {
         mut self,
         spectra: I,
     ) -> Self {
-        let fields = ArrayTypesSampler::new(&self.spectrum_overrides(), self.peaks_chunked_encoding)
+        let fields = ArrayTypesSampler::new(&self.spectrum_overrides(), self.peaks_chunked_encoding.as_ref(), self.spectrum_peak_arrays.grid_policies_ref())
             .sample_spectrum_array_types(spectra, true);
         for f in fields {
             self.spectrum_peak_arrays = self.spectrum_peak_arrays.add_field(f);
@@ -668,10 +717,12 @@ impl MzPeakWriterBuilder {
     ) -> Self {
         for f in sample_array_types_from_spectrum_source(
             reader,
-            &self.spectrum_overrides(),
-            self.peaks_chunked_encoding.clone(),
+            &self.spectrum_peak_overrides(),
+            self.peaks_chunked_encoding.as_ref(),
             true,
+            self.spectrum_peak_arrays.grid_policies_ref(),
         ) {
+            log::debug!("Adding field spectrum peak field {f:?}");
             self.spectrum_peak_arrays = self.spectrum_peak_arrays.add_field(f);
         }
         self
@@ -698,7 +749,8 @@ impl MzPeakWriterBuilder {
         let fields = sample_array_types_from_spectrum_stream(
             reader,
             &self.spectrum_overrides(),
-            self.chunked_encoding,
+            self.chunked_encoding.as_ref(),
+            self.spectrum_arrays.grid_policies_ref(),
         );
 
         for f in fields {
@@ -721,7 +773,7 @@ impl MzPeakWriterBuilder {
         let fields = sample_array_types_from_chromatograms(
             iter,
             &self.chromatogram_overrides(),
-            self.chromatogram_chunked_encoding,
+            self.chromatogram_chunked_encoding.as_ref(),
         );
         for f in fields {
             self = self.add_chromatogram_field(f);
@@ -736,7 +788,7 @@ pub struct MzPeakWriterType<
     C: CentroidLike + ToMzPeakDataSeries = CentroidPeak,
     D: DeconvolutedCentroidLike + ToMzPeakDataSeries = DeconvolutedPeak,
 > {
-    archive_writer: Option<ArrowWriter<ZipArchiveWriter<W>>>,
+    archive_writer: Option<ArrowWriter<SHA512HashingStream<ZipArchiveWriter<W>>>>,
     spectrum_data_buffers: ArrayBufferWriterVariants,
     spectrum_peaks_writer: Option<MiniPeakWriterType<fs::File>>,
 
@@ -765,6 +817,7 @@ pub struct MzPeakWriterType<
     mz_metadata: FileMetadataConfig,
     controlled_vocabularies: Vec<ControlledVocabularyEntry>,
     _t: PhantomData<(C, D)>,
+    digest_summaries: Vec<DigestSummary>,
 }
 
 impl<
@@ -789,7 +842,9 @@ impl<
     }
 
     fn use_chunked_encoding_for_peaks(&self) -> Option<&ChunkingStrategy> {
-        self.spectrum_peaks_writer.as_ref().and_then(|v| v.buffers().chunking_strategy())
+        self.spectrum_peaks_writer
+            .as_ref()
+            .and_then(|v| v.buffers().chunking_strategy())
     }
 
     fn spectrum_entry_buffer_mut(&mut self) -> &mut SpectrumBuilder {
@@ -882,7 +937,7 @@ impl<
         value: &impl serde::Serialize,
     ) -> Result<(), serde_json::Error> {
         if let Some(v) = self.archive_writer.as_mut() {
-            v.inner_mut().add_index_metadata(key, value)
+            v.inner_mut().get_mut().add_index_metadata(key, value)
         } else {
             Ok(())
         }
@@ -955,28 +1010,24 @@ impl<
             spectrum_buffers.into()
         };
 
-        // The chromatogram buffer's schema must follow the CHROMATOGRAM chunking flag, not the
-        // spectrum one. write_chromatogram_arrays() (base.rs) branches on
-        // use_chromatogram_chunked_encoding; building the buffer off use_chunked_encoding instead
-        // lets the two disagree (point spectra + chunked-chromatogram flag → point buffer, chunked
-        // write → drain panics "N columns vs M fields"). The split writer already uses this flag.
-        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chromatogram_chunked_encoding.is_some() {
-            chromatogram_buffers_builder
-                .build_chunked(
-                    Arc::new(Schema::empty()),
-                    BufferContext::Chromatogram,
-                    false,
-                )
-                .into()
-        } else {
-            chromatogram_buffers_builder
-                .build(
-                    Arc::new(Schema::empty()),
-                    BufferContext::Chromatogram,
-                    false,
-                )
-                .into()
-        };
+        let chromatogram_buffers: ArrayBufferWriterVariants =
+            if use_chromatogram_chunked_encoding.is_some() {
+                chromatogram_buffers_builder
+                    .build_chunked(
+                        Arc::new(Schema::empty()),
+                        BufferContext::Chromatogram,
+                        false,
+                    )
+                    .into()
+            } else {
+                chromatogram_buffers_builder
+                    .build(
+                        Arc::new(Schema::empty()),
+                        BufferContext::Chromatogram,
+                        false,
+                    )
+                    .into()
+            };
 
         let mut writer = ZipArchiveWriter::new(writer);
         writer.start_spectrum_data().unwrap();
@@ -989,7 +1040,7 @@ impl<
             &spectrum_buffers,
             spectrum_buffers.index_path(),
             shuffle_mz,
-            &use_chunked_encoding,
+            use_chunked_encoding.as_ref(),
             compression,
             write_batch_config,
             spectrum_data_encryption_props,
@@ -1019,7 +1070,7 @@ impl<
         let mut this = Self {
             archive_writer: Some(
                 ArrowWriter::try_new_with_options(
-                    writer,
+                    SHA512HashingStream::new(writer),
                     spectrum_buffers.schema().clone(),
                     ArrowWriterOptions::new().with_properties(data_props),
                 )
@@ -1045,6 +1096,7 @@ impl<
                 ControlledVocabulary::MS.into(),
                 ControlledVocabulary::UO.into(),
             ],
+            digest_summaries: Vec::new(),
         };
         this.add_spectrum_array_metadata();
         this
@@ -1091,19 +1143,6 @@ impl<
     /// `spectra_peaks` while its raw arrays go to `spectra_data`.
     ///
     /// # See also
-    /// [`AbstractMzPeakWriter::write_spectrum_with_peak_arrays`]
-    pub fn write_spectrum_with_peak_arrays<
-        A: ToMzPeakDataSeries + CentroidLike,
-        B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
-        S: SpectrumLike<A, B> + 'static,
-    >(
-        &mut self,
-        spectrum: &S,
-        peak_arrays: &BinaryArrayMap,
-    ) -> io::Result<()> {
-        AbstractMzPeakWriter::write_spectrum_with_peak_arrays(self, spectrum, peak_arrays)
-    }
-
     fn flush_data_arrays(&mut self) -> io::Result<()> {
         for batch in self.spectrum_data_buffers.drain() {
             if let Some(writer) = self.archive_writer.as_mut() {
@@ -1180,14 +1219,38 @@ impl<
         Ok(())
     }
 
-    fn wrap_writer(writer: ZipArchiveWriter<W>, metadata_fields: Arc<Schema>, encryption_props: Option<Arc<FileEncryptionProperties>> ) -> io::Result<ArrowWriter<ZipArchiveWriter<W>>> {
+    fn wrap_writer(
+        writer: ZipArchiveWriter<W>,
+        metadata_fields: Arc<Schema>,
+        encryption_props: Option<Arc<FileEncryptionProperties>>,
+    ) -> io::Result<ArrowWriter<SHA512HashingStream<ZipArchiveWriter<W>>>> {
         Ok(ArrowWriter::try_new_with_options(
-            writer,
+            SHA512HashingStream::new(writer),
             metadata_fields.clone(),
-            ArrowWriterOptions::new().with_properties(
-                Self::spectrum_metadata_writer_props(&metadata_fields, encryption_props),
-            ),
+            ArrowWriterOptions::new().with_properties(Self::spectrum_metadata_writer_props(
+                &metadata_fields,
+                encryption_props,
+            )),
         )?)
+    }
+
+    fn take_writer(
+        &mut self,
+    ) -> Result<Option<(DigestSummary, ZipArchiveWriter<W>)>, parquet::errors::ParquetError> {
+        self.archive_writer
+            .take()
+            .map(|v| v.into_inner())
+            .transpose()
+            .map(|v| {
+                v.and_then(|v| {
+                    let checksum = v.digest();
+                    let mut v = v.into_inner();
+                    v.index_mut()
+                        .last_entry_mut()
+                        .map(|v| v.checksum = Some(checksum.digest.clone()));
+                    Some((checksum, v))
+                })
+            })
     }
 
     fn finish_parquet_inner(
@@ -1210,7 +1273,8 @@ impl<
                 Some(self.spectrum_data_buffers.point_count().to_string()),
             );
 
-            let mut writer = self.archive_writer.take().unwrap().into_inner()?;
+            let (mut checksum, mut writer) = self.take_writer()?.unwrap();
+            self.digest_summaries.push(checksum);
 
             if let Some(peak_file_writer) = self.spectrum_peaks_writer.take() {
                 let peak_props = peak_file_writer.properties().clone();
@@ -1228,119 +1292,148 @@ impl<
             }
 
             // ----------------------------------------------
+            {
+                writer.start_spectrum_metadata().unwrap();
+                let metadata_fields = self.spectrum_metadata_buffer.spectrum().schema();
+                let encryption_props = writer
+                    .current_entry()
+                    .and_then(|v| self.encryption_properties.get(&v.name))
+                    .cloned();
 
-            writer.start_spectrum_metadata().unwrap();
-            let metadata_fields = self.spectrum_metadata_buffer.spectrum().schema();
-            let encryption_props = writer
-                .current_entry()
-                .and_then(|v| self.encryption_properties.get(&v.name))
-                .cloned();
-
-            writer.current_entry_mut().unwrap().column_mapping = self
-                .spectrum_metadata_buffer
-                .spectrum_metadata_columns()
-                .into();
-            self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
-            let s = self.spectrum_metadata_buffer.finish_spectrum();
-            self.write_struct_arrays(s)?;
-            self.append_metadata();
-            self.append_key_value_metadata(
-                SPECTRUM_COUNT.into(),
-                Some(self.spectrum_counter().to_string()),
-            );
-            writer = self.archive_writer.take().unwrap().into_inner()?;
-
+                writer.current_entry_mut().unwrap().column_mapping = self
+                    .spectrum_metadata_buffer
+                    .spectrum_metadata_columns()
+                    .into();
+                self.archive_writer = Some(Self::wrap_writer(
+                    writer,
+                    metadata_fields,
+                    encryption_props,
+                )?);
+                let s = self.spectrum_metadata_buffer.finish_spectrum();
+                self.write_struct_arrays(s)?;
+                self.append_metadata();
+                self.append_key_value_metadata(
+                    SPECTRUM_COUNT.into(),
+                    Some(self.spectrum_counter().to_string()),
+                );
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
+            }
             // ----------------------------------------------
 
-            writer
-                .start_for_entry(FileEntry::from(MzPeakArchiveType::SpectrumMetadataScans))
-                .unwrap();
-            writer.current_entry_mut().unwrap().column_mapping =
-                self.spectrum_metadata_buffer.scan_metadata_columns().into();
+            {
+                writer
+                    .start_for_entry(FileEntry::from(MzPeakArchiveType::SpectrumMetadataScans))
+                    .unwrap();
+                writer.current_entry_mut().unwrap().column_mapping =
+                    self.spectrum_metadata_buffer.scan_metadata_columns().into();
 
-            let metadata_fields = self.spectrum_metadata_buffer.scan().schema();
+                let metadata_fields = self.spectrum_metadata_buffer.scan().schema();
 
-            let encryption_props = writer
-                .current_entry()
-                .and_then(|v| self.encryption_properties.get(&v.name))
-                .cloned();
+                let encryption_props = writer
+                    .current_entry()
+                    .and_then(|v| self.encryption_properties.get(&v.name))
+                    .cloned();
 
-            self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
+                self.archive_writer = Some(Self::wrap_writer(
+                    writer,
+                    metadata_fields,
+                    encryption_props,
+                )?);
 
-            let s = self.spectrum_metadata_buffer.finish_scan();
-            self.write_struct_arrays(s)?;
-            self.append_metadata();
-            // The secondaries carry no entity count (issue #1, decision D2): neither their rows nor
-            // their parents is a count a reader can plan from, and the run total stamped here sat on
-            // facets with no rows at all, such as an MS1-only run's precursors.
-            writer = self.archive_writer.take().unwrap().into_inner()?;
-
+                let s = self.spectrum_metadata_buffer.finish_scan();
+                self.write_struct_arrays(s)?;
+                self.append_metadata();
+                // The secondaries carry no entity count (issue #1, decision D2): neither their rows
+                // nor their parents is a count a reader can plan from.
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
+            }
             // ----------------------------------------------
+            {
+                writer
+                    .start_for_entry(FileEntry::from(
+                        MzPeakArchiveType::SpectrumMetadataPrecursors,
+                    ))
+                    .unwrap();
+                writer.current_entry_mut().unwrap().column_mapping = self
+                    .spectrum_metadata_buffer
+                    .precursor_metadata_columns()
+                    .into();
 
-            writer
-                .start_for_entry(FileEntry::from(MzPeakArchiveType::SpectrumMetadataPrecursors))
-                .unwrap();
-            writer.current_entry_mut().unwrap().column_mapping =
-                self.spectrum_metadata_buffer.precursor_metadata_columns().into();
+                let metadata_fields = self.spectrum_metadata_buffer.precursor().schema();
 
-            let metadata_fields = self.spectrum_metadata_buffer.precursor().schema();
+                let encryption_props = writer
+                    .current_entry()
+                    .and_then(|v| self.encryption_properties.get(&v.name))
+                    .cloned();
+                self.archive_writer = Some(Self::wrap_writer(
+                    writer,
+                    metadata_fields,
+                    encryption_props,
+                )?);
 
-            let encryption_props = writer
-                .current_entry()
-                .and_then(|v| self.encryption_properties.get(&v.name))
-                .cloned();
-            self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
-
-            let s = self.spectrum_metadata_buffer.finish_precursor();
-            self.write_struct_arrays(s)?;
-            self.append_metadata();
-            writer = self.archive_writer.take().unwrap().into_inner()?;
-
+                let s = self.spectrum_metadata_buffer.finish_precursor();
+                self.write_struct_arrays(s)?;
+                self.append_metadata();
+                // The secondaries carry no entity count (issue #1, decision D2): neither their rows
+                // nor their parents is a count a reader can plan from.
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
+            }
             // ----------------------------------------------
+            {
+                writer
+                    .start_for_entry(FileEntry::from(
+                        MzPeakArchiveType::SpectrumMetadataSelectedIons,
+                    ))
+                    .unwrap();
+                writer.current_entry_mut().unwrap().column_mapping = self
+                    .spectrum_metadata_buffer
+                    .selected_ion_metadata_columns()
+                    .into();
 
-            writer
-                .start_for_entry(FileEntry::from(MzPeakArchiveType::SpectrumMetadataSelectedIons))
-                .unwrap();
-            writer.current_entry_mut().unwrap().column_mapping =
-                self.spectrum_metadata_buffer.selected_ion_metadata_columns().into();
+                let metadata_fields = self.spectrum_metadata_buffer.selected_ion().schema();
 
-            let metadata_fields = self.spectrum_metadata_buffer.selected_ion().schema();
+                let encryption_props = writer
+                    .current_entry()
+                    .and_then(|v| self.encryption_properties.get(&v.name))
+                    .cloned();
+                self.archive_writer = Some(Self::wrap_writer(
+                    writer,
+                    metadata_fields,
+                    encryption_props,
+                )?);
 
-            let encryption_props = writer
-                .current_entry()
-                .and_then(|v| self.encryption_properties.get(&v.name))
-                .cloned();
-            self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
-
-            let s = self.spectrum_metadata_buffer.finish_selected_ion();
-            self.write_struct_arrays(s)?;
-            self.append_metadata();
-            writer = self.archive_writer.take().unwrap().into_inner()?;
-
+                let s = self.spectrum_metadata_buffer.finish_selected_ion();
+                self.write_struct_arrays(s)?;
+                self.append_metadata();
+                // The secondaries carry no entity count (issue #1, decision D2): neither their rows
+                // nor their parents is a count a reader can plan from.
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
+            }
             // ----------------------------------------------
 
             if !self.wavelength_spectrum_metadata_buffer.is_empty() {
-
                 // ----------------------------------------------
 
                 let mut entry = FileEntry::from(MzPeakArchiveType::WavelengthSpectrumMetadata);
-                entry.column_mapping = self.wavelength_spectrum_metadata_buffer.spectrum_metadata_columns().into();
+                entry.column_mapping = self
+                    .wavelength_spectrum_metadata_buffer
+                    .spectrum_metadata_columns()
+                    .into();
 
-                let encryption_props = self
-                    .encryption_properties
-                    .get(entry.name.as_str())
-                    .cloned();
+                let encryption_props = self.encryption_properties.get(entry.name.as_str()).cloned();
 
                 writer
                     .start_for_entry(entry)
                     .map_err(|e| io::Error::other(e))?;
                 let metadata_fields = self.wavelength_spectrum_metadata_buffer.spectrum().schema();
-                self.archive_writer = Some(ArrowWriter::try_new_with_options(
+                self.archive_writer = Some(Self::wrap_writer(
                     writer,
-                    metadata_fields.clone(),
-                    ArrowWriterOptions::new().with_properties(
-                        Self::spectrum_metadata_writer_props(&metadata_fields, encryption_props),
-                    ),
+                    metadata_fields,
+                    encryption_props,
                 )?);
 
                 // Captured BEFORE `finish_spectrum()` drains the builder, after which `len()` is 0.
@@ -1365,24 +1458,25 @@ impl<
 
                 let arrays = self.wavelength_spectrum_metadata_buffer.finish_spectrum();
                 self.write_struct_arrays(arrays)?;
-                writer = self.archive_writer.take().unwrap().into_inner()?;
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
 
                 // ----------------------------------------------
 
                 let mut entry = FileEntry::from(MzPeakArchiveType::WavelengthSpectrumMetadataScans);
-                entry.column_mapping = self.wavelength_spectrum_metadata_buffer.scan_metadata_columns().into();
+                entry.column_mapping = self
+                    .wavelength_spectrum_metadata_buffer
+                    .scan_metadata_columns()
+                    .into();
 
-                let encryption_props = self
-                    .encryption_properties
-                    .get(entry.name.as_str())
-                    .cloned();
+                let encryption_props = self.encryption_properties.get(entry.name.as_str()).cloned();
 
                 writer
                     .start_for_entry(entry)
                     .map_err(|e| io::Error::other(e))?;
                 let metadata_fields = self.wavelength_spectrum_metadata_buffer.scan().schema();
                 self.archive_writer = Some(ArrowWriter::try_new_with_options(
-                    writer,
+                    SHA512HashingStream::new(writer),
                     metadata_fields.clone(),
                     ArrowWriterOptions::new().with_properties(
                         Self::spectrum_metadata_writer_props(&metadata_fields, encryption_props),
@@ -1393,7 +1487,8 @@ impl<
 
                 let arrays = self.wavelength_spectrum_metadata_buffer.finish_scan();
                 self.write_struct_arrays(arrays)?;
-                writer = self.archive_writer.take().unwrap().into_inner()?;
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
 
                 // ----------------------------------------------
 
@@ -1423,7 +1518,7 @@ impl<
                                 .index_field()
                                 .name()
                                 .to_string(),
-                            &buffers.use_chunked_encoding().copied(),
+                            buffers.use_chunked_encoding(),
                             self.compression,
                             &["wavelength"],
                             encryption_props,
@@ -1434,7 +1529,7 @@ impl<
                     };
                 if let Some((schema, props)) = schema_props {
                     self.archive_writer = Some(ArrowWriter::try_new_with_options(
-                        writer,
+                        SHA512HashingStream::new(writer),
                         schema,
                         ArrowWriterOptions::new().with_properties(props),
                     )?);
@@ -1473,22 +1568,29 @@ impl<
                     let buffers = self.wavelength_spectrum_data_buffers.as_mut().unwrap();
                     buffers.drain_into(self.archive_writer.as_mut().unwrap())?;
 
-                    writer = self.archive_writer.take().unwrap().into_inner()?;
+                    (checksum, writer) = self.take_writer()?.unwrap();
+                    self.digest_summaries.push(checksum);
                 }
             }
 
             if !self.chromatogram_metadata_buffer.is_empty() {
-
                 // ----------------------------------------------
 
                 writer.start_chromatogram_metadata().unwrap();
                 let metadata_fields = self.chromatogram_metadata_buffer.chromatogram().schema();
-                writer.current_entry_mut().unwrap().column_mapping = self.chromatogram_metadata_buffer.chromatogram_metadata_columns().into();
+                writer.current_entry_mut().unwrap().column_mapping = self
+                    .chromatogram_metadata_buffer
+                    .chromatogram_metadata_columns()
+                    .into();
                 let encryption_props = writer
                     .current_entry()
                     .and_then(|v| self.encryption_properties.get(&v.name).cloned());
 
-                self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
+                self.archive_writer = Some(Self::wrap_writer(
+                    writer,
+                    metadata_fields,
+                    encryption_props,
+                )?);
 
                 let s = self.chromatogram_metadata_buffer.finish_chromatogram();
                 self.write_struct_arrays(s)?;
@@ -1501,50 +1603,76 @@ impl<
                     CHROMATOGRAM_DATA_POINT_COUNT.into(),
                     Some(self.chromatogram_data_buffers.point_count().to_string()),
                 );
-                writer = self.archive_writer.take().unwrap().into_inner()?;
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
 
                 // ----------------------------------------------
 
                 let mut entry = FileEntry::from(MzPeakArchiveType::ChromatogramMetadataPrecursors);
-                entry.column_mapping = self.chromatogram_metadata_buffer.precursor_metadata_columns().into();
+                entry.column_mapping = self
+                    .chromatogram_metadata_buffer
+                    .precursor_metadata_columns()
+                    .into();
                 let encryption_props = self.encryption_properties.get(&entry.name).cloned();
 
                 writer.start_for_entry(entry).unwrap();
 
                 let metadata_fields = self.chromatogram_metadata_buffer.precursor().schema();
-                self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
+                self.archive_writer = Some(Self::wrap_writer(
+                    writer,
+                    metadata_fields,
+                    encryption_props,
+                )?);
                 let s = self.chromatogram_metadata_buffer.finish_precursor();
                 self.write_struct_arrays(s)?;
-                writer = self.archive_writer.take().unwrap().into_inner()?;
+
+                // The secondaries carry no entity count (issue #1, decision D2): neither their rows
+                // nor their parents is a count a reader can plan from.
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
 
                 // ----------------------------------------------
 
-                let mut entry = FileEntry::from(MzPeakArchiveType::ChromatogramMetadataSelectedIons);
-                entry.column_mapping = self.chromatogram_metadata_buffer.selected_ion_metadata_columns().into();
+                let mut entry =
+                    FileEntry::from(MzPeakArchiveType::ChromatogramMetadataSelectedIons);
+                entry.column_mapping = self
+                    .chromatogram_metadata_buffer
+                    .selected_ion_metadata_columns()
+                    .into();
                 let encryption_props = self.encryption_properties.get(&entry.name).cloned();
 
                 writer.start_for_entry(entry).unwrap();
 
                 let metadata_fields = self.chromatogram_metadata_buffer.selected_ion().schema();
-                self.archive_writer = Some(Self::wrap_writer(writer, metadata_fields, encryption_props)?);
+                self.archive_writer = Some(Self::wrap_writer(
+                    writer,
+                    metadata_fields,
+                    encryption_props,
+                )?);
 
                 let s = self.chromatogram_metadata_buffer.finish_selected_ion();
                 self.write_struct_arrays(s)?;
-                writer = self.archive_writer.take().unwrap().into_inner()?;
+
+                // The secondaries carry no entity count (issue #1, decision D2): neither their rows
+                // nor their parents is a count a reader can plan from.
+                (checksum, writer) = self.take_writer()?.unwrap();
+                self.digest_summaries.push(checksum);
 
                 // ----------------------------------------------
 
                 writer.start_chromatogram_data().unwrap();
-                let encryption_props = writer.current_entry().and_then(|v| self.encryption_properties.get(&v.name).cloned());
+                let encryption_props = writer
+                    .current_entry()
+                    .and_then(|v| self.encryption_properties.get(&v.name).cloned());
 
                 self.archive_writer = Some(ArrowWriter::try_new_with_options(
-                    writer,
+                    SHA512HashingStream::new(writer),
                     self.chromatogram_data_buffers.schema().clone(),
                     ArrowWriterOptions::new().with_properties(
                         Self::chromatogram_data_writer_props(
                             &self.chromatogram_data_buffers,
                             BufferContext::Chromatogram.index_field().name().to_string(),
-                            &None,
+                            None,
                             self.compression,
                             encryption_props,
                         ),
@@ -1565,8 +1693,9 @@ impl<
                 if let Err(e) = self.copy_metadata_to_index() {
                     log::error!("Failed to copy metadata to file index: {e}");
                 }
-                writer = self.archive_writer.take().unwrap().into_inner()?;
+                (checksum, writer) = self.take_writer()?.unwrap();
                 writer.flush()?;
+                self.digest_summaries.push(checksum);
             }
 
             Ok(writer)
@@ -1660,11 +1789,44 @@ mod test {
     use std::io;
 
     #[test_log::test]
+    fn test_array_sampling_with_transforms() -> io::Result<()> {
+        let mut reader = mzdata::MZReader::open_path("small.mzML")?;
+
+        let override_table_with_slof =
+            ArrayConversionHelper::new(false, true, false, false, true, false)
+                .create_type_overrides(Some(ChunkingStrategy::Delta { chunk_size: 50.0 }));
+
+        let fields = sample_array_types_from_spectrum_source(
+            &mut reader,
+            &override_table_with_slof,
+            Some(&ChunkingStrategy::Delta { chunk_size: 50.0 }),
+            false,
+            None,
+        );
+
+        let mut i = 0;
+        for f in fields.iter().cloned() {
+            if let Some(name) = BufferName::from_field(BufferContext::Spectrum, f.clone()) {
+                if name.array_type == ArrayType::IntensityArray {
+                    assert_eq!(
+                        name.transform,
+                        Some(crate::buffer_descriptors::BufferTransform::NumpressSLOF)
+                    );
+                    i += 1;
+                }
+            }
+        }
+        assert!(i > 0, "No intensity arrays found");
+
+        Ok(())
+    }
+
+    #[test_log::test]
     fn test_array_type_sampling() -> io::Result<()> {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
         let overrides1 = BufferOverrideTable::default();
         let array_types =
-            sample_array_types_from_spectrum_source(&mut reader, &overrides1, None, false);
+            sample_array_types_from_spectrum_source(&mut reader, &overrides1, None, false, None);
 
         assert_eq!(array_types.len(), 3);
         let mz_buffer = BufferName::new(
@@ -1692,8 +1854,9 @@ mod test {
         let array_types = sample_array_types_from_spectrum_source(
             &mut reader,
             &overrides1,
-            Some(ChunkingStrategy::Delta { chunk_size: 50.0 }),
+            Some(ChunkingStrategy::Delta { chunk_size: 50.0 }).as_ref(),
             false,
+            None,
         );
 
         assert_eq!(array_types.len(), 6);
@@ -1720,7 +1883,7 @@ mod test {
 
         let mut it = StreamingSpectrumIterator::new(reader.iter());
 
-        let array_types = sample_array_types_from_spectrum_stream(&mut it, &overrides1, None);
+        let array_types = sample_array_types_from_spectrum_stream(&mut it, &overrides1, None, None);
         assert_eq!(array_types.len(), 3);
         for f in array_types {
             if let Some(name) = BufferName::from_field(BufferContext::Spectrum, f.clone()) {
@@ -1781,14 +1944,18 @@ mod test {
 
         let mut zip_writer = writer.finish_parquet()?;
 
+        // Write directly into a member file, but this circumvents the automatic checksum calculation
         zip_writer.start_other(&"example.config")?;
         zip_writer.write_all(b"<config><foo>some XML gobbledygook</foo></config>")?;
 
+        // Create a new entry and add it directly from another `Read` implementer, which *does*
+        // automatically checksum
         let job_entry = FileEntry::new(
             "job.sig".into(),
             crate::archive::EntityType::Other("other".into()),
             crate::archive::DataKind::Proprietary,
         );
+
         zip_writer.add_file_from_read(
             &mut b"some binary sludge".as_slice(),
             None::<&String>,
@@ -1835,6 +2002,20 @@ mod test {
             );
         }
 
+        let (state, failed) = new_reader.check_archive_integrity()?;
+        assert!(
+            state == None,
+            "Overall validation status failed: {failed:?}. A file should be missing a checksum"
+        );
+        assert_eq!(
+            failed.len(),
+            1,
+            "Failed file list is not empty: {failed:?}. Only one file should have failed because of missing checksum"
+        );
+        let (failed_entry, chk) = &failed[0];
+        assert!(chk.is_some());
+        assert!(failed_entry.checksum.is_none());
+        assert_eq!(failed_entry.name, "example.config");
         Ok(())
     }
 
@@ -1892,6 +2073,15 @@ mod test {
             let arrays = spec.raw_arrays().unwrap();
             assert!(arrays.has_array(&ArrayType::WavelengthArray));
         }
+        let (state, failed) = new_reader.check_archive_integrity()?;
+        assert!(
+            state.unwrap(),
+            "Overall validation status failed: {failed:?}"
+        );
+        assert!(
+            failed.is_empty(),
+            "Failed file list is not empty: {failed:?}"
+        );
         Ok(())
     }
 
@@ -1957,11 +2147,15 @@ mod test {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
         let mut builder = MzPeakWriter::<fs::File>::builder();
 
-        let spectrum_overrides = ArrayConversionHelper::new(false, true, false, true, true)
+        let spectrum_overrides = ArrayConversionHelper::new(false, true, false, true, true, false)
             .create_type_overrides(Some(ChunkingStrategy::NumpressLinear { chunk_size: 50.0 }));
+
         for (k, v) in spectrum_overrides.iter() {
-            builder = builder.add_spectrum_array_override(k.clone(), v.clone())
+            builder = builder
+                .add_spectrum_array_override(k.clone(), v.clone())
+                .add_spectrum_peak_array_override(k.clone(), v.clone())
         }
+
         builder = builder
             .shuffle_mz(true)
             .chunked_encoding(Some(ChunkingStrategy::NumpressLinear { chunk_size: 50.0 }))
@@ -1976,6 +2170,13 @@ mod test {
             v.buffer_priority
                 .is_some_and(|v| matches!(v, BufferPriority::Primary))
         }));
+
+        let peak_overrides = writer
+            .get_or_create_spectrum_peak_writer()
+            .unwrap()
+            .buffers()
+            .overrides();
+        eprintln!("{peak_overrides:?}");
 
         assert!(
             writer

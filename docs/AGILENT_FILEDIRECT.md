@@ -1,5 +1,15 @@
 # Agilent Q-TOF `.d` — file-direct grid-TOF reader
 
+> **Layout note (0.14, vendoring exit item 1):** the lane now writes the reference implementation's
+> chunk grid — one `MS:1003826` row per scan under the scan's own `MS:1003825 [c0, c1, 1]` model holding
+> the vendor's bin ordinals — instead of the `tof_index` point column with `tof_c0`/`tof_c1`/
+> `tof_calibration_id` columns and the `tof_calibration` block described below. The per-`CalibrationID`
+> polynomial rows now sit in the `agilent_calibration` index block (`calibrations`, the refined-m/z
+> formula, `max_bare_grid_ppm`), selected per spectrum by the `agilent_calibration_id` parameter; a
+> reader that wants MassHunter's polynomial-refined m/z evaluates them, every other reader decodes
+> the bare quadratic grid the rows declare. The measurements below were taken on the point layout.
+
+
 > **SUPERSEDED (2026-09-04):** describes a CLI/design that no longer exists; kept for history.
 > Current status: `docs/PLATFORM_SUPPORT.md` and the review ledger
 > (`scratchpad/review2/review-ledger.html`).

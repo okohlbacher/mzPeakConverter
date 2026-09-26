@@ -203,19 +203,16 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   `precursor_isolationwindow_may`) and the validator say MAY. That is the spec's call, and every
   corpus row conforms under either reading. PSI's DIA recommendation v1.0 (§3.4) marks full-range
   acquisitions (MSe/HDMSe, AIF, bbCID, MSall) with MS:1003159 "no isolation". Decision: write the
-  marker beside the acquisition-range numbers the lanes already write. mzdata 58e509bc07 (unreleased,
-  0.66.7) adds `IsolationWindowState::NoIsolation`, so no side channel is needed: the vendored writer
-  gains a `NoIsolation` arm that keeps target and offsets and appends MS:1003159 (without it the bump
-  fails E0004 in `writer/visitor.rs`), the reader maps the term back, and the Waters lane sets the
-  flag. Order matters on an mzML round trip: upstream's reader drops offsets that follow the marker.
-- **The mzdata git fork (`[patch.crates-io]`).** `Cargo.toml` pins `mzdata =0.66.6` to
-  `okohlbacher/mzdata@1d53971` (v0.66.6 plus the 7-line isolation-offset reader fix, branch
-  `fix/isolation-window-offsets-before-target`). Upstream merged it as mobiusklein/mzdata#58 on
-  2026-09-10, but crates.io still tops out at 0.66.6, so every fresh build (CI, the vendor jobs, the
-  Flash box) clones the fork and the lockfile carries `git+` sources without checksums. The bump needs
-  the `NoIsolation` arm above; then pin `=0.66.7`, delete the patch block and keep
-  `tests/isolation_window_offset_order.rs`. The zero-lower-offset sweep is done: 0 collapsed offsets
-  in 2,669,071 corpus precursor rows.
+  marker beside the acquisition-range numbers the lanes already write. mzdata 0.66.7 (linked since
+  2026-09-23) has `IsolationWindowState::NoIsolation`, so no side channel is needed. Still to do: the
+  vendored writer's `NoIsolation` arm currently writes nulls (upstream's behaviour, a placeholder — no
+  lane sets the flag yet); the designed arm keeps target and offsets and appends MS:1003159, the
+  reader maps the term back, and the Waters lane sets the flag. Order matters on an mzML round trip:
+  upstream's reader drops offsets that follow the marker.
+- ~~**The mzdata git fork (`[patch.crates-io]`).**~~ Done 2026-09-23: mzdata `=0.66.7` from
+  crates.io, patch block deleted, `tests/isolation_window_offset_order.rs` kept and green against the
+  released crate. (The zero-lower-offset sweep had already found 0 collapsed offsets in 2,669,071
+  corpus precursor rows.)
 - **Not in the ledger — the Thermo target-only isolation-window guard is interim (2026-09-10).**
   When a scan has no `MS<n> Isolation Width` trailer, thermorawfilereader's `Lib.cs` builds its window
   from the scan filter's width, halved twice, and inverted when the filter reports a negative width.
@@ -312,6 +309,122 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   - D15: `transformations` lists what a conversion applied, counted by the writer, not what it was configured to do (135 corpus archives change on rebuild).
   - Harmonization (2026-09-11): every chromatogram time is stored in minutes, on every lane; a time recorded in seconds or milliseconds (ProteoWizard's mzML chromatograms, HyStar's device traces) is divided into minutes before the schema is sampled and declared as `chromatogram-time-to-minutes`. `--rt` keeps reading a column's declared unit, for the seconds columns of mzML-lane archives built by 0.11.5 and earlier (none published).
   - Harmonization (2026-09-11): a default archive embeds no raw signal file of a BAF, Agilent MassHunter or Waters MassLynx directory (`analysis.baf*`, `*.ami`, `ser`/`fid`; `MSProfile.bin`, `MSPeak.bin`, `IMSFrame.bin`; `_FUNC*.DAT/.IDX`, `_func*.cdt/.ind`), matched by file name in any case; kept by decision: `MSScan.bin`, `MSMassCal.bin`, `*.mcf`, `_FUNC*.STS`, `_CHRO*`, `_mob/`, and the timsTOF `*_bin` on the f64 TDF/TSF lanes.
+
+## Vendoring exit — `vendor/mzpeak_prototyping` (opened 2026-09-23)
+
+Owner decision: *"we will move away from vendored libraries asap."* **Guiding principle (owner, 2026-09-23):
+converge on the upstream code — mzdata and mzpeak_prototyping — to the extent possible.** When a choice
+exists, take upstream's layout, cutter, encodings and API; a deviation must be measured, minimal, and named
+as such (a candidate for an upstream proposal, not a permanent fork). Evidence and the full catalogue live
+in `~/Claude/mzPeak/output/vendor-audit-2026-09-23/` (`VENDOR-AUDIT-mzpeak_prototyping.md`,
+`upstream-grid-writer-assessment.md`, `delta-categorization.md`). State: base `589d6e3`, 18 commits behind
+upstream `eb08ba0`, ~4,830 lines / 268 hunks of local delta in 23 of 30 files; 61 distinct changes
+(31 bug fixes, 14 upstreamable features, 15 converter-specific, 9 already superseded, 4 churn groups).
+**Merging upstream HEAD is not viable** — the residual would be 516 hunks, larger than the delta — so the
+route is: adopt a clean `eb08ba0` (needs mzdata 0.67.1 + `cv`), re-apply only what is not superseded or
+churn, in this order. Each item below is explored and decided one at a time.
+
+1. **Point-layout grid → upstream chunk-layout grid** (~1,150 lines; the hard residual). SciEX and
+   Agilent-via-msconvert sqrt grids, the Shimadzu Int64 lattice and the 0.12.x timsTOF path write an
+   integer point column tagged `MS:1003824/5` with `mzpeak:transform_params` (+ per-spectrum
+   `tof_c0/c1`). Upstream's grid is chunk-layout only; a spec-conformant reader misreads ours. Writing,
+   m/z-less summaries and above all range queries cannot live outside the library.
+   **Tested 2026-09-23** (`point-to-chunk-grid-test-2026-09-23.md` + `chunk_grid_proto.py` in the audit
+   directory; Shimadzu Blind/HEK, Agilent FM_01_Pos, Shimadzu DIA 20 ng). Outcome: the **sqrt/TOF grids
+   migrate** — bit-exact, decoded by the vendored reader (Blind/HEK round trips 100 % identical), size
+   −7.5 … +6 % with one chunk per spectrum (+2.5 % on the 1.1 GB Agilent file) but +13 … +30 % with
+   upstream's 50-Th default, so the chunk width must be per lane; negative indices from a run-wide fit
+   need per-chunk re-anchoring (≤ 7e-10 ppm) and bounds must be the model at the stored indices. The
+   **1e-9 lattice centroids cannot move as-is**: 2³² steps = 4.29 Th caps every chunk, +18.7 % on DIA,
+   +126 … +132 % on sparse Blind; needs 64-bit `indices` upstream (ask Joshua), or accept the cost, or drop
+   the lattice (+64 … +91 %). Also found: a chunk facet without a Parquet page index reads back as EMPTY
+   spectra with exit 0 (fix the reader regardless); ungriddable spectra need `Basic` rows, not delta.
+   Closeness to upstream (measured): the exact sqrt chunk grid is literally mzdata's own `MS:1003825
+   [intercept, slope]` Param convention per spectrum, and upstream's writer recovers our indices 100 %
+   from the values + that Param (Blind/HEK); a run-wide fit loses its negative indices to `clamp_u32`
+   (Agilent: 1.15 M points → 0, silently), and the lattice saturates (0.4–5 % of points survive) because
+   upstream holds one model per spectrum. Upstream's own fit (F, ≤ 1e-6 Da, lossy 0.004 ppm) is −10.6 %
+   on DIA / −6.4 % HEK / +56 % Blind. **Decided (owner, 2026-09-23): go with upstream.** The sqrt/TOF
+   lanes (Shimadzu profile, Agilent-via-msconvert, SciEX) move onto upstream's `ChunkingStrategy::Grid`
+   with the exact per-spectrum model attached as an `MS:1003825` Param (mzdata's convention); the 1e-9
+   lattice is dropped — Shimadzu centroids take upstream's grid fit (F) / default. Chunk width per lane,
+   spectrum-sized for profile/TOF. Requires the re-vendor to `eb08ba0` first (see the plan below).
+   `src/shimadzu_grid.rs`, `src/mz_lattice.rs`, `src/tof_grid.rs`, the `tof_index` schemas and the MZP
+   `tof_c0/c1` columns retire with it; `tof_calibration`/`mz_calibration` index blocks go.
+   **DONE (2026-09-23, unreleased → 0.14.0).** All four point-grid lanes write upstream's chunk grid:
+   mzML `--tof-grid`, native SCIEX and the Shimadzu profile facet attach the exact per-spectrum
+   `MS:1003825 [c0, c1, 1]` model to the m/z array (`sqrt_grid_arrays`; negative run-wide indices
+   re-anchored per spectrum; one chunk per spectrum), `--agilent-grid` the same with the vendor's
+   polynomial rows moved to an `agilent_calibration` block; lattice centroids (mzML lane when
+   detected, Shimadzu native) take upstream's fitted `MS:1003824` grid (50-Th chunks, ≤ 1e-6 Da,
+   declared `grid-fit:1e-6Da`). Deleted: `tof_index_field`/`tof_index_peak_schema`/`tof_grid_block`/
+   `MzReconstruction`, the lattice half of `mz_lattice.rs` + `shimadzu_grid.rs`, `VendorHints`'
+   point-layout fields, `write_spectrum_with_peak_arrays` in the vendored writer,
+   `tests/shimadzu_lattice_peaks.rs`. KEPT on purpose: `tof_grid.rs` / `shimadzu_grid.rs`'s fits —
+   they recover the VENDOR lattice (small indices, −7.5 … +6 %), where upstream's slot fit gives
+   +52 … +94 %; converter-side model providers, not library deviations. The vendored reader keeps the
+   0.9–0.13 point-grid decode path (`reconstruct_grid_mz`, `LinearMz`/`SqrtMzFromTof`) for one
+   release so existing archives read; retire it once the corpus is rebuilt. Verified: SWATH
+   `--tof-grid` 201/201 spectra, worst 6.4e-10 ppm vs 0.13.0; the Shimadzu/SCIEX Windows lanes
+   compile-checked only until the box build.
+
+**Plan (owner, 2026-09-23):** (a) fix the empty-facet reader bug (item below); (b) re-vendor
+`vendor/mzpeak_prototyping` to a clean `eb08ba0` (mzdata 0.67.1 + `cv`), re-applying only the A/B/C
+hunks of `delta-categorization.md` (D+E vanish), corpus as the semantic oracle; (c) integrate item 1 on
+top; (d) commit, push, tag — an output-changing release (Shimadzu/Agilent/SciEX archives change layout,
+SHA512 file-index checksums and term markers arrive with upstream) → corpus rebuild after.
+
+- **TDF MzCalibration ModelType 2 (2026-09-26).** Converter side fixed for 0.14.0 (quadratic +
+  declared bound; mzdata lanes on the chord). Open: (a) upstream mzdata `MzCalibrationModel2::try_from`
+  accepts ModelType 2 and reads C3/C4 as cubic/shift — report with the formula and the OpenTIMS golden
+  (item in the Joshua message); (b) a grid model that carries the calibrant polynomial (new CURIE,
+  Joshua's call) so ModelType-2 runs can be exact; (c) a validator rule: decoded m/z outside
+  `MzAcqRangeLower/Upper` (or the scan window) is an error — it would have caught 0.13.0's SBA415 at once;
+  (d) SDK-verify SBA415 itself (`MZPC_TDF_SDK_GOLDEN` on the box) — only the OpenTIMS file is SDK-pinned.
+- **Message to Joshua Klein — due 2026-09-23.** Draft: `~/Claude/mzPeak/output/vendor-audit-2026-09-23/
+  MESSAGE-to-Joshua-2026-09-23.md`. Six findings, all verified in code or data: (1) `clamp_u32`
+  saturates silently — a run-wide sqrt fit's negative indices (Agilent FM_01_Pos: 1.15 M points below
+  `c0²`) become index 0, a 1e-9 lattice beyond 2³² becomes `u32::MAX−1`, no error; (2) is
+  `indices: uint64` acceptable? (the exact-lattice case his grid cannot hold); (3) single-point chunks
+  get `chunk_end = 0.0` (rows 131/294 of his own `diaPASEF.grid.mzpeak`; invisible to his range
+  predicate); (4) grid-row bounds should be the model at the stored index, not the input value; (5) the
+  Python reader (`grid.py:136-152`) still has the pre-#34 parameter order; (6) mzdata 0.67.1
+  `convert_f6_wide` has a sign-flipped discriminant (scalar path unaffected). Plus the one proposal: a
+  `WriterProperties` hook for BSS with dictionary off (measured −9.6 % vs his default on 2485; his
+  DELTA intent on index lists would be +21.4 %).
+2. **0.12.x ims-chunked TOF-boundary layout** (~500 lines). Still the intermediate the TDF lane writes
+   before `src/tdf_grid.rs` rewrites it, and `--no-ims-grid`'s final form. Retire by emitting upstream's
+   `ChunkingStrategy::Grid` natively with the exact `MzCalibration`/`TimsCalibration` models attached as
+   array params — kills this and the rewrite pass together.
+   **DONE (2026-09-24, unreleased → 0.14.0).** `bruker_native::ims_grid_arrays` builds each frame's
+   m/z / 1/K0 through upstream's `TimsTofMzGrid2` / `TimsTofTimsLinearGrid2` models (Params on the
+   arrays; per-frame `TdfMzCalibrationRow::grid_parameters(t1, t2)`, `TimsMobilityCalibration::
+   grid_parameters()`); `write_ims_compact_archive_impl` uses `ChunkingStrategy::Grid` + tolerance-0
+   policies on both facets, the schema sampled from the first frame. `src/tdf_grid.rs`, the TOF
+   layout, the flat layout, `--no-ims-grid`/`--ims-grid`/`--grid-encoding` deleted; the SDK lane takes
+   the same path (compile-checked only until the box/CI build). Inversion `to_index(from_index(k))`
+   verified on every bin of 2485 and on the C2 ≠ 0 goldens. Remaining vendored deviations this leaves
+   unused: `TofMzBoundary`/`add_raw_mz_boundary` (C7) and the chunk-facet `tof_chunk_*` decode path
+   — reader side stays one release for 0.12.x archives, writer side can go (item 6).
+3. **MZP provisional CV** (~150 lines). mzdata's `CURIE` cannot carry a foreign prefix and its `Display`
+   panics on `Unknown`; the serialisers are inside the crate. Retire MZP: `tof_c0/c1` are unnecessary
+   under the grid layout, SciEX/Agilent can write them as name-only userParams, request PSI terms for
+   the two mobility-limit params (MZP:1000006/7). The honest upstream fix is
+   `ControlledVocabulary::Other` in mzdata.
+4. **Row-group and flush sizing.** The 16 MB row-group cap on every layout and the flush thresholds shape
+   every point-layout archive's bytes; needs `WriteBatchConfig` knobs upstream. Until then a switch
+   changes every archive's row groups.
+5. **One-setter hooks upstream:** install a custom peak schema, a `spectra()` accessor, a peaks-facet
+   stream sampler, one `pub use` (`EntryMetadataDerivedFromData`). Trivial PRs.
+6. **Byte-comparability across the switch.** 25 output-affecting bug fixes / features of ours are in the
+   published corpus; each must land upstream or archives change on the switch. Largest movers: the
+   BSS/dictionary-off encoding policy (measured: upstream's DELTA intent would be +21 % on the grid
+   facet) and the row-group sizing (item 4). Also to decide once: parquet 57 (upstream) vs 59 (ours).
+
+Also found on the way, to report upstream: single-point chunks get `chunk_end = 0.0` (in Joshua's own file;
+invisible to his range predicate); the Python reader still has the pre-#34 parameter order; mzdata 0.67.1's
+`convert_f6_wide` has a sign-flipped discriminant; two panics on malformed grids; upstream's `mini_peak.rs`
+chunked path repeats our old `size = chunks.len()` point-count bug.
 
 ## History
 

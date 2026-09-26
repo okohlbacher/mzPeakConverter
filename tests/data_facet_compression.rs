@@ -266,10 +266,21 @@ fn point_layout_float_mz_is_byte_stream_split() {
     }
     let _ = std::fs::remove_file(&point);
 
-    // The mzML `--tof-grid` lane builds its writer separately: the f64 column beside its gridded centroids.
+    // The mzML `--tof-grid` lane builds its writer separately: its gridded centroids are chunk-grid
+    // rows whose index lists are byte-stream-split without a dictionary.
     let swath = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
     let gridded = convert(swath, "tof-grid-mz", &["--tof-grid", "on"]);
-    assert_bss(&gridded, "spectra_peaks.parquet");
+    // (The bounds keep the writer's dictionary encoding, as on every chunk facet — see below.)
+    for column in ["chunk.mz_grid.indices.list.item"] {
+        let row_groups = column_encodings(&gridded, "spectra_peaks.parquet", column);
+        assert!(!row_groups.is_empty(), "no row group");
+        for encodings in row_groups {
+            assert!(
+                encodings.contains(&Encoding::BYTE_STREAM_SPLIT) && !encodings.iter().any(is_dictionary),
+                "spectra_peaks {column} must be BYTE_STREAM_SPLIT without a dictionary (encodings: {encodings:?})"
+            );
+        }
+    }
     let _ = std::fs::remove_file(&gridded);
 
     // Chunk facets are outside the rule, so a chunked archive keeps its bytes.

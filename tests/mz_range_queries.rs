@@ -1,9 +1,10 @@
 //! m/z range queries through the vendored reader return exactly the points of a full read filtered
 //! in memory — on the three facet kinds where they did not, or could not be trusted to:
 //!
-//! * an INTEGER-LATTICE point facet (`point.tof_index` Int64, `LinearMz`, NULL `point.mz`, one
-//!   off-lattice spectrum keeping real f64 m/z): returned nothing but the off-lattice spectrum,
-//!   because the m/z predicate pushed into Parquet drops NULLs and the grid column was never
+//! * a FITTED LINEAR-GRID chunk facet (a lattice mzML's centroids: `MS:1003826` rows under
+//!   per-spectrum `MS:1003824` models, real m/z bounds). Through 0.13 this input took an
+//!   integer-lattice point facet whose m/z predicate returned nothing but its one f64 spectrum,
+//!   because the predicate pushed into Parquet dropped NULLs and the grid column was never
 //!   projected. (The sqrt-grid twin of this lives in `tof_grid_facets.rs`, which owns that fixture.)
 //! * a CHUNKED m/z facet: the answer was right but the chunk page index never existed — the reader
 //!   looked up `chunk.mz_chunk_values_chunk_start`, a column no archive has. It is looked up by the
@@ -43,13 +44,14 @@ fn everything() -> SimpleInterval<f64> {
 }
 
 #[test]
-fn an_mz_window_over_an_integer_lattice_facet_matches_the_filtered_full_read() {
+fn an_mz_window_over_a_fitted_linear_grid_facet_matches_the_filtered_full_read() {
     let dir = scratch("lattice");
     let archive = dir.join("lattice.mzpeak");
     convert(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/mz_lattice_1e9.mzML"), &archive, &[]);
     let mut reader = MzPeakReader::new(&archive).unwrap();
     let n = reader.len() as u64;
-    // 12 spectra of 90 peaks over 120-1900 Da; spectrum 7 is off the lattice (real f64 m/z).
+    // 12 spectra of 90 peaks over 120-1900 Da; spectrum 7 carries one apex off the 1e-9 lattice
+    // (it fits the linear grid like the others — the window must still hit it).
     for window in [Some((400.0, 1200.0)), None] {
         let mut want = Vec::new();
         let mut off_lattice = 0;

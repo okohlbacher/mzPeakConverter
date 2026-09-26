@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, path::PathBuf};
 
 use crate::buffer_descriptors::BufferTransform;
+use crate::grid::GridPolicyTable;
 use crate::peak_series::{INTENSITY_UNITS, ION_MOBILITY_ARRAY_TYPES, ION_MOBILITY_UNITS};
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
@@ -32,10 +33,10 @@ pub struct WriteBatchConfig {
 }
 
 pub struct SpectrumFieldVisitors {
-    pub(crate) spectrum_fields: Vec<SpectrumVisitor>,
-    pub(crate) spectrum_selected_ion_fields: Vec<Box<dyn StructVisitorBuilder<SelectedIon>>>,
-    pub(crate) spectrum_scan_fields: Vec<Box<dyn StructVisitorBuilder<ScanEvent>>>,
-    pub(crate) spectrum_activation_fields: Vec<Box<dyn StructVisitorBuilder<Activation>>>,
+    pub spectrum_fields: Vec<SpectrumVisitor>,
+    pub spectrum_selected_ion_fields: Vec<Box<dyn StructVisitorBuilder<SelectedIon>>>,
+    pub spectrum_scan_fields: Vec<Box<dyn StructVisitorBuilder<ScanEvent>>>,
+    pub spectrum_activation_fields: Vec<Box<dyn StructVisitorBuilder<Activation>>>,
 }
 
 /// A builder for mzPeak writers
@@ -125,8 +126,24 @@ impl MzPeakWriterBuilder {
     /// if `Some`, otherwise use the point list representation.
     pub fn chunked_encoding(mut self, value: Option<ChunkingStrategy>) -> Self {
         log::debug!("Setting spectrum data encoding: {value:?}");
-        self.chunked_encoding = value;
+        self.chunked_encoding = value.clone();
         self.spectrum_arrays = self.spectrum_arrays.chunking_strategy(value);
+        self
+    }
+
+    pub fn add_grid_policies(mut self, policies: GridPolicyTable) -> Self {
+        if self.chunked_encoding.is_none() {
+            panic!("Cannot register grid policies for spectra when not using the chunked layout for spectra")
+        }
+        self.spectrum_arrays = self.spectrum_arrays.grid_policies(policies);
+        self
+    }
+
+    pub fn add_peak_grid_policies(mut self, policies: GridPolicyTable) -> Self {
+        if self.peaks_chunked_encoding.is_none() {
+            panic!("Cannot register grid policies for spectrum peaks when not using the chunked layout for spectrum peaks")
+        }
+        self.spectrum_peak_arrays = self.spectrum_peak_arrays.grid_policies(policies);
         self
     }
 
@@ -134,7 +151,7 @@ impl MzPeakWriterBuilder {
     /// if `Some`, otherwise use the point list representation.
     pub fn chromatogram_chunked_encoding(mut self, value: Option<ChunkingStrategy>) -> Self {
         log::debug!("Setting chromatogram data encoding: {value:?}");
-        self.chromatogram_chunked_encoding = value;
+        self.chromatogram_chunked_encoding = value.clone();
         self.chromatogram_arrays = self.chromatogram_arrays.chunking_strategy(value);
         self
     }
@@ -147,8 +164,28 @@ impl MzPeakWriterBuilder {
         to: impl Into<BufferName> + Clone,
     ) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.add_override(from.clone(), to.clone());
+        self
+    }
+
+    /// Add a rule to store the `from` buffer as the type given by the `to` buffer name for the
+    /// spectrum peak data.
+    pub fn add_spectrum_peak_array_override(
+        mut self,
+        from: impl Into<BufferName> + Clone,
+        to: impl Into<BufferName> + Clone,
+    ) -> Self {
         self.spectrum_peak_arrays = self.spectrum_peak_arrays.add_override(from, to);
         self
+    }
+
+    /// Get the set of [`ArrayType`] mapped to [`Field`] for mass spectra
+    pub fn spectrum_array_types(&self) -> Vec<ArrayType> {
+        self.spectrum_arrays.covered_array_types()
+    }
+
+    /// Get the set of [`ArrayType`] mapped to [`Field`] for peaks in mass spectra
+    pub fn spectrum_peaks_array_types(&self) -> Vec<ArrayType> {
+        self.spectrum_peak_arrays.covered_array_types()
     }
 
     /// Shuffle m/z arrays using [`Encoding::BYTE_STREAM_SPLIT`] encoding (or not)
@@ -197,7 +234,7 @@ impl MzPeakWriterBuilder {
 
     /// Add columns to the spectrum data file's schema to support serializing `T`
     pub fn add_spectrum_peak_type<T: ToMzPeakDataSeries>(mut self) -> Self {
-        self.spectrum_arrays = self.spectrum_arrays.add_peak_type::<T>();
+        self.spectrum_peak_arrays = self.spectrum_peak_arrays.add_peak_type::<T>();
         self
     }
 
@@ -213,6 +250,8 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    /// Configure how many rows to buffer in memory before compression and packing into data pages
+    /// in-memory, which in turn may cause the in-memory row group to be flushed to disk
     pub fn write_batch_size(mut self, value: Option<usize>) -> Self {
         self.write_batch_config.write_batch_size = value;
         self
@@ -330,6 +369,10 @@ impl MzPeakWriterBuilder {
         self.spectrum_arrays.overrides()
     }
 
+    pub fn spectrum_peak_overrides(&self) -> BufferOverrideTable {
+        self.spectrum_peak_arrays.overrides()
+    }
+
     pub fn chromatogram_overrides(&self) -> BufferOverrideTable {
         self.chromatogram_arrays.overrides()
     }
@@ -347,6 +390,14 @@ impl MzPeakWriterBuilder {
         self.encryption_properties.insert(name, encryption_properties);
         self
     }
+
+    pub fn view_spectrum_arrays(&self) -> &ArrayBuffersBuilder {
+        &self.spectrum_arrays
+    }
+
+    pub fn view_spectrum_peak_arrays(&self) -> &ArrayBuffersBuilder {
+        &self.spectrum_peak_arrays
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -356,6 +407,7 @@ pub struct ArrayConversionHelper {
     intensity_i32: bool,
     ion_mobility_f32: bool,
     intensity_slof: bool,
+    ion_mobility_grid: bool,
 }
 
 impl ArrayConversionHelper {
@@ -365,6 +417,7 @@ impl ArrayConversionHelper {
         intensity_i32: bool,
         ion_mobility_f32: bool,
         intensity_slof: bool,
+        ion_mobility_grid: bool,
     ) -> Self {
         Self {
             mz_f32,
@@ -372,6 +425,7 @@ impl ArrayConversionHelper {
             intensity_i32,
             ion_mobility_f32,
             intensity_slof,
+            ion_mobility_grid,
         }
     }
 
@@ -417,8 +471,9 @@ impl ArrayConversionHelper {
             }
         }
 
-        let intensity_transform = if chunked_encoding.is_some() {
-            self.intensity_slof.then_some(BufferTransform::NumpressSLOF)
+        let intensity_transform = if chunked_encoding.is_some() && self.intensity_slof {
+            log::debug!("Using intensity short logged float");
+            Some(BufferTransform::NumpressSLOF)
         } else {
             None
         };
@@ -484,6 +539,14 @@ impl ArrayConversionHelper {
                 }
             }
         }
+
+        let ion_mobility_transform = if self.ion_mobility_grid && chunked_encoding.is_some() {
+            log::debug!("Using ion mobility grid encoding transform in override table");
+            Some(BufferTransform::GridEncoding)
+        } else {
+            None
+        };
+
         if self.ion_mobility_f32 {
             for unit in ION_MOBILITY_UNITS {
                 for t in ION_MOBILITY_ARRAY_TYPES {
@@ -499,11 +562,65 @@ impl ArrayConversionHelper {
                             t.clone(),
                             BinaryDataArrayType::Float32,
                         )
+                        .with_unit(unit)
+                        .with_transform(ion_mobility_transform),
+                    );
+                }
+            }
+        } else {
+            for unit in ION_MOBILITY_UNITS {
+                for t in ION_MOBILITY_ARRAY_TYPES {
+                    overrides.insert(
+                        BufferName::new(
+                            BufferContext::Spectrum,
+                            t.clone(),
+                            BinaryDataArrayType::Float64,
+                        )
                         .with_unit(unit),
+                        BufferName::new(
+                            BufferContext::Spectrum,
+                            t.clone(),
+                            BinaryDataArrayType::Float64,
+                        )
+                        .with_unit(unit)
+                        .with_transform(ion_mobility_transform),
                     );
                 }
             }
         }
         overrides.into()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_array_conversion_builder() {
+        let mut builder = ArrayConversionHelper::new(false, false, false, false, false, false);
+        let mapper = builder.create_type_overrides(None);
+
+        let from = BufferName::new(BufferContext::Spectrum, ArrayType::MZArray, BinaryDataArrayType::Float32);
+        let to = mapper.map(&from);
+        assert_eq!(from.buffer_format, to.buffer_format);
+        assert_eq!(from.array_type, to.array_type);
+        assert_eq!(to.dtype, BinaryDataArrayType::Float64);
+
+        builder.intensity_slof = true;
+        builder.intensity_f32 = true;
+        let mapper = builder.create_type_overrides(Some(ChunkingStrategy::Basic { chunk_size: 50.0 }));
+        let from = BufferName::new(BufferContext::Spectrum, ArrayType::MZArray, BinaryDataArrayType::Float32);
+        let to = mapper.map(&from);
+        assert_eq!(from.buffer_format, to.buffer_format);
+        assert_eq!(from.array_type, to.array_type);
+        assert_eq!(to.dtype, BinaryDataArrayType::Float64);
+
+        let from = BufferName::new(BufferContext::Spectrum, ArrayType::IntensityArray, BinaryDataArrayType::Float32);
+        let to = mapper.map(&from);
+        assert_eq!(from.buffer_format, to.buffer_format);
+        assert_eq!(from.array_type, to.array_type);
+        assert_eq!(to.dtype, BinaryDataArrayType::Float32);
+        assert_eq!(to.transform, Some(BufferTransform::NumpressSLOF));
     }
 }

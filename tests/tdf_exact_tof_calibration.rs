@@ -1,4 +1,4 @@
-//! timsTOF ims-compact: exact per-frame `tof_c0`/`tof_c1` on a sqrt-linear vendor calibration
+//! timsTOF ims-compact: every grid row carries the vendor's exact ModelType-1 calibration
 //! (corpus-gated; ~5 s on PXD059079 2485.d, dominated by the conversion itself).
 //!
 //! 2485.d has a single `MzCalibration` row of ModelType 1 with `C2 = C3 = C4 = dC2 = 0`, so the
@@ -10,31 +10,31 @@
 //!   m/z    = ((t_ns − C0)·√C1_eff / 1e6)²
 //! ```
 //!
-//! is EXACTLY `m/z = (c0 + c1·tof)²` per frame. The default (native timsrust) lane must:
-//!   * declare it in `ims_calibration` (`per_spectrum`, `exact_per_spectrum`; `a`/`b` and
-//!     `exact: false` kept for legacy readers);
-//!   * carry the pair on EVERY frame as `spectra_metadata` columns `…_tof_c0` / `…_tof_c1`;
-//!   * name `tof` as the archive's `lossless` column, ship a non-zero `total_ion_current` /
-//!     `base_peak_intensity` on every MS1 row, and synthesize TIC/BPC chromatograms that are
-//!     bit-equal to those columns (the archive-level pin of invariants 2/3);
-//!   * reproduce the vendor formula from the pair to 1e-12 relative (50 frames × 10 tof values,
-//!     each with its OWN `Frames.T1`), while the run-wide chord is > 1 ppm off somewhere;
+//! is EXACTLY `m/z = (c0 + c1·tof)²` per frame. Since 0.14 the native lane writes the reference
+//! implementation's chunk grid natively (no 0.12.x TOF layout, no rewrite pass): each frame's rows
+//! carry the row's 7 parameters at the FRAME's `T1`/`T2` (`mz_grid`), evaluated by the reader as
+//! mzdata does. The default lane must:
+//!   * declare the grid in `ims_calibration` (`tof_encoding: grid`, `exact: true`, the model
+//!     columns; the chord only as the fallback of a frame without a row);
+//!   * carry `Frames.T1/T2/MzCalibration` on EVERY frame as `spectra_metadata` columns (provenance);
+//!   * ship a non-zero `total_ion_current` / `base_peak_intensity` on every MS1 row, and keep the
+//!     source's TIC/BPC chromatograms (the archive-level pin of invariants 2/3);
 //!   * make the vendored reader — on the PEAKS facet, where ims-compact keeps its points
 //!     (`get_spectrum_peak_arrays_for` and the collapsed `get_spectrum` peak list) — and therefore
-//!     `mzpeak-convert ARCHIVE -o x.mzML` emit the per-frame m/z, not the chord.
+//!     `mzpeak-convert ARCHIVE -o x.mzML` emit m/z that sits on INTEGER digitizer bins of the
+//!     vendor formula at each frame's OWN `T1` (1e-12 relative), while the run-wide chord is
+//!     > 1 ppm off somewhere;
+//!   * write the same values with one chunk per frame (`--no-ims-chunked`).
 //!
 //! Needs 2485.d from the corpus, so it is `#[ignore]`d: CI reports it as not run rather than as passed.
-//! Run with `MZPEAK_CORPUS=<data root> cargo test --release --test tdf_exact_tof_calibration -- --include-ignored`;
-//! `MZPC_REQUIRE_CORPUS=1` makes a missing fixture fail instead of skip.
 
 use std::path::Path;
 use std::process::Command;
 
 use arrow::array::{Array, AsArray};
-use arrow::datatypes::{Float64Type, Int64Type};
+use arrow::datatypes::Float64Type;
 use mzdata::io::DetailLevel;
 use mzdata::prelude::*;
-use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType};
 use mzpeak_prototyping::MzPeakReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -45,7 +45,6 @@ const DOT_D: &str = "ims-examples/PXD059079/20230830_100SPD_NCI7_0p12ng_HS_01_S1
 const FRAMES: usize = 3_994;
 /// `GlobalMetadata.DigitizerNumSamples` of 2485.d.
 const NUM_SAMPLES: i64 = 636_031;
-
 
 fn run(args: &[&str], envs: &[(&str, &str)]) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"));
@@ -99,76 +98,62 @@ impl Cal {
         .unwrap()
     }
 
+    fn c1_eff(&self, t1_frame: f64) -> f64 {
+        self.c1 * (1.0 + self.dc1 * (self.t1_row - t1_frame) / 1e6)
+    }
+
     /// The vendor formula at the frame's digitizer temperature.
     fn mz(&self, tof: f64, t1_frame: f64) -> f64 {
         let t_ns = tof * self.timebase + self.delay;
-        let c1_eff = self.c1 * (1.0 + self.dc1 * (self.t1_row - t1_frame) / 1e6);
-        let u = (t_ns - self.c0) * c1_eff.sqrt() / 1e6;
+        let u = (t_ns - self.c0) * self.c1_eff(t1_frame).sqrt() / 1e6;
         u * u
+    }
+
+    /// The (fractional) digitizer bin of an m/z at the frame's temperature — the inverse of [`Self::mz`].
+    fn tof(&self, mz: f64, t1_frame: f64) -> f64 {
+        let t_ns = mz.sqrt() * 1e6 / self.c1_eff(t1_frame).sqrt() + self.c0;
+        (t_ns - self.delay) / self.timebase
     }
 }
 
-/// Per-frame `(tof_c0, tof_c1, Frames.T1)` from `spectra_metadata.parquet`, in frame order,
-/// asserting every frame carries the pair (no nulls) and the calibration-id column.
-fn per_frame_pairs(archive: &Path, dir: &Path) -> Vec<(f64, f64, f64)> {
-    let f = std::fs::File::open(archive).unwrap();
-    let mut z = zip::ZipArchive::new(f).unwrap();
-    let mut e = z.by_name("spectra_metadata.parquet").unwrap();
-    let out = dir.join("spectra_metadata.parquet");
-    std::io::copy(&mut e, &mut std::fs::File::create(&out).unwrap()).unwrap();
-    let rdr = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&out).unwrap())
-        .unwrap()
-        .with_batch_size(1 << 16)
-        .build()
-        .unwrap();
-    let mut rows = Vec::new();
-    for b in rdr {
-        let b = b.unwrap();
+/// Per-frame `Frames.T1` from `spectra_metadata.parquet` (the `*_tdf_t1` column), in frame order,
+/// asserting every frame carries it and the `T2` / calibration-id columns exist.
+fn per_frame_t1(archive: &Path, dir: &Path) -> Vec<f64> {
+    let mut t1 = Vec::new();
+    for b in member_batches(archive, "spectra_metadata.parquet", dir) {
         let col = |suffix: &str| {
-            b.schema()
-                .fields()
-                .iter()
-                .position(|f| f.name().ends_with(suffix))
-                .map(|i| b.column(i).clone())
-                .unwrap_or_else(|| panic!("no spectra_metadata column ending in {suffix}: {:?}", b.schema()))
+            let name = b.schema().fields().iter().map(|f| f.name().clone()).find(|n| n.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no `*{suffix}` column in spectra_metadata"));
+            b.column_by_name(&name).unwrap().clone()
         };
-        let c0 = col("_tof_c0");
-        let c1 = col("_tof_c1");
-        let t1 = col("_tdf_t1");
-        let id = col("_tdf_mz_calibration_id");
-        let (c0, c1, t1) = (
-            c0.as_primitive::<Float64Type>(),
-            c1.as_primitive::<Float64Type>(),
-            t1.as_primitive::<Float64Type>(),
-        );
-        let id = id.as_primitive::<Int64Type>();
-        for i in 0..b.num_rows() {
-            assert!(!c0.is_null(i) && !c1.is_null(i), "row {}: tof_c0/tof_c1 null", rows.len());
-            assert!(!t1.is_null(i), "row {}: tdf_t1 null", rows.len());
-            assert_eq!(id.value(i), 1, "row {}: MzCalibration id", rows.len());
-            rows.push((c0.value(i), c1.value(i), t1.value(i)));
+        let _ = col("_tdf_t2");
+        let _ = col("_tdf_mz_calibration_id");
+        let c = col("_tdf_t1");
+        let a = c.as_primitive::<Float64Type>();
+        for i in 0..a.len() {
+            assert!(a.is_valid(i), "row {}: NULL tdf_t1", t1.len());
+            t1.push(a.value(i));
         }
     }
-    rows
+    t1
 }
 
 fn ims_calibration(archive: &Path) -> serde_json::Value {
     let f = std::fs::File::open(archive).unwrap();
     let mut z = zip::ZipArchive::new(f).unwrap();
-    let mut e = z.by_name("mzpeak_index.json").unwrap();
-    let mut s = String::new();
-    std::io::Read::read_to_string(&mut e, &mut s).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-    v["metadata"]["ims_calibration"].clone()
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut z.by_name("mzpeak_index.json").unwrap(), &mut buf).unwrap();
+    let idx: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    idx["metadata"]["ims_calibration"].clone()
 }
 
-/// One parquet member of the archive, extracted to `dir` and read whole.
 fn member_batches(archive: &Path, member: &str, dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
     let f = std::fs::File::open(archive).unwrap();
     let mut z = zip::ZipArchive::new(f).unwrap();
     let mut e = z.by_name(member).unwrap_or_else(|_| panic!("{member} missing"));
-    let out = dir.join(member);
-    std::io::copy(&mut e, &mut std::fs::File::create(&out).unwrap()).unwrap();
+    let out = dir.join(format!("{}-{member}", archive.file_name().unwrap().to_string_lossy()));
+    let mut o = std::fs::File::create(&out).unwrap();
+    std::io::copy(&mut e, &mut o).unwrap();
     ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&out).unwrap())
         .unwrap()
         .with_batch_size(1 << 16)
@@ -178,84 +163,72 @@ fn member_batches(archive: &Path, member: &str, dir: &Path) -> Vec<arrow::record
         .collect()
 }
 
-/// `(total_ion_current, base_peak_intensity)` of every MS1 row of `spectra_metadata`, in `index`
-/// order, as stored (f32 columns; `None` = NULL).
+/// `(total_ion_current, base_peak_intensity)` of every MS1 row of `spectra_metadata`.
 fn ms1_summary_columns(archive: &Path, dir: &Path) -> Vec<(Option<f32>, Option<f32>)> {
-    let mut rows = Vec::new();
+    use arrow::datatypes::{Float32Type, UInt8Type};
+    let mut out = Vec::new();
     for b in member_batches(archive, "spectra_metadata.parquet", dir) {
-        let lvl = b.column_by_name("ms_level").unwrap().as_primitive::<arrow::datatypes::UInt8Type>();
-        let tic = b.column_by_name("total_ion_current").unwrap().as_primitive::<arrow::datatypes::Float32Type>();
-        let bpi = b.column_by_name("base_peak_intensity").unwrap().as_primitive::<arrow::datatypes::Float32Type>();
+        let level = b.column_by_name("ms_level").unwrap().as_primitive::<UInt8Type>();
+        let tic = b.column_by_name("total_ion_current").unwrap().as_primitive::<Float32Type>();
+        let bpi = b.column_by_name("base_peak_intensity").unwrap().as_primitive::<Float32Type>();
         for i in 0..b.num_rows() {
-            if lvl.value(i) == 1 {
-                rows.push((
-                    (!tic.is_null(i)).then(|| tic.value(i)),
-                    (!bpi.is_null(i)).then(|| bpi.value(i)),
-                ));
+            if level.value(i) == 1 {
+                out.push((tic.is_valid(i).then(|| tic.value(i)), bpi.is_valid(i).then(|| bpi.value(i))));
             }
         }
     }
-    rows
+    out
 }
 
-/// The `id` of every chromatogram in `chromatograms_metadata`.
 fn chromatogram_ids(archive: &Path, dir: &Path) -> Vec<String> {
     let mut ids = Vec::new();
     for b in member_batches(archive, "chromatograms_metadata.parquet", dir) {
-        let id = b.column_by_name("id").unwrap();
-        ids.extend((0..b.num_rows()).map(|i| arrow::util::display::array_value_to_string(id, i).unwrap()));
+        let col = b.column_by_name("id").unwrap();
+        let col = arrow::compute::cast(col, &arrow::datatypes::DataType::Utf8).unwrap();
+        ids.extend(col.as_string::<i32>().iter().flatten().map(str::to_string));
     }
     ids
 }
 
-/// The integer `tof` array of a decoded spectrum. The reader hands the ims-compact grid column
-/// back as a non-standard Int32 array whose name may be empty, so locate it by kind + dtype.
-fn tof_of(arrays: &mzdata::spectrum::BinaryArrayMap, what: &str) -> Vec<i32> {
-    let mut found = None;
-    for (k, da) in arrays.iter() {
-        if matches!(k, ArrayType::NonStandardDataArray { .. }) && da.dtype == BinaryDataArrayType::Int32 {
-            assert!(found.is_none(), "{what}: several Int32 non-standard arrays");
-            found = Some(da.to_i32().unwrap().to_vec());
-        }
-    }
-    found.unwrap_or_else(|| {
-        panic!("{what}: no Int32 tof array among {:?}", arrays.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>())
-    })
+fn rel(a: f64, b: f64) -> f64 {
+    ((a - b) / b).abs()
 }
 
-fn rel(a: f64, b: f64) -> f64 {
-    (a - b).abs() / b.abs()
+/// Every m/z of `mz` sits on an integer bin of the vendor formula at `t1` (< 1e-3 bins off, and
+/// the integer bin re-evaluates to it within 1e-12); returns the worst distance to the chord in ppm.
+fn assert_on_vendor_lattice(mz: &[f64], vendor: &Cal, t1: f64, chord: &dyn Fn(f64) -> f64, what: &str) -> f64 {
+    let mut vs_chord = 0.0f64;
+    for m in mz {
+        let k = vendor.tof(*m, t1);
+        assert!((k - k.round()).abs() < 1e-3, "{what}: m/z {m} is {k} bins — not on the integer lattice");
+        assert!((0.0..NUM_SAMPLES as f64).contains(&k.round()), "{what}: bin {k} outside the digitizer range");
+        let exact = vendor.mz(k.round(), t1);
+        assert!(rel(*m, exact) < 1e-12, "{what}: reader {m} vs vendor {exact} at bin {k}");
+        vs_chord = vs_chord.max(rel(*m, chord(k.round())) * 1e6);
+    }
+    vs_chord
 }
 
 #[test]
 #[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
-fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
+fn ims_compact_carries_the_exact_vendor_model_on_every_grid_row() {
     let Some(dot_d) = corpus::corpus_path(DOT_D) else { return };
     let tdf = dot_d.join("analysis.tdf");
     let tmp = std::env::temp_dir().join(format!("mzpc-exacttof-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let archive = tmp.join("2485.mzpeak");
-    // This pins the 0.12.x TOF layout's contract (the per-frame pair beside the run-wide chord); the
-    // grid layout that is the default since 0.13.0 carries the same frames' exactness in the chunk
-    // rows themselves and is pinned by `tests/tdf_grid_layout.rs`.
-    run(&[dot_d.to_str().unwrap(), "-o", archive.to_str().unwrap(), "--force", "--no-vendor", "--no-ims-grid"], &[]);
+    run(&[dot_d.to_str().unwrap(), "-o", archive.to_str().unwrap(), "--force", "--no-vendor"], &[]);
 
-    // ims_calibration: per-spectrum declared, legacy chord kept.
+    // ims_calibration: the grid declared, exact; the chord only as the fallback model.
     let cal = ims_calibration(&archive);
-    assert_eq!(cal["per_spectrum"], "tof_c0,tof_c1", "{cal}");
-    assert_eq!(cal["exact_per_spectrum"], true, "{cal}");
-    assert_eq!(cal["exact"], false, "run-wide a/b stay approximate: {cal}");
-    assert!(cal["per_spectrum_note"].as_str().is_some_and(|s| s.contains("C2 = 0")), "{cal}");
-    assert!(
-        cal.get("per_spectrum_chord_frames").is_none(),
-        "2485.d has no NULL Frames.T1, so no frame stays on the chord: {cal}"
-    );
-    // Invariant 2/3 at the ARCHIVE level (review: no test pinned these on a real timsTOF archive).
-    // `lossless` must name the exactly-stored integer column — the reader's contract for "what in
-    // this archive is the data and what is a reconstruction". Every MS1 row must carry a real TIC
-    // and base-peak intensity: the published corpus shipped `total_ion_current = 0` on every
-    // gridded spectrum (mzdata derives both from an m/z array the integer-axis lane does not have).
-    assert_eq!(cal["lossless"], "tof", "ims_calibration must name `tof` as the exactly-stored column: {cal}");
+    assert_eq!(cal["tof_encoding"], "grid", "{cal}");
+    assert_eq!(cal["exact"], true, "{cal}");
+    assert_eq!(cal["mz_grid"]["column"], "chunk.mz_grid", "{cal}");
+    assert_eq!(cal["ion_mobility_grid"]["column"], "chunk.mean_inverse_reduced_ion_mobility_grid", "{cal}");
+    assert!(cal.get("per_spectrum").is_none() && cal.get("lossless").is_none(), "0.13 keys are gone: {cal}");
+    assert_eq!(cal["chunk_width_th"], 50.0, "{cal}");
+    // Invariant 2/3 at the ARCHIVE level: every MS1 row must carry a real TIC and base-peak
+    // intensity — the published corpus once shipped `total_ion_current = 0` on every gridded spectrum.
     let ms1 = ms1_summary_columns(&archive, &tmp);
     assert!(!ms1.is_empty(), "no MS1 rows in spectra_metadata");
     for (i, (tic, bpi)) in ms1.iter().enumerate() {
@@ -263,77 +236,39 @@ fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
         assert!(bpi.is_some_and(|v| v > 0.0), "MS1 row {i}: base_peak_intensity is {bpi:?}, expected > 0");
     }
     // Since 0.12.4 the run's own traces are stored and a summed TIC/BPC is added only for a kind the
-    // source lacks. 2485.d carries both (`TIC,±MS`, `TIC,±AllMS/MS`, `BPC,±MS` from its chromatogram
-    // tables), so nothing is synthesized here — and a summed trace next to them would be the
-    // regression. The column contract above is what guards the grid-summary defect on this file.
+    // source lacks. 2485.d carries both, so nothing is synthesized here.
     let ids = chromatogram_ids(&archive, &tmp);
     for want in ["TIC,±MS", "BPC,±MS"] {
         assert!(ids.iter().any(|i| i == want), "the source's {want} trace is missing: {ids:?}");
     }
-    assert!(
-        !ids.iter().any(|i| i == "TIC" || i == "BPC"),
-        "a summed TIC/BPC was added although the source carries both kinds: {ids:?}"
-    );
-    eprintln!("archive: {} MS1 rows with TIC/base peak > 0; the source's TIC/BPC traces kept, none summed", ms1.len());
+    assert!(!ids.iter().any(|i| i == "TIC" || i == "BPC"), "a summed TIC/BPC was added although the source carries both kinds: {ids:?}");
 
-    let (a, b) = (cal["a"].as_f64().unwrap(), cal["b"].as_f64().unwrap());
+    let (a, b) = (cal["chord"]["a"].as_f64().unwrap(), cal["chord"]["b"].as_f64().unwrap());
     let chord = |tof: f64| (a + b * tof).powi(2);
 
-    // The pair on all 3,994 frames.
-    let pairs = per_frame_pairs(&archive, &tmp);
-    assert_eq!(pairs.len(), FRAMES);
-
-    // 50 frames × 10 tof values: the pair reproduces the vendor formula at the FRAME's T1 to 1e-12,
-    // the chord does not (> 1 ppm somewhere). The frames' T1 differ from the row's T1, so a pair
-    // that dropped the temperature term would miss by ~1e-7 (dC1·ΔT/1e6 ≈ 20·4e-3/1e6 / 2).
+    // Frames.T1 on all 3,994 frames, and it differs from the row's reference T1 (else the
+    // temperature term is untested).
+    let t1s = per_frame_t1(&archive, &tmp);
+    assert_eq!(t1s.len(), FRAMES);
     let vendor = Cal::read(&tdf);
-    let tofs: Vec<f64> = (0..10).map(|j| (j as f64 * (NUM_SAMPLES - 1) as f64 / 9.0).round()).collect();
-    let (mut worst_pair, mut worst_chord_ppm, mut worst_no_temp) = (0.0f64, 0.0f64, 0.0f64);
-    for k in 0..50 {
-        let i = k * (FRAMES - 1) / 49;
-        let (c0, c1, t1) = pairs[i];
-        assert_ne!(t1, vendor.t1_row, "frame {i}: T1 equals the row's reference T1; test is vacuous");
-        for &tof in &tofs {
-            let model = vendor.mz(tof, t1);
-            assert!(model.is_finite() && model > 0.0);
-            let lin = (c0 + c1 * tof).powi(2);
-            worst_pair = worst_pair.max(rel(lin, model));
-            worst_chord_ppm = worst_chord_ppm.max(rel(chord(tof), model) * 1e6);
-            worst_no_temp = worst_no_temp.max(rel(vendor.mz(tof, vendor.t1_row), model));
-        }
-    }
-    assert!(worst_pair < 1e-12, "pair vs vendor formula: {worst_pair:e} relative");
-    assert!(worst_chord_ppm > 1.0, "chord is only {worst_chord_ppm} ppm off — the exact path proves nothing here");
-    assert!(worst_no_temp > 1e-9, "temperature term is inert on this file ({worst_no_temp:e}); test is vacuous");
-    eprintln!("pair vs model {worst_pair:e} rel; chord {worst_chord_ppm:.2} ppm; temp term {worst_no_temp:e} rel");
+    assert!(t1s.iter().any(|t| *t != vendor.t1_row), "every frame's T1 equals the row's reference T1; test is vacuous");
 
-    // The vendored reader (the `mzpeak-convert ARCHIVE` input path) reconstructs m/z from the
-    // per-spectrum pair — equal to (c0 + c1·tof)² to 1e-12 — and NOT from the chord. ims-compact
-    // stores its points in the PEAKS facet, so the check runs on the peak-facet arrays (where the
-    // integer `tof` is still alongside the reconstructed m/z) and then on the collapsed spectrum
-    // `get_spectrum` hands to every consumer (a centroid set: same m/z values, possibly re-sorted).
+    // The vendored reader (the `mzpeak-convert ARCHIVE` input path) reconstructs m/z from the grid
+    // rows — the vendor formula at the frame's own T1, on integer bins — and NOT from the chord.
     let mut reader = MzPeakReader::new(&archive).unwrap();
     reader.set_detail_level(DetailLevel::Full);
     assert_eq!(reader.len(), FRAMES);
-    let mut reader_vs_chord = 0.0f64;
-    let mut checked = 0usize;
+    let (mut reader_vs_chord, mut checked) = (0.0f64, 0usize);
+    let mut frames_mz: Vec<(usize, Vec<f64>)> = Vec::new();
     for i in [0usize, 1, 977, 2500, FRAMES - 1] {
         let arrays = reader
             .get_spectrum_peak_arrays_for(i as u64)
             .unwrap()
             .unwrap_or_else(|| panic!("spectrum {i}: no peak-facet arrays"));
-        let tof = tof_of(&arrays, &format!("spectrum {i}"));
-        let mz = arrays.mzs().unwrap();
-        assert_eq!(tof.len(), mz.len(), "spectrum {i}");
+        let mz = arrays.mzs().unwrap().to_vec();
         assert!(!mz.is_empty(), "spectrum {i}: empty");
-        let (c0, c1, t1) = pairs[i];
-        for (t, m) in tof.iter().zip(mz.iter()) {
-            let exact = (c0 + c1 * *t as f64).powi(2);
-            assert!(rel(*m, exact) < 1e-12, "spectrum {i} tof {t}: reader {m} vs exact {exact}");
-            assert!(rel(*m, vendor.mz(*t as f64, t1)) < 1e-12, "spectrum {i} tof {t}: reader {m} vs vendor");
-            reader_vs_chord = reader_vs_chord.max(rel(*m, chord(*t as f64)) * 1e6);
-            checked += 1;
-        }
+        reader_vs_chord = reader_vs_chord.max(assert_on_vendor_lattice(&mz, &vendor, t1s[i], &chord, &format!("spectrum {i}")));
+        checked += mz.len();
         // The collapsed spectrum carries exactly those m/z values (as a multiset).
         let spec = reader.get_spectrum(i).unwrap_or_else(|| panic!("spectrum {i}"));
         let mut from_spec: Vec<f64> = spec
@@ -343,90 +278,48 @@ fn ims_compact_carries_exact_per_frame_tof_coefficients_on_a_c2_zero_tdf() {
             .iter()
             .map(|p| p.mz)
             .collect();
-        let mut from_arrays: Vec<f64> = mz.to_vec();
+        let mut from_arrays = mz.clone();
         from_spec.sort_by(|a, b| a.total_cmp(b));
         from_arrays.sort_by(|a, b| a.total_cmp(b));
         assert_eq!(from_spec.len(), from_arrays.len(), "spectrum {i}: peak count");
         for (a, b) in from_spec.iter().zip(from_arrays.iter()) {
             assert!(rel(*a, *b) < 1e-12, "spectrum {i}: get_spectrum m/z {a} vs peak-facet arrays {b}");
         }
+        frames_mz.push((i, mz));
     }
     assert!(checked > 1000, "only {checked} points checked");
-    assert!(reader_vs_chord > 1.0, "reader m/z is within {reader_vs_chord} ppm of the chord — the per-spectrum path is not live");
-    eprintln!("reader: {checked} points on the exact pair; chord up to {reader_vs_chord:.2} ppm away");
+    assert!(reader_vs_chord > 1.0, "reader m/z is within {reader_vs_chord} ppm of the chord — the vendor model is not live");
+    eprintln!("reader: {checked} points on the vendor lattice; chord up to {reader_vs_chord:.2} ppm away");
 
-    // mzML export of the archive carries the exact m/z (first 3 frames). The mzML holds m/z +
-    // intensity only (the integer `tof` does not survive the peak-list collapse), so invert each
-    // m/z through the frame's pair: an exact-lane m/z lands on an INTEGER tof to < 1e-3 bins and
-    // round-trips to < 1e-9 relative; a chord m/z is > 1 ppm (≈ 0.8 bins) off the same lattice.
+    // mzML export of the archive carries the exact m/z (first 3 frames).
     let mzml = tmp.join("2485.mzML");
     run(&[archive.to_str().unwrap(), "-o", mzml.to_str().unwrap(), "--force"], &[("MZPC_MAX_SPECTRA", "3")]);
-    let mut n_mzml = 0usize;
-    let mut mzml_vs_chord = 0.0f64;
-    let mut worst_bin_offset = 0.0f64;
+    let (mut n_mzml, mut mzml_vs_chord) = (0usize, 0.0f64);
     for (i, spec) in mzdata::MZReader::open_path(&mzml).unwrap().enumerate() {
-        let (c0, c1, _) = pairs[i];
         let mz: Vec<f64> = match spec.peaks.as_ref() {
             Some(p) => p.iter().map(|p| p.mz).collect(),
-            None => spec
-                .arrays
-                .as_ref()
-                .unwrap_or_else(|| panic!("mzML spectrum {i}: no peaks and no arrays"))
-                .mzs()
-                .unwrap()
-                .to_vec(),
+            None => spec.arrays.as_ref().unwrap_or_else(|| panic!("mzML spectrum {i}: no peaks and no arrays")).mzs().unwrap().to_vec(),
         };
         assert!(!mz.is_empty(), "mzML spectrum {i}: empty");
-        for m in &mz {
-            let k = (m.sqrt() - c0) / c1;
-            worst_bin_offset = worst_bin_offset.max((k - k.round()).abs());
-            let exact = (c0 + c1 * k.round()).powi(2);
-            assert!(rel(*m, exact) < 1e-9, "mzML spectrum {i}: {m} is not on the exact lattice (tof {k})");
-            mzml_vs_chord = mzml_vs_chord.max(rel(*m, chord(k.round())) * 1e6);
-            n_mzml += 1;
-        }
+        mzml_vs_chord = mzml_vs_chord.max(assert_on_vendor_lattice(&mz, &vendor, t1s[i], &chord, &format!("mzML spectrum {i}")));
+        n_mzml += mz.len();
     }
     assert!(n_mzml > 100, "mzML export checked only {n_mzml} points");
-    assert!(worst_bin_offset < 1e-3, "mzML m/z off the integer tof lattice by {worst_bin_offset} bins");
     assert!(mzml_vs_chord > 1.0, "mzML m/z is within {mzml_vs_chord} ppm of the chord");
-    eprintln!("mzML: {n_mzml} points on the exact lattice (worst {worst_bin_offset:e} bins); chord up to {mzml_vs_chord:.2} ppm away");
+    eprintln!("mzML: {n_mzml} points on the vendor lattice; chord up to {mzml_vs_chord:.2} ppm away");
     drop(reader);
 
-    // `--ims-chunked`: the same pair on the same frames, and the CHUNKED peaks facet (the chunk
-    // reader branch of the per-spectrum fixup) reconstructs from it too.
-    let chunked = tmp.join("2485.chunked.mzpeak");
-    run(
-        &[dot_d.to_str().unwrap(), "-o", chunked.to_str().unwrap(), "--force", "--no-vendor", "--ims-chunked", "--no-ims-grid"],
-        &[],
-    );
-    let cal = ims_calibration(&chunked);
-    assert_eq!(cal["per_spectrum"], "tof_c0,tof_c1", "{cal}");
-    assert_eq!(cal["exact_per_spectrum"], true, "{cal}");
-    assert_eq!(cal["chunk_bounds"], "mz", "{cal}");
-    let chunked_pairs = per_frame_pairs(&chunked, &tmp);
-    assert_eq!(chunked_pairs, pairs, "chunked and flat layouts carry the same per-frame pair");
-    let mut reader = MzPeakReader::new(&chunked).unwrap();
+    // `--no-ims-chunked`: one chunk per frame, the same values on the same frames.
+    let whole = tmp.join("2485.frame-chunks.mzpeak");
+    run(&[dot_d.to_str().unwrap(), "-o", whole.to_str().unwrap(), "--force", "--no-vendor", "--no-ims-chunked"], &[]);
+    let cal = ims_calibration(&whole);
+    assert_eq!(cal["tof_encoding"], "grid", "{cal}");
+    assert!(cal["chunk_width_th"].as_f64().unwrap() >= 1e5, "one chunk per frame: {cal}");
+    let mut reader = MzPeakReader::new(&whole).unwrap();
     reader.set_detail_level(DetailLevel::Full);
-    let (mut n_chunked, mut chunked_vs_chord) = (0usize, 0.0f64);
-    for i in [0usize, 977, FRAMES - 1] {
-        let arrays = reader
-            .get_spectrum_peak_arrays_for(i as u64)
-            .unwrap()
-            .unwrap_or_else(|| panic!("chunked spectrum {i}: no peak-facet arrays"));
-        let tof = tof_of(&arrays, &format!("chunked spectrum {i}"));
-        let mz = arrays.mzs().unwrap();
-        assert_eq!(tof.len(), mz.len(), "chunked spectrum {i}");
-        assert!(!mz.is_empty(), "chunked spectrum {i}: empty");
-        let (c0, c1, _) = pairs[i];
-        for (t, m) in tof.iter().zip(mz.iter()) {
-            let exact = (c0 + c1 * *t as f64).powi(2);
-            assert!(rel(*m, exact) < 1e-12, "chunked spectrum {i} tof {t}: reader {m} vs exact {exact}");
-            chunked_vs_chord = chunked_vs_chord.max(rel(*m, chord(*t as f64)) * 1e6);
-            n_chunked += 1;
-        }
+    for (i, want) in &frames_mz {
+        let arrays = reader.get_spectrum_peak_arrays_for(*i as u64).unwrap().unwrap_or_else(|| panic!("frame-chunk spectrum {i}: no arrays"));
+        assert_eq!(arrays.mzs().unwrap().as_ref(), want.as_slice(), "spectrum {i}: one chunk per frame must store the same values");
     }
-    assert!(n_chunked > 1000, "chunked: only {n_chunked} points checked");
-    assert!(chunked_vs_chord > 1.0, "chunked reader m/z is within {chunked_vs_chord} ppm of the chord");
-    eprintln!("chunked: {n_chunked} points on the exact pair; chord up to {chunked_vs_chord:.2} ppm away");
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -28,6 +28,7 @@ use libloading::Library;
 use rusqlite::{Connection, OpenFlags};
 
 use mzdata::params::Unit;
+use mzpeak_prototyping::grid::GridModelLike;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{
     MultiLayerSpectrum, ScanEvent, ScanPolarity, SignalContinuity, SpectrumDescription,
@@ -458,11 +459,15 @@ pub struct TdfSdkReader {
     windows: HashMap<i64, Vec<crate::bruker_native::FrameWindow>>,
     /// The `.d` directory (for the golden dump's re-read of `analysis.tdf`).
     dir: PathBuf,
-    /// EXACT per-frame `(c0, c1)` with `m/z = (c0 + c1·tof)²` when every frame's `MzCalibration`
-    /// row is sqrt-linear (ModelType 1, `C2 = 0`) — identical to the native lane's
-    /// (`crate::bruker_native::exact_tof_coeffs`), so both lanes write the same columns. A `None`
-    /// entry is a frame with a NULL `Frames.T1`, which stays on the chord.
-    exact_tof: Option<Vec<Option<(f64, f64)>>>,
+    /// The vendor's `MzCalibration` rows — the per-frame m/z grid models' source, identical to the
+    /// native lane's (`crate::bruker_native::frame_mz_grid`), so both lanes write the same rows.
+    mz_rows: HashMap<i64, crate::bruker_native::TdfMzCalibrationRow>,
+    /// The TIMS ModelType-2 model as the reference implementation's grid; `None` without such a row
+    /// (1/K0 is then stored as the SDK's plain values).
+    tims_grid: Option<mzpeak_prototyping::grid::GridEncoding>,
+    /// Frames whose points [`Self::ims_grid_spectrum`] re-sorted into TOF order (the SDK hands them
+    /// over mobility-major); the converter declares `sort-by-mz` from it.
+    grid_resorted: std::sync::atomic::AtomicUsize,
     /// Frames whose points the SDK handed over out of m/z order, re-sorted by [`Self::spectrum`].
     /// Shared with the converter, which counts it over the written frames only
     /// (`VendorHints::counters`) and declares `sort-by-mz` when it moved.
@@ -484,30 +489,43 @@ impl TdfSdkReader {
             log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
             HashMap::new()
         });
-        // Exact per-frame coefficients need the per-frame T1 / MzCalibration columns — the same
-        // guard as the native lane (`table.t1.len() == frames.len()`). Without it a TDF lacking
-        // the columns would resolve every frame to the single row at its reference T1 and ship as
-        // "exact" with no temperature term, while the native lane keeps the chord for the same file.
-        let exact_tof = if has_cal {
-            crate::bruker_native::exact_tof_coeffs_for(
-                &tdf,
-                frames.len(),
-                frames.iter().map(|f| (f.t1, f.mz_cal_id)),
-            )
-        } else {
-            None
+        if !has_cal {
+            log::warn!("TDF Frames lacks T1/T2/MzCalibration; every frame's grid model is its MzCalibration row at the row's own temperatures");
+        }
+        let mz_rows = match crate::bruker_native::read_mz_calibration_rows(&tdf) {
+            Ok(rows) if !rows.is_empty() => rows,
+            Ok(_) => {
+                log::warn!("MzCalibration is empty; every frame's grid model is the SDK's two-point chord");
+                HashMap::new()
+            }
+            Err(e) => {
+                log::warn!("MzCalibration unreadable ({e}); every frame's grid model is the SDK's two-point chord");
+                HashMap::new()
+            }
         };
-        Ok(Self { api, handle, frames, windows, dir, exact_tof, resorted: Default::default(), _not_thread_safe: PhantomData })
+        let tims_grid = crate::tims_mobility::TimsMobilityCalibration::from_tdf_path(&tdf)
+            .unwrap_or(None)
+            .and_then(|c| mzpeak_prototyping::grid::GridEncoding::from_parameters(mzpeak_prototyping::grid::TimsTofTimsLinearGrid2::ACCESSION, &c.grid_parameters()));
+        Ok(Self { api, handle, frames, windows, dir, mz_rows, tims_grid, resorted: Default::default(), grid_resorted: Default::default(), _not_thread_safe: PhantomData })
+    }
+
+    /// What the grid rows' m/z amount to against the vendor's model.
+    pub fn mz_model_summary(&self) -> crate::bruker_native::MzModelSummary {
+        crate::bruker_native::mz_model_summary(&self.mz_rows)
+    }
+
+    /// Whether 1/K0 is stored as TIMS scan numbers under the vendor's ModelType-2 grid.
+    pub fn mobility_grid(&self) -> bool {
+        self.tims_grid.is_some()
+    }
+
+    /// Frames [`Self::ims_grid_spectrum`] re-sorted into TOF order so far.
+    pub fn frames_reordered(&self) -> &std::sync::atomic::AtomicUsize {
+        &self.grid_resorted
     }
 
     pub fn len(&self) -> usize {
         self.frames.len()
-    }
-
-    /// Whether the run carries exact `tof_c0`/`tof_c1` params (see `exact_tof`), with the count of
-    /// frames that have none (NULL `Frames.T1`) and stay on the chord.
-    pub fn exact_tof_per_spectrum(&self) -> Option<crate::bruker_native::ExactTofSummary> {
-        self.exact_tof.as_deref().map(crate::bruker_native::ExactTofSummary::of)
     }
 
     /// `MZPC_TDF_SDK_GOLDEN` diagnostic: sample the SDK's own `tims_index_to_mz` on up to 240
@@ -695,25 +713,24 @@ impl TdfSdkReader {
         }
     }
 
-    /// Build the ims-compact spectrum for frame `i`: integer `tof` (raw index) + intensity + per-peak
-    /// 1/K0, in the SDK's native mobility-major order (NO m/z sort — the ims-compact reader recovers
-    /// m/z from the tof grid). Same layout as `bruker_native::ims_compact_spectrum`, so it flows
-    /// through `write_ims_compact_archive`. `int_intensity` stores counts as Int32 for byte-plane.
-    pub fn ims_compact_spectrum(&self, i: usize, int_intensity: bool) -> Result<MultiLayerSpectrum> {
+    /// Build the ims-compact spectrum for frame `i` on the reference implementation's chunk grid —
+    /// the same arrays the native lane builds (`bruker_native::ims_grid_arrays`): m/z from the raw
+    /// TOF index through the frame's `MzCalibration` model, 1/K0 from the scan number through the
+    /// TIMS model (or the SDK's own values when there is no ModelType-2 row), each carrying its model
+    /// as a Param; the whole frame sorted by TOF (the SDK hands it over mobility-major; counted for
+    /// `sort-by-mz`). The writer turns them back into the integer bins and scan numbers.
+    pub fn ims_grid_spectrum(&self, i: usize, int_intensity: bool) -> Result<MultiLayerSpectrum> {
         let frame = self
             .frames
             .get(i)
             .with_context(|| format!("TDF frame index {i} out of range"))?;
-        let peaks = self.read_frame_peaks(frame)?;
-        let scans: Vec<f64> = peaks.iter().map(|p| p.scan as f64).collect();
-        let mobility = self.convert(
-            self.api.tims_scannum_to_oneoverk0,
-            frame.id,
-            &scans,
-            "tims_scannum_to_oneoverk0",
-        )?;
-
+        let mut peaks = self.read_frame_peaks(frame)?;
+        if !peaks.is_sorted_by_key(|p| p.index) {
+            self.grid_resorted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        peaks.sort_by_key(|p| p.index);
         let mut tof: Vec<i32> = Vec::with_capacity(peaks.len());
+        let scans: Vec<u32> = peaks.iter().map(|p| p.scan).collect();
         let (mut int_f32, mut int_i32): (Vec<f32>, Vec<i32>) = (Vec::new(), Vec::new());
         for p in &peaks {
             tof.push(i32::try_from(p.index).map_err(|_| anyhow!("TOF index {} exceeds i32", p.index))?);
@@ -723,45 +740,48 @@ impl TdfSdkReader {
                 int_f32.push(p.intensity as f32);
             }
         }
-
-        let arrays = crate::bruker_native::ims_compact_arrays(
+        let (a, b) = self.tof_mz_model();
+        let mz_model = crate::bruker_native::frame_mz_grid(
+            &self.mz_rows,
+            crate::bruker_native::TofMzModel { a, b },
+            frame.t1,
+            frame.t2,
+            frame.mz_cal_id,
+        );
+        let sdk_k0: Vec<f64>;
+        let mobility = match self.tims_grid.as_ref() {
+            Some(model) => crate::bruker_native::ImsMobility::Scans(&scans, model),
+            None => {
+                let scans_f: Vec<f64> = scans.iter().map(|&s| s as f64).collect();
+                sdk_k0 = self.convert(self.api.tims_scannum_to_oneoverk0, frame.id, &scans_f, "tims_scannum_to_oneoverk0")?;
+                crate::bruker_native::ImsMobility::Values(&sdk_k0)
+            }
+        };
+        let (arrays, mz) = crate::bruker_native::ims_grid_arrays(
             &tof,
             if int_intensity {
                 crate::bruker_native::ImsIntensity::Counts(&int_i32)
             } else {
                 crate::bruker_native::ImsIntensity::Float(&int_f32)
             },
-            &mobility,
+            mobility,
+            &mz_model,
         )?;
 
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
         if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
             crate::bruker_native::add_frame_calibration_params(&mut descr, t1, t2, id);
         }
-        let exact = self.exact_tof.as_ref().and_then(|v| v.get(i).copied().flatten());
-        if let Some((c0, c1)) = exact {
-            crate::bruker_native::add_exact_tof_params(&mut descr, c0, c1);
-        }
         self.attach_precursors(&mut descr, frame);
-        // Observed-m/z range: the output stores integer `tof`, so reconstruct m/z = (c0 + c1·tof)²
-        // (monotonic in tof; the exact per-frame pair when the run has one, else the run-wide
-        // chord) over the min/max TOF index present. Without this the viewer shows "m/z 0–0".
-        let (a, b) = exact.unwrap_or_else(|| self.tof_mz_model());
-        let mz = |t: i32| -> f64 {
-            let v = a + b * t as f64;
-            v * v
-        };
-        if let (Some(&tmin), Some(&tmax)) = (tof.iter().min(), tof.iter().max()) {
-            let (mz_a, mz_b) = (mz(tmin), mz(tmax));
-            crate::set_observed_mz_range(&mut descr, mz_a.min(mz_b), mz_a.max(mz_b));
+        // Summary terms from the STORED points — the grid values — stated explicitly, as on every
+        // grid lane.
+        if let (Some(&lo), Some(&hi)) = (mz.first(), mz.last()) {
+            crate::set_observed_mz_range(&mut descr, lo.min(hi), lo.max(hi));
         }
-        // TIC / base peak: this lane REPLACES the m/z array with integer `tof`, so mzdata derives
-        // tic = 0 and base peak (0, 0) from the m/z-less array map. Compute them from the
-        // intensities actually stored, reconstructing m/z only at the running maximum bin.
         let (tic, base) = if int_intensity {
-            crate::summarize_points(int_i32.iter().map(|&v| v as f32), |k| mz(tof[k]))
+            crate::summarize_points(int_i32.iter().map(|&v| v as f32), |k| mz[k])
         } else {
-            crate::summarize_points(int_f32.iter().copied(), |k| mz(tof[k]))
+            crate::summarize_points(int_f32.iter().copied(), |k| mz[k])
         };
         crate::set_spectrum_summary_params(&mut descr, tic, base);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))

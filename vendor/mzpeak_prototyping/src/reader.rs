@@ -6,14 +6,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow::array::{AsArray, UInt64Array};
+use arrow::{
+    array::{Array, ArrayRef, AsArray, UInt64Array}, datatypes::{DataType, Float32Type, Float64Type},
+};
 
 use identity_hash::BuildIdentityHasher;
 use mzdata::{
     curie,
     io::{DetailLevel, OffsetIndex},
     meta::MSDataFileMetadata,
-    params::Unit,
+    params::{CURIE, Unit},
     prelude::*,
     spectrum::{
         ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType,
@@ -37,12 +39,9 @@ use parquet::{
 };
 
 use crate::{
-    BufferContext,
-    archive::{
-        ArchiveReader, ArchiveSource, DataKind, DirectorySource, DispatchArchiveSource, EntityType,
-        SplittingZipArchiveSource, ZipArchiveBytesSource,
-    },
-    reader::{
+    BufferContext, archive::{
+        ArchiveReader, ArchiveSource, DataKind, DirectorySource, DispatchArchiveSource, EntityType, FileEntry, SplittingZipArchiveSource, ZipArchiveBytesSource,
+    }, reader::{
         chunk::ChunkDataReader,
         index::{
             BasicQueryIndex, ChromatogramQueryIndex, PageQuery, QueryIndex, SpanDynNumeric,
@@ -70,6 +69,8 @@ pub(crate) mod cache;
 pub(crate) use cache::{CacheBuffer, DataCacheBlock, DataCacheFrontend};
 pub(crate) mod utils;
 
+pub use utils::{IntoQueryRange, MaskSet, BatchIterator};
+
 pub mod index;
 pub mod visitor;
 
@@ -79,7 +80,6 @@ mod object_store_async;
 pub use metadata::ReaderMetadata;
 use point::PointDataArrayReader;
 
-pub use crate::reader::utils::{BatchIterator, MaskSet};
 
 /// Express a preference for loading profile data, centroid data, or both, when the option
 /// is available.
@@ -391,6 +391,15 @@ impl<
         self.handle.open_stream(name)
     }
 
+    /// Check if all the entries in the archive match their checksums.
+    ///
+    /// ## Returns
+    /// - The main status flag: `Some` if all entries have a checksum recorded. `None` otherwise.
+    /// - Each failed entry and its computed checksum if it was resolved, None otherwise.
+    pub fn check_archive_integrity(&self) -> io::Result<(Option<bool>, Vec<(FileEntry, Option<String>)>)> {
+        self.handle.check_archive_integrity()
+    }
+
     /// Open a [`ParquetRecordBatchReaderBuilder`] by it's name
     pub fn open_parquet(
         &self,
@@ -399,6 +408,15 @@ impl<
         let stream = self.handle.open_stream(name)?;
         let builder = ArrowReaderBuilder::try_new(stream).map_err(|e| io::Error::other(e))?;
         Ok(builder)
+    }
+
+    /// Open a [`ParquetRecordBatchReaderBuilder`] by it's [`EntityType`] and [`DataKind`]
+    pub fn open_parquet_entry(
+        &self,
+        entity_type: &EntityType,
+        data_kind: &DataKind,
+    ) -> Result<ParquetRecordBatchReaderBuilder<<T as ArchiveSource>::File>, io::Error> {
+        self.handle.read_entry(entity_type, data_kind)
     }
 
     /// Load the descriptive metadata for all spectra
@@ -628,12 +646,38 @@ impl<
         Ok(time_indexer.finish())
     }
 
+    /// Get the time dimension encoded in the spectrum metadata table
+    pub fn spectrum_time_axis(&self) -> Option<ArrayRef> {
+        let builder = self.handle.spectrum_metadata().ok()?;
+
+        let schema = builder.parquet_schema();
+        let i = schema
+            .columns()
+            .iter()
+            .position(|c| c.name() == "time")?;
+
+        let mask = ProjectionMask::leaves(schema, [i]);
+        let mut reader = builder
+            .with_projection(mask)
+            .with_batch_size(usize::MAX)
+            .build()
+            .ok()?;
+
+        let batch = reader.next()?;
+        let arr = batch.ok()?.column(0).clone();
+        if matches!(arr.data_type(), DataType::Float64) {
+            return Some(arr)
+        } else {
+            return arrow::compute::cast(&arr, &DataType::Float64).ok()
+        }
+    }
+
     /// Read all signal data within the specified `time_range`, optionally constrained to `mz_range` m/z values and/or
     /// `ion_mobility_range` IM values. This operates **only** on the profile data. See [`Self::query_peaks`] to do the
     /// same operation on centroids.
     ///
     /// # Arguments
-    /// - `time_range`: A time interval to select spectra from.
+    /// - `time_range`: A time interval to select spectra from, or an index range that will be resolved to the same.
     /// - `mz_range`: An optional m/z range to filter within.
     /// - `ion_mobility_range`: An optional ion mobility range to filter within.
     /// - `ms_level_range`: An optional MS level to filter within
@@ -643,7 +687,7 @@ impl<
     /// - A mapping from spectrum index to scan start time.
     pub fn extract_signal(
         &mut self,
-        time_range: SimpleInterval<f64>,
+        time_range: impl Into<IntoQueryRange>,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
         ms_level_range: Option<SimpleInterval<u8>>,
@@ -652,10 +696,22 @@ impl<
         HashMap<u64, f64, BuildIdentityHasher<u64>>,
     )> {
         self.ensure_grid_coefficients()?;
-        let (time_index, index_range) =
-            self.get_spectrum_index_range_for_time_range(time_range, ms_level_range)?;
+        let (time_index, index_range) = match time_range.into() {
+            IntoQueryRange::TimeRange(time_range) => {
+                self.get_spectrum_index_range_for_time_range(time_range, ms_level_range)?
+            }
+            IntoQueryRange::IndexRange(index_range) => {
+                if let Some(time_axis) = self.spectrum_time_axis() {
+                    let time_axis = time_axis.as_primitive::<Float64Type>();
+                    let start = time_axis.value(index_range.start() as usize);
+                    let end = time_axis.value(index_range.end() as usize);
+                    self.get_spectrum_index_range_for_time_range(SimpleInterval::new(start, end), ms_level_range)?
+                } else {
+                    return Ok((Box::new(std::iter::empty()), Default::default()))
+                }
+            }
+        };
         let builder = self.handle.spectrum_data()?;
-
         let ion_mobility_range = if !self.metadata.spectrum_array_indices().has_ion_mobility() {
             None
         } else {
@@ -815,6 +871,164 @@ impl<
         self.metadata.spectra.id_index.is_empty()
     }
 
+    /// Check if a specific [`CURIE`] has been mapped to a column
+    pub fn has_column_for_accession(
+        &self,
+        entity_type: &EntityType,
+        data_kind: &DataKind,
+        accession: CURIE,
+    ) -> Option<&crate::param::MetadataColumn> {
+        self.file_index()
+            .find_entry(entity_type, data_kind)
+            .and_then(|v| v.column_mapping.find(accession))
+    }
+
+    /// Read a specific [`MetadataColumn`] from an [`EntityType`] and [`DataKind`] into Arrow [`ParquetRecordBatchReaderBuilder`]
+    ///
+    /// The builder may be customized further before invoking [`ParquetRecordBatchReaderBuilder::build`] and processing the
+    /// resulting [`Iterator`] of [`RecordBatch`](arrow::array::RecordBatch)
+    pub fn extract_column_for(
+        &self,
+        entity_type: &EntityType,
+        data_kind: &DataKind,
+        metadata_column: &crate::param::MetadataColumn,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+        let builder = self.open_parquet_entry(entity_type, data_kind)?;
+        let mask = metadata_column.as_projection_mask(
+            &builder,
+            match data_kind {
+                DataKind::Metadata | DataKind::DataArray | DataKind::Peaks => 1,
+                _ => 2,
+            },
+        );
+        let reader = builder.with_projection(mask);
+        Ok(reader)
+    }
+
+    /// Read a specific [`MetadataColumn`] from an [`EntityType`] and [`DataKind`] into Arrow [`ArrayRef`] of
+    /// row group minimum and maximum values.
+    pub fn extract_row_group_statistics_for(
+        &self,
+        entity_type: &EntityType,
+        data_kind: &DataKind,
+        metadata_column: &crate::param::MetadataColumn,
+    ) -> io::Result<(Option<ArrayRef>, Option<ArrayRef>)> {
+        let builder = self.open_parquet_entry(entity_type, data_kind)?;
+        Ok(metadata_column.parquet_statistics(&builder))
+    }
+
+    /// Query the spectrum metadata to obtain the lowest and highest scan start times as reported
+    /// by the column mapped to `MS:1000016`.
+    ///
+    /// This queries Parquet row group statistics.
+    pub fn observed_time_range(&self) -> (Option<f64>, Option<f64>) {
+        let arc = match self.handle.spectrum_metadata_scans() {
+            Ok(arc) => arc,
+            Err(e) => {
+                log::error!("Failed to locate spectrum metadata file in archive: {e}");
+                return (None, None);
+            }
+        };
+        if let Some(fentry) = self
+            .file_index()
+            .find_entry(&EntityType::Spectrum, &DataKind::Scans) {
+            if let Some(col) = fentry.column_mapping_for(curie!(MS:1000016)) {
+                let (min, max) = col.parquet_statistics(&arc);
+
+                let min = min.and_then(|min| match min.data_type() {
+                    DataType::Float32 => {
+                        arrow::compute::min(min.as_primitive::<Float32Type>())
+                            .map(|v| v as f64)
+                    }
+                    DataType::Float64 => {
+                        arrow::compute::min(min.as_primitive::<Float64Type>())
+                    }
+                    dtype => {
+                        unimplemented!("Lowest scan start time type {dtype:?} not yet implemented")
+                    }
+                });
+                let max = max.and_then(|max| match max.data_type() {
+                    DataType::Float32 => {
+                        arrow::compute::max(max.as_primitive::<Float32Type>())
+                            .map(|v| v as f64)
+                    }
+                    DataType::Float64 => {
+                        arrow::compute::max(max.as_primitive::<Float64Type>())
+                    }
+                    dtype => {
+                        unimplemented!("Highest scan start time type {dtype:?} not yet implemented")
+                    }
+                });
+                (min, max)
+            } else {
+                (None, None)
+            }
+        }
+        else {
+            (None, None)
+        }
+    }
+
+    /// Query the spectrum metadata to obtain the lowest and highest observed m/z as reported
+    /// by columns mapped to `MS:1000528` and `MS:1000527`.
+    ///
+    /// This queries Parquet row group statistics.
+    pub fn observed_mz_range(&self) -> (Option<f64>, Option<f64>) {
+        let arc = match self.handle.spectrum_metadata() {
+            Ok(arc) => arc,
+            Err(e) => {
+                log::error!("Failed to locate spectrum metadata file in archive: {e}");
+                return (None, None);
+            }
+        };
+        if let Some(fentry) = self
+            .file_index()
+            .find_entry(&EntityType::Spectrum, &DataKind::Metadata)
+        {
+            let lowest_obs = fentry
+                .column_mapping_for(curie!(MS:1000528))
+                .and_then(|c| c.parquet_statistics(&arc).0);
+            let highest_obs = fentry
+                .column_mapping_for(curie!(MS:1000527))
+                .and_then(|c| c.parquet_statistics(&arc).1);
+            let mut min_mz: Option<f64> = None;
+            let mut max_mz: Option<f64> = None;
+            if let Some(lowest_obs) = lowest_obs {
+                min_mz = match lowest_obs.data_type() {
+                    DataType::Float32 => {
+                        arrow::compute::min(lowest_obs.as_primitive::<Float32Type>())
+                            .map(|v| v as f64)
+                    }
+                    DataType::Float64 => {
+                        arrow::compute::min(lowest_obs.as_primitive::<Float64Type>())
+                    }
+                    dtype => {
+                        unimplemented!("Lowest observed m/z type {dtype:?} not yet implemented")
+                    }
+                };
+            }
+
+            if let Some(highest_obs) = highest_obs {
+                max_mz = match highest_obs.data_type() {
+                    DataType::Float32 => {
+                        arrow::compute::max(highest_obs.as_primitive::<Float32Type>())
+                            .map(|v| v as f64)
+                    }
+                    DataType::Float64 => {
+                        arrow::compute::max(highest_obs.as_primitive::<Float64Type>())
+                    }
+                    dtype => {
+                        unimplemented!("Lowest observed m/z type {dtype:?} not yet implemented")
+                    }
+                };
+            }
+
+            (min_mz, max_mz)
+        } else {
+            (None, None)
+        }
+    }
+
     /// Get an iterator over wavelength spectra
     pub fn iter_wavelength_spectra(
         &mut self,
@@ -856,7 +1070,7 @@ impl<
     /// # Returns
     /// - If this mzPeak archive does not have a peak data file, this method will return an Err([`io::Error`])
     /// - If this mzPeak archive does have a peak data file, but does not have an entry for the requested
-    ///   spectrum index, this method will return `Ok(None)`. There may still be peak data available in the main
+    ///   spectrum index, this method will return `Ok(None)`. There may still be signal data available in the main
     ///   spectrum data file.
     pub fn get_spectrum_peaks_for(
         &mut self,
@@ -1016,7 +1230,7 @@ impl<
     /// If there are no stored peaks for a given spectrum, there will be gaps.
     ///
     /// # Arguments
-    /// - `time_range`: A time interval to select spectra from.
+    /// - `time_range`: A time interval to select spectra from, or an index range that will be resolved to the same.
     /// - `mz_range`: An optional m/z range to filter within.
     /// - `ion_mobility_range`: An optional ion mobility range to filter within.
     ///
@@ -1026,7 +1240,7 @@ impl<
     /// - A mapping from spectrum index to scan start time.
     pub fn query_peaks(
         &mut self,
-        time_range: SimpleInterval<f64>,
+        time_range: impl Into<IntoQueryRange>,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
         ms_level_range: Option<SimpleInterval<u8>>,
@@ -1052,8 +1266,21 @@ impl<
             ion_mobility_range
         };
 
-        let (time_index, index_range) =
-            self.get_spectrum_index_range_for_time_range(time_range, ms_level_range)?;
+        let (time_index, index_range) = match time_range.into() {
+            IntoQueryRange::TimeRange(time_range) => {
+                self.get_spectrum_index_range_for_time_range(time_range, ms_level_range)?
+            }
+            IntoQueryRange::IndexRange(index_range) => {
+                if let Some(time_axis) = self.spectrum_time_axis() {
+                    let time_axis = time_axis.as_primitive::<Float64Type>();
+                    let start = time_axis.value(index_range.start() as usize);
+                    let end = time_axis.value(index_range.end() as usize);
+                    self.get_spectrum_index_range_for_time_range(SimpleInterval::new(start, end), ms_level_range)?
+                } else {
+                    return Ok((Box::new(std::iter::empty()), Default::default()))
+                }
+            }
+        };
 
         match meta_index.query_index {
             index::GenericDataIndex::Point(ref query_index) => {
@@ -2592,6 +2819,21 @@ mod test {
         Ok(())
     }
 
+
+    #[test_log::test]
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    #[case::chunked("small.chunked.mzpeak")]
+    #[case::numpress("small.numpress.mzpeak")]
+    fn test_integrity_check(#[case] path: &str) -> io::Result<()> {
+        let reader = MzPeakReader::new(path)?;
+        let (state, failed) = reader.check_archive_integrity()?;
+        assert!(state.unwrap(), "Overall validation status failed: {failed:?}");
+        assert!(failed.is_empty(), "Failed file list is not empty: {failed:?}");
+        Ok(())
+    }
+
     #[test_log::test]
     #[rstest::rstest]
     fn test_read_spectrum_memmap() -> io::Result<()> {
@@ -2668,6 +2910,33 @@ mod test {
     #[case::packed("small.mzpeak")]
     #[case::unpacked("small.unpacked.mzpeak")]
     #[case::packed_chunks("small.chunked.mzpeak")]
+    fn test_read_mz_range(#[case] path: &str) -> io::Result<()> {
+        let reader = MzPeakReader::new(path).unwrap();
+        let (min, max) = reader.observed_mz_range();
+        let expected_min = 162.24594116210938;
+        let expected_max = 2000.0099466203774;
+        assert!(min.is_some());
+        let min = min.unwrap();
+        let err = (min - expected_min).abs();
+        assert!(
+            err < 1e-6,
+            "The observed error {err} from |{min} - {expected_min}| is too large"
+        );
+        assert!(max.is_some());
+        let max = max.unwrap();
+        let err = (max - expected_max).abs();
+        assert!(
+            err < 1e-6,
+            "The observed error {err} from |{max} - {expected_min}| is too large"
+        );
+        Ok(())
+    }
+
+    #[test_log::test]
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    #[case::packed_chunks("small.chunked.mzpeak")]
     fn test_read_chromatogram(#[case] path: &str) -> io::Result<()> {
         let mut reader = MzPeakReader::new(path).unwrap();
         let tic = reader.get_chromatogram_by_index(0).unwrap();
@@ -2726,7 +2995,7 @@ mod test {
         let mut reader = MzPeakReader::new(path)?;
 
         let (it, _time_index) =
-            reader.extract_signal((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
+            reader.extract_signal(0.3..0.4, Some((800.0..820.0).into()), None, None)?;
 
         let mut k = 0;
         for batch in it.flatten() {
@@ -2739,7 +3008,7 @@ mod test {
         assert_eq!(k, 563);
 
         let (it, _) = reader.query_peaks(
-            (0.3..0.4).into(),
+            0.3..0.4,
             Some((800.0..820.0).into()),
             None,
             Some((2u8..10).into()),
@@ -2768,7 +3037,7 @@ mod test {
             .count();
         assert!(k_models_defined > 0);
         let (it, _time_index) =
-            reader.extract_signal((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
+            reader.extract_signal(0.3..0.4f64, Some((800.0..820.0).into()), None, None)?;
 
         let mut k = 0;
         for batch in it.flatten() {
@@ -2784,7 +3053,7 @@ mod test {
         assert_eq!(k, 689);
 
         let (it, _) = reader.query_peaks(
-            (0.3..0.4).into(),
+            0.3..0.4,
             Some((800.0..820.0).into()),
             None,
             Some((2u8..10).into()),
@@ -2800,7 +3069,7 @@ mod test {
         assert_eq!(k, 96);
 
         let (it, _time_index) =
-            reader.query_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
+            reader.query_peaks(0.3..0.4, Some((800.0..820.0).into()), None, None)?;
 
         k = 0;
         for batch in it.flatten() {

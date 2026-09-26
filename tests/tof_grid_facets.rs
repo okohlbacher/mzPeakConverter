@@ -1,11 +1,12 @@
 //! M6 — a TOF-grid archive files each spectrum by the representation its SOURCE declares, and the
 //! integer axis is declared on both facets:
 //!
-//! * a PROFILE spectrum on the lattice → `spectra_data`, `tof_index` set, `mz` NULL,
+//! * a PROFILE spectrum on the lattice → `spectra_data`, one `MS:1003826` grid row (`mz_grid`),
 //!   `spectrum_representation = MS:1000128`, `number_of_data_points` set;
-//! * a CENTROID spectrum on the lattice → `spectra_peaks`, `tof_index` set, `mz` NULL,
+//! * a CENTROID spectrum on the lattice → `spectra_peaks`, one `MS:1003826` grid row,
 //!   `MS:1000127`, `number_of_peaks` set;
-//! * a CENTROID spectrum off the lattice → `spectra_peaks`, `mz` set (exact f64), `tof_index` NULL.
+//! * a CENTROID spectrum off the lattice → `spectra_peaks`, one raw `MS:1000576` row (exact f64 m/z:
+//!   `mz_chunk_start` + the remaining values).
 //!
 //! Until 0.10.0 every gridded spectrum was forced to Centroid to reach the one facet that knew the
 //! axis, and every off-grid one to Profile — the representation was a routing knob. The mzML export
@@ -112,7 +113,10 @@ fn member(archive: &Path, name: &str, dir: &Path) -> Vec<arrow::record_batch::Re
         .collect()
 }
 
-/// Per spectrum index: (rows, rows with non-null `tof_index`, rows with non-null `mz`) in a facet.
+/// Per spectrum index: (chunk rows, points stored as grid indices, points stored raw) in a facet.
+/// Since the chunk-grid layout a gridded spectrum is ONE `MS:1003826` row whose `mz_grid.indices`
+/// holds every point; an off-grid spectrum is ONE raw `MS:1000576` row whose `mz_chunk_values`
+/// holds every exact f64 m/z.
 fn facet_rows(archive: &Path, name: &str, dir: &Path) -> std::collections::BTreeMap<u64, (usize, usize, usize)> {
     let mut m = std::collections::BTreeMap::new();
     for b in member(archive, name, dir) {
@@ -123,13 +127,18 @@ fn facet_rows(archive: &Path, name: &str, dir: &Path) -> std::collections::BTree
             .find(|st| st.column_by_name("spectrum_index").is_some())
             .expect("a struct column with spectrum_index");
         let idx = st.column_by_name("spectrum_index").unwrap().as_primitive::<UInt64Type>();
-        let tof = st.column_by_name("tof_index").expect("both facets declare tof_index");
-        let mz = st.column_by_name("mz").expect("both facets declare an f64 mz");
+        let enc = st.column_by_name("chunk_encoding").expect("a chunk facet").as_string::<i32>();
+        let grid = st.column_by_name("mz_grid").expect("both facets declare mz_grid").as_struct();
+        let indices = grid.column_by_name("indices").unwrap().as_list::<i64>();
+        let values = st.column_by_name("mz_chunk_values").unwrap().as_list::<i64>();
         for i in 0..st.len() {
             let e = m.entry(idx.value(i)).or_insert((0, 0, 0));
             e.0 += 1;
-            e.1 += tof.is_valid(i) as usize;
-            e.2 += mz.is_valid(i) as usize;
+            match enc.value(i) {
+                "MS:1003826" => e.1 += indices.value(i).len(),
+                "MS:1000576" => e.2 += values.value(i).len(),
+                other => panic!("spectrum {}: unexpected chunk encoding {other}", idx.value(i)),
+            }
         }
     }
     m
@@ -181,12 +190,14 @@ fn facet_follows_the_declared_representation_and_the_export_is_clean() {
     let peaks = facet_rows(&archive, "spectra_peaks.parquet", &dir);
     assert_eq!(data.keys().copied().collect::<Vec<_>>(), (0..N_PROFILE as u64).collect::<Vec<_>>(), "spectra_data holds exactly the profile spectra");
     for (ix, (rows, tof, mz)) in &data {
-        assert_eq!((*rows, *tof, *mz), (200, 200, 0), "spectrum {ix}: gridded profile rows carry tof_index and a NULL mz");
+        assert_eq!((*rows, *tof, *mz), (1, 200, 0), "spectrum {ix}: a gridded profile spectrum is one grid row of 200 indices");
     }
     assert_eq!(peaks.keys().copied().collect::<Vec<_>>(), (N_PROFILE as u64..N_TOTAL as u64).collect::<Vec<_>>(), "spectra_peaks holds exactly the centroid spectra");
-    assert_eq!(peaks[&(CENTROID_ON as u64)], (50, 50, 0), "the on-lattice centroid spectrum is gridded in the peaks facet");
+    assert_eq!(peaks[&(CENTROID_ON as u64)], (1, 50, 0), "the on-lattice centroid spectrum is one grid row of 50 indices in the peaks facet");
     for ix in CENTROID_ON as u64 + 1..N_TOTAL as u64 {
-        assert_eq!(peaks[&ix], (30, 0, 30), "spectrum {ix}: an off-lattice centroid keeps exact f64 mz in the peaks facet");
+        // A raw (`MS:1000576`) row keeps the chunk's first m/z in `mz_chunk_start` and the other 29 in
+        // `mz_chunk_values` — the start point is excluded from the values list, as for delta chunks.
+        assert_eq!(peaks[&ix], (1, 0, 29), "spectrum {ix}: an off-lattice centroid is one raw row (30 exact f64 m/z: start + 29 values) in the peaks facet");
     }
 
     // --- export: two arrays per spectrum, no leaked axis, values within the declared bound ---
