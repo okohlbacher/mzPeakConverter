@@ -1,0 +1,104 @@
+{
+ "description": "Bruker MzCalibration ModelType 2: one calibration row and ten (frame, tof) -> m/z values computed by Bruker's timsdata SDK (tims_index_to_mz), for pinning the ModelType-2 formula.",
+ "source": "OpenTIMS (https://github.com/michalsta/opentims, MIT licence, commit c2a3081): the calibration row and frame temperatures are read from pytest/test.d/analysis.tdf; the m/z values are the expected values of pytest/test_bruker.py::test_bruker (NoPressureCompensation), which that test produces through the Bruker SDK bridge.",
+ "global_metadata": {
+  "AcquisitionSoftwareVersion": "4.0.5",
+  "DigitizerNumSamples": "434064",
+  "InstrumentName": "impacTEM-pt",
+  "MzAcqRangeLower": "50.000000",
+  "MzAcqRangeUpper": "1700.000000"
+ },
+ "mz_calibration": [
+  {
+   "Id": 1,
+   "ModelType": 2,
+   "DigitizerTimebase": 0.2,
+   "DigitizerDelay": 18290.0,
+   "T1": 25.353281850324734,
+   "T2": 25.813574051301327,
+   "dC1": 20.0,
+   "dC2": 0.0,
+   "C0": 319.7503329247901,
+   "C1": 154829.60678941052,
+   "C2": -0.001040750146883009,
+   "C3": 319.7503329247901,
+   "C4": -0.001040750146883009,
+   "C5": 225.951491,
+   "C6": 1519.712539,
+   "C7": 7,
+   "C8": -0.0043683204947120545,
+   "C9": 0.00012177064496731006,
+   "C10": -7.730837368063309e-07,
+   "C11": 1.9667556408381262e-09,
+   "C12": -2.3445026756938558e-12,
+   "C13": 1.3101290806617338e-15,
+   "C14": -2.770441001766999e-19
+  }
+ ],
+ "frames": [
+  {
+   "frame": 1,
+   "t1": 25.3817491946934,
+   "t2": 26.21541128830221,
+   "cal_id": 1
+  },
+  {
+   "frame": 2,
+   "t1": 25.3817491946934,
+   "t2": 26.21541128830221,
+   "cal_id": 1
+  }
+ ],
+ "points": [
+  {
+   "frame": 1,
+   "tof": 268877,
+   "mz_sdk": 796.9921854479367
+  },
+  {
+   "frame": 1,
+   "tof": 36849,
+   "mz_sdk": 99.41965089967422
+  },
+  {
+   "frame": 1,
+   "tof": 356994,
+   "mz_sdk": 1236.6336533434433
+  },
+  {
+   "frame": 1,
+   "tof": 366925,
+   "mz_sdk": 1292.2121019027802
+  },
+  {
+   "frame": 1,
+   "tof": 103614,
+   "mz_sdk": 231.80534833156824
+  },
+  {
+   "frame": 2,
+   "tof": 399169,
+   "mz_sdk": 1481.0877220591449
+  },
+  {
+   "frame": 2,
+   "tof": 205746,
+   "mz_sdk": 541.1568097825563
+  },
+  {
+   "frame": 2,
+   "tof": 205657,
+   "mz_sdk": 540.8309909167342
+  },
+  {
+   "frame": 2,
+   "tof": 66533,
+   "mz_sdk": 151.46216019386975
+  },
+  {
+   "frame": 2,
+   "tof": 315625,
+   "mz_sdk": 1018.2541692375131
+  }
+ ]
+}

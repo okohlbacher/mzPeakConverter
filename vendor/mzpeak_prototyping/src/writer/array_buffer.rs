@@ -24,9 +24,15 @@ pub(crate) static FLUSH_MEM_BYTES: std::sync::LazyLock<usize> = std::sync::LazyL
 });
 
 use crate::{
-    BufferContext, BufferName, ToMzPeakDataSeries, buffer_descriptors::{BufferOverrideTable, BufferPriority, BufferTransform}, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, filter::{drop_where_column_is_zero_run_arrays, nullify_at_zero_pair_arrays}, peak_series::{
+    BufferContext, BufferName, ToMzPeakDataSeries,
+    buffer_descriptors::{BufferOverrideTable, BufferPriority, BufferTransform},
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
+    filter::{drop_where_column_is_zero_run_arrays, nullify_at_zero_pair_arrays},
+    grid::{GridEncoding, GridPolicy, GridPolicyTable},
+    peak_series::{
         ArrayIndex, ArrayIndexEntry, INTENSITY_ARRAY, MZ_ARRAY, TIME_ARRAY, WAVELENGTH_ARRAY,
-    }, spectrum::AuxiliaryArray
+    },
+    spectrum::AuxiliaryArray,
 };
 
 /// The precision-twin identity of a field: `(array_accession, buffer_format)`. Two fields with the
@@ -82,7 +88,13 @@ pub trait ArrayBufferWriter {
     }
 
     /// Add the provided `arrays` belonging to `fields` to the buffer
-    fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool) -> usize;
+    fn add_arrays(
+        &mut self,
+        fields: Fields,
+        arrays: Vec<ArrayRef>,
+        size: usize,
+        is_profile: bool,
+    ) -> usize;
 
     /// Whether or not to use a gapped sparse encoding, filling zero-intensity points with nulls left
     /// after zero intensity runs were dropped ([`ArrayBufferWriter::drop_zero_intensity`]).
@@ -219,6 +231,26 @@ pub trait ArrayBufferWriter {
         array_index
     }
 
+    fn grid_policies(&self) -> Option<&HashMap<ArrayType, GridPolicy>>;
+
+    fn grid_policies_mut(&mut self) -> Option<&mut HashMap<ArrayType, GridPolicy>>;
+
+    fn set_current_grid_for(&mut self, array_type: ArrayType, grid: Option<GridEncoding>) -> bool {
+        if let Some(m) = self.grid_policies_mut() {
+            if let Some(policy) = m.get_mut(&array_type) {
+                policy.set_current_grid(grid);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn clear_current_grids(&mut self) {
+        if let Some(policies) = self.grid_policies_mut() {
+            policies.iter_mut().for_each(|(_, p)| p.current_grid = None);
+        }
+    }
+
     fn point_count(&self) -> u64;
     fn point_count_mut(&mut self) -> &mut u64;
 
@@ -304,7 +336,7 @@ pub struct PointBuffers {
     entries: EntryCounter,
     tally: SignalTally,
     nullable_targets: Vec<usize>,
-    drop_zero_columns: Vec<usize>
+    drop_zero_columns: Vec<usize>,
 }
 
 impl PointBuffers {
@@ -462,17 +494,14 @@ impl PointBuffers {
                             null_at_indices.push(j);
                         }
                     }
-                    arrays = nullify_at_zero_pair_arrays(
-                        arrays,
-                        j,
-                        &null_at_indices
-                    ).unwrap();
+                    arrays = nullify_at_zero_pair_arrays(arrays, j, &null_at_indices).unwrap();
                 }
             }
-
         }
 
-        let index_of_insertion = arrays.first().and_then(|arr| arr.as_primitive::<UInt64Type>().iter().next()?);
+        let index_of_insertion = arrays
+            .first()
+            .and_then(|arr| arr.as_primitive::<UInt64Type>().iter().next()?);
         let n = arrays.iter().map(|v| v.len()).next().unwrap_or_default();
 
         let mut visited: HashSet<String> = HashSet::new();
@@ -640,6 +669,14 @@ impl ArrayBufferWriter for PointBuffers {
     fn entry_count(&self) -> u64 {
         self.entries.count
     }
+
+    fn grid_policies(&self) -> Option<&HashMap<ArrayType, GridPolicy>> {
+        None
+    }
+
+    fn grid_policies_mut(&mut self) -> Option<&mut HashMap<ArrayType, GridPolicy>> {
+        None
+    }
 }
 
 /// A data buffer for the `chunked layout`
@@ -662,6 +699,7 @@ pub struct ChunkBuffers {
     point_count: u64,
     entries: EntryCounter,
     tally: SignalTally,
+    grid_policies: HashMap<ArrayType, GridPolicy>,
 }
 
 impl ChunkBuffers {
@@ -678,6 +716,7 @@ impl ChunkBuffers {
         include_time: bool,
         chunking_strategy: ChunkingStrategy,
         mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
+        grid_policies: HashMap<ArrayType, GridPolicy>,
     ) -> Self {
         Self {
             chunk_array_fields,
@@ -695,6 +734,7 @@ impl ChunkBuffers {
             point_count: 0,
             entries: EntryCounter::default(),
             tally: SignalTally::default(),
+            grid_policies,
         }
     }
 
@@ -720,13 +760,14 @@ impl ChunkBuffers {
             series_time,
             self.buffer_context,
             arrays,
-            self.chunking_strategy,
+            self.chunking_strategy.clone(),
             &self.overrides,
             false,
             false,
             &self.chunk_array_fields,
             Some(main_axis),
             Some(boundary),
+            Some(&self.grid_policies),
         );
         match res {
             Ok((chunks, aux, n_pts)) => {
@@ -736,44 +777,6 @@ impl ChunkBuffers {
                 } else {
                     // Empty frame (no points): nothing to buffer, but count the (zero) points.
                     self.point_count += 0;
-                }
-                Some(Ok((aux, n_pts)))
-            }
-            Err(e) => Some(Err(e)),
-        }
-    }
-
-    /// Chunk raw `(m/z, intensity)` arrays on the DEFAULT m/z main axis, for a peak facet that is
-    /// in the chunked layout without an ims `tof` boundary. This is what a centroid spectrum takes:
-    /// its peak list is a plain sorted m/z array, so it chunks exactly like profile signal does,
-    /// and the m/z column then gets the configured [`ChunkingStrategy`] instead of being stored as
-    /// PLAIN `f64` points. Returns `None` when no chunking is configured, so the caller falls back
-    /// to the flat point path.
-    pub fn add_raw_chunked(
-        &mut self,
-        series_index: u64,
-        series_time: Option<f32>,
-        arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
-        let series_time = if self.include_time { series_time } else { None };
-        let res = ArrowArrayChunk::build(
-            series_index,
-            series_time,
-            self.buffer_context,
-            arrays,
-            self.chunking_strategy,
-            &self.overrides,
-            false,
-            false,
-            &self.chunk_array_fields,
-        );
-        match res {
-            // An array the chunk schema does not carry comes back as an auxiliary array; hand it
-            // up so it lands in the metadata facet rather than being dropped here.
-            Ok((chunks, aux, n_pts)) => {
-                if let Some(chunks) = chunks {
-                    let (fields, cols, _) = chunks.into_parts();
-                    self.add_arrays(fields, cols, n_pts, false);
                 }
                 Some(Ok((aux, n_pts)))
             }
@@ -842,11 +845,14 @@ impl ArrayBufferWriter for ChunkBuffers {
             series_time,
             BufferContext::Spectrum,
             &arrays,
-            self.chunking_strategy,
+            &self.chunking_strategy,
             self.overrides(),
             self.drop_zero_intensity(),
             self.nullify_zero_intensity(),
-            self.fields()).unwrap();
+            self.fields(),
+            self.grid_policies(),
+        )
+        .unwrap();
         if let Some(chunks) = chunks {
             let (fields, arrays, _) = chunks.into_parts();
             self.add_arrays(fields, arrays, peaks.len(), false);
@@ -858,12 +864,10 @@ impl ArrayBufferWriter for ChunkBuffers {
     fn drain(&mut self) -> impl Iterator<Item = RecordBatch> {
         let prefix = self.prefix().to_string();
         let schema = self.schema.clone();
-        self.chunk_buffer
-            .drain(..)
-            .map(move |batch| {
-                let batch = RecordBatch::from(batch);
-                Self::promote_record_batch_to_struct(&prefix, batch, schema.clone())
-            })
+        self.chunk_buffer.drain(..).map(move |batch| {
+            let batch = RecordBatch::from(batch);
+            Self::promote_record_batch_to_struct(&prefix, batch, schema.clone())
+        })
     }
 
     fn prefix(&self) -> &str {
@@ -896,6 +900,14 @@ impl ArrayBufferWriter for ChunkBuffers {
 
     fn entry_count(&self) -> u64 {
         self.entries.count
+    }
+
+    fn grid_policies(&self) -> Option<&HashMap<ArrayType, GridPolicy>> {
+        Some(&self.grid_policies)
+    }
+
+    fn grid_policies_mut(&mut self) -> Option<&mut HashMap<ArrayType, GridPolicy>> {
+        Some(&mut self.grid_policies)
     }
 }
 
@@ -972,22 +984,6 @@ impl ArrayBufferWriterVariants {
         }
     }
 
-    /// Chunked raw-array write on the default m/z axis. Delegates to
-    /// [`ChunkBuffers::add_raw_chunked`]; returns `None` for a point buffer, so the caller falls
-    /// back to the flat point path.
-    pub fn add_raw_chunked(
-        &mut self,
-        series_index: u64,
-        series_time: Option<f32>,
-        arrays: &mzdata::spectrum::BinaryArrayMap,
-    ) -> Option<Result<(Vec<AuxiliaryArray>, usize), mzdata::spectrum::bindata::ArrayRetrievalError>> {
-        match self {
-            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
-                chunk_buffers.add_raw_chunked(series_index, series_time, arrays)
-            }
-            ArrayBufferWriterVariants::PointBuffers(_) => None,
-        }
-    }
 }
 
 impl From<ChunkBuffers> for ArrayBufferWriterVariants {
@@ -1051,7 +1047,13 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
         }
     }
 
-    fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool) -> usize {
+    fn add_arrays(
+        &mut self,
+        fields: Fields,
+        arrays: Vec<ArrayRef>,
+        size: usize,
+        is_profile: bool,
+    ) -> usize {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
                 chunk_buffers.add_arrays(fields, arrays, size, is_profile)
@@ -1142,6 +1144,24 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
             ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.entry_count(),
         }
     }
+
+    fn grid_policies(&self) -> Option<&HashMap<ArrayType, GridPolicy>> {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.grid_policies(),
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.grid_policies(),
+        }
+    }
+
+    fn grid_policies_mut(&mut self) -> Option<&mut HashMap<ArrayType, GridPolicy>> {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
+                chunk_buffers.grid_policies_mut()
+            }
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => {
+                point_buffers.grid_policies_mut()
+            }
+        }
+    }
 }
 
 /// A builder for [`ArrayBufferWriter`] types.
@@ -1157,6 +1177,7 @@ pub struct ArrayBuffersBuilder {
     /// GATED (timsTOF `--ims-chunked`): when set, chunk an integer `tof` main axis on m/z bins.
     /// `None` for every default/other-format path, so normal m/z-axis chunking is untouched.
     mz_boundary: Option<crate::chunk_series::TofMzBoundary>,
+    grid_policies: Option<GridPolicyTable>,
 }
 
 /// The builder will default to the `point` layout
@@ -1171,6 +1192,7 @@ impl Default for ArrayBuffersBuilder {
             buffer_context: BufferContext::Spectrum,
             chunking_strategy: None,
             mz_boundary: None,
+            grid_policies: None,
         }
     }
 }
@@ -1181,6 +1203,15 @@ impl ArrayBuffersBuilder {
     pub fn prefix(mut self, value: impl ToString) -> Self {
         self.prefix = value.to_string();
         self
+    }
+
+    /// Get the list of [`ArrayType`] that have been mapped to [`Field`] in this builder
+    pub fn covered_array_types(&self) -> Vec<ArrayType> {
+        self.array_fields
+            .iter()
+            .flat_map(|f| BufferName::from_field(self.buffer_context, f.clone()))
+            .map(|v| v.array_type)
+            .collect()
     }
 
     /// Set the [`BufferContext`] that this will build arrays for
@@ -1203,8 +1234,25 @@ impl ArrayBuffersBuilder {
         self.deduplicate_fields();
         for (k, v) in self.overrides.iter() {
             let f = k.to_field();
+            if f == v.to_field() {
+                continue;
+            }
+            // Matching on name here probably isn't the best solution
             if let Some(i) = self.array_fields.iter().position(|p| p.name() == f.name()) {
-                self.array_fields[i] = v.to_field();
+                if let Some(name_in) =
+                    BufferName::from_field(self.buffer_context, self.array_fields[i].clone())
+                {
+                    if name_in.buffer_format == k.buffer_format
+                        && name_in.buffer_format == v.buffer_format
+                    {
+                        log::debug!(
+                            "Replacing {:?} from {f:?} with {:?}",
+                            self.array_fields[i],
+                            v.to_field()
+                        );
+                        self.array_fields[i] = v.to_field();
+                    }
+                }
             }
         }
         self.deduplicate_fields();
@@ -1216,7 +1264,10 @@ impl ArrayBuffersBuilder {
         self.chunking_strategy = chunking_strategy;
         if !no_change && !self.array_fields.is_empty() {
             log::warn!("Chunking strategy changed, invalidating previous array fields");
-            log::debug!("Chunking strategy changed from {previous:?}, invalidating previous array fields to {:?}", self.chunking_strategy);
+            log::debug!(
+                "Chunking strategy changed from {previous:?}, invalidating previous array fields to {:?}",
+                self.chunking_strategy
+            );
             self.array_fields.clear();
         }
         self
@@ -1233,6 +1284,10 @@ impl ArrayBuffersBuilder {
     }
 
     /// Whether a chunked layout has been requested for this facet.
+    pub fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
+        self.chunking_strategy.as_ref()
+    }
+
     pub fn has_chunking(&self) -> bool {
         self.chunking_strategy.is_some()
     }
@@ -1240,12 +1295,20 @@ impl ArrayBuffersBuilder {
     /// Register an new rule mapping from one [`BufferName`]-like to another [`BufferName`]-like
     /// when later writing arrays
     pub fn add_override(mut self, from: impl Into<BufferName>, to: impl Into<BufferName>) -> Self {
-        self.overrides.insert(from.into(), to.into());
+        let from = from.into();
+        let to = to.into();
+        if from.context != self.buffer_context || to.context != self.buffer_context {
+            return self;
+        }
+        self.overrides.insert(from, to);
         self.apply_overrides();
         self
     }
 
-    pub fn extend_overrides(mut self, iter: impl Iterator<Item = (BufferName, BufferName)>) -> Self {
+    pub fn extend_overrides(
+        mut self,
+        iter: impl Iterator<Item = (BufferName, BufferName)>,
+    ) -> Self {
         for (k, v) in iter {
             self = self.add_override(k, v);
         }
@@ -1289,6 +1352,7 @@ impl ArrayBuffersBuilder {
             }
         }
         if !self.array_fields.iter().any(|f| f.name() == field.name()) {
+            log::trace!("Keeping {field:?}");
             self.array_fields.push(field);
         }
         self.apply_overrides();
@@ -1297,6 +1361,15 @@ impl ArrayBuffersBuilder {
 
     pub fn fields_empty(&self) -> bool {
         self.array_fields.is_empty()
+    }
+
+    pub fn grid_policies(mut self, policies: GridPolicyTable) -> Self {
+        let _ = self.grid_policies.insert(policies);
+        self
+    }
+
+    pub fn grid_policies_ref(&self) -> Option<&HashMap<ArrayType, GridPolicy>> {
+        self.grid_policies.as_ref()
     }
 
     pub(crate) fn add_default_fields_for_context(mut self, buffer_context: BufferContext) -> Self {
@@ -1535,6 +1608,7 @@ impl ArrayBuffersBuilder {
             self.include_time,
             self.chunking_strategy.unwrap(),
             self.mz_boundary,
+            self.grid_policies.unwrap_or_default(),
         )
     }
 
@@ -1569,13 +1643,15 @@ impl ArrayBuffersBuilder {
         let mut drop_zero_column = Vec::new();
         let mut nullable_targets = Vec::new();
         if self.null_zeros {
-             for (i, f) in self.array_fields.iter().enumerate() {
+            for (i, f) in self.array_fields.iter().enumerate() {
                 if let Some(buf) = BufferName::from_field(self.buffer_context, f.clone()) {
-                    if buf.transform == Some(BufferTransform::NullInterpolate) || buf.transform == Some(BufferTransform::NullZero) {
+                    if buf.transform == Some(BufferTransform::NullInterpolate)
+                        || buf.transform == Some(BufferTransform::NullZero)
+                    {
                         nullable_targets.push(i)
                     }
                 }
-             }
+            }
         }
         let mut drop_zero_columns = Vec::new();
         for (i, f) in self.array_fields.iter().enumerate() {
@@ -1607,14 +1683,21 @@ impl ArrayBuffersBuilder {
             drop_zero_columns,
         }
     }
+
+    pub fn view_array_fields(&self) -> &[Arc<Field>] {
+        &self.array_fields
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use std::io::{self, prelude::*};
-    use arrow::{array::{AsArray, Float32Array, Float64Array, UInt64Array}, datatypes::Float64Type};
+    use arrow::{
+        array::{AsArray, Float32Array, Float64Array, UInt64Array},
+        datatypes::Float64Type,
+    };
     use mzdata::io::MZFileReader;
     use mzpeaks::CentroidPeak;
+    use std::io::{self, prelude::*};
 
     use super::*;
 
@@ -1652,8 +1735,6 @@ mod test {
         let arr = arr.as_primitive::<Float64Type>();
         let v = arr.value(0);
         assert_eq!(peaks[0].mz, v);
-
-
     }
 
     #[test_log::test]
@@ -1678,10 +1759,11 @@ mod test {
         let fields_of = vec![
             BufferContext::Spectrum.index_field(),
             builder.fields()[1].clone(),
-            builder.fields()[2].clone()
+            builder.fields()[2].clone(),
         ];
         let n = mzs.len();
-        let indices = Arc::new(UInt64Array::from_iter_values(std::iter::repeat_n(0, n))) as ArrayRef;
+        let indices =
+            Arc::new(UInt64Array::from_iter_values(std::iter::repeat_n(0, n))) as ArrayRef;
         let mzs = Arc::new(Float64Array::from(mzs)) as ArrayRef;
         let intensities = Arc::new(Float32Array::from(intensities)) as ArrayRef;
 
@@ -1725,8 +1807,9 @@ mod test {
         let fields = crate::writer::sample_array_types_from_spectrum_source(
             &mut reader,
             &builder.overrides(),
-            builder.chunking_strategy,
+            builder.chunking_strategy.as_ref(),
             false,
+            None,
         );
         for f in fields {
             builder = builder.add_field(f)

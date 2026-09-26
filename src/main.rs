@@ -62,7 +62,6 @@ mod bruker_tsf;
 mod bruker_traces;
 mod tof_grid;
 mod tims_mobility;
-mod tdf_grid;
 mod thermo_status;
 mod thermo_trailers;
 mod thermo_isolation;
@@ -95,12 +94,10 @@ use mzdata::prelude::*;
 use mzdata::spectrum::bindata::BinaryArrayMap3D;
 use mzdata::spectrum::{BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType, MultiLayerSpectrum};
 use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
-use mzpeak_prototyping::{BufferContext, BufferName};
 use mzpeak_prototyping::archive::ZipArchiveWriter;
 use mzpeak_prototyping::chunk_series::ChunkingStrategy;
-use mzpeak_prototyping::peak_series::INTENSITY_ARRAY;
 use mzpeak_prototyping::writer::{
-    AbstractMzPeakWriter, ArrayBuffersBuilder, CustomBuilderFromParameter, MzPeakWriterType,
+    AbstractMzPeakWriter, CustomBuilderFromParameter, MzPeakWriterType,
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
@@ -293,16 +290,17 @@ struct Cli {
     ///
     /// Some vendors hand over m/z that are really integers over a power of ten (Shimadzu `MassHigh`
     /// at 1e-9 Da, and the LabSolutions mzML export of the same acquisition). When the sampled
-    /// centroids all land on such a lattice, the peaks facet stores `tof_index` = round(m/z·scale)
-    /// as Int64 (DELTA_BINARY_PACKED) with an `mz_calibration` index block, which is LOSSLESS and
-    /// smaller than both numpress-linear (lossy) and delta chunking — measured on a 4.5 GB
-    /// LabSolutions DIA mzML: 2.19 GB delta / 1.36 GB numpress / 1.31 GB lattice. Any spectrum that
-    /// does not fit keeps its exact f64 m/z in the same facet's `mz` column; nothing is snapped.
+    /// centroids all land on such a lattice, the peaks facet is stored on the reference
+    /// implementation's fitted linear grid (chunk-grid layout, one `MS:1003824` model per spectrum,
+    /// every value within 1e-6 Da — 2e-7 Da in practice; declared as `grid-fit:1e-6Da` in
+    /// `transformations`), which is markedly smaller than delta chunking on such data (−45 % on the
+    /// m/z bytes of a 4.5 GB LabSolutions DIA mzML). Through 0.13 this was an exact Int64 point
+    /// lattice of the converter's own; that layout is gone (readers still decode it).
     ///
     /// This flag turns the whole thing off, on every lane (the native Shimadzu `.lcd` one
     /// included); `MZPC_NO_MZ_LATTICE=1` does the same from the environment. Use it when the
-    /// archive is destined for a reader that does not know the `mz-grid` codec and so cannot
-    /// reconstruct an integer m/z axis. Data that is not on a lattice is unaffected either way.
+    /// centroid m/z must survive to the last bit rather than to 1e-6 Da. Data that is not on a
+    /// lattice is unaffected either way.
     #[arg(long)]
     no_mz_lattice: bool,
 
@@ -336,48 +334,21 @@ struct Cli {
     #[arg(long, value_enum)]
     representation: Option<RepresentationArg>,
 
-    /// Bruker timsTOF (TDF) ims-compact only — the CHUNKED layout, **ON BY DEFAULT**. Each frame's
-    /// peaks are split into true m/z 50-Th bins (override width with `--chunk-size`, in Th); every
-    /// chunk records its main-axis (TOF) bounds (`chunk_start`/`chunk_end`) as Parquet columns WITH
-    /// page statistics, so the m/z axis is page-prunable — XIC / m/z-slice queries are ~20x faster.
-    /// TOF is delta-encoded within each chunk (start point excluded; cumulative-sum from
-    /// `chunk_start` to reconstruct, lossless). Measured on PXD059079's 2485.d it is also 7.8%
-    /// SMALLER than the flat layout: chunk-relative TOF costs a quarter of what absolute TOF does,
-    /// which more than pays for the mobility column losing its run-length ordering. Accepting the
-    /// flag explicitly is inert and says so. Note the deviation this layout carries: the archive
-    /// then holds a CHUNK `spectra_peaks` facet beside a POINT `spectra_data` facet, which
-    /// conformance.md lists as a deliberate mixed-layout-family deviation.
+    /// Bruker timsTOF (TDF) ims-compact only — 50-Th chunks, **ON BY DEFAULT**. Each frame's peaks
+    /// are split into true m/z bins (override the width with `--chunk-size`, in Th) on the reference
+    /// implementation's chunk grid: every chunk row keeps its real m/z bounds (page-prunable, so m/z
+    /// window queries read only the chunks they need) and its points as integer TOF bins and TIMS
+    /// scan numbers under the frame's own vendor calibration models (`mz_grid`,
+    /// `mean_inverse_reduced_ion_mobility_grid`; exact, SDK-verified). Accepting the flag explicitly
+    /// is inert and says so.
     #[arg(long)]
     ims_chunked: bool,
 
-    /// Bruker timsTOF (TDF) ims-compact only: write the flat ARCHIVE layout instead of the chunked
-    /// one — a single table of ABSOLUTE integer TOF bins, no m/z index and no mixed layout family,
-    /// at ~8% more bytes. This was the default through 0.12.0.
+    /// Bruker timsTOF (TDF) ims-compact only: one chunk per frame instead of 50-Th chunks — the same
+    /// grid rows, whole-frame access in one row, no m/z pruning within a frame. (Through 0.13 this
+    /// selected a flat point table of absolute TOF bins; that layout is gone.)
     #[arg(long)]
     no_ims_chunked: bool,
-
-    /// Bruker timsTOF (TDF) ims-compact, chunked layout: keep the 0.12.x TOF layout (integer TOF
-    /// bounds, `tof_chunk_values` deltas, `tof_c0`/`tof_c1` per spectrum) instead of the GRID layout
-    /// that is the default since 0.13.0: real m/z chunk bounds, `mz_chunk_values` null, chunk
-    /// encoding MS:1003826, and one struct column per dimension (`mz_grid`,
-    /// `mean_inverse_reduced_ion_mobility_grid`: grid type, the vendor's calibration parameters,
-    /// integer indices) — the layout of the reference implementation (mzpeak_prototyping
-    /// `e62e18c`). Every frame is exact, including those whose calibration row has `C2`/`C4`.
-    #[arg(long)]
-    no_ims_grid: bool,
-
-    /// On a `.mzpeak` input: rewrite a 0.12.x ims-chunked timsTOF archive into the grid layout,
-    /// every other member copied byte for byte. On a `.d` input the grid layout is the default and
-    /// this flag is inert.
-    #[arg(long)]
-    ims_grid: bool,
-
-    /// Parquet encoding of the grid layout's index lists and bounds: `bss` (byte-stream-split; the
-    /// measured best, −2.3 % on PXD059079 2485 against the 0.12.5 layout) or `plain` (Parquet's
-    /// default — dictionary, then plain — as the reference implementation's files are encoded;
-    /// +8.1 % on the same run).
-    #[arg(long, default_value = "bss", value_parser = ["bss", "plain"])]
-    grid_encoding: String,
 
     /// Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default
     /// pure-Rust readers; Windows/Linux only, needs timsdata.dll/libtimsdata.so). On a TDF `.d` this
@@ -440,14 +411,14 @@ struct Cli {
     /// **Inputs read through mzdata only** (mzML incl. `--via-msconvert`, imzML, Thermo `.raw`, and a
     /// TDF read as f64 m/z under `--no-ims-compact` or the ims-compact fallback): compactify
     /// exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z
-    /// and storing `tof_index` (Int32) + a per-run `{c0,c1}` instead, recovering
-    /// `m/z = (c0 + c1·tof_index)²`. **Off by default** and
+    /// and storing each spectrum as a chunk-grid row (`MS:1003825` model `[c0, c1, 1]`, integer
+    /// indices) instead, recovering `m/z = (c0 + c1·k)²`. **Off by default** and
     /// bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`, default 5 ppm) — it reverse-engineers the grid msconvert
     /// discarded. `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise);
     /// `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF
-    /// ims-compact lanes and `--agilent-grid` store the integer grid of the vendor calibration
-    /// (lossless), and the Bruker TSF/BAF, Agilent MHDAC (with a warning), Waters and Shimadzu lanes
-    /// store the m/z their reader returns.
+    /// ims-compact lanes, `--agilent-grid` and the Shimadzu profile facet store the vendor's own
+    /// integer grid (exact models), and the Bruker TSF/BAF, Agilent MHDAC (with a warning) and
+    /// Waters lanes store the m/z their reader returns.
     ///
     /// **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that
     /// lane also fits the grid statistically. There the default (flag absent) is `auto` — the
@@ -467,10 +438,11 @@ struct Cli {
     sample: Option<u32>,
 
     /// Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from
-    /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) with
-    /// per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id` columns (the MassHunter calibration drifts
-    /// from scan to scan) instead of f64 m/z, recovering `m/z = (tof_c0 + tof_c1·tof_index)²`, in
-    /// `spectra_data` (it is profile data).
+    /// `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store the vendor's bin ordinals
+    /// as chunk-grid rows, each scan under its own `MS:1003825` model (the MassHunter calibration
+    /// drifts from scan to scan), in `spectra_data` (it is profile data). The grid is the bare
+    /// quadratic; MassHunter's polynomial refinement (up to ~7.5 ppm) rides verbatim in the
+    /// `agilent_calibration` index block.
     /// Far smaller than the msconvert lane (≈0.14×). OFF by default; only applies when
     /// `AcqData/MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path).
     #[arg(long)]
@@ -606,7 +578,6 @@ struct FileConfig {
     no_ims_compact: Option<bool>,
     ims_chunked: Option<bool>,
     no_ims_chunked: Option<bool>,
-    no_ims_grid: Option<bool>,
     bruker_sdk: Option<bool>,
     no_tims_recalibration: Option<bool>,
     no_vendor: Option<bool>,
@@ -646,12 +617,8 @@ struct Settings {
     ims_zstd_level: i32,
     force: bool,
     no_ims_compact: bool,
-    /// OPT-IN chunked integer-TOF ims-compact layout (m/z-boundary chunks). Default false.
+    /// timsTOF ims-compact: 50-Th (`--chunk-size`) grid chunks (default) or one chunk per frame.
     ims_chunked: bool,
-    /// Grid layout for the chunked timsTOF facet (`--no-ims-grid` keeps the 0.12.x TOF layout).
-    ims_grid: bool,
-    /// Byte-stream-split on the grid layout's index lists and bounds (`--grid-encoding plain` off).
-    grid_bss: bool,
     bruker_sdk: bool,
     tims_recalibration: bool,
     no_vendor: bool,
@@ -719,8 +686,6 @@ impl Settings {
         note(cli.representation.is_some(), "--representation");
         note(cli.ims_chunked, "--ims-chunked");
         note(cli.no_ims_chunked, "--no-ims-chunked");
-        note(cli.no_ims_grid, "--no-ims-grid");
-        note(cli.ims_grid, "--ims-grid");
         note(cli.bruker_sdk, "--bruker-sdk");
         note(cli.no_tims_recalibration, "--no-tims-recalibration");
         note(cli.no_vendor, "--no-vendor");
@@ -755,11 +720,9 @@ impl Settings {
             force: cli.force || fc.force.unwrap_or(false),
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
             // Chunked is the default since 0.12.1. `--no-ims-chunked` (or `no_ims_chunked: true`,
-            // or the older `ims_chunked: false`) goes back to the flat layout.
+            // or the older `ims_chunked: false`) goes to one chunk per frame.
             ims_chunked: !(cli.no_ims_chunked || fc.no_ims_chunked.unwrap_or(false))
                 && fc.ims_chunked.unwrap_or(true),
-            ims_grid: !(cli.no_ims_grid || fc.no_ims_grid.unwrap_or(false)),
-            grid_bss: cli.grid_encoding != "plain",
             bruker_sdk: cli.bruker_sdk || fc.bruker_sdk.unwrap_or(false),
             tims_recalibration: !(cli.no_tims_recalibration
                 || fc.no_tims_recalibration.unwrap_or(false)),
@@ -1176,17 +1139,6 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         // cumulatively summed it — every TOF bin after the first in a scan decodes as a tiny bin and
         // squares to a nonsense m/z. Refuse rather than emit silently wrong masses.
         reject_legacy_tof_delta(&cli.input)?;
-        // `--ims-grid` on an archive: the 0.12.x ims-chunked facet is rewritten into the grid
-        // layout; nothing else is filtered or touched.
-        if cli.ims_grid {
-            let report = tdf_grid::rewrite_archive(&cli.input, &output, cfg.ims_zstd_level, cfg.grid_bss)
-                .with_context(|| format!("rewriting {} into the grid layout", cli.input.display()))?;
-            log::info!(
-                "wrote {} ({} frames, {} points; peaks facet {} -> {} bytes)",
-                output.display(), report.frames, report.points, report.peaks_bytes_before, report.peaks_bytes_after
-            );
-            return Ok(exit::OK);
-        }
         // `--no-vendor` strips the embedded vendor data on the filter path too — same effect as
         // `--drop-aux 'vendor*'` (the glob's `*` spans `/`, so it also catches `vendor/…` side-files).
         // (It is moot for mzML output — vendor facets aren't carried into mzML at all.)
@@ -1351,7 +1303,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
                 .with_context(|| format!("converting {} via msconvert", cli.input.display()))?;
         }
         Lane::SdkImsCompact => {
-            convert_ims_compact_sdk(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms)
+            convert_ims_compact_sdk(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.ims_chunked, cfg.chunk_size)
                 .with_context(|| format!("SDK ims-compact converting {}", cli.input.display()))?;
         }
         Lane::BrukerSdk => {
@@ -1366,7 +1318,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
             // upstream a raw-TOF mode so ims-compact works on newer data through mzdata too.)
             ims_compact_with_fallback(
                 &cli.input,
-                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size, cfg.ims_grid, cfg.grid_bss),
+                || convert_ims_compact_archive(&cli.input, &output, cfg.ims_zstd_level, vendor.as_ref(), cfg.chromatograms, cfg.tims_recalibration, cfg.ims_chunked, cfg.chunk_size),
                 |route| {
                     // The fallback IS the standard lane: its flags were checked against ims-compact,
                     // which honours `--ims-chunked`; the standard lane cannot, so say so now.
@@ -1525,7 +1477,7 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
         // Lane selection puts msconvert before every native backend, so these four would be
         // silently overridden — the user chose a reader and gets a different one.
         Lane::ViaMsconvert => &["--aux", "--bruker-sdk", "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
-        Lane::SdkImsCompact => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
+        Lane::SdkImsCompact => &["--image", "--sdrf", "--no-tims-recalibration"],
         Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
         Lane::ImsCompact => &["--image", "--sdrf"],
         Lane::VendorReader => &["--image", "--sdrf"],
@@ -1556,8 +1508,8 @@ fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
             "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration", "--no-chromatograms",
             "--tof-grid", "--agilent-grid",
         ],
-        Lane::AgilentGrid | Lane::SdkImsCompact => &["--layout", "--no-numpress", "--chunk-size"],
-        Lane::ImsCompact => &["--layout", "--no-numpress"],
+        Lane::AgilentGrid => &["--layout", "--no-numpress", "--chunk-size"],
+        Lane::SdkImsCompact | Lane::ImsCompact => &["--layout", "--no-numpress"],
         // No chunked TOF layout off the timsTOF ims-compact lane — which falls back to `Standard`
         // on a TDF timsrust cannot decompress, and checks this list again when it does.
         Lane::VendorReader | Lane::Standard => &["--ims-chunked", "--no-ims-chunked"],
@@ -1924,18 +1876,8 @@ fn refine_chunking(
 /// profile/dual run they do not, and a profile axis (a flight-time grid) must not arm a route that
 /// will never touch it.
 fn probe_lattice_scale(spectra: &[mzdata::spectrum::MultiLayerSpectrum]) -> Option<f64> {
-    let lists: Vec<Vec<f64>> =
-        spectra.iter().filter_map(mz_lattice::centroid_pairs).map(|(mz, _)| mz).collect();
-    let centroids: Vec<f64> = lists.iter().flatten().copied().collect();
-    let scale = mz_lattice::fixed_point_lattice_scale(&centroids)?;
-    // The detector pools the probes' values; the ROUTE decides one spectrum at a time, and its
-    // `centroid_lattice` also requires a non-decreasing k. Re-ask it per probe list so the scale
-    // this run commits to is one every probe would actually have taken, not merely one their
-    // concatenation passes.
-    lists
-        .iter()
-        .all(|mz| mz.is_empty() || mz_lattice::centroid_lattice(mz, scale).is_some())
-        .then_some(scale)
+    let centroids: Vec<f64> = spectra.iter().filter_map(mz_lattice::centroid_mzs).flatten().collect();
+    mz_lattice::fixed_point_lattice_scale(&centroids)
 }
 
 /// Collect m/z values from a few sample spectra, for `refine_chunking`.
@@ -3040,12 +2982,11 @@ where
     tof_grid::fit(&samples)
 }
 
-/// Convert an mzML reader to a TOF-grid mzPeak archive: each spectrum's f64 m/z is replaced by an
-/// integer `tof_index` (Int32) column, with the per-run `{c0,c1}` grid stored in the index
-/// `tof_calibration` block. Readers reconstruct `m/z = (c0 + c1·tof_index)²`. The integer column is
-/// named `tof_index` so the vendored writer applies DELTA_BINARY_PACKED automatically. Mirrors
-/// `convert_ims_compact_archive`'s custom-peak-schema mechanism, but for the mzML path. `read_path`
-/// is the file `reader` was opened from, which differs from `input` for a gzipped source.
+/// Convert an mzML reader to a TOF-grid mzPeak archive: every spectrum on the run-wide grid is
+/// stored as a chunk-grid row (`MS:1003826`) under the exact `MS:1003825 [c0, c1, 1]` model —
+/// integer indices `k`, readers reconstruct `m/z = (c0 + c1·k)²` — and an off-grid spectrum as a
+/// raw row with its exact f64 m/z (`tof_grid_spectrum`). `read_path` is the file `reader` was
+/// opened from, which differs from `input` for a gzipped source.
 #[allow(clippy::too_many_arguments)]
 fn convert_file_tof_grid(
     input: &Path,
@@ -3058,6 +2999,8 @@ fn convert_file_tof_grid(
     grid: tof_grid::TofGrid,
     images: &[PathBuf],
     sdrf: Option<&Path>,
+    // A TDF read on timsrust's chord (`mzdata_tdf_needs_chord`): declared.
+    tdf_chord: bool,
 ) -> Result<()> {
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
@@ -3065,21 +3008,24 @@ fn convert_file_tof_grid(
     let level = ZstdLevel::try_new(zstd_level)
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
 
-    let tof_field = tof_index_field((grid.c0, grid.c1), false);
-
+    // Both facets in the reference implementation's chunk-grid layout. PER-SPECTRUM ROUTING by the
+    // source's own representation is unchanged: profile spectra go to `spectra_data`, centroid
+    // spectra to `spectra_peaks`. A spectrum that carries the model (`sqrt_grid_param`) is stored as
+    // `mz_grid {MS:1003825, [c0, c1, 1], indices}`; one that does not (off-grid, kept exact f64) as a
+    // raw `MS:1000576` chunk — upstream's own fallback. One chunk per spectrum (`GRID_CHUNK_TH`):
+    // measured −7.5 … +6 % against the point layout, where 50-Th chunks cost +13 … +30 % (vendor
+    // audit 2026-09-23).
+    let grid_chunk = || Some(ChunkingStrategy::Grid { chunk_size: GRID_CHUNK_TH, grid: None });
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
-        // The off-grid f64 m/z of these point facets: BYTE_STREAM_SPLIT, no dictionary.
         .shuffle_mz(true)
-        .store_peaks_and_profiles_apart(Some(tof_index_peak_schema(tof_field.clone())));
-    // PER-SPECTRUM ROUTING by the source's own representation: profile spectra go to `spectra_data`
-    // (point layout — the builder default here; an integer axis has no chunk encoder), centroid
-    // spectra to `spectra_peaks`. Gridded spectra carry `tof_index`, off-grid ones (MS2, sparse,
-    // off-lattice) their EXACT f64 m/z, in whichever facet their representation selects. Sample the
-    // source so the data facet's f64 m/z / intensity schema is configured — without this the f64 m/z
-    // column would spill to auxiliary_arrays and read back wrong — then declare the axis on it too.
-    builder = builder.sample_array_types_from_spectrum_source(&mut reader).add_spectrum_field(tof_field);
+        .chunked_encoding(grid_chunk())
+        .peaks_chunked_encoding(grid_chunk())
+        .add_grid_policies(exact_sqrt_grid_policy())
+        .add_peak_grid_policies(exact_sqrt_grid_policy());
+    builder = builder.sample_array_types_from_spectrum_source(&mut reader);
+    builder = builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader);
     // Derive the chromatogram schema (intensity/time dtypes) from the source chromatograms so the
     // facet matches what we write (the synthesized TIC/base-peak are f64 — sampling f64 source
     // chromatograms keeps the schema f64 and avoids an f32/f64 record-batch mismatch).
@@ -3137,8 +3083,11 @@ fn convert_file_tof_grid(
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
-    // `tof_calibration` first, as this lane has written it since 0.9.11.
-    let index_blocks: Vec<(String, serde_json::Value)> = std::iter::once(tof_grid_calibration_block(&grid))
+    if tdf_chord {
+        declare(&mut applied, TDF_CHORD_TRANSFORMATION);
+    }
+    // No `tof_calibration` block since the chunk-grid layout: the model rides on every grid row.
+    let index_blocks: Vec<(String, serde_json::Value)> = std::iter::empty::<(String, serde_json::Value)>()
         .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&applied)))
@@ -3146,137 +3095,133 @@ fn convert_file_tof_grid(
     finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
 }
 
-/// The integer flight-time axis column of every TOF-grid lane: `tof_index` (Int32) carrying the
-/// `SqrtMzFromTof` transform CURIE plus the coefficients as field metadata, so a conformant reader
-/// recovers `m/z = (c0 + c1·tof_index)²` from the column alone. `run_wide` is `mzpeak:transform_params`
-/// — the run's `(c0, c1)` when one grid serves every spectrum (the mzML `--tof-grid` lane), or a
-/// hint / the `(0, 1)` identity placeholder the reader deliberately skips when `per_spectrum` is set,
-/// which adds `mzpeak:transform_params_per_spectrum = "tof_c0,tof_c1"` and makes the per-spectrum
-/// columns authoritative (SCIEX, Agilent, Shimadzu). The BufferName MUST match the DataArray built per
-/// spectrum (Spectrum context, nonstandard("tof_index"), Int32) or the array spills to auxiliary.
-///
-/// One definition because the SAME field is declared on BOTH facets of a TOF-grid archive: on
-/// `spectra_data` for profile spectra and on `spectra_peaks` for centroid ones. The representation
-/// the source states is carried through unchanged (`signal_continuity` is never rewritten to steer
-/// the facet — review item M6), so a spectrum lands in the facet its representation dictates, finds
-/// its axis declared there, and `number_of_data_points` / `number_of_peaks` describe the source.
-/// Until 0.10.1 gridded spectra were forced to Centroid to reach the only facet that knew the axis,
-/// which labelled every gridded profile a centroid spectrum in `spectra_metadata`.
-fn tof_index_field(run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
-    tof_axis_field("tof_index", run_wide, per_spectrum)
-}
+/// Chunk width for grid-encoded facets whose model is per spectrum: one chunk per spectrum.
+/// Measured −7.5 … +6 % against the 0.13 point layout on the sqrt grids, where the reference
+/// implementation's 50-Th default costs +13 … +30 % (vendor audit 2026-09-23).
+const GRID_CHUNK_TH: f64 = 1.0e6;
+/// Chunk width of a peaks facet under the reference implementation's FITTED linear grid: its default.
+const GRID_PEAK_CHUNK_TH: f64 = 50.0;
+/// Acceptance bound of that fitted grid, in Da (the reference implementation's own default). The fit
+/// spreads a spectrum's padded m/z range over 2³² slots, so the error is ≤ span/2³³ — 2e-7 Da on a
+/// 1,500-Th spectrum — and the bound is never reached on real lists; it is what the archive declares.
+const GRID_FIT_TOL_DA: f64 = 1e-6;
+/// The `transformations` entry of a peaks facet on the fitted grid (the bound spelled out).
+const GRID_FIT_TRANSFORMATION: &str = "grid-fit:1e-6Da";
+/// The `transformations` entry of a TDF whose m/z came from timsrust's two-point chord through
+/// mzdata instead of its `MzCalibration` model (`mzdata_tdf_needs_chord`).
+const TDF_CHORD_TRANSFORMATION: &str = bruker_native::CHORD;
 
-/// The integer flight-time axis column itself, for both names it goes by: `tof_index` on the
-/// sqrt-grid lanes ([`tof_index_field`]) and `tof` on ims-compact, whose index block likewise says
-/// `"lossless": "tof"`. The two names are a published format difference and stay; the field around
-/// them — Int32, the `SqrtMzFromTof` transform CURIE, `mzpeak:transform_params` = "c0,c1" and the
-/// per-spectrum key — is one definition, so a third key added for one lane cannot miss the other.
-fn tof_axis_field(axis: &str, run_wide: (f64, f64), per_spectrum: bool) -> std::sync::Arc<arrow::datatypes::Field> {
-    let base = BufferName::new(
-        BufferContext::Spectrum,
-        ArrayType::nonstandard(axis),
-        BinaryDataArrayType::Int32,
-    )
-    .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof))
-    .to_field();
-    let mut md = base.metadata().clone();
-    md.insert("mzpeak:transform_params".to_string(), format!("{},{}", run_wide.0, run_wide.1));
-    if per_spectrum {
-        md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
+/// A TDF read through mzdata whose `MzCalibration` holds a row of a model type other than 1:
+/// switch mzdata's per-frame m/z model off (timsrust's chord instead) and say so. mzdata 0.67.1
+/// reads every row as ModelType 1, which turns a ModelType-2 row's `C3`/`C4` (copies of `C0`/`C2`)
+/// into a cubic term and a shift and puts every m/z an order of magnitude low. `true` when switched.
+fn mzdata_tdf_needs_chord(reader: &mut MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>, input: &Path) -> bool {
+    let MZReaderType::BrukerTDF(tdf) = reader else { return false };
+    let path = if input.is_dir() { input.join("analysis.tdf") } else { input.to_path_buf() };
+    let types: Vec<i64> = match bruker_native::read_mz_calibration_rows(&path) {
+        Ok(rows) => rows.values().map(|r| r.model_type).filter(|t| *t != 1).collect(),
+        Err(_) => return false,
+    };
+    if types.is_empty() {
+        return false;
     }
-    std::sync::Arc::new((*base).clone().with_metadata(md))
+    log::warn!(
+        "{}: MzCalibration ModelType {:?}, which mzdata reads as ModelType 1 (wrong m/z); reading m/z on \
+         timsrust's two-point chord instead (declared as {TDF_CHORD_TRANSFORMATION}). The default \
+         ims-compact lane stores this file exactly up to the declared calibrant correction.",
+        input.display(),
+        types
+    );
+    tdf.use_custom_mz_calibration(false);
+    true
 }
 
-/// The `spectra_peaks` schema of a TOF-grid lane: `tof_index` (the axis of a gridded centroid
-/// spectrum) beside an f64 `mz` that is NULL on gridded rows and carries the exact m/z of a centroid
-/// spectrum that did not fit the grid, plus intensity — the same integer-axis-with-f64-fallback shape
-/// as the `mz-grid` lattice facet (`mz_lattice::lattice_peak_schema`), so either representation keeps
-/// its exact m/z in its own facet. Shared by the mzML and native-vendor TOF-grid paths.
-fn tof_index_peak_schema(tof_field: std::sync::Arc<arrow::datatypes::Field>) -> ArrayBuffersBuilder {
-    ArrayBuffersBuilder::default()
-        .prefix("point")
-        .with_context(BufferContext::Spectrum)
-        .add_field(BufferContext::Spectrum.index_field())
-        .add_field(tof_field)
-        .add_field(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field())
-        // Intensity matches the baseline f32 (SCIEX detector counts; f32 is exact for them).
-        .add_field(INTENSITY_ARRAY.to_field())
+/// The writer's m/z grid policy for lanes that attach an EXACT model to the array
+/// ([`sqrt_grid_param`]): tolerance 0 means a fitted grid is never accepted, so a spectrum without a
+/// model is stored raw (lossless) rather than snapped to an approximation.
+fn exact_sqrt_grid_policy() -> mzpeak_prototyping::grid::GridPolicyTable {
+    use mzpeak_prototyping::grid::GridPolicy;
+    std::iter::once((
+        ArrayType::MZArray,
+        GridPolicy::quadratic(ArrayType::MZArray, Some(mzpeaks::Tolerance::Da(0.0))),
+    ))
+    .collect()
 }
 
-/// What a `codec: "tof-grid"` block claims about the m/z a reader REBUILDS from the stored integer
-/// axis — and, for the two inexact claims, the bound that claim is worth nothing without.
+/// PSI-MS `MS:1003825` "square root grid interpolation" as mzdata represents it on an array:
+/// `[intercept, slope, scale]`, `m/z = ((c0 + c1·k)²) / scale`. The reference implementation reads
+/// it with `SquareRootLinearGrid::from_param` (parameter order verified against mzdata 0.67.1
+/// `basic_mz_parameters`, 2026-09-23).
+fn sqrt_grid_param(c0: f64, c1: f64) -> mzdata::Param {
+    mzdata::Param::builder()
+        .curie(mzdata::curie!(MS:1003825))
+        .name("square root grid interpolation")
+        .value(mzdata::params::Value::List(Box::new([c0, c1, 1.0].map(mzdata::params::Value::Float))))
+        .unit(Unit::MZ)
+        .build()
+}
+
+/// The reference implementation's own FITTED linear grid, for centroid lists that sit on a
+/// fixed-point lattice (Shimadzu `MassHigh` at 1e-9 Da and the LabSolutions mzML export of it):
+/// `LinearGrid::fit` per spectrum, accepted only while every value rebuilds within
+/// [`GRID_FIT_TOL_DA`]; a spectrum that does not fit is stored raw. This replaced the 0.9–0.13 Int64
+/// point lattice (vendoring exit, item 1): that lattice is the one representation the chunk grid
+/// cannot hold exactly (2³² steps of 1e-9 Da is 4.29 Th per chunk), and the fit is what upstream's
+/// `--peak-encoding grid` writes — within 0.004 ppm of the vendor value, −10.6 % on DIA_Hela_20ng.
+fn lattice_fit_grid_policy() -> mzpeak_prototyping::grid::GridPolicyTable {
+    use mzpeak_prototyping::grid::GridPolicy;
+    std::iter::once((
+        ArrayType::MZArray,
+        GridPolicy::linear(ArrayType::MZArray, Some(mzpeaks::Tolerance::Da(GRID_FIT_TOL_DA))),
+    ))
+    .collect()
+}
+
+/// A spectrum on the sqrt grid `m/z = (c0 + c1·k)²`, as the chunk-grid layout stores it: the GRID
+/// VALUES as f64 m/z — what a 0.13 reader reconstructed from its `tof_index` column — with the model
+/// riding on the m/z array as a Param (`MS:1003825 [c0, c1, 1]`, mzdata's own convention). The
+/// writer's grid policy turns each spectrum back into integer indices through upstream's
+/// `SquareRootLinearGrid`; that inversion is exact (`round((√mz − c0)/c1) == k` on every point,
+/// measured 2026-09-23 on Blind/HEK), so the facet holds the same integers the point layout did.
 ///
-/// The bound lives inside the variant on purpose. Through 0.9.13 the Shimadzu profile lane's block
-/// carried a `max_error_da` its fit never enforced, and for one release it carried neither
-/// `lossless` nor `mz_reconstruction` at all while sharing its `model` string with the per-spectrum
-/// SCIEX lane — so a reader keying off the model got one answer there and null here. A test counting
-/// strings caught that after the fact; this cannot be written down wrong in the first place.
-#[derive(Clone, Copy)]
-enum MzReconstruction {
-    /// The vendor's OWN bin ordinal, re-evaluated through the vendor's OWN calibration: exact by
-    /// construction rather than by measurement (the `--agilent-grid` lane).
-    Exact,
-    /// A fit accepted only while every point rebuilds within this many ppm (both SCIEX lanes).
-    BoundedLossyPpm(f64),
-    /// Within the vendor's own rounding of the m/z it handed over, in Da — the fit's acceptance gate
-    /// itself, so the bound and the check cannot diverge (the Shimadzu profile grid).
-    #[cfg_attr(not(windows), allow(dead_code))]
-    WithinVendorRoundingDa(f64),
-}
-
-/// The keys EVERY `codec: "tof-grid"` block carries: which column is stored exactly, and whether the
-/// m/z rebuilt from it is. One builder for all four lanes so a reader answers both questions from one
-/// place regardless of model, and a fifth lane cannot ship a block that answers neither. Lanes extend
-/// the returned map with their own keys — the reconstruction formula, the per-spectrum columns, the
-/// vendor's calibration table.
+/// A run-wide grid is anchored at `c0²` (index 0); points below that m/z have NEGATIVE indices,
+/// which the reference implementation's `to_index` clamps to 0 without a word (mzdata `clamp_u32`)
+/// — on this converter's SWATH fixture that silently moved the three lowest points of 20 of 201
+/// spectra to 57.076 Th. Such a spectrum gets its own anchor: `c0' = c0 + c1·k_min` and indices
+/// relative to `k_min`. Same grid, different rounding, so the stored values are the re-anchored
+/// model's — they differ from the run-wide formula by at most an ulp (≤ 7e-10 ppm on Agilent
+/// FM_01_Pos), and the archive stays self-consistent: every value is its row's model at its index.
 ///
-/// `lossless` is the SPEC's key and its value is a COLUMN NAME — "the exactly-preserved stored
-/// column". Do not "fix" it by renaming: it was once read as a fidelity claim, judged
-/// self-contradictory beside a ppm bound, and renamed to a synonym — which broke nothing at runtime
-/// but diverged from the spec and from the 11 published archives carrying it (the synonym is banned
-/// by name in tests/contract_strings.rs, so this comment cannot spell it). The genuinely new
-/// information, whether the m/z you REBUILD is exact, is `mz_reconstruction` beside it.
-fn tof_grid_block(model: &str, reconstruction: MzReconstruction) -> serde_json::Map<String, serde_json::Value> {
-    let mut block = serde_json::Map::new();
-    block.insert("codec".to_string(), serde_json::json!("tof-grid"));
-    block.insert("model".to_string(), serde_json::json!(model));
-    block.insert("lossless".to_string(), serde_json::json!("tof_index"));
-    match reconstruction {
-        MzReconstruction::Exact => {
-            block.insert("mz_reconstruction".to_string(), serde_json::json!("exact"));
-        }
-        MzReconstruction::BoundedLossyPpm(ppm) => {
-            block.insert("mz_reconstruction".to_string(), serde_json::json!("bounded-lossy"));
-            block.insert("roundtrip_tolerance_ppm".to_string(), serde_json::json!(ppm));
-        }
-        MzReconstruction::WithinVendorRoundingDa(da) => {
-            block.insert("mz_reconstruction".to_string(), serde_json::json!("within-vendor-rounding"));
-            block.insert("max_error_da".to_string(), serde_json::json!(da));
-        }
-    }
-    block
+/// Returns the arrays and the reconstructed m/z (for the summary terms).
+fn sqrt_grid_arrays(c0: f64, c1: f64, k: &[i32], intensity: &[f32]) -> Result<(BinaryArrayMap, Vec<f64>)> {
+    let (c0, k_shift) = match k.first() {
+        Some(&k_min) if k_min < 0 => (c0 + c1 * k_min as f64, k_min),
+        _ => (c0, 0),
+    };
+    let recon: Vec<f64> = k
+        .iter()
+        .map(|&k| {
+            let r = c0 + c1 * (k - k_shift) as f64;
+            r * r
+        })
+        .collect();
+    let mut out = BinaryArrayMap::new();
+    let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+    mz_da.update_buffer(recon.as_slice()).map_err(|e| anyhow::anyhow!("encoding m/z: {e}"))?;
+    mz_da.unit = Unit::MZ;
+    // The model rides on the m/z DataArray itself: `GridPolicy::find_grid_model_param` looks there.
+    mz_da.add_param(sqrt_grid_param(c0, c1));
+    out.add(mz_da);
+    let mut int_da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    int_da.update_buffer(intensity).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
+    int_da.unit = Unit::DetectorCounts;
+    out.add(int_da);
+    Ok((out, recon))
 }
 
-/// The `tof_calibration` block of the run-wide sqrt grid (`--tof-grid`, and the native SCIEX lane's
-/// run-wide fit): how a reader recovers `m/z = (c0 + c1·tof_index)²` from the stored integer axis.
-fn tof_grid_calibration_block(grid: &tof_grid::TofGrid) -> (String, serde_json::Value) {
-    // The run-wide grid accepts a point landing within `tof_grid::ppm_tol()` of the source (an
-    // exact-fit-or-nothing rule would refuse almost every real spectrum), so the axis is stored
-    // exactly and the m/z rebuilt from it is bounded. The per-spectrum summaries describe the
-    // RECONSTRUCTED coordinates, so metadata and data agree inside the archive; it is the relation
-    // to the SOURCE that is bounded. (Intensity is stored verbatim.)
-    let mut cal = tof_grid_block("sciex_sqrt", MzReconstruction::BoundedLossyPpm(tof_grid::ppm_tol()));
-    cal.insert("mz_from_tof_index".to_string(), serde_json::json!("(c0 + c1*tof_index)^2"));
-    cal.insert("c0".to_string(), serde_json::json!(grid.c0));
-    cal.insert("c1".to_string(), serde_json::json!(grid.c1));
-    ("tof_calibration".to_string(), cal.into())
-}
-
-/// Per-spectrum routing decision for the TOF-grid path. Neither variant changes the spectrum's
-/// representation: the facet follows `signal_continuity` as the source stated it.
 enum TofRoute {
-    /// Every point reconstructed from the run-wide grid within tolerance: the spectrum carries
-    /// `tof_index` (Int32) in place of m/z.
+    /// Every point reconstructed from the run-wide grid within tolerance: the spectrum carries the
+    /// grid values with the model attached (`sqrt_grid_arrays`).
     Gridded(MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>),
     /// At least one point is off-lattice (MS2, sparse, off-lattice): the spectrum is kept verbatim
     /// with EXACT f64 m/z.
@@ -3582,75 +3527,37 @@ fn tof_grid_spectrum(
             set_observed_mz_range(&mut descr, lo, hi);
         }
         // Representation preserved here too: a Profile spectrum keeps its f64 m/z in `spectra_data`,
-        // a Centroid one in the peaks facet's own f64 `mz` column (`tof_index_peak_schema`). Until
-        // 0.10.1 this route forced Profile, mislabelling an off-grid centroid spectrum the other way.
+        // a Centroid one in the peaks facet, each as a raw (`MS:1000576`) chunk row. Until 0.10.1
+        // this route forced Profile, mislabelling an off-grid centroid spectrum the other way.
         return Ok(TofRoute::F64(MultiLayerSpectrum::new(descr, entry.arrays.clone(), None, None)));
     }
 
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(tof.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-    int_da.unit = Unit::DetectorCounts; // match INTENSITY_ARRAY's unit so it maps to point.intensity
-    out.add(int_da);
+    let (out, recon) = sqrt_grid_arrays(grid.c0, grid.c1, &tof, &intensity)?;
 
     // No blanket MS:1000294 "mass spectrum" here (or on any other route since 0.9.13): mzdata's
     // `spectrum_type()` returns the first matching term, and the writer infers MS:1000579/580 from
     // ms_level ONLY when it returns nothing — so the generic parent shadowed the MS1/MSn child on
     // every row of the affected archives.
     let mut descr = entry.description().clone();
-    // Summary terms (TIC, base peak, observed-m/z range): the output stores integer tof_index, so
-    // mzdata would derive tic = 0, base peak = (0, 0) and "m/z 0–0" from the m/z-less array map.
-    // Summarize the RECONSTRUCTED m/z — `grid.mz(k)`, what a reader computes from the stored
-    // column — not the source f64 the fit consumed. Same points, but the grid is accepted at a ppm
-    // tolerance, so the two coordinate sets differ by up to that bound; stating the source values
-    // would name m/z that the archive does not contain.
-    let recon: Vec<f64> = tof.iter().map(|&k| grid.mz(k)).collect();
+    // Summary terms (TIC, base peak, observed-m/z range) from the RECONSTRUCTED m/z — the grid
+    // values the archive stores — not the source f64 the fit consumed. Same points, but the grid
+    // is accepted at a ppm tolerance, so the two coordinate sets differ by up to that bound;
+    // stating the source values would name m/z that the archive does not contain.
     set_gridded_spectrum_summary(&mut descr, &recon, &intensity);
     // `signal_continuity` stays what the source said. The writer routes a Profile spectrum's raw
-    // arrays to `spectra_data` and a Centroid one's to `spectra_peaks`, and BOTH facets declare the
-    // `tof_index` axis (`tof_index_field`), so the representation is no longer a routing knob —
-    // until 0.10.1 this line forced Centroid to reach the one facet that knew the axis, and every
-    // gridded profile spectrum was labelled a centroid spectrum with `number_of_peaks` set (M6).
+    // arrays to `spectra_data` and a Centroid one's to `spectra_peaks`, and both facets are grid
+    // chunk facets, so the representation is no longer a routing knob — until 0.10.1 this line
+    // forced Centroid to reach the one facet that knew the axis, and every gridded profile spectrum
+    // was labelled a centroid spectrum with `number_of_peaks` set (M6).
     Ok(TofRoute::Gridded(MultiLayerSpectrum::new(descr, Some(out), None, None)))
 }
 
-/// Converter-owned CURIEs for the per-spectrum TOF-grid coefficients (Agilent profile grid drifts
-/// scan-to-scan — `base`/`coeff` vary per scan — so a single run-wide `[c0,c1]` is ~100 ppm off; we
-/// store c0/c1 as per-spectrum columns instead); a reader recovers
-/// `m/z = (tof_c0 + tof_c1·tof_index)²` per spectrum. Also carried per spectrum by the timsTOF
-/// ims-compact lanes when the vendor `MzCalibration` row is sqrt-linear
-/// (`bruker_native::add_exact_tof_params`).
-///
-/// The terms are `cv/mzpeak.obo` MZP:1000003 / MZP:1000004 / MZP:1000005, represented in this crate
-/// as `ControlledVocabulary::Unknown` CURIEs that the vendored writer/reader render and parse as
-/// `MZP:` (`mzpeak_prototyping::param::curie_to_string`), so the spectra_metadata columns are
-/// `opt_MZP_1000003_tof_c0` / `opt_MZP_1000004_tof_c1` / `opt_MZP_1000005_tof_calibration_id`. Until
-/// 0.10.1 they squatted `MS:4000900`–`MS:4000902` in the PSI-owned namespace (columns
-/// `opt_MS_4000900_tof_c0` …), which is what the spec calls a column-naming artifact and asked to be
-/// converter-owned. Readers were built for the move: the vendored reader binds the coefficients by
-/// NAME (`reconstruct_per_spectrum_grid_mz`), and the viewer by the `_tof_c0` / `_tof_c1` column-name
-/// SUFFIX, so archives of either generation reconstruct.
-pub(crate) const TOF_C0_CURIE: mzdata::params::CURIE =
-    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_003);
-pub(crate) const TOF_C1_CURIE: mzdata::params::CURIE =
-    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_004);
-/// Per-spectrum CalibrationID column — selects the polynomial-refinement row in the
-/// `tof_calibration` index block, so the EXACT MassHunter m/z (quadratic + polynomial) reconstructs.
-const TOF_CALID_CURIE: mzdata::params::CURIE =
-    mzdata::params::CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_005);
-
 /// FILE-DIRECT Agilent Q-TOF profile converter: read the integer flight-time grid straight from
-/// `AcqData/MSProfile.bin` (pure Rust, no MHDAC) and write the SAME `tof_index` (Int32) + intensity
-/// axis `convert_file_tof_grid` uses (in `spectra_data`: it is profile data), plus per-spectrum
-/// `tof_c0`/`tof_c1` columns (Agilent
-/// calibration drifts per scan). Each point is gated for losslessness against the polynomial-refined
-/// MassHunter m/z (`PPM_TOL`); over-tolerance points abort (this lane is only dispatched when the
-/// `.d` has profile data, so an abort means the grid model genuinely failed and is a real error).
+/// `AcqData/MSProfile.bin` (pure Rust, no MHDAC) and write it the way `convert_file_tof_grid` does
+/// (in `spectra_data`: it is profile data) — the bare quadratic grid values with each scan's own
+/// `MS:1003825` model (Agilent calibration drifts per scan). The vendor's polynomial refinement
+/// (up to ~7.5 ppm) is not a sqrt grid: it rides verbatim in the `agilent_calibration` index block,
+/// selected per spectrum by `agilent_calibration_id`, for a reader that wants MassHunter's m/z.
 /// Diagnostic: decode the whole Agilent profile run with the pure-Rust reader and print one CSV row
 /// per selected scan (`sum,nnz,first_k,first_v,last_k,last_v,maxv` + grid c0/c1) for byte-exact
 /// validation against `rainbow`. Also reports the run-wide max reconstruction ppm vs the
@@ -3695,31 +3602,21 @@ fn dump_agilent_profile(input: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The `--agilent-grid` writer. Its data schema is hand-built, so every column the batches carry
-/// must be declared, `spectrum_index` included: 0.10.1 dropped it (5692603), and the writer then met
-/// the batch's index column in `route_unexpected`, which panics on a column no array metadata
-/// describes. The other hand-built TOF schemas declare it too.
-fn agilent_grid_writer_builder(level: ZstdLevel, grid: (f64, f64)) -> mzpeak_prototyping::writer::MzPeakWriterBuilder {
-    let tof_field = tof_index_field(grid, true);
+/// The `--agilent-grid` writer: `spectra_data` on the chunk grid, its schema sampled from one
+/// spectrum shaped as `agilent_grid_spectrum` builds them (m/z + intensity; the lane has no mzdata
+/// reader to sample from).
+fn agilent_grid_writer_builder(
+    level: ZstdLevel,
+    probe: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
+) -> mzpeak_prototyping::writer::MzPeakWriterBuilder {
     MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
-        .add_spectrum_field(BufferContext::Spectrum.index_field())
-        .add_spectrum_field(tof_field)
-        .add_spectrum_field(INTENSITY_ARRAY.to_field())
-        // Per-spectrum grid coefficients as Float64 spectrum columns (pulled from each spectrum's
-        // params by CURIE). These are the AUTHORITATIVE per-scan calibration for m/z reconstruction.
-        .add_spectrum_param_field(
-            CustomBuilderFromParameter::from_spec(TOF_C0_CURIE, "tof_c0", DataType::Float64),
-        )
-        .add_spectrum_param_field(
-            CustomBuilderFromParameter::from_spec(TOF_C1_CURIE, "tof_c1", DataType::Float64),
-        )
-        // Per-spectrum CalibrationID → selects the polynomial refinement in the index block for the
-        // EXACT MassHunter m/z. Per-run-constant in practice, so it compresses to ~nothing.
-        .add_spectrum_param_field(
-            CustomBuilderFromParameter::from_spec(TOF_CALID_CURIE, "tof_calibration_id", DataType::Int64),
-        )
+        .shuffle_mz(true)
+        .chunked_encoding(Some(ChunkingStrategy::Grid { chunk_size: GRID_CHUNK_TH, grid: None }))
+        .chromatogram_chunked_encoding(None)
+        .add_grid_policies(exact_sqrt_grid_policy())
+        .sample_array_types_from_spectra(std::iter::once(probe))
 }
 
 fn convert_agilent_grid(
@@ -3738,22 +3635,16 @@ fn convert_agilent_grid(
     let level = ZstdLevel::try_new(zstd_level)
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
 
-    // Data facet (`spectra_data`, point layout): integer `tof_index` (Int32, ΔBP) + intensity — the
-    // vendor's profile vector is PROFILE data and is filed as such (M6). The run-wide
-    // `transform_params` on the column is informational (per-spectrum c0/c1 ride their own columns);
-    // set it to the first spectrum's grid so a single-calibration run still self-describes. Nothing
-    // samples this lane's schema (the reader yields no m/z array), so intensity is declared explicitly
-    // or it spills into `auxiliary_arrays`.
-    let first_grid = {
-        // Peek the first spectrum's grid without consuming the stream: re-open a probe reader.
+    // The schema probe: the first spectrum, built exactly as the loop below builds them (a second
+    // reader, so the stream is not consumed). The vendor's profile vector is PROFILE data and is
+    // filed as such (M6).
+    let probe = {
         let mut probe = agilent_profile::AgilentProfileReader::open(input)?;
-        probe.next_spectrum()?.map(|s| s.grid)
+        let ps = probe.next_spectrum()?.with_context(|| format!("no profile spectra in {}", input.display()))?;
+        agilent_grid_spectrum(&probe, ps, &mut 0.0, &mut 0)?
     };
-    let (c0_hint, c1_hint) = first_grid.map(|g| (g.c0, g.c1)).unwrap_or((0.0, 1.0));
-    let mut writer = agilent_grid_writer_builder(level, (c0_hint, c1_hint)).build(handle, true);
+    let mut writer = agilent_grid_writer_builder(level, probe).build(handle, true);
     add_processing_metadata(&mut writer);
-    // The per-spectrum coefficient columns are MZP terms (`TOF_C0_CURIE` …): declare the CV.
-    ensure_mzp_cv(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
     let cap = max_spectra();
@@ -3772,8 +3663,8 @@ fn convert_agilent_grid(
         n += 1;
     }
     log::info!(
-        "Agilent-grid: wrote {n} profile spectra of {} scan records; max round-trip m/z error \
-         {max_ppm:.6} ppm vs MassHunter (traditional quadratic + polynomial refinement){}",
+        "Agilent-grid: wrote {n} profile spectra of {} scan records; the stored quadratic grid is at \
+         most {max_ppm:.4} ppm from MassHunter's polynomial-refined m/z (agilent_calibration block){}",
         reader.len(),
         if f32_rounded > 0 { format!(" (WARNING: {f32_rounded} intensities above 2^24 were rounded to Float32)") } else { String::new() }
     );
@@ -3797,28 +3688,26 @@ fn convert_agilent_grid(
         declare(&mut applied, entry);
     }
     applied.extend(chromatogram_transforms);
-    // This lane is the exact one: `tof_index` is the vendor's OWN bin ordinal and a conformant reader
-    // re-evaluates the vendor's OWN calibration (`calibrations` below), so reconstruction is exact by
-    // construction rather than by measurement — note `max_roundtrip_ppm` here compares two
-    // evaluations of the same formula and is therefore necessarily ~0, a consistency check and not
-    // evidence of anything.
-    let mut cal = tof_grid_block("agilent_sqrt_poly", MzReconstruction::Exact);
-    // Per-spectrum (tof_c0, tof_c1) + per-spectrum tof_calibration_id select a row in
-    // `calibrations`; reconstruction: t = base + (tof_c0 + tof_c1*tof_index)/coeff;
-    // m/z = (coeff*(t-base))^2 - poly(clip(t,left,right)), poly orders set by use_flags.
-    cal.insert(
-        "tof_to_mz".to_string(),
-        serde_json::json!("t = base + (tof_c0 + tof_c1*tof_index)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))"),
-    );
-    cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1", "tof_calibration_id"]));
-    cal.insert("calibrations".to_string(), calibrations);
-    cal.insert("max_roundtrip_ppm".to_string(), serde_json::json!(max_ppm));
-    let cal = serde_json::Value::from(cal);
+    // The grid rows carry the bare quadratic — the vendor's OWN bin ordinal `k` under each scan's
+    // `MS:1003825 [c0, c1, 1]` — which is what every reader decodes. MassHunter's m/z subtracts a
+    // per-CalibrationID polynomial from it (`ValueUseFlags`, up to ~7.5 ppm on MTBLS1334); that is
+    // not a sqrt grid, so the vendor's calibration rows ride verbatim here for a reader that wants
+    // it: `t = base + (c0 + c1·k)/coeff; mz = (coeff·(t−base))² − poly(clip(t, left, right))`, the
+    // row selected by the spectrum's `agilent_calibration_id` parameter. `max_bare_grid_ppm` is how
+    // far the stored grid values sit from that, at worst, over this run.
+    let cal = serde_json::json!({
+        "vendor": "agilent",
+        "declared_grid": "MS:1003825 [c0, c1, 1] per spectrum: the bare quadratic, mz = (c0 + c1*k)^2",
+        "refined_mz": "t = base + (c0 + c1*k)/coeff ; mz = (coeff*(t-base))^2 - poly(clip(t,left,right))",
+        "per_spectrum": "agilent_calibration_id",
+        "calibrations": calibrations,
+        "max_bare_grid_ppm": max_ppm,
+    });
     // A capped run stops early on request. An uncapped one whose MSProfile.bin ended before its scan
     // records is partial too, and says so offline instead of only in the log.
     let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
         .into_iter()
-        .chain(std::iter::once(("tof_calibration".to_string(), cal)))
+        .chain(std::iter::once(("agilent_calibration".to_string(), cal)))
         .chain(partial_marker(input, cap, n).or_else(|| agilent_truncation_marker(cap, reader.skipped(), reader.len(), n)))
         .chain(std::iter::once(transformations_block(&applied)))
         .collect();
@@ -3882,8 +3771,8 @@ fn agilent_truncation_marker(
 }
 
 /// Build one mzPeak spectrum from an Agilent profile spectrum: the integer `tof_index` (Int32) +
-/// integer intensity (as Float32, exact for counts < 2^24), the per-spectrum grid as `tof_c0`/`tof_c1`
-/// params, and a per-point lossless gate against the polynomial-refined MassHunter m/z.
+/// integer intensity (as Float32, exact for counts < 2^24), the per-spectrum grid as the
+/// `MS:1003825` model on the m/z array, and the distance to the polynomial-refined MassHunter m/z.
 fn agilent_grid_spectrum(
     reader: &agilent_profile::AgilentProfileReader,
     ps: agilent_profile::ProfileSpectrum,
@@ -3891,26 +3780,18 @@ fn agilent_grid_spectrum(
     f32_rounded: &mut usize,
 ) -> Result<MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>> {
     let grid = ps.grid;
-    // Losslessness vs MassHunter. The stored representation is: integer `tof_index = k`, per-spectrum
-    // (c0,c1), and the per-CalibrationID polynomial in the index block. A conformant reader recovers
-    // raw TOF `t = base + (c0+c1·k)/coeff` and then the FULL MassHunter m/z (traditional quadratic +
-    // polynomial), so reconstruction is exact to f64 noise. We measure that round-trip error here
-    // (`max_ppm` ≈ 0). For the report we ALSO track how far the bare 2-coeff grid (no polynomial)
-    // would be — the magnitude of the refinement the index block captures.
+    // How far the stored representation — the bare quadratic `(c0 + c1·k)²` every reader decodes —
+    // sits from MassHunter's polynomial-refined m/z, at worst. The refinement itself is in the
+    // `agilent_calibration` index block.
     if let (Some(row), uf) = (reader.calib_row(ps.index), reader.poly_flags_for(ps.index)) {
-        let coeff = row[0];
-        let base = row[1];
+        let (coeff, base) = (row[0], row[1]);
         for &k in &ps.tof_index {
-            // MassHunter's reported m/z for this bin (the lossless target).
             let t = base + (grid.c0 + grid.c1 * k as f64) / coeff;
             let target = agilent_profile::calibrated_mz(row, uf, t);
             if !(target > 0.0) {
                 continue;
             }
-            // Reader's reconstruction from the stored columns + index polynomial — identical formula.
-            let t_rec = base + (grid.c0 + grid.c1 * k as f64) / coeff;
-            let rec = agilent_profile::calibrated_mz(row, uf, t_rec);
-            let ppm = (rec - target).abs() / target * 1e6;
+            let ppm = (grid.mz(k) - target).abs() / target * 1e6;
             if ppm > *max_ppm {
                 *max_ppm = ppm;
             }
@@ -3919,16 +3800,7 @@ fn agilent_grid_spectrum(
 
     let intensity = intensities_as_f32(&ps.intensity, f32_rounded);
 
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(ps.tof_index.as_slice()).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-    int_da.unit = Unit::DetectorCounts;
-    out.add(int_da);
+    let (out, recon) = sqrt_grid_arrays(grid.c0, grid.c1, &ps.tof_index, &intensity)?;
 
     let mut descr = mzdata::spectrum::SpectrumDescription::default();
     descr.index = ps.index;
@@ -3949,37 +3821,11 @@ fn agilent_grid_spectrum(
         agilent_profile::Polarity::Negative => mzdata::spectrum::ScanPolarity::Negative,
         agilent_profile::Polarity::Unknown => mzdata::spectrum::ScanPolarity::Unknown,
     };
-    descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
-    descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
-    descr.add_param(
-        Param::builder()
-            .name("tof_calibration_id")
-            .curie(TOF_CALID_CURIE)
-            .value(ps.calibration_id as i64)
-            .build(),
-    );
-    // Summary terms: the output stores integer tof_index and NO m/z array, so mzdata would derive
-    // tic = 0, base peak = (0, 0) and "m/z 0–0". Reconstruct m/z the way a conformant reader does —
-    // the polynomial-refined MassHunter value when this spectrum has a calibration row, else the
-    // bare 2-coefficient grid — and hand the reconstructed array to the shared grid-summary helper.
-    //
-    // The reconstruction is materialized rather than evaluated lazily at the index extremes: the
-    // bare quadratic grid is monotonic in `tof_index`, but the polynomial refinement subtracted
-    // from it is not guaranteed to be, so "min/max of m/z = m/z at min/max index" is an assumption
-    // this code has never checked. Scanning costs one `calibrated_mz` per stored point, in a
-    // function that already evaluates it twice per point for the losslessness gate above.
-    let calib = reader.calib_row(ps.index).map(|row| (row, reader.poly_flags_for(ps.index)));
-    let mz_of = |k: i32| -> f64 {
-        match calib {
-            Some((row, uf)) => {
-                let (coeff, base) = (row[0], row[1]);
-                agilent_profile::calibrated_mz(row, uf, base + (grid.c0 + grid.c1 * k as f64) / coeff)
-            }
-            None => grid.mz(k),
-        }
-    };
-    let mzs: Vec<f64> = ps.tof_index.iter().map(|&k| mz_of(k)).collect();
-    set_gridded_spectrum_summary(&mut descr, &mzs, &intensity);
+    // Which `calibrations` row refines this scan (per-run-constant in practice): a plain user
+    // param, kept in the spectrum's parameter list.
+    descr.add_param(Param::new_key_value("agilent_calibration_id", ps.calibration_id as i64));
+    // Summary terms from the STORED points — the bare grid values, not the refined m/z.
+    set_gridded_spectrum_summary(&mut descr, &recon, &intensity);
     // Set retention time on the scan event.
     let mut acq = mzdata::spectrum::Acquisition::default();
     if let Some(ev) = acq.first_scan_mut() {
@@ -4113,6 +3959,11 @@ fn convert_file(
         .with_context(|| format!("opening {}", input.display()))?;
     // Before the TOF-grid branch below, which is handed this reader.
     recover_chromatogram_index(&mut reader, input, read_path);
+    // mzdata applies a TDF's MzCalibration rows by default and reads every row as ModelType 1; a
+    // ModelType-2 row's C3/C4 then become a cubic term and an m/z shift (m/z 270 → 21 on the SBA415
+    // run). Until mzdata handles the model type, such a file is read on timsrust's two-point chord —
+    // an approximation, declared below — rather than on a model that is wrong.
+    let tdf_chord = mzdata_tdf_needs_chord(&mut reader, input);
 
     // TOF-grid m/z encoding (SCIEX / exact-lattice TOF): if requested, sample spectra and try to fit
     // a per-run integer flight-time grid `sqrt(m/z)=c0+c1·k`. When every sampled point reconstructs
@@ -4134,7 +3985,7 @@ fn convert_file(
                 // PER-SPECTRUM routing: off-grid spectra (MS2 / sparse / off-lattice) are stored as
                 // exact f64 m/z in the `spectra_data` facet, while griddable spectra use `tof_index`.
                 // There is no longer a whole-run fallback — a single archive holds both facets.
-                return convert_file_tof_grid(input, read_path, output, zstd_level, vendor, synth_chroms, reader, fit.grid, images, sdrf);
+                return convert_file_tof_grid(input, read_path, output, zstd_level, vendor, synth_chroms, reader, fit.grid, images, sdrf, tdf_chord);
             }
             None => {
                 if tof_grid == TofGridMode::On {
@@ -4180,23 +4031,19 @@ fn convert_file(
     let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
 
     // FIXED-POINT m/z LATTICE (see `mz_lattice`). The same probes decide, from the CENTROID values
-    // only, whether this run's peaks are vendor integers over a power of ten. When they are, the
-    // peaks facet stores `tof_index` = round(m/z·scale) as Int64 (DELTA_BINARY_PACKED, with an
-    // `mz_calibration` index block) instead of f64 `mz` — lossless AND smaller than either chunk
-    // encoding, so it takes precedence over both numpress-linear and delta on that facet. It
-    // supersedes NOTHING on the data facet: profile arrays keep `chunk` exactly as refined above,
-    // including the `--no-numpress` / `--layout point` / explicit-strategy choices, so a
-    // profile-only lattice input is byte-identical to before (the route needs centroids to fire).
-    // `--no-mz-lattice` (or $MZPC_NO_MZ_LATTICE) opts out.
-    let lattice_scale = if mz_lattice_enabled() {
-        probe_lattice_scale(&probes)
-    } else {
-        None
-    };
-    if let Some(scale) = lattice_scale {
+    // only, whether this run's peaks are vendor integers over a power of ten (Shimadzu `MassHigh`
+    // at 1e-9 Da, the LabSolutions mzML export of it). When they are, the peaks facet takes the
+    // reference implementation's FITTED linear grid (`lattice_fit_grid_policy`, chunk-grid layout,
+    // within `GRID_FIT_TOL_DA`): −10.6 % against the 0.13 Int64 lattice on DIA_Hela_20ng, and
+    // upstream's own encoding. It supersedes NOTHING on the data facet: profile arrays keep `chunk`
+    // exactly as refined above, including the `--no-numpress` / `--layout point` / explicit-strategy
+    // choices, so a profile-only lattice input is byte-identical to before (the route needs
+    // centroids to fire). `--no-mz-lattice` (or $MZPC_NO_MZ_LATTICE) opts out.
+    let lattice = mz_lattice_enabled() && probe_lattice_scale(&probes).is_some();
+    if lattice {
         log::info!(
-            "centroid m/z is on a 1/{scale:e} fixed-point lattice; storing the peaks facet as \
-             Int64 tof_index = round(m/z·{scale:e}) (lossless; off-lattice spectra keep f64 m/z)"
+            "centroid m/z is on a fixed-point lattice; storing the peaks facet on the fitted linear \
+             grid (chunk grid, every value within {GRID_FIT_TOL_DA:e} Da; --no-mz-lattice keeps f64 m/z)"
         );
     }
 
@@ -4208,14 +4055,15 @@ fn convert_file(
     // motivated the heuristic (HEK_PosOAD1: 33,392,175 B against 35,018,328 B mixed); a centroid-only
     // run keeps the whole chunked-peaks win (-46% on Shimadzu `.lcd`), and a profile run with a small
     // centroid sidecar pays for it (+34% on that facet, ~3% of the archive; a Thermo LTQ Velos file).
-    // The exceptions are deliberate: a lattice peaks facet below, and the timsTOF ims-compact archive's
-    // chunked peaks beside point data (2026-09-02; the writer logs the deviation).
+    // The exceptions are deliberate: the lattice grid on the peaks facet, and the timsTOF ims-compact
+    // archive's chunked peaks beside point data (2026-09-02; the writer logs the deviation).
     let mut builder = MzPeakWriterType::<fs::File>::builder()
-        .chunked_encoding(chunk)
-        // A lattice peaks facet is an integer axis with an f64 fallback column: never chunked,
-        // never numpressed — the lattice replaces both. This MUST precede
-        // `store_peaks_and_profiles_apart`, which stamps the configured strategy onto the schema.
-        .peaks_chunked_encoding(if lattice_scale.is_some() { None } else { chunk })
+        .chunked_encoding(chunk.clone())
+        .peaks_chunked_encoding(if lattice {
+            Some(ChunkingStrategy::Grid { chunk_size: GRID_PEAK_CHUNK_TH, grid: None })
+        } else {
+            chunk
+        })
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -4231,14 +4079,11 @@ fn convert_file(
 
     // Derive the data schema from the data actually present (one m/z + one intensity column at
     // their source dtype) so points land in point.mz/point.intensity, not auxiliary_arrays.
+    if lattice {
+        builder = builder.add_peak_grid_policies(lattice_fit_grid_policy());
+    }
     builder = builder.sample_array_types_from_spectrum_source(&mut reader);
-    builder = match lattice_scale {
-        // The lattice facet is fully declared (its four columns are the contract: spectrum_index,
-        // tof_index Int64, the f64 `mz` fallback, intensity); sampling the source's peak arrays
-        // would only re-add the f64 `mz` it already carries.
-        Some(scale) => builder.store_peaks_and_profiles_apart(Some(mz_lattice::lattice_peak_schema(scale))),
-        None => builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader),
-    };
+    builder = builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader);
     builder = builder.sample_array_types_from_chromatograms(chromatograms_by_index(&mut reader).take(10).map(schema_sample_chromatogram));
 
     let mut writer = builder.build(handle, true);
@@ -4293,7 +4138,6 @@ fn convert_file(
     let mut n = 0usize;
     let cap = max_spectra();
     let mut ms1 = Ms1Chroms::default();
-    let mut lattice_tally = FacetTally::default();
     // Whether any spectrum was actually re-ordered below — declared in `transformations` so a
     // reader knows the stored point order is not the source's.
     let mut resorted = false;
@@ -4346,55 +4190,13 @@ fn convert_file(
         if synth_chroms {
             ms1.observe(&entry);
         }
-        match lattice_scale {
-            // Lattice lane: the spectrum comes back UNCHANGED (its m/z array is what the writer
-            // derives the TIC / base peak / observed-m/z columns from — see `lattice_route`'s
-            // summary contract), and only the peak-facet ROWS become integers. A spectrum whose
-            // centroids miss the lattice falls through to `write_spectrum`, which stores its exact
-            // f64 m/z in the same facet's `mz` column: nothing is snapped, nothing is refused.
-            Some(scale) => {
-                let (spec, peak_arrays, outcome) = mz_lattice::lattice_route(entry, scale);
-                lattice_tally.record(FacetRoutes {
-                    centroid_lattice: outcome.on_lattice(),
-                    ..FacetRoutes::default()
-                });
-                match peak_arrays.as_ref() {
-                    Some(arrays) => writer.write_spectrum_with_peak_arrays(&spec, arrays)?,
-                    None => writer.write_spectrum(&spec)?,
-                }
-            }
-            None => writer.write_spectrum(&entry)?,
-        }
+        writer.write_spectrum(&entry)?;
         n += 1;
     }
     log::debug!("wrote {n} spectra");
     if let Some(g) = &thermo_windows {
         g.report();
     }
-    if let Some(scale) = lattice_scale {
-        log::info!(
-            "m/z lattice (1/{scale:e}): {} spectra stored as Int64 tof_index, {} kept exact f64 m/z",
-            lattice_tally.centroid_lattice,
-            lattice_tally.centroid_f64
-        );
-        // The scale is decided from a handful of probe spectra but the SCHEMA is run-wide, so a
-        // spectrum that misses it keeps its exact f64 m/z in a point column that is neither
-        // chunked nor numpressed. Values are never wrong, but a run that lands mostly there can be
-        // BIGGER than the same file with `--no-mz-lattice`. Say so rather than let it pass in
-        // silence: this is the one way the lattice can cost space instead of saving it.
-        let routed = lattice_tally.centroid_lattice + lattice_tally.centroid_f64;
-        if routed > 0 && lattice_tally.centroid_f64 * 10 > routed {
-            log::warn!(
-                "{} of {routed} spectra ({:.0} %) missed the 1/{scale:e} lattice the probe spectra \
-                 chose, so their m/z are stored as unchunked f64: this archive may be \
-                 LARGER than the same conversion with --no-mz-lattice. Mixed-lattice \
-                 input (two different scales in one run) is the usual cause.",
-                lattice_tally.centroid_f64,
-                100.0 * lattice_tally.centroid_f64 as f64 / routed as f64
-            );
-        }
-    }
-
     // Cross-check against the source's own declared count. A reader that stops early — a truncated
     // imzML `.ibd`, a half-downloaded mzML — otherwise yields a structurally valid archive that is
     // silently missing most of its spectra, with exit code 0. Fail loudly instead: the archive is
@@ -4409,28 +4211,21 @@ fn convert_file(
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     let acquisition_block = fixup_run_metadata(&mut writer, input);
 
-    // The `mz_calibration` block is what the viewer's `mz-grid` codec (and any conformant reader
-    // that would rather not re-derive the scale from the column metadata) gates on.
-    let index_blocks: Vec<(String, serde_json::Value)> = lattice_scale
-        .map(|scale| {
-            (
-                "mz_calibration".to_string(),
-                mz_lattice::mz_calibration_block(
-                    scale,
-                    "detected",
-                    "fixed-point m/z lattice detected in the decoded f64 m/z of the source \
-                     (see mzpeak-convert --no-mz-lattice); off-lattice spectra keep f64 point.mz",
-                ),
-            )
-        })
+    let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
         .into_iter()
-        .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
         .chain(route)
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
             if resorted {
                 declare(&mut applied, "sort-by-mz");
+            }
+            // The fitted grid re-encodes the centroid m/z within a bound: say so, with the bound.
+            if lattice {
+                declare(&mut applied, GRID_FIT_TRANSFORMATION);
+            }
+            if tdf_chord {
+                declare(&mut applied, TDF_CHORD_TRANSFORMATION);
             }
             applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
             applied.extend(chromatogram_transforms);
@@ -5306,9 +5101,9 @@ fn write_ims_compact_archive<F>(
     model_b: f64,
     chord_source: &'static str,
     n_total: usize,
-    tof_encoding: &str,
-    chunk_cfg: Option<f64>,
-    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
+    chunk_width: f64,
+    mobility_grid: bool,
+    mz_summary: bruker_native::MzModelSummary,
     frame_sort: Option<&std::sync::atomic::AtomicUsize>,
     spectrum: F,
 ) -> Result<()>
@@ -5320,7 +5115,7 @@ where
     type ParPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
     write_ims_compact_archive_impl::<F, ParPlaceholder>(
         input, output, zstd_level, vendor, synth_chroms, model_a, model_b, chord_source, n_total,
-        tof_encoding, chunk_cfg, exact_per_spectrum, frame_sort, Driver::Serial(spectrum),
+        chunk_width, mobility_grid, mz_summary, frame_sort, Driver::Serial(spectrum),
     )
 }
 
@@ -5337,9 +5132,9 @@ fn write_ims_compact_archive_parallel<F>(
     model_b: f64,
     chord_source: &'static str,
     n_total: usize,
-    tof_encoding: &str,
-    chunk_cfg: Option<f64>,
-    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
+    chunk_width: f64,
+    mobility_grid: bool,
+    mz_summary: bruker_native::MzModelSummary,
     frame_sort: Option<&std::sync::atomic::AtomicUsize>,
     spectrum: F,
 ) -> Result<()>
@@ -5349,7 +5144,7 @@ where
     type SerPlaceholder = fn(usize, bool) -> Result<MultiLayerSpectrum>;
     write_ims_compact_archive_impl::<SerPlaceholder, F>(
         input, output, zstd_level, vendor, synth_chroms, model_a, model_b, chord_source, n_total,
-        tof_encoding, chunk_cfg, exact_per_spectrum, frame_sort, Driver::Parallel(spectrum),
+        chunk_width, mobility_grid, mz_summary, frame_sort, Driver::Parallel(spectrum),
     )
 }
 
@@ -5363,94 +5158,6 @@ enum Driver<S, P> {
     Parallel(P),
 }
 
-/// Build the CHUNKED `spectra_peaks` facet schema for the `--ims-chunked` layout. The chunk-shaped
-/// fields (`spectrum_index`, `..._chunk_start`/`_end`/`_values`, `chunk_encoding`, per-chunk
-/// intensity + mobility secondaries) are materialized by running the chunker on a synthetic 2-point
-/// sample whose arrays are the SAME shape (ArrayType + dtype + unit) as `ims_compact_spectrum_chunked`
-/// produces — so the write-time schema matches the runtime chunk struct and column promotion (by
-/// name) lines up. `chunking_strategy` + `mz_boundary` on the builder make `make_peaks_writer` build
-/// a `ChunkBuffers` that chunks raw arrays on m/z bins.
-fn ims_chunked_peak_schema(
-    model_a: f64,
-    model_b: f64,
-    width_th: f64,
-    int_intensity: bool,
-    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
-) -> ArrayBuffersBuilder {
-    use mzpeak_prototyping::chunk_series::{ArrowArrayChunk, TofMzBoundary};
-    let boundary = TofMzBoundary { a: model_a, b: model_b };
-    let strategy = ChunkingStrategy::Delta { chunk_size: width_th };
-
-    // Synthetic sample: two points far enough apart to land in different m/z bins (=> >=1 chunk).
-    // Built through the SAME constructor as a real ims-compact spectrum, so the write-time schema
-    // cannot drift from the runtime chunk struct.
-    let arrays = bruker_native::ims_compact_arrays(
-        &[100_000i32, 300_000i32],
-        if int_intensity {
-            bruker_native::ImsIntensity::Counts(&[1i32, 1i32])
-        } else {
-            bruker_native::ImsIntensity::Float(&[1.0f32, 1.0f32])
-        },
-        &[1.0f64, 1.0f64],
-    )
-    .expect("materialize the ims-chunked sample arrays");
-
-    // Register the TOF→m/z reconstruction on the chunk axis, exactly as the archive path does for
-    // `point.tof`. Without it the chunked array index carries `transform: null` on every entry and
-    // the m/z model lives ONLY in the index `ims_calibration` block, so a reader that resolves
-    // transforms through the array index — as the spec requires — cannot reach m/z at all.
-    // `from_arrays` looks arrays up by `array_type`, not by full BufferName, so the added transform
-    // does not disturb the chunking itself.
-    let main_axis = BufferName::new(
-        BufferContext::Spectrum,
-        ArrayType::nonstandard("tof"),
-        BinaryDataArrayType::Int32,
-    )
-    .with_transform(Some(mzpeak_prototyping::buffer_descriptors::BufferTransform::SqrtMzFromTof));
-    let (chunks, _, _) = ArrowArrayChunk::from_arrays(
-        0,
-        None,
-        main_axis,
-        &arrays,
-        strategy,
-        &Default::default(),
-        false,
-        false,
-        None,
-        Some(boundary),
-    )
-    .expect("materialize ims-chunked schema");
-    let sample = chunks.first().expect("ims-chunked sample produced no chunk");
-    let schema = sample.to_schema(
-        BufferContext::Spectrum,
-        &[strategy, ChunkingStrategy::Basic { chunk_size: width_th }],
-        false,
-    );
-
-    let mut builder = ArrayBuffersBuilder::default()
-        .prefix("point")
-        .with_context(BufferContext::Spectrum)
-        .chunking_strategy(Some(strategy))
-        .mz_boundary(Some(boundary));
-    for f in schema.fields().iter().cloned() {
-        // The transform CURIE rides the BufferName into the field metadata, but the [a, b]
-        // coefficients cannot (BufferName is Copy/Hash), so attach them to every tof-derived
-        // column the same way the archive path does.
-        let f = if f.metadata().contains_key("transform") {
-            let mut md = f.metadata().clone();
-            md.insert("mzpeak:transform_params".to_string(), format!("{model_a},{model_b}"));
-            if exact_per_spectrum.is_some() {
-                md.insert("mzpeak:transform_params_per_spectrum".to_string(), "tof_c0,tof_c1".to_string());
-            }
-            std::sync::Arc::new((*f).clone().with_metadata(md))
-        } else {
-            f
-        };
-        builder = builder.add_field(f);
-    }
-    builder
-}
-
 fn write_ims_compact_archive_impl<S, P>(
     input: &Path,
     output: &Path,
@@ -5461,14 +5168,14 @@ fn write_ims_compact_archive_impl<S, P>(
     model_b: f64,
     chord_source: &'static str,
     n_total: usize,
-    tof_encoding: &str,
-    chunk_cfg: Option<f64>,
-    // `Some`: the run carries exact `tof_c0`/`tof_c1` params (`bruker_native::exact_tof_coeffs`;
-    // frames with a NULL `Frames.T1` have none — their count rides in the summary): declare them as
-    // spectra_metadata columns, stamp the `tof` column's per-spectrum transform parameters and say
-    // so in `ims_calibration`. `None`: the archive is exactly as before.
-    exact_per_spectrum: Option<bruker_native::ExactTofSummary>,
-    // `--ims-chunked`: the reader's count of frames whose points its TOF sort re-ordered.
+    // Chunk width in Th: 50 (`--chunk-size`) or one chunk per frame (`GRID_CHUNK_TH`).
+    chunk_width: f64,
+    // Whether 1/K0 is stored as TIMS scan numbers under the vendor's ModelType-2 grid (else as
+    // plain values — `--no-tims-recalibration`, or a TDF without such a row).
+    mobility_grid: bool,
+    // Whether the m/z rows carry the vendor model exactly (`bruker_native::mz_model_summary`).
+    mz_summary: bruker_native::MzModelSummary,
+    // The reader's count of frames whose points its TOF sort re-ordered.
     frame_sort: Option<&std::sync::atomic::AtomicUsize>,
     mut driver: Driver<S, P>,
 ) -> Result<()>
@@ -5485,70 +5192,70 @@ where
     let level = ZstdLevel::try_new(zstd_level)
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
 
-    // Custom peaks-facet schema (the mechanism BRFP uses): the `point` facet carries integer `tof`
-    // (nonstandard, replaces m/z) + intensity + ion mobility. `store_peaks_and_profiles_apart`
-    // installs it so the spectra' tof arrays land in the peaks facet instead of defaulting to a
-    // (null) m/z column. BufferNames here must exactly match the arrays built in
-    // `ims_compact_spectrum` (array_type + dtype + unit) or they'd spill to auxiliary_arrays.
-    // Register the TOF→m/z reconstruction on the `tof` column itself: the transform CURIE
-    // (SqrtMzFromTof) rides via the BufferName, and the [a, b] coefficients via the field metadata
-    // (`mzpeak:transform_params`), so a conformant reader recovers m/z = (a + b·tof)² generically
-    // from the column metadata — not only from the index `ims_calibration` block (still written).
-    // Exact per-frame coefficients override the run-wide chord in the reader (the same per-spectrum
-    // contract as the sqrt-grid lanes; `reconstruct_per_spectrum_grid_mz`).
-    let tof_field = tof_axis_field("tof", (model_a, model_b), exact_per_spectrum.is_some());
-    let mob_field = BufferName::new(
-        BufferContext::Spectrum,
-        ArrayType::MeanInverseReducedIonMobilityArray,
-        BinaryDataArrayType::Float64,
-    )
-    .to_field();
     // Byte-plane intensity: store native counts as Int32 so the writer BYTE_STREAM_SPLITs the column
     // (~ -16% on intensity, lossless; cf. BACKLOG #14). On by default for timsTOF ims-compact; set
     // MZPC_BYTE_PLANE_INTENSITY=0 to opt back out to f32 intensity. Read through `env_flag` so the
     // "off" spellings are the documented ones — a set-but-empty value used to flip the column to
     // Float32 with nothing in the log or the archive saying so.
     let int_intensity = env_flag("MZPC_BYTE_PLANE_INTENSITY").unwrap_or(true);
-    let intensity_field = if int_intensity {
-        BufferName::new(
-            BufferContext::Spectrum,
-            ArrayType::IntensityArray,
-            BinaryDataArrayType::Int32,
-        )
-        .to_field()
-    } else {
-        INTENSITY_ARRAY.to_field()
+    // Both facets in the reference implementation's chunk-grid layout (spectra_data stays empty —
+    // TDF frames are centroid — but declares the same family): each frame is one or more
+    // `MS:1003826` rows whose `mz_grid` / `mean_inverse_reduced_ion_mobility_grid` hold the integer
+    // TOF bins and TIMS scan numbers under the frame's own vendor models, attached to the arrays as
+    // Params (`bruker_native::ims_grid_arrays`); the policies (tolerance 0) never fit anything. The
+    // schema is sampled from the first frame with points, built exactly as the loop builds them.
+    let grid = Some(ChunkingStrategy::Grid { chunk_size: chunk_width, grid: None });
+    let policies = || -> mzpeak_prototyping::grid::GridPolicyTable {
+        use mzpeak_prototyping::grid::GridPolicy;
+        std::iter::once(ArrayType::MZArray)
+            .chain(mobility_grid.then_some(ArrayType::MeanInverseReducedIonMobilityArray))
+            .map(|t| (t.clone(), GridPolicy::new(t, false, Some(mzpeaks::Tolerance::Da(0.0)))))
+            .collect()
     };
-    let peak_schema = match chunk_cfg {
-        // GATED --ims-chunked: build a CHUNKED peak facet keyed on the integer `tof` axis, split on
-        // true m/z bins. The chunk-shaped fields are materialized by running the chunker on a
-        // representative sample of the real per-frame arrays (identical BufferNames/units), so the
-        // write-time schema matches the runtime chunk struct exactly.
-        Some(width_th) => ims_chunked_peak_schema(model_a, model_b, width_th, int_intensity, exact_per_spectrum),
-        None => ArrayBuffersBuilder::default()
-            .prefix("point")
-            .with_context(BufferContext::Spectrum)
-            .add_field(BufferContext::Spectrum.index_field())
-            .add_field(tof_field)
-            .add_field(intensity_field)
-            .add_field(mob_field),
-    };
-
-    // One layout family per entity (the scope HUPO-PSI/mzPeak-specification#21 proposes):
-    // `spectra_data` and `spectra_peaks` are both `entity_type: spectrum`, so under --ims-chunked
-    // the DATA facet is declared chunked too; beside a point data facet the writer only warns and
-    // writes a mixed archive (the base.rs deviation). Centroid-only TDF never writes a row to it, but
-    // its schema still has to be chunk-shaped: an empty chunked builder falls back to point-shaped
-    // default fields, so hand it the same fields the peak facet uses.
-    let data_fields: Vec<_> = match (chunk_cfg, peak_schema.dtype()) {
-        (Some(_), DataType::Struct(fields)) => fields.iter().cloned().collect(),
-        _ => Vec::new(),
+    let n_frames = max_spectra().map_or(n_total, |m| m.min(n_total));
+    let probe = {
+        let mut probe = None;
+        for i in 0..n_frames.min(64) {
+            let spec = match &mut driver {
+                Driver::Serial(f) => f(i, int_intensity)?,
+                Driver::Parallel(f) => f(i, int_intensity)?,
+            };
+            let has_points = spec.arrays.as_ref().and_then(|a| a.mzs().ok()).is_some_and(|m| !m.is_empty());
+            probe = Some(spec);
+            if has_points {
+                break;
+            }
+        }
+        probe.ok_or_else(|| anyhow::anyhow!("no frames in {}", input.display()))?
     };
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .compression(Compression::ZSTD(level))
+        .shuffle_mz(true)
+        .chunked_encoding(grid.clone())
+        .peaks_chunked_encoding(grid.clone())
+        .chromatogram_chunked_encoding(None)
+        .add_grid_policies(policies())
+        .add_peak_grid_policies(policies());
+    // The ion-mobility grid is switched on through the writer's override table, as the reference
+    // implementation's own converter does (`ArrayConversionHelper`, `--grid-transform-ion-mobility`):
+    // the mobility BufferName gets the `GridEncoding` transform, which is what makes the chunk writer
+    // encode the array through its policy. Without it the values are stored as a plain f64 list.
+    if mobility_grid {
+        let overrides = mzpeak_prototyping::writer::ArrayConversionHelper::new(false, false, false, false, false, true)
+            .create_type_overrides(grid);
+        for (from, to) in overrides.iter() {
+            builder = builder
+                .add_spectrum_array_override(from.clone(), to.clone())
+                .add_spectrum_peak_array_override(from.clone(), to.clone());
+        }
+    }
+    builder = builder
+        .sample_array_types_from_spectra(std::iter::once(probe.clone()))
+        .sample_array_types_for_peaks_from_spectra(std::iter::once(probe))
         // Per-frame inputs of the vendor's exact TOF→m/z model (`Frames.T1/T2/MzCalibration`) as
-        // spectra_metadata columns; the calibration rows themselves go into the
-        // `vendor_mz_calibration` index block below. Null on a TDF whose Frames lacks them.
+        // spectra_metadata columns — the provenance of each row's grid model; the calibration rows
+        // themselves go into the `vendor_mz_calibration` index block below. Null on a TDF whose
+        // Frames lacks them.
         .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
             bruker_native::TDF_T1_CURIE,
             "tdf_t1",
@@ -5563,32 +5270,7 @@ where
             bruker_native::TDF_MZ_CAL_ID_CURIE,
             "tdf_mz_calibration_id",
             DataType::Int64,
-        ))
-        .store_peaks_and_profiles_apart(Some(peak_schema));
-    if let Some(width_th) = chunk_cfg {
-        builder = builder.chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: width_th }));
-        for f in data_fields {
-            builder = builder.add_spectrum_field(f);
-        }
-    }
-    if exact_per_spectrum.is_some() {
-        // The exact per-frame `m/z = (tof_c0 + tof_c1·tof)²` coefficients (vendor ModelType 1 with
-        // C2 = 0, temperature-corrected with Frames.T1), as Float64 spectra_metadata columns — the
-        // same columns/CURIEs the sqrt-grid lanes write, so the vendored reader's per-spectrum
-        // fixup (`reconstruct_per_spectrum_grid_mz`, applied on the PEAKS facet where ims-compact
-        // keeps its points — `get_spectrum_peak_arrays_for`) recovers the exact m/z.
-        builder = builder
-            .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-                TOF_C0_CURIE,
-                "tof_c0",
-                DataType::Float64,
-            ))
-            .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-                TOF_C1_CURIE,
-                "tof_c1",
-                DataType::Float64,
-            ));
-    }
+        ));
     // Peak-facet row-group size (rows) = the per-chunk zstd granularity. Smaller = finer random
     // access (fewer peaks to decompress per frame) but worse compression; default is parquet's 2^20.
     // Tunable via $MZPC_ROW_GROUP_ROWS for benchmarking the size/random-access tradeoff.
@@ -5600,7 +5282,7 @@ where
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .or(if chunk_cfg.is_some() { Some(8192) } else { None });
+        .or(Some(8192));
     if let Some(n) = row_group_rows {
         builder = builder.row_group_size(Some(n));
     }
@@ -5610,7 +5292,6 @@ where
     ensure_mzp_cv(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
-    let n_frames = max_spectra().map_or(n_total, |m| m.min(n_total));
     match &mut driver {
         Driver::Serial(spectrum) => {
             for i in 0..n_frames {
@@ -5708,72 +5389,64 @@ where
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, std::iter::empty(), synth_chroms)?;
     let acquisition_block = fixup_run_metadata(&mut writer, input);
 
-    // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename.
-    // `tof_encoding` is TRUTHFUL: "absolute" (archive layout + SDK) or "m/z-chunked"
-    // (--ims-chunked). For the chunked layout, `chunk_start`/`chunk_end` are the per-chunk main-axis
-    // (TOF) bounds and `tof` is delta-encoded within each chunk with the start point EXCLUDED
-    // (cumsum from `chunk_start` to reconstruct), per the spec's chunked-layout rules — and
-    // `chunk_tof_encoding` below states exactly that rule. Until 0.9.13 it read "delta-within-chunk;
-    // first absolute; cumsum", which describes a layout the writer never produced: anyone decoding
-    // by that sentence lost `chunk_start` on every chunk.
+    // Finish: add the ims_calibration index block, embed vendor side-files, finalize, rename. The
+    // block describes the grid layout (0.13.0's, now written natively) for readers that want the
+    // models spelled out; the models themselves ride on every grid row.
     let mut cal = serde_json::json!({
         "codec": "ims-compact",
-        "lossless": "tof",
-        "mz_from_tof": "(a + b*tof)^2",
-        "tof_encoding": tof_encoding,
-        "a": model_a,
-        "b": model_b,
+        "layout": "grid-transform",
+        "tof_encoding": "grid",
+        "chunk_bounds": "mz",
+        "chunk_width_th": chunk_width,
+        "intensity_dtype": if int_intensity { "int32" } else { "float32" },
+        "exact": mz_summary.exact,
+        "mz_grid": {
+            "column": "chunk.mz_grid",
+            "model": mzpeak_prototyping::grid::TimsTofMzGrid2::ACCESSION.to_string(),
+            "parameters": "[C0, 1e6/sqrt(C1*cf), C2/cf, C3, C4, DigitizerTimebase, DigitizerDelay] of the frame's MzCalibration row, cf = 1 + (dC1*(T1 - Frames.T1) + dC2*(T2 - Frames.T2))/1e6",
+            "indices": "[first TOF bin, deltas...] (uint32); t_ns = fma(bin, timebase, delay); solve t_ns = C0 + beta*u + C2*u^2 (+ C3*u^3) for u; m/z = u^2 - C4",
+            "evaluation": "mzdata::io::tdf::MzCalibrationModel2::convert_f64 (reference implementation); the chunk bounds are that evaluation at the first and last bin",
+            "verified": "1e-9 ppm vs Bruker timsdata SDK on a C2 != 0, C4 != 0 file (tests/fixtures/tdf_diapasef_sdk_golden.json)",
+            "fallback": "a frame without a usable MzCalibration row carries the two-point chord below as an MS:1003825 sqrt model",
+        },
+        "encoding": "byte-stream-split on the index lists and intensity; Parquet default (dictionary) on the bounds",
         // The two lanes derive the chord differently: the native lane from GlobalMetadata
         // (MzAcqRangeLower/Upper, DigitizerNumSamples), the SDK lane from the vendor library's
-        // own `tims_index_to_mz(frame 1, [0, 1])`. Measured 4.28 ppm apart on 2485.d, and until
-        // 0.9.13 an archive did not say which (a, b) it held.
-        "chord_source": chord_source,
-        // `(a + b·tof)²` is timsrust's TWO-POINT CHORD, not the instrument's model: it drops the
-        // quadratic `C2·mz` term and the per-frame temperature correction, and is off by roughly
-        // −11…−40 ppm across the range on files where `C2 ≠ 0` (measured: +8.5/−10.6/−3.4 ppm at
-        // tof 0/mid/max on a diaPASEF run). A search at 20 ppm loses peptides to it — speXtract
-        // measured −11.7 % at 1 % FDR. Say so in the archive, because MS:1003825 otherwise reads
-        // as "this fit IS the calibration" and readers apply it blindly.
-        "exact": false,
-        "approximation": "two-point chord (timsrust); drops C2 and the per-frame temperature term",
-        "exact_model": "metadata.vendor_mz_calibration (ModelType 1) when present",
+        // own `tims_index_to_mz(frame 1, [0, 1])`. Measured 4.28 ppm apart on 2485.d. It is NOT
+        // the archive's calibration (every row carries the vendor model); it is the fallback model
+        // of a frame without one, recorded so a reader can tell which chord that would be.
+        "chord": {"a": model_a, "b": model_b, "source": chord_source, "mz_from_tof": "(a + b*tof)^2",
+                  "note": "timsrust's two-point chord, -5..-11 ppm against the vendor model; only a frame without a usable MzCalibration row is stored on it"},
     });
-    if let Some(exact) = exact_per_spectrum {
-        // Every frame's MzCalibration row is ModelType 1 with C2 = C3 = C4 = dC2 = 0 (stored zeros,
-        // not NULL), so the vendor model IS a sqrt-linear law in tof per frame: the per-spectrum
-        // pair reproduces the ModelType-1 formula exactly (1e-12 relative, `tests/
-        // tdf_exact_tof_calibration.rs`; the formula is SDK-verified on C2 ≠ 0 rows, the C2 = 0
-        // SDK golden comes from `MZPC_TDF_SDK_GOLDEN`). `a`/`b` and `exact: false` stay as they are
-        // for readers that only know the run-wide chord. `exact_per_spectrum` is a PER-SPECTRUM
-        // statement: a spectrum whose tof_c0/tof_c1 cells are NULL (NULL Frames.T1, counted in
-        // `per_spectrum_chord_frames`) is on the chord, and both readers treat it so.
-        cal["per_spectrum"] = serde_json::json!("tof_c0,tof_c1");
-        cal["exact_per_spectrum"] = serde_json::json!(true);
-        if exact.chord_frames > 0 {
-            cal["per_spectrum_chord_frames"] = serde_json::json!(exact.chord_frames);
-        }
-        cal["per_spectrum_note"] = serde_json::json!(
-            "spectra_metadata tof_c0/tof_c1 give the vendor ModelType-1 m/z per spectrum, m/z = (tof_c0 + tof_c1*tof)^2 \
-             (MzCalibration ModelType 1 with C2 = 0, C1 temperature-corrected with Frames.T1); a spectrum with NULL \
-             tof_c0/tof_c1 (NULL Frames.T1, count in per_spectrum_chord_frames) is on the run-wide chord a/b, which \
-             remains for legacy readers"
-        );
+    // Not every calibration is expressible exactly: a ModelType-2 row's calibrant polynomial has no
+    // place in the reference model, and a missing or unknown row leaves the frame on the chord.
+    if let Some(note) = &mz_summary.note {
+        cal["approximation"] = serde_json::json!(note);
     }
-    if let Some(width_th) = chunk_cfg {
-        cal["chunk_bounds"] = serde_json::json!("mz");
-        cal["chunk_width_th"] = serde_json::json!(width_th);
-        cal["chunk_tof_encoding"] = serde_json::json!("chunk_start + cumsum(deltas); first delta is relative to chunk_start");
+    if let Some(ppm) = mz_summary.max_error_ppm {
+        cal["max_error_ppm"] = serde_json::json!(ppm);
     }
-    // Which intensity column the archive holds — Int32 byte-plane by default, Float32 under
-    // `MZPC_BYTE_PLANE_INTENSITY=0` — stated here so a reader (or an offline audit) need not infer
-    // it from the Parquet schema.
-    cal["intensity_dtype"] = serde_json::json!(if int_intensity { "int32" } else { "float32" });
+    cal["ion_mobility_grid"] = if mobility_grid {
+        serde_json::json!({
+            "column": "chunk.mean_inverse_reduced_ion_mobility_grid",
+            "model": mzpeak_prototyping::grid::TimsTofTimsLinearGrid2::ACCESSION.to_string(),
+            "parameters": "[C6, C7, offset, slope] of TimsCalibration ModelType 2: slope = (C3 - C2)/C1, offset = C2 - slope*(C4 + C0)",
+            "indices": "TIMS scan number (uint32, 0-based, not delta-coded); 1/K0 = 1/(C6 + C7/(offset + slope*scan))",
+            "evaluation": "mzdata::io::tdf::TimsCalibrationModel2::convert (reference implementation); differs from the closed form W/(C7 + C6*W) by at most 1 ulp",
+        })
+    } else {
+        serde_json::json!({"column": null, "note": "1/K0 stored as plain values (no TimsCalibration ModelType-2 row, or --no-tims-recalibration: timsrust's linear approximation, which no grid expresses)"})
+    };
     let mut applied = base_transformations(&writer);
-    // `--ims-chunked` sorts each frame's points by TOF across mobility scans. Declared from the
-    // reader's count of frames that sort changed; the order is recoverable, since mobility is
-    // stored per point.
+    // The grid sorts each frame's points by TOF across mobility scans. Declared from the reader's
+    // count of frames that sort changed; the order is recoverable, since mobility is stored per
+    // point. The grid encoding itself is exact; it is declared as 0.13.0 declared it.
     if frame_sort.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed) > 0) {
         declare(&mut applied, "sort-by-mz");
+    }
+    declare(&mut applied, if mobility_grid { "grid-encode:mz,ion_mobility" } else { "grid-encode:mz" });
+    if let Some(entry) = mz_summary.transformation {
+        declare(&mut applied, entry);
     }
     applied.extend(chromatogram_transforms);
     // The vendor's exact calibration, verbatim, so the archive is self-sufficient without the
@@ -5822,52 +5495,24 @@ fn convert_ims_compact_archive(
     tims_recalibration: bool,
     ims_chunked: bool,
     chunk_size_th: f64,
-    ims_grid: bool,
-    grid_bss: bool,
 ) -> Result<()> {
     let reader = bruker_native::NativeTofReader::open_with(input, tims_recalibration)?;
     let (a, b, n) = (reader.model.a, reader.model.b, reader.len());
-    // Truthful self-describing tof_encoding label for the ims_calibration index block.
-    let (tof_encoding, chunk_cfg) = if ims_chunked {
-        ("m/z-chunked", Some(chunk_size_th))
-    } else {
-        ("absolute", None)
-    };
-    let exact = reader.exact_tof_per_spectrum();
+    let chunk_width = if ims_chunked { chunk_size_th } else { GRID_CHUNK_TH };
+    if !tims_recalibration {
+        log::warn!("--no-tims-recalibration: 1/K0 is timsrust's linear approximation, stored as plain values (no TIMS grid)");
+    }
     // The native reader is Sync (mmap-backed timsrust FrameReader), so decode frames in parallel.
-    write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, "global_metadata", n, tof_encoding, chunk_cfg, exact, ims_chunked.then(|| reader.frames_reordered()), |i, int| {
-        if ims_chunked {
-            // Chunked layout: absolute TOF, whole frame sorted by TOF (== sorted by m/z) so the
-            // chunker's m/z bins are contiguous. Per-scan delta OFF (chunker deltas per chunk).
-            reader.ims_compact_spectrum_chunked(i, int)
-        } else {
-            reader.ims_compact_spectrum(i, int)
-        }
-    })?;
-    if ims_chunked && ims_grid && !tims_recalibration {
-        // The grid stores ion mobility as TIMS scan numbers under the vendor's exact model; timsrust's
-        // linear approximation is not on that grid, so the archive keeps the TOF layout.
-        log::warn!("--no-tims-recalibration: the 1/K0 values are timsrust's linear approximation, which the grid layout cannot express; the archive keeps the 0.12.x TOF layout");
+    let mz_summary = reader.mz_model_summary();
+    if let Some(note) = &mz_summary.note {
+        log::warn!("{note}");
     }
-    if ims_chunked && ims_grid && tims_recalibration {
-        // The grid layout is a second pass over the finished archive (`tdf_grid`): the 0.12.x
-        // archive moves aside and is removed once the rewrite has replaced it — also on failure, so
-        // no `.tmp` is left behind.
-        struct RemoveOnDrop(PathBuf);
-        impl Drop for RemoveOnDrop {
-            fn drop(&mut self) {
-                let _ = fs::remove_file(&self.0);
-            }
-        }
-        let pre = output.with_extension("mzpeak.pre-grid.tmp");
-        fs::rename(output, &pre).with_context(|| format!("staging {}", pre.display()))?;
-        let _guard = RemoveOnDrop(pre.clone());
-        tdf_grid::rewrite_archive(&pre, output, zstd_level, grid_bss).context("grid layout rewrite")?;
-    }
-    Ok(())
+    write_ims_compact_archive_parallel(input, output, zstd_level, vendor, synth_chroms, a, b, "global_metadata", n, chunk_width, reader.mobility_grid(), mz_summary, Some(reader.frames_reordered()), |i, int| {
+        reader.ims_grid_spectrum(i, int)
+    })
 }
 
-/// Bruker-SDK ims-compact: same integer-tof layout, but decoded via the official `timsdata` library
+/// Bruker-SDK ims-compact: the same grid layout, but decoded via the official `timsdata` library
 /// (handles newer timsTOF, e.g. 5.1.x, that the vendored timsrust can't). Windows/Linux only.
 #[cfg(any(windows, target_os = "linux"))]
 fn convert_ims_compact_sdk(
@@ -5876,11 +5521,13 @@ fn convert_ims_compact_sdk(
     zstd_level: i32,
     vendor: Option<&vendor::VendorPolicy>,
     synth_chroms: bool,
+    ims_chunked: bool,
+    chunk_size_th: f64,
 ) -> Result<()> {
     let reader = bruker_sdk::TdfSdkReader::open(input)?;
     let (a, b) = reader.tof_mz_model();
     let n = reader.len();
-    let exact = reader.exact_tof_per_spectrum();
+    let chunk_width = if ims_chunked { chunk_size_th } else { GRID_CHUNK_TH };
     // Diagnostic (MZPC_TDF_SDK_GOLDEN=<out.json>): sample the SDK's own tims_index_to_mz over the
     // run so the ModelType-1 formula can be checked against the vendor library off-box. Never
     // fails the conversion.
@@ -5891,9 +5538,13 @@ fn convert_ims_compact_sdk(
             Err(e) => log::warn!("MZPC_TDF_SDK_GOLDEN: no golden dump written to {} ({e:#}); continuing", out.display()),
         }
     }
-    // The SDK decoder writes absolute TOF (its ims_compact_spectrum has no delta and no chunking).
-    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, "sdk_tims_index_to_mz", n, "absolute", None, exact, None, |i, int| {
-        reader.ims_compact_spectrum(i, int)
+    // The SDK reader is !Sync: serial decode, the same grid rows as the native lane.
+    let mz_summary = reader.mz_model_summary();
+    if let Some(note) = &mz_summary.note {
+        log::warn!("{note}");
+    }
+    write_ims_compact_archive(input, output, zstd_level, vendor, synth_chroms, a, b, "sdk_tims_index_to_mz", n, chunk_width, reader.mobility_grid(), mz_summary, Some(reader.frames_reordered()), |i, int| {
+        reader.ims_grid_spectrum(i, int)
     })
 }
 
@@ -5904,6 +5555,8 @@ fn convert_ims_compact_sdk(
     _zstd_level: i32,
     _vendor: Option<&vendor::VendorPolicy>,
     _synth_chroms: bool,
+    _ims_chunked: bool,
+    _chunk_size_th: f64,
 ) -> Result<()> {
     Err(UnsupportedVendor(
         "the Bruker timsdata SDK path (--bruker-sdk) is only available on Windows and Linux".into(),
@@ -6289,66 +5942,34 @@ fn convert_shimadzu(
         }
     };
     // Profile facet as an exact sqrt grid (see `shimadzu_grid`): probe dense profile spectra across
-    // the run for the run-wide step; if the fit holds, the profile of every spectrum that fits is
-    // stored as `tof_index` + per-spectrum `tof_c0`/`tof_c1`, and any that does not keeps f64 m/z.
+    // the run for the run-wide step; if the fit holds, every spectrum that fits is stored on the
+    // chunk grid with its own `MS:1003825` model (`shimadzu_grid_route`), and any that does not
+    // keeps f64 m/z as a raw chunk row. Within vendor rounding, NOT bit-exact: the axis is the
+    // vendor's own sqrt lattice and the fit is accepted only when it reproduces every m/z to within
+    // `shimadzu_grid::TOL` (1e-9 Da: the vendor's ±5e-10 rounding plus f64 slack).
     let grid_step = shimadzu_grid_step(&reader);
     if let Some(step) = grid_step {
-        // (0,1) is the identity placeholder the reader deliberately skips; the real grid is the
-        // per-spectrum pair below (same contract as the SciEX per-spectrum encoding).
-        let tof_field = tof_index_field((0.0, 1.0), true);
-        // The schema sampler derives columns from probe spectra, and a gridded probe carries no
-        // m/z array — so declare the data facet explicitly: the grid axis, the f64 m/z that the
-        // rare off-grid spectrum keeps (null for gridded rows), and the intensity. Without the
-        // explicit intensity field it spilled into `auxiliary_arrays` on every spectrum.
-        hints.data_facet_fields.push(tof_field);
-        hints.data_facet_fields.push(mzpeak_prototyping::peak_series::MZ_ARRAY.to_field());
-        hints.data_facet_fields.push(INTENSITY_ARRAY.to_field());
-        hints.spectrum_param_fields.push((TOF_C0_CURIE, "tof_c0"));
-        hints.spectrum_param_fields.push((TOF_C1_CURIE, "tof_c1"));
-        hints.data_facet_point_layout = true;
-        // The profile route stores the signal span only (`shimadzu_grid_route`): the zero pad at
-        // the scan-window bounds is trimmed before the fit and never reaches the archive. Each
-        // gridded spectrum reports whether it had one, and `convert_vendor_reader` declares
-        // `shimadzu:span-trim` from that count.
-        // The model string names the FORMULA family the viewer reconstructs with (per-spectrum
-        // sqrt); the instrument is a Shimadzu Q-TOF, recorded beside it. Within vendor rounding,
-        // NOT bit-exact: the axis is the vendor's own sqrt lattice and the fit is accepted only
-        // when it reproduces every m/z to within `shimadzu_grid::TOL` (1e-9 Da: the vendor's
-        // ±5e-10 rounding plus f64 slack), so that gate IS the bound. Through 0.11.5 this said
-        // 5e-10, which the gate never enforced: refitting HEK_PosOAD1's nine f64 spectra puts 169
-        // of 32,434 points between 5e-10 and 5.47e-10 Da off. Spectra that do not fit are not
-        // gridded at all — they keep f64 m/z in the data facet.
-        let mut cal = tof_grid_block(
-            "sciex_sqrt_per_spectrum",
-            MzReconstruction::WithinVendorRoundingDa(shimadzu_grid::TOL),
-        );
-        cal.insert("vendor".to_string(), serde_json::json!("shimadzu"));
-        cal.insert("tof_to_mz".to_string(), serde_json::json!("mz = (tof_c0 + tof_c1*tof_index)^2"));
-        cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1"]));
-        cal.insert("run_wide_c1".to_string(), serde_json::json!(step));
-        cal.insert("vendor_mz_rounding".to_string(), serde_json::json!(1e-9));
-        hints.index_blocks.push(("tof_calibration".to_string(), cal.into()));
+        hints.data_grid = Some(exact_sqrt_grid_policy());
         log::info!(
-            "Shimadzu profile axis is an exact sqrt grid (run-wide c1 = {step:.15}); storing tof_index + per-spectrum tof_c0/tof_c1"
+            "Shimadzu profile axis is an exact sqrt grid (run-wide c1 = {step:.15}); storing each \
+             spectrum on the chunk grid with its MS:1003825 model"
         );
     }
-    // Centroid facet as an exact integer lattice (see `shimadzu_grid`): the vendor's `MassHigh`
-    // is an Int64 at 1e-9 Da (and the coarse `Mass` under MZPC_SHIMADZU_COARSE_MZ=1 lies on the
-    // same lattice), so every centroid list is checked per spectrum and stored as `tof_index`
-    // Int64 + intensity in the custom peaks facet; one that fails the guard keeps f64 m/z in the
-    // same facet's `mz` column. The `mz_calibration` block tells the viewer's `mz-grid` codec. A
-    // profile-only run builds no centroid list at all, so neither the facet nor the block that
-    // claims `applies_to: spectra_peaks` is declared for it.
-    // `--no-mz-lattice` (config `no_mz_lattice`, `$MZPC_NO_MZ_LATTICE`) turns it off here too, so
-    // the flag means the same thing on every lane: without this the native lane wrote `tof_index`
-    // regardless and the opt-out silently did nothing for exactly the users who need it (a
-    // downstream reader that cannot reconstruct the integer axis).
-    let lattice_on = mz_lattice_enabled();
-    if rep != shimadzu::Representation::Profile && lattice_on {
-        hints.peaks_facet = Some(shimadzu_grid::lattice_peak_schema());
-        hints.index_blocks.push(("mz_calibration".to_string(), shimadzu_grid::mz_calibration_block(shimadzu_grid::coarse_mz_requested())));
+    // Centroid facet: the vendor's `MassHigh` is an Int64 at 1e-9 Da (and the coarse `Mass` under
+    // MZPC_SHIMADZU_COARSE_MZ=1 lies on the same lattice), so the peaks facet takes the reference
+    // implementation's fitted linear grid (`lattice_fit_grid_policy`; the same treatment the mzML
+    // lane gives the LabSolutions export of these files). `--no-mz-lattice` (config `no_mz_lattice`,
+    // `$MZPC_NO_MZ_LATTICE`) keeps f64 m/z here too, so the flag means the same thing on every lane.
+    if rep != shimadzu::Representation::Profile && mz_lattice_enabled() {
+        hints.peak_grid = Some(lattice_fit_grid_policy());
+        hints.transformations.push(GRID_FIT_TRANSFORMATION.to_string());
+        if shimadzu_grid::coarse_mz_requested() {
+            // The coarse 1e-4 `Mass` field was read instead of `MassHigh`: a 100× coarser value,
+            // declared so the archive names the field the glue actually read.
+            hints.transformations.push("shimadzu:coarse-mz".to_string());
+        }
     }
-    // The per-facet totals ("N spectra on the sqrt grid / on the lattice") are counted by
+    // The per-facet totals ("N spectra on the sqrt grid") are counted by
     // `convert_vendor_reader` over the written spectra and logged there (`FacetTally::report`);
     // this closure only reports each spectrum's route.
     let result = convert_vendor_reader(
@@ -6360,16 +5981,7 @@ fn convert_shimadzu(
                 Some(step) => shimadzu_grid_route(spec, step),
                 None => (spec, None, false),
             };
-            let (spec, peak_arrays, outcome) = if lattice_on {
-                shimadzu_grid::lattice_route(spec)
-            } else {
-                (spec, None, shimadzu_grid::LatticeOutcome::NoCentroids)
-            };
-            Ok(VendorSpectrum {
-                spectrum: spec,
-                peak_arrays,
-                routes: FacetRoutes { profile_grid, profile_span_trimmed, centroid_lattice: outcome.on_lattice() },
-            })
+            Ok(VendorSpectrum { spectrum: spec, routes: FacetRoutes { profile_grid, profile_span_trimmed } })
         },
     );
     // Dropping the reader calls the glue's `Close`, which releases the vendor's handle on the
@@ -6441,7 +6053,8 @@ fn shimadzu_grid_step(reader: &shimadzu::ShimadzuReader) -> Option<f64> {
     Some(step)
 }
 
-/// Replace a fitting profile spectrum's f64 m/z with `tof_index` + per-spectrum `tof_c0`/`tof_c1`;
+/// Put a fitting profile spectrum on the exact sqrt grid — the grid values with the per-spectrum
+/// `MS:1003825` model attached (`sqrt_grid_arrays`), which the writer stores as a chunk-grid row;
 /// leave anything else (centroid-only spectra, off-grid spectra) untouched. The second value is
 /// the [`FacetRoutes::profile_grid`] outcome: `None` for a spectrum with no profile to route. The
 /// third is [`FacetRoutes::profile_span_trimmed`]: whether a gridded spectrum had a zero pad to trim.
@@ -6481,24 +6094,11 @@ fn shimadzu_grid_route(
     let Some((grid, k)) = shimadzu_grid::fit_spectrum(mz, step) else {
         return (spec, Some(false), false);
     };
-    let intensity: Vec<f32> = inten.to_vec();
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    if tof_da.update_buffer(k.as_slice()).is_err() {
+    let Ok((out, recon)) = sqrt_grid_arrays(grid.c0, grid.c1, &k, inten) else {
         return (spec, Some(false), false);
-    }
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    if int_da.update_buffer(intensity.as_slice()).is_err() {
-        return (spec, Some(false), false);
-    }
-    int_da.unit = Unit::DetectorCounts;
-    out.add(int_da);
+    };
     let mut descr = spec.description().clone();
-    // Summarize BEFORE the f64 m/z is thrown away: the output map holds tof_index + intensity and
-    // no MZArray, so mzdata would fold it to tic = 0, base peak = (0, 0), m/z range = (0, 0).
+    // The summary terms, stated explicitly (the same rule on every grid lane).
     //
     // WHICH POINTS: the SIGNAL SPAN of the PROFILE trace (`mz`/`inten` above are already the
     // `signal_span` slice) — the points this route writes to the `spectra_data` facet.
@@ -6521,7 +6121,6 @@ fn shimadzu_grid_route(
     //    to `shimadzu_grid::TOL` (1e-9 Da) so the two agree to well past f32 display precision, but
     //    the contract is "the summary describes the stored points" and it is stated the same way on
     //    every grid lane rather than depending on how tight one lane's tolerance happens to be.
-    let recon: Vec<f64> = k.iter().map(|&kk| grid.mz(kk)).collect();
     // A `debug_assert_eq!` here was a no-op in the shipped release build, and the failure it was
     // guarding is not benign: `set_gridded_spectrum_summary` refuses a misaligned pair, which would
     // leave this spectrum with NO MS:1000285/504/505 — the exact zero-summary defect this route
@@ -6537,8 +6136,6 @@ fn shimadzu_grid_route(
         return (spec, Some(false), false);
     }
     set_gridded_spectrum_summary(&mut descr, &recon, inten);
-    descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
-    descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
     let out = MultiLayerSpectrum::new(descr, Some(out), spec.peaks.clone(), spec.deconvoluted_peaks.clone());
     (out, Some(true), trimmed)
 }
@@ -6713,14 +6310,6 @@ fn convert_sciex_grid(
     let level = ZstdLevel::try_new(zstd_level)
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
 
-    // The axis on both facets: tof_index (Int32) + per-spectrum tof_c0/tof_c1 (the run-wide
-    // transform_params are the `(0,1)` placeholder; the authoritative coefficients ride the
-    // per-spectrum columns). Profile spectra file to `spectra_data`, centroid ones to `spectra_peaks`,
-    // gridded or not (M6) — the peaks schema carries an f64 `mz` for a centroid spectrum that did not
-    // fit, the data facet's f64 `mz` comes from the probe sample below.
-    let tof_field = tof_index_field((0.0, 1.0), true);
-    let peak_schema = tof_index_peak_schema(tof_field.clone());
-
     // Probe spectra spread across the run: feed the f64 data-facet schema (chunk-aware) AND fit the
     // run-wide digitizer clock c1. The SCIEX clock is GLOBAL (only c0 drifts per scan), so a single c1
     // lets even sparse SWATH/DIA MS2 windows grid against the shared lattice (per-spectrum c1
@@ -6755,26 +6344,21 @@ fn convert_sciex_grid(
     // The probe reads above went through the glue too: count only what the loop below writes.
     reader.take_value_changes();
 
-    // The data facet holds the integer axis, which has no chunk encoder: point layout whenever the
-    // grid is in play (`convert_vendor_reader` makes the same call for the Shimadzu profile grid).
-    // The off-lattice f64 minority is stored flat and EXACT in the same facet instead of
-    // numpress-chunked. Measured on the 0.10.2 corpus rebuild (rows of `spectra_data` with a
-    // non-null `mz`): 9.2 % of the points on MSV000093587 Sample002, 3.2 % on PXD011326, 2.7 % on
-    // PXD053710, 1.6 % on MSV000090684, 1.1 % on PXD065872, 0.07 % on PXD071869 — at 6–9.5 B per f64
-    // point, which is +27 %, +12 %, +7 %, +3.5 %, +2.3 % and +0.2 % on the archive. (An earlier
-    // version of this comment said "well under 1 %"; it counted chunk ROWS of the old facet, not
-    // points.) Those figures are the dictionary-encoded column; `shuffle_mz` now writes it
-    // BYTE_STREAM_SPLIT, about 6 B per point on the densest row groups of Sample002 and PXD011326
-    // (−22 % / −25 %). A chunk-capable integer axis (~2–3 B per point) is not built: the remaining
-    // size is accepted, the trade being fidelity for size, declared by `transformations` no longer
-    // listing `numpress-linear` here. Under `--tof-grid off` nothing is gridded, so the facet keeps
-    // the requested chunking.
-    let data_chunk = if mode == TofGridMode::Off { chunk } else { None };
+    // Both facets in the reference implementation's chunk-grid layout whenever the grid is in play:
+    // a gridded spectrum is an `MS:1003825` row (its per-spectrum model on the m/z array,
+    // `sciex_grid_spectrum`), an off-lattice one a raw `MS:1000576` row with its exact f64 m/z.
+    // Profile spectra file to `spectra_data`, centroid ones to `spectra_peaks` (M6). Measured on the
+    // 0.10.2 corpus rebuild: 9.2 % of the points on MSV000093587 Sample002 are off the lattice,
+    // 3.2 % on PXD011326, 2.7 % on PXD053710 — those rows are raw f64 either way. Under
+    // `--tof-grid off` nothing is gridded and both facets keep the requested chunking.
+    let grid_chunk = || Some(ChunkingStrategy::Grid { chunk_size: GRID_CHUNK_TH, grid: None });
+    let (data_chunk, peaks_chunk) = if mode == TofGridMode::Off { (chunk.clone(), chunk) } else { (grid_chunk(), grid_chunk()) };
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .buffer_size(buffer_spectra())
         .compression(Compression::ZSTD(level))
         .shuffle_mz(true)
         .chunked_encoding(data_chunk)
+        .peaks_chunked_encoding(peaks_chunk)
         // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
         // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
         // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
@@ -6782,25 +6366,13 @@ fn convert_sciex_grid(
         // losing the time axis outright. 99 of 330 reference archives are affected. A chromatogram
         // is a few thousand points; chunking bought nothing.
         .chromatogram_chunked_encoding(None)
-        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            TOF_C0_CURIE,
-            "tof_c0",
-            DataType::Float64,
-        ))
-        .add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            TOF_C1_CURIE,
-            "tof_c1",
-            DataType::Float64,
-        ))
-        .store_peaks_and_profiles_apart(Some(peak_schema))
-        .sample_array_types_from_spectra(probes.into_iter());
+        .sample_array_types_from_spectra(probes.clone().into_iter())
+        .sample_array_types_for_peaks_from_spectra(probes.into_iter());
     if mode != TofGridMode::Off {
-        builder = builder.add_spectrum_field(tof_field);
+        builder = builder.add_grid_policies(exact_sqrt_grid_policy()).add_peak_grid_policies(exact_sqrt_grid_policy());
     }
     let mut writer = builder.build(handle, true);
     add_processing_metadata(&mut writer);
-    // The per-spectrum coefficient columns are MZP terms (`TOF_C0_CURIE` …): declare the CV.
-    ensure_mzp_cv(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
     let len = max_spectra().map_or(total, |m| m.min(total));
@@ -6860,26 +6432,16 @@ fn convert_sciex_grid(
     let acquisition_block = acquisition_block.or(fixup_block);
     let mut applied = base_transformations(&writer);
 
-    // `lossless` names the exactly-stored column, `mz_reconstruction` rates the m/z you rebuild
-    // from it — see `tof_grid_calibration_block`. `max_roundtrip_ppm` is the measured worst case over
-    // this run (it has run at ~5 ppm on the published MSV000095995 archive), and
-    // `roundtrip_tolerance_ppm` is the bound the per-spectrum fit was accepted under.
-    let mut cal = tof_grid_block("sciex_sqrt_per_spectrum", MzReconstruction::BoundedLossyPpm(tof_grid::ppm_tol()));
-    cal.insert("tof_to_mz".to_string(), serde_json::json!("mz = (tof_c0 + tof_c1*tof_index)^2"));
-    cal.insert("per_spectrum_columns".to_string(), serde_json::json!(["tof_c0", "tof_c1"]));
-    cal.insert("max_roundtrip_ppm".to_string(), serde_json::json!(max_ppm));
-    let cal = serde_json::Value::from(cal);
     applied.extend(chromatogram_transforms);
+    // The per-spectrum fit is accepted within a ppm bound (`max_ppm` is this run's worst case; it
+    // has run at ~5 ppm on the published MSV000095995 archive), and the archive says so. No
+    // `tof_calibration` block since the chunk-grid layout: the model rides on every grid row.
     if n_grid > 0 {
         applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
     }
     applied.extend(value_changes.transformations());
-    // No block under `off`: nothing was transformed, and a `codec: tof-grid` block on an archive
-    // whose every spectrum sits in the f64 data facet would tell readers to look for a facet that
-    // holds nothing.
     let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
         .into_iter()
-        .chain((mode != TofGridMode::Off).then(|| ("tof_calibration".to_string(), cal)))
         .chain(std::iter::once(transformations_block(&applied)))
         .chain(partial_marker(input, max_spectra(), len))
         .collect();
@@ -6889,9 +6451,9 @@ fn convert_sciex_grid(
     finish_archive(writer, tmp_guard, output, input, None, None, &index_blocks)
 }
 
-/// Build a gridded SCIEX spectrum: `tof_index` (Int32) + intensity (f32) + per-spectrum tof_c0/tof_c1.
-/// Keeps the source description (RT, MS level, polarity — and the representation Clearcore2 stated,
-/// which decides the facet; M6).
+/// Build a gridded SCIEX spectrum: the grid values with the per-spectrum `MS:1003825` model attached
+/// (`sqrt_grid_arrays`) + intensity (f32). Keeps the source description (RT, MS level, polarity — and
+/// the representation Clearcore2 stated, which decides the facet; M6).
 #[cfg(windows)]
 fn sciex_grid_spectrum(
     spec: &MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>,
@@ -6911,28 +6473,15 @@ fn sciex_grid_spectrum(
         .map_err(|e| anyhow::anyhow!("decoding SCIEX m/z: {e}"))?
         .into_owned();
 
-    let mut out = BinaryArrayMap::new();
-    let mut tof_da =
-        DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-    tof_da.update_buffer(tof_index).map_err(|e| anyhow::anyhow!("encoding tof_index: {e}"))?;
-    out.add(tof_da);
-    let mut int_da =
-        DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-    int_da.update_buffer(intensity.as_slice()).map_err(|e| anyhow::anyhow!("encoding intensity: {e}"))?;
-    int_da.unit = Unit::DetectorCounts;
-    out.add(int_da);
-
     let mut descr = spec.description().clone();
-    // Summarize from the RECONSTRUCTED m/z — `grid.mz(k)` over the stored `tof_index` — not the
-    // source f64 being replaced. Every point of this spectrum is on the lattice (that is why it
-    // took this route), so the two are the same SET of points, but "on the lattice" means "within
+    // Summarize from the RECONSTRUCTED m/z — the grid values the archive stores — not the source
+    // f64 being replaced. Every point of this spectrum is on the lattice (that is why it took this
+    // route), so the two are the same SET of points, but "on the lattice" means "within
     // `tof_grid::ppm_tol()`", not "identical": on the published MSV000095995 archive the source and
-    // reconstructed base-peak m/z differ by 4.6 ppm. The summary must be taken here either way,
-    // because the output map has no MZArray and would fold to tic = 0 / base peak (0,0) / "m/z 0–0".
-    // `debug_assert_eq!` here was a no-op in the shipped release build. The vendor shim clamps a
-    // length disagreement to `Math.Min` before we ever see it (counted, and declared as
-    // `sciex:truncate-unequal-arrays`), so an unequal pair here is a decode failure that must stop
-    // the conversion, not something to summarize half of.
+    // reconstructed base-peak m/z differ by 4.6 ppm. The vendor shim clamps a length disagreement
+    // to `Math.Min` before we ever see it (counted, and declared as `sciex:truncate-unequal-arrays`),
+    // so an unequal pair here is a decode failure that must stop the conversion, not something to
+    // summarize half of.
     require_aligned_arrays(
         "SCIEX grid",
         spec.description().index,
@@ -6945,10 +6494,8 @@ fn sciex_grid_spectrum(
         tof_index.len(),
         intensity.len(),
     )?;
-    let recon: Vec<f64> = tof_index.iter().map(|&k| grid.mz(k)).collect();
+    let (out, recon) = sqrt_grid_arrays(grid.c0, grid.c1, tof_index, &intensity)?;
     set_gridded_spectrum_summary(&mut descr, &recon, &intensity);
-    descr.add_param(Param::builder().name("tof_c0").curie(TOF_C0_CURIE).value(grid.c0).build());
-    descr.add_param(Param::builder().name("tof_c1").curie(TOF_C1_CURIE).value(grid.c1).build());
     Ok(MultiLayerSpectrum::new(descr, Some(out), None, None))
 }
 
@@ -7022,27 +6569,20 @@ struct VendorHints {
     /// is still empty after the generic fixup (i.e. the run/scans reference configuration 0 with
     /// nothing behind it).
     instrument: Option<InstrumentConfiguration>,
-    /// Extra columns for the `spectra_data` facet (e.g. a `tof_index` grid axis). Sampling from
-    /// the probe spectra adds the ordinary ones.
-    data_facet_fields: Vec<std::sync::Arc<arrow::datatypes::Field>>,
-    /// Per-spectrum Float64 parameter columns, `(accession, name)` — the sqrt-grid `tof_c0`/`tof_c1`.
-    spectrum_param_fields: Vec<(mzdata::params::CURIE, &'static str)>,
-    /// Force the point layout on `spectra_data` (an integer grid axis cannot be delta-chunked)
-    /// while the peaks facet keeps the requested chunking — a deliberate mixed-family archive.
-    data_facet_point_layout: bool,
-    /// Index blocks (`tof_calibration` …) added to `mzpeak_index.json` at finish.
+    /// `spectra_data` on the reference implementation's chunk grid, one chunk per spectrum, under
+    /// this grid policy (the Shimadzu profile sqrt grid: each spectrum carries its exact
+    /// `MS:1003825` model, `exact_sqrt_grid_policy`). `None`: the requested chunking.
+    data_grid: Option<mzpeak_prototyping::grid::GridPolicyTable>,
+    /// `spectra_peaks` on the chunk grid (50-Th chunks) under this policy (the Shimadzu centroid
+    /// lists: `lattice_fit_grid_policy`). `None`: the requested chunking.
+    peak_grid: Option<mzpeak_prototyping::grid::GridPolicyTable>,
+    /// Index blocks (`waters_functions` …) added to `mzpeak_index.json` at finish.
     index_blocks: Vec<(String, serde_json::Value)>,
     /// MS:1000569 SHA-1 of the input, computed BEFORE the vendor reader opened it. The Shimadzu DLL
     /// holds a byte-range lock on the `.lcd` for as long as it is open, so hashing afterwards fails
     /// on large files (`os error 33`) — msconvert hashes first for the same reason. When present,
     /// the `sourceFile` entry is seeded with it so `fixup_run_metadata` neither re-hashes nor warns.
     source_sha1: Option<String>,
-    /// A custom `spectra_peaks` schema (the Shimadzu centroid lattice: point layout,
-    /// `spectrum_index` + `tof_index` Int64 + f64 `mz` fallback + `intensity`). When set the peaks
-    /// facet is never chunked or numpressed (the lattice replaces both), its schema is not sampled
-    /// from the probes, and a spectrum may hand the writer its peak rows explicitly through
-    /// [`VendorSpectrum::peak_arrays`]; the reader-side calibration block rides in `index_blocks`.
-    peaks_facet: Option<ArrayBuffersBuilder>,
     /// Lane-specific entries for the `transformations` index block (see [`transformations_block`]);
     /// the writer-level ones (zero-run mask, numpress) are added by `convert_vendor_reader`.
     transformations: Vec<String>,
@@ -7073,34 +6613,30 @@ struct VendorHints {
     counters: Vec<(&'static str, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
 }
 
-/// One spectrum from a vendor reader, plus — for a lattice-routed centroid list — the arrays that
-/// go to the peaks facet in place of `spectrum.peaks()` (see
-/// `MzPeakWriterType::write_spectrum_with_peak_arrays`). Every reader that has no such facet
-/// returns a bare `MultiLayerSpectrum` and converts through `From`.
+/// One spectrum from a vendor reader, with its routing outcome for the run summary. Every reader
+/// that routes nothing returns a bare `MultiLayerSpectrum` and converts through `From`.
 struct VendorSpectrum {
     spectrum: MultiLayerSpectrum,
-    peak_arrays: Option<BinaryArrayMap>,
-    /// Which axis encoding each facet of this spectrum took, for the run summary.
+    /// Which axis encoding the profile facet of this spectrum took, for the run summary.
     routes: FacetRoutes,
 }
 
 impl From<MultiLayerSpectrum> for VendorSpectrum {
     fn from(spectrum: MultiLayerSpectrum) -> Self {
-        Self { spectrum, peak_arrays: None, routes: FacetRoutes::default() }
+        Self { spectrum, routes: FacetRoutes::default() }
     }
 }
 
-/// Per-spectrum routing outcome of a vendor lane that encodes an axis as an integer grid (today
-/// only the Shimadzu lane: the profile sqrt grid and the centroid lattice). `None` = the spectrum
-/// had nothing to route on that facet (no profile / no centroid list, or the lane has no grid);
-/// `Some(true)` = on the grid; `Some(false)` = the guard failed and the spectrum kept f64 m/z.
+/// Per-spectrum routing outcome of a vendor lane that puts the profile axis on an exact grid
+/// (today only the Shimadzu lane's sqrt grid). `None` = the spectrum had no profile to route (or
+/// the lane has no grid); `Some(true)` = on the grid; `Some(false)` = the fit failed and the
+/// spectrum kept f64 m/z.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FacetRoutes {
     profile_grid: Option<bool>,
     /// The profile sqrt-grid route left this gridded spectrum's zero-intensity pad at the
     /// scan-window bounds out (`shimadzu:span-trim`).
     profile_span_trimmed: bool,
-    centroid_lattice: Option<bool>,
 }
 
 /// Run totals of [`FacetRoutes`], counted over the WRITTEN spectra only. The counting used to sit
@@ -7114,9 +6650,6 @@ struct FacetTally {
     profile_f64: usize,
     /// Gridded profile spectra whose zero pad the route left out: `shimadzu:span-trim`.
     profile_span_trimmed: usize,
-    /// Centroid facet: on the 1e-9 lattice / kept f64 m/z.
-    centroid_lattice: usize,
-    centroid_f64: usize,
 }
 
 impl FacetTally {
@@ -7127,48 +6660,15 @@ impl FacetTally {
             Some(false) => self.profile_f64 += 1,
             None => {}
         }
-        match routes.centroid_lattice {
-            Some(true) => self.centroid_lattice += 1,
-            Some(false) => self.centroid_f64 += 1,
-            None => {}
-        }
     }
 
-    fn total(&self) -> usize {
-        self.profile_grid + self.profile_f64 + self.centroid_lattice + self.centroid_f64
-    }
-
-    /// The summary lines the Shimadzu lane used to log itself; silent for a lane that routes
+    /// The summary line the Shimadzu lane used to log itself; silent for a lane that routes
     /// nothing (every other vendor reader).
     fn report(&self) {
-        if self.total() == 0 {
-            return;
-        }
         if self.profile_grid + self.profile_f64 > 0 {
             log::info!(
                 "Shimadzu profile facet: {} spectra on the sqrt grid, {} kept f64 m/z",
                 self.profile_grid, self.profile_f64
-            );
-        }
-        log::info!(
-            "Shimadzu centroid facet: {} spectra on the 1e-9 m/z lattice (tof_index Int64), \
-             {} kept f64 m/z",
-            self.centroid_lattice, self.centroid_f64
-        );
-        if self.centroid_lattice == 0 && self.centroid_f64 > 0 {
-            // The archive is still correct (exact f64 m/z in `point.mz` on every row), but the
-            // size target is missed, and silently so without this: e.g. a file whose
-            // MassHigh/Mass ratio is not 1e5 puts the centroids on a finer lattice than 1e-9.
-            // The tolerance is quoted from the guard itself (`mz_lattice::LATTICE_TOL`): the text
-            // said 1e-3 while the guard checked 1e-6.
-            log::warn!(
-                "Shimadzu centroid facet: none of the {} centroid lists passed the 1e-9 \
-                 lattice guard (|m/z·1e9 − k| < max({:e}, 8 ulp) on every point, k non-decreasing); every \
-                 centroid is stored as exact f64 m/z under the mz_calibration block. Is this file's \
-                 MassHigh at 1e-9 Da? (MZPC_SHIMADZU_COARSE_MZ=1 selects the 1e-4 Mass field, which \
-                 lies on the same lattice.)",
-                self.centroid_f64,
-                mz_lattice::LATTICE_TOL
             );
         }
     }
@@ -7210,12 +6710,10 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     }
     let VendorHints {
         instrument,
-        data_facet_fields,
-        spectrum_param_fields,
-        data_facet_point_layout,
+        data_grid,
+        peak_grid,
         index_blocks,
         source_sha1,
-        peaks_facet,
         transformations,
         run_metadata,
         keep_zero_runs,
@@ -7252,30 +6750,13 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             probes.push(s.spectrum);
         }
     }
-    // A custom peaks facet (the Shimadzu centroid lattice) is an integer axis with an f64 fallback
-    // column: never chunked, never numpressed — the lattice replaces both.
-    let lattice_peaks = peaks_facet.is_some();
     // Pick delta-vs-numpress from the actual m/z values in the probes, not from the extension.
-    // Only a facet that is actually chunked needs the sample: when the data facet is grid-encoded
-    // the probes carry no m/z array, so the values being chunked are the CENTROIDS in the peak
-    // set (or nothing at all, when those go to the lattice facet — a probe with no m/z array must
-    // not be sampled).
-    let sample_mz: Vec<f64> = if data_facet_point_layout && lattice_peaks {
-        Vec::new()
-    } else if data_facet_point_layout {
-        probes
-            .iter()
-            .filter_map(|s| s.peaks.as_ref())
-            .flat_map(|p| p.iter().map(|pk| pk.mz))
-            .collect()
-    } else {
-        sample_mz_from(&probes)
-    };
-    let chunk = refine_chunking(&sample_mz, chunk);
-    // A grid-encoded data facet is an integer axis, which has no chunk encoder: point layout there,
-    // chunked peaks beside it — the mixed-family archive this project accepts on purpose.
-    let data_chunk = if data_facet_point_layout { None } else { chunk };
-    let peaks_chunk = if lattice_peaks { None } else { chunk };
+    let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
+    // A facet under a grid policy takes the reference implementation's chunk grid: one chunk per
+    // spectrum for the profile facet (the model is per spectrum), its 50-Th default for the peaks.
+    let grid_chunk = |width| Some(ChunkingStrategy::Grid { chunk_size: width, grid: None });
+    let data_chunk = if data_grid.is_some() { grid_chunk(GRID_CHUNK_TH) } else { chunk.clone() };
+    let peaks_chunk = if peak_grid.is_some() { grid_chunk(GRID_PEAK_CHUNK_TH) } else { chunk };
     let mut builder = MzPeakWriterType::<fs::File>::builder()
         .chunked_encoding(data_chunk)
         .peaks_chunked_encoding(peaks_chunk)
@@ -7294,29 +6775,18 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         // Both facets need their schema sampled: the data facet from the probes, and — when the
         // peak facet is chunked — the peak facet too, or its buffer declares scalar columns while
         // the chunked writer hands it list-typed ones.
-        .sample_array_types_from_spectra(probes.clone().into_iter());
-    builder = match peaks_facet {
-        // The lattice facet is fully declared (its four columns are the contract); sampling the
-        // probes' peak sets would only re-add the f64 `mz`/`intensity` it already carries.
-        Some(schema) => builder.store_peaks_and_profiles_apart(Some(schema)),
-        None => builder.sample_array_types_for_peaks_from_spectra(probes.into_iter()),
-    };
-    for f in data_facet_fields {
-        builder = builder.add_spectrum_field(f);
+        .sample_array_types_from_spectra(probes.clone().into_iter())
+        .sample_array_types_for_peaks_from_spectra(probes.into_iter());
+    if let Some(policies) = data_grid {
+        builder = builder.add_grid_policies(policies);
     }
-    let has_mzp_params = !spectrum_param_fields.is_empty();
-    for (curie, name) in spectrum_param_fields {
-        builder = builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            curie,
-            name,
-            DataType::Float64,
-        ));
+    if let Some(policies) = peak_grid {
+        builder = builder.add_peak_grid_policies(policies);
     }
     let mut writer = builder.build(handle, !keep_zero_runs);
     add_processing_metadata(&mut writer);
-    // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band; the
-    // per-spectrum grid coefficient columns (`TOF_C0_CURIE` …) are MZP terms too.
-    if has_mzp_params || is_tdf_dir(input) {
+    // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band.
+    if is_tdf_dir(input) {
         ensure_mzp_cv(&mut writer);
     }
     let mut ms1 = Ms1Chroms::default();
@@ -7326,17 +6796,12 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     let mut tally = FacetTally::default();
     let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
     for i in 0..len {
-        let VendorSpectrum { spectrum: spec, peak_arrays, routes } = spectrum(i)?.into();
+        let VendorSpectrum { spectrum: spec, routes } = spectrum(i)?.into();
         tally.record(routes);
         if synth_chroms {
             ms1.observe(&spec);
         }
-        match peak_arrays.as_ref() {
-            // Lattice-routed centroids: the spectrum keeps its peak set / raw arrays for the
-            // metadata row, the explicit arrays are what the peaks facet stores.
-            Some(arrays) => writer.write_spectrum_with_peak_arrays(&spec, arrays)?,
-            None => writer.write_spectrum(&spec)?,
-        }
+        writer.write_spectrum(&spec)?;
     }
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, chromatograms.into_iter(), synth_chroms)?;
     if let Some(hex) = source_sha1 {
@@ -9007,8 +8472,7 @@ mod tests {
                 spec.description_mut().id = format!("scan={}", i + 1);
                 Ok(VendorSpectrum {
                     spectrum: spec,
-                    peak_arrays: None,
-                    routes: FacetRoutes { profile_grid: Some(true), profile_span_trimmed: false, centroid_lattice: Some(i % 2 == 0) },
+                    routes: FacetRoutes { profile_grid: Some(i % 2 == 0), profile_span_trimmed: false },
                 })
             },
         )
@@ -9017,7 +8481,7 @@ mod tests {
         assert_eq!(calls.get(), LEN + 6, "closure calls = probes + written");
         assert_eq!(
             tally,
-            FacetTally { profile_grid: LEN, profile_f64: 0, profile_span_trimmed: 0, centroid_lattice: LEN / 2, centroid_f64: LEN / 2 },
+            FacetTally { profile_grid: LEN / 2, profile_f64: LEN / 2, profile_span_trimmed: 0 },
             "tally must count the written spectra only"
         );
         assert!(out.is_file());
@@ -9368,8 +8832,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// PER-SPECTRUM routing: a spectrum entirely on the grid → tof_index (Gridded);
-    /// a spectrum with any off-lattice point → exact f64 m/z (F64). Both in one run.
+    /// PER-SPECTRUM routing: a spectrum entirely on the grid → the grid values with the model
+    /// attached (Gridded); a spectrum with any off-lattice point → exact f64 m/z (F64). Both in one run.
     #[test]
     fn tof_grid_routes_per_spectrum() {
         // Coarse-enough step that the half-step quantization at low m/z exceeds PPM_TOL, so a genuinely
@@ -9384,8 +8848,12 @@ mod tests {
             TofRoute::Gridded(s) => {
                 // The representation is the source's (Profile here), not a routing instruction (M6).
                 assert_eq!(s.signal_continuity(), mzdata::spectrum::SignalContinuity::Profile);
-                // the gridded spectrum carries tof_index, NOT f64 m/z
-                assert!(s.arrays.as_ref().unwrap().get(&ArrayType::nonstandard("tof_index")).is_some());
+                // the gridded spectrum carries the grid values as m/z with the MS:1003825 model on the array
+                let arrays = s.arrays.as_ref().unwrap();
+                assert!(arrays.get(&ArrayType::nonstandard("tof_index")).is_none());
+                let mz_da = arrays.get(&ArrayType::MZArray).expect("m/z array");
+                assert!(mz_da.params().iter().any(|p| p.curie() == Some(mzdata::curie!(MS:1003825))), "model param");
+                assert_eq!(mz_da.to_f64().unwrap().as_ref(), on.as_slice(), "grid values, exactly");
                 // No blanket MS:1000294 on the routed spectrum (M33): the writer must be free to
                 // infer MS:1000579/580 from ms_level, which it does only when nothing shadows it.
                 assert!(
@@ -9484,10 +8952,10 @@ mod tests {
     /// must carry the SAME numbers as the per-spectrum summary columns of the same archive.
     ///
     /// The old `Ms1Chroms::observe` asked mzdata for `peaks.base_peak()`, which needs an m/z array;
-    /// a gridded spectrum has none, so mzdata returned `(0, 0)` and every point of the BPC was zero
-    /// (timsTOF 2485: max 0 across all 400 points; SciEX Sample002: zero on 2,371 of 2,372) while
-    /// the `base_peak_intensity` COLUMN beside it was right. This asserts both halves: non-zero,
-    /// and equal to the column.
+    /// a 0.13 gridded spectrum had none, so mzdata returned `(0, 0)` and every point of the BPC was
+    /// zero (timsTOF 2485: max 0 across all 400 points; SciEX Sample002: zero on 2,371 of 2,372)
+    /// while the `base_peak_intensity` COLUMN beside it was right. This asserts both halves:
+    /// non-zero, and equal to the column (which the chunk-grid route still sets explicitly).
     #[test]
     fn gridded_chromatogram_matches_the_spectrum_summary_columns() {
         let grid = tof_grid::TofGrid { c0: 14.0, c1: 1.0e-4 };
@@ -9504,13 +8972,6 @@ mod tests {
         // What the WRITER puts in the metadata row (the explicit terms the grid route set).
         let col_tic = param_value(&s, mzdata::curie!(MS:1000285)).expect("MS:1000285 present");
         let col_bp = param_value(&s, mzdata::curie!(MS:1000505)).expect("MS:1000505 present");
-
-        // The defect, still reproducible: the array-derived base peak of a gridded spectrum is 0.
-        assert_eq!(
-            s.peaks().base_peak().intensity,
-            0.0,
-            "precondition: a gridded spectrum has no m/z array, so mzdata derives base peak 0"
-        );
 
         let mut ms1 = super::Ms1Chroms::default();
         ms1.observe(&s);
@@ -9657,11 +9118,12 @@ mod tests {
         assert!(require_aligned_arrays("SCIEX grid", 0, 1, 2).is_err());
     }
 
-    /// REGRESSION (the Shimadzu profile grid lane). `shimadzu_grid_route` replaces the f64 m/z with
-    /// `tof_index`, and mzdata folds an m/z-less array map to tic = 0 / base peak (0, 0) / "m/z 0–0",
-    /// so every gridded spectrum of a published Shimadzu archive shipped zeros while the peak data
-    /// itself was intact. The route must state the summary explicitly — and it must describe the
-    /// SIGNAL SPAN it actually stores, not the zero-padded source array.
+    /// REGRESSION (the Shimadzu profile grid lane). Through 0.13 `shimadzu_grid_route` replaced the
+    /// f64 m/z with `tof_index`, and mzdata folded an m/z-less array map to tic = 0 / base peak
+    /// (0, 0) / "m/z 0–0", so every gridded spectrum of a published Shimadzu archive shipped zeros
+    /// while the peak data itself was intact. The route states the summary explicitly — and it must
+    /// describe the SIGNAL SPAN it actually stores, not the zero-padded source array. Since the chunk
+    /// grid the route emits the grid values as f64 m/z with the `MS:1003825` model on the array.
     #[test]
     fn shimadzu_grid_route_summarizes_the_points_it_stores() {
         let (c0, c1) = (14.0f64, 1.0e-4f64);
@@ -9687,14 +9149,16 @@ mod tests {
             super::shimadzu_grid_route(spec_from(&mz[10..70], &inten[10..70], 1), c1);
         assert_eq!((routed_unpadded, trimmed_unpadded), (Some(true), false));
 
-        // The m/z array is gone, replaced by tof_index — which is exactly why the summary has to be
-        // carried as CV terms.
+        // The m/z array holds the grid values (the span only) and carries the sqrt model.
         let arrays = out.arrays.as_ref().expect("gridded spectrum keeps arrays");
-        assert!(
-            arrays.get(&ArrayType::nonstandard("tof_index")).is_some(),
-            "the grid route must emit a tof_index array"
-        );
-        assert!(arrays.mzs().is_err(), "the grid route must drop the m/z array");
+        assert!(arrays.get(&ArrayType::nonstandard("tof_index")).is_none(), "no point-layout axis");
+        let mz_da = arrays.get(&ArrayType::MZArray).expect("the grid route keeps an m/z array");
+        assert_eq!(mz_da.data_len().unwrap(), 60, "only the signal span is stored");
+        let model = mz_da.params().iter().find(|p| p.curie() == Some(mzdata::curie!(MS:1003825))).expect("MS:1003825 model on the m/z array");
+        let mzdata::params::Value::List(v) = &model.value else { panic!("model value is a list: {model:?}") };
+        assert_eq!(v.len(), 3, "[c0, c1, scale]");
+        assert!((v[1].to_f64().unwrap() - c1).abs() < 1e-12 * c1, "c1 {:?}", v[1]);
+        assert_eq!(v[2].to_f64().unwrap(), 1.0);
         assert_eq!(
             arrays.get(&ArrayType::IntensityArray).unwrap().data_len().unwrap(),
             60,
@@ -10095,27 +9559,24 @@ mod tests {
         let output = scratch.join("ims_compact.mzpeak");
         let _ = fs::remove_file(&output);
 
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0, false, true).expect("ims-compact conversion");
+        super::convert_ims_compact_archive(input, &output, 3, None, false, true, false, 50.0).expect("ims-compact conversion");
 
         // Crack the zip archive and extract facets to scratch files (File: ChunkReader).
         let f = fs::File::open(&output).unwrap();
         let mut zip = zip::ZipArchive::new(f).unwrap();
 
-        // (a) the peak facet has the mean 1/K0 mobility column (MS:1003006).
+        // (a) the peak facet is the grid layout — `mz_grid` + `mean_inverse_reduced_ion_mobility_grid`
+        // (MS:1003006) — and the mobility grid is POPULATED, not merely declared: through the reader
+        // every point carries its scan's 1/K0, inside the acquisition's mobility range, and the
+        // values vary (a constant is a placeholder, not a mobility).
         let peaks_path = extract_zip_entry(&mut zip, "spectra_peaks.parquet", scratch);
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&peaks_path).unwrap()).unwrap();
-        let schema = builder.schema().clone();
-        let cols = leaf_column_names(&schema);
-        assert!(
-            cols.iter().any(|n| n == "mean_inverse_reduced_ion_mobility"),
-            "spectra_peaks must carry mean_inverse_reduced_ion_mobility (MS:1003006); got {cols:?}"
-        );
-        // The peak facet stores integer `tof`, not m/z.
-        assert!(cols.iter().any(|n| n == "tof"), "peak facet must have a `tof` column; got {cols:?}");
-        // …and the mobility column is POPULATED, not merely declared: every point carries its scan's
-        // 1/K0, inside the acquisition's mobility range, and the values vary (a constant is a
-        // placeholder, not a mobility).
+        let cols = leaf_column_names(builder.schema());
+        for col in ["mz_grid", "mean_inverse_reduced_ion_mobility_grid"] {
+            assert!(cols.iter().any(|n| n.starts_with(col)), "spectra_peaks must carry `{col}`; got {cols:?}");
+        }
+        assert!(!cols.iter().any(|n| n == "tof"), "no point-layout `tof` column any more; got {cols:?}");
         let conn = rusqlite::Connection::open_with_flags(
             input.join("analysis.tdf"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -10129,32 +9590,25 @@ mod tests {
                 .unwrap()
         };
         let (lo, hi) = (global("OneOverK0AcqRangeLower"), global("OneOverK0AcqRangeUpper"));
-        let (mut points, mut nulls, mut min, mut max) = (0usize, 0usize, f64::INFINITY, f64::NEG_INFINITY);
-        for batch in builder.build().unwrap() {
-            let batch = batch.unwrap();
-            let mobility = batch
-                .columns()
-                .iter()
-                .find_map(|c| {
-                    c.as_any()
-                        .downcast_ref::<arrow::array::StructArray>()?
-                        .column_by_name("mean_inverse_reduced_ion_mobility")
-                        .cloned()
-                })
-                .expect("mean_inverse_reduced_ion_mobility inside the peak struct");
-            let mobility = arrow::compute::cast(&mobility, &arrow::datatypes::DataType::Float64).unwrap();
-            let mobility = mobility.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
-            points += mobility.len();
-            nulls += arrow::array::Array::null_count(mobility);
-            for v in mobility.iter().flatten() {
-                min = min.min(v);
-                max = max.max(v);
+        let mut reader = mzpeak_prototyping::MzPeakReader::new(&output).unwrap();
+        let (mut points, mut min, mut max) = (0usize, f64::INFINITY, f64::NEG_INFINITY);
+        for i in (0..reader.len() as u64).step_by(97) {
+            let Some(arrays) = reader.get_spectrum_peak_arrays_for(i).unwrap() else { continue };
+            let (k0, _) = arrays.ion_mobility().expect("1/K0 on every frame with points");
+            points += k0.len();
+            for v in k0.iter() {
+                min = min.min(*v);
+                max = max.max(*v);
             }
         }
         assert!(points > 0, "the peak facet holds no points");
-        assert_eq!(nulls, 0, "{nulls} of {points} points carry no 1/K0");
+        // The vendor's ModelType-2 calibration puts the first and last scan a few 1e-4 Vs/cm²
+        // outside the NOMINAL acquisition range (2485.d: 0.70050..1.45032 against 0.70..1.45);
+        // timsrust's linear map, which this test read through 0.13, is pinned to the nominal
+        // bounds by construction. A 1 % margin separates that from a wrong column.
+        let margin = 0.01 * (hi - lo);
         assert!(
-            lo - 1e-9 <= min && max <= hi + 1e-9 && min < max,
+            lo - margin <= min && max <= hi + margin && min < max,
             "1/K0 spans {min}..{max}; the acquisition range is {lo}..{hi}, and a real mobility varies"
         );
 
@@ -10197,7 +9651,7 @@ mod tests {
         let output = scratch.join("ims_chunked.mzpeak");
 
         // ims_chunked = true: the configuration that wrote a point data facet beside chunked peaks.
-        super::convert_ims_compact_archive(&input, &output, 3, None, false, false, true, 50.0, false, true).expect("--ims-chunked conversion");
+        super::convert_ims_compact_archive(&input, &output, 3, None, false, true, true, 50.0).expect("--ims-chunked conversion");
 
         // The family is declared in each facet's footer as `spectrum_array_index.prefix`.
         let mut zip = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
@@ -10229,32 +9683,24 @@ mod tests {
     /// `spectrum` facets must declare `chunk` (the empty data facet used to be `point`).
     #[test]
     fn ims_chunked_spectrum_facets_share_one_family_without_the_corpus() {
-        use mzdata::params::Unit;
+        use mzpeak_prototyping::grid::GridModelLike;
         use parquet::file::reader::{FileReader, SerializedFileReader};
 
         let dir = scratch("ims-chunked-synthetic");
         let output = dir.join("synthetic.mzpeak");
         // m/z = (10 + 2e-5·tof)² spans 144–256 Th over these bins, so 50-Th chunks split each frame.
+        // The chord as an MS:1003825 model (a TDF without MzCalibration rows), plain 1/K0 values.
+        let model = mzpeak_prototyping::grid::GridEncoding::from_parameters(
+            mzpeak_prototyping::grid::SquareRootLinearGrid::ACCESSION, &[10.0, 2e-5, 1.0]).unwrap();
         let frame = |i: usize, int_intensity: bool| -> anyhow::Result<MultiLayerSpectrum> {
-            let mut arrays = BinaryArrayMap::new();
-            let mut tof = DataArray::wrap(&ArrayType::nonstandard("tof"), BinaryDataArrayType::Int32, Vec::new());
-            tof.update_buffer(&[100_000i32, 150_000, 200_000, 300_000]).unwrap();
-            arrays.add(tof);
-            let mut intensity = if int_intensity {
-                let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
-                da.update_buffer(&[1i32, 2, 3, 4]).unwrap();
-                da
-            } else {
-                let mut da = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-                da.update_buffer(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
-                da
-            };
-            intensity.unit = Unit::DetectorCounts;
-            arrays.add(intensity);
-            let mut mobility =
-                DataArray::wrap(&ArrayType::MeanInverseReducedIonMobilityArray, BinaryDataArrayType::Float64, Vec::new());
-            mobility.update_buffer(&[1.0f64, 1.05, 1.1, 1.2]).unwrap();
-            arrays.add(mobility);
+            let tof = [100_000i32, 150_000, 200_000, 300_000];
+            let (counts, floats) = ([1i32, 2, 3, 4], [1.0f32, 2.0, 3.0, 4.0]);
+            let (arrays, _) = crate::bruker_native::ims_grid_arrays(
+                &tof,
+                if int_intensity { crate::bruker_native::ImsIntensity::Counts(&counts) } else { crate::bruker_native::ImsIntensity::Float(&floats) },
+                crate::bruker_native::ImsMobility::Values(&[1.0f64, 1.05, 1.1, 1.2]),
+                &model,
+            )?;
             let descr = SpectrumDescription {
                 id: format!("frame={}", i + 1),
                 index: i,
@@ -10268,7 +9714,7 @@ mod tests {
         // The input is only named: without an analysis.tdf the vendor calibration block is skipped.
         super::write_ims_compact_archive_impl::<_, Parallel>(
             &dir.join("synthetic.d"), &output, 3, None, false, 10.0, 2e-5, "global_metadata", 2,
-            "m/z-chunked", Some(50.0), None, None, super::Driver::Serial(frame),
+            50.0, false, crate::bruker_native::mz_model_summary(&Default::default()), None, super::Driver::Serial(frame),
         )
         .expect("--ims-chunked write");
 
@@ -10292,37 +9738,31 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `--agilent-grid` hand-builds its data schema, which lost `spectrum_index` in 0.10.1: the writer
-    /// meets the batch's index column in `route_unexpected` and panics, so the release build aborted
-    /// on the first spectrum. No profile `.d` in reach decodes, so one gridded profile spectrum,
-    /// shaped as `agilent_grid_spectrum` builds it, goes through the lane's own builder.
+    /// `--agilent-grid`'s writer: one gridded profile spectrum, shaped as `agilent_grid_spectrum`
+    /// builds it (grid values + the `MS:1003825` model on the m/z array, a user param naming the
+    /// calibration row), goes through the lane's own builder and comes back through the reader as
+    /// an `MS:1003826` grid row holding the vendor's bin ordinals.
     #[test]
     fn agilent_grid_schema_writes_a_gridded_profile_spectrum() {
-        use arrow::array::{Array, Int32Array, StructArray, UInt64Array};
-        use mzdata::params::Unit;
+        use mzpeak_prototyping::MzPeakReader;
 
         let dir = scratch("agilent-grid-schema");
         let path = dir.join("grid.mzpeak");
         let level = parquet::basic::ZstdLevel::try_new(3).unwrap();
-        let mut writer =
-            super::agilent_grid_writer_builder(level, (0.5, 1e-4)).build(fs::File::create(&path).unwrap(), true);
-        super::ensure_mzp_cv(&mut writer);
-        let mut arrays = BinaryArrayMap::new();
-        let mut tof = DataArray::wrap(&ArrayType::nonstandard("tof_index"), BinaryDataArrayType::Int32, Vec::new());
-        tof.update_buffer(&[1000i32, 1001, 1002]).unwrap();
-        arrays.add(tof);
-        let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        intensity.update_buffer(&[3.0f32, 7.0, 2.0]).unwrap();
-        intensity.unit = Unit::DetectorCounts;
-        arrays.add(intensity);
-        let mut descr = SpectrumDescription::default();
-        descr.id = "scan=1".into();
-        descr.ms_level = 1;
-        descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
-        descr.add_param(Param::builder().name("tof_c0").curie(super::TOF_C0_CURIE).value(0.5).build());
-        descr.add_param(Param::builder().name("tof_c1").curie(super::TOF_C1_CURIE).value(1e-4).build());
-        descr.add_param(Param::builder().name("tof_calibration_id").curie(super::TOF_CALID_CURIE).value(1i64).build());
-        let spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(descr, Some(arrays), None, None);
+        let build = |k: &[i32], inten: &[f32]| {
+            let (arrays, recon) = super::sqrt_grid_arrays(0.5, 1e-4, k, inten).unwrap();
+            let mut descr = SpectrumDescription::default();
+            descr.id = "scan=1".into();
+            descr.ms_level = 1;
+            descr.signal_continuity = mzdata::spectrum::SignalContinuity::Profile;
+            descr.add_param(Param::new_key_value("agilent_calibration_id", 1i64));
+            super::set_gridded_spectrum_summary(&mut descr, &recon, inten);
+            let spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(descr, Some(arrays), None, None);
+            (spec, recon)
+        };
+        let (probe, _) = build(&[1000, 1001, 1002], &[3.0, 7.0, 2.0]);
+        let mut writer = super::agilent_grid_writer_builder(level, probe).build(fs::File::create(&path).unwrap(), true);
+        let (spec, want) = build(&[1000, 1001, 1002], &[3.0, 7.0, 2.0]);
         writer.write_spectrum(&spec).unwrap();
         super::finish_chromatograms(&mut writer, &dir, &super::Ms1Chroms::default(), std::iter::empty(), false).unwrap();
         writer.finish_parquet().unwrap().finish().unwrap();
@@ -10336,11 +9776,17 @@ mod tests {
             .next()
             .expect("spectra_data holds the spectrum")
             .unwrap();
-        let point = batch.column_by_name("point").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
-        let index = point.column_by_name("spectrum_index").expect("point.spectrum_index");
-        assert_eq!(index.as_any().downcast_ref::<UInt64Array>().unwrap().values().to_vec(), vec![0, 0, 0]);
-        let tof = point.column_by_name("tof_index").expect("point.tof_index");
-        assert_eq!(tof.as_any().downcast_ref::<Int32Array>().unwrap().values().to_vec(), vec![1000, 1001, 1002]);
+        let chunk = batch.column_by_name("chunk").unwrap().as_any().downcast_ref::<arrow::array::StructArray>().unwrap();
+        assert!(chunk.column_by_name("mz_grid").is_some(), "the data facet is a grid chunk facet");
+        let mut reader = MzPeakReader::new(&path).unwrap();
+        let got = reader.get_spectrum_arrays(0).unwrap().expect("arrays").mzs().unwrap().to_vec();
+        assert_eq!(got, want, "the grid values read back exactly");
+        let meta = reader.get_spectrum_metadata(0).unwrap().unwrap();
+        assert!(
+            meta.params().iter().any(|p| p.name == "agilent_calibration_id"),
+            "the calibration row selector survives as a spectrum parameter: {:?}",
+            meta.params()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -10365,7 +9811,7 @@ mod tests {
         let _rm = RmDir(scratch.to_path_buf());
         let output = scratch.join("contract.mzpeak");
         let _ = fs::remove_file(&output);
-        super::convert_ims_compact_archive(input, &output, 3, None, false, false, false, 50.0, false, true).expect("ims-compact conversion");
+        super::convert_ims_compact_archive(input, &output, 3, None, false, true, false, 50.0).expect("ims-compact conversion");
 
         let f = fs::File::open(&output).unwrap();
         let mut zip = zip::ZipArchive::new(f).unwrap();
@@ -10379,10 +9825,15 @@ mod tests {
             .get("metadata")
             .and_then(|m| m.get("ims_calibration"))
             .expect("metadata.ims_calibration present");
-        for key in ["codec", "mz_from_tof", "tof_encoding", "a", "b"] {
+        for key in ["codec", "layout", "tof_encoding", "mz_grid", "ion_mobility_grid", "chord"] {
             assert!(cal.get(key).is_some(), "ims_calibration missing key `{key}`: {cal}");
         }
         assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("ims-compact"));
+        assert_eq!(cal["tof_encoding"], "grid");
+        assert_eq!(cal["exact"], true);
+        assert_eq!(cal["mz_grid"]["column"], "chunk.mz_grid");
+        assert_eq!(cal["ion_mobility_grid"]["column"], "chunk.mean_inverse_reduced_ion_mobility_grid");
+        let cal = &cal["chord"];
         // Present is not the contract; a reader decodes with the VALUES. `(a, b)` is timsrust's
         // two-point chord through GlobalMetadata — m/z = MzAcqRangeLower at tof 0 and MzAcqRangeUpper
         // at tof = DigitizerNumSamples — recomputed here from analysis.tdf, not taken from the converter.
@@ -10405,9 +9856,7 @@ mod tests {
         assert!((got_a - a).abs() <= 1e-12 * a, "ims_calibration.a = {got_a}; the chord's sqrt(MzAcqRangeLower) = {a}");
         assert!((got_b - b).abs() <= 1e-8 * b, "ims_calibration.b = {got_b}; the chord's slope = {b}");
         assert_eq!(cal["mz_from_tof"], "(a + b*tof)^2");
-        assert_eq!(cal["lossless"], "tof");
-        assert_eq!(cal["tof_encoding"], "absolute", "the default archive layout stores absolute tof");
-        assert_eq!(cal["chord_source"], "global_metadata", "the native lane's chord comes from GlobalMetadata");
+        assert_eq!(cal["source"], "global_metadata", "the native lane's chord comes from GlobalMetadata");
         // The vendor's exact calibration rides beside the two-point chord.
         let vmc = idx
             .get("metadata")
@@ -10441,17 +9890,15 @@ mod tests {
             );
         }
 
-        // peaks schema has a `tof` column.
+        // peaks schema is the grid layout: `mz_grid`, no point-layout `tof`.
         let peaks_path = extract_zip_entry(&mut zip, "spectra_peaks.parquet", scratch);
         let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
             fs::File::open(&peaks_path).unwrap(),
         )
         .unwrap();
         let cols = leaf_column_names(builder.schema());
-        assert!(
-            cols.iter().any(|n| n == "tof"),
-            "ims-compact peaks schema must have a `tof` column; got {cols:?}"
-        );
+        assert!(cols.iter().any(|n| n.starts_with("mz_grid")), "ims-compact peaks schema must carry `mz_grid`; got {cols:?}");
+        assert!(!cols.iter().any(|n| n == "tof"), "no point-layout `tof` column; got {cols:?}");
     }
 
     /// Extract a named entry from an open zip archive to a scratch file and return its path.
@@ -10911,8 +10358,7 @@ mod tests {
                 calls.set(calls.get() + 1);
                 Ok(VendorSpectrum {
                     spectrum: spec_from(&[100.0, 200.0, 300.0], &[1.0, 2.0, 3.0], i),
-                    peak_arrays: None,
-                    routes: FacetRoutes { profile_grid: Some(true), profile_span_trimmed: trimmed(calls.get(), i), centroid_lattice: None },
+                    routes: FacetRoutes { profile_grid: Some(true), profile_span_trimmed: trimmed(calls.get(), i) },
                 })
             })
             .unwrap();
@@ -11435,7 +10881,10 @@ mod tests {
         let (ok, _, err) = run_bin(&args, &[]);
         assert!(ok, "{err}");
         let md = index_metadata(&out);
-        assert_eq!(md["tof_calibration"]["codec"], serde_json::json!("tof-grid"), "the grid sub-path ran");
+        assert!(
+            md["transformations"].as_array().is_some_and(|t| t.iter().any(|e| e.as_str().is_some_and(|e| e.starts_with("tof-grid:")))),
+            "the grid sub-path ran: {md}"
+        );
         let members = zip_members(&out);
         assert!(
             members.iter().any(|m| m == "sample_metadata/sdrf.tsv"),

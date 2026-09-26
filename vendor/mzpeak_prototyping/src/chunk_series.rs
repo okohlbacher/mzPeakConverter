@@ -5,12 +5,14 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, ArrowPrimitiveType, AsArray, Float32Array, Float32Builder,
     Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    LargeListBuilder, PrimitiveArray, StructArray, StructBuilder, UInt8Array, UInt8Builder,
+    LargeListBuilder, LargeStringArray, LargeStringBuilder, PrimitiveArray, StructArray,
+    StructBuilder, UInt8Array, UInt8Builder, UInt16Builder, UInt32Builder,
     UInt64Array, UInt64Builder,
 };
 use arrow::compute::kernels::nullif;
 use arrow::datatypes::{
     DataType, Field, Fields, Float32Type, Float64Type, Int32Type, Int64Type, Schema, UInt8Type,
+    UInt16Type, UInt32Type,
 };
 use itertools::Itertools;
 use mzdata::params::CURIE;
@@ -24,6 +26,8 @@ use bytemuck::Pod;
 use num_traits::{Float, NumCast, ToPrimitive};
 
 use crate::buffer_descriptors::{BufferOverrideTable, BufferPriority};
+use crate::filter::{delta_decode_integer, delta_encode_integer};
+use crate::grid::{GridEncoding, GridModelLike, GridPolicy, GridPolicyTable};
 use crate::writer::StructVisitor;
 use crate::{
     buffer_descriptors::BufferTransform,
@@ -71,10 +75,10 @@ pub const NO_COMPRESSION: CURIE = mzdata::curie!(MS:1000576);
 pub const DELTA_ENCODE: CURIE = mzdata::curie!(MS:1003089);
 pub const NUMPRESS_LINEAR: CURIE = mzdata::curie!(MS:1002312);
 pub const NUMPRESS_SLOF: CURIE = mzdata::curie!(MS:1002314);
-pub use crate::grid::GRID_ENCODING;
+pub const GRID_ENCODING: CURIE = crate::buffer_descriptors::GRID_ENCODING;
 
 /// Different methods for encoding chunks along a coordinate dimension
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ChunkingStrategy {
     /// Values are encoded as-is without any transformation. While this doesn't have any compression
     /// benefits, it provides compatibility for sparse data. The start and end values are included in
@@ -88,6 +92,10 @@ pub enum ChunkingStrategy {
     /// which may not align with a multi-byte value type and must be stored in a dedicated byte array. The
     /// start and end values are included in the encoded chunk as well as the chunk metadata.
     NumpressLinear { chunk_size: f64 },
+    Grid {
+        chunk_size: f64,
+        grid: Option<GridEncoding>,
+    },
 }
 
 impl ChunkingStrategy {
@@ -97,6 +105,59 @@ impl ChunkingStrategy {
             Self::Basic { chunk_size: _ } => NO_COMPRESSION,
             Self::Delta { chunk_size: _ } => DELTA_ENCODE,
             Self::NumpressLinear { chunk_size: _ } => NUMPRESS_LINEAR,
+            Self::Grid {
+                chunk_size: _,
+                grid: _,
+            } => GRID_ENCODING,
+        }
+    }
+
+    pub const fn as_delta(&self) -> Self {
+        Self::Delta {
+            chunk_size: self.chunk_size(),
+        }
+    }
+
+    pub const fn basic(&self) -> Self {
+        Self::Basic {
+            chunk_size: self.chunk_size(),
+        }
+    }
+
+    pub const fn is_grid(&self) -> bool {
+        matches!(
+            self,
+            Self::Grid {
+                chunk_size: _,
+                grid: _
+            }
+        )
+    }
+
+    pub const fn has_grid(&self) -> bool {
+        match self {
+            Self::Grid {
+                chunk_size: _,
+                grid,
+            } => grid.is_some(),
+            _ => false,
+        }
+    }
+
+    pub const fn grid(&self) -> Option<&GridEncoding> {
+        match self {
+            Self::Grid {
+                chunk_size: _,
+                grid,
+            } => grid.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub const fn with_grid(&self, grid: Option<GridEncoding>) -> Self {
+        Self::Grid {
+            chunk_size: self.chunk_size(),
+            grid,
         }
     }
 
@@ -119,6 +180,15 @@ impl ChunkingStrategy {
                 )
                 .with_metadata(name.as_field_metadata());
                 vec![bytes]
+            }
+            ChunkingStrategy::Grid {
+                chunk_size: _,
+                grid: _,
+            } => {
+                vec![
+                    BufferTransformEncoder(BufferTransform::GridEncoding, None)
+                        .to_field(main_axis_name),
+                ]
             }
         }
     }
@@ -167,6 +237,69 @@ impl ChunkingStrategy {
                     b.append_null();
                 }
             }
+            ChunkingStrategy::Grid {
+                chunk_size: _,
+                grid: _,
+            } => {
+                let fields = self.extra_arrays(main_axis_name);
+                let grid_col = &fields[0];
+                let idx = schema
+                    .fields()
+                    .iter()
+                    .position(|p| p.name() == grid_col.name())
+                    .unwrap();
+
+                if visited.contains(&idx) {
+                    return;
+                }
+                visited.insert(idx);
+                let b: &mut StructBuilder = chunk_builder.field_builder(idx).unwrap();
+                if chunk.chunk_encoding.is_grid() {
+                    let encoded = chunk.chunk_values.as_struct();
+                    let indices_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(2).unwrap();
+                    let indices_values_builder: &mut UInt32Builder = indices_builder
+                        .values()
+                        .as_any_mut()
+                        .downcast_mut()
+                        .unwrap();
+                    let indices = encoded.column(2).as_list::<i64>();
+                    indices_values_builder
+                        .append_array(indices.value(0).as_primitive::<UInt32Type>());
+                    indices_builder.append(true);
+
+                    let parameters_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(1).unwrap();
+                    let parameters_values_builder: &mut Float64Builder = parameters_builder
+                        .values()
+                        .as_any_mut()
+                        .downcast_mut()
+                        .unwrap();
+                    let parameters = encoded.column(1).as_list::<i64>();
+                    parameters_values_builder
+                        .append_array(parameters.value(0).as_primitive::<Float64Type>());
+                    parameters_builder.append(true);
+
+                    let grid_type_builder: &mut LargeStringBuilder = b.field_builder(0).unwrap();
+                    let grid_type = encoded.column(0).as_string::<i64>();
+                    grid_type_builder.append_value(grid_type.value(0));
+
+                    b.append(true);
+                } else {
+                    let grid_type_builder: &mut LargeStringBuilder = b.field_builder(0).unwrap();
+                    grid_type_builder.append_null();
+
+                    let parameters_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(1).unwrap();
+                    parameters_builder.append_null();
+
+                    let indices_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(2).unwrap();
+                    indices_builder.append_null();
+
+                    b.append_null();
+                }
+            }
         }
     }
 
@@ -176,6 +309,10 @@ impl ChunkingStrategy {
             ChunkingStrategy::Basic { chunk_size } => *chunk_size,
             ChunkingStrategy::Delta { chunk_size } => *chunk_size,
             ChunkingStrategy::NumpressLinear { chunk_size } => *chunk_size,
+            ChunkingStrategy::Grid {
+                chunk_size,
+                grid: _,
+            } => *chunk_size,
         }
     }
 
@@ -234,16 +371,27 @@ impl ChunkingStrategy {
                 let bytes_of = if matches!(array.data_type(), DataType::Float64) {
                     let array: &PrimitiveArray<Float64Type> =
                         array.as_any().downcast_ref().unwrap();
-                    DataArray::compress_numpress_linear(array.values()).unwrap()
+                    let fp = numpress_rs::optimal_scaling(array.values());
+                    numpress_rs::numpress_compress(array.values(), fp).unwrap()
                 } else {
                     let values: Vec<_> = array
                         .iter()
                         .map(|v| v.and_then(|v| v.to_f64()).unwrap_or_default())
                         .collect();
-                    DataArray::compress_numpress_linear(&values).unwrap()
+                    let fp = numpress_rs::optimal_scaling(&values);
+                    numpress_rs::numpress_compress(&values, fp).unwrap()
                 };
                 let array = Arc::new(UInt8Array::from(bytes_of));
                 (start, end, array)
+            }
+            ChunkingStrategy::Grid {
+                chunk_size: _,
+                grid,
+            } => {
+                let grid = grid.as_ref().unwrap();
+                let part =
+                    BufferTransformEncoder::encode_grid::<T>(array, grid, DataType::UInt32, true);
+                (start, end, part)
             }
         }
     }
@@ -370,7 +518,7 @@ impl ChunkingStrategy {
                 DataType::UInt8 => {
                     let it = array.as_primitive::<UInt8Type>();
                     let buf = it.values();
-                    let data: Float64Array = DataArray::decompress_numpress_linear(buf)
+                    let data: Float64Array = numpress_rs::numpress_decompress(buf)
                         .unwrap()
                         .into_iter()
                         .map(|v| if v == 0.0 { None } else { Some(v) })
@@ -402,12 +550,31 @@ impl ChunkingStrategy {
                     array.data_type()
                 ),
             },
+            ChunkingStrategy::Grid {
+                chunk_size: _,
+                grid: _,
+            } => {
+                let values = BufferTransformDecoder::grid_decode_at(array.as_struct(), 0, true);
+                let values = values.as_primitive::<Float64Type>();
+                match accumulator.dtype() {
+                    BinaryDataArrayType::Float64 => {
+                        accumulator.extend(&values.values()).unwrap();
+                    }
+                    BinaryDataArrayType::Float32 => {
+                        for v in values.values() {
+                            accumulator.push(*v as f32).unwrap();
+                        }
+                    }
+                    _ => unimplemented!(),
+                }
+                values.len()
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferTransformEncoder(BufferTransform);
+pub struct BufferTransformEncoder(BufferTransform, Option<GridEncoding>);
 
 impl TryFrom<Option<BufferTransform>> for BufferTransformEncoder {
     type Error = <Self as TryFrom<BufferTransform>>::Error;
@@ -420,6 +587,12 @@ impl TryFrom<Option<BufferTransform>> for BufferTransformEncoder {
     }
 }
 
+impl From<GridEncoding> for BufferTransformEncoder {
+    fn from(value: GridEncoding) -> Self {
+        Self(BufferTransform::GridEncoding, Some(value))
+    }
+}
+
 impl TryFrom<BufferTransform> for BufferTransformEncoder {
     type Error = String;
 
@@ -427,21 +600,28 @@ impl TryFrom<BufferTransform> for BufferTransformEncoder {
         match value {
             BufferTransform::NumpressLinear
             | BufferTransform::NumpressSLOF
-            | BufferTransform::NumpressPIC => Ok(Self(value)),
+            | BufferTransform::NumpressPIC => Ok(Self(value, None)),
             BufferTransform::NullInterpolate
             | BufferTransform::NullZero
             | BufferTransform::SqrtMzFromTof
-            | BufferTransform::LinearMz
-            | BufferTransform::GridEncoding => Err(format!("{value:?} does not have an encoder")),
+            | BufferTransform::LinearMz => Err(format!("{value:?} does not have an encoder")),
+            // This branch might change, depending upon context
+            BufferTransform::GridEncoding => Ok(Self(value, None)),
         }
     }
 }
 
 impl BufferTransformEncoder {
+    pub fn method(&self) -> &BufferTransform {
+        &self.0
+    }
+
     pub fn to_buffer_name(&self, buffer_name: &BufferName) -> BufferName {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
-            BufferTransform::NumpressSLOF | BufferTransform::NumpressPIC => buffer_name
+            BufferTransform::NumpressSLOF
+            | BufferTransform::NumpressPIC
+            | BufferTransform::GridEncoding => buffer_name
                 .clone()
                 .with_format(BufferFormat::ChunkTransform)
                 .with_transform(Some(self.0)),
@@ -462,6 +642,12 @@ impl BufferTransformEncoder {
                 )
                 .with_metadata(meta);
                 bytes
+            }
+            BufferTransform::GridEncoding => {
+                let meta = buffer_name.as_field_metadata();
+                let fields = Self::grid_fields(DataType::UInt32);
+                let group = DataType::Struct(fields.into());
+                Field::new(buffer_name.to_string(), group, true).with_metadata(meta)
             }
             _ => unimplemented!("{:?} does not have a field conversion", self.0),
         }
@@ -485,28 +671,186 @@ impl BufferTransformEncoder {
             return;
         }
         visited.insert(idx);
-        let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
-            chunk_builder.field_builder(idx).unwrap();
 
-        if let Some(chunk_segment) = chunk.arrays.get(buffer_name) {
-            let inner = b
-                .values()
-                .as_any_mut()
-                .downcast_mut::<UInt8Builder>()
-                .unwrap();
-            let bytes: &UInt8Array = chunk_segment.as_primitive();
-            inner.extend(bytes);
-            b.append(true);
-        } else {
-            b.append_null();
+        match self.0 {
+            BufferTransform::NumpressPIC | BufferTransform::NumpressSLOF => {
+                let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                    chunk_builder.field_builder(idx).unwrap();
+                if let Some(chunk_segment) = chunk.arrays.get(buffer_name) {
+                    let inner = b
+                        .values()
+                        .as_any_mut()
+                        .downcast_mut::<UInt8Builder>()
+                        .unwrap();
+                    let bytes: &UInt8Array = chunk_segment.as_primitive();
+                    inner.extend(bytes);
+                    b.append(true);
+                } else {
+                    b.append_null();
+                }
+            }
+            BufferTransform::GridEncoding => {
+                let b: &mut StructBuilder = chunk_builder.field_builder(idx).unwrap();
+                if let Some(chunk_segment) = chunk.arrays.get(buffer_name)  {
+                    let encoded = chunk_segment.as_struct();
+                    let indices_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(2).unwrap();
+                    let indices_values_builder: &mut UInt32Builder = indices_builder
+                        .values()
+                        .as_any_mut()
+                        .downcast_mut()
+                        .unwrap();
+                    let indices = encoded.column(2).as_list::<i64>();
+                    indices_values_builder
+                        .append_array(indices.value(0).as_primitive::<UInt32Type>());
+                    indices_builder.append(true);
+
+                    let parameters_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(1).unwrap();
+                    let parameters_values_builder: &mut Float64Builder = parameters_builder
+                        .values()
+                        .as_any_mut()
+                        .downcast_mut()
+                        .unwrap();
+                    let parameters = encoded.column(1).as_list::<i64>();
+                    parameters_values_builder
+                        .append_array(parameters.value(0).as_primitive::<Float64Type>());
+                    parameters_builder.append(true);
+
+                    let grid_type_builder: &mut LargeStringBuilder = b.field_builder(0).unwrap();
+                    let grid_type = encoded.column(0).as_string::<i64>();
+                    grid_type_builder.append_value(grid_type.value(0));
+
+                    b.append(true);
+                } else {
+                    let grid_type_builder: &mut LargeStringBuilder = b.field_builder(0).unwrap();
+                    grid_type_builder.append_null();
+
+                    let parameters_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(1).unwrap();
+                    parameters_builder.append_null();
+
+                    let indices_builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                        b.field_builder(2).unwrap();
+                    indices_builder.append_null();
+
+                    b.append_null();
+                }
+            }
+            _ => unimplemented!("Buffer transform {:?} is not implemented", self.0),
         }
+
     }
 
-    pub fn encode_arrow(
-        &self,
-        _buffer_name: &BufferName,
-        chunk_segment: &impl AsArray,
-    ) -> ArrayRef {
+    pub fn grid_fields(index_type: DataType) -> Vec<Arc<Field>> {
+        let indices = Field::new(
+            "indices",
+            DataType::LargeList(Arc::new(Field::new("item", index_type, false))),
+            true,
+        );
+
+        let parameters = Field::new(
+            "parameters",
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float64, false))),
+            true,
+        );
+
+        let grid_type = Field::new("grid_type", DataType::LargeUtf8, false);
+
+        vec![Arc::new(grid_type), Arc::new(parameters), Arc::new(indices)]
+    }
+
+    fn encode_grid_inner<T: ArrowPrimitiveType, U: TryFrom<u32>>(
+        values: &PrimitiveArray<T>,
+        model: &GridEncoding,
+    ) -> Vec<U>
+    where
+        T::Native: Float,
+    {
+        let mut indices = Vec::new();
+        indices.reserve(values.len());
+        for v in values.iter() {
+            let v = v.and_then(|v| v.to_f64()).unwrap();
+            match model.to_index(v).try_into() {
+                Ok(i) => indices.push(i),
+                Err(_) => panic!("Failed to convert grid index from {v} with {model:?}"),
+            }
+        }
+        indices
+    }
+
+    pub fn encode_grid<T: ArrowPrimitiveType>(
+        values: &PrimitiveArray<T>,
+        model: &GridEncoding,
+        index_type: DataType,
+        delta_indices_sorted: bool,
+    ) -> ArrayRef
+    where
+        T::Native: Float,
+    {
+        let indices = match &index_type {
+            DataType::UInt32 => {
+                let indices = Self::encode_grid_inner::<T, u32>(values, model);
+                let indices = if delta_indices_sorted {
+                    delta_encode_integer(&indices)
+                } else {
+                    indices
+                };
+                let mut builder =
+                    LargeListBuilder::new(UInt32Builder::with_capacity(indices.len()))
+                        .with_field(Field::new("item", index_type.clone(), false));
+                builder.values().append_slice(&indices);
+                builder.append(true);
+                Arc::new(builder.finish())
+            }
+            DataType::UInt16 => {
+                let indices = Self::encode_grid_inner::<T, u16>(values, model);
+                let indices = if delta_indices_sorted {
+                    delta_encode_integer(&indices)
+                } else {
+                    indices
+                };
+                let mut builder =
+                    LargeListBuilder::new(UInt16Builder::with_capacity(indices.len()))
+                        .with_field(Field::new("item", index_type.clone(), false));
+                builder.values().append_slice(&indices);
+                builder.append(true);
+                Arc::new(builder.finish())
+            }
+            DataType::UInt8 => {
+                let indices = Self::encode_grid_inner::<T, u8>(values, model);
+                let indices = if delta_indices_sorted {
+                    delta_encode_integer(&indices)
+                } else {
+                    indices
+                };
+                let mut builder = LargeListBuilder::new(UInt8Builder::with_capacity(indices.len()))
+                    .with_field(Field::new("item", index_type.clone(), false));
+                builder.values().append_slice(&indices);
+                builder.append(true);
+                Arc::new(builder.finish())
+            }
+            _ => unimplemented!(),
+        };
+        let parameters: Vec<_> = model.parameters(); //.into_iter().map(Some).collect();
+        let mut parameters_builder =
+            LargeListBuilder::new(Float64Builder::with_capacity(parameters.len()))
+                .with_field(Field::new("item", DataType::Float64, false));
+        parameters_builder.values().append_slice(&parameters);
+        parameters_builder.append(true);
+        let parameters = Arc::new(parameters_builder.finish());
+        let grid_type = Arc::new(LargeStringArray::from_iter_values([model
+            .grid_type()
+            .to_string()]));
+        let fields = Self::grid_fields(index_type);
+        Arc::new(StructArray::new(
+            fields.into(),
+            vec![grid_type as ArrayRef, parameters, indices],
+            None,
+        ))
+    }
+
+    pub fn encode_arrow(&self, chunk_segment: &ArrayRef) -> ArrayRef {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
             BufferTransform::NumpressPIC => {
@@ -538,17 +882,140 @@ impl BufferTransformEncoder {
                 let bytes = UInt8Array::from(bytes);
                 Arc::new(bytes)
             }
+            BufferTransform::GridEncoding => {
+                let model = self
+                    .1
+                    .as_ref()
+                    .expect("Attempted to encode a grid without providing a grid model");
+
+                let encoded = if let Some(vals) = chunk_segment.as_primitive_opt::<Float32Type>() {
+                    Self::encode_grid(vals, model, DataType::UInt32, false)
+                } else if let Some(vals) = chunk_segment.as_primitive_opt::<Float64Type>() {
+                    Self::encode_grid(vals, model, DataType::UInt32, false)
+                } else {
+                    unimplemented!("{:?} grid not yet supported", chunk_segment.data_type())
+                };
+                encoded
+            }
             _ => unimplemented!("{:?} does not have an encoder", self.0),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferTransformDecoder(BufferTransform);
+pub struct BufferTransformDecoder(BufferTransform, Option<GridEncoding>);
+
+impl From<GridEncoding> for BufferTransformDecoder {
+    fn from(value: GridEncoding) -> Self {
+        Self(BufferTransform::GridEncoding, Some(value))
+    }
+}
 
 impl BufferTransformDecoder {
-    pub fn decode(&self, buffer_name: &BufferName, array: &impl AsArray) -> ArrayRef {
-        macro_rules! decoder {
+    pub fn method(&self) -> BufferTransform {
+        self.0
+    }
+
+    pub fn grid_decode_at(array: &StructArray, i: usize, delta_indices_sorted: bool) -> ArrayRef {
+        let indices_arr = array.column_by_name("indices").unwrap();
+        let grid_type_arr = array.column_by_name("grid_type").unwrap();
+        let parameters_arr = array.column_by_name("parameters").unwrap();
+
+        macro_rules! grid_type_curie {
+            ($i:expr) => {
+                if let Some(grid_type) = grid_type_arr.as_string_opt::<i64>() {
+                    grid_type.value($i).parse::<CURIE>().unwrap()
+                } else if let Some(grid_type) = grid_type_arr.as_string_opt::<i32>() {
+                    grid_type.value($i).parse().unwrap()
+                } else {
+                    unimplemented!()
+                }
+            };
+        }
+
+        macro_rules! parameters_at {
+            ($i:expr) => {
+                if let Some(parameters) = parameters_arr.as_list_opt::<i64>() {
+                    let tmp = parameters.value($i);
+                    tmp
+                } else if let Some(parameters) = parameters_arr.as_list_opt::<i32>() {
+                    let tmp = parameters.value($i);
+                    tmp
+                } else {
+                    unimplemented!()
+                }
+            };
+        }
+
+        macro_rules! indices_at {
+            ($i:expr) => {
+                if let Some(parameters) = indices_arr.as_list_opt::<i64>() {
+                    let tmp = parameters.value($i);
+                    tmp
+                } else if let Some(parameters) = indices_arr.as_list_opt::<i32>() {
+                    let tmp = parameters.value($i);
+                    tmp
+                } else {
+                    unimplemented!()
+                }
+            };
+        }
+
+        let grid_type = grid_type_curie!(i);
+        let parameters = parameters_at!(i);
+        let indices = indices_at!(i);
+        let parameters = parameters.as_primitive::<Float64Type>();
+        let grid = GridEncoding::from_parameters(grid_type, parameters.values()).unwrap();
+        Self::grid_decode_values(&indices, &grid, delta_indices_sorted)
+    }
+
+    pub fn grid_decode_values(array: &ArrayRef, model: &GridEncoding, delta_indices_sorted: bool) -> ArrayRef {
+        let mut values = Vec::new();
+        values.reserve(array.len());
+
+        macro_rules! map_index {
+            ($indices:expr) => {
+                for v in $indices {
+                    values.push(model.from_index(*v as u32));
+                }
+            };
+        }
+
+        match array.data_type() {
+            DataType::UInt32 => {
+                let indices = array.as_primitive::<UInt32Type>();
+                if delta_indices_sorted {
+                    let decoded = delta_decode_integer(indices.values());
+                    map_index!(&decoded)
+                } else {
+                    map_index!(indices.values())
+                }
+            }
+            DataType::UInt16 => {
+                let indices = array.as_primitive::<UInt16Type>();
+                if delta_indices_sorted {
+                    let decoded = delta_decode_integer(indices.values());
+                    map_index!(&decoded)
+                } else {
+                    map_index!(indices.values())
+                }
+            }
+            DataType::UInt8 => {
+                let indices = array.as_primitive::<UInt8Type>();
+                if delta_indices_sorted {
+                    let decoded = delta_decode_integer(indices.values());
+                    map_index!(&decoded)
+                } else {
+                    map_index!(indices.values())
+                }
+            }
+            _ => unimplemented!(),
+        }
+        Arc::new(Float64Array::from(values))
+    }
+
+    pub fn decode(&self, buffer_name: &BufferName, array: &ArrayRef) -> ArrayRef {
+        macro_rules! numpress_decoder {
             ($decoder:path) => {
                 let data: &UInt8Array = array.as_primitive();
                 match buffer_name.dtype {
@@ -585,17 +1052,27 @@ impl BufferTransformDecoder {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
             BufferTransform::NumpressSLOF => {
-                decoder!(numpress_rs::decode_slof);
+                numpress_decoder!(numpress_rs::decode_slof);
             }
             BufferTransform::NumpressPIC => {
-                decoder!(numpress_rs::decode_pic);
+                numpress_decoder!(numpress_rs::decode_pic);
             }
-            // A SECONDARY grid (e.g. ion mobility as TIMS scan numbers): every row of the struct
-            // column, indices stored as they are. The main-axis grid is decoded by the chunk
-            // decoders' `GRID_ENCODING` arm, where the row's bounds and delta coding apply.
+            // A SECONDARY grid (e.g. ion mobility as TIMS scan numbers): indices stored as they are;
+            // the main-axis grid is decoded by the chunk decoders' `GRID_ENCODING` arm, where the
+            // row's bounds and delta coding apply. Upstream decodes row 0 only — what
+            // `unpack_secondary_grid` wants per row — but the scan decoder (reader/chunk.rs) hands
+            // the whole struct column in, so decode every non-null row and concatenate.
             BufferTransform::GridEncoding => {
                 let rows = array.as_struct();
-                return crate::grid::decode_rows_arrow(rows, false)
+                let parts: Vec<ArrayRef> = (0..rows.len())
+                    .filter(|&i| !rows.is_null(i))
+                    .map(|i| Self::grid_decode_at(rows, i, false))
+                    .collect();
+                if parts.len() == 1 {
+                    return parts.into_iter().next().unwrap();
+                }
+                let refs: Vec<&dyn Array> = parts.iter().map(|a| a.as_ref()).collect();
+                return arrow::compute::concat(&refs)
                     .unwrap_or_else(|e| panic!("grid column {buffer_name}: {e}"));
             }
             _ => unimplemented!("{:?} does not have a decoder", self.0),
@@ -621,12 +1098,12 @@ impl TryFrom<BufferTransform> for BufferTransformDecoder {
         match value {
             BufferTransform::NumpressLinear
             | BufferTransform::NumpressSLOF
-            | BufferTransform::NumpressPIC => Ok(Self(value)),
+            | BufferTransform::NumpressPIC => Ok(Self(value, None)),
             BufferTransform::NullInterpolate
             | BufferTransform::NullZero
             | BufferTransform::SqrtMzFromTof
             | BufferTransform::LinearMz => Err(format!("{value:?} does not have a decoder")),
-            BufferTransform::GridEncoding => Ok(Self(value)),
+            BufferTransform::GridEncoding => Ok(Self(value, None)),
         }
     }
 }
@@ -759,24 +1236,26 @@ impl ArrowArrayChunk {
         series_time: Option<f32>,
         buffer_context: BufferContext,
         arrays: &BinaryArrayMap,
-        encoding: ChunkingStrategy,
+        encoding: &ChunkingStrategy,
         overrides: &BufferOverrideTable,
         drop_zero_intensity: bool,
         nullify_zero_intensity: bool,
         fields: &Fields,
+        grid_policies: Option<&GridPolicyTable>,
     ) -> Result<(Option<StructArray>, Vec<AuxiliaryArray>, usize), ArrayRetrievalError> {
         Self::build_with_axis(
             series_index,
             series_time,
             buffer_context,
             arrays,
-            encoding,
+            encoding.clone(),
             overrides,
             drop_zero_intensity,
             nullify_zero_intensity,
             fields,
             None,
             None,
+            grid_policies,
         )
     }
 
@@ -796,6 +1275,7 @@ impl ArrowArrayChunk {
         fields: &Fields,
         main_axis_override: Option<BufferName>,
         mz_boundary: Option<TofMzBoundary>,
+        grid_policies: Option<&GridPolicyTable>,
     ) -> Result<(Option<StructArray>, Vec<AuxiliaryArray>, usize), ArrayRetrievalError> {
         let main_axis = main_axis_override
             .unwrap_or_else(|| buffer_context.main_axis())
@@ -805,19 +1285,20 @@ impl ArrowArrayChunk {
             series_time,
             main_axis,
             &arrays,
-            encoding,
+            &encoding,
             overrides,
             drop_zero_intensity,
             nullify_zero_intensity,
             Some(fields),
             mz_boundary,
+            grid_policies,
         )?;
         let chunks = if !chunks.is_empty() {
             let chunks = ArrowArrayChunk::to_struct_array(
                 &chunks,
                 buffer_context,
                 &[
-                    encoding,
+                    encoding.clone(),
                     ChunkingStrategy::Basic {
                         chunk_size: encoding.chunk_size(),
                     },
@@ -907,9 +1388,15 @@ impl ArrowArrayChunk {
 
             let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                 this_builder.field_builder(field_i).unwrap();
+
+            // These encodings aren't written into the `chunk_values` array
             if matches!(
                 chunk.chunk_encoding,
                 ChunkingStrategy::NumpressLinear { chunk_size: _ }
+                    | ChunkingStrategy::Grid {
+                        chunk_size: _,
+                        grid: _
+                    }
             ) {
                 b.append_null();
             } else {
@@ -942,6 +1429,7 @@ impl ArrowArrayChunk {
                 }
                 b.append(true);
             }
+
             visited.insert(field_i);
             field_i += 1;
             for encoding in encodings {
@@ -975,8 +1463,6 @@ impl ArrowArrayChunk {
                 if let Some(buf_name) = BufferName::from_field(chunk.chunk_axis.context, f.clone())
                     .map(|f| f.with_format(BufferFormat::ChunkSecondary))
                 {
-                    let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
-                        this_builder.field_builder(i).unwrap();
 
                     if let Some(transform) =
                         BufferTransformEncoder::try_from(buf_name.transform).ok()
@@ -989,6 +1475,9 @@ impl ArrowArrayChunk {
                             &mut visited,
                         );
                     } else {
+                        let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                            this_builder.field_builder(i).unwrap();
+
                         if let Some(arr) = chunk.arrays.get(&buf_name) {
                             macro_rules! primitive_builder {
                                 ($builder:ty) => {
@@ -1114,12 +1603,13 @@ impl ArrowArrayChunk {
         series_time: Option<f32>,
         main_axis: BufferName,
         arrays: &BinaryArrayMap,
-        chunk_encoding: ChunkingStrategy,
+        chunk_encoding: &ChunkingStrategy,
         overrides: &BufferOverrideTable,
         drop_zero_intensity: bool,
         nullify_zero_intensity: bool,
         fields: Option<&Fields>,
         mz_boundary: Option<TofMzBoundary>,
+        grid_policies: Option<&GridPolicyTable>,
     ) -> Result<(Vec<Self>, Vec<AuxiliaryArray>, usize), ArrayRetrievalError> {
         let mut chunks = Vec::new();
 
@@ -1195,6 +1685,15 @@ impl ArrowArrayChunk {
             }
             return Ok((Vec::new(), auxiliary_arrays, 0));
         }
+
+        let main_axis_grid = chunk_encoding
+            .is_grid()
+            .then(|| {
+                grid_policies
+                    .as_ref()
+                    .and_then(|v| v.get(&main_axis.array_type)?.current_grid.clone())
+            })
+            .flatten();
 
         for (_, arr) in arrays.iter() {
             let name = BufferName::from_data_array(main_axis.context, arr);
@@ -1353,7 +1852,7 @@ impl ArrowArrayChunk {
                     let k = k.clone().with_format(BufferFormat::ChunkSecondary);
                     let v = v.slice(s, e - s);
                     if let Ok(transform) = BufferTransformEncoder::try_from(k.transform) {
-                        let vi = transform.encode_arrow(&k, &v);
+                        let vi = transform.encode_arrow(&v);
                         chunk_arrays.insert(k, vi);
                     } else {
                         chunk_arrays.insert(k, v);
@@ -1367,7 +1866,7 @@ impl ArrowArrayChunk {
                     chunk_end,
                     main_axis.clone(),
                     chunk_values,
-                    chunk_encoding,
+                    chunk_encoding.clone(),
                     chunk_arrays,
                 ));
             }
@@ -1388,16 +1887,60 @@ impl ArrowArrayChunk {
 
         for step in steps {
             let slice = main_axis_array.slice(step.start, step.end - step.start);
-            let (chunk_start, chunk_end, chunk_values) = match array_to_arrow_type(main_axis.dtype)
-            {
-                DataType::Float32 => {
-                    chunk_encoding.encode_arrow(slice.as_primitive::<Float32Type>())
-                }
-                DataType::Float64 => {
-                    chunk_encoding.encode_arrow(slice.as_primitive::<Float64Type>())
-                }
-                _ => unimplemented!("{}", main_axis),
-            };
+            let ((chunk_start, chunk_end, chunk_values), chunk_encoding) =
+                match array_to_arrow_type(main_axis.dtype) {
+                    DataType::Float32 => {
+                        if chunk_encoding.is_grid() {
+                            let grid = chunk_encoding.grid().or(main_axis_grid.as_ref()).cloned();
+                            if grid.is_some() {
+                                let chunk_encoding = chunk_encoding.with_grid(grid);
+                                (
+                                    chunk_encoding
+                                        .encode_arrow(slice.as_primitive::<Float32Type>()),
+                                    chunk_encoding,
+                                )
+                            } else {
+                                let chunk_encoding = chunk_encoding.basic();
+                                (
+                                    chunk_encoding
+                                        .encode_arrow(slice.as_primitive::<Float32Type>()),
+                                    chunk_encoding,
+                                )
+                            }
+                        } else {
+                            (
+                                chunk_encoding.encode_arrow(slice.as_primitive::<Float32Type>()),
+                                chunk_encoding.clone(),
+                            )
+                        }
+                    }
+                    DataType::Float64 => {
+                        if chunk_encoding.is_grid() {
+                            let grid = chunk_encoding.grid().or(main_axis_grid.as_ref()).cloned();
+                            if grid.is_some() {
+                                let chunk_encoding = chunk_encoding.with_grid(grid);
+                                (
+                                    chunk_encoding
+                                        .encode_arrow(slice.as_primitive::<Float64Type>()),
+                                    chunk_encoding,
+                                )
+                            } else {
+                                let chunk_encoding = chunk_encoding.basic();
+                                (
+                                    chunk_encoding
+                                        .encode_arrow(slice.as_primitive::<Float64Type>()),
+                                    chunk_encoding,
+                                )
+                            }
+                        } else {
+                            (
+                                chunk_encoding.encode_arrow(slice.as_primitive::<Float64Type>()),
+                                chunk_encoding.clone(),
+                            )
+                        }
+                    }
+                    _ => unimplemented!("{}", main_axis),
+                };
 
             let mut chunk_arrays: HashMap<BufferName, ArrayRef> = Default::default();
             for (k, v) in arrow_arrays
@@ -1407,7 +1950,23 @@ impl ArrowArrayChunk {
                 let k = k.clone().with_format(BufferFormat::ChunkSecondary);
                 let v = v.slice(step.start, step.end - step.start);
                 if let Ok(transform) = BufferTransformEncoder::try_from(k.transform) {
-                    let vi = transform.encode_arrow(&k, &v);
+                    let vi = if matches!(transform.method(), BufferTransform::GridEncoding) {
+
+                        let grid = grid_policies
+                            .and_then(|v| {
+                                v.get(&k.array_type).and_then(|v| v.current_grid().cloned())
+                            })
+                            .or_else(|| {
+                                arrays
+                                    .get(&k.array_type)
+                                    .and_then(|a| GridPolicy::find_grid_model_param(a))
+                            })
+                            .unwrap();
+                        let transform = BufferTransformEncoder::from(grid);
+                        transform.encode_arrow(&v)
+                    } else {
+                        transform.encode_arrow(&v)
+                    };
                     chunk_arrays.insert(k, vi);
                 } else {
                     chunk_arrays.insert(k, v);
@@ -1627,7 +2186,7 @@ mod test {
             None,
             target,
             &arrays,
-            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &ChunkingStrategy::Delta { chunk_size: 50.0 },
             &BufferOverrideTable::default(),
             true,
             false,
@@ -1716,7 +2275,7 @@ mod test {
             None,
             target,
             &arrays,
-            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &ChunkingStrategy::Delta { chunk_size: 50.0 },
             &BufferOverrideTable::default(),
             true,
             true,
@@ -1850,7 +2409,7 @@ mod test {
             None,
             target,
             &arrays,
-            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &ChunkingStrategy::Delta { chunk_size: 50.0 },
             &overrides,
             false,
             false,
@@ -1902,7 +2461,7 @@ mod test {
             None,
             target,
             &arrays,
-            ChunkingStrategy::NumpressLinear { chunk_size: 50.0 },
+            &ChunkingStrategy::NumpressLinear { chunk_size: 50.0 },
             &overrides,
             false,
             false,
@@ -1969,7 +2528,7 @@ mod test {
             None,
             target,
             &arrays,
-            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &ChunkingStrategy::Delta { chunk_size: 50.0 },
             &Default::default(),
             false,
             false,
@@ -2066,7 +2625,7 @@ mod test {
             None,
             target,
             &arrays,
-            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &ChunkingStrategy::Delta { chunk_size: 50.0 },
             &Default::default(),
             true,
             true,
@@ -2209,7 +2768,7 @@ mod test {
             None,
             target,
             &arrays,
-            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &ChunkingStrategy::Delta { chunk_size: 50.0 },
             &Default::default(),
             true,
             true,

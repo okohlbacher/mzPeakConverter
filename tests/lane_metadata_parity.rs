@@ -150,8 +150,9 @@ const EXPECTED: &[Expected] = &[
         key: "index.metadata.keys",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "codec blocks differ by construction: a lane that grids or lattices its m/z declares \
-                 `tof_calibration` / `mz_calibration`, one that chunks does not.",
+        reason: "index blocks differ by construction: a native lane declares what its reader \
+                 states (`agilent_calibration`, `waters_functions`, `ims_calibration`), the mzML \
+                 lane what ProteoWizard left it.",
     },
     Expected {
         key: "transformations",
@@ -165,13 +166,13 @@ const EXPECTED: &[Expected] = &[
         key: "facet.spectra_data.parquet.columns",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "point versus chunk layout, and the integer-axis columns of a grid/lattice lane.",
+        reason: "point versus chunk layout, and the `mz_grid` column of a grid-chunk lane.",
     },
     Expected {
         key: "facet.spectra_peaks.parquet.columns",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "point versus chunk layout, and the integer-axis columns of a grid/lattice lane.",
+        reason: "point versus chunk layout, and the `mz_grid` column of a grid-chunk lane.",
     },
     Expected {
         key: "facet.spectra_data.parquet.rows",
@@ -190,22 +191,22 @@ const EXPECTED: &[Expected] = &[
         key: "cv.ids",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "the native lanes declare the converter's own MZP vocabulary because they emit MZP \
-                 terms (grid coefficients, mobility bands); the mzML lane has no MZP params to declare. \
-                 The native lane carries MORE here, not less.",
+        reason: "the Bruker lanes declare the converter's own MZP vocabulary because they emit MZP \
+                 terms (mobility bands, the 0.12.x TOF coefficients); the mzML lane has no MZP params \
+                 to declare. The native lane carries MORE here, not less.",
     },
     Expected {
         key: "facet.spectra_metadata.parquet.columns",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "the grid/lattice native lanes add their per-spectrum coefficient columns \
-                 (opt_MZP_1000003_tof_c0 …), which the mzML lane has no equivalent for.",
+        reason: "the timsTOF lanes add per-frame vendor columns (tdf_t1 …, opt_MZP_1000003_tof_c0 …), \
+                 which the mzML lane has no equivalent for.",
     },
     Expected {
         key: "spectra_metadata.opt_MZP_*",
-        vendors: Some(&[Vendor::Bruker, Vendor::Sciex, Vendor::Shimadzu]),
+        vendors: Some(&[Vendor::Bruker]),
         kind: Kind::ByDesign,
-        reason: "as above: per-spectrum grid coefficients exist only where a lane grids.",
+        reason: "as above: the per-frame TOF coefficients exist only on the timsTOF lanes.",
     },
     Expected {
         key: "run.default_data_processing_id",

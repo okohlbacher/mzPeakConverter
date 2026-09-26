@@ -1,42 +1,40 @@
-//! End-to-end contract for the fixed-point m/z lattice on the ORDINARY mzML lane (`convert_file`).
+//! End-to-end contract for fixed-point-lattice m/z on the ORDINARY mzML lane (`convert_file`).
 //!
-//! `tests/shimadzu_lattice_peaks.rs` pins the archive SHAPE by driving the vendored writer API
-//! directly, because the Shimadzu reader is `#[cfg(windows)]`. This one goes through the real
-//! binary on a committed fixture, so it also pins the DETECTION (which scale, from the data alone),
-//! the per-spectrum fallback, and the summary columns.
+//! Goes through the real binary on committed fixtures, so it pins the DETECTION (from the data
+//! alone), what the detection selects — the reference implementation's fitted linear grid on the
+//! peaks facet, `MS:1003826` rows under per-spectrum `MS:1003824` models (vendoring exit, item 1;
+//! through 0.13 this was an exact Int64 point lattice of the converter's own) — its declared bound,
+//! and the summary columns.
 //!
 //! Fixtures (`tests/data/`): `mz_lattice_1e9.mzML` — 12 centroid spectra of 90 peaks spanning a
 //! realistic 120–1900 Da on a 1e-9 Da lattice (Shimadzu `MassHigh` / the LabSolutions mzML
 //! export), one of which (index 7) carries a single interpolated apex 0.3 of a step off the
 //! lattice; `mz_lattice_1e4.mzML` — 8 spectra over the same range on the coarse 1e-4 lattice, to
-//! prove the scale is read off the data rather than hard-coded.
-//! `mixed_precision.mzML` is the NON-lattice control.
+//! prove the scale is read off the data rather than hard-coded. `mixed_precision.mzML` is the
+//! NON-lattice control.
 //!
 //! Asserted here:
-//!   * the `mz_calibration` index block (`mz-grid`, the detected scale, `applies_to spectra_peaks`);
-//!   * `point.tof_index` as INT64, DELTA_BINARY_PACKED, ZSTD, no dictionary, `LinearMz` with
-//!     `transform_params == [1/scale]`, beside a Float64 `point.mz` fallback column;
-//!   * the vendored reader hands back m/z BIT-IDENTICAL to the SOURCE mzML's — the archive's
-//!     contract is `m/z = tof_index / scale`, which is the exact inverse of `round(m/z · scale)`,
-//!     and the fixtures span 120–1900 Da precisely so that a reader multiplying by `1/scale`
-//!     instead (one ulp off on ~40 % of values) fails this — and exactly f64-equal on the
-//!     off-lattice spectrum: nothing is snapped, nothing is refused;
+//!   * `transformations` declares `grid-fit:1e-6Da` (and no 0.13 `mz_calibration` block exists);
+//!   * every peak row is an `MS:1003826` grid row under an `MS:1003824` model, the index lists
+//!     byte-stream-split without a dictionary — the off-lattice spectrum included: the fit does not
+//!     care about the lattice, the detection only arms it;
+//!   * the vendored reader hands back every m/z within the declared 1e-6 Da of the SOURCE (in
+//!     practice ≤ 3e-7 Da: the fit spreads the spectrum's padded range over 2³² slots), and never
+//!     changes a peak count or an intensity;
 //!   * the per-spectrum summary columns (MS:1000285 / 504 / 505 / 527 / 528) are REAL, and equal to
-//!     the same file converted without the lattice. This is the bc8497c regression: a route that
-//!     leaves the writer an m/z-less array map ships `total_ion_current = 0`, a null base peak and
-//!     null observed-m/z bounds on every routed spectrum;
+//!     the same file converted without the lattice (the writer derives them from the source arrays
+//!     on both lanes);
 //!   * a non-lattice input converts to a BYTE-IDENTICAL set of parquet members with the lattice on
 //!     and off.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arrow::datatypes::DataType;
+use arrow::array::{Array, AsArray};
 use mzdata::prelude::*;
 use mzdata::spectrum::PeakDataLevel;
-use mzpeak_prototyping::buffer_descriptors::BufferTransform;
 use mzpeak_prototyping::MzPeakReader;
-use parquet::basic::{Compression, Encoding, Type as PhysicalType};
+use parquet::basic::{Compression, Encoding};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 fn fixture(name: &str) -> PathBuf {
@@ -141,11 +139,14 @@ fn summaries(archive: &Path, dir: &Path) -> Summaries {
     s
 }
 
-/// One fixture, end to end: detection, round trip, column contract, summaries.
-///
-/// `off_lattice` is the index of the spectrum whose centroids miss the lattice (it must come back
-/// as EXACT f64, not snapped); `None` when every spectrum fits.
-fn lattice_fixture(name: &str, scale: f64, params: &str, off_lattice: Option<usize>) {
+/// A string column as `StringArray`, whether Arrow materialised it as plain or dictionary-encoded
+/// Utf8 (the grid struct's `grid_type` comes back dictionary-encoded).
+fn strings(col: &arrow::array::ArrayRef) -> arrow::array::StringArray {
+    arrow::compute::cast(col, &arrow::datatypes::DataType::Utf8).unwrap().as_string::<i32>().clone()
+}
+
+/// One fixture, end to end: detection, round trip, row contract, summaries.
+fn lattice_fixture(name: &str, scale: f64) {
     let dir = scratch(name);
     let input = fixture(name);
     assert!(input.exists(), "fixture missing: {}", input.display());
@@ -156,120 +157,85 @@ fn lattice_fixture(name: &str, scale: f64, params: &str, off_lattice: Option<usi
 
     let src = source_mzs(&input);
     assert!(src.len() >= 8 && src[0].len() >= 64, "fixture too small to arm the detector");
+    for (i, mz) in src.iter().enumerate() {
+        let off = mz.iter().filter(|w| (*w * scale - (*w * scale).round()).abs() >= 1e-3).count();
+        assert!(off <= usize::from(i == 7), "fixture bug: spectrum {i} has {off} values off the 1/{scale:e} lattice");
+    }
 
-    // (a) The `mz_calibration` index block the viewer's `mz-grid` codec gates on.
-    let index: serde_json::Value =
-        serde_json::from_slice(&member(&out, "mzpeak_index.json")).unwrap();
-    let cal = &index["metadata"]["mz_calibration"];
-    assert_eq!(cal["codec"], "mz-grid", "no mz_calibration block in {index:#}");
-    assert_eq!(cal["applies_to"], "spectra_peaks");
-    assert_eq!(cal["lossless"], "tof_index");
-    assert_eq!(cal["scale"].as_f64(), Some(scale), "the block must name the DETECTED scale");
-    // ... and it is absent when the lattice is off, so a reader cannot be told to un-scale f64 m/z.
-    let plain_index: serde_json::Value =
-        serde_json::from_slice(&member(&plain, "mzpeak_index.json")).unwrap();
-    assert!(plain_index["metadata"]["mz_calibration"].is_null());
+    // (a) The transformation is declared, with its bound; the 0.13 block is gone, and nothing is
+    // declared when the lattice is off.
+    let index: serde_json::Value = serde_json::from_slice(&member(&out, "mzpeak_index.json")).unwrap();
+    let applied = |index: &serde_json::Value| -> Vec<String> {
+        index["metadata"]["transformations"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    };
+    assert!(applied(&index).iter().any(|e| e == "grid-fit:1e-6Da"), "no grid-fit entry in {:?}", applied(&index));
+    assert!(index["metadata"]["mz_calibration"].is_null(), "the point-lattice block is gone");
+    let plain_index: serde_json::Value = serde_json::from_slice(&member(&plain, "mzpeak_index.json")).unwrap();
+    assert!(!applied(&plain_index).iter().any(|e| e.starts_with("grid-fit")), "{:?}", applied(&plain_index));
 
-    // (b) Read back through the vendored reader: m/z reconstructed from the column metadata alone.
+    // (b) Read back through the vendored reader: every m/z within the declared bound of the
+    // source — and far inside it — with the peak counts and intensities untouched.
     let mut reader = MzPeakReader::new(&out).unwrap();
     assert_eq!(reader.len(), src.len());
-    // BIT-FOR-BIT, not within an epsilon. The archive's contract is `m/z = tof_index / scale`
-    // (`mz_calibration.mz_from_tof_index`), and `round(m/z·scale) / scale` is the identity on every
-    // value that is genuinely on the lattice — so the round trip must reproduce the source f64
-    // exactly, at any m/z. A tolerance here would have to be at least one ulp of the m/z (1.14e-13
-    // at m/z 512, 2.27e-13 above 1024) and so could not tell the exact quotient apart from the
-    // one-ulp-off `tof_index · (1/scale)`, which is the whole thing being pinned. The fixtures
-    // therefore span a realistic 120–1900 Da, where those two differ.
+    let mut worst = 0.0f64;
     for (i, want) in src.iter().enumerate() {
         let got = peak_mzs(reader.get_spectrum_peaks_for(i as u64).unwrap().expect("peaks"));
         assert_eq!(got.len(), want.len(), "spectrum {i}: peak count");
-        if off_lattice == Some(i) {
-            assert_eq!(&got, want, "the off-lattice spectrum must keep its EXACT f64 m/z");
-            continue;
-        }
         for (j, (g, w)) in got.iter().zip(want).enumerate() {
-            // The encode step is exact by construction ...
-            let k = (w * scale).round();
-            assert!(
-                (w * scale - k).abs() < 1e-3,
-                "fixture bug: spectrum {i} peak {j} ({w:.15}) is not on the 1/{scale:e} lattice"
-            );
-            // ... and the decode step reproduces the source, to the last bit.
-            assert_eq!(
-                *g, k / scale,
-                "spectrum {i} peak {j}: reader gave {g:.17e}, contract says tof_index / scale"
-            );
-            assert_eq!(
-                g.to_bits(),
-                w.to_bits(),
-                "spectrum {i} peak {j}: {g:.17e} is not bit-identical to source {w:.17e} \
-                 (delta {:e}, ulp {:e})",
-                g - w,
-                f64::from_bits(w.to_bits() + 1) - *w
-            );
+            let d = (g - w).abs();
+            assert!(d <= 1e-6, "spectrum {i} peak {j}: reader gave {g:.12}, source {w:.12} (Δ {d:e} > 1e-6 Da)");
+            worst = worst.max(d);
         }
     }
+    assert!(worst <= 3e-7, "the fit over 2^32 slots of a ~1,900 Th span must land within 3e-7 Da; worst {worst:e}");
+    assert!(worst > 0.0, "a fitted grid quantizes: bit-identity here would mean the lattice was not routed");
 
-    // (c) The declared columns: an Int64 lattice axis with the right transform, and the f64
-    // fallback beside it.
-    let peak_index = reader.metadata.peak_array_indices().expect("peaks facet array index");
-    let tof = peak_index
-        .iter()
-        .find(|e| e.path.ends_with("tof_index"))
-        .expect("spectrum_array_index must list point.tof_index");
-    assert_eq!(tof.path, "point.tof_index");
-    assert_eq!(tof.data_type, DataType::Int64);
-    assert_eq!(tof.transform, Some(BufferTransform::LinearMz));
-    let want_params: f64 = params.parse().unwrap();
-    assert_eq!(tof.transform_params, Some(vec![want_params]));
-    assert!((want_params * scale - 1.0).abs() < 1e-12, "params must be 1/scale");
-    assert!(
-        peak_index.iter().any(|e| e.path == "point.mz" && e.data_type == DataType::Float64),
-        "the f64 `mz` fallback column must be declared beside the lattice"
-    );
-
-    // (d) Parquet encoding: this is the whole point of naming the column `*_index`.
+    // (c) The rows: grid rows under the linear model on EVERY spectrum, the off-lattice one included.
     let extracted = extract(&out, "spectra_peaks.parquet", &dir);
-    let pq = SerializedFileReader::new(std::fs::File::open(&extracted).unwrap()).unwrap();
-    let (mut tof_nulls, mut mz_nulls, mut rows) = (0i64, 0i64, 0i64);
-    for rg in pq.metadata().row_groups() {
-        rows += rg.num_rows();
-        let tof = rg
-            .columns()
-            .iter()
-            .find(|c| c.column_path().string() == "point.tof_index")
-            .expect("point.tof_index column");
-        assert_eq!(tof.column_type(), PhysicalType::INT64);
-        assert!(matches!(tof.compression(), Compression::ZSTD(_)), "tof_index is {}", tof.compression());
-        let encodings: Vec<Encoding> = tof.encodings().collect();
-        assert!(
-            encodings.contains(&Encoding::DELTA_BINARY_PACKED),
-            "tof_index must be DELTA_BINARY_PACKED (encodings: {encodings:?})"
-        );
-        assert!(
-            !encodings
-                .iter()
-                .any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)),
-            "tof_index must not be dictionary-encoded (encodings: {encodings:?})"
-        );
-        tof_nulls += tof.statistics().and_then(|s| s.null_count_opt()).unwrap_or(0) as i64;
-        let mz = rg
-            .columns()
-            .iter()
-            .find(|c| c.column_path().string() == "point.mz")
-            .expect("point.mz column");
-        assert_eq!(mz.column_type(), PhysicalType::DOUBLE);
-        mz_nulls += mz.statistics().and_then(|s| s.null_count_opt()).unwrap_or(0) as i64;
+    let batches: Vec<arrow::record_batch::RecordBatch> =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&extracted).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect();
+    let (mut rows, mut points) = (0usize, 0usize);
+    for b in &batches {
+        let chunk = b.column_by_name("chunk").expect("a chunk facet").as_struct();
+        let enc = strings(chunk.column_by_name("chunk_encoding").unwrap());
+        let grid = chunk.column_by_name("mz_grid").expect("mz_grid").as_struct();
+        let kind = strings(grid.column_by_name("grid_type").unwrap());
+        let indices = grid.column_by_name("indices").unwrap().as_list::<i64>();
+        for i in 0..b.num_rows() {
+            rows += 1;
+            assert_eq!(enc.value(i), "MS:1003826", "row {rows}: a grid row");
+            assert_eq!(kind.value(i), "MS:1003824", "row {rows}: the linear model");
+            points += indices.value(i).len();
+        }
     }
-    let total: i64 = src.iter().map(|v| v.len() as i64).sum();
-    assert_eq!(rows, total, "every source peak must be stored");
-    let n_fallback: i64 = off_lattice.map_or(0, |i| src[i].len() as i64);
-    assert_eq!(tof_nulls, n_fallback, "tof_index is NULL on exactly the fallback rows");
-    assert_eq!(mz_nulls, total - n_fallback, "the f64 mz fallback is NULL on every lattice row");
+    let total: usize = src.iter().map(Vec::len).sum();
+    assert_eq!(points, total, "every source peak is stored on the grid");
+    assert!(rows >= src.len(), "at least one chunk per spectrum");
 
-    // (e) THE SUMMARY CONTRACT (bc8497c). A lattice-routed spectrum stores no m/z in its facet, so
-    // this is exactly where `tic = 0` / null base peak / null m/z bounds crept in before. They must
-    // be real, and identical to the same file converted without the lattice.
+    // (d) Parquet encoding of the index lists: byte-stream-split, no dictionary, ZSTD.
+    let pq = SerializedFileReader::new(std::fs::File::open(&extracted).unwrap()).unwrap();
+    for rg in pq.metadata().row_groups() {
+        let col = rg
+            .columns()
+            .iter()
+            .find(|c| c.column_path().string() == "chunk.mz_grid.indices.list.item")
+            .expect("chunk.mz_grid.indices.list.item column");
+        assert!(matches!(col.compression(), Compression::ZSTD(_)), "indices are {}", col.compression());
+        let encodings: Vec<Encoding> = col.encodings().collect();
+        assert!(encodings.contains(&Encoding::BYTE_STREAM_SPLIT), "indices must be BYTE_STREAM_SPLIT: {encodings:?}");
+        assert!(
+            !encodings.iter().any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)),
+            "indices must not be dictionary-encoded: {encodings:?}"
+        );
+    }
+
+    // (e) THE SUMMARY CONTRACT (bc8497c). They must be real, and identical to the same file
+    // converted without the lattice: the writer derives them from the source arrays on both lanes.
     let a = summaries(&out, &dir);
     let b = summaries(&plain, &dir);
     assert_eq!(a.tic.len(), src.len());
@@ -291,13 +257,13 @@ fn lattice_fixture(name: &str, scale: f64, params: &str, off_lattice: Option<usi
 
 #[test]
 fn a_1e9_lattice_mzml_round_trips_through_the_generic_lane() {
-    // Spectrum 7 carries one interpolated apex 0.3 of a step off: it keeps exact f64 m/z.
-    lattice_fixture("mz_lattice_1e9.mzML", 1e9, "1e-9", Some(7));
+    // Spectrum 7 carries one interpolated apex 0.3 of a step off: the fit takes it like the others.
+    lattice_fixture("mz_lattice_1e9.mzML", 1e9);
 }
 
 #[test]
 fn a_coarse_1e4_lattice_mzml_is_detected_at_its_own_scale() {
-    lattice_fixture("mz_lattice_1e4.mzML", 1e4, "1e-4", None);
+    lattice_fixture("mz_lattice_1e4.mzML", 1e4);
 }
 
 /// A non-lattice input must be untouched by all of this — the same converter decisions, the same
@@ -342,7 +308,8 @@ fn a_non_lattice_mzml_converts_identically_with_the_lattice_on_and_off() {
         } else {
             let ja: serde_json::Value = serde_json::from_slice(&a).unwrap();
             let jb: serde_json::Value = serde_json::from_slice(&b).unwrap();
-            assert!(ja["metadata"]["mz_calibration"].is_null(), "no lattice, no calibration block");
+            let applied = ja["metadata"]["transformations"].to_string();
+            assert!(!applied.contains("grid-fit"), "no lattice, no grid fit: {applied}");
             assert_eq!(ja["files"], jb["files"], "{name}: the file list must not change");
         }
     }

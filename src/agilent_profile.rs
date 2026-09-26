@@ -311,10 +311,10 @@ impl AgilentProfileReader {
     }
 
     /// The distinct per-scan calibrations as a JSON map `calibration_id → {coeff, base, left, right,
-    /// poly_coeffs, use_flags}`, for the `tof_calibration` index block. A reader reconstructs the
-    /// EXACT MassHunter m/z (traditional quadratic + polynomial refinement) from a point's
-    /// `tof_index` and its scan's `calibration_id`:
-    ///   `t = base + (c0 + c1·tof_index)/coeff`; `m/z = (coeff·(t−base))² − poly(clip(t,left,right))`
+    /// poly_coeffs, use_flags}`, for the `agilent_calibration` index block. A reader reconstructs the
+    /// EXACT MassHunter m/z (traditional quadratic + polynomial refinement) from a point's grid
+    /// index `k` and its scan's `agilent_calibration_id` parameter:
+    ///   `t = base + (c0 + c1·k)/coeff`; `m/z = (coeff·(t−base))² − poly(clip(t,left,right))`
     /// where the polynomial fills the orders set in `use_flags` (ascending) from `poly_coeffs`.
     pub fn calibrations_json(&self) -> serde_json::Value {
         // Map each distinct CalibrationID to its (row, use_flags), in first-seen order.

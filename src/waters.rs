@@ -954,11 +954,11 @@ impl WatersReader {
         let (ions, isolation_window) = if set_mass > 0.0 {
             (
                 vec![SelectedIon { mz: set_mass, ..Default::default() }],
-                IsolationWindow { target: set_mass as f32, lower_bound: 0.0, upper_bound: 0.0, flags: IsolationWindowState::Complete },
+                IsolationWindow::new(set_mass as f32, 0.0, 0.0, IsolationWindowState::Complete),
             )
         } else if let Some((lo, hi)) = fi.mass_range.filter(|(lo, hi)| hi > lo) {
             activation.add_param(Param::new_key_value("isolation window source", "acquisition mass range (MSe: no quadrupole isolation; ProteoWizard's convention)"));
-            (Vec::new(), IsolationWindow { target: (lo + hi) / 2.0, lower_bound: lo, upper_bound: hi, flags: IsolationWindowState::Complete })
+            (Vec::new(), IsolationWindow::new((lo + hi) / 2.0, lo, hi, IsolationWindowState::Complete))
         } else {
             (Vec::new(), IsolationWindow::default())
         };

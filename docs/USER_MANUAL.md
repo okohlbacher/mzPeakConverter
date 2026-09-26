@@ -129,17 +129,14 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--layout <chunked\|point>` | `chunked` | Signal layout: `chunked` m/z layout (numpress-linear or delta); `point` — flat point layout, one row per m/z–intensity pair (§9) |
 | `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` → `mzml`, else `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1) |
 | `--no-numpress` | off | Lossless delta m/z chunking instead of the default lossy numpress-linear |
-| `--no-mz-lattice` | off | Disable the fixed-point m/z **lattice** for centroid peaks and store f64 `mz` instead — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the archive is destined for a reader that does not know the `mz-grid` codec (§9). Data that is not on a lattice is unaffected either way |
+| `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
 | `--zstd-level <ZSTD_LEVEL>` | `3` (timsTOF ims-compact lanes: `22`) | Zstd compression level (1–22). The ims-compact lanes default to 22: their archives are written once and read many times, and 22 is 1.4 % smaller than 5 on PXD059079's 2485.d. An explicit value applies to every lane (§9) |
 | `-f, --force` | off | Overwrite the output if it already exists |
 | `--no-ims-compact` | off | Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and write standard f64 m/z instead |
 | `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum (Shimadzu `.lcd` does). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written. Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) |
-| `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: the **chunked** layout, the default since 0.12.1 — passing the flag is inert and says so. Splits each frame's peaks into 50-Th m/z bins (`--chunk-size` overrides), each chunk recording its TOF bounds as page-prunable Parquet columns — XIC / m/z-slice queries ~20× faster. TOF is delta-encoded within each chunk: `chunk_start + cumsum(deltas)`, lossless (§9). It is also **smaller**: 7.8 % on 2485.d, because chunk-relative TOF costs a quarter of absolute TOF, which more than pays for the mobility column losing its run-length ordering. The archive then holds a CHUNK `spectra_peaks` facet beside a POINT `spectra_data` facet — the mixed layout-family deviation (§9) |
-| `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: write the flat **archive** layout instead — one table of ABSOLUTE integer TOF bins, no m/z index, no mixed layout family, ~8 % more bytes. This was the default through 0.12.0 |
-| `--no-ims-grid` | off | Bruker timsTOF (TDF) ims-compact, chunked layout: keep the 0.12.x **TOF layout** (integer TOF chunk bounds, `tof_chunk_values` deltas, `tof_c0`/`tof_c1` per spectrum) instead of the **grid layout** that is the default since 0.13.0: real m/z chunk bounds, `mz_chunk_values` null, `chunk_encoding` MS:1003826 ("coordinate grid encoding"), and one struct column per dimension — `mz_grid` and `mean_inverse_reduced_ion_mobility_grid`, each `{grid_type, parameters, indices}` — carrying the vendor's own calibration model for that frame (the `MzCalibration` row as `[C0, 1e6/√(C1·cf), C2/cf, C3, C4, timebase, delay]`, the `TimsCalibration` row as `[C6, C7, offset, slope]`) and the integer TOF bins / TIMS scan numbers. This is the layout of the reference implementation (mzpeak_prototyping `e62e18c`); its m/z model reproduces the Bruker SDK to 1e-9 ppm, including frames whose calibration row has `C2`/`C4`, which the TOF layout could only put on the run-wide chord. Readers before 0.13.0 cannot open it; the 0.12.x layout stays readable. Measured on PXD059079 2485: peaks facet −3.0 % (§9) |
-| `--ims-grid` | off | On a `.mzpeak` input: rewrite a 0.12.x ims-chunked timsTOF archive into the grid layout, every other member copied byte for byte (`mzpeak-convert old.mzpeak -o new.mzpeak --ims-grid`). On a `.d` input the grid layout is the default and the flag is inert |
-| `--grid-encoding` | `bss` | Parquet encoding of the grid layout's index lists and chunk bounds: `bss` (byte-stream-split, dictionary off — the measured best) or `plain` (Parquet's default, dictionary then plain, as the reference implementation's files are encoded). On 2485: `bss` −3.0 %, `plain` +7.3 % against the 0.12.5 facet |
+| `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: 50-Th chunks (`--chunk-size` overrides the width) on the reference implementation's chunk grid — every chunk row keeps its real m/z bounds (page-prunable: m/z window queries read only the chunks they need) and its points as integer TOF bins and TIMS scan numbers under the frame's own vendor calibration models (§9). Passing the flag explicitly is inert and says so |
+| `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: one chunk per frame instead of 50-Th chunks — the same grid rows, whole-frame access in one row, no m/z pruning within a frame. (Through 0.13 this selected a flat point table of absolute TOF bins; that layout is gone) |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
 | `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. With the grid layout (default since 0.13.0, §9) this flag also keeps the 0.12.x TOF layout, with a warning: the grid stores 1/K0 as TIMS scan numbers under the exact model, which the linear approximation is not on. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
@@ -150,8 +147,8 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
 | `--drop-aux <DROP_AUX>` | — | mzPeak input only: drop archive members matching this glob (repeatable) (§4.2) |
-| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **Inputs read through mzdata only** (mzML incl. `--via-msconvert`, imzML, Thermo `.raw`, and a TDF read as f64 m/z under `--no-ims-compact` or the ims-compact fallback): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing `tof_index` (Int32) + a per-run `{c0,c1}`, recovering `m/z = (c0 + c1·tof_index)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF ims-compact lanes and `--agilent-grid` store the integer grid of the vendor calibration (lossless), and the Bruker TSF/BAF, Agilent MHDAC, Waters and Shimadzu lanes store the m/z their reader returns (on MHDAC a warning names the alternatives: `--via-msconvert --tof-grid`, or `--agilent-grid` for the flight-time grid of a profile `.d`). **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
-| `--agilent-grid` | off | Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store `tof_index` (Int32) + per-spectrum `tof_c0`/`tof_c1`/`tof_calibration_id` columns (the MassHunter calibration drifts per scan) instead of f64 m/z — in `spectra_data`, since it is profile data (0.10.1; earlier releases filed it as centroid). Far smaller than the msconvert lane (≈0.14×). Only applies when `MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path) |
+| `--tof-grid <off\|auto\|on>` | `off` on mzML lanes; native SCIEX `.wiff`: `auto` when the flag is absent | **Inputs read through mzdata only** (mzML incl. `--via-msconvert`, imzML, Thermo `.raw`, and a TDF read as f64 m/z under `--no-ims-compact` or the ims-compact fallback): compactify exact-lattice TOF profile data by DETECTING an integer flight-time grid in the decoded f64 m/z and storing each spectrum as a chunk-grid row (`MS:1003825` model `[c0, c1, 1]` + integer indices), recovering `m/z = (c0 + c1·k)²`. Bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`). `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise); `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF ims-compact lanes and `--agilent-grid` store the integer grid of the vendor calibration (lossless), and the Bruker TSF/BAF, Agilent MHDAC, Waters and Shimadzu lanes store the m/z their reader returns (on MHDAC a warning names the alternatives: `--via-msconvert --tof-grid`, or `--agilent-grid` for the flight-time grid of a profile `.d`). **Since 0.10.1 a gridded spectrum keeps the representation its source declares**: a profile spectrum's `tof_index` is filed in `spectra_data` (point layout), a centroid spectrum's in `spectra_peaks`; both facets declare the axis beside an f64 `mz` that is NULL on gridded rows, so `number_of_data_points` / `number_of_peaks` describe the source (until 0.10.0 every gridded spectrum was forced to centroid to reach the one facet that knew the axis — §9). **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that lane also fits the grid statistically; there the default (flag absent) is `auto` — the per-spectrum fit, unchanged from earlier releases — `off` stores the exact f64 m/z the vendor library returned (the opt-out the fidelity invariant requires), and `on` errors when no run-wide digitizer clock can be fitted |
+| `--agilent-grid` | off | Agilent Q-TOF **profile** `.d` only: read the integer flight-time grid straight from `AcqData/MSProfile.bin` (pure Rust, no MHDAC/msconvert) and store the vendor's bin ordinals as chunk-grid rows, each scan under its own `MS:1003825` model (the MassHunter calibration drifts per scan) — in `spectra_data`, since it is profile data. The grid is the bare quadratic; MassHunter's polynomial refinement (up to ~7.5 ppm) rides verbatim in the `agilent_calibration` index block (§8). Far smaller than the msconvert lane (≈0.14×). Only applies when `MSProfile.bin` is non-empty (centroid-only `.d` fall through to the standard path) |
 | `--sample <N>` | — | SciEX `.wiff` only: convert sample `N` (1-based) of a multi-sample WIFF. Native lane and both `--via-msconvert` lanes, mzPeak and `--to mzml` (mapped to msconvert's `--runIndexSet N-1`). A multi-sample WIFF without it is refused: the native lane lists its samples, the msconvert lanes give their count once msconvert has written every run. `0`, and a number beyond the file's samples, are refused; on any other input it is inert and warned about. Config key `sample` |
 | `--via-msconvert` | off | Read the input via ProteoWizard `msconvert` (→ mzML → mzPeak). Cross-vendor path for formats without a native reader in this build (Agilent `.d`, SciEX `.wiff`, …) |
 | `--msconvert-path <MSCONVERT_PATH>` | `$MSCONVERT_PATH`, else `msconvert` on `PATH` | Path to the `msconvert` executable |
@@ -177,7 +174,7 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 | `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --ims-grid --grid-encoding --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
 | `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert` | `--layout --no-numpress --chunk-size` |
 | `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --grid-encoding --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
-| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --ims-chunked --no-ims-chunked --no-ims-grid --grid-encoding --no-tims-recalibration` (the SDK lane writes the flat layout, which the grid rewrite does not apply to) | `--layout --no-numpress --chunk-size` |
+| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --no-tims-recalibration` (the SDK lane's 1/K0 comes from the vendor's own scan→1/K0 model) | `--layout --no-numpress` |
 | `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | — |
 | default timsTOF (TDF) ims-compact | `--image --sdrf` | `--layout --no-numpress` |
 | native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` | `--ims-chunked --no-ims-chunked` |
@@ -290,7 +287,6 @@ force: true
 no_ims_compact: false      # TDF: keep the lossless ims-compact default
 ims_chunked: true          # the default since 0.12.1
 no_ims_chunked: false      # opt back out to the flat archive layout
-no_ims_grid: false         # keep the 0.12.x TOF layout instead of the grid layout (§9)
 bruker_sdk: false
 no_tims_recalibration: false
 no_vendor: false
@@ -537,56 +533,47 @@ the vendor lanes used to, and because mzdata's `spectrum_type()` is first-match 
 shadowed the inference on every SCIEX / Waters / BAF / SDK / Agilent row — archives from ≤ 0.9.12
 carry `MS:1000294` in `spectrum_type` where 579/580 was meant.) Bruker TSF/BAF m/z is produced from the
 vendor calibration (TSF applies the otofControl ±Th correction); Bruker TDF stores
-the native integer TOF grid plus the `a,b` calibration in `ims_calibration` so a
-reader reconstructs `m/z = (a + b·tof)²` exactly. That `a,b` is timsrust's two-point
-chord (−5…−11 ppm against the vendor SDK), so the archive also carries the vendor's
-**exact** calibration: the `vendor_mz_calibration` index block holds every
-`analysis.tdf` `MzCalibration` row verbatim plus `DigitizerNumSamples` /
-`MzAcqRangeLower` / `MzAcqRangeUpper`, and `spectra_metadata` gains per-frame
-`…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id` columns (`Frames.T1/T2/MzCalibration`;
-`MZP:1000008`–`MZP:1000010` since 0.10.1, `MS:4000903`–`MS:4000905` before — match the suffix).
-The block spells out the ModelType-1 expression a reader evaluates —
-`t_ns = tof·DigitizerTimebase + DigitizerDelay`,
-`C1_eff = C1·(1 + dC1·(T1 − tdf_t1)/1e6)`, `t_ns = C0 + (1e6/√C1_eff)·√mz + C2·mz`
-solved for √mz — verified in speXtract to 2.5e-5 ppm against Bruker's SDK. It is
-present with `--no-vendor` too. Because the chord is an approximation, `ims_calibration`
-says so: `"exact": false`, with an `approximation` note (two-point chord; drops `C2·mz`
-and the per-frame temperature term) and `exact_model` pointing at `vendor_mz_calibration`.
-How far off the chord is depends on the file: on PXD059079 2485.d (`C2 = 0`) it runs from
-+3.2 ppm at TOF 0 to −4.2 ppm at the top of the range; on a diaPASEF run with `C2 ≠ 0` it
-was +8.5 / −10.6 / −3.4 ppm at TOF 0 / mid / max, and a 20 ppm search on it lost 11.7 % of
-the peptides at 1 % FDR. A reader that wants vendor-grade m/z evaluates the ModelType-1
-expression; one that does not is still exact to the archive's own `tof` grid.
+every point on the reference implementation's chunk grid under the vendor's **exact** calibration:
+each frame's rows carry its `MzCalibration` row as the model's 7 parameters at the frame's own
+`T1`/`T2` (`mz_grid`, §9), and the `TimsCalibration` ModelType-2 row as the mobility model
+(`mean_inverse_reduced_ion_mobility_grid`), so a reader evaluating the rows — as the reference
+implementation does — gets the vendor's m/z and 1/K0 to 1e-9 ppm (SDK-verified on a `C2 ≠ 0`,
+`C4 ≠ 0` file). The archive also carries the calibration verbatim: the `vendor_mz_calibration`
+index block holds every `analysis.tdf` `MzCalibration` row plus `DigitizerNumSamples` /
+`MzAcqRangeLower` / `MzAcqRangeUpper`, `vendor_tims_calibration` the `TimsCalibration` rows, and
+`spectra_metadata` gains per-frame `…_tdf_t1`, `…_tdf_t2`, `…_tdf_mz_calibration_id` columns
+(`Frames.T1/T2/MzCalibration`; `MZP:1000008`–`MZP:1000010` since 0.10.1, `MS:4000903`–`MS:4000905`
+before — match the suffix), the provenance of each frame's model. Both are present with
+`--no-vendor` too. `ims_calibration` says `"exact": true` when every row is ModelType 1; its `chord` entry records timsrust's
+two-point chord `(a + b·tof)²` (−5…−11 ppm against the vendor model) only as the model a frame
+WITHOUT a usable `MzCalibration` row is stored on (as an `MS:1003825` sqrt model), never as the
+archive's calibration.
 
-**Exact per-spectrum coefficients when `C2 = 0`.** When every `MzCalibration` row a run
-references is ModelType 1 with `C2 = C3 = C4 = dC2 = 0` — stored as numeric zeros; a NULL or
-text cell is a *missing* term, not a zero, and keeps the run on the chord (PXD059079 2485.d is
-such a file), the vendor model is *exactly* a sqrt-linear law in `tof` per frame:
-`m/z = (tof_c0 + tof_c1·tof)²` with `tof_c1 = DigitizerTimebase·√C1_eff/1e6`,
-`tof_c0 = (DigitizerDelay − C0)·√C1_eff/1e6` and `C1_eff` temperature-corrected with the
-frame's `Frames.T1`. Both ims-compact lanes (native and `--bruker-sdk`) then write the pair as
-per-spectrum Float64 columns `…_tof_c0` / `…_tof_c1` in `spectra_metadata` (the same columns
-and accessions the SciEX/Agilent/Shimadzu sqrt grids use: the converter-owned `MZP:1000003` /
-`MZP:1000004` terms of `cv/mzpeak.obo`, so the columns are `opt_MZP_1000003_tof_c0` /
-`opt_MZP_1000004_tof_c1`; archives written before 0.10.1 carry them as `opt_MS_4000900_tof_c0` /
-`opt_MS_4000901_tof_c1`, and every reader in the family binds by the `_tof_c0` / `_tof_c1` suffix
-or by name, so both generations reconstruct), stamp the `tof` column with
-`mzpeak:transform_params_per_spectrum = "tof_c0,tof_c1"`, and add
-`"per_spectrum": "tof_c0,tof_c1"`, `"exact_per_spectrum": true` and a note to
-`ims_calibration`; `a`/`b` and `"exact": false` stay for readers that only know the run-wide
-chord. The vendored reader — and therefore `mzpeak-convert ARCHIVE -o x.mzML` — reconstructs
-m/z from the per-spectrum pair (1e-12 relative to the ModelType-1 model, versus up to 4.2 ppm
-for the chord on 2485.d). A frame whose `Frames.T1` is NULL cannot be evaluated and gets *no*
-pair: its `tof_c0`/`tof_c1` cells are NULL, readers fall back to the chord for that spectrum,
-and the count appears as `"per_spectrum_chord_frames"` — so `"exact_per_spectrum": true` is a
-per-spectrum statement (a spectrum *with* the pair is on the model). A run with any `C2 ≠ 0`
-row, or a TDF whose `Frames` table lacks `T1`/`MzCalibration` (both lanes), gets no
-`tof_c0`/`tof_c1` columns and no `per_spectrum` keys — nothing changes for it. The `C2 = 0` pair is
-checked against the vendor too: `MZPC_TDF_SDK_GOLDEN=<out.json>` (§10) dumps the SDK's own
-`tims_index_to_mz` at up to 240 `(frame, tof)` points during a `--bruker-sdk` conversion, and the
-dump of 2485.d, committed as `tests/fixtures/tdf_2485_sdk_golden.json`, is what
-`sqrt_linear_pair_matches_the_vendor_sdk_goldens` (`src/bruker_native.rs`) holds the pair to: it
-reproduces the SDK to 1.0e-7 ppm, where the run-wide chord is 4.28 ppm off.
+**ModelType 2.** A few timsTOF files carry `MzCalibration` rows of ModelType 2 (in the example
+corpus, one of 33: the SBA415 timsTOF Pro run). Bruker's library evaluates them as the ModelType-1
+quadratic on `C0`, `C1`, `C2` (no `C4` shift) and then subtracts a calibrant polynomial,
+`m/z = m − Σ_{i<C7} C[8+i]·mⁱ` for `C5 ≤ m ≤ C6` and `m/z = m` outside; `C3`/`C4` repeat
+`C0`/`C2` in these rows. Pinned against the SDK to 1e-9 ppm (OpenTIMS's `test.d`,
+`tests/fixtures/tdf_modeltype2_sdk_golden.json`). The reference implementation's grid model has
+no place for the polynomial, so such a run's rows carry the quadratic — the TOF bins stay exact —
+and the archive says `"exact": false` with the `approximation` spelled out, `max_error_ppm` (0.66 ppm
+on SBA415) and `bruker:mz-calibrant-omitted` in `transformations`; the row itself, polynomial
+included, is in `vendor_mz_calibration`. **Archives written by 0.13.0 read ModelType-2 rows as
+ModelType 1 and are wrong by an order of magnitude (m/z 270 stored as 21): reconvert them.** mzdata
+0.67.1 has the same defect, so the `--no-ims-compact` and fallback lanes read such files on
+timsrust's chord instead (`bruker:mz-calibration-chord`).
+
+**History.** Through 0.13 the archive stored integer `tof` columns with the chord in
+`ims_calibration` (`"exact": false`), and — when every row was ModelType 1 with `C2 = 0` — per-frame
+`opt_MZP_1000003_tof_c0` / `opt_MZP_1000004_tof_c1` columns (`m/z = (tof_c0 + tof_c1·tof)²`,
+`ims_calibration.per_spectrum`); 0.13.0 rewrote its chunked facet into the grid layout in a second
+pass. Since 0.14 the grid is written natively for every frame, `C2 ≠ 0` rows included, and the
+`tof_c0`/`tof_c1` columns are gone; archives of every earlier generation still read. The vendor
+formula is checked against Bruker's own library: `MZPC_TDF_SDK_GOLDEN=<out.json>` (§10) dumps the
+SDK's `tims_index_to_mz` at up to 240 `(frame, tof)` points during a `--bruker-sdk` conversion, and
+the dumps of 2485.d (`tests/fixtures/tdf_2485_sdk_golden.json`) and of a `C2 ≠ 0`, `C4 ≠ 0`
+diaPASEF run (`tests/fixtures/tdf_diapasef_sdk_golden.json`) hold the grid model to 1e-6 ppm and
+every digitizer bin to an exact inversion (`src/bruker_native.rs`).
 
 **Several precursors on one spectrum (timsTOF PASEF).** dia-PASEF writes two precursors
 per MS2 frame and DDA-PASEF several, all with the same `(source_index, precursor_index)`
@@ -648,21 +635,25 @@ archive; the lane-specific changes, each declared when it happens, are in the ta
    (7). The baseline extent of every peak is preserved, so the profile shape is unchanged, but
    `number_of_data_points` reflects the stored count rather than the source's. **Centroid spectra
    are never touched** — isolated and interior zero-intensity centroids round-trip exactly.
-3. **`--tof-grid` sqrt grid** (`tof-grid:<ppm>ppm`) — a profile is stored on an integer sqrt-space grid only when every
-   point reconstructs within the ppm bound (`MZPC_TOF_GRID_PPM`, default 5); the achieved
-   `max_roundtrip_ppm` is recorded. Spectra outside the bound keep f64 m/z.
-4. **Shimadzu profile pad trim** (`shimadzu:span-trim`) — the native `.lcd` route fits and stores the signal span between
+3. **`--tof-grid` sqrt grid** (`tof-grid:<ppm>ppm`) — a spectrum is stored on an integer sqrt-space grid (a
+   chunk-grid row under its `MS:1003825` model) only when every point reconstructs within the ppm bound
+   (`MZPC_TOF_GRID_PPM`, default 5). Spectra outside the bound keep f64 m/z as raw chunk rows.
+4. **Fitted linear grid on lattice centroids** (`grid-fit:1e-6Da`) — a centroid list whose m/z sit on a
+   fixed-point lattice (Shimadzu `MassHigh`, the LabSolutions mzML export) is stored as a chunk-grid row
+   under the reference implementation's fitted `MS:1003824` model, every value within 1e-6 Da (≤ 3e-7 Da
+   in practice); `--no-mz-lattice` keeps the exact f64.
+5. **Shimadzu profile pad trim** (`shimadzu:span-trim`) — the native `.lcd` route fits and stores the signal span between
    the first and last positive sample; the zero-intensity pad LabSolutions writes at the
    scan-window bounds is not stored (the span bounds are).
 
-Where the source m/z is on a lattice the archive says how exactly it reconstructs
-(`mz_reconstruction` with its `max_error_da` bound) rather than claiming "exact": the Shimadzu
-profile block says `within-vendor-rounding` with `max_error_da: 1e-9` — the fit's own acceptance
-gate, since a spectrum is gridded only when every point rebuilds within 1e-9 Da of the vendor m/z
-(archives written by 0.11.5 and earlier state 5e-10, which the gate did not enforce: refitting
-HEK_PosOAD1's nine f64 spectra puts 169 of 32,434 points between 5e-10 and 5.47e-10 Da off), the
-Agilent file-direct block is the one lane that says `exact`, and the two SCIEX lanes say
-`bounded-lossy` with `roundtrip_tolerance_ppm`.
+Where a lane stores a grid instead of the source m/z, the model a reader evaluates rides on every
+grid row (`mz_grid {grid_type, parameters, indices}`, the reference implementation's layout) and the
+bound rides in `transformations`: `tof-grid:<ppm>ppm` for the statistically fitted SCIEX / mzML sqrt
+grids, `grid-fit:1e-6Da` for lattice centroids; the Shimadzu profile grid and the Agilent file-direct
+grid carry the vendor's own bin ordinals under exact models and declare nothing (the Shimadzu fit is
+accepted only when every point rebuilds within 1e-9 Da, the vendor's own rounding). Archives written
+by 0.13 and earlier carried these grids as integer point columns with `tof_calibration` /
+`mz_calibration` index blocks; they still read.
 
 **The `transformations` index key.** Every mzPeak lane writes `metadata.transformations` — a JSON
 list of the declared, bounded changes that were APPLIED to this archive's stored data on the way in
@@ -671,8 +662,8 @@ least once, counted while the archive was written, never inferred from what the 
 to do; so an empty list says the signal is stored as it was handed over. Archives written by 0.11.5
 and earlier listed `zero-run-mask` on every lane and `numpress-linear` whenever the codec was chosen,
 whether or not a spectrum was masked or a chunk encoded. An entry names the transformation, never
-how often it was applied: a count goes to the run's warning. `tof-grid:<ppm>ppm` is the one entry
-with a parameter, and it names a bound, the one `tof_calibration.roundtrip_tolerance_ppm` repeats.
+how often it was applied: a count goes to the run's warning. `tof-grid:<ppm>ppm` and `grid-fit:<Da>Da` are
+the two entries with a parameter, and each names the bound its grid was accepted under.
 The vocabulary:
 
 | Entry | Written when | Lanes |
@@ -683,8 +674,12 @@ The vocabulary:
 | `sort-by-time` | the writer's backstop re-ordered at least one chromatogram into time order before it was stored | any lane that hands the writer a chromatogram out of time order, a source chromatogram or the MS1 TIC/base-peak trace synthesized in spectrum order |
 | `sort-by-wavelength` | the writer's backstop re-ordered at least one wavelength (UV/PDA) spectrum into wavelength order before it was stored | any lane that writes wavelength spectra handed over out of order |
 | `chromatogram-time-to-minutes` | at least one chromatogram time recorded in seconds or milliseconds was divided into minutes, the unit `chromatograms_data` declares on every lane, as a 64-bit float (not bit-exact). A time array that states no unit is stored as given | mzML/imzML with source chromatograms (ProteoWizard writes seconds), Bruker `.d` with `chromatography-data.sqlite` (HyStar records seconds) |
-| `tof-grid:<ppm>ppm` | a statistically fitted integer grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
-| `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 4) | native Shimadzu `.lcd` profile |
+| `tof-grid:<ppm>ppm` | a statistically fitted integer sqrt grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
+| `grid-fit:1e-6Da` | a centroid list on a fixed-point lattice was stored under the reference implementation's fitted linear grid, every value within 1e-6 Da (item 4) | generic mzML lane (lattice detected), native Shimadzu `.lcd` centroids |
+| `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 5) | native Shimadzu `.lcd` profile |
+| `bruker:mz-calibrant-omitted` | a timsTOF run's `MzCalibration` is ModelType 2: the grid rows carry the quadratic on `C0`–`C2`, without the vendor's calibrant polynomial (bounded by `ims_calibration.max_error_ppm`, the polynomial verbatim in `vendor_mz_calibration`) | timsTOF ims-compact (native, `--bruker-sdk`) |
+| `bruker:mz-calibration-chord` | a timsTOF run's m/z came from timsrust's two-point chord instead of its `MzCalibration` model: no usable row or an unsupported model type (ims-compact), or a ModelType-2 file read through mzdata, which reads every row as ModelType 1 (`--no-ims-compact`, the fallback lane) | timsTOF |
+| `shimadzu:coarse-mz` | the glue read the coarse 1e-4 `Mass` field instead of `MassHigh` (`MZPC_SHIMADZU_COARSE_MZ=1`): centroid m/z 100× coarser than the file holds | native Shimadzu `.lcd` centroids |
 | `agilent:drop-zero-samples` | the profile grid lane left at least one zero-intensity sample, or an all-zero scan, out of its sparse point lists | `--agilent-grid` |
 | `agilent:intensity-f32-rounding` | an integer count above 2^24 was rounded into the Float32 intensity column | `--agilent-grid` |
 | `agilent:nonfinite-intensity-to-zero` | MHDAC returned a NaN or ±Inf intensity, stored as 0 (counted by the net48 host over the scans it exported, which under `MZPC_MAX_SPECTRA` are the written ones) | native Agilent (MHDAC) |
@@ -763,128 +758,99 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
 - **zstd** — applied inside Parquet, `--zstd-level` 1–22 (default 3; the timsTOF **ims-compact**
   lanes default to **5**, the measured byte-plane plateau — an explicit `--zstd-level` applies to
   both).
-- **Fixed-point m/z lattice** *(automatic; `--no-mz-lattice` to disable)* — some vendors hand over
-  m/z that are really integers over a power of ten: Shimadzu `MassHigh` at 1e-9 Da, its coarse
-  `Mass` field at 1e-4 Da, and the LabSolutions **mzML export** of the same acquisition. The
-  converter samples the CENTROID m/z of six spectra spread across the run and, if every one of them
-  lands on such a lattice, stores the peaks facet as `point.tof_index` = `round(m/z · scale)`
-  (Int64, DELTA_BINARY_PACKED) with an `mz_calibration` index block (`"codec": "mz-grid"`) and a
-  `LinearMz` transform on the column; readers recover `m/z = tof_index / scale` — the DIVISION, not
-  a multiplication by the column's `mzpeak:transform_params` (`1/scale`), which is a different
-  number: `1e-9` is not exactly 10⁻⁹, so `tof_index · 1e-9` lands one ulp (~1e-13 Da) off the
-  source value on about 40 % of points. Dividing by the `scale` in the `mz_calibration` block
-  reproduces the vendor's f64 **bit for bit**, which is what makes the lattice **lossless
-  and smaller than either chunk encoding**, so on the peaks facet it supersedes both numpress-linear
-  and delta. Measured on the 4.5 GB LabSolutions `DIA_Hela_20ng` mzML (279.7 M centroids):
-  **2,188 MB** (lossless delta) or 1,355 MB (lossy numpress) → **1,312 MB**, with the m/z bytes
-  going 1,897 MB → 1,035 MB (−45 %); on the 13,200-spectrum `Blind_P1_pos_012.mzML`,
-  3,709 kB → 2,264 kB (−39 %). Nothing is snapped: a spectrum with even one off-lattice value keeps
-  its exact f64 m/z in the same facet's `mz` column, per spectrum. Only the **peaks** facet is
-  affected — profile arrays keep the chunked layout and the `--no-numpress` / `--chunk-size` /
-  `--layout` choices exactly as before, so a profile-only input converts unchanged. The native
-  Shimadzu `.lcd` lane has done this at 1e-9 since v0.9.0; this is the same mechanism applied to any
-  input whose data earns it. `--tof-grid` (a different, sqrt/flight-time grid) still wins where it
-  is asked for and fits.
-- **Reader support for the lattice, and when to turn it off.** A lattice archive's peaks facet has
-  an Int64 `point.tof_index` and an all-NULL `point.mz` on the routed rows, so a reader that does
-  not know the `mz-grid` codec sees no m/z there (`mzpeak-convert`'s own vendored reader and
-  mzPeakViewer do know it; other tools in the mzPeak family — OpenMS's `MzPeakFile`, mzPeakJ,
-  mzPeakIV, mzPeakExplorer, mzPeakValidator — do not, at the time of writing, and read those cells
-  as 0). Until they do, pass **`--no-mz-lattice`** (config `no_mz_lattice: true`, or
-  `MZPC_NO_MZ_LATTICE=1` in the environment) when the archive is destined for one of them: it
-  stores plain f64 `mz` instead, on **every** lane — the mzML/generic one and the native Shimadzu
-  `.lcd` one alike. Note this is a change of on-disk representation for ordinary mzML input, which
-  before v0.9.7 always got f64 `mz`; the values are the same either way.
+- **Fixed-point m/z lattice → fitted linear grid** *(automatic; `--no-mz-lattice` to disable)* — some
+  vendors hand over m/z that are really integers over a power of ten: Shimadzu `MassHigh` at 1e-9 Da,
+  its coarse `Mass` field at 1e-4 Da, and the LabSolutions **mzML export** of the same acquisition.
+  The converter samples the CENTROID m/z of six spectra spread across the run and, if every one of
+  them lands on such a lattice, stores the peaks facet on the reference implementation's **fitted
+  linear grid**: 50-Th chunk-grid rows (`chunk_encoding` `MS:1003826`), each spectrum under its own
+  `MS:1003824` model `[intercept, slope, scale]` fitted over 2³² slots of the spectrum's padded
+  range and accepted only when every value rebuilds within 1e-6 Da (≤ 3e-7 Da on a 1,900-Th
+  spectrum) — declared as `grid-fit:1e-6Da`. That is upstream's own `--peak-encoding grid`, and on
+  such data it is far smaller than delta chunking: on the 4.5 GB LabSolutions `DIA_Hela_20ng` mzML
+  (279.7 M centroids) the m/z bytes go 1,897 MB (lossless delta) → ~0.93 GB. Only the **peaks** facet
+  is affected — profile arrays keep the chunked layout and the `--no-numpress` / `--chunk-size` /
+  `--layout` choices exactly as before, so a profile-only input converts unchanged.
+  From 0.9.7 to 0.13 this was an exact Int64 point lattice of the converter's own (`point.tof_index`
+  = `round(m/z·scale)`, an `mz_calibration` index block, `m/z = tof_index / scale`); that layout is
+  the one representation the reference implementation's chunk grid cannot hold (2³² steps of
+  1e-9 Da is 4.29 Th per chunk) and was retired in 0.14 for upstream's encoding. Archives of that
+  generation still read. `--no-mz-lattice` (config `no_mz_lattice: true`, or `MZPC_NO_MZ_LATTICE=1`
+  in the environment) keeps the exact f64 m/z on every lane, at the delta-chunk size.
 - **ims-compact** — for Bruker timsTOF (**TDF**) this is the **default**: the
   native integer `tof` is stored bit-exact (Int32 + `ims_calibration`) instead of
   f64 m/z, roughly halving the m/z bytes with an exact grid. Disable with
   `--no-ims-compact` to write standard f64 m/z. m/z is reconstructed by readers as
   `m/z = (a + b·tof)²` — the chord, marked `"exact": false`; the vendor's exact model sits
   beside it in `vendor_mz_calibration` (§8).
-- **TOF-grid archives (`--tof-grid`, native SCIEX `.wiff`, `--agilent-grid`) — one axis, two
-  facets (since 0.10.1).** The Int32 `tof_index` column (`SqrtMzFromTof`, `mzpeak:transform_params`
-  or `…_per_spectrum` on the field) is declared on BOTH `spectra_data` (point layout) and
-  `spectra_peaks`, each beside an f64 `mz`. A spectrum goes to the facet its declared representation
-  selects and is gridded or not independently of that: on a gridded row `tof_index` is set and `mz`
-  NULL, on an off-lattice row `mz` holds the exact f64 and `tof_index` is NULL — never both. Readers
-  therefore decide per row, not per facet, and `spectrum_representation` / `number_of_data_points` /
-  `number_of_peaks` mean what the source said. Until 0.10.0 only the peaks facet knew the axis, so
-  every gridded spectrum was rewritten to centroid to reach it: the 13 published TOF-grid archives
-  labelled 1.6 M profile spectra as centroid spectra with `number_of_peaks` set (review item M6;
-  fixed together with the accession move above, one corpus rebuild). Under `--tof-grid off`
-  (SCIEX) nothing is gridded and `spectra_data` keeps the requested chunked layout. Size: the
-  off-lattice profile minority of a native SCIEX run is now stored as exact f64 points rather than
-  numpress chunks — on the corpus that share is 0.07–9.2 % of the points and the archives grew
-  0.2–27 % (see the 0.10.1 changelog for the per-file numbers). That size is accepted: no
-  chunk-capable integer axis or mixed layout is planned.
-- **ims-compact TOF layout (two modes)** — the peak facet has two mutually-exclusive layouts,
-  recorded in `ims_calibration.tof_encoding`:
-  - **Archive** *(default)* — a flat table of **absolute integer TOF bins** (`absolute`). Maximum
-    compression and fast whole-spectrum access; no m/z index (an m/z-range query is a full scan).
-    Size vs the vendor `analysis.tdf_bin`: DDA-PASEF runs come out below it; a dense diaPASEF run
-    (S30, 2.47 G peaks) is **+3–5 %** at zstd 3–15, with `tof` two thirds of the table. (A per-scan
-    delta variant existed up to v0.7.2 and was removed in v0.7.3 — no reader decoded it correctly and
-    its m/z is wrong after the first peak of each scan; such archives are ~8 % smaller only because
-    small deltas byte-shuffle well. Reconvert them, and never use one as a size baseline.)
-  - **Chunked** *(`--ims-chunked`)* — each frame's peaks are split into true m/z bins (`--chunk-size`,
-    default 50 Th); each chunk stores its main-axis (TOF) bounds (`chunk_start`/`chunk_end`, Parquet
-    page-prunable) and delta-encodes TOF within the chunk (`m/z-chunked`). **m/z-slice / XIC queries
-    are ~20–30× faster** (they touch only the overlapping chunks) at roughly parity size. Reconstruct
-    a chunk's absolute TOF as **`chunk_start + cumsum(deltas)`** — the first point is `chunk_start`
-    itself and is *not* in the delta array; summing the array alone is wrong from the first point of
-    every chunk. Whole-spectrum access matches archive when
-    row groups are sized finely (`MZPC_ROW_GROUP_ROWS`); the default (8192 chunks/row group) is coarse
-    on very large files. On the diaPASEF S30 run the chunked table is **−2 %** vs the vendor file
-    (−8 % on a DDA run): TOF deltas shrink to a fifth, but the per-peak `1/K0` column becomes half the
-    table — sorting each frame by TOF scrambles the scan id, ~1.2 B/peak of irreducible entropy — so a
-    per-scan mobility representation would not help here either.
-  - **Grid** *(the default since 0.13.0; `--no-ims-grid` keeps the TOF layout above)* — the chunked
-    facet in the layout of the reference implementation: the chunk bounds are **real m/z**
-    (`mz_chunk_start`/`mz_chunk_end`, so an m/z window prunes rows without any model), `mz_chunk_values`
-    is null, `chunk_encoding` is `MS:1003826` ("coordinate grid encoding"), and each dimension's
-    coordinates are integer indices in a struct column that carries the model with them:
-    `mz_grid {grid_type, parameters, indices}` holds `[first TOF bin, deltas…]` (cumulative sum to
-    reconstruct; the first point IS in the list) with the frame's `MzCalibration` row as
-    `[C0, 1e6/√(C1·cf), C2/cf, C3, C4, DigitizerTimebase, DigitizerDelay]`
-    (`cf = 1 + (dC1·(T1 − Frames.T1) + dC2·(T2 − Frames.T2))/1e6`), and
-    `mean_inverse_reduced_ion_mobility_grid` holds the TIMS scan numbers with the `TimsCalibration` row
-    as `[C6, C7, offset, slope]`. Decoding: `t = bin·timebase + delay`, solve
-    `t = C0 + β·u + C2·u² (+ C3·u³)` for `u`, `m/z = u² − C4`; `1/K0 = 1/(C6 + C7/(offset + slope·scan))` —
-    exactly as `mzdata::io::tdf::MzCalibrationModel2::convert_f64` / `TimsCalibrationModel2::convert`
-    evaluate them, which is how the bounds were computed, so a bound and its decoded point agree bit
-    for bit. Both columns are array-index entries of `buffer_format: chunk_transform`,
-    `transform: MS:1003826`, with the DECODED type. Every frame is exact (SDK-verified to 1e-9 ppm;
-    frames whose row has `C2`/`C4`, which the TOF layout left on the chord, included), no run-wide chord
-    and no `mzpeak:transform_params*` metadata remain, and the `tof_c0`/`tof_c1`,
-    `tdf_t1`/`tdf_t2`/`tdf_mz_calibration_id` columns stay as provenance only. Size on 2485: **−3.0 %**
-    against the TOF layout with the default byte-stream-split encoding (`--grid-encoding bss`), +7.3 %
-    with Parquet's default encodings (`--grid-encoding plain`); the gain is the ion mobility column
-    (scan numbers, byte-stream-split, beat dictionary-coded float64 by 7.5 %). Written as a rewrite of
-    the finished TOF-layout facet; `mzpeak-convert old.mzpeak -o new.mzpeak --ims-grid` upgrades a
-    0.12.5 archive in place of a reconversion. The models' placeholder terms `MS:9999001/2` are the
-    reference implementation's until PSI-MS assigns them.
-- **Shimadzu `.lcd` (two integer axes, one per facet)** — the native lane stores each facet on
-  the exact integer grid the vendor data sits on; both are lossless and reproduce the vendor's
-  m/z to the last digit.
-  - **Profile → per-spectrum sqrt grid** in `spectra_data` (point layout): `tof_index` (Int32,
-    delta-packed) with per-spectrum `tof_c0` / `tof_c1` columns and an f64 `mz` column that is
-    NULL on gridded rows; `m/z = (tof_c0 + tof_c1·tof_index)²`, `tof_c1` constant across the run
-    (`tof_calibration`: `{codec: tof-grid, model: sciex_sqrt_per_spectrum, vendor: shimadzu,
-    run_wide_c1, per_spectrum_columns}`), verified on every point to ≤ 1e-9 before a spectrum
-    is gridded. A spectrum that does not fit (LabSolutions clamps the first/last sample of some
-    MS2 scans to the scan-window bound) keeps f64 m/z in the same facet.
-  - **Centroids → exact Int64 lattice** in `spectra_peaks` (point layout, never chunked or
-    numpressed): `point.tof_index` Int64 with `LinearMz` and `mzpeak:transform_params = "1e-9"`,
-    i.e. `m/z = tof_index / 1e9` (the division, not `1e-9 · tof_index` — see above), plus the
-    f64 `point.mz` fallback (NULL on lattice rows) and
-    `point.intensity`; index block `mz_calibration: {codec: mz-grid, scale: 1e9, vendor:
-    shimadzu, lossless: tof_index, applies_to: spectra_peaks}`. Each centroid list is checked on
-    its own (`|m/z·1e9 − k| < max(1e-3, 8 ulp)`, `k` non-decreasing); one that fails keeps f64.
-  - **Reader rule, per facet:** for the centroid facet consult `mz_calibration` first, for the
-    profile facet `tof_calibration` first; in both, a row whose `mz` is finite and > 0 is an f64
-    fallback and wins over the axis (a NULL Int64 cell materialises as 0 in some Arrow bindings —
-    never reconstruct from it). The two `tof_index` columns differ in dtype and transform.
-  - **Size** (`MassHigh` f64 → grid + lattice): Blind_P1_pos_012 5.24 → **3.79 MB**, HEK_PosOAD1
+- **TOF-grid archives (`--tof-grid`, native SCIEX `.wiff`, `--agilent-grid`) — chunk-grid rows
+  (since 0.14).** Both `spectra_data` and `spectra_peaks` are chunk facets, one chunk per spectrum
+  (`chunk_encoding` `MS:1003826`, real m/z bounds, `mz_chunk_values` null): a gridded spectrum's row
+  carries `mz_grid {grid_type: MS:1003825, parameters: [c0, c1, 1], indices}` — the integer bins,
+  `[first, deltas…]`, decoded as `m/z = (c0 + c1·k)² / 1` exactly as the reference implementation's
+  `SquareRootLinearGrid` does — and a spectrum that did not fit is a raw `MS:1000576` row holding its
+  exact f64 m/z. A spectrum goes to the facet its declared representation selects and is gridded or
+  not independently of that, so `spectrum_representation` / `number_of_data_points` /
+  `number_of_peaks` mean what the source said (0.10.1, review M6). Under `--tof-grid off` (SCIEX)
+  nothing is gridded and both facets keep the requested chunked layout. Through 0.13 the same
+  archives held an Int32 `tof_index` point column with `mzpeak:transform_params` /
+  per-spectrum `tof_c0`/`tof_c1` columns and a `tof_calibration` block; they still read. The grid
+  values in a row are the row's model at its indices (a run-wide fit whose anchor `c0²` lies above a
+  spectrum's lowest m/z is re-anchored for that spectrum, so no index is negative), which keeps
+  the bounds and the decoded points bit-identical.
+- **ims-compact layout — the reference implementation's chunk grid** (since 0.13.0; written
+  natively since 0.14, `ims_calibration.tof_encoding = "grid"`) — the peaks facet holds each frame
+  as `MS:1003826` chunk rows: real m/z bounds (`mz_chunk_start`/`mz_chunk_end`, so an m/z window
+  prunes rows without any model), `mz_chunk_values` null, and each dimension's coordinates as
+  integer indices in a struct column that carries the model with them: `mz_grid {grid_type,
+  parameters, indices}` holds `[first TOF bin, deltas…]` (cumulative sum to reconstruct; the first
+  point IS in the list) with the frame's `MzCalibration` row as
+  `[C0, 1e6/√(C1·cf), C2/cf, C3, C4, DigitizerTimebase, DigitizerDelay]`
+  (`cf = 1 + (dC1·(T1 − Frames.T1) + dC2·(T2 − Frames.T2))/1e6`), and
+  `mean_inverse_reduced_ion_mobility_grid` holds the TIMS scan numbers with the `TimsCalibration` row
+  as `[C6, C7, offset, slope]`. Decoding: `t = bin·timebase + delay`, solve
+  `t = C0 + β·u + C2·u² (+ C3·u³)` for `u`, `m/z = u² − C4`; `1/K0 = 1/(C6 + C7/(offset + slope·scan))` —
+  exactly as `mzdata::io::tdf::MzCalibrationModel2::convert_f64` / `TimsCalibrationModel2::convert`
+  evaluate them, which is how the bounds were computed, so a bound and its decoded point agree bit
+  for bit. Both columns are array-index entries of `buffer_format: chunk_transform`,
+  `transform: MS:1003826`, with the DECODED type. Every frame is exact (SDK-verified to 1e-9 ppm,
+  `C2`/`C4` rows included). Points are sorted by TOF within a frame (declared `sort-by-mz`; mobility
+  is stored per point, so nothing is lost); intensity is the native count as Int32 (byte-plane,
+  `MZPC_BYTE_PLANE_INTENSITY=0` for Float32). Under `--no-tims-recalibration` 1/K0 is timsrust's
+  linear approximation, which no grid expresses: it is stored as plain per-point values and
+  `ims_calibration.ion_mobility_grid.column` is null.
+  - **Chunk width.** `--ims-chunked` *(default)*: 50-Th chunks (`--chunk-size`), the m/z-prunable
+    form. `--no-ims-chunked`: one chunk per frame — whole-frame access in one row, no pruning within
+    a frame. Row groups are 8192 chunks (`MZPC_ROW_GROUP_ROWS`), the measured random-access sweet
+    spot (7.5 vs 13.4 ms/frame at +1 % size).
+  - **Encodings.** Index lists and intensity are byte-stream-split with the dictionary off (measured
+    −9.6 % against the reference implementation's dictionary default on 2485; its DELTA intent on
+    index lists would be +21 %), `spectrum_index` delta-packed, the bounds Parquet's default. Size on
+    2485.d against the vendor `analysis.tdf_bin`: about parity (the 0.13.0 corpus Bruker set measured
+    1.097× with this layout).
+  - **History.** 0.12.x wrote a TOF layout (integer TOF bounds, `tof_chunk_values` deltas,
+    per-frame `tof_c0`/`tof_c1`; a flat point table of absolute bins under `--no-ims-chunked`), and
+    0.13.0 rewrote its chunked facet into the grid in a second pass (`--ims-grid`, `--no-ims-grid`,
+    `--grid-encoding`). All of that is gone in 0.14; archives written by 0.12.x and 0.13.0 still
+    read. (A per-scan-delta variant up to v0.7.2 was removed in v0.7.3: no reader decoded it
+    correctly. Reconvert those, and never use one as a size baseline.) The models' placeholder
+    terms `MS:9999001/2` are the reference implementation's until PSI-MS assigns them.
+- **Shimadzu `.lcd` (two grids, one per facet)** — the native lane stores each facet on the
+  reference implementation's chunk grid:
+  - **Profile → per-spectrum sqrt grid** in `spectra_data`: one chunk-grid row per spectrum under
+    its own `MS:1003825` model `[c0, c1, 1]` (`m/z = (c0 + c1·k)²`, `c1` constant across the run),
+    the vendor's own TOF lattice, verified on every point to ≤ 1e-9 Da before a spectrum is
+    gridded. A spectrum that does not fit (LabSolutions clamps the first/last sample of some MS2
+    scans to the scan-window bound) is a raw `MS:1000576` row with its f64 m/z.
+  - **Centroids → fitted linear grid** in `spectra_peaks` (50-Th chunks, `MS:1003824` per
+    spectrum, within 1e-6 Da — `grid-fit:1e-6Da`; see the lattice bullet above). The coarse
+    `Mass` field (`MZPC_SHIMADZU_COARSE_MZ=1`) takes the same route and is declared as
+    `shimadzu:coarse-mz`.
+  - Archives written by 0.9–0.13 carry the profile as an Int32 `tof_index` point column with
+    per-spectrum `tof_c0`/`tof_c1` and a `tof_calibration` block, and the centroids as an exact
+    Int64 lattice (`mz_calibration`, `m/z = tof_index / 1e9`); both still read.
+  - **Size** (`MassHigh` f64 → grid + lattice, measured on the 0.9.5 point layout; the chunk grid is
+    −7.5 … +6 % on the profile facet and −6 … −11 % on the dense centroid facets against it):
     29.0 → **23.9 MB**, DIA_Hela_20ng 2.19 GB → **1.31 GB** (839 MB with the coarse 1e-4 `Mass`,
     which is 100× less precise). Peak for peak identical to the f64 archives on all four
     reference files, with zero f64 fallbacks.
@@ -949,8 +915,8 @@ instead.
 
 | Variable | Effect | Recorded in the archive? |
 |---|---|---|
-| `MZPC_NO_MZ_LATTICE=1` | Same as `--no-mz-lattice` (§9): store f64 `mz` instead of the fixed-point lattice, on every lane (`env_flag` spellings) | implicitly — the peaks facet has an `mz` column and no `mz_calibration` block |
-| `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | yes — `mz_calibration.source` names `Mass (Int32, 1e-4 Da)` instead of `MassHigh (Int64, 1e-9 Da)`; the glue's own automatic fallbacks to `Mass` are not recorded yet |
+| `MZPC_NO_MZ_LATTICE=1` | Same as `--no-mz-lattice` (§9): keep exact f64 m/z for lattice centroid lists instead of the fitted linear grid, on every lane (`env_flag` spellings) | implicitly — `transformations` has no `grid-fit` entry and the peaks facet has no grid rows |
+| `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | yes — `transformations` lists `shimadzu:coarse-mz` |
 | `MZPC_WATERS_KEEP_COLLAPSED` | Native Waters lane: write MassLynx's collapsed retention-time functions (run-summed mobilograms) as spectra instead of leaving them out. On/off lever read through the common rule (empty, `0`, `false`, `no` are off) | yes — `collapsed_functions[].written` in `waters_functions` (and `waters_drift`), and `waters:drop-functions` when they were left out |
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |

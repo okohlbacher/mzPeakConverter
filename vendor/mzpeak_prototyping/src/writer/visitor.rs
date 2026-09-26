@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::Arc,
+};
 
 use arrow::{
     array::{
@@ -9,8 +13,9 @@ use arrow::{
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
 use mzdata::{
-    curie,
-    params::{CURIE, Unit},
+    Param, curie,
+    meta::DissociationMethodTerm,
+    params::{CURIE, CVTraversal, Unit},
     prelude::*,
     spectrum::{
         ArrayType, Chromatogram, RefPeakDataLevel, ScanPolarity, SignalContinuity,
@@ -96,7 +101,6 @@ macro_rules! finish_cloned_extra {
         }
     };
 }
-
 
 /// A set of shared behaviors for consuming references of a type and building an Arrow (sub-)structure from them
 pub trait StructVisitor<T>: VisitorBase {
@@ -197,6 +201,7 @@ pub struct CustomBuilderFromParameter {
     field: FieldRef,
     unit: Option<CURIEBuilder>,
     fixed_unit: Option<Unit>,
+    term_marker: bool,
 }
 
 impl Debug for CustomBuilderFromParameter {
@@ -206,6 +211,7 @@ impl Debug for CustomBuilderFromParameter {
             .field("value", &"...")
             .field("field", &self.field)
             .field("unit", if self.unit.is_some() { &"yes" } else { &"no" })
+            .field("term_marker", &self.term_marker)
             .finish()
     }
 }
@@ -235,6 +241,12 @@ impl CustomBuilderFromParameter {
         self.accession
     }
 
+    pub fn from_spec_param_marker(curie: CURIE, name: &str) -> Self {
+        let mut this = Self::from_spec(curie, name, DataType::Boolean);
+        this.term_marker = true;
+        this
+    }
+
     /// Create a new [`CustomBuilderFromParameter`] for the specified CURIE with the requested Arrow [`DataType`]
     pub fn from_spec(curie: CURIE, name: &str, dtype: DataType) -> Self {
         let original_name = name.to_string();
@@ -249,6 +261,7 @@ impl CustomBuilderFromParameter {
                 value: Box::new(NullBuilder::new()),
                 unit,
                 fixed_unit: None,
+                term_marker: false,
             },
             DataType::Boolean => Self {
                 accession: curie,
@@ -257,6 +270,7 @@ impl CustomBuilderFromParameter {
                 value: Box::new(BooleanBuilder::new()),
                 unit,
                 fixed_unit: None,
+                term_marker: false,
             },
             DataType::Int64 => Self {
                 accession: curie,
@@ -265,6 +279,7 @@ impl CustomBuilderFromParameter {
                 value: Box::new(Int64Builder::new()),
                 unit,
                 fixed_unit: None,
+                term_marker: false,
             },
             DataType::UInt32 => Self {
                 accession: curie,
@@ -273,6 +288,7 @@ impl CustomBuilderFromParameter {
                 value: Box::new(UInt32Builder::new()),
                 unit,
                 fixed_unit: None,
+                term_marker: false,
             },
             DataType::Int32 => Self {
                 accession: curie,
@@ -281,6 +297,7 @@ impl CustomBuilderFromParameter {
                 value: Box::new(Int32Builder::new()),
                 unit,
                 fixed_unit: None,
+                term_marker: false,
             },
             DataType::Float64 => Self {
                 accession: curie,
@@ -289,17 +306,34 @@ impl CustomBuilderFromParameter {
                 value: Box::new(Float64Builder::new()),
                 unit,
                 fixed_unit: None,
+                term_marker: false,
             },
-            DataType::LargeUtf8 => Self {
+            DataType::Float32 => Self {
+                accession: curie,
+                name: original_name,
+                field,
+                value: Box::new(Float32Builder::new()),
+                unit,
+                fixed_unit: None,
+                term_marker: false,
+            },
+            DataType::LargeUtf8 | DataType::Utf8 => Self {
                 accession: curie,
                 name: original_name,
                 field,
                 value: Box::new(LargeStringBuilder::new()),
                 unit,
                 fixed_unit: None,
+                term_marker: false,
             },
             _ => unimplemented!("{dtype:?} is not supported by CustomBuilderFromParameter"),
         }
+    }
+
+    /// Check if this column was created as a "term marker" that is `true` when the [`Param`]
+    /// is present, false otherwise.
+    pub fn term_marker(&self) -> bool {
+        self.term_marker
     }
 }
 
@@ -360,6 +394,13 @@ impl VisitorBase for CustomBuilderFromParameter {
                     .unwrap()
                     .append_null();
             }
+            DataType::Float32 => {
+                self.value
+                    .as_any_mut()
+                    .downcast_mut::<Float32Builder>()
+                    .unwrap()
+                    .append_null();
+            }
             DataType::Float64 => {
                 self.value
                     .as_any_mut()
@@ -367,7 +408,7 @@ impl VisitorBase for CustomBuilderFromParameter {
                     .unwrap()
                     .append_null();
             }
-            DataType::LargeUtf8 => {
+            DataType::LargeUtf8 | DataType::Utf8 => {
                 self.value
                     .as_any_mut()
                     .downcast_mut::<LargeStringBuilder>()
@@ -384,7 +425,8 @@ impl VisitorBase for CustomBuilderFromParameter {
             self.name.clone(),
             vec![self.field.name().to_string()],
             Some(self.accession()),
-        );
+        )
+        .with_term_marker(self.term_marker);
         if self.unit.is_some() {
             columns.push(f.with_unit(vec![format!("{}_unit", self.field.name())]));
             columns.push(MetadataColumn::new(
@@ -420,7 +462,11 @@ where
                         .as_any_mut()
                         .downcast_mut::<BooleanBuilder>()
                         .unwrap()
-                        .append_option(val.to_bool().ok());
+                        .append_option(if self.term_marker {
+                            val.curie().as_ref().map(|v| *v == self.accession)
+                        } else {
+                            val.to_bool().ok()
+                        });
                 }
                 DataType::UInt32 => {
                     self.value
@@ -450,7 +496,14 @@ where
                         .unwrap()
                         .append_option(val.to_f64().ok());
                 }
-                DataType::LargeUtf8 => {
+                DataType::Float32 => {
+                    self.value
+                        .as_any_mut()
+                        .downcast_mut::<Float32Builder>()
+                        .unwrap()
+                        .append_option(val.to_f32().ok());
+                }
+                DataType::LargeUtf8 | DataType::Utf8 => {
                     self.value
                         .as_any_mut()
                         .downcast_mut::<LargeStringBuilder>()
@@ -504,6 +557,130 @@ impl ArrayBuilder for CustomBuilderFromParameter {
             Arc::new(StructArray::new(fields.into(), arrays, None))
         } else {
             self.value.finish_cloned()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CustomBuilderFromParameterDerived {
+    accession: CURIE,
+    name: String,
+    field: Arc<Field>,
+    value: CURIEBuilder,
+    last: Option<CURIE>,
+    terms_to_match: HashSet<CURIE>,
+}
+
+impl ArrayBuilder for CustomBuilderFromParameterDerived {
+    fn len(&self) -> usize {
+        self.value.len()
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        self.value.finish()
+    }
+
+    fn finish_cloned(&self) -> ArrayRef {
+        self.value.finish_cloned()
+    }
+
+    anyways!();
+}
+
+impl CustomBuilderFromParameterDerived {
+    pub fn from_spec(curie: CURIE, name: &str) -> Self {
+        Self::from(CustomBuilderFromParameter::from_spec(
+            curie,
+            name,
+            DataType::LargeUtf8,
+        ))
+    }
+
+    pub fn accession(&self) -> CURIE {
+        self.accession
+    }
+
+    pub fn terms_to_match(&self) -> &HashSet<CURIE> {
+        &self.terms_to_match
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Set the name of the column
+    pub fn with_field_name(mut self, name: &str) -> Self {
+        self.field = Arc::new(self.field.as_ref().clone().with_name(name));
+        self
+    }
+}
+
+impl VisitorBase for CustomBuilderFromParameterDerived {
+    fn flatten(&self) -> bool {
+        false
+    }
+
+    fn fields(&self) -> Vec<FieldRef> {
+        vec![self.field.clone()]
+    }
+
+    fn append_null(&mut self) {
+        self.last = None;
+        self.value.append_null();
+    }
+
+    fn map_metadata_columns(&self) -> Vec<MetadataColumn> {
+        let f = MetadataColumn::new(
+            self.name.clone(),
+            vec![self.field.name().to_string()],
+            Some(self.accession()),
+        );
+        vec![f]
+    }
+}
+
+impl<T> StructVisitor<T> for CustomBuilderFromParameterDerived
+where
+    T: ParamDescribed,
+{
+    fn append_value(&mut self, item: &T) -> bool {
+        self.last = None;
+        for param in item.params() {
+            if let Some(id) = param.curie().as_ref() {
+                if self.terms_to_match.contains(id) {
+                    self.value.append_value(id);
+                    self.last = Some(*id);
+                    return true;
+                }
+            }
+        }
+        self.append_null();
+        return false;
+    }
+
+    fn associated_curie_to_skip(&self) -> Option<CURIE> {
+        self.last
+    }
+}
+
+impl From<CustomBuilderFromParameter> for CustomBuilderFromParameterDerived {
+    fn from(builder: CustomBuilderFromParameter) -> Self {
+        let cv = mzdata::params::MSVocabulary::init();
+        let mut children_to_match = HashSet::new();
+        if let Some(term) = cv.get_by_index(&builder.accession) {
+            children_to_match = cv
+                .children_of_recursive(term.curie())
+                .into_iter()
+                .map(|v| v.0)
+                .collect();
+        }
+        Self {
+            name: builder.name,
+            accession: builder.accession,
+            field: Arc::new(Arc::unwrap_or_clone(builder.field).with_data_type(DataType::Utf8)),
+            value: Default::default(),
+            last: None,
+            terms_to_match: children_to_match,
         }
     }
 }
@@ -589,6 +766,7 @@ impl VisitorBase for ParamValueBuilder {
         self.integer.append_null();
         self.string.append_null();
         self.float.append_null();
+
     }
 
     fn map_metadata_columns(&self) -> Vec<MetadataColumn> {
@@ -636,7 +814,11 @@ impl StructVisitor<mzdata::params::Value> for ParamValueBuilder {
                 true
             }
             mzdata::params::Value::List(_values) => {
-                unimplemented!()
+                self.string.append_null();
+                self.integer.append_null();
+                self.float.append_null();
+                self.boolean.append_null();
+                true
             }
         }
     }
@@ -681,7 +863,6 @@ impl ArrayBuilder for ParamValueBuilder {
         self as Box<dyn std::any::Any>
     }
 }
-
 
 /// A builder for [`mzdata::params::Param`]-like types
 #[derive(Debug, Default)]
@@ -766,7 +947,6 @@ impl ArrayBuilder for ParamBuilder {
         self as Box<dyn std::any::Any>
     }
 }
-
 
 #[derive(Debug, Default)]
 pub struct ParamListBuilder(LargeListBuilder<ParamBuilder>);
@@ -867,14 +1047,8 @@ pub struct ScanWindowBuilder {
 impl VisitorBase for ScanWindowBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
-            field!(
-                "scan_window_lower_limit",
-                DataType::Float32
-            ),
-            field!(
-                "scan_window_upper_limit",
-                DataType::Float32
-            ),
+            field!("scan_window_lower_limit", DataType::Float32),
+            field!("scan_window_upper_limit", DataType::Float32),
         ];
         fields.extend(self.parameters.fields());
         fields
@@ -944,14 +1118,13 @@ impl ArrayBuilder for ScanWindowBuilder {
     anyways!();
 }
 
-
 /// A builder for [`mzdata::spectrum::ScanEvent`], mapping to the `scan` table. It carries two indices, the source's index (usually a spectrum),
 /// and a unique scan index.
 #[derive(Default, Debug)]
 pub struct ScanBuilder {
     source_index: UInt64Builder,
     scan_index: UInt64Builder,
-    scan_start_time: Float32Builder,
+    scan_start_time: Float64Builder,
     preset_scan_configuration: UInt32Builder,
     filter_string: LargeStringBuilder,
     ion_injection_time: Float32Builder,
@@ -979,16 +1152,10 @@ impl VisitorBase for ScanBuilder {
         let mut fields = vec![
             field!("source_index", DataType::UInt64),
             field!("scan_index", DataType::UInt64),
-            field!(
-                "scan_start_time",
-                DataType::Float32
-            ),
+            field!("scan_start_time", DataType::Float64),
             field!("preset_scan_configuration", DataType::UInt32),
             field!("filter_string", DataType::LargeUtf8),
-            field!(
-                "ion_injection_time",
-                DataType::Float32
-            ),
+            field!("ion_injection_time", DataType::Float32),
             field!("ion_mobility_value", DataType::Float64),
             field!("ion_mobility_type", self.ion_mobility_type.as_struct_type()),
             field!("instrument_configuration_id", DataType::UInt32),
@@ -1069,7 +1236,7 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
         let (si, sci, item) = item;
         self.source_index.append_value(*si);
         self.scan_index.append_value(*sci);
-        self.scan_start_time.append_value(item.start_time as f32);
+        self.scan_start_time.append_value(item.start_time);
         self.preset_scan_configuration.append_option(
             item.scan_configuration()
                 .map(|i| i.to_u64().unwrap() as u32),
@@ -1217,7 +1384,14 @@ impl ArrayBuilder for IsolationWindowBuilder {
 impl StructVisitor<mzdata::spectrum::IsolationWindow> for IsolationWindowBuilder {
     fn append_value(&mut self, item: &mzdata::spectrum::IsolationWindow) -> bool {
         match item.flags {
-            mzdata::spectrum::IsolationWindowState::Unknown => {
+            // `NoIsolation` (mzdata 0.66.7): all ions were fragmented on purpose. Written as nulls,
+            // the same arm as `Unknown` and what upstream mzpeak_prototyping `1505fce` does. This is
+            // the compile-time placeholder for the mzdata bump: no lane sets the flag yet (all set
+            // `Complete`), so the arm is unreachable today. The designed behaviour — keep the
+            // acquisition range as target/offsets and append MS:1003159 "no isolation" — is a
+            // BACKLOG.md item that changes archive output and the mzML round trip; it is not this.
+            mzdata::spectrum::IsolationWindowState::Unknown
+            | mzdata::spectrum::IsolationWindowState::NoIsolation => {
                 self.lower_bound.append_null();
                 self.upper_bound.append_null();
                 self.target.append_null();
@@ -1296,11 +1470,103 @@ impl VisitorBase for IsolationWindowBuilder {
     }
 }
 
+#[derive(Debug)]
+pub struct DissociationMethodBuilder(CustomBuilderFromParameterDerived);
+
+impl Default for DissociationMethodBuilder {
+    fn default() -> Self {
+        Self(
+            CustomBuilderFromParameterDerived::from_spec(curie!(MS:1000044), "dissociation method")
+                .with_field_name("dissociation_method"),
+        )
+    }
+}
+
+impl ArrayBuilder for DissociationMethodBuilder {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        self.0.finish()
+    }
+
+    fn finish_cloned(&self) -> ArrayRef {
+        self.0.finish_cloned()
+    }
+
+    anyways!();
+}
+
+impl StructVisitor<mzdata::spectrum::Activation> for DissociationMethodBuilder {
+    fn append_value(&mut self, item: &mzdata::spectrum::Activation) -> bool {
+        if item.methods().is_empty() {
+            self.append_null();
+            return false;
+        }
+        // Ensure supplemental methods come after regular methods
+        else if item.methods().len() > 1 {
+            let mut methods = item.methods().to_vec();
+            methods.sort_by_key(|v| {
+                matches!(
+                    v,
+                    DissociationMethodTerm::SupplementalBeamTypeCollisionInducedDissociation
+                        | DissociationMethodTerm::SupplementalCollisionInducedDissociation
+                )
+            });
+            let buf: Vec<Param> = methods.into_iter().map(|v| v.to_param().into()).collect();
+            return self.0.append_value(&buf);
+        } else {
+            let buf: Vec<Param> = vec![item.method().unwrap().to_param().into()];
+            return self.0.append_value(&buf);
+        }
+    }
+
+    fn associated_curie_to_skip(&self) -> Option<CURIE> {
+        <CustomBuilderFromParameterDerived as StructVisitor<mzdata::spectrum::Activation>>::associated_curie_to_skip(&self.0)
+    }
+}
+
+impl VisitorBase for DissociationMethodBuilder {
+    fn flatten(&self) -> bool {
+        <CustomBuilderFromParameterDerived as VisitorBase>::flatten(&self.0)
+    }
+
+    fn fields(&self) -> Vec<FieldRef> {
+        <CustomBuilderFromParameterDerived as VisitorBase>::fields(&self.0)
+    }
+
+    fn append_null(&mut self) {
+        <CustomBuilderFromParameterDerived as VisitorBase>::append_null(&mut self.0)
+    }
+
+    fn map_metadata_columns(&self) -> Vec<MetadataColumn> {
+        <CustomBuilderFromParameterDerived as VisitorBase>::map_metadata_columns(&self.0)
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct ActivationBuilder {
     parameters: ParamListBuilder,
+    dissociation_method: DissociationMethodBuilder,
+    energy: Float32Builder,
     extra: Vec<Box<dyn StructVisitorBuilder<mzdata::spectrum::Activation>>>,
     curies_to_mask: Vec<CURIE>,
+    buffer: Vec<mzdata::Param>,
+}
+
+impl ActivationBuilder {
+    pub fn supplemental_collision_energy_visitor()
+    -> Box<dyn StructVisitorBuilder<mzdata::spectrum::Activation>> {
+        Box::new(
+            CustomBuilderFromParameter::from_spec(
+                curie!(MS:1002680),
+                "supplemental collision energy",
+                DataType::Float32,
+            )
+            .with_unit_fixed(Unit::Electronvolt.to_curie()),
+        )
+    }
 }
 
 impl ArrayBuilder for ActivationBuilder {
@@ -1312,7 +1578,11 @@ impl ArrayBuilder for ActivationBuilder {
 
     fn finish(&mut self) -> ArrayRef {
         let fields = self.fields();
-        let mut arrays = vec![self.parameters.finish()];
+        let mut arrays = vec![
+            self.dissociation_method.finish(),
+            Arc::new(self.energy.finish()),
+            self.parameters.finish(),
+        ];
 
         for e in self.extra.iter_mut() {
             arrays.push(e.finish());
@@ -1322,7 +1592,11 @@ impl ArrayBuilder for ActivationBuilder {
 
     fn finish_cloned(&self) -> ArrayRef {
         let fields = self.fields();
-        let mut arrays = vec![self.parameters.finish_cloned()];
+        let mut arrays = vec![
+            self.dissociation_method.finish_cloned(),
+            Arc::new(self.energy.finish_cloned()),
+            self.parameters.finish_cloned(),
+        ];
 
         for e in self.extra.iter() {
             arrays.push(e.finish_cloned());
@@ -1333,26 +1607,22 @@ impl ArrayBuilder for ActivationBuilder {
 
 impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
     fn append_value(&mut self, item: &mzdata::spectrum::Activation) -> bool {
-        let params = self.parameters.as_mut().values();
-        for method in item.methods() {
-            let par: mzdata::Param = method.to_param().into();
-            params.append_value(&par);
-        }
-
+        self.dissociation_method.append_value(item);
         // Only when the source actually declared one. `Activation::energy` is a plain f32 that
-        // DEFAULTS to 0.0, so emitting unconditionally stamped `MS:1000045 = 0.0 eV` onto every MS2
-        // of every file that reports no collision energy — a fabricated measurement indistinguishable
-        // from a real one. 0 eV is not a meaningful dissociation energy, so absent and zero are
-        // treated alike, as they already are for `peak_intensity` and `ion_injection_time`.
-        let energy = (item.energy != 0.0).then(|| {
-            mzdata::Param::builder()
-                .name("collision energy")
-                .curie(mzdata::curie!(MS:1000045))
-                .value(item.energy)
-                .unit(Unit::Electronvolt)
-                .build()
-        });
+        // DEFAULTS to 0.0, so writing it unconditionally stamped `0.0 eV` onto every MS2 of every
+        // file that reports no collision energy — a fabricated measurement indistinguishable from a
+        // real one. 0 eV is not a meaningful dissociation energy: absent and zero are treated alike,
+        // as they already are for `peak_intensity` and `ion_injection_time`.
+        if item.energy != 0.0 {
+            self.energy.append_value(item.energy);
+        } else {
+            self.energy.append_null();
+        }
+        self.curies_to_mask
+            .extend(self.dissociation_method.associated_curie_to_skip());
 
+        self.buffer
+            .extend(item.methods().iter().map(|v| Param::from(v.to_param())));
         for e in self.extra.iter_mut() {
             if e.append_value(item) {
                 self.curies_to_mask.extend(e.associated_curie_to_skip());
@@ -1360,7 +1630,7 @@ impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
         }
 
         self.parameters
-            .append_iter(item.params().iter().chain(energy.iter()).filter(|p| {
+            .append_iter(item.params().iter().chain(self.buffer.iter()).filter(|p| {
                 if let Some(c) = p.curie() {
                     !self.curies_to_mask.contains(&c)
                 } else {
@@ -1368,13 +1638,20 @@ impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
                 }
             }));
         self.curies_to_mask.clear();
+        self.buffer.clear();
         true
     }
 }
 
 impl VisitorBase for ActivationBuilder {
     fn fields(&self) -> Vec<FieldRef> {
-        let mut fields = self.parameters.fields();
+        let mut fields = self.dissociation_method.fields();
+        fields.push(Arc::new(Field::new(
+            "collision_energy",
+            DataType::Float32,
+            true,
+        )));
+        fields.extend(self.parameters.fields());
         for e in self.extra.iter() {
             fields.extend(e.fields());
         }
@@ -1383,15 +1660,26 @@ impl VisitorBase for ActivationBuilder {
 
     fn append_null(&mut self) {
         self.parameters.append_null();
+        self.dissociation_method.append_null();
+        self.energy.append_null();
         self.extra.iter_mut().for_each(|e| e.append_null());
     }
 
     fn map_metadata_columns(&self) -> Vec<MetadataColumn> {
-        self.extra
+        let mut cols: Vec<MetadataColumn> = self
+            .extra
             .iter()
             .map(|e| e.map_metadata_columns())
             .flatten()
-            .collect()
+            .collect();
+        cols.extend(self.dissociation_method.map_metadata_columns());
+        cols.push(metacol!(
+            "collision energy",
+            ["collision_energy"],
+            mzdata::curie!(MS:1000045),
+            Unit::Electronvolt
+        ));
+        cols
     }
 }
 
@@ -1650,9 +1938,19 @@ impl VisitorBase for SelectedIonBuilder {
         let mut cols = Vec::new();
         let fields = self.fields();
         cols.extend([
-            metacol!("selected ion m/z", [fields[2].name()], curie!(MS:1000744), Unit::MZ),
+            metacol!(
+                "selected ion m/z",
+                [fields[2].name()],
+                curie!(MS:1000744),
+                Unit::MZ
+            ),
             metacol!("charge state", [fields[3].name()], curie!(MS:1000041)),
-            metacol!("intensity", [fields[4].name()], curie!(MS:1000042), Unit::DetectorCounts),
+            metacol!(
+                "intensity",
+                [fields[4].name()],
+                curie!(MS:1000042),
+                Unit::DetectorCounts
+            ),
         ]);
         for e in self.extra.iter() {
             cols.extend(e.map_metadata_columns());
@@ -1842,7 +2140,7 @@ impl VisitorBase for SpectrumVisitor {
 
     fn map_metadata_columns(&self) -> Vec<MetadataColumn> {
         match self {
-            Self::Description(builder) => builder.map_metadata_columns()
+            Self::Description(builder) => builder.map_metadata_columns(),
         }
     }
 }
@@ -1887,7 +2185,10 @@ impl VisitorBase for SpectrumDetailsBuilder {
             field!("ms_level", DataType::UInt8),
             field!("time", DataType::Float64),
             field!("scan_polarity", DataType::Int8),
-            field!("spectrum_representation", self.spectrum_representation.as_struct_type()),
+            field!(
+                "spectrum_representation",
+                self.spectrum_representation.as_struct_type()
+            ),
             field!("spectrum_type", self.spectrum_type.as_struct_type()),
             field!("lowest_observed_mz", DataType::Float64),
             field!("highest_observed_mz", DataType::Float64),
@@ -1958,15 +2259,50 @@ impl VisitorBase for SpectrumDetailsBuilder {
             // discoverable from the index at all.
             metacol!("scan start time", [fields[3].name()], curie!(MS:1000016), Unit::Minute),
             metacol!("scan polarity", [fields[4].name()], curie!(MS:1000465)),
-            metacol!("spectrum representation", [fields[5].name()], curie!(MS:1000525)),
-            metacol!("spectrum type", [fields[6].name()], curie!(MS:1000559)),
-            metacol!("lowest observed m/z", [fields[7].name()], curie!(MS:1000528), Unit::MZ),
-            metacol!("highest observed m/z", [fields[8].name()], curie!(MS:1000527), Unit::MZ),
-            metacol!("number of data points", [fields[9].name()], curie!(MS:1003060)),
+            metacol!(
+                "spectrum representation",
+                [fields[5].name()],
+                curie!(MS:1000525)
+            )
+            .with_term_marker(true),
+            metacol!("spectrum type", [fields[6].name()], curie!(MS:1000559))
+                .with_term_marker(true),
+            metacol!(
+                "lowest observed m/z",
+                [fields[7].name()],
+                curie!(MS:1000528),
+                Unit::MZ
+            ),
+            metacol!(
+                "highest observed m/z",
+                [fields[8].name()],
+                curie!(MS:1000527),
+                Unit::MZ
+            ),
+            metacol!(
+                "number of data points",
+                [fields[9].name()],
+                curie!(MS:1003060)
+            ),
             metacol!("number of peaks", [fields[10].name()], curie!(MS:1003059)),
-            metacol!("base peak m/z", [fields[11].name()], curie!(MS:1000504), Unit::MZ),
-            metacol!("base peak intensity", [fields[12].name()], curie!(MS:1000505), Unit::DetectorCounts),
-            metacol!("total ion current", [fields[13].name()], curie!(MS:1000285), Unit::DetectorCounts)
+            metacol!(
+                "base peak m/z",
+                [fields[11].name()],
+                curie!(MS:1000504),
+                Unit::MZ
+            ),
+            metacol!(
+                "base peak intensity",
+                [fields[12].name()],
+                curie!(MS:1000505),
+                Unit::DetectorCounts
+            ),
+            metacol!(
+                "total ion current",
+                [fields[13].name()],
+                curie!(MS:1000285),
+                Unit::DetectorCounts
+            ),
         ]);
         for e in self.extra.iter() {
             cols.extend(e.map_metadata_columns());
@@ -2353,18 +2689,26 @@ impl SpectrumBuilder {
         self.selected_ion.map_metadata_columns()
     }
 
+    /// Calls [`ArrayBuilder::finish`] on the `spectrum` facet, consuming the
+    /// accumulated arrays to build the table as a [`StructArray`].
     pub fn finish_spectrum(&mut self) -> ArrayRef {
         self.spectrum.finish()
     }
 
+    /// Calls [`ArrayBuilder::finish`] on the `scan` facet, consuming the
+    /// accumulated arrays to build the table as a [`StructArray`].
     pub fn finish_scan(&mut self) -> ArrayRef {
         self.scan.finish()
     }
 
+    /// Calls [`ArrayBuilder::finish`] on the `precursor` facet, consuming the
+    /// accumulated arrays to build the table as a [`StructArray`].
     pub fn finish_precursor(&mut self) -> ArrayRef {
         self.precursor.finish()
     }
 
+    /// Calls [`ArrayBuilder::finish`] on the `selected_ion` facet, consuming the
+    /// accumulated arrays to build the table as a [`StructArray`].
     pub fn finish_selected_ion(&mut self) -> ArrayRef {
         self.selected_ion.finish()
     }
@@ -2378,6 +2722,8 @@ impl SpectrumBuilder {
             .extend_extra_activation_fields(visitors.spectrum_activation_fields);
     }
 
+    /// Adds extra [`CustomBuilderFromParameter`] visitors to the `scan` facet that convert the `IMS:1000050|position x` and `IMS:1000051|position y`
+    /// [`Param`] into columns. If these parameters are not present, those columns will contain `null`s.
     pub fn add_imaging_position_visitors(&mut self) {
         let visitors: [Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>>; _] = [
             CustomBuilderFromParameter::from_spec(
@@ -2529,6 +2875,38 @@ impl SpectrumBuilder {
 
     pub fn selected_ion(&self) -> &SelectedIonBuilder {
         &self.selected_ion
+    }
+
+    /// Get a mutable reference to the builder of the `scan` facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn scan_mut(&mut self) -> &mut ScanBuilder {
+        &mut self.scan
+    }
+
+    /// Get a mutable reference to the builder of the `precursor` facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn precursor_mut(&mut self) -> &mut PrecursorBuilder {
+        &mut self.precursor
+    }
+
+    /// Get a mutable reference to the builder of the `selected_ion` facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn selected_ion_mut(&mut self) -> &mut SelectedIonBuilder {
+        &mut self.selected_ion
+    }
+
+    /// Get a mutable reference to the builder of the `spectrum` facet, the primary metadata.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn spectrum_mut(&mut self) -> &mut SpectrumDetailsBuilder {
+        &mut self.spectrum
     }
 }
 
@@ -2724,8 +3102,13 @@ impl VisitorBase for ChromatogramDetailsBuilder {
 
         cols.extend([
             metacol!("scan polarity", [fields[2].name()], curie!(MS:1000465)),
-            metacol!("chromatogram type", [fields[3].name()], curie!(MS:1000626)),
-            metacol!("number of data points", [fields[5].name()], curie!(MS:1003060)),
+            metacol!("chromatogram type", [fields[3].name()], curie!(MS:1000626))
+                .with_term_marker(true),
+            metacol!(
+                "number of data points",
+                [fields[5].name()],
+                curie!(MS:1003060)
+            ),
         ]);
         for e in self.extra.iter() {
             cols.extend(e.map_metadata_columns());
@@ -2837,7 +3220,6 @@ impl ChromatogramBuilder {
         self.selected_ion.finish()
     }
 
-
     pub fn precursor(&self) -> &PrecursorBuilder {
         &self.precursor
     }
@@ -2896,6 +3278,30 @@ impl ChromatogramBuilder {
         builder: Box<T>,
     ) {
         self.precursor.activation.extra.push(builder);
+    }
+
+    /// Get a mutable reference to the builder of the `chromatogram` facet, the primary metadata facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn chromatogram_mut(&mut self) -> &mut ChromatogramDetailsBuilder {
+        &mut self.chromatogram
+    }
+
+    /// Get a mutable reference to the builder of the `precursor` facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn precursor_mut(&mut self) -> &mut PrecursorBuilder {
+        &mut self.precursor
+    }
+
+    /// Get a mutable reference to the builder of the `selected_ion` facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn selected_ion_mut(&mut self) -> &mut SelectedIonBuilder {
+        &mut self.selected_ion
     }
 }
 
@@ -3126,32 +3532,17 @@ impl VisitorBase for WavelengthSpectrumDetailsBuilder {
             field!("index", DataType::UInt64),
             field!("id", DataType::LargeUtf8),
             field!("time", DataType::Float64),
-            field!(
-                "spectrum_type",
-                self.spectrum_type.as_struct_type()
-            ),
+            field!("spectrum_type", self.spectrum_type.as_struct_type()),
             field!(
                 "spectrum_representation",
                 self.spectrum_representation.as_struct_type()
             ),
             field!("lowest_observed_wavelength", DataType::Float64),
-            field!(
-                "highest_observed_wavelength",
-                DataType::Float64
-            ),
+            field!("highest_observed_wavelength", DataType::Float64),
             field!("number_of_data_points", DataType::UInt64),
-            field!(
-                "lambda_max",
-                DataType::Float64
-            ),
-            field!(
-                "base_peak_intensity",
-                DataType::Float32
-            ),
-            field!(
-                "total_ion_current",
-                DataType::Float32
-            ),
+            field!("lambda_max", DataType::Float64),
+            field!("base_peak_intensity", DataType::Float32),
+            field!("total_ion_current", DataType::Float32),
             field!("data_processing_id", DataType::LargeUtf8),
             field!(
                 "parameters",
@@ -3201,14 +3592,49 @@ impl VisitorBase for WavelengthSpectrumDetailsBuilder {
         let mut cols = Vec::new();
         let fields = self.fields();
         cols.extend([
-            metacol!("spectrum type", [fields[3].name()], curie!(MS:1000559)),
-            metacol!("spectrum representation", [fields[4].name()], curie!(MS:1000525)),
-            metacol!("lowest observed wavelength", [fields[5].name()], curie!(MS:1000619), Unit::Nanometer),
-            metacol!("highest observed wavelength", [fields[6].name()], curie!(MS:1000618), Unit::Nanometer),
-            metacol!("number of data points", [fields[7].name()], curie!(MS:1003060)),
-            metacol!("lambda max", [fields[8].name()], curie!(MS:1003812), Unit::Nanometer),
-            metacol!("base peak intensity", [fields[9].name()], curie!(MS:1000505), Unit::DetectorCounts),
-            metacol!("total ion current", [fields[10].name()], curie!(MS:1000285), Unit::DetectorCounts),
+            metacol!("spectrum type", [fields[3].name()], curie!(MS:1000559))
+                .with_term_marker(true),
+            metacol!(
+                "spectrum representation",
+                [fields[4].name()],
+                curie!(MS:1000525)
+            )
+            .with_term_marker(true),
+            metacol!(
+                "lowest observed wavelength",
+                [fields[5].name()],
+                curie!(MS:1000619),
+                Unit::Nanometer
+            ),
+            metacol!(
+                "highest observed wavelength",
+                [fields[6].name()],
+                curie!(MS:1000618),
+                Unit::Nanometer
+            ),
+            metacol!(
+                "number of data points",
+                [fields[7].name()],
+                curie!(MS:1003060)
+            ),
+            metacol!(
+                "lambda max",
+                [fields[8].name()],
+                curie!(MS:1003812),
+                Unit::Nanometer
+            ),
+            metacol!(
+                "base peak intensity",
+                [fields[9].name()],
+                curie!(MS:1000505),
+                Unit::DetectorCounts
+            ),
+            metacol!(
+                "total ion current",
+                [fields[10].name()],
+                curie!(MS:1000285),
+                Unit::DetectorCounts
+            ),
         ]);
 
         for e in self.extra.iter() {
@@ -3296,10 +3722,14 @@ impl WavelengthSpectrumBuilder {
         self.scan.map_metadata_columns()
     }
 
+    /// Calls [`ArrayBuilder::finish`] on the spectrum facet, consuming the
+    /// accumulated arrays to build the table as a [`StructArray`].
     pub fn finish_spectrum(&mut self) -> ArrayRef {
         self.spectrum.finish()
     }
 
+    /// Calls [`ArrayBuilder::finish`] on the scan facet, consuming the
+    /// accumulated arrays to build the table as a [`StructArray`].
     pub fn finish_scan(&mut self) -> ArrayRef {
         self.scan.finish()
     }
@@ -3376,6 +3806,22 @@ impl WavelengthSpectrumBuilder {
     pub fn scan(&self) -> &ScanBuilder {
         &self.scan
     }
+
+    /// Get a mutable reference to the builder of the `spectrum` facet, the primary metadata facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn spectrum_mut(&mut self) -> &mut WavelengthSpectrumDetailsBuilder {
+        &mut self.spectrum
+    }
+
+    /// Get a mutable reference to the builder of the `scan` facet.
+    ///
+    /// Care **must** be taken not to call the [`ArrayBuilder::finish`] method
+    /// while other facets are still being built.
+    pub fn scan_mut(&mut self) -> &mut ScanBuilder {
+        &mut self.scan
+    }
 }
 
 impl VisitorBase for WavelengthSpectrumBuilder {
@@ -3430,9 +3876,9 @@ mod test {
     use super::*;
     use arrow::{
         array::{Array, AsArray},
-        datatypes::Float64Type,
+        datatypes::{Float32Type, Float64Type},
     };
-    use mzdata::{self, spectrum::DataArray};
+    use mzdata::{self, meta::DissociationMethodTerm, spectrum::DataArray};
     use std::io;
 
     #[test]
@@ -3514,6 +3960,27 @@ mod test {
         builder.finish();
     }
 
+    #[test_log::test]
+    fn test_build_derived() -> io::Result<()> {
+        let mut reader = mzdata::MZReader::open_path("small.mzML")?;
+        let spec = reader.get_spectrum_by_index(2).unwrap();
+        let activation = spec.precursor().unwrap().activation();
+        let mut builder = ActivationBuilder::default();
+        builder.append_value(activation);
+        let dm_visitor = &builder.dissociation_method;
+        assert_eq!(dm_visitor.len(), 1);
+        let dat = builder.finish();
+        let dat = dat.as_struct();
+        let ce_col = dat.column(1).as_primitive::<Float32Type>();
+        assert_eq!(ce_col.value(0), activation.energy);
+        let dm_col = dat.column(0).as_string::<i32>();
+        let dm_curie_str = dm_col.value(0);
+        let dm_curie = dm_curie_str.parse::<CURIE>().unwrap();
+        let dm = DissociationMethodTerm::from_curie(&dm_curie).unwrap();
+        assert_eq!(dm, *activation.method().unwrap());
+        Ok(())
+    }
+
     #[test]
     fn test_build_spectra() -> io::Result<()> {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
@@ -3541,9 +4008,20 @@ mod test {
         );
 
         let meta_map = builder.spectrum.map_metadata_columns();
-        assert!(meta_map.iter().find(|v| v.name == "base_peak_mz_2").is_some());
+        assert!(
+            meta_map
+                .iter()
+                .find(|v| v.name == "base_peak_mz_2")
+                .is_some()
+        );
         // Match the main column plus the two addons, but not the unit column
-        assert_eq!(meta_map.iter().filter(|v| v.accession == Some(curie!(MS:1000504))).count(), 3);
+        assert_eq!(
+            meta_map
+                .iter()
+                .filter(|v| v.accession == Some(curie!(MS:1000504)))
+                .count(),
+            3
+        );
 
         builder.append_value(&spec, Default::default());
         builder.equalize_lengths();
@@ -3559,12 +4037,8 @@ mod test {
         assert!(names.contains(&"base_peak_mz_2_unit"));
         assert!(names.contains(&"base_peak_mz_3"));
 
-        let arr1 = arrays
-            .column_by_name("base_peak_mz")
-            .unwrap();
-        let arr2 = arrays
-            .column_by_name("base_peak_mz_3")
-            .unwrap();
+        let arr1 = arrays.column_by_name("base_peak_mz").unwrap();
+        let arr2 = arrays.column_by_name("base_peak_mz_3").unwrap();
         let arr1 = arr1.as_primitive::<Float64Type>();
         let arr2 = arr2.as_primitive::<Float64Type>();
 
@@ -3576,9 +4050,7 @@ mod test {
         // is read as a cvParam from the input.
         assert!(e < 1e-5, "{x1} - {x2} = {e} > 1e-5");
 
-        let arr3 = arrays
-            .column_by_name("base_peak_mz_2_unit")
-            .unwrap();
+        let arr3 = arrays.column_by_name("base_peak_mz_2_unit").unwrap();
         assert_eq!(arr3.len(), 2);
 
         Ok(())

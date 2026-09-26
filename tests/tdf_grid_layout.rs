@@ -1,15 +1,17 @@
 //! The grid layout of the timsTOF ims-compact chunked facet (`src/tdf_grid.rs`), on PXD059079 2485:
 //!
 //! * the facet has the reference implementation's columns, the array index declares the two
-//!   `chunk_transform` grid columns (`MS:1003826`), the index lists and bounds are byte-stream-split;
-//! * every frame decodes through the vendored reader to the SAME points as the 0.12.5 corpus
-//!   archive: intensities and point counts identical, m/z within 1e-6 ppm (the same vendor model in
-//!   the reference implementation's arithmetic), 1/K0 within 4 ulp (two forms of the same rational);
-//!   the stored TOF bins are identical integers;
+//!   `chunk_transform` grid columns (`MS:1003826`), the index lists and intensity are byte-stream-split;
+//! * every frame decodes through the vendored reader to the SAME points as the corpus archive
+//!   (0.12.5 TOF layout or 0.13.x grid layout — detected from its columns): intensities and point
+//!   counts identical, m/z within 1e-6 ppm (the same vendor model in the reference implementation's
+//!   arithmetic), 1/K0 within 4 ulp (two forms of the same rational); the stored TOF bins are
+//!   identical integers;
 //! * an m/z window query returns the filtered full read;
-//! * `--ims-grid` on the corpus archive writes a peaks facet byte-identical to the fresh conversion's.
+//! * `--ims-grid` on a 0.12.5 corpus archive writes a peaks facet byte-identical to the fresh conversion's
+//!   (skipped once the corpus archive is itself the grid layout).
 //!
-//! Corpus-gated: needs `2485.d` and its 0.12.5 archive.
+//! Corpus-gated: needs `2485.d` and its corpus archive.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +19,6 @@ use std::process::Command;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float64Type, Int32Type, UInt32Type, UInt64Type};
 use mzdata::mzpeaks::coordinate::SimpleInterval;
-use mzdata::prelude::*;
 use mzpeak_prototyping::MzPeakReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Encoding;
@@ -51,15 +52,16 @@ fn member(archive: &Path, name: &str) -> Vec<u8> {
     buf
 }
 
-/// (tof bins, intensities, 1/K0) of every point of `frame`, from the raw facet: the 0.12.5 layout
-/// (`tof_chunk_start` + cumsum of `tof_chunk_values`) or the grid layout (cumsum of
-/// `mz_grid.indices`, scans through the mobility model are checked by the reader test instead).
-fn raw_tof_bins(peaks: &[u8], grid: bool) -> Vec<(u64, Vec<u32>)> {
+/// The TOF bins of every point per frame, from the raw facet: the 0.12.5 layout (`tof_chunk_start`
+/// + cumsum of `tof_chunk_values`) or the grid layout (cumsum of `mz_grid.indices`; scans through
+/// the mobility model are checked by the reader test instead). The layout is detected per facet.
+fn raw_tof_bins(peaks: &[u8]) -> Vec<(u64, Vec<u32>)> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(peaks.to_vec())).unwrap().build().unwrap();
     let mut out: Vec<(u64, Vec<u32>)> = Vec::new();
     for batch in reader {
         let batch = batch.unwrap();
         let root = batch.column(0).as_struct();
+        let grid = root.column_by_name("tof_chunk_start").is_none();
         let si = root.column_by_name("spectrum_index").unwrap().as_primitive::<UInt64Type>();
         for r in 0..batch.num_rows() {
             let bins: Vec<u32> = if grid {
@@ -112,15 +114,15 @@ fn the_grid_layout_stores_the_same_points_as_the_tof_layout_and_reads_back() {
         let col = (0..rg.num_columns()).map(|i| rg.column(i)).find(|c| c.column_path().string() == path).unwrap_or_else(|| panic!("no column {path}"));
         col.encodings().collect::<Vec<Encoding>>()
     };
-    for p in ["chunk.mz_chunk_start", "chunk.mz_chunk_end", "chunk.intensity.list.item", "chunk.mz_grid.indices.list.item", "chunk.mean_inverse_reduced_ion_mobility_grid.indices.list.item"] {
+    for p in ["chunk.intensity.list.item", "chunk.mz_grid.indices.list.item", "chunk.mean_inverse_reduced_ion_mobility_grid.indices.list.item"] {
         assert!(enc(p).contains(&Encoding::BYTE_STREAM_SPLIT), "{p} is not byte-stream-split: {:?}", enc(p));
         assert!(!enc(p).contains(&Encoding::RLE_DICTIONARY), "{p} still dictionary-encoded");
     }
     assert!(enc("chunk.spectrum_index").contains(&Encoding::DELTA_BINARY_PACKED));
 
     // --- the stored TOF bins are the same integers ---
-    let old_bins = raw_tof_bins(&member(&old, "spectra_peaks.parquet"), false);
-    let new_bins = raw_tof_bins(&peaks, true);
+    let old_bins = raw_tof_bins(&member(&old, "spectra_peaks.parquet"));
+    let new_bins = raw_tof_bins(&peaks);
     assert_eq!(old_bins.len(), new_bins.len(), "frames with points");
     for ((fo, bo), (fn_, bn)) in old_bins.iter().zip(&new_bins) {
         assert_eq!(fo, fn_);
@@ -164,9 +166,13 @@ fn the_grid_layout_stores_the_same_points_as_the_tof_layout_and_reads_back() {
     assert!(want.len() > 1000);
     assert!(got == want, "range query: {} vs {} points", got.len(), want.len());
 
-    // --- the rewrite of the 0.12.5 archive is the same facet ---
-    let rewritten = dir.join("2485.rewrite.mzpeak");
-    convert(&old, &rewritten, &["--ims-grid"]);
-    assert!(member(&rewritten, "spectra_peaks.parquet") == peaks, "rewrite and fresh conversion differ");
+    // --- the rewrite of a 0.12.5 TOF-layout archive is the same facet (a grid-layout corpus
+    // archive has nothing to rewrite; the 0.12.x layout itself goes with vendoring-exit item 2) ---
+    let old_index: serde_json::Value = serde_json::from_slice(&member(&old, "mzpeak_index.json")).unwrap();
+    if old_index["metadata"]["ims_calibration"]["tof_encoding"] != "grid" {
+        let rewritten = dir.join("2485.rewrite.mzpeak");
+        convert(&old, &rewritten, &["--ims-grid"]);
+        assert!(member(&rewritten, "spectra_peaks.parquet") == peaks, "rewrite and fresh conversion differ");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
