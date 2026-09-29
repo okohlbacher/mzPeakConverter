@@ -386,10 +386,13 @@ impl From<mzdata::params::ControlledVocabulary> for ControlledVocabularyEntry {
                 "http://purl.obolibrary.org/obo/pride/releases/2026-06-01/pride.obo",
                 Some("2026-06-01"),
             ),
+            // Pinned to the commit, not `master`: the file changed in 2022 while still calling
+            // itself 1.1.0, so the branch URL names no fixed vocabulary (MS and UO are pinned to
+            // releases). DELIBERATE DEVIATION, to be proposed upstream. Commit 2c28b05, 2022-04-12.
             mzdata::params::ControlledVocabulary::IMS => ControlledVocabularyEntry::new(
                 "IMS",
                 "Imaging Mass Spectrometry Ontology",
-                "https://raw.githubusercontent.com/imzML/imzML/refs/heads/master/imagingMS.obo",
+                "https://raw.githubusercontent.com/imzML/imzML/2c28b05ca297430303627d8c7d192cac1a2b1374/imagingMS.obo",
                 Some("1.1.0"),
             ),
             // The converter represents its provisional MZP terms as `Unknown`-CV CURIEs (see
