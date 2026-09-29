@@ -76,6 +76,7 @@ mod embed_aux;
 mod filter;
 mod encoding_prescan;
 mod vendor_sqlite;
+mod imaging;
 mod mzml_isolation;
 mod mzml_wavelength;
 mod pwiz_id;
@@ -4092,12 +4093,53 @@ fn convert_file(
     if is_imzml {
         log::info!("imzML input: adding imaging position columns + IMS cv");
         writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
+        // Position z only when the file states one: a column of nulls on every other archive.
+        if probes.iter().any(|s| s.acquisition().scans.iter().any(|sc| sc.get_param_by_curie(&curie!(IMS:1000052)).is_some())) {
+            writer.spectrum_entry_buffer_mut().add_imaging_position_z_visitor();
+        }
         writer
             .controlled_vocabularies_mut()
             .push(ControlledVocabulary::IMS.into());
     }
 
     writer.copy_metadata_from(&reader);
+    // imzML: put back the file provenance mzdata consumes, check the pixel size, and write the
+    // obsolete scan term "one way" as flyback — each change declared (`imaging`).
+    let mut imaging_applied: Vec<&'static str> = Vec::new();
+    let mut imaging_block: Option<serde_json::Value> = None;
+    if let MZReaderType::IMzML(r) = &reader {
+        writer.file_description_mut().contents.extend(imaging::provenance_params(&r.imzml_metadata));
+        let fixes = imaging::read_scan_settings(read_path).map(|s| imaging::pixel_size_fixes(&s)).unwrap_or_else(|e| {
+            log::warn!("imzML pixel-size check skipped: {e:#}");
+            Vec::new()
+        });
+        let mut fixes = fixes;
+        if let Some(list) = writer.scan_settings_mut() {
+            for settings in list.iter_mut() {
+                if let Some(f) = fixes.iter_mut().find(|f| f.settings_id == settings.id) {
+                    imaging::apply(f, settings);
+                    if imaging::check_written_units(f, settings) {
+                        imaging_applied.push(imaging::UNIT_FROM_NAME);
+                    }
+                }
+                if imaging::one_way_to_flyback(settings) {
+                    imaging_applied.push(imaging::ONE_WAY_AS_FLYBACK);
+                }
+            }
+        }
+        for f in &fixes {
+            for m in f.unit_mismatches.iter().chain(&f.written_units) {
+                log::warn!("imzML scan settings {}: {m}", f.settings_id);
+            }
+            if let Some(t) = f.transformation {
+                log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
+                imaging_applied.push(t);
+            }
+        }
+        if !fixes.is_empty() {
+            imaging_block = Some(fixes.iter().map(imaging::fix_json).collect());
+        }
+    }
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
     }
@@ -4214,8 +4256,12 @@ fn convert_file(
         .into_iter()
         .chain(acquisition_block)
         .chain(route)
+        .chain(imaging_block.map(|b| ("imaging_pixel_size".to_string(), b)))
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
+            for t in &imaging_applied {
+                declare(&mut applied, *t);
+            }
             if resorted {
                 declare(&mut applied, "sort-by-mz");
             }
@@ -11247,5 +11293,87 @@ mod tests {
             fs::metadata(&input).unwrap().len(),
             fs::metadata(&out).unwrap().len()
         );
+    }
+
+    /// The imzML lane (HUPO-PSI/mzPeak-specification#23): the file provenance mzdata consumes comes
+    /// back into `file_description`, the pixel-size rule acts and declares what it did, "one way" is
+    /// written as flyback, and a stated position z gets its column. Variants of one synthetic 3×3
+    /// grid (100 µm pixels over 300 µm; `tests/fixtures/imaging`, from the mzML2mzPeak generator).
+    #[test]
+    fn imzml_imaging_metadata_is_checked_and_restored() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        let px = r#"<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size x" value="100.0" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#;
+        let py = r#"<cvParam cvRef="IMS" accession="IMS:1000047" name="pixel size y" value="100.0" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#;
+        assert!(base.contains(px) && base.contains(py));
+        let dir = scratch("imzml-imaging");
+        let convert = |name: &str, imzml: String| -> serde_json::Value {
+            std::fs::write(dir.join(format!("{name}.imzML")), imzml).unwrap();
+            std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[dir.join(format!("{name}.imzML")).as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            index_metadata(&out)
+        };
+        let param = |settings: &serde_json::Value, acc: &str| -> Option<serde_json::Value> {
+            settings["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == acc).cloned()
+        };
+        let declared = |m: &serde_json::Value, entry: &str| -> bool {
+            m["transformations"].to_string().contains(entry)
+        };
+
+        // As found: provenance restored, pixel sizes untouched, nothing declared.
+        let m = convert("asis", base.clone());
+        let contents: Vec<String> = m["file_description"]["contents"].as_array().unwrap().iter().map(|p| p["accession"].as_str().unwrap().to_string()).collect();
+        for acc in ["IMS:1000031", "IMS:1000080", "IMS:1000091"] {
+            assert!(contents.contains(&acc.to_string()), "{acc} missing from file_description: {contents:?}");
+        }
+        let sha = m["file_description"]["contents"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000091").unwrap();
+        assert_eq!(sha["value"], "fd5c5dae18095ba7ab55a6ad1bd1175180b292a8");
+        let s = &m["scan_settings_list"][0];
+        assert_eq!(param(s, "IMS:1000046").unwrap()["value"], 100.0);
+        assert!(m.get("imaging_pixel_size").is_none(), "{:#}", m["imaging_pixel_size"]);
+
+        // x and y without a unit: micrometre, declared.
+        let strip = |l: &str| l.replace(r#" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer""#, "");
+        let m = convert("nounit", base.replace(px, &strip(px)).replace(py, &strip(py)));
+        let s = &m["scan_settings_list"][0];
+        assert_eq!(param(s, "IMS:1000046").unwrap()["unit"], "UO:0000017");
+        assert!(declared(&m, super::imaging::UNIT_ASSUMED), "{:#}", m["transformations"]);
+        assert_eq!(m["imaging_pixel_size"][0]["case"], "x and y without a unit: micrometre assumed");
+
+        // One value that is an area (10000 µm²: √ × 3 = 300): its square root, declared.
+        let area = r#"<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size" value="10000"/>"#;
+        let m = convert("area", base.replace(px, area).replace(py, ""));
+        let s = &m["scan_settings_list"][0];
+        assert_eq!(param(s, "IMS:1000046").unwrap()["value"], 100.0);
+        assert_eq!(param(s, "IMS:1000046").unwrap()["unit"], "UO:0000017");
+        assert!(declared(&m, super::imaging::AREA_TO_LENGTH));
+
+        // The centimetre accession labelled micrometer: reported, not rewritten.
+        let cm = |l: &str| l.replace("UO:0000017", "UO:0000015");
+        let m = convert("cm", base.replace(px, &cm(px)).replace(py, &cm(py)));
+        // mzdata takes the unit from whichever attribute comes last (here the name): the archive
+        // says which unit it wrote, and declares that it is not the stated accession.
+        assert_eq!(m["imaging_pixel_size"][0]["unit_mismatches"].as_array().unwrap().len(), 2, "{:#}", m["imaging_pixel_size"]);
+        let written = param(&m["scan_settings_list"][0], "IMS:1000046").unwrap()["unit"].clone();
+        assert!(m["imaging_pixel_size"][0]["written_units"].to_string().contains(&format!("written {}", written.as_str().unwrap())), "{:#}", m["imaging_pixel_size"]);
+        assert_eq!(declared(&m, super::imaging::UNIT_FROM_NAME), written != "UO:0000015");
+
+        // "one way" becomes flyback; a stated position z gets a column.
+        let one_way = base
+            .replace(px, &format!(r#"{px}<cvParam cvRef="IMS" accession="IMS:1000411" name="one way"/>"#))
+            .replace(r#"name="position y" value="1"/>"#, r#"name="position y" value="1"/><cvParam cvRef="IMS" accession="IMS:1000052" name="position z" value="7"/>"#);
+        let m = convert("oneway", one_way);
+        let s = &m["scan_settings_list"][0];
+        assert!(param(s, "IMS:1000411").is_none() && param(s, "IMS:1000413").is_some(), "{s:#}");
+        assert!(declared(&m, super::imaging::ONE_WAY_AS_FLYBACK));
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(dir.join("oneway.mzpeak")).unwrap()).unwrap();
+        let mut scans = Vec::new();
+        zip.by_name("spectra_metadata_scans.parquet").unwrap().read_to_end(&mut scans).unwrap();
+        let pf = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(scans)).unwrap();
+        let schema: Vec<String> = parquet::file::reader::FileReader::metadata(&pf).file_metadata().schema_descr().columns().iter().map(|c| c.path().string()).collect();
+        assert!(schema.iter().any(|c| c.contains("IMS_1000052")), "no position z column: {schema:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

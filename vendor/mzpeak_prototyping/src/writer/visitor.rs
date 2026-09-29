@@ -2741,6 +2741,17 @@ impl SpectrumBuilder {
         self.scan.extend_extra_fields(visitors);
     }
 
+    /// Position z (`IMS:1000052`), for imaging inputs that state one. DELIBERATE DEVIATION (not
+    /// upstream): a separate call so archives without a z coordinate get no column of nulls.
+    pub fn add_imaging_position_z_visitor(&mut self) {
+        let z: Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>> = Box::new(CustomBuilderFromParameter::from_spec(
+            mzdata::curie!(IMS:1000052),
+            "position z",
+            DataType::UInt32,
+        ));
+        self.scan.extend_extra_fields([z]);
+    }
+
     pub fn append_value<
         C: CentroidLike,
         D: DeconvolutedCentroidLike,
