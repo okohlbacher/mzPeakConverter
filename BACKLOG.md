@@ -14,6 +14,15 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   imzML input converts correctly; imaging converted straight from Bruker or Waters raw files loses its
   pixel coordinates, so the image cannot be rebuilt. Re-run the handoff's two imzML conversions on
   v0.15.0 first. Work that does not wait on the specification, in order:
+
+  **Status 2026-09-30, branch `feat/imaging-support` (unreleased, not pushed):** DONE — Bruker positions on
+  the TSF lane and every TDF lane (synthetic tests + a tagged copy of 2485.d; no real MALDI run yet),
+  item 2 (immutable SQLite opens; timsrust/mzdata read-write opens remain, upstream), item 3 (pixel-size
+  rule + unit mismatch report), item 4 (IMS pinned to `imzML/imzML@2c28b05`), item 5 (provenance), item 6
+  (flyback), position z, README/USER_MANUAL. OPEN — Waters positions (laser x/y in mm → fitted grid; needs
+  the MassLynx call and a Waters imaging `.raw` on the box); the `.mis` raster step instead of the beam
+  scan size; Bruker `max count`/`max dimension` scan settings (need the coordinate base); a real MALDI `.d`
+  from the issue author; the spec decisions and the issue replies below.
   1. **Pixel coordinates for vendor input** (highest). Only the imzML path writes
      `opt_IMS_1000050_position_x`/`_y`; the Bruker TSF/TDF and Waters lanes write none. Confirmed by the
      issue author on v0.14.0: a 33,800-pixel timsTOF MALDI acquisition (TSF) converted with every

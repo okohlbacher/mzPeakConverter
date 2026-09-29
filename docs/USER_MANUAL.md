@@ -329,9 +329,9 @@ take effect because settings are resolved before logging is initialised.
 | Format | Linux | macOS | Windows | Notes |
 |---|:---:|:---:|:---:|---|
 | mzML, `.mzML.gz` | ✅ | ✅ | ✅ | full metadata + chromatograms; gzip detected by magic, decompressed to a temp copy |
-| imzML | ✅ | ✅ | ✅ | imaging coordinate columns; IMS CV promoted |
-| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default** |
-| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; otofControl m/z correction |
+| imzML | ✅ | ✅ | ✅ | imaging coordinate columns; IMS CV promoted; pixel size checked and file provenance kept (§8) |
+| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default**; MALDI imaging positions (§8) |
+| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; otofControl m/z correction; MALDI imaging positions (§8) |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; needs `libbaf2sql_c` at runtime |
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | net48 `AgilentGlueHost.exe` (§11) → MHDAC, since 0.11.0; **MRM/SIM-only runs are refused** — they are transition chromatograms, use `--via-msconvert` for them |
@@ -481,6 +481,24 @@ zero flanks are 44–46 % of the stored points on the corpus HDMSe runs, and a f
 MassLynx returns only flank zeros plus two sentinels per bin, so a mask that keeps peak boundaries
 would save nothing, and dropping every zero could not be undone. Spectra are in acquisition-time
 order across functions.
+
+**Imaging.** imzML input keeps its positions (`IMS:1000050/51`, and `IMS:1000052` when the file
+states a z coordinate) as `opt_IMS_*_position_*` columns of `spectra_metadata_scans`, and its scan
+settings, with three checks since the release after 0.15.0 (HUPO-PSI/mzPeak-specification#23):
+the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
+checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
+issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; a single value
+is an area when `√value × count = extent` and written as its square root, a length when
+`value × count = extent`, and otherwise dropped), each action declared and listed in the
+`imaging_pixel_size` index block together with any unit accession that disagrees with its unit name;
+and the obsolete "one way" is written as flyback. A **Bruker MALDI** `.d` (TSF or TDF, every timsTOF
+lane) now carries the same position columns: `MaldiFrameInfo.XIndexPos/YIndexPos` per frame, **as
+stored** — absolute raster indices on the target, not shifted to start at 1, because the mzPeak
+coordinate base is still an open specification decision. The `bruker_maldi` index block holds the
+regions (`RegionNumber`), index ranges and beam scan size; the pixel size is the beam scan size,
+declared as such, since the FlexImaging `.mis` with the raster step is not part of the `.d`. Waters
+imaging runs carry no positions yet. Vendor SQLite databases are opened immutable, so a conversion
+writes nothing into the `.d` (a read-only open of a WAL-mode MALDI TSF used to leave `-shm`/`-wal`).
 
 **Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
 of consecutive spectra spread over the run, up to 64 spectra or 2 M points each) is written once per
@@ -709,6 +727,12 @@ The vocabulary:
 | `sciex:nan-intensity-to-zero` | the glue mapped at least one NaN intensity Clearcore2 returned to 0 (counted per spectrum; a warning gives the total) | native SciEX `.wiff` |
 | `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
+| `imzml:pixel-size-unit-assumed-um` | an imzML pixel size stated without a unit was taken as micrometre (§8, imaging) | imzML |
+| `imzml:pixel-size-area-to-length` | a single imzML pixel size tested as an area (`√value × count = extent`) and was written as its square root, in micrometre | imzML |
+| `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
+| `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata keeps whichever attribute comes last) | imzML |
+| `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
+| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step (the `.mis` is not part of the `.d`) | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |

@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change (imaging).** Bruker MALDI runs gain pixel positions; imzML archives gain their file
+provenance in `file_description` and, where the header needed it, a checked pixel size. The IMS
+vocabulary entry names a pinned commit.
+
+### Added
+
+- **Bruker MALDI imaging positions** (HUPO-PSI/mzPeak-specification#23). A timsTOF fleX run converted
+  straight from the `.d` had no pixel positions, so the image could not be rebuilt. `MaldiFrameInfo`
+  (`XIndexPos`, `YIndexPos`) now becomes the same `IMS:1000050/51` position columns the imzML path
+  writes, on the TSF lane and every TDF lane (ims-compact native and SDK, `--no-ims-compact`), with the
+  IMS vocabulary. Indices are written as stored — absolute on the target, not shifted to 1 — since the
+  coordinate base is an open specification decision. A `bruker_maldi` index block keeps regions, index
+  ranges and beam scan size; the beam scan size is written as the pixel size and declared
+  (`bruker:pixel-size-from-beam-scan-size`), as the `.mis` raster step is not part of the `.d`.
+- **imzML pixel-size check** by the issue author's rule: x and y with a unit are kept; without a unit,
+  micrometre is assumed; a single value is an area when `√value × count = extent` (its square root is
+  written) and a length when `value × count = extent`; anything else is dropped. Every action is a
+  `transformations` entry (`imzml:pixel-size-unit-assumed-um`, `-area-to-length`, `-dropped`) and a row
+  of the new `imaging_pixel_size` index block, which also reports unit accessions that disagree with
+  their unit names (`imzml:unit-accession-replaced-by-name` when the unit written is not the stated
+  accession).
+- imzML position z (`IMS:1000052`) gets a column when the file states one.
+
+### Fixed
+
+- **A conversion wrote into the raw data folder.** A read-only SQLite open of a WAL-mode database — a
+  Bruker MALDI `analysis.tsf` — created `analysis.tsf-shm` / `-wal` beside it and left them there.
+  Every vendor database is now opened with `immutable=1`; a `-wal` the acquisition software left
+  non-empty is still read through. (timsrust 0.4.1 and mzdata's second TDF connection still open the
+  TDF read-write; not covered.)
+- **imzML file provenance was dropped.** Storage mode (`IMS:1000030/31`), UUID (`IMS:1000080`) and the
+  `.ibd` checksum (`IMS:1000090/91/92`) are consumed by mzdata and never reached `file_description`;
+  they are written back.
+- The obsolete imzML scan term "one way" (`IMS:1000411`) is written as flyback (`IMS:1000413`), its
+  stated replacement, and declared (`imzml:one-way-as-flyback`).
+
+### Changed
+
+- The IMS vocabulary entry points at `imzML/imzML@2c28b05` instead of `master`, which changed in 2022
+  while still calling itself 1.1.0.
+
 ## [0.15.0] — 2026-09-29
 
 **Output change (native Waters lane).** Each data-facet column is written under the encoding a
