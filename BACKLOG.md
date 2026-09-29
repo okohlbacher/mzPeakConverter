@@ -7,6 +7,32 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Current issues, ranked, with evidence and status:** the *mzPeakConverter Review Ledger*
   (claude.ai artifact, §8 "Measures" carries a Status column: *done* / *open*). Its source is kept
   at `scratchpad/review2/review-ledger.html` in the maintainer's session; ask for the link.
+- **NEXT — update the imaging support (added 2026-09-29).** Handoff from the specification session
+  after HUPO-PSI/mzPeak-specification issue #23:
+  `/Users/kohlbach/Claude/mzPeak-spec-new/local_docs/handoff-mzpeakconverter-imaging-2026-09-29.md`.
+  Its findings came from a 2026-09-22 binary; re-run its two imzML conversions on v0.15.0 first. Items,
+  in its order:
+  1. **Pixel coordinates for vendor input** (highest priority). Only the imzML path writes
+     `opt_IMS_1000050_position_x`/`_y` (`src/main.rs`, imzML branch); the Bruker TSF/TDF and Waters
+     lanes write none, so a MALDI imaging run converted straight from `.d` or `.raw` has no pixels —
+     the gap behind the public statement that raw input no longer needs imzML. Bruker: per-frame
+     positions in `MaldiFrameInfo` (expected `XIndexPos`, `YIndexPos`, `RegionNumber`, `SpotName`;
+     confirm on a real acquisition). Waters: stage positions in mm → integer pixel indices. The corpus
+     has no TSF/MALDI acquisition: ask the issue author, who offered data. Done when a Bruker MALDI
+     `.d` gives the same position columns and `scan_settings_list` as the imzML path.
+  2. **Pin the IMS vocabulary to a commit**: the vendored writer registers `imagingMS.obo` by its
+     `master` URL at version `1.1.0`, which changed in 2022 without a version bump (upstream too).
+  3. **Check pixel size instead of copying it**: warn on `IMS:1000046`/`1000047` without a unit or
+     with unit accession and name disagreeing; the pre-2017 area meaning needs a rule — wait for the
+     issue author's answer. Never rewrite silently.
+  4. **Keep imzML provenance** (storage mode `IMS:1000031`, UUID `IMS:1000080`, `.ibd` checksum
+     `IMS:1000091`) in `file_description`, optional; today they are dropped.
+  5. Smaller: write position z (`IMS:1000052`); drop the `opt_` prefix once the spec defines the
+     columns; decide with the spec whether every imaging archive gets `metadata.imaging` (today only
+     with `--image`); README and USER_MANUAL must say the vendor lanes carry no coordinates until 1.
+  6. Blocked on the issue author: the obsolete "one way" scan term; acquisition regions and order.
+  Not a converter bug: the empty `metadata`/`cv_list` on imzML input belongs to the example converter
+  in `HUPO-PSI/mzPeak`; correct the statement on the issue.
 - **What is open** (2026-09-11): precursors on the BAF and Agilent lanes (neither has an MSn
   acquisition to verify against, here or in the corpus); device chromatograms beyond Bruker; the
   "no isolation" marker, which waits on mzdata 0.66.7; a shared `.NET` host for the four glue lanes
