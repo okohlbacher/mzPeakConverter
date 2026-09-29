@@ -224,6 +224,23 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   PR #18 the msconvert lanes refuse a multi-sample WIFF without `--sample`, so the box fallback, which
   passes none, now fails on `En_PPY.wiff`; which of its samples to republish, each as its own
   archive, is D4 and still open.
+- **Surfaced by the 0.15.0 corpus rebuild (2026-09-29).** 194 of 200 archives rebuilt; logs in
+  `~/Claude/mzPeak/output/corpus-rebuild-0.15.0/`. (1) **The timsTOF grid facet encodes serially on
+  big runs.** PXD076703 (10 GB `tdf_bin`) took about 2 h 20 min on the host on one core: a row group of
+  8192 chunks is larger than the parallel encoder's in-flight budget (`max(256 MB, threads × 48 MB)`),
+  and `InFlight::acquire` (`writer/mini_peak.rs`) admits an oversized group only when nothing else is
+  in flight, so one worker compresses at zstd 22 while fifteen idle. Cap row groups by bytes, or let
+  one oversized group share the budget. (2) **Box jobs hang forever when ssh stdin does not arrive.**
+  From the host's network of that night (UTC+8) every job's JSON piped to `box_convert_remote.ps1`
+  never reached `[Console]::In.ReadToEnd()`; the gateway closes the session after ~3 min and `run_job`
+  has no watchdog, so the run stalls (scp and plain ssh commands still worked). Ship the job spec by
+  scp and add the per-job watchdog. (3) `run_pool` waits on the OLDEST job (`wait "${pids[0]}"`), so
+  one long unit keeps the other box slots idle. (4) Two SciEX SWATH runs (PXD071869 `08_SWATH_1E_1H`,
+  PXD053710 Exposome zSWATH) failed natively under three parallel box jobs and shipped as msconvert
+  fallbacks; retry them with `--box-jobs 1`. (5) The six units not delivered — Shimadzu Blind and HEK,
+  SciEX Sample002, MRM_03 and Ozaki SWATH, Waters PXD077098 (its 7.1 GB 0.15.0 archive waits in the
+  box's `bxc-hold`) — keep their 0.13.0 archives until a box run from a working network. (6) The
+  worktree has no `tools/box.env` (gitignored): export the main checkout's before `--box`.
 - **Surfaced by the 0.11.3 corpus rebuild (2026-09-09).** (1) The box relay returns archives through
   one presigned S3 PUT, capped at 5 GB: PXD077098's Waters TWIMS run (15.4 GB `.raw`) now writes a
   9.04 GB frame archive (it was 2.1 GB as drift-summed scans) and was delivered by hand (direct scp
