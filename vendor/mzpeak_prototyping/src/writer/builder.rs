@@ -30,6 +30,35 @@ pub struct WriteBatchConfig {
     pub page_size: Option<usize>,
     pub row_group_size: Option<usize>,
     pub dictionary_page_size: Option<usize>,
+    /// Per-role encoding overrides for the spectrum data facets, applied after the writer's own
+    /// rules. DELIBERATE DEVIATION, and the `WriterProperties` hook proposed upstream: the
+    /// converter's encoding pre-scan measures which encoding each column compresses best under.
+    pub data_encodings: DataColumnEncodings,
+}
+
+/// How one spectrum data-facet column is encoded when the writer's own rule is overridden.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColumnEncoding {
+    /// Keep the writer's rule for this column.
+    #[default]
+    Writer,
+    /// Dictionary encoding, PLAIN when the dictionary overflows.
+    Dictionary,
+    /// `BYTE_STREAM_SPLIT`, dictionary off.
+    ByteStreamSplit,
+    /// `PLAIN`, dictionary off.
+    Plain,
+}
+
+/// [`ColumnEncoding`] overrides by column role, for the spectrum data and peak facets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DataColumnEncodings {
+    /// The chunked m/z values (`*mz_chunk_values`).
+    pub mz_values: ColumnEncoding,
+    /// The intensity array.
+    pub intensity: ColumnEncoding,
+    /// Every ion-mobility array column.
+    pub ion_mobility: ColumnEncoding,
 }
 
 pub struct SpectrumFieldVisitors {
@@ -270,6 +299,13 @@ impl MzPeakWriterBuilder {
 
     pub fn dictionary_page_size(mut self, value: Option<usize>) -> Self {
         self.write_batch_config.dictionary_page_size = value;
+        self
+    }
+
+    /// Override the encoding of the spectrum data facets' m/z values, intensity and ion-mobility
+    /// columns (see [`DataColumnEncodings`]).
+    pub fn data_column_encodings(mut self, value: DataColumnEncodings) -> Self {
+        self.write_batch_config.data_encodings = value;
         self
     }
 

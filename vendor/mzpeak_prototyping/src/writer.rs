@@ -62,7 +62,7 @@ pub use array_buffer::{
     SignalTally,
 };
 pub use base::AbstractMzPeakWriter;
-pub use builder::{ArrayConversionHelper, MzPeakWriterBuilder, WriteBatchConfig};
+pub use builder::{ArrayConversionHelper, ColumnEncoding, DataColumnEncodings, MzPeakWriterBuilder, WriteBatchConfig};
 pub use split::UnpackedMzPeakWriterType;
 
 pub use visitor::{

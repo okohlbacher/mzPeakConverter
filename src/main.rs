@@ -74,6 +74,7 @@ mod shimadzu_meta;
 mod vendor;
 mod embed_aux;
 mod filter;
+mod encoding_prescan;
 mod mzml_isolation;
 mod mzml_wavelength;
 mod pwiz_id;
@@ -97,7 +98,8 @@ use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
 use mzpeak_prototyping::archive::ZipArchiveWriter;
 use mzpeak_prototyping::chunk_series::ChunkingStrategy;
 use mzpeak_prototyping::writer::{
-    AbstractMzPeakWriter, CustomBuilderFromParameter, MzPeakWriterType,
+    AbstractMzPeakWriter, CustomBuilderFromParameter, DataColumnEncodings, MzPeakWriterBuilder,
+    MzPeakWriterType,
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
@@ -6529,6 +6531,9 @@ fn convert_waters(
     // (`waters.rs`): the reader counts the frames that sort moved, and `sort-by-mz` is declared from
     // that count over the written spectra. Readers get the run's drift table + CCS calibration.
     hints.counters.push(("sort-by-mz", reader.reorder_counter()));
+    // Each data-facet column under the encoding a sample of the run compresses best under
+    // (`encoding_prescan`); `MZPC_ENCODING_PRESCAN=0` keeps the writer's fixed encodings.
+    hints.encoding_prescan = env_flag("MZPC_ENCODING_PRESCAN").unwrap_or(true);
     if let Some(block) = reader.drift_block() {
         hints.index_blocks.push(("waters_drift".to_string(), block));
         // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
@@ -6611,6 +6616,10 @@ struct VendorHints {
     /// native Waters reader: a frame's drift bins interleave); `waters:sonar-summed` for the scans the
     /// Waters reader read as a SONAR function's quadrupole bins summed.
     counters: Vec<(&'static str, std::sync::Arc<std::sync::atomic::AtomicUsize>)>,
+    /// Run the encoding pre-scan ([`encoding_prescan`]) before writing: each data-facet column is
+    /// written under the encoding a sample of the run compressed best under. The Waters lane sets
+    /// it; `MZPC_ENCODING_PRESCAN=0` turns it off.
+    encoding_prescan: bool,
 }
 
 /// One spectrum from a vendor reader, with its routing outcome for the run summary. Every reader
@@ -6721,11 +6730,12 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         counters,
         chromatograms,
         source_file_params,
+        encoding_prescan,
     } = hints;
+    let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
-    let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let level = ZstdLevel::try_new(zstd_level)
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
     // Derive the data-facet schema from a few REAL sample spectra, CHUNK-AWARELY. The writer chunks
@@ -6751,57 +6761,120 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         }
     }
     // Pick delta-vs-numpress from the actual m/z values in the probes, not from the extension.
-    let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
+    let mut chunk = refine_chunking(&sample_mz_from(&probes), chunk);
+    let len = max_spectra().map_or(len, |m| m.min(len));
+    // The encoding pre-scan: a sample written once per arm, each column's smallest arm kept. Only
+    // for the delta/numpress chunked layout; a grid facet already stores its own integer axis.
+    let mut prescan: Option<(encoding_prescan::Trial, encoding_prescan::IntensityArm, serde_json::Value)> = None;
+    let chunk_width = match chunk {
+        Some(ChunkingStrategy::NumpressLinear { chunk_size } | ChunkingStrategy::Delta { chunk_size }) => Some(chunk_size),
+        _ => None,
+    };
+    if let Some(width) = chunk_width.filter(|_| encoding_prescan && data_grid.is_none() && peak_grid.is_none()) {
+        let numpress = matches!(chunk, Some(ChunkingStrategy::NumpressLinear { .. }));
+        let sample = prescan_sample(len, &mut spectrum);
+        if !sample.is_empty() {
+            let started = std::time::Instant::now();
+            let int32 = sample.iter().chain(&probes).all(encoding_prescan::intensities_fit_int32);
+            let arms = encoding_prescan::Arms::new(numpress, int32);
+            let mut results = Vec::new();
+            for (k, trial) in arms.trials().into_iter().enumerate() {
+                let measured = prescan_trial(&sample, &probes, trial, width, level, keep_zero_runs, output, k)
+                    .with_context(|| format!("encoding pre-scan trial {k}"))?;
+                results.push((trial, measured));
+            }
+            let chosen = encoding_prescan::choose(&results);
+            let points: usize = sample.iter().map(point_count).sum();
+            let has_mobility = results.iter().any(|(_, m)| m.ion_mobility > 0);
+            log::info!(
+                "encoding pre-scan ({} spectra, {points} points, {} trials, {:.1} s): m/z {}; intensity {}{}",
+                sample.len(),
+                results.len(),
+                started.elapsed().as_secs_f64(),
+                encoding_prescan::mz_label(chosen.mz),
+                encoding_prescan::intensity_label(chosen.intensity),
+                if has_mobility {
+                    format!("; ion mobility {}", encoding_prescan::encoding_label(chosen.ion_mobility))
+                } else {
+                    String::new()
+                },
+            );
+            chunk = Some(prescan_chunk(chosen.mz, width));
+            let block = encoding_prescan::block(&results, chosen, sample.len(), points, has_mobility, int32);
+            prescan = Some((chosen, encoding_prescan::best_float_intensity(&results), block));
+        }
+    }
     // A facet under a grid policy takes the reference implementation's chunk grid: one chunk per
     // spectrum for the profile facet (the model is per spectrum), its 50-Th default for the peaks.
     let grid_chunk = |width| Some(ChunkingStrategy::Grid { chunk_size: width, grid: None });
     let data_chunk = if data_grid.is_some() { grid_chunk(GRID_CHUNK_TH) } else { chunk.clone() };
     let peaks_chunk = if peak_grid.is_some() { grid_chunk(GRID_PEAK_CHUNK_TH) } else { chunk };
-    let mut builder = MzPeakWriterType::<fs::File>::builder()
-        .chunked_encoding(data_chunk)
-        .peaks_chunked_encoding(peaks_chunk)
-        // Float m/z of a point facet (a grid facet's f64 minority, the lattice's f64 fallback):
-        // BYTE_STREAM_SPLIT, no dictionary. Chunk facets are unaffected.
-        .shuffle_mz(true)
-        // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
-        // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
-        // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
-        // intensity array into an uncompressed `auxiliary_arrays` blob in chromatograms_metadata —
-        // losing the time axis outright. 99 of 330 reference archives are affected. A chromatogram
-        // is a few thousand points; chunking bought nothing.
-        .chromatogram_chunked_encoding(None)
-        .buffer_size(buffer_spectra())
-        .compression(Compression::ZSTD(level))
-        // Both facets need their schema sampled: the data facet from the probes, and — when the
-        // peak facet is chunked — the peak facet too, or its buffer declares scalar columns while
-        // the chunked writer hands it list-typed ones.
-        .sample_array_types_from_spectra(probes.clone().into_iter())
-        .sample_array_types_for_peaks_from_spectra(probes.into_iter());
-    if let Some(policies) = data_grid {
-        builder = builder.add_grid_policies(policies);
-    }
-    if let Some(policies) = peak_grid {
-        builder = builder.add_peak_grid_policies(policies);
-    }
-    let mut writer = builder.build(handle, !keep_zero_runs);
-    add_processing_metadata(&mut writer);
-    // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band.
-    if is_tdf_dir(input) {
-        ensure_mzp_cv(&mut writer);
-    }
-    let mut ms1 = Ms1Chroms::default();
-    let len = max_spectra().map_or(len, |m| m.min(len));
-    // Count here, over the written spectra: the probe fetches above went through the same
-    // closure and must not show up in the run totals.
-    let mut tally = FacetTally::default();
-    let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
-    for i in 0..len {
-        let VendorSpectrum { spectrum: spec, routes } = spectrum(i)?.into();
-        tally.record(routes);
-        if synth_chroms {
-            ms1.observe(&spec);
+    // Written once — or twice, when the pre-scan chose int32 intensities and a spectrum then carries
+    // one int32 cannot hold exactly: that run is discarded and rewritten with the best float arm.
+    let mut int32_fallback: Option<usize> = None;
+    let (mut writer, ms1, tally, counted_before) = 'attempt: loop {
+        let trial = prescan.as_ref().map(|(t, _, _)| *t);
+        let int32 = trial.is_some_and(|t| t.intensity.int32);
+        let mut schema_probes = probes.clone();
+        if int32 {
+            schema_probes.iter_mut().for_each(|s| {
+                encoding_prescan::intensity_to_int32(s);
+            });
         }
-        writer.write_spectrum(&spec)?;
+        let handle = fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let encodings = trial.map_or(DataColumnEncodings::default(), |t| t.encodings());
+        let mut builder = vendor_writer_builder(data_chunk.clone(), peaks_chunk.clone(), level, &schema_probes, encodings);
+        if let Some(policies) = data_grid.take() {
+            builder = builder.add_grid_policies(policies);
+        }
+        if let Some(policies) = peak_grid.take() {
+            builder = builder.add_peak_grid_policies(policies);
+        }
+        let mut writer = builder.build(handle, !keep_zero_runs);
+        add_processing_metadata(&mut writer);
+        // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band.
+        if is_tdf_dir(input) {
+            ensure_mzp_cv(&mut writer);
+        }
+        let mut ms1 = Ms1Chroms::default();
+        // Count here, over the written spectra: the probe and sample fetches above went through
+        // the same closure and must not show up in the run totals.
+        let mut tally = FacetTally::default();
+        let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        for i in 0..len {
+            let VendorSpectrum { spectrum: mut spec, routes } = spectrum(i)?.into();
+            if int32 && !encoding_prescan::intensity_to_int32(&mut spec) {
+                let (chosen, fallback, _) = prescan.as_mut().expect("int32 comes from the pre-scan");
+                log::warn!(
+                    "encoding pre-scan: spectrum {i} ({}) carries an intensity int32 cannot hold \
+                     exactly; writing the run again with {} intensities",
+                    spec.id(),
+                    encoding_prescan::intensity_label(*fallback),
+                );
+                chosen.intensity = *fallback;
+                int32_fallback = Some(i);
+                drop(writer);
+                continue 'attempt;
+            }
+            tally.record(routes);
+            if synth_chroms {
+                ms1.observe(&spec);
+            }
+            writer.write_spectrum(&spec)?;
+        }
+        break (writer, ms1, tally, counted_before);
+    };
+    if let Some((chosen, _, mut block)) = prescan {
+        if let Some(i) = int32_fallback {
+            let label = encoding_prescan::intensity_label(chosen.intensity);
+            block["chosen"]["intensity"] = label.clone().into();
+            block["int32_fallback"] = serde_json::json!({
+                "spectrum_index": i,
+                "reason": "an intensity that is not an integer in int32 range",
+                "intensity": label,
+            });
+        }
+        index_blocks.push(("encoding_prescan".to_string(), block));
     }
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, chromatograms.into_iter(), synth_chroms)?;
     if let Some(hex) = source_sha1 {
@@ -6861,6 +6934,133 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // No aux: `--image`/`--sdrf` are refused on the native vendor lanes (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)?;
     Ok(tally)
+}
+
+/// The archive writer every custom vendor reader writes through (grid policies aside). The
+/// encoding pre-scan's trial writes use the same builder, so they measure what the run will write.
+fn vendor_writer_builder(
+    data_chunk: Option<ChunkingStrategy>,
+    peaks_chunk: Option<ChunkingStrategy>,
+    level: ZstdLevel,
+    probes: &[MultiLayerSpectrum],
+    encodings: DataColumnEncodings,
+) -> MzPeakWriterBuilder {
+    MzPeakWriterType::<fs::File>::builder()
+        .chunked_encoding(data_chunk)
+        .peaks_chunked_encoding(peaks_chunk)
+        // Float m/z of a point facet (a grid facet's f64 minority, the lattice's f64 fallback):
+        // BYTE_STREAM_SPLIT, no dictionary. Chunk facets are unaffected.
+        .shuffle_mz(true)
+        // ponytail: chromatograms are POINT layout, never chunked. Passing the spectrum strategy
+        // here produced a `chunk` struct with no chunk_start/chunk_end columns, so the chunk builder
+        // saw an empty main axis, wrote 0 time and 0 intensity points, and spilled the whole
+        // intensity array into an uncompressed `auxiliary_arrays` blob in chromatograms_metadata —
+        // losing the time axis outright. 99 of 330 reference archives are affected. A chromatogram
+        // is a few thousand points; chunking bought nothing.
+        .chromatogram_chunked_encoding(None)
+        .buffer_size(buffer_spectra())
+        .compression(Compression::ZSTD(level))
+        // Both facets need their schema sampled: the data facet from the probes, and — when the
+        // peak facet is chunked — the peak facet too, or its buffer declares scalar columns while
+        // the chunked writer hands it list-typed ones.
+        .sample_array_types_from_spectra(probes.to_vec().into_iter())
+        .sample_array_types_for_peaks_from_spectra(probes.to_vec().into_iter())
+        .data_column_encodings(encodings)
+}
+
+/// Points in a spectrum's raw arrays (0 without them).
+fn point_count(spec: &MultiLayerSpectrum) -> usize {
+    spec.raw_arrays().and_then(|a| a.mzs().ok()).map_or(0, |m| m.len())
+}
+
+/// The spectra the encoding pre-scan writes: four stretches of consecutive spectra spread over the
+/// run, each up to 64 spectra or 2 M points. Consecutive, because the writer's row groups are
+/// consecutive spectra and dictionaries and zstd windows work within them.
+fn prescan_sample<S: Into<VendorSpectrum>>(
+    len: usize,
+    spectrum: &mut impl FnMut(usize) -> Result<S>,
+) -> Vec<MultiLayerSpectrum> {
+    const BLOCKS: usize = 4;
+    const MAX_SPECTRA: usize = 64;
+    const MAX_POINTS: usize = 2_000_000;
+    let mut sample = Vec::new();
+    for b in 0..BLOCKS {
+        let (start, next) = (b * len / BLOCKS, (b + 1) * len / BLOCKS);
+        let mut points = 0;
+        for i in start..next.min(start + MAX_SPECTRA) {
+            // A spectrum the reader cannot return is the write loop's error to report, not ours.
+            let Ok(s) = spectrum(i) else { continue };
+            let s = s.into().spectrum;
+            points += point_count(&s);
+            sample.push(s);
+            if points >= MAX_POINTS {
+                break;
+            }
+        }
+    }
+    sample
+}
+
+/// The chunking strategy an m/z arm writes with.
+fn prescan_chunk(arm: encoding_prescan::MzArm, chunk_size: f64) -> ChunkingStrategy {
+    match arm {
+        encoding_prescan::MzArm::Numpress => ChunkingStrategy::NumpressLinear { chunk_size },
+        encoding_prescan::MzArm::Delta(_) => ChunkingStrategy::Delta { chunk_size },
+    }
+}
+
+/// Write the pre-scan sample under one trial's arms to a scratch archive beside `output` and
+/// return each column group's compressed bytes. The scratch file is removed on return.
+fn prescan_trial(
+    sample: &[MultiLayerSpectrum],
+    probes: &[MultiLayerSpectrum],
+    trial: encoding_prescan::Trial,
+    chunk_size: f64,
+    level: ZstdLevel,
+    keep_zero_runs: bool,
+    output: &Path,
+    k: usize,
+) -> Result<encoding_prescan::Measured> {
+    let convert = |spectra: &[MultiLayerSpectrum]| -> Vec<MultiLayerSpectrum> {
+        let mut spectra = spectra.to_vec();
+        if trial.intensity.int32 {
+            spectra.iter_mut().for_each(|s| {
+                encoding_prescan::intensity_to_int32(s);
+            });
+        }
+        spectra
+    };
+    let path = output.with_extension(format!("mzpeak.prescan{k}.tmp"));
+    let _guard = TmpGuard::new(&path);
+    let handle = fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    let chunk = Some(prescan_chunk(trial.mz, chunk_size));
+    let mut writer = vendor_writer_builder(chunk.clone(), chunk, level, &convert(probes), trial.encodings())
+        .build(handle, !keep_zero_runs);
+    for spec in convert(sample) {
+        writer.write_spectrum(&spec)?;
+    }
+    writer.finish_parquet()?.finish().map_err(|e| anyhow!("finalizing the pre-scan archive: {e}"))?;
+    facet_column_bytes(&path)
+}
+
+/// Compressed bytes of the spectrum data and peak facets of an archive, by column group.
+fn facet_column_bytes(archive: &Path) -> Result<encoding_prescan::Measured> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let mut zip = zip::ZipArchive::new(fs::File::open(archive)?)?;
+    let mut measured = encoding_prescan::Measured::default();
+    for name in ["spectra_data.parquet", "spectra_peaks.parquet"] {
+        let Ok(mut entry) = zip.by_name(name) else { continue };
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf)?;
+        drop(entry);
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buf))?;
+        for rg in reader.metadata().row_groups() {
+            for c in rg.columns() {
+                measured.add(&c.column_path().string(), c.compressed_size() as u64);
+            }
+        }
+    }
+    Ok(measured)
 }
 
 /// Convert a Bruker TSF `.d` (line spectra) → mzPeak. Like [`convert_file`] but the reader is the
@@ -10891,5 +11091,164 @@ mod tests {
             "the TOF-grid finisher must embed the SDRF; members: {members:?}"
         );
         assert!(md.get("sample_metadata").is_some(), "and write its index block");
+    }
+
+    /// A Waters-like HDMSe frame: `bins` drift bins sharing one float32 m/z axis of `axis` values,
+    /// points sorted by m/z then drift time, whole-number intensities (about half of them zero)
+    /// and a per-point drift time, as `waters::WatersReader` hands a frame over.
+    fn waters_like_frame(index: usize, axis: usize, bins: usize) -> MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> {
+        let mut seed = (index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut next = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as u32
+        };
+        let (mut mz, mut intensity, mut drift) = (Vec::new(), Vec::new(), Vec::new());
+        for k in 0..axis {
+            let m = ((20.0 + k as f64 * 0.01).powi(2) as f32) as f64;
+            for b in 0..bins {
+                if next() % 3 == 0 {
+                    mz.push(m);
+                    intensity.push(if next() % 2 == 0 { 0.0 } else { (next() % 5000) as f32 });
+                    drift.push(b as f32 * 0.03925);
+                }
+            }
+        }
+        let mut spec = spec_from(&mz, &intensity, index);
+        let mut im = DataArray::wrap(&ArrayType::RawIonMobilityArray, BinaryDataArrayType::Float32, Vec::new());
+        im.update_buffer(&drift).unwrap();
+        im.unit = mzdata::params::Unit::Millisecond;
+        spec.arrays.as_mut().unwrap().add(im);
+        spec.description_mut().id = format!("function=1 process=0 scan={}", index + 1);
+        spec
+    }
+
+    /// The bytes an `encoding_prescan` block measured for the arm it chose in `column`.
+    fn chosen_bytes(block: &serde_json::Value, column: &str) -> (u64, u64) {
+        let measured = block["measured_bytes"][column].as_object().unwrap();
+        let chosen = block["chosen"][column].as_str().unwrap();
+        let min = measured.values().map(|v| v.as_u64().unwrap()).min().unwrap();
+        (measured[chosen].as_u64().unwrap_or_else(|| panic!("{chosen} not measured: {block:#}")), min)
+    }
+
+    /// The pre-scan writes a sample once per arm and keeps each column's smallest arm; whatever it
+    /// chooses, every m/z, intensity and drift time reads back as written.
+    #[test]
+    fn encoding_prescan_keeps_each_columns_smallest_arm_and_the_values() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+        use mzpeak_prototyping::MzPeakReader;
+
+        let dir = scratch("prescan");
+        let out = dir.join("frames.mzpeak");
+        const LEN: usize = 12;
+        let frame = |i| waters_like_frame(i, 400, 50);
+        let hints = VendorHints { encoding_prescan: true, keep_zero_runs: true, ..VendorHints::default() };
+        let numpress = Some(super::ChunkingStrategy::NumpressLinear { chunk_size: 50.0 });
+        convert_vendor_reader_tallied(&dir, &out, numpress, 3, None, false, hints, LEN, |i| Ok(frame(i))).unwrap();
+
+        let block = index_metadata(&out)["encoding_prescan"].clone();
+        assert_eq!(block["measured_bytes"]["mz"].as_object().unwrap().len(), 4, "{block:#}");
+        assert_eq!(block["measured_bytes"]["intensity"].as_object().unwrap().len(), 4, "{block:#}");
+        assert_eq!(block["measured_bytes"]["ion_mobility"].as_object().unwrap().len(), 3, "{block:#}");
+        assert_eq!(block["int32_intensity_eligible"], true);
+        for column in ["mz", "intensity", "ion_mobility"] {
+            let (chosen, min) = chosen_bytes(&block, column);
+            assert_eq!(chosen, min, "{column}: the chosen arm is the smallest: {block:#}");
+        }
+        assert!(!dir.read_dir().unwrap().any(|e| e.unwrap().file_name().to_string_lossy().contains("prescan")), "trial archives are removed");
+
+        let lossless = block["chosen"]["mz"].as_str().unwrap().starts_with("delta");
+        let int32 = block["chosen"]["intensity"].as_str().unwrap().starts_with("int32");
+        let mut r = MzPeakReader::new(&out).unwrap();
+        for i in 0..LEN {
+            let want = frame(i);
+            let got = r.get_spectrum(i).unwrap();
+            let (w, g) = (want.arrays.as_ref().unwrap(), got.arrays.as_ref().unwrap());
+            let (wm, gm) = (w.mzs().unwrap(), g.mzs().unwrap());
+            assert_eq!(wm.len(), gm.len(), "spectrum {i}");
+            if lossless {
+                assert_eq!(wm.to_vec(), gm.to_vec(), "spectrum {i}: delta m/z is exact");
+            } else {
+                assert!(wm.iter().zip(gm.iter()).all(|(a, b)| (a - b).abs() < 1e-4), "spectrum {i}");
+            }
+            assert_eq!(w.intensities().unwrap().to_vec(), g.intensities().unwrap().to_vec(), "spectrum {i}");
+            let im = |a: &BinaryArrayMap| a.get(&ArrayType::RawIonMobilityArray).unwrap().to_f32().unwrap().to_vec();
+            assert_eq!(im(w), im(g), "spectrum {i}");
+            let dtype = g.get(&ArrayType::IntensityArray).unwrap().dtype;
+            assert_eq!(dtype == BinaryDataArrayType::Int32, int32, "spectrum {i}: intensity stored as chosen");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// int32 intensities are chosen from a sample; a later spectrum the sample did not see carries
+    /// 1.5. The run is written again with the best float arm, and every value survives.
+    #[test]
+    fn encoding_prescan_rewrites_with_float_intensities_when_int32_does_not_hold() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+        use mzpeak_prototyping::MzPeakReader;
+
+        let dir = scratch("prescan-fallback");
+        let out = dir.join("scans.mzpeak");
+        // 300 spectra: the sample takes up to 64 from each quarter (0–63, 75–138, …) and the probes
+        // every 50th, so spectrum 70 is seen by neither.
+        const LEN: usize = 300;
+        const ODD: usize = 70;
+        let scan = |i: usize| {
+            let mz: Vec<f64> = (0..400).map(|k| ((20.0 + k as f64 * 0.01).powi(2) as f32) as f64).collect();
+            let intensity: Vec<f32> = (0..400)
+                .map(|k| if i == ODD && k == 7 { 1.5 } else { (((i * 7919 + k * 104_729) % 20_011) * 97) as f32 })
+                .collect();
+            spec_from(&mz, &intensity, i)
+        };
+        let hints = VendorHints { encoding_prescan: true, ..VendorHints::default() };
+        let delta = Some(super::ChunkingStrategy::Delta { chunk_size: 50.0 });
+        convert_vendor_reader_tallied(&dir, &out, delta, 3, None, false, hints, LEN, |i| Ok(scan(i))).unwrap();
+
+        let block = index_metadata(&out)["encoding_prescan"].clone();
+        assert_eq!(block["int32_intensity_eligible"], true, "{block:#}");
+        assert!(block["measured_bytes"]["intensity"].as_object().unwrap().keys().all(|k| !k.contains("numpress")));
+        assert_eq!(block["int32_fallback"]["spectrum_index"], ODD, "the pre-scan chose int32, then met spectrum {ODD}: {block:#}");
+        assert!(block["chosen"]["intensity"].as_str().unwrap().starts_with("float32"), "{block:#}");
+        assert!(!block["measured_bytes"]["mz"].as_object().unwrap().contains_key("numpress-linear"), "--no-numpress keeps numpress out");
+
+        let mut r = MzPeakReader::new(&out).unwrap();
+        for i in 0..LEN {
+            let got = r.get_spectrum(i).unwrap();
+            let g = got.arrays.as_ref().unwrap();
+            assert_eq!(g.get(&ArrayType::IntensityArray).unwrap().dtype, BinaryDataArrayType::Float32);
+            assert_eq!(scan(i).arrays.as_ref().unwrap().intensities().unwrap().to_vec(), g.intensities().unwrap().to_vec(), "spectrum {i}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replay an archive's spectra through the vendor writer with the encoding pre-scan on, as the
+    /// native Waters lane runs it (zero runs kept, zstd 3, numpress requested): real data for the
+    /// pre-scan where the Windows-only lane cannot run. The input must hold the reader's exact
+    /// values (a `--no-numpress` build). Prints the `encoding_prescan` block and the sizes.
+    /// `MZPC_PRESCAN_REPLAY=<in.mzpeak> MZPC_PRESCAN_OUT=<out.mzpeak> cargo test --release
+    /// --bin mzpeak-convert encoding_prescan_replay -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn encoding_prescan_replay() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+        use mzpeak_prototyping::MzPeakReader;
+
+        let input = std::path::PathBuf::from(std::env::var("MZPC_PRESCAN_REPLAY").expect("MZPC_PRESCAN_REPLAY"));
+        let out = std::path::PathBuf::from(std::env::var("MZPC_PRESCAN_OUT").expect("MZPC_PRESCAN_OUT"));
+        let mut r = MzPeakReader::new(&input).unwrap();
+        let len = r.len();
+        let hints = VendorHints { encoding_prescan: true, keep_zero_runs: true, ..VendorHints::default() };
+        let numpress = Some(super::ChunkingStrategy::NumpressLinear { chunk_size: 50.0 });
+        let started = std::time::Instant::now();
+        convert_vendor_reader_tallied(&input, &out, numpress, 3, None, false, hints, len, |i| {
+            r.get_spectrum(i).ok_or_else(|| anyhow::anyhow!("spectrum {i} unreadable"))
+        })
+        .unwrap();
+        println!("{:#}", index_metadata(&out)["encoding_prescan"]);
+        println!(
+            "{len} spectra in {:.0} s: {} -> {} bytes",
+            started.elapsed().as_secs_f64(),
+            fs::metadata(&input).unwrap().len(),
+            fs::metadata(&out).unwrap().len()
+        );
     }
 }

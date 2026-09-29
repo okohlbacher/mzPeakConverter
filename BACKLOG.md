@@ -420,6 +420,11 @@ SHA512 file-index checksums and term markers arrive with upstream) → corpus re
    published corpus; each must land upstream or archives change on the switch. Largest movers: the
    BSS/dictionary-off encoding policy (measured: upstream's DELTA intent would be +21 % on the grid
    facet) and the row-group sizing (item 4). Also to decide once: parquet 57 (upstream) vs 59 (ours).
+   Since the Waters encoding pre-scan (0.15.0), the policy is also overridable per column role
+   (`DataColumnEncodings` in `WriteBatchConfig`): the same `WriterProperties` hook proposed to Joshua,
+   so landing it upstream removes that deviation and the pre-scan could serve every lane. Measured
+   on PXD063409 CK1 (2.1 G points, replayed from the lossless build): 3.78 GB against 4.86 GB with the
+   fixed encodings, every point identical.
 
 Also found on the way, to report upstream: single-point chunks get `chunk_end = 0.0` (in Joshua's own file;
 invisible to his range predicate); the Python reader still has the pre-#34 parameter order; mzdata 0.67.1's
