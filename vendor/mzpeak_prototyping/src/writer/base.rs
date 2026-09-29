@@ -38,7 +38,7 @@ use crate::{
     spectrum::AuxiliaryArray,
     writer::{
         ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChromatogramBuilder,
-        MiniPeakWriterType, SpectrumBuilder, WavelengthSpectrumBuilder, WriteBatchConfig,
+        MiniPeakWriterType, SpectrumBuilder, WavelengthSpectrumBuilder, WriteBatchConfig, ColumnEncoding,
     },
 };
 
@@ -1628,6 +1628,26 @@ pub trait AbstractMzPeakWriter {
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
             }
+            // The caller's per-role overrides win over every rule above.
+            let overrides = write_batch_config.data_encodings;
+            let role = if c.name() == "intensity" || colpath.ends_with("intensity.list.item") {
+                overrides.intensity
+            } else if colpath.contains("ion_mobility") {
+                overrides.ion_mobility
+            } else if colpath.ends_with("mz_chunk_values.list.item") {
+                overrides.mz_values
+            } else {
+                ColumnEncoding::Writer
+            };
+            let (dictionary, encoding) = match role {
+                ColumnEncoding::Writer => continue,
+                ColumnEncoding::Dictionary => (true, Encoding::PLAIN),
+                ColumnEncoding::ByteStreamSplit => (false, Encoding::BYTE_STREAM_SPLIT),
+                ColumnEncoding::Plain => (false, Encoding::PLAIN),
+            };
+            data_props = data_props
+                .set_column_dictionary_enabled(c.path().clone(), dictionary)
+                .set_column_encoding(c.path().clone(), encoding);
         }
 
         if let Some(encryption_props) = encryption_properties {

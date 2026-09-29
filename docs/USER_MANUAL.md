@@ -480,7 +480,27 @@ zero flanks are 44–46 % of the stored points on the corpus HDMSe runs, and a f
 3.2× the drift-summed one earlier releases wrote (Capan2 166 → 531 MB, PXD077098 2.1 → 9.0 GB).
 MassLynx returns only flank zeros plus two sentinels per bin, so a mask that keeps peak boundaries
 would save nothing, and dropping every zero could not be undone. Spectra are in acquisition-time
-order across functions. The scan
+order across functions.
+
+**Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
+of consecutive spectra spread over the run, up to 64 spectra or 2 M points each) is written once per
+trial through the same writer, each trial trying another encoding for every data-facet column, and
+each column keeps the arm whose compressed bytes came out smallest (a tie keeps the writer default):
+
+| column | arms |
+|---|---|
+| m/z | lossless delta chunks under dictionary, byte-stream split or plain encoding; numpress-linear unless `--no-numpress` |
+| intensity | float32 under byte-stream split or dictionary; the same values as int32 (MS:1000519) under either, when every sampled intensity is an integer in int32 range |
+| ion mobility | dictionary, byte-stream split or plain |
+
+The `encoding_prescan` index block states the sample size, every arm's bytes and the choice. Parquet
+records its encoding per page, so any reader reads every arm; int32 intensities are the vendor's
+values unchanged. If a spectrum the sample did not see carries an intensity int32 cannot hold, the
+run is written again with the smallest float32 arm and the block says so (`int32_fallback`).
+Measured on PXD063409 `20181112_HDMSE_CK1` (2.1 G points) before this lane had it: numpress m/z
+2.02 GB against 1.45 GB lossless delta, float32 byte-stream-split intensity 1.60 GB against 1.08 GB as
+int32, and float ion mobility under byte-stream split 3.3× its dictionary size. `MZPC_ENCODING_PRESCAN=0`
+(§10) keeps the fixed encodings. The scan
 row's `ion_mobility_value` stays NULL on purpose: a frame has no single drift time. Retention time,
 polarity, scan window, the MS level (from the function-type code: product-ion types are MS2, the
 second function of an MSe pair is MS2, every other MS function — lock mass, auxiliary — is MS1) and
@@ -919,6 +939,7 @@ instead.
 | `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | yes — `transformations` lists `shimadzu:coarse-mz` |
 | `MZPC_WATERS_KEEP_COLLAPSED` | Native Waters lane: write MassLynx's collapsed retention-time functions (run-summed mobilograms) as spectra instead of leaving them out. On/off lever read through the common rule (empty, `0`, `false`, `no` are off) | yes — `collapsed_functions[].written` in `waters_functions` (and `waters_drift`), and `waters:drop-functions` when they were left out |
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
+| `MZPC_ENCODING_PRESCAN=0` | Native Waters lane: skip the encoding pre-scan (§8) and write the fixed encodings — numpress m/z (or delta under `--no-numpress`), float32 byte-stream-split intensity, dictionary ion mobility (`env_flag` spellings) | yes — the archive then has no `encoding_prescan` block |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |
 | `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`) | the fitted `{c0,c1}` is stored; the fact that `c1` was forced is not |
 | `MZPC_MAX_SPECTRA=<n>` | Stop after `n` spectra. **Deliberately truncating**: it also disables the "all source spectra written" completeness check, so the archive is a partial one that exits 0. Diagnostics only; the WARN stays | yes — every mzPeak lane that honours the cap writes `metadata.partial` = `{partial: true, max_spectra, source_declared, spectra_written, cause: "MZPC_MAX_SPECTRA"}` when the cap bit (0.9.13); a cap larger than the file writes no marker |

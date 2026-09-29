@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Output change (native Waters lane).** Each data-facet column is written under the encoding a
+pre-scan of the run measured smallest, instead of fixed encodings.
+
+### Added
+
+- **Encoding pre-scan (native Waters `.raw`).** Before the run is written, a sample (four stretches
+  of consecutive spectra, up to 64 spectra or 2 M points each) is written once per trial through
+  the same writer; each column keeps its smallest arm. Arms: m/z as lossless delta chunks under
+  dictionary, byte-stream split or plain encoding, or numpress-linear (not under `--no-numpress`);
+  intensity as float32 or — when every sampled value is an integer in int32 range — the same values
+  as int32 (MS:1000519), each under byte-stream split or dictionary; ion mobility under dictionary,
+  byte-stream split or plain. A tie keeps the writer default. The `encoding_prescan` index block
+  records the sample, every arm's bytes and the choice. A later spectrum int32 cannot hold exactly
+  makes the conversion write the run again with the smallest float32 arm (`int32_fallback` in the
+  block). `MZPC_ENCODING_PRESCAN=0` keeps the fixed encodings. USER_MANUAL §8, §10.
+- Vendored writer: `DataColumnEncodings` / `MzPeakWriterBuilder::data_column_encodings`, per-role
+  encoding overrides (m/z chunk values, intensity, ion mobility) applied after the writer's own
+  rules — the `WriterProperties` hook proposed upstream. Default: no override, bytes unchanged.
+
 ## [0.14.0] — 2026-09-24
 
 **Output change (data facets of every grid lane, timsTOF included).** The converter's own point-layout grid — an
