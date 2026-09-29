@@ -77,6 +77,7 @@ mod filter;
 mod encoding_prescan;
 mod vendor_sqlite;
 mod imaging;
+mod bruker_maldi;
 mod mzml_isolation;
 mod mzml_wavelength;
 mod pwiz_id;
@@ -4171,6 +4172,11 @@ fn convert_file(
     } else {
         None
     };
+    // A MALDI timsTOF run through mzdata (`--no-ims-compact`): each frame's raster position.
+    let maldi = if matches!(reader, MZReaderType::BrukerTDF(_)) { bruker_maldi::read_dot_d(input) } else { None };
+    if let Some(m) = &maldi {
+        enable_bruker_imaging(&mut writer, m);
+    }
     // Thermo precursor windows the reader library computed without a stated width are written
     // target-only (`thermo_isolation`); the count is declared in `transformations` below.
     let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
@@ -4225,6 +4231,9 @@ fn convert_file(
         if let Some(r) = &tdf_remap {
             r.apply(entry.description_mut());
         }
+        if let Some(m) = &maldi {
+            m.attach(&mut entry);
+        }
         if let Some(g) = thermo_windows.as_mut() {
             g.apply(entry.description_mut());
         }
@@ -4257,6 +4266,7 @@ fn convert_file(
         .chain(acquisition_block)
         .chain(route)
         .chain(imaging_block.map(|b| ("imaging_pixel_size".to_string(), b)))
+        .chain(maldi.as_ref().map(|m| ("bruker_maldi".to_string(), m.block())))
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
             for t in &imaging_applied {
@@ -4271,6 +4281,9 @@ fn convert_file(
             }
             if tdf_chord {
                 declare(&mut applied, TDF_CHORD_TRANSFORMATION);
+            }
+            if maldi.as_ref().is_some_and(|m| m.scan_settings().is_some()) {
+                declare(&mut applied, bruker_maldi::PIXEL_FROM_BEAM);
             }
             applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
             applied.extend(chromatogram_transforms);
@@ -5335,12 +5348,20 @@ where
     add_processing_metadata(&mut writer);
     // Both ims-compact lanes (native + SDK) attach the MZP:1000006/7 window band to selected ions.
     ensure_mzp_cv(&mut writer);
+    // MALDI imaging (timsTOF fleX): each frame's raster position (`bruker_maldi`).
+    let maldi = bruker_maldi::read_dot_d(input);
+    if let Some(m) = &maldi {
+        enable_bruker_imaging(&mut writer, m);
+    }
 
     let mut ms1 = Ms1Chroms::default();
     match &mut driver {
         Driver::Serial(spectrum) => {
             for i in 0..n_frames {
-                let spec = spectrum(i, int_intensity)?;
+                let mut spec = spectrum(i, int_intensity)?;
+                if let Some(m) = &maldi {
+                    m.attach(&mut spec);
+                }
                 if synth_chroms {
                     ms1.observe(&spec);
                 }
@@ -5377,8 +5398,12 @@ where
             let decode_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let wns = writer_ns.clone();
             // The writer thread owns writer+ms1 and returns them (or the first write error) on join.
+            let maldi_w = maldi.clone();
             let writer_thread = std::thread::spawn(move || -> Result<(MzPeakWriterType<fs::File>, Ms1Chroms)> {
-                while let Ok(spec) = rx.recv() {
+                while let Ok(mut spec) = rx.recv() {
+                    if let Some(m) = &maldi_w {
+                        m.attach(&mut spec);
+                    }
                     if synth_chroms {
                         ms1.observe(&spec);
                     }
@@ -5493,6 +5518,9 @@ where
     if let Some(entry) = mz_summary.transformation {
         declare(&mut applied, entry);
     }
+    if maldi.as_ref().is_some_and(|m| m.scan_settings().is_some()) {
+        declare(&mut applied, bruker_maldi::PIXEL_FROM_BEAM);
+    }
     applied.extend(chromatogram_transforms);
     // The vendor's exact calibration, verbatim, so the archive is self-sufficient without the
     // embedded `vendor/analysis.tdf.gz` (`--no-vendor`). Best-effort: a TDF without the table is
@@ -5525,6 +5553,7 @@ where
         .chain(partial_marker(input, max_spectra(), n_frames))
         .chain(vendor_calibration)
         .chain(vendor_tims)
+        .chain(maldi.as_ref().map(|m| ("bruker_maldi".to_string(), m.block())))
         .collect();
     // No aux: `--image`/`--sdrf` are refused on the ims-compact lane (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
@@ -6776,6 +6805,8 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         encoding_prescan,
     } = hints;
     let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
+    // MALDI imaging from a Bruker `.d` (the TSF lane): each frame's raster position.
+    let maldi = if input.is_dir() { bruker_maldi::read_dot_d(input) } else { None };
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
@@ -6875,6 +6906,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         }
         let mut writer = builder.build(handle, !keep_zero_runs);
         add_processing_metadata(&mut writer);
+        if let Some(m) = &maldi {
+            enable_bruker_imaging(&mut writer, m);
+        }
         // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band.
         if is_tdf_dir(input) {
             ensure_mzp_cv(&mut writer);
@@ -6886,6 +6920,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
         for i in 0..len {
             let VendorSpectrum { spectrum: mut spec, routes } = spectrum(i)?.into();
+            if let Some(m) = &maldi {
+                m.attach(&mut spec);
+            }
             if int32 && !encoding_prescan::intensity_to_int32(&mut spec) {
                 let (chosen, fallback, _) = prescan.as_mut().expect("int32 comes from the pre-scan");
                 log::warn!(
@@ -6958,6 +6995,12 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     }
     // A lane that keeps zero runs built the writer with the mask off, so its tally has none to report.
     let mut applied = base_transformations(&writer);
+    if let Some(m) = &maldi {
+        if m.scan_settings().is_some() {
+            declare(&mut applied, bruker_maldi::PIXEL_FROM_BEAM);
+        }
+        index_blocks.push(("bruker_maldi".to_string(), m.block()));
+    }
     for entry in transformations {
         declare(&mut applied, entry);
     }
@@ -6977,6 +7020,17 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // No aux: `--image`/`--sdrf` are refused on the native vendor lanes (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)?;
     Ok(tally)
+}
+
+/// Turn a writer into an imaging one for a Bruker MALDI run: the position columns the imzML path
+/// writes, the IMS vocabulary, and the beam-scan-size pixel size when there is one.
+fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) {
+    log::info!("Bruker MALDI imaging: {} frames carry a raster position", maldi.spots.len());
+    writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
+    writer.controlled_vocabularies_mut().push(ControlledVocabulary::IMS.into());
+    if let (Some(settings), Some(list)) = (maldi.scan_settings(), writer.scan_settings_mut()) {
+        list.push(settings);
+    }
 }
 
 /// The archive writer every custom vendor reader writes through (grid policies aside). The
@@ -11374,6 +11428,93 @@ mod tests {
         let pf = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(scans)).unwrap();
         let schema: Vec<String> = parquet::file::reader::FileReader::metadata(&pf).file_metadata().schema_descr().columns().iter().map(|c| c.path().string()).collect();
         assert!(schema.iter().any(|c| c.contains("IMS_1000052")), "no position z column: {schema:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Bruker MALDI imaging run straight from the `.d` (HUPO-PSI/mzPeak-specification#23): a
+    /// synthetic TSF in WAL mode, like the issue author's, with a `MaldiFrameInfo` table. The frames'
+    /// raster indices land in the same position columns the imzML path writes, as stored (absolute,
+    /// not from 1); the archive names the IMS vocabulary and says where its pixel size came from; and
+    /// the conversion leaves the `.d` exactly as it found it (no `-shm` / `-wal`).
+    #[test]
+    fn bruker_maldi_tsf_carries_its_pixel_positions() {
+        use arrow::array::{Array, UInt32Array};
+        let dir = scratch("maldi-tsf");
+        let dot_d = dir.join("imaging.d");
+        std::fs::create_dir_all(&dot_d).unwrap();
+        // tsf_bin: per frame an 8-byte [padded][compressed] header, then zstd([tof f64 × n][intensity f32 × n]).
+        let mut bin = Vec::new();
+        let mut frames = Vec::new();
+        for (id, n) in [(1i64, 3usize), (2, 2), (3, 4)] {
+            let mut raw = Vec::new();
+            for k in 0..n {
+                raw.extend_from_slice(&(1000.0 * (k + 1) as f64 + id as f64).to_le_bytes());
+            }
+            for k in 0..n {
+                raw.extend_from_slice(&(10.0 * (k + 1) as f32).to_le_bytes());
+            }
+            let z = zstd::encode_all(&raw[..], 3).unwrap();
+            let offset = bin.len();
+            bin.extend_from_slice(&((z.len() + 8) as u32).to_le_bytes());
+            bin.extend_from_slice(&(z.len() as u32).to_le_bytes());
+            bin.extend_from_slice(&z);
+            frames.push(format!("({id}, {}, 0, '+', {n}, {offset})", id as f64 * 0.5));
+        }
+        std::fs::write(dot_d.join("analysis.tsf_bin"), &bin).unwrap();
+        let db = rusqlite::Connection::open(dot_d.join("analysis.tsf")).unwrap();
+        db.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)).unwrap();
+        db.execute_batch(&format!(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('MzAcqRangeLower', '100'), ('MzAcqRangeUpper', '1000'),
+                                               ('DigitizerNumSamples', '100000'), ('AcquisitionSoftware', 'timsControl');
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, MsMsType INTEGER, Polarity TEXT, NumPeaks INTEGER, TimsId INTEGER);
+             INSERT INTO Frames VALUES {};
+             CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, Chip INTEGER, SpotName TEXT, RegionNumber INTEGER,
+                                          XIndexPos INTEGER, YIndexPos INTEGER, BeamScanSizeX REAL, BeamScanSizeY REAL);
+             INSERT INTO MaldiFrameInfo VALUES (1, 0, 'R00X669Y700', 0, 669, 700, 20.0, 20.0),
+                                               (2, 0, 'R00X670Y700', 0, 670, 700, 20.0, 20.0),
+                                               (3, 0, 'R01X837Y812', 1, 837, 812, 20.0, 20.0);",
+            frames.join(", ")
+        ))
+        .unwrap();
+        drop(db);
+        let before: std::collections::BTreeSet<_> = std::fs::read_dir(&dot_d).unwrap().map(|e| e.unwrap().file_name()).collect();
+
+        let out = dir.join("imaging.mzpeak");
+        let (ok, _, err) = run_bin(&[dot_d.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let after: std::collections::BTreeSet<_> = std::fs::read_dir(&dot_d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(before, after, "the conversion wrote into the .d");
+
+        let m = index_metadata(&out);
+        assert!(m["cv_list"].to_string().contains("\"IMS\""), "{:#}", m["cv_list"]);
+        assert_eq!(m["bruker_maldi"]["x_index"], serde_json::json!([669, 837]), "{:#}", m["bruker_maldi"]);
+        assert_eq!(m["bruker_maldi"]["regions"].as_array().unwrap().len(), 2);
+        assert!(m["transformations"].to_string().contains(super::bruker_maldi::PIXEL_FROM_BEAM));
+        let px = m["scan_settings_list"][0]["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000046").unwrap().clone();
+        assert_eq!((px["value"].clone(), px["unit"].clone()), (serde_json::json!(20.0), serde_json::json!("UO:0000017")));
+
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+        let mut scans = Vec::new();
+        zip.by_name("spectra_metadata_scans.parquet").unwrap().read_to_end(&mut scans).unwrap();
+        let batches: Vec<_> = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(scans))
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect();
+        let col = |name: &str| -> Vec<u32> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let a = b.column_by_name(name).unwrap_or_else(|| panic!("no {name} in {:?}", b.schema()));
+                    let a = a.as_any().downcast_ref::<UInt32Array>().unwrap();
+                    (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(col("opt_IMS_1000050_position_x"), vec![669, 670, 837]);
+        assert_eq!(col("opt_IMS_1000051_position_y"), vec![700, 700, 812]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
