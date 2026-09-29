@@ -596,7 +596,7 @@ impl TdfMzCalibrationRow {
 /// actually stored as numbers (informational since the grid layout: the row is evaluated as the
 /// vendor library evaluates it either way).
 pub(crate) fn read_mz_calibration_rows(tdf: &Path) -> Result<HashMap<i64, TdfMzCalibrationRow>> {
-    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = crate::vendor_sqlite::open(tdf)
         .with_context(|| format!("opening {}", tdf.display()))?;
     let mut stmt = conn
         .prepare(
@@ -803,7 +803,7 @@ pub(crate) fn sdk_golden_sample_plan(n_frames: usize, num_samples: i64) -> (Vec<
 /// biased there and +3.2…−4.2 ppm on 2485.d (m/z dependent). `ims_calibration.a/b` stay the reader
 /// contract; this block is the exact model beside it.
 pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
-    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = crate::vendor_sqlite::open(tdf)
         .with_context(|| format!("opening {}", tdf.display()))?;
     let rows_out = table_rows_json(&conn, "MzCalibration")?;
     let global = global_metadata_json(&conn, &["DigitizerNumSamples", "MzAcqRangeLower", "MzAcqRangeUpper"])?;
@@ -834,7 +834,7 @@ pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
 /// `mean_inverse_reduced_ion_mobility` ([`crate::tims_mobility`]), so a reader can go from a stored
 /// 1/K0 back to the vendor's scan coordinate without the SDK. Best-effort like the m/z block.
 pub fn vendor_tims_calibration(tdf: &Path) -> Result<serde_json::Value> {
-    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = crate::vendor_sqlite::open(tdf)
         .with_context(|| format!("opening {}", tdf.display()))?;
     let rows_out = table_rows_json(&conn, "TimsCalibration")?;
     let global = global_metadata_json(&conn, &["OneOverK0AcqRangeLower", "OneOverK0AcqRangeUpper"])?;
@@ -1277,7 +1277,7 @@ impl NativeTofReader {
 /// `sqlite_master` rather than assuming. PRM (`PrmFrameMsMsInfo`) is not handled yet; such a run
 /// simply gets no precursors rather than a wrong one.
 pub(crate) fn read_frame_windows(tdf: &Path) -> Result<HashMap<i64, Vec<FrameWindow>>> {
-    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = crate::vendor_sqlite::open(tdf)
         .map_err(|e| anyhow::anyhow!("opening {} for MS2 info: {e}", tdf.display()))?;
     let has = |name: &str| -> bool {
         conn.query_row(
@@ -1380,7 +1380,7 @@ fn frame_calibration_at(table: &FrameTable, i: usize) -> Option<(f64, f64, i64)>
 /// Read the per-frame [`FrameTable`] from `analysis.tdf`, ordered by `Id` so position `i` matches
 /// timsrust's frame index.
 fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
-    let conn = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = crate::vendor_sqlite::open(tdf)
         .map_err(|e| anyhow::anyhow!("opening {} for Frames: {e}", tdf.display()))?;
     // T1/T2/MzCalibration are in every TDF schema seen; should one lack them, keep the core four
     // rather than failing the conversion.

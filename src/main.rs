@@ -75,6 +75,7 @@ mod vendor;
 mod embed_aux;
 mod filter;
 mod encoding_prescan;
+mod vendor_sqlite;
 mod mzml_isolation;
 mod mzml_wavelength;
 mod pwiz_id;
@@ -1633,11 +1634,7 @@ fn dump_im_table(input: &Path) -> Result<()> {
     let tdf = dir.join("analysis.tdf");
 
     // num_scans straight from the SQLite Frames table — no binary needed.
-    let conn = rusqlite::Connection::open_with_flags(
-        &tdf,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", tdf.display()))?;
+    let conn = vendor_sqlite::open(&tdf).with_context(|| format!("opening {}", tdf.display()))?;
     let n: i64 = conn
         .query_row("SELECT MAX(NumScans) FROM Frames", [], |r| r.get(0))
         .context("reading MAX(NumScans)")?;

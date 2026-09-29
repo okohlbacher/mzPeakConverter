@@ -14,7 +14,7 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 use mzdata::meta::DissociationMethodTerm;
 use mzdata::params::Unit;
@@ -114,10 +114,11 @@ pub struct TsfReader {
 impl TsfReader {
     pub fn open(dot_d: &Path) -> Result<Self> {
         let tsf = dot_d.join("analysis.tsf");
-        // Read-only. A plain `Connection::open` is read-write and CREATES a missing file, so opening a
-        // `.d` that has no TSF left an empty `analysis.tsf` inside the user's raw data — the corpus
-        // still holds one, beside a real TDF, and it had passed for a TSF fixture.
-        let conn = Connection::open_with_flags(&tsf, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        // Read-only and immutable (`vendor_sqlite`). A plain `Connection::open` is read-write and
+        // CREATES a missing file, so opening a `.d` that has no TSF left an empty `analysis.tsf`
+        // inside the user's raw data; a read-only open of a WAL-mode TSF (MALDI acquisitions) left
+        // `analysis.tsf-shm` / `-wal` there.
+        let conn = crate::vendor_sqlite::open(&tsf)
             .with_context(|| format!("opening {}", tsf.display()))?;
 
         // Calibration from GlobalMetadata. SQLite's own error stays in the chain: a read-only open of a

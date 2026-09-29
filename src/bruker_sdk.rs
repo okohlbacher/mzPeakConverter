@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 use mzdata::params::Unit;
 use mzpeak_prototyping::grid::GridModelLike;
@@ -312,10 +312,7 @@ fn read_frames_inner(conn: &Connection, with_scans: bool, with_cal: bool) -> Res
 
 fn open_sqlite(dir: &Path, marker: &str) -> Result<Connection> {
     let db = dir.join(marker);
-    Connection::open_with_flags(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    crate::vendor_sqlite::open(&db)
     .with_context(|| format!("opening {}", db.display()))
 }
 
