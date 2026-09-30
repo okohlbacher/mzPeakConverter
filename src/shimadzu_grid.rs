@@ -28,21 +28,11 @@ pub fn signal_span(intensity: &[f32]) -> (usize, usize) {
     (start, end.max(start))
 }
 
-/// Per-spectrum sqrt grid: `m/z = (c0 + c1·k)²`.
+/// Per-spectrum sqrt grid: `m/z = (c0 + c1·k)²`, as a conformant reader reconstructs it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SqrtGrid {
     pub c0: f64,
     pub c1: f64,
-}
-
-impl SqrtGrid {
-    /// Reconstruct m/z from a stored bin ordinal, exactly as a conformant reader does:
-    /// `m/z = (c0 + c1·k)²`. The summary CV terms must be computed from THIS, not from the source
-    /// f64 m/z the fit consumed, so the archive's metadata names coordinates that exist in it.
-    pub fn mz(&self, k: i32) -> f64 {
-        let r = self.c0 + self.c1 * (k as f64);
-        r * r
-    }
 }
 
 /// Reconstruction tolerance in Da: the vendor's own 1e-9 rounding is ±5e-10, plus f64 slack.
