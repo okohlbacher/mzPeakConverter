@@ -224,6 +224,18 @@ with every window's precursor and no mobility limits of its own, and the export 
 that assigns precursors by mobility window (OpenSWATH's diaPASEF mode) needs the `.d` exported with
 `--to mzml`, or a `--no-ims-compact` archive.
 
+An archive's export states what the direct export of its source states. Its chromatograms are the
+archive's, as stored (times in minutes), each with its type and polarity term; a TIC or base-peak
+chromatogram summed over the exported spectra is added only for a kind the archive lacks, in time
+order (so is the direct export's). Every precursor, a spectrum's or a chromatogram's, keeps its
+isolation window, dissociation method and collision energy; 1/K0 is MS:1002815 `inverse reduced ion
+mobility`, once per element. Different by design: a spectrum's total ion current, base peak and
+observed m/z range are the archive's, computed from the stored peaks (a timsTOF `.d` states each
+window spectrum's frame totals); an ims-compact archive's whole frames state no per-window 1/K0,
+`window group` or limits, and it holds HyStar's TIC/base-peak traces but not mzdata's per-window
+pair (28 chromatograms where the `.d`'s export has 30). Not in any archive yet, so not in its
+export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` combination.
+
 ```sh
 mzpeak-convert run.raw -o run.mzML            # Thermo → mzML
 mzpeak-convert run.d --to mzml -o run.xml     # format forced, any name

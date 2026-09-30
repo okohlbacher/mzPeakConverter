@@ -116,7 +116,15 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     (µL/min) or percent chromatogram is stored under the intensity column's single unit and written
     back to mzML the same way, on every lane; indexed sources too.
   - **SRM product windows (Q3) have no place in the archive.** mzML → mzPeak keeps a chromatogram's
-    precursor and drops its `<product>`, so the export writes none.
+    precursor and drops its `<product>`, so the export writes none (201 traces of the corpus
+    `PC_Allan1`, 4 of pwiz's `MRM Neg C5`; the Q3 survives only in the id text). The spec has the
+    facet (`chromatograms_metadata_products.parquet`, the spectrum products schema), but no writer
+    builds it and the reference reader `todo!()`s on a chromatogram `products` entry (as of
+    `93c1982`), so writing it would crash every reader built on it: owner decision, upstream first.
+  - **A spectrum's `sum of spectra` combination is not stored.** The spec's `spectra_combination`
+    column (MS:1000570) is written by no writer, so the export of a `--no-ims-compact` timsTOF archive
+    states `no combination` on each of the 16,377 window spectra the `.d`'s export sums (PXD059079
+    2485); pwiz mzML sources that sum scans lose it the same way.
   - **mzdata's writer wraps a chromatogram's precursor and product in list elements** the mzML 1.1
     schema rejects (`<precursorList>` inside `<chromatogram>`): 143 xmllint errors on the Shimadzu MRM
     file's mzML-lane output.
@@ -432,13 +440,13 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     (`sciex::tests::a_reader_opens_again_after_one_was_dropped`, `MZPC_SCIEX_GLUE` and
     `MZPC_PWIZ_DIR=${{ runner.temp }}`, the same `1 passed` guard) needs glue/sciex `Glue.cs`
     `Open` to catch and return 0 as Shimadzu's does; confirm that first.
-  - An archive → mzML export drops the archive's stored TIC/BPC and writes a TIC and BIC the
-    vendored exporter derives from the spectra in spectrum order, so a run whose spectra are not in
-    time order gets an unsorted time array (`tiny.pwiz.1.1`: 5.8905, 5.9905, 0.0, 0.7008). Export the
-    stored pair, or sort.
-  - The archive route loses `tiny.pwiz.1.1`'s two target-only precursors on its `cycle=22`
-    spectrum (no `spectrumRef`): the archive holds one precursor row, and its export shows a window
-    of target 0, while `--to mzml` keeps 456.7 and 678.9. Same on 0.11.5; a precursor-storage item.
+  - ~~An archive → mzML export drops the archive's stored TIC/BPC and writes a TIC and BIC in
+    spectrum order.~~ The stored pair goes across since 0.12.4; the writer's summed pair, added
+    only for a kind the source or archive lacks, is sorted by time on every mzML lane (wave 2).
+  - ~~The archive route loses `tiny.pwiz.1.1`'s two target-only precursors on its `cycle=22`
+    spectrum.~~ They are the `sic` chromatogram's precursor (456.7) and product (678.9). The
+    precursor's window and CID came back empty from the vendored reader (an empty column mapping;
+    the activation columns never read) and go across since wave 2; the product is the SRM item above.
   - A filtered archive → mzML export (`-o x.mzML --rt`/`--ms-level`) keeps a precursor's
     `spectrumRef` to a spectrum it filtered out, which the rewrite route nulls (small.RAW
     `scan=9`); it also parses the archive index twice (duplicated reader warnings).
