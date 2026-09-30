@@ -345,14 +345,16 @@ type EncodeResult = ParquetResult<(usize, Vec<ArrowColumnChunk>)>;
 
 /// Byte-budget backpressure gate. Bounds the total in-memory size of the input `RecordBatch`es for
 /// row groups that are dispatched-but-not-yet-finished-encoding, so more cores never mean more
-/// memory. Independent of the core count.
+/// memory while every group fits its per-thread share of the budget (the default: `threads × 48 MiB`
+/// against row groups of at most 48 MiB).
 ///
 /// DELIBERATE DEVIATION (see `row_group`): a row group is charged at most `max_charge`, the budget's
 /// per-thread share. A group larger than the whole budget used to be admitted only once nothing else
 /// was in flight, so a run of them (8192 timsTOF grid chunks, 270–460 MiB each on PXD076703)
 /// encoded one at a time on one core while the other workers idled — 2 h 20 min for a 10 GB `.d`.
 /// Capped, up to one such group per worker is in flight: memory stays within
-/// `max(budget, threads × largest group)`, and the byte cap of the row groups bounds the latter.
+/// `max(budget, threads × largest group)`, and the byte cap of the row groups bounds the latter. A
+/// budget below `threads × byte cap` therefore no longer lowers memory; fewer threads do.
 struct InFlight {
     bytes: Mutex<usize>,
     cv: Condvar,
@@ -412,13 +414,15 @@ struct ParallelPeakEncoder<W: Write + Send + Seek + 'static> {
     collector: Option<JoinHandle<ParquetResult<SerializedFileWriter<W>>>>,
     kv: Vec<KeyValue>,
     dead: bool,
-    /// `$MZPC_TIMING` only: how busy the workers were, reported at `finish`.
+    /// `$MZPC_TIMING` only: how many encode jobs ran at once, reported at `finish`.
     stats: Option<Arc<EncodeStats>>,
 }
 
-/// Worker occupancy of the parallel encode, for the `[timing]` report: the summed encode time of
-/// every row group against the wall time from the first dispatch to `finish` is the mean number of
-/// busy workers.
+/// Occupancy of the parallel encode, for the `[timing]` report: the summed wall time of every row
+/// group's encode job against the wall time from the first dispatch to `finish` is the mean number
+/// of jobs running at once. Wall clock, not CPU: a job the OS has descheduled still counts, so on an
+/// oversubscribed host it overstates the parallelism (process CPU time / wall time measures that).
+/// DELIBERATE DEVIATION (local instrumentation, with the byte-capped row groups of `row_group`).
 struct EncodeStats {
     first_dispatch: std::sync::OnceLock<std::time::Instant>,
     encode_nanos: AtomicU64,
@@ -468,6 +472,7 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         if timing {
+            // `max_row_group_bytes`: DELIBERATE DEVIATION (see `row_group`).
             eprintln!(
                 "[timing] parallel peak encode: threads={threads} inflight_budget={}MB max_row_group_rows={} max_row_group_bytes={:.1}MB",
                 budget >> 20,
@@ -534,7 +539,9 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
         self.kv.push(kv);
     }
 
-    /// Append rows to the open row group.
+    /// Append rows to the open row group. DELIBERATE DEVIATION (see `row_group`): the facet's
+    /// `RowGroupCutter` decides where groups end, for this encoder and the serial path alike, where
+    /// this encoder used to cut every `max_rows` rows itself (`add_batch`/`cut_and_dispatch`).
     fn add_rows(&mut self, rows: RecordBatch) {
         self.pending.push(rows);
     }
@@ -558,7 +565,7 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
         self.next_idx += 1;
         let input_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
 
-        // Backpressure: cap the total input bytes in flight (memory-bounded regardless of cores).
+        // Backpressure: cap the total input bytes in flight (see `InFlight` for the bound).
         let charge = self.inflight.acquire(input_bytes);
 
         let (result_tx, result_rx) = channel::<EncodeResult>();
@@ -614,8 +621,8 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
             let wall = s.first_dispatch.get().map_or(0.0, |t| t.elapsed().as_secs_f64());
             let busy = s.encode_nanos.load(Ordering::SeqCst) as f64 / 1e9;
             eprintln!(
-                "[timing] parallel peak encode: {} row groups, {busy:.1} s of encoding in {wall:.1} s \
-                 ({:.1} workers busy on average, at most {} at once)",
+                "[timing] parallel peak encode: {} row groups, {busy:.1} s of encode jobs in {wall:.1} s \
+                 ({:.1} running on average by wall clock, at most {} at once)",
                 self.next_idx,
                 if wall > 0.0 { busy / wall } else { 0.0 },
                 s.peak_running.load(Ordering::SeqCst)

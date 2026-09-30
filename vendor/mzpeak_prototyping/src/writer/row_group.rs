@@ -91,9 +91,11 @@ pub enum RowGroupCut {
 /// Decides where the row groups of one facet end, from the batches written to it: a group closes
 /// once it holds `max_rows` rows (the writer's own row cap, cut exactly there as parquet does) or
 /// once the next batch would take it past `max_bytes` of [`batch_bytes`]. A batch that does not fit
-/// the open group starts the next one instead of being split, so the byte rule keeps a spectrum in
-/// one group; only a batch larger than a whole group is split, into pieces of at most `max_bytes`
-/// (down to a single row).
+/// the open group starts the next one instead of being split; only a batch larger than a whole
+/// group is split, into pieces of at most `max_bytes` (down to a single row). Where a batch is one
+/// spectrum's rows (the writers' buffers) the byte rule therefore keeps a spectrum that fits a
+/// group in one group; a reader's fixed-size batches (the prune rewrite, the filter lane) carry no
+/// such boundary, and neither does the row cap.
 #[derive(Debug, Clone)]
 pub struct RowGroupCutter {
     max_rows: usize,

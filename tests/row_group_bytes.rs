@@ -11,10 +11,11 @@
 //! `profile_and_centroid_facets_stay_under_the_byte_cap` writes, through the writer, ~90 MB of
 //! profile and of centroid signal that compresses far past 4:1 and checks both facets' row groups
 //! against the default cap and the validator's 64 MiB, and that spectra on either side of a
-//! boundary read back intact. The two CLI tests pin the paths only a conversion reaches: the serial
-//! and parallel peak encoders cut the same row groups under a byte cap, and the mzPeak→mzPeak filter
-//! lane re-groups within it.
+//! boundary read back intact. The CLI tests pin the paths only a conversion reaches: the serial and
+//! parallel peak encoders cut the same row groups under a byte cap, and the mzPeak→mzPeak filter
+//! lane re-groups within it, in the source's column encodings (a dictionary per group otherwise).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,7 +29,7 @@ use mzpeak_prototyping::chunk_series::ChunkingStrategy;
 use mzpeak_prototyping::writer::{
     AbstractMzPeakWriter, ColumnEncoding, DEFAULT_ROW_GROUP_BYTES, DataColumnEncodings, MzPeakWriterType,
 };
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
@@ -324,6 +325,75 @@ fn filter_lane_keeps_row_groups_under_the_byte_cap() {
     assert_eq!(before.file_metadata().num_rows(), after.file_metadata().num_rows(), "rows lost");
     assert!(sizes.len() > 2, "the filter lane re-grouped by rows alone ({sizes:?})");
     assert!(sizes.iter().all(|&s| s <= cap), "a filtered row group exceeds the byte cap ({sizes:?})");
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Per column of `md`: whether any row group used the dictionary, and the value encodings the
+/// non-dictionary columns chose (a dictionary column's fallback depends on its group sizes). RLE
+/// and PLAIN are no choice: levels and the defaults, whose boolean form follows the writer version.
+fn column_encodings(md: &ParquetMetaData) -> BTreeMap<String, (bool, BTreeSet<String>)> {
+    let mut out: BTreeMap<String, (bool, BTreeSet<String>)> = BTreeMap::new();
+    for rg in md.row_groups() {
+        for c in rg.columns() {
+            let e = out.entry(c.column_path().string()).or_default();
+            for enc in c.encodings() {
+                match enc {
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => e.0 = true,
+                    Encoding::RLE | Encoding::PLAIN => {}
+                    other => {
+                        e.1.insert(format!("{other:?}"));
+                    }
+                }
+            }
+        }
+    }
+    for e in out.values_mut() {
+        if e.0 {
+            e.1.clear();
+        }
+    }
+    out
+}
+
+/// The filter lane writes every column in the encodings the source used. Parquet's dictionary is
+/// on by default and takes precedence over a column encoding, so its former fixed rules shipped
+/// every column dictionary-encoded — byte-stream-split intensity and delta-packed spectrum indices
+/// included — and with the byte cap splitting a facet each row group paid its own dictionary.
+#[test]
+fn filter_lane_keeps_the_source_column_encodings() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let src = dir.join(format!("mzpc-rgb-{pid}-enc-src.mzpeak"));
+    let out = dir.join(format!("mzpc-rgb-{pid}-enc-out.mzpeak"));
+    convert(Path::new(SWATH), &src, &[]);
+    let _ = std::fs::remove_file(&out);
+    let status = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&src)
+        .args(["-o"])
+        .arg(&out)
+        .args(["--force", "-q", "--rt", "0-1000000"])
+        .status()
+        .expect("failed to run mzpeak-convert");
+    assert!(status.success(), "filter failed: {status}");
+    let members: Vec<String> = zip::ZipArchive::new(File::open(&src).unwrap())
+        .unwrap()
+        .file_names()
+        .filter(|n| n.ends_with(".parquet"))
+        .map(str::to_string)
+        .collect();
+    let peaks = column_encodings(&facet_metadata(&src, "spectra_peaks.parquet"));
+    assert!(
+        peaks.values().any(|(dict, values)| !dict && values.contains("BYTE_STREAM_SPLIT")),
+        "the fixture's peak facet has no byte-stream-split column to keep: {peaks:?}"
+    );
+    for member in &members {
+        let want = column_encodings(&facet_metadata(&src, member));
+        let got = column_encodings(&facet_metadata(&out, member));
+        for (column, enc) in &want {
+            assert_eq!(got.get(column), Some(enc), "{member}: {column} (dictionary, value encodings)");
+        }
+    }
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&out);
 }

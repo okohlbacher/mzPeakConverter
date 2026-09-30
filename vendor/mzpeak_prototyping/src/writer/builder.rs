@@ -302,6 +302,7 @@ impl MzPeakWriterBuilder {
     }
 
     /// Set the byte cap of a signal-facet row group (see [`WriteBatchConfig::row_group_bytes`]).
+    /// DELIBERATE DEVIATION (see `writer::row_group`).
     pub fn row_group_bytes(mut self, value: Option<usize>) -> Self {
         self.write_batch_config.row_group_bytes = value;
         self

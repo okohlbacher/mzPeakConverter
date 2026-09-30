@@ -39,14 +39,13 @@ use arrow::array::{
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
-use parquet::file::metadata::KeyValue;
+use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
-use parquet::schema::types::ColumnPath;
 
 use mzpeak_prototyping::archive::{DataKind, EntityType, FileEntry, ZipArchiveWriter};
 use mzpeak_prototyping::reader::visitor::AnyCURIEArray;
@@ -857,8 +856,9 @@ enum CountMode {
 
 /// Stream a Parquet facet through `map` (batch → optional filtered batch), re-encoding to zstd with
 /// the original key-value metadata preserved (minus ARROW:schema and the recomputed counts) and the
-/// counts refreshed via `append_key_value_metadata`. Peak-column encodings are matched best-effort;
-/// on any encoding incompatibility we retry the whole facet with plain zstd (correctness first).
+/// counts refreshed via `append_key_value_metadata`. Every column keeps the source facet's encodings
+/// (`apply_encodings`); on any encoding incompatibility we retry the whole facet with plain zstd
+/// (correctness first).
 fn reencode<F>(bytes: &[u8], map: F, mode: CountMode) -> Result<Vec<u8>>
 where
     F: Fn(&RecordBatch) -> Result<Option<RecordBatch>>,
@@ -885,6 +885,7 @@ where
         .key_value_metadata()
         .map(|v| v.clone())
         .unwrap_or_default();
+    let source = builder.metadata().clone();
     let reader = builder.build()?;
 
     // Preserve original KV except ARROW:schema (regenerated) and the count keys we recompute.
@@ -905,7 +906,7 @@ where
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
         .set_key_value_metadata(Some(preserved));
     if fancy {
-        props = apply_encodings(props, &schema);
+        props = apply_encodings(props, &source);
     }
     let props = props.build();
     // The writer's row groups end at the byte cap as well as parquet's row cap, as every convert
@@ -1422,45 +1423,40 @@ fn replace_struct_child(s: &StructArray, pos: usize, new_child: ArrayRef) -> Res
 // Encodings, index, helpers
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Best-effort match of the mzPeak peak-column encodings: DELTA_BINARY_PACKED on integer `*_index`
-/// direct struct children + top-level `ordinal`; BYTE_STREAM_SPLIT on `tof`/`intensity` primitives.
-/// Applied only to direct (non-list) leaves of `point`/`chunk` structs and the vendor `ordinal`.
+/// Encode every column as the source facet did: its dictionary on or off as it was, and the value
+/// encoding it used (BYTE_STREAM_SPLIT, DELTA_*) as the column's explicit one — whatever lane wrote
+/// the source, the filtered facet keeps its encodings. Parquet's dictionary is on by default and
+/// takes precedence over a column encoding, so the former fixed rules here (DELTA on `*_index`,
+/// BYTE_STREAM_SPLIT on direct `tof`/`intensity` leaves) were only the fallback: every filtered
+/// column shipped dictionary-encoded, and once the byte cap split a facet into row groups each
+/// group paid for its own dictionary. The 2485 peak facet, all spectra kept, came out 16.8 %
+/// larger than the converter wrote it in one 178 MiB group and 20.0 % larger in 11 byte-capped
+/// ones; following the source it is 1.5 % larger.
 fn apply_encodings(
     mut props: parquet::file::properties::WriterPropertiesBuilder,
-    schema: &Schema,
+    source: &ParquetMetaData,
 ) -> parquet::file::properties::WriterPropertiesBuilder {
-    for f in schema.fields() {
-        if f.name() == "ordinal" && is_int(f.data_type()) {
-            props = props.set_column_encoding(ColumnPath::from(vec![f.name().clone()]), Encoding::DELTA_BINARY_PACKED);
+    for (i, column) in source.file_metadata().schema_descr().columns().iter().enumerate() {
+        let used: Vec<Encoding> = source.row_groups().iter().flat_map(|rg| rg.column(i).encodings()).collect();
+        if used.is_empty() {
+            continue; // no row group: nothing to follow, parquet's defaults
         }
-        if let DataType::Struct(children) = f.data_type() {
-            if !matches!(f.name().as_str(), "point" | "chunk" | "peak") {
-                continue;
-            }
-            for c in children.iter() {
-                let path = ColumnPath::from(vec![f.name().clone(), c.name().clone()]);
-                let leaf = c.name().as_str();
-                if leaf.ends_with("_index") && is_int(c.data_type()) {
-                    props = props.set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
-                } else if (leaf == "tof" || leaf == "intensity") && is_primitive_numeric(c.data_type()) {
-                    props = props.set_column_encoding(path, Encoding::BYTE_STREAM_SPLIT);
-                }
-            }
+        let path = column.path().clone();
+        let dictionary = used.iter().any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY));
+        props = props.set_column_dictionary_enabled(path.clone(), dictionary);
+        let value = [
+            Encoding::BYTE_STREAM_SPLIT,
+            Encoding::DELTA_BINARY_PACKED,
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+            Encoding::DELTA_BYTE_ARRAY,
+        ]
+        .into_iter()
+        .find(|e| used.contains(e));
+        if let Some(encoding) = value {
+            props = props.set_column_encoding(path, encoding);
         }
     }
     props
-}
-
-fn is_int(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-            | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-    )
-}
-
-fn is_primitive_numeric(dt: &DataType) -> bool {
-    is_int(dt) || matches!(dt, DataType::Float32 | DataType::Float64)
 }
 
 /// Carry the original index `metadata` blocks into `w`, add a `data_processing` entry, and add the
