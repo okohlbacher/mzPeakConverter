@@ -887,6 +887,13 @@ fn install_tmp_panic_hook() {
 }
 
 fn main() {
+    // mzdata's PSI-MS vocabulary: the copy embedded in this binary. The vendored writer asks for it
+    // through `MSVocabulary::init()`, which first looks for an on-disk cache — normally absent — and
+    // logs two ERROR lines on every conversion before falling back to this same copy (since 0.14.0).
+    // Filling the singleton here silences that and keeps the vocabulary the one this binary was
+    // built with, whatever cache a host may have.
+    mzdata::params::MSVocabulary::init_static();
+
     // mzdata's Thermo reader panics on an unrecognized instrument model by default; downgrade to a
     // warning so a newer Astral/firmware doesn't hard-crash the converter. User override respected.
     if std::env::var_os("MZDATA_IGNORE_UNKNOWN_INSTRUMENT").is_none() {
@@ -10306,6 +10313,15 @@ mod tests {
     }
 
     /// Run the built binary with `args` and `envs`, returning (exit ok, stdout, stderr).
+    /// A conversion logs no vocabulary-cache ERROR lines (`MSVocabulary::init_static` in `main`).
+    #[test]
+    fn a_conversion_logs_no_vocabulary_cache_error() {
+        let out = scratch("cv-static").join("t.mzpeak");
+        let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert!(!err.contains("vocabulary database"), "{err}");
+    }
+
     fn run_bin(args: &[&std::ffi::OsStr], envs: &[(&str, &str)]) -> (bool, String, String) {
         let mut cmd = std::process::Command::new(built_binary());
         cmd.args(args);

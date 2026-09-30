@@ -261,12 +261,6 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   plain read-only open when a non-empty `-wal` exists (what `src/vendor_sqlite.rs` does). Harmless on
   the rollback-journal TDFs seen so far; on a WAL-mode TDF the read-write open writes `-shm`/`-wal`
   beside the data and folds the log into `analysis.tdf` on close. Drafts only; the owner files them.
-- **mzdata's vocabulary load logs two ERROR lines on every conversion (since 0.14.0).** The vendored
-  writer's `CustomBuilderFromParameterDerived` calls `MSVocabulary::init()`, which looks for an
-  on-disk CV cache, logs "CV cache file could not be openend" / "Default path does not exist", and
-  falls back to the embedded vocabulary — harmless, but it reads as a failure. Calling
-  `MSVocabulary::init_static()` once at start-up (it fills the same singleton) would silence it and
-  pin the CV to the embedded copy.
 - **Surfaced by the 0.15.0 corpus rebuild (2026-09-29).** 194 of 200 archives rebuilt; logs in
   `~/Claude/mzPeak/output/corpus-rebuild-0.15.0/`. (1) **The timsTOF grid facet encodes serially on
   big runs.** PXD076703 (10 GB `tdf_bin`) took about 2 h 20 min on the host on one core: a row group of

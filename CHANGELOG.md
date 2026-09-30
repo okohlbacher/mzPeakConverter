@@ -55,6 +55,11 @@ viewer) need their update.
   they are written back.
 - The obsolete imzML scan term "one way" (`IMS:1000411`) is written as flyback (`IMS:1000413`), its
   stated replacement, and declared (`imzml:one-way-as-flyback`).
+- **Two spurious ERROR lines on every conversion** (since 0.14.0): "Error while initializing MS
+  vocabulary database: CV cache file could not be openend" / "Default path does not exist". The vendored
+  writer asked mzdata for the PSI-MS vocabulary, which looks for an on-disk cache first and falls back
+  to its embedded copy. The converter now loads the embedded copy at start-up, so nothing is logged and
+  the vocabulary is always the one the binary was built with.
 
 ### Changed
 
