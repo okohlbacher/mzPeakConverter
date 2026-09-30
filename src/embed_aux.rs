@@ -101,10 +101,15 @@ fn embed_optical_images(
         return Ok(());
     }
 
-    // The full-extent affine maps image pixels onto the MS pixel grid Nx×Ny. Read the declared grid
-    // (IMS:1000042 / IMS:1000043) from the imzML header. If unknown, a Strict --image hard-fails
-    // (we have no grid to map onto); a Soft-only run warns + embeds nothing.
-    let grid = read_imzml_pixel_grid(input);
+    // The full-extent affine maps image pixels onto the MS pixel grid Nx×Ny: the grid of the lane's
+    // own `metadata.imaging` block (a detected imaging run), else the imzML header's IMS:1000042/43.
+    // If unknown, a Strict --image hard-fails (we have no grid to map onto); a Soft-only run warns +
+    // embeds nothing.
+    let marker = zip.index().metadata.get("imaging").cloned();
+    let grid = marker
+        .as_ref()
+        .and_then(|m| Some((m["pixel_count"]["x"].as_i64()?, m["pixel_count"]["y"].as_i64()?)))
+        .or_else(|| read_imzml_pixel_grid(input));
     let (nx, ny) = match grid {
         Some(g) => g,
         None => {
@@ -145,13 +150,10 @@ fn embed_optical_images(
         return Ok(());
     }
 
-    // metadata.imaging.images[] — match the prototype's block shape. The forward port carries only
-    // the discovery flag + images[] (the prototype's full geometry projection is out of scope here).
-    let block = serde_json::json!({
-        "is_imaging": true,
-        "coordinate_base": 1,
-        "images": entries,
-    });
+    // metadata.imaging.images[] — match the prototype's block shape. Added to the lane's marker block
+    // when it wrote one (the run was detected as imaging), else the discovery flag + images[] alone.
+    let mut block = marker.unwrap_or_else(|| serde_json::json!({"is_imaging": true, "coordinate_base": 1}));
+    block["images"] = serde_json::json!(entries);
     zip.add_index_metadata("imaging", &block)
         .context("writing metadata.imaging index")?;
     Ok(())
@@ -231,8 +233,8 @@ fn embed_one_image(
         .unwrap_or_else(|| "bin".to_string());
     let member = format!("images/image_{ordinal:04}.{ext}");
 
-    // Stream the bytes into the ZIP as an Other/Proprietary member (64 KiB chunks inside
-    // add_file_from_read — never a whole-file load).
+    // Stream the bytes into the ZIP (64 KiB chunks inside add_file_from_read — never a whole-file
+    // load) as the imaging profile lists an image: `entity_type` `image`, `data_kind` `other`.
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => fail!("file became unreadable before embed"),
@@ -240,7 +242,7 @@ fn embed_one_image(
     let fe = FileEntry::new(
         member.clone(),
         EntityType::Other("image".to_string()),
-        DataKind::Proprietary,
+        DataKind::Other("other".to_string()),
     );
     if zip.add_file_from_read(&mut f, None::<&String>, Some(fe)).is_err() {
         fail!("failed to stream image bytes into the archive");
@@ -793,6 +795,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&idx).unwrap();
         let meta = &v["metadata"];
         assert_eq!(meta["imaging"]["images"][0]["archive_path"], "images/image_0000.png");
+        // The imaging profile lists an image member as entity_type `image`, data_kind `other`.
+        let listed = v["files"].as_array().unwrap().iter().find(|f| f["name"] == "images/image_0000.png").unwrap();
+        assert_eq!((&listed["entity_type"], &listed["data_kind"]), (&serde_json::json!("image"), &serde_json::json!("other")), "{listed:#}");
         assert_eq!(meta["imaging"]["images"][0]["role"], "optical");
         assert_eq!(meta["imaging"]["images"][0]["affine"]["maps"], "image_px -> ms_px");
         assert_eq!(meta["study"]["sample_metadata_ref"], SDRF_MEMBER_NAME);

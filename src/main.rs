@@ -75,6 +75,9 @@ mod vendor;
 mod embed_aux;
 mod filter;
 mod encoding_prescan;
+mod vendor_sqlite;
+mod imaging;
+mod bruker_maldi;
 mod mzml_isolation;
 mod mzml_wavelength;
 mod pwiz_id;
@@ -884,6 +887,13 @@ fn install_tmp_panic_hook() {
 }
 
 fn main() {
+    // mzdata's PSI-MS vocabulary: the copy embedded in this binary. The vendored writer asks for it
+    // through `MSVocabulary::init()`, which first looks for an on-disk cache — normally absent — and
+    // logs two ERROR lines on every conversion before falling back to this same copy (since 0.14.0).
+    // Filling the singleton here silences that and keeps the vocabulary the one this binary was
+    // built with, whatever cache a host may have.
+    mzdata::params::MSVocabulary::init_static();
+
     // mzdata's Thermo reader panics on an unrecognized instrument model by default; downgrade to a
     // warning so a newer Astral/firmware doesn't hard-crash the converter. User override respected.
     if std::env::var_os("MZDATA_IGNORE_UNKNOWN_INSTRUMENT").is_none() {
@@ -1633,11 +1643,7 @@ fn dump_im_table(input: &Path) -> Result<()> {
     let tdf = dir.join("analysis.tdf");
 
     // num_scans straight from the SQLite Frames table — no binary needed.
-    let conn = rusqlite::Connection::open_with_flags(
-        &tdf,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", tdf.display()))?;
+    let conn = vendor_sqlite::open(&tdf).with_context(|| format!("opening {}", tdf.display()))?;
     let n: i64 = conn
         .query_row("SELECT MAX(NumScans) FROM Frames", [], |r| r.get(0))
         .context("reading MAX(NumScans)")?;
@@ -4090,17 +4096,69 @@ fn convert_file(
 
     let mut writer = builder.build(handle, true);
 
-    // imzML carries imaging coordinate cvParams that must be promoted to columns; the archive then
-    // references the IMS CV, so declare it (the writer seeds only MS+UO).
-    if is_imzml {
-        log::info!("imzML input: adding imaging position columns + IMS cv");
+    // Imaging (`imaging::detect`): imzML always, a Bruker MALDI `.d` (mzdata's TDF lane,
+    // `--no-ims-compact`), or any input whose spectra state positions. Positions stated as scan
+    // cvParams are promoted to the `position_*` columns; the archive then references the IMS CV, so
+    // declare it (the writer seeds only MS+UO).
+    let (maldi, scan_positions) = match imaging::detect(input, is_imzml, &probes) {
+        Some(imaging::Detected::BrukerMaldi(m)) => (Some(m), None),
+        Some(d) => (None, Some(d)),
+        None => (None, None),
+    };
+    if scan_positions.is_some() {
+        log::info!("imaging input: adding position columns + IMS cv");
         writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
+        // Position z only when the file states one: a column of nulls on every other archive.
+        if probes.iter().any(|s| s.acquisition().scans.iter().any(|sc| sc.get_param_by_curie(&curie!(IMS:1000052)).is_some())) {
+            writer.spectrum_entry_buffer_mut().add_imaging_position_z_visitor();
+        }
         writer
             .controlled_vocabularies_mut()
             .push(ControlledVocabulary::IMS.into());
     }
 
     writer.copy_metadata_from(&reader);
+    // imzML: put back the file provenance mzdata consumes, check the pixel size, and write the
+    // obsolete scan term "one way" as flyback — each change declared (`imaging`).
+    let mut imaging_applied: Vec<&'static str> = Vec::new();
+    let mut imaging_block: Option<serde_json::Value> = None;
+    if let MZReaderType::IMzML(_) = &reader {
+        let content = imaging::read_file_content(read_path).unwrap_or_else(|e| {
+            log::warn!("imzML file provenance not read: {e:#}");
+            Vec::new()
+        });
+        writer.file_description_mut().contents.extend(imaging::provenance_params(&content));
+        let fixes = imaging::read_scan_settings(read_path).map(|s| imaging::pixel_size_fixes(&s)).unwrap_or_else(|e| {
+            log::warn!("imzML pixel-size check skipped: {e:#}");
+            Vec::new()
+        });
+        let mut fixes = fixes;
+        if let Some(list) = writer.scan_settings_mut() {
+            for settings in list.iter_mut() {
+                if let Some(f) = fixes.iter_mut().find(|f| f.settings_id == settings.id) {
+                    imaging::apply(f, settings);
+                    if imaging::check_written_units(f, settings) {
+                        imaging_applied.push(imaging::UNIT_FROM_NAME);
+                    }
+                }
+                if imaging::one_way_to_flyback(settings) {
+                    imaging_applied.push(imaging::ONE_WAY_AS_FLYBACK);
+                }
+            }
+        }
+        for f in &fixes {
+            for m in f.unit_mismatches.iter().chain(&f.written_units) {
+                log::warn!("imzML scan settings {}: {m}", f.settings_id);
+            }
+            if let Some(t) = f.transformation {
+                log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
+                imaging_applied.push(t);
+            }
+        }
+        if !fixes.is_empty() {
+            imaging_block = Some(fixes.iter().map(imaging::fix_json).collect());
+        }
+    }
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
     }
@@ -4132,6 +4190,10 @@ fn convert_file(
     } else {
         None
     };
+    // A MALDI timsTOF run through mzdata (`--no-ims-compact`): each frame's raster position.
+    if let Some(m) = &maldi {
+        enable_bruker_imaging(&mut writer, m);
+    }
     // Thermo precursor windows the reader library computed without a stated width are written
     // target-only (`thermo_isolation`); the count is declared in `transformations` below.
     let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
@@ -4143,6 +4205,7 @@ fn convert_file(
     // Whether any spectrum was actually re-ordered below — declared in `transformations` so a
     // reader knows the stored point order is not the source's.
     let mut resorted = false;
+    let mut extent = imaging::Extent::default();
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
@@ -4186,6 +4249,12 @@ fn convert_file(
         if let Some(r) = &tdf_remap {
             r.apply(entry.description_mut());
         }
+        if let Some(m) = &maldi {
+            m.attach(&mut entry);
+        }
+        if scan_positions.is_some() {
+            extent.observe(entry.description());
+        }
         if let Some(g) = thermo_windows.as_mut() {
             g.apply(entry.description_mut());
         }
@@ -4213,12 +4282,42 @@ fn convert_file(
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     let acquisition_block = fixup_run_metadata(&mut writer, input);
 
+    // The imaging marker (`metadata.imaging`), with the grid: the input's own pixel counts, else the
+    // largest positions written (declared).
+    let mut imaging_blocks: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Some(d) = &scan_positions {
+        let list = writer.scan_settings_mut();
+        let counted = list.as_ref().is_some_and(|l| imaging::grid(l).is_none());
+        if let (true, Some(l)) = (counted, list) {
+            l.push(extent.settings());
+            imaging_applied.push(imaging::COUNT_FROM_POSITIONS);
+        }
+        let grid = writer.scan_settings_mut().and_then(|l| imaging::grid(l).cloned());
+        let provenance = serde_json::json!({
+            "detected_from": if matches!(d, imaging::Detected::ImzML) { "imzML input" } else { "IMS:1000050/51 on the input's scans" },
+            "positions": "IMS:1000050/51 of each spectrum, as stated",
+            "grid": if counted { "counted from the positions" } else { "the input's scan settings" },
+            "pixel_size": if imaging_block.is_some() { "checked, see imaging_pixel_size" } else { "as stated" },
+        });
+        imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), provenance)));
+    }
+    if let Some(m) = &maldi {
+        let (blocks, applied) = m.index_blocks();
+        imaging_blocks.extend(blocks);
+        imaging_applied.extend(applied);
+    }
+
     let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
         .into_iter()
         .chain(acquisition_block)
         .chain(route)
+        .chain(imaging_block.map(|b| ("imaging_pixel_size".to_string(), b)))
+        .chain(imaging_blocks)
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
+            for t in &imaging_applied {
+                declare(&mut applied, *t);
+            }
             if resorted {
                 declare(&mut applied, "sort-by-mz");
             }
@@ -5292,12 +5391,20 @@ where
     add_processing_metadata(&mut writer);
     // Both ims-compact lanes (native + SDK) attach the MZP:1000006/7 window band to selected ions.
     ensure_mzp_cv(&mut writer);
+    // MALDI imaging (timsTOF fleX): each frame's raster position (`imaging::detect`, `bruker_maldi`).
+    let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
+    if let Some(m) = &maldi {
+        enable_bruker_imaging(&mut writer, m);
+    }
 
     let mut ms1 = Ms1Chroms::default();
     match &mut driver {
         Driver::Serial(spectrum) => {
             for i in 0..n_frames {
-                let spec = spectrum(i, int_intensity)?;
+                let mut spec = spectrum(i, int_intensity)?;
+                if let Some(m) = &maldi {
+                    m.attach(&mut spec);
+                }
                 if synth_chroms {
                     ms1.observe(&spec);
                 }
@@ -5334,8 +5441,12 @@ where
             let decode_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let wns = writer_ns.clone();
             // The writer thread owns writer+ms1 and returns them (or the first write error) on join.
+            let maldi_w = maldi.clone();
             let writer_thread = std::thread::spawn(move || -> Result<(MzPeakWriterType<fs::File>, Ms1Chroms)> {
-                while let Ok(spec) = rx.recv() {
+                while let Ok(mut spec) = rx.recv() {
+                    if let Some(m) = &maldi_w {
+                        m.attach(&mut spec);
+                    }
                     if synth_chroms {
                         ms1.observe(&spec);
                     }
@@ -5450,6 +5561,10 @@ where
     if let Some(entry) = mz_summary.transformation {
         declare(&mut applied, entry);
     }
+    let (maldi_blocks, maldi_applied) = maldi.as_ref().map(|m| m.index_blocks()).unwrap_or_default();
+    for t in maldi_applied {
+        declare(&mut applied, t);
+    }
     applied.extend(chromatogram_transforms);
     // The vendor's exact calibration, verbatim, so the archive is self-sufficient without the
     // embedded `vendor/analysis.tdf.gz` (`--no-vendor`). Best-effort: a TDF without the table is
@@ -5482,6 +5597,7 @@ where
         .chain(partial_marker(input, max_spectra(), n_frames))
         .chain(vendor_calibration)
         .chain(vendor_tims)
+        .chain(maldi_blocks)
         .collect();
     // No aux: `--image`/`--sdrf` are refused on the ims-compact lane (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
@@ -6531,9 +6647,20 @@ fn convert_waters(
     // (`waters.rs`): the reader counts the frames that sort moved, and `sort-by-mz` is declared from
     // that count over the written spectra. Readers get the run's drift table + CCS calibration.
     hints.counters.push(("sort-by-mz", reader.reorder_counter()));
-    // Each data-facet column under the encoding a sample of the run compresses best under
+    // Each data-facet column under the encoding a sample of the run compressed best under
     // (`encoding_prescan`); `MZPC_ENCODING_PRESCAN=0` keeps the writer's fixed encodings.
     hints.encoding_prescan = env_flag("MZPC_ENCODING_PRESCAN").unwrap_or(true);
+    // Imaging (MALDI / DESI): the reader attaches each scan's pixel, fitted to its laser positions —
+    // the Waters branch of imaging detection, which needs MassLynx open.
+    if let Some(im) = reader.imaging() {
+        let grid = im.scan_settings();
+        let marker = imaging::marker_block(Some(&grid), im.provenance());
+        hints.imaging = Some(ImagingHints {
+            grid,
+            blocks: vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())],
+            transformations: vec![waters::LASER_GRID],
+        });
+    }
     if let Some(block) = reader.drift_block() {
         hints.index_blocks.push(("waters_drift".to_string(), block));
         // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
@@ -6620,6 +6747,17 @@ struct VendorHints {
     /// written under the encoding a sample of the run compressed best under. The Waters lane sets
     /// it; `MZPC_ENCODING_PRESCAN=0` turns it off.
     encoding_prescan: bool,
+    /// An imaging run whose reader attaches each spectrum's pixel itself (Waters laser positions).
+    imaging: Option<ImagingHints>,
+}
+
+/// A vendor reader whose spectra carry their pixel (`IMS:1000050/51`): the grid for
+/// `scan_settings_list`, the index blocks (the `metadata.imaging` marker among them) and the
+/// `transformations` entries. The writer gets the position columns and the IMS vocabulary.
+struct ImagingHints {
+    grid: mzdata::meta::ScanSettings,
+    blocks: Vec<(String, serde_json::Value)>,
+    transformations: Vec<&'static str>,
 }
 
 /// One spectrum from a vendor reader, with its routing outcome for the run summary. Every reader
@@ -6731,8 +6869,11 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         chromatograms,
         source_file_params,
         encoding_prescan,
+        imaging: imaging_hints,
     } = hints;
     let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
+    // MALDI imaging from a Bruker `.d` (the TSF lane): each frame's raster position.
+    let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
@@ -6832,6 +6973,12 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         }
         let mut writer = builder.build(handle, !keep_zero_runs);
         add_processing_metadata(&mut writer);
+        if let Some(m) = &maldi {
+            enable_bruker_imaging(&mut writer, m);
+        }
+        if let Some(h) = &imaging_hints {
+            enable_imaging(&mut writer, h.grid.clone());
+        }
         // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band.
         if is_tdf_dir(input) {
             ensure_mzp_cv(&mut writer);
@@ -6843,6 +6990,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
         for i in 0..len {
             let VendorSpectrum { spectrum: mut spec, routes } = spectrum(i)?.into();
+            if let Some(m) = &maldi {
+                m.attach(&mut spec);
+            }
             if int32 && !encoding_prescan::intensity_to_int32(&mut spec) {
                 let (chosen, fallback, _) = prescan.as_mut().expect("int32 comes from the pre-scan");
                 log::warn!(
@@ -6915,6 +7065,19 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     }
     // A lane that keeps zero runs built the writer with the mask off, so its tally has none to report.
     let mut applied = base_transformations(&writer);
+    if let Some(m) = &maldi {
+        let (blocks, maldi_applied) = m.index_blocks();
+        for t in maldi_applied {
+            declare(&mut applied, t);
+        }
+        index_blocks.extend(blocks);
+    }
+    if let Some(h) = imaging_hints {
+        for t in h.transformations {
+            declare(&mut applied, t);
+        }
+        index_blocks.extend(h.blocks);
+    }
     for entry in transformations {
         declare(&mut applied, entry);
     }
@@ -6934,6 +7097,23 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // No aux: `--image`/`--sdrf` are refused on the native vendor lanes (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)?;
     Ok(tally)
+}
+
+/// Turn a writer into an imaging one for a Bruker MALDI run: the position columns the imzML path
+/// writes, the IMS vocabulary, and the grid (pixel counts; pixel size from the beam scan size when
+/// there is one).
+fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) {
+    log::info!("Bruker MALDI imaging: {} frames carry a raster position", maldi.spots.len());
+    enable_imaging(writer, maldi.scan_settings());
+}
+
+/// Turn a writer into an imaging one: the position columns, the IMS vocabulary and the grid.
+fn enable_imaging(writer: &mut MzPeakWriterType<fs::File>, grid: mzdata::meta::ScanSettings) {
+    writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
+    writer.controlled_vocabularies_mut().push(ControlledVocabulary::IMS.into());
+    if let Some(list) = writer.scan_settings_mut() {
+        list.push(grid);
+    }
 }
 
 /// The archive writer every custom vendor reader writes through (grid policies aside). The
@@ -8844,7 +9024,7 @@ mod tests {
         let cvs = index["metadata"]["cv_list"].as_array().unwrap();
         let mzp: Vec<_> = cvs.iter().filter(|c| c["id"] == "MZP").collect();
         assert_eq!(mzp.len(), 1, "cv_list: {cvs:?}");
-        assert!(mzp[0]["uri"].as_str().unwrap().ends_with("cv/mzpeak.obo"));
+        assert_eq!((mzp[0]["uri"].as_str(), mzp[0]["version"].as_str()), (Some(mzpeak_prototyping::param::MZP_CV_URI), Some(mzpeak_prototyping::param::MZP_CV_VERSION)));
 
         let mut r = MzPeakReader::new(&path).unwrap();
         let mut back = r.get_spectrum_by_index(0).expect("spectrum 0");
@@ -10174,6 +10354,34 @@ mod tests {
     }
 
     /// Run the built binary with `args` and `envs`, returning (exit ok, stdout, stderr).
+    /// The MZP vocabulary is a fixed snapshot (conformance.md): `cv/mzpeak.obo` states the version the
+    /// `cv_list` entry names, the URI names the tag `mzp-cv-<version>`, and the file is the content
+    /// that version was cut with — editing it without a bump fails here (it went from 5 to 10 terms
+    /// as "0.1.0", review 2026-09-30).
+    #[test]
+    fn the_mzp_vocabulary_is_a_fixed_snapshot() {
+        use sha2::{Digest, Sha256};
+        let obo = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/cv/mzpeak.obo")).unwrap().replace("\r\n", "\n");
+        let v = mzpeak_prototyping::param::MZP_CV_VERSION;
+        assert!(obo.lines().any(|l| l == format!("data-version: {v}")), "cv/mzpeak.obo does not state data-version {v}");
+        assert!(mzpeak_prototyping::param::MZP_CV_URI.contains(&format!("/mzp-cv-{v}/")), "{}", mzpeak_prototyping::param::MZP_CV_URI);
+        let digest: String = Sha256::digest(obo.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            digest, "8becada8856f82ed35e0d8c439c5032eea9e5d635c021fb16dc9b4a1a81a96c5",
+            "cv/mzpeak.obo changed: bump its data-version and MZP_CV_VERSION, move MZP_CV_URI to the new \
+             tag, update this digest, and tag the release commit mzp-cv-<version>"
+        );
+    }
+
+    /// A conversion logs no vocabulary-cache ERROR lines (`MSVocabulary::init_static` in `main`).
+    #[test]
+    fn a_conversion_logs_no_vocabulary_cache_error() {
+        let out = scratch("cv-static").join("t.mzpeak");
+        let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert!(!err.contains("vocabulary database"), "{err}");
+    }
+
     fn run_bin(args: &[&std::ffi::OsStr], envs: &[(&str, &str)]) -> (bool, String, String) {
         let mut cmd = std::process::Command::new(built_binary());
         cmd.args(args);
@@ -11250,5 +11458,209 @@ mod tests {
             fs::metadata(&input).unwrap().len(),
             fs::metadata(&out).unwrap().len()
         );
+    }
+
+    /// The imzML lane (HUPO-PSI/mzPeak-specification#23): the file provenance mzdata consumes comes
+    /// back into `file_description`, the pixel-size rule acts and declares what it did, "one way" is
+    /// written as flyback, and a stated position z gets its column. Variants of one synthetic 3×3
+    /// grid (100 µm pixels over 300 µm; `tests/fixtures/imaging`, from the mzML2mzPeak generator).
+    #[test]
+    fn imzml_imaging_metadata_is_checked_and_restored() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        let px = r#"<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size x" value="100.0" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#;
+        let py = r#"<cvParam cvRef="IMS" accession="IMS:1000047" name="pixel size y" value="100.0" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#;
+        assert!(base.contains(px) && base.contains(py));
+        let dir = scratch("imzml-imaging");
+        let convert = |name: &str, imzml: String| -> serde_json::Value {
+            std::fs::write(dir.join(format!("{name}.imzML")), imzml).unwrap();
+            std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[dir.join(format!("{name}.imzML")).as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            index_metadata(&out)
+        };
+        let param = |settings: &serde_json::Value, acc: &str| -> Option<serde_json::Value> {
+            settings["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == acc).cloned()
+        };
+        let declared = |m: &serde_json::Value, entry: &str| -> bool {
+            m["transformations"].to_string().contains(entry)
+        };
+
+        // As found: provenance restored, pixel sizes untouched, nothing declared.
+        let m = convert("asis", base.clone());
+        let contents: Vec<String> = m["file_description"]["contents"].as_array().unwrap().iter().map(|p| p["accession"].as_str().unwrap().to_string()).collect();
+        for acc in ["IMS:1000031", "IMS:1000080", "IMS:1000091"] {
+            assert!(contents.contains(&acc.to_string()), "{acc} missing from file_description: {contents:?}");
+        }
+        let sha = m["file_description"]["contents"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000091").unwrap();
+        assert_eq!(sha["value"], "fd5c5dae18095ba7ab55a6ad1bd1175180b292a8");
+        // The UUID as the header spells it, not mzdata's re-spelling of its parse.
+        let uuid = m["file_description"]["contents"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000080").unwrap();
+        assert_eq!(uuid["value"], "{1a2b3c4d-5e6f-7081-9203-b4c5d6e7f8a9}");
+        let s = &m["scan_settings_list"][0];
+        assert_eq!(param(s, "IMS:1000046").unwrap()["value"], 100.0);
+        assert!(m.get("imaging_pixel_size").is_none(), "{:#}", m["imaging_pixel_size"]);
+        // imzML is always marked imaging, without `--image`, with its grid and provenance.
+        let img = &m["imaging"];
+        assert_eq!((&img["is_imaging"], &img["coordinate_base"]), (&serde_json::json!(true), &serde_json::json!(1)), "{img:#}");
+        assert_eq!(img["pixel_count"], serde_json::json!({"x": 3, "y": 3}));
+        assert_eq!(img["pixel_size_um"], serde_json::json!({"x": 100.0, "y": 100.0}));
+        assert_eq!(img["provenance"]["detected_from"], "imzML input");
+        assert!(img.get("images").is_none(), "no optical image was embedded");
+
+        // x and y without a unit: micrometre, declared.
+        let strip = |l: &str| l.replace(r#" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer""#, "");
+        let m = convert("nounit", base.replace(px, &strip(px)).replace(py, &strip(py)));
+        let s = &m["scan_settings_list"][0];
+        assert_eq!(param(s, "IMS:1000046").unwrap()["unit"], "UO:0000017");
+        assert!(declared(&m, super::imaging::UNIT_ASSUMED), "{:#}", m["transformations"]);
+        assert_eq!(m["imaging_pixel_size"][0]["case"], "x and y without a unit: micrometre assumed");
+
+        // One value that is an area (10000 µm²: √ × 3 = 300): its square root, declared.
+        let area = r#"<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size" value="10000"/>"#;
+        let m = convert("area", base.replace(px, area).replace(py, ""));
+        let s = &m["scan_settings_list"][0];
+        assert_eq!(param(s, "IMS:1000046").unwrap()["value"], 100.0);
+        assert_eq!(param(s, "IMS:1000046").unwrap()["unit"], "UO:0000017");
+        assert!(declared(&m, super::imaging::AREA_TO_LENGTH));
+
+        // The centimetre accession labelled micrometer: reported, not rewritten.
+        let cm = |l: &str| l.replace("UO:0000017", "UO:0000015");
+        let m = convert("cm", base.replace(px, &cm(px)).replace(py, &cm(py)));
+        // mzdata takes the unit from whichever attribute comes last (here the name): the archive
+        // says which unit it wrote, and declares that it is not the stated accession.
+        assert_eq!(m["imaging_pixel_size"][0]["unit_mismatches"].as_array().unwrap().len(), 2, "{:#}", m["imaging_pixel_size"]);
+        let written = param(&m["scan_settings_list"][0], "IMS:1000046").unwrap()["unit"].clone();
+        assert!(m["imaging_pixel_size"][0]["written_units"].to_string().contains(&format!("written {}", written.as_str().unwrap())), "{:#}", m["imaging_pixel_size"]);
+        assert_eq!(declared(&m, super::imaging::UNIT_FROM_NAME), written != "UO:0000015");
+
+        // "one way" becomes flyback; a stated position z gets a column.
+        let one_way = base
+            .replace(px, &format!(r#"{px}<cvParam cvRef="IMS" accession="IMS:1000411" name="one way"/>"#))
+            .replace(r#"name="position y" value="1"/>"#, r#"name="position y" value="1"/><cvParam cvRef="IMS" accession="IMS:1000052" name="position z" value="7"/>"#);
+        let m = convert("oneway", one_way);
+        let s = &m["scan_settings_list"][0];
+        assert!(param(s, "IMS:1000411").is_none() && param(s, "IMS:1000413").is_some(), "{s:#}");
+        assert!(declared(&m, super::imaging::ONE_WAY_AS_FLYBACK));
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(dir.join("oneway.mzpeak")).unwrap()).unwrap();
+        let mut scans = Vec::new();
+        zip.by_name("spectra_metadata_scans.parquet").unwrap().read_to_end(&mut scans).unwrap();
+        let pf = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(scans)).unwrap();
+        let schema: Vec<String> = parquet::file::reader::FileReader::metadata(&pf).file_metadata().schema_descr().columns().iter().map(|c| c.path().string()).collect();
+        // The imaging profile's column names (HUPO-PSI/mzPeak-specification#24), no `opt_` inflection.
+        for c in ["position_x", "position_y", "position_z"] {
+            assert!(schema.iter().any(|s| s == c), "no {c} column: {schema:?}");
+        }
+        assert!(!schema.iter().any(|c| c.contains("opt_IMS")), "{schema:?}");
+
+        // Round trip through mzML: the positions come back as scan cvParams, and the mzML — no
+        // longer imzML — is still detected as imaging by the positions it states.
+        let mzml = dir.join("oneway.mzML");
+        let (ok, _, err) = run_bin(&[dir.join("oneway.mzpeak").as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert!(std::fs::read_to_string(&mzml).unwrap().contains(r#"accession="IMS:1000050""#), "positions lost in the mzML export");
+        let back = dir.join("back.mzpeak");
+        let (ok, _, err) = run_bin(&[mzml.as_os_str(), "-o".as_ref(), back.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let m = index_metadata(&back);
+        assert_eq!(m["imaging"]["is_imaging"], true, "{:#}", m["imaging"]);
+        assert_eq!(m["imaging"]["provenance"]["detected_from"], "IMS:1000050/51 on the input's scans");
+        assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 3, "y": 3}), "{:#}", m["imaging"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Bruker MALDI imaging run straight from the `.d` (HUPO-PSI/mzPeak-specification#23): a
+    /// synthetic TSF in WAL mode, like the issue author's, with a `MaldiFrameInfo` table. The frames'
+    /// raster indices land in the same position columns the imzML path writes, shifted so the
+    /// smallest is 1 (declared, origin recorded); the archive is marked imaging, names the IMS
+    /// vocabulary, states the grid and says where its pixel size came from; and the conversion leaves
+    /// the `.d` exactly as it found it (no `-shm` / `-wal`).
+    #[test]
+    fn bruker_maldi_tsf_carries_its_pixel_positions() {
+        use arrow::array::{Array, UInt32Array};
+        let dir = scratch("maldi-tsf");
+        let dot_d = dir.join("imaging.d");
+        std::fs::create_dir_all(&dot_d).unwrap();
+        // tsf_bin: per frame an 8-byte [padded][compressed] header, then zstd([tof f64 × n][intensity f32 × n]).
+        let mut bin = Vec::new();
+        let mut frames = Vec::new();
+        for (id, n) in [(1i64, 3usize), (2, 2), (3, 4)] {
+            let mut raw = Vec::new();
+            for k in 0..n {
+                raw.extend_from_slice(&(1000.0 * (k + 1) as f64 + id as f64).to_le_bytes());
+            }
+            for k in 0..n {
+                raw.extend_from_slice(&(10.0 * (k + 1) as f32).to_le_bytes());
+            }
+            let z = zstd::encode_all(&raw[..], 3).unwrap();
+            let offset = bin.len();
+            bin.extend_from_slice(&((z.len() + 8) as u32).to_le_bytes());
+            bin.extend_from_slice(&(z.len() as u32).to_le_bytes());
+            bin.extend_from_slice(&z);
+            frames.push(format!("({id}, {}, 0, '+', {n}, {offset})", id as f64 * 0.5));
+        }
+        std::fs::write(dot_d.join("analysis.tsf_bin"), &bin).unwrap();
+        let db = rusqlite::Connection::open(dot_d.join("analysis.tsf")).unwrap();
+        db.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)).unwrap();
+        db.execute_batch(&format!(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('MzAcqRangeLower', '100'), ('MzAcqRangeUpper', '1000'),
+                                               ('DigitizerNumSamples', '100000'), ('AcquisitionSoftware', 'timsControl');
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, MsMsType INTEGER, Polarity TEXT, NumPeaks INTEGER, TimsId INTEGER);
+             INSERT INTO Frames VALUES {};
+             CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, Chip INTEGER, SpotName TEXT, RegionNumber INTEGER,
+                                          XIndexPos INTEGER, YIndexPos INTEGER, BeamScanSizeX REAL, BeamScanSizeY REAL);
+             INSERT INTO MaldiFrameInfo VALUES (1, 0, 'R00X669Y700', 0, 669, 700, 20.0, 20.0),
+                                               (2, 0, 'R00X670Y700', 0, 670, 700, 20.0, 20.0),
+                                               (3, 0, 'R01X837Y812', 1, 837, 812, 20.0, 20.0);",
+            frames.join(", ")
+        ))
+        .unwrap();
+        drop(db);
+        let before: std::collections::BTreeSet<_> = std::fs::read_dir(&dot_d).unwrap().map(|e| e.unwrap().file_name()).collect();
+
+        let out = dir.join("imaging.mzpeak");
+        let (ok, _, err) = run_bin(&[dot_d.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let after: std::collections::BTreeSet<_> = std::fs::read_dir(&dot_d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(before, after, "the conversion wrote into the .d");
+
+        let m = index_metadata(&out);
+        assert!(m["cv_list"].to_string().contains("\"IMS\""), "{:#}", m["cv_list"]);
+        assert_eq!(m["bruker_maldi"]["x_index"], serde_json::json!([669, 837]), "{:#}", m["bruker_maldi"]);
+        assert_eq!(m["bruker_maldi"]["regions"].as_array().unwrap().len(), 2);
+        assert!(m["transformations"].to_string().contains(super::bruker_maldi::PIXEL_FROM_BEAM));
+        assert!(m["transformations"].to_string().contains(super::bruker_maldi::SHIFTED_TO_BASE_1));
+        let grid = |acc: &str| m["scan_settings_list"][0]["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == acc).unwrap().clone();
+        assert_eq!((grid("IMS:1000046")["value"].clone(), grid("IMS:1000046")["unit"].clone()), (serde_json::json!(20.0), serde_json::json!("UO:0000017")));
+        assert_eq!((grid("IMS:1000042")["value"].clone(), grid("IMS:1000043")["value"].clone()), (serde_json::json!(169), serde_json::json!(113)));
+        let img = &m["imaging"];
+        assert_eq!((&img["is_imaging"], &img["coordinate_base"]), (&serde_json::json!(true), &serde_json::json!(1)), "{img:#}");
+        assert_eq!(img["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
+        assert_eq!(img["position_offset"], serde_json::json!({"x": 668, "y": 699}), "{img:#}");
+
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+        let mut scans = Vec::new();
+        zip.by_name("spectra_metadata_scans.parquet").unwrap().read_to_end(&mut scans).unwrap();
+        let batches: Vec<_> = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(scans))
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect();
+        let col = |name: &str| -> Vec<u32> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let a = b.column_by_name(name).unwrap_or_else(|| panic!("no {name} in {:?}", b.schema()));
+                    let a = a.as_any().downcast_ref::<UInt32Array>().unwrap();
+                    (0..a.len()).filter(|&i| a.is_valid(i)).map(|i| a.value(i)).collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(col("position_x"), vec![1, 2, 169]);
+        assert_eq!(col("position_y"), vec![1, 1, 113]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

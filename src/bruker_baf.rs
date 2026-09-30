@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 use mzdata::params::Unit;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
@@ -738,10 +738,7 @@ impl BafReader {
         let paths = BafPaths::resolve(dot_d)?;
         let api = Baf2SqlApi::load(sdk_lib)?;
         let sqlite_cache = api.sqlite_cache_path(&paths.baf_file)?;
-        let connection = Connection::open_with_flags(
-            &sqlite_cache,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
+        let connection = crate::vendor_sqlite::open(&sqlite_cache)
         .with_context(|| format!("opening BAF SQLite cache {}", sqlite_cache.display()))?;
         let rows = read_spectrum_rows(&connection)?;
         let properties = read_properties(&connection);

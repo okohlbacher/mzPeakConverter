@@ -35,7 +35,7 @@ use mzdata::params::{Param, Unit};
 use mzdata::prelude::*;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
 use mzdata::spectrum::{Chromatogram, ChromatogramDescription, ChromatogramType};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 /// One device trace, and what reading it did to its samples — each a `transformations` entry the
 /// lane declares when the trace is written (`finish_chromatograms` names them).
@@ -79,8 +79,7 @@ pub fn read(dot_d: &Path) -> Vec<Trace> {
         );
         return Vec::new();
     }
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    match Connection::open_with_flags(&path, flags).and_then(|conn| read_traces(&conn)) {
+    match crate::vendor_sqlite::open(&path).and_then(|conn| read_traces(&conn)) {
         Ok(traces) => {
             log::info!("{}: {} device traces", path.display(), traces.len());
             traces

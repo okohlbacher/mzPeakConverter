@@ -57,15 +57,15 @@ table lists every entry.
 | Format | Linux | macOS | Windows | Notes |
 |---|:---:|:---:|:---:|---|
 | mzML, `.mzML.gz` | ✅ | ✅ | ✅ | gzip detected by magic and inflated to a temp copy; and `-o x.mzML.gz` writes gzipped mzML |
-| imzML | ✅ | ✅ | ✅ | imaging coords + IMS CV |
-| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default** |
-| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF |
+| imzML | ✅ | ✅ | ✅ | imaging profile: `position_x/y`, grid, `metadata.imaging`; pixel size checked, file provenance kept |
+| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default**; MALDI imaging (positions from 1, grid) |
+| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; MALDI imaging (positions from 1, grid) |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; `libbaf2sql_c` at runtime |
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | out-of-process **net48** host (`glue/agilent`) → MHDAC; since 0.11.0. MRM/SIM-only runs are refused (they are chromatograms) — use `--via-msconvert` for those ([details](docs/PLATFORM_SUPPORT.md)) |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/sciex`); Clearcore2 at runtime. MSn precursors (selected ion, isolation window, collision energy) are read but not yet run on Windows. MRM/SIM dwell runs are refused (they are chromatograms) — use `--via-msconvert`; multi-sample files take `--sample N` |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | in-process .NET glue (`glue/shimadzu`); LabSolutions.IO at runtime — **needs a current ProteoWizard**, see [`glue/shimadzu/README.md`](glue/shimadzu/README.md) |
-| Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` called directly, no .NET glue (`MZPC_MASSLYNX_DIR`, else `MZPC_PWIZ_DIR`); HDMSe/HDDDA functions are written as frames with a per-point drift time |
+| Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` called directly, no .NET glue (`MZPC_MASSLYNX_DIR`, else `MZPC_PWIZ_DIR`); HDMSe/HDDDA functions are written as frames with a per-point drift time; MALDI/DESI imaging positions fitted to a grid |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Wine off-Windows) |
 
 Thermo `.raw` and Bruker `.d` link their readers in automatically (no build flag).

@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 
 /// Bruker timsTOF `ModelType = 2` mobility calibration: mobility scan index → 1/K0 (Vs·s/cm²).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -93,10 +93,7 @@ impl TimsMobilityCalibration {
 
     /// Convenience: open `analysis.tdf` read-only and load the calibration.
     pub fn from_tdf_path(tdf: &Path) -> Result<Option<Self>> {
-        let conn = Connection::open_with_flags(
-            tdf,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
+        let conn = crate::vendor_sqlite::open(tdf)
         .with_context(|| format!("opening {}", tdf.display()))?;
         Self::from_tdf(&conn)
     }

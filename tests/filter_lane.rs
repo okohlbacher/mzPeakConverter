@@ -651,3 +651,28 @@ fn a_stated_wavelength_range_wins_over_the_computed_one() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every member of a rewritten archive carries the SHA-512 of the bytes actually written. The rewrite
+/// re-encodes each Parquet facet, and it used to keep the source's checksum for them (9 of 12 members
+/// of a filtered MALDI archive mismatched, review 2026-09-30).
+#[test]
+fn rewritten_members_carry_their_own_checksums() {
+    use sha2::{Digest, Sha512};
+    let dir = scratch("checksums");
+    let src = convert(TINY, &dir);
+    for (tag, extra) in [("ms1", &["--ms-level", "1"][..]), ("rt", &["--rt", "0-1"][..])] {
+        let out = dir.join(format!("{tag}.mzpeak"));
+        ok(&mzpc(&src, &out, extra));
+        let index: serde_json::Value = serde_json::from_slice(&member(&out, "mzpeak_index.json")).unwrap();
+        let mut checked = 0;
+        for f in index["files"].as_array().unwrap() {
+            let name = f["name"].as_str().unwrap();
+            let Some(want) = f["checksum"]["value"].as_str().or_else(|| f["checksum"].as_str()) else { continue };
+            let got: String = Sha512::digest(member(&out, name)).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, want, "{tag}: {name} carries a stale checksum");
+            checked += 1;
+        }
+        assert!(checked >= 5, "{tag}: only {checked} members carry a checksum: {index:#}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

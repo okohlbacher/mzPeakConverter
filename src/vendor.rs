@@ -20,7 +20,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::read::GzEncoder;
-use rusqlite::Connection;
 use serde::Deserialize;
 
 use mzpeak_prototyping::archive::{DataKind, EntityType, FileEntry, ZipArchiveWriter};
@@ -394,7 +393,7 @@ pub(crate) fn baf_properties_metadata(
 /// Read run-level `GlobalMetadata` (key/value) from a TSF or TDF SQLite, as a JSON object.
 pub(crate) fn read_global_metadata(dot_d: &Path) -> Option<serde_json::Value> {
     let sql = bruker_sqlite(dot_d)?;
-    let conn = Connection::open_with_flags(&sql, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = crate::vendor_sqlite::open(&sql).ok()?;
     let mut stmt = conn.prepare("SELECT Key, Value FROM GlobalMetadata").ok()?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))

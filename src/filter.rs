@@ -296,10 +296,10 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
                 wavelength_survivors.as_ref(),
             )
             .with_context(|| format!("filtering facet {name}"))?;
-            w.start_for_entry(fe)
-                .map_err(|e| anyhow!("starting member {name}: {e}"))?;
-            use std::io::Write as _;
-            w.write_all(&out_bytes)
+            // Through the hashing path: the bytes changed, so the SHA-512 must be recomputed. The
+            // entry is the source's, and `start_for_entry` + `write_all` shipped its old checksum on
+            // the re-encoded bytes (review 2026-09-30).
+            w.add_file_from_read(&mut std::io::Cursor::new(&out_bytes), None::<&String>, Some(fe))
                 .with_context(|| format!("writing member {name}"))?;
         } else {
             // Non-Parquet member (vendor side-file, image, sdrf, …): copy verbatim, streamed.

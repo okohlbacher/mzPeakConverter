@@ -191,6 +191,13 @@ pub fn inflect_cv_term_to_column_name(curie: CURIE, name: &str, unit: Option<CUR
     buffer
 }
 
+/// An imaging position column under the imaging profile's name (`position_x`, …) rather than the inflected one.
+fn imaging_position(curie: CURIE, term: &str, column: &str) -> CustomBuilderFromParameter {
+    let mut v = CustomBuilderFromParameter::from_spec(curie, term, DataType::UInt32);
+    v.field = Arc::new(v.field.as_ref().clone().with_name(column));
+    v
+}
+
 /// A [`StructVisitor`] that will match an [`mzdata::Param`] by [`CURIE`]
 /// and map it to a new column, and then prevent the same `CURIE` from being
 /// reused again elsewhere for that object.
@@ -2722,23 +2729,27 @@ impl SpectrumBuilder {
             .extend_extra_activation_fields(visitors.spectrum_activation_fields);
     }
 
-    /// Adds extra [`CustomBuilderFromParameter`] visitors to the `scan` facet that convert the `IMS:1000050|position x` and `IMS:1000051|position y`
-    /// [`Param`] into columns. If these parameters are not present, those columns will contain `null`s.
+    /// Adds extra [`CustomBuilderFromParameter`] visitors to the `scan` facet that convert the `IMS:1000050|position x`
+    /// and `IMS:1000051|position y` [`Param`] into columns. If these parameters are not present, those columns will contain `null`s.
+    ///
+    /// DELIBERATE DEVIATION (not upstream): the columns are named `position_x` / `position_y`, as the imaging profile
+    /// (HUPO-PSI/mzPeak-specification#24) requires, not the inflected `opt_IMS_1000050_position_x`. The column mapping
+    /// still names each term, and the param name stays the term's own.
     pub fn add_imaging_position_visitors(&mut self) {
         let visitors: [Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>>; _] = [
-            CustomBuilderFromParameter::from_spec(
-                mzdata::curie!(IMS:1000050),
-                "position x",
-                DataType::UInt32,
-            ),
-            CustomBuilderFromParameter::from_spec(
-                mzdata::curie!(IMS:1000051),
-                "position y",
-                DataType::UInt32,
-            ),
+            imaging_position(mzdata::curie!(IMS:1000050), "position x", "position_x"),
+            imaging_position(mzdata::curie!(IMS:1000051), "position y", "position_y"),
         ]
         .map(|v| Box::new(v) as Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>>);
         self.scan.extend_extra_fields(visitors);
+    }
+
+    /// Position z (`IMS:1000052`, column `position_z`), for imaging inputs that state one. DELIBERATE DEVIATION (not
+    /// upstream): a separate call so archives without a z coordinate get no column of nulls.
+    pub fn add_imaging_position_z_visitor(&mut self) {
+        let z: Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>> =
+            Box::new(imaging_position(mzdata::curie!(IMS:1000052), "position z", "position_z"));
+        self.scan.extend_extra_fields([z]);
     }
 
     pub fn append_value<
