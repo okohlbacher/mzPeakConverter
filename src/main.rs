@@ -6258,11 +6258,36 @@ fn shimadzu_grid_route(
     (out, Some(true), trimmed)
 }
 
+/// The PSI-MS term for the Shimadzu model a `.lcd` states: the descendant of MS:1000124 "Shimadzu
+/// instrument model" in the vocabulary mzdata embeds whose name the stated model is, or begins with
+/// before a non-alphanumeric — `LCMS-9030 wo PDA` is an LCMS-9030 (MS:1002998); the longest such name
+/// wins, so an `LCMS-8030 Plus` is not an LCMS-8030. A model the vocabulary does not know keeps the
+/// family term, the stated name as its value. Until 0.16.0 every `.lcd` was written MS:1002998 (the
+/// LCMS-9030) under the family's name, whatever its model (review 2026-09-30 §E). Host-independent
+/// (only the `.lcd` reader is Windows-only) so it is testable anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shimadzu_model_term(model: &str) -> Param {
+    use mzdata::params::MSVocabulary;
+    // What `main` does first; a unit test has no `main`.
+    MSVocabulary::init_static();
+    let stated = model.trim().to_lowercase();
+    let names_it = |name: &str| {
+        stated.strip_prefix(name.to_lowercase().as_str()).is_some_and(|rest| !rest.starts_with(char::is_alphanumeric))
+    };
+    MSVocabulary::children_of_recursive(curie!(MS:1000124))
+        .into_iter()
+        .filter_map(|c| MSVocabulary::get(c.0))
+        .filter(|t| names_it(&t.name))
+        .max_by_key(|t| t.name.len())
+        .map(|t| Param::builder().name(t.name.as_ref()).curie(t.curie()).build())
+        .unwrap_or_else(|| run_metadata::term_str(1000124, "Shimadzu instrument model", model))
+}
+
 /// Instrument configuration from what the vendor API states — and only that. `SystemName()` is the
 /// model; `DeviceID = MSID_QTFL` names the Q-TOF family, so the quadrupole + TOF analysers are not
 /// in doubt; the ion source is asserted only when the spectra say `ESI`. No detector is invented.
 #[cfg(windows)]
-/// The instrument configuration of a `.lcd`: the family term ProteoWizard states, the model — the MS
+/// The instrument configuration of a `.lcd`: the model's PSI-MS term (`shimadzu_model_term`), the model — the MS
 /// unit's name from the file's system configuration (`LCMS-9030`) when `stated_model` has it, else the
 /// vendor library's `SystemName()`, which is the operator's name for the whole system (`neo-ms`) and is
 /// then kept as a user param — and the components ProteoWizard's Reader_Shimadzu states for the QTFL
@@ -6273,7 +6298,7 @@ fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo, stated_model: Op
     let system_name = info.system_name.clone();
     let model = stated_model.map(str::to_string).or_else(|| system_name.clone())?;
     let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
-    cfg.params.push(run_metadata::term(1002998, "Shimadzu instrument model"));
+    cfg.params.push(shimadzu_model_term(&model));
     cfg.params.push(Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model.clone()).build());
     if let Some(name) = system_name.filter(|n| *n != model) {
         cfg.params.push(Param::new_key_value("system name", name));
@@ -9361,6 +9386,29 @@ mod tests {
         assert_eq!(ms1.tic[0], col_tic, "TIC must equal the total_ion_current column");
         assert_eq!(ms1.bpc[0], 5.0);
         assert_eq!(ms1.tic[0], 399.0 + 5.0);
+    }
+
+    /// The Shimadzu model term comes from the vocabulary, not from a constant: until 0.16.0 every
+    /// `.lcd` was written MS:1002998 (the LCMS-9030) whatever its model.
+    #[test]
+    fn shimadzu_model_resolves_against_the_psi_ms_vocabulary() {
+        let term = |model: &str| {
+            let p = super::shimadzu_model_term(model);
+            (p.curie().map(|c| c.to_string()), p.name.clone(), p.value.to_string())
+        };
+        let known = |acc: &str, name: &str| (Some(acc.to_string()), name.to_string(), String::new());
+        assert_eq!(term("LCMS-9030"), known("MS:1002998", "LCMS-9030"));
+        // What the file's system configuration states on the corpus 9030s, and the case of it.
+        assert_eq!(term("LCMS-9030 wo PDA"), known("MS:1002998", "LCMS-9030"));
+        assert_eq!(term("lcms-9050"), known("MS:1003568", "LCMS-9050"));
+        // The longest name wins, and a prefix must end at a word: 8030 Plus, not 8030; 2010EV, not 2010.
+        assert_eq!(term("LCMS-8030 Plus"), known("MS:1003486", "LCMS-8030 Plus"));
+        assert_eq!(term("LCMS-2010EV"), known("MS:1000605", "LCMS-2010EV"));
+        // Not in the vocabulary (a digit continues the name; the operator's system name): the family
+        // term, carrying what the file states.
+        let family = |value: &str| (Some("MS:1000124".to_string()), "Shimadzu instrument model".to_string(), value.to_string());
+        assert_eq!(term("LCMS-90300"), family("LCMS-90300"));
+        assert_eq!(term("neo-ms"), family("neo-ms"));
     }
 
     /// A DUAL scan (gridded profile in the data facet + a centroid `PeakSet` alongside) states a
