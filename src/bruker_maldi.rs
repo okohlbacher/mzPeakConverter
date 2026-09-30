@@ -265,13 +265,16 @@ impl MaldiInfo {
     /// inside its box passes. Regions without motor positions, areas of another type and a `.mis`
     /// without three teach points are not tested.
     pub fn mis_mismatch(&self, mis: &Mis) -> Option<String> {
+        let unmapped = |r: i64| usize::try_from(r).map_or(true, |a| a >= mis.areas.len());
+        // The largest unmapped RegionNumber: the reason is recorded, so it must not follow hash order.
+        if let Some(r) = self.spots.values().filter_map(|s| s.region).filter(|&r| unmapped(r)).max() {
+            return Some(format!("RegionNumber {r} has no <Area> (the file has {})", mis.areas.len()));
+        }
         let mut regions: BTreeMap<usize, Vec<(f64, f64)>> = BTreeMap::new();
         for s in self.spots.values() {
-            let Some(r) = s.region else { continue };
-            let Some(area) = usize::try_from(r).ok().filter(|&a| a < mis.areas.len()) else {
-                return Some(format!("RegionNumber {r} has no <Area> (the file has {})", mis.areas.len()));
-            };
-            regions.entry(area).or_default().extend(s.motor);
+            if let Some(r) = s.region {
+                regions.entry(r as usize).or_default().extend(s.motor); // 0 ≤ r < areas, checked above
+            }
         }
         let Some(&[(a, sa), (b, sb), (c, sc)]) = mis.teach.get(..3) else { return None };
         let d = (b.1 - c.1) * (a.0 - c.0) + (c.0 - b.0) * (a.1 - c.1);
@@ -589,6 +592,21 @@ mod tests {
         assert_eq!(b["mis_rejected"]["reason"], reason);
         assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)), "no raster step from it");
         assert!(b["pixel_size"].as_str().unwrap().contains("run.mis not used"), "{}", b["pixel_size"]);
+    }
+
+    /// Several unmapped regions: the reason names the largest, whatever the hash order of the frames
+    /// (it was the first met, so the recorded reason changed from run to run).
+    #[test]
+    fn the_largest_unmapped_region_is_reported() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, RegionNumber INTEGER, XIndexPos INTEGER, YIndexPos INTEGER);")
+            .unwrap();
+        for r in 0..16 {
+            c.execute("INSERT INTO MaldiFrameInfo VALUES (?1, ?2, ?1, 1)", [r + 1, r]).unwrap();
+        }
+        let info = read(&c).unwrap();
+        let mis = read_mis_from("run.mis", MIS.as_bytes()).unwrap();
+        assert_eq!(info.mis_mismatch(&mis).as_deref(), Some("RegionNumber 15 has no <Area> (the file has 2)"));
     }
 
     /// The geometric check on MassIVE MSV000088438 (`20210921_vc_rugose_tims_gordon`): its teach

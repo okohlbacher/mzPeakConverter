@@ -302,6 +302,9 @@ pub struct PixelSizeFix {
     /// Pixel sizes to write: accession (`IMS:1000046`/`47`), value, and whether its unit is set to
     /// micrometre. An accession absent here is removed.
     pub write: Vec<(&'static str, f64, bool)>,
+    /// The unit accession each `write` value is in: micrometre where set, else as the file states it
+    /// (an area's root keeps a stated length unit, so the values are not all µm).
+    pub write_units: Vec<Option<String>>,
     /// Unit accession/name disagreements seen on the pixel-size and extent params.
     pub unit_mismatches: Vec<String>,
     /// `(param accession, stated unit accession)` of those params, to compare with what was written.
@@ -343,10 +346,14 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
         })
         .collect();
     let (x, y) = (get(PIXEL_X), get(PIXEL_Y));
-    let fix = |case, transformation, write, detail: String| PixelSizeFix {
+    let fix = |case, transformation, write: Vec<(&'static str, f64, bool)>, detail: String| PixelSizeFix {
         settings_id: s.id.clone(),
         case,
         transformation,
+        write_units: write
+            .iter()
+            .map(|&(a, _, um)| if um { Some("UO:0000017".into()) } else { get(a).and_then(|p| p.unit_accession.clone()) })
+            .collect(),
         write,
         unit_mismatches: unit_mismatches.clone(),
         mismatched: mismatched.clone(),
@@ -395,40 +402,43 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
                 ));
             };
             // Value and extent compared in µm, each by its unit accession (B17: the units were
-            // ignored); a param without a known length unit is taken as µm, and the detail says so.
+            // ignored); a param without a known length unit is tested as µm, and the detail says so.
             let mut assumed = Vec::new();
-            let mut um = |q: &RawParam| match q.unit_accession.as_deref().and_then(length_unit) {
-                Some((_, size)) => size,
-                None => {
+            let mut unit = |q: &RawParam| {
+                q.unit_accession.as_deref().and_then(length_unit).unwrap_or_else(|| {
                     assumed.push(q.accession.clone());
-                    1.0
-                }
+                    ("micrometer", 1.0)
+                })
             };
-            let (value_um, extent_um) = (um(p), extent * um(e));
-            let unit_assumed = assumed.contains(&p.accession);
+            let ((vu, v_size), (eu, e_size)) = (unit(p), unit(e));
+            let extent_um = extent * e_size;
             let note = if assumed.is_empty() { String::new() } else { format!(" ({} without a length unit: micrometre assumed)", assumed.join(", ")) };
-            if approx(v.sqrt() * value_um * count, extent_um) {
+            if approx(v.sqrt() * v_size * count, extent_um) {
                 Some(fix(
                     "one value: an area (√value × count = extent)",
                     Some(AREA_TO_LENGTH),
                     // The square root of an area is a length in the unit the area is the square
-                    // of (µm² → µm, mm² → mm): the stated unit stays.
-                    vec![(acc, v.sqrt(), unit_assumed)],
-                    format!("{acc}={v} as area; √{v} × {count} = {extent}{note}"),
+                    // of (µm² → µm, mm² → mm): a stated length unit stays, anything else was
+                    // tested as µm² and becomes µm.
+                    vec![(acc, v.sqrt(), assumed.contains(&p.accession))],
+                    format!("{acc}={v} as area; √({v} {vu}²) × {count} = {extent} {eu}{note}"),
                 ))
-            } else if approx(v * value_um * count, extent_um) {
+            } else if approx(v * v_size * count, extent_um) {
+                // A stated unit stays even when it is no length, as in the two-value case:
+                // micrometre is written only where none is stated.
+                let unit_assumed = p.unit_accession.is_none();
                 Some(fix(
                     "one value: a length (value × count = extent)",
                     unit_assumed.then_some(UNIT_ASSUMED),
                     vec![(acc, v, unit_assumed)],
-                    format!("{acc}={v}; {v} × {count} = {extent}{note}"),
+                    format!("{acc}={v}; {v} {vu} × {count} = {extent} {eu}{note}"),
                 ))
             } else {
                 Some(fix(
                     "one value that tests as neither area nor length",
                     Some(DROPPED),
                     vec![],
-                    format!("{acc}={v}; count {count}, max dimension {extent}{note}"),
+                    format!("{acc}={v} {vu}; count {count}, max dimension {extent} {eu}{note}"),
                 ))
             }
         }
@@ -497,7 +507,13 @@ pub fn fix_json(f: &PixelSizeFix) -> serde_json::Value {
         "scan_settings": f.settings_id,
         "case": f.case,
         "transformation": f.transformation,
-        "written_um": f.write.iter().map(|(a, v, assumed)| serde_json::json!({"accession": a, "value": v, "unit_assumed": assumed})).collect::<Vec<_>>(),
+        // The key predates `unit` (review 2026-09-30: an mm² area's root is written in mm).
+        "written_um": f
+            .write
+            .iter()
+            .zip(&f.write_units)
+            .map(|((a, v, assumed), unit)| serde_json::json!({"accession": a, "value": v, "unit": unit, "unit_assumed": assumed}))
+            .collect::<Vec<_>>(),
         "unit_mismatches": f.unit_mismatches,
         "written_units": f.written_units,
         "detail": f.detail,
@@ -696,12 +712,24 @@ mod tests {
         assert_eq!(nm.transformation, None, "10 µm × 100 = 10⁶ nm");
         // An area in mm²: its square root in mm (√0.0001 mm² = 0.01 mm; × 100 = 1 mm), the unit kept.
         let area = pixel_size_fix(&settings(&[("IMS:1000046", "0.0001", MM), ("IMS:1000042", "100", None), ("IMS:1000044", "1", MM)])).unwrap();
-        assert_eq!((area.transformation, area.write), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 0.01, false)]));
+        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 0.01, false)]));
+        // The index row says which unit that is (its key, `written_um`, predates the mm case).
+        assert_eq!(fix_json(&area)["written_um"][0]["unit"], "UO:0000016");
         // No unit anywhere: micrometre, and the detail says so.
         let bare = pixel_size_fix(&settings(&[("IMS:1000046", "20", None), ("IMS:1000042", "100", None), ("IMS:1000044", "2000", None)])).unwrap();
-        assert_eq!((bare.transformation, bare.write), (Some(UNIT_ASSUMED), vec![(PIXEL_X, 20.0, true)]));
+        assert_eq!((bare.transformation, bare.write.clone()), (Some(UNIT_ASSUMED), vec![(PIXEL_X, 20.0, true)]));
+        assert_eq!(fix_json(&bare)["written_um"][0]["unit"], "UO:0000017");
         assert!(bare.detail.ends_with("(IMS:1000046, IMS:1000044 without a length unit: micrometre assumed)"), "{}", bare.detail);
         assert!(!mm.detail.contains("assumed"), "{}", mm.detail);
+        // The detail's equation carries its units: the numbers are in different ones.
+        assert!(mm.detail.contains("0.01 millimeter × 100 = 1000 micrometer"), "{}", mm.detail);
+        assert!(area.detail.contains("√(0.0001 millimeter²) × 100 = 1 millimeter"), "{}", area.detail);
+        // A stated unit that is no length (UO:0000186, dimensionless) is tested as µm but kept, as
+        // the two-value case keeps it: nothing is declared.
+        let odd = pixel_size_fix(&settings(&[("IMS:1000046", "100", Some(("UO:0000186", "dimensionless unit"))), ("IMS:1000042", "3", None), ("IMS:1000044", "300", UM)])).unwrap();
+        assert_eq!((odd.transformation, odd.write.clone()), (None, vec![(PIXEL_X, 100.0, false)]));
+        assert_eq!(fix_json(&odd)["written_um"][0]["unit"], "UO:0000186");
+        assert!(odd.detail.ends_with("(IMS:1000046 without a length unit: micrometre assumed)"), "{}", odd.detail);
     }
 
     #[test]
@@ -743,6 +771,7 @@ mod tests {
             case: "area",
             transformation: Some(AREA_TO_LENGTH),
             write: vec![(PIXEL_X, 10.0, true)],
+            write_units: vec![],
             unit_mismatches: vec![],
             mismatched: vec![],
             written_units: vec![],
