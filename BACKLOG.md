@@ -247,13 +247,17 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   PR #18 the msconvert lanes refuse a multi-sample WIFF without `--sample`, so the box fallback, which
   passes none, now fails on `En_PPY.wiff`; which of its samples to republish, each as its own
   archive, is D4 and still open.
-- **Box test of `feat/imaging-support`, and the harness change that makes it possible (added
-  2026-09-30; the owner's network is slow for the day).** On the box: build the branch (it removes
-  `OpenFlags` imports and reroutes SQLite opens in `bruker_sdk.rs` / `bruker_baf.rs`, code a macOS
-  build only half-checks), then convert the synthetic-MALDI copy of 2485.d on the SDK lane
-  (`--bruker-sdk`) and a BAF unit, and check positions, grid and `metadata.imaging` as on the host.
-  Needs a network where ssh stdin reaches the box, or item (2) of the 0.15.0 entry below: ship each job spec by
-  scp and give `run_job` a per-job watchdog; the same change delivers the six missing 0.15.0 units.
+- **Box test of `feat/imaging-support` — DONE 2026-09-30 (`15b5e62`).** ssh stdin still did not reach the
+  box and GitHub was unreachable from the host, so the commits went over as a git bundle into a
+  separate clone and target dir (`C:\Users\User\stageA\imaging`; the box's v0.15.0 checkout untouched,
+  HEAD asserted). Windows build clean apart from a pre-existing `SqrtGrid::mz` dead-code warning
+  (`shimadzu_grid.rs:42`); 16/16 selected tests (drive-letter URIs, the WAL-mode TSF, imaging,
+  vocabulary); the synthetic-MALDI 2485.d on all three timsTOF routes (native, `--bruker-sdk`,
+  `--no-ims-compact`) per-frame identical to the host archives, positions 1–60 × 1–67, grid 60 × 67,
+  origin (500, 300), the `.d` unchanged; a BAF run: new and v0.15.0 binaries write same-size archives
+  (2,674 spectra), the `.d` unchanged by both. Still open: push the branch when GitHub is reachable; the
+  harness change (job spec by scp + a per-job watchdog in `run_job`) before the six missing 0.15.0
+  units can go through the box.
 - **Upstream: open the timsTOF database read-only (added 2026-09-30).** Minimally invasive draft PRs,
   one per library, each only changing the open: timsrust 0.4.1 `SqlReader`
   (`io/readers/file_readers/sql_reader.rs:24`, `Connection::open`) and mzdata's TDF reader
@@ -261,6 +265,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   plain read-only open when a non-empty `-wal` exists (what `src/vendor_sqlite.rs` does). Harmless on
   the rollback-journal TDFs seen so far; on a WAL-mode TDF the read-write open writes `-shm`/`-wal`
   beside the data and folds the log into `analysis.tdf` on close. Drafts only; the owner files them.
+  The timsrust PR should also fix `utils::find_extension`: it returns the first directory entry whose
+  name ENDS WITH `analysis.tdf`, so a macOS AppleDouble companion `._analysis.tdf` (163 bytes, left by
+  copying a `.d` from a Mac to NTFS, exFAT or SMB) is opened as the database when it lists first —
+  NTFS does — and the default timsTOF route and `--no-ims-compact` fail with "file is not a database"
+  while `--bruker-sdk` works (seen on the box's `stageA` copy of 2485.d; no corpus unit has one).
+  Match the exact name. Converter side, meanwhile: name the `._*` file in that error.
 - **Surfaced by the 0.15.0 corpus rebuild (2026-09-29).** 194 of 200 archives rebuilt; logs in
   `~/Claude/mzPeak/output/corpus-rebuild-0.15.0/`. (1) **The timsTOF grid facet encodes serially on
   big runs.** PXD076703 (10 GB `tdf_bin`) took about 2 h 20 min on the host on one core: a row group of
