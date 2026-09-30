@@ -35,8 +35,16 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   **OPEN, waiting on example data** (do not code against a guess): the FlexImaging `.mis` raster step
   and region names; Waters imaging positions (laser x/y in mm → fitted grid; needs the MassLynx call,
   a Waters imaging `.raw` and the box). A real MALDI `.d`: the owner sends the issue author a Dropbox
-  link for his files (33,800-pixel TSF, five synthetic pixel-size imzML); public candidates from PRIDE /
-  Zenodo are being looked for. Regions are kept in `bruker_maldi` only (the profile covers one grid).
+  link for his files (33,800-pixel TSF, five synthetic pixel-size imzML). Public candidates found
+  2026-09-30 (file listings only, nothing downloaded yet): Bruker — MassIVE MSV000088438 (TIMSCONVERT
+  test data, CC0): a 7.4 MB MALDI-TIMS `.d` and a 25 MB TSF `.d`, each with its `.mis`, poslog and spot
+  list as plain files; MSV000102588 (TSF runs with imzML exports to cross-check); MSV000092935 (~1.6 GB
+  TDF with `.mis`). Waters — MetaboLights MTBLS14771 `Representative/20250327_MG3_HBackupACN_CLMC.raw.zip`
+  (67 MB, Xevo MRT DESI, with the HDI `imaging/` folder, CC0; zip entries use backslash paths); MALDI
+  with mobility only from 7 GB up (MSV000092638) or a single `_B.raw` out of Zenodo 13766901.
+  Standalone `.mis` files in MSV000088438, MSV000092935, PXD044958 (rapifleX), PXD034851 (ultraflex).
+  MassIVE FTP needs TLS (`curl --ssl-reqd`). Regions are kept in `bruker_maldi` only (the profile covers
+  one grid).
   1. **Pixel coordinates for vendor input** (highest). Only the imzML path writes
      `opt_IMS_1000050_position_x`/`_y`; the Bruker TSF/TDF and Waters lanes write none. Confirmed by the
      issue author on v0.14.0: a 33,800-pixel timsTOF MALDI acquisition (TSF) converted with every
