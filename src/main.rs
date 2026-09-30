@@ -777,10 +777,10 @@ fn track_tmp_in_flight(path: &Path) {
 /// 0.9.5) or any writer error left a partial `.tmp` beside the missing output.
 ///
 /// Declare it BEFORE the `File::create` of the tmp so it is dropped after the writer that owns
-/// the handle (Windows cannot unlink an open file). The rename itself lives in [`Self::finish`],
-/// which is the only way to disarm the guard. The existing output-path guards (`--force`, the
-/// in-place / nested-output refusals in `run`) are untouched: this never removes anything but
-/// its own `.tmp`.
+/// the handle (Windows cannot unlink an open file). The rename itself lives in [`Self::finish`];
+/// it and [`Self::discard`] (a scratch archive removed quietly) are the only ways to disarm the
+/// guard. The existing output-path guards (`--force`, the in-place / nested-output refusals in
+/// `run`) are untouched: this never removes anything but its own `.tmp`.
 struct TmpGuard {
     path: PathBuf,
 }

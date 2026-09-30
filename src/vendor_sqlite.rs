@@ -79,18 +79,26 @@ fn has_hot_journal(path: &Path) -> bool {
 /// query-only. ponytail: the whole database in memory, and a live writer can change the files
 /// between the two copies — only for a WAL or journal left behind by a crashed or running
 /// acquisition.
+///
+/// The copies are new files, not `fs::copy`s: those keep the source's permissions, and a raw
+/// folder made read-only to protect it gave a read-only copy, which SQLite opens read-only in
+/// silence and then cannot roll back (`SQLITE_READONLY_ROLLBACK`; review 2026-09-30 verification).
 fn open_copy(path: &Path, suffix: &str) -> rusqlite::Result<Connection> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let scratch = std::env::temp_dir().join(format!("mzpc-sqlite-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     let io = |e: std::io::Error| {
         rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN), Some(format!("copying {} with its {suffix}: {e}", path.display())))
     };
+    let copy_file = |from: &Path, to: &Path| std::io::copy(&mut std::fs::File::open(from)?, &mut std::fs::File::create(to)?);
     let read = || -> rusqlite::Result<Connection> {
         std::fs::create_dir_all(&scratch).map_err(io)?;
         let copy = scratch.join("db");
-        std::fs::copy(path, &copy).map_err(io)?;
-        std::fs::copy(side(path, suffix), side(&copy, suffix)).map_err(io)?;
+        copy_file(path, &copy).map_err(io)?;
+        copy_file(&side(path, suffix), &side(&copy, suffix)).map_err(io)?;
         let src = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        // The first read rolls the journal back; a failure there carries SQLite's message, which
+        // the backup below would report as the in-memory database's "not an error".
+        src.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?;
         let mut mem = Connection::open_in_memory()?;
         rusqlite::backup::Backup::new(&src, &mut mem)?.run_to_completion(4096, std::time::Duration::ZERO, None)?;
         mem.pragma_update(None, "query_only", true)?;
@@ -274,17 +282,23 @@ mod tests {
         let immutable = Connection::open_with_flags(immutable_uri(&copy), OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI).unwrap();
         assert!(count(&immutable, "SELECT count(*) FROM TraceChunks WHERE Trace = 2") > 0, "no uncommitted page reached the file");
         drop(immutable);
-        // The fix.
+        // The fix, on a folder made read-only to protect it: the scratch copies must still be
+        // writable for the rollback.
+        for f in [copy.clone(), side(&copy, "-journal")] {
+            let mut p = std::fs::metadata(&f).unwrap().permissions();
+            p.set_readonly(true);
+            std::fs::set_permissions(&f, p).unwrap();
+        }
         let before = snapshot(&copy_dir);
         let c = open(&copy).unwrap();
         assert_eq!(count(&c, "SELECT count(*) FROM TraceChunks WHERE Trace = 1"), 2000, "the database as last committed");
         drop(c);
         assert!(snapshot(&copy_dir) == before, "the open wrote into the folder");
         // A journal that restores nothing is not hot: zero bytes (TRUNCATE), a zeroed header (PERSIST).
-        std::fs::write(side(&copy, "-journal"), b"").unwrap();
-        assert!(!has_hot_journal(&copy));
-        std::fs::write(side(&copy, "-journal"), [0u8; 512]).unwrap();
-        assert!(!has_hot_journal(&copy));
+        std::fs::write(side(&db, "-journal"), b"").unwrap();
+        assert!(!has_hot_journal(&db));
+        std::fs::write(side(&db, "-journal"), [0u8; 512]).unwrap();
+        assert!(!has_hot_journal(&db));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
