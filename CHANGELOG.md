@@ -11,9 +11,9 @@ processing of both lists, which mzML 1.1 requires and stock OpenMS 3.5.0 needs t
 refused every export of a raw file or an archive through 0.16.0. A timsTOF `.d` → mzML writes its
 diaPASEF window limits in order and on the vendor mobility model, and, where its m/z calibration is
 ModelType 2, its m/z on timsrust's chord instead of an order of magnitude low; an archive → mzML
-carries each peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).** The window limits and the scan
-and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the arrays (PXD059079
-2485.d: 49,126 of 79,885 values move).
+carries each peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).** The window
+limits and the scan and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the
+arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
 
 ### Fixed
 
@@ -48,22 +48,22 @@ and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the ar
   (1.3437 over an upper limit of 1.2910 for the first window of PXD059079 2485.d), on every MS2
   spectrum — OpenSWATH assigns precursors with a strict `lower < IM < upper` and matched none; on
   2485.d all 15,977 windows were inverted and all 6,752,874 MS2 peaks outside — and on timsrust's
-  linear map, while the
-  spectrum's mobility array is on mzdata's ModelType-2 calibration. The lane now applies
-  `bruker_native::TdfMobilityRemap`, as the `--no-ims-compact` archive lane has since 0.9.6: the
-  pair ordered, it and the scan and selected-ion 1/K0 on the ModelType-2 model (1.305615 < 1.332387
-  < 1.359142 for the first window of PXD059079 2485.d, the ims-compact lane's values), and the
-  window band on the selected ion as `userParam`s. Ordering alone would not have done: 8.9 % of the
-  MS2 peaks of a real run's first 2,000 window spectra lie outside their window's ordered linear
-  limits. The remap now also evaluates the model in mzdata's own arithmetic, at the scan snapped
-  back onto the half-scan grid the linear round trip leaves by ~1e-13: a window's upper limit is
-  bit for bit the array value of its first scan. Evaluated in the SDK's order, as the remap did,
-  the limit fell 1 to 4 ulp short at half to two thirds of all scans, and 1.5 million of the 2.2
-  billion MS2 peaks of a full diaPASEF run lay above their window by up to 2.2e-16 (a 0.16.0
-  `--no-ims-compact` archive of 2485.d: 8,624 peaks in 4,885 windows); now none lies outside, with
-  no tolerance, and 11,011 of 2485.d's 15,977 windows have a peak on the upper limit.
-  `--no-tims-recalibration` stays inert on this lane (and says so; the export is identical): the
-  arrays cannot leave the model, and limits on the linear map would miss 9 % of the peaks.
+  linear map, while the spectrum's mobility array is on mzdata's ModelType-2 calibration. The lane
+  now applies `bruker_native::TdfMobilityRemap`, as the `--no-ims-compact` archive lane has since
+  0.9.6: the pair ordered, it and the scan and selected-ion 1/K0 on the ModelType-2 model
+  (1.305615 < 1.332387 < 1.359142 for the first window of PXD059079 2485.d, the ims-compact lane's
+  values), and the window band on the selected ion as `userParam`s. Ordering alone would not have
+  done: 8.9 % of the MS2 peaks of a real run's first 2,000 window spectra lie outside their
+  window's ordered linear limits. The remap now also evaluates the model in mzdata's own
+  arithmetic, at the scan snapped back onto the half-scan grid the linear round trip leaves by
+  ~1e-13: a window's upper limit is bit for bit the array value of its first scan. Evaluated in
+  the SDK's order, as the remap did, the limit fell 1 to 4 ulp short at half to two thirds of all
+  scans, and 1.5 million of the 2.2 billion MS2 peaks of a full diaPASEF run lay above their window
+  by up to 2.2e-16 (a 0.16.0 `--no-ims-compact` archive of 2485.d: 8,624 peaks in 4,885 windows);
+  now none lies outside, with no tolerance, and 11,011 of 2485.d's 15,977 windows have a peak on
+  the upper limit. `--no-tims-recalibration` stays inert on this lane (and says so; the export is
+  identical): the arrays cannot leave the model, and limits on the linear map would miss 9 % of
+  the peaks.
 - **The mzML `<scan>` of a diaPASEF spectrum lists its cvParams first.** mzdata's TDF reader puts the
   `window group` userParam before the MS:1002815 cvParam, which the mzML schema forbids (one XSD
   error per MS2 scan). Every mzML lane that demotes MZP params now also puts each param list's
@@ -79,10 +79,12 @@ and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the ar
   (2485.d: 3,594 MS2 frames, 9,226,605 peaks, each with its 1/K0; the corpus's 0.15.0 archive
   exports the same), and the export warns that a reader assigning precursors by mobility window
   (OpenSWATH's diaPASEF mode) needs the `.d` exported with `--to mzml`, or a `--no-ims-compact`
-  archive. Through 0.16.0 the export wrote the same frames without mobility, and OpenMS refused
-  them for want of a default processing. Such a spectrum's peaks are read twice, as a peak list and
-  as arrays: the `--no-ims-compact` archive of 2485.d exports in 211 s instead of 139 s, the
-  ims-compact one in 37 s instead of 29 s.
+  archive. The warning is for an ims-compact archive alone (the one kind with an `ims_calibration`
+  block): an MS2 spectrum of any other source with a mobility array but no window limits lacked
+  them in its source too. Through 0.16.0 the export wrote the same frames without mobility, and
+  OpenMS refused them for want of a default processing. Such a spectrum's peaks are read twice, as
+  a peak list and as arrays: the `--no-ims-compact` archive of 2485.d exports in 211 s instead of
+  139 s, the ims-compact one in 37 s instead of 29 s.
 - **A timsTOF `.d` with a ModelType-2 m/z calibration exports its m/z to mzML at the right
   magnitude.** 0.14.0 put the mzdata archive lanes (`--no-ims-compact`, the fallback) on
   timsrust's two-point chord for such a file, because mzdata 0.67.1 reads every `MzCalibration`
@@ -108,13 +110,16 @@ and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the ar
   element-level `dataProcessingRef` resolving, both lists' default ending in this version's
   `Conversion to mzML`, unique ids) on the `--to mzml` export of an mzML (the chain extends the
   source's default), of that export again, of a Thermo `.raw`, of a file with a Latin-1 name, and on
-  an archive's export; an archive holding a mobility array per peak exports it value for value.
-  Corpus-gated, a 2485.d export with and without `--no-tims-recalibration` and both of its archive
-  kinds: every MS2 window ordered, equal to its band, around its 1/K0, and bracketing its own
-  mobility array exactly, with peaks on the upper limit. Unit tests: the prologue on a source with
-  no processing, with its own (default not first), and with this tool's step already in it; the
-  lane's per-spectrum step through the mzML writer; the remap bit for bit against mzdata's model at
-  every scan of two runs; the recorded command line. The mzML reader they share is
+  an archive's export; an archive holding a mobility array per peak exports it value for value, and
+  one whose MS2 spectrum has a precursor and a mobility array but no window limits exports it
+  without the whole-frame warning. Corpus-gated, a 2485.d export with and without
+  `--no-tims-recalibration` and both of its archive kinds: every MS2 window ordered, equal to its
+  band, around its 1/K0, and bracketing its own mobility array exactly, with peaks on the upper
+  limit; the whole-frame warning on the ims-compact archive's export and not on the
+  `--no-ims-compact` one's. Unit tests: the prologue on a source with no processing, with its own
+  (default not first), and with this tool's step already in it; the lane's per-spectrum step
+  through the mzML writer; the remap bit for bit against mzdata's model at every scan of two runs,
+  and within 4 ulp of the SDK order; the recorded command line. The mzML reader they share is
   `tests/common/mzml_meta.rs`.
 
 ## [0.16.0] — 2026-09-30

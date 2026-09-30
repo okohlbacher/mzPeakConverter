@@ -161,6 +161,39 @@ fn an_archive_export_keeps_the_peak_mobility_array() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The whole-frame warning names an ims-compact timsTOF archive and sends the reader to the `.d`; it
+/// is that archive's alone. An MS2 spectrum from any other source with a precursor and a mobility
+/// array but no window limits (the PASEF fixture made MS2, its limits taken out: a pwiz mzML that
+/// states none) lacked them in its source too, and is exported as it was, without the warning — which
+/// the first build of this export gave it.
+#[test]
+fn only_an_ims_compact_archive_is_warned_about_whole_frames() {
+    const PRECURSOR: &str = r#"<precursorList count="1"><precursor><isolationWindow><cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="500.0" unitCvRef="MS" unitAccession="MS:1000040" unitName="m/z"/></isolationWindow><selectedIonList count="1"><selectedIon><cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="500.0" unitCvRef="MS" unitAccession="MS:1000040" unitName="m/z"/></selectedIon></selectedIonList><activation><cvParam cvRef="MS" accession="MS:1000133" name="collision-induced dissociation" value=""/></activation></precursor></precursorList>"#;
+    let xml = std::fs::read_to_string(PASEF).unwrap();
+    let ms2: String = xml
+        .replace(r#"name="ms level" value="1""#, r#"name="ms level" value="2""#)
+        .replace(r#"accession="MS:1000579" name="MS1 spectrum""#, r#"accession="MS:1000580" name="MSn spectrum""#)
+        // The fixture's one spectrum comes before its chromatograms.
+        .replacen("<binaryDataArrayList", &format!("{PRECURSOR}<binaryDataArrayList"), 1)
+        .lines()
+        .filter(|l| !l.contains(r#"name="ion mobility lower limit""#) && !l.contains(r#"name="ion mobility upper limit""#))
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    assert!(!ms2.contains("ion mobility upper limit") && ms2.contains("<precursorList"), "the fixture edit took");
+    let dir = scratch("ms2-no-limits");
+    let (src, archive, mzml) = (dir.join("ms2.mzML"), dir.join("ms2.mzpeak"), dir.join("ms2.out.mzML"));
+    std::fs::write(&src, ms2).unwrap();
+    convert(&src, &archive, &[], &[]);
+    let log = convert(&archive, &mzml, &[], &[]);
+    assert!(!log.contains("whole timsTOF frames"), "not an ims-compact archive, yet: {log}");
+    let back = spectra(&mzml);
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].description.ms_level, 2);
+    assert!(!back[0].description.precursor.is_empty(), "the precursor is exported");
+    assert!(array(&back[0], &mzdata::spectrum::ArrayType::MeanInverseReducedIonMobilityArray).is_some(), "the mobility array is exported");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A file whose name is not Unicode converts. `std::env::args`, which the recorded command line
 /// was read through, panics on such an argument: 0.16.0 aborted every archive conversion of the
 /// file, and recording the step in every mzML would have aborted those too.
@@ -277,7 +310,8 @@ fn a_timstof_archive_exports_its_peak_mobility() {
 
     let (archive, mzml) = (dir.join("nic.mzpeak"), dir.join("nic.mzML"));
     convert(&dot_d, &archive, &["--no-ims-compact"], &cap);
-    convert(&archive, &mzml, &[], &[]);
+    let log = convert(&archive, &mzml, &[], &[]);
+    assert!(!log.contains("whole timsTOF frames"), "--no-ims-compact archive: a whole-frame warning in {log}");
     let (_, on_upper) = assert_windows_bracket_their_peaks(&mzml, "--no-ims-compact archive");
     assert!(on_upper > 0, "--no-ims-compact archive: no window has a peak on its upper limit");
 

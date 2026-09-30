@@ -2471,7 +2471,12 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // with m/z and intensity only. Such a spectrum is exported from the facet's arrays instead.
     let peak_mobility = reader.metadata.peak_array_indices().is_some_and(|a| a.has_ion_mobility());
     // MS2 spectra that are whole frames (an ims-compact archive): precursors, but no window limits
-    // of their own. Counted, and named once the export is done.
+    // of their own. Counted, and named once the export is done. Only such an archive is counted —
+    // the ims-compact lanes are the one writer of the `ims_calibration` block: an MS2 spectrum of
+    // any other source with a mobility array but no limits (a pwiz mzML that states none) lacked
+    // them in its source as well, and the warning's advice (export the `.d`, or a
+    // `--no-ims-compact` archive) does not apply to it.
+    let ims_compact = reader.file_index().metadata.contains_key("ims_calibration");
     let mut whole_frames = 0usize;
     for item in &items {
         match *item {
@@ -2479,7 +2484,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 let mut spec = reader
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
-                if peak_mobility && with_peak_facet_arrays(&mut reader, i, &mut spec)? {
+                if peak_mobility && with_peak_facet_arrays(&mut reader, i, &mut spec)? && ims_compact {
                     let d = spec.description();
                     if !d.precursor.is_empty() && !d.params.iter().any(|p| p.name == "ion mobility lower limit") {
                         whole_frames += 1;
