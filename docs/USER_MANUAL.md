@@ -495,7 +495,7 @@ declared `imaging:pixel-count-from-positions` when the input states none, raised
 `imaging:pixel-count-raised-to-positions` when a stated count does not bound them); and the
 `metadata.imaging` index block — `is_imaging`, `coordinate_base: 1`, `pixel_count`,
 `pixel_count_source` (`declared`, or `observed_max` when the counts are the largest positions: always
-on the Bruker and Waters lanes), `pixel_size_um` and a `provenance` record of what was detected and
+on the Bruker and Waters lanes), `pixel_size_um` (when both axes have one in µm) and a `provenance` record of what was detected and
 where each value came from. A position stated as a scan cvParam (imzML, mzML) is written only as a
 pixel index: x and y both present, integers from 1 to 2³² − 1; any other is removed from its scan,
 all axes together, and declared `imaging:invalid-position-dropped`. A stated z that is not such an
@@ -537,11 +537,26 @@ such, when every positioned frame states the same finite one. The max dimension 
 count × size. The `bruker_maldi` index block holds the regions (number, name, raster step, frames,
 raw index ranges), the `.mis` it read (or rejected, and why) and the beam scan size.
 A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
-in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them —
-the step is the most common gap, origin the smallest position, and every position must lie within a
-quarter step of its grid point or the run gets no positions — and writes the grid index, declared
-(`waters:laser-position-fitted-to-grid`), with the fit (origin, step, count, largest residual) in the
-`waters_imaging` block and the step as the pixel size. The vendor SQLite databases the converter
+in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them
+and writes the grid index, declared (`waters:laser-position-fitted-to-grid`), with the fit (origin,
+step and its source, count, largest residual) in the `waters_imaging` block and each axis's step as
+its pixel size. The step is the one the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`,
+any `…XStep`/`…YStep`) when the positions lie within a quarter step of it. Otherwise the positions
+must lie on an exact lattice, as the stage's set points do: positions within 1 µm are one, and the
+step is the largest gap between neighbouring distinct positions (3 µm or more) whose lattice, laid
+at that gap, holds all but 1 % of the scans in one 1 µm window. The step written is that gap refined
+by least squares within float noise, and a whole µm or 0.1 µm when the positions cannot tell it from
+one; a position within half a µm of its grid point is on it. The fit refuses rather than guesses:
+jittered positions, a serpentine lag, regions rastered from origins off one lattice and rotated
+rasters fit no lattice and need the declared step; positions recorded at 3 µm or coarser, or lagging
+by a whole finer step, fit that finer lattice, each at its own pixel. A lattice that is a fraction of
+a coarser one, needed only by columns holding at most half the scans of the coarser lattice's
+median column (strays, not raster columns), is refused too. Lock-mass scans get no
+position. Up to 1 % of the positioned scans may lie off the grid, or far outside the raster at one
+position (a parked scan, even one on the grid by chance): they get no position
+(`waters:off-grid-position-dropped`). A group far outside that spans columns (a QC region) is part
+of the raster, and so are parked scans beyond 1 %. More than 1 % off the grid, or no grid at all:
+the run gets no positions and no marker, and `waters_imaging` says why. The vendor SQLite databases the converter
 opens itself are opened immutable — or, when a `-wal` beside one still holds rows or its `-journal`
 is hot, read from a scratch copy — so those reads write nothing into the `.d` (a read-only open of a
 WAL-mode MALDI TSF used to leave `-shm`/`-wal`). A BAF `.d` is the exception: Bruker's baf2sql
@@ -782,6 +797,7 @@ The vocabulary:
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
+| `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid, or far outside the raster at one position (a scan taken with the stage parked off it), and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
 | `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `imaging:pixel-count-from-positions` | the input states positions but no pixel counts; `IMS:1000042/43` were written as the largest positions | imzML, mzML with `IMS:1000050/51` |
 | `imaging:pixel-count-raised-to-positions` | a pixel count the input states does not bound the written positions (a position lies beyond it, it is not a whole number, or only the other axis states one); that `IMS:1000042/43` was set to the largest position on its axis (`pixel_count_source: observed_max`) | imzML, mzML with `IMS:1000050/51` |

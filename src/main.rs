@@ -6794,13 +6794,7 @@ fn convert_waters(
     // Imaging (MALDI / DESI): the reader attaches each scan's pixel, fitted to its laser positions —
     // the Waters branch of imaging detection, which needs MassLynx open.
     if let Some(im) = reader.imaging() {
-        let grid = im.scan_settings();
-        let marker = imaging::marker_block(Some(&grid), imaging::COUNTS_OBSERVED_MAX, im.provenance());
-        hints.imaging = Some(ImagingHints {
-            grid,
-            blocks: vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())],
-            transformations: vec![waters::LASER_GRID],
-        });
+        waters_imaging_hints(im, &mut hints);
     }
     if let Some(block) = reader.drift_block() {
         hints.index_blocks.push(("waters_drift".to_string(), block));
@@ -6814,6 +6808,23 @@ fn convert_waters(
         // (box round 21) — the chunked secondary-array field shape needs its own constructor first.
     }
     convert_vendor_reader(input, output, chunk, zstd_level, vendor, synth_chroms, hints, reader.len(), |i| reader.spectrum(i))
+}
+
+/// A Waters imaging run's hints: with a grid, the grid, the `metadata.imaging` marker and the
+/// `waters_imaging` block; laser positions that fit no grid get the block alone, saying why — no
+/// positions, no marker (review 2026-09-30 B14). Outside `convert_waters` so every host compiles it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn waters_imaging_hints(im: &waters::WatersImaging, hints: &mut VendorHints) {
+    let Some(grid) = im.scan_settings() else {
+        hints.index_blocks.push(("waters_imaging".to_string(), im.block()));
+        return;
+    };
+    let marker = imaging::marker_block(Some(&grid), imaging::COUNTS_OBSERVED_MAX, im.provenance());
+    hints.imaging = Some(ImagingHints {
+        grid,
+        blocks: vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())],
+        transformations: im.transformations(),
+    });
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak through the net48 MHDAC host (`agilent.rs`;
