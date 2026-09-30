@@ -4046,8 +4046,10 @@ fn convert_file(
     // upstream's own encoding. It supersedes NOTHING on the data facet: profile arrays keep `chunk`
     // exactly as refined above, including the `--no-numpress` / `--layout point` / explicit-strategy
     // choices, so a profile-only lattice input is byte-identical to before (the route needs
-    // centroids to fire). `--no-mz-lattice` (or $MZPC_NO_MZ_LATTICE) opts out.
-    let lattice = mz_lattice_enabled() && probe_lattice_scale(&probes).is_some();
+    // centroids to fire). `--no-mz-lattice` (or $MZPC_NO_MZ_LATTICE) opts out, and so does
+    // `--layout point` (`chunk` is `None`): the grid is a chunk layout, and a chunked peaks facet
+    // beside the point data facet mixed two layout families in one entity (review 2026-09-30 §E).
+    let lattice = chunk.is_some() && mz_lattice_enabled() && probe_lattice_scale(&probes).is_some();
     if lattice {
         log::info!(
             "centroid m/z is on a fixed-point lattice; storing the peaks facet on the fitted linear \
@@ -6065,7 +6067,12 @@ fn convert_shimadzu(
     // keeps f64 m/z as a raw chunk row. Within vendor rounding, NOT bit-exact: the axis is the
     // vendor's own sqrt lattice and the fit is accepted only when it reproduces every m/z to within
     // `shimadzu_grid::TOL` (1e-9 Da: the vendor's ±5e-10 rounding plus f64 slack).
-    let grid_step = shimadzu_grid_step(&reader);
+    //
+    // Neither grid (this one or the centroid lattice below) under `--layout point` (`chunk` is
+    // `None`): both are chunk layouts, and either one beside the point layout on the other facet
+    // mixed two layout families in one entity (review 2026-09-30 §E). The point layout stores the
+    // f64 m/z the vendor library returns.
+    let grid_step = if chunk.is_some() { shimadzu_grid_step(&reader) } else { None };
     if let Some(step) = grid_step {
         hints.data_grid = Some(exact_sqrt_grid_policy());
         log::info!(
@@ -6078,7 +6085,7 @@ fn convert_shimadzu(
     // implementation's fitted linear grid (`lattice_fit_grid_policy`; the same treatment the mzML
     // lane gives the LabSolutions export of these files). `--no-mz-lattice` (config `no_mz_lattice`,
     // `$MZPC_NO_MZ_LATTICE`) keeps f64 m/z here too, so the flag means the same thing on every lane.
-    if rep != shimadzu::Representation::Profile && mz_lattice_enabled() {
+    if chunk.is_some() && rep != shimadzu::Representation::Profile && mz_lattice_enabled() {
         hints.peak_grid = Some(lattice_fit_grid_policy());
         hints.transformations.push(GRID_FIT_TRANSFORMATION.to_string());
         if shimadzu_grid::coarse_mz_requested() {

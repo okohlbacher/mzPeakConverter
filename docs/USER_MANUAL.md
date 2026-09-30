@@ -840,7 +840,9 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   such data it is far smaller than delta chunking: on the 4.5 GB LabSolutions `DIA_Hela_20ng` mzML
   (279.7 M centroids) the m/z bytes go 1,897 MB (lossless delta) → ~0.93 GB. Only the **peaks** facet
   is affected — profile arrays keep the chunked layout and the `--no-numpress` / `--chunk-size` /
-  `--layout` choices exactly as before, so a profile-only input converts unchanged.
+  `--layout` choices exactly as before, so a profile-only input converts unchanged. Under
+  `--layout point` the grid is not applied (nor, on the native Shimadzu lane, the profile sqrt grid):
+  both spectrum facets stay in the point layout with exact f64 m/z, one layout family per entity.
   From 0.9.7 to 0.13 this was an exact Int64 point lattice of the converter's own (`point.tof_index`
   = `round(m/z·scale)`, an `mz_calibration` index block, `m/z = tof_index / scale`); that layout is
   the one representation the reference implementation's chunk grid cannot hold (2³² steps of
