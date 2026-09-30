@@ -517,10 +517,14 @@ The max dimension `IMS:1000044/45` is count × size. The `bruker_maldi` index bl
 (number, name, raster step, frames, raw index ranges), the `.mis` it read and the beam scan size.
 A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
 in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them —
-the step is the most common gap, origin the smallest position, and every position must lie within a
-quarter step of its grid point or the run gets no positions — and writes the grid index, declared
-(`waters:laser-position-fitted-to-grid`), with the fit (origin, step, count, largest residual) in the
-`waters_imaging` block and the step as the pixel size. Vendor SQLite databases are opened immutable, so a conversion
+the step the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`, any `…XStep`/`…YStep`) when the
+positions lie within a quarter step of it, else the smallest step between columns (positions closer
+than a third of the typical gap being one column: jitter, a serpentine lag) that holds them within a
+quarter step — and writes the grid index, declared (`waters:laser-position-fitted-to-grid`), with the
+fit (origin, step and its source, count, largest residual) in the `waters_imaging` block and each
+axis's step as its pixel size. Lock-mass scans get no position. Up to 1 % of the positioned scans may
+lie off the grid (a parked scan): they get no position (`waters:off-grid-position-dropped`); beyond
+that, or with no grid at all, the run gets no positions and no marker, and `waters_imaging` says why. Vendor SQLite databases are opened immutable, so a conversion
 writes nothing into the `.d` (a read-only open of a WAL-mode MALDI TSF used to leave `-shm`/`-wal`).
 
 **Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
@@ -757,6 +761,7 @@ The vocabulary:
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
+| `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid (a scan taken with the stage parked off the raster) and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
 | `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `imaging:pixel-count-from-positions` | the input states positions but no pixel counts; `IMS:1000042/43` were written as the largest positions | imzML, mzML with `IMS:1000050/51` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |

@@ -208,109 +208,269 @@ struct ScanItemIds {
     set_mass: Option<c_int>,
     collision_energy: Option<c_int>,
     sonar: Option<c_int>,
-    /// The laser (MALDI) / sprayer (DESI) aim position in mm — `LASERAIM_XPOS` / `_YPOS` in the SDK
-    /// enum, stat codes 9 / 10 in `_funcNNN.sts`.
-    laser_x: Option<c_int>,
-    laser_y: Option<c_int>,
 }
 
 /// `transformations` entry: pixel positions are grid indices fitted to the laser aim positions (mm).
 pub const LASER_GRID: &str = "waters:laser-position-fitted-to-grid";
+/// `transformations` entry: a few scans (at most [`crate::imaging::MAX_OFF_GRID`] of those with a
+/// position) lie off the grid and were written without a pixel; the count is in `waters_imaging`.
+pub const OFF_GRID_DROPPED: &str = "waters:off-grid-position-dropped";
 
 /// A Waters imaging run (MALDI or DESI): the grid fitted to every scan's laser aim position, and each
 /// spectrum's pixel. MassLynx states positions in mm, not pixel indices, so the step, origin and
-/// count are fitted ([`crate::imaging::fit_axis`]); every position lies within a quarter step of its
-/// grid point or the run gets none. Several scans may share a pixel (functions a long raster is split
-/// into keep their own scan numbers; the pixel comes from the position).
+/// count are fitted ([`crate::imaging::fit_axis`]), the step the method declares preferred. Several
+/// scans may share a pixel (functions a long raster is split into keep their own scan numbers; the
+/// pixel comes from the position). When the positions fit no grid the run keeps the reason and
+/// writes no positions and no marker, only the `waters_imaging` block (review 2026-09-30 B14).
 #[derive(Debug, Clone)]
 pub struct WatersImaging {
-    pub x: crate::imaging::GridAxis,
-    pub y: crate::imaging::GridAxis,
-    /// Per spectrum index: its pixel, when its scan states a position.
-    positions: Vec<Option<(i64, i64)>>,
+    grid: Result<LaserGrid, String>,
     /// The item names MassLynx gave for x and y.
     names: (String, String),
+    /// The step each axis's acquisition declares: `methodfile.xml` setting name and value (mm).
+    steps: [Option<(String, f64)>; 2],
+    /// Scans stating a laser position (the lock-mass function's excluded).
+    positioned: usize,
+    /// Scans of the lock-mass (reference) function: no pixel.
+    lockmass_scans: usize,
+}
+
+/// The grid the laser positions fit.
+#[derive(Debug, Clone)]
+struct LaserGrid {
+    x: crate::imaging::GridAxis,
+    y: crate::imaging::GridAxis,
+    /// Per spectrum index: its pixel, when its scan states a position on the grid.
+    positions: Vec<Option<(i64, i64)>>,
+    /// Scans whose position lies off the grid, written without a pixel.
+    off_grid: usize,
+}
+
+/// Fit the pixel grid to each spectrum's laser position (mm; `None`: none stated, or the lock-mass
+/// function's). A scan off either axis's grid loses its pixel, and both axes are fitted again
+/// without it: a stray on one axis's grid by chance must not stretch that axis. `Err` says why
+/// there is no grid — an axis fits none, or more than [`crate::imaging::MAX_OFF_GRID`] of the
+/// positioned scans lie off it.
+fn fit_grid(mm: &[Option<(f64, f64)>], steps: [Option<f64>; 2]) -> Result<LaserGrid, String> {
+    use crate::imaging::{MAX_OFF_GRID, fit_axis};
+    let positioned = mm.iter().flatten().count();
+    // A step larger than the whole raster (its central 90 %: a parked scan must not widen it) is not
+    // its step: one read in the wrong unit (a MALDI method stating µm) would otherwise hold every
+    // position in one pixel.
+    // ponytail: the declared step is taken in mm, the unit of the positions and of DESI's settings.
+    let (xs, ys): (Vec<f64>, Vec<f64>) = mm.iter().flatten().copied().unzip();
+    let span = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        let trim = v.len() / 20;
+        v[v.len() - 1 - trim] - v[trim]
+    };
+    let raster = span(xs).max(span(ys));
+    let steps = steps.map(|s| s.filter(|d| *d <= raster));
+    let mut keep: Vec<bool> = mm.iter().map(Option::is_some).collect();
+    loop {
+        let (xs, ys): (Vec<f64>, Vec<f64>) = mm.iter().zip(&keep).filter(|(_, k)| **k).filter_map(|(p, _)| *p).unzip();
+        let (x, xi) = fit_axis(&xs, steps[0]).ok_or("the x positions lie on no raster")?;
+        let (y, yi) = fit_axis(&ys, steps[1]).ok_or("the y positions lie on no raster")?;
+        let pixels: Vec<Option<(i64, i64)>> = xi.into_iter().zip(yi).map(|(a, b)| a.zip(b)).collect();
+        if pixels.iter().all(Option::is_some) {
+            let off_grid = positioned - pixels.len();
+            if off_grid as f64 > MAX_OFF_GRID * positioned as f64 {
+                return Err(format!("{off_grid} of {positioned} positioned scans lie off the grid (more than {}%)", MAX_OFF_GRID * 100.0));
+            }
+            let mut pixels = pixels.into_iter();
+            let positions = keep.iter().map(|k| if *k { pixels.next().flatten() } else { None }).collect();
+            return Ok(LaserGrid { x, y, positions, off_grid });
+        }
+        let mut pixels = pixels.into_iter();
+        for k in keep.iter_mut().filter(|k| **k) {
+            *k = pixels.next().flatten().is_some();
+        }
+    }
 }
 
 impl WatersImaging {
-    fn read(api: ScanItemApi, info: *mut c_void, index: &[(c_int, c_int, f32)], ids: [c_int; 2], names: (String, String)) -> Option<Self> {
+    fn read(
+        api: ScanItemApi,
+        info: *mut c_void,
+        index: &[(c_int, c_int, f32)],
+        ids: [c_int; 2],
+        names: (String, String),
+        lockmass: Option<c_int>,
+        steps: [Option<(String, f64)>; 2],
+    ) -> Option<Self> {
         let mut records: std::collections::HashMap<c_int, bool> = std::collections::HashMap::new();
-        let mm: Vec<Option<(f64, f64)>> = index
-            .iter()
-            .map(|&(f, scan, _)| {
-                let has = *records.entry(f).or_insert_with(|| {
-                    let a = api.available(info, f);
-                    ids.iter().all(|i| a.contains(i))
-                });
-                if !has {
-                    return None;
-                }
-                let v = api.values(info, f, scan, &ids);
-                let num = |k: usize| v.get(k).cloned().flatten()?.trim().parse::<f64>().ok().filter(|x| x.is_finite());
-                Some((num(0)?, num(1)?))
-            })
-            .collect();
-        let (xs, ys): (Vec<f64>, Vec<f64>) = mm.iter().flatten().copied().unzip();
+        let mm = laser_positions(index, lockmass, |f, scan| {
+            let has = *records.entry(f).or_insert_with(|| {
+                let a = api.available(info, f);
+                ids.iter().all(|i| a.contains(i))
+            });
+            if !has {
+                return None;
+            }
+            let v = api.values(info, f, scan, &ids);
+            let num = |k: usize| v.get(k).cloned().flatten()?.trim().parse::<f64>().ok().filter(|x| x.is_finite());
+            Some((num(0)?, num(1)?))
+        });
+        let lockmass_scans = index.iter().filter(|e| Some(e.0) == lockmass).count();
+        Self::from_positions(mm, names, steps, lockmass_scans)
+    }
+
+    /// The run's imaging from each spectrum's laser position; `None` when fewer than two distinct
+    /// positions are stated (no raster: not an imaging run).
+    fn from_positions(mm: Vec<Option<(f64, f64)>>, names: (String, String), steps: [Option<(String, f64)>; 2], lockmass_scans: usize) -> Option<Self> {
         let cells: std::collections::BTreeSet<(i64, i64)> = mm.iter().flatten().map(|(x, y)| ((x * 1e3).round() as i64, (y * 1e3).round() as i64)).collect();
         if cells.len() < 2 {
             return None;
         }
-        let (Some(x), Some(y)) = (crate::imaging::fit_axis(&xs), crate::imaging::fit_axis(&ys)) else {
-            log::warn!("MassLynx: {} scans state a laser position, but the positions lie on no raster; no pixel positions written", xs.len());
-            return None;
-        };
-        let positions = mm.iter().map(|p| p.map(|(a, b)| (x.index(a), y.index(b)))).collect();
-        log::info!(
-            "Waters imaging: {} scans, grid {} x {} at {:?} x {:?} mm",
-            xs.len(), x.count, y.count, x.pitch, y.pitch
-        );
-        Some(WatersImaging { x, y, positions, names })
+        let positioned = mm.iter().flatten().count();
+        let grid = fit_grid(&mm, [steps[0].as_ref().map(|s| s.1), steps[1].as_ref().map(|s| s.1)]);
+        match &grid {
+            Ok(g) => log::info!(
+                "Waters imaging: {positioned} scans, grid {} x {} at {:?} x {:?} mm, {} off the grid",
+                g.x.count, g.y.count, g.x.pitch, g.y.pitch, g.off_grid
+            ),
+            Err(why) => log::warn!("MassLynx: {positioned} scans state a laser position, but {why}; no pixel positions written"),
+        }
+        Some(WatersImaging { grid, names, steps, positioned, lockmass_scans })
     }
 
     /// The pixel of spectrum `i`.
     pub fn position(&self, i: usize) -> Option<(i64, i64)> {
-        self.positions.get(i).copied().flatten()
+        self.grid.as_ref().ok()?.positions.get(i).copied().flatten()
     }
 
-    /// The grid: pixel counts always; pixel size (the step, µm) and max dimension on an axis with a step.
-    pub fn scan_settings(&self) -> mzdata::meta::ScanSettings {
+    /// The grid: pixel counts always; pixel size (the step, µm) and max dimension on each axis with a
+    /// step — a single row keeps the column step (review 2026-09-30 B15). `None` without a grid.
+    pub fn scan_settings(&self) -> Option<mzdata::meta::ScanSettings> {
+        let g = self.grid.as_ref().ok()?;
         let mut s = mzdata::meta::ScanSettings { id: "scansettings1".into(), ..Default::default() };
         let p = |name: &str, curie, v: mzdata::params::Value, unit| Param::builder().name(name).curie(curie).value(v).unit(unit).build();
-        s.params.push(p("max count of pixels x", mzdata::curie!(IMS:1000042), self.x.count.into(), Unit::Unknown));
-        s.params.push(p("max count of pixels y", mzdata::curie!(IMS:1000043), self.y.count.into(), Unit::Unknown));
-        if let (Some(px), Some(py)) = (self.x.pitch, self.y.pitch) {
-            let (ux, uy) = (px * 1000.0, py * 1000.0);
+        s.params.push(p("max count of pixels x", mzdata::curie!(IMS:1000042), g.x.count.into(), Unit::Unknown));
+        s.params.push(p("max count of pixels y", mzdata::curie!(IMS:1000043), g.y.count.into(), Unit::Unknown));
+        if let Some(ux) = g.x.pitch.map(|p| p * 1000.0) {
             s.params.push(p("pixel size (x)", mzdata::curie!(IMS:1000046), ux.into(), Unit::Micrometer));
-            s.params.push(p("pixel size y", mzdata::curie!(IMS:1000047), uy.into(), Unit::Micrometer));
-            s.params.push(p("max dimension x", mzdata::curie!(IMS:1000044), (self.x.count as f64 * ux).into(), Unit::Micrometer));
-            s.params.push(p("max dimension y", mzdata::curie!(IMS:1000045), (self.y.count as f64 * uy).into(), Unit::Micrometer));
+            s.params.push(p("max dimension x", mzdata::curie!(IMS:1000044), (g.x.count as f64 * ux).into(), Unit::Micrometer));
         }
-        s
+        if let Some(uy) = g.y.pitch.map(|p| p * 1000.0) {
+            s.params.push(p("pixel size y", mzdata::curie!(IMS:1000047), uy.into(), Unit::Micrometer));
+            s.params.push(p("max dimension y", mzdata::curie!(IMS:1000045), (g.y.count as f64 * uy).into(), Unit::Micrometer));
+        }
+        Some(s)
     }
 
-    /// The `waters_imaging` index block: where the positions came from and how well they fit.
+    /// The `transformations` entries of a run with a grid.
+    pub fn transformations(&self) -> Vec<&'static str> {
+        match &self.grid {
+            Ok(g) if g.off_grid > 0 => vec![LASER_GRID, OFF_GRID_DROPPED],
+            _ => vec![LASER_GRID],
+        }
+    }
+
+    /// Where an axis's step came from.
+    fn step_source(&self, a: usize, axis: &crate::imaging::GridAxis) -> String {
+        match (&self.steps[a], axis.declared) {
+            (Some((name, _)), true) => format!("declared: methodfile.xml {name}"),
+            (Some((name, v)), false) => format!("fitted: the declared methodfile.xml {name} = {v} mm does not hold the positions"),
+            (None, _) if axis.pitch.is_none() => "none: a single row or column".into(),
+            (None, _) => "fitted".into(),
+        }
+    }
+
+    /// The `waters_imaging` index block: where the positions came from and how well they fit, or why
+    /// they fit no grid.
     pub fn block(&self) -> serde_json::Value {
-        let axis = |a: &crate::imaging::GridAxis| serde_json::json!({
-            "origin_mm": a.origin, "pitch_mm": a.pitch, "count": a.count, "max_residual_mm": a.max_residual,
-        });
-        serde_json::json!({
+        let mut b = serde_json::json!({
             "source": format!("MassLynx scan items {:?} / {:?} (laser aim position, mm)", self.names.0, self.names.1),
-            "positions": "grid index = round((position − origin) / pitch) + 1",
-            "scans_with_position": self.positions.iter().flatten().count(),
-            "x": axis(&self.x),
-            "y": axis(&self.y),
-        })
+            "scans_with_laser_position": self.positioned,
+            "lockmass_scans_excluded": self.lockmass_scans,
+            "declared_steps_mm": self.steps.iter().map(|s| s.as_ref().map(|(name, v)| serde_json::json!({"setting": name, "value": v}))).collect::<Vec<_>>(),
+        });
+        match &self.grid {
+            Ok(g) => {
+                let axis = |a: usize, x: &crate::imaging::GridAxis| serde_json::json!({
+                    "origin_mm": x.origin, "pitch_mm": x.pitch, "count": x.count, "max_residual_mm": x.max_residual,
+                    "step_source": self.step_source(a, x),
+                });
+                b["positions"] = "grid index = round((position − origin) / pitch) + 1".into();
+                b["scans_with_position"] = g.positions.iter().flatten().count().into();
+                b["off_grid_scans_dropped"] = g.off_grid.into();
+                b["x"] = axis(0, &g.x);
+                b["y"] = axis(1, &g.y);
+            }
+            Err(why) => b["no_grid"] = format!("{why}: no positions and no imaging marker written").into(),
+        }
+        b
     }
 
     /// The `provenance` of the `metadata.imaging` marker.
     pub fn provenance(&self) -> serde_json::Value {
+        let Ok(g) = &self.grid else { return serde_json::Value::Null };
+        let size = |a: &crate::imaging::GridAxis| if a.pitch.is_some() { "the step" } else { "not written: a single row or column" };
         serde_json::json!({
             "detected_from": "laser aim positions in the MassLynx scan items",
             "positions": "grid indices fitted to the positions in mm (waters_imaging)",
-            "origin_mm": {"x": self.x.origin, "y": self.y.origin},
-            "pixel_size": if self.x.pitch.is_some() && self.y.pitch.is_some() { "the fitted step" } else { "not written: a single row or column" },
+            "origin_mm": {"x": g.x.origin, "y": g.y.origin},
+            "pixel_size": {"x": size(&g.x), "y": size(&g.y)},
         })
     }
+}
+
+/// Each spectrum's laser position (mm) as `read(function, scan)` gives it — except the lock-mass
+/// function's: its reference scans sample the lock spray, not the surface, and get no pixel
+/// (review 2026-09-30 B15).
+fn laser_positions(
+    index: &[(c_int, c_int, f32)],
+    lockmass: Option<c_int>,
+    mut read: impl FnMut(c_int, c_int) -> Option<(f64, f64)>,
+) -> Vec<Option<(f64, f64)>> {
+    index.iter().map(|&(f, scan, _)| if Some(f) == lockmass { None } else { read(f, scan) }).collect()
+}
+
+/// The laser position items among the scan items of every written function but the lock mass —
+/// `available(f)` lists a function's item ids, `names(ids)` names them (function 1 alone was asked
+/// before, and a run recording them only in a later function lost its positions; review 2026-09-30
+/// B15): ids and names for x and y. With no names readable at all, the SDK enum's `LASERAIM_XPOS` /
+/// `_YPOS` (stat codes 9 / 10 in `_funcNNN.sts`).
+fn laser_items(
+    index: &[(c_int, c_int, f32)],
+    lockmass: Option<c_int>,
+    available: impl FnMut(c_int) -> Vec<c_int>,
+    names: impl FnOnce(&[c_int]) -> Vec<(c_int, String)>,
+) -> Option<([c_int; 2], (String, String))> {
+    let functions: std::collections::BTreeSet<c_int> = index.iter().map(|e| e.0).filter(|f| Some(*f) != lockmass).collect();
+    let ids: std::collections::BTreeSet<c_int> = functions.into_iter().flat_map(available).collect();
+    let named = names(&ids.into_iter().collect::<Vec<_>>());
+    let find = |axis| named.iter().find(|(_, n)| names_position(&n.to_ascii_uppercase().replace(['_', '-'], " "), axis));
+    match (find('X'), find('Y')) {
+        (Some(x), Some(y)) => Some(([x.0, y.0], (x.1.clone(), y.1.clone()))),
+        _ if named.is_empty() => Some(([SCAN_ITEM_FIRST + 8, SCAN_ITEM_FIRST + 9], ("LASERAIM_XPOS".into(), "LASERAIM_YPOS".into()))),
+        _ => None,
+    }
+}
+
+/// The raster step a Waters method declares per axis (`methodfile.xml`: `<Setting Name="DesiXStep"
+/// Value="0.1" Mapping="Desi.Pattern.XStep"/>`, mm): the first setting whose name ends in `XStep` /
+/// `YStep`, whatever its prefix (MALDI methods may use another).
+fn declared_steps(xml: &str) -> [Option<(String, f64)>; 2] {
+    let mut steps: [Option<(String, f64)>; 2] = [None, None];
+    let mut reader = quick_xml::Reader::from_str(xml);
+    while let Ok(ev) = reader.read_event() {
+        match ev {
+            quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) if e.local_name().as_ref() == b"Setting" => {
+                let (Some(name), Some(value)) = (crate::imaging::attr(&e, b"Name"), crate::imaging::attr(&e, b"Value")) else { continue };
+                let Some(v) = value.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0) else { continue };
+                let lower = name.to_ascii_lowercase();
+                for (slot, suffix) in steps.iter_mut().zip(["xstep", "ystep"]) {
+                    if slot.is_none() && lower.ends_with(suffix) {
+                        *slot = Some((name.clone(), v));
+                    }
+                }
+            }
+            quick_xml::events::Event::Eof => break,
+            _ => {}
+        }
+    }
+    steps
 }
 
 /// Does a MassLynx scan-item name (upper-cased, `_`/`-` as spaces) name the `axis` position?
@@ -499,7 +659,6 @@ impl WatersReader {
             .or_else(|| reference_functions_from_extern_inf(input).first().copied());
         // The scan items the DLL records, by NAME, so the ids do not depend on the enum base.
         let mut item_ids = ScanItemIds::default();
-        let mut laser_names = (String::new(), String::new());
         if let Some(api) = scan_items {
             let ids = api.available(info_reader, 0);
             let named = api.names(info_reader, &ids);
@@ -516,12 +675,6 @@ impl WatersReader {
                     item_ids.collision_energy = Some(*id);
                 } else if u.contains("SONAR") && item_ids.sonar.is_none() {
                     item_ids.sonar = Some(*id);
-                } else if names_position(&u, 'X') && item_ids.laser_x.is_none() {
-                    item_ids.laser_x = Some(*id);
-                    laser_names.0 = name.clone();
-                } else if names_position(&u, 'Y') && item_ids.laser_y.is_none() {
-                    item_ids.laser_y = Some(*id);
-                    laser_names.1 = name.clone();
                 }
             }
             if named.is_empty() {
@@ -530,10 +683,7 @@ impl WatersReader {
                     set_mass: Some(SCAN_ITEM_FIRST + 76),
                     collision_energy: Some(SCAN_ITEM_FIRST + 61),
                     sonar: Some(SCAN_ITEM_FIRST + 80),
-                    laser_x: Some(SCAN_ITEM_FIRST + 8),
-                    laser_y: Some(SCAN_ITEM_FIRST + 9),
                 };
-                laser_names = ("LASERAIM_XPOS".into(), "LASERAIM_YPOS".into());
             }
             log::info!("MassLynx scan item ids: {item_ids:?}; lock-mass function: {:?}", lockmass_function.map(|f| f + 1));
         }
@@ -784,11 +934,13 @@ impl WatersReader {
             return Err(close(format!("Waters .raw {} has no readable scans", input.display())));
         }
 
-        // Imaging (MALDI / DESI): every scan's laser aim position, fitted to a pixel grid.
-        let imaging = match (scan_items, item_ids.laser_x, item_ids.laser_y) {
-            (Some(api), Some(x), Some(y)) => WatersImaging::read(api, info_reader, &index, [x, y], laser_names),
-            _ => None,
-        };
+        // Imaging (MALDI / DESI): every scan's laser aim position, fitted to a pixel grid — the items
+        // looked up in every written function but the lock mass, the step the method declares.
+        let imaging = scan_items.and_then(|api| {
+            let (items, names) = laser_items(&index, lockmass_function, |f| api.available(info_reader, f), |ids| api.names(info_reader, ids))?;
+            let method = crate::run_metadata::read_text_lossy(&input.join("methodfile.xml")).unwrap_or_default();
+            WatersImaging::read(api, info_reader, &index, items, names, lockmass_function, declared_steps(&method))
+        });
 
         if let Some(level) = std::env::var("MZPC_WATERS_PROBE_QUAD").ok().filter(|v| !v.is_empty() && v != "0") {
             probe_quad_windows(&lib, info_reader, scan_reader, functions.len(), &index, scan_items, &level);
@@ -1556,6 +1708,173 @@ mod tests {
         assert!(names_position(&u("Laser Aim X Position"), 'X'));
         assert!(!names_position(&u("RAMP MAX POS"), 'X'), "MAX POS is not an x position");
         assert!(!names_position(&u("COLLISION ENERGY"), 'X'));
+    }
+
+    /// Review 2026-09-30 B15: the items were looked up in function 1 only; a run recording them in
+    /// a later function lost its positions. The lock-mass function is not asked.
+    #[test]
+    fn laser_items_are_looked_up_in_every_written_function() {
+        let index = [(0, 0, 0.1), (2, 0, 0.12), (1, 0, 0.15), (0, 1, 0.2)];
+        let table = |f: c_int| match f {
+            0 => vec![462],
+            1 => vec![462, 409, 410],
+            _ => vec![409, 410],
+        };
+        let name = |ids: &[c_int]| -> Vec<(c_int, String)> {
+            ids.iter().map(|&i| (i, match i { 409 => "LASERAIM_XPOS", 410 => "LASERAIM_YPOS", _ => "COLLISION_ENERGY" }.to_string())).collect()
+        };
+        let mut asked = Vec::new();
+        let found = laser_items(&index, Some(2), |f| {
+            asked.push(f);
+            table(f)
+        }, name);
+        assert_eq!(found, Some(([409, 410], ("LASERAIM_XPOS".to_string(), "LASERAIM_YPOS".to_string()))));
+        assert_eq!(asked, [0, 1], "every written function but the lock mass");
+        // Only x named: no position.
+        assert_eq!(laser_items(&index, None, |_| vec![409, 462], name), None);
+        // No names readable at all: the SDK enum's ids.
+        assert_eq!(laser_items(&index, None, table, |_| Vec::new()).map(|l| l.0), Some([409, 410]));
+    }
+
+    /// Review 2026-09-30 B15: the lock-mass (reference) function's scans sample the lock spray; they
+    /// get no position and are never read for one.
+    #[test]
+    fn lock_mass_scans_get_no_position() {
+        let index = [(0, 0, 0.1), (2, 0, 0.15), (0, 1, 0.2)];
+        let mut asked = Vec::new();
+        let mm = laser_positions(&index, Some(2), |f, scan| {
+            asked.push((f, scan));
+            Some((f as f64, scan as f64))
+        });
+        assert_eq!(mm, [Some((0.0, 0.0)), None, Some((0.0, 1.0))]);
+        assert_eq!(asked, [(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn the_method_declares_the_raster_step() {
+        // MTBLS14771's methodfile.xml, abridged.
+        let xml = "<?xml version=\"1.0\"?>\r\n<MsMethod InstrumentType=\"QTof\" InstrumentModel=\"Select Series MRT\" Version=\"1.0\">\r\n    <Settings>\r\n        <Setting Name=\"StartMass\" Value=\"50\"/>\r\n        <Setting Name=\"DesiXStart\" Value=\"79.9552\" Mapping=\"Desi.Pattern.XStart\"/>\r\n        <Setting Name=\"DesiXStep\" Value=\"0.1\" Mapping=\"Desi.Pattern.XStep\"/>\r\n        <Setting Name=\"DesiXRate\" Value=\"66.6667\" Mapping=\"Desi.Pattern.XRate\"/>\r\n        <Setting Name=\"DesiYStep\" Value=\"0.1\" Mapping=\"Desi.Pattern.YStep\"/>\r\n    </Settings>\r\n</MsMethod>\r\n";
+        assert_eq!(declared_steps(xml), [Some(("DesiXStep".to_string(), 0.1)), Some(("DesiYStep".to_string(), 0.1))]);
+        // Any prefix; a value that is no step is passed over.
+        let other = r#"<S><Setting Name="LaserXStep" Value="x"/><Setting Name="MaldiXStep" Value="0.05"/></S>"#;
+        assert_eq!(declared_steps(other), [Some(("MaldiXStep".to_string(), 0.05)), None]);
+        assert_eq!(declared_steps(""), [None, None]);
+    }
+
+    /// The shape of the DESI run MTBLS14771: `rows` × `cols` positions 0.1 mm apart as f32, in
+    /// raster order.
+    fn desi(rows: usize, cols: usize) -> Vec<Option<(f64, f64)>> {
+        (0..rows)
+            .flat_map(|r| (0..cols).map(move |c| Some(((80.3673f32 + c as f32 * 0.1) as f64, (45.9005f32 + r as f32 * 0.1) as f64))))
+            .collect()
+    }
+
+    fn laser_names() -> (String, String) {
+        ("LASERAIM_XPOS".into(), "LASERAIM_YPOS".into())
+    }
+
+    fn step(name: &str, mm: f64) -> Option<(String, f64)> {
+        Some((name.to_string(), mm))
+    }
+
+    fn accessions(s: &mzdata::meta::ScanSettings) -> Vec<String> {
+        s.params.iter().map(|p| p.curie().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn the_declared_step_is_the_pitch_and_its_source_is_recorded() {
+        let im = WatersImaging::from_positions(desi(103, 104), laser_names(), [step("DesiXStep", 0.1), step("DesiYStep", 0.1)], 0).unwrap();
+        let g = im.grid.as_ref().unwrap();
+        assert_eq!((g.x.count, g.y.count, g.x.pitch, g.y.pitch, g.off_grid), (104, 103, Some(0.1), Some(0.1), 0));
+        assert_eq!((im.position(0), im.position(104 * 103 - 1)), (Some((1, 1)), Some((104, 103))));
+        let b = im.block();
+        assert_eq!(b["x"]["step_source"], "declared: methodfile.xml DesiXStep");
+        assert_eq!(b["declared_steps_mm"][1]["setting"], "DesiYStep");
+        assert_eq!(im.transformations(), [LASER_GRID]);
+        // A step larger than the whole raster (a µm value read as mm) is not taken.
+        let im = WatersImaging::from_positions(desi(10, 10), laser_names(), [step("MaldiXStep", 50.0), step("MaldiYStep", 50.0)], 0).unwrap();
+        let g = im.grid.as_ref().unwrap();
+        assert_eq!((g.x.count, g.x.pitch, g.x.declared), (10, Some(0.1), false));
+        assert!(im.block()["x"]["step_source"].as_str().unwrap().starts_with("fitted: the declared methodfile.xml MaldiXStep"));
+    }
+
+    /// Review 2026-09-30 B15: a scan off the grid (parked at the stage origin before the raster)
+    /// took imaging away from the whole run. Now it loses its pixel, counted and declared — and does
+    /// not stretch the y grid, on which it lies by chance (459 steps below the first row).
+    #[test]
+    fn a_parked_scan_loses_its_pixel_and_is_declared() {
+        let mut mm = desi(103, 104);
+        mm.insert(0, Some((0.0, 0.0)));
+        let im = WatersImaging::from_positions(mm, laser_names(), [None, None], 0).unwrap();
+        let g = im.grid.as_ref().unwrap();
+        assert_eq!((g.x.count, g.y.count, g.off_grid), (104, 103, 1));
+        assert_eq!((im.position(0), im.position(1)), (None, Some((1, 1))));
+        assert_eq!(im.transformations(), [LASER_GRID, OFF_GRID_DROPPED]);
+        assert_eq!(im.block()["off_grid_scans_dropped"], 1);
+    }
+
+    /// Review 2026-09-30 B14: when the positions fit no grid, the archive says so — a
+    /// `waters_imaging` block with the reason — and writes no positions and no grid.
+    #[test]
+    fn positions_on_no_grid_leave_the_reason_and_nothing_else() {
+        let mut mm = desi(10, 10);
+        mm.push(Some((0.0, 0.0)));
+        mm.push(Some((1.0, 1.0)));
+        let im = WatersImaging::from_positions(mm, laser_names(), [None, None], 3).unwrap();
+        assert!(im.grid.is_err());
+        assert!(im.position(0).is_none() && im.scan_settings().is_none());
+        let b = im.block();
+        assert!(b["no_grid"].as_str().unwrap().contains("no positions and no imaging marker"), "{b}");
+        assert_eq!((b["scans_with_laser_position"].as_u64(), b["lockmass_scans_excluded"].as_u64()), (Some(102), Some(3)));
+        assert!(b.get("x").is_none());
+        // Fewer than two distinct positions: no raster, not an imaging run at all.
+        assert!(WatersImaging::from_positions(vec![Some((1.0, 1.0)); 5], laser_names(), [None, None], 0).is_none());
+    }
+
+    /// Review 2026-09-30 B15: a single row dropped the pixel size of the axis whose step is known.
+    #[test]
+    fn a_single_row_keeps_the_column_step() {
+        let row: Vec<Option<(f64, f64)>> = (0..50).map(|c| Some((10.0 + c as f64 * 0.05, 20.0))).collect();
+        let im = WatersImaging::from_positions(row.clone(), laser_names(), [None, None], 0).unwrap();
+        let s = im.scan_settings().unwrap();
+        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044"]);
+        assert!((s.params[2].value.to_f64().unwrap() - 50.0).abs() < 1e-9);
+        assert_eq!(im.block()["y"]["step_source"], "none: a single row or column");
+        // With the method's y step, both axes have a pixel size.
+        let im = WatersImaging::from_positions(row, laser_names(), [None, step("DesiYStep", 0.05)], 0).unwrap();
+        let s = im.scan_settings().unwrap();
+        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044", "IMS:1000047", "IMS:1000045"]);
+    }
+
+    /// The real DESI run (MetaboLights MTBLS14771): `_func001.sts` holds each scan's laser aim
+    /// position (a u16 header size at byte 0, record size at 4, item count at 6; 48-byte item
+    /// descriptors from 0x20: u16 code, type (3 = f32), offset; codes 9 / 10 = x / y in mm), and
+    /// `methodfile.xml` its 0.1 mm steps. Declared or fitted, the grid is 104 × 103 at 0.1 mm.
+    #[test]
+    #[ignore = "needs MTBLS14771's .raw under ~/Claude/mzPeak/data/imaging-examples; run with --include-ignored"]
+    fn mtbls14771_fits_104_by_103_at_a_tenth_of_a_millimetre() {
+        let raw = PathBuf::from(std::env::var("HOME").unwrap())
+            .join("Claude/mzPeak/data/imaging-examples/MTBLS14771/20250327_MG3_HBackupACN_CLMC.raw");
+        let sts = std::fs::read(raw.join("_func001.sts")).expect("_func001.sts");
+        let u16_at = |o: usize| u16::from_le_bytes([sts[o], sts[o + 1]]) as usize;
+        let (header, record, items) = (u16_at(0), u16_at(4), u16_at(6));
+        let offset = |code| {
+            (0..items).map(|i| 0x20 + 48 * i).find(|&d| u16_at(d) == code && u16_at(d + 2) == 3).map(|d| u16_at(d + 4)).unwrap()
+        };
+        let (ox, oy) = (offset(9), offset(10));
+        let f32_at = |o: usize| f32::from_le_bytes(sts[o..o + 4].try_into().unwrap()) as f64;
+        let mm: Vec<Option<(f64, f64)>> =
+            (0..(sts.len() - header) / record).map(|s| header + s * record).map(|r| Some((f32_at(r + ox), f32_at(r + oy)))).collect();
+        assert_eq!(mm.len(), 104 * 103);
+        let steps = declared_steps(&std::fs::read_to_string(raw.join("methodfile.xml")).unwrap());
+        assert_eq!(steps, [step("DesiXStep", 0.1), step("DesiYStep", 0.1)]);
+        for (steps, declared) in [(steps, true), ([None, None], false)] {
+            let im = WatersImaging::from_positions(mm.clone(), laser_names(), steps, 0).unwrap();
+            let g = im.grid.as_ref().unwrap();
+            assert_eq!((g.x.count, g.y.count, g.x.pitch, g.y.pitch, g.off_grid), (104, 103, Some(0.1), Some(0.1), 0));
+            assert_eq!((g.x.declared, g.y.declared), (declared, declared));
+            assert!(g.x.max_residual < 1e-4 && g.y.max_residual < 1e-4, "{g:?}");
+        }
     }
 
     fn fi(code: Option<c_int>, bins: c_int, ce: Option<f64>) -> FunctionInfo {
