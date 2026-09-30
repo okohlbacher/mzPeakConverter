@@ -6,7 +6,13 @@
 //!     (`tiny.pwiz.1.1`: 5.8905, 5.9905, 0.0, 0.7008) — on the direct lane, and on an export of an
 //!     archive that holds no chromatogram of that kind;
 //!   * a chromatogram's polarity (`negative scan` on every SRM trace of a negative-mode run) was
-//!     written on neither route.
+//!     written on neither route;
+//!   * a chromatogram's precursor came back with an isolation window of target 0 (the SRM trace of
+//!     `tiny.pwiz.1.1` states 456.7) and no activation: the vendored reader looked the window's
+//!     columns up in an empty column mapping;
+//!   * every precursor, a spectrum's or a chromatogram's, came back with no dissociation method and a
+//!     collision energy of 0: the reader read the activation's `parameters` list alone, and the
+//!     writer keeps both in columns of their own.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,6 +63,13 @@ fn elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
         .filter(|(at, _)| xml[at + open.len()..].starts_with([' ', '>']))
         .map(|(at, _)| &xml[at..at + xml[at..].find(&close).unwrap()])
         .collect()
+}
+
+/// `(target, the chromatogram's first activation method, collision energy)` of `id`'s first precursor.
+fn chromatogram_precursor(chroms: &[Chromatogram], id: &str) -> (f32, Option<String>, f32) {
+    let c = chroms.iter().find(|c| c.id() == id).unwrap_or_else(|| panic!("no chromatogram {id}"));
+    let p = c.precursor().unwrap_or_else(|| panic!("chromatogram {id} has no precursor"));
+    (p.isolation_window.target, p.activation.method().map(|m| m.to_param().name.to_string()), p.activation.energy)
 }
 
 /// (1) `--to mzml`: tiny.pwiz.1.1 carries a TIC but no base-peak chromatogram, so the writer sums
@@ -129,5 +142,43 @@ fn a_chromatograms_polarity_goes_across() {
             assert_eq!(negative, c.contains(r#"id="sic""#), "{route}: `negative scan` on the SRM trace alone:\n{c}");
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (2) tiny.pwiz.1.1's selected ion current chromatogram states a target-only precursor window
+/// (456.7) activated by CID. The archive stores both; the export wrote a window of target 0 (and
+/// offsets 0) and no activation. The direct lane is the reference.
+#[test]
+fn an_exported_chromatograms_precursor_keeps_its_window_and_activation() {
+    let dir = scratch("sic");
+    let (archive, export, direct) = (dir.join("tiny.mzpeak"), dir.join("export.mzML"), dir.join("direct.mzML"));
+    convert(Path::new(TINY), &archive, &[], &[]);
+    convert(&archive, &export, &[], &[]);
+    convert(Path::new(TINY), &direct, &[], &[]);
+    let (target, method, _) = chromatogram_precursor(&chromatograms(&export), "sic");
+    assert_eq!(chromatogram_precursor(&chromatograms(&direct), "sic").0, target, "export vs --to mzml");
+    assert!((target - 456.7).abs() < 1e-3, "target {target}");
+    assert_eq!(method.as_deref(), Some("collision-induced dissociation"));
+    // Target-only stays target-only: no offsets are written for a window of unknown width.
+    let xml = std::fs::read_to_string(&export).unwrap();
+    let sic = elements(&xml, "chromatogram").into_iter().find(|c| c.contains(r#"id="sic""#)).unwrap();
+    assert!(!sic.contains("MS:1000828") && !sic.contains("MS:1000829"), "offsets on a target-only window:\n{sic}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (2)/(3c) A spectrum's activation: tiny.pwiz.1.1's `scan=20` states CID at 35 eV, which the
+/// archive stores in `activation.dissociation_method` / `collision_energy`; the export wrote
+/// `collision energy 0` and no method.
+#[test]
+fn an_exported_spectrums_activation_keeps_its_method_and_energy() {
+    let dir = scratch("activation");
+    let (archive, export) = (dir.join("tiny.mzpeak"), dir.join("export.mzML"));
+    convert(Path::new(TINY), &archive, &[], &[]);
+    convert(&archive, &export, &[], &[]);
+    let mut reader = mzdata::io::mzml::MzMLReader::open_path(&export).unwrap();
+    let spec = reader.get_spectrum_by_id("scan=20").unwrap();
+    let activation = &spec.precursor().expect("scan=20's precursor").activation;
+    assert_eq!(activation.method().map(|m| m.to_param().name.to_string()).as_deref(), Some("collision-induced dissociation"));
+    assert_eq!(activation.energy, 35.0);
     let _ = std::fs::remove_dir_all(&dir);
 }

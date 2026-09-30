@@ -1349,9 +1349,15 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
         if acc.is_empty() && n > 0 {
             acc.resize(n, Default::default());
         }
+        // DELIBERATE DEVIATION (not upstream, as of `93c1982`): the chromatogram facets' own column
+        // mappings. Upstream hands the precursor visitor an EMPTY mapping, which is where it looks
+        // up the isolation window's columns, so every chromatogram precursor came back with a
+        // window of target 0 (an SRM trace's stored `456.7` among them); and the selected ions the
+        // SPECTRUM facet's mapping, which an archive without spectrum precursors does not have.
         let empty = MetadataMapping::default();
+        let metacols = self.metadata.chromatograms.precursor_metadata_map.as_ref().unwrap_or(&empty);
         if n > 0 {
-            MzPrecursorVisitor::new(acc, &empty, 0, Vec::new()).visit(&precursor_arr);
+            MzPrecursorVisitor::new(acc, metacols, 0, Vec::new()).visit(&precursor_arr);
         }
     }
 
@@ -1363,7 +1369,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
         let empty = MetadataMapping::default();
         let metacols = self
             .metadata
-            .spectra
+            .chromatograms
             .selected_ion_metadata_map
             .as_ref()
             .unwrap_or(&empty);

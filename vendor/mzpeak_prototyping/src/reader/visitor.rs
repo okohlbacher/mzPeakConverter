@@ -2037,6 +2037,71 @@ impl<'a> MzPrecursorVisitor<'a> {
         } else {
             panic!("Unsupported data type: {:?}", params_array.data_type());
         }
+        self.visit_activation_columns(spec_arr);
+    }
+
+    /// The activation group's promoted columns. DELIBERATE DEVIATION (not upstream, which reads the
+    /// `parameters` list alone, as of `93c1982`): the writer ([`crate::writer::visitor`]'s
+    /// `ActivationBuilder`) moves the dissociation method (MS:1000044, a child term) to
+    /// `dissociation_method` and the collision energy (MS:1000045) to `collision_energy`, and masks
+    /// both out of `parameters`. Read `parameters` alone, every precursor of every archive came back
+    /// with no dissociation method and an energy of 0 (a dia-PASEF MS2 frame's `CID, 48.46 eV`
+    /// became `collision energy 0` in the mzML export). A column is found by its accession in the
+    /// facet's column mapping, else by the writer's name for it. The column's method goes first, as
+    /// the writer ranks it: the list's are the supplemental ones. Proposed upstream.
+    fn visit_activation_columns(&mut self, activation: &StructArray) {
+        let mapping = self.metadata_map().member("activation");
+        for (field, arr) in activation.fields().iter().zip(activation.columns()) {
+            let name = field.name().as_str();
+            let accession = mapping
+                .and_then(|m| m.traverse::<&str>(&[], name))
+                .and_then(|col| col.accession)
+                .or(match name {
+                    "dissociation_method" => Some(curie!(MS:1000044)),
+                    "collision_energy" => Some(curie!(MS:1000045)),
+                    _ => None,
+                });
+            match accession {
+                Some(curie!(MS:1000044)) => {
+                    if arr.as_string_opt::<i32>().is_none()
+                        && arr.as_string_opt::<i64>().is_none()
+                        && arr.as_struct_opt().is_none()
+                    {
+                        continue;
+                    }
+                    let methods = AnyCURIEArray::try_from(arr).unwrap();
+                    for (i, descr) in self.iter_instances() {
+                        let Some(method) = methods
+                            .value(i)
+                            .and_then(|c| mzdata::meta::DissociationMethodTerm::from_curie(&c))
+                        else {
+                            continue;
+                        };
+                        let activation = &mut descr.description_mut().activation;
+                        if !activation.methods().contains(&method) {
+                            activation.methods_mut().insert(0, method);
+                        }
+                    }
+                }
+                Some(curie!(MS:1000045)) => {
+                    macro_rules! energy {
+                        ($arr:expr) => {
+                            for (i, descr) in self.iter_instances() {
+                                if !$arr.is_null(i) {
+                                    descr.description_mut().activation.energy = $arr.value(i) as f32;
+                                }
+                            }
+                        };
+                    }
+                    if let Some(arr) = arr.as_primitive_opt::<Float32Type>() {
+                        energy!(arr);
+                    } else if let Some(arr) = arr.as_primitive_opt::<Float64Type>() {
+                        energy!(arr);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn visit(&mut self, spec_arr: &StructArray) {
