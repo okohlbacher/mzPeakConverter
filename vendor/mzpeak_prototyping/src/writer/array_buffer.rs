@@ -1543,27 +1543,35 @@ impl ArrayBuffersBuilder {
         mask_zero_intensity_runs: bool,
     ) -> ChunkBuffers {
         if self.fields_empty() {
-            // `add_default_fields_for_context` is layout-blind: it installs POINT-shaped scalars
-            // (`mz: Float64`, `intensity: Float32`) regardless of `self.chunking_strategy`. Those
-            // cannot describe a chunked buffer, whose columns are `LargeList`. We deliberately do
-            // NOT synthesize chunk-shaped defaults here: the correct chunk field *names* encode the
-            // source dtype (`intensity_f32_dc` vs `intensity_f64_dc`) and the transform
-            // (`mz_numpress_linear_bytes`), neither of which is knowable without seeing data —
-            // guessing wrong swaps a loud panic for a silently all-null column.
-            //
-            // Reaching here with a chunking strategy set means schema sampling produced nothing.
-            // That is only benign when the source carries no signal at all (no chunk batch is ever
-            // built, so this schema stays inert). If any spectrum does have data, the writer will
-            // panic in `promote_record_batch_to_struct`. Sampling is where that must be fixed; see
-            // `sample_array_types_from_spectrum_source`.
-            if self.chunking_strategy.is_some() {
-                log::warn!(
-                    "chunked {buffer_context:?} buffer has an empty array schema; falling back to \
-                     point-shaped default fields, which cannot describe chunked data. This is \
-                     only safe if the source has no signal at all."
-                );
+            // Schema sampling found no signal: a source without any (SRM/MRM chromatogram-only
+            // runs), or a facet the source never feeds (the profile facet of a centroid-only Thermo
+            // run). DELIBERATE DEVIATION (not upstream), review 2026-09-30 §E: upstream falls back
+            // to `add_default_fields_for_context`, whose POINT columns under a `chunk` prefix made
+            // the empty facet contradict itself — `point` entries in a chunked file, no
+            // `chunk_start`/`chunk_end`/`chunk_encoding`/`chunk_values` (signal-data.md), and a
+            // second layout family beside a chunked peaks facet (conformance.md) — in 66 facets of
+            // 35 corpus archives. Sample a one-point spectrum of the context's default arrays (its
+            // main axis, f32 intensity) instead, through the same overrides and strategy as real
+            // data: the facet gets the chunk columns such a spectrum would have. Data reaching it
+            // later is chunked against it like against any sampled schema — a float width is
+            // aliased onto the declared column, an array it lacks spills to `auxiliary_arrays` —
+            // where the point-shaped fallback panicked the writer.
+            if let Some(strategy) = self.chunking_strategy.clone() {
+                let one_point = |name: BufferName| {
+                    let mut array = name.as_data_array(1);
+                    array.data.resize(name.dtype.size_of(), 0);
+                    array
+                };
+                let mut arrays = mzdata::spectrum::BinaryArrayMap::new();
+                arrays.add(one_point(buffer_context.main_axis()));
+                arrays.add(one_point(INTENSITY_ARRAY.with_context(buffer_context)));
+                let fields = super::ArrayTypesSampler::new(&self.overrides, Some(&strategy), None)
+                    .from_binary_array_map(&arrays, buffer_context)
+                    .unwrap_or_default();
+                for f in fields {
+                    self = self.add_field(f);
+                }
             }
-            self = self.add_default_fields_for_context(buffer_context);
         }
         if self.include_time {
             self = self.add_time_field(buffer_context);
