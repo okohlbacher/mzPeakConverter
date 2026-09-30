@@ -12,7 +12,10 @@
 //!     columns up in an empty column mapping;
 //!   * every precursor, a spectrum's or a chromatogram's, came back with no dissociation method and a
 //!     collision energy of 0: the reader read the activation's `parameters` list alone, and the
-//!     writer keeps both in columns of their own.
+//!     writer keeps both in columns of their own;
+//!   * a selected ion's and a scan's 1/K0 (MS:1002815) were named `inverse reduced ion mobility drift
+//!     time`, a scan stated it twice, and every spectrum stated its `scan start time` a second time,
+//!     at the spectrum level.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,6 +66,17 @@ fn elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
         .filter(|(at, _)| xml[at + open.len()..].starts_with([' ', '>']))
         .map(|(at, _)| &xml[at..at + xml[at..].find(&close).unwrap()])
         .collect()
+}
+
+/// The `<spectrum>` with this id.
+fn spectrum_element<'a>(xml: &'a str, id: &str) -> &'a str {
+    let key = format!(r#"id="{id}""#);
+    elements(xml, "spectrum").into_iter().find(|s| s.contains(&key)).unwrap_or_else(|| panic!("no spectrum {id}"))
+}
+
+/// The spectrum-level part of a `<spectrum>`: what precedes its lists.
+fn spectrum_head(spectrum: &str) -> &str {
+    &spectrum[..spectrum.find("<scanList").unwrap_or(spectrum.len())]
 }
 
 /// `(target, the chromatogram's first activation method, collision energy)` of `id`'s first precursor.
@@ -180,5 +194,47 @@ fn an_exported_spectrums_activation_keeps_its_method_and_energy() {
     let activation = &spec.precursor().expect("scan=20's precursor").activation;
     assert_eq!(activation.method().map(|m| m.to_param().name.to_string()).as_deref(), Some("collision-induced dissociation"));
     assert_eq!(activation.energy, 35.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// tiny.pwiz.1.1 with a diaPASEF window's 1/K0 on `scan=20`'s scan and selected ion, as ProteoWizard
+/// and the `.d → mzML` lane state it. The writer keeps the scan's copy in its `ion_mobility_value`
+/// column and in its `parameters`, as it does on the `--no-ims-compact` timsTOF lane.
+fn tiny_with_mobility(dir: &Path) -> PathBuf {
+    const K0: &str = r#"<cvParam cvRef="MS" accession="MS:1002815" name="inverse reduced ion mobility" value="1.3323874701174356" unitCvRef="MS" unitAccession="MS:1002814" unitName="volt-second per square centimeter"/>"#;
+    let src = std::fs::read_to_string(TINY).unwrap();
+    let scan = r#"<cvParam cvRef="MS" accession="MS:1000616" name="preset scan configuration" value="4"/>"#;
+    let ion = r#"<cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="2"/>"#;
+    assert_eq!((src.matches(scan).count(), src.matches(ion).count()), (1, 1), "the fixture's scan=20 moved");
+    let patched = src.replacen(scan, &format!("{scan}\n{K0}"), 1).replacen(ion, &format!("{ion}\n{K0}"), 1);
+    let path = dir.join("tiny_k0.mzML");
+    std::fs::write(&path, patched).unwrap();
+    path
+}
+
+/// (3a, 3b) A selected ion's and a scan's 1/K0 go out under PSI-MS's name for MS:1002815, `inverse
+/// reduced ion mobility`, once per element; and no spectrum states a `scan start time` of its own
+/// beside its scan's. The export named both `… drift time` and wrote the scan's twice.
+#[test]
+fn an_exported_1_over_k0_is_named_as_psi_ms_names_it_and_stated_once() {
+    let dir = scratch("k0");
+    let source = tiny_with_mobility(&dir);
+    let (archive, export, direct) = (dir.join("k0.mzpeak"), dir.join("export.mzML"), dir.join("direct.mzML"));
+    convert(&source, &archive, &[], &[]);
+    convert(&archive, &export, &[], &[]);
+    convert(&source, &direct, &[], &[]);
+    for (route, mzml) in [("export", &export), ("--to mzml", &direct)] {
+        let xml = std::fs::read_to_string(mzml).unwrap();
+        let spectrum = spectrum_element(&xml, "scan=20");
+        let scan = elements(spectrum, "scan")[0];
+        let ion = elements(spectrum, "selectedIon")[0];
+        for (element, text) in [("scan", scan), ("selectedIon", ion)] {
+            assert_eq!(text.matches(r#"accession="MS:1002815""#).count(), 1, "{route}: {element} states MS:1002815 once:\n{text}");
+            assert!(text.contains(r#"accession="MS:1002815" cvRef="MS" name="inverse reduced ion mobility" "#), "{route}: {element}:\n{text}");
+        }
+        for s in elements(&xml, "spectrum") {
+            assert!(!spectrum_head(s).contains("MS:1000016"), "{route}: a spectrum-level scan start time:\n{}", spectrum_head(s));
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2519,6 +2519,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                         whole_frames += 1;
                     }
                 }
+                correct_reader_terms(spec.description_mut());
                 demote_mzp_params(spec.description_mut());
                 unreferenced += drop_references_to(spec.description_mut(), &left_out);
                 if let Some(arrays) = spec.arrays.as_mut() {
@@ -2581,6 +2582,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let chroms: Vec<Chromatogram> = (0..n_chrom)
         .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
         .map(|mut c| {
+            c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
             demote_mzp_params_chrom(c.description_mut());
             unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
             if let Some(window) = opts.rt {
@@ -8249,6 +8251,72 @@ fn strip_grid_axis(arrays: &mut BinaryArrayMap) {
     });
 }
 
+/// What the vendored reader states wrongly for an archive's spectrum, put right on the way into an
+/// mzML (`filter_mzpeak_to_mzml`); the `.d → mzML` lane states each of them right. Through 0.16.0:
+///
+/// * PSI-MS names MS:1002815 `inverse reduced ion mobility`; the reader names every 1/K0 it rebuilds
+///   from a scan's or a selected ion's `ion_mobility_value` column `inverse reduced ion mobility
+///   drift time`, a label no PSI-MS release has (every selected ion of a timsTOF archive's export).
+/// * The writer keeps a scan's 1/K0 in the scan's `ion_mobility_value` column AND in its
+///   `parameters`, and the reader adds the column's copy after the list's: every MS2 `<scan>` of a
+///   `--no-ims-compact` archive's export stated MS:1002815 twice (15,977 of PXD059079 2485's). A
+///   scan keeps one of each accession with a given value and unit.
+/// * The reader hands `spectra_metadata.time` back as a SPECTRUM-level `scan start time`, beside the
+///   scan's own: mzML states the time on the scan. It is dropped, or becomes the scan's time where the
+///   scan has none (an archive without its scans facet).
+fn correct_reader_terms(descr: &mut mzdata::spectrum::SpectrumDescription) {
+    let time = descr.params.iter().find(|p| p.curie() == Some(curie!(MS:1000016))).map(|p| p.value.to_f64());
+    if let Some(time) = time {
+        descr.params.retain(|p| p.curie() != Some(curie!(MS:1000016)));
+        // Without a scans facet the reader hands over one default scan, at time 0.
+        match (descr.acquisition.scans.first_mut(), time) {
+            (None, Ok(t)) => {
+                let mut scan = mzdata::spectrum::ScanEvent::default();
+                scan.start_time = t;
+                descr.acquisition.scans.push(scan);
+            }
+            (Some(scan), Ok(t)) if scan.start_time == 0.0 => scan.start_time = t,
+            _ => {}
+        }
+    }
+    for scan in descr.acquisition.scans.iter_mut() {
+        if let Some(ps) = scan.params.as_mut() {
+            correct_reader_params(ps);
+        }
+    }
+    for prec in descr.precursor.iter_mut() {
+        correct_reader_ion_terms(prec);
+    }
+}
+
+/// [`correct_reader_terms`] for a precursor's selected ions (a spectrum's or a chromatogram's).
+fn correct_reader_ion_terms(prec: &mut mzdata::spectrum::Precursor) {
+    for ion in prec.ions.iter_mut() {
+        if let Some(ps) = ion.params.as_mut() {
+            correct_reader_params(ps);
+        }
+    }
+}
+
+/// One parameter list of [`correct_reader_terms`]: MS:1002815 under its PSI-MS name, and one of each
+/// controlled term with a given value and unit.
+fn correct_reader_params(params: &mut Vec<Param>) {
+    for p in params.iter_mut() {
+        if p.curie() == Some(curie!(MS:1002815)) {
+            p.name = "inverse reduced ion mobility".to_string();
+        }
+    }
+    let mut seen: Vec<(mzdata::params::CURIE, mzdata::params::Value, Unit)> = Vec::new();
+    params.retain(|p| match p.curie() {
+        Some(c) if seen.iter().any(|(sc, sv, su)| *sc == c && *sv == p.value && *su == p.unit) => false,
+        Some(c) => {
+            seen.push((c, p.value.clone(), p.unit));
+            true
+        }
+        None => true,
+    });
+}
+
 /// [`demote_mzp_params`] for a chromatogram.
 fn demote_mzp_params_chrom(descr: &mut ChromatogramDescription) {
     demote_mzp_in(&mut descr.params);
@@ -9026,6 +9094,40 @@ mod tests {
             assert_eq!(p.curie().and_then(C::from_curie), Some(kind), "{accession} reads back as {kind:?}");
         }
         assert!(super::chromatogram_type_param(C::Unknown).is_none());
+    }
+
+    /// An archive spectrum as the vendored reader hands it over, without its scans facet: one default
+    /// scan at time 0, the time a spectrum-level `scan start time`, and a scan 1/K0 twice, the second
+    /// under the reader's label. The export states the time on the scan alone and the 1/K0 once, under
+    /// PSI-MS's name; a second `window group`-like uncontrolled param and a different value stay.
+    #[test]
+    fn reader_terms_are_put_right_for_the_mzml_export() {
+        use mzdata::curie;
+        use mzdata::params::Unit;
+        let k0 = |name: &str, v: f64| {
+            Param::builder().name(name).curie(curie!(MS:1002815)).value(v).unit(Unit::VoltSecondPerSquareCentimeter).build()
+        };
+        let mut descr = SpectrumDescription::default();
+        descr.add_param(Param::builder().name("scan start time").curie(curie!(MS:1000016)).value(5.8905).unit(Unit::Minute).build());
+        let scan = descr.acquisition.first_scan_mut().unwrap();
+        assert_eq!(scan.start_time, 0.0);
+        scan.add_param(k0("inverse reduced ion mobility", 1.3323874701174356));
+        scan.add_param(Param::new_key_value("window group", 1i64));
+        scan.add_param(k0("inverse reduced ion mobility drift time", 1.3323874701174356));
+        scan.add_param(k0("inverse reduced ion mobility drift time", 1.1));
+        super::correct_reader_terms(&mut descr);
+        assert!(descr.params.iter().all(|p| p.curie() != Some(curie!(MS:1000016))));
+        let scan = descr.acquisition.first_scan().unwrap();
+        assert_eq!(scan.start_time, 5.8905);
+        let names: Vec<(&str, String)> = scan.params().iter().map(|p| (p.name.as_str(), p.value.to_string())).collect();
+        assert_eq!(
+            names,
+            [
+                ("inverse reduced ion mobility", "1.3323874701174356".to_string()),
+                ("window group", "1".to_string()),
+                ("inverse reduced ion mobility", "1.1".to_string()),
+            ]
+        );
     }
 
     /// mzML → mzML keeps each chromatogram's type term. mzdata's reader moves it into the typed
