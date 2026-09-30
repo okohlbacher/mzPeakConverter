@@ -145,6 +145,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
         .context("reading mzpeak_index.json")?;
     let index: serde_json::Value = serde_json::from_slice(&index_json)
         .context("parsing mzpeak_index.json")?;
+    crate::reject_legacy_tof_delta(input, index.pointer("/metadata/ims_calibration"))?;
     let orig_files = index_file_entries(&index);
 
     let member_names: Vec<String> = zip.file_names().map(str::to_string).collect();
@@ -325,7 +326,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     if wavelength_survivors.as_ref().is_some_and(|w| !w.is_identity()) {
         renumbered.push("wavelength_spectrum");
     }
-    carry_index_metadata(&mut w, &index, opts, input, &dropped, &injected, &renumbered)?;
+    carry_index_metadata(&mut w, &index, opts, input, &dropped, &injected, spectra, &renumbered)?;
 
     // ── injection (Phase 1) ─────────────────────────────────────────────────────────────────────
     // Reuse the forward-path verbatim embed. --image needs the carried marker's pixel grid, so it
@@ -605,7 +606,8 @@ enum Facet {
     /// keyed by a TOP-LEVEL `source_index` referencing `spectra_metadata.index`.
     SpectrumSecondary,
     /// A chromatogram's precursors / selected ions, keyed by `source_index`. Chromatograms are
-    /// truncated, never dropped, so every row stays; the facet is re-encoded to shed a count key.
+    /// truncated, never dropped, so every row stays; the facet is re-encoded to shed a count key, and
+    /// its references to spectra follow a spectrum filter.
     ChromatogramSecondary,
     /// No spectrum linkage — copy verbatim (run-global vendor status log, etc.).
     RunGlobal,
@@ -786,7 +788,11 @@ fn process_parquet(
             let f = field.clone();
             (Box::new(move |b| filter_by_struct_key(b, &f, "wavelength_spectrum_index", kept, false)), CountMode::WavelengthData(field))
         }
-        (Facet::ChromatogramSecondary, _, _) => (copy(), CountMode::Vendor),
+        (Facet::ChromatogramSecondary, None, _) => (copy(), CountMode::Vendor),
+        // A chromatogram's precursor has the spectrum precursor's schema: its `precursor_index` and
+        // `precursor_id` name the spectrum it was selected from. Copied as they were, one naming a
+        // filtered-out spectrum survived the rewrite, and the mzML export wrote it as a spectrumRef.
+        (Facet::ChromatogramSecondary, Some(s), _) => (Box::new(move |b| Ok(Some(remap_references(b, s)?))), CountMode::Vendor),
         (Facet::SpectrumMeta | Facet::SpectrumMetaFlat, None, _) => (copy(), CountMode::SpectrumMeta),
         (Facet::SpectrumData(field), None, _) => (copy(), CountMode::SpectrumData(field)),
         (Facet::SpectrumSecondary | Facet::VendorOrdinal, None, _) => (copy(), CountMode::Vendor),
@@ -1491,10 +1497,12 @@ fn is_primitive_numeric(dt: &DataType) -> bool {
 }
 
 /// Carry the original index `metadata` blocks into `w`, add a `data_processing` entry, and add the
-/// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members;
-/// `ims_calibration` and every other block are preserved verbatim. The provenance block's `renumbered`
-/// lists the entities (`spectrum`, `wavelength_spectrum`) whose kept indices were renumbered 0..n-1,
-/// every column holding such an index with them; their ids are the source's.
+/// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members, and
+/// `encoding_prescan` names its spectrum by the new index ([`renumber_prescan_block`]); `ims_calibration`
+/// and every other block are preserved verbatim. The provenance block's `renumbered` lists the entities
+/// (`spectrum`, `wavelength_spectrum`) whose kept indices were renumbered 0..n-1, every column holding
+/// such an index with them; their ids are the source's.
+#[allow(clippy::too_many_arguments)]
 fn carry_index_metadata(
     w: &mut ZipArchiveWriter<File>,
     index: &serde_json::Value,
@@ -1502,6 +1510,7 @@ fn carry_index_metadata(
     input: &Path,
     dropped: &[String],
     injected: &[String],
+    spectra: Option<&Survivors>,
     renumbered: &[&str],
 ) -> Result<()> {
     if let Some(meta) = index.get("metadata").and_then(|m| m.as_object()) {
@@ -1521,6 +1530,9 @@ fn carry_index_metadata(
                     images.retain(|i| !dropped.iter().any(|d| i["archive_path"] == d.as_str()));
                 }
                 w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
+            } else if k == "encoding_prescan" {
+                let block = renumber_prescan_block(v, spectra);
+                w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
             } else {
                 w.add_index_metadata(k, v).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
             }
@@ -1538,6 +1550,19 @@ fn carry_index_metadata(
     w.add_index_metadata("filter", &provenance)
         .map_err(|e| anyhow!("index metadata filter: {e}"))?;
     Ok(())
+}
+
+/// The `encoding_prescan` block of a rewrite. Its `int32_fallback.spectrum_index` is the spectrum whose
+/// intensity made the converter give up int32 intensities, by index: it takes that spectrum's new
+/// index, and null when the spectrum was filtered out. Carried verbatim, it named whichever spectrum
+/// took the old number. `spectra` `None` (nothing renumbered) leaves the block as it is.
+fn renumber_prescan_block(block: &serde_json::Value, spectra: Option<&Survivors>) -> serde_json::Value {
+    let mut block = block.clone();
+    let old = block.pointer("/int32_fallback/spectrum_index").and_then(serde_json::Value::as_u64);
+    if let (Some(s), Some(old)) = (spectra, old) {
+        block["int32_fallback"]["spectrum_index"] = s.kept.get(old).map_or(serde_json::Value::Null, Into::into);
+    }
+    block
 }
 
 /// An mzML-style data_processing method entry describing this filter operation.
@@ -1773,6 +1798,44 @@ mod tests {
         assert_eq!(u64s("precursor_index"), [None, Some(0), None, None]);
         assert_eq!(strs("precursor_id"), [None, Some("s3".into()), Some("USI:elsewhere".into()), None]);
         assert_eq!(strs("spectrum_reference"), [None, None, Some("other run".into()), None]);
+    }
+
+    /// A chromatogram's precursors keep every row and their own `source_index`, while their references
+    /// to spectra follow the spectrum filter: a kept parent's new index, null (index and id) for a
+    /// parent that was filtered out, and an id naming a filtered-out spectrum nulled.
+    #[test]
+    fn a_chromatogram_precursor_follows_the_spectra() {
+        let bytes = parquet(
+            vec![
+                ("source_index", Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef),
+                ("precursor_index", Arc::new(UInt64Array::from(vec![Some(2u64), Some(5), None])) as ArrayRef),
+                ("precursor_id", Arc::new(arrow::array::LargeStringArray::from(vec!["s2", "s5", "s6"])) as ArrayRef),
+            ],
+            &[],
+        );
+        let spectra = Survivors { kept: Renumber::new([3u64, 5]), total: 7, dangling: 0, dropped_ids: ["s2", "s6"].map(String::from).into() };
+        let fe = FileEntry::new("chromatograms_metadata_precursors.parquet".to_string(), EntityType::Chromatogram, DataKind::Precursors);
+        let out = process_parquet(&bytes, classify_facet(&bytes, &fe).unwrap(), Some(&spectra), &FilterOpts::default(), None, None).unwrap();
+        let t = ParquetRecordBatchReaderBuilder::try_new(bytes_of(&out)).unwrap().build().unwrap().next().unwrap().unwrap();
+        let u64s = |name: &str| to_u64(t.column_by_name(name).unwrap()).unwrap().iter().collect::<Vec<_>>();
+        let ids = t.column_by_name("precursor_id").unwrap().as_any().downcast_ref::<arrow::array::LargeStringArray>().unwrap().clone();
+        assert_eq!(u64s("source_index"), [Some(0), Some(1), Some(2)]);
+        assert_eq!(u64s("precursor_index"), [None, Some(1), None]);
+        assert_eq!(ids.iter().collect::<Vec<_>>(), [None, Some("s5"), None]);
+    }
+
+    /// The `encoding_prescan` block names the spectrum that ended the int32 intensities by its new
+    /// index, null when it was filtered out, and is left as it is when nothing was renumbered.
+    #[test]
+    fn the_prescan_block_follows_the_renumbering() {
+        let block = serde_json::json!({"chosen": {"intensity": "f32"}, "int32_fallback": {"spectrum_index": 70, "intensity": "f32"}});
+        let survivors = |kept: &[u64]| Survivors { kept: Renumber::new(kept.iter().copied()), total: 300, dangling: 0, dropped_ids: HashSet::new() };
+        let fallback = |spectra: Option<&Survivors>| renumber_prescan_block(&block, spectra)["int32_fallback"]["spectrum_index"].clone();
+        assert_eq!(fallback(Some(&survivors(&(50..300).collect::<Vec<_>>()))), serde_json::json!(20));
+        assert_eq!(fallback(Some(&survivors(&[1, 2, 3]))), serde_json::Value::Null);
+        assert_eq!(fallback(None), serde_json::json!(70));
+        let without = serde_json::json!({"chosen": {"intensity": "int32"}});
+        assert_eq!(renumber_prescan_block(&without, Some(&survivors(&[1]))), without, "a block with no fallback is carried as it is");
     }
 
     /// #20 review: the refreshed `number_of_data_points` keeps the column's type; a UInt64 array under

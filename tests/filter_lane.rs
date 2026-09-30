@@ -255,11 +255,13 @@ fn a_filtered_export_refers_only_to_spectra_it_holds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The filtered export parses the archive's index once. It opened the archive a second time to find
-/// the survivors, and every warning of that parse came twice: one per `vendor/` member of a timsTOF
-/// archive (21 became 42 on PXD059079's 2485), here the one an SDRF member's entity type draws.
+/// The filtered export warns about the archive's index once: its reader's parse is the only one. It
+/// opened the archive a second time to find the survivors, and every warning of that parse came twice:
+/// one per `vendor/` member of a timsTOF archive (21 became 42 on PXD059079's 2485), here the one an
+/// SDRF member's entity type draws. (The per-scan-delta check parsed the index a third time, silently;
+/// it reads the reader's now, [`a_per_scan_delta_archive_is_refused_on_both_lanes`].)
 #[test]
-fn a_filtered_export_parses_the_index_once() {
+fn a_filtered_export_warns_about_the_index_once() {
     let dir = scratch("parse-once");
     let sdrf = dir.join("s.tsv");
     std::fs::write(&sdrf, "source name\tassay name\nS1\tA1\n").unwrap();
@@ -270,6 +272,115 @@ fn a_filtered_export_parses_the_index_once() {
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert_eq!(stderr.matches("Found entity type sample-metadata").count(), 1, "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `archive` with `mzpeak_index.json` replaced by `edit` applied to it, as `dst`.
+fn with_index(archive: &Path, dst: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    use std::io::Write;
+    let mut index: serde_json::Value = serde_json::from_slice(&member(archive, "mzpeak_index.json")).unwrap();
+    edit(&mut index);
+    let mut zin = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+    let mut zout = zip::ZipWriter::new(File::create(dst).unwrap());
+    for i in 0..zin.len() {
+        let entry = zin.by_index(i).unwrap();
+        if entry.name() == "mzpeak_index.json" {
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zout.start_file("mzpeak_index.json", opts).unwrap();
+            zout.write_all(&serde_json::to_vec(&index).unwrap()).unwrap();
+        } else {
+            zout.raw_copy_file(entry).unwrap();
+        }
+    }
+    zout.finish().unwrap();
+}
+
+/// An archive written with the removed per-scan TOF delta encoding is refused by the rewrite and by
+/// the mzML export, each reading the index it has parsed for itself.
+#[test]
+fn a_per_scan_delta_archive_is_refused_on_both_lanes() {
+    let dir = scratch("per-scan-delta");
+    let src = convert(TINY, &dir);
+    let legacy = dir.join("legacy.mzpeak");
+    with_index(&src, &legacy, |index| index["metadata"]["ims_calibration"] = serde_json::json!({"tof_encoding": "per-scan-delta"}));
+    for out in ["f.mzpeak", "f.mzML"] {
+        let r = mzpc(&legacy, &dir.join(out), &["--ms-level", "2"]);
+        assert!(!r.status.success(), "{out}: a per-scan-delta archive was read");
+        assert!(String::from_utf8_lossy(&r.stderr).contains("per-scan-delta"), "{out}: {}", String::from_utf8_lossy(&r.stderr));
+        assert!(!dir.join(out).exists(), "{out} was written");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A chromatogram's precursor names the spectrum it was selected from (`precursor_id`, the spectrum
+/// precursor's schema), and a spectrum filter that drops that spectrum drops the reference: the
+/// rewrite nulls it and the mzML export writes no `spectrumRef` to it. Both copied it as it was, and the
+/// export named a spectrum the file did not hold. tiny's `sic` trace is given a precursor naming
+/// `scan=21`, which has no time: `--rt 0.2-100` drops it, `--ms-level 1` keeps it and the reference.
+#[test]
+fn a_chromatogram_precursor_follows_the_spectrum_filter() {
+    let dir = scratch("chromatogram-ref");
+    // Inside the `sic` chromatogram, after every indexed offset but the index's own.
+    let text = String::from_utf8(std::fs::read(TINY).unwrap()).expect("tiny is ASCII, its offsets bytes");
+    let reference = " spectrumRef=\"scan=21\"";
+    assert_eq!(text.matches("<precursor>").count(), 1, "tiny's `sic` precursor is its only bare one");
+    let edited = text
+        .replace("<precursor>", &format!("<precursor{reference}>"))
+        .replace("<indexListOffset>24498<", &format!("<indexListOffset>{}<", 24498 + reference.len()));
+    let mzml = dir.join("tiny-chromatogram-ref.mzML");
+    std::fs::write(&mzml, edited).unwrap();
+    let src = dir.join("src.mzpeak");
+    ok(&mzpc(&mzml, &src, &[]));
+    let precursor_ids = |archive: &Path| -> Vec<Option<String>> {
+        let t = table(archive, "chromatograms_metadata_precursors.parquet");
+        column::<LargeStringArray>(&t, "precursor_id").iter().map(|v| v.map(str::to_string)).collect()
+    };
+    let chromatogram_refs = |mzml: &Path| -> Vec<String> {
+        let xml = std::fs::read_to_string(mzml).unwrap();
+        let list = &xml[xml.find("<chromatogramList").unwrap()..];
+        list.split("spectrumRef=\"").skip(1).map(|s| s.split('"').next().unwrap().to_string()).collect()
+    };
+    assert_eq!(precursor_ids(&src), [Some("scan=21".to_string())], "the source names scan=21");
+    for (tag, args, kept) in [("rt", ["--rt", "0.2-100"], false), ("ms1", ["--ms-level", "1"], true)] {
+        let archive = dir.join(format!("{tag}.mzpeak"));
+        ok(&mzpc(&src, &archive, &args));
+        assert_eq!(spectra_ids(&archive).contains(&"scan=21".to_string()), kept, "{tag}");
+        let want: Vec<Option<String>> = vec![kept.then(|| "scan=21".to_string())];
+        assert_eq!(precursor_ids(&archive), want, "{tag}: the rewrite");
+        let want: Vec<String> = want.into_iter().flatten().collect();
+        let direct = dir.join(format!("{tag}.mzML"));
+        ok(&mzpc(&src, &direct, &args));
+        assert_eq!(chromatogram_refs(&direct), want, "{tag}: the direct export");
+        let two_step = dir.join(format!("{tag}.two-step.mzML"));
+        ok(&mzpc(&archive, &two_step, &[]));
+        assert_eq!(chromatogram_refs(&two_step), want, "{tag}: the rewrite, exported");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `encoding_prescan` index block names the spectrum that ended the converter's int32 intensities
+/// by index, and a rewrite renumbers it with the spectra: carried verbatim, it named whichever
+/// spectrum took the old number. `--ms-level 1` keeps tiny's spectra 0, 2 and 3.
+#[test]
+fn the_prescan_note_names_its_spectrum_by_the_new_index() {
+    let dir = scratch("prescan-note");
+    let src = convert(TINY, &dir);
+    for (old, new) in [(2u64, serde_json::json!(1)), (1, serde_json::Value::Null)] {
+        let noted = dir.join(format!("noted-{old}.mzpeak"));
+        with_index(&src, &noted, |index| {
+            index["metadata"]["encoding_prescan"] = serde_json::json!({"int32_fallback": {"spectrum_index": old, "intensity": "float32"}});
+        });
+        let out = dir.join(format!("f-{old}.mzpeak"));
+        ok(&mzpc(&noted, &out, &["--ms-level", "1"]));
+        let index: serde_json::Value = serde_json::from_slice(&member(&out, "mzpeak_index.json")).unwrap();
+        assert_eq!(index["metadata"]["encoding_prescan"]["int32_fallback"]["spectrum_index"], new, "spectrum {old}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `id` column of an archive's spectrum metadata.
+fn spectra_ids(archive: &Path) -> Vec<String> {
+    let t = table(archive, "spectra_metadata.parquet");
+    column::<LargeStringArray>(&t, "id").iter().map(|v| v.unwrap().to_string()).collect()
 }
 
 /// (b) `--rt` keeps the spectra in the window, truncates the chromatogram traces to it, and rewrites

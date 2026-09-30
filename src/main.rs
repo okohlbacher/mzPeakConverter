@@ -1160,10 +1160,8 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         if output.exists() && !cfg.force {
             bail!("output {} exists (use --force to overwrite)", output.display());
         }
-        // Releases up to v0.7.2 could write `tof_encoding: per-scan-delta`, but no reader ever
-        // cumulatively summed it — every TOF bin after the first in a scan decodes as a tiny bin and
-        // squares to a nonsense m/z. Refuse rather than emit silently wrong masses.
-        reject_legacy_tof_delta(&cli.input)?;
+        // Both lanes refuse an archive written with the removed per-scan TOF delta encoding
+        // ([`reject_legacy_tof_delta`]), each from the index it has parsed for itself.
         // `--no-vendor` strips the embedded vendor data on the filter path too — same effect as
         // `--drop-aux 'vendor*'` (the glob's `*` spans `/`, so it also catches `vendor/…` side-files).
         // (It is moot for mzML output — vendor facets aren't carried into mzML at all.)
@@ -2368,6 +2366,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
 
     let mut reader =
         MzPeakReader::new(input).with_context(|| format!("opening {} as mzPeak", input.display()))?;
+    reject_legacy_tof_delta(input, reader.file_index().metadata.get("ims_calibration"))?;
     let total = reader.len();
     // An mzPeak spectrum may carry BOTH facets; an mzML spectrum cannot. The reader's default
     // preference is profile, so the peak lists are dropped — correct, but it used to be silent.
@@ -2434,8 +2433,8 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     };
     // The archive's spectra this export leaves out, by id. A precursor or scan naming one wrote a
     // `spectrumRef` to an element the mzML does not hold (small.RAW's MS2 spectra all named their
-    // filtered-out MS1 under `--ms-level 2`), where rewriting the archive nulls the reference. Empty
-    // when every spectrum is written.
+    // filtered-out MS1 under `--ms-level 2`), where rewriting the archive nulls the reference. A
+    // chromatogram's precursor names a spectrum the same way. Empty when every spectrum is written.
     let written: std::collections::HashSet<usize> =
         items.iter().filter_map(|item| if let ExportItem::Mass(i) = *item { Some(i) } else { None }).collect();
     let left_out: std::collections::HashSet<String> =
@@ -2504,12 +2503,6 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
             }
         }
     }
-    if unreferenced > 0 {
-        log::warn!(
-            "{unreferenced} precursor or scan references named a spectrum this export leaves out; their \
-             spectrumRef is not written"
-        );
-    }
 
     // Carry the archive's chromatograms across. Without this the lane emitted ONLY the writer's
     // synthesized TIC/base-peak summary: on a 300-chromatogram SIM/SRM run, 299 quantitative traces
@@ -2522,12 +2515,19 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
         .map(|mut c| {
             demote_mzp_params_chrom(c.description_mut());
+            unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
             if let Some(window) = opts.rt {
                 cut_chromatogram_to_window(&mut c, window);
             }
             c
         })
         .collect();
+    if unreferenced > 0 {
+        log::warn!(
+            "{unreferenced} precursor or scan references named a spectrum this export leaves out; their \
+             spectrumRef is not written"
+        );
+    }
     write_source_chromatograms_mzml(&mut w, chroms.into_iter())?;
 
     finish_mzml(w, tmp_guard, output)
@@ -2536,16 +2536,23 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
 /// Clear the spectrum references of `descr` that name one of `left_out` — a precursor's
 /// `precursor_id` and a scan's `spectrum_reference`, each written as a `spectrumRef`. How many.
 fn drop_references_to(descr: &mut mzdata::spectrum::SpectrumDescription, left_out: &std::collections::HashSet<String>) -> usize {
-    let mut dropped = 0;
-    for precursor in descr.precursor.iter_mut() {
-        if precursor.precursor_id.as_deref().is_some_and(|id| left_out.contains(id)) {
-            precursor.precursor_id = None;
-            dropped += 1;
-        }
-    }
+    let mut dropped = drop_precursor_references(&mut descr.precursor, left_out);
     for scan in descr.acquisition.scans.iter_mut() {
         if scan.spectrum_reference.as_deref().is_some_and(|id| left_out.contains(id)) {
             scan.spectrum_reference = None;
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// Clear the `precursor_id` of each of `precursors` — a spectrum's or a chromatogram's — that names one
+/// of `left_out`. How many.
+fn drop_precursor_references(precursors: &mut [mzdata::spectrum::Precursor], left_out: &std::collections::HashSet<String>) -> usize {
+    let mut dropped = 0;
+    for precursor in precursors {
+        if precursor.precursor_id.as_deref().is_some_and(|id| left_out.contains(id)) {
+            precursor.precursor_id = None;
             dropped += 1;
         }
     }
@@ -4859,22 +4866,17 @@ fn assert_source_complete(input: &Path, written: usize, cap: Option<usize>) -> R
     Ok(())
 }
 
-/// Refuse to read an archive written with the removed per-scan TOF delta encoding.
+/// Refuse to read an archive written with the removed per-scan TOF delta encoding, from its index's
+/// `ims_calibration` block (`None` when it has none).
 ///
 /// Releases up to v0.7.2 could emit `ims_calibration.tof_encoding = "per-scan-delta"`, but no reader
 /// (ours or the reference one) ever cumulatively summed those deltas — only the first bin of each
 /// mobility scan decodes correctly and the rest square to nonsense m/z. The encoding is gone from the
 /// writer; this stops an old archive from silently producing wrong masses. Reconvert from the `.d`.
-fn reject_legacy_tof_delta(input: &Path) -> Result<()> {
-    let Ok(file) = fs::File::open(input) else { return Ok(()) };
-    let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else { return Ok(()) };
-    let Ok(entry) = zip.by_name("mzpeak_index.json") else { return Ok(()) };
-    let Ok(idx) = serde_json::from_reader::<_, serde_json::Value>(entry) else { return Ok(()) };
-    let enc = idx
-        .get("metadata")
-        .and_then(|m| m.get("ims_calibration"))
-        .and_then(|c| c.get("tof_encoding"))
-        .and_then(|e| e.as_str());
+/// Each `.mzpeak` input lane passes the block from the index it has parsed: this check used to open
+/// the archive and parse its index once more.
+fn reject_legacy_tof_delta(input: &Path, ims_calibration: Option<&serde_json::Value>) -> Result<()> {
+    let enc = ims_calibration.and_then(|c| c.get("tof_encoding")).and_then(|e| e.as_str());
     if enc == Some("per-scan-delta") {
         bail!(
             "{} was written with the removed `per-scan-delta` TOF encoding, which no reader decodes \
