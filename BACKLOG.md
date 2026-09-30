@@ -17,12 +17,26 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 
   **Status 2026-09-30, branch `feat/imaging-support` (unreleased, not pushed):** DONE — Bruker positions on
   the TSF lane and every TDF lane (synthetic tests + a tagged copy of 2485.d; no real MALDI run yet),
-  item 2 (immutable SQLite opens; timsrust/mzdata read-write opens remain, upstream), item 3 (pixel-size
-  rule + unit mismatch report), item 4 (IMS pinned to `imzML/imzML@2c28b05`), item 5 (provenance), item 6
-  (flyback), position z, README/USER_MANUAL. OPEN — Waters positions (laser x/y in mm → fitted grid; needs
-  the MassLynx call and a Waters imaging `.raw` on the box); the `.mis` raster step instead of the beam
-  scan size; Bruker `max count`/`max dimension` scan settings (need the coordinate base); a real MALDI `.d`
-  from the issue author; the spec decisions and the issue replies below.
+  item 2 (immutable SQLite opens), item 3 (pixel-size rule + unit mismatch report), item 4 (IMS pinned to
+  `imzML/imzML@2c28b05`), item 5 (provenance), item 6 (flyback), position z, README/USER_MANUAL.
+  **Owner decisions of 2026-09-30, implemented the same day:** position columns named `position_x` /
+  `_y` / `_z` as the merged imaging profile has them (spec PR #24, not the handoff's `IMS_1000050_…`);
+  coordinate base 1 — Bruker's absolute indices are shifted by the run's smallest (declared, `origin`
+  recorded), imzML stays as stated (already base 1; the corpus has two imzML files with margins,
+  `ltpmsi-chilli` 8–92 and the FlexImaging export `Test_P15_r2` 675–735, both with pixel counts equal
+  to their largest index, so they conform); `metadata.imaging` written by every detected imaging run
+  (imzML always, Bruker `MaldiFrameInfo`, positions stated on an mzML's scans — one detector,
+  `imaging::detect`), with a `provenance` record, `--image` merging its `images[]` into it; Bruker
+  pixel counts and max dimension (`IMS:1000042–45`). mzPeakValidator needs its branch
+  `imaging-profile-column-names` (accepts `position_x`; local, unreleased) released before a corpus
+  rebuild, or every imaging archive fails `imaging_coordinates`. The viewer, mzPeakIV and the explorer
+  look for `IMS_1000050_position_x` / `opt_…` and need the same rename (the viewer falls back to scan
+  cvParams, so it degrades rather than breaks).
+  **OPEN, waiting on example data** (do not code against a guess): the FlexImaging `.mis` raster step
+  and region names; Waters imaging positions (laser x/y in mm → fitted grid; needs the MassLynx call,
+  a Waters imaging `.raw` and the box). A real MALDI `.d`: the owner sends the issue author a Dropbox
+  link for his files (33,800-pixel TSF, five synthetic pixel-size imzML); public candidates from PRIDE /
+  Zenodo are being looked for. Regions are kept in `bruker_maldi` only (the profile covers one grid).
   1. **Pixel coordinates for vendor input** (highest). Only the imzML path writes
      `opt_IMS_1000050_position_x`/`_y`; the Bruker TSF/TDF and Waters lanes write none. Confirmed by the
      issue author on v0.14.0: a 33,800-pixel timsTOF MALDI acquisition (TSF) converted with every
@@ -233,6 +247,26 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   PR #18 the msconvert lanes refuse a multi-sample WIFF without `--sample`, so the box fallback, which
   passes none, now fails on `En_PPY.wiff`; which of its samples to republish, each as its own
   archive, is D4 and still open.
+- **Box test of `feat/imaging-support`, and the harness change that makes it possible (added
+  2026-09-30; the owner's network is slow for the day).** On the box: build the branch (it removes
+  `OpenFlags` imports and reroutes SQLite opens in `bruker_sdk.rs` / `bruker_baf.rs`, code a macOS
+  build only half-checks), then convert the synthetic-MALDI copy of 2485.d on the SDK lane
+  (`--bruker-sdk`) and a BAF unit, and check positions, grid and `metadata.imaging` as on the host.
+  Needs a network where ssh stdin reaches the box, or item (2) of the 0.15.0 entry below: ship each job spec by
+  scp and give `run_job` a per-job watchdog; the same change delivers the six missing 0.15.0 units.
+- **Upstream: open the timsTOF database read-only (added 2026-09-30).** Minimally invasive draft PRs,
+  one per library, each only changing the open: timsrust 0.4.1 `SqlReader`
+  (`io/readers/file_readers/sql_reader.rs:24`, `Connection::open`) and mzdata's TDF reader
+  (`io/tdf/sql.rs:664`) — open `file:…?immutable=1` read-only with `SQLITE_OPEN_URI`, falling back to a
+  plain read-only open when a non-empty `-wal` exists (what `src/vendor_sqlite.rs` does). Harmless on
+  the rollback-journal TDFs seen so far; on a WAL-mode TDF the read-write open writes `-shm`/`-wal`
+  beside the data and folds the log into `analysis.tdf` on close. Drafts only; the owner files them.
+- **mzdata's vocabulary load logs two ERROR lines on every conversion (since 0.14.0).** The vendored
+  writer's `CustomBuilderFromParameterDerived` calls `MSVocabulary::init()`, which looks for an
+  on-disk CV cache, logs "CV cache file could not be openend" / "Default path does not exist", and
+  falls back to the embedded vocabulary — harmless, but it reads as a failure. Calling
+  `MSVocabulary::init_static()` once at start-up (it fills the same singleton) would silence it and
+  pin the CV to the embedded copy.
 - **Surfaced by the 0.15.0 corpus rebuild (2026-09-29).** 194 of 200 archives rebuilt; logs in
   `~/Claude/mzPeak/output/corpus-rebuild-0.15.0/`. (1) **The timsTOF grid facet encodes serially on
   big runs.** PXD076703 (10 GB `tdf_bin`) took about 2 h 20 min on the host on one core: a row group of
