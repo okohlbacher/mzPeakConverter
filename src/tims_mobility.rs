@@ -242,7 +242,9 @@ mod scan_number_precision_tests {
                 let (a, b) = (ours.one_over_k0_as_mzdata(s as f64), theirs.convert(s));
                 assert_eq!(a.to_bits(), b.to_bits(), "scan {s}: {a} vs mzdata {b}");
                 let sdk = ours.one_over_k0(s as f64);
-                assert!((a - sdk).abs() <= 4.0 * f64::EPSILON, "scan {s}: {a} vs {sdk}");
+                // In ulps, not in EPSILON: below 1/K0 = 1 (SBA415 reaches 0.60) an ulp is EPSILON/2.
+                // Both are positive and finite, so their bit patterns count ulps.
+                assert!(a.to_bits().abs_diff(sdk.to_bits()) <= 4, "scan {s}: {a} vs {sdk}");
                 differ += usize::from(a != sdk);
             }
             // The premise: the two orders really do disagree somewhere.
