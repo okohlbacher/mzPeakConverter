@@ -399,7 +399,10 @@ Contents:
   reduced to the bare `file://` authority; non-`file` URL schemes are kept), `run.id` is never a
   path, and `default_instrument_id` always resolves: a run without an instrument record gets one
   empty configuration `0` to point at (the spec requires the integer; 0.10.0 briefly wrote `null`,
-  which the validator's schema check refuses — fixed in 0.10.2).
+  which the validator's schema check refuses — fixed in 0.10.2). `cv_list` declares for `MS` the
+  `data-version` of the PSI-MS vocabulary mzdata embeds, which every CURIE resolves against, read from
+  that copy (4.1.258 with mzdata 0.67.1; archives through 0.16.0 declared 4.1.249); `UO` and `IMS`,
+  which mzdata holds no copy of, stay pinned to one release or commit each.
 - `spectra_metadata.parquet` — per-spectrum descriptors (id, index, MS level,
   polarity, scan time, precursor info, …).
 - `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point): profile

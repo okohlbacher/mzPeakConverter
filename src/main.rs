@@ -11099,6 +11099,31 @@ mod tests {
         );
     }
 
+    /// `cv_list` declares the PSI-MS release its CURIEs resolve against: the `data-version` of the
+    /// vocabulary mzdata embeds, behind the tag of that release (archives declared 4.1.249 over mzdata's
+    /// 4.1.258 through 0.16.0). UO and IMS have no copy in mzdata to read — its units are a fixed list
+    /// of accessions — so each stays pinned by hand, and the version it declares must name the release
+    /// its URI pins.
+    #[test]
+    fn cv_list_declares_the_vocabulary_versions_the_archive_resolves_against() {
+        let out = scratch("cv-versions").join("t.mzpeak");
+        let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let cvs = index_metadata(&out)["cv_list"].clone();
+        let entry = |id: &str| cvs.as_array().unwrap().iter().find(|c| c["id"] == id).cloned().unwrap_or_else(|| panic!("no {id} in {cvs:#}"));
+        let embedded = mzdata::params::MSVocabulary::init_static().version().version.clone().expect("the embedded PSI-MS states a data-version");
+        let ms = entry("MS");
+        assert_eq!(ms["version"], embedded.as_str(), "{ms:#}");
+        assert_eq!(ms["uri"], format!("https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/v{embedded}/psi-ms.obo"), "{ms:#}");
+        let uo = entry("UO");
+        let v = uo["version"].as_str().unwrap();
+        assert!(uo["uri"].as_str().unwrap().contains(&format!("/releases/{v}/")), "{uo:#}");
+        let ims: mzpeak_prototyping::param::ControlledVocabularyEntry = mzdata::params::ControlledVocabulary::IMS.into();
+        let commit = ims.uri.split('/').nth(5).unwrap_or_default();
+        assert!(commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()), "IMS is pinned to a commit: {}", ims.uri);
+        assert_eq!(ims.version.as_deref(), Some("1.1.0"), "imagingMS.obo at that commit states data-version 1.1.0");
+    }
+
     /// Two conversions of inputs with one stem in one process get a private copy each: the gunzip,
     /// UTF-8 and sanitized copies were named `<prefix>-<pid>-<stem>`, so the second wrote into the
     /// first's, and whichever finished first removed both ("writing transcoded …: Invalid argument").
