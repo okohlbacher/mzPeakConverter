@@ -491,8 +491,8 @@ when stated) columns of `spectra_metadata_scans`, each mapped to its `IMS` term;
 `scan_settings_list` (`IMS:1000042/43` pixel counts always — counted from the largest positions and
 declared `imaging:pixel-count-from-positions` when the input states none); and the
 `metadata.imaging` index block — `is_imaging`, `coordinate_base: 1`, `pixel_count`, `pixel_size_um`
-and a `provenance` record of what was detected and where each value came from. `--image` adds its
-`images[]` to that block. Positions count from 1. imzML input keeps its positions and scan settings
+(when both axes have one in µm) and a `provenance` record of what was detected and where each value
+came from. `--image` adds its `images[]` to that block. Positions count from 1. imzML input keeps its positions and scan settings
 as stated (imzML already counts from 1), with three checks since 0.16.0
 (HUPO-PSI/mzPeak-specification#23):
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
@@ -520,12 +520,17 @@ in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter
 the step the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`, any `…XStep`/`…YStep`) when the
 positions lie within a quarter step of it, else the smallest step between columns (positions closer
 than 30 % of the typical gap being one column: jitter, a small serpentine lag; a larger lag's two
-halves fold into one column) that holds them within a quarter step — and writes the grid index,
-declared (`waters:laser-position-fitted-to-grid`), with the fit (origin, step and its source, count,
-largest residual) in the `waters_imaging` block and each axis's step as its pixel size. Lock-mass
-scans get no position. Up to 1 % of the positioned scans may lie off the grid or far outside the
-raster (a parked scan, even one on the grid by chance): they get no position
-(`waters:off-grid-position-dropped`); beyond that, or with no grid at all, the run gets no positions and no marker, and `waters_imaging` says why. Vendor SQLite databases are opened immutable, so a conversion
+halves fold into one column) that holds them within a quarter step — or, where that would fold three
+or more distinct positions into a pixel (small regions: spots, tissue-microarray cores), the
+smallest step that holds each distinct position within 1 µm, as exact stage set points are; a step
+under 3 µm is taken for the recording resolution — and writes the grid index, declared
+(`waters:laser-position-fitted-to-grid`), with the fit (origin, step and its source, count, largest
+residual) in the `waters_imaging` block and each axis's step as its pixel size. Lock-mass scans get
+no position. Up to 1 % of the positioned scans may lie off the grid, or far outside the raster at
+one position (a parked scan, even one on the grid by chance): they get no position
+(`waters:off-grid-position-dropped`). A group far outside that spans columns (a QC region) is part
+of the raster, and so are parked scans beyond 1 %. More than 1 % off the grid, or no grid at all:
+the run gets no positions and no marker, and `waters_imaging` says why. Vendor SQLite databases are opened immutable, so a conversion
 writes nothing into the `.d` (a read-only open of a WAL-mode MALDI TSF used to leave `-shm`/`-wal`).
 
 **Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
@@ -762,7 +767,7 @@ The vocabulary:
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
-| `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid or far outside the raster (a scan taken with the stage parked off it) and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
+| `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid, or far outside the raster at one position (a scan taken with the stage parked off it), and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
 | `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `imaging:pixel-count-from-positions` | the input states positions but no pixel counts; `IMS:1000042/43` were written as the largest positions | imzML, mzML with `IMS:1000050/51` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |

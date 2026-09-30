@@ -1844,6 +1844,39 @@ mod tests {
         assert!(b.get("x").is_none());
         // Fewer than two distinct positions: no raster, not an imaging run at all.
         assert!(WatersImaging::from_positions(vec![Some((1.0, 1.0)); 5], laser_names(), [None, None], 0).is_none());
+        // A continuum of positions (20000 over 1 × 1 mm, gaps under 1 µm) is no 1 × 1 grid, which
+        // marked it imaging with every scan at (1, 1) (review 2026-09-30, second pass).
+        let mut seed = 9u64;
+        let mut u = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let walk: Vec<Option<(f64, f64)>> = (0..20_000).map(|_| Some((10.0 + u(), 20.0 + u()))).collect();
+        assert!(WatersImaging::from_positions(walk, laser_names(), [None, None], 0).unwrap().grid.is_err());
+    }
+
+    /// Review 2026-09-30 B14/B15, second pass: without a declared step a spot array (4 × 4 spots
+    /// of 5 × 5 pixels at a 12-pixel pitch) became 4 × 4 pixels of 1.2 mm; and a small region on the
+    /// grid far off the raster (a QC region, 0.9 % of the scans) lost every position as if parked.
+    #[test]
+    fn small_and_far_regions_keep_the_step() {
+        let spot = |s: i64, k: i64, from: f32| Some((from + (s * 12 + k) as f32 * 0.1) as f64);
+        let spots: Vec<Option<(f64, f64)>> = (0..4)
+            .flat_map(|sy| (0..5).flat_map(move |r| (0..4).flat_map(move |sx| (0..5).map(move |c| spot(sx, c, 30.0).zip(spot(sy, r, 20.0))))))
+            .collect();
+        let im = WatersImaging::from_positions(spots.clone(), laser_names(), [None, None], 0).unwrap();
+        let g = im.grid.as_ref().unwrap();
+        assert_eq!((g.x.count, g.y.count, g.x.pitch, g.y.pitch, g.off_grid), (41, 41, Some(0.1), Some(0.1), 0));
+        assert_eq!((im.position(1), im.position(5), im.position(399)), (Some((2, 1)), Some((13, 1)), Some((41, 41))));
+        let mut mm = desi(103, 104);
+        mm.extend((0..8).flat_map(|r| (0..12).map(move |c| Some(((80.3673f32 + (150 + c) as f32 * 0.1) as f64, (45.9005f32 + (20 + r) as f32 * 0.1) as f64)))));
+        for steps in [[None, None], [step("DesiXStep", 0.1), step("DesiYStep", 0.1)]] {
+            let im = WatersImaging::from_positions(mm.clone(), laser_names(), steps, 0).unwrap();
+            let g = im.grid.as_ref().unwrap();
+            assert_eq!((g.x.count, g.y.count, g.off_grid), (162, 103, 0));
+            assert_eq!((im.position(0), im.position(mm.len() - 1)), (Some((1, 1)), Some((162, 28))));
+            assert_eq!(im.transformations(), [LASER_GRID]);
+        }
     }
 
     /// Review 2026-09-30 B15: a single row dropped the pixel size of the axis whose step is known.
