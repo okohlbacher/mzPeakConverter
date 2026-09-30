@@ -810,6 +810,18 @@ impl TmpGuard {
         Ok(())
     }
 
+    /// Remove the tmp without the "removed incomplete" warning, for a scratch archive that did its
+    /// job: the encoding pre-scan's trials, which warned on every Waters conversion (review
+    /// 2026-09-30).
+    fn discard(mut self) {
+        let path = std::mem::take(&mut self.path);
+        Self::forget_path(&path);
+        std::mem::forget(self);
+        if let Err(e) = fs::remove_file(&path) {
+            log::warn!("could not remove {}: {e}", path.display());
+        }
+    }
+
     fn forget_path(path: &Path) {
         if let Ok(mut v) = TMP_IN_FLIGHT.lock() {
             v.retain(|(_, p, _)| p != path);
@@ -7211,7 +7223,7 @@ fn prescan_trial(
         spectra
     };
     let path = output.with_extension(format!("mzpeak.prescan{k}.tmp"));
-    let _guard = TmpGuard::new(&path);
+    let guard = TmpGuard::new(&path);
     let handle = fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
     let chunk = Some(prescan_chunk(trial.mz, chunk_size));
     let mut writer = vendor_writer_builder(chunk.clone(), chunk, level, &convert(probes), trial.encodings())
@@ -7220,7 +7232,9 @@ fn prescan_trial(
         writer.write_spectrum(&spec)?;
     }
     writer.finish_parquet()?.finish().map_err(|e| anyhow!("finalizing the pre-scan archive: {e}"))?;
-    facet_column_bytes(&path)
+    let measured = facet_column_bytes(&path);
+    guard.discard();
+    measured
 }
 
 /// Compressed bytes of the spectrum data and peak facets of an archive, by column group.
@@ -11338,8 +11352,34 @@ mod tests {
         (measured[chosen].as_u64().unwrap_or_else(|| panic!("{chosen} not measured: {block:#}")), min)
     }
 
+    /// The WARN lines logged in this test process so far; the first call installs the logger that
+    /// records them (no other test installs one). Every test's warnings land here: filter by path.
+    fn warnings() -> Vec<String> {
+        struct Capture;
+        static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        impl log::Log for Capture {
+            fn enabled(&self, m: &log::Metadata) -> bool {
+                m.level() <= log::Level::Warn
+            }
+            fn log(&self, r: &log::Record) {
+                if self.enabled(r.metadata()) {
+                    WARNINGS.lock().unwrap().push(r.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            if log::set_logger(&Capture).is_ok() {
+                log::set_max_level(log::LevelFilter::Warn);
+            }
+        });
+        WARNINGS.lock().unwrap().clone()
+    }
+
     /// The pre-scan writes a sample once per arm and keeps each column's smallest arm; whatever it
-    /// chooses, every m/z, intensity and drift time reads back as written.
+    /// chooses, every m/z, intensity and drift time reads back as written. Its trial archives are
+    /// removed without the "removed incomplete" warning a failed conversion gets (review 2026-09-30).
     #[test]
     fn encoding_prescan_keeps_each_columns_smallest_arm_and_the_values() {
         use super::{convert_vendor_reader_tallied, VendorHints};
@@ -11351,7 +11391,11 @@ mod tests {
         let frame = |i| waters_like_frame(i, 400, 50);
         let hints = VendorHints { encoding_prescan: true, keep_zero_runs: true, ..VendorHints::default() };
         let numpress = Some(super::ChunkingStrategy::NumpressLinear { chunk_size: 50.0 });
+        warnings();
         convert_vendor_reader_tallied(&dir, &out, numpress, 3, None, false, hints, LEN, |i| Ok(frame(i))).unwrap();
+        let trials = dir.join("frames.mzpeak.prescan").display().to_string();
+        let warned: Vec<_> = warnings().into_iter().filter(|w| w.contains(&trials)).collect();
+        assert!(warned.is_empty(), "{warned:?}");
 
         let block = index_metadata(&out)["encoding_prescan"].clone();
         assert_eq!(block["measured_bytes"]["mz"].as_object().unwrap().len(), 4, "{block:#}");
