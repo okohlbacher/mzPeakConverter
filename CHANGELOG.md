@@ -42,6 +42,17 @@ viewer) need their update.
   their unit names (`imzml:unit-accession-replaced-by-name` when the unit written is not the stated
   accession).
 - imzML position z (`IMS:1000052`) gets a column when the file states one.
+- **Bruker pixel size from the FlexImaging `.mis`.** The `<stem>.mis` beside the `.d` gives each
+  region's raster step and name (`RegionNumber` n is the n-th `<Area>`, checked against timsControl's
+  poslog and flexImaging's spot list on MassIVE MSV000088438). The step is the pixel size when every
+  acquired region shares it; regions on different steps get none; without a `.mis` the beam scan size
+  stays the declared fallback. Region names and steps are in `bruker_maldi.regions`.
+- **Waters imaging positions** (MALDI / DESI, native lane). MassLynx states each scan's laser aim
+  position in mm; a grid is fitted (step = the most common gap, every position within a quarter step)
+  and each spectrum gets its grid index, declared `waters:laser-position-fitted-to-grid`, with the fit
+  in a `waters_imaging` block and the step as the pixel size. Checked on MetaboLights MTBLS14771 (Xevo
+  MRT DESI, 10,712 scans on 104 × 103 pixels of 100 µm): every scan lands on the pixel Waters HDI
+  gives it.
 
 ### Fixed
 

@@ -32,9 +32,12 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   rebuild, or every imaging archive fails `imaging_coordinates`. The viewer, mzPeakIV and the explorer
   look for `IMS_1000050_position_x` / `opt_…` and need the same rename (the viewer falls back to scan
   cvParams, so it degrades rather than breaks).
-  **OPEN, waiting on example data** (do not code against a guess): the FlexImaging `.mis` raster step
-  and region names; Waters imaging positions (laser x/y in mm → fitted grid; needs the MassLynx call,
-  a Waters imaging `.raw` and the box). A real MALDI `.d`: the owner sends the issue author a Dropbox
+  **DONE 2026-09-30 with public example data:** the FlexImaging `.mis` raster step and region names
+  (MassIVE MSV000088438, real MALDI-TIMS TDF + TSF, all three timsTOF routes incl. `--bruker-sdk` on the
+  box); Waters imaging positions (MassLynx items "Laser Aim X/Y Position" → fitted grid; MetaboLights
+  MTBLS14771 DESI on the box, 10,712/10,712 scans on HDI's pixels). Open: a Waters MALDI run with
+  several functions or mobility (MSV000092638, 7 GB), and the optical image the `.mis` names
+  (`<ImageFile>` + teach points → an image-to-stage affine) — not embedded yet. A real MALDI `.d`: the owner sends the issue author a Dropbox
   link for his files (33,800-pixel TSF, five synthetic pixel-size imzML). Public candidates found
   2026-09-30 (file listings only, nothing downloaded yet): Bruker — MassIVE MSV000088438 (TIMSCONVERT
   test data, CC0): a 7.4 MB MALDI-TIMS `.d` and a 25 MB TSF `.d`, each with its `.mis`, poslog and spot
@@ -279,6 +282,9 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   NTFS does — and the default timsTOF route and `--no-ims-compact` fail with "file is not a database"
   while `--bruker-sdk` works (seen on the box's `stageA` copy of 2485.d; no corpus unit has one).
   Match the exact name. Converter side, meanwhile: name the `._*` file in that error.
+- **The encoding pre-scan logs four WARN lines on every Waters conversion** ("removed incomplete
+  …mzpeak.prescan{k}.tmp"): its trial archives are dropped through the `TmpGuard` path that reports a
+  failed conversion. Seen on the box 2026-09-30. Remove them without the warning.
 - **Surfaced by the 0.15.0 corpus rebuild (2026-09-29).** 194 of 200 archives rebuilt; logs in
   `~/Claude/mzPeak/output/corpus-rebuild-0.15.0/`. (1) **The timsTOF grid facet encodes serially on
   big runs.** PXD076703 (10 GB `tdf_bin`) took about 2 h 20 min on the host on one core: a row group of

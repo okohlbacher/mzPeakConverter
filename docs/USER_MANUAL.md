@@ -337,7 +337,7 @@ take effect because settings are resolved before logging is initialised.
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | net48 `AgilentGlueHost.exe` (§11) → MHDAC, since 0.11.0; **MRM/SIM-only runs are refused** — they are transition chromatograms, use `--via-msconvert` for them |
 | SciEX `.wiff` (native) | ❌ | ❌ | ✅ | auto-built; Clearcore2 DLLs at runtime; **MRM/SIM dwell runs are refused** (they are transition chromatograms — `--via-msconvert` writes them as SRM chromatograms); multi-sample files need `--sample N` |
 | Shimadzu `.lcd` (native) | ❌ | ❌ | ✅ | LabSolutions.IO DLLs at runtime (§11); profile as a sqrt grid, centroids as an exact lattice (§8, §9); the vendor's per-event TIC/BPC chromatograms, the serial number and model from the file's system configuration |
-| Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` through its C ABI, no .NET glue (§11); HDMSe/HDDDA functions as frames with a per-point drift time (§8) |
+| Waters `.raw` (native) | ❌ | ❌ | ✅ | `MassLynxRaw.dll` through its C ABI, no .NET glue (§11); HDMSe/HDDDA functions as frames with a per-point drift time; MALDI/DESI imaging positions fitted to a grid (§8) |
 | Agilent / SciEX / … via msconvert | ✅ | ✅ | ✅ | `--via-msconvert`; needs ProteoWizard (Windows, or Wine elsewhere) |
 
 The native vendor readers are **compiled in automatically on the platforms where
@@ -508,10 +508,18 @@ the whole run, keeping regions where they lie relative to each other — declare
 (`bruker:raster-index-shifted-to-base-1`) and recorded as `origin` in the `bruker_maldi` and
 `metadata.imaging` blocks; the pixel counts are the shifted extent. FlexImaging's own imzML export
 keeps the absolute indices (with the pixel counts set to the largest index), so a `.d` and its imzML
-export differ by exactly `origin − 1`. The `bruker_maldi` index block holds the regions
-(`RegionNumber`), raw index ranges and beam scan size; the pixel size is the beam scan size, with the
-max dimension `IMS:1000044/45` = count × size, declared as such, since the FlexImaging `.mis` with the
-raster step is not part of the `.d`. Waters imaging runs carry no positions yet. Vendor SQLite databases are opened immutable, so a conversion
+export differ by exactly `origin − 1`. The pixel size is the raster step of the FlexImaging sequence
+`<stem>.mis` beside the `.d` (not part of it): `RegionNumber` n is the n-th `<Area>`, which also names
+the region; when the acquired regions have different steps no pixel size is written (the profile
+describes one grid). Without a `.mis` the frames' beam scan size is the fallback, declared as such.
+The max dimension `IMS:1000044/45` is count × size. The `bruker_maldi` index block holds the regions
+(number, name, raster step, frames, raw index ranges), the `.mis` it read and the beam scan size.
+A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
+in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them —
+the step is the most common gap, origin the smallest position, and every position must lie within a
+quarter step of its grid point or the run gets no positions — and writes the grid index, declared
+(`waters:laser-position-fitted-to-grid`), with the fit (origin, step, count, largest residual) in the
+`waters_imaging` block and the step as the pixel size. Vendor SQLite databases are opened immutable, so a conversion
 writes nothing into the `.d` (a read-only open of a WAL-mode MALDI TSF used to leave `-shm`/`-wal`).
 
 **Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
@@ -746,7 +754,8 @@ The vocabulary:
 | `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
 | `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata keeps whichever attribute comes last) | imzML |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
-| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step (the `.mis` is not part of the `.d`) | Bruker TSF / TDF with `MaldiFrameInfo` |
+| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
+| `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
 | `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `imaging:pixel-count-from-positions` | the input states positions but no pixel counts; `IMS:1000042/43` were written as the largest positions | imzML, mzML with `IMS:1000050/51` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
