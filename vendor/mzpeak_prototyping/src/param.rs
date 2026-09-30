@@ -47,6 +47,14 @@ pub fn is_mzp(c: &CURIE) -> bool {
     )
 }
 
+/// The MZP vocabulary's version: `data-version` of `cv/mzpeak.obo`. DELIBERATE DEVIATION (not
+/// upstream; converter-owned): bump it, and [`MZP_CV_URI`]'s tag, whenever the file changes — a test
+/// in the converter pins the file's digest to this version — and tag the commit `mzp-cv-<version>`.
+pub const MZP_CV_VERSION: &str = "0.2.0";
+/// A fixed snapshot of the MZP vocabulary (conformance.md: a `uri` that identifies a fixed release or
+/// snapshot), the tag `mzp-cv-<MZP_CV_VERSION>`; it pointed at `main` through 0.15.0.
+pub const MZP_CV_URI: &str = "https://raw.githubusercontent.com/okohlbacher/mzPeakConverter/mzp-cv-0.2.0/cv/mzpeak.obo";
+
 /// The `cv_list` entry for the converter-owned MZP vocabulary (`cv/mzpeak.obo`). An archive that
 /// carries any `MZP:` accession MUST list it, exactly as it lists MS and UO, so a reader can resolve
 /// the prefix; the writer seeds only MS+UO, so lanes that emit MZP terms push this themselves
@@ -55,8 +63,8 @@ pub fn mzp_cv_entry() -> ControlledVocabularyEntry {
     ControlledVocabularyEntry::new(
         MZP_CV_PREFIX,
         "mzPeak converter provisional controlled vocabulary",
-        "https://raw.githubusercontent.com/okohlbacher/mzPeakConverter/main/cv/mzpeak.obo",
-        Some("0.1.0"),
+        MZP_CV_URI,
+        Some(MZP_CV_VERSION),
     )
 }
 
@@ -400,8 +408,8 @@ impl From<mzdata::params::ControlledVocabulary> for ControlledVocabularyEntry {
             mzdata::params::ControlledVocabulary::Unknown => ControlledVocabularyEntry::new(
                 MZP_CV_PREFIX,
                 "mzPeak converter provisional controlled vocabulary",
-                "https://raw.githubusercontent.com/okohlbacher/mzPeakConverter/main/cv/mzpeak.obo",
-                Some("0.1.0"),
+                MZP_CV_URI,
+                Some(MZP_CV_VERSION),
             ),
         }
     }

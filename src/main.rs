@@ -4122,8 +4122,12 @@ fn convert_file(
     // obsolete scan term "one way" as flyback — each change declared (`imaging`).
     let mut imaging_applied: Vec<&'static str> = Vec::new();
     let mut imaging_block: Option<serde_json::Value> = None;
-    if let MZReaderType::IMzML(r) = &reader {
-        writer.file_description_mut().contents.extend(imaging::provenance_params(&r.imzml_metadata));
+    if let MZReaderType::IMzML(_) = &reader {
+        let content = imaging::read_file_content(read_path).unwrap_or_else(|e| {
+            log::warn!("imzML file provenance not read: {e:#}");
+            Vec::new()
+        });
+        writer.file_description_mut().contents.extend(imaging::provenance_params(&content));
         let fixes = imaging::read_scan_settings(read_path).map(|s| imaging::pixel_size_fixes(&s)).unwrap_or_else(|e| {
             log::warn!("imzML pixel-size check skipped: {e:#}");
             Vec::new()
@@ -9020,7 +9024,7 @@ mod tests {
         let cvs = index["metadata"]["cv_list"].as_array().unwrap();
         let mzp: Vec<_> = cvs.iter().filter(|c| c["id"] == "MZP").collect();
         assert_eq!(mzp.len(), 1, "cv_list: {cvs:?}");
-        assert!(mzp[0]["uri"].as_str().unwrap().ends_with("cv/mzpeak.obo"));
+        assert_eq!((mzp[0]["uri"].as_str(), mzp[0]["version"].as_str()), (Some(mzpeak_prototyping::param::MZP_CV_URI), Some(mzpeak_prototyping::param::MZP_CV_VERSION)));
 
         let mut r = MzPeakReader::new(&path).unwrap();
         let mut back = r.get_spectrum_by_index(0).expect("spectrum 0");
@@ -10350,6 +10354,25 @@ mod tests {
     }
 
     /// Run the built binary with `args` and `envs`, returning (exit ok, stdout, stderr).
+    /// The MZP vocabulary is a fixed snapshot (conformance.md): `cv/mzpeak.obo` states the version the
+    /// `cv_list` entry names, the URI names the tag `mzp-cv-<version>`, and the file is the content
+    /// that version was cut with — editing it without a bump fails here (it went from 5 to 10 terms
+    /// as "0.1.0", review 2026-09-30).
+    #[test]
+    fn the_mzp_vocabulary_is_a_fixed_snapshot() {
+        use sha2::{Digest, Sha256};
+        let obo = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/cv/mzpeak.obo")).unwrap().replace("\r\n", "\n");
+        let v = mzpeak_prototyping::param::MZP_CV_VERSION;
+        assert!(obo.lines().any(|l| l == format!("data-version: {v}")), "cv/mzpeak.obo does not state data-version {v}");
+        assert!(mzpeak_prototyping::param::MZP_CV_URI.contains(&format!("/mzp-cv-{v}/")), "{}", mzpeak_prototyping::param::MZP_CV_URI);
+        let digest: String = Sha256::digest(obo.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            digest, "8becada8856f82ed35e0d8c439c5032eea9e5d635c021fb16dc9b4a1a81a96c5",
+            "cv/mzpeak.obo changed: bump its data-version and MZP_CV_VERSION, move MZP_CV_URI to the new \
+             tag, update this digest, and tag the release commit mzp-cv-<version>"
+        );
+    }
+
     /// A conversion logs no vocabulary-cache ERROR lines (`MSVocabulary::init_static` in `main`).
     #[test]
     fn a_conversion_logs_no_vocabulary_cache_error() {
@@ -11472,6 +11495,9 @@ mod tests {
         }
         let sha = m["file_description"]["contents"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000091").unwrap();
         assert_eq!(sha["value"], "fd5c5dae18095ba7ab55a6ad1bd1175180b292a8");
+        // The UUID as the header spells it, not mzdata's re-spelling of its parse.
+        let uuid = m["file_description"]["contents"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000080").unwrap();
+        assert_eq!(uuid["value"], "{1a2b3c4d-5e6f-7081-9203-b4c5d6e7f8a9}");
         let s = &m["scan_settings_list"][0];
         assert_eq!(param(s, "IMS:1000046").unwrap()["value"], 100.0);
         assert!(m.get("imaging_pixel_size").is_none(), "{:#}", m["imaging_pixel_size"]);
@@ -11612,7 +11638,7 @@ mod tests {
         let img = &m["imaging"];
         assert_eq!((&img["is_imaging"], &img["coordinate_base"]), (&serde_json::json!(true), &serde_json::json!(1)), "{img:#}");
         assert_eq!(img["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
-        assert_eq!(img["provenance"]["origin"], serde_json::json!({"x": 669, "y": 700}));
+        assert_eq!(img["position_offset"], serde_json::json!({"x": 668, "y": 699}), "{img:#}");
 
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
         let mut scans = Vec::new();

@@ -233,8 +233,8 @@ fn embed_one_image(
         .unwrap_or_else(|| "bin".to_string());
     let member = format!("images/image_{ordinal:04}.{ext}");
 
-    // Stream the bytes into the ZIP as an Other/Proprietary member (64 KiB chunks inside
-    // add_file_from_read — never a whole-file load).
+    // Stream the bytes into the ZIP (64 KiB chunks inside add_file_from_read — never a whole-file
+    // load) as the imaging profile lists an image: `entity_type` `image`, `data_kind` `other`.
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => fail!("file became unreadable before embed"),
@@ -242,7 +242,7 @@ fn embed_one_image(
     let fe = FileEntry::new(
         member.clone(),
         EntityType::Other("image".to_string()),
-        DataKind::Proprietary,
+        DataKind::Other("other".to_string()),
     );
     if zip.add_file_from_read(&mut f, None::<&String>, Some(fe)).is_err() {
         fail!("failed to stream image bytes into the archive");
@@ -795,6 +795,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&idx).unwrap();
         let meta = &v["metadata"];
         assert_eq!(meta["imaging"]["images"][0]["archive_path"], "images/image_0000.png");
+        // The imaging profile lists an image member as entity_type `image`, data_kind `other`.
+        let listed = v["files"].as_array().unwrap().iter().find(|f| f["name"] == "images/image_0000.png").unwrap();
+        assert_eq!((&listed["entity_type"], &listed["data_kind"]), (&serde_json::json!("image"), &serde_json::json!("other")), "{listed:#}");
         assert_eq!(meta["imaging"]["images"][0]["role"], "optical");
         assert_eq!(meta["imaging"]["images"][0]["affine"]["maps"], "image_px -> ms_px");
         assert_eq!(meta["study"]["sample_metadata_ref"], SDRF_MEMBER_NAME);

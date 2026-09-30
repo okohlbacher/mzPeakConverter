@@ -21,7 +21,8 @@ viewer) need their update.
   (`XIndexPos`, `YIndexPos`) now becomes the same `IMS:1000050/51` position columns the imzML path
   writes, on the TSF lane and every TDF lane (ims-compact native and SDK, `--no-ims-compact`), with the
   IMS vocabulary. Bruker's indices are absolute on the target; they are shifted so the run's smallest
-  is 1 (declared `bruker:raster-index-shifted-to-base-1`, `origin` recorded), and the grid —
+  is 1 (declared `bruker:raster-index-shifted-to-base-1`; the constant subtracted is
+  `metadata.imaging.position_offset`, as the imaging profile has it), and the grid —
   `IMS:1000042/43` pixel counts, and with a pixel size the max dimension `IMS:1000044/45` — is written.
   A `bruker_maldi` index block keeps regions, raw index ranges and beam scan size; the beam scan size
   is written as the pixel size and declared (`bruker:pixel-size-from-beam-scan-size`), as the `.mis`
@@ -58,9 +59,21 @@ viewer) need their update.
 
 - **A conversion wrote into the raw data folder.** A read-only SQLite open of a WAL-mode database — a
   Bruker MALDI `analysis.tsf` — created `analysis.tsf-shm` / `-wal` beside it and left them there.
-  Every vendor database is now opened with `immutable=1`; a `-wal` the acquisition software left
-  non-empty is still read through. (timsrust 0.4.1 and mzdata's second TDF connection still open the
-  TDF read-write; not covered.)
+  Every vendor database is now opened with `immutable=1`. A `-wal` the acquisition software left
+  non-empty holds committed rows an immutable open would skip, and a read-only open in place creates
+  the `-shm` and never removes it: the database and its WAL are copied into a private scratch
+  directory, read into memory from there, and the scratch directory is removed. (timsrust 0.4.1
+  opens the TDF read-write and mzdata's TDF reader read-only but not immutable; not covered.)
+- **Rewritten archives carried stale checksums** (the `.mzpeak → .mzpeak` lane: `--rt`, `--ms-level`,
+  `--drop-aux`, `--image`/`--sdrf` injection). Every Parquet member is re-encoded, but kept the
+  source's SHA-512 in the index: 9 of 12 members of a filtered MALDI archive failed conformance.md's
+  integrity check. The rewritten bytes are hashed now. (mzPeakValidator does not check member
+  checksums, so it passed those archives.)
+- **The imzML UUID was re-spelled.** It was written from mzdata's parse, so `686ec248…` became
+  `{686EC248-…}` without a declaration (fidelity level L0 keeps the identifier as stated). Storage
+  mode, UUID and `.ibd` checksum are now copied from the header exactly as it states them.
+- **Image members are listed as the imaging profile has them**: `entity_type` `image`, `data_kind`
+  `other` (was `proprietary`).
 - **imzML file provenance was dropped.** Storage mode (`IMS:1000030/31`), UUID (`IMS:1000080`) and the
   `.ibd` checksum (`IMS:1000090/91/92`) are consumed by mzdata and never reached `file_description`;
   they are written back.
@@ -79,6 +92,13 @@ viewer) need their update.
   `opt_IMS_1000052_position_z`); the column mapping still names each `IMS` term.
 - The IMS vocabulary entry points at `imzML/imzML@2c28b05` instead of `master`, which changed in 2022
   while still calling itself 1.1.0.
+- **The MZP vocabulary is a fixed snapshot**: `cv/mzpeak.obo` is version 0.2.0 (it grew from 5 to 10
+  terms as "0.1.0") and the `cv_list` entry names the tag `mzp-cv-0.2.0` instead of `main`
+  (conformance.md: a `uri` that identifies a fixed release or snapshot). A test fails when the file
+  changes without a version bump.
+- **The base-1 shift is recorded as `metadata.imaging.position_offset`** — the constant subtracted
+  from each source index (smallest index − 1), as the imaging profile has it — instead of
+  `provenance.origin`; the smallest index stays in `bruker_maldi.origin`.
 
 ## [0.15.0] — 2026-09-29
 

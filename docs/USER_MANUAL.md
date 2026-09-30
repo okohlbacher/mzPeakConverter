@@ -484,8 +484,8 @@ order across functions.
 
 **Imaging.** A run is an imaging run when the converter detects one — imzML input always; a Bruker
 `.d` whose `analysis.tsf`/`.tdf` has `MaldiFrameInfo` positions; any other input (an mzML, the mzML
-this converter exports from an imaging archive) whose spectra state `IMS:1000050/51`. Waters imaging
-`.raw` is not detected yet. A detected run follows the imaging profile
+this converter exports from an imaging archive) whose spectra state `IMS:1000050/51`; a Waters `.raw`
+whose scans state laser aim positions (below). A detected run follows the imaging profile
 (HUPO-PSI/mzPeak-specification#24): positions in the `position_x` / `position_y` (and `position_z`
 when stated) columns of `spectra_metadata_scans`, each mapped to its `IMS` term; the grid in
 `scan_settings_list` (`IMS:1000042/43` pixel counts always — counted from the largest positions and
@@ -505,8 +505,9 @@ and the obsolete "one way" is written as flyback. A **Bruker MALDI** `.d` (TSF o
 lane) carries the same position columns from `MaldiFrameInfo.XIndexPos/YIndexPos` per frame. Those are
 absolute raster indices on the target, so they are **shifted so the smallest is 1** — one shift for
 the whole run, keeping regions where they lie relative to each other — declared
-(`bruker:raster-index-shifted-to-base-1`) and recorded as `origin` in the `bruker_maldi` and
-`metadata.imaging` blocks; the pixel counts are the shifted extent. FlexImaging's own imzML export
+(`bruker:raster-index-shifted-to-base-1`) and recorded as the imaging profile has it,
+`metadata.imaging.position_offset` = the constant subtracted (smallest index − 1), with the smallest
+index itself as `origin` in the `bruker_maldi` block; the pixel counts are the shifted extent. FlexImaging's own imzML export
 keeps the absolute indices (with the pixel counts set to the largest index), so a `.d` and its imzML
 export differ by exactly `origin − 1`. The pixel size is the raster step of the FlexImaging sequence
 `<stem>.mis` beside the `.d` (not part of it): `RegionNumber` n is the n-th `<Area>`, which also names

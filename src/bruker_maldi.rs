@@ -281,15 +281,19 @@ impl MaldiInfo {
         if matches!(self.pixel_size_from(), Some((_, PixelSource::Beam))) {
             applied.push(PIXEL_FROM_BEAM);
         }
-        let marker = crate::imaging::marker_block(
+        let mut marker = crate::imaging::marker_block(
             Some(&self.scan_settings()),
             serde_json::json!({
                 "detected_from": "MaldiFrameInfo in analysis.tsf/.tdf",
-                "positions": "XIndexPos/YIndexPos − origin + 1",
-                "origin": {"x": self.min.0, "y": self.min.1},
+                "positions": "XIndexPos/YIndexPos − position_offset",
                 "pixel_size": self.pixel_size_note(),
             }),
         );
+        // The imaging profile's record of the shift: the constant SUBTRACTED from each source index
+        // (origin − 1), absent when nothing moved.
+        if self.min != (1, 1) {
+            marker["position_offset"] = serde_json::json!({"x": self.min.0 - 1, "y": self.min.1 - 1});
+        }
         (vec![("imaging".into(), marker), ("bruker_maldi".into(), self.block())], applied)
     }
 
@@ -304,7 +308,7 @@ impl MaldiInfo {
         }
         serde_json::json!({
             "source": "analysis.tsf/.tdf MaldiFrameInfo (XIndexPos, YIndexPos, RegionNumber, BeamScanSizeX/Y)",
-            "coordinates": "positions are XIndexPos/YIndexPos − origin + 1; x_index/y_index and the regions give the raw indices",
+            "coordinates": "positions are XIndexPos/YIndexPos − origin + 1 (metadata.imaging.position_offset = origin − 1); x_index/y_index and the regions give the raw indices",
             "origin": {"x": self.min.0, "y": self.min.1},
             "frames_with_position": self.spots.len(),
             "x_index": range(|s| s.x, &mut self.spots.values()),
@@ -367,7 +371,20 @@ mod tests {
         assert_eq!((blocks[0].0.as_str(), &marker["is_imaging"], &marker["coordinate_base"]), ("imaging", &serde_json::json!(true), &serde_json::json!(1)));
         assert_eq!(marker["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
         assert_eq!(marker["pixel_size_um"], serde_json::json!({"x": 20.0, "y": 20.0}));
-        assert_eq!(marker["provenance"]["origin"], serde_json::json!({"x": 669, "y": 700}));
+        assert_eq!(marker["position_offset"], serde_json::json!({"x": 668, "y": 699}), "the constant subtracted, origin − 1");
+    }
+
+    #[test]
+    fn a_run_already_counting_from_1_is_not_shifted() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, XIndexPos INTEGER, YIndexPos INTEGER);
+             INSERT INTO MaldiFrameInfo VALUES (1, 1, 1), (2, 2, 1);",
+        )
+        .unwrap();
+        let (blocks, applied) = read(&c).unwrap().index_blocks();
+        assert!(blocks[0].1.get("position_offset").is_none(), "absent when nothing was shifted");
+        assert!(applied.is_empty());
     }
 
     #[test]

@@ -7,10 +7,13 @@
 //! `immutable=1` tells SQLite the file cannot change, so it creates nothing and takes no locks.
 //!
 //! The catch: an immutable open also ignores the WAL, and a `-wal` left non-empty by the acquisition
-//! software holds committed rows. Then the database is read the ordinary read-only way, which sees
-//! them; SQLite may maintain the existing side files, but it does not create a WAL that was not there.
+//! software holds committed rows. Reading those in place is not possible without side files — a
+//! read-only open creates the `-shm` when there is none, and never deletes it (review 2026-09-30) —
+//! so the database and its WAL are copied into a private scratch directory, read from there into
+//! memory, and the scratch directory is removed ([`open_through_wal`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -20,18 +23,48 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     if has_wal_content(path) {
         log::warn!(
             "{} has a non-empty -wal beside it (committed rows the acquisition software never \
-             checkpointed); reading it through the WAL",
+             checkpointed); reading a copy of both through the WAL",
             path.display()
         );
-        return Connection::open_with_flags(path, flags);
+        return open_through_wal(path);
     }
     Connection::open_with_flags(immutable_uri(path), flags | OpenFlags::SQLITE_OPEN_URI)
 }
 
-fn has_wal_content(path: &Path) -> bool {
+fn wal_of(path: &Path) -> PathBuf {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
-    std::fs::metadata(wal).is_ok_and(|m| m.len() > 0)
+    wal.into()
+}
+
+fn has_wal_content(path: &Path) -> bool {
+    std::fs::metadata(wal_of(path)).is_ok_and(|m| m.len() > 0)
+}
+
+/// A database whose `-wal` holds committed rows: the database and its WAL are copied into a private
+/// scratch directory, read from the copy (SQLite writes its `-shm` there) into an in-memory
+/// database, and the scratch directory is removed. The in-memory copy is query-only. ponytail: the
+/// whole database in memory — only for a WAL left behind by a crashed or running acquisition.
+fn open_through_wal(path: &Path) -> rusqlite::Result<Connection> {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let scratch = std::env::temp_dir().join(format!("mzpc-wal-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let io = |e: std::io::Error| {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN), Some(format!("copying {} to read its WAL: {e}", path.display())))
+    };
+    let read = || -> rusqlite::Result<Connection> {
+        std::fs::create_dir_all(&scratch).map_err(io)?;
+        let copy = scratch.join("db");
+        std::fs::copy(path, &copy).map_err(io)?;
+        std::fs::copy(wal_of(path), wal_of(&copy)).map_err(io)?;
+        let src = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        let mut mem = Connection::open_in_memory()?;
+        rusqlite::backup::Backup::new(&src, &mut mem)?.run_to_completion(4096, std::time::Duration::ZERO, None)?;
+        mem.pragma_update(None, "query_only", true)?;
+        Ok(mem)
+    };
+    let out = read();
+    let _ = std::fs::remove_dir_all(&scratch);
+    out
 }
 
 /// `file:<path>?immutable=1`, with the characters a URI gives meaning to escaped. Windows paths
@@ -121,9 +154,41 @@ mod tests {
         let c = open(&db).unwrap();
         let n: i64 = c.query_row("SELECT count(*) FROM Frames", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 5, "the two frames in the WAL must be seen");
+        assert!(c.execute("INSERT INTO Frames VALUES (6)", []).is_err(), "the copy is query-only");
         drop(c);
         drop(writer);
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// A `.d` copied while the acquisition wrote: a non-empty `-wal` and no `-shm`. A read-only open
+    /// in place would create the `-shm` beside the data and leave it there (reproduced 2026-09-30);
+    /// the rows are read and the folder is left exactly as found.
+    #[test]
+    fn a_wal_without_its_shm_is_read_without_creating_one() {
+        let db = wal_db("noshm");
+        let dir = db.parent().unwrap().to_path_buf();
+        let copy_dir = dir.join("copied.d");
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        let copy = copy_dir.join("analysis.tsf");
+        {
+            let writer = Connection::open(&db).unwrap();
+            writer.execute_batch("PRAGMA wal_autocheckpoint=0; INSERT INTO Frames VALUES (4), (5);").unwrap();
+            std::fs::copy(&db, &copy).unwrap();
+            std::fs::copy(wal_of(&db), wal_of(&copy)).unwrap();
+        }
+        let listing = || {
+            let mut v: Vec<(String, u64)> = std::fs::read_dir(&copy_dir).unwrap().map(|e| e.unwrap()).map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len())).collect();
+            v.sort();
+            v
+        };
+        let before = listing();
+        assert_eq!(before.len(), 2, "{before:?}");
+        let c = open(&copy).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM Frames", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 5);
+        drop(c);
+        assert_eq!(listing(), before, "the open wrote into the folder");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

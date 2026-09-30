@@ -1,5 +1,5 @@
 format-version: 1.4
-data-version: 0.1.0
+data-version: 0.2.0
 ontology: mzpeak
 default-namespace: mzpeak
 remark: Converter-owned provisional controlled vocabulary for mzPeakConverter. These terms cover the

@@ -12,7 +12,7 @@
 //!   (`IMS:1000413`), and declared.
 //! * **File provenance.** mzdata consumes storage mode, UUID and `.ibd` checksum into its
 //!   `ImzMLFileMetadata` and leaves them out of `file_description`; [`provenance_params`] puts them
-//!   back.
+//!   back from the header ([`read_file_content`]), values as stated.
 //!
 //! mzdata keeps a unit by its accession only, so the unit NAME the file states — needed to see an
 //! accession/name disagreement — is read from the header here ([`read_scan_settings`]).
@@ -61,9 +61,9 @@ impl Detected {
     }
 }
 
-/// The imaging detector for every lane. `probes` are the lane's sampled spectra (empty where a lane
-/// has none yet). ponytail: Waters imaging `.raw` is not detected — its laser positions need a
-/// MassLynx call nobody has probed on an example file yet (backlog).
+/// The imaging detector for every lane that knows its input from the path and sampled spectra.
+/// `probes` are the lane's sampled spectra (empty where a lane has none yet). A Waters imaging
+/// `.raw` is detected by its reader instead, which needs MassLynx open (`WatersReader::imaging`).
 pub fn detect(input: &Path, is_imzml: bool, probes: &[mzdata::spectrum::MultiLayerSpectrum]) -> Option<Detected> {
     if is_imzml {
         return Some(Detected::ImzML);
@@ -478,41 +478,113 @@ pub fn fix_json(f: &PixelSizeFix) -> serde_json::Value {
     })
 }
 
-/// `file_description.contents` params for the imzML provenance mzdata consumed.
-pub fn provenance_params(meta: &mzdata::io::imzml::reader::ImzMLFileMetadata) -> Vec<Param> {
-    use mzdata::io::imzml::reader::IbdDataMode;
-    let mut out = Vec::new();
-    match meta.data_mode {
-        Some(IbdDataMode::Continuous) => out.push(Param::builder().name("continuous").curie(mzdata::curie!(IMS:1000030)).build()),
-        Some(IbdDataMode::Processed) => out.push(Param::builder().name("processed").curie(mzdata::curie!(IMS:1000031)).build()),
-        _ => {}
-    }
-    if let Some(uuid) = meta.uuid {
-        out.push(
-            Param::builder()
-                .name("universally unique identifier")
-                .curie(mzdata::curie!(IMS:1000080))
-                .value(format!("{{{}}}", uuid.hyphenated().to_string().to_uppercase()))
-                .build(),
-        );
-    }
-    if let Some(sum) = meta.ibd_checksum.as_deref().filter(|s| !s.is_empty()) {
-        let term = match meta.ibd_checksum_type.as_deref() {
-            Some("MD5") => Some(("ibd MD5", mzdata::curie!(IMS:1000090))),
-            Some("SHA1") => Some(("ibd SHA-1", mzdata::curie!(IMS:1000091))),
-            Some("SHA256") => Some(("ibd SHA-256", mzdata::curie!(IMS:1000092))),
-            _ => None,
-        };
-        if let Some((name, curie)) = term {
-            out.push(Param::builder().name(name).curie(curie).value(sum.to_string()).build());
+/// The imzML provenance terms: storage mode, UUID, `.ibd` checksum.
+const PROVENANCE: [(mzdata::params::CURIE, &str); 6] = [
+    (mzdata::curie!(IMS:1000030), "continuous"),
+    (mzdata::curie!(IMS:1000031), "processed"),
+    (mzdata::curie!(IMS:1000080), "universally unique identifier"),
+    (mzdata::curie!(IMS:1000090), "ibd MD5"),
+    (mzdata::curie!(IMS:1000091), "ibd SHA-1"),
+    (mzdata::curie!(IMS:1000092), "ibd SHA-256"),
+];
+
+/// `file_description.contents` params for the imzML provenance mzdata consumed, with the values
+/// exactly as the header states them (mzdata parses the UUID, and writing its parse back re-spelled
+/// `686ec248…` as `{686EC248-…}`: fidelity L0 keeps the identifier as stated).
+pub fn provenance_params(content: &[RawParam]) -> Vec<Param> {
+    PROVENANCE
+        .iter()
+        .filter_map(|(curie, name)| {
+            let p = content.iter().find(|p| p.accession == curie.to_string())?;
+            let b = Param::builder().name(*name).curie(*curie);
+            Some(if p.value.is_empty() { b.build() } else { b.value(p.value.clone()).build() })
+        })
+        .collect()
+}
+
+/// The `<fileContent>` cvParams of an imzML header, values as stated, param-group references
+/// expanded (the groups are declared after `<fileDescription>`, so they resolve at the end).
+pub fn read_file_content(path: &Path) -> Result<Vec<RawParam>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    read_file_content_from(std::io::BufReader::new(file))
+}
+
+pub fn read_file_content_from(input: impl BufRead) -> Result<Vec<RawParam>> {
+    let mut reader = quick_xml::Reader::from_reader(input);
+    let mut buf = Vec::new();
+    let mut groups: HashMap<String, Vec<RawParam>> = HashMap::new();
+    let mut group: Option<(String, Vec<RawParam>)> = None;
+    let mut in_content = false;
+    // A param, or the id of a referenced group.
+    let mut content: Vec<Result<RawParam, String>> = Vec::new();
+    loop {
+        let ev = reader.read_event_into(&mut buf).context("parsing the imzML header")?;
+        match &ev {
+            Event::Start(e) | Event::Empty(e) => {
+                let empty = matches!(ev, Event::Empty(_));
+                match e.local_name().as_ref() {
+                    b"run" => break,
+                    b"fileContent" if !empty => in_content = true,
+                    b"referenceableParamGroup" if !empty => group = attr(e, b"id").map(|id| (id, Vec::new())),
+                    b"cvParam" => {
+                        if let Some(p) = raw_param(e) {
+                            if in_content {
+                                content.push(Ok(p));
+                            } else if let Some((_, g)) = group.as_mut() {
+                                g.push(p);
+                            }
+                        }
+                    }
+                    b"referenceableParamGroupRef" if in_content => content.extend(attr(e, b"ref").map(Err)),
+                    _ => {}
+                }
+            }
+            Event::End(e) => match e.local_name().as_ref() {
+                b"fileContent" => in_content = false,
+                b"referenceableParamGroup" => {
+                    if let Some((id, g)) = group.take() {
+                        groups.insert(id, g);
+                    }
+                }
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
         }
+        buf.clear();
     }
-    out
+    Ok(content
+        .into_iter()
+        .flat_map(|c| match c {
+            Ok(p) => vec![p],
+            Err(r) => groups.get(&r).cloned().unwrap_or_default(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_is_copied_as_the_header_states_it() {
+        // A bare lowercase UUID (ltpmsi-chilli) and a checksum reached through a param group.
+        let xml = r#"<mzML><fileDescription><fileContent>
+            <cvParam cvRef="IMS" accession="IMS:1000031" name="processed" value=""/>
+            <cvParam cvRef="IMS" accession="IMS:1000080" name="universally unique identifier" value="686ec248523749d8a17590dde78ab130"/>
+            <referenceableParamGroupRef ref="sums"/>
+            </fileContent></fileDescription>
+            <referenceableParamGroupList><referenceableParamGroup id="sums">
+            <cvParam cvRef="IMS" accession="IMS:1000091" name="ibd SHA-1" value="ABCDEF0123"/>
+            </referenceableParamGroup></referenceableParamGroupList><run/></mzML>"#;
+        let p = provenance_params(&read_file_content_from(xml.as_bytes()).unwrap());
+        let got: Vec<(String, String)> = p.iter().map(|p| (p.curie().unwrap().to_string(), p.value.to_string())).collect();
+        assert_eq!(got, [
+            ("IMS:1000031".to_string(), String::new()),
+            ("IMS:1000080".to_string(), "686ec248523749d8a17590dde78ab130".to_string()),
+            ("IMS:1000091".to_string(), "ABCDEF0123".to_string()),
+        ]);
+    }
 
     #[test]
     fn a_raster_of_float32_stage_positions_fits_its_grid() {
