@@ -158,16 +158,18 @@ const FOLD: f64 = 0.95 * QUARTER;
 /// positions, then the coarsest multiple of it that still does ([`coarsest`]). One takes positions
 /// closer than 30 % of the typical gap as one column — jitter, a small lag. The other takes each
 /// distinct position as a column and holds it within 1 µm, as stage set points (float32) are: it
-/// wins where the first folds three or more of its columns into a pixel ([`folds_as_lag`]), so small
-/// regions (spots, tissue-microarray cores) keep their step however many long gaps lie between them.
-/// A fully regularly half-sampled raster is indistinguishable from a coarser grid and fits as one.
+/// wins where the first folds its columns other than as strays or a lag do ([`folds_as_lag`]: three
+/// or more in a pixel, or pairs in some pixels only or off one coarser grid), so small regions
+/// (spots, tissue-microarray cores) keep their step however many long gaps lie between them. A fully
+/// regularly half-sampled raster is indistinguishable from a coarser grid and fits as one.
 ///
 /// ponytail: a step under 3 µm is taken for the recording lattice (jitter recorded at µm
 /// resolution), and jitter recorded more coarsely than that for a raster at that resolution; a
 /// single column whose positions spread over 5 µm fits no grid unless a step is declared; jittered
 /// positions whose gaps are more than a tenth over three steps merge one-step neighbours; a lag of
-/// 0.45 step or more is not told from a grid of half the step; columns in pairs (spots two pixels
-/// wide) fold like a lag's two halves.
+/// 0.45 step or more is not told from a grid of half the step; columns that come only in pairs, the
+/// pairs on one coarser grid (an array of spots two pixels wide; any two such regions), fold like a
+/// lag's two halves.
 pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
     if values.is_empty() || !values.iter().all(|v| v.is_finite()) {
         return None;
@@ -245,7 +247,8 @@ pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
         (r, typical, median) = (2.0 * r, pct(above, 9), pct(above, 5));
     }
     // One pass: the columns are runs of positions whose neighbours are closer than `merge`, averaged,
-    // and the first step whose grid holds them — within a quarter step, or within 1 µm (`exact`).
+    // and the first step whose grid holds them — within a quarter step, or within 1 µm (`exact`): the
+    // fit, and each position's index on that grid before [`coarsest`].
     let pass = |merge: f64, exact: bool| {
         let mut centres: Vec<f64> = Vec::new();
         let mut run = (core[0], 0.0, 0usize);
@@ -292,9 +295,9 @@ pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
             }
             tried = c;
             let band = if exact { (SAME_POSITION_MM / c).min(QUARTER) } else { QUARTER };
-            if let Some(fit) = grid_at(values, raster, refine(c), false, band) {
-                let fit = coarsest(fit, values, raster);
-                let Some(pitch) = fit.0.pitch else { return Some(fit) };
+            if let Some(fine) = grid_at(values, raster, refine(c), false, band) {
+                let fit = coarsest(fine.clone(), values, raster);
+                let Some(pitch) = fit.0.pitch else { return Some((fit, fine.1)) };
                 // A stage step is set in whole µm or 0.1 µm: snap the fitted pitch to the roundest
                 // such value within three standard errors of it (at least 1e-7 of it, a float32 step
                 // multiplied up). Float32 noise would otherwise write 99.99995 µm; a 33.33 µm step
@@ -303,10 +306,11 @@ pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
                 let se = standard_error(&fit, values).max(1e-7 * pitch);
                 let snapped = [1e3, 1e4].into_iter().map(|u| (pitch * u).round() / u).find(|s| (s - pitch).abs() <= 3.0 * se);
                 let off = |f: &AxisFit| f.1.iter().filter(|i| i.is_none()).count();
-                return Some(match grid_at(values, raster, snapped.unwrap_or(pitch), true, QUARTER) {
+                let fit = match grid_at(values, raster, snapped.unwrap_or(pitch), true, QUARTER) {
                     Some(s) if off(&s) <= off(&fit) => s,
                     _ => fit,
-                });
+                };
+                return Some((fit, fine.1));
             }
         }
         None
@@ -315,12 +319,13 @@ pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
     // Where that folds the distinct positions other than as strays or a lag do — small regions
     // (spots, tissue-microarray cores) with more than a tenth of the gaps between them — the stage
     // set points are exact (float32), and the grid holding each within 1 µm is the step (review
-    // 2026-09-30 B14).
+    // 2026-09-30 B14). The fold is judged on that grid before it is coarsened: coarsened, it may
+    // have folded pairs of columns already, and the merged grid four columns into a pixel.
     let merged = pass(0.3 * typical, false);
     let exact = pass(SAME_POSITION_MM, true);
     match (merged, exact) {
-        (Some(m), Some(e)) if !folds_as_lag(&m.1, &e.1, values.len()) => Some(e),
-        (m, e) => m.or(e),
+        (Some(m), Some(e)) if !folds_as_lag(&m.0.1, &e.1, values.len()) => Some(e.0),
+        (m, e) => m.or(e).map(|f| f.0),
     }
 }
 
@@ -415,21 +420,37 @@ fn coarsest(fit: AxisFit, values: &[f64], raster: &[f64]) -> AxisFit {
 
 /// Whether a grid (`index`) puts the columns of a finer one (`fine`: each position's index on it)
 /// into its pixels as strays or a serpentine lag do: strays put at most [`MAX_OFF_GRID`] of the `n`
-/// positions beside a pixel's fullest column, a lag's second half at least a third of those on
-/// both grids. A third column in a pixel is neither — whole regions folded into one (a spot array,
-/// tissue-microarray cores; review 2026-09-30 B14) — nor are pairs in some pixels only.
+/// positions beside a pixel's fullest column; a lag splits the pixels of all but a tenth of the
+/// positions on both grids into two columns, the second holding at least a third of them, at one
+/// offset: the same number of finer steps apart in every pixel, the first columns on one grid of
+/// whole finer steps per pixel. A third column in a pixel is neither — whole regions folded into one
+/// (a spot array, tissue-microarray cores; review 2026-09-30 B14) — nor are pairs in some pixels
+/// only, at different distances or off that grid (regions one and two pixels wide, at any gaps).
 fn folds_as_lag(index: &[Option<i64>], fine: &[Option<i64>], n: usize) -> bool {
     let mut pairs: Vec<(i64, i64)> = index.iter().zip(fine).filter_map(|(k, f)| Some(((*k)?, (*f)?))).collect();
     pairs.sort_unstable();
-    let (mut second, mut beyond) = (0, 0);
+    // Each split pixel: its index, its first column's finer index, the distance to its second.
+    let (mut second, mut beyond, mut unsplit, mut split) = (0, 0, 0, Vec::new());
     for pixel in pairs.chunk_by(|a, b| a.0 == b.0) {
-        let mut k: Vec<usize> = pixel.chunk_by(|a, b| a == b).map(<[_]>::len).collect();
-        k.sort_unstable_by(|a, b| b.cmp(a));
-        second += k.get(1).copied().unwrap_or(0);
-        beyond += k.iter().skip(2).sum::<usize>();
+        let mut k: Vec<(usize, i64)> = pixel.chunk_by(|a, b| a == b).map(|c| (c.len(), c[0].1)).collect();
+        k.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        if let [(_, f0), (two, f1), ..] = k[..] {
+            second += two;
+            split.push((pixel[0].0, f0.min(f1), f0.abs_diff(f1)));
+        } else {
+            unsplit += k[0].0;
+        }
+        beyond += k.iter().skip(2).map(|c| c.0).sum::<usize>();
     }
     let few = |k: usize| k as f64 <= MAX_OFF_GRID * n as f64;
-    few(beyond) && (few(second) || 3 * second >= pairs.len())
+    let lag = match (split.first(), split.last()) {
+        (Some(&(k0, a0, d0)), Some(&(k1, a1, _))) => {
+            let m = if k1 > k0 { (a1 - a0) / (k1 - k0) } else { 0 };
+            3 * second >= pairs.len() && 10 * unsplit <= pairs.len() && split.iter().all(|&(k, a, d)| d == d0 && a - a0 == m * (k - k0))
+        }
+        _ => false,
+    };
+    few(beyond) && (few(second) || lag)
 }
 
 /// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
@@ -1066,7 +1087,9 @@ mod tests {
     /// Review 2026-09-30 B14, second pass: the fit must keep every exact layout v0.16.0 fitted.
     /// Without a declared step, small regions with more than a tenth of the gaps between them
     /// became a pixel each (4 × 4 spots of 5 pixels at a 12-pixel pitch: 4 pixels of 1.2 mm), and a
-    /// 5 µm raster with three columns missing lost its grid.
+    /// 5 µm raster with three columns missing lost its grid. Third pass: regions one and two columns
+    /// wide passed for a serpentine lag's halves (0.621 mm for a 0.1 mm raster), and pairs at
+    /// irregular gaps four columns into a pixel (10.231 mm for 0.2 mm).
     #[test]
     fn exact_layouts_v0_16_fitted_keep_their_step() {
         let regions = |n: i64, width: i64, pitch: i64| -> Vec<i64> { (0..n).flat_map(|k| (0..width).map(move |c| k * pitch + c)).collect() };
@@ -1080,6 +1103,12 @@ mod tests {
             (0.005, regions(2, 100, 103)),
             (0.005, regions(2, 50, 250)),
             (0.008, regions(2, 100, 103)),
+            (0.1, vec![0, 6, 7, 12, 13]),
+            (0.1, vec![0, 13, 14]),
+            (0.2, vec![0, 14, 15, 25, 26, 42]),
+            (0.1, vec![0, 1, 11, 13, 33, 34]),
+            (0.03, vec![0, 2, 6, 9, 15, 20, 21]),
+            (0.2, vec![0, 1, 8, 9, 37, 38, 44, 45]),
         ];
         let mut seed = 5;
         for _ in 0..40 {
@@ -1097,7 +1126,7 @@ mod tests {
             assert_eq!((a.pitch, a.count), (Some(pitch), count), "{cols:?}");
             assert_eq!(columns(&index), raster(7, cols.len(), |_, i| (cols[i] - cols[0] + 1) as f64).iter().map(|c| *c as i64).collect::<Vec<_>>());
         }
-        assert!(compared > 40, "{compared}");
+        assert!(compared >= 47, "{compared}");
     }
 
     fn settings(params: &[(&str, &str, Option<(&str, &str)>)]) -> RawSettings {

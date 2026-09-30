@@ -520,10 +520,12 @@ in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter
 the step the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`, any `…XStep`/`…YStep`) when the
 positions lie within a quarter step of it, else the smallest step between columns (positions closer
 than 30 % of the typical gap being one column: jitter, a small serpentine lag; a larger lag's two
-halves fold into one column) that holds them within a quarter step — or, where that would fold three
-or more distinct positions into a pixel (small regions: spots, tissue-microarray cores), the
-smallest step that holds each distinct position within 1 µm, as exact stage set points are; a step
-under 3 µm is taken for the recording resolution — and writes the grid index, declared
+halves fold into one column) that holds them within a quarter step — or, where that would fold
+distinct positions into a pixel other than as a lag's two halves (three or more in a pixel, or pairs
+in some pixels only, at different distances or off one coarser grid: small regions such as spots,
+tissue-microarray cores), the smallest step that holds each distinct position within 1 µm, as exact
+stage set points are (regions only ever two columns wide, the pairs on one coarser grid, still fold
+like a lag); a step under 3 µm is taken for the recording resolution — and writes the grid index, declared
 (`waters:laser-position-fitted-to-grid`), with the fit (origin, step and its source, count, largest
 residual) in the `waters_imaging` block and each axis's step as its pixel size. Lock-mass scans get
 no position. Up to 1 % of the positioned scans may lie off the grid, or far outside the raster at
