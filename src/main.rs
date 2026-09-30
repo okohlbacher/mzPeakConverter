@@ -1855,6 +1855,9 @@ fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
     }
     let _gz = if input.is_file() { gunzip_to_temp(input)? } else { None };
     let open_path: &Path = _gz.as_ref().map(|g| g.file.as_path()).unwrap_or(input);
+    if is_tdf_dir(input) {
+        bruker_native::refuse_timsrust_lookalikes(input)?; // mzdata opens a TDF .d through timsrust
+    }
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(open_path)
         .with_context(|| format!("opening {}", input.display()))?;
     recover_chromatogram_index(&mut reader, input, open_path);
@@ -2287,6 +2290,9 @@ fn convert_to_mzml(
         } else {
             (None, None, None, input.to_path_buf())
         };
+    if is_tdf_dir(input) {
+        bruker_native::refuse_timsrust_lookalikes(input)?; // mzdata opens a TDF .d through timsrust
+    }
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&read_path)
         .with_context(|| format!("opening {}", input.display()))?;
     recover_chromatogram_index(&mut reader, input, &read_path);
@@ -4146,6 +4152,9 @@ fn convert_file(
             (None, None, None, input.to_path_buf())
         };
     let read_path: &Path = read_path.as_path();
+    if is_tdf_dir(input) {
+        bruker_native::refuse_timsrust_lookalikes(input)?; // mzdata opens a TDF .d through timsrust
+    }
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
         .with_context(|| format!("opening {}", input.display()))?;
     // Before the TOF-grid branch below, which is handed this reader.

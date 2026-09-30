@@ -339,6 +339,50 @@ fn snap_to_half_scan(scan: f64) -> f64 {
     if (scan - grid).abs() < 1e-6 { grid } else { scan }
 }
 
+/// The two files timsrust 0.4.1 looks up by name suffix inside a `.d` (`FrameReader::new`).
+const TIMSRUST_SUFFIX_LOOKUPS: [&str; 2] = ["analysis.tdf", "analysis.tdf_bin"];
+
+/// The names in `names` that timsrust can take for `analysis.tdf` or `analysis.tdf_bin` without
+/// being either (letter case aside), sorted: whatever the listing order, the same answer.
+fn timsrust_lookalikes(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut found: Vec<String> = names
+        .into_iter()
+        .filter(|n| {
+            let lower = n.to_lowercase();
+            TIMSRUST_SUFFIX_LOOKUPS.iter().any(|&want| lower.ends_with(want) && lower != want)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Refuse a TDF `.d` in which timsrust could open another file in place of `analysis.tdf` or
+/// `analysis.tdf_bin`. timsrust 0.4.1 (`utils::find_extension`) takes the FIRST directory entry
+/// whose name ends with the one it wants, and a macOS AppleDouble companion does: copying a `.d`
+/// from a Mac to NTFS, exFAT or SMB leaves `._analysis.tdf` (163 bytes of Finder metadata) beside
+/// every file. NTFS lists it first, so the default lane and `--no-ims-compact` failed with "file is
+/// not a database" while `--bruker-sdk`, which opens the exact names, converted the same copy
+/// (2485.d on the box, 2026-09-30). The whole listing is checked, so the verdict does not depend on
+/// the order a filesystem happens to list it in. Called before every timsrust open of a `.d`.
+pub fn refuse_timsrust_lookalikes(dot_d: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dot_d) else {
+        return Ok(()); // the open itself reports an unreadable directory
+    };
+    let found = timsrust_lookalikes(entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()));
+    if found.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{} holds {} beside analysis.tdf / analysis.tdf_bin. The timsTOF reader (timsrust) opens the \
+         first file whose name ends in `analysis.tdf` / `analysis.tdf_bin`, so it can read one of these \
+         in place of the run (\"file is not a database\"). `._*` files are macOS AppleDouble companions, \
+         Finder metadata left by copying a .d from a Mac to NTFS, exFAT or SMB. Remove them from the \
+         .d, or convert with --bruker-sdk (Windows/Linux), which opens the exact files",
+        dot_d.display(),
+        found.join(", ")
+    )
+}
+
 /// Native integer-TOF reader over a Bruker `.d` (TDF). The mzdata-integration seam: a future
 /// upstream native-TOF API would back this same surface.
 pub struct NativeTofReader {
@@ -959,6 +1003,7 @@ impl NativeTofReader {
         if !tdf.exists() {
             bail!("{} is not a TDF .d (no analysis.tdf)", dot_d.display());
         }
+        refuse_timsrust_lookalikes(dot_d)?;
         let meta = MetadataReader::new(&tdf)
             .map_err(|e| anyhow::anyhow!("reading TDF metadata: {e}"))?;
         let frames = FrameReader::new(dot_d)
@@ -1790,6 +1835,75 @@ mod single_point_chunk_tests {
             .decode_arrow(&empty, 123_456.0, 123_456.0, &mut acc, None);
         assert_eq!(n, 1, "a single-point chunk decodes to exactly one point");
         assert_eq!(acc.to_i32().unwrap().to_vec(), vec![123_456]);
+    }
+}
+
+#[cfg(test)]
+mod appledouble_tests {
+    /// A readable synthetic TDF of three empty frames (timsrust never decodes them, so the
+    /// `.tdf_bin` only has to exist), as `empty_frame_read_tests` builds it.
+    fn synthetic_tdf(dot_d: &std::path::Path) {
+        std::fs::write(dot_d.join("analysis.tdf_bin"), [0u8; 8]).unwrap();
+        let conn = rusqlite::Connection::open(dot_d.join("analysis.tdf")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', '2'), ('AcquisitionSoftware', 'timsTOF'),
+                 ('MzAcqRangeLower', '100'), ('MzAcqRangeUpper', '2000'), ('DigitizerNumSamples', '439442'),
+                 ('OneOverK0AcqRangeLower', '0.78'), ('OneOverK0AcqRangeUpper', '1.6');
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, Polarity TEXT, ScanMode INTEGER, MsMsType INTEGER,
+                 TimsId INTEGER, NumScans INTEGER, NumPeaks INTEGER, AccumulationTime REAL);
+             INSERT INTO Frames VALUES (1, 0.5, '+', 20, 0, 0, 900, 0, 100.0), (2, 0.6, '+', 20, 0, 0, 900, 0, 100.0),
+                                       (3, 0.9, '+', 20, 0, 0, 900, 0, 100.0);",
+        )
+        .unwrap();
+    }
+
+    /// A 163-byte AppleDouble header (magic 0x00051607, version 2, "Mac OS X" filler), the size
+    /// macOS leaves beside each file of a `.d` copied to NTFS, exFAT or SMB.
+    fn appledouble() -> Vec<u8> {
+        let mut b = vec![0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00];
+        b.extend_from_slice(b"Mac OS X        ");
+        b.resize(163, 0);
+        b
+    }
+
+    #[test]
+    fn lookalikes_are_the_same_in_any_listing_order() {
+        let names = ["._analysis.tdf", "analysis.tdf", "Analysis.TDF", "analysis.tdf_bin", "._analysis.tdf_bin",
+                     "._chromatography-data.sqlite", "analysis.tdf-journal"];
+        let forward = super::timsrust_lookalikes(names.iter().map(|s| s.to_string()));
+        let reverse = super::timsrust_lookalikes(names.iter().rev().map(|s| s.to_string()));
+        assert_eq!(forward, ["._analysis.tdf", "._analysis.tdf_bin"]);
+        assert_eq!(reverse, forward);
+    }
+
+    /// timsrust takes the first entry ending in `analysis.tdf`; APFS and NTFS list the AppleDouble
+    /// `._analysis.tdf` before it, so this read "file is not a database". The companion is created
+    /// before the run in one `.d` and after it in the other: the refusal is the same.
+    #[test]
+    fn an_appledouble_companion_is_named_before_timsrust_opens_the_run() {
+        for stub_first in [true, false] {
+            let dot_d = std::env::temp_dir().join(format!("mzpc-appledouble-{}-{stub_first}.d", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dot_d);
+            std::fs::create_dir_all(&dot_d).unwrap();
+            if stub_first {
+                std::fs::write(dot_d.join("._analysis.tdf"), appledouble()).unwrap();
+                synthetic_tdf(&dot_d);
+            } else {
+                synthetic_tdf(&dot_d);
+                assert!(super::NativeTofReader::open(&dot_d).is_ok(), "the synthetic run opens without the companion");
+                std::fs::write(dot_d.join("._analysis.tdf"), appledouble()).unwrap();
+            }
+            let Err(e) = super::NativeTofReader::open(&dot_d) else {
+                panic!("stub_first={stub_first}: a .d with ._analysis.tdf was opened");
+            };
+            let msg = format!("{e:#}");
+            let kept = dot_d.join("._analysis.tdf").is_file();
+            let _ = std::fs::remove_dir_all(&dot_d);
+            assert!(msg.contains("holds ._analysis.tdf beside"), "stub_first={stub_first}: {msg}");
+            assert!(msg.contains("--bruker-sdk") && msg.contains("AppleDouble"), "the fix is named: {msg}");
+            assert!(kept, "the converter never removes the companion itself");
+        }
     }
 }
 
