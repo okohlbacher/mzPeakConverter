@@ -6643,9 +6643,20 @@ fn convert_waters(
     // (`waters.rs`): the reader counts the frames that sort moved, and `sort-by-mz` is declared from
     // that count over the written spectra. Readers get the run's drift table + CCS calibration.
     hints.counters.push(("sort-by-mz", reader.reorder_counter()));
-    // Each data-facet column under the encoding a sample of the run compresses best under
+    // Each data-facet column under the encoding a sample of the run compressed best under
     // (`encoding_prescan`); `MZPC_ENCODING_PRESCAN=0` keeps the writer's fixed encodings.
     hints.encoding_prescan = env_flag("MZPC_ENCODING_PRESCAN").unwrap_or(true);
+    // Imaging (MALDI / DESI): the reader attaches each scan's pixel, fitted to its laser positions —
+    // the Waters branch of imaging detection, which needs MassLynx open.
+    if let Some(im) = reader.imaging() {
+        let grid = im.scan_settings();
+        let marker = imaging::marker_block(Some(&grid), im.provenance());
+        hints.imaging = Some(ImagingHints {
+            grid,
+            blocks: vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())],
+            transformations: vec![waters::LASER_GRID],
+        });
+    }
     if let Some(block) = reader.drift_block() {
         hints.index_blocks.push(("waters_drift".to_string(), block));
         // Frames interleave 200 traces: the zero-run mask would strip bin boundaries across bins,
@@ -6732,6 +6743,17 @@ struct VendorHints {
     /// written under the encoding a sample of the run compressed best under. The Waters lane sets
     /// it; `MZPC_ENCODING_PRESCAN=0` turns it off.
     encoding_prescan: bool,
+    /// An imaging run whose reader attaches each spectrum's pixel itself (Waters laser positions).
+    imaging: Option<ImagingHints>,
+}
+
+/// A vendor reader whose spectra carry their pixel (`IMS:1000050/51`): the grid for
+/// `scan_settings_list`, the index blocks (the `metadata.imaging` marker among them) and the
+/// `transformations` entries. The writer gets the position columns and the IMS vocabulary.
+struct ImagingHints {
+    grid: mzdata::meta::ScanSettings,
+    blocks: Vec<(String, serde_json::Value)>,
+    transformations: Vec<&'static str>,
 }
 
 /// One spectrum from a vendor reader, with its routing outcome for the run summary. Every reader
@@ -6843,6 +6865,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         chromatograms,
         source_file_params,
         encoding_prescan,
+        imaging: imaging_hints,
     } = hints;
     let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
     // MALDI imaging from a Bruker `.d` (the TSF lane): each frame's raster position.
@@ -6949,6 +6972,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         if let Some(m) = &maldi {
             enable_bruker_imaging(&mut writer, m);
         }
+        if let Some(h) = &imaging_hints {
+            enable_imaging(&mut writer, h.grid.clone());
+        }
         // The `--bruker-sdk` f64 lane shares `bruker_native::build_precursors` and so the MZP band.
         if is_tdf_dir(input) {
             ensure_mzp_cv(&mut writer);
@@ -7042,6 +7068,12 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         }
         index_blocks.extend(blocks);
     }
+    if let Some(h) = imaging_hints {
+        for t in h.transformations {
+            declare(&mut applied, t);
+        }
+        index_blocks.extend(h.blocks);
+    }
     for entry in transformations {
         declare(&mut applied, entry);
     }
@@ -7068,10 +7100,15 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
 /// there is one).
 fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) {
     log::info!("Bruker MALDI imaging: {} frames carry a raster position", maldi.spots.len());
+    enable_imaging(writer, maldi.scan_settings());
+}
+
+/// Turn a writer into an imaging one: the position columns, the IMS vocabulary and the grid.
+fn enable_imaging(writer: &mut MzPeakWriterType<fs::File>, grid: mzdata::meta::ScanSettings) {
     writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
     writer.controlled_vocabularies_mut().push(ControlledVocabulary::IMS.into());
     if let Some(list) = writer.scan_settings_mut() {
-        list.push(maldi.scan_settings());
+        list.push(grid);
     }
 }
 

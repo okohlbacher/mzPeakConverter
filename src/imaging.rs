@@ -108,6 +108,60 @@ impl Extent {
     }
 }
 
+/// One axis of a pixel grid fitted to stage positions in mm (Waters states laser positions, not pixel
+/// indices): the position of pixel 1, the step (`None` for a single column), the pixel count, and
+/// the farthest any position lies from its grid point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridAxis {
+    pub origin: f64,
+    pub pitch: Option<f64>,
+    pub count: i64,
+    pub max_residual: f64,
+}
+
+impl GridAxis {
+    /// The 1-based pixel index of a position.
+    pub fn index(&self, v: f64) -> i64 {
+        self.pitch.map_or(1, |p| ((v - self.origin) / p).round() as i64 + 1)
+    }
+}
+
+/// Fit a grid axis to positions (mm). The step is the most common gap between neighbouring distinct
+/// positions, positions closer than 1 µm counting as one (float32 noise must not pose as a step);
+/// every position must then lie within a quarter step of its grid point. `None` when they do not —
+/// the positions are not a raster — or there are none.
+pub fn fit_axis(values: &[f64]) -> Option<GridAxis> {
+    let origin = values.iter().copied().fold(f64::INFINITY, f64::min);
+    if !origin.is_finite() {
+        return None;
+    }
+    // Distinct positions in 0.1 µm units, merged within 1 µm.
+    let mut keys: Vec<i64> = values.iter().map(|v| ((v - origin) * 1e4).round() as i64).collect();
+    keys.sort_unstable();
+    let mut distinct: Vec<i64> = Vec::new();
+    for k in keys {
+        if distinct.last().is_none_or(|&last| k - last >= 10) {
+            distinct.push(k);
+        }
+    }
+    let spread = |pitch: f64| values.iter().map(move |&v| {
+        let k = ((v - origin) / pitch).round();
+        (k as i64 + 1, (v - (origin + k * pitch)).abs())
+    });
+    if distinct.len() < 2 {
+        let max_residual = values.iter().map(|&v| v - origin).fold(0.0, f64::max);
+        return Some(GridAxis { origin, pitch: None, count: 1, max_residual });
+    }
+    let mut gaps: HashMap<i64, usize> = HashMap::new();
+    for w in distinct.windows(2) {
+        *gaps.entry(w[1] - w[0]).or_default() += 1;
+    }
+    let (&step, _) = gaps.iter().max_by_key(|(g, n)| (**n, std::cmp::Reverse(**g)))?;
+    let pitch = step as f64 / 1e4;
+    let (count, max_residual) = spread(pitch).fold((1, 0.0f64), |(c, r), (k, d)| (c.max(k), r.max(d)));
+    (max_residual <= pitch / 4.0).then_some(GridAxis { origin, pitch: Some(pitch), count, max_residual })
+}
+
 /// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
 /// marker, the coordinate base, the grid as the viewer reads it, and where it all came from.
 pub fn marker_block(grid: Option<&ScanSettings>, provenance: serde_json::Value) -> serde_json::Value {
@@ -141,7 +195,7 @@ pub struct RawSettings {
     pub params: Vec<RawParam>,
 }
 
-fn attr(e: &quick_xml::events::BytesStart, key: &[u8]) -> Option<String> {
+pub(crate) fn attr(e: &quick_xml::events::BytesStart, key: &[u8]) -> Option<String> {
     e.attributes()
         .flatten()
         .find(|a| a.key.as_ref() == key)
@@ -459,6 +513,25 @@ pub fn provenance_params(meta: &mzdata::io::imzml::reader::ImzMLFileMetadata) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_raster_of_float32_stage_positions_fits_its_grid() {
+        // The shape of a Waters DESI run (MTBLS14771): 0.1 mm steps from 80.3673 mm, stored as f32.
+        let xs: Vec<f64> = (0..104).map(|k| (80.3673f32 + k as f32 * 0.1) as f64).collect();
+        let a = fit_axis(&xs).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.1), 104));
+        assert!(a.max_residual < 1e-4, "{a:?}");
+        assert_eq!((a.index(xs[0]), a.index(xs[103])), (1, 104));
+        // Missing columns keep their place; the step is still the common gap.
+        let gappy: Vec<f64> = [0.0, 0.05, 0.10, 0.25, 0.30].to_vec();
+        let g = fit_axis(&gappy).unwrap();
+        assert_eq!((g.pitch, g.count, g.index(0.25)), (Some(0.05), 7, 6));
+        // One column: a single pixel, no step.
+        assert_eq!(fit_axis(&[5.0, 5.0000004]).unwrap().count, 1);
+        // Not a raster: positions far off any common step.
+        assert!(fit_axis(&[0.0, 0.1, 0.2, 0.37, 0.4]).is_none());
+        assert!(fit_axis(&[]).is_none());
+    }
 
     fn settings(params: &[(&str, &str, Option<(&str, &str)>)]) -> RawSettings {
         RawSettings {

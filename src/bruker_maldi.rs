@@ -13,10 +13,12 @@
 //! * The grid: `IMS:1000042/43` pixel counts (the shifted extent), always.
 //! * The `bruker_maldi` index block keeps what has no mzPeak home yet: the regions
 //!   (`RegionNumber`, frames and index ranges each), the raw index ranges, the beam scan size.
-//! * Pixel size: the FlexImaging `.mis` holds the raster step but is not part of the `.d`; the
-//!   frames' `BeamScanSizeX/Y` (µm) is the stated fallback, written as `IMS:1000046/47` — with
-//!   `IMS:1000044/45` max dimension = count × size — and declared as such ([`PIXEL_FROM_BEAM`]).
-//!   Only when every frame states the same size.
+//! * Pixel size: the raster step of the FlexImaging sequence, `<stem>.mis` beside the `.d` (not part
+//!   of it) — `RegionNumber` n is the n-th `<Area>`, each with its `<Raster>` in µm and its name —
+//!   when every acquired region has the same step; regions on different steps get no pixel size (the
+//!   profile describes one grid). Without a `.mis`, the frames' `BeamScanSizeX/Y` (µm) is the
+//!   fallback, declared as such ([`PIXEL_FROM_BEAM`]), and only when every frame states the same size.
+//!   Either way written as `IMS:1000046/47`, with `IMS:1000044/45` max dimension = count × size.
 //!
 //! Column names are Bruker's (`MaldiFrameInfo(Frame, …, RegionNumber, XIndexPos, YIndexPos, …,
 //! BeamScanSizeX, BeamScanSizeY)`), confirmed by the issue author on a real acquisition; the corpus
@@ -30,8 +32,18 @@ use mzdata::params::{Param, ParamDescribed, Unit};
 use mzdata::prelude::*;
 use mzdata::spectrum::{MultiLayerSpectrum, ScanEvent};
 use rusqlite::Connection;
+use quick_xml::events::Event;
 
 pub const PIXEL_FROM_BEAM: &str = "bruker:pixel-size-from-beam-scan-size";
+
+/// Where a Bruker MALDI run's pixel size came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PixelSource {
+    /// The FlexImaging `.mis` raster step.
+    Mis,
+    /// The frames' `BeamScanSizeX/Y` (declared, [`PIXEL_FROM_BEAM`]).
+    Beam,
+}
 /// Positions are the raster indices minus the run's smallest index plus 1.
 pub const SHIFTED_TO_BASE_1: &str = "bruker:raster-index-shifted-to-base-1";
 
@@ -51,6 +63,66 @@ pub struct MaldiInfo {
     /// Smallest and largest `(XIndexPos, YIndexPos)` of the run: `min` becomes position (1, 1).
     pub min: (i64, i64),
     pub max: (i64, i64),
+    /// The FlexImaging sequence beside the `.d`, if there is one.
+    pub mis: Option<Mis>,
+}
+
+/// One `<Area>` of a FlexImaging `.mis`: its name and raster step (µm).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MisArea {
+    pub name: Option<String>,
+    pub raster: Option<(f64, f64)>,
+}
+
+/// A FlexImaging sequence: its areas in file order. `MaldiFrameInfo.RegionNumber` n is the n-th
+/// `<Area>` — checked on MassIVE MSV000088438 against timsControl's poslog (`R00`…) and flexImaging's
+/// spot list (region names).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Mis {
+    pub file: String,
+    pub areas: Vec<MisArea>,
+}
+
+/// Read a `.mis`; `None` when it cannot be read or has no `<Area>`.
+pub fn read_mis(path: &Path) -> Option<Mis> {
+    let f = std::fs::File::open(path).ok()?;
+    let file = path.file_name()?.to_string_lossy().into_owned();
+    read_mis_from(&file, std::io::BufReader::new(f))
+}
+
+pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
+    let mut reader = quick_xml::Reader::from_reader(input);
+    let mut buf = Vec::new();
+    let mut mis = Mis { file: file.into(), areas: Vec::new() };
+    let (mut in_area, mut in_raster) = (false, false);
+    loop {
+        match reader.read_event_into(&mut buf).ok()? {
+            Event::Start(e) if e.local_name().as_ref() == b"Area" => {
+                in_area = true;
+                mis.areas.push(MisArea { name: crate::imaging::attr(&e, b"Name"), raster: None });
+            }
+            Event::Empty(e) if e.local_name().as_ref() == b"Area" => {
+                mis.areas.push(MisArea { name: crate::imaging::attr(&e, b"Name"), raster: None });
+            }
+            Event::Start(e) if in_area && e.local_name().as_ref() == b"Raster" => in_raster = true,
+            Event::Text(t) if in_raster => {
+                let text = String::from_utf8_lossy(&t).into_owned();
+                let mut v = text.split(',').map(|v| v.trim().parse::<f64>());
+                if let (Some(Ok(x)), Some(Ok(y)), Some(a)) = (v.next(), v.next(), mis.areas.last_mut()) {
+                    a.raster = (x > 0.0 && y > 0.0).then_some((x, y));
+                }
+            }
+            Event::End(e) => match e.local_name().as_ref() {
+                b"Area" => in_area = false,
+                b"Raster" => in_raster = false,
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    (!mis.areas.is_empty()).then_some(mis)
 }
 
 /// `MaldiFrameInfo` of an open TSF/TDF database; `None` without the table or its position columns.
@@ -102,15 +174,18 @@ pub fn read(conn: &Connection) -> Option<MaldiInfo> {
     Some(info)
 }
 
-/// [`read`] on a Bruker `.d` (its `analysis.tsf`, else `analysis.tdf`); `None` for anything else.
+/// [`read`] on a Bruker `.d` (its `analysis.tsf`, else `analysis.tdf`), with the `<stem>.mis` beside
+/// it; `None` for anything else.
 pub fn read_dot_d(dot_d: &Path) -> Option<MaldiInfo> {
-    ["analysis.tsf", "analysis.tdf"].iter().find_map(|name| {
+    let mut info = ["analysis.tsf", "analysis.tdf"].iter().find_map(|name| {
         let db = dot_d.join(name);
         if !std::fs::metadata(&db).is_ok_and(|m| m.is_file() && m.len() > 0) {
             return None;
         }
         read(&crate::vendor_sqlite::open(&db).ok()?)
-    })
+    })?;
+    info.mis = read_mis(&dot_d.with_extension("mis"));
+    Some(info)
 }
 
 impl MaldiInfo {
@@ -136,10 +211,48 @@ impl MaldiInfo {
         (self.max.0 - self.min.0 + 1, self.max.1 - self.min.1 + 1)
     }
 
-    /// Pixel size from the beam scan size, when every frame states the same one.
-    pub fn pixel_size(&self) -> Option<(f64, f64)> {
+    /// Pixel size in µm and its source: the `.mis` raster step when every acquired region maps to an
+    /// area with one and they agree (none when they differ); without a usable `.mis`, the beam scan
+    /// size when every frame states the same one.
+    pub fn pixel_size_from(&self) -> Option<((f64, f64), PixelSource)> {
+        if let Some(steps) = self.mis_rasters() {
+            let [step] = steps.as_slice() else { return None };
+            return Some((*step, PixelSource::Mis));
+        }
         let [b] = self.beam.as_slice() else { return None };
-        Some(*b)
+        Some((*b, PixelSource::Beam))
+    }
+
+    pub fn pixel_size(&self) -> Option<(f64, f64)> {
+        self.pixel_size_from().map(|(p, _)| p)
+    }
+
+    /// The distinct raster steps of the acquired regions; `None` when there is no `.mis` or a region
+    /// does not map to an `<Area>` with a step.
+    fn mis_rasters(&self) -> Option<Vec<(f64, f64)>> {
+        let mis = self.mis.as_ref()?;
+        let mut steps = Vec::new();
+        for r in self.spots.values().map(|s| s.region).collect::<std::collections::BTreeSet<_>>() {
+            let step = mis.areas.get(usize::try_from(r?).ok()?)?.raster?;
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
+        Some(steps)
+    }
+
+    fn pixel_size_note(&self) -> String {
+        match (self.pixel_size_from(), &self.mis) {
+            (Some((_, PixelSource::Mis)), Some(m)) => format!("the raster step in {}", m.file),
+            (Some((_, PixelSource::Beam)), _) => "the beam scan size (no FlexImaging .mis beside the .d)".into(),
+            (None, Some(m)) if self.mis_rasters().is_some() => format!("not written: the regions of {} have different raster steps", m.file),
+            _ => "not written: no single beam scan size stated".into(),
+        }
+    }
+
+    /// The name the `.mis` gives region `r`.
+    fn region_name(&self, r: Option<i64>) -> Option<&str> {
+        self.mis.as_ref()?.areas.get(usize::try_from(r?).ok()?)?.name.as_deref()
     }
 
     /// The grid: pixel counts always; pixel size and max dimension when [`Self::pixel_size`] is known.
@@ -165,7 +278,7 @@ impl MaldiInfo {
         if self.min != (1, 1) {
             applied.push(SHIFTED_TO_BASE_1);
         }
-        if self.pixel_size().is_some() {
+        if matches!(self.pixel_size_from(), Some((_, PixelSource::Beam))) {
             applied.push(PIXEL_FROM_BEAM);
         }
         let marker = crate::imaging::marker_block(
@@ -174,7 +287,7 @@ impl MaldiInfo {
                 "detected_from": "MaldiFrameInfo in analysis.tsf/.tdf",
                 "positions": "XIndexPos/YIndexPos − origin + 1",
                 "origin": {"x": self.min.0, "y": self.min.1},
-                "pixel_size": if self.pixel_size().is_some() { "BeamScanSizeX/Y" } else { "not stated" },
+                "pixel_size": self.pixel_size_note(),
             }),
         );
         (vec![("imaging".into(), marker), ("bruker_maldi".into(), self.block())], applied)
@@ -196,18 +309,17 @@ impl MaldiInfo {
             "frames_with_position": self.spots.len(),
             "x_index": range(|s| s.x, &mut self.spots.values()),
             "y_index": range(|s| s.y, &mut self.spots.values()),
+            "mis": self.mis.as_ref().map(|m| &m.file),
             "regions": regions.iter().map(|(r, spots)| serde_json::json!({
                 "region_number": r,
+                "name": self.region_name(*r),
+                "raster_step_um": self.mis.as_ref().and_then(|m| m.areas.get(usize::try_from((*r)?).ok()?)?.raster).map(|(x, y)| serde_json::json!({"x": x, "y": y})),
                 "frames": spots.len(),
                 "x_index": range(|s| s.x, &mut spots.iter().copied()),
                 "y_index": range(|s| s.y, &mut spots.iter().copied()),
             })).collect::<Vec<_>>(),
             "beam_scan_size_um": self.beam.iter().map(|(x, y)| serde_json::json!({"x": x, "y": y})).collect::<Vec<_>>(),
-            "pixel_size": if self.pixel_size().is_some() {
-                "the beam scan size (the FlexImaging .mis raster step is not part of the .d)"
-            } else {
-                "not written: no single beam scan size stated"
-            },
+            "pixel_size": self.pixel_size_note(),
         })
     }
 }
@@ -268,6 +380,46 @@ mod tests {
         let accs: Vec<String> = info.scan_settings().params.iter().map(|p| p.curie().unwrap().to_string()).collect();
         assert_eq!(accs, ["IMS:1000042", "IMS:1000043"]);
         assert_eq!(info.index_blocks().1, vec![SHIFTED_TO_BASE_1]);
+    }
+
+    /// The shape of a flexImaging 5.1 sequence (MassIVE MSV000088438): no XML declaration, CRLF,
+    /// polygon (`Type="3"`) and rectangle (`Type="0"`) areas, each with its own raster step.
+    const MIS: &str = "<ImagingSequence flexImagingVersion=\"5.1.52.0_1664_120\">\r\n<Comment>1000 um</Comment>\r\n\
+        <TeachPoint>1204,778;-22965,15855</TeachPoint>\r\n\
+        <Area Type=\"3\" Name=\"vc_rugose_1\" Enabled=\"0\">\r\n<Raster>1000,1000</Raster>\r\n<Point>1250,1817</Point>\r\n</Area>\r\n\
+        <Area Type=\"0\" Name=\"agar_1\" Enabled=\"0\">\r\n<Raster>1000,1000</Raster>\r\n<Point>1962,4015</Point>\r\n</Area>\r\n\
+        </ImagingSequence>\r\n";
+
+    #[test]
+    fn the_mis_gives_the_raster_step_and_the_region_names() {
+        let mis = read_mis_from("run.mis", MIS.as_bytes()).unwrap();
+        assert_eq!(mis.areas.len(), 2);
+        assert_eq!((mis.areas[0].name.as_deref(), mis.areas[0].raster), (Some("vc_rugose_1"), Some((1000.0, 1000.0))));
+        assert_eq!(mis.areas[1].name.as_deref(), Some("agar_1"));
+
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c); // regions 0 and 1, beam 20 µm
+        let mut info = read(&c).unwrap();
+        assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)), "no .mis: the beam scan size");
+        info.mis = Some(mis.clone());
+        assert_eq!(info.pixel_size_from(), Some(((1000.0, 1000.0), PixelSource::Mis)), "the raster step wins");
+        assert_eq!(info.index_blocks().1, vec![SHIFTED_TO_BASE_1], "a stated step is not declared as a fallback");
+        let b = info.block();
+        assert_eq!(b["mis"], "run.mis");
+        assert_eq!(b["regions"][0]["name"], "vc_rugose_1");
+        assert_eq!(b["regions"][1]["name"], "agar_1");
+        assert_eq!(b["regions"][1]["raster_step_um"], serde_json::json!({"x": 1000.0, "y": 1000.0}));
+        let grid = info.scan_settings();
+        let v = |acc: &str| grid.params.iter().find(|p| p.curie().unwrap().to_string() == acc).map(|p| p.value.to_f64().unwrap());
+        assert_eq!((v("IMS:1000046"), v("IMS:1000044")), (Some(1000.0), Some(169_000.0)));
+
+        // Regions on different steps: no pixel size at all, not the beam fallback.
+        info.mis.as_mut().unwrap().areas[1].raster = Some((500.0, 500.0));
+        assert_eq!(info.pixel_size_from(), None);
+        assert!(info.block()["pixel_size"].as_str().unwrap().contains("different raster steps"));
+        // A .mis the regions do not map onto is ignored.
+        info.mis = Some(Mis { file: "other.mis".into(), areas: vec![mis.areas[0].clone()] });
+        assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)));
     }
 
     #[test]
