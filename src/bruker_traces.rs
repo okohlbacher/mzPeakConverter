@@ -23,12 +23,11 @@
 //! its own unit; an intensity array in percent would instead land in the `intensity` column, which
 //! is declared as detector counts, and silently lose it.
 //!
-//! A database in WAL mode is skipped with a warning: SQLite creates its `-wal` and `-shm` files
-//! beside it even for a read-only connection, which would write into the input directory. Every
-//! HyStar file known (the corpus TDF runs and the private TSF run) uses a rollback journal.
+//! The database is opened through [`crate::vendor_sqlite`], which writes nothing beside it whatever
+//! its journal mode. Every HyStar file known (the corpus TDF runs and the private TSF run) uses a
+//! rollback journal; a WAL-mode one was skipped with a warning until review 2026-09-30.
 
 use std::collections::HashSet;
-use std::io::Read;
 use std::path::Path;
 
 use mzdata::params::{Param, Unit};
@@ -67,16 +66,6 @@ struct Source {
 pub fn read(dot_d: &Path) -> Vec<Trace> {
     let path = dot_d.join("chromatography-data.sqlite");
     if !path.is_file() {
-        return Vec::new();
-    }
-    // Header bytes 18 and 19 (the file format's write and read versions) are 2 in WAL mode.
-    let mut header = [0u8; 20];
-    if std::fs::File::open(&path).and_then(|mut f| f.read_exact(&mut header)).is_ok() && (header[18] == 2 || header[19] == 2) {
-        log::warn!(
-            "{}: a WAL-mode database, which SQLite cannot read without creating files beside it in the input; \
-             device traces not read, the archive has no LC chromatograms",
-            path.display()
-        );
         return Vec::new();
     }
     match crate::vendor_sqlite::open(&path).and_then(|conn| read_traces(&conn)) {
@@ -564,20 +553,34 @@ mod tests {
         assert!(read_traces(&Connection::open_in_memory().unwrap()).is_err());
     }
 
-    /// A WAL-mode database is skipped: opening it, even read-only, leaves `-wal` and `-shm` files
-    /// beside it in the input directory.
+    /// A WAL-mode database is read, and nothing is created beside it: checkpointed, and with rows
+    /// still in a non-empty `-wal` while HyStar's connection is open. Until review 2026-09-30 both
+    /// were skipped.
     #[test]
-    fn a_wal_database_is_skipped_and_nothing_created() {
+    fn a_wal_database_is_read_and_nothing_created() {
         let d = Scratch::new("wal");
+        let flow = |c: &Connection, t: f64| {
+            let (t, v): (Vec<u8>, Vec<u8>) = (t.to_le_bytes().to_vec(), 400f32.to_le_bytes().to_vec());
+            c.execute("INSERT INTO TraceChunks VALUES (1, ?1, ?2)", rusqlite::params![t, v]).unwrap();
+        };
+        let times = |traces: &[Trace]| traces.iter().map(|t| arrays(&t.chromatogram).1).collect::<Vec<_>>();
         {
             let c = Connection::open(d.0.join("chromatography-data.sqlite")).unwrap();
             assert_eq!(c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
             c.execute_batch(SCHEMA).unwrap();
             c.execute("INSERT INTO TraceSources (Id, Description, Type, Unit) VALUES (1, 'Flow - [µl/min]', 6, 2)", []).unwrap();
+            flow(&c, 1.0);
         }
         assert_eq!(d.listing(), ["chromatography-data.sqlite"], "closing the writer removes its -wal and -shm");
-        let traces = read(&d.0);
+        assert_eq!(times(&read(&d.0)), [vec![1.0]]);
         assert_eq!(d.listing(), ["chromatography-data.sqlite"], "read() created a file in the input directory");
-        assert!(traces.is_empty());
+
+        let writer = Connection::open(d.0.join("chromatography-data.sqlite")).unwrap();
+        writer.execute_batch("PRAGMA wal_autocheckpoint=0").unwrap();
+        flow(&writer, 2.0);
+        let before = d.listing();
+        assert!(before.contains(&"chromatography-data.sqlite-wal".to_string()), "{before:?}");
+        assert_eq!(times(&read(&d.0)), [vec![1.0, 2.0]], "the chunk in the -wal is read");
+        assert_eq!(d.listing(), before, "read() created a file in the input directory");
     }
 }
