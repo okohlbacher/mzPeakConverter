@@ -13,6 +13,15 @@ reads roll a hot journal back in a copy, and an empty chunked facet is a chunked
 imaging, empty chunked facets or a native Shimadzu model term change; rebuilding from the raw file
 applies the fixes (the `.mzpeak` → `.mzpeak` filter keeps member schemas as they are).
 
+**Output change (mzML).** Every mzML the tool writes records its conversion as the default
+processing of both lists, which mzML 1.1 requires and stock OpenMS 3.5.0 needs to read the file — it
+refused every export of a raw file or an archive through 0.16.0. A timsTOF `.d` → mzML writes its
+diaPASEF window limits in order and on the vendor mobility model, and, where its m/z calibration is
+ModelType 2, its m/z on timsrust's chord instead of an order of magnitude low; an archive → mzML
+carries each peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).** The window
+limits and the scan and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the
+arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
+
 ### Added
 
 - `metadata.imaging.pixel_count_source` (imaging profile, review B18): `declared` when the source
@@ -131,6 +140,110 @@ applies the fixes (the `.mzpeak` → `.mzpeak` filter keeps member schemas as th
   over ssh stdin, which stalled on slow links; every job is capped by a watchdog
   (`BOX_JOB_TIMEOUT`, default 6 h) and every upload by `BOX_SCP_TIMEOUT` (default 300 s); a pool
   slot frees when any job ends, not only the oldest.
+- **Every mzML export records its conversion as the default processing.** mzML 1.1 requires at
+  least one `dataProcessing` and a `defaultDataProcessingRef` on `spectrumList` and
+  `chromatogramList`; mzdata's writer names the list's first entry there and writes the attribute
+  only when the list is not empty, and only an mzML source brings entries (the archive reader
+  restores none of the archive's lists). So every export of a Bruker TDF/TSF/BAF, Thermo `.raw`,
+  Agilent profile `.d`, Windows vendor file or `.mzpeak` came out with `<dataProcessingList
+  count="0">` and no default — an archive's export with `<softwareList count="0">` as well — and
+  OpenMS 3.5.0 `FileInfo` / `SwathFile::loadMzML` stop at "Required attribute
+  'defaultDataProcessingRef' not present!" (found by DIALibGen's identification on timsTOF diaPASEF
+  runs). The prologue all four mzML lanes share (`fixup_mzml_run_metadata`) now puts
+  `mzpeak_convert_to_mzml` first: software `mzpeak-convert` (this version) doing MS:1000544
+  `Conversion to mzML`, with the path-free `conversion options` the archive lanes record, after the
+  methods of the processing a source's spectra point at by default, as msconvert extends a re-written
+  mzML's history. That also ends a drift older than this fix: the writer ignores the default an mzML
+  source declares, so its spectra moved to whatever processing came first (`tiny.pwiz.1.1.mzML`:
+  from `pwiz_processing` to `CompassXtract_x0020_processing`). The source's entries stay listed after
+  the step; an array's redundant reference to the source's default is left out, so it inherits the
+  step that extends it. A re-export of this tool's own mzML reuses its software entry and gives the
+  step a fresh id (`mzpeak_convert_to_mzml_2`). OpenMS 3.5 `FileInfo` refuses the 0.16.0 exports of
+  PXD059079 2485.d, of both its archive kinds and of a Thermo `.raw`, and reads all of this
+  version's (the `.d`: 16,377 spectra); on a timsTOF diaPASEF run capped at 20,000 spectra,
+  OpenSWATH assigns the precursors of the export. This is the processing requirement, not full XSD
+  validity: mzdata's writer still gives the run the id `1` (not an NCName), writes an empty
+  `precursorList` on every MS1 spectrum and an empty `softwareRef` where a source states nothing,
+  as 0.16.0 does.
+- **A timsTOF `.d` → mzML writes each diaPASEF window's 1/K0 limits in order, on the vendor
+  model, bracketing the window's own peaks.** `--to mzml` wrote mzdata's TDF params as they come:
+  the spectrum-level `ion mobility lower limit` from the window's first scan, the larger 1/K0
+  (1.3437 over an upper limit of 1.2910 for the first window of PXD059079 2485.d), on every MS2
+  spectrum — OpenSWATH assigns precursors with a strict `lower < IM < upper` and matched none; on
+  2485.d all 15,977 windows were inverted and all 6,752,874 MS2 peaks outside — and on timsrust's
+  linear map, while the spectrum's mobility array is on mzdata's ModelType-2 calibration. The lane
+  now applies `bruker_native::TdfMobilityRemap`, as the `--no-ims-compact` archive lane has since
+  0.9.6: the pair ordered, it and the scan and selected-ion 1/K0 on the ModelType-2 model
+  (1.305615 < 1.332387 < 1.359142 for the first window of PXD059079 2485.d, the ims-compact lane's
+  values), and the window band on the selected ion as `userParam`s. Ordering alone would not have
+  done: 8.9 % of the MS2 peaks of a real run's first 2,000 window spectra lie outside their
+  window's ordered linear limits. The remap now also evaluates the model in mzdata's own
+  arithmetic, at the scan snapped back onto the half-scan grid the linear round trip leaves by
+  ~1e-13: a window's upper limit is bit for bit the array value of its first scan. Evaluated in
+  the SDK's order, as the remap did, the limit fell 1 to 4 ulp short at half to two thirds of all
+  scans, and 1.5 million of the 2.2 billion MS2 peaks of a full diaPASEF run lay above their window
+  by up to 2.2e-16 (a 0.16.0 `--no-ims-compact` archive of 2485.d: 8,624 peaks in 4,885 windows);
+  now none lies outside, with no tolerance, and 11,011 of 2485.d's 15,977 windows have a peak on
+  the upper limit. `--no-tims-recalibration` stays inert on this lane (and says so; the export is
+  identical): the arrays cannot leave the model, and limits on the linear map would miss 9 % of
+  the peaks.
+- **The mzML `<scan>` of a diaPASEF spectrum lists its cvParams first.** mzdata's TDF reader puts the
+  `window group` userParam before the MS:1002815 cvParam, which the mzML schema forbids (one XSD
+  error per MS2 scan). Every mzML lane that demotes MZP params now also puts each param list's
+  cvParams first, keeping each kind's order.
+- **An archive → mzML export carries each peak's ion mobility.** The archive reader collapses the
+  peak facet into a peak list with no room for it, so the export of a timsTOF archive — and of any
+  archive holding a mobility array per peak — wrote m/z and intensity only. Such a spectrum is now
+  exported from the facet's arrays (MS:1003006 `mean inverse reduced ion mobility array`, m/z
+  ordered, 32-bit float intensities as before). A `--no-ims-compact` archive holds one spectrum per
+  diaPASEF window and now exports like the `.d` (2485.d: the same 15,977 windows and limits, every
+  peak inside). An ims-compact archive holds whole frames, on the chunk grid since 0.14.0: each is
+  exported as one spectrum, with every window's precursor and no mobility limits of its own
+  (2485.d: 3,594 MS2 frames, 9,226,605 peaks, each with its 1/K0; the corpus's 0.15.0 archive
+  exports the same), and the export warns that a reader assigning precursors by mobility window
+  (OpenSWATH's diaPASEF mode) needs the `.d` exported with `--to mzml`, or a `--no-ims-compact`
+  archive. The warning is for an ims-compact archive alone (the one kind with an `ims_calibration`
+  block): an MS2 spectrum of any other source with a mobility array but no window limits lacked
+  them in its source too. Through 0.16.0 the export wrote the same frames without mobility, and
+  OpenMS refused them for want of a default processing. Such a spectrum's peaks are read twice, as
+  a peak list and as arrays: the `--no-ims-compact` archive of 2485.d exports in 211 s instead of
+  139 s, the ims-compact one in 37 s instead of 29 s.
+- **A timsTOF `.d` with a ModelType-2 m/z calibration exports its m/z to mzML at the right
+  magnitude.** 0.14.0 put the mzdata archive lanes (`--no-ims-compact`, the fallback) on
+  timsrust's two-point chord for such a file, because mzdata 0.67.1 reads every `MzCalibration`
+  row as ModelType 1; `--to mzml` kept mzdata's reading and wrote the first frame of the corpus's
+  SBA415 run as m/z 21.03 … 35.95 instead of 270.18 … 1055.84 — and the ims-compact archive
+  export's own warning sends diaPASEF users to that lane. It now switches to the chord too, and
+  says so (mzML has no `transformations` list for `bruker:mz-calibration-chord`): over SBA415's
+  first 200 spectra (1.69 M peaks) the export agrees with the `--no-ims-compact` archive's to
+  2.6e-4 ppm. The chord is −5 … −11 ppm off the vendor model; the default ims-compact archive keeps
+  the model up to its declared calibrant correction. `tests/tdf_mzml_modeltype2_mz.rs`
+  (corpus-gated) checks the first frames' m/z against the run's acquisition range.
+- **A file name that is not Unicode no longer aborts a conversion.** The recorded `conversion
+  options` came from `std::env::args`, which panics on such an argument (a Latin-1 name on Linux):
+  every archive conversion of the file aborted, and recording the mzML step would have aborted every
+  mzML export too. It is now read through `args_os` and recorded lossily. A path is reduced to its
+  last component wherever it contains `/` (Windows takes `C:/Users/…` as readily as `C:\Users\…`,
+  and such a path used to be recorded whole), `--flag=path` keeps its flag, and a path ending in
+  `..` no longer comes back in full.
+- **A timsTOF run whose frames reference several `TimsCalibration` rows is named.** Every 1/K0 the
+  converter computes uses the first ModelType-2 row, where the SDK and mzdata use each frame's own;
+  every run seen references one row, and one referencing more now draws a warning.
+- `tests/mzml_data_processing.rs`: the processing contract (non-empty list, every `softwareRef` and
+  element-level `dataProcessingRef` resolving, both lists' default ending in this version's
+  `Conversion to mzML`, unique ids) on the `--to mzml` export of an mzML (the chain extends the
+  source's default), of that export again, of a Thermo `.raw`, of a file with a Latin-1 name, and on
+  an archive's export; an archive holding a mobility array per peak exports it value for value, and
+  one whose MS2 spectrum has a precursor and a mobility array but no window limits exports it
+  without the whole-frame warning. Corpus-gated, a 2485.d export with and without
+  `--no-tims-recalibration` and both of its archive kinds: every MS2 window ordered, equal to its
+  band, around its 1/K0, and bracketing its own mobility array exactly, with peaks on the upper
+  limit; the whole-frame warning on the ims-compact archive's export and not on the
+  `--no-ims-compact` one's. Unit tests: the prologue on a source with no processing, with its own
+  (default not first), and with this tool's step already in it; the lane's per-spectrum step
+  through the mzML writer; the remap bit for bit against mzdata's model at every scan of two runs,
+  and within 4 ulp of the SDK order; the recorded command line. The mzML reader they share is
+  `tests/common/mzml_meta.rs`.
 
 ### Documentation
 

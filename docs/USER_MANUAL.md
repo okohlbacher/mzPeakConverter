@@ -138,7 +138,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: 50-Th chunks (`--chunk-size` overrides the width) on the reference implementation's chunk grid — every chunk row keeps its real m/z bounds (page-prunable: m/z window queries read only the chunks they need) and its points as integer TOF bins and TIMS scan numbers under the frame's own vendor calibration models (§9). Passing the flag explicitly is inert and says so |
 | `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: one chunk per frame instead of 50-Th chunks — the same grid rows, whole-frame access in one row, no m/z pruning within a frame. (Through 0.13 this selected a flat point table of absolute TOF bins; that layout is gone) |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
-| `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. With the grid layout (default since 0.13.0, §9) this flag also keeps the 0.12.x TOF layout, with a warning: the grid stores 1/K0 as TIMS scan numbers under the exact model, which the linear approximation is not on. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
+| `--no-tims-recalibration` | off | Bruker timsTOF (TDF): disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. On the ims-compact grid (§9) the flag stores 1/K0 as plain values (`ion_mobility_grid.column: null`), with a warning: the grid stores 1/K0 as TIMS scan numbers under the exact model, which the linear approximation is not on. The ims-compact path applies the choice to arrays and params alike; `--no-ims-compact` takes its mobility ARRAYS from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally, so there the flag switches only the precursor/scan/window-limit 1/K0 params (and warns that the arrays stay on the model). INERT with `--to mzml`, and says so: that export keeps every 1/K0 on the model its mobility arrays use, so each diaPASEF window's limits bracket its own peaks (on timsrust's linear map they would miss 9 % of them) |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
@@ -203,6 +203,26 @@ also be exported to mzML (`mzpeak-convert a.mzpeak -o a.mzML`), optionally throu
 §4.2. All mzML exports are atomic: the file is written as `x.mzML.tmp` (`x.mzML.tmp.gz`) and
 renamed into place only on success, so a failed run never leaves a partial `.mzML` and never
 destroys a previous output under `--force`.
+
+Every mzML the tool writes itself records the conversion as the default processing of its
+`spectrumList` and `chromatogramList` (`defaultDataProcessingRef`), which mzML 1.1 requires and
+stock OpenMS 3.5 needs to read the file: a `dataProcessing` (`mzpeak_convert_to_mzml`) whose last
+method is software `mzpeak-convert` doing MS:1000544 `Conversion to mzML`, with the command line
+(paths reduced to their file names) as a `conversion options` userParam. For a source that states
+processing of its own (an mzML), the entry first repeats the methods of the processing the source's
+spectra point at by default, as msconvert does, and the source's entries follow it unchanged; a
+source that states none (every raw vendor format, an archive) gets the step alone. A timsTOF `.d` is
+exported with its mobility params as the archive lanes write them: each diaPASEF spectrum's
+`ion mobility lower limit` / `upper limit` pair in order (mzdata's reader emits it inverted) and,
+with the precursor and scan 1/K0, on the vendor's ModelType-2 model that its mobility array uses,
+evaluated as mzdata evaluates the array, so each window's limits bracket its own peaks exactly;
+and the window's band as `userParam`s on the selected ion. `--no-tims-recalibration` is inert here.
+An archive's export (`a.mzpeak -o a.mzML`) carries each peak's ion mobility where the archive holds
+it (every timsTOF archive). A `--no-ims-compact` archive holds one spectrum per diaPASEF window, and
+exports like the `.d`. An ims-compact archive holds whole frames: each is exported as one spectrum,
+with every window's precursor and no mobility limits of its own, and the export says so. A reader
+that assigns precursors by mobility window (OpenSWATH's diaPASEF mode) needs the `.d` exported with
+`--to mzml`, or a `--no-ims-compact` archive.
 
 ```sh
 mzpeak-convert run.raw -o run.mzML            # Thermo → mzML
@@ -682,7 +702,9 @@ on SBA415) and `bruker:mz-calibrant-omitted` in `transformations`; the row itsel
 included, is in `vendor_mz_calibration`. **Archives written by 0.13.0 read ModelType-2 rows as
 ModelType 1 and are wrong by an order of magnitude (m/z 270 stored as 21): reconvert them.** mzdata
 0.67.1 has the same defect, so the `--no-ims-compact` and fallback lanes read such files on
-timsrust's chord instead (`bruker:mz-calibration-chord`).
+timsrust's chord instead (`bruker:mz-calibration-chord`), and so does `--to mzml`, with a warning
+in place of the declaration an mzML has no list for (through 0.16.0 that export was an order of
+magnitude low).
 
 **History.** Through 0.13 the archive stored integer `tof` columns with the chord in
 `ims_calibration` (`"exact": false`), and — when every row was ModelType 1 with `C2 = 0` — per-frame
