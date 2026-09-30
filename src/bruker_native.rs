@@ -362,6 +362,10 @@ pub struct NativeTofReader {
 /// * `Polarity` — `+`/`-`; timsrust does not expose it.
 #[derive(Default)]
 struct FrameTable {
+    /// `Id` — the frame's id, which timsrust also reports for every frame it decodes (its unordered
+    /// `SELECT … FROM Frames` walks the `INTEGER PRIMARY KEY`, i.e. `Id` order). Not `position + 1`:
+    /// `Frames.Id` may have gaps (review 2026-09-30 B16), and the id is what MALDI positions attach by.
+    id: Vec<i64>,
     num_peaks: Vec<u32>,
     rt: Vec<f64>,
     ms_level: Vec<u8>,
@@ -1014,11 +1018,12 @@ impl NativeTofReader {
         // frame directly rather than letting it error the whole run. scan_offsets=[0] => 0 scans.
         if self.table.num_peaks.get(i).copied() == Some(0) {
             return Ok(RawFrame {
-                // timsrust reports the 1-based TDF frame Id in `index` (position 0 => Id 1), and
-                // `index` only ever becomes the `frame=N` spectrum id. Using the 0-based position
-                // here handed every empty frame its predecessor's id — duplicate ids collapse the
-                // reader's id_index, which then sizes its per-spectrum vecs short and panics.
-                index: i + 1,
+                // timsrust reports the TDF `Frames.Id` in `index`, and `index` only ever becomes the
+                // `frame=N` spectrum id. The 0-based position here handed every empty frame its
+                // predecessor's id — duplicate ids collapse the reader's id_index, which then sizes
+                // its per-spectrum vecs short and panics — and `position + 1` is another frame's id
+                // once `Frames.Id` has a gap, where a MALDI frame's position would not attach.
+                index: self.table.id[i] as usize,
                 ms_level: self.ms_level_at(i),
                 scan_offsets: vec![0],
                 tof: Vec::new(),
@@ -1395,9 +1400,9 @@ fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
 
 fn read_frame_rows(conn: &rusqlite::Connection, with_cal: bool) -> Result<FrameTable> {
     let sql = if with_cal {
-        "SELECT NumPeaks, Time, MsMsType, Polarity, T1, T2, MzCalibration FROM Frames ORDER BY Id"
+        "SELECT NumPeaks, Time, MsMsType, Polarity, Id, T1, T2, MzCalibration FROM Frames ORDER BY Id"
     } else {
-        "SELECT NumPeaks, Time, MsMsType, Polarity FROM Frames ORDER BY Id"
+        "SELECT NumPeaks, Time, MsMsType, Polarity, Id FROM Frames ORDER BY Id"
     };
     let mut stmt = conn.prepare(sql).map_err(|e| anyhow::anyhow!("querying Frames: {e}"))?;
     let mut rows = stmt.query([]).map_err(|e| anyhow::anyhow!("reading Frames: {e}"))?;
@@ -1413,10 +1418,11 @@ fn read_frame_rows(conn: &rusqlite::Connection, with_cal: bool) -> Result<FrameT
             "-" => ScanPolarity::Negative,
             _ => ScanPolarity::Unknown,
         });
+        t.id.push(r.get::<_, i64>(4)?);
         if with_cal {
-            t.t1.push(r.get::<_, Option<f64>>(4)?);
-            t.t2.push(r.get::<_, Option<f64>>(5)?);
-            t.mz_cal_id.push(r.get::<_, Option<i64>>(6)?);
+            t.t1.push(r.get::<_, Option<f64>>(5)?);
+            t.t2.push(r.get::<_, Option<f64>>(6)?);
+            t.mz_cal_id.push(r.get::<_, Option<i64>>(7)?);
         }
     }
     Ok(t)
@@ -1735,6 +1741,41 @@ mod single_point_chunk_tests {
 
 #[cfg(test)]
 mod empty_frame_read_tests {
+    /// An empty frame's spectrum id is its `Frames.Id`, not `position + 1`, when the ids have a gap
+    /// (review 2026-09-30 B16), so a MALDI frame's position attaches. A synthetic TDF of empty frames
+    /// with ids 1, 2, 5: timsrust never decodes them, so the `.tdf_bin` only has to exist.
+    #[test]
+    fn an_empty_frame_keeps_its_id_across_a_gap() {
+        let dot_d = std::env::temp_dir().join(format!("mzpc-gapped-ids-{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dot_d);
+        std::fs::create_dir_all(&dot_d).unwrap();
+        std::fs::write(dot_d.join("analysis.tdf_bin"), [0u8; 8]).unwrap();
+        let conn = rusqlite::Connection::open(dot_d.join("analysis.tdf")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', '2'), ('AcquisitionSoftware', 'timsTOF'),
+                 ('MzAcqRangeLower', '100'), ('MzAcqRangeUpper', '2000'), ('DigitizerNumSamples', '439442'),
+                 ('OneOverK0AcqRangeLower', '0.78'), ('OneOverK0AcqRangeUpper', '1.6');
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, Polarity TEXT, ScanMode INTEGER, MsMsType INTEGER,
+                 TimsId INTEGER, NumScans INTEGER, NumPeaks INTEGER, AccumulationTime REAL);
+             INSERT INTO Frames VALUES (1, 0.5, '+', 20, 0, 0, 900, 0, 100.0), (2, 0.6, '+', 20, 0, 0, 900, 0, 100.0),
+                                       (5, 0.9, '+', 20, 0, 0, 900, 0, 100.0);
+             CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, RegionNumber INTEGER, XIndexPos INTEGER, YIndexPos INTEGER);
+             INSERT INTO MaldiFrameInfo VALUES (1, 0, 10, 15), (2, 0, 11, 15), (5, 0, 12, 15);",
+        )
+        .unwrap();
+        let maldi = crate::bruker_maldi::read(&conn).unwrap();
+        drop(conn);
+        let reader = super::NativeTofReader::open(&dot_d).unwrap();
+        let ids: Vec<usize> = (0..reader.len()).map(|i| reader.frame(i).unwrap().index).collect();
+        assert_eq!(ids, [1, 2, 5]);
+        let mut spec = reader.ims_grid_spectrum(2, true).unwrap();
+        let _ = std::fs::remove_dir_all(&dot_d);
+        assert_eq!(spec.description.id, "frame=5");
+        assert!(maldi.attach(&mut spec), "the position of frame 5 attaches");
+        assert_eq!(crate::imaging::position_of(&spec.description), Some((3, 1)));
+    }
+
     /// Random access to an EMPTY spectrum must not abort the process.
     ///
     /// Newer timsTOF (5.1.x) writes frames with `NumPeaks = 0`, which this build converts. The point

@@ -498,13 +498,17 @@ as stated (imzML already counts from 1), with three checks since 0.16.0
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
 checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
 issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; a single value
-is an area when `√value × count = extent` and written as its square root, a length when
-`value × count = extent`, and otherwise dropped), each action declared and listed in the
-`imaging_pixel_size` index block together with any unit accession that disagrees with its unit name;
-and the obsolete "one way" is written as flyback. A **Bruker MALDI** `.d` (TSF or TDF, every timsTOF
-lane) carries the same position columns from `MaldiFrameInfo.XIndexPos/YIndexPos` per frame. Those are
-absolute raster indices on the target, so they are **shifted so the smallest is 1** — one shift for
-the whole run, keeping regions where they lie relative to each other — declared
+is tested against its own axis's count and extent — the other axis's when its own states none — both
+converted to one length unit, each by the unit it is written in (its unit name's when mzdata knows the
+name, which then overrides the accession, else its unit accession), micrometre where that is no length
+unit: it is an area when `√value × count = extent` and written as its square root, in the unit the
+area is the square of, a length when `value × count = extent`, and otherwise dropped), each action
+declared and listed in the `imaging_pixel_size` index block together with any unit accession that
+disagrees with its unit name; and the obsolete "one way" is written as flyback. A **Bruker MALDI**
+`.d` (TSF or TDF, every timsTOF lane) carries the same position columns from
+`MaldiFrameInfo.XIndexPos/YIndexPos` per frame. Those are absolute raster indices on the target, so
+they are **shifted so the smallest is 1** — one shift for the whole run,
+keeping regions where they lie relative to each other — declared
 (`bruker:raster-index-shifted-to-base-1`) and recorded as the imaging profile has it,
 `metadata.imaging.position_offset` = the constant subtracted (smallest index − 1), with the smallest
 index itself as `origin` in the `bruker_maldi` block; the pixel counts are the shifted extent. FlexImaging's own imzML export
@@ -512,9 +516,13 @@ keeps the absolute indices (with the pixel counts set to the largest index), so 
 export differ by exactly `origin − 1`. The pixel size is the raster step of the FlexImaging sequence
 `<stem>.mis` beside the `.d` (not part of it): `RegionNumber` n is the n-th `<Area>`, which also names
 the region; when the acquired regions have different steps no pixel size is written (the profile
-describes one grid). Without a `.mis` the frames' beam scan size is the fallback, declared as such.
-The max dimension `IMS:1000044/45` is count × size. The `bruker_maldi` index block holds the regions
-(number, name, raster step, frames, raw index ranges), the `.mis` it read and the beam scan size.
+describes one grid). A `.mis` the regions do not map onto — a region number with no `<Area>`, or
+regions whose `MotorPositionX/Y` no single offset places inside their areas' bounding boxes (within
+half a raster step) as the `.mis` teach points locate them — is not used, with a warning and the
+reason in the block. Without a usable `.mis` the frames' beam scan size is the fallback, declared as
+such, when every positioned frame states the same finite one. The max dimension `IMS:1000044/45` is
+count × size. The `bruker_maldi` index block holds the regions (number, name, raster step, frames,
+raw index ranges), the `.mis` it read (or rejected, and why) and the beam scan size.
 A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
 in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them —
 the step is the most common gap, origin the smallest position, and every position must lie within a
@@ -755,9 +763,9 @@ The vocabulary:
 | `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
 | `imzml:pixel-size-unit-assumed-um` | an imzML pixel size stated without a unit was taken as micrometre (§8, imaging) | imzML |
-| `imzml:pixel-size-area-to-length` | a single imzML pixel size tested as an area (`√value × count = extent`) and was written as its square root, in micrometre | imzML |
+| `imzml:pixel-size-area-to-length` | a single imzML pixel size tested as an area (`√value × count = extent`) and was written as its square root, in the unit the area is the square of (micrometre when no length unit is stated) | imzML |
 | `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
-| `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata keeps whichever attribute comes last) | imzML |
+| `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata takes the unit name when it names a unit mzdata knows, whatever the attribute order) | imzML |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
