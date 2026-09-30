@@ -2440,6 +2440,14 @@ impl<'a> MzChromatogramBuilder<'a> {
                             .copied()
                             .zip(self.descriptions.iter_mut())
                         {
+                            // DELIBERATE DEVIATION (not upstream, as of `93c1982`): a null polarity
+                            // is unknown. Upstream reads the value slot under a null, which holds
+                            // whatever the decoder left there: a TIC or base-peak trace (no polarity)
+                            // stored beside a negative SRM trace read back negative.
+                            if array.is_null(i) {
+                                descr.polarity = ScanPolarity::Unknown;
+                                continue;
+                            }
                             let polarity_val = array.value(i);
                             match polarity_val {
                                 1 => descr.polarity = ScanPolarity::Positive,

@@ -3014,8 +3014,9 @@ fn schema_sample_chromatogram(mut chrom: Chromatogram) -> Chromatogram {
 }
 
 /// Pass a source's chromatograms through to an mzML — every one of them, its TIC and base-peak
-/// chromatograms included — then the TIC and the base-peak chromatogram the mzML writer sums over
-/// the mass spectra written so far, each only when the source carries no chromatogram of that kind:
+/// chromatograms included, as they are — then the TIC and the base-peak chromatogram the mzML writer
+/// sums over the mass spectra written so far, in time order ([`time_sorted_summary`]), each only when
+/// the source carries no chromatogram of that kind:
 /// a LabSolutions export's pair per acquisition event and an archive's own pair reach the mzML, and
 /// neither is doubled. The writer used to add its pair whenever a mass spectrum had been written and
 /// the source's pair was dropped for it. A chromatogramList must hold a chromatogram, so with nothing
@@ -3050,6 +3051,21 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
                     c.description_mut().params.insert(0, p);
                 }
             }
+            // The polarity likewise: mzdata's reader takes `negative scan` / `positive scan` into the
+            // typed field (an archive's `scan_polarity` column comes back there too) and its writer
+            // writes no chromatogram's, so every SRM trace of `MRM Neg C5` (pwiz's Agilent test
+            // file) lost its `negative scan` on both routes. Put it back after the type term.
+            let polarity = match c.description().polarity {
+                mzdata::spectrum::ScanPolarity::Positive => Some(("positive scan", curie!(MS:1000130))),
+                mzdata::spectrum::ScanPolarity::Negative => Some(("negative scan", curie!(MS:1000129))),
+                _ => None,
+            };
+            if let Some((name, accession)) = polarity {
+                if !c.params().iter().any(|p| matches!(p.curie(), Some(curie!(MS:1000129)) | Some(curie!(MS:1000130)))) {
+                    let at = usize::from(c.params().first().is_some_and(|p| p.curie().and_then(ChromatogramType::from_curie).is_some()));
+                    c.description_mut().params.insert(at, Param::builder().name(name).curie(accession).build());
+                }
+            }
             c
         })
         .collect();
@@ -3064,7 +3080,7 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
     ]
     .into_iter()
     .filter(|(kind, _)| !carried(*kind))
-    .map(|(_, collector)| collector.to_chromatogram())
+    .map(|(_, collector)| time_sorted_summary(collector.to_chromatogram()))
     .collect();
     if !kept.is_empty() {
         summaries.retain(|c| c.arrays.get(&ArrayType::TimeArray).and_then(|t| t.data_len().ok()).unwrap_or(0) > 0);
@@ -3084,6 +3100,17 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
         );
     }
     Ok(())
+}
+
+/// A summary chromatogram of the mzML writer, in time order. The writer appends a point per spectrum
+/// in the order the spectra are written, so a run whose spectra are not in time order came out with
+/// an unsorted time array (`tiny.pwiz.1.1`'s base-peak trace: 5.8905, 5.9905, 0.0, 0.7008 min), which
+/// a chromatogram cannot have. The points are sorted by time, stably, each keeping its intensity.
+fn time_sorted_summary(mut chrom: Chromatogram) -> Chromatogram {
+    if let Err(e) = chrom.arrays.sort_by_array(&ArrayType::TimeArray) {
+        log::warn!("summary chromatogram {:?}: not sorted by time: {e}", chrom.id());
+    }
+    chrom
 }
 
 /// Run ProteoWizard `msconvert` for the output mzML (`--via-msconvert --to mzml`). It writes into a
