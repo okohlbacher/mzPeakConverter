@@ -888,6 +888,8 @@ letter case, wherever it sits in the directory:
   lanes store as calibrated f64 m/z, in a format open readers decode (timsrust a TDF, this converter a
   TSF), and at 70 % of a TSF archive it is the price of that copy.
 - **baf2sql's `analysis.sqlite`**, the cache the BAF reader itself creates inside the `.d`.
+- **macOS AppleDouble companions `._*`**, the Finder metadata that copying a directory from a Mac to
+  NTFS, exFAT or SMB leaves beside every file (`--aux '._*=embed'` keeps them).
 
 Through 0.11.5 only TDF/TSF directories, `--agilent-grid` and ims-compact embedded anything, and
 `--agilent-grid` embedded `MSProfile.bin` and `MSPeak.bin` beside the grid it stores. For Thermo
