@@ -79,6 +79,7 @@ mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
 mod mzml_isolation;
+mod mzml_refs;
 mod mzml_wavelength;
 mod pwiz_id;
 
@@ -3218,8 +3219,10 @@ fn convert_file_tof_grid(
     builder = builder.sample_array_types_from_chromatograms(chromatograms_by_index(&mut reader).take(10).map(schema_sample_chromatogram));
     let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);
+    let mut source_refs = None;
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
+        source_refs = Some(check_source_refs(read_path, &mut writer));
     }
     add_processing_metadata(&mut writer);
 
@@ -3236,6 +3239,9 @@ fn convert_file_tof_grid(
         }
         if let Some(g) = thermo_windows.as_mut() {
             g.apply(entry.description_mut());
+        }
+        if let Some(r) = source_refs.as_mut() {
+            r.check_scans(entry.description_mut());
         }
         let spec = match tof_grid_spectrum(&entry, &grid)? {
             TofRoute::Gridded(s) => {
@@ -3271,6 +3277,10 @@ fn convert_file_tof_grid(
     applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
     if tdf_chord {
         declare(&mut applied, TDF_CHORD_TRANSFORMATION);
+    }
+    if let Some(r) = &source_refs {
+        r.warn(input);
+        applied.extend(r.transformation().map(str::to_string));
     }
     // No `tof_calibration` block since the chunk-grid layout: the model rides on every grid row.
     let index_blocks: Vec<(String, serde_json::Value)> = std::iter::empty::<(String, serde_json::Value)>()
@@ -4386,8 +4396,10 @@ fn convert_file(
             imaging_block = Some(fixes.iter().map(imaging::fix_json).collect());
         }
     }
+    let mut source_refs = None;
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
+        source_refs = Some(check_source_refs(read_path, &mut writer));
     }
     add_processing_metadata(&mut writer);
 
@@ -4496,6 +4508,9 @@ fn convert_file(
         if let Some(g) = thermo_windows.as_mut() {
             g.apply(entry.description_mut());
         }
+        if let Some(r) = source_refs.as_mut() {
+            r.check_scans(entry.description_mut());
+        }
         if synth_chroms {
             ms1.observe(&entry);
         }
@@ -4565,6 +4580,9 @@ fn convert_file(
         imaging_blocks.extend(blocks);
         imaging_applied.extend(applied);
     }
+    if let Some(r) = &source_refs {
+        r.warn(input);
+    }
 
     let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
         .into_iter()
@@ -4588,6 +4606,7 @@ fn convert_file(
                 declare(&mut applied, TDF_CHORD_TRANSFORMATION);
             }
             applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
+            applied.extend(source_refs.as_ref().and_then(mzml_refs::DanglingRefs::transformation).map(str::to_string));
             applied.extend(chromatogram_transforms);
             applied
         })))
@@ -5989,11 +6008,12 @@ fn convert_ims_compact_sdk(
 /// `thermo:target-only-isolation-window` (a Thermo precursor window the reader library computed
 /// without a stated width was written target-only), and the native SciEX glue's counted value
 /// changes `sciex:nan-intensity-to-zero`, `sciex:clamp-intensity-to-f32` and
-/// `sciex:truncate-unequal-arrays` (`sciex_run::GlueValueChanges`). An entry names the
-/// transformation and never how often it was applied, which the run's warning says;
-/// `tof-grid:<ppm>ppm` is the one entry with a parameter, the bound its grid was accepted within.
-/// [`finish_archive`] mirrors the list into this conversion's processing method
-/// ([`mirror_transformations`]).
+/// `sciex:truncate-unequal-arrays` (`sciex_run::GlueValueChanges`), and
+/// `mzml:dangling-reference-dropped` (an mzML or imzML reference that names no entry of the source's
+/// lists was dropped; [`mzml_refs`]). An entry names the transformation and never how often it was
+/// applied, which the run's warning says; `tof-grid:<ppm>ppm` is the one entry with a parameter, the
+/// bound its grid was accepted within. [`finish_archive`] mirrors the list into this conversion's
+/// processing method ([`mirror_transformations`]).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -8336,6 +8356,18 @@ fn mirror_transformations(target: &mut impl MSDataFileMetadata, applied: &[&str]
     method.params.extend(
         applied.iter().map(|t| Param::new_key_value("transformation", mzdata::params::Value::String(t.to_string()))),
     );
+}
+
+/// The mzML and imzML lanes' reference check ([`mzml_refs`]): the self-closing `<software/>` entries
+/// mzdata skips are put back from the header, then every reference that still names no entry of the
+/// source's lists is dropped. After `decode_pwiz_ids`, before [`add_processing_metadata`].
+fn check_source_refs(read_path: &Path, target: &mut impl MSDataFileMetadata) -> mzml_refs::DanglingRefs {
+    match mzml_refs::restore_self_closing_software(read_path, target) {
+        Ok(0) => {}
+        Ok(n) => log::info!("{n} self-closing <software/> entries read back from the header (mzdata skips them)"),
+        Err(e) => log::warn!("self-closing <software/> entries not read back: {e:#}"),
+    }
+    mzml_refs::DanglingRefs::check_metadata(target)
 }
 
 /// The `conversion options` param every conversion records (the archive lanes'

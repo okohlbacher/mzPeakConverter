@@ -73,7 +73,7 @@ pub use split::UnpackedMzPeakWriterType;
 pub use visitor::{
     ActivationBuilder, AuxiliaryArrayBuilder, CURIEBuilder, ChromatogramBuilder,
     ChromatogramDetailsBuilder, CustomBuilderFromParameter, CustomBuilderFromParameterDerived,
-    IsolationWindowBuilder, ParamBuilder, ParamListBuilder, ParamValueBuilder, PrecursorBuilder,
+    IsolationWindowBuilder, NO_INSTRUMENT_CONFIGURATION, ParamBuilder, ParamListBuilder, ParamValueBuilder, PrecursorBuilder,
     ScanBuilder, ScanWindowBuilder, SelectedIonBuilder, SpectrumBuilder, SpectrumDetailsBuilder,
     SpectrumVisitor, StructVisitor, StructVisitorBuilder, VisitorBase, WavelengthSpectrumBuilder,
     inflect_cv_term_to_column_name,
