@@ -16,13 +16,18 @@
 //!
 //! mzdata keeps a unit by its accession only, so the unit NAME the file states — needed to see an
 //! accession/name disagreement — is read from the header here ([`read_scan_settings`]).
+//!
+//! **Which runs are imaging** is decided by [`detect`], the one detector every lane calls: imzML
+//! input always; a Bruker `.d` with `MaldiFrameInfo` positions; any other input whose spectra state
+//! `IMS:1000050/51`. A detected run gets the imaging profile's `metadata.imaging` marker
+//! ([`marker_block`]) with its provenance; nothing else is marked imaging.
 
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use mzdata::params::{Param, Unit};
+use mzdata::params::{Param, ParamDescribed, Unit};
 use mzdata::meta::ScanSettings;
 use quick_xml::events::Event;
 
@@ -33,6 +38,92 @@ pub const ONE_WAY_AS_FLYBACK: &str = "imzml:one-way-as-flyback";
 /// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes whichever of
 /// `unitAccession` / `unitName` comes last, so a disagreeing pair resolves by attribute order).
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
+/// The input states positions but no pixel counts: `IMS:1000042/43` are the largest positions.
+pub const COUNT_FROM_POSITIONS: &str = "imaging:pixel-count-from-positions";
+
+/// What made a run an imaging run.
+pub enum Detected {
+    /// imzML input: always imaging.
+    ImzML,
+    /// A Bruker `.d` whose `analysis.tsf`/`.tdf` has `MaldiFrameInfo` positions.
+    BrukerMaldi(crate::bruker_maldi::MaldiInfo),
+    /// Any other input whose sampled spectra state `IMS:1000050`/`51`: an mzML written from imaging
+    /// data, e.g. this converter's own `--to mzml` export of an imaging archive.
+    ScanPositions,
+}
+
+impl Detected {
+    pub fn bruker(self) -> Option<crate::bruker_maldi::MaldiInfo> {
+        match self {
+            Detected::BrukerMaldi(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+/// The imaging detector for every lane. `probes` are the lane's sampled spectra (empty where a lane
+/// has none yet). ponytail: Waters imaging `.raw` is not detected — its laser positions need a
+/// MassLynx call nobody has probed on an example file yet (backlog).
+pub fn detect(input: &Path, is_imzml: bool, probes: &[mzdata::spectrum::MultiLayerSpectrum]) -> Option<Detected> {
+    if is_imzml {
+        return Some(Detected::ImzML);
+    }
+    if input.is_dir() {
+        if let Some(m) = crate::bruker_maldi::read_dot_d(input) {
+            return Some(Detected::BrukerMaldi(m));
+        }
+    }
+    probes.iter().any(|s| position_of(&s.description).is_some()).then_some(Detected::ScanPositions)
+}
+
+/// The `(x, y)` position a spectrum's scans state, if any.
+pub fn position_of(d: &mzdata::spectrum::SpectrumDescription) -> Option<(i64, i64)> {
+    d.acquisition.scans.iter().find_map(|sc| {
+        let v = |c| sc.get_param_by_curie(&c)?.value.to_i64().ok();
+        Some((v(mzdata::curie!(IMS:1000050))?, v(mzdata::curie!(IMS:1000051))?))
+    })
+}
+
+/// The grid entry of a scan settings list: the one stating the pixel counts.
+pub fn grid(list: &[ScanSettings]) -> Option<&ScanSettings> {
+    list.iter().find(|s| s.params.iter().any(|p| p.curie() == Some(mzdata::curie!(IMS:1000042))))
+}
+
+/// The largest position written — the pixel counts of an input that states positions but no grid.
+#[derive(Debug, Default)]
+pub struct Extent(pub i64, pub i64);
+
+impl Extent {
+    pub fn observe(&mut self, d: &mzdata::spectrum::SpectrumDescription) {
+        if let Some((x, y)) = position_of(d) {
+            (self.0, self.1) = (self.0.max(x), self.1.max(y));
+        }
+    }
+
+    pub fn settings(&self) -> ScanSettings {
+        let mut s = ScanSettings { id: "scansettings1".into(), ..Default::default() };
+        s.params.push(Param::builder().name("max count of pixels x").curie(mzdata::curie!(IMS:1000042)).value(self.0).build());
+        s.params.push(Param::builder().name("max count of pixels y").curie(mzdata::curie!(IMS:1000043)).value(self.1).build());
+        s
+    }
+}
+
+/// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
+/// marker, the coordinate base, the grid as the viewer reads it, and where it all came from.
+pub fn marker_block(grid: Option<&ScanSettings>, provenance: serde_json::Value) -> serde_json::Value {
+    let mut b = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "provenance": provenance});
+    let param = |acc| grid?.params.iter().find(|p| p.curie() == Some(acc));
+    let int = |acc| param(acc)?.value.to_i64().ok();
+    let um = |acc| param(acc).filter(|p| p.unit == Unit::Micrometer)?.value.to_f64().ok();
+    if let (Some(x), Some(y)) = (int(mzdata::curie!(IMS:1000042)), int(mzdata::curie!(IMS:1000043))) {
+        b["pixel_count"] = serde_json::json!({"x": x, "y": y});
+    }
+    // ponytail: micrometre only; a pixel size in another length unit stays in the scan settings.
+    if let (Some(x), Some(y)) = (um(mzdata::curie!(IMS:1000046)), um(mzdata::curie!(IMS:1000047))) {
+        b["pixel_size_um"] = serde_json::json!({"x": x, "y": y});
+    }
+    b
+}
 
 /// One `cvParam` of a `<scanSettings>`, as the file states it.
 #[derive(Debug, Clone, PartialEq)]

@@ -3,14 +3,20 @@
 //! only the imzML path wrote positions (HUPO-PSI/mzPeak-specification#23).
 //!
 //! * `XIndexPos` / `YIndexPos` become `IMS:1000050` / `IMS:1000051` on the frame's scan, the same
-//!   params — and so the same `opt_IMS_*_position_*` columns — as the imzML path. They are written
-//!   AS STORED: absolute raster indices on the target (669–837 in the issue author's file), not
-//!   shifted to start at 1. Whether mzPeak fixes a coordinate base is an open specification decision.
+//!   params — and so the same `position_x` / `position_y` columns — as the imzML path. Bruker's
+//!   indices are absolute on the target (669–837 in the issue author's file); the archive counts
+//!   from 1 (owner decision 2026-09-30), so every index is shifted by the smallest one of the run —
+//!   one shift for all regions, which keeps them where they lie relative to each other — and the
+//!   shift is declared ([`SHIFTED_TO_BASE_1`]) and recorded (`origin` in the `bruker_maldi` block).
+//!   FlexImaging's own imzML export writes the indices unshifted, with the pixel counts set to the
+//!   largest index; the two differ by exactly `origin − 1`.
+//! * The grid: `IMS:1000042/43` pixel counts (the shifted extent), always.
 //! * The `bruker_maldi` index block keeps what has no mzPeak home yet: the regions
-//!   (`RegionNumber`, frames and index ranges each), the index ranges, the beam scan size.
+//!   (`RegionNumber`, frames and index ranges each), the raw index ranges, the beam scan size.
 //! * Pixel size: the FlexImaging `.mis` holds the raster step but is not part of the `.d`; the
-//!   frames' `BeamScanSizeX/Y` (µm) is the stated fallback, written as `IMS:1000046/47` and declared
-//!   as such ([`PIXEL_FROM_BEAM`]). Only when every frame states the same size.
+//!   frames' `BeamScanSizeX/Y` (µm) is the stated fallback, written as `IMS:1000046/47` — with
+//!   `IMS:1000044/45` max dimension = count × size — and declared as such ([`PIXEL_FROM_BEAM`]).
+//!   Only when every frame states the same size.
 //!
 //! Column names are Bruker's (`MaldiFrameInfo(Frame, …, RegionNumber, XIndexPos, YIndexPos, …,
 //! BeamScanSizeX, BeamScanSizeY)`), confirmed by the issue author on a real acquisition; the corpus
@@ -26,6 +32,8 @@ use mzdata::spectrum::{MultiLayerSpectrum, ScanEvent};
 use rusqlite::Connection;
 
 pub const PIXEL_FROM_BEAM: &str = "bruker:pixel-size-from-beam-scan-size";
+/// Positions are the raster indices minus the run's smallest index plus 1.
+pub const SHIFTED_TO_BASE_1: &str = "bruker:raster-index-shifted-to-base-1";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spot {
@@ -40,6 +48,9 @@ pub struct MaldiInfo {
     pub spots: HashMap<i64, Spot>,
     /// Every distinct `(BeamScanSizeX, BeamScanSizeY)` stated, in µm.
     pub beam: Vec<(f64, f64)>,
+    /// Smallest and largest `(XIndexPos, YIndexPos)` of the run: `min` becomes position (1, 1).
+    pub min: (i64, i64),
+    pub max: (i64, i64),
 }
 
 /// `MaldiFrameInfo` of an open TSF/TDF database; `None` without the table or its position columns.
@@ -85,7 +96,10 @@ pub fn read(conn: &Connection) -> Option<MaldiInfo> {
             }
         }
     }
-    (!info.spots.is_empty()).then_some(info)
+    let (xs, ys) = (info.spots.values().map(|s| s.x), info.spots.values().map(|s| s.y));
+    info.min = (xs.clone().min()?, ys.clone().min()?);
+    info.max = (xs.max()?, ys.max()?);
+    Some(info)
 }
 
 /// [`read`] on a Bruker `.d` (its `analysis.tsf`, else `analysis.tdf`); `None` for anything else.
@@ -111,18 +125,59 @@ impl MaldiInfo {
         if scans.is_empty() {
             scans.push(ScanEvent::default());
         }
-        scans[0].add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(spot.x).build());
-        scans[0].add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(spot.y).build());
+        let (x, y) = (spot.x - self.min.0 + 1, spot.y - self.min.1 + 1);
+        scans[0].add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(x).build());
+        scans[0].add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(y).build());
         true
     }
 
+    /// Pixel counts of the shifted grid.
+    pub fn count(&self) -> (i64, i64) {
+        (self.max.0 - self.min.0 + 1, self.max.1 - self.min.1 + 1)
+    }
+
     /// Pixel size from the beam scan size, when every frame states the same one.
-    pub fn scan_settings(&self) -> Option<ScanSettings> {
-        let [(bx, by)] = self.beam.as_slice() else { return None };
+    pub fn pixel_size(&self) -> Option<(f64, f64)> {
+        let [b] = self.beam.as_slice() else { return None };
+        Some(*b)
+    }
+
+    /// The grid: pixel counts always; pixel size and max dimension when [`Self::pixel_size`] is known.
+    pub fn scan_settings(&self) -> ScanSettings {
+        let (nx, ny) = self.count();
         let mut s = ScanSettings { id: "scansettings1".into(), ..Default::default() };
-        s.params.push(Param::builder().name("pixel size x").curie(mzdata::curie!(IMS:1000046)).value(*bx).unit(Unit::Micrometer).build());
-        s.params.push(Param::builder().name("pixel size y").curie(mzdata::curie!(IMS:1000047)).value(*by).unit(Unit::Micrometer).build());
-        Some(s)
+        let p = |name: &str, curie, v: mzdata::params::Value, unit| Param::builder().name(name).curie(curie).value(v).unit(unit).build();
+        s.params.push(p("max count of pixels x", mzdata::curie!(IMS:1000042), nx.into(), Unit::Unknown));
+        s.params.push(p("max count of pixels y", mzdata::curie!(IMS:1000043), ny.into(), Unit::Unknown));
+        if let Some((bx, by)) = self.pixel_size() {
+            s.params.push(p("pixel size (x)", mzdata::curie!(IMS:1000046), bx.into(), Unit::Micrometer));
+            s.params.push(p("pixel size y", mzdata::curie!(IMS:1000047), by.into(), Unit::Micrometer));
+            s.params.push(p("max dimension x", mzdata::curie!(IMS:1000044), (nx as f64 * bx).into(), Unit::Micrometer));
+            s.params.push(p("max dimension y", mzdata::curie!(IMS:1000045), (ny as f64 * by).into(), Unit::Micrometer));
+        }
+        s
+    }
+
+    /// The `metadata.imaging` marker block, the `bruker_maldi` block, and the transformations to
+    /// declare.
+    pub fn index_blocks(&self) -> (Vec<(String, serde_json::Value)>, Vec<&'static str>) {
+        let mut applied = Vec::new();
+        if self.min != (1, 1) {
+            applied.push(SHIFTED_TO_BASE_1);
+        }
+        if self.pixel_size().is_some() {
+            applied.push(PIXEL_FROM_BEAM);
+        }
+        let marker = crate::imaging::marker_block(
+            Some(&self.scan_settings()),
+            serde_json::json!({
+                "detected_from": "MaldiFrameInfo in analysis.tsf/.tdf",
+                "positions": "XIndexPos/YIndexPos − origin + 1",
+                "origin": {"x": self.min.0, "y": self.min.1},
+                "pixel_size": if self.pixel_size().is_some() { "BeamScanSizeX/Y" } else { "not stated" },
+            }),
+        );
+        (vec![("imaging".into(), marker), ("bruker_maldi".into(), self.block())], applied)
     }
 
     /// The `bruker_maldi` index block.
@@ -136,7 +191,8 @@ impl MaldiInfo {
         }
         serde_json::json!({
             "source": "analysis.tsf/.tdf MaldiFrameInfo (XIndexPos, YIndexPos, RegionNumber, BeamScanSizeX/Y)",
-            "coordinates": "XIndexPos/YIndexPos as stored: absolute raster indices on the target, not shifted to start at 1 (the mzPeak coordinate base is an open specification decision)",
+            "coordinates": "positions are XIndexPos/YIndexPos − origin + 1; x_index/y_index and the regions give the raw indices",
+            "origin": {"x": self.min.0, "y": self.min.1},
             "frames_with_position": self.spots.len(),
             "x_index": range(|s| s.x, &mut self.spots.values()),
             "y_index": range(|s| s.y, &mut self.spots.values()),
@@ -147,7 +203,7 @@ impl MaldiInfo {
                 "y_index": range(|s| s.y, &mut spots.iter().copied()),
             })).collect::<Vec<_>>(),
             "beam_scan_size_um": self.beam.iter().map(|(x, y)| serde_json::json!({"x": x, "y": y})).collect::<Vec<_>>(),
-            "pixel_size": if self.scan_settings().is_some() {
+            "pixel_size": if self.pixel_size().is_some() {
                 "the beam scan size (the FlexImaging .mis raster step is not part of the .d)"
             } else {
                 "not written: no single beam scan size stated"
@@ -181,12 +237,37 @@ mod tests {
         assert_eq!(info.spots[&1], Spot { x: 669, y: 700, region: Some(0) });
         assert_eq!(info.spots[&3], Spot { x: 837, y: 812, region: Some(1) });
         assert_eq!(info.beam, vec![(20.0, 20.0)]);
+        assert_eq!((info.min, info.max, info.count()), ((669, 700), (837, 812), (169, 113)));
         let b = info.block();
-        assert_eq!(b["x_index"], serde_json::json!([669, 837]));
+        assert_eq!(b["x_index"], serde_json::json!([669, 837]), "the block keeps the raw indices");
+        assert_eq!(b["origin"], serde_json::json!({"x": 669, "y": 700}));
         assert_eq!(b["regions"].as_array().unwrap().len(), 2);
-        let ss = info.scan_settings().unwrap();
-        assert_eq!(ss.params[0].value.to_f64().unwrap(), 20.0);
-        assert_eq!(ss.params[0].unit, Unit::Micrometer);
+        let ss = info.scan_settings();
+        let get = |acc: &str| ss.params.iter().find(|p| p.curie().unwrap().to_string() == acc).map(|p| (p.value.to_f64().unwrap(), p.unit));
+        assert_eq!(get("IMS:1000042"), Some((169.0, Unit::Unknown)));
+        assert_eq!(get("IMS:1000043"), Some((113.0, Unit::Unknown)));
+        assert_eq!(get("IMS:1000046"), Some((20.0, Unit::Micrometer)));
+        assert_eq!(get("IMS:1000044"), Some((3380.0, Unit::Micrometer)));
+        assert_eq!(get("IMS:1000045"), Some((2260.0, Unit::Micrometer)));
+        let (blocks, applied) = info.index_blocks();
+        assert_eq!(applied, vec![SHIFTED_TO_BASE_1, PIXEL_FROM_BEAM]);
+        let marker = &blocks[0].1;
+        assert_eq!((blocks[0].0.as_str(), &marker["is_imaging"], &marker["coordinate_base"]), ("imaging", &serde_json::json!(true), &serde_json::json!(1)));
+        assert_eq!(marker["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
+        assert_eq!(marker["pixel_size_um"], serde_json::json!({"x": 20.0, "y": 20.0}));
+        assert_eq!(marker["provenance"]["origin"], serde_json::json!({"x": 669, "y": 700}));
+    }
+
+    #[test]
+    fn without_a_single_beam_size_only_the_counts_are_written() {
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c);
+        c.execute_batch("UPDATE MaldiFrameInfo SET BeamScanSizeX = 10.0 WHERE Frame = 3;").unwrap();
+        let info = read(&c).unwrap();
+        assert!(info.pixel_size().is_none());
+        let accs: Vec<String> = info.scan_settings().params.iter().map(|p| p.curie().unwrap().to_string()).collect();
+        assert_eq!(accs, ["IMS:1000042", "IMS:1000043"]);
+        assert_eq!(info.index_blocks().1, vec![SHIFTED_TO_BASE_1]);
     }
 
     #[test]
@@ -204,15 +285,19 @@ mod tests {
         let mut spec = MultiLayerSpectrum::default();
         spec.description_mut().id = "frame=2".into();
         assert!(info.attach(&mut spec));
-        let scan = &spec.description().acquisition.scans[0];
-        assert_eq!(scan.get_param_by_curie(&mzdata::curie!(IMS:1000050)).unwrap().value.to_i64().unwrap(), 670);
-        assert_eq!(scan.get_param_by_curie(&mzdata::curie!(IMS:1000051)).unwrap().value.to_i64().unwrap(), 700);
+        let pos = |s: &MultiLayerSpectrum| {
+            let scan = &s.description().acquisition.scans[0];
+            let v = |c| scan.get_param_by_curie(&c).unwrap().value.to_i64().unwrap();
+            (v(mzdata::curie!(IMS:1000050)), v(mzdata::curie!(IMS:1000051)))
+        };
+        assert_eq!(pos(&spec), (2, 1), "index (670, 700) on a run starting at (669, 700)");
         spec.description_mut().id = "frame=99".into();
-        assert!(!MaldiInfo { spots: HashMap::new(), beam: vec![] }.attach(&mut spec));
+        assert!(!MaldiInfo::default().attach(&mut spec));
         spec.description_mut().id = "scan=2".into();
         assert!(!info.attach(&mut spec), "only frame ids are matched");
         let mut merged = MultiLayerSpectrum::default();
         merged.description_mut().id = "merged=0 frame=3 startScan=1 endScan=900".into();
         assert!(info.attach(&mut merged), "mzdata's TDF ids carry the frame as a token");
+        assert_eq!(pos(&merged), (169, 113));
     }
 }

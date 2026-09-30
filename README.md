@@ -57,9 +57,9 @@ table lists every entry.
 | Format | Linux | macOS | Windows | Notes |
 |---|:---:|:---:|:---:|---|
 | mzML, `.mzML.gz` | ✅ | ✅ | ✅ | gzip detected by magic and inflated to a temp copy; and `-o x.mzML.gz` writes gzipped mzML |
-| imzML | ✅ | ✅ | ✅ | imaging coords + IMS CV; pixel size checked, file provenance kept |
-| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default**; MALDI imaging positions |
-| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; MALDI imaging positions |
+| imzML | ✅ | ✅ | ✅ | imaging profile: `position_x/y`, grid, `metadata.imaging`; pixel size checked, file provenance kept |
+| Bruker `.d` **TDF** (timsTOF) | ✅ | ✅ | ✅ | ion mobility; **ims-compact by default**; MALDI imaging (positions from 1, grid) |
+| Bruker `.d` **TSF** (line spectra) | ✅ | ✅ | ✅ | MALDI/TOF; MALDI imaging (positions from 1, grid) |
 | Thermo `.raw` | ✅ | ✅ | ✅ | needs a **.NET 8+ runtime** |
 | Bruker `.d` **BAF** | ✅ | ❌ | ✅ | auto-built; `libbaf2sql_c` at runtime |
 | Agilent `.d` (native, scan data) | ❌ | ❌ | ✅ | out-of-process **net48** host (`glue/agilent`) → MHDAC; since 0.11.0. MRM/SIM-only runs are refused (they are chromatograms) — use `--via-msconvert` for those ([details](docs/PLATFORM_SUPPORT.md)) |

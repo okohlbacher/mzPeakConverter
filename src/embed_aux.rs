@@ -101,10 +101,15 @@ fn embed_optical_images(
         return Ok(());
     }
 
-    // The full-extent affine maps image pixels onto the MS pixel grid Nx×Ny. Read the declared grid
-    // (IMS:1000042 / IMS:1000043) from the imzML header. If unknown, a Strict --image hard-fails
-    // (we have no grid to map onto); a Soft-only run warns + embeds nothing.
-    let grid = read_imzml_pixel_grid(input);
+    // The full-extent affine maps image pixels onto the MS pixel grid Nx×Ny: the grid of the lane's
+    // own `metadata.imaging` block (a detected imaging run), else the imzML header's IMS:1000042/43.
+    // If unknown, a Strict --image hard-fails (we have no grid to map onto); a Soft-only run warns +
+    // embeds nothing.
+    let marker = zip.index().metadata.get("imaging").cloned();
+    let grid = marker
+        .as_ref()
+        .and_then(|m| Some((m["pixel_count"]["x"].as_i64()?, m["pixel_count"]["y"].as_i64()?)))
+        .or_else(|| read_imzml_pixel_grid(input));
     let (nx, ny) = match grid {
         Some(g) => g,
         None => {
@@ -145,13 +150,10 @@ fn embed_optical_images(
         return Ok(());
     }
 
-    // metadata.imaging.images[] — match the prototype's block shape. The forward port carries only
-    // the discovery flag + images[] (the prototype's full geometry projection is out of scope here).
-    let block = serde_json::json!({
-        "is_imaging": true,
-        "coordinate_base": 1,
-        "images": entries,
-    });
+    // metadata.imaging.images[] — match the prototype's block shape. Added to the lane's marker block
+    // when it wrote one (the run was detected as imaging), else the discovery flag + images[] alone.
+    let mut block = marker.unwrap_or_else(|| serde_json::json!({"is_imaging": true, "coordinate_base": 1}));
+    block["images"] = serde_json::json!(entries);
     zip.add_index_metadata("imaging", &block)
         .context("writing metadata.imaging index")?;
     Ok(())

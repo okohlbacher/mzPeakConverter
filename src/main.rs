@@ -4089,10 +4089,17 @@ fn convert_file(
 
     let mut writer = builder.build(handle, true);
 
-    // imzML carries imaging coordinate cvParams that must be promoted to columns; the archive then
-    // references the IMS CV, so declare it (the writer seeds only MS+UO).
-    if is_imzml {
-        log::info!("imzML input: adding imaging position columns + IMS cv");
+    // Imaging (`imaging::detect`): imzML always, a Bruker MALDI `.d` (mzdata's TDF lane,
+    // `--no-ims-compact`), or any input whose spectra state positions. Positions stated as scan
+    // cvParams are promoted to the `position_*` columns; the archive then references the IMS CV, so
+    // declare it (the writer seeds only MS+UO).
+    let (maldi, scan_positions) = match imaging::detect(input, is_imzml, &probes) {
+        Some(imaging::Detected::BrukerMaldi(m)) => (Some(m), None),
+        Some(d) => (None, Some(d)),
+        None => (None, None),
+    };
+    if scan_positions.is_some() {
+        log::info!("imaging input: adding position columns + IMS cv");
         writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
         // Position z only when the file states one: a column of nulls on every other archive.
         if probes.iter().any(|s| s.acquisition().scans.iter().any(|sc| sc.get_param_by_curie(&curie!(IMS:1000052)).is_some())) {
@@ -4173,7 +4180,6 @@ fn convert_file(
         None
     };
     // A MALDI timsTOF run through mzdata (`--no-ims-compact`): each frame's raster position.
-    let maldi = if matches!(reader, MZReaderType::BrukerTDF(_)) { bruker_maldi::read_dot_d(input) } else { None };
     if let Some(m) = &maldi {
         enable_bruker_imaging(&mut writer, m);
     }
@@ -4188,6 +4194,7 @@ fn convert_file(
     // Whether any spectrum was actually re-ordered below — declared in `transformations` so a
     // reader knows the stored point order is not the source's.
     let mut resorted = false;
+    let mut extent = imaging::Extent::default();
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
@@ -4234,6 +4241,9 @@ fn convert_file(
         if let Some(m) = &maldi {
             m.attach(&mut entry);
         }
+        if scan_positions.is_some() {
+            extent.observe(entry.description());
+        }
         if let Some(g) = thermo_windows.as_mut() {
             g.apply(entry.description_mut());
         }
@@ -4261,12 +4271,37 @@ fn convert_file(
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     let acquisition_block = fixup_run_metadata(&mut writer, input);
 
+    // The imaging marker (`metadata.imaging`), with the grid: the input's own pixel counts, else the
+    // largest positions written (declared).
+    let mut imaging_blocks: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Some(d) = &scan_positions {
+        let list = writer.scan_settings_mut();
+        let counted = list.as_ref().is_some_and(|l| imaging::grid(l).is_none());
+        if let (true, Some(l)) = (counted, list) {
+            l.push(extent.settings());
+            imaging_applied.push(imaging::COUNT_FROM_POSITIONS);
+        }
+        let grid = writer.scan_settings_mut().and_then(|l| imaging::grid(l).cloned());
+        let provenance = serde_json::json!({
+            "detected_from": if matches!(d, imaging::Detected::ImzML) { "imzML input" } else { "IMS:1000050/51 on the input's scans" },
+            "positions": "IMS:1000050/51 of each spectrum, as stated",
+            "grid": if counted { "counted from the positions" } else { "the input's scan settings" },
+            "pixel_size": if imaging_block.is_some() { "checked, see imaging_pixel_size" } else { "as stated" },
+        });
+        imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), provenance)));
+    }
+    if let Some(m) = &maldi {
+        let (blocks, applied) = m.index_blocks();
+        imaging_blocks.extend(blocks);
+        imaging_applied.extend(applied);
+    }
+
     let index_blocks: Vec<(String, serde_json::Value)> = partial_marker(input, cap, n)
         .into_iter()
         .chain(acquisition_block)
         .chain(route)
         .chain(imaging_block.map(|b| ("imaging_pixel_size".to_string(), b)))
-        .chain(maldi.as_ref().map(|m| ("bruker_maldi".to_string(), m.block())))
+        .chain(imaging_blocks)
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
             for t in &imaging_applied {
@@ -4281,9 +4316,6 @@ fn convert_file(
             }
             if tdf_chord {
                 declare(&mut applied, TDF_CHORD_TRANSFORMATION);
-            }
-            if maldi.as_ref().is_some_and(|m| m.scan_settings().is_some()) {
-                declare(&mut applied, bruker_maldi::PIXEL_FROM_BEAM);
             }
             applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
             applied.extend(chromatogram_transforms);
@@ -5348,8 +5380,8 @@ where
     add_processing_metadata(&mut writer);
     // Both ims-compact lanes (native + SDK) attach the MZP:1000006/7 window band to selected ions.
     ensure_mzp_cv(&mut writer);
-    // MALDI imaging (timsTOF fleX): each frame's raster position (`bruker_maldi`).
-    let maldi = bruker_maldi::read_dot_d(input);
+    // MALDI imaging (timsTOF fleX): each frame's raster position (`imaging::detect`, `bruker_maldi`).
+    let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
     if let Some(m) = &maldi {
         enable_bruker_imaging(&mut writer, m);
     }
@@ -5518,8 +5550,9 @@ where
     if let Some(entry) = mz_summary.transformation {
         declare(&mut applied, entry);
     }
-    if maldi.as_ref().is_some_and(|m| m.scan_settings().is_some()) {
-        declare(&mut applied, bruker_maldi::PIXEL_FROM_BEAM);
+    let (maldi_blocks, maldi_applied) = maldi.as_ref().map(|m| m.index_blocks()).unwrap_or_default();
+    for t in maldi_applied {
+        declare(&mut applied, t);
     }
     applied.extend(chromatogram_transforms);
     // The vendor's exact calibration, verbatim, so the archive is self-sufficient without the
@@ -5553,7 +5586,7 @@ where
         .chain(partial_marker(input, max_spectra(), n_frames))
         .chain(vendor_calibration)
         .chain(vendor_tims)
-        .chain(maldi.as_ref().map(|m| ("bruker_maldi".to_string(), m.block())))
+        .chain(maldi_blocks)
         .collect();
     // No aux: `--image`/`--sdrf` are refused on the ims-compact lane (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)
@@ -6806,7 +6839,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     } = hints;
     let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
     // MALDI imaging from a Bruker `.d` (the TSF lane): each frame's raster position.
-    let maldi = if input.is_dir() { bruker_maldi::read_dot_d(input) } else { None };
+    let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
@@ -6996,10 +7029,11 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // A lane that keeps zero runs built the writer with the mask off, so its tally has none to report.
     let mut applied = base_transformations(&writer);
     if let Some(m) = &maldi {
-        if m.scan_settings().is_some() {
-            declare(&mut applied, bruker_maldi::PIXEL_FROM_BEAM);
+        let (blocks, maldi_applied) = m.index_blocks();
+        for t in maldi_applied {
+            declare(&mut applied, t);
         }
-        index_blocks.push(("bruker_maldi".to_string(), m.block()));
+        index_blocks.extend(blocks);
     }
     for entry in transformations {
         declare(&mut applied, entry);
@@ -7023,13 +7057,14 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
 }
 
 /// Turn a writer into an imaging one for a Bruker MALDI run: the position columns the imzML path
-/// writes, the IMS vocabulary, and the beam-scan-size pixel size when there is one.
+/// writes, the IMS vocabulary, and the grid (pixel counts; pixel size from the beam scan size when
+/// there is one).
 fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) {
     log::info!("Bruker MALDI imaging: {} frames carry a raster position", maldi.spots.len());
     writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
     writer.controlled_vocabularies_mut().push(ControlledVocabulary::IMS.into());
-    if let (Some(settings), Some(list)) = (maldi.scan_settings(), writer.scan_settings_mut()) {
-        list.push(settings);
+    if let Some(list) = writer.scan_settings_mut() {
+        list.push(maldi.scan_settings());
     }
 }
 
@@ -11387,6 +11422,13 @@ mod tests {
         let s = &m["scan_settings_list"][0];
         assert_eq!(param(s, "IMS:1000046").unwrap()["value"], 100.0);
         assert!(m.get("imaging_pixel_size").is_none(), "{:#}", m["imaging_pixel_size"]);
+        // imzML is always marked imaging, without `--image`, with its grid and provenance.
+        let img = &m["imaging"];
+        assert_eq!((&img["is_imaging"], &img["coordinate_base"]), (&serde_json::json!(true), &serde_json::json!(1)), "{img:#}");
+        assert_eq!(img["pixel_count"], serde_json::json!({"x": 3, "y": 3}));
+        assert_eq!(img["pixel_size_um"], serde_json::json!({"x": 100.0, "y": 100.0}));
+        assert_eq!(img["provenance"]["detected_from"], "imzML input");
+        assert!(img.get("images").is_none(), "no optical image was embedded");
 
         // x and y without a unit: micrometre, declared.
         let strip = |l: &str| l.replace(r#" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer""#, "");
@@ -11427,15 +11469,34 @@ mod tests {
         zip.by_name("spectra_metadata_scans.parquet").unwrap().read_to_end(&mut scans).unwrap();
         let pf = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from(scans)).unwrap();
         let schema: Vec<String> = parquet::file::reader::FileReader::metadata(&pf).file_metadata().schema_descr().columns().iter().map(|c| c.path().string()).collect();
-        assert!(schema.iter().any(|c| c.contains("IMS_1000052")), "no position z column: {schema:?}");
+        // The imaging profile's column names (HUPO-PSI/mzPeak-specification#24), no `opt_` inflection.
+        for c in ["position_x", "position_y", "position_z"] {
+            assert!(schema.iter().any(|s| s == c), "no {c} column: {schema:?}");
+        }
+        assert!(!schema.iter().any(|c| c.contains("opt_IMS")), "{schema:?}");
+
+        // Round trip through mzML: the positions come back as scan cvParams, and the mzML — no
+        // longer imzML — is still detected as imaging by the positions it states.
+        let mzml = dir.join("oneway.mzML");
+        let (ok, _, err) = run_bin(&[dir.join("oneway.mzpeak").as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert!(std::fs::read_to_string(&mzml).unwrap().contains(r#"accession="IMS:1000050""#), "positions lost in the mzML export");
+        let back = dir.join("back.mzpeak");
+        let (ok, _, err) = run_bin(&[mzml.as_os_str(), "-o".as_ref(), back.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let m = index_metadata(&back);
+        assert_eq!(m["imaging"]["is_imaging"], true, "{:#}", m["imaging"]);
+        assert_eq!(m["imaging"]["provenance"]["detected_from"], "IMS:1000050/51 on the input's scans");
+        assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 3, "y": 3}), "{:#}", m["imaging"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A Bruker MALDI imaging run straight from the `.d` (HUPO-PSI/mzPeak-specification#23): a
     /// synthetic TSF in WAL mode, like the issue author's, with a `MaldiFrameInfo` table. The frames'
-    /// raster indices land in the same position columns the imzML path writes, as stored (absolute,
-    /// not from 1); the archive names the IMS vocabulary and says where its pixel size came from; and
-    /// the conversion leaves the `.d` exactly as it found it (no `-shm` / `-wal`).
+    /// raster indices land in the same position columns the imzML path writes, shifted so the
+    /// smallest is 1 (declared, origin recorded); the archive is marked imaging, names the IMS
+    /// vocabulary, states the grid and says where its pixel size came from; and the conversion leaves
+    /// the `.d` exactly as it found it (no `-shm` / `-wal`).
     #[test]
     fn bruker_maldi_tsf_carries_its_pixel_positions() {
         use arrow::array::{Array, UInt32Array};
@@ -11491,8 +11552,14 @@ mod tests {
         assert_eq!(m["bruker_maldi"]["x_index"], serde_json::json!([669, 837]), "{:#}", m["bruker_maldi"]);
         assert_eq!(m["bruker_maldi"]["regions"].as_array().unwrap().len(), 2);
         assert!(m["transformations"].to_string().contains(super::bruker_maldi::PIXEL_FROM_BEAM));
-        let px = m["scan_settings_list"][0]["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000046").unwrap().clone();
-        assert_eq!((px["value"].clone(), px["unit"].clone()), (serde_json::json!(20.0), serde_json::json!("UO:0000017")));
+        assert!(m["transformations"].to_string().contains(super::bruker_maldi::SHIFTED_TO_BASE_1));
+        let grid = |acc: &str| m["scan_settings_list"][0]["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == acc).unwrap().clone();
+        assert_eq!((grid("IMS:1000046")["value"].clone(), grid("IMS:1000046")["unit"].clone()), (serde_json::json!(20.0), serde_json::json!("UO:0000017")));
+        assert_eq!((grid("IMS:1000042")["value"].clone(), grid("IMS:1000043")["value"].clone()), (serde_json::json!(169), serde_json::json!(113)));
+        let img = &m["imaging"];
+        assert_eq!((&img["is_imaging"], &img["coordinate_base"]), (&serde_json::json!(true), &serde_json::json!(1)), "{img:#}");
+        assert_eq!(img["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
+        assert_eq!(img["provenance"]["origin"], serde_json::json!({"x": 669, "y": 700}));
 
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
         let mut scans = Vec::new();
@@ -11513,8 +11580,8 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(col("opt_IMS_1000050_position_x"), vec![669, 670, 837]);
-        assert_eq!(col("opt_IMS_1000051_position_y"), vec![700, 700, 812]);
+        assert_eq!(col("position_x"), vec![1, 2, 169]);
+        assert_eq!(col("position_y"), vec![1, 1, 113]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

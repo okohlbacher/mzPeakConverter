@@ -6,9 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-**Output change (imaging).** Bruker MALDI runs gain pixel positions; imzML archives gain their file
-provenance in `file_description` and, where the header needed it, a checked pixel size. The IMS
-vocabulary entry names a pinned commit.
+**Output change (imaging).** Imaging archives follow the imaging profile (HUPO-PSI/mzPeak-specification#24):
+the position columns are renamed from `opt_IMS_1000050_position_x` / `…_y` / `…_z` to `position_x` /
+`position_y` / `position_z`, and every detected imaging run carries the `metadata.imaging` marker.
+Bruker MALDI runs gain pixel positions, counted from 1; imzML archives gain their file provenance in
+`file_description` and, where the header needed it, a checked pixel size. The IMS vocabulary entry
+names a pinned commit. Readers that look for the old column names (mzPeakValidator ≤ 0.9.22, the
+viewer) need their update.
 
 ### Added
 
@@ -16,10 +20,20 @@ vocabulary entry names a pinned commit.
   straight from the `.d` had no pixel positions, so the image could not be rebuilt. `MaldiFrameInfo`
   (`XIndexPos`, `YIndexPos`) now becomes the same `IMS:1000050/51` position columns the imzML path
   writes, on the TSF lane and every TDF lane (ims-compact native and SDK, `--no-ims-compact`), with the
-  IMS vocabulary. Indices are written as stored — absolute on the target, not shifted to 1 — since the
-  coordinate base is an open specification decision. A `bruker_maldi` index block keeps regions, index
-  ranges and beam scan size; the beam scan size is written as the pixel size and declared
-  (`bruker:pixel-size-from-beam-scan-size`), as the `.mis` raster step is not part of the `.d`.
+  IMS vocabulary. Bruker's indices are absolute on the target; they are shifted so the run's smallest
+  is 1 (declared `bruker:raster-index-shifted-to-base-1`, `origin` recorded), and the grid —
+  `IMS:1000042/43` pixel counts, and with a pixel size the max dimension `IMS:1000044/45` — is written.
+  A `bruker_maldi` index block keeps regions, raw index ranges and beam scan size; the beam scan size
+  is written as the pixel size and declared (`bruker:pixel-size-from-beam-scan-size`), as the `.mis`
+  raster step is not part of the `.d`.
+- **Imaging detection and the `metadata.imaging` marker.** One detector decides which runs are imaging:
+  imzML always, a Bruker `.d` with `MaldiFrameInfo` positions, and any other input whose spectra state
+  `IMS:1000050/51` (so an imaging archive exported to mzML converts back as imaging). Each gets the
+  imaging profile's `metadata.imaging` block — `is_imaging`, `coordinate_base: 1`, `pixel_count`,
+  `pixel_size_um` and a `provenance` record — without `--image`, which now adds its `images[]` to that
+  block instead of replacing it (and takes the grid from it, so `--image` works on a MALDI `.d` through
+  `--no-ims-compact`). An input with positions but no pixel counts gets them from its largest
+  positions (`imaging:pixel-count-from-positions`).
 - **imzML pixel-size check** by the issue author's rule: x and y with a unit are kept; without a unit,
   micrometre is assumed; a single value is an area when `√value × count = extent` (its square root is
   written) and a length when `value × count = extent`; anything else is dropped. Every action is a
@@ -44,6 +58,9 @@ vocabulary entry names a pinned commit.
 
 ### Changed
 
+- **Position columns renamed** to the imaging profile's `position_x` / `position_y` / `position_z`
+  (were the inflected `opt_IMS_1000050_position_x` / `opt_IMS_1000051_position_y` /
+  `opt_IMS_1000052_position_z`); the column mapping still names each `IMS` term.
 - The IMS vocabulary entry points at `imzML/imzML@2c28b05` instead of `master`, which changed in 2022
   while still calling itself 1.1.0.
 

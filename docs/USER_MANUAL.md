@@ -482,9 +482,19 @@ MassLynx returns only flank zeros plus two sentinels per bin, so a mask that kee
 would save nothing, and dropping every zero could not be undone. Spectra are in acquisition-time
 order across functions.
 
-**Imaging.** imzML input keeps its positions (`IMS:1000050/51`, and `IMS:1000052` when the file
-states a z coordinate) as `opt_IMS_*_position_*` columns of `spectra_metadata_scans`, and its scan
-settings, with three checks since the release after 0.15.0 (HUPO-PSI/mzPeak-specification#23):
+**Imaging.** A run is an imaging run when the converter detects one — imzML input always; a Bruker
+`.d` whose `analysis.tsf`/`.tdf` has `MaldiFrameInfo` positions; any other input (an mzML, the mzML
+this converter exports from an imaging archive) whose spectra state `IMS:1000050/51`. Waters imaging
+`.raw` is not detected yet. A detected run follows the imaging profile
+(HUPO-PSI/mzPeak-specification#24): positions in the `position_x` / `position_y` (and `position_z`
+when stated) columns of `spectra_metadata_scans`, each mapped to its `IMS` term; the grid in
+`scan_settings_list` (`IMS:1000042/43` pixel counts always — counted from the largest positions and
+declared `imaging:pixel-count-from-positions` when the input states none); and the
+`metadata.imaging` index block — `is_imaging`, `coordinate_base: 1`, `pixel_count`, `pixel_size_um`
+and a `provenance` record of what was detected and where each value came from. `--image` adds its
+`images[]` to that block. Positions count from 1. imzML input keeps its positions and scan settings
+as stated (imzML already counts from 1), with three checks since the release after 0.15.0
+(HUPO-PSI/mzPeak-specification#23):
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
 checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
 issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; a single value
@@ -492,12 +502,16 @@ is an area when `√value × count = extent` and written as its square root, a l
 `value × count = extent`, and otherwise dropped), each action declared and listed in the
 `imaging_pixel_size` index block together with any unit accession that disagrees with its unit name;
 and the obsolete "one way" is written as flyback. A **Bruker MALDI** `.d` (TSF or TDF, every timsTOF
-lane) now carries the same position columns: `MaldiFrameInfo.XIndexPos/YIndexPos` per frame, **as
-stored** — absolute raster indices on the target, not shifted to start at 1, because the mzPeak
-coordinate base is still an open specification decision. The `bruker_maldi` index block holds the
-regions (`RegionNumber`), index ranges and beam scan size; the pixel size is the beam scan size,
-declared as such, since the FlexImaging `.mis` with the raster step is not part of the `.d`. Waters
-imaging runs carry no positions yet. Vendor SQLite databases are opened immutable, so a conversion
+lane) carries the same position columns from `MaldiFrameInfo.XIndexPos/YIndexPos` per frame. Those are
+absolute raster indices on the target, so they are **shifted so the smallest is 1** — one shift for
+the whole run, keeping regions where they lie relative to each other — declared
+(`bruker:raster-index-shifted-to-base-1`) and recorded as `origin` in the `bruker_maldi` and
+`metadata.imaging` blocks; the pixel counts are the shifted extent. FlexImaging's own imzML export
+keeps the absolute indices (with the pixel counts set to the largest index), so a `.d` and its imzML
+export differ by exactly `origin − 1`. The `bruker_maldi` index block holds the regions
+(`RegionNumber`), raw index ranges and beam scan size; the pixel size is the beam scan size, with the
+max dimension `IMS:1000044/45` = count × size, declared as such, since the FlexImaging `.mis` with the
+raster step is not part of the `.d`. Waters imaging runs carry no positions yet. Vendor SQLite databases are opened immutable, so a conversion
 writes nothing into the `.d` (a read-only open of a WAL-mode MALDI TSF used to leave `-shm`/`-wal`).
 
 **Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
@@ -732,7 +746,9 @@ The vocabulary:
 | `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
 | `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata keeps whichever attribute comes last) | imzML |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
-| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step (the `.mis` is not part of the `.d`) | Bruker TSF / TDF with `MaldiFrameInfo` |
+| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step (the `.mis` is not part of the `.d`) | Bruker TSF / TDF with `MaldiFrameInfo` |
+| `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |
+| `imaging:pixel-count-from-positions` | the input states positions but no pixel counts; `IMS:1000042/43` were written as the largest positions | imzML, mzML with `IMS:1000050/51` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
