@@ -1,9 +1,9 @@
 cask "mzpeak-convert" do
   arch arm: "aarch64", intel: "x86_64"
 
-  version "0.15.0"
-  sha256 arm:   "ea35cbb5394a392dcc6a1b60224e8ebee3d0c7033409f0bd3809350ed9fb84e7",
-         intel: "90a9a30bd907ea3eda05381f643395227c64bcd2776f67dee30c69317f414a37"
+  version "0.16.0"
+  sha256 arm:   "99bc85e90ece716b8324a36543b9b952147ae84de6418648eb35f3e2b415348d",
+         intel: "26dd63423a51165c47e935f035e6767ab0bfee9042cd8ac8e3bc041524aa2d30"
 
   url "https://github.com/okohlbacher/mzPeakConverter/releases/download/v#{version}/" \
       "mzpeak-convert-#{version}-#{arch}-apple-darwin.tar.gz"
