@@ -243,30 +243,44 @@ pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
     };
     // Largest first, each run of gaps within 1 µm: first the mean of the gaps within four float32
     // steps of its median (a float32 step's variants average to the step over the raster; a stray
-    // splitting a column's gap does not pull it off), then every other gap in the run, largest
-    // first — a sparse raster's scans just off absent columns can outnumber its step's gaps and
-    // move the median off the step (review 2026-09-30, fifth pass). Each is tested at itself and
-    // within two float32 steps: a sparse raster's one or two float32 gaps drift past 1 µm over the
-    // raster, and a shift that small is noise, never a fraction. A run with a gap that holds ends
-    // the search, fitted or not: a smaller run would be a fraction of the step.
+    // splitting a column's gap does not pull it off), then up to 16 other gaps of the run, largest
+    // first, each two float32 steps from those tried — a sparse raster's scans just off absent
+    // columns can outnumber its step's gaps and move the median off the step (review 2026-09-30,
+    // fifth pass). Each is tested at itself, then outward by quarter float32 steps to two, the
+    // first that holds: a sparse raster's one or two float32 gaps drift past 1 µm over the raster,
+    // and a shift that small is noise, never a fraction. A run with a gap that holds ends the
+    // search, fitted or not: a smaller run would be a fraction of the step.
     let mut fit = None;
+    let mut from_other = false;
     for run in runs(&gaps).into_iter().rev() {
         let median = run[run.len() / 2];
         let centre = mean(&run.iter().copied().filter(|g| (g - median).abs() <= 4.0 * float32).collect::<Vec<_>>());
-        let others = run.iter().rev().copied().filter(|g| (g - centre).abs() > 4.0 * float32);
+        let mut tried = vec![centre];
+        for &g in run.iter().rev() {
+            if tried.len() > 16 {
+                break;
+            }
+            if tried.iter().all(|t| (g - t).abs() > 2.0 * float32) {
+                tried.push(g);
+            }
+        }
         let mut held = false;
-        fit = std::iter::once(centre).chain(others).find_map(|g0| {
-            let (g, origin) = (-8..=8)
+        fit = tried.into_iter().find_map(|g0| {
+            let (g, origin) = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7, -8, 8]
+                .into_iter()
                 .map(|i| g0 + i as f64 / 4.0 * float32)
-                .filter_map(|g| holds(g).map(|o| (g, o)))
-                .min_by(|a, b| (a.0 - g0).abs().total_cmp(&(b.0 - g0).abs()))?;
+                .find_map(|g| holds(g).map(|o| (g, o)))?;
             held = true;
+            from_other = g0 != centre;
             // Least squares refines pitch and origin by float noise only — the grid points move by
-            // 1 µm at most over the raster — else the grid is g's.
+            // 1 µm at most over the raster, and it places no scan the grid at g leaves off (a stray
+            // half a µm off would slide the pitch to seat it) — else the grid is g's.
             let tight = |f: &AxisFit| f.0.pitch.is_some_and(|p| (p - g).abs() * (f.0.count - 1) as f64 <= SAME_POSITION_MM);
+            let fixed = grid_at(values, raster, g, Some(origin), true, ON_LATTICE_MM);
             grid_at(values, raster, g, Some(origin), false, ON_LATTICE_MM)
                 .filter(tight)
-                .or_else(|| grid_at(values, raster, g, Some(origin), true, ON_LATTICE_MM))
+                .filter(|r| fixed.as_ref().is_none_or(|f| r.1.iter().zip(&f.1).all(|(a, b)| a.is_none() || b.is_some())))
+                .or(fixed)
         });
         if held {
             break;
@@ -282,17 +296,22 @@ pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
     let snapped = [1e3, 1e4].into_iter().map(|u| (pitch * u).round() / u).find(|s| (s - pitch).abs() <= 3.0 * se);
     let fit = match snapped.and_then(|s| grid_at(values, raster, s, Some(fit.0.origin), true, ON_LATTICE_MM)) {
         Some(s) if off(&s.1) <= off(&fit.1) => s,
+        // A pitch from a gap other than the run's median must be a round step: sub-µm scatter on a
+        // few columns lets such a gap hold a pitch off the step.
+        _ if from_other => return None,
         _ => fit,
     };
     (fit.0.pitch.is_some_and(|p| p >= min_step) && !seated_by_strays(&fit.1)).then_some(fit)
 }
 
 /// Whether a step-free lattice is a fraction 1/m of a coarser one seated by strays: the columns off
-/// the coarser lattice each hold at most half the scans of its median column (a raster column holds
-/// one scan per row; a stray, one). Such a grid places every scan right but states a pixel size the
-/// raster never had (review 2026-09-30, fifth pass).
+/// the coarser lattice each hold at most half the scans of its median column, and at least two of
+/// its columns hold twice the scans of any of them (a raster column holds one scan per row; a
+/// stray, one — and a row acquired twice is not a coarser lattice). Such a grid places every scan
+/// right but states a pixel size the raster never had (review 2026-09-30, fifth pass).
 ///
-/// ponytail: m up to 64; a single-row raster (one scan per column) cannot tell strays from columns.
+/// ponytail: m up to 64; a single-row raster (one scan per column) cannot tell strays from columns,
+/// and tiny plus-shaped cores (1, 3, 1 scans per column) are refused.
 fn seated_by_strays(index: &[Option<i64>]) -> bool {
     let mut per = std::collections::BTreeMap::<i64, usize>::new();
     index.iter().flatten().for_each(|&i| *per.entry(i).or_default() += 1);
@@ -303,7 +322,8 @@ fn seated_by_strays(index: &[Option<i64>]) -> bool {
         let (mut coarse, fine): (Vec<_>, Vec<_>) = per.iter().partition(|(i, _)| i.rem_euclid(m) == r);
         coarse.sort_by_key(|(_, n)| **n);
         let median = *coarse[coarse.len() / 2].1;
-        fine.iter().all(|(_, n)| 2 * **n <= median)
+        let most = fine.iter().map(|(_, n)| **n).max().unwrap_or(0);
+        2 * most <= median && coarse.iter().filter(|(_, n)| **n >= 2 * most).count() >= 2
     })
 }
 
@@ -1044,6 +1064,47 @@ mod tests {
         let (a, index) = fit_axis(&xs, None).unwrap();
         assert_eq!((a.pitch, a.count), (Some(0.1), 89), "{a:?}");
         assert_eq!(index.iter().filter(|i| i.is_none()).count(), 1);
+    }
+
+    /// Review 2026-09-30, sixth pass: the stray-seated-fraction check took a row acquired twice, or
+    /// a one-row region, for the coarser lattice and every other row for strays.
+    #[test]
+    fn a_row_acquired_twice_is_no_coarser_lattice() {
+        let y = |r: f32| (40.0f32 + r * 0.1) as f64;
+        let mut ys = raster(20, 30, |r, _| y(r as f32));
+        ys.extend((0..30).map(|_| y(7.0)));
+        assert_eq!(fit_axis(&ys, None).map(|f| (f.0.pitch, f.0.count)), Some((Some(0.1), 20)));
+        let y5 = |r: f32| (40.0f32 + r * 0.05) as f64;
+        let mut ys = raster(20, 20, |r, _| y5(r as f32));
+        ys.extend((0..40).map(|_| y5(10.0)));
+        assert_eq!(fit_axis(&ys, None).map(|f| (f.0.pitch, f.0.count)), Some((Some(0.05), 20)));
+    }
+
+    /// Review 2026-09-30, sixth pass: trying every gap of a run at 17 offsets took 21 s to refuse
+    /// 100 rows of 10,000 columns with ±0.8 µm stage error per column (26 ms before).
+    #[test]
+    fn a_refusal_stays_fast() {
+        let mut seed = 5u64;
+        let off: Vec<f64> = (0..10_000).map(|_| 0.0008 * noise(&mut seed)).collect();
+        let xs = raster(100, 10_000, |_, c| 30.0 + c as f64 * 0.05 + off[c]);
+        let t = std::time::Instant::now();
+        assert!(fit_axis(&xs, None).is_none());
+        assert!(t.elapsed().as_secs_f64() < 3.0, "{:?}", t.elapsed());
+    }
+
+    /// Review 2026-09-30, sixth pass: sub-µm scatter on three 5 µm columns let a gap other than the
+    /// median hold 4.769 µm; and least squares slid the pitch to seat a stray 0.55 µm off (4.988 µm).
+    #[test]
+    fn neither_scatter_nor_a_stray_moves_the_step() {
+        let xs = [
+            141.86657616777987, 141.87166224238672, 141.87626637913908, 141.86631059022847, 141.8716289639936,
+            141.87603692814076, 141.86616945213697, 141.87154144273012, 141.87581197003428,
+        ];
+        assert!(fit_axis(&xs, None).is_none_or(|f| f.0.pitch == Some(0.005)));
+        let at = |c: f32| (138.66708f32 + c * 0.005) as f64;
+        let mut xs = raster(38, 6, |_, c| at(c as f32));
+        xs.extend([at(14.0) - 0.0003, at(18.0) - 0.00055]);
+        assert_eq!(fit_axis(&xs, None).unwrap().0.pitch, Some(0.005));
     }
 
     /// Review 2026-09-30, fifth pass: a very sparse raster at 195 mm whose step's only neighbouring
