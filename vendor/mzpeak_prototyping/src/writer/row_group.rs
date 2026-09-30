@@ -22,7 +22,8 @@ use parquet::errors::Result as ParquetResult;
 /// The validator's `data_row_group_not_monolithic` advisory fires above 64 MiB (67,108,864 bytes)
 /// of a group's uncompressed Parquet pages (`total_byte_size`). Those pages are never larger than
 /// the Arrow buffers they encode: measured over 63 corpus facets (every lane, point and chunk
-/// layouts), `total_byte_size` / Arrow bytes was 0.80–0.986. Three quarters of the threshold leaves
+/// layouts), `total_byte_size` / Arrow bytes was 0.20–0.986 (0.38–0.986 on the chunk facets; the
+/// low end is dictionary and delta encodings). Three quarters of the threshold leaves
 /// a quarter for what the estimate cannot see (definition/repetition levels, all-null columns), and
 /// it is the per-thread share of the parallel peak encoder's budget (`threads × 48 MiB`), so each
 /// encode worker holds one group. `$MZPC_ROW_GROUP_MB` overrides it for measurements.
