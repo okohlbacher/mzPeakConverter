@@ -54,6 +54,7 @@ mod array_buffer;
 mod base;
 mod builder;
 mod mini_peak;
+mod row_group;
 mod split;
 mod visitor;
 
@@ -63,6 +64,10 @@ pub use array_buffer::{
 };
 pub use base::AbstractMzPeakWriter;
 pub use builder::{ArrayConversionHelper, ColumnEncoding, DataColumnEncodings, MzPeakWriterBuilder, WriteBatchConfig};
+pub use row_group::{
+    DEFAULT_ROW_GROUP_BYTES, RowGroupCut, RowGroupCutter, batch_bytes, row_group_max_bytes,
+    write_row_groups,
+};
 pub use split::UnpackedMzPeakWriterType;
 
 pub use visitor::{
@@ -461,6 +466,7 @@ pub fn sample_array_types_from_spectrum_source<
 fn prune_all_null_dup_point_columns(
     mut peak_file: fs::File,
     props: &WriterProperties,
+    max_row_group_bytes: usize,
 ) -> Result<fs::File, parquet::errors::ParquetError> {
     use arrow::array::{Array, ArrayRef, StructArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -558,6 +564,7 @@ fn prune_all_null_dup_point_columns(
         out_schema.clone(),
         ArrowWriterOptions::new().with_properties(props.clone()),
     )?;
+    let mut row_groups = RowGroupCutter::new(props.max_row_group_row_count(), max_row_group_bytes);
     let dropped: Vec<String> = drop.iter().map(|&i| format!("{}.{}", point_field.name(), children[i].name())).collect();
     if let Some(kvs) = pq_meta.file_metadata().key_value_metadata() {
         for kv in kvs {
@@ -589,7 +596,8 @@ fn prune_all_null_dup_point_columns(
         cols[point_idx] = Arc::new(new_point);
         let new_batch = arrow::record_batch::RecordBatch::try_new(out_schema.clone(), cols)
             .map_err(|e| parquet::errors::ParquetError::General(e.to_string()))?;
-        w.write(&new_batch)?;
+        // The facet's byte cap holds for the rewrite too (DELIBERATE DEVIATION, see `row_group`).
+        write_row_groups(&mut w, &mut row_groups, new_batch, None)?;
     }
     w.close()?;
 
@@ -792,6 +800,9 @@ pub struct MzPeakWriterType<
 > {
     archive_writer: Option<ArrowWriter<SHA512HashingStream<ZipArchiveWriter<W>>>>,
     spectrum_data_buffers: ArrayBufferWriterVariants,
+    /// Where `spectra_data`'s row groups end (row cap or byte cap). DELIBERATE DEVIATION, see
+    /// `row_group`.
+    spectrum_data_row_groups: RowGroupCutter,
     spectrum_peaks_writer: Option<MiniPeakWriterType<fs::File>>,
 
     chromatogram_data_buffers: ArrayBufferWriterVariants,
@@ -1068,6 +1079,10 @@ impl<
         // `auxiliary_arrays` blob. There is no correct archive on this path, so refuse to write one.
         .unwrap_or_else(|e| panic!("Failed to open peak writer: {e}"));
         let separate_peak_writer = Some(separate_peak_writer);
+        let spectrum_data_row_groups = RowGroupCutter::new(
+            data_props.max_row_group_row_count(),
+            row_group_max_bytes(write_batch_config.row_group_bytes),
+        );
 
         let mut this = Self {
             archive_writer: Some(
@@ -1083,6 +1098,7 @@ impl<
             use_chromatogram_chunked_encoding,
             spectrum_metadata_buffer,
             spectrum_data_buffers: spectrum_buffers,
+            spectrum_data_row_groups,
             chromatogram_data_buffers: chromatogram_buffers,
             chromatogram_metadata_buffer: Default::default(),
             buffer_size,
@@ -1148,16 +1164,17 @@ impl<
     fn flush_data_arrays(&mut self) -> io::Result<()> {
         for batch in self.spectrum_data_buffers.drain() {
             if let Some(writer) = self.archive_writer.as_mut() {
-                writer.write(&batch)?;
                 // Bound the in-progress row group by size for EVERY layout (not just chunked) so a
-                // point/non-chunked file can't grow an unbounded row group in RAM.
-                if writer.in_progress_size() > 16_000_000 {
-                    log::debug!(
-                        "Flushing row group buffer with approximately {} bytes",
-                        writer.in_progress_size()
-                    );
-                    writer.flush()?;
-                }
+                // point/non-chunked file can't grow an unbounded row group in RAM: 16 MB of the
+                // writer's compressed estimate, and (DELIBERATE DEVIATION, see `row_group`) the
+                // uncompressed byte cap, which a well-compressing chunk facet reaches first — one
+                // Shimadzu profile facet sat in a single 85 MiB group under the 16 MB alone.
+                write_row_groups(
+                    writer,
+                    &mut self.spectrum_data_row_groups,
+                    batch,
+                    Some(16_000_000),
+                )?;
             } else {
                 panic!("Attempted to write spectrum data but writer does not exist");
             }
@@ -1203,10 +1220,11 @@ impl<
         Ok(())
     }
 
-    fn flush_chromatogram_data_records(&mut self) -> io::Result<()> {
+    /// `row_groups`: the facet's row and byte caps (DELIBERATE DEVIATION, see `row_group`).
+    fn flush_chromatogram_data_records(&mut self, row_groups: &mut RowGroupCutter) -> io::Result<()> {
         for batch in self.chromatogram_data_buffers.drain() {
             if let Some(writer) = self.archive_writer.as_mut() {
-                writer.write(&batch)?;
+                write_row_groups(writer, row_groups, batch, None)?;
                 // if writer.in_progress_size() > 16_000_000 && use_chunks {
                 //     log::debug!(
                 //         "Flushing row group buffer with approximately {} bytes",
@@ -1283,7 +1301,11 @@ impl<
                 let peak_file = peak_file_writer.finish()?;
                 // Option E backstop: drop any all-null column that duplicates a populated sibling's
                 // `array_name` (e.g. a spurious `intensity_f64` twin). No-op unless one is present.
-                let mut peak_file = prune_all_null_dup_point_columns(peak_file, &peak_props)?;
+                let mut peak_file = prune_all_null_dup_point_columns(
+                    peak_file,
+                    &peak_props,
+                    row_group_max_bytes(self.write_batch_config.row_group_bytes),
+                )?;
                 log::trace!("Copying peaks file into zip archive");
                 peak_file.rewind()?;
                 writer.add_file_from_read(
@@ -1530,6 +1552,10 @@ impl<
                         None
                     };
                 if let Some((schema, props)) = schema_props {
+                    let mut row_groups = RowGroupCutter::new(
+                        props.max_row_group_row_count(),
+                        row_group_max_bytes(self.write_batch_config.row_group_bytes),
+                    );
                     self.archive_writer = Some(ArrowWriter::try_new_with_options(
                         SHA512HashingStream::new(writer),
                         schema,
@@ -1568,7 +1594,7 @@ impl<
                     );
 
                     let buffers = self.wavelength_spectrum_data_buffers.as_mut().unwrap();
-                    buffers.drain_into(self.archive_writer.as_mut().unwrap())?;
+                    buffers.drain_into(self.archive_writer.as_mut().unwrap(), &mut row_groups)?;
 
                     (checksum, writer) = self.take_writer()?.unwrap();
                     self.digest_summaries.push(checksum);
@@ -1667,20 +1693,23 @@ impl<
                     .current_entry()
                     .and_then(|v| self.encryption_properties.get(&v.name).cloned());
 
+                let props = Self::chromatogram_data_writer_props(
+                    &self.chromatogram_data_buffers,
+                    BufferContext::Chromatogram.index_field().name().to_string(),
+                    None,
+                    self.compression,
+                    encryption_props,
+                );
+                let mut row_groups = RowGroupCutter::new(
+                    props.max_row_group_row_count(),
+                    row_group_max_bytes(self.write_batch_config.row_group_bytes),
+                );
                 self.archive_writer = Some(ArrowWriter::try_new_with_options(
                     SHA512HashingStream::new(writer),
                     self.chromatogram_data_buffers.schema().clone(),
-                    ArrowWriterOptions::new().with_properties(
-                        Self::chromatogram_data_writer_props(
-                            &self.chromatogram_data_buffers,
-                            BufferContext::Chromatogram.index_field().name().to_string(),
-                            None,
-                            self.compression,
-                            encryption_props,
-                        ),
-                    ),
+                    ArrowWriterOptions::new().with_properties(props),
                 )?);
-                self.flush_chromatogram_data_records()?;
+                self.flush_chromatogram_data_records(&mut row_groups)?;
                 self.add_chromatogram_array_metadata();
                 // Per-facet, like `spectra_data`: chromatograms with rows in this file.
                 self.append_key_value_metadata(
