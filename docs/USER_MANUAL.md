@@ -937,8 +937,9 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   `ims_calibration.ion_mobility_grid.column` is null.
   - **Chunk width.** `--ims-chunked` *(default)*: 50-Th chunks (`--chunk-size`), the m/z-prunable
     form. `--no-ims-chunked`: one chunk per frame — whole-frame access in one row, no pruning within
-    a frame. Row groups are 8192 chunks (`MZPC_ROW_GROUP_ROWS`), the measured random-access sweet
-    spot (7.5 vs 13.4 ms/frame at +1 % size).
+    a frame. Row groups end at 8192 chunks (`MZPC_ROW_GROUP_ROWS`), the measured random-access
+    sweet spot (7.5 vs 13.4 ms/frame at +1 % size), or at 48 MiB (`MZPC_ROW_GROUP_MB`), whichever
+    comes first — on a dense run 8192 chunks were 270–460 MiB.
   - **Encodings.** Index lists and intensity are byte-stream-split with the dictionary off (measured
     −9.6 % against the reference implementation's dictionary default on 2485; its DELTA intent on
     index lists would be +21 %), `spectrum_index` delta-packed, the bounds Parquet's default. Size on
@@ -1047,12 +1048,13 @@ when unset.
 |---|---|
 | `MZPC_BUFFER_SPECTRA=<n>` | Spectra buffered in RAM before the writer flushes a row group (default 256) on the standard f64 paths |
 | `MZPC_DECODE_WINDOW=<n>` | Bounded reorder window for the parallel timsTOF decoder (default 8× rayon threads, capped at 128). Output order — and therefore the bytes — is unchanged |
-| `MZPC_ROW_GROUP_ROWS=<n>` | Peak-facet parquet row-group size in rows (default 8192 chunks/group on chunked facets, parquet's 2^20 otherwise). Trades size against per-frame random access |
+| `MZPC_ROW_GROUP_ROWS=<n>` | Peak-facet parquet row-group size in rows (default 8192 chunks/group on chunked facets, parquet's 2^20 otherwise). Trades size against per-frame random access; a group also ends at `MZPC_ROW_GROUP_MB` |
+| `MZPC_ROW_GROUP_MB=<MiB>` | Vendored writer (and the filter lane's rewrites): byte cap of a signal-facet row group — `spectra_data`, `spectra_peaks`, `chromatograms_data`, wavelength data — in MiB of Arrow buffers, fractions allowed (default 48, three quarters of the validator's 64 MiB `data_row_group_not_monolithic` threshold). A group ends at this or at its row cap, whichever comes first; the byte rule starts a new group rather than split a spectrum that fits one. Changes row-group boundaries, so the bytes — not the values — differ |
 | `MZPC_ENCODE_THREADS=<n>` | Vendored writer: worker threads for the parallel peak-facet encode (default `available_parallelism()`; `RAYON_NUM_THREADS` is honoured as a fallback; `0` or a non-number is ignored). Output is byte-identical at any thread count |
-| `MZPC_ENCODE_INFLIGHT_BYTES=<bytes>` | Vendored writer: byte budget for row groups in flight in that parallel encode (default `max(256 MB, threads × 48 MB)`); bounds memory, never the bytes written |
+| `MZPC_ENCODE_INFLIGHT_BYTES=<bytes>` | Vendored writer: byte budget for row groups in flight in that parallel encode (default `max(256 MB, threads × 48 MB)`); bounds memory, never the bytes written. A group is charged at most the budget's per-thread share, so groups larger than that still encode one per worker instead of one at a time |
 | `MZPC_PARALLEL_ENCODE=0` | Vendored writer: serial peak-facet encode instead of the parallel default (on for every unencrypted archive; encrypted facets are always serial). Output is byte-identical either way. Its own rule: empty or `0` = off, any other value (including `false`) = on |
 | `MZPC_FLUSH_MEM_MB=<MB>` | Vendored writer: flush the in-RAM array buffers once they exceed this many MB (default 128), independent of spectrum or point counts. Changes row-group boundaries on the standard f64 facets, so the bytes — not the values — can differ |
-| `MZPC_TIMING=1` | Log decode-vs-write busy times for the pipelined timsTOF path (`env_flag` in `src/`; the vendored encoder's own timing line uses empty-or-`0` = off) |
+| `MZPC_TIMING=1` | Log decode-vs-write busy times for the pipelined timsTOF path (`env_flag` in `src/`; the vendored encoder's own timing lines — its settings, and at the end its row groups and how many workers were busy on average and at most — use empty-or-`0` = off) |
 | `MZPC_SHIMADZU_DEBUG=1` | Shimadzu glue: trace scan-count discovery on stderr (read by the C# glue: empty or `0` = off, anything else on) |
 | `MZPC_SHIMADZU_PROBE=<n>` | Shimadzu `.lcd`: print the first `n` spectra as JSON lines and exit **without writing an archive**. Since 0.9.13 it is handled before lane selection (in `run`, `src/main.rs`), so it works without `-o` — it used to live inside the Shimadzu lane, which only runs with `-o`, and therefore always swallowed the requested archive; a value that is not a count (including empty) is an error rather than 10; with `-o` it refuses; on macOS/Linux, where the reader does not exist, it is an error rather than silently ignored |
 | `MZPC_DUMP_IM_TABLE=1` | Bruker TDF: dump the scan→1/K0 table (timsrust, and the SDK where available) and exit without converting. Refuses with `-o` |

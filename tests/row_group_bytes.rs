@@ -1,0 +1,329 @@
+//! Row groups of the signal facets are bounded by bytes as well as rows.
+//!
+//! Through 0.16 a signal row group was capped by its row count alone — and in the chunked layout a
+//! row is a whole chunk, so a facet that compresses well stayed in ONE group however large: the
+//! 16 MB flush of `spectra_data` measures the writer's compressed estimate, which a Shimadzu profile
+//! facet never reached before its single group held 85 MiB of pages (validator:
+//! `data_row_group_not_monolithic`), and the peak facet had no byte bound at all (8192 timsTOF grid
+//! chunks: 270–460 MiB per group on PXD076703). Parquet decodes a whole row group for any row of
+//! it, and the parallel peak encoder serialised on groups larger than its in-flight budget.
+//!
+//! `profile_and_centroid_facets_stay_under_the_byte_cap` writes, through the writer, ~90 MB of
+//! profile and of centroid signal that compresses far past 4:1 and checks both facets' row groups
+//! against the default cap and the validator's 64 MiB, and that spectra on either side of a
+//! boundary read back intact. The two CLI tests pin the paths only a conversion reaches: the serial
+//! and parallel peak encoders cut the same row groups under a byte cap, and the mzPeak→mzPeak filter
+//! lane re-groups within it.
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use mzdata::params::Unit;
+use mzdata::prelude::*;
+use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
+use mzdata::spectrum::{Chromatogram, ChromatogramDescription, MultiLayerSpectrum, SignalContinuity, SpectrumDescription};
+use mzpeak_prototyping::MzPeakReader;
+use mzpeak_prototyping::chunk_series::ChunkingStrategy;
+use mzpeak_prototyping::writer::{
+    AbstractMzPeakWriter, ColumnEncoding, DEFAULT_ROW_GROUP_BYTES, DataColumnEncodings, MzPeakWriterType,
+};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::statistics::Statistics;
+
+/// The validator's `data_row_group_not_monolithic` threshold on a group's uncompressed pages.
+const VALIDATOR_MAX_BYTES: i64 = 64 * 1024 * 1024;
+
+const SPECTRA: usize = 8;
+const POINTS: usize = 1_000_000;
+
+/// Spectrum `index`: `POINTS` points on a regular 0.0004-Th grid from 100 Th, intensity a step ramp.
+/// Byte-stream-split, both compress well past 4:1 (as real profile data does), so the writer's
+/// 16 MB compressed-size flush never cuts the facet and only a byte cap on the pages can.
+fn spectrum(index: usize, continuity: SignalContinuity) -> MultiLayerSpectrum {
+    let mut arrays = BinaryArrayMap::new();
+    let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+    mz.update_buffer(&(0..POINTS).map(|i| 100.0 + 0.0004 * i as f64).collect::<Vec<_>>()).unwrap();
+    mz.unit = Unit::MZ;
+    arrays.add(mz);
+    let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+    intensity
+        .update_buffer(&(0..POINTS).map(|i| (((i / 256) + index) % 4096) as f32 + 1.0).collect::<Vec<_>>())
+        .unwrap();
+    intensity.unit = Unit::DetectorCounts;
+    arrays.add(intensity);
+    let descr = SpectrumDescription {
+        id: format!("scan={}", index + 1),
+        index,
+        ms_level: 1,
+        signal_continuity: continuity,
+        ..Default::default()
+    };
+    MultiLayerSpectrum::new(descr, Some(arrays), None, None)
+}
+
+fn write_archive(path: &Path) {
+    let probe = spectrum(0, SignalContinuity::Profile);
+    let basic = Some(ChunkingStrategy::Basic { chunk_size: 50.0 });
+    let bss = DataColumnEncodings {
+        mz_values: ColumnEncoding::ByteStreamSplit,
+        intensity: ColumnEncoding::ByteStreamSplit,
+        ion_mobility: ColumnEncoding::Writer,
+    };
+    let mut writer = MzPeakWriterType::<File>::builder()
+        .chunked_encoding(basic.clone())
+        .peaks_chunked_encoding(basic)
+        .chromatogram_chunked_encoding(None)
+        .data_column_encodings(bss)
+        .compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        .sample_array_types_from_spectra(std::iter::once(probe.clone()))
+        .sample_array_types_for_peaks_from_spectra(std::iter::once(probe))
+        .build(File::create(path).unwrap(), false);
+    // The first half profile (→ spectra_data), the second centroid (→ spectra_peaks).
+    for i in 0..2 * SPECTRA {
+        let continuity = if i < SPECTRA { SignalContinuity::Profile } else { SignalContinuity::Centroid };
+        writer.write_spectrum(&spectrum(i, continuity)).unwrap();
+    }
+    let mut chrom = BinaryArrayMap::new();
+    chrom.add(DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new()));
+    chrom.add(DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new()));
+    writer.write_chromatogram(&Chromatogram::new(ChromatogramDescription::default(), chrom)).unwrap();
+    writer.finish_parquet().unwrap().finish().unwrap();
+}
+
+/// `member` of `archive`, extracted to a temp file named after both.
+fn extract(archive: &Path, member: &str) -> PathBuf {
+    let mut zip = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+    let stem = archive.file_stem().unwrap().to_string_lossy();
+    let out = std::env::temp_dir().join(format!("mzpc-rgb-{}-{stem}-{member}", std::process::id()));
+    let mut src = zip.by_name(member).unwrap_or_else(|_| panic!("{member} missing"));
+    std::io::copy(&mut src, &mut File::create(&out).unwrap()).unwrap();
+    out
+}
+
+fn facet_metadata(archive: &Path, member: &str) -> ParquetMetaData {
+    let extracted = extract(archive, member);
+    let md = SerializedFileReader::new(File::open(&extracted).unwrap()).unwrap().metadata().clone();
+    let _ = std::fs::remove_file(&extracted);
+    md
+}
+
+/// `(min, max)` spectrum index of each row group, from the column statistics.
+fn spectrum_index_ranges(md: &ParquetMetaData) -> Vec<(u64, u64)> {
+    md.row_groups()
+        .iter()
+        .map(|rg| {
+            let col = rg
+                .columns()
+                .iter()
+                .find(|c| c.column_path().string().ends_with("spectrum_index"))
+                .expect("a spectrum_index column");
+            match col.statistics() {
+                Some(Statistics::Int64(s)) => (*s.min_opt().unwrap() as u64, *s.max_opt().unwrap() as u64),
+                other => panic!("unexpected spectrum_index statistics {other:?}"),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn profile_and_centroid_facets_stay_under_the_byte_cap() {
+    let out = std::env::temp_dir().join(format!("mzpc-rgb-{}-archive.mzpeak", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    write_archive(&out);
+
+    for member in ["spectra_data.parquet", "spectra_peaks.parquet"] {
+        let md = facet_metadata(&out, member);
+        let sizes: Vec<i64> = md.row_groups().iter().map(|rg| rg.total_byte_size()).collect();
+        let total: i64 = sizes.iter().sum();
+        eprintln!("{member}: {} row groups, uncompressed {sizes:?} (total {total})", sizes.len());
+        assert!(
+            total > VALIDATOR_MAX_BYTES,
+            "{member}: the fixture must hold more than one group's worth ({total} bytes)"
+        );
+        assert!(
+            sizes.iter().all(|&s| s <= VALIDATOR_MAX_BYTES),
+            "{member}: a row group exceeds the validator's 64 MiB ({sizes:?}) — capped by rows alone"
+        );
+        assert!(
+            sizes.iter().all(|&s| s <= DEFAULT_ROW_GROUP_BYTES as i64),
+            "{member}: a row group exceeds the writer's byte cap ({sizes:?})"
+        );
+        // The byte rule starts a new group rather than splitting a spectrum that fits one.
+        let ranges = spectrum_index_ranges(&md);
+        for w in ranges.windows(2) {
+            assert!(w[0].1 < w[1].0, "{member}: a spectrum spans two row groups ({ranges:?})");
+        }
+    }
+
+    // Spectra on both sides of the first boundary of each facet read back point for point
+    // (basic chunks are lossless).
+    let mut reader = MzPeakReader::new(&out).unwrap();
+    for member in ["spectra_data.parquet", "spectra_peaks.parquet"] {
+        let ranges = spectrum_index_ranges(&facet_metadata(&out, member));
+        for index in [ranges[0].1, ranges[1].0] {
+            let continuity = if (index as usize) < SPECTRA { SignalContinuity::Profile } else { SignalContinuity::Centroid };
+            let want = spectrum(index as usize, continuity);
+            let want = want.raw_arrays().unwrap();
+            let got = if continuity == SignalContinuity::Profile {
+                reader.get_spectrum_arrays(index).unwrap()
+            } else {
+                reader.get_spectrum_peak_arrays_for(index).unwrap()
+            }
+            .unwrap_or_else(|| panic!("{member}: spectrum {index} not found"));
+            assert_eq!(got.mzs().unwrap().as_ref(), want.mzs().unwrap().as_ref(), "{member}: m/z of {index}");
+            assert_eq!(
+                got.intensities().unwrap().as_ref(),
+                want.intensities().unwrap().as_ref(),
+                "{member}: intensity of {index}"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&out);
+}
+
+const SWATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
+
+fn convert(input: &Path, out: &Path, env: &[(&str, &str)]) {
+    let _ = std::fs::remove_file(out);
+    let status = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(input)
+        .arg("-o")
+        .arg(out)
+        .arg("--force")
+        .arg("-q")
+        .envs(env.iter().copied())
+        .env_remove("MZPC_PARALLEL_ENCODE")
+        .status()
+        .expect("failed to run mzpeak-convert");
+    assert!(status.success(), "conversion of {} failed: {status}", input.display());
+}
+
+/// Per row group: its row count and every column chunk's raw bytes.
+fn row_group_bytes(facet: &Path) -> Vec<(i64, Vec<Vec<u8>>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let md = SerializedFileReader::new(File::open(facet).unwrap()).unwrap().metadata().clone();
+    let mut f = File::open(facet).unwrap();
+    md.row_groups()
+        .iter()
+        .map(|rg| {
+            let chunks = rg
+                .columns()
+                .iter()
+                .map(|c| {
+                    let (start, len) = c.byte_range();
+                    let mut buf = vec![0u8; len as usize];
+                    f.seek(SeekFrom::Start(start)).unwrap();
+                    f.read_exact(&mut buf).unwrap();
+                    buf
+                })
+                .collect();
+            (rg.num_rows(), chunks)
+        })
+        .collect()
+}
+
+/// The serial peak encoder (encrypted facets, `MZPC_PARALLEL_ENCODE=0`) and the parallel one cut
+/// the facet with the same cutter, so under a byte cap that splits it they still agree byte for
+/// byte, row group by row group.
+#[test]
+fn serial_and_parallel_peak_encoders_cut_the_same_row_groups() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let mut facets = Vec::new();
+    for parallel in ["0", "1"] {
+        let out = dir.join(format!("mzpc-rgb-{pid}-swath-parallel{parallel}.mzpeak"));
+        // ~0.1 MiB groups: the fixture's peak facet is a few MiB of Arrow buffers.
+        convert(Path::new(SWATH), &out, &[("MZPC_ROW_GROUP_MB", "0.1"), ("MZPC_PARALLEL_ENCODE", parallel)]);
+        facets.push(extract(&out, "spectra_peaks.parquet"));
+        let _ = std::fs::remove_file(&out);
+    }
+    let serial = row_group_bytes(&facets[0]);
+    let parallel = row_group_bytes(&facets[1]);
+    let rows: Vec<i64> = serial.iter().map(|g| g.0).collect();
+    eprintln!("{} row groups, rows {rows:?}", rows.len());
+    assert!(serial.len() > 2, "the byte cap did not split the peak facet ({rows:?})");
+    assert_eq!(
+        rows,
+        parallel.iter().map(|g| g.0).collect::<Vec<_>>(),
+        "serial and parallel encoders cut different row groups"
+    );
+    for (i, (s, p)) in serial.iter().zip(&parallel).enumerate() {
+        assert!(s.1 == p.1, "row group {i}: serial and parallel column chunks differ");
+    }
+    for f in facets {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// A row group larger than the parallel encoder's whole in-flight budget used to be admitted only
+/// once nothing else was in flight, so a run of them encoded on one worker. Here every group is
+/// (0.1 MiB groups against a 4 KiB budget), and zstd-19 keeps each encode busy long enough that the
+/// next groups are dispatched while it runs: several workers must be busy at once. Read from the
+/// encoder's `MZPC_TIMING` report — the only place its concurrency is visible.
+#[test]
+fn oversized_row_groups_encode_on_several_workers() {
+    let out = std::env::temp_dir().join(format!("mzpc-rgb-{}-oversized.mzpeak", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let run = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(SWATH)
+        .arg("-o")
+        .arg(&out)
+        .args(["--force", "-q", "--zstd-level", "19"])
+        .env("MZPC_TIMING", "1")
+        .env("MZPC_ROW_GROUP_MB", "0.1")
+        .env("MZPC_ENCODE_INFLIGHT_BYTES", "4096")
+        .env("MZPC_ENCODE_THREADS", "4")
+        .env_remove("MZPC_PARALLEL_ENCODE")
+        .output()
+        .expect("failed to run mzpeak-convert");
+    assert!(run.status.success(), "conversion failed: {}", run.status);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let report = stderr
+        .lines()
+        .find(|l| l.contains("parallel peak encode:") && l.contains("at once"))
+        .unwrap_or_else(|| panic!("no encoder occupancy report in:\n{stderr}"));
+    eprintln!("{report}");
+    let at_once: usize = report
+        .split("at most ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparsable report: {report}"));
+    assert!(at_once >= 2, "oversized row groups were encoded one at a time: {report}");
+    let _ = std::fs::remove_file(&out);
+}
+
+/// The filter lane re-encodes every facet it filters; it re-groups within the byte cap too, instead
+/// of merging the input's groups up to parquet's million-row default.
+#[test]
+fn filter_lane_keeps_row_groups_under_the_byte_cap() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let src = dir.join(format!("mzpc-rgb-{pid}-filter-src.mzpeak"));
+    let out = dir.join(format!("mzpc-rgb-{pid}-filter-out.mzpeak"));
+    convert(Path::new(SWATH), &src, &[]);
+    let before = facet_metadata(&src, "spectra_peaks.parquet");
+    // Keep every spectrum: the filter still rewrites the per-spectrum facets.
+    let _ = std::fs::remove_file(&out);
+    let status = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&src)
+        .args(["-o"])
+        .arg(&out)
+        .args(["--force", "-q", "--rt", "0-1000000"])
+        .env("MZPC_ROW_GROUP_MB", "0.1")
+        .status()
+        .expect("failed to run mzpeak-convert");
+    assert!(status.success(), "filter failed: {status}");
+    let after = facet_metadata(&out, "spectra_peaks.parquet");
+    let cap = (0.1 * 1024.0 * 1024.0) as i64;
+    let sizes: Vec<i64> = after.row_groups().iter().map(|rg| rg.total_byte_size()).collect();
+    eprintln!("filter: {} → {} row groups, uncompressed {sizes:?}", before.num_row_groups(), sizes.len());
+    assert_eq!(before.file_metadata().num_rows(), after.file_metadata().num_rows(), "rows lost");
+    assert!(sizes.len() > 2, "the filter lane re-grouped by rows alone ({sizes:?})");
+    assert!(sizes.iter().all(|&s| s <= cap), "a filtered row group exceeds the byte cap ({sizes:?})");
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+}

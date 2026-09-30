@@ -29,6 +29,10 @@ pub struct WriteBatchConfig {
     pub write_batch_size: Option<usize>,
     pub page_size: Option<usize>,
     pub row_group_size: Option<usize>,
+    /// Byte cap of a signal-facet row group, beside the `row_group_size` row cap; `None` is
+    /// [`crate::writer::DEFAULT_ROW_GROUP_BYTES`] (or `$MZPC_ROW_GROUP_MB`). DELIBERATE DEVIATION
+    /// (see `writer::row_group`), the knob BACKLOG "Vendoring exit" item 4 asks upstream for.
+    pub row_group_bytes: Option<usize>,
     pub dictionary_page_size: Option<usize>,
     /// Per-role encoding overrides for the spectrum data facets, applied after the writer's own
     /// rules. DELIBERATE DEVIATION, and the `WriterProperties` hook proposed upstream: the
@@ -294,6 +298,12 @@ impl MzPeakWriterBuilder {
 
     pub fn row_group_size(mut self, value: Option<usize>) -> Self {
         self.write_batch_config.row_group_size = value;
+        self
+    }
+
+    /// Set the byte cap of a signal-facet row group (see [`WriteBatchConfig::row_group_bytes`]).
+    pub fn row_group_bytes(mut self, value: Option<usize>) -> Self {
+        self.write_batch_config.row_group_bytes = value;
         self
     }
 

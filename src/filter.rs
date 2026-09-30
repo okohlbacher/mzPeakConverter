@@ -50,6 +50,7 @@ use parquet::schema::types::ColumnPath;
 
 use mzpeak_prototyping::archive::{DataKind, EntityType, FileEntry, ZipArchiveWriter};
 use mzpeak_prototyping::reader::visitor::AnyCURIEArray;
+use mzpeak_prototyping::writer::{RowGroupCutter, row_group_max_bytes, write_row_groups};
 
 /// Effective filter settings for one `.mzpeak → .mzpeak` run. Built by `main.rs` from the CLI/config.
 #[derive(Debug, Default, Clone)]
@@ -907,6 +908,10 @@ where
         props = apply_encodings(props, &schema);
     }
     let props = props.build();
+    // The writer's row groups end at the byte cap as well as parquet's row cap, as every convert
+    // lane's do: re-grouping a filtered chunk facet by rows alone merges its bounded groups back
+    // into oversized ones (a million chunk rows are gigabytes).
+    let mut row_groups = RowGroupCutter::new(props.max_row_group_row_count(), row_group_max_bytes(None));
 
     let mut buf: Vec<u8> = Vec::new();
     let mut rows: u64 = 0;
@@ -921,7 +926,7 @@ where
                 continue;
             }
             accumulate_counts(&out, mode, &mut rows, &mut points, &mut keys);
-            writer.write(&out)?;
+            write_row_groups(&mut writer, &mut row_groups, out, None)?;
         }
         // Append the recomputed counts as footer KV.
         for (k, v) in count_kvs(mode, rows, points, &keys) {

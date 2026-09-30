@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use std::io::{self, prelude::*};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -17,7 +17,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 
 use crate::{
-    ToMzPeakDataSeries, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, peak_series::{ArrayIndex, array_map_to_schema_arrays_and_excess}, writer::{ArrayBufferWriter, ArrayBufferWriterVariants, base::EntryMetadataDerivedFromData},
+    ToMzPeakDataSeries, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, peak_series::{ArrayIndex, array_map_to_schema_arrays_and_excess}, writer::{ArrayBufferWriter, ArrayBufferWriterVariants, base::EntryMetadataDerivedFromData, row_group::{RowGroupCut, RowGroupCutter, write_row_groups}},
 };
 
 /// The peak facet (`spectra_peaks.parquet`) is ~95% of the mzPeak output bytes and, in the
@@ -25,13 +25,13 @@ use crate::{
 /// conversion wall (~97% on a 1.5 GB `.d`, all on ONE core while the perf cores idle). This module
 /// parallelizes that encode across cores WITHOUT changing a single output byte:
 ///
-/// * Row groups are cut at exactly `WriterProperties::max_row_group_size` rows (the parquet default,
-///   1_048_576) — the same boundary the serial `ArrowWriter` uses internally. (The historical 64 MB
-///   `in_progress_size()` byte trigger never fires here: a 1_048_576-row peak row group compresses to
-///   ~8.6 MB, far under 64 MB, so the row cap always wins.) Because the boundaries, the column
-///   encodings/props, and the value streams are all identical, the encoded bytes are identical too —
-///   feeding a row group as one big batch or many small slices produces the same pages, since the
-///   column writer buffers values and flushes pages by size, independent of batch boundaries.
+/// * Row groups are cut by one [`RowGroupCutter`] for both backends: at exactly
+///   `WriterProperties::max_row_group_row_count` rows (the boundary the serial `ArrowWriter` uses
+///   internally) or at the byte cap, whichever comes first (see `row_group`). Because the
+///   boundaries, the column encodings/props, and the value streams are all identical, the encoded
+///   bytes are identical too — feeding a row group as one big batch or many small slices produces
+///   the same pages, since the column writer buffers values and flushes pages by size, independent
+///   of batch boundaries.
 /// * Each cut row group is encoded on a bounded worker pool (`ArrowRowGroupWriterFactory` +
 ///   `compute_leaves` + `ArrowColumnWriter`; zstd runs here, off the writer thread).
 /// * Encoded row groups are appended in strict row-group-index order into a `SerializedFileWriter`
@@ -51,6 +51,8 @@ pub struct MiniPeakWriterType<W: Write + Send + Seek + 'static> {
     /// facet (see `prune_all_null_dup_point_columns`) can re-apply them instead of silently
     /// falling back to parquet's defaults (UNCOMPRESSED, no byte-stream-split, no encryption).
     props: WriterProperties,
+    /// Where the facet's row groups end, for either backend. DELIBERATE DEVIATION (see `row_group`).
+    row_groups: RowGroupCutter,
 }
 
 enum PeakBackend<W: Write + Send + Seek + 'static> {
@@ -61,12 +63,15 @@ enum PeakBackend<W: Write + Send + Seek + 'static> {
 }
 
 impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
+    /// `max_row_group_bytes`: the byte cap of a row group (see `row_group`); its row cap is `props`'.
     pub fn new(
         writer: ArrowWriter<W>,
         buffers: ArrayBufferWriterVariants,
         buffer_size: usize,
         props: WriterProperties,
+        max_row_group_bytes: usize,
     ) -> Self {
+        let row_groups = RowGroupCutter::new(props.max_row_group_row_count(), max_row_group_bytes);
         let mut this = Self {
             backend: PeakBackend::Serial(writer),
             buffers,
@@ -74,24 +79,32 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
             n_points: 0,
             n_entries: 0,
             props,
+            row_groups,
         };
         this.init_array_index_metadata();
         this
     }
 
-    /// Build a peak writer that encodes row groups across cores (see module docs). `max_rows` is the
-    /// row-group boundary (`WriterProperties::max_row_group_size`); pass the value from the same
-    /// properties used to build `file_writer`/`factory` so boundaries match the serial path exactly.
+    /// Build a peak writer that encodes row groups across cores (see module docs). The row groups
+    /// are cut as on the serial path: at `props`' row cap or at `max_row_group_bytes`; `props` must
+    /// be the properties `file_writer`/`factory` were built with.
     pub fn new_parallel(
         file_writer: SerializedFileWriter<W>,
         factory: ArrowRowGroupWriterFactory,
         schema: SchemaRef,
-        max_rows: usize,
         buffers: ArrayBufferWriterVariants,
         buffer_size: usize,
         props: WriterProperties,
+        max_row_group_bytes: usize,
     ) -> Self {
-        let encoder = ParallelPeakEncoder::new(file_writer, factory, schema, max_rows);
+        let row_groups = RowGroupCutter::new(props.max_row_group_row_count(), max_row_group_bytes);
+        let encoder = ParallelPeakEncoder::new(
+            file_writer,
+            factory,
+            schema,
+            props.max_row_group_row_count(),
+            max_row_group_bytes,
+        );
         let mut this = Self {
             backend: PeakBackend::Parallel(encoder),
             buffers,
@@ -99,6 +112,7 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
             n_points: 0,
             n_entries: 0,
             props,
+            row_groups,
         };
         this.init_array_index_metadata();
         this
@@ -274,28 +288,24 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
+        // Both backends cut the facet's row groups with the same `RowGroupCutter` (row cap or byte
+        // cap), so they stay byte-identical. It replaces the serial path's former 64 MB flush on
+        // `in_progress_size()`, a compressed-size estimate the parallel path never applied.
         match &mut self.backend {
             PeakBackend::Serial(writer) => {
                 for batch in self.buffers.drain() {
-                    writer.write(&batch)?;
-                    // Bound the in-progress row group by its real Parquet byte size. The peak/data
-                    // facet can accumulate a very large signal row group (timsTOF ims-compact,
-                    // TOF-grid) under the row-count cap alone, so mirror the main facet's reliable
-                    // byte cap here. Use `in_progress_size()` (the writer's true accounting), NOT
-                    // arrow `memory_size()` which under-reports. 64 MB target for the data facet.
-                    if writer.in_progress_size() > 64_000_000 {
-                        log::debug!(
-                            "Flushing peak row group buffer with approximately {} bytes",
-                            writer.in_progress_size()
-                        );
-                        writer.flush()?;
-                    }
+                    write_row_groups(writer, &mut self.row_groups, batch, None)?;
                 }
                 Ok(())
             }
             PeakBackend::Parallel(enc) => {
                 for batch in self.buffers.drain() {
-                    enc.add_batch(batch)?;
+                    for cut in self.row_groups.cut(batch) {
+                        match cut {
+                            RowGroupCut::Rows(rows) => enc.add_rows(rows),
+                            RowGroupCut::Close => enc.close_row_group()?,
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -336,20 +346,40 @@ type EncodeResult = ParquetResult<(usize, Vec<ArrowColumnChunk>)>;
 /// Byte-budget backpressure gate. Bounds the total in-memory size of the input `RecordBatch`es for
 /// row groups that are dispatched-but-not-yet-finished-encoding, so more cores never mean more
 /// memory. Independent of the core count.
+///
+/// DELIBERATE DEVIATION (see `row_group`): a row group is charged at most `max_charge`, the budget's
+/// per-thread share. A group larger than the whole budget used to be admitted only once nothing else
+/// was in flight, so a run of them (8192 timsTOF grid chunks, 270–460 MiB each on PXD076703)
+/// encoded one at a time on one core while the other workers idled — 2 h 20 min for a 10 GB `.d`.
+/// Capped, up to one such group per worker is in flight: memory stays within
+/// `max(budget, threads × largest group)`, and the byte cap of the row groups bounds the latter.
 struct InFlight {
     bytes: Mutex<usize>,
     cv: Condvar,
     budget: usize,
+    max_charge: usize,
 }
 
 impl InFlight {
-    fn acquire(&self, want: usize) {
+    fn new(budget: usize, threads: usize) -> Self {
+        Self {
+            bytes: Mutex::new(0),
+            cv: Condvar::new(),
+            budget,
+            max_charge: (budget / threads.max(1)).max(1),
+        }
+    }
+
+    /// Admit a row group of `want` input bytes; returns the charge to [`Self::release`].
+    fn acquire(&self, want: usize) -> usize {
+        let want = want.min(self.max_charge);
         let mut g = self.bytes.lock().unwrap();
-        // Always admit at least one job (even a huge one) to avoid deadlock.
+        // Always admit at least one job to avoid deadlock.
         while *g > 0 && *g + want > self.budget {
             g = self.cv.wait(g).unwrap();
         }
         *g += want;
+        want
     }
 
     fn release(&self, amount: usize) {
@@ -362,9 +392,9 @@ impl InFlight {
 /// Encodes the peak facet's row groups across a bounded worker pool and appends them in order.
 ///
 /// Concurrency model:
-/// * The caller (single writer thread) accumulates `RecordBatch`es and cuts a row group every
-///   `max_rows` rows, splitting the boundary batch so each row group holds EXACTLY `max_rows` rows
-///   (last one may be shorter) — reproducing the serial `ArrowWriter` boundaries byte-for-byte.
+/// * The caller (single writer thread) accumulates the rows of the open row group and dispatches it
+///   where the facet's [`RowGroupCutter`] closes it — the boundaries the serial `ArrowWriter` path
+///   gets from the same cutter, byte-for-byte.
 /// * Each cut row group is `pool.spawn`ed for encoding (create column writers for its final index,
 ///   write leaves, close → `Vec<ArrowColumnChunk>`; zstd happens here). A per-job oneshot channel
 ///   carries the result, and the oneshot's receiver is pushed onto an ordered `ready` channel in
@@ -374,9 +404,7 @@ impl InFlight {
 struct ParallelPeakEncoder<W: Write + Send + Seek + 'static> {
     factory: Arc<ArrowRowGroupWriterFactory>,
     schema: SchemaRef,
-    max_rows: usize,
-    pending: VecDeque<RecordBatch>,
-    pending_rows: usize,
+    pending: Vec<RecordBatch>,
     next_idx: usize,
     pool: rayon::ThreadPool,
     inflight: Arc<InFlight>,
@@ -384,6 +412,18 @@ struct ParallelPeakEncoder<W: Write + Send + Seek + 'static> {
     collector: Option<JoinHandle<ParquetResult<SerializedFileWriter<W>>>>,
     kv: Vec<KeyValue>,
     dead: bool,
+    /// `$MZPC_TIMING` only: how busy the workers were, reported at `finish`.
+    stats: Option<Arc<EncodeStats>>,
+}
+
+/// Worker occupancy of the parallel encode, for the `[timing]` report: the summed encode time of
+/// every row group against the wall time from the first dispatch to `finish` is the mean number of
+/// busy workers.
+struct EncodeStats {
+    first_dispatch: std::sync::OnceLock<std::time::Instant>,
+    encode_nanos: AtomicU64,
+    running: AtomicUsize,
+    peak_running: AtomicUsize,
 }
 
 fn detect_encode_threads() -> usize {
@@ -419,17 +459,20 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
         file_writer: SerializedFileWriter<W>,
         factory: ArrowRowGroupWriterFactory,
         schema: SchemaRef,
-        max_rows: usize,
+        max_rows: Option<usize>,
+        max_bytes: usize,
     ) -> Self {
         let threads = detect_encode_threads();
         let budget = detect_inflight_budget(threads);
-        if std::env::var("MZPC_TIMING")
+        let timing = std::env::var("MZPC_TIMING")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if timing {
             eprintln!(
-                "[timing] parallel peak encode: threads={threads} inflight_budget={}MB max_row_group_rows={max_rows}",
-                budget >> 20
+                "[timing] parallel peak encode: threads={threads} inflight_budget={}MB max_row_group_rows={} max_row_group_bytes={:.1}MB",
+                budget >> 20,
+                max_rows.map_or("unlimited".to_string(), |n| n.to_string()),
+                max_bytes as f64 / (1024.0 * 1024.0)
             );
         }
         // Dedicated pool: don't fight the decoder's global rayon pool (idle by the encode-bound tail,
@@ -468,20 +511,22 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
         Self {
             factory: Arc::new(factory),
             schema,
-            max_rows,
-            pending: VecDeque::new(),
-            pending_rows: 0,
+            pending: Vec::new(),
             next_idx: 0,
             pool,
-            inflight: Arc::new(InFlight {
-                bytes: Mutex::new(0),
-                cv: Condvar::new(),
-                budget,
-            }),
+            inflight: Arc::new(InFlight::new(budget, threads)),
             ready_tx: Some(ready_tx),
             collector: Some(collector),
             kv: Vec::new(),
             dead: false,
+            stats: timing.then(|| {
+                Arc::new(EncodeStats {
+                    first_dispatch: std::sync::OnceLock::new(),
+                    encode_nanos: AtomicU64::new(0),
+                    running: AtomicUsize::new(0),
+                    peak_running: AtomicUsize::new(0),
+                })
+            }),
         }
     }
 
@@ -489,44 +534,18 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
         self.kv.push(kv);
     }
 
-    fn add_batch(&mut self, batch: RecordBatch) -> io::Result<()> {
-        let n = batch.num_rows();
-        if n == 0 {
-            return Ok(());
-        }
-        self.pending.push_back(batch);
-        self.pending_rows += n;
-        while self.pending_rows >= self.max_rows {
-            self.cut_and_dispatch(self.max_rows)?;
-        }
-        Ok(())
+    /// Append rows to the open row group.
+    fn add_rows(&mut self, rows: RecordBatch) {
+        self.pending.push(rows);
     }
 
-    /// Pull exactly `target` rows off the front of `pending` (splitting the boundary batch) and
-    /// dispatch them as one row group.
-    fn cut_and_dispatch(&mut self, target: usize) -> io::Result<()> {
-        let mut out: Vec<RecordBatch> = Vec::new();
-        let mut need = target;
-        while need > 0 {
-            let front = self
-                .pending
-                .pop_front()
-                .expect("pending_rows accounting is out of sync with pending batches");
-            let fr = front.num_rows();
-            if fr <= need {
-                need -= fr;
-                self.pending_rows -= fr;
-                out.push(front);
-            } else {
-                let head = front.slice(0, need);
-                let tail = front.slice(need, fr - need);
-                self.pending.push_front(tail);
-                self.pending_rows -= need;
-                need = 0;
-                out.push(head);
-            }
+    /// Dispatch the open row group for encoding (a no-op when it is empty).
+    fn close_row_group(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
         }
-        self.dispatch(out)
+        let batches = std::mem::take(&mut self.pending);
+        self.dispatch(batches)
     }
 
     fn dispatch(&mut self, batches: Vec<RecordBatch>) -> io::Result<()> {
@@ -540,16 +559,29 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
         let input_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
 
         // Backpressure: cap the total input bytes in flight (memory-bounded regardless of cores).
-        self.inflight.acquire(input_bytes);
+        let charge = self.inflight.acquire(input_bytes);
 
         let (result_tx, result_rx) = channel::<EncodeResult>();
         let factory = self.factory.clone();
         let schema = self.schema.clone();
         let inflight = self.inflight.clone();
+        let stats = self.stats.clone();
+        if let Some(s) = &stats {
+            s.first_dispatch.get_or_init(std::time::Instant::now);
+        }
         self.pool.spawn(move || {
+            let t0 = stats.as_ref().map(|s| {
+                let now = s.running.fetch_add(1, Ordering::SeqCst) + 1;
+                s.peak_running.fetch_max(now, Ordering::SeqCst);
+                std::time::Instant::now()
+            });
             let res = encode_row_group(&factory, &schema, idx, batches);
+            if let (Some(s), Some(t0)) = (stats.as_ref(), t0) {
+                s.encode_nanos.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::SeqCst);
+                s.running.fetch_sub(1, Ordering::SeqCst);
+            }
             // `batches` consumed by `encode_row_group`; release its input budget now.
-            inflight.release(input_bytes);
+            inflight.release(charge);
             let _ = result_tx.send(res);
         });
 
@@ -563,28 +595,32 @@ impl<W: Write + Send + Seek + 'static> ParallelPeakEncoder<W> {
             .is_err()
         {
             self.dead = true;
-            self.inflight.release(input_bytes); // collector won't; avoid a stuck budget
+            self.inflight.release(charge); // collector won't; avoid a stuck budget
         }
         Ok(())
     }
 
     fn finish(mut self) -> Result<W, ParquetError> {
         // Flush the remainder as the final (possibly short) row group.
-        while self.pending_rows >= self.max_rows {
-            self.cut_and_dispatch(self.max_rows)
-                .map_err(|e| ParquetError::General(e.to_string()))?;
-        }
-        if self.pending_rows > 0 {
-            let target = self.pending_rows;
-            self.cut_and_dispatch(target)
-                .map_err(|e| ParquetError::General(e.to_string()))?;
-        }
+        self.close_row_group()
+            .map_err(|e| ParquetError::General(e.to_string()))?;
         // Close the ordered channel so the collector's recv loop ends once drained, then join.
         drop(self.ready_tx.take());
         let collector = self.collector.take().expect("collector present until finish");
         let mut file_writer = collector
             .join()
             .map_err(|_| ParquetError::General("peak-collector thread panicked".into()))??;
+        if let Some(s) = &self.stats {
+            let wall = s.first_dispatch.get().map_or(0.0, |t| t.elapsed().as_secs_f64());
+            let busy = s.encode_nanos.load(Ordering::SeqCst) as f64 / 1e9;
+            eprintln!(
+                "[timing] parallel peak encode: {} row groups, {busy:.1} s of encoding in {wall:.1} s \
+                 ({:.1} workers busy on average, at most {} at once)",
+                self.next_idx,
+                if wall > 0.0 { busy / wall } else { 0.0 },
+                s.peak_running.load(Ordering::SeqCst)
+            );
+        }
         // Footer key/value metadata, in the same order the serial path appends it.
         for kv in self.kv.drain(..) {
             file_writer.append_key_value_metadata(kv);
