@@ -1853,6 +1853,13 @@ mod tests {
         };
         let walk: Vec<Option<(f64, f64)>> = (0..20_000).map(|_| Some((10.0 + u(), 20.0 + u()))).collect();
         assert!(WatersImaging::from_positions(walk, laser_names(), [None, None], 0).unwrap().grid.is_err());
+        // Two regions rastered on lattices 30 µm apart in x (not a whole step), no step declared:
+        // no lattice holds both — refused, not a wrong grid.
+        let mut two = desi(20, 30);
+        two.extend(desi(20, 30).into_iter().map(|p| p.map(|(x, y)| (x + 3.03, y))));
+        let im = WatersImaging::from_positions(two, laser_names(), [None, None], 0).unwrap();
+        assert!(im.grid.is_err() && im.position(0).is_none() && im.scan_settings().is_none());
+        assert!(im.block()["no_grid"].as_str().unwrap().starts_with("the x positions lie on no raster"), "{}", im.block());
     }
 
     /// Review 2026-09-30 B14/B15, second pass: without a declared step a spot array (4 × 4 spots

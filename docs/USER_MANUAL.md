@@ -516,23 +516,22 @@ describes one grid). Without a `.mis` the frames' beam scan size is the fallback
 The max dimension `IMS:1000044/45` is count × size. The `bruker_maldi` index block holds the regions
 (number, name, raster step, frames, raw index ranges), the `.mis` it read and the beam scan size.
 A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
-in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them —
-the step the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`, any `…XStep`/`…YStep`) when the
-positions lie within a quarter step of it, else the smallest step between columns (positions closer
-than 30 % of the typical gap being one column: jitter, a small serpentine lag; a larger lag's two
-halves fold into one column) that holds them within a quarter step — or, where that would fold
-distinct positions into a pixel other than as a lag's two halves (three or more in a pixel, or pairs
-in some pixels only, at different distances or off one coarser grid: small regions such as spots,
-tissue-microarray cores), the smallest step that holds each distinct position within 1 µm, as exact
-stage set points are (regions only ever two columns wide, the pairs on one coarser grid, still fold
-like a lag); a step under 3 µm is taken for the recording resolution — and writes the grid index, declared
-(`waters:laser-position-fitted-to-grid`), with the fit (origin, step and its source, count, largest
-residual) in the `waters_imaging` block and each axis's step as its pixel size. Lock-mass scans get
-no position. Up to 1 % of the positioned scans may lie off the grid, or far outside the raster at
-one position (a parked scan, even one on the grid by chance): they get no position
-(`waters:off-grid-position-dropped`). A group far outside that spans columns (a QC region) is part
-of the raster, and so are parked scans beyond 1 %. More than 1 % off the grid, or no grid at all:
-the run gets no positions and no marker, and `waters_imaging` says why. Vendor SQLite databases are opened immutable, so a conversion
+in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them
+and writes the grid index, declared (`waters:laser-position-fitted-to-grid`), with the fit (origin,
+step and its source, count, largest residual) in the `waters_imaging` block and each axis's step as
+its pixel size. The step is the one the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`,
+any `…XStep`/`…YStep`) when the positions lie within a quarter step of it. Otherwise the positions
+must lie on an exact lattice, as the stage's set points do: positions within 1 µm are one, and the
+step is the largest gap between neighbouring distinct positions (3 µm or more) whose lattice holds
+all but 1 % of the scans within 1 µm. The fit refuses rather than guesses: jittered positions, a
+serpentine lag, regions rastered from origins off one lattice and rotated rasters fit no lattice and
+need the declared step; positions recorded at 3 µm or coarser, or lagging by a whole finer step, fit
+that finer lattice, each at its own pixel. Lock-mass scans get no position. Up to 1 % of the
+positioned scans may lie off the grid, or far outside the raster at one position (a parked scan, even
+one on the grid by chance): they get no position (`waters:off-grid-position-dropped`). A group far
+outside that spans columns (a QC region) is part of the raster, and so are parked scans beyond 1 %.
+More than 1 % off the grid, or no grid at all: the run gets no positions and no marker, and
+`waters_imaging` says why. Vendor SQLite databases are opened immutable, so a conversion
 writes nothing into the `.d` (a read-only open of a WAL-mode MALDI TSF used to leave `-shm`/`-wal`).
 
 **Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
