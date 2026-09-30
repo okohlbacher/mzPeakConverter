@@ -113,18 +113,24 @@ fn embed_optical_images(
         .as_ref()
         .and_then(|m| Some((m["pixel_count"]["x"].as_i64()?, m["pixel_count"]["y"].as_i64()?)));
     let (Some(mut block), Some((nx, ny))) = (marker, grid) else {
-        if let Some((path, _)) = embed_list.iter().find(|(_, m)| *m == EmbedMode::Strict) {
-            bail!(
-                "--image {}: {} carries no pixel positions (no imaging marker with a pixel grid was \
-                 written), so there is no grid to overlay the image on",
-                path.display(),
+        // The filter lane (`.mzpeak` input) carries the source's marker only after this embed, so an
+        // imaging archive has none here either: say that, not "no pixel positions".
+        let why = if crate::filter::is_mzpeak_input(input) {
+            "adding an image to an existing archive is not supported yet (the source's imaging marker \
+             is carried only after the image would be placed); pass --image when converting the \
+             imaging run"
+                .to_string()
+        } else {
+            format!(
+                "{} carries no pixel positions (no imaging marker with a pixel grid was written), so \
+                 there is no grid to overlay the image on",
                 input.display()
-            );
+            )
+        };
+        if let Some((path, _)) = embed_list.iter().find(|(_, m)| *m == EmbedMode::Strict) {
+            bail!("--image {}: {why}", path.display());
         }
-        log::warn!(
-            "{} carries no pixel positions — skipping auto-discovered optical image",
-            input.display()
-        );
+        log::warn!("skipping auto-discovered optical image: {why}");
         return Ok(());
     };
 

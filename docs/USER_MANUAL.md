@@ -142,7 +142,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
-| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine. Repeatable. A bad/missing path ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable) (§4.3) |
+| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`), imaging runs only:** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine. Repeatable. A bad/missing path, or a run with no pixel positions, ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable or the run is not imaging) (§4.3) |
 | `--sdrf <SDRF>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an SDRF (sample-metadata) TSV VERBATIM as `sample_metadata/sdrf.tsv` with `metadata.study` + `metadata.sample_metadata` back-refs. A missing/unreadable path ERRORS the conversion (§4.3) |
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
@@ -225,8 +225,8 @@ synthesized TIC/BPC in minutes under that seconds label, so `--rt` cuts those tw
 the times it names: rebuild it first. No published corpus archive has a seconds column. Parquet
 facets are copied verbatim, so encoder options are inert here — warned about, not refused (see the
 table above). The same
-lane injects `--image` / `--sdrf` into an existing archive — the documented way to add them to an
-archive from a lane that cannot embed them (§4.3) — and writes to `<out>.mzpeak.tmp` first, renaming
+lane injects `--sdrf` into an existing archive — the documented way to add it to an archive from a
+lane that cannot embed it (§4.3; `--image` is refused there) — and writes to `<out>.mzpeak.tmp` first, renaming
 into place on success. The three filters on a **raw or exchange** input are a hard error with the
 two-step remedy printed (convert first, then filter the archive); they used to be silently ignored.
 
@@ -254,11 +254,11 @@ auto-discovered sibling is skipped with a warning; `--sdrf` needs nothing. Which
 
 | Lane | `--sdrf` / `--image` |
 |---|---|
-| mzML / imzML on the standard lane, **including the `--tof-grid` sub-path** (the same command used to keep or lose the SDRF depending on whether the grid fit passed — fixed in 0.9.13) | embedded |
+| mzML / imzML on the standard lane, **including the `--tof-grid` sub-path** (the same command used to keep or lose the SDRF depending on whether the grid fit passed — fixed in 0.9.13) | embedded (`--sdrf`; `--image` on an imaging run only, which skips the `--tof-grid` sub-path) |
 | Thermo `.raw`, Bruker TDF with `--no-ims-compact` (mzdata path) | embedded (`--sdrf`; `--image` on an imaging run only) |
 | `--via-msconvert` | embedded (since 0.9.13; it used to hard-code "none") |
-| `.mzpeak` → `.mzpeak` (§4.2) | injected into the existing archive |
-| default timsTOF ims-compact, both `--bruker-sdk` lanes, `--agilent-grid`, native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | **refused** (exit 1) — convert first, then inject: `mzpeak-convert out.mzpeak -o with.mzpeak --sdrf …` |
+| `.mzpeak` → `.mzpeak` (§4.2) | `--sdrf` injected into the existing archive; `--image` **refused**: the source's `metadata.imaging` marker is carried only after the image would be placed, so pass `--image` when converting the imaging run |
+| default timsTOF ims-compact, both `--bruker-sdk` lanes, `--agilent-grid`, native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | **refused** (exit 1) — convert first, then inject: `mzpeak-convert out.mzpeak -o with.mzpeak --sdrf …` (`--sdrf` only, see the row above) |
 | `--to mzml`, `.mzpeak` → mzML | **refused** — mzML has no place for them |
 
 ## 5. Configuration file
@@ -491,7 +491,7 @@ whose scans state laser aim positions (below). A detected run follows the imagin
 when stated) columns of `spectra_metadata_scans`, each mapped to its `IMS` term; the grid in
 `scan_settings_list` (`IMS:1000042/43` pixel counts always — counted from the largest positions and
 declared `imaging:pixel-count-from-positions` when the input states none, raised to them and declared
-`imaging:pixel-count-raised-to-positions` when a position lies beyond the stated counts); and the
+`imaging:pixel-count-raised-to-positions` when a stated count does not bound them); and the
 `metadata.imaging` index block — `is_imaging`, `coordinate_base: 1`, `pixel_count`,
 `pixel_count_source` (`declared`, or `observed_max` when the counts are the largest positions: always
 on the Bruker and Waters lanes), `pixel_size_um` and a `provenance` record of what was detected and
@@ -499,7 +499,8 @@ where each value came from. A position stated as a scan cvParam (imzML, mzML) is
 pixel index: x and y both present, integers from 1 to 2³² − 1 (z too, when stated); any other is
 removed from its scan, both axes together, and declared `imaging:invalid-position-dropped`. An mzML
 whose sampled spectra state no position is searched in full for `IMS:1000050/51`, so positions on
-the other spectra are not lost; the marker (and, for an mzML, the `IMS` vocabulary) is written only
+the other spectra are not lost (an imaging mzML or imzML whose sampled spectra state no z, for
+`IMS:1000052`); the marker (and, for an mzML, the `IMS` vocabulary) is written only
 once a position was. `--tof-grid` does not apply to an imaging run: it is converted on the standard
 lane with f64 m/z, with a warning. `--image` adds its `images[]` to that block. Positions count
 from 1. imzML input keeps its positions and scan settings as stated (imzML already counts from 1),
@@ -769,7 +770,7 @@ The vocabulary:
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
 | `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `imaging:pixel-count-from-positions` | the input states positions but no pixel counts; `IMS:1000042/43` were written as the largest positions | imzML, mzML with `IMS:1000050/51` |
-| `imaging:pixel-count-raised-to-positions` | a written position lies beyond the pixel counts the input states; `IMS:1000042/43` were raised to the largest positions (`pixel_count_source: observed_max`) | imzML, mzML with `IMS:1000050/51` |
+| `imaging:pixel-count-raised-to-positions` | a pixel count the input states does not bound the written positions (a position lies beyond it, it is not a whole number, or only the other axis states one); that `IMS:1000042/43` was set to the largest position on its axis (`pixel_count_source: observed_max`) | imzML, mzML with `IMS:1000050/51` |
 | `imaging:invalid-position-dropped` | at least one scan stated a position that is not a pixel index (x or y missing, not an integer, below 1 or above 2³² − 1, or such a z); its position params were removed and both columns are null for it. The run's warning gives the count | imzML, mzML with `IMS:1000050/51` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |

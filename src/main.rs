@@ -386,11 +386,12 @@ struct Cli {
     #[arg(long)]
     aux: Vec<String>,
 
-    /// **Standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):**
-    /// embed an optical image VERBATIM into the archive as
+    /// **Standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`),
+    /// imaging runs only:** embed an optical image VERBATIM into the archive as
     /// `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine. Repeatable. A bad/missing
-    /// path here ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}`
-    /// sibling is additionally auto-discovered (best-effort: warn + skip if unreadable).
+    /// path, or a run with no pixel positions, ERRORS the conversion (strict). An
+    /// `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered
+    /// (best-effort: warn + skip if unreadable or the run is not imaging).
     #[arg(long)]
     image: Vec<PathBuf>,
 
@@ -3996,10 +3997,12 @@ fn convert_file(
     // not a second decode (review 2026-09-30 B11). Decided before the TOF-grid lane, which has no
     // imaging handling.
     let mut stated_z = probes.iter().any(|s| s.acquisition().scans.iter().any(|sc| sc.get_param_by_curie(&curie!(IMS:1000052)).is_some()));
+    let mut searched = false;
     let detected = imaging::detect(input, is_imzml, &probes).or_else(|| {
         if !matches!(reader, MZReaderType::MzML(_)) {
             return None;
         }
+        searched = true;
         let [x, y, z] = imaging::file_mentions(read_path, ["IMS:1000050", "IMS:1000051", "IMS:1000052"]).unwrap_or_else(|e| {
             log::warn!("imaging positions not searched for in {}: {e}", input.display());
             [false; 3]
@@ -4010,6 +4013,18 @@ fn convert_file(
             imaging::Detected::ScanPositions
         })
     });
+    // A z the probes miss is searched for the same way (an imzML's text is its header and scans, the
+    // arrays live in the `.ibd`); it used to stay a generic scan param with no `position_z` column.
+    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    if scan_lane && detected.is_some() && !searched && !stated_z {
+        stated_z = imaging::file_mentions(read_path, ["IMS:1000052"]).map_or_else(
+            |e| {
+                log::warn!("position z not searched for in {}: {e}", input.display());
+                false
+            },
+            |[z]| z,
+        );
+    }
 
     // TOF-grid m/z encoding (SCIEX / exact-lattice TOF): if requested, sample spectra and try to fit
     // a per-run integer flight-time grid `sqrt(m/z)=c0+c1·k`. When every sampled point reconstructs
@@ -4139,8 +4154,6 @@ fn convert_file(
         log::info!("imaging input: adding position columns");
         writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
         // Position z only when the file states one: a column of nulls on every other archive.
-        // ponytail: z is seen on the probes, and by the full search only when that ran (an mzML
-        // whose probes state no position); a z only on unsampled spectra of any other stays a param.
         if stated_z {
             writer.spectrum_entry_buffer_mut().add_imaging_position_z_visitor();
         }
@@ -4349,7 +4362,7 @@ fn convert_file(
                 },
                 "grid": match counts {
                     Some(imaging::COUNT_FROM_POSITIONS) => "counted from the positions",
-                    Some(_) => "the input's scan settings, counts raised to the largest positions",
+                    Some(_) => "the input's scan settings, a count that did not bound the positions set to the largest",
                     None => "the input's scan settings",
                 },
                 "pixel_size": if imaging_block.is_some() { "checked, see imaging_pixel_size" } else { "as stated" },
@@ -11822,6 +11835,50 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Each scan row's `position_z`; `None` for the whole when the archive has no such column.
+    fn scan_position_z(archive: &std::path::Path) -> Option<Vec<Option<u32>>> {
+        use arrow::array::{Array, UInt32Array};
+        let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+        let mut scans = Vec::new();
+        zip.by_name("spectra_metadata_scans.parquet").unwrap().read_to_end(&mut scans).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(scans)).unwrap().build().unwrap();
+        let mut rows = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            let z = b.column_by_name("position_z")?.as_any().downcast_ref::<UInt32Array>().unwrap().clone();
+            rows.extend((0..z.len()).map(|i| z.is_valid(i).then(|| z.value(i))));
+        }
+        Some(rows)
+    }
+
+    /// A position z stated only on spectra the probes skip, in a run whose probes state x/y: found
+    /// by the same byte search, so it gets its `position_z` column (it used to stay a generic scan
+    /// param) — an mzML (spectrum 1 of 201) and an imzML (spectrum 7 of 9; the probes read 0–5).
+    #[test]
+    fn a_z_beyond_the_probes_gets_its_column() {
+        let dir = scratch("unsampled-z");
+        let z = r#"<cvParam cvRef="IMS" accession="IMS:1000052" name="position z" value="2"/>"#;
+        let src = swath_variant(&dir, "z_unsampled", "", |k| position(k % 20 + 1, k / 20 + 1) + if k == 1 { z } else { "" });
+        let out = dir.join("z_unsampled.mzpeak");
+        let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let zs = scan_position_z(&out).expect("a position_z column");
+        assert_eq!((zs.len(), zs[1], zs.iter().flatten().count()), (201, Some(2), 1));
+
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let y7 = r#"<cvParam cvRef="IMS" accession="IMS:1000050" name="position x" value="2"/>
+            <cvParam cvRef="IMS" accession="IMS:1000051" name="position y" value="3"/>"#;
+        assert_eq!(base.matches(y7).count(), 1);
+        std::fs::write(dir.join("z.imzML"), base.replace(y7, &format!("{y7}{z}"))).unwrap();
+        std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd"), dir.join("z.ibd")).unwrap();
+        let out = dir.join("z_imzml.mzpeak");
+        let (ok, _, err) = run_bin(&[dir.join("z.imzML").as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let zs = scan_position_z(&out).expect("a position_z column");
+        assert_eq!((zs.len(), zs[7], zs.iter().flatten().count()), (9, Some(2), 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Review 2026-09-30 B12/B13 on the imzML lane: a position that is not a pixel index leaves its
     /// scan with both columns null (it used to be null on one axis, or written as 0), declared; a
     /// position beyond the declared counts raises them, declared, with `pixel_count_source`
@@ -11908,6 +11965,11 @@ mod tests {
         assert!(ok, "{err}");
         let img = &index_metadata(&out)["imaging"];
         assert_eq!((&img["images"][0]["archive_path"], &img["pixel_count_source"]), (&serde_json::json!("images/image_0000.png"), &serde_json::json!("declared")), "{img:#}");
+
+        // The filter lane cannot add one yet (its marker is carried after the embed): refused, but
+        // not with a claim that this imaging archive has no positions.
+        let (ok, _, err) = run_bin(&[out.as_os_str(), "-o".as_ref(), dir.join("re.mzpeak").as_os_str(), "--force".as_ref(), "--image".as_ref(), image.as_os_str()], &[]);
+        assert!(!ok && err.contains("existing archive") && !err.contains("no pixel positions"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

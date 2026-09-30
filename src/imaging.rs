@@ -41,7 +41,8 @@ pub const ONE_WAY_AS_FLYBACK: &str = "imzml:one-way-as-flyback";
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
 /// The input states positions but no pixel counts: `IMS:1000042/43` are the largest positions.
 pub const COUNT_FROM_POSITIONS: &str = "imaging:pixel-count-from-positions";
-/// The declared pixel counts were smaller than a written position: raised to the largest positions.
+/// A declared pixel count did not bound the written positions — smaller than one, not a whole
+/// number, or stated for the other axis only: set to the largest position on its axis.
 pub const COUNT_RAISED: &str = "imaging:pixel-count-raised-to-positions";
 /// A scan's position was not a pixel index the `UInt32` columns can hold (x or y missing, not
 /// integral, below 1, above `u32::MAX`): all its position params were removed.
@@ -53,6 +54,8 @@ pub const COUNTS_DECLARED: &str = "declared";
 pub const COUNTS_OBSERVED_MAX: &str = "observed_max";
 
 const POSITIONS: [CURIE; 3] = [mzdata::curie!(IMS:1000050), mzdata::curie!(IMS:1000051), mzdata::curie!(IMS:1000052)];
+/// The pixel counts, x and y: an entry stating either is the grid entry.
+const COUNTS: [CURIE; 2] = [mzdata::curie!(IMS:1000042), mzdata::curie!(IMS:1000043)];
 
 /// What made a run an imaging run.
 pub enum Detected {
@@ -164,9 +167,14 @@ pub fn drop_invalid_positions(d: &mut mzdata::spectrum::SpectrumDescription) -> 
     (kept, dropped)
 }
 
-/// The grid entry of a scan settings list: the one stating the pixel counts.
+/// The grid entry of a scan settings list: the one stating the pixel counts (either axis: an entry
+/// with only a y count used to be passed over and a second grid entry added).
 pub fn grid(list: &[ScanSettings]) -> Option<&ScanSettings> {
-    list.iter().find(|s| s.params.iter().any(|p| p.curie() == Some(mzdata::curie!(IMS:1000042))))
+    list.iter().find(|s| states(s, &COUNTS))
+}
+
+fn states(s: &ScanSettings, accessions: &[CURIE]) -> bool {
+    s.params.iter().any(|p| p.curie().is_some_and(|c| accessions.contains(&c)))
 }
 
 /// The largest position written, per axis — what the pixel counts must at least be.
@@ -183,17 +191,16 @@ impl Extent {
 
     /// Make the grid bound the written positions. Without a grid entry the counts are the largest
     /// positions ([`COUNT_FROM_POSITIONS`]), added to the entry that states a pixel size (one grid
-    /// description), else to a new entry under an id not in use; declared counts below a written
-    /// position are raised to it ([`COUNT_RAISED`]). The transformation applied, if any.
+    /// description), else to a new entry under an id not in use; a declared count that does not
+    /// bound the positions (below one, not a whole number, missing beside the other axis') is set
+    /// to the largest position ([`COUNT_RAISED`]). The transformation applied, if any.
     pub fn bound(&self, list: &mut Vec<ScanSettings>) -> Option<&'static str> {
-        let count = mzdata::curie!(IMS:1000042);
-        let grids = list.iter().filter(|s| s.params.iter().any(|p| p.curie() == Some(count))).count();
+        let grids = list.iter().filter(|s| states(s, &COUNTS)).count();
         if grids > 1 {
             // The profile wants exactly one grid entry; which one to keep is an owner decision.
-            log::warn!("{grids} scan settings state pixel counts (IMS:1000042); the imaging profile describes one grid — the first is the one checked");
+            log::warn!("{grids} scan settings state pixel counts (IMS:1000042/43); the imaging profile describes one grid — the first is the one checked");
         }
-        let states = |s: &ScanSettings, accs: &[CURIE]| s.params.iter().any(|p| p.curie().is_some_and(|c| accs.contains(&c)));
-        let (i, counted) = match list.iter().position(|s| states(s, &[count])) {
+        let (i, counted) = match list.iter().position(|s| states(s, &COUNTS)) {
             Some(i) => (i, false),
             None => {
                 let sized = list.iter().position(|s| states(s, &[mzdata::curie!(IMS:1000046), mzdata::curie!(IMS:1000047)]));
@@ -206,14 +213,14 @@ impl Extent {
             }
         };
         let s = &mut list[i];
-        let raised = raise_count(s, count, "max count of pixels x", self.0)
-            | raise_count(s, mzdata::curie!(IMS:1000043), "max count of pixels y", self.1);
+        let raised = raise_count(s, COUNTS[0], "max count of pixels x", self.0)
+            | raise_count(s, COUNTS[1], "max count of pixels y", self.1);
         if counted { Some(COUNT_FROM_POSITIONS) } else { raised.then_some(COUNT_RAISED) }
     }
 }
 
-/// Set a pixel count to `max` unless it already states an integer of at least that. `true` when it
-/// changed.
+/// Set a pixel count to `max` unless it already states an integer of at least that (a fractional
+/// count is replaced, even by a smaller `max`: it is no count of pixels). `true` when it changed.
 fn raise_count(s: &mut ScanSettings, curie: CURIE, name: &str, max: i64) -> bool {
     match s.params.iter_mut().find(|p| p.curie() == Some(curie)) {
         Some(p) if p.value.to_f64().is_ok_and(|v| v.fract() == 0.0 && v >= max as f64) => false,
@@ -780,6 +787,15 @@ mod tests {
         let mut list = vec![settings("s", &[(cx, "3"), (cy, "2")])];
         assert_eq!(e.bound(&mut list), Some(COUNT_RAISED));
         assert_eq!((count(&list[0], cx), count(&list[0], cy)), (Some(4), Some(2)));
+        // A y count alone makes the grid entry: x joins it (no second entry), y is kept.
+        let mut list = vec![settings("s", &[(cy, "50")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_RAISED));
+        assert_eq!((list.len(), count(&list[0], cx), count(&list[0], cy)), (1, Some(4), Some(50)));
+        assert_eq!(grid(&list).map(|s| s.id.as_str()), Some("s"));
+        // A fractional count is no count of pixels: replaced by the largest position.
+        let mut list = vec![settings("s", &[(cx, "25.5"), (cy, "5")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_RAISED));
+        assert_eq!(count(&list[0], cx), Some(4));
     }
 
     /// Review 2026-09-30 B11: the full-input search finds an accession anywhere, including one
