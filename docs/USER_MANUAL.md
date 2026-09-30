@@ -642,7 +642,9 @@ on SBA415) and `bruker:mz-calibrant-omitted` in `transformations`; the row itsel
 included, is in `vendor_mz_calibration`. **Archives written by 0.13.0 read ModelType-2 rows as
 ModelType 1 and are wrong by an order of magnitude (m/z 270 stored as 21): reconvert them.** mzdata
 0.67.1 has the same defect, so the `--no-ims-compact` and fallback lanes read such files on
-timsrust's chord instead (`bruker:mz-calibration-chord`).
+timsrust's chord instead (`bruker:mz-calibration-chord`), and so does `--to mzml`, with a warning
+in place of the declaration an mzML has no list for (through 0.16.0 that export was an order of
+magnitude low).
 
 **History.** Through 0.13 the archive stored integer `tof` columns with the chord in
 `ims_calibration` (`"exact": false`), and — when every row was ModelType 1 with `C2 = 0` — per-frame

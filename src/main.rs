@@ -2272,6 +2272,10 @@ fn convert_to_mzml(
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&read_path)
         .with_context(|| format!("opening {}", input.display()))?;
     recover_chromatogram_index(&mut reader, input, &read_path);
+    // A TDF with a ModelType-2 m/z calibration is read on timsrust's chord, as the archive lanes
+    // read it since 0.14.0 (`convert_file`); through 0.16.0 this lane kept mzdata's ModelType-1
+    // reading of the row and wrote every m/z an order of magnitude low (SBA415: 21.03 for 270.18).
+    mzdata_tdf_needs_chord(&mut reader, input, "mzML has no transformations list to declare it in");
 
     use mzdata::prelude::{MSDataFileMetadata, SpectrumSource, SpectrumWriter};
     // mzdata reaches chromatograms only by offset, through the index `recover_chromatogram_index`
@@ -3225,10 +3229,15 @@ const GRID_FIT_TRANSFORMATION: &str = "grid-fit:1e-6Da";
 const TDF_CHORD_TRANSFORMATION: &str = bruker_native::CHORD;
 
 /// A TDF read through mzdata whose `MzCalibration` holds a row of a model type other than 1:
-/// switch mzdata's per-frame m/z model off (timsrust's chord instead) and say so. mzdata 0.67.1
-/// reads every row as ModelType 1, which turns a ModelType-2 row's `C3`/`C4` (copies of `C0`/`C2`)
-/// into a cubic term and a shift and puts every m/z an order of magnitude low. `true` when switched.
-fn mzdata_tdf_needs_chord(reader: &mut MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>, input: &Path) -> bool {
+/// switch mzdata's per-frame m/z model off (timsrust's chord instead) and say so, with `declared`
+/// saying where the lane records it. mzdata 0.67.1 reads every row as ModelType 1, which turns a
+/// ModelType-2 row's `C3`/`C4` (copies of `C0`/`C2`) into a cubic term and a shift and puts every
+/// m/z an order of magnitude low. `true` when switched.
+fn mzdata_tdf_needs_chord(
+    reader: &mut MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>,
+    input: &Path,
+    declared: &str,
+) -> bool {
     let MZReaderType::BrukerTDF(tdf) = reader else { return false };
     let path = if input.is_dir() { input.join("analysis.tdf") } else { input.to_path_buf() };
     let types: Vec<i64> = match bruker_native::read_mz_calibration_rows(&path) {
@@ -3240,8 +3249,8 @@ fn mzdata_tdf_needs_chord(reader: &mut MZReaderType<fs::File, CentroidPeak, Deco
     }
     log::warn!(
         "{}: MzCalibration ModelType {:?}, which mzdata reads as ModelType 1 (wrong m/z); reading m/z on \
-         timsrust's two-point chord instead (declared as {TDF_CHORD_TRANSFORMATION}). The default \
-         ims-compact lane stores this file exactly up to the declared calibrant correction.",
+         timsrust's two-point chord instead ({declared}). The default ims-compact lane stores this \
+         file exactly up to the declared calibrant correction.",
         input.display(),
         types
     );
@@ -4076,7 +4085,7 @@ fn convert_file(
     // ModelType-2 row's C3/C4 then become a cubic term and an m/z shift (m/z 270 → 21 on the SBA415
     // run). Until mzdata handles the model type, such a file is read on timsrust's two-point chord —
     // an approximation, declared below — rather than on a model that is wrong.
-    let tdf_chord = mzdata_tdf_needs_chord(&mut reader, input);
+    let tdf_chord = mzdata_tdf_needs_chord(&mut reader, input, &format!("declared as {TDF_CHORD_TRANSFORMATION}"));
 
     // TOF-grid m/z encoding (SCIEX / exact-lattice TOF): if requested, sample spectra and try to fit
     // a per-run integer flight-time grid `sqrt(m/z)=c0+c1·k`. When every sampled point reconstructs

@@ -9,8 +9,9 @@ All notable changes to this project are documented here. The format follows
 **Output change (mzML).** Every mzML the tool writes records its conversion as the default
 processing of both lists, which mzML 1.1 requires and stock OpenMS 3.5.0 needs to read the file — it
 refused every export of a raw file or an archive through 0.16.0. A timsTOF `.d` → mzML writes its
-diaPASEF window limits in order and on the vendor mobility model; an archive → mzML carries each
-peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).** The window limits and the scan
+diaPASEF window limits in order and on the vendor mobility model, and, where its m/z calibration is
+ModelType 2, its m/z on timsrust's chord instead of an order of magnitude low; an archive → mzML
+carries each peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).** The window limits and the scan
 and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the arrays (PXD059079
 2485.d: 49,126 of 79,885 values move).
 
@@ -82,6 +83,17 @@ and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the ar
   them for want of a default processing. Such a spectrum's peaks are read twice, as a peak list and
   as arrays: the `--no-ims-compact` archive of 2485.d exports in 211 s instead of 139 s, the
   ims-compact one in 37 s instead of 29 s.
+- **A timsTOF `.d` with a ModelType-2 m/z calibration exports its m/z to mzML at the right
+  magnitude.** 0.14.0 put the mzdata archive lanes (`--no-ims-compact`, the fallback) on
+  timsrust's two-point chord for such a file, because mzdata 0.67.1 reads every `MzCalibration`
+  row as ModelType 1; `--to mzml` kept mzdata's reading and wrote the first frame of the corpus's
+  SBA415 run as m/z 21.03 … 35.95 instead of 270.18 … 1055.84 — and the ims-compact archive
+  export's own warning sends diaPASEF users to that lane. It now switches to the chord too, and
+  says so (mzML has no `transformations` list for `bruker:mz-calibration-chord`): over SBA415's
+  first 200 spectra (1.69 M peaks) the export agrees with the `--no-ims-compact` archive's to
+  2.6e-4 ppm. The chord is −5 … −11 ppm off the vendor model; the default ims-compact archive keeps
+  the model up to its declared calibrant correction. `tests/tdf_mzml_modeltype2_mz.rs`
+  (corpus-gated) checks the first frames' m/z against the run's acquisition range.
 - **A file name that is not Unicode no longer aborts a conversion.** The recorded `conversion
   options` came from `std::env::args`, which panics on such an argument (a Latin-1 name on Linux):
   every archive conversion of the file aborted, and recording the mzML step would have aborted every
