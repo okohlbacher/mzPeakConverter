@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.16.0] — 2026-09-30
 
 **Output change (imaging).** Imaging archives follow the imaging profile (HUPO-PSI/mzPeak-specification#24):
 the position columns are renamed from `opt_IMS_1000050_position_x` / `…_y` / `…_z` to `position_x` /
@@ -12,7 +12,10 @@ the position columns are renamed from `opt_IMS_1000050_position_x` / `…_y` / `
 Bruker MALDI runs gain pixel positions, counted from 1; imzML archives gain their file provenance in
 `file_description` and, where the header needed it, a checked pixel size. The IMS vocabulary entry
 names a pinned commit. Readers that look for the old column names (mzPeakValidator ≤ 0.9.22, the
-viewer) need their update.
+viewer) need their update. Waters MALDI/DESI runs gain pixel positions fitted to their laser
+positions. Also: archives rewritten from an `.mzpeak` carry correct member checksums again, the `MZP`
+vocabulary entry names a fixed snapshot (tag `mzp-cv-0.2.0`), and a conversion no longer logs two
+spurious vocabulary ERROR lines.
 
 ### Added
 

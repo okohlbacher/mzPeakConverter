@@ -493,7 +493,7 @@ declared `imaging:pixel-count-from-positions` when the input states none); and t
 `metadata.imaging` index block — `is_imaging`, `coordinate_base: 1`, `pixel_count`, `pixel_size_um`
 and a `provenance` record of what was detected and where each value came from. `--image` adds its
 `images[]` to that block. Positions count from 1. imzML input keeps its positions and scan settings
-as stated (imzML already counts from 1), with three checks since the release after 0.15.0
+as stated (imzML already counts from 1), with three checks since 0.16.0
 (HUPO-PSI/mzPeak-specification#23):
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
 checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
