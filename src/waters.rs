@@ -1860,6 +1860,16 @@ mod tests {
         let im = WatersImaging::from_positions(two, laser_names(), [None, None], 0).unwrap();
         assert!(im.grid.is_err() && im.position(0).is_none() && im.scan_settings().is_none());
         assert!(im.block()["no_grid"].as_str().unwrap().starts_with("the x positions lie on no raster"), "{}", im.block());
+        // Four strays in 304 scans (1.3 %) lose the 0.1 mm grid, and the pitch no longer slides to
+        // the fraction of it that seats them: 320 columns of 9.09 µm (review 2026-09-30, fourth pass).
+        let mut strays = desi(10, 30);
+        let at = |c: f32, d: f64| Some(((80.3673f32 + c * 0.1) as f64 + d, (45.9005f32 + 3.0 * 0.1) as f64));
+        strays.extend([at(6.0, 0.0091), at(6.0, 0.0182), at(13.0, 0.0091), at(13.0, 0.0182)]);
+        let im = WatersImaging::from_positions(strays.clone(), laser_names(), [None, None], 0).unwrap();
+        assert!(im.grid.is_err() && im.position(0).is_none() && im.scan_settings().is_none(), "{}", im.block());
+        let steps = [Some(("DesiXStep".to_string(), 0.1)), Some(("DesiYStep".to_string(), 0.1))];
+        let g = WatersImaging::from_positions(strays, laser_names(), steps, 0).unwrap().grid.unwrap();
+        assert_eq!((g.x.pitch, g.x.count, g.y.count), (Some(0.1), 30, 10));
     }
 
     /// Review 2026-09-30 B14/B15, second pass: without a declared step a spot array (4 × 4 spots
