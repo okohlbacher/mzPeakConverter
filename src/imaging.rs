@@ -19,15 +19,16 @@
 //!
 //! **Which runs are imaging** is decided by [`detect`], the one detector every lane calls: imzML
 //! input always; a Bruker `.d` with `MaldiFrameInfo` positions; any other input whose spectra state
-//! `IMS:1000050/51`. A detected run gets the imaging profile's `metadata.imaging` marker
-//! ([`marker_block`]) with its provenance; nothing else is marked imaging.
+//! `IMS:1000050/51` (an mzML the probes miss is searched in full, [`file_mentions`]). A detected run
+//! gets the imaging profile's `metadata.imaging` marker ([`marker_block`]) with its provenance once
+//! at least one position was written; nothing else is marked imaging.
 
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use mzdata::params::{Param, ParamDescribed, Unit};
+use mzdata::params::{CURIE, Param, ParamDescribed, Unit};
 use mzdata::meta::ScanSettings;
 use quick_xml::events::Event;
 
@@ -40,6 +41,18 @@ pub const ONE_WAY_AS_FLYBACK: &str = "imzml:one-way-as-flyback";
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
 /// The input states positions but no pixel counts: `IMS:1000042/43` are the largest positions.
 pub const COUNT_FROM_POSITIONS: &str = "imaging:pixel-count-from-positions";
+/// The declared pixel counts were smaller than a written position: raised to the largest positions.
+pub const COUNT_RAISED: &str = "imaging:pixel-count-raised-to-positions";
+/// A scan's position was not a pixel index the `UInt32` columns can hold (x or y missing, not
+/// integral, below 1, above `u32::MAX`): all its position params were removed.
+pub const INVALID_POSITION_DROPPED: &str = "imaging:invalid-position-dropped";
+
+/// `metadata.imaging.pixel_count_source`: the source stated the counts…
+pub const COUNTS_DECLARED: &str = "declared";
+/// …or the writer took them from the largest positions.
+pub const COUNTS_OBSERVED_MAX: &str = "observed_max";
+
+const POSITIONS: [CURIE; 3] = [mzdata::curie!(IMS:1000050), mzdata::curie!(IMS:1000051), mzdata::curie!(IMS:1000052)];
 
 /// What made a run an imaging run.
 pub enum Detected {
@@ -47,8 +60,9 @@ pub enum Detected {
     ImzML,
     /// A Bruker `.d` whose `analysis.tsf`/`.tdf` has `MaldiFrameInfo` positions.
     BrukerMaldi(crate::bruker_maldi::MaldiInfo),
-    /// Any other input whose sampled spectra state `IMS:1000050`/`51`: an mzML written from imaging
-    /// data, e.g. this converter's own `--to mzml` export of an imaging archive.
+    /// Any other input whose spectra state `IMS:1000050`/`51` (sampled, or an mzML's full text):
+    /// an mzML written from imaging data, e.g. this converter's own `--to mzml` export of an imaging
+    /// archive.
     ScanPositions,
 }
 
@@ -78,10 +92,76 @@ pub fn detect(input: &Path, is_imzml: bool, probes: &[mzdata::spectrum::MultiLay
 
 /// The `(x, y)` position a spectrum's scans state, if any.
 pub fn position_of(d: &mzdata::spectrum::SpectrumDescription) -> Option<(i64, i64)> {
-    d.acquisition.scans.iter().find_map(|sc| {
-        let v = |c| sc.get_param_by_curie(&c)?.value.to_i64().ok();
-        Some((v(mzdata::curie!(IMS:1000050))?, v(mzdata::curie!(IMS:1000051))?))
-    })
+    d.acquisition.scans.iter().find_map(scan_position)
+}
+
+fn scan_position(sc: &mzdata::spectrum::ScanEvent) -> Option<(i64, i64)> {
+    let v = |c| sc.get_param_by_curie(&c)?.value.to_i64().ok();
+    Some((v(mzdata::curie!(IMS:1000050))?, v(mzdata::curie!(IMS:1000051))?))
+}
+
+/// Which of `accessions` occur anywhere in a file's bytes. The detector's probes sample six spectra,
+/// so positions stated only on the others were lost with no trace (review 2026-09-30 B11); this
+/// finds them with one streamed byte search — no array is decoded; 2.5 s on a 6.4 GB mzML. Stops
+/// once all are found. The accessions share their first byte (`IMS:` terms): one pass finds that
+/// byte and tests each accession there.
+pub fn file_mentions<const N: usize>(path: &Path, accessions: [&str; N]) -> std::io::Result<[bool; N]> {
+    let first = accessions[0].as_bytes()[0];
+    assert!(accessions.iter().all(|a| a.as_bytes().first() == Some(&first)), "{accessions:?}");
+    let mut f = std::fs::File::open(path)?;
+    // An accession split across two blocks is found in the next: each block keeps the previous
+    // block's last `longest − 1` bytes in front.
+    let keep = accessions.iter().map(|a| a.len()).max().unwrap_or(1) - 1;
+    let mut buf = vec![0u8; keep + (1 << 20)];
+    let (mut carried, mut found) = (0, [false; N]);
+    loop {
+        let n = f.read(&mut buf[carried..])?;
+        if n == 0 {
+            return Ok(found);
+        }
+        let block = &buf[..carried + n];
+        let mut at = 0;
+        while let Some(i) = block[at..].iter().position(|&b| b == first) {
+            at += i;
+            for (hit, acc) in found.iter_mut().zip(accessions) {
+                *hit |= block[at..].starts_with(acc.as_bytes());
+            }
+            at += 1;
+        }
+        if found.iter().all(|h| *h) {
+            return Ok(found);
+        }
+        carried = keep.min(block.len());
+        let end = block.len();
+        buf.copy_within(end - carried..end, 0);
+    }
+}
+
+/// A position value the `UInt32` position columns can hold as a pixel index: integral, at least 1
+/// (the profile counts from 1), at most `u32::MAX`.
+fn pixel_index(p: &Param) -> bool {
+    p.value.to_f64().is_ok_and(|v| v.fract() == 0.0 && (1.0..=u32::MAX as f64).contains(&v))
+}
+
+/// Remove every position a scan cannot carry as the profile has it (review 2026-09-30 B12): x and y
+/// must both be pixel indices, and z too when stated. The writer used to narrow each value on its
+/// own, so a negative or out-of-range one became null on ONE axis ("both set or both null") and a 0
+/// was written as 0. Returns `(scans keeping a position, scans whose position was removed)`.
+pub fn drop_invalid_positions(d: &mut mzdata::spectrum::SpectrumDescription) -> (usize, usize) {
+    let (mut kept, mut dropped) = (0, 0);
+    for sc in d.acquisition.scans.iter_mut() {
+        let [x, y, z] = POSITIONS.map(|c| sc.get_param_by_curie(&c).map(pixel_index));
+        if x.is_none() && y.is_none() && z.is_none() {
+            continue;
+        }
+        if x == Some(true) && y == Some(true) && z != Some(false) {
+            kept += 1;
+        } else {
+            sc.params_mut().retain(|p| !p.curie().is_some_and(|c| POSITIONS.contains(&c)));
+            dropped += 1;
+        }
+    }
+    (kept, dropped)
 }
 
 /// The grid entry of a scan settings list: the one stating the pixel counts.
@@ -89,22 +169,62 @@ pub fn grid(list: &[ScanSettings]) -> Option<&ScanSettings> {
     list.iter().find(|s| s.params.iter().any(|p| p.curie() == Some(mzdata::curie!(IMS:1000042))))
 }
 
-/// The largest position written — the pixel counts of an input that states positions but no grid.
+/// The largest position written, per axis — what the pixel counts must at least be.
 #[derive(Debug, Default)]
 pub struct Extent(pub i64, pub i64);
 
 impl Extent {
+    /// Every positioned scan of the spectrum, not only the first (review 2026-09-30 B13).
     pub fn observe(&mut self, d: &mzdata::spectrum::SpectrumDescription) {
-        if let Some((x, y)) = position_of(d) {
+        for (x, y) in d.acquisition.scans.iter().filter_map(scan_position) {
             (self.0, self.1) = (self.0.max(x), self.1.max(y));
         }
     }
 
-    pub fn settings(&self) -> ScanSettings {
-        let mut s = ScanSettings { id: "scansettings1".into(), ..Default::default() };
-        s.params.push(Param::builder().name("max count of pixels x").curie(mzdata::curie!(IMS:1000042)).value(self.0).build());
-        s.params.push(Param::builder().name("max count of pixels y").curie(mzdata::curie!(IMS:1000043)).value(self.1).build());
-        s
+    /// Make the grid bound the written positions. Without a grid entry the counts are the largest
+    /// positions ([`COUNT_FROM_POSITIONS`]), added to the entry that states a pixel size (one grid
+    /// description), else to a new entry under an id not in use; declared counts below a written
+    /// position are raised to it ([`COUNT_RAISED`]). The transformation applied, if any.
+    pub fn bound(&self, list: &mut Vec<ScanSettings>) -> Option<&'static str> {
+        let count = mzdata::curie!(IMS:1000042);
+        let grids = list.iter().filter(|s| s.params.iter().any(|p| p.curie() == Some(count))).count();
+        if grids > 1 {
+            // The profile wants exactly one grid entry; which one to keep is an owner decision.
+            log::warn!("{grids} scan settings state pixel counts (IMS:1000042); the imaging profile describes one grid — the first is the one checked");
+        }
+        let states = |s: &ScanSettings, accs: &[CURIE]| s.params.iter().any(|p| p.curie().is_some_and(|c| accs.contains(&c)));
+        let (i, counted) = match list.iter().position(|s| states(s, &[count])) {
+            Some(i) => (i, false),
+            None => {
+                let sized = list.iter().position(|s| states(s, &[mzdata::curie!(IMS:1000046), mzdata::curie!(IMS:1000047)]));
+                let i = sized.unwrap_or_else(|| {
+                    let id = (1..).map(|k| format!("scansettings{k}")).find(|id| list.iter().all(|s| &s.id != id)).unwrap();
+                    list.push(ScanSettings { id, ..Default::default() });
+                    list.len() - 1
+                });
+                (i, true)
+            }
+        };
+        let s = &mut list[i];
+        let raised = raise_count(s, count, "max count of pixels x", self.0)
+            | raise_count(s, mzdata::curie!(IMS:1000043), "max count of pixels y", self.1);
+        if counted { Some(COUNT_FROM_POSITIONS) } else { raised.then_some(COUNT_RAISED) }
+    }
+}
+
+/// Set a pixel count to `max` unless it already states an integer of at least that. `true` when it
+/// changed.
+fn raise_count(s: &mut ScanSettings, curie: CURIE, name: &str, max: i64) -> bool {
+    match s.params.iter_mut().find(|p| p.curie() == Some(curie)) {
+        Some(p) if p.value.to_f64().is_ok_and(|v| v.fract() == 0.0 && v >= max as f64) => false,
+        Some(p) => {
+            p.value = max.into();
+            true
+        }
+        None => {
+            s.params.push(Param::builder().name(name).curie(curie).value(max).build());
+            true
+        }
     }
 }
 
@@ -163,14 +283,17 @@ pub fn fit_axis(values: &[f64]) -> Option<GridAxis> {
 }
 
 /// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
-/// marker, the coordinate base, the grid as the viewer reads it, and where it all came from.
-pub fn marker_block(grid: Option<&ScanSettings>, provenance: serde_json::Value) -> serde_json::Value {
+/// marker, the coordinate base, the grid as the viewer reads it and where its counts came from
+/// (`pixel_count_source`: [`COUNTS_DECLARED`] or [`COUNTS_OBSERVED_MAX`]; review 2026-09-30 B18),
+/// and where it all came from.
+pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, provenance: serde_json::Value) -> serde_json::Value {
     let mut b = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "provenance": provenance});
     let param = |acc| grid?.params.iter().find(|p| p.curie() == Some(acc));
     let int = |acc| param(acc)?.value.to_i64().ok();
     let um = |acc| param(acc).filter(|p| p.unit == Unit::Micrometer)?.value.to_f64().ok();
     if let (Some(x), Some(y)) = (int(mzdata::curie!(IMS:1000042)), int(mzdata::curie!(IMS:1000043))) {
         b["pixel_count"] = serde_json::json!({"x": x, "y": y});
+        b["pixel_count_source"] = pixel_count_source.into();
     }
     // ponytail: micrometre only; a pixel size in another length unit stays in the scan settings.
     if let (Some(x), Some(y)) = (um(mzdata::curie!(IMS:1000046)), um(mzdata::curie!(IMS:1000047))) {
@@ -584,6 +707,94 @@ mod tests {
             ("IMS:1000080".to_string(), "686ec248523749d8a17590dde78ab130".to_string()),
             ("IMS:1000091".to_string(), "ABCDEF0123".to_string()),
         ]);
+    }
+
+    fn scan(params: &[(CURIE, &str)]) -> mzdata::spectrum::ScanEvent {
+        let mut sc = mzdata::spectrum::ScanEvent::default();
+        for (c, v) in params {
+            sc.add_param(Param::builder().name("p").curie(*c).value(v.parse::<mzdata::params::Value>().unwrap()).build());
+        }
+        sc
+    }
+    const X: CURIE = mzdata::curie!(IMS:1000050);
+    const Y: CURIE = mzdata::curie!(IMS:1000051);
+    const Z: CURIE = mzdata::curie!(IMS:1000052);
+
+    /// Review 2026-09-30 B12: a position the `UInt32` columns cannot hold as a pixel index leaves the
+    /// scan whole — x, y and z together — instead of becoming null on one axis.
+    #[test]
+    fn positions_that_are_not_pixel_indices_are_removed() {
+        let mut d = mzdata::spectrum::SpectrumDescription::default();
+        let other = (mzdata::curie!(MS:1000016), "1.5");
+        d.acquisition.scans = vec![
+            scan(&[(X, "1"), (Y, "4294967295"), other]),
+            scan(&[(X, "3.0"), (Y, "2"), (Z, "7")]),
+            scan(&[(X, "0"), (Y, "2")]),
+            scan(&[(X, "-3"), (Y, "2")]),
+            scan(&[(X, "2.5"), (Y, "2")]),
+            scan(&[(X, "4294967296"), (Y, "2")]),
+            scan(&[(X, "2"), other]),
+            scan(&[(X, "2"), (Y, "2"), (Z, "0")]),
+            scan(&[other]),
+        ];
+        assert_eq!(drop_invalid_positions(&mut d), (2, 6));
+        let left: Vec<usize> = d.acquisition.scans.iter().map(|s| s.params().iter().filter(|p| p.curie().is_some_and(|c| POSITIONS.contains(&c))).count()).collect();
+        assert_eq!(left, [2, 3, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(d.acquisition.scans[6].get_param_by_curie(&mzdata::curie!(MS:1000016)).is_some(), "other params stay");
+    }
+
+    /// Review 2026-09-30 B13: every positioned scan counts toward the extent; the counts are
+    /// derived into the entry that states the pixel size, else a new entry under a free id, and
+    /// declared counts that do not bound the positions are raised.
+    #[test]
+    fn the_extent_sees_every_scan_and_bounds_the_grid() {
+        let mut d = mzdata::spectrum::SpectrumDescription::default();
+        d.acquisition.scans = vec![scan(&[(X, "1"), (Y, "2")]), scan(&[(X, "4"), (Y, "1")])];
+        let mut e = Extent::default();
+        e.observe(&d);
+        assert_eq!((e.0, e.1), (4, 2));
+        let count = |s: &ScanSettings, c: CURIE| s.params.iter().find(|p| p.curie() == Some(c)).map(|p| p.value.to_i64().unwrap());
+        let settings = |id: &str, params: &[(CURIE, &str)]| {
+            let mut s = ScanSettings { id: id.into(), ..Default::default() };
+            s.params = scan(params).params().to_vec();
+            s
+        };
+        let (cx, cy) = (mzdata::curie!(IMS:1000042), mzdata::curie!(IMS:1000043));
+
+        // No list at all: a new entry.
+        let mut list = Vec::new();
+        assert_eq!(e.bound(&mut list), Some(COUNT_FROM_POSITIONS));
+        assert_eq!((list[0].id.as_str(), count(&list[0], cx), count(&list[0], cy)), ("scansettings1", Some(4), Some(2)));
+        // An entry without a grid takes the next free id…
+        let mut list = vec![settings("scansettings1", &[(mzdata::curie!(IMS:1000044), "300")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_FROM_POSITIONS));
+        assert_eq!((list.len(), list[1].id.as_str(), count(&list[1], cx)), (2, "scansettings2", Some(4)));
+        // …unless it states the pixel size: the counts join it, one grid description.
+        let mut list = vec![settings("s", &[(mzdata::curie!(IMS:1000046), "100")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_FROM_POSITIONS));
+        assert_eq!((list.len(), count(&list[0], cx), count(&list[0], cy)), (1, Some(4), Some(2)));
+        // Declared counts: kept when they bound the positions, raised per axis when not.
+        let mut list = vec![settings("s", &[(cx, "5"), (cy, "5")])];
+        assert_eq!(e.bound(&mut list), None);
+        assert_eq!((count(&list[0], cx), count(&list[0], cy)), (Some(5), Some(5)));
+        let mut list = vec![settings("s", &[(cx, "3"), (cy, "2")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_RAISED));
+        assert_eq!((count(&list[0], cx), count(&list[0], cy)), (Some(4), Some(2)));
+    }
+
+    /// Review 2026-09-30 B11: the full-input search finds an accession anywhere, including one
+    /// that straddles two read blocks, and only the ones present.
+    #[test]
+    fn file_mentions_finds_accessions_across_blocks() {
+        let p = std::env::temp_dir().join(format!("mzpc-imaging-mentions-{}", std::process::id()));
+        let keep = "IMS:1000050".len() - 1;
+        let mut bytes = vec![b'I'; keep + (1 << 20) - 5];
+        bytes.extend_from_slice(b"IMS:1000051 IMS:1000050");
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(file_mentions(&p, ["IMS:1000050", "IMS:1000051", "IMS:1000052"]).unwrap(), [true, true, false]);
+        std::fs::write(&p, "no positions here").unwrap();
+        assert_eq!(file_mentions(&p, ["IMS:1000050", "IMS:1000051"]).unwrap(), [false, false]);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

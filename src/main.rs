@@ -420,10 +420,10 @@ struct Cli {
     /// indices) instead, recovering `m/z = (c0 + c1·k)²`. **Off by default** and
     /// bounded-lossy (reconstruction within `MZPC_TOF_GRID_PPM`, default 5 ppm) — it reverse-engineers the grid msconvert
     /// discarded. `auto` applies it when a strict fit passes; `on` requires the fit (errors otherwise);
-    /// `off` keeps exact f64. The native vendor lanes other than SCIEX ignore it: the timsTOF
-    /// ims-compact lanes, `--agilent-grid` and the Shimadzu profile facet store the vendor's own
-    /// integer grid (exact models), and the Bruker TSF/BAF, Agilent MHDAC (with a warning) and
-    /// Waters lanes store the m/z their reader returns.
+    /// `off` keeps exact f64. An imaging run skips it, with a warning. The native vendor lanes other
+    /// than SCIEX ignore it: the timsTOF ims-compact lanes, `--agilent-grid` and the Shimadzu
+    /// profile facet store the vendor's own integer grid (exact models), and the Bruker TSF/BAF,
+    /// Agilent MHDAC (with a warning) and Waters lanes store the m/z their reader returns.
     ///
     /// **Native SCIEX `.wiff` (Windows):** Clearcore2 hands over decoded f64 m/z only, so that
     /// lane also fits the grid statistically. There the default (flag absent) is `auto` — the
@@ -3973,13 +3973,59 @@ fn convert_file(
     // an approximation, declared below — rather than on a model that is wrong.
     let tdf_chord = mzdata_tdf_needs_chord(&mut reader, input);
 
+    let is_imzml = matches!(reader, MZReaderType::IMzML(_));
+
+    // Sample real m/z before choosing an encoding: numpress-linear and delta win on opposite kinds
+    // of data, and which one this file holds cannot be told from its name. Spread the probes across
+    // the run rather than taking the first few, which on a DIA file would be all one window.
+    let probes: Vec<mzdata::spectrum::MultiLayerSpectrum> = {
+        let n = reader.len();
+        let step = (n / 6).max(1);
+        let v: Vec<_> = (0..n)
+            .step_by(step)
+            .take(6)
+            .filter_map(|i| reader.get_spectrum_by_index(i))
+            .collect();
+        reader.reset();
+        v
+    };
+
+    // Imaging (`imaging::detect`): imzML always, a Bruker MALDI `.d` (mzdata's TDF lane,
+    // `--no-ims-compact`), or any input whose spectra state positions. The probes see six spectra,
+    // so an mzML whose probes state none is searched in full for the position accessions — bytes,
+    // not a second decode (review 2026-09-30 B11). Decided before the TOF-grid lane, which has no
+    // imaging handling.
+    let mut stated_z = probes.iter().any(|s| s.acquisition().scans.iter().any(|sc| sc.get_param_by_curie(&curie!(IMS:1000052)).is_some()));
+    let detected = imaging::detect(input, is_imzml, &probes).or_else(|| {
+        if !matches!(reader, MZReaderType::MzML(_)) {
+            return None;
+        }
+        let [x, y, z] = imaging::file_mentions(read_path, ["IMS:1000050", "IMS:1000051", "IMS:1000052"]).unwrap_or_else(|e| {
+            log::warn!("imaging positions not searched for in {}: {e}", input.display());
+            [false; 3]
+        });
+        stated_z |= z;
+        (x && y).then(|| {
+            log::info!("positions stated beyond the sampled spectra: imaging input");
+            imaging::Detected::ScanPositions
+        })
+    });
+
     // TOF-grid m/z encoding (SCIEX / exact-lattice TOF): if requested, sample spectra and try to fit
     // a per-run integer flight-time grid `sqrt(m/z)=c0+c1·k`. When every sampled point reconstructs
     // within `tof_grid::ppm_tol()` we store `tof_index` (Int32) instead of f64 m/z. `auto` falls
     // back to the standard f64 path when the fit fails; `on` errors. Scoped to the mzML path (this
     // `open_path` branch only). Not given = `off`: exact f64 is the safe default here.
     let tof_grid = tof_grid.unwrap_or_default();
-    if tof_grid != TofGridMode::Off {
+    if tof_grid != TofGridMode::Off && detected.is_some() {
+        // `convert_file_tof_grid` writes no position columns, no IMS entry and no marker: the run's
+        // positions would become ordinary params (review 2026-09-30 B9). Skipped, `on` included.
+        log::warn!(
+            "--tof-grid not applied: {} is an imaging run and the TOF-grid lane has no imaging \
+             handling; converting it on the standard lane with f64 m/z",
+            input.display()
+        );
+    } else if tof_grid != TofGridMode::Off {
         match try_fit_tof_grid(&mut reader) {
             Some(fit) => {
                 log::info!(
@@ -4020,22 +4066,6 @@ fn convert_file(
     let level = ZstdLevel::try_new(zstd_level)
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
 
-    let is_imzml = matches!(reader, MZReaderType::IMzML(_));
-
-    // Sample real m/z before choosing an encoding: numpress-linear and delta win on opposite kinds
-    // of data, and which one this file holds cannot be told from its name. Spread the probes across
-    // the run rather than taking the first few, which on a DIA file would be all one window.
-    let probes: Vec<mzdata::spectrum::MultiLayerSpectrum> = {
-        let n = reader.len();
-        let step = (n / 6).max(1);
-        let v: Vec<_> = (0..n)
-            .step_by(step)
-            .take(6)
-            .filter_map(|i| reader.get_spectrum_by_index(i))
-            .collect();
-        reader.reset();
-        v
-    };
     let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
 
     // FIXED-POINT m/z LATTICE (see `mz_lattice`). The same probes decide, from the CENTROID values
@@ -4096,25 +4126,24 @@ fn convert_file(
 
     let mut writer = builder.build(handle, true);
 
-    // Imaging (`imaging::detect`): imzML always, a Bruker MALDI `.d` (mzdata's TDF lane,
-    // `--no-ims-compact`), or any input whose spectra state positions. Positions stated as scan
-    // cvParams are promoted to the `position_*` columns; the archive then references the IMS CV, so
-    // declare it (the writer seeds only MS+UO).
-    let (maldi, scan_positions) = match imaging::detect(input, is_imzml, &probes) {
+    // Positions stated as scan cvParams (imzML, an mzML with positions) are promoted to the
+    // `position_*` columns; the IMS vocabulary is declared after the write, once a position was
+    // written (an imzML's header states IMS terms anyway). A MALDI `.d` goes through
+    // `enable_bruker_imaging` below.
+    let (maldi, scan_positions) = match detected {
         Some(imaging::Detected::BrukerMaldi(m)) => (Some(m), None),
         Some(d) => (None, Some(d)),
         None => (None, None),
     };
     if scan_positions.is_some() {
-        log::info!("imaging input: adding position columns + IMS cv");
+        log::info!("imaging input: adding position columns");
         writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
         // Position z only when the file states one: a column of nulls on every other archive.
-        if probes.iter().any(|s| s.acquisition().scans.iter().any(|sc| sc.get_param_by_curie(&curie!(IMS:1000052)).is_some())) {
+        // ponytail: z is seen on the probes, and by the full search only when that ran (an mzML
+        // whose probes state no position); a z only on unsampled spectra of any other stays a param.
+        if stated_z {
             writer.spectrum_entry_buffer_mut().add_imaging_position_z_visitor();
         }
-        writer
-            .controlled_vocabularies_mut()
-            .push(ControlledVocabulary::IMS.into());
     }
 
     writer.copy_metadata_from(&reader);
@@ -4206,6 +4235,8 @@ fn convert_file(
     // reader knows the stored point order is not the source's.
     let mut resorted = false;
     let mut extent = imaging::Extent::default();
+    // Scans written with a position, and scans whose position was removed (`drop_invalid_positions`).
+    let (mut positioned, mut unpositioned) = (0usize, 0usize);
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
@@ -4253,6 +4284,11 @@ fn convert_file(
             m.attach(&mut entry);
         }
         if scan_positions.is_some() {
+            let (kept, dropped) = imaging::drop_invalid_positions(entry.description_mut());
+            if dropped > 0 && unpositioned == 0 {
+                log::warn!("spectrum {}: a scan position is not a pixel index (x and y integers from 1 to 2^32 − 1); removed", entry.id());
+            }
+            (positioned, unpositioned) = (positioned + kept, unpositioned + dropped);
             extent.observe(entry.description());
         }
         if let Some(g) = thermo_windows.as_mut() {
@@ -4282,24 +4318,45 @@ fn convert_file(
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     let acquisition_block = fixup_run_metadata(&mut writer, input);
 
-    // The imaging marker (`metadata.imaging`), with the grid: the input's own pixel counts, else the
-    // largest positions written (declared).
+    // The imaging marker (`metadata.imaging`), once a position was written — the profile wants at
+    // least one. The grid: the input's own pixel counts, raised where a position lies beyond them,
+    // else the largest positions written; each change declared.
     let mut imaging_blocks: Vec<(String, serde_json::Value)> = Vec::new();
     if let Some(d) = &scan_positions {
-        let list = writer.scan_settings_mut();
-        let counted = list.as_ref().is_some_and(|l| imaging::grid(l).is_none());
-        if let (true, Some(l)) = (counted, list) {
-            l.push(extent.settings());
-            imaging_applied.push(imaging::COUNT_FROM_POSITIONS);
+        if unpositioned > 0 {
+            log::warn!("{unpositioned} scans stated a position that is not a pixel index; their positions were removed");
+            imaging_applied.push(imaging::INVALID_POSITION_DROPPED);
         }
-        let grid = writer.scan_settings_mut().and_then(|l| imaging::grid(l).cloned());
-        let provenance = serde_json::json!({
-            "detected_from": if matches!(d, imaging::Detected::ImzML) { "imzML input" } else { "IMS:1000050/51 on the input's scans" },
-            "positions": "IMS:1000050/51 of each spectrum, as stated",
-            "grid": if counted { "counted from the positions" } else { "the input's scan settings" },
-            "pixel_size": if imaging_block.is_some() { "checked, see imaging_pixel_size" } else { "as stated" },
-        });
-        imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), provenance)));
+        // An imzML header states IMS terms (storage mode, grid) whether or not a position survived.
+        if is_imzml || positioned > 0 {
+            writer.controlled_vocabularies_mut().push(ControlledVocabulary::IMS.into());
+        }
+        if positioned == 0 {
+            log::warn!("{}: no scan carries a pixel position; the archive is not marked imaging", input.display());
+        } else {
+            // mzdata's `FileMetadataConfig` behind the writer always holds a list, empty when the
+            // input states no scan settings.
+            let list = writer.scan_settings_mut().expect("the writer holds a scan settings list");
+            let counts = extent.bound(list);
+            imaging_applied.extend(counts);
+            let grid = imaging::grid(list).cloned();
+            let provenance = serde_json::json!({
+                "detected_from": if matches!(d, imaging::Detected::ImzML) { "imzML input" } else { "IMS:1000050/51 on the input's scans" },
+                "positions": if unpositioned > 0 {
+                    "IMS:1000050/51 of each spectrum, as stated; positions that are not pixel indices removed"
+                } else {
+                    "IMS:1000050/51 of each spectrum, as stated"
+                },
+                "grid": match counts {
+                    Some(imaging::COUNT_FROM_POSITIONS) => "counted from the positions",
+                    Some(_) => "the input's scan settings, counts raised to the largest positions",
+                    None => "the input's scan settings",
+                },
+                "pixel_size": if imaging_block.is_some() { "checked, see imaging_pixel_size" } else { "as stated" },
+            });
+            let source = if counts.is_some() { imaging::COUNTS_OBSERVED_MAX } else { imaging::COUNTS_DECLARED };
+            imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), source, provenance)));
+        }
     }
     if let Some(m) = &maldi {
         let (blocks, applied) = m.index_blocks();
@@ -6654,7 +6711,7 @@ fn convert_waters(
     // the Waters branch of imaging detection, which needs MassLynx open.
     if let Some(im) = reader.imaging() {
         let grid = im.scan_settings();
-        let marker = imaging::marker_block(Some(&grid), im.provenance());
+        let marker = imaging::marker_block(Some(&grid), imaging::COUNTS_OBSERVED_MAX, im.provenance());
         hints.imaging = Some(ImagingHints {
             grid,
             blocks: vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())],
@@ -11505,6 +11562,7 @@ mod tests {
         let img = &m["imaging"];
         assert_eq!((&img["is_imaging"], &img["coordinate_base"]), (&serde_json::json!(true), &serde_json::json!(1)), "{img:#}");
         assert_eq!(img["pixel_count"], serde_json::json!({"x": 3, "y": 3}));
+        assert_eq!(img["pixel_count_source"], "declared");
         assert_eq!(img["pixel_size_um"], serde_json::json!({"x": 100.0, "y": 100.0}));
         assert_eq!(img["provenance"]["detected_from"], "imzML input");
         assert!(img.get("images").is_none(), "no optical image was embedded");
@@ -11638,6 +11696,7 @@ mod tests {
         let img = &m["imaging"];
         assert_eq!((&img["is_imaging"], &img["coordinate_base"]), (&serde_json::json!(true), &serde_json::json!(1)), "{img:#}");
         assert_eq!(img["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
+        assert_eq!(img["pixel_count_source"], "observed_max", "the counts are the shifted span");
         assert_eq!(img["position_offset"], serde_json::json!({"x": 668, "y": 699}), "{img:#}");
 
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
@@ -11662,5 +11721,193 @@ mod tests {
         assert_eq!(col("position_x"), vec![1, 2, 169]);
         assert_eq!(col("position_y"), vec![1, 1, 113]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each scan row's `(position_x, position_y)`, `None` for a null; `None` for the whole when the
+    /// archive has no position columns.
+    fn scan_positions(archive: &std::path::Path) -> Option<Vec<(Option<u32>, Option<u32>)>> {
+        use arrow::array::{Array, UInt32Array};
+        let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+        let mut scans = Vec::new();
+        zip.by_name("spectra_metadata_scans.parquet").unwrap().read_to_end(&mut scans).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(scans)).unwrap().build().unwrap();
+        let mut rows = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            let col = |name: &str| Some(b.column_by_name(name)?.as_any().downcast_ref::<UInt32Array>().unwrap().clone());
+            let (x, y) = (col("position_x")?, col("position_y")?);
+            rows.extend((0..x.len()).map(|i| (x.is_valid(i).then(|| x.value(i)), y.is_valid(i).then(|| y.value(i)))));
+        }
+        Some(rows)
+    }
+
+    /// The SWATH example as a plain mzML under `dir`, with `header` placed before the instrument
+    /// configurations and `scan(k)` as the first children of spectrum k's `<scan>`.
+    fn swath_variant(dir: &std::path::Path, name: &str, header: &str, scan: impl Fn(usize) -> String) -> std::path::PathBuf {
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(fs::File::open(SWATH_GZ).unwrap()).read_to_string(&mut text).unwrap();
+        let mut parts = text.split("<scan>");
+        let mut out = parts.next().unwrap().replacen("<instrumentConfigurationList", &format!("{header}<instrumentConfigurationList"), 1);
+        for (k, rest) in parts.enumerate() {
+            out.push_str("<scan>");
+            out.push_str(&scan(k));
+            out.push_str(rest);
+        }
+        let path = dir.join(format!("{name}.mzML"));
+        fs::write(&path, out).unwrap();
+        path
+    }
+
+    fn position(x: impl std::fmt::Display, y: impl std::fmt::Display) -> String {
+        format!(
+            r#"<cvParam cvRef="IMS" accession="IMS:1000050" name="position x" value="{x}"/><cvParam cvRef="IMS" accession="IMS:1000051" name="position y" value="{y}"/>"#
+        )
+    }
+
+    /// Review 2026-09-30 B9: `--tof-grid on|auto` used to take an imaging mzML down the TOF-grid lane
+    /// (the SWATH run's fit passes), which has no imaging handling: no position columns, no IMS
+    /// entry, no marker. An imaging run now skips the grid, with a warning, and keeps its imaging.
+    #[test]
+    fn tof_grid_skips_an_imaging_run() {
+        let dir = scratch("tofgrid-imaging");
+        let src = swath_variant(&dir, "imaging_swath", "", |k| position(k % 20 + 1, k / 20 + 1));
+        for mode in ["on", "auto"] {
+            let out = dir.join(format!("{mode}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref(), "--tof-grid".as_ref(), mode.as_ref()], &[]);
+            assert!(ok, "{mode}: {err}");
+            assert!(err.contains("is an imaging run"), "{mode}: {err}");
+            let m = index_metadata(&out);
+            assert!(!m["transformations"].to_string().contains("tof-grid:"), "{mode}: {:#}", m["transformations"]);
+            assert_eq!(m["imaging"]["is_imaging"], true, "{mode}: {:#}", m["imaging"]);
+            assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 20, "y": 11}), "{mode}");
+            assert!(m["cv_list"].to_string().contains("\"IMS\""), "{mode}");
+            let rows = scan_positions(&out).expect("position columns");
+            assert_eq!((rows.len(), rows[0], rows[200]), (201, (Some(1), Some(1)), (Some(1), Some(11))), "{mode}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Review 2026-09-30 B11: positions stated only on spectra the six probes skip (201 spectra,
+    /// probes every 33rd) are found by the full-input search: the columns, the grid counted from
+    /// them into a scan settings entry the input did not have, the marker, the IMS entry. When no
+    /// stated position is a pixel index, nothing is marked imaging.
+    #[test]
+    fn positions_beyond_the_probes_are_found() {
+        let dir = scratch("unsampled-positions");
+        let src = swath_variant(&dir, "unsampled", "", |k| if k == 1 || k == 2 { position(k + 3, k) } else { String::new() });
+        let out = dir.join("unsampled.mzpeak");
+        let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let m = index_metadata(&out);
+        let img = &m["imaging"];
+        assert_eq!((&img["is_imaging"], &img["pixel_count"]), (&serde_json::json!(true), &serde_json::json!({"x": 5, "y": 2})), "{img:#}");
+        assert_eq!(img["pixel_count_source"], "observed_max");
+        assert!(m["transformations"].to_string().contains(super::imaging::COUNT_FROM_POSITIONS));
+        assert_eq!(m["scan_settings_list"].as_array().unwrap().len(), 1, "{:#}", m["scan_settings_list"]);
+        assert!(m["cv_list"].to_string().contains("\"IMS\""));
+        let rows = scan_positions(&out).expect("position columns");
+        let set: Vec<(usize, (Option<u32>, Option<u32>))> = rows.into_iter().enumerate().filter(|(_, r)| r.0.is_some() || r.1.is_some()).collect();
+        assert_eq!(set, [(1, (Some(4), Some(1))), (2, (Some(5), Some(2)))]);
+
+        // Stated, but not one of them a pixel index: removed and declared, no marker, no IMS entry.
+        let src = swath_variant(&dir, "invalid", "", |k| if k == 1 { position(0, 1) } else { String::new() });
+        let out = dir.join("invalid.mzpeak");
+        let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let m = index_metadata(&out);
+        assert!(m.get("imaging").is_none(), "{:#}", m["imaging"]);
+        assert!(!m["cv_list"].to_string().contains("\"IMS\""), "{:#}", m["cv_list"]);
+        assert!(m["transformations"].to_string().contains(super::imaging::INVALID_POSITION_DROPPED), "{:#}", m["transformations"]);
+        assert!(scan_positions(&out).unwrap().iter().all(|r| *r == (None, None)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Review 2026-09-30 B12/B13 on the imzML lane: a position that is not a pixel index leaves its
+    /// scan with both columns null (it used to be null on one axis, or written as 0), declared; a
+    /// position beyond the declared counts raises them, declared, with `pixel_count_source`
+    /// `observed_max`; without declared counts they are derived into the entry stating the pixel size.
+    #[test]
+    fn imzml_positions_are_checked_against_the_grid() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        let dir = scratch("imzml-positions");
+        let convert = |name: &str, imzml: String| -> std::path::PathBuf {
+            std::fs::write(dir.join(format!("{name}.imzML")), imzml).unwrap();
+            std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[dir.join(format!("{name}.imzML")).as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            out
+        };
+        // Spectrum k states (k % 3 + 1, k / 3 + 1), one line each.
+        let at = |k: usize, x: &str, y: &str| {
+            let line = |acc: &str, axis: &str, v: String| format!(r#"<cvParam cvRef="IMS" accession="{acc}" name="position {axis}" value="{v}"/>"#);
+            let old = format!("{}\n            {}", line("IMS:1000050", "x", (k % 3 + 1).to_string()), line("IMS:1000051", "y", (k / 3 + 1).to_string()));
+            assert!(base.contains(&old), "{old}");
+            (old, [(!x.is_empty()).then(|| line("IMS:1000050", "x", x.into())), (!y.is_empty()).then(|| line("IMS:1000051", "y", y.into()))].into_iter().flatten().collect::<Vec<_>>().join(""))
+        };
+        let with = |edits: &[(String, String)]| edits.iter().fold(base.clone(), |t, (old, new)| t.replace(old, new));
+
+        let bad = convert("bad", with(&[at(0, "0", "1"), at(1, "2.5", "1"), at(2, "3", ""), at(3, "4294967296", "2")]));
+        let m = index_metadata(&bad);
+        assert!(m["transformations"].to_string().contains(super::imaging::INVALID_POSITION_DROPPED), "{:#}", m["transformations"]);
+        assert_eq!((&m["imaging"]["pixel_count"], &m["imaging"]["pixel_count_source"]), (&serde_json::json!({"x": 3, "y": 3}), &serde_json::json!("declared")));
+        let rows = scan_positions(&bad).unwrap();
+        assert_eq!(&rows[..5], [(None, None), (None, None), (None, None), (None, None), (Some(2), Some(2))]);
+
+        let beyond = convert("beyond", with(&[at(8, "5", "3")]));
+        let m = index_metadata(&beyond);
+        assert!(m["transformations"].to_string().contains(super::imaging::COUNT_RAISED), "{:#}", m["transformations"]);
+        assert_eq!((&m["imaging"]["pixel_count"], &m["imaging"]["pixel_count_source"]), (&serde_json::json!({"x": 5, "y": 3}), &serde_json::json!("observed_max")));
+        let counts = m["scan_settings_list"][0]["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000042").unwrap().clone();
+        assert_eq!(counts["value"], 5);
+
+        let uncounted = base.lines().filter(|l| !l.contains("IMS:1000042") && !l.contains("IMS:1000043")).collect::<Vec<_>>().join("\n");
+        let m = index_metadata(&convert("uncounted", uncounted));
+        assert!(m["transformations"].to_string().contains(super::imaging::COUNT_FROM_POSITIONS));
+        assert_eq!(m["scan_settings_list"].as_array().unwrap().len(), 1, "the counts join the entry stating the pixel size: {:#}", m["scan_settings_list"]);
+        assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 3, "y": 3}));
+        assert_eq!(m["imaging"]["pixel_size_um"], serde_json::json!({"x": 100.0, "y": 100.0}));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Review 2026-09-30 B10: an optical image never makes a run imaging. The run below states pixel
+    /// counts in its scan settings but no position, so the lane writes no marker: an explicit
+    /// `--image` is an error (it used to invent `is_imaging: true` from the header's counts), a
+    /// sibling image is skipped. On an imaging run the image joins the lane's marker.
+    #[test]
+    fn an_image_never_makes_a_run_imaging() {
+        let dir = scratch("image-not-imaging");
+        let grid = r#"<scanSettingsList count="1"><scanSettings id="ss1"><cvParam cvRef="IMS" accession="IMS:1000042" name="max count of pixels x" value="3"/><cvParam cvRef="IMS" accession="IMS:1000043" name="max count of pixels y" value="3"/></scanSettings></scanSettingsList>"#;
+        let src = swath_variant(&dir, "counts_only", grid, |_| String::new());
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 4, 8, 2, 0, 0, 0]);
+        let image = dir.join("slide.png");
+        fs::write(&image, &png).unwrap();
+
+        let out = dir.join("explicit.mzpeak");
+        let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref(), "--image".as_ref(), image.as_os_str()], &[]);
+        assert!(!ok && err.contains("carries no pixel positions"), "{err}");
+        assert!(!out.exists());
+
+        fs::write(dir.join("counts_only-opticalimage.png"), &png).unwrap();
+        let out = dir.join("sibling.mzpeak");
+        let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert!(err.contains("skipping auto-discovered optical image"), "{err}");
+        assert!(index_metadata(&out).get("imaging").is_none());
+        assert!(!zip_members(&out).iter().any(|m| m.starts_with("images/")));
+
+        let imzml = dir.join("grid.imzML");
+        fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML"), &imzml).unwrap();
+        fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd"), dir.join("grid.ibd")).unwrap();
+        let out = dir.join("imaging.mzpeak");
+        let (ok, _, err) = run_bin(&[imzml.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref(), "--image".as_ref(), image.as_os_str()], &[]);
+        assert!(ok, "{err}");
+        let img = &index_metadata(&out)["imaging"];
+        assert_eq!((&img["images"][0]["archive_path"], &img["pixel_count_source"]), (&serde_json::json!("images/image_0000.png"), &serde_json::json!("declared")), "{img:#}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
