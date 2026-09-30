@@ -450,7 +450,9 @@ fn laser_items(
 
 /// The raster step a Waters method declares per axis (`methodfile.xml`: `<Setting Name="DesiXStep"
 /// Value="0.1" Mapping="Desi.Pattern.XStep"/>`, mm): the first setting whose name ends in `XStep` /
-/// `YStep`, whatever its prefix (MALDI methods may use another).
+/// `YStep`, whatever its prefix (MALDI methods may use another). Case as written: the names of
+/// `CollisionEnergyStep`, `MaxStep` or `LaserDelayStep` end in `yStep` / `xStep` too, and one
+/// before `DesiYStep` would stand in for it (review 2026-09-30).
 fn declared_steps(xml: &str) -> [Option<(String, f64)>; 2] {
     let mut steps: [Option<(String, f64)>; 2] = [None, None];
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -459,9 +461,8 @@ fn declared_steps(xml: &str) -> [Option<(String, f64)>; 2] {
             quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e) if e.local_name().as_ref() == b"Setting" => {
                 let (Some(name), Some(value)) = (crate::imaging::attr(&e, b"Name"), crate::imaging::attr(&e, b"Value")) else { continue };
                 let Some(v) = value.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0) else { continue };
-                let lower = name.to_ascii_lowercase();
-                for (slot, suffix) in steps.iter_mut().zip(["xstep", "ystep"]) {
-                    if slot.is_none() && lower.ends_with(suffix) {
+                for (slot, suffix) in steps.iter_mut().zip(["XStep", "YStep"]) {
+                    if slot.is_none() && name.ends_with(suffix) {
                         *slot = Some((name.clone(), v));
                     }
                 }
@@ -1758,6 +1759,10 @@ mod tests {
         // Any prefix; a value that is no step is passed over.
         let other = r#"<S><Setting Name="LaserXStep" Value="x"/><Setting Name="MaldiXStep" Value="0.05"/></S>"#;
         assert_eq!(declared_steps(other), [Some(("MaldiXStep".to_string(), 0.05)), None]);
+        // Review 2026-09-30: names ending in `yStep` / `xStep` are no raster steps, and must not
+        // stand in for the DESI steps that follow them.
+        let others = r#"<S><Setting Name="CollisionEnergyStep" Value="2"/><Setting Name="MaxStep" Value="4"/><Setting Name="LaserDelayStep" Value="1.5"/><Setting Name="DesiXStep" Value="0.1"/><Setting Name="DesiYStep" Value="0.1"/></S>"#;
+        assert_eq!(declared_steps(others), [Some(("DesiXStep".to_string(), 0.1)), Some(("DesiYStep".to_string(), 0.1))]);
         assert_eq!(declared_steps(""), [None, None]);
     }
 
@@ -1811,6 +1816,16 @@ mod tests {
         assert_eq!((im.position(0), im.position(1)), (None, Some((1, 1))));
         assert_eq!(im.transformations(), [LASER_GRID, OFF_GRID_DROPPED]);
         assert_eq!(im.block()["off_grid_scans_dropped"], 1);
+        // On both grids by chance (the raster starts at 80.3 mm): it stretched them to 907 × 562
+        // pixels, dropping nothing, declared step or not (review 2026-09-30).
+        let mut mm: Vec<Option<(f64, f64)>> = desi(103, 104).into_iter().map(|p| p.map(|(x, y)| (x - 0.0673, y))).collect();
+        mm.insert(0, Some((0.0, 0.0)));
+        for steps in [[None, None], [step("DesiXStep", 0.1), step("DesiYStep", 0.1)]] {
+            let im = WatersImaging::from_positions(mm.clone(), laser_names(), steps, 0).unwrap();
+            let g = im.grid.as_ref().unwrap();
+            assert_eq!((g.x.count, g.y.count, g.off_grid), (104, 103, 1));
+            assert_eq!((im.position(0), im.position(1)), (None, Some((1, 1))));
+        }
     }
 
     /// Review 2026-09-30 B14: when the positions fit no grid, the archive says so — a
