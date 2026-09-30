@@ -16,6 +16,8 @@
 //!   * a selected ion's and a scan's 1/K0 (MS:1002815) were named `inverse reduced ion mobility drift
 //!     time`, a scan stated it twice, and every spectrum stated its `scan start time` a second time,
 //!     at the spectrum level.
+//!
+//! The corpus-gated test runs the comparison the fixtures stand in for on PXD059079 2485.d.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,7 +25,11 @@ use std::process::Command;
 use mzdata::prelude::*;
 use mzdata::spectrum::{ArrayType, Chromatogram};
 
+#[path = "common/corpus.rs"]
+mod corpus;
+
 const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwiz.1.1.mzML");
+const DOT_D: &str = "ims-examples/PXD059079/20230830_100SPD_NCI7_0p12ng_HS_01_S1-B1_1_2485.d";
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mzpc-export-fidelity-{}-{name}", std::process::id()));
@@ -234,6 +240,80 @@ fn an_exported_1_over_k0_is_named_as_psi_ms_names_it_and_stated_once() {
         }
         for s in elements(&xml, "spectrum") {
             assert!(!spectrum_head(s).contains("MS:1000016"), "{route}: a spectrum-level scan start time:\n{}", spectrum_head(s));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PXD059079 2485.d through both kinds of archive against its `--to mzml` export (40 spectra): every
+/// precursor's activation (CID at the window's energy), each frame's ion injection time and scan
+/// window as the `.d` states them, no 1/K0 misnamed, each `<scan>`'s once. What stays different, by
+/// design: an ims-compact archive holds whole frames (no per-window scan 1/K0 or limits) and not
+/// mzdata's per-window TIC/BPC pair, which repeats each frame's summed and maximum intensity once per
+/// window (so its export has 28 chromatograms, the `.d`'s 30: HyStar's 25 pump traces and 3 MS
+/// traces, and that pair).
+#[test]
+#[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
+fn a_timstof_archive_exports_the_precursors_the_d_exports() {
+    let Some(dot_d) = corpus::corpus_path(DOT_D) else { return };
+    let dir = scratch("tdf");
+    let cap = [("MZPC_MAX_SPECTRA", "40")];
+    let direct = dir.join("d.mzML");
+    convert(&dot_d, &direct, &["--to", "mzml"], &cap);
+    let activation = |mzml: &Path| -> Vec<(String, u32, Option<String>, f32)> {
+        let reader = mzdata::io::mzml::MzMLReader::open_path(mzml).unwrap();
+        let mut out = Vec::new();
+        for s in reader {
+            let frame = s.id().split_whitespace().find(|t| t.starts_with("frame=")).unwrap().to_string();
+            for p in s.precursor_iter() {
+                let method = p.activation.method().map(|m| m.to_param().name.to_string());
+                out.push((frame.clone(), (p.isolation_window.target * 1000.0).round() as u32, method, p.activation.energy));
+            }
+        }
+        out.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        out
+    };
+    // Each frame's scan: its injection (accumulation) time and its scan windows, from the frame's first
+    // spectrum.
+    type Scan = (f32, Vec<(f32, f32)>);
+    let scans = |mzml: &Path| -> std::collections::BTreeMap<String, Scan> {
+        let reader = mzdata::io::mzml::MzMLReader::open_path(mzml).unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for s in reader {
+            let frame = s.id().split_whitespace().find(|t| t.starts_with("frame=")).unwrap().to_string();
+            let scan = s.acquisition().first_scan().unwrap();
+            let windows = scan.scan_windows.iter().map(|w| (w.lower_bound, w.upper_bound)).collect();
+            out.entry(frame).or_insert((scan.injection_time, windows));
+        }
+        out
+    };
+    let reference = activation(&direct);
+    assert!(!reference.is_empty() && reference.iter().all(|(_, _, m, e)| m.is_some() && *e > 0.0));
+    let reference_scans = scans(&direct);
+    for (label, extra) in [("--no-ims-compact", &["--no-ims-compact"][..]), ("ims-compact", &[][..])] {
+        let (archive, export) = (dir.join(format!("{label}.mzpeak")), dir.join(format!("{label}.mzML")));
+        convert(&dot_d, &archive, extra, &cap);
+        convert(&archive, &export, &[], &[]);
+        let got = activation(&export);
+        // The ims-compact archive's 40 spectra are 40 FRAMES: more windows than the `.d`'s 40.
+        let common: Vec<_> = got.iter().filter(|g| reference.iter().any(|r| (&r.0, r.1) == (&g.0, g.1))).collect();
+        assert!(!common.is_empty(), "{label}: no precursor in common");
+        for g in common {
+            let r = reference.iter().find(|r| (&r.0, r.1) == (&g.0, g.1)).unwrap();
+            assert_eq!(g, r, "{label}: activation differs from the .d's");
+        }
+        // An ims-compact archive held no frame's accumulation time or the acquisition range through
+        // 0.16.0: its export stated `ion injection time 0` and no scan window.
+        let got_scans = scans(&export);
+        let common: Vec<_> = got_scans.keys().filter(|f| reference_scans.contains_key(*f)).collect();
+        assert!(!common.is_empty(), "{label}: no frame in common");
+        for f in common {
+            assert_eq!(got_scans[f], reference_scans[f], "{label} {f}: scan differs from the .d's");
+        }
+        let xml = std::fs::read_to_string(&export).unwrap();
+        assert!(!xml.contains("inverse reduced ion mobility drift time"), "{label}: MS:1002815 misnamed");
+        for scan in elements(&xml, "scan") {
+            assert!(scan.matches(r#"accession="MS:1002815""#).count() <= 1, "{label}: {scan}");
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
