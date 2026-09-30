@@ -303,7 +303,9 @@ pub struct PixelSizeFix {
     /// micrometre. An accession absent here is removed.
     pub write: Vec<(&'static str, f64, bool)>,
     /// The unit accession each `write` value is in: micrometre where set, else as the file states it
-    /// (an area's root keeps a stated length unit, so the values are not all µm).
+    /// (an area's root keeps a stated length unit, so the values are not all µm) — until
+    /// [`check_written_units`] replaces it by the unit actually written, which differs where the
+    /// stated accession and name disagree.
     pub write_units: Vec<Option<String>>,
     /// Unit accession/name disagreements seen on the pixel-size and extent params.
     pub unit_mismatches: Vec<String>,
@@ -475,15 +477,23 @@ pub fn apply(fix: &PixelSizeFix, settings: &mut ScanSettings) {
     }
 }
 
-/// After [`apply`]: the unit each mismatched param was actually written with. `true` when one of
-/// them differs from the accession the file states — mzdata resolved the pair by the name.
+/// After [`apply`]: the unit each mismatched param was actually written with, and each `write`
+/// value's unit as written (the index row must not contradict the archive). `true` when a
+/// mismatched param's differs from the accession the file states — mzdata resolved the pair by the
+/// name.
 pub fn check_written_units(fix: &mut PixelSizeFix, settings: &ScanSettings) -> bool {
+    let param = |acc: &str| settings.params.iter().find(|p| p.curie().is_some_and(|c| c.to_string() == acc));
     let mut replaced = false;
     for (acc, stated) in &fix.mismatched {
-        let Some(p) = settings.params.iter().find(|p| p.curie().is_some_and(|c| c.to_string() == *acc)) else { continue };
+        let Some(p) = param(acc) else { continue };
         let written = p.unit.to_curie().map(|c| c.to_string()).unwrap_or_else(|| "none".into());
         replaced |= written != *stated;
         fix.written_units.push(format!("{acc}: stated {stated}, written {written}"));
+    }
+    for ((acc, _, _), unit) in fix.write.iter().zip(fix.write_units.iter_mut()) {
+        if let Some(p) = param(acc) {
+            *unit = p.unit.to_curie().map(|c| c.to_string());
+        }
     }
     replaced
 }
@@ -738,6 +748,17 @@ mod tests {
         let f = pixel_size_fix(&settings(&[("IMS:1000046", "50", cm), ("IMS:1000047", "50", cm)])).unwrap();
         assert_eq!(f.transformation, None, "reported, not rewritten");
         assert_eq!(f.unit_mismatches.len(), 2, "{f:?}");
+        // Written as micrometre (mzdata took the name): the index row gives that unit, not the
+        // stated centimetre accession.
+        let mut ss = ScanSettings { id: "s1".into(), ..Default::default() };
+        for acc in [mzdata::curie!(IMS:1000046), mzdata::curie!(IMS:1000047)] {
+            ss.params.push(Param::builder().name("pixel size").curie(acc).value(50.0).unit(Unit::Micrometer).build());
+        }
+        let mut f = f;
+        apply(&f, &mut ss);
+        assert!(check_written_units(&mut f, &ss));
+        let units: Vec<serde_json::Value> = fix_json(&f)["written_um"].as_array().unwrap().iter().map(|e| e["unit"].clone()).collect();
+        assert_eq!(units, ["UO:0000017", "UO:0000017"]);
         let fine = Some(("UO:0000017", "micrometre"));
         assert_eq!(pixel_size_fix(&settings(&[("IMS:1000046", "50", fine), ("IMS:1000047", "50", fine)])), None);
     }

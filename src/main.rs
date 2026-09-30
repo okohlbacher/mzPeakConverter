@@ -11534,6 +11534,13 @@ mod tests {
         let written = param(&m["scan_settings_list"][0], "IMS:1000046").unwrap()["unit"].clone();
         assert!(m["imaging_pixel_size"][0]["written_units"].to_string().contains(&format!("written {}", written.as_str().unwrap())), "{:#}", m["imaging_pixel_size"]);
         assert_eq!(declared(&m, super::imaging::UNIT_FROM_NAME), written != "UO:0000015");
+        // The row's `written_um` units are the ones written, not the stated accession.
+        let rows = m["imaging_pixel_size"][0]["written_um"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{:#}", m["imaging_pixel_size"]);
+        for row in rows {
+            let acc = row["accession"].as_str().unwrap();
+            assert_eq!(row["unit"], param(&m["scan_settings_list"][0], acc).unwrap()["unit"], "{acc}: {:#}", m["imaging_pixel_size"]);
+        }
 
         // "one way" becomes flyback; a stated position z gets a column.
         let one_way = base

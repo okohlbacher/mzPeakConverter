@@ -65,8 +65,9 @@ pub struct MaldiInfo {
     pub spots: HashMap<i64, Spot>,
     /// Every distinct finite, positive `(BeamScanSizeX, BeamScanSizeY)` stated, in µm.
     pub beam: Vec<(f64, f64)>,
-    /// Positioned frames whose beam scan size is NULL, not finite or not positive: one is enough to
-    /// rule the beam fallback out (review 2026-09-30 B16: NULLs were skipped and +inf passed).
+    /// Positioned frames whose beam scan size is NULL, no number, not finite or not positive: one is
+    /// enough to rule the beam fallback out (review 2026-09-30 B16: NULLs were skipped and +inf
+    /// passed).
     pub beam_unstated: usize,
     /// Smallest and largest `(XIndexPos, YIndexPos)` of the run: `min` becomes position (1, 1).
     pub min: (i64, i64),
@@ -82,8 +83,9 @@ pub struct MaldiInfo {
 pub struct MisArea {
     pub name: Option<String>,
     pub raster: Option<(f64, f64)>,
-    /// The `<Point>`s (image px) of a rectangle (`Type="0"`, two corners) or polygon (`Type="3"`);
-    /// empty for any other type, whose outline is not known here.
+    /// The corners (image px) of a rectangle (`Type="0"`: its two stated corners, expanded to all
+    /// four) or polygon (`Type="3"`: its `<Point>`s); empty for any other type, whose outline is not
+    /// known here.
     pub points: Vec<(f64, f64)>,
 }
 
@@ -109,9 +111,9 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
     let mut reader = quick_xml::Reader::from_reader(input);
     let mut buf = Vec::new();
     let mut mis = Mis { file: file.into(), ..Default::default() };
-    // `in_area`, whether its `<Point>`s are an outline (rectangle or polygon), and the element
-    // whose text is read.
-    let (mut in_area, mut outline, mut element) = (false, false, Vec::new());
+    // `in_area`, whether its `<Point>`s are an outline (rectangle or polygon), whether a rectangle,
+    // and the element whose text is read.
+    let (mut in_area, mut outline, mut rect, mut element) = (false, false, false, Vec::new());
     let pair = |s: &str| {
         let mut v = s.split(',').map(|v| v.trim().parse::<f64>().ok().filter(|v| v.is_finite()));
         Some((v.next()??, v.next()??))
@@ -120,7 +122,9 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
         match reader.read_event_into(&mut buf).ok()? {
             Event::Start(e) if e.local_name().as_ref() == b"Area" => {
                 in_area = true;
-                outline = matches!(crate::imaging::attr(&e, b"Type").as_deref(), Some("0" | "3"));
+                let kind = crate::imaging::attr(&e, b"Type");
+                outline = matches!(kind.as_deref(), Some("0" | "3"));
+                rect = kind.as_deref() == Some("0");
                 mis.areas.push(MisArea { name: crate::imaging::attr(&e, b"Name"), raster: None, points: Vec::new() });
             }
             Event::Empty(e) if e.local_name().as_ref() == b"Area" => {
@@ -141,7 +145,17 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
                 }
             }
             Event::End(e) => {
-                in_area &= e.local_name().as_ref() != b"Area";
+                if e.local_name().as_ref() == b"Area" {
+                    in_area = false;
+                    // Two opposite corners in image px; the teach-point map rotates and shears
+                    // (both MSV000088438 maps do), so the other two can lie outside the stage box
+                    // of these.
+                    if let (true, Some(a)) = (rect, mis.areas.last_mut()) {
+                        if let [(x1, y1), (x2, y2)] = a.points[..] {
+                            a.points = vec![(x1, y1), (x2, y1), (x2, y2), (x1, y2)];
+                        }
+                    }
+                }
                 element.clear();
             }
             Event::Eof => break,
@@ -177,8 +191,11 @@ pub fn read(conn: &Connection) -> Option<MaldiInfo> {
     let mut stmt = conn.prepare(&sql).ok()?;
     let rows = stmt
         .query_map([], |r| {
-            let f = |i| r.get::<_, Option<f64>>(i);
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?, f(4)?, f(5)?, f(6)?, f(7)?))
+            // Beam size and motor position only feed the pixel size and the .mis check: a value that
+            // is no number (text 'n/a' in a REAL column) is unstated there, not a lost row — the
+            // frame keeps its position.
+            let f = |i| r.get::<_, Option<f64>>(i).ok().flatten();
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?, f(4), f(5), f(6), f(7)))
         })
         .ok()?;
     let mut info = MaldiInfo::default();
@@ -253,17 +270,20 @@ impl MaldiInfo {
     /// silently (review 2026-09-30 B16) — so two checks:
     /// * every `RegionNumber` is an area: 0 ≤ n < the number of `<Area>`s;
     /// * the regions lie where their areas are. The first three `<TeachPoint>`s fix the affine map
-    ///   image px → stage µm, which puts each area's outline on the stage. `MotorPositionX/Y` are
-    ///   stage µm as well, but from another origin — a translation stated in neither file
+    ///   image px → stage µm, which puts each area's corners (a rectangle's four, a polygon's
+    ///   vertices) on the stage; their bounding box there holds the whole area. `MotorPositionX/Y`
+    ///   are stage µm as well, but from another origin — a translation stated in neither file
     ///   (+54000.8, −45642.5 µm on both MSV000088438 runs, by flexImaging's spot list) — so the test
-    ///   is whether ONE translation puts every region's spots inside its area's bounding box, within
-    ///   half a raster step: per axis, the intersection of each region's interval of translations.
-    ///   On MSV000088438 the file's mapping fits and every permutation of the areas misses by ≥ 5 mm.
+    ///   is whether ONE translation puts every region's spots inside its area's stage bounding box,
+    ///   within half a raster step: per axis, the intersection of each region's interval of
+    ///   translations. On MSV000088438 the file's mapping fits and every permutation of the areas
+    ///   misses by ≥ 5 mm.
     ///
-    /// ponytail: the bounding box, not the polygon, and a translation, not a fitted affine — enough
-    /// to catch areas shifted, swapped or deleted by a re-save; a mapping that keeps every region
-    /// inside its box passes. Regions without motor positions, areas of another type and a `.mis`
-    /// without three teach points are not tested.
+    /// ponytail: the area's stage bounding box, not its shape (a rotated rectangle or a polygon is
+    /// smaller), and a translation, not a fitted affine — enough to catch areas shifted, swapped or
+    /// deleted by a re-save; a mapping that keeps every region inside its box passes. Regions
+    /// without motor positions, areas of another type and a `.mis` without three teach points are
+    /// not tested.
     pub fn mis_mismatch(&self, mis: &Mis) -> Option<String> {
         let unmapped = |r: i64| usize::try_from(r).map_or(true, |a| a >= mis.areas.len());
         // The largest unmapped RegionNumber: the reason is recorded, so it must not follow hash order.
@@ -295,11 +315,11 @@ impl MaldiInfo {
             if area.points.is_empty() || spots.is_empty() {
                 continue;
             }
-            let outline: Vec<[f64; 2]> = area.points.iter().map(|&p| stage(p)).collect();
+            let corners: Vec<[f64; 2]> = area.points.iter().map(|&p| stage(p)).collect();
             let spots: Vec<[f64; 2]> = spots.iter().map(|&(x, y)| [x, y]).collect();
             let tol = area.raster.map_or([0.0; 2], |(x, y)| [x / 2.0, y / 2.0]);
             for k in 0..2 {
-                let (a_lo, a_hi) = bounds(&mut outline.iter().map(|p| p[k]));
+                let (a_lo, a_hi) = bounds(&mut corners.iter().map(|p| p[k]));
                 let (s_lo, s_hi) = bounds(&mut spots.iter().map(|p| p[k]));
                 lo[k] = lo[k].max(a_lo - s_lo - tol[k]);
                 hi[k] = hi[k].min(a_hi - s_hi + tol[k]);
@@ -531,6 +551,24 @@ mod tests {
         assert_eq!(info.block()["frames_without_beam_scan_size"], 0);
     }
 
+    /// A motor position or beam size that is no number (SQLite keeps text in a REAL column) is
+    /// unstated; the frame keeps its position (it lost the whole row, and so its position, silently).
+    #[test]
+    fn an_unreadable_motor_or_beam_value_keeps_the_frame() {
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c);
+        c.execute_batch(
+            "UPDATE MaldiFrameInfo SET MotorPositionX = 'n/a' WHERE Frame = 2;
+             UPDATE MaldiFrameInfo SET BeamScanSizeY = 'n/a' WHERE Frame = 3;",
+        )
+        .unwrap();
+        let info = read(&c).unwrap();
+        assert_eq!(info.spots.len(), 3, "every positioned frame is kept");
+        assert_eq!(info.spots[&2], Spot { x: 670, y: 700, region: Some(0), motor: None });
+        assert_eq!(info.spots[&3], Spot { x: 837, y: 812, region: Some(1), motor: Some((1.0, 2.0)) });
+        assert_eq!((info.beam_unstated, info.pixel_size()), (1, None), "an unreadable beam size is unstated");
+    }
+
     /// The shape of a flexImaging 5.1 sequence (MassIVE MSV000088438): no XML declaration, CRLF,
     /// polygon (`Type="3"`) and rectangle (`Type="0"`) areas, each with its own raster step.
     const MIS: &str = "<ImagingSequence flexImagingVersion=\"5.1.52.0_1664_120\">\r\n<Comment>1000 um</Comment>\r\n\
@@ -636,7 +674,7 @@ mod tests {
         .unwrap();
         let mut info = read(&c).unwrap();
         let right = read_mis_from("run.mis", mis_xml(agar_1, agar_2).as_bytes()).unwrap();
-        assert_eq!((right.teach.len(), right.areas[0].points.len()), (3, 2));
+        assert_eq!((right.teach.len(), &right.areas[0].points), (3, &vec![(1962.0, 4015.0), (2454.0, 4015.0), (2454.0, 4635.0), (1962.0, 4635.0)]));
         assert_eq!(info.mis_mismatch(&right), None);
         let swapped = read_mis_from("run.mis", mis_xml(agar_2, agar_1).as_bytes()).unwrap();
         assert!(info.mis_mismatch(&swapped).is_some_and(|r| r.contains("MotorPositionX/Y")));
@@ -650,6 +688,34 @@ mod tests {
         // Without motor positions, or with an area whose outline is unknown, there is nothing to test.
         info.spots.values_mut().for_each(|s| s.motor = None);
         assert_eq!(info.mis_mismatch(&read_mis_from("run.mis", mis_xml(agar_2, agar_1).as_bytes()).unwrap()), None);
+    }
+
+    /// A rectangle is two corners in image px, and the teach-point map rotates and shears: the other
+    /// two corners lie outside the stage box of the stated ones (by 151 µm in y here, the 20210920
+    /// map on a 1250-px square). Spots at all four, as MotorPositionX/Y (+54000.8, −45642.5 µm), fit
+    /// a 20 µm raster; checked on the two stated corners, the rectangle was rejected.
+    #[test]
+    fn a_rectangle_is_checked_on_all_four_corners() {
+        let mis = read_mis_from(
+            "run.mis",
+            "<ImagingSequence>\r\n<TeachPoint>1252,776;-22963,15832</TeachPoint>\r\n<TeachPoint>6842,696;21879,17145</TeachPoint>\r\n\
+             <TeachPoint>2610,5064;-11828,-18267</TeachPoint>\r\n\
+             <Area Type=\"0\" Name=\"tissue\"><Raster>20,20</Raster><Point>1500,1500</Point><Point>2750,2750</Point></Area>\r\n\
+             </ImagingSequence>\r\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, RegionNumber INTEGER, XIndexPos INTEGER, YIndexPos INTEGER,
+                                          MotorPositionX REAL, MotorPositionY REAL);
+             INSERT INTO MaldiFrameInfo VALUES (1, 0, 1, 1, 33067.98, -35565.63),
+                                               (2, 0, 2, 1, 43096.26, -35414.97),
+                                               (3, 0, 1, 2, 33138.02, -45553.59),
+                                               (4, 0, 2, 2, 43166.31, -45402.92);",
+        )
+        .unwrap();
+        assert_eq!(read(&c).unwrap().mis_mismatch(&mis), None);
     }
 
     #[test]
