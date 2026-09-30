@@ -498,8 +498,10 @@ as stated (imzML already counts from 1), with three checks since 0.16.0
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
 checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
 issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; a single value
-is an area when `√value × count = extent` and written as its square root, a length when
-`value × count = extent`, and otherwise dropped), each action declared and listed in the
+is tested against its own axis's count and extent — the other axis's when its own states none — both
+converted to one length unit by unit accession, micrometre where none is stated: it is an area when
+`√value × count = extent` and written as its square root, in the unit the area is the square of, a
+length when `value × count = extent`, and otherwise dropped), each action declared and listed in the
 `imaging_pixel_size` index block together with any unit accession that disagrees with its unit name;
 and the obsolete "one way" is written as flyback. A **Bruker MALDI** `.d` (TSF or TDF, every timsTOF
 lane) carries the same position columns from `MaldiFrameInfo.XIndexPos/YIndexPos` per frame. Those are
@@ -751,7 +753,7 @@ The vocabulary:
 | `sciex:clamp-intensity-to-f32` | at least one intensity beyond ±`f32::MAX` (±Inf included) was clamped to it when narrowed to the schema's f32 | native SciEX `.wiff` |
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
 | `imzml:pixel-size-unit-assumed-um` | an imzML pixel size stated without a unit was taken as micrometre (§8, imaging) | imzML |
-| `imzml:pixel-size-area-to-length` | a single imzML pixel size tested as an area (`√value × count = extent`) and was written as its square root, in micrometre | imzML |
+| `imzml:pixel-size-area-to-length` | a single imzML pixel size tested as an area (`√value × count = extent`) and was written as its square root, in the unit the area is the square of (micrometre when none is stated) | imzML |
 | `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
 | `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata keeps whichever attribute comes last) | imzML |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
