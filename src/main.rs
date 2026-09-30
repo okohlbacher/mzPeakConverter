@@ -4740,6 +4740,29 @@ fn rewrite_encoding_decl_to_utf8(s: &str) -> String {
     out
 }
 
+/// Create a temp directory or file for one conversion's private copy of its input, named
+/// `<prefix>-<pid>-<n>-<name>` in the temp dir, and return its path with what `create` returned.
+/// `n` counts the calls in this process, and `create` must fail on an existing path
+/// (`fs::create_dir`, `create_new`), which moves on to the next `n` — so no two conversions share a
+/// copy, a leftover of an earlier process with the same pid included. The name was
+/// `<prefix>-<pid>-<name>` through 0.16.0: two conversions of same-named inputs in one process (the
+/// in-process tests) wrote into, and removed, one copy ("writing transcoded …: Invalid argument").
+fn fresh_temp<T>(prefix: &str, name: &str, create: impl Fn(&Path) -> io::Result<T>) -> Result<(PathBuf, T)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    fs::create_dir_all(&base).with_context(|| format!("creating {}", base.display()))?;
+    for _ in 0..100 {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = base.join(format!("{prefix}-{}-{n}-{name}", std::process::id()));
+        match create(&path) {
+            Ok(made) => return Ok((path, made)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+        }
+    }
+    bail!("could not create a fresh {prefix} temp copy under {}", base.display())
+}
+
 /// RAII cleanup for a gunzipped input: the temp directory holding the decompressed copy goes on
 /// drop, on every exit path, like [`TranscodeGuard`].
 struct GunzipGuard {
@@ -4786,8 +4809,7 @@ fn gunzip_to_temp(input: &Path) -> Result<Option<GunzipGuard>> {
     } else {
         log::info!("input is named .gz but is not gzip; handing the reader a plain-named link to it");
     }
-    let dir = std::env::temp_dir().join(format!(".mzpc-gz-{}-{inner}", std::process::id()));
-    fs::create_dir_all(&dir).with_context(|| format!("creating temp dir {}", dir.display()))?;
+    let (dir, ()) = fresh_temp(".mzpc-gz", inner, |p| fs::create_dir(p))?;
     let guard = GunzipGuard { dir: dir.clone(), file: dir.join(inner) };
     if !is_gzip {
         if fs::hard_link(input, &guard.file).is_err() {
@@ -4923,8 +4945,7 @@ fn transcode_to_utf8(input: &Path) -> Result<Option<TranscodeGuard>> {
 
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("xml");
-    let dir = std::env::temp_dir().join(format!(".mzpc-utf8-{}-{}", std::process::id(), stem));
-    fs::create_dir_all(&dir).with_context(|| format!("creating temp dir {}", dir.display()))?;
+    let (dir, ()) = fresh_temp(".mzpc-utf8", stem, |p| fs::create_dir(p))?;
     let guard = TranscodeGuard { dir: dir.clone(), file: dir.join(format!("{stem}.{ext}")) };
     fs::write(&guard.file, utf8.as_bytes())
         .with_context(|| format!("writing transcoded {}", guard.file.display()))?;
@@ -5334,9 +5355,10 @@ fn sanitize_param_groups(input: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
-    let temp =
-        std::env::temp_dir().join(format!("mzpc-san-{}-{}.mzML", std::process::id(), stem));
-    let mut out = BufWriter::new(fs::File::create(&temp)?);
+    let (temp, file) = fresh_temp("mzpc-san", &format!("{stem}.mzML"), |p| {
+        fs::OpenOptions::new().write(true).create_new(true).open(p)
+    })?;
+    let mut out = BufWriter::new(file);
     out.write_all(fixed.as_bytes())?;
     f.seek(SeekFrom::Start(split as u64))?;
     match index_at {
@@ -11075,6 +11097,46 @@ mod tests {
             "cv/mzpeak.obo changed: bump its data-version and MZP_CV_VERSION, move MZP_CV_URI to the new \
              tag, update this digest, and tag the release commit mzp-cv-<version>"
         );
+    }
+
+    /// Two conversions of inputs with one stem in one process get a private copy each: the gunzip,
+    /// UTF-8 and sanitized copies were named `<prefix>-<pid>-<stem>`, so the second wrote into the
+    /// first's, and whichever finished first removed both ("writing transcoded …: Invalid argument").
+    #[test]
+    fn same_named_inputs_get_their_own_temp_copies() {
+        let dir = scratch("temp-names");
+        let latin1 = fs::read(TINY).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("run.mzML"), &latin1).unwrap();
+            let mut gz = flate2::write::GzEncoder::new(fs::File::create(d.join("run.mzML.gz")).unwrap(), flate2::Compression::fast());
+            gz.write_all(&latin1).unwrap();
+            gz.finish().unwrap();
+        }
+        let first = super::transcode_to_utf8(&a.join("run.mzML")).unwrap().expect("the fixture is ISO-8859-1");
+        let second = super::transcode_to_utf8(&b.join("run.mzML")).unwrap().unwrap();
+        assert_ne!(first.dir, second.dir);
+        drop(first);
+        assert!(second.file.is_file(), "the first conversion's cleanup removed the second's copy");
+        let first = super::gunzip_to_temp(&a.join("run.mzML.gz")).unwrap().unwrap();
+        let second = super::gunzip_to_temp(&b.join("run.mzML.gz")).unwrap().unwrap();
+        assert_ne!(first.dir, second.dir);
+        drop(first);
+        assert!(second.file.is_file());
+        // An empty self-closing param group sends the header through the sanitized copy.
+        let marker = "<referenceableParamGroupList count=\"2\">";
+        let src = String::from_utf8_lossy(&latin1).replacen(marker, "<referenceableParamGroupList count=\"3\">\n<referenceableParamGroup id=\"empty\"/>", 1);
+        for d in [&a, &b] {
+            fs::write(d.join("run.mzML"), src.as_bytes()).unwrap();
+        }
+        let first = super::sanitize_param_groups(&a.join("run.mzML")).unwrap().expect("a sanitized copy");
+        let second = super::sanitize_param_groups(&b.join("run.mzML")).unwrap().unwrap();
+        assert_ne!(first, second);
+        for p in [first, second] {
+            fs::remove_file(p).unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A conversion logs no vocabulary-cache ERROR lines (`MSVocabulary::init_static` in `main`).
