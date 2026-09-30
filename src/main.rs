@@ -1160,10 +1160,8 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         if output.exists() && !cfg.force {
             bail!("output {} exists (use --force to overwrite)", output.display());
         }
-        // Releases up to v0.7.2 could write `tof_encoding: per-scan-delta`, but no reader ever
-        // cumulatively summed it — every TOF bin after the first in a scan decodes as a tiny bin and
-        // squares to a nonsense m/z. Refuse rather than emit silently wrong masses.
-        reject_legacy_tof_delta(&cli.input)?;
+        // Both lanes refuse an archive written with the removed per-scan TOF delta encoding
+        // ([`reject_legacy_tof_delta`]), each from the index it has parsed for itself.
         // `--no-vendor` strips the embedded vendor data on the filter path too — same effect as
         // `--drop-aux 'vendor*'` (the glob's `*` spans `/`, so it also catches `vendor/…` side-files).
         // (It is moot for mzML output — vendor facets aren't carried into mzML at all.)
@@ -2368,6 +2366,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
 
     let mut reader =
         MzPeakReader::new(input).with_context(|| format!("opening {} as mzPeak", input.display()))?;
+    reject_legacy_tof_delta(input, reader.file_index().metadata.get("ims_calibration"))?;
     let total = reader.len();
     // An mzPeak spectrum may carry BOTH facets; an mzML spectrum cannot. The reader's default
     // preference is profile, so the peak lists are dropped — correct, but it used to be silent.
@@ -2391,23 +2390,24 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let cap = max_spectra();
 
     // The surviving indices, known up front for the spectrumList `count` attribute: the indices the
-    // archive holds, ascending, up to MZPC_MAX_SPECTRA of them (not `0..total`: an archive rewritten
-    // with --rt or --ms-level keeps each survivor's original index, and counting up from 0 asked for
-    // spectra that were filtered out while never reaching the last ones), and of those, when something
-    // filters, the ones one scan of the `time` / `ms_level` columns keeps. This was a metadata-only
-    // read of every spectrum, filtered or not, before the survivors were read again in full: 265 s for
-    // the 32,700 spectra of MSV000099123's `…_8225.mzpeak` before a first write.
+    // archive holds, ascending, up to MZPC_MAX_SPECTRA of them (not `0..total`: an archive an older
+    // rewrite filtered with --rt or --ms-level keeps each survivor's original index, and counting up
+    // from 0 asked for spectra that were filtered out while never reaching the last ones), and of
+    // those, when something filters, the ones one scan of the `time` / `ms_level` columns keeps. This
+    // was a metadata-only read of every spectrum, filtered or not, before the survivors were read
+    // again in full: 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak` before a first
+    // write.
     let mut indices: Vec<usize> = reader.get_index().iter().map(|(_, i)| *i as usize).collect();
     indices.sort_unstable();
     // The wavelength (UV/PDA) spectra live in facets of their own, which this export never read: a
     // PDA run's archive came out without its 8 (Waters) or 520 (Agilent) UV spectra, and no warning.
-    let wavelength = exported_wavelength_spectra(input, reader.len_wavelength_spectra(), opts)?;
+    let wavelength = exported_wavelength_spectra(&reader, opts)?;
     let wavelength_time: std::collections::HashMap<u64, Option<f64>> = wavelength.iter().copied().collect();
     let mut items: Vec<ExportItem> = if wavelength.is_empty() {
         indices.iter().map(|&i| ExportItem::Mass(i)).collect()
     } else {
         let times: std::collections::HashMap<u64, Option<f64>> =
-            filter::metadata_index_times(input, false)?.unwrap_or_default().into_iter().collect();
+            filter::metadata_index_times(&reader, false)?.unwrap_or_default().into_iter().collect();
         let mass: Vec<(usize, Option<f64>)> = indices.iter().map(|&i| (i, times.get(&(i as u64)).copied().flatten())).collect();
         interleave_by_time(&mass, &wavelength)
     };
@@ -2415,9 +2415,9 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // mass spectra were exported; a wavelength spectrum counts toward it, as in every import lane.
     items.truncate(cap.unwrap_or(usize::MAX));
     if filtering {
-        let kept = filter::surviving_spectra(input, opts)?;
+        let kept = filter::surviving_spectra(&reader, opts)?.kept;
         items.retain(|item| match *item {
-            ExportItem::Mass(i) => kept.contains(&(i as u64)),
+            ExportItem::Mass(i) => kept.contains(i as u64),
             ExportItem::Wavelength(k) => opts.rt.is_none_or(|(lo, hi)| wavelength_time[&k].is_some_and(|t| t >= lo && t <= hi)),
         });
         let mass = items.iter().filter(|item| matches!(item, ExportItem::Mass(_))).count();
@@ -2431,6 +2431,15 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     } else {
         reader.get_index().iter().map(|(id, _)| id.to_string()).collect()
     };
+    // The archive's spectra this export leaves out, by id. A precursor or scan naming one wrote a
+    // `spectrumRef` to an element the mzML does not hold (small.RAW's MS2 spectra all named their
+    // filtered-out MS1 under `--ms-level 2`), where rewriting the archive nulls the reference. A
+    // chromatogram's precursor names a spectrum the same way. Empty when every spectrum is written.
+    let written: std::collections::HashSet<usize> =
+        items.iter().filter_map(|item| if let ExportItem::Mass(i) = *item { Some(i) } else { None }).collect();
+    let left_out: std::collections::HashSet<String> =
+        reader.get_index().iter().filter(|&(_, &i)| !written.contains(&(i as usize))).map(|(id, _)| id.to_string()).collect();
+    let mut unreferenced = 0usize;
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
     // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
@@ -2453,6 +2462,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
                 demote_mzp_params(spec.description_mut());
+                unreferenced += drop_references_to(spec.description_mut(), &left_out);
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
                 }
@@ -2505,15 +2515,48 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
         .map(|mut c| {
             demote_mzp_params_chrom(c.description_mut());
+            unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
             if let Some(window) = opts.rt {
                 cut_chromatogram_to_window(&mut c, window);
             }
             c
         })
         .collect();
+    if unreferenced > 0 {
+        log::warn!(
+            "{unreferenced} precursor or scan references named a spectrum this export leaves out; their \
+             spectrumRef is not written"
+        );
+    }
     write_source_chromatograms_mzml(&mut w, chroms.into_iter())?;
 
     finish_mzml(w, tmp_guard, output)
+}
+
+/// Clear the spectrum references of `descr` that name one of `left_out` — a precursor's
+/// `precursor_id` and a scan's `spectrum_reference`, each written as a `spectrumRef`. How many.
+fn drop_references_to(descr: &mut mzdata::spectrum::SpectrumDescription, left_out: &std::collections::HashSet<String>) -> usize {
+    let mut dropped = drop_precursor_references(&mut descr.precursor, left_out);
+    for scan in descr.acquisition.scans.iter_mut() {
+        if scan.spectrum_reference.as_deref().is_some_and(|id| left_out.contains(id)) {
+            scan.spectrum_reference = None;
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// Clear the `precursor_id` of each of `precursors` — a spectrum's or a chromatogram's — that names one
+/// of `left_out`. How many.
+fn drop_precursor_references(precursors: &mut [mzdata::spectrum::Precursor], left_out: &std::collections::HashSet<String>) -> usize {
+    let mut dropped = 0;
+    for precursor in precursors {
+        if precursor.precursor_id.as_deref().is_some_and(|id| left_out.contains(id)) {
+            precursor.precursor_id = None;
+            dropped += 1;
+        }
+    }
+    dropped
 }
 
 /// Summary values the vendored writer computes for every wavelength spectrum from its arrays, and its
@@ -2535,13 +2578,14 @@ enum ExportItem {
 /// search engine one reads as MS1 profile data with its wavelengths as m/z (OpenMS takes a spectrum
 /// stating no level for level 1). `--rt` keeps those inside the window (`filter_mzpeak_to_mzml`).
 /// Filtering into an archive applies the same two rules (`filter::run`).
-fn exported_wavelength_spectra(input: &Path, listed: usize, opts: &filter::FilterOpts) -> Result<Vec<(u64, Option<f64>)>> {
+fn exported_wavelength_spectra(reader: &mzpeak_prototyping::MzPeakReader, opts: &filter::FilterOpts) -> Result<Vec<(u64, Option<f64>)>> {
+    let listed = reader.len_wavelength_spectra();
     if listed == 0 {
         return Ok(Vec::new());
     }
     // `--drop-aux` can take one wavelength member and leave the others, and the reader panics on the
     // arrays it then cannot find.
-    if !filter::archive_has_member(input, "wavelength_spectra_data.parquet")? {
+    if !filter::archive_has_member(reader, "wavelength_spectra_data.parquet") {
         log::warn!("{listed} wavelength (UV/PDA) spectra are listed, but the archive holds no wavelength_spectra_data.parquet: they are not exported");
         return Ok(Vec::new());
     }
@@ -2549,7 +2593,7 @@ fn exported_wavelength_spectra(input: &Path, listed: usize, opts: &filter::Filte
         log::warn!("--ms-level leaves out the {listed} wavelength (UV/PDA) spectra, which have no MS level");
         return Ok(Vec::new());
     }
-    Ok(filter::metadata_index_times(input, true)?.unwrap_or_default())
+    Ok(filter::metadata_index_times(reader, true)?.unwrap_or_default())
 }
 
 /// The export's spectrum order: the wavelength spectra in time order, each before the first mass
@@ -4822,22 +4866,17 @@ fn assert_source_complete(input: &Path, written: usize, cap: Option<usize>) -> R
     Ok(())
 }
 
-/// Refuse to read an archive written with the removed per-scan TOF delta encoding.
+/// Refuse to read an archive written with the removed per-scan TOF delta encoding, from its index's
+/// `ims_calibration` block (`None` when it has none).
 ///
 /// Releases up to v0.7.2 could emit `ims_calibration.tof_encoding = "per-scan-delta"`, but no reader
 /// (ours or the reference one) ever cumulatively summed those deltas — only the first bin of each
 /// mobility scan decodes correctly and the rest square to nonsense m/z. The encoding is gone from the
 /// writer; this stops an old archive from silently producing wrong masses. Reconvert from the `.d`.
-fn reject_legacy_tof_delta(input: &Path) -> Result<()> {
-    let Ok(file) = fs::File::open(input) else { return Ok(()) };
-    let Ok(mut zip) = zip::ZipArchive::new(std::io::BufReader::new(file)) else { return Ok(()) };
-    let Ok(entry) = zip.by_name("mzpeak_index.json") else { return Ok(()) };
-    let Ok(idx) = serde_json::from_reader::<_, serde_json::Value>(entry) else { return Ok(()) };
-    let enc = idx
-        .get("metadata")
-        .and_then(|m| m.get("ims_calibration"))
-        .and_then(|c| c.get("tof_encoding"))
-        .and_then(|e| e.as_str());
+/// Each `.mzpeak` input lane passes the block from the index it has parsed: this check used to open
+/// the archive and parse its index once more.
+fn reject_legacy_tof_delta(input: &Path, ims_calibration: Option<&serde_json::Value>) -> Result<()> {
+    let enc = ims_calibration.and_then(|c| c.get("tof_encoding")).and_then(|e| e.as_str());
     if enc == Some("per-scan-delta") {
         bail!(
             "{} was written with the removed `per-scan-delta` TOF encoding, which no reader decodes \

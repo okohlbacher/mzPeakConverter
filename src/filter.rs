@@ -14,9 +14,9 @@
 //!     facet (metadata, peaks/data, vendor trailers) down to that set. Peak columns are row-filtered,
 //!     never re-valued: keeping whole spectra leaves each spectrum's per-scan/per-chunk delta chain
 //!     intact. Chromatograms are truncated to the RT window, their auxiliary arrays with them (else
-//!     copied). Indices are NEVER
-//!     renumbered — surviving spectra keep their original (now-sparse) indices, so every
-//!     `source_index`/`precursor_index` cross-reference stays valid.
+//!     copied). The survivors are renumbered 0..n-1 in index order, as the spec's `index` (0-based,
+//!     incrementing by 1) requires, and every column that holds a spectrum index follows
+//!     ([`Renumber`]); a reference to a spectrum that was filtered out is nulled. The ids stay.
 //!
 //! Facets are classified by schema INTROSPECTION, not a hard-coded name list (the format is
 //! extensible): a member is per-spectrum if it has `spectrum.index`, a `point`/`chunk.spectrum_index`,
@@ -26,7 +26,7 @@
 //! per-spectrum-shaped (a top-level `point`/`chunk`/`peak` struct) but carries no key we can map to
 //! survivors is a hard ERROR — we never silently ship a facet that references dropped spectra.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -41,12 +41,14 @@ use arrow::buffer::OffsetBuffer;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::ChunkReader;
 
+use mzpeak_prototyping::MzPeakReader;
 use mzpeak_prototyping::archive::{DataKind, EntityType, FileEntry, ZipArchiveWriter};
 use mzpeak_prototyping::reader::visitor::AnyCURIEArray;
 use mzpeak_prototyping::writer::{RowGroupCutter, row_group_max_bytes, write_row_groups};
@@ -143,6 +145,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
         .context("reading mzpeak_index.json")?;
     let index: serde_json::Value = serde_json::from_slice(&index_json)
         .context("parsing mzpeak_index.json")?;
+    crate::reject_legacy_tof_delta(input, index.pointer("/metadata/ims_calibration"))?;
     let orig_files = index_file_entries(&index);
 
     let member_names: Vec<String> = zip.file_names().map(str::to_string).collect();
@@ -189,20 +192,17 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
         );
     }
 
-    let (survivors, total_spectra, dangling) =
-        compute_survivors(&meta_bytes, opts).context("computing surviving spectra")?;
+    let survivors = compute_survivors(ParquetRecordBatchReaderBuilder::try_new(bytes_of(&meta_bytes))?, opts)
+        .context("computing surviving spectra")?;
     if filtering_spectra {
-        log::info!(
-            "filter: keeping {}/{} spectra",
-            survivors.len(),
-            total_spectra
-        );
-        if dangling > 0 {
-            log::warn!(
-                "{dangling} fragment spectra now reference a filtered-out precursor"
-            );
+        log::info!("filter: keeping {}/{} spectra", survivors.kept.len(), survivors.total);
+        if survivors.dangling > 0 {
+            log::warn!("{} fragment spectra now reference a filtered-out precursor", survivors.dangling);
         }
     }
+    // A spectrum filter keeps the survivors' rows and renumbers them; without one (`--drop-aux`,
+    // `--sdrf`, `--image`) the spectrum facets are copied as they are.
+    let spectra = filtering_spectra.then_some(&survivors);
     // Wavelength (UV/PDA) spectra take the rules of the mzML export (`exported_wavelength_spectra` in
     // main.rs), so filtering into an archive and exporting that writes the spectra a filtered export
     // does: `--ms-level` leaves them all out, since they have no MS level, and `--rt` keeps those inside
@@ -211,20 +211,21 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     let has_wavelength = orig_files.values().any(|fe| matches!(fe.entity_type, EntityType::WavelengthSpectrum));
     let wavelength_rows = if has_wavelength && filtering_spectra && member_names.iter().any(|n| n == WAVELENGTH_METADATA) {
         let bytes = read_member(&mut zip, WAVELENGTH_METADATA).with_context(|| format!("reading {WAVELENGTH_METADATA}"))?;
-        Some(index_times(&bytes, WAVELENGTH_METADATA)?)
+        Some(index_times(ParquetRecordBatchReaderBuilder::try_new(bytes_of(&bytes))?, WAVELENGTH_METADATA)?)
     } else {
         None
     };
-    let wavelength_survivors: Option<BTreeSet<u64>> = if !has_wavelength || !filtering_spectra {
+    // The kept wavelength spectra, renumbered 0..n-1 as the mass spectra are.
+    let wavelength_survivors: Option<Renumber> = if !has_wavelength || !filtering_spectra {
         None
     } else if !opts.ms_levels.is_empty() {
         log::warn!(
             "--ms-level leaves out the {} wavelength (UV/PDA) spectra, which have no MS level",
             wavelength_rows.as_ref().map_or(0, Vec::len)
         );
-        Some(BTreeSet::new())
+        Some(Renumber::default())
     } else if let (Some(rows), Some((lo, hi))) = (&wavelength_rows, opts.rt) {
-        let kept: BTreeSet<u64> = rows.iter().filter(|(_, t)| t.is_some_and(|t| t >= lo && t <= hi)).map(|(i, _)| *i).collect();
+        let kept = Renumber::new(rows.iter().filter(|(_, t)| t.is_some_and(|t| t >= lo && t <= hi)).map(|(i, _)| *i));
         log::info!("filter: keeping {}/{} wavelength spectra", kept.len(), rows.len());
         Some(kept)
     } else {
@@ -277,7 +278,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
             .cloned()
             .unwrap_or_else(|| synthesize_entry(name));
         // No wavelength spectrum survives: their facets go, as `--drop-aux 'wavelength_spectra*'` takes them.
-        if wavelength_survivors.as_ref().is_some_and(BTreeSet::is_empty)
+        if wavelength_survivors.as_ref().is_some_and(Renumber::is_empty)
             && matches!(fe.entity_type, EntityType::WavelengthSpectrum)
         {
             continue;
@@ -287,16 +288,8 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
             let bytes = read_member(&mut zip, name)?;
             let class = classify_facet(&bytes, &fe)
                 .with_context(|| format!("classifying facet {name}"))?;
-            let out_bytes = process_parquet(
-                &bytes,
-                class,
-                &survivors,
-                filtering_spectra,
-                opts,
-                chrom_kept.as_ref(),
-                wavelength_survivors.as_ref(),
-            )
-            .with_context(|| format!("filtering facet {name}"))?;
+            let out_bytes = process_parquet(&bytes, class, spectra, opts, chrom_kept.as_ref(), wavelength_survivors.as_ref())
+                .with_context(|| format!("filtering facet {name}"))?;
             // Through the hashing path: the bytes changed, so the SHA-512 must be recomputed. The
             // entry is the source's, and `start_for_entry` + `write_all` shipped its old checksum on
             // the re-encoded bytes (review 2026-09-30).
@@ -324,7 +317,16 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     if opts.sdrf.is_some() {
         injected.push("sample_metadata/sdrf.tsv".to_string());
     }
-    carry_index_metadata(&mut w, &index, opts, input, &dropped, &injected)?;
+    // The entities whose kept indices moved: a filter that keeps a leading run (an `--rt` window from
+    // the first spectrum) renumbers nothing, and says so.
+    let mut renumbered: Vec<&str> = Vec::new();
+    if spectra.is_some_and(|s| !s.kept.is_identity()) {
+        renumbered.push("spectrum");
+    }
+    if wavelength_survivors.as_ref().is_some_and(|w| !w.is_identity()) {
+        renumbered.push("wavelength_spectrum");
+    }
+    carry_index_metadata(&mut w, &index, opts, input, &dropped, &injected, spectra, &renumbered)?;
 
     // ── injection (Phase 1) ─────────────────────────────────────────────────────────────────────
     // Reuse the forward-path verbatim embed. --image needs the carried marker's pixel grid, so it
@@ -367,33 +369,32 @@ fn spectrum_metadata_member(files: &HashMap<String, FileEntry>) -> String {
         .unwrap_or_else(|| "spectra_metadata.parquet".to_string())
 }
 
+/// The spectrum metadata member of the archive `reader` opened, as [`spectrum_metadata_member`] finds
+/// it, from the index the reader has already parsed.
+fn reader_metadata_member(reader: &MzPeakReader) -> String {
+    reader
+        .file_index()
+        .find_entry(&EntityType::Spectrum, &DataKind::Metadata)
+        .map_or_else(|| "spectra_metadata.parquet".to_string(), |fe| fe.name.clone())
+}
+
 /// `(index, time)` of every row of an archive's spectrum metadata facet (`wavelength` false) or its
 /// wavelength-spectrum one, in stored order, with `None` for a row that states no time. `None` when
 /// the archive has no such facet. The 64-bit `time` column, not a reader's description, whose time
-/// comes from the scans facet and is 0.0, a real time, where that facet has no row.
-pub(crate) fn metadata_index_times(input: &Path, wavelength: bool) -> Result<Option<Vec<(u64, Option<f64>)>>> {
-    let f = File::open(input).with_context(|| format!("opening {}", input.display()))?;
-    let mut zip = zip::ZipArchive::new(BufReader::new(f))
-        .with_context(|| format!("reading {} as a mzPeak ZIP", input.display()))?;
-    let member = if wavelength {
-        "wavelength_spectra_metadata.parquet".to_string()
-    } else {
-        let index: serde_json::Value = serde_json::from_slice(&read_member(&mut zip, "mzpeak_index.json")?)
-            .context("parsing mzpeak_index.json")?;
-        spectrum_metadata_member(&index_file_entries(&index))
-    };
-    if !zip.file_names().any(|n| n == member) {
+/// comes from the scans facet and is 0.0, a real time, where that facet has no row. Read through the
+/// archive `reader` opened, whose index is not parsed a second time.
+pub(crate) fn metadata_index_times(reader: &MzPeakReader, wavelength: bool) -> Result<Option<Vec<(u64, Option<f64>)>>> {
+    let member = if wavelength { "wavelength_spectra_metadata.parquet".to_string() } else { reader_metadata_member(reader) };
+    if !archive_has_member(reader, &member) {
         return Ok(None);
     }
-    let bytes = read_member(&mut zip, &member)?;
-    Ok(Some(index_times(&bytes, &member)?))
+    let facet = reader.open_parquet(&member).with_context(|| format!("opening {member}"))?;
+    Ok(Some(index_times(facet, &member)?))
 }
 
-/// `(index, time)` of every row of a metadata facet's bytes, in stored order ([`metadata_index_times`]).
-fn index_times(bytes: &[u8], member: &str) -> Result<Vec<(u64, Option<f64>)>> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))
-        .with_context(|| format!("opening {member}"))?
-        .build()?;
+/// `(index, time)` of every row of a metadata facet, in stored order ([`metadata_index_times`]).
+fn index_times<T: ChunkReader + 'static>(facet: ParquetRecordBatchReaderBuilder<T>, member: &str) -> Result<Vec<(u64, Option<f64>)>> {
+    let reader = facet.build().with_context(|| format!("reading {member}"))?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch?;
@@ -411,41 +412,85 @@ fn index_times(bytes: &[u8], member: &str) -> Result<Vec<(u64, Option<f64>)>> {
     Ok(rows)
 }
 
-/// Whether the archive holds a member called `name`.
-pub(crate) fn archive_has_member(input: &Path, name: &str) -> Result<bool> {
-    let f = File::open(input).with_context(|| format!("opening {}", input.display()))?;
-    let zip = zip::ZipArchive::new(BufReader::new(f))
-        .with_context(|| format!("reading {} as a mzPeak ZIP", input.display()))?;
-    Ok(zip.file_names().any(|n| n == name))
+/// Whether the archive `reader` opened holds a member called `name`.
+pub(crate) fn archive_has_member(reader: &MzPeakReader, name: &str) -> bool {
+    reader.list_all_files_in_archive().iter().any(|n| n == name)
 }
 
-/// The `spectrum.index` of every spectrum `opts` keeps in `input`, from one scan of its spectrum
-/// metadata — what [`run`] filters by, for the `.mzpeak` → mzML export.
-pub fn surviving_spectra(input: &Path, opts: &FilterOpts) -> Result<BTreeSet<u64>> {
-    let f = File::open(input).with_context(|| format!("opening {}", input.display()))?;
-    let mut zip = zip::ZipArchive::new(BufReader::new(f))
-        .with_context(|| format!("reading {} as a mzPeak ZIP", input.display()))?;
-    let index: serde_json::Value = serde_json::from_slice(&read_member(&mut zip, "mzpeak_index.json")?)
-        .context("parsing mzpeak_index.json")?;
-    let meta_name = spectrum_metadata_member(&index_file_entries(&index));
-    let meta = read_member(&mut zip, &meta_name).with_context(|| format!("reading {meta_name}"))?;
-    Ok(compute_survivors(&meta, opts).context("computing surviving spectra")?.0)
+/// The spectra `opts` keeps in the archive `reader` opened, from one scan of its spectrum metadata —
+/// what [`run`] filters by, for the `.mzpeak` → mzML export. The export used to open the archive a
+/// second time for this and parse its index again, every warning of that parse (one per vendor
+/// member of a timsTOF archive) printed twice.
+pub fn surviving_spectra(reader: &MzPeakReader, opts: &FilterOpts) -> Result<Survivors> {
+    let member = reader_metadata_member(reader);
+    let facet = reader.open_parquet(&member).with_context(|| format!("opening {member}"))?;
+    compute_survivors(facet, opts).context("computing surviving spectra")
 }
 
-/// Read `spectra_metadata`, apply the RT / MS-level predicates, and return
-/// `(surviving spectrum.index set, total spectra, dangling-precursor count)`.
+/// Old and new numbering of the entities a filter keeps. `kept` holds the kept indices, ascending,
+/// and a kept entity's new index is its position there: what the rewrite keeps is numbered 0..n-1 in
+/// index order, as the spec's `index` (0-based, incrementing by 1 per entry) requires. The HUPO
+/// reference reader sizes its spectrum iterator by the row count and looks each spectrum up by index,
+/// so the sparse indices a rewrite used to keep raised a KeyError there.
+#[derive(Debug, Clone, Default)]
+pub struct Renumber {
+    kept: Vec<u64>,
+}
+
+impl Renumber {
+    /// From the kept indices, in any order.
+    fn new(kept: impl IntoIterator<Item = u64>) -> Self {
+        let mut kept: Vec<u64> = kept.into_iter().collect();
+        kept.sort_unstable();
+        kept.dedup();
+        Self { kept }
+    }
+
+    /// The new index of the entity with old index `old`, `None` when it was not kept.
+    fn get(&self, old: u64) -> Option<u64> {
+        self.kept.binary_search(&old).ok().map(|at| at as u64)
+    }
+
+    pub fn contains(&self, old: u64) -> bool {
+        self.kept.binary_search(&old).is_ok()
+    }
+
+    pub fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty()
+    }
+
+    /// Nothing moves: the kept indices are already 0..n-1.
+    fn is_identity(&self) -> bool {
+        self.kept.last().is_none_or(|&last| last + 1 == self.kept.len() as u64)
+    }
+}
+
+/// What a spectrum filter keeps, read from the spectrum metadata ([`compute_survivors`]).
+#[derive(Debug)]
+pub struct Survivors {
+    /// The kept spectra and their new indices.
+    pub kept: Renumber,
+    /// Spectra in the metadata facet.
+    pub total: usize,
+    /// Surviving fragment spectra whose precursor was filtered out (packed layout only).
+    pub dangling: usize,
+    /// The `id` of every spectrum that was filtered out. A `precursor_id` or a scan's
+    /// `spectrum_reference` naming one would point at a spectrum the archive no longer holds.
+    dropped_ids: HashSet<String>,
+}
+
+/// Read the spectrum metadata facet, apply the RT / MS-level predicates, and return what survives.
 ///
 /// A "dangling precursor" is a SURVIVING fragment spectrum (ms_level ≥ 2) whose `precursor.precursor_id`
 /// resolves (via `spectrum.id`) to a spectrum that did NOT survive. We count distinct such fragments.
 /// `precursor_id` is the reliable cross-converter link — `precursor.source_index` is often null or,
 /// on some native readers, points at the source scan numbering rather than the precursor's `index`.
-fn compute_survivors(
-    meta_bytes: &[u8],
-    opts: &FilterOpts,
-) -> Result<(BTreeSet<u64>, usize, usize)> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_of(meta_bytes))
-        .context("opening spectra_metadata")?;
-    let reader = builder.build()?;
+fn compute_survivors<T: ChunkReader + 'static>(facet: ParquetRecordBatchReaderBuilder<T>, opts: &FilterOpts) -> Result<Survivors> {
+    let reader = facet.build().context("opening spectra_metadata")?;
 
     let mut survivors: BTreeSet<u64> = BTreeSet::new();
     let mut total = 0usize;
@@ -532,8 +577,9 @@ fn compute_survivors(
                 .is_some_and(|src| !survivors.contains(src))
         })
         .count();
+    let dropped_ids = id_to_index.into_iter().filter(|(_, index)| !survivors.contains(index)).map(|(id, _)| id).collect();
 
-    Ok((survivors, total, dangling))
+    Ok(Survivors { kept: Renumber::new(survivors), total, dangling, dropped_ids })
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -560,7 +606,8 @@ enum Facet {
     /// keyed by a TOP-LEVEL `source_index` referencing `spectra_metadata.index`.
     SpectrumSecondary,
     /// A chromatogram's precursors / selected ions, keyed by `source_index`. Chromatograms are
-    /// truncated, never dropped, so every row stays; the facet is re-encoded to shed a count key.
+    /// truncated, never dropped, so every row stays; the facet is re-encoded to shed a count key, and
+    /// its references to spectra follow a spectrum filter.
     ChromatogramSecondary,
     /// No spectrum linkage — copy verbatim (run-global vendor status log, etc.).
     RunGlobal,
@@ -714,128 +761,73 @@ fn classify_facet_by_schema(bytes: &[u8]) -> Result<Facet> {
 // Per-facet processing
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Filter/copy one Parquet facet and return the re-encoded bytes.
+/// What a facet's batches go through on their way to the output ([`reencode`]).
+type BatchMap<'a> = Box<dyn Fn(&RecordBatch) -> Result<Option<RecordBatch>> + 'a>;
+
+/// Filter/copy one Parquet facet and return the re-encoded bytes. `spectra` `None` copies the spectrum
+/// facets' rows as they are, `wavelength` `None` the wavelength facets; otherwise the rows of the kept
+/// entities stay, renumbered.
 fn process_parquet(
     bytes: &[u8],
     class: Facet,
-    survivors: &BTreeSet<u64>,
-    filtering_spectra: bool,
+    spectra: Option<&Survivors>,
     opts: &FilterOpts,
     chrom_kept: Option<&HashMap<u64, Vec<bool>>>,
-    wavelength_survivors: Option<&BTreeSet<u64>>,
+    wavelength: Option<&Renumber>,
 ) -> Result<Vec<u8>> {
-    match class {
-        Facet::RunGlobal => Ok(bytes.to_vec()), // verbatim
-        Facet::WavelengthMeta | Facet::WavelengthSecondary | Facet::WavelengthData(_) if wavelength_survivors.is_none() => {
-            Ok(bytes.to_vec())
+    let copy = || -> BatchMap { Box::new(|b: &RecordBatch| Ok(Some(b.clone()))) };
+    let (map, mode): (BatchMap, CountMode) = match (class, spectra, wavelength) {
+        (Facet::RunGlobal, _, _) => return Ok(bytes.to_vec()), // verbatim
+        (Facet::WavelengthMeta | Facet::WavelengthSecondary | Facet::WavelengthData(_), _, None) => return Ok(bytes.to_vec()),
+        (Facet::WavelengthMeta, _, Some(kept)) => (Box::new(move |b| filter_by_top_key(b, "index", kept)), CountMode::WavelengthMeta),
+        (Facet::WavelengthSecondary, _, Some(kept)) => {
+            let own = own_index(bytes, kept)?;
+            (Box::new(move |b| filter_secondary(b, kept, None, own.as_ref())), CountMode::Vendor)
         }
-        Facet::WavelengthMeta => {
-            let surv = wavelength_survivors.cloned().unwrap_or_default();
-            reencode(bytes, move |b| filter_by_top_key(b, "index", &surv), CountMode::WavelengthMeta)
+        (Facet::WavelengthData(field), _, Some(kept)) => {
+            let f = field.clone();
+            (Box::new(move |b| filter_by_struct_key(b, &f, "wavelength_spectrum_index", kept, false)), CountMode::WavelengthData(field))
         }
-        Facet::WavelengthSecondary => {
-            let surv = wavelength_survivors.cloned().unwrap_or_default();
-            reencode(bytes, move |b| filter_by_top_key(b, "source_index", &surv), CountMode::Vendor)
+        (Facet::ChromatogramSecondary, None, _) => (copy(), CountMode::Vendor),
+        // A chromatogram's precursor has the spectrum precursor's schema: its `precursor_index` and
+        // `precursor_id` name the spectrum it was selected from. Copied as they were, one naming a
+        // filtered-out spectrum survived the rewrite, and the mzML export wrote it as a spectrumRef.
+        (Facet::ChromatogramSecondary, Some(s), _) => (Box::new(move |b| Ok(Some(remap_references(b, s)?))), CountMode::Vendor),
+        (Facet::SpectrumMeta | Facet::SpectrumMetaFlat, None, _) => (copy(), CountMode::SpectrumMeta),
+        (Facet::SpectrumData(field), None, _) => (copy(), CountMode::SpectrumData(field)),
+        (Facet::SpectrumSecondary | Facet::VendorOrdinal, None, _) => (copy(), CountMode::Vendor),
+        (Facet::SpectrumMeta, Some(s), _) => {
+            (Box::new(move |b| filter_by_struct_key(b, "spectrum", "index", &s.kept, true)), CountMode::SpectrumMeta)
         }
-        Facet::WavelengthData(field) => {
-            let surv = wavelength_survivors.cloned().unwrap_or_default();
-            let f2 = field.clone();
-            reencode(
-                bytes,
-                move |b| filter_by_struct_key(b, &f2, "wavelength_spectrum_index", &surv, false),
-                CountMode::WavelengthData(field),
-            )
+        (Facet::SpectrumMetaFlat, Some(s), _) => (Box::new(move |b| filter_by_top_key(b, "index", &s.kept)), CountMode::SpectrumMeta),
+        (Facet::SpectrumData(field), Some(s), _) => {
+            let f = field.clone();
+            (Box::new(move |b| filter_by_struct_key(b, &f, "spectrum_index", &s.kept, false)), CountMode::SpectrumData(field))
         }
-        Facet::ChromatogramSecondary => reencode(bytes, |b| Ok(Some(b.clone())), CountMode::Vendor),
-        Facet::SpectrumMeta => {
-            if !filtering_spectra {
-                reencode(bytes, |b| Ok(Some(b.clone())), CountMode::SpectrumMeta)
-            } else {
-                let surv = survivors.clone();
-                reencode(
-                    bytes,
-                    move |b| filter_by_struct_key(b, "spectrum", "index", &surv, true),
-                    CountMode::SpectrumMeta,
-                )
-            }
+        (Facet::SpectrumSecondary, Some(s), _) => {
+            let own = own_index(bytes, &s.kept)?;
+            (Box::new(move |b| filter_secondary(b, &s.kept, Some(s), own.as_ref())), CountMode::Vendor)
         }
-        Facet::SpectrumData(field) => {
-            if !filtering_spectra {
-                reencode(bytes, |b| Ok(Some(b.clone())), CountMode::SpectrumData(field.clone()))
-            } else {
-                let surv = survivors.clone();
-                let f2 = field.clone();
-                reencode(
-                    bytes,
-                    move |b| filter_by_struct_key(b, &f2, "spectrum_index", &surv, false),
-                    CountMode::SpectrumData(field),
-                )
-            }
+        // The Thermo trailer facets' `ordinal` is the spectrum index.
+        (Facet::VendorOrdinal, Some(s), _) => (Box::new(move |b| filter_by_top_key(b, "ordinal", &s.kept)), CountMode::Vendor),
+        (Facet::ChromatogramData(field), _, _) => {
+            let (rt, f) = (opts.rt, field.clone());
+            let map: BatchMap = Box::new(move |b| match rt {
+                Some((lo, hi)) => filter_chromatogram_time(b, &f, lo, hi),
+                None => Ok(Some(b.clone())),
+            });
+            (map, CountMode::ChromatogramData(field))
         }
-        Facet::SpectrumMetaFlat => {
-            if !filtering_spectra {
-                reencode(bytes, |b| Ok(Some(b.clone())), CountMode::SpectrumMeta)
-            } else {
-                let surv = survivors.clone();
-                reencode(
-                    bytes,
-                    move |b| filter_by_top_key(b, "index", &surv),
-                    CountMode::SpectrumMeta,
-                )
-            }
-        }
-        Facet::SpectrumSecondary => {
-            if !filtering_spectra {
-                reencode(bytes, |b| Ok(Some(b.clone())), CountMode::Vendor)
-            } else {
-                let surv = survivors.clone();
-                reencode(
-                    bytes,
-                    move |b| filter_by_top_key(b, "source_index", &surv),
-                    CountMode::Vendor,
-                )
-            }
-        }
-        Facet::VendorOrdinal => {
-            if !filtering_spectra {
-                reencode(bytes, |b| Ok(Some(b.clone())), CountMode::Vendor)
-            } else {
-                let surv = survivors.clone();
-                reencode(
-                    bytes,
-                    move |b| filter_by_top_key(b, "ordinal", &surv),
-                    CountMode::Vendor,
-                )
-            }
-        }
-        Facet::ChromatogramData(field) => {
-            let rt = opts.rt;
-            let f2 = field.clone();
-            reencode(
-                bytes,
-                move |b| {
-                    if let Some((lo, hi)) = rt {
-                        filter_chromatogram_time(b, &f2, lo, hi)
-                    } else {
-                        Ok(Some(b.clone()))
-                    }
-                },
-                CountMode::ChromatogramData(field),
-            )
-        }
-        Facet::ChromatogramMeta => {
+        (Facet::ChromatogramMeta, _, _) => {
             // Only --rt changes a chromatogram; otherwise copy verbatim, footer counts included.
             let Some(kept) = chrom_kept else {
                 return Ok(bytes.to_vec());
             };
             let total = kept.values().map(|points| kept_count(points)).sum();
-            reencode(
-                bytes,
-                |b| Ok(Some(refresh_chrom_point_counts(b, kept)?)),
-                CountMode::ChromatogramMeta(total),
-            )
+            (Box::new(move |b| Ok(Some(refresh_chrom_point_counts(b, kept)?))), CountMode::ChromatogramMeta(total))
         }
-    }
+    };
+    reencode(bytes, map, mode)
 }
 
 /// How to recompute the per-facet count KVs after filtering.
@@ -1040,9 +1032,9 @@ fn intensity_row_len(s: &StructArray, row: usize) -> u64 {
     }
 }
 
-/// The count KV pairs to append to the footer for this facet. A data facet's entity count is one
-/// past the largest index left in it (0 when empty), as the writer stamps it: the rewrite keeps the
-/// original, sparse indices, and a reader bounding by the number of entities would stop early.
+/// The count KV pairs to append to the footer for this facet (issue #1, decisions D1 and D2). A data
+/// facet's entity count is one past the largest index left in it, 0 when empty, as the writer stamps
+/// it: the survivors are numbered 0..n-1, but a data facet holds only the spectra with points in it.
 fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> Vec<(String, String)> {
     let bound = keys.last().map_or(0, |max| max + 1).to_string();
     match mode {
@@ -1075,13 +1067,14 @@ fn count_kvs(mode: &CountMode, rows: u64, points: u64, keys: &BTreeSet<u64>) -> 
 // Row filters
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Keep rows whose `<field>.<key>` (a uint64 child) is in `survivors`. `keep_null_key` decides rows
-/// whose key is null (metadata keeps them defensively; data facets drop them — they must have a key).
+/// Keep rows whose `<field>.<key>` (a uint64 child) is a kept index, and renumber it. `keep_null_key`
+/// decides rows whose key is null (metadata keeps them defensively; data facets drop them — they must
+/// have a key).
 fn filter_by_struct_key(
     batch: &RecordBatch,
     field: &str,
     key: &str,
-    survivors: &BTreeSet<u64>,
+    kept: &Renumber,
     keep_null_key: bool,
 ) -> Result<Option<RecordBatch>> {
     let s = struct_col(batch, field)
@@ -1093,90 +1086,135 @@ fn filter_by_struct_key(
             if idx.is_null(r) {
                 Some(keep_null_key)
             } else {
-                Some(survivors.contains(&idx.value(r)))
+                Some(kept.contains(idx.value(r)))
             }
         })
         .collect();
-    Ok(Some(filter_record_batch(batch, &mask)?))
+    let out = filter_record_batch(batch, &mask)?;
+    let pos = out.schema().index_of(field)?;
+    let s = struct_col(&out, field).expect("filtering keeps the struct");
+    let child = s.fields().iter().position(|f| f.name() == key).expect("the key child was read above");
+    let renumbered = replace_struct_child(s, child, map_indices(s.column(child), |old| kept.get(old))?)?;
+    let mut cols = out.columns().to_vec();
+    cols[pos] = Arc::new(renumbered);
+    Ok(Some(RecordBatch::try_new(out.schema(), cols)?))
 }
 
-/// Keep rows whose top-level `key` column (coerced to u64) is in `survivors`.
-fn filter_by_top_key(
-    batch: &RecordBatch,
-    key: &str,
-    survivors: &BTreeSet<u64>,
-) -> Result<Option<RecordBatch>> {
+/// Keep rows whose top-level `key` column (coerced to u64) is a kept index, and renumber it.
+fn filter_by_top_key(batch: &RecordBatch, key: &str, kept: &Renumber) -> Result<Option<RecordBatch>> {
     let col = batch
         .column_by_name(key)
         .ok_or_else(|| anyhow!("expected `{key}` column"))?;
     let idx = to_u64(col).ok_or_else(|| anyhow!("`{key}` is not an integer column"))?;
     let mask: BooleanArray = (0..idx.len())
-        .map(|r| Some(!idx.is_null(r) && survivors.contains(&idx.value(r))))
+        .map(|r| Some(!idx.is_null(r) && kept.contains(idx.value(r))))
         .collect();
-    let kept = filter_record_batch(batch, &mask)?;
-    Ok(Some(null_dangling_parent_refs(&kept, survivors)?))
+    let out = filter_record_batch(batch, &mask)?;
+    Ok(Some(renumber_column(&out, key, kept)?))
 }
 
-/// Null `precursor_index` / `precursor_id` on rows whose PARENT spectrum did not survive.
-///
-/// These point at the survey spectrum an MS2 was selected from. Filtering by MS level drops exactly
-/// those parents, so without this every surviving precursor row keeps a reference to a spectrum that
-/// is no longer in the archive — breaking the spec's "every non-null foreign key resolves to an
-/// existing key/id" MUST. Surviving spectra keep their ORIGINAL `index`, so nulling is sufficient;
-/// no remapping is needed. A facet without these columns passes through untouched.
-fn null_dangling_parent_refs(
+/// One batch of a spectrum or wavelength-spectrum secondary (scans, precursors, selected ions,
+/// products): the rows of kept entities, `source_index` renumbered, their references to other spectra
+/// remapped (`spectra`, [`remap_references`]), and the facet's own row index (`own`, [`own_index`])
+/// renumbered.
+fn filter_secondary(
     batch: &RecordBatch,
-    survivors: &BTreeSet<u64>,
-) -> Result<RecordBatch> {
-    let Some(pidx) = batch.column_by_name("precursor_index").and_then(to_u64) else {
-        return Ok(batch.clone());
-    };
-    let keep: Vec<bool> = (0..pidx.len())
-        .map(|r| !pidx.is_null(r) && survivors.contains(&pidx.value(r)))
-        .collect();
-    if keep.iter().all(|k| *k) {
-        return Ok(batch.clone());
+    kept: &Renumber,
+    spectra: Option<&Survivors>,
+    own: Option<&(&'static str, Renumber)>,
+) -> Result<Option<RecordBatch>> {
+    let Some(mut out) = filter_by_top_key(batch, "source_index", kept)? else { return Ok(None) };
+    if let Some(spectra) = spectra {
+        out = remap_references(&out, spectra)?;
     }
-    let n_dropped = keep.iter().filter(|k| !**k).count();
-    log::warn!(
-        "{n_dropped} precursor rows referenced a filtered-out parent spectrum; \
-         nulling their precursor_index/precursor_id"
-    );
-    let cols: Vec<ArrayRef> = batch
-        .schema()
-        .fields()
-        .iter()
-        .zip(batch.columns())
-        .map(|(f, c)| -> Result<ArrayRef> {
-            match f.name().as_str() {
-                "precursor_index" => {
-                    let src = to_u64(c).unwrap();
-                    let mut b = arrow::array::UInt64Builder::with_capacity(src.len());
-                    for (r, k) in keep.iter().enumerate() {
-                        b.append_option((*k && !src.is_null(r)).then(|| src.value(r)));
-                    }
-                    Ok(Arc::new(b.finish()) as ArrayRef)
-                }
-                "precursor_id" => {
-                    let src = c
-                        .as_any()
-                        .downcast_ref::<arrow::array::LargeStringArray>()
-                        .ok_or_else(|| anyhow!("precursor_id is not a LargeUtf8 column"))?;
-                    let mut b = arrow::array::LargeStringBuilder::new();
-                    for (r, k) in keep.iter().enumerate() {
-                        if *k && !src.is_null(r) {
-                            b.append_value(src.value(r));
-                        } else {
-                            b.append_null();
-                        }
-                    }
-                    Ok(Arc::new(b.finish()) as ArrayRef)
-                }
-                _ => Ok(c.clone()),
-            }
-        })
-        .collect::<Result<_>>()?;
+    if let Some((column, renumber)) = own {
+        out = renumber_column(&out, column, renumber)?;
+    }
+    Ok(Some(out))
+}
+
+/// A secondary facet's own 0-based row index — a scans facet's `scan_index`, a products facet's
+/// `product_index` — over the rows whose `source_index` is kept, renumbered like the entities it
+/// belongs to: the spec asks it too to increment by 1 per entry. Read ahead of the rewrite, as the
+/// new numbers depend on every kept row. `None` when the facet has no such column.
+fn own_index(bytes: &[u8], kept: &Renumber) -> Result<Option<(&'static str, Renumber)>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))?;
+    let schema = builder.schema().clone();
+    let Some(own) = ["scan_index", "product_index"].into_iter().find(|c| schema.column_with_name(c).is_some()) else {
+        return Ok(None);
+    };
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [schema.index_of("source_index")?, schema.index_of(own)?]);
+    let mut values = Vec::new();
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let (Some(source), Some(index)) =
+            (batch.column_by_name("source_index").and_then(to_u64), batch.column_by_name(own).and_then(to_u64))
+        else {
+            bail!("`source_index` or `{own}` is not an integer column");
+        };
+        values.extend((0..batch.num_rows()).filter(|&r| source.is_valid(r) && index.is_valid(r) && kept.contains(source.value(r))).map(|r| index.value(r)));
+    }
+    Ok(Some((own, Renumber::new(values))))
+}
+
+/// Point a kept row's references to other spectra at their new indices. `precursor_index` — the
+/// parent spectrum of a precursor or a selected ion — takes the parent's new index, and null when the
+/// parent was filtered out (the spec: null when that spectrum is not in the archive); `precursor_id`
+/// goes with it. A `precursor_id` or a scan's `spectrum_reference` naming a filtered-out spectrum by
+/// id is nulled as well. A reference the archive cannot resolve (another run's spectrum, a USI) is
+/// kept, as is a `precursor_id` whose `precursor_index` the source left null. A facet without these
+/// columns passes through untouched.
+fn remap_references(batch: &RecordBatch, spectra: &Survivors) -> Result<RecordBatch> {
+    let parent = batch
+        .column_by_name("precursor_index")
+        .map(|c| to_u64(c).ok_or_else(|| anyhow!("precursor_index is {}, not an integer column", c.data_type())))
+        .transpose()?;
+    let parent_gone = |r: usize| parent.as_ref().is_some_and(|p| p.is_valid(r) && !spectra.kept.contains(p.value(r)));
+    let mut cols = batch.columns().to_vec();
+    // The rows that lose a reference, for the warning.
+    let mut touched: Vec<bool> = (0..batch.num_rows()).map(parent_gone).collect();
+    for (at, field) in batch.schema().fields().iter().enumerate() {
+        let name = field.name().as_str();
+        if name == "precursor_index" {
+            cols[at] = map_indices(&cols[at], |old| spectra.kept.get(old))?;
+        } else if name == "precursor_id" || name == "spectrum_reference" {
+            let ids = arrow::compute::cast(&cols[at], &DataType::LargeUtf8)?;
+            let ids = ids.as_any().downcast_ref::<arrow::array::LargeStringArray>().expect("cast to LargeUtf8");
+            let gone: BooleanArray = (0..ids.len())
+                .map(|r| {
+                    let named = ids.is_valid(r) && spectra.dropped_ids.contains(ids.value(r));
+                    touched[r] |= named;
+                    Some(ids.is_valid(r) && (named || (name == "precursor_id" && parent_gone(r))))
+                })
+                .collect();
+            cols[at] = arrow::compute::nullif(&cols[at], &gone)?;
+        }
+    }
+    let nulled = touched.iter().filter(|t| **t).count();
+    if nulled > 0 {
+        log::warn!(
+            "{nulled} rows referenced a filtered-out spectrum (a precursor's parent, or a scan's \
+             spectrum_reference); the reference is nulled"
+        );
+    }
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
+}
+
+/// `batch` with its top-level index column `name` renumbered through `kept`.
+fn renumber_column(batch: &RecordBatch, name: &str, kept: &Renumber) -> Result<RecordBatch> {
+    let at = batch.schema().index_of(name)?;
+    let mut cols = batch.columns().to_vec();
+    cols[at] = map_indices(&cols[at], |old| kept.get(old))?;
+    Ok(RecordBatch::try_new(batch.schema(), cols)?)
+}
+
+/// An integer index column with each value `v` replaced by `new(v)`, null where that is `None`, in
+/// the column's own type.
+fn map_indices(col: &ArrayRef, new: impl Fn(u64) -> Option<u64>) -> Result<ArrayRef> {
+    let old = to_u64(col).ok_or_else(|| anyhow!("an index column of type {} is not an integer column", col.data_type()))?;
+    let mapped: UInt64Array = old.iter().map(|v| v.and_then(&new)).collect();
+    let opts = arrow::compute::CastOptions { safe: false, ..Default::default() };
+    Ok(arrow::compute::cast_with_options(&mapped, col.data_type(), &opts)?)
 }
 
 /// `--rt` is in minutes, the unit of `spectrum.time`, but a chromatogram time axis declares its own
@@ -1460,8 +1498,12 @@ fn apply_encodings(
 }
 
 /// Carry the original index `metadata` blocks into `w`, add a `data_processing` entry, and add the
-/// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members;
-/// `ims_calibration` and every other block are preserved verbatim.
+/// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members, and
+/// `encoding_prescan` names its spectrum by the new index ([`renumber_prescan_block`]); `ims_calibration`
+/// and every other block are preserved verbatim. The provenance block's `renumbered` lists the entities
+/// (`spectrum`, `wavelength_spectrum`) whose kept indices were renumbered 0..n-1, every column holding
+/// such an index with them; their ids are the source's.
+#[allow(clippy::too_many_arguments)]
 fn carry_index_metadata(
     w: &mut ZipArchiveWriter<File>,
     index: &serde_json::Value,
@@ -1469,6 +1511,8 @@ fn carry_index_metadata(
     input: &Path,
     dropped: &[String],
     injected: &[String],
+    spectra: Option<&Survivors>,
+    renumbered: &[&str],
 ) -> Result<()> {
     if let Some(meta) = index.get("metadata").and_then(|m| m.as_object()) {
         for (k, v) in meta {
@@ -1487,6 +1531,9 @@ fn carry_index_metadata(
                     images.retain(|i| !dropped.iter().any(|d| i["archive_path"] == d.as_str()));
                 }
                 w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
+            } else if k == "encoding_prescan" {
+                let block = renumber_prescan_block(v, spectra);
+                w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
             } else {
                 w.add_index_metadata(k, v).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
             }
@@ -1498,11 +1545,25 @@ fn carry_index_metadata(
         "ms_level": opts.ms_levels,
         "dropped_aux": dropped,
         "injected_aux": injected,
+        "renumbered": renumbered,
         "tool_version": env!("CARGO_PKG_VERSION"),
     });
     w.add_index_metadata("filter", &provenance)
         .map_err(|e| anyhow!("index metadata filter: {e}"))?;
     Ok(())
+}
+
+/// The `encoding_prescan` block of a rewrite. Its `int32_fallback.spectrum_index` is the spectrum whose
+/// intensity made the converter give up int32 intensities, by index: it takes that spectrum's new
+/// index, and null when the spectrum was filtered out. Carried verbatim, it named whichever spectrum
+/// took the old number. `spectra` `None` (nothing renumbered) leaves the block as it is.
+fn renumber_prescan_block(block: &serde_json::Value, spectra: Option<&Survivors>) -> serde_json::Value {
+    let mut block = block.clone();
+    let old = block.pointer("/int32_fallback/spectrum_index").and_then(serde_json::Value::as_u64);
+    if let (Some(s), Some(old)) = (spectra, old) {
+        block["int32_fallback"]["spectrum_index"] = s.kept.get(old).map_or(serde_json::Value::Null, Into::into);
+    }
+    block
 }
 
 /// An mzML-style data_processing method entry describing this filter operation.
@@ -1655,9 +1716,9 @@ fn to_u64(a: &ArrayRef) -> Option<UInt64Array> {
 mod tests {
     use super::*;
 
-    /// In-memory Parquet holding `columns`, with `kv` in its footer.
+    /// In-memory Parquet holding `columns`, nullable as the writer declares them, with `kv` in its footer.
     fn parquet(columns: Vec<(&str, ArrayRef)>, kv: &[(&str, &str)]) -> Vec<u8> {
-        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let batch = RecordBatch::try_from_iter_with_nullable(columns.into_iter().map(|(name, c)| (name, c, true))).unwrap();
         let kv = kv.iter().map(|(k, v)| KeyValue::new(k.to_string(), v.to_string())).collect();
         let props = WriterProperties::builder().set_key_value_metadata(Some(kv)).build();
         let mut buf = Vec::new();
@@ -1680,13 +1741,102 @@ mod tests {
             parquet(vec![("index", Arc::new(UInt64Array::from(vec![0u64, 1])) as ArrayRef), ("ms_level", ms), ("time", time)], &[])
         };
         let opts = FilterOpts { ms_levels: vec![2], rt: Some((0.0, 1.0)), ..Default::default() };
+        let survivors = |bytes: &[u8]| compute_survivors(ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes)).unwrap(), &opts);
         let retyped = meta(Arc::new(arrow::array::Int32Array::from(vec![1, 2])), Arc::new(arrow::array::Float32Array::from(vec![0.5f32, 0.5])));
-        let (survivors, total, _) = compute_survivors(&retyped, &opts).unwrap();
-        assert_eq!((survivors.into_iter().collect::<Vec<_>>(), total), (vec![1], 2));
+        let s = survivors(&retyped).unwrap();
+        assert_eq!((s.kept.kept, s.total), (vec![1], 2));
         let too_wide = meta(Arc::new(arrow::array::Int32Array::from(vec![1, 300])), Arc::new(Float64Array::from(vec![0.5, 0.5])));
-        assert!(compute_survivors(&too_wide, &opts).is_err(), "an ms_level of 300 does not fit UInt8");
+        assert!(survivors(&too_wide).is_err(), "an ms_level of 300 does not fit UInt8");
         let float_level = meta(Arc::new(Float64Array::from(vec![1.0, 2.0])), Arc::new(Float64Array::from(vec![0.5, 0.5])));
-        assert!(compute_survivors(&float_level, &opts).is_err(), "a float ms_level is not cast");
+        assert!(survivors(&float_level).is_err(), "a float ms_level is not cast");
+    }
+
+    /// The kept indices, renumbered: a kept entity's new index is its rank, nothing else maps, and
+    /// only a leading run 0..n-1 is left as it is.
+    #[test]
+    fn renumbering_gives_each_kept_index_its_rank() {
+        let r = Renumber::new([7u64, 2, 9, 2]);
+        assert_eq!([2, 7, 9, 3].map(|old| r.get(old)), [Some(0), Some(1), Some(2), None]);
+        assert!(!r.is_identity());
+        assert!(Renumber::new([0u64, 1, 2]).is_identity());
+        assert!(Renumber::default().is_identity());
+    }
+
+    /// A secondary's references follow the renumbering: a kept parent's new index, null (index and id)
+    /// for a parent that was filtered out, a `precursor_id` or `spectrum_reference` naming a
+    /// filtered-out spectrum nulled, and an id the archive cannot resolve kept. The source's
+    /// `scan_index` restarts at 0.
+    #[test]
+    fn a_secondary_follows_the_renumbering() {
+        let ids = |v: Vec<Option<&str>>| Arc::new(arrow::array::LargeStringArray::from(v)) as ArrayRef;
+        let bytes = parquet(
+            vec![
+                ("source_index", Arc::new(UInt64Array::from(vec![3u64, 5, 6, 7, 7])) as ArrayRef),
+                ("scan_index", Arc::new(UInt64Array::from(vec![3u64, 5, 6, 7, 8])) as ArrayRef),
+                ("precursor_index", Arc::new(UInt64Array::from(vec![Some(2u64), Some(3), Some(5), None, None])) as ArrayRef),
+                ("precursor_id", ids(vec![Some("s2"), Some("s3"), Some("s5"), Some("USI:elsewhere"), Some("s6")])),
+                ("spectrum_reference", ids(vec![None, Some("s2"), Some("s3"), Some("other run"), None])),
+            ],
+            &[],
+        );
+        // Spectra 3, 5 and 7 are kept (new 0, 1 and 2); 2 and 6 were filtered out.
+        let spectra = Survivors {
+            kept: Renumber::new([3u64, 5, 7]),
+            total: 8,
+            dangling: 0,
+            dropped_ids: ["s2", "s6"].map(String::from).into(),
+        };
+        let fe = FileEntry::new("spectra_metadata_precursors.parquet".to_string(), EntityType::Spectrum, DataKind::Precursors);
+        let out = process_parquet(&bytes, classify_facet(&bytes, &fe).unwrap(), Some(&spectra), &FilterOpts::default(), None, None).unwrap();
+        let t = ParquetRecordBatchReaderBuilder::try_new(bytes_of(&out)).unwrap().build().unwrap().next().unwrap().unwrap();
+        let u64s = |name: &str| to_u64(t.column_by_name(name).unwrap()).unwrap().iter().collect::<Vec<_>>();
+        let strs = |name: &str| {
+            let c = t.column_by_name(name).unwrap().as_any().downcast_ref::<arrow::array::LargeStringArray>().unwrap().clone();
+            c.iter().map(|v| v.map(str::to_string)).collect::<Vec<_>>()
+        };
+        assert_eq!(u64s("source_index"), [Some(0), Some(1), Some(2), Some(2)]);
+        assert_eq!(u64s("scan_index"), [Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(u64s("precursor_index"), [None, Some(0), None, None]);
+        assert_eq!(strs("precursor_id"), [None, Some("s3".into()), Some("USI:elsewhere".into()), None]);
+        assert_eq!(strs("spectrum_reference"), [None, None, Some("other run".into()), None]);
+    }
+
+    /// A chromatogram's precursors keep every row and their own `source_index`, while their references
+    /// to spectra follow the spectrum filter: a kept parent's new index, null (index and id) for a
+    /// parent that was filtered out, and an id naming a filtered-out spectrum nulled.
+    #[test]
+    fn a_chromatogram_precursor_follows_the_spectra() {
+        let bytes = parquet(
+            vec![
+                ("source_index", Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef),
+                ("precursor_index", Arc::new(UInt64Array::from(vec![Some(2u64), Some(5), None])) as ArrayRef),
+                ("precursor_id", Arc::new(arrow::array::LargeStringArray::from(vec!["s2", "s5", "s6"])) as ArrayRef),
+            ],
+            &[],
+        );
+        let spectra = Survivors { kept: Renumber::new([3u64, 5]), total: 7, dangling: 0, dropped_ids: ["s2", "s6"].map(String::from).into() };
+        let fe = FileEntry::new("chromatograms_metadata_precursors.parquet".to_string(), EntityType::Chromatogram, DataKind::Precursors);
+        let out = process_parquet(&bytes, classify_facet(&bytes, &fe).unwrap(), Some(&spectra), &FilterOpts::default(), None, None).unwrap();
+        let t = ParquetRecordBatchReaderBuilder::try_new(bytes_of(&out)).unwrap().build().unwrap().next().unwrap().unwrap();
+        let u64s = |name: &str| to_u64(t.column_by_name(name).unwrap()).unwrap().iter().collect::<Vec<_>>();
+        let ids = t.column_by_name("precursor_id").unwrap().as_any().downcast_ref::<arrow::array::LargeStringArray>().unwrap().clone();
+        assert_eq!(u64s("source_index"), [Some(0), Some(1), Some(2)]);
+        assert_eq!(u64s("precursor_index"), [None, Some(1), None]);
+        assert_eq!(ids.iter().collect::<Vec<_>>(), [None, Some("s5"), None]);
+    }
+
+    /// The `encoding_prescan` block names the spectrum that ended the int32 intensities by its new
+    /// index, null when it was filtered out, and is left as it is when nothing was renumbered.
+    #[test]
+    fn the_prescan_block_follows_the_renumbering() {
+        let block = serde_json::json!({"chosen": {"intensity": "f32"}, "int32_fallback": {"spectrum_index": 70, "intensity": "f32"}});
+        let survivors = |kept: &[u64]| Survivors { kept: Renumber::new(kept.iter().copied()), total: 300, dangling: 0, dropped_ids: HashSet::new() };
+        let fallback = |spectra: Option<&Survivors>| renumber_prescan_block(&block, spectra)["int32_fallback"]["spectrum_index"].clone();
+        assert_eq!(fallback(Some(&survivors(&(50..300).collect::<Vec<_>>()))), serde_json::json!(20));
+        assert_eq!(fallback(Some(&survivors(&[1, 2, 3]))), serde_json::Value::Null);
+        assert_eq!(fallback(None), serde_json::json!(70));
+        let without = serde_json::json!({"chosen": {"intensity": "int32"}});
+        assert_eq!(renumber_prescan_block(&without, Some(&survivors(&[1]))), without, "a block with no fallback is carried as it is");
     }
 
     /// #20 review: the refreshed `number_of_data_points` keeps the column's type; a UInt64 array under
@@ -1720,7 +1870,7 @@ mod tests {
     #[test]
     fn rewrite_leaves_no_entity_count_on_secondaries() {
         let source_index: ArrayRef = Arc::new(UInt64Array::from(vec![0u64, 2]));
-        let survivors: BTreeSet<u64> = [2].into();
+        let survivors = Survivors { kept: Renumber::new([2]), total: 3, dangling: 0, dropped_ids: HashSet::new() };
         for (name, entity, kind, key) in [
             ("spectra_metadata_precursors.parquet", EntityType::Spectrum, DataKind::Precursors, "spectrum_count"),
             ("chromatograms_metadata_precursors.parquet", EntityType::Chromatogram, DataKind::Precursors, "chromatogram_count"),
@@ -1728,7 +1878,7 @@ mod tests {
             let bytes = parquet(vec![("source_index", source_index.clone())], &[(key, "4")]);
             let fe = FileEntry::new(name.to_string(), entity, kind);
             let class = classify_facet(&bytes, &fe).unwrap();
-            let out = process_parquet(&bytes, class, &survivors, true, &FilterOpts::default(), None, None).unwrap();
+            let out = process_parquet(&bytes, class, Some(&survivors), &FilterOpts::default(), None, None).unwrap();
             assert!(!footer_keys(&out).iter().any(|k| k.ends_with("_count")), "{name}: {:?}", footer_keys(&out));
         }
     }
