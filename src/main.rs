@@ -1657,6 +1657,12 @@ fn is_tdf_dir(input: &Path) -> bool {
     input.is_dir() && has_nonempty(input, "analysis.tdf")
 }
 
+/// A failed mzdata open of `input`, with any file timsrust could have taken for `analysis.tdf`
+/// named when `input` is a TDF `.d` ([`bruker_native::name_timsrust_lookalikes`]).
+fn tdf_open_error(input: &Path, e: anyhow::Error) -> anyhow::Error {
+    if is_tdf_dir(input) { bruker_native::name_timsrust_lookalikes(input, e) } else { e }
+}
+
 /// Print `scan,timsrust_1overk0,sdk_1overk0,abs_diff` for every mobility scan of a TDF `.d`, so the
 /// timsrust `Scan2ImConverter` calibration can be compared scan-by-scan against the vendor SDK's
 /// `tims_scannum_to_oneoverk0`. Reads ONLY `analysis.tdf` (no frame/`.tdf_bin` read) so it can run on
@@ -1859,7 +1865,8 @@ fn report_inspect(input: &Path, skip_native: Option<&str>) -> Result<()> {
         bruker_native::refuse_timsrust_lookalikes(input)?; // mzdata opens a TDF .d through timsrust
     }
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(open_path)
-        .with_context(|| format!("opening {}", input.display()))?;
+        .with_context(|| format!("opening {}", input.display()))
+        .map_err(|e| tdf_open_error(input, e))?;
     recover_chromatogram_index(&mut reader, input, open_path);
     println!("format:        {}", reader_format(&reader));
     println!("spectra:       {}", reader.len());
@@ -2294,7 +2301,8 @@ fn convert_to_mzml(
         bruker_native::refuse_timsrust_lookalikes(input)?; // mzdata opens a TDF .d through timsrust
     }
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&read_path)
-        .with_context(|| format!("opening {}", input.display()))?;
+        .with_context(|| format!("opening {}", input.display()))
+        .map_err(|e| tdf_open_error(input, e))?;
     recover_chromatogram_index(&mut reader, input, &read_path);
     // A TDF with a ModelType-2 m/z calibration is read on timsrust's chord, as the archive lanes
     // read it since 0.14.0 (`convert_file`); through 0.16.0 this lane kept mzdata's ModelType-1
@@ -4156,7 +4164,8 @@ fn convert_file(
         bruker_native::refuse_timsrust_lookalikes(input)?; // mzdata opens a TDF .d through timsrust
     }
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(read_path)
-        .with_context(|| format!("opening {}", input.display()))?;
+        .with_context(|| format!("opening {}", input.display()))
+        .map_err(|e| tdf_open_error(input, e))?;
     // Before the TOF-grid branch below, which is handed this reader.
     recover_chromatogram_index(&mut reader, input, read_path);
     // mzdata applies a TDF's MzCalibration rows by default and reads every row as ModelType 1; a

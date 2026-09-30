@@ -356,6 +356,29 @@ fn timsrust_lookalikes(names: impl IntoIterator<Item = String>) -> Vec<String> {
     found
 }
 
+/// [`timsrust_lookalikes`] of the entries of `dot_d`; none when it cannot be listed (the open
+/// itself then reports the directory).
+fn lookalikes_in(dot_d: &Path) -> Vec<String> {
+    match std::fs::read_dir(dot_d) {
+        Ok(entries) => timsrust_lookalikes(entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned())),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn lookalikes_message(dot_d: &Path, found: &[String]) -> String {
+    format!(
+        "{} holds {} beside analysis.tdf / analysis.tdf_bin. The timsTOF reader (timsrust) opens the \
+         first file whose name ends in `analysis.tdf` / `analysis.tdf_bin`, so it can read one of these \
+         in place of the run (\"file is not a database\"). `._*` files are macOS AppleDouble companions: \
+         Finder metadata that copying a .d from a Mac to NTFS, exFAT or SMB leaves beside every file, \
+         and that macOS writes on such a volume whenever a file there is opened for writing, as timsrust \
+         opens analysis.tdf. Remove them from the .d (on a Mac, copy the .d to an APFS disk instead: \
+         macOS writes them back), or convert with --bruker-sdk (Windows/Linux), which opens the exact files",
+        dot_d.display(),
+        found.join(", ")
+    )
+}
+
 /// Refuse a TDF `.d` in which timsrust could open another file in place of `analysis.tdf` or
 /// `analysis.tdf_bin`. timsrust 0.4.1 (`utils::find_extension`) takes the FIRST directory entry
 /// whose name ends with the one it wants, and a macOS AppleDouble companion does: copying a `.d`
@@ -365,22 +388,21 @@ fn timsrust_lookalikes(names: impl IntoIterator<Item = String>) -> Vec<String> {
 /// (2485.d on the box, 2026-09-30). The whole listing is checked, so the verdict does not depend on
 /// the order a filesystem happens to list it in. Called before every timsrust open of a `.d`.
 pub fn refuse_timsrust_lookalikes(dot_d: &Path) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(dot_d) else {
-        return Ok(()); // the open itself reports an unreadable directory
-    };
-    let found = timsrust_lookalikes(entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()));
+    let found = lookalikes_in(dot_d);
     if found.is_empty() {
         return Ok(());
     }
-    bail!(
-        "{} holds {} beside analysis.tdf / analysis.tdf_bin. The timsTOF reader (timsrust) opens the \
-         first file whose name ends in `analysis.tdf` / `analysis.tdf_bin`, so it can read one of these \
-         in place of the run (\"file is not a database\"). `._*` files are macOS AppleDouble companions, \
-         Finder metadata left by copying a .d from a Mac to NTFS, exFAT or SMB. Remove them from the \
-         .d, or convert with --bruker-sdk (Windows/Linux), which opens the exact files",
-        dot_d.display(),
-        found.join(", ")
-    )
+    bail!(lookalikes_message(dot_d, &found))
+}
+
+/// `err`, a failed timsrust open of `dot_d`, with any lookalike named in front of it. The open can
+/// write one itself: on a Mac, a `.d` on an exFAT or SMB volume gets `._analysis.tdf` the moment
+/// timsrust opens `analysis.tdf` read-write (its metadata read, before it looks the file up), because
+/// macOS keeps the file's `com.apple.provenance` attribute there (measured on an exFAT disk image,
+/// macOS 26), so [`refuse_timsrust_lookalikes`] found nothing a moment earlier.
+pub fn name_timsrust_lookalikes(dot_d: &Path, err: anyhow::Error) -> anyhow::Error {
+    let found = lookalikes_in(dot_d);
+    if found.is_empty() { err } else { err.context(lookalikes_message(dot_d, &found)) }
 }
 
 /// Native integer-TOF reader over a Bruker `.d` (TDF). The mzdata-integration seam: a future
@@ -1007,7 +1029,7 @@ impl NativeTofReader {
         let meta = MetadataReader::new(&tdf)
             .map_err(|e| anyhow::anyhow!("reading TDF metadata: {e}"))?;
         let frames = FrameReader::new(dot_d)
-            .map_err(|e| anyhow::anyhow!("opening TDF frames: {e}"))?;
+            .map_err(|e| name_timsrust_lookalikes(dot_d, anyhow::anyhow!("opening TDF frames: {e}")))?;
         let model = TofMzModel::from_converter(&meta.mz_converter);
         // Best-effort: a missing/other-ModelType calibration just leaves us on the linear path.
         let recal = if recalibrate {
@@ -1904,6 +1926,24 @@ mod appledouble_tests {
             assert!(msg.contains("--bruker-sdk") && msg.contains("AppleDouble"), "the fix is named: {msg}");
             assert!(kept, "the converter never removes the companion itself");
         }
+    }
+
+    /// A companion that appears DURING the open — macOS writes `._analysis.tdf` on an exFAT or SMB
+    /// volume when timsrust opens the database read-write — is named in front of the open's error.
+    #[test]
+    fn a_companion_written_during_the_open_is_named_when_it_fails() {
+        let dot_d = std::env::temp_dir().join(format!("mzpc-appledouble-late-{}.d", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dot_d);
+        std::fs::create_dir_all(&dot_d).unwrap();
+        synthetic_tdf(&dot_d);
+        let failed = || anyhow::anyhow!("opening TDF frames: file is not a database");
+        let plain = format!("{:#}", super::name_timsrust_lookalikes(&dot_d, failed()));
+        std::fs::write(dot_d.join("._analysis.tdf"), appledouble()).unwrap();
+        let named = format!("{:#}", super::name_timsrust_lookalikes(&dot_d, failed()));
+        let _ = std::fs::remove_dir_all(&dot_d);
+        assert_eq!(plain, "opening TDF frames: file is not a database", "nothing to name, nothing added");
+        assert!(named.contains("holds ._analysis.tdf beside") && named.contains("APFS"), "{named}");
+        assert!(named.ends_with(": opening TDF frames: file is not a database"), "the open's own error follows: {named}");
     }
 }
 
