@@ -9,13 +9,20 @@ use mzdata::{
 use serde::{Deserialize, Serialize};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 
-use crate::{constants::{CHROMATOGRAM_ARRAY_INDEX, CHROMATOGRAM_INDEX, SPECTRUM_ARRAY_INDEX, SPECTRUM_INDEX, SPECTRUM_TIME, WAVELENGTH_SPECTRUM_ARRAY_INDEX, WAVELENGTH_SPECTRUM_INDEX, WAVELENGTH_SPECTRUM_TIME}, peak_series::array_to_arrow_type};
 use crate::{
     constants::{CHROMATOGRAM, SPECTRUM},
     param::{
         CURIE, curie_deserialize, curie_serialize, opt_curie_deserialize, opt_curie_serialize,
     },
     peak_series::{MZ_ARRAY, TIME_ARRAY, WAVELENGTH_ARRAY},
+};
+use crate::{
+    constants::{
+        CHROMATOGRAM_ARRAY_INDEX, CHROMATOGRAM_INDEX, SPECTRUM_ARRAY_INDEX, SPECTRUM_INDEX,
+        SPECTRUM_TIME, WAVELENGTH_SPECTRUM_ARRAY_INDEX, WAVELENGTH_SPECTRUM_INDEX,
+        WAVELENGTH_SPECTRUM_TIME,
+    },
+    peak_series::array_to_arrow_type,
 };
 
 /// Whether an data array series is associated with a spectrum or a chromatogram
@@ -519,25 +526,17 @@ pub enum BufferTransform {
     GridEncoding,
 }
 
-// NOTE: upstream (and docs/layouts/signal-data.md) assign MS:1003901 = zero intensity point
-// trimming, MS:1003902 = ...interpolation. Our vendored copy had these two swapped; adopting
-// upstream's mapping fixes the read path for spec-conformant third-party files.
-const NULL_ZERO: CURIE = mzdata::curie!(MS:1003901);
-const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003902);
-// Grid reconstruction transforms, using the ASSIGNED PSI-MS "coordinate spacing model" terms seeded
-// for grid encoding (children of MS:1003820 / MS:1003822 "grid coordinate interpolation"):
+pub(crate) const NULL_ZERO: CURIE = mzdata::curie!(MS:1003901);
+pub(crate) const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003902);
+pub const GRID_ENCODING: CURIE = mzdata::curie!(MS:1003826);
+// Point-layout grid transforms (retire with backlog "vendoring exit" item 1 — read path kept until
+// every corpus archive is rewritten): the ASSIGNED PSI-MS "coordinate spacing model" terms,
 //   MS:1003825 = square root grid interpolation   x = f((b + i·a)²)
 //   MS:1003824 = linear grid interpolation        x = f(b + i·a)
-// `f` (recalibration) is identity for these; a non-identity `f` (e.g. Agilent's per-CalibrationID
-// polynomial, the TIMS mobility model) awaits a PSI recalibration-function term (BACKLOG.md #1).
+// with `f` = identity. Legacy codings recognized on READ only: our earlier MS:1003903/1003904 and
+// the converter-owned MZP:1000001/1000002 (Unknown-CV).
 const SQRT_MZ_FROM_TOF: CURIE = mzdata::curie!(MS:1003825);
 const LINEAR_MZ: CURIE = mzdata::curie!(MS:1003824);
-const GRID_ENCODING: CURIE = mzdata::curie!(MS:1003826);
-// (MS:1003826 "coordinate grid encoding" would additionally mark the grid-index column, but the
-// array index `transform` field holds a single CURIE — already the spacing model — so there is no
-// slot for it; revisit if the spec adds a dedicated grid-encoding marker field.)
-// Legacy codings recognized on READ only, so archives written before the assignment keep decoding:
-// our earlier made-up MS:1003903/1003904 and the converter-owned MZP:1000001/1000002 (Unknown-CV).
 const SQRT_LEGACY_MS: CURIE = mzdata::curie!(MS:1003903);
 const LINEAR_LEGACY_MS: CURIE = mzdata::curie!(MS:1003904);
 const SQRT_LEGACY_MZP: CURIE = CURIE::new(mzdata::params::ControlledVocabulary::Unknown, 1_000_001);
@@ -601,9 +600,9 @@ impl BufferTransform {
 
     pub const fn array_name_fragment(&self) -> Option<&'static str> {
         match self {
-            BufferTransform::NumpressLinear => Some("numpress_linear"),
-            BufferTransform::NumpressSLOF => Some("numpress_slof"),
-            BufferTransform::NumpressPIC => Some("numpress_pic"),
+            BufferTransform::NumpressLinear => Some("numpress_linear_bytes"),
+            BufferTransform::NumpressSLOF => Some("numpress_slof_bytes"),
+            BufferTransform::NumpressPIC => Some("numpress_pic_bytes"),
             BufferTransform::NullInterpolate => None,
             BufferTransform::NullZero => None,
             // The stored column is the raw integer TOF; the transform is a reconstruction formula, not
@@ -658,14 +657,10 @@ pub fn binary_datatype_from_accession(
 /// Compute an ordering constant for [`mzdata::spectrum::ArrayType`]
 pub const fn array_type_ordering_ordinal(array_type: &ArrayType) -> u64 {
     match array_type {
+        ArrayType::IndexArray => 0,
         ArrayType::MZArray => 1,
         ArrayType::TimeArray => 2,
         ArrayType::WavelengthArray => 3,
-        // mzdata 0.66.0 added IndexArray (MS:1003870, "index array") -- a generic index/coordinate
-        // axis. Ordinal 4 was unused; placed with the other axis arrays (before IntensityArray),
-        // not the value arrays. Not currently emitted or consumed by any converter path -- this
-        // arm exists only to keep the match exhaustive against mzdata::spectrum::ArrayType.
-        ArrayType::IndexArray => 4,
         ArrayType::IntensityArray => 5,
         ArrayType::ChargeArray => 6,
         ArrayType::SignalToNoiseArray => 7,
@@ -964,6 +959,7 @@ impl Display for BufferName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tp_name = match &self.array_type {
             ArrayType::Unknown => Cow::Borrowed("unknown"),
+            ArrayType::IndexArray => Cow::Borrowed("index"),
             ArrayType::MZArray => Cow::Borrowed("mz"),
             ArrayType::IntensityArray => Cow::Borrowed("intensity"),
             ArrayType::ChargeArray => Cow::Borrowed("charge"),
@@ -1017,7 +1013,7 @@ impl Display for BufferName {
                 BufferFormat::ChunkTransform => {
                     if let Some(tfm) = self.transform {
                         if let Some(fragment) = tfm.array_name_fragment() {
-                            write!(f, "{tp_name}_{fragment}_bytes")
+                            write!(f, "{tp_name}_{fragment}")
                         } else {
                             panic!(
                                 "Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment"
@@ -1041,7 +1037,7 @@ impl Display for BufferName {
             if let BufferFormat::ChunkTransform = self.buffer_format {
                 if let Some(tfm) = self.transform {
                     if let Some(fragment) = tfm.array_name_fragment() {
-                        write!(f, "{tp_name}_{dtype}_{fragment}_bytes")
+                        write!(f, "{tp_name}_{dtype}_{fragment}")
                     } else {
                         panic!(
                             "Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment"
@@ -1089,7 +1085,7 @@ impl Display for BufferName {
             if let BufferFormat::ChunkTransform = self.buffer_format {
                 if let Some(tfm) = self.transform {
                     if let Some(fragment) = tfm.array_name_fragment() {
-                        write!(f, "{tp_name}_{dtype}_{unit}_{fragment}_bytes")
+                        write!(f, "{tp_name}_{dtype}_{unit}_{fragment}")
                     } else {
                         panic!(
                             "Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment"
@@ -1568,11 +1564,17 @@ impl BufferOverrideTable {
         let mut name = self.get(k).or(Some(k)).cloned().unwrap();
         name.buffer_priority = k.buffer_priority.max(name.buffer_priority);
         name.sorting_rank = k.sorting_rank.or(name.sorting_rank);
+        if name.buffer_format != k.buffer_format {
+            log::error!("Mapped {k} in format {} to {name} in format {}", k.buffer_format, name.buffer_format);
+        }
         name
     }
 
     /// See [`HashMap::insert`]
     pub fn insert(&mut self, k: BufferName, v: BufferName) -> Option<BufferName> {
+        if (k.buffer_format == BufferFormat::Point || v.buffer_format == BufferFormat::Point) && k.buffer_format != v.buffer_format {
+            log::warn!("Attempted to register invalid mapping rule from {k:?} to {v:?}");
+        }
         self.0.insert(k, v)
     }
 

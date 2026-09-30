@@ -30,7 +30,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 
 /// Bruker timsTOF `ModelType = 2` mobility calibration: mobility scan index → 1/K0 (Vs·s/cm²).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -67,20 +67,29 @@ impl TimsMobilityCalibration {
         w / (self.c7 + self.c6 * w)
     }
 
+    /// The reference implementation's 4 parameters of this model (`TimsTofTimsLinearGrid2`, mzdata
+    /// `TimsCalibrationModel2`): `[C6, C7, offset, slope]` with `slope = (C3 − C2)/C1` and
+    /// `offset = C2 − slope·(C4 + C0)`, so that `1/K0 = 1/(C6 + C7/(offset + slope·scan))` — the
+    /// same rational as [`Self::one_over_k0`] in the other form (equal to within 4 ulp,
+    /// [`Self::one_over_k0_as_mzdata`]).
+    pub fn grid_parameters(&self) -> [f64; 4] {
+        let slope = if self.c1 == 0.0 { 0.0 } else { (self.c3 - self.c2) / self.c1 };
+        [self.c6, self.c7, self.c2 - slope * (self.c4 + self.c0), slope]
+    }
+
     /// [`Self::one_over_k0`] evaluated the way mzdata's `TimsCalibrationModel2` evaluates the
-    /// per-peak mobility arrays of its TDF reader, with mzdata's own code:
-    /// `1/(C6 + C7/(offset + slope·scan))`, `slope = (C3 − C2)/C1`, `offset = C2 − slope·(C4 + C0)`.
-    /// The same model; the operations run in another order, so at about half of all scans the two
-    /// differ in the last bit or two. A param that must bracket mzdata's array values — a diaPASEF
+    /// per-peak mobility arrays of its TDF reader, with mzdata's own code on
+    /// [`Self::grid_parameters`]: `1/(C6 + C7/(offset + slope·scan))`. The same model; the
+    /// operations run in another order, so at half to two thirds of all scans the two differ, by
+    /// 1 to 4 ulp (2485.d, SBA415). A param that must bracket mzdata's array values — a diaPASEF
     /// window's limits on the `--no-ims-compact` and `--to mzml` lanes — needs this one: with
     /// [`Self::one_over_k0`], 1.5 million of the 2.2 billion MS2 peaks of a diaPASEF run sat up to
     /// 2.2e-16 above their window's upper limit.
     #[inline]
     pub fn one_over_k0_as_mzdata(&self, scan: f64) -> f64 {
         use timsrust::converters::ConvertableDomain;
-        let slope = if self.c1 == 0.0 { 0.0 } else { (self.c3 - self.c2) / self.c1 };
-        let offset = self.c2 - slope * (self.c4 + self.c0);
-        mzdata::io::tdf::TimsCalibrationModel2::new(self.c6, self.c7, offset, slope).convert(scan)
+        let [c6, c7, offset, slope] = self.grid_parameters();
+        mzdata::io::tdf::TimsCalibrationModel2::new(c6, c7, offset, slope).convert(scan)
     }
 
     /// Load from an open `analysis.tdf` connection. `Ok(None)` when there is no `ModelType = 2` row
@@ -114,10 +123,7 @@ impl TimsMobilityCalibration {
 
     /// Convenience: open `analysis.tdf` read-only and load the calibration.
     pub fn from_tdf_path(tdf: &Path) -> Result<Option<Self>> {
-        let conn = Connection::open_with_flags(
-            tdf,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
+        let conn = crate::vendor_sqlite::open(tdf)
         .with_context(|| format!("opening {}", tdf.display()))?;
         Self::from_tdf(&conn)
     }
@@ -217,7 +223,7 @@ mod scan_number_precision_tests {
 
     /// `one_over_k0_as_mzdata` is bit for bit what mzdata's `TimsCalibrationModel2`, built by
     /// mzdata from the same row, gives at every scan — the value its TDF reader puts in a
-    /// spectrum's mobility array — and the SDK-order `one_over_k0` to the last bit or two.
+    /// spectrum's mobility array — and the SDK-order `one_over_k0` to within 4 ulp.
     #[test]
     fn mzdata_order_matches_mzdata_bit_for_bit() {
         use timsrust::converters::ConvertableDomain;

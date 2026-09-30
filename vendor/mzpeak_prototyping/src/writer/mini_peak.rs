@@ -17,9 +17,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 
 use crate::{
-    ToMzPeakDataSeries,
-    peak_series::{ArrayIndex, array_map_to_schema_arrays_and_excess},
-    writer::{ArrayBufferWriter, ArrayBufferWriterVariants, base::EntryMetadataDerivedFromData},
+    ToMzPeakDataSeries, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, peak_series::{ArrayIndex, array_map_to_schema_arrays_and_excess}, writer::{ArrayBufferWriter, ArrayBufferWriterVariants, base::EntryMetadataDerivedFromData},
 };
 
 /// The peak facet (`spectra_peaks.parquet`) is ~95% of the mzPeak output bytes and, in the
@@ -123,6 +121,22 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
         &self.props
     }
 
+    pub fn grid_policies(&self) -> Option<&std::collections::HashMap<mzdata::spectrum::ArrayType, crate::grid::GridPolicy>> {
+        self.buffers().grid_policies()
+    }
+
+    pub fn grid_policies_mut(&mut self) -> Option<&mut std::collections::HashMap<mzdata::spectrum::ArrayType, crate::grid::GridPolicy>> {
+        self.buffers.grid_policies_mut()
+    }
+
+    pub fn clear_current_grids(&mut self) {
+        self.buffers.clear_current_grids();
+    }
+
+    pub fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
+        self.buffers.chunking_strategy()
+    }
+
     pub fn append_key_value_metadata(
         &mut self,
         key: impl Into<String>,
@@ -165,19 +179,12 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
             // than aborting the whole conversion on an `unimplemented!()`.
             RefPeakDataLevel::Missing => (Vec::new(), 0),
             RefPeakDataLevel::RawData(arrays) => {
-                // GATED ims-chunked: if this facet is a ChunkBuffers with an m/z boundary, chunk the
-                // raw `tof`/intensity/mobility arrays on m/z bins instead of storing flat points.
-                // Returns `None` for every other facet, falling through to the normal point path.
-                // Then, for a chunked peak facet WITHOUT an ims boundary: a centroid peak list is a
-                // plain sorted m/z array, so it chunks on the default m/z axis exactly like profile
-                // signal. This is what keeps `point.mz` out of PLAIN f64 -- the encoding that made
-                // it 82% of a centroid-only archive at only 1.8x compression.
+                // GATED ims-chunked (0.12.x TOF layout, retires with backlog item 2): a ChunkBuffers
+                // with an m/z boundary chunks the raw `tof`/intensity/mobility arrays on m/z bins.
+                // `None` for every other facet.
                 if let Some(res) = self
                     .buffers
                     .add_raw_mz_boundary(spectrum_count, spectrum_time, arrays)
-                    .or_else(|| {
-                        self.buffers.add_raw_chunked(spectrum_count, spectrum_time, arrays)
-                    })
                 {
                     let (aux, n_peaks) = res.map_err(io::Error::other)?;
                     self.n_points += n_peaks as u64;
@@ -195,31 +202,55 @@ impl<W: Write + Send + Seek + 'static> MiniPeakWriterType<W> {
                         Some(n_peaks),
                     ));
                 }
-                // `RefPeakDataLevel::len()` derives the point count from the m/z array, which is 0
-                // for a custom peak facet that REPLACES m/z with a nonstandard main axis (e.g. an
-                // integer `tof`/`tof_index` flight-time column). Fall back to the longest data array
-                // so the primary length is correct and the columns land as typed columns instead of
-                // spilling to auxiliary (the `primary_array_len == 0` aux path).
-                let primary_len = if n == 0 {
-                    arrays
-                        .iter()
-                        .filter_map(|(_, v)| v.data_len().ok())
-                        .max()
-                        .unwrap_or(0)
+                if let Some(chunk_encoding) = self.use_chunked_encoding().cloned() {
+                    let buffer = &mut self.buffers;
+                    let (chunks, auxiliary_arrays, n_pts) = ArrowArrayChunk::build(
+                        spectrum_count,
+                        spectrum_time,
+                        buffer.buffer_context(),
+                        arrays,
+                        &chunk_encoding,
+                        buffer.overrides(),
+                        buffer.drop_zero_intensity(),
+                        buffer.nullify_zero_intensity(),
+                        buffer.fields(),
+                        buffer.grid_policies(),
+                    )?;
+
+                    if let Some(chunks) = chunks {
+                        // The facet's point count is the number of POINTS, not of chunk rows
+                        // (upstream counts `chunks.len()` here — the A16 defect, again).
+                        let (fields, arrays, _nulls) = chunks.into_parts();
+                        buffer.add_arrays(fields, arrays, n_pts, false);
+                    }
+
+                    (auxiliary_arrays, n_pts)
                 } else {
-                    n
-                };
-                let (fields, cols, aux) = array_map_to_schema_arrays_and_excess(
-                    crate::BufferContext::Spectrum,
-                    arrays,
-                    primary_len,
-                    spectrum_count,
-                    spectrum_time,
-                    Some(self.buffers.fields()),
-                    self.buffers.overrides(),
-                )?;
-                let pts_written = self.buffers.add_arrays(fields, cols, primary_len, false);
-                (aux, pts_written)
+                    // `RefPeakDataLevel::len()` derives the point count from the m/z array, which is 0
+                    // for a custom peak facet whose main axis is not m/z (an integer `tof` column).
+                    // Fall back to the longest data array so the columns land as typed columns
+                    // instead of spilling to auxiliary (the `primary_array_len == 0` aux path).
+                    let primary_len = if n == 0 {
+                        arrays
+                            .iter()
+                            .filter_map(|(_, v)| v.data_len().ok())
+                            .max()
+                            .unwrap_or(0)
+                    } else {
+                        n
+                    };
+                    let (fields, cols, aux) = array_map_to_schema_arrays_and_excess(
+                        crate::BufferContext::Spectrum,
+                        arrays,
+                        primary_len,
+                        spectrum_count,
+                        spectrum_time,
+                        Some(self.buffers.fields()),
+                        self.buffers.overrides(),
+                    )?;
+                    let pts_written = self.buffers.add_arrays(fields, cols, primary_len, false);
+                    (aux, pts_written)
+                }
             }
         };
 

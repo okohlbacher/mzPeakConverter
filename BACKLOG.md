@@ -7,6 +7,95 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
 - **Current issues, ranked, with evidence and status:** the *mzPeakConverter Review Ledger*
   (claude.ai artifact, §8 "Measures" carries a Status column: *done* / *open*). Its source is kept
   at `scratchpad/review2/review-ledger.html` in the maintainer's session; ask for the link.
+- **NEXT — update the imaging support (added 2026-09-29, revised the same day).** Handoff from the
+  specification session after HUPO-PSI/mzPeak-specification issue #23, updated after the issue
+  author's comment of 2026-09-29 17:22 UTC:
+  `/Users/kohlbach/Claude/mzPeak-spec-new/local_docs/handoff-mzpeakconverter-imaging-2026-09-29.md`.
+  imzML input converts correctly; imaging converted straight from Bruker or Waters raw files loses its
+  pixel coordinates, so the image cannot be rebuilt. Re-run the handoff's two imzML conversions on
+  v0.15.0 first. Work that does not wait on the specification, in order:
+
+  **Status 2026-09-30, branch `feat/imaging-support` (unreleased, not pushed):** DONE — Bruker positions on
+  the TSF lane and every TDF lane (synthetic tests + a tagged copy of 2485.d; no real MALDI run yet),
+  item 2 (immutable SQLite opens), item 3 (pixel-size rule + unit mismatch report), item 4 (IMS pinned to
+  `imzML/imzML@2c28b05`), item 5 (provenance), item 6 (flyback), position z, README/USER_MANUAL.
+  **Owner decisions of 2026-09-30, implemented the same day:** position columns named `position_x` /
+  `_y` / `_z` as the merged imaging profile has them (spec PR #24, not the handoff's `IMS_1000050_…`);
+  coordinate base 1 — Bruker's absolute indices are shifted by the run's smallest (declared, `origin`
+  recorded), imzML stays as stated (already base 1; the corpus has two imzML files with margins,
+  `ltpmsi-chilli` 8–92 and the FlexImaging export `Test_P15_r2` 675–735, both with pixel counts equal
+  to their largest index, so they conform); `metadata.imaging` written by every detected imaging run
+  (imzML always, Bruker `MaldiFrameInfo`, positions stated on an mzML's scans — one detector,
+  `imaging::detect`), with a `provenance` record, `--image` merging its `images[]` into it; Bruker
+  pixel counts and max dimension (`IMS:1000042–45`). mzPeakValidator needs its branch
+  `imaging-profile-column-names` (accepts `position_x`; local, unreleased) released before a corpus
+  rebuild, or every imaging archive fails `imaging_coordinates`. The viewer, mzPeakIV and the explorer
+  look for `IMS_1000050_position_x` / `opt_…` and need the same rename (the viewer falls back to scan
+  cvParams, so it degrades rather than breaks).
+  **DONE 2026-09-30 with public example data:** the FlexImaging `.mis` raster step and region names
+  (MassIVE MSV000088438, real MALDI-TIMS TDF + TSF, all three timsTOF routes incl. `--bruker-sdk` on the
+  box); Waters imaging positions (MassLynx items "Laser Aim X/Y Position" → fitted grid; MetaboLights
+  MTBLS14771 DESI on the box, 10,712/10,712 scans on HDI's pixels). Open: a Waters MALDI run with
+  several functions or mobility (MSV000092638, 7 GB), and the optical image the `.mis` names
+  (`<ImageFile>` + teach points → an image-to-stage affine) — not embedded yet. A real MALDI `.d`: the owner sends the issue author a Dropbox
+  link for his files (33,800-pixel TSF, five synthetic pixel-size imzML). Public candidates found
+  2026-09-30 (file listings only, nothing downloaded yet): Bruker — MassIVE MSV000088438 (TIMSCONVERT
+  test data, CC0): a 7.4 MB MALDI-TIMS `.d` and a 25 MB TSF `.d`, each with its `.mis`, poslog and spot
+  list as plain files; MSV000102588 (TSF runs with imzML exports to cross-check); MSV000092935 (~1.6 GB
+  TDF with `.mis`). Waters — MetaboLights MTBLS14771 `Representative/20250327_MG3_HBackupACN_CLMC.raw.zip`
+  (67 MB, Xevo MRT DESI, with the HDI `imaging/` folder, CC0; zip entries use backslash paths); MALDI
+  with mobility only from 7 GB up (MSV000092638) or a single `_B.raw` out of Zenodo 13766901.
+  Standalone `.mis` files in MSV000088438, MSV000092935, PXD044958 (rapifleX), PXD034851 (ultraflex).
+  MassIVE FTP needs TLS (`curl --ssl-reqd`). Regions are kept in `bruker_maldi` only (the profile covers
+  one grid).
+  1. **Pixel coordinates for vendor input** (highest). Only the imzML path writes
+     `opt_IMS_1000050_position_x`/`_y`; the Bruker TSF/TDF and Waters lanes write none. Confirmed by the
+     issue author on v0.14.0: a 33,800-pixel timsTOF MALDI acquisition (TSF) converted with every
+     spectrum but no position columns, no scan settings and no IMS entry in `cv_list`. Where the data
+     is — Bruker `.d`: `MaldiFrameInfo.XIndexPos`/`YIndexPos`, an integer raster index per frame,
+     absolute on the slide (669–837 in his file, not from 1); region `MaldiFrameInfo.RegionNumber`, its
+     name from the FlexImaging `.mis`; pixel size the `.mis` raster step, else `BeamScanSizeX/Y`;
+     acquisition order `Frames.Id`. Waters `.raw`: laser x/y per scan in mm, so fit a grid (origin,
+     pitch, count); order the scan number, carried across the functions a long raster is split into.
+     The corpus has no TSF/MALDI acquisition; the author offered test files. Done when a Bruker MALDI
+     `.d` gives the same position columns and `scan_settings_list` as the imzML path.
+  2. **Stop writing into the source folder** (data safety). A TSF conversion leaves
+     `analysis.tsf-shm`/`analysis.tsf-wal` beside the user's data (reported, not reproduced here).
+     Our own SQLite opens are already `SQLITE_OPEN_READ_ONLY` (`bruker_tsf.rs`, `bruker_native.rs`,
+     `bruker_sdk.rs`, `bruker_baf.rs`), but read-only on a WAL-mode database still creates those
+     files: open `file:…?immutable=1` with `SQLITE_OPEN_URI`. timsrust 0.4.1 opens the TDF
+     READ-WRITE (`SqlReader`, `Connection::open`, `io/readers/file_readers/sql_reader.rs:24`):
+     patch or report upstream, and check the mzdata TDF path too.
+  3. **Check pixel size instead of copying it.** The author's rule: x and y with a unit — take them;
+     x and y without a unit — micrometre, and record that it was assumed; one value — an area if
+     `sqrt(value) × count` equals the extent (write the square root), a length if `value × count`
+     does; anything else — no pixel size unless the user supplies one. It settles 448 of the 479
+     surveyed files with a pixel size, and 406 of the 409 giving x and y test as a length (none as
+     an area), so correct files stay untouched. Also warn when unit accession and unit name
+     disagree (31 files). Never rewrite silently: record what was detected and done. He has five
+     synthetic test files, one per case.
+  4. **Pin the IMS vocabulary to a commit**: the vendored writer registers `imagingMS.obo` by its
+     `master` URL at version `1.1.0` (`param.rs:389-393`), which changed in 2022 without a version
+     bump; MS and UO are pinned to releases. Upstream `HUPO-PSI/mzPeak` too.
+  5. **Keep imzML provenance** — storage mode `IMS:1000031`, UUID `IMS:1000080`, `.ibd` checksum
+     `IMS:1000091` — in `file_description`, optional (vendor input has none); today they are dropped.
+  6. **Scan terms**: write the obsolete "one way" as flyback `IMS:1000413` (the vocabulary's stated
+     replacement, same definition; 141 surveyed files). Acquisition order needs no new field.
+  7. Smaller: write position z (`IMS:1000052`); `README.md` and USER_MANUAL must say the vendor lanes
+     carry no coordinates until item 1 lands; the author's reader (Thyra) reads the point layout only,
+     so exchange test archives built with `--layout point`.
+
+  **Waiting on the specification — do not code against a guess:** the position column names (the
+  converter writes `opt_…`; mzPeakIV, the validator, the viewer and the explorer expect no prefix);
+  the coordinate base (Bruker indices are absolute; the June proposal fixes the base at 1 — shift or
+  write as found?); whether `metadata.imaging` marks every imaging archive (today only with
+  `--image`; all four tools read it); acquisition regions (Bruker has number and name, Waters none);
+  the requirement level of the imzML provenance (item 5: rule or recommendation).
+
+  **Owed on the issue (owner):** where the author's test files and per-file survey results should
+  go (asked twice); that direct Bruker conversion does not carry positions yet. Not a converter bug:
+  the empty `metadata`/`cv_list` on imzML input is the example converter in `HUPO-PSI/mzPeak`
+  (the author confirmed) — report it there.
 - **What is open** (2026-09-11): precursors on the BAF and Agilent lanes (neither has an MSn
   acquisition to verify against, here or in the corpus); device chromatograms beyond Bruker; the
   "no isolation" marker, which waits on mzdata 0.66.7; a shared `.NET` host for the four glue lanes
@@ -169,6 +258,120 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   PR #18 the msconvert lanes refuse a multi-sample WIFF without `--sample`, so the box fallback, which
   passes none, now fails on `En_PPY.wiff`; which of its samples to republish, each as its own
   archive, is D4 and still open.
+- **Adversarial review of 2026-09-30 (Codex, Kimi, three Claude reviewers) — what is still open.**
+  Report with file:line, evidence and the reviewer disagreements:
+  `~/Claude/mzPeak/output/review-imaging-2026-09-30.md`. Scope: `feat/imaging-support`, converter
+  PR #35, spec main + spec PR #25. FIXED the same day (A1–A5, A8): stale checksums on the rewrite
+  lane, `position_offset`, image `data_kind`, the re-spelled imzML UUID, the `-shm` the WAL fallback
+  left, the unpinned MZP vocabulary. **Release step that fix needs: tag the release commit
+  `mzp-cv-0.2.0` and push the tag — until then the MZP `uri` in new archives does not resolve.**
+  Open, in the order I would take them:
+  1. **Owner decision — Waters claims the imaging profile for positions in mm** (A6). Spec PR #25's
+     open item says such data "cannot claim the profile" until a derivation rule exists; the lane
+     writes `position_x/_y` and `is_imaging` with fitted indices (correct on MTBLS14771). Options:
+     gate the claim behind a flag until PR #25 carries the rule; or propose the fit rule in PR #25
+     and keep it. Either way write the physical origin as `IMS:1000053/54` (µm).
+  2. **Owner decision — timsTOF grid models under invented accessions** (A7, vendored, every
+     ims-compact archive since 0.14.0): `grid_type` `MS:9999002` / `MS:9999001` are not PSI-MS terms
+     and `mz_chunk_values` is null where the spec says an empty list. Mint `MZP` terms (the
+     vocabulary is declared already) or request PSI-MS ones; write `[]`.
+  3. **Merge converter PR #35** with this branch as the base: take only its `data_kind` change (done
+     here already), keep this branch's `embed_aux` marker merge (PR #35's wrapper merges without a
+     conflict and would erase `pixel_count` / `pixel_size_um` / `provenance` from every imzML
+     archive), keep `vendor_sqlite` and drop `sqlite_ro.rs` (rewrite the three test opens git merges
+     onto it), one renaming mechanism, fold the two `[Unreleased]` sections; then close #35.
+  4. **Imaging input on lanes without imaging handling**: `--tof-grid auto|on` routes imzML, imaging
+     mzML and MALDI TDF through `convert_file_tof_grid`, which writes no position columns, no IMS
+     entry and no marker — refuse or skip that lane for imaging input. `--image` (or a sibling
+     optical image) on an input not detected as imaging invents `is_imaging: true` — refuse (explicit)
+     or skip (auto-discovered) when the lane wrote no marker.
+  5. **The detector samples six spectra** (`imaging::detect` on `convert_file`'s probes): positions
+     only on unsampled spectra are lost without a trace. Decide during the full write pass.
+  6. **Position sanity before claiming the profile**: values narrowed unchecked to `UInt32` (out of
+     range or negative → null on ONE axis), positions < 1 or beyond the declared counts not rejected,
+     `Extent` reads only a spectrum's first positioned scan, the count fallback is skipped when the
+     input has no scan-settings list and reuses the id `scansettings1`, a second grid-bearing
+     `scanSettings` passes through (the profile wants exactly one), `pixel_count_source` not written.
+  7. **Grid fit (`imaging::fit_axis`)** trusts the most common gap: exact sparse `[0, .1, .3, .5, .7]`
+     mm picks 0.2 mm, fails the residual check and loses every position; jitter at µm resolution can
+     yield a µm step; a half-sampled raster reads as the double step. Prefer the step the Waters
+     method file states (`DesiXStep/YStep`), try the smaller gap candidates, and write a
+     `waters_imaging` block with the reason when the fit fails. Also: laser items are discovered
+     from function 1 only, lock-mass scans are not excluded from the fit, a single row or column
+     drops the pitch known on the other axis.
+  8. **Bruker**: regions on different raster steps still share one claimed grid (only the pixel size
+     is dropped); the `.mis` mapping relies on `<Area>` order alone (right on both real datasets; a
+     re-saved `.mis` would misattribute silently — check each region's index extent against its
+     area); the beam fallback should require every positioned frame to state the same finite size;
+     an empty frame gets `index = position + 1`, wrong when `Frames.Id` has gaps.
+  9. **imzML pixel-size rule edge cases** (`imaging.rs`, the single-value case): tests x first when
+     only y is stated, compares with the extent ignoring units, writes √area as µm whatever the unit.
+  10. **Source-folder safety, remaining**: `immutable=1` skips SQLite's hot-journal check — treat a
+      `-journal` carrying the journal magic like a non-empty `-wal` (not mere existence: the corpus has
+      32 zero-byte journals); baf2sql writes `analysis.sqlite` into BAF `.d` folders (move the cache
+      or document the exception); `bruker_traces` still skips WAL-mode HyStar databases
+      `vendor_sqlite` can now read (manual stale too); the URI builder turns `\` into `/` on Unix and
+      goes through `to_string_lossy`.
+  11. **Core conformance, not imaging**: the rewrite lane keeps sparse `index` values and
+      `tests/filter_lane.rs` locks them in (spectra.md: increments by 1); empty chunked facets declare
+      `prefix: chunk` with point columns (66 facets in 35 corpus archives, zero rows); broken
+      cross-references from mzML/imzML sources pass through (instrument configuration, software,
+      data processing); archives declare PSI-MS 4.1.249 while mzdata embeds 4.1.258; scan settings use
+      `source_file_refs` for the schema's `source_file_references` (vendored, list empty today);
+      Shimadzu writes MS:1002998 (the LCMS-9030 term) for every `.lcd`; converter transformations are
+      not mirrored into `data_processing_method_list`; `--layout point` with a detected lattice still
+      mixes layout families with a warning.
+  12. **Tests the review found missing**: JSON-schema validation of `mzpeak_index.json`, PR #25's
+      validator checks 1–8, a member-hash check on every lane (the rewrite lane has one now),
+      `imaging::detect` in both failure directions, the `--image` marker merge, a hot journal, a UNC
+      path, `--tof-grid` on imaging input, `.mis` negative cases, Waters imaging end to end (box).
+  13. **mzPeakValidator gaps the review exposed** (it passed archives with stale checksums, a missing
+      `position_offset` and the wrong image `data_kind`): member SHA-512, the PR #25 checks, and that
+      written accessions exist in the declared vocabulary version.
+- **Box test of `feat/imaging-support` — DONE 2026-09-30 (`15b5e62`).** ssh stdin still did not reach the
+  box and GitHub was unreachable from the host, so the commits went over as a git bundle into a
+  separate clone and target dir (`C:\Users\User\stageA\imaging`; the box's v0.15.0 checkout untouched,
+  HEAD asserted). Windows build clean apart from a pre-existing `SqrtGrid::mz` dead-code warning
+  (`shimadzu_grid.rs:42`); 16/16 selected tests (drive-letter URIs, the WAL-mode TSF, imaging,
+  vocabulary); the synthetic-MALDI 2485.d on all three timsTOF routes (native, `--bruker-sdk`,
+  `--no-ims-compact`) per-frame identical to the host archives, positions 1–60 × 1–67, grid 60 × 67,
+  origin (500, 300), the `.d` unchanged; a BAF run: new and v0.15.0 binaries write same-size archives
+  (2,674 spectra), the `.d` unchanged by both. Still open: push the branch when GitHub is reachable; the
+  harness change (job spec by scp + a per-job watchdog in `run_job`) before the six missing 0.15.0
+  units can go through the box.
+- **Upstream: open the timsTOF database read-only (added 2026-09-30).** Minimally invasive draft PRs,
+  one per library, each only changing the open: timsrust 0.4.1 `SqlReader`
+  (`io/readers/file_readers/sql_reader.rs:24`, `Connection::open`) and mzdata's TDF reader
+  (`io/tdf/sql.rs:285`, the open the converter reaches; read-only but not immutable) — open `file:…?immutable=1` read-only with `SQLITE_OPEN_URI`, falling back to a
+  plain read-only open when a non-empty `-wal` exists (what `src/vendor_sqlite.rs` does). Harmless on
+  the rollback-journal TDFs seen so far; on a WAL-mode TDF the read-write open writes `-shm`/`-wal`
+  beside the data and folds the log into `analysis.tdf` on close. Drafts only; the owner files them.
+  The timsrust PR should also fix `utils::find_extension`: it returns the first directory entry whose
+  name ENDS WITH `analysis.tdf`, so a macOS AppleDouble companion `._analysis.tdf` (163 bytes, left by
+  copying a `.d` from a Mac to NTFS, exFAT or SMB) is opened as the database when it lists first —
+  NTFS does — and the default timsTOF route and `--no-ims-compact` fail with "file is not a database"
+  while `--bruker-sdk` works (seen on the box's `stageA` copy of 2485.d; no corpus unit has one).
+  Match the exact name. Converter side, meanwhile: name the `._*` file in that error.
+- **The encoding pre-scan logs four WARN lines on every Waters conversion** ("removed incomplete
+  …mzpeak.prescan{k}.tmp"): its trial archives are dropped through the `TmpGuard` path that reports a
+  failed conversion. Seen on the box 2026-09-30. Remove them without the warning.
+- **Surfaced by the 0.15.0 corpus rebuild (2026-09-29).** 194 of 200 archives rebuilt; logs in
+  `~/Claude/mzPeak/output/corpus-rebuild-0.15.0/`. (1) **The timsTOF grid facet encodes serially on
+  big runs.** PXD076703 (10 GB `tdf_bin`) took about 2 h 20 min on the host on one core: a row group of
+  8192 chunks is larger than the parallel encoder's in-flight budget (`max(256 MB, threads × 48 MB)`),
+  and `InFlight::acquire` (`writer/mini_peak.rs`) admits an oversized group only when nothing else is
+  in flight, so one worker compresses at zstd 22 while fifteen idle. Cap row groups by bytes, or let
+  one oversized group share the budget. (2) **Box jobs hang forever when ssh stdin does not arrive.**
+  From the host's network of that night (UTC+8) every job's JSON piped to `box_convert_remote.ps1`
+  never reached `[Console]::In.ReadToEnd()`; the gateway closes the session after ~3 min and `run_job`
+  has no watchdog, so the run stalls (scp and plain ssh commands still worked). Ship the job spec by
+  scp and add the per-job watchdog. (3) `run_pool` waits on the OLDEST job (`wait "${pids[0]}"`), so
+  one long unit keeps the other box slots idle. (4) Two SciEX SWATH runs (PXD071869 `08_SWATH_1E_1H`,
+  PXD053710 Exposome zSWATH) failed natively under three parallel box jobs and shipped as msconvert
+  fallbacks; retry them with `--box-jobs 1`. (5) The six units not delivered — Shimadzu Blind and HEK,
+  SciEX Sample002, MRM_03 and Ozaki SWATH, Waters PXD077098 (its 7.1 GB 0.15.0 archive waits in the
+  box's `bxc-hold`) — keep their 0.13.0 archives until a box run from a working network. (6) The
+  worktree has no `tools/box.env` (gitignored): export the main checkout's before `--box`.
 - **Surfaced by the 0.11.3 corpus rebuild (2026-09-09).** (1) The box relay returns archives through
   one presigned S3 PUT, capped at 5 GB: PXD077098's Waters TWIMS run (15.4 GB `.raw`) now writes a
   9.04 GB frame archive (it was 2.1 GB as drift-summed scans) and was delivered by hand (direct scp
@@ -203,19 +406,16 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   `precursor_isolationwindow_may`) and the validator say MAY. That is the spec's call, and every
   corpus row conforms under either reading. PSI's DIA recommendation v1.0 (§3.4) marks full-range
   acquisitions (MSe/HDMSe, AIF, bbCID, MSall) with MS:1003159 "no isolation". Decision: write the
-  marker beside the acquisition-range numbers the lanes already write. mzdata 58e509bc07 (unreleased,
-  0.66.7) adds `IsolationWindowState::NoIsolation`, so no side channel is needed: the vendored writer
-  gains a `NoIsolation` arm that keeps target and offsets and appends MS:1003159 (without it the bump
-  fails E0004 in `writer/visitor.rs`), the reader maps the term back, and the Waters lane sets the
-  flag. Order matters on an mzML round trip: upstream's reader drops offsets that follow the marker.
-- **The mzdata git fork (`[patch.crates-io]`).** `Cargo.toml` pins `mzdata =0.66.6` to
-  `okohlbacher/mzdata@1d53971` (v0.66.6 plus the 7-line isolation-offset reader fix, branch
-  `fix/isolation-window-offsets-before-target`). Upstream merged it as mobiusklein/mzdata#58 on
-  2026-09-10, but crates.io still tops out at 0.66.6, so every fresh build (CI, the vendor jobs, the
-  Flash box) clones the fork and the lockfile carries `git+` sources without checksums. The bump needs
-  the `NoIsolation` arm above; then pin `=0.66.7`, delete the patch block and keep
-  `tests/isolation_window_offset_order.rs`. The zero-lower-offset sweep is done: 0 collapsed offsets
-  in 2,669,071 corpus precursor rows.
+  marker beside the acquisition-range numbers the lanes already write. mzdata 0.66.7 (linked since
+  2026-09-23) has `IsolationWindowState::NoIsolation`, so no side channel is needed. Still to do: the
+  vendored writer's `NoIsolation` arm currently writes nulls (upstream's behaviour, a placeholder — no
+  lane sets the flag yet); the designed arm keeps target and offsets and appends MS:1003159, the
+  reader maps the term back, and the Waters lane sets the flag. Order matters on an mzML round trip:
+  upstream's reader drops offsets that follow the marker.
+- ~~**The mzdata git fork (`[patch.crates-io]`).**~~ Done 2026-09-23: mzdata `=0.66.7` from
+  crates.io, patch block deleted, `tests/isolation_window_offset_order.rs` kept and green against the
+  released crate. (The zero-lower-offset sweep had already found 0 collapsed offsets in 2,669,071
+  corpus precursor rows.)
 - **Not in the ledger — the Thermo target-only isolation-window guard is interim (2026-09-10).**
   When a scan has no `MS<n> Isolation Width` trailer, thermorawfilereader's `Lib.cs` builds its window
   from the scan filter's width, halved twice, and inverted when the filter reports a negative width.
@@ -312,6 +512,127 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   - D15: `transformations` lists what a conversion applied, counted by the writer, not what it was configured to do (135 corpus archives change on rebuild).
   - Harmonization (2026-09-11): every chromatogram time is stored in minutes, on every lane; a time recorded in seconds or milliseconds (ProteoWizard's mzML chromatograms, HyStar's device traces) is divided into minutes before the schema is sampled and declared as `chromatogram-time-to-minutes`. `--rt` keeps reading a column's declared unit, for the seconds columns of mzML-lane archives built by 0.11.5 and earlier (none published).
   - Harmonization (2026-09-11): a default archive embeds no raw signal file of a BAF, Agilent MassHunter or Waters MassLynx directory (`analysis.baf*`, `*.ami`, `ser`/`fid`; `MSProfile.bin`, `MSPeak.bin`, `IMSFrame.bin`; `_FUNC*.DAT/.IDX`, `_func*.cdt/.ind`), matched by file name in any case; kept by decision: `MSScan.bin`, `MSMassCal.bin`, `*.mcf`, `_FUNC*.STS`, `_CHRO*`, `_mob/`, and the timsTOF `*_bin` on the f64 TDF/TSF lanes.
+
+## Vendoring exit — `vendor/mzpeak_prototyping` (opened 2026-09-23)
+
+Owner decision: *"we will move away from vendored libraries asap."* **Guiding principle (owner, 2026-09-23):
+converge on the upstream code — mzdata and mzpeak_prototyping — to the extent possible.** When a choice
+exists, take upstream's layout, cutter, encodings and API; a deviation must be measured, minimal, and named
+as such (a candidate for an upstream proposal, not a permanent fork). Evidence and the full catalogue live
+in `~/Claude/mzPeak/output/vendor-audit-2026-09-23/` (`VENDOR-AUDIT-mzpeak_prototyping.md`,
+`upstream-grid-writer-assessment.md`, `delta-categorization.md`). State: base `589d6e3`, 18 commits behind
+upstream `eb08ba0`, ~4,830 lines / 268 hunks of local delta in 23 of 30 files; 61 distinct changes
+(31 bug fixes, 14 upstreamable features, 15 converter-specific, 9 already superseded, 4 churn groups).
+**Merging upstream HEAD is not viable** — the residual would be 516 hunks, larger than the delta — so the
+route is: adopt a clean `eb08ba0` (needs mzdata 0.67.1 + `cv`), re-apply only what is not superseded or
+churn, in this order. Each item below is explored and decided one at a time.
+
+1. **Point-layout grid → upstream chunk-layout grid** (~1,150 lines; the hard residual). SciEX and
+   Agilent-via-msconvert sqrt grids, the Shimadzu Int64 lattice and the 0.12.x timsTOF path write an
+   integer point column tagged `MS:1003824/5` with `mzpeak:transform_params` (+ per-spectrum
+   `tof_c0/c1`). Upstream's grid is chunk-layout only; a spec-conformant reader misreads ours. Writing,
+   m/z-less summaries and above all range queries cannot live outside the library.
+   **Tested 2026-09-23** (`point-to-chunk-grid-test-2026-09-23.md` + `chunk_grid_proto.py` in the audit
+   directory; Shimadzu Blind/HEK, Agilent FM_01_Pos, Shimadzu DIA 20 ng). Outcome: the **sqrt/TOF grids
+   migrate** — bit-exact, decoded by the vendored reader (Blind/HEK round trips 100 % identical), size
+   −7.5 … +6 % with one chunk per spectrum (+2.5 % on the 1.1 GB Agilent file) but +13 … +30 % with
+   upstream's 50-Th default, so the chunk width must be per lane; negative indices from a run-wide fit
+   need per-chunk re-anchoring (≤ 7e-10 ppm) and bounds must be the model at the stored indices. The
+   **1e-9 lattice centroids cannot move as-is**: 2³² steps = 4.29 Th caps every chunk, +18.7 % on DIA,
+   +126 … +132 % on sparse Blind; needs 64-bit `indices` upstream (ask Joshua), or accept the cost, or drop
+   the lattice (+64 … +91 %). Also found: a chunk facet without a Parquet page index reads back as EMPTY
+   spectra with exit 0 (fix the reader regardless); ungriddable spectra need `Basic` rows, not delta.
+   Closeness to upstream (measured): the exact sqrt chunk grid is literally mzdata's own `MS:1003825
+   [intercept, slope]` Param convention per spectrum, and upstream's writer recovers our indices 100 %
+   from the values + that Param (Blind/HEK); a run-wide fit loses its negative indices to `clamp_u32`
+   (Agilent: 1.15 M points → 0, silently), and the lattice saturates (0.4–5 % of points survive) because
+   upstream holds one model per spectrum. Upstream's own fit (F, ≤ 1e-6 Da, lossy 0.004 ppm) is −10.6 %
+   on DIA / −6.4 % HEK / +56 % Blind. **Decided (owner, 2026-09-23): go with upstream.** The sqrt/TOF
+   lanes (Shimadzu profile, Agilent-via-msconvert, SciEX) move onto upstream's `ChunkingStrategy::Grid`
+   with the exact per-spectrum model attached as an `MS:1003825` Param (mzdata's convention); the 1e-9
+   lattice is dropped — Shimadzu centroids take upstream's grid fit (F) / default. Chunk width per lane,
+   spectrum-sized for profile/TOF. Requires the re-vendor to `eb08ba0` first (see the plan below).
+   `src/shimadzu_grid.rs`, `src/mz_lattice.rs`, `src/tof_grid.rs`, the `tof_index` schemas and the MZP
+   `tof_c0/c1` columns retire with it; `tof_calibration`/`mz_calibration` index blocks go.
+   **DONE (2026-09-23, unreleased → 0.14.0).** All four point-grid lanes write upstream's chunk grid:
+   mzML `--tof-grid`, native SCIEX and the Shimadzu profile facet attach the exact per-spectrum
+   `MS:1003825 [c0, c1, 1]` model to the m/z array (`sqrt_grid_arrays`; negative run-wide indices
+   re-anchored per spectrum; one chunk per spectrum), `--agilent-grid` the same with the vendor's
+   polynomial rows moved to an `agilent_calibration` block; lattice centroids (mzML lane when
+   detected, Shimadzu native) take upstream's fitted `MS:1003824` grid (50-Th chunks, ≤ 1e-6 Da,
+   declared `grid-fit:1e-6Da`). Deleted: `tof_index_field`/`tof_index_peak_schema`/`tof_grid_block`/
+   `MzReconstruction`, the lattice half of `mz_lattice.rs` + `shimadzu_grid.rs`, `VendorHints`'
+   point-layout fields, `write_spectrum_with_peak_arrays` in the vendored writer,
+   `tests/shimadzu_lattice_peaks.rs`. KEPT on purpose: `tof_grid.rs` / `shimadzu_grid.rs`'s fits —
+   they recover the VENDOR lattice (small indices, −7.5 … +6 %), where upstream's slot fit gives
+   +52 … +94 %; converter-side model providers, not library deviations. The vendored reader keeps the
+   0.9–0.13 point-grid decode path (`reconstruct_grid_mz`, `LinearMz`/`SqrtMzFromTof`) for one
+   release so existing archives read; retire it once the corpus is rebuilt. Verified: SWATH
+   `--tof-grid` 201/201 spectra, worst 6.4e-10 ppm vs 0.13.0; the Shimadzu/SCIEX Windows lanes
+   compile-checked only until the box build.
+
+**Plan (owner, 2026-09-23):** (a) fix the empty-facet reader bug (item below); (b) re-vendor
+`vendor/mzpeak_prototyping` to a clean `eb08ba0` (mzdata 0.67.1 + `cv`), re-applying only the A/B/C
+hunks of `delta-categorization.md` (D+E vanish), corpus as the semantic oracle; (c) integrate item 1 on
+top; (d) commit, push, tag — an output-changing release (Shimadzu/Agilent/SciEX archives change layout,
+SHA512 file-index checksums and term markers arrive with upstream) → corpus rebuild after.
+
+- **TDF MzCalibration ModelType 2 (2026-09-26).** Converter side fixed for 0.14.0 (quadratic +
+  declared bound; mzdata lanes on the chord). Open: (a) upstream mzdata `MzCalibrationModel2::try_from`
+  accepts ModelType 2 and reads C3/C4 as cubic/shift — report with the formula and the OpenTIMS golden
+  (item in the Joshua message); (b) a grid model that carries the calibrant polynomial (new CURIE,
+  Joshua's call) so ModelType-2 runs can be exact; (c) a validator rule: decoded m/z outside
+  `MzAcqRangeLower/Upper` (or the scan window) is an error — it would have caught 0.13.0's SBA415 at once;
+  (d) SDK-verify SBA415 itself (`MZPC_TDF_SDK_GOLDEN` on the box) — only the OpenTIMS file is SDK-pinned.
+- **Message to Joshua Klein — due 2026-09-23.** Draft: `~/Claude/mzPeak/output/vendor-audit-2026-09-23/
+  MESSAGE-to-Joshua-2026-09-23.md`. Six findings, all verified in code or data: (1) `clamp_u32`
+  saturates silently — a run-wide sqrt fit's negative indices (Agilent FM_01_Pos: 1.15 M points below
+  `c0²`) become index 0, a 1e-9 lattice beyond 2³² becomes `u32::MAX−1`, no error; (2) is
+  `indices: uint64` acceptable? (the exact-lattice case his grid cannot hold); (3) single-point chunks
+  get `chunk_end = 0.0` (rows 131/294 of his own `diaPASEF.grid.mzpeak`; invisible to his range
+  predicate); (4) grid-row bounds should be the model at the stored index, not the input value; (5) the
+  Python reader (`grid.py:136-152`) still has the pre-#34 parameter order; (6) mzdata 0.67.1
+  `convert_f6_wide` has a sign-flipped discriminant (scalar path unaffected). Plus the one proposal: a
+  `WriterProperties` hook for BSS with dictionary off (measured −9.6 % vs his default on 2485; his
+  DELTA intent on index lists would be +21.4 %).
+2. **0.12.x ims-chunked TOF-boundary layout** (~500 lines). Still the intermediate the TDF lane writes
+   before `src/tdf_grid.rs` rewrites it, and `--no-ims-grid`'s final form. Retire by emitting upstream's
+   `ChunkingStrategy::Grid` natively with the exact `MzCalibration`/`TimsCalibration` models attached as
+   array params — kills this and the rewrite pass together.
+   **DONE (2026-09-24, unreleased → 0.14.0).** `bruker_native::ims_grid_arrays` builds each frame's
+   m/z / 1/K0 through upstream's `TimsTofMzGrid2` / `TimsTofTimsLinearGrid2` models (Params on the
+   arrays; per-frame `TdfMzCalibrationRow::grid_parameters(t1, t2)`, `TimsMobilityCalibration::
+   grid_parameters()`); `write_ims_compact_archive_impl` uses `ChunkingStrategy::Grid` + tolerance-0
+   policies on both facets, the schema sampled from the first frame. `src/tdf_grid.rs`, the TOF
+   layout, the flat layout, `--no-ims-grid`/`--ims-grid`/`--grid-encoding` deleted; the SDK lane takes
+   the same path (compile-checked only until the box/CI build). Inversion `to_index(from_index(k))`
+   verified on every bin of 2485 and on the C2 ≠ 0 goldens. Remaining vendored deviations this leaves
+   unused: `TofMzBoundary`/`add_raw_mz_boundary` (C7) and the chunk-facet `tof_chunk_*` decode path
+   — reader side stays one release for 0.12.x archives, writer side can go (item 6).
+3. **MZP provisional CV** (~150 lines). mzdata's `CURIE` cannot carry a foreign prefix and its `Display`
+   panics on `Unknown`; the serialisers are inside the crate. Retire MZP: `tof_c0/c1` are unnecessary
+   under the grid layout, SciEX/Agilent can write them as name-only userParams, request PSI terms for
+   the two mobility-limit params (MZP:1000006/7). The honest upstream fix is
+   `ControlledVocabulary::Other` in mzdata.
+4. **Row-group and flush sizing.** The 16 MB row-group cap on every layout and the flush thresholds shape
+   every point-layout archive's bytes; needs `WriteBatchConfig` knobs upstream. Until then a switch
+   changes every archive's row groups.
+5. **One-setter hooks upstream:** install a custom peak schema, a `spectra()` accessor, a peaks-facet
+   stream sampler, one `pub use` (`EntryMetadataDerivedFromData`). Trivial PRs.
+6. **Byte-comparability across the switch.** 25 output-affecting bug fixes / features of ours are in the
+   published corpus; each must land upstream or archives change on the switch. Largest movers: the
+   BSS/dictionary-off encoding policy (measured: upstream's DELTA intent would be +21 % on the grid
+   facet) and the row-group sizing (item 4). Also to decide once: parquet 57 (upstream) vs 59 (ours).
+   Since the Waters encoding pre-scan (0.15.0), the policy is also overridable per column role
+   (`DataColumnEncodings` in `WriteBatchConfig`): the same `WriterProperties` hook proposed to Joshua,
+   so landing it upstream removes that deviation and the pre-scan could serve every lane. Measured
+   on PXD063409 CK1 (2.1 G points, replayed from the lossless build): 3.78 GB against 4.86 GB with the
+   fixed encodings, every point identical.
+
+Also found on the way, to report upstream: single-point chunks get `chunk_end = 0.0` (in Joshua's own file;
+invisible to his range predicate); the Python reader still has the pre-#34 parameter order; mzdata 0.67.1's
+`convert_f6_wide` has a sign-flipped discriminant; two panics on malformed grids; upstream's `mini_peak.rs`
+chunked path repeats our old `size = chunks.len()` point-count bug.
 
 ## History
 

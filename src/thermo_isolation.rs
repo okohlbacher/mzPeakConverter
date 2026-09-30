@@ -100,7 +100,7 @@ mod tests {
     use mzdata::spectrum::{IsolationWindowState, Precursor};
 
     fn window(target: f32, lower_bound: f32, upper_bound: f32) -> IsolationWindow {
-        IsolationWindow { target, lower_bound, upper_bound, flags: IsolationWindowState::Complete }
+        IsolationWindow::new(target, lower_bound, upper_bound, IsolationWindowState::Complete)
     }
 
     #[test]

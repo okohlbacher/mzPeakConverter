@@ -46,9 +46,9 @@ impl SqrtGrid {
 }
 
 /// Reconstruction tolerance in Da: the vendor's own 1e-9 rounding is ±5e-10, plus f64 slack.
-/// Measured worst residuals on exact spectra: 7.2e-10. It is also the bound the archive declares
-/// (`tof_calibration.max_error_da`): a spectrum is gridded only when every point rebuilds within
-/// it, so no smaller number can be claimed.
+/// Measured worst residuals on exact spectra: 7.2e-10. A spectrum is gridded only when every point
+/// rebuilds within it (the grid rows then carry the exact model, nothing is declared as lossy), so
+/// no smaller number could be claimed.
 pub const TOL: f64 = 1e-9;
 
 /// Least squares of `r` on `k` with centred sums (k reaches 3e5, r is ~8–40).
@@ -145,57 +145,16 @@ pub fn fit_spectrum(mz: &[f64], step: f64) -> Option<(SqrtGrid, Vec<i32>)> {
 // the binding through these same three entry points.
 // ---------------------------------------------------------------------------------------------
 
-pub use crate::mz_lattice::{LatticeOutcome, LATTICE_SCALE};
-
-use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum};
-
-/// The `mzpeak:transform_params` string the reader multiplies `k` by (`LinearMz`: m/z = p0*k).
-/// Kept as the literal `"1e-9"` so the test pins exactly what the archive must carry; production
-/// derives it from `LATTICE_SCALE` inside `crate::mz_lattice`, which is what the test checks.
-#[cfg(test)]
-const LATTICE_TRANSFORM_PARAMS: &str = "1e-9";
-
-/// [`crate::mz_lattice::lattice_peak_schema`] at Shimadzu's 1e-9 scale.
-pub fn lattice_peak_schema() -> mzpeak_prototyping::writer::ArrayBuffersBuilder {
-    crate::mz_lattice::lattice_peak_schema(LATTICE_SCALE)
-}
-
 /// Whether the glue reads the coarse `Mass` field for this run. `Glue.cs` (`DecideMassScale`)
-/// compares `MZPC_SHIMADZU_COARSE_MZ` to the literal `"1"`, and the archive must name the field the
-/// glue actually read, so this applies the same test rather than `crate::env_flag`'s spellings.
+/// compares `MZPC_SHIMADZU_COARSE_MZ` to the literal `"1"`, and the archive must declare the field
+/// the glue actually read (`shimadzu:coarse-mz`), so this applies the same test rather than
+/// `crate::env_flag`'s spellings.
 pub fn coarse_mz_requested() -> bool {
     coarse_mz_lever(std::env::var("MZPC_SHIMADZU_COARSE_MZ").ok().as_deref())
 }
 
 fn coarse_mz_lever(value: Option<&str>) -> bool {
     value == Some("1")
-}
-
-/// The `mz_calibration` index block for this lane, naming the field its centroid m/z came from:
-/// `MassHigh` (1e-9 Da), or with `coarse` (`MZPC_SHIMADZU_COARSE_MZ=1`) the coarse `Mass`
-/// (1e-4 Da). Both lie on the same 1e-9 lattice, so through 0.11.5 an archive could not tell them
-/// apart. The glue's own per-file and per-spectrum fallbacks to `Mass` do not cross the ABI and are
-/// not recorded here.
-pub fn mz_calibration_block(coarse: bool) -> serde_json::Value {
-    crate::mz_lattice::mz_calibration_block(
-        LATTICE_SCALE,
-        "shimadzu",
-        if coarse {
-            "Mass (Int32, 1e-4 Da), selected by MZPC_SHIMADZU_COARSE_MZ=1; on the 1e-9 lattice as multiples of 1e5"
-        } else {
-            "MassHigh (Int64, 1e-9 Da)"
-        },
-    )
-}
-
-/// [`crate::mz_lattice::lattice_route`] at Shimadzu's 1e-9 scale. The list is the peak set when the
-/// spectrum also carries a profile (a dual `.lcd`), or the raw arrays of a Centroid spectrum
-/// otherwise; the spectrum comes back UNCHANGED so its peak list still yields the metadata
-/// summaries (counts, TIC, base peak, observed m/z range).
-pub fn lattice_route(
-    spec: MultiLayerSpectrum,
-) -> (MultiLayerSpectrum, Option<BinaryArrayMap>, LatticeOutcome) {
-    crate::mz_lattice::lattice_route(spec, LATTICE_SCALE)
 }
 
 #[cfg(test)]
@@ -256,79 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn coarse_lattice_data_does_not_fit() {
-        // Mass at 1e-4 (the coarse field): residuals ~5e-5 ≫ TOL, so the grid is refused and the
-        // lane falls back to plain f64 for the whole file.
-        let c1 = 0.000091602119892;
-        let bins: Vec<i32> = (0..2000).collect();
-        let coarse: Vec<f64> = synth(8.0, c1, &bins).iter().map(|m| (m * 1e4).round() / 1e4).collect();
-        assert!(fit_spectrum(&coarse, c1).is_none());
-    }
-}
-
-#[cfg(test)]
-mod lattice_tests {
-    //! The lattice mechanism itself is tested in [`crate::mz_lattice`]; what is Shimadzu-specific,
-    //! and what `convert_shimadzu` and `tests/shimadzu_lattice_peaks.rs` depend on, is that this
-    //! lane binds it to the 1e-9 `MassHigh` scale and to that literal params string. Pin exactly
-    //! that — through the three wrappers production calls, not through test-only copies — so a
-    //! change of scale in the shared module cannot silently move this lane.
-    use super::*;
-    use mzdata::prelude::*;
-    use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
-    use mzdata::spectrum::{SignalContinuity, SpectrumDescription};
-    use mzpeak_prototyping::writer::ArrayBufferWriter;
-    use mzpeak_prototyping::BufferContext;
-
-    /// A Centroid spectrum whose raw arrays are the given m/z list — the shape `lattice_route`
-    /// sees for a centroid-only `.lcd`.
-    fn centroid_spectrum(mz: &[f64]) -> MultiLayerSpectrum {
-        let mut arrays = BinaryArrayMap::new();
-        let mut mz_da = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
-        mz_da.update_buffer(mz).unwrap();
-        arrays.add(mz_da);
-        let mut int_da =
-            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        int_da.update_buffer(&vec![1.0f32; mz.len()]).unwrap();
-        arrays.add(int_da);
-        let descr = SpectrumDescription { signal_continuity: SignalContinuity::Centroid, ..Default::default() };
-        MultiLayerSpectrum::new(descr, Some(arrays), None, None)
-    }
-
-    fn tof_index_of(arrays: &BinaryArrayMap) -> Vec<i64> {
-        arrays.get(&ArrayType::nonstandard("tof_index")).unwrap().to_i64().unwrap().to_vec()
-    }
-
-    #[test]
-    fn this_lane_is_bound_to_the_1e_minus_9_masshigh_scale() {
-        assert_eq!(LATTICE_SCALE, 1e9);
-        assert_eq!(crate::mz_lattice::transform_params(LATTICE_SCALE), LATTICE_TRANSFORM_PARAMS);
-        // The peaks-facet schema `convert_shimadzu` hands the writer carries the literal params.
-        let buffers = lattice_peak_schema().build(
-            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-            BufferContext::Spectrum,
-            false,
-        );
-        let schema = buffers.schema();
-        let point = schema.field_with_name("point").expect("point struct");
-        let arrow::datatypes::DataType::Struct(children) = point.data_type() else {
-            panic!("point is not a struct: {:?}", point.data_type())
-        };
-        let tof = children.iter().find(|c| c.name() == "tof_index").expect("tof_index column");
-        assert_eq!(tof.data_type(), &arrow::datatypes::DataType::Int64);
-        assert_eq!(
-            tof.metadata().get("mzpeak:transform_params").map(String::as_str),
-            Some(LATTICE_TRANSFORM_PARAMS)
-        );
-        // The index block names this lane and its scale.
-        let b = mz_calibration_block(false);
-        assert_eq!(b["codec"], "mz-grid");
-        assert_eq!(b["vendor"], "shimadzu");
-        assert_eq!(b["scale"].as_f64(), Some(1e9));
-        assert!(b["source"].as_str().unwrap().starts_with("MassHigh"), "{b}");
-        // The coarse field names itself: the lattice is identical, so the source is the only record.
-        let coarse = mz_calibration_block(true);
-        assert!(coarse["source"].as_str().unwrap().starts_with("Mass (Int32"), "{coarse}");
+    fn the_coarse_lever_is_the_literal_one() {
         // Decided the way the glue decides: only the literal "1" selects Mass.
         assert!(coarse_mz_lever(Some("1")));
         for off in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some(" 1")] {
@@ -337,25 +224,12 @@ mod lattice_tests {
     }
 
     #[test]
-    fn masshigh_and_coarse_mass_both_land_on_this_lanes_lattice() {
-        // MassHigh (1e-9 Da) recovers its own integer through the per-spectrum route ...
-        let ks = [100_000_123_456i64, 200_000_000_001, 1_250_123_456_789];
-        let mz: Vec<f64> = ks.iter().map(|&k| k as f64 * 1e-9).collect();
-        let (_, lattice, outcome) = lattice_route(centroid_spectrum(&mz));
-        assert_eq!(outcome, LatticeOutcome::Lattice);
-        assert_eq!(tof_index_of(&lattice.expect("lattice arrays")), ks);
-        // ... and the coarse `Mass` field (1e-4 Da) is a multiple of 1e5 on the same lattice.
-        let coarse: Vec<f64> = [500_001i64, 500_002, 12_345_678].iter().map(|&m| m as f64 * 1e-4).collect();
-        let (_, lattice, outcome) = lattice_route(centroid_spectrum(&coarse));
-        assert_eq!(outcome, LatticeOutcome::Lattice);
-        let k = tof_index_of(&lattice.expect("lattice arrays"));
-        assert_eq!(k, vec![50_000_100_000, 50_000_200_000, 1_234_567_800_000]);
-        assert!(k.iter().all(|v| v % 100_000 == 0));
-        // An interpolated apex 0.3 of a step off keeps the spectrum in f64.
-        let mut off = mz.clone();
-        off[1] += 0.3e-9;
-        let (_, lattice, outcome) = lattice_route(centroid_spectrum(&off));
-        assert_eq!(outcome, LatticeOutcome::KeptF64);
-        assert!(lattice.is_none());
+    fn coarse_lattice_data_does_not_fit() {
+        // Mass at 1e-4 (the coarse field): residuals ~5e-5 ≫ TOL, so the grid is refused and the
+        // lane falls back to plain f64 for the whole file.
+        let c1 = 0.000091602119892;
+        let bins: Vec<i32> = (0..2000).collect();
+        let coarse: Vec<f64> = synth(8.0, c1, &bins).iter().map(|m| (m * 1e4).round() / 1e4).collect();
+        assert!(fit_spectrum(&coarse, c1).is_none());
     }
 }

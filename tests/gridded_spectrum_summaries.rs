@@ -1,22 +1,23 @@
 //! Grid-routed spectra must carry real per-spectrum summaries (corpus-gated; ~2 s).
 //!
-//! REGRESSION. A grid route rebuilds the spectrum around an INTEGER axis (`tof_index` / `tof`) and
-//! drops the `m/z array`. mzdata derives `total_ion_current`, `base_peak_mz`, `base_peak_intensity`
-//! and the observed-m/z bounds from the m/z + intensity arrays, so an m/z-less array map folds to
-//! `tic = 0`, `base peak = (0, 0)`, `m/z range = (0, 0)` — and the published corpus shipped
-//! `total_ion_current = 0` on EVERY gridded spectrum (13,200/13,200 on a Shimadzu run,
-//! 2,092/2,101 on a second Shimadzu one, 1,502/1,502 on an Agilent one) while the peak data
-//! itself was intact.
+//! REGRESSION. Through 0.13 a grid route rebuilt the spectrum around an INTEGER axis (`tof_index` /
+//! `tof`) and dropped the `m/z array`. mzdata derives `total_ion_current`, `base_peak_mz`,
+//! `base_peak_intensity` and the observed-m/z bounds from the m/z + intensity arrays, so an m/z-less
+//! array map folds to `tic = 0`, `base peak = (0, 0)`, `m/z range = (0, 0)` — and the published
+//! corpus shipped `total_ion_current = 0` on EVERY gridded spectrum (13,200/13,200 on a Shimadzu
+//! run, 2,092/2,101 on a second Shimadzu one, 1,502/1,502 on an Agilent one) while the peak data
+//! itself was intact. The chunk-grid route (0.14) hands the writer the grid VALUES as m/z with the
+//! model attached, and still states the summary explicitly; this test keeps both halves honest.
 //!
 //! The mzML `--tof-grid` lane is the one grid lane reachable off Windows, and it gives the sharpest
 //! possible assertion: the SAME input converted with and without the grid must describe its data
 //! the same way. A gridded archive is not allowed to be a worse description of its own data.
 //!
 //! WHAT "the same" MEANS, and why it is not bit-equality on m/z. The summary columns describe the
-//! points STORED IN THIS ARCHIVE, so the grid lane states the m/z a reader RECONSTRUCTS from
-//! `tof_index`, not the source f64 the fit consumed. The grid accepts a point whose reconstruction
+//! points STORED IN THIS ARCHIVE, so the grid lane states the m/z a reader RECONSTRUCTS from the
+//! grid row, not the source f64 the fit consumed. The grid accepts a point whose reconstruction
 //! lands within `MZPC_TOF_GRID_PPM` (default 5) of the source, so those two differ — which is the
-//! encoding being bounded-lossy, exactly as the `tof_calibration` block now says. The alternative
+//! encoding being bounded-lossy, exactly as `transformations` says. The alternative
 //! (copy the source m/z into the columns) makes the archive contradict ITSELF: the published
 //! `20240826_RNAseB_…_MRM_03.mzpeak` states `base_peak_mz = 519.1402875577935` on spectrum 7313
 //! while its own stored `tof_index` reconstructs to `519.1426532537401`, so no point in the file
@@ -73,17 +74,17 @@ struct Summaries {
     bp_int: Vec<Option<f32>>,
     lo_mz: Vec<Option<f64>>,
     hi_mz: Vec<Option<f64>>,
-    /// Gridded: the spectrum's rows carry a non-null `tof_index` — in `spectra_peaks.parquet` for a
-    /// centroid spectrum, in `spectra_data.parquet` for a profile one. Since 0.10.1 the facet follows
-    /// the source's representation and BOTH facets declare the axis (review M6), so neither facet
-    /// membership nor `number_of_peaks` says whether a spectrum was gridded; the axis column does.
+    /// Gridded: the spectrum's rows are `MS:1003826` grid rows (a non-null `mz_grid`) — in
+    /// `spectra_peaks.parquet` for a centroid spectrum, in `spectra_data.parquet` for a profile one.
+    /// Since 0.10.1 the facet follows the source's representation (review M6), so neither facet
+    /// membership nor `number_of_peaks` says whether a spectrum was gridded; the grid column does.
     gridded: Vec<bool>,
 }
 
 /// `(all, gridded)`: the set of `spectrum_index` values whose points live in `member`, and the subset
-/// whose rows carry a non-null `tof_index`. A facet's rows are one struct column — `point` on the
-/// grid lane, `chunk` on the f64 lane (the mzML→mzPeak default is m/z-chunked) — and either carries a
-/// `spectrum_index` child, so the struct is located by that child, not by name.
+/// whose rows carry a non-null `mz_grid`. A facet's rows are one `chunk` struct column on both lanes
+/// (the mzML→mzPeak default is m/z-chunked, the grid lane is grid-chunked); the struct is located by
+/// its `spectrum_index` child, not by name.
 fn spectrum_indices_in(
     archive: &Path,
     member: &str,
@@ -99,10 +100,10 @@ fn spectrum_indices_in(
             .find(|st| st.column_by_name("spectrum_index").is_some())
             .unwrap_or_else(|| panic!("{member}: no struct column with a spectrum_index child: {:?}", b.schema()));
         let idx = rows.column_by_name("spectrum_index").unwrap().as_primitive::<arrow::datatypes::UInt64Type>();
-        let tof = rows.column_by_name("tof_index");
+        let grid = rows.column_by_name("mz_grid");
         for i in 0..b.num_rows() {
             all.insert(idx.value(i));
-            if tof.is_some_and(|c| c.is_valid(i)) {
+            if grid.is_some_and(|c| c.is_valid(i)) {
                 gridded.insert(idx.value(i));
             }
         }
@@ -218,14 +219,19 @@ fn gridded_archive_summaries_match_the_f64_lane() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The `tof_calibration` block a real gridded archive carries must be self-consistent with the
-/// summary columns asserted above: it must NAME the integer axis a reader has to evaluate, and it
-/// must ADMIT that m/z is quantized — because the columns state the reconstructed coordinate, not
-/// the source f64, and a reader comparing them against an mzML needs to know the difference is
-/// encoding loss and not a defect.
+/// A string column as `StringArray`, whether Arrow materialised it as plain or dictionary-encoded
+/// Utf8 (the grid struct's `grid_type` comes back dictionary-encoded).
+fn strings(col: &arrow::array::ArrayRef) -> arrow::array::StringArray {
+    arrow::compute::cast(col, &arrow::datatypes::DataType::Utf8).unwrap().as_string::<i32>().clone()
+}
+
+/// A real gridded archive must ADMIT that m/z is quantized — the summary columns state the
+/// reconstructed coordinate, not the source f64, and a reader comparing them against an mzML needs
+/// to know the difference is encoding loss and not a defect — and its rows must carry the model a
+/// reader evaluates: `MS:1003826` chunk rows under the PSI-MS sqrt model `MS:1003825`.
 ///
-/// This is the archive-level half of `contract_strings::tof_grid_reconstruction_keys_pinned`, which
-/// pins the same keys in the source. Both exist because the string pin cannot see whether the block
+/// This is the archive-level half of `contract_strings::chunk_grid_models_pinned`, which pins the
+/// same strings in the source. Both exist because the string pin cannot see whether the model
 /// actually reaches the file, and this one reads the file itself.
 #[test]
 fn gridded_archive_states_its_reconstruction_contract() {
@@ -235,52 +241,31 @@ fn gridded_archive_states_its_reconstruction_contract() {
     let gridded = dir.join("grid.mzpeak");
     run(&[input.to_str().unwrap(), "-o", gridded.to_str().unwrap(), "--tof-grid", "on"]);
 
+    // Every row of the peaks facet (this fixture is centroid-only) is a grid row under the sqrt model.
+    let (mut rows, mut grid_rows) = (0usize, 0usize);
+    for b in batches(&gridded, "spectra_peaks.parquet", &dir) {
+        let chunk = b.column_by_name("chunk").expect("chunk facet").as_struct();
+        let enc = strings(chunk.column_by_name("chunk_encoding").unwrap());
+        let grid = chunk.column_by_name("mz_grid").expect("mz_grid column").as_struct();
+        let kind = strings(grid.column_by_name("grid_type").unwrap());
+        for i in 0..b.num_rows() {
+            rows += 1;
+            if enc.value(i) == "MS:1003826" {
+                grid_rows += 1;
+                assert_eq!(kind.value(i), "MS:1003825", "row {i}: the sqrt model");
+            }
+        }
+    }
+    assert_eq!(rows, SPECTRA, "one chunk per spectrum");
+    assert_eq!(grid_rows, SPECTRA, "every spectrum of this file is on the lattice");
+
     let f = std::fs::File::open(&gridded).unwrap();
     let mut z = zip::ZipArchive::new(f).unwrap();
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut z.by_name("mzpeak_index.json").unwrap(), &mut buf).unwrap();
     let idx: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-    let cal = idx
-        .get("metadata")
-        .and_then(|m| m.get("tof_calibration"))
-        .expect("metadata.tof_calibration present in a --tof-grid archive");
-
-    assert_eq!(cal.get("codec").and_then(|v| v.as_str()), Some("tof-grid"));
-    assert_eq!(cal.get("model").and_then(|v| v.as_str()), Some("sciex_sqrt"));
-    assert_eq!(
-        cal.get("lossless").and_then(|v| v.as_str()),
-        Some("tof_index"),
-        "the block must name its exactly-stored column with the spec's `lossless` key; got {cal}"
-    );
-    assert_eq!(
-        cal.get("mz_reconstruction").and_then(|v| v.as_str()),
-        Some("bounded-lossy"),
-        "the run-wide grid accepts a reconstruction within tolerance, so it is not exact; got {cal}"
-    );
-    assert!(
-        cal.get("roundtrip_tolerance_ppm").and_then(|v| v.as_f64()).is_some_and(|v| v > 0.0),
-        "a bounded-lossy block must state its bound; got {cal}"
-    );
-    // The two keys answer DIFFERENT questions and must not be conflated: `lossless` names the
-    // column stored exactly, `mz_reconstruction` rates the m/z rebuilt from it. `integer_column`
-    // was a short-lived synonym for the first and must not come back.
-    assert!(
-        cal.get("integer_column").is_none(),
-        "`integer_column` duplicated the spec's `lossless`; got {cal}"
-    );
-    // The formula itself, with the coefficients it names. A reader that has the column and the
-    // bound still cannot rebuild m/z without these three.
-    assert_eq!(
-        cal.get("mz_from_tof_index").and_then(|v| v.as_str()),
-        Some("(c0 + c1*tof_index)^2"),
-        "the block must state the reconstruction formula; got {cal}"
-    );
-    for k in ["c0", "c1"] {
-        assert!(
-            cal.get(k).and_then(|v| v.as_f64()).is_some(),
-            "the formula names {k}, so the block must carry it; got {cal}"
-        );
-    }
+    // No 0.13 `tof_calibration` block: the model rides on every grid row.
+    assert!(idx["metadata"]["tof_calibration"].is_null(), "the point-layout calibration block is gone: {idx}");
     // Storing a quantized axis IS a transformation, and `transformations` lists what a conversion
     // APPLIED (0.12.0). An archive that quietly re-encoded m/z without saying so is the failure.
     let applied = idx
@@ -291,7 +276,7 @@ fn gridded_archive_states_its_reconstruction_contract() {
         .unwrap_or_default();
     assert!(
         applied.iter().any(|e| e.starts_with("tof-grid:") && e.ends_with("ppm")),
-        "a gridded archive must declare the grid in `transformations`; got {applied:?}"
+        "a gridded archive must declare the grid and its bound in `transformations`; got {applied:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

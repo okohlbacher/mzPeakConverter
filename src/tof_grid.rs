@@ -10,8 +10,8 @@
 //!
 //! The lane is **bounded-lossy, not lossless**, and the acceptance gate IS the bound: a fit is
 //! taken when every sampled point reconstructs within [`ppm_tol()`] (default 5 ppm) of its source
-//! m/z, so a stored `tof_index` is a quantized m/z and the archive's `tof_calibration` block says
-//! exactly that (`mz_reconstruction: "bounded-lossy"`, `roundtrip_tolerance_ppm`). In practice the
+//! m/z, so a stored index is a quantized m/z and the archive's `transformations` entry says
+//! exactly that (`tof-grid:<ppm>ppm`, the bound the fit was accepted under). In practice the
 //! fit is far tighter than the bound on the instruments this targets (SCIEX TripleTOF reconstructs
 //! to <0.1 ppm with a 2-coefficient per-run calibration), which is what makes it usable — but
 //! "tight" is not "exact", and only INTENSITY is stored verbatim. Data that is not on a flight-time

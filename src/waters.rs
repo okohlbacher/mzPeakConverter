@@ -208,6 +208,118 @@ struct ScanItemIds {
     set_mass: Option<c_int>,
     collision_energy: Option<c_int>,
     sonar: Option<c_int>,
+    /// The laser (MALDI) / sprayer (DESI) aim position in mm — `LASERAIM_XPOS` / `_YPOS` in the SDK
+    /// enum, stat codes 9 / 10 in `_funcNNN.sts`.
+    laser_x: Option<c_int>,
+    laser_y: Option<c_int>,
+}
+
+/// `transformations` entry: pixel positions are grid indices fitted to the laser aim positions (mm).
+pub const LASER_GRID: &str = "waters:laser-position-fitted-to-grid";
+
+/// A Waters imaging run (MALDI or DESI): the grid fitted to every scan's laser aim position, and each
+/// spectrum's pixel. MassLynx states positions in mm, not pixel indices, so the step, origin and
+/// count are fitted ([`crate::imaging::fit_axis`]); every position lies within a quarter step of its
+/// grid point or the run gets none. Several scans may share a pixel (functions a long raster is split
+/// into keep their own scan numbers; the pixel comes from the position).
+#[derive(Debug, Clone)]
+pub struct WatersImaging {
+    pub x: crate::imaging::GridAxis,
+    pub y: crate::imaging::GridAxis,
+    /// Per spectrum index: its pixel, when its scan states a position.
+    positions: Vec<Option<(i64, i64)>>,
+    /// The item names MassLynx gave for x and y.
+    names: (String, String),
+}
+
+impl WatersImaging {
+    fn read(api: ScanItemApi, info: *mut c_void, index: &[(c_int, c_int, f32)], ids: [c_int; 2], names: (String, String)) -> Option<Self> {
+        let mut records: std::collections::HashMap<c_int, bool> = std::collections::HashMap::new();
+        let mm: Vec<Option<(f64, f64)>> = index
+            .iter()
+            .map(|&(f, scan, _)| {
+                let has = *records.entry(f).or_insert_with(|| {
+                    let a = api.available(info, f);
+                    ids.iter().all(|i| a.contains(i))
+                });
+                if !has {
+                    return None;
+                }
+                let v = api.values(info, f, scan, &ids);
+                let num = |k: usize| v.get(k).cloned().flatten()?.trim().parse::<f64>().ok().filter(|x| x.is_finite());
+                Some((num(0)?, num(1)?))
+            })
+            .collect();
+        let (xs, ys): (Vec<f64>, Vec<f64>) = mm.iter().flatten().copied().unzip();
+        let cells: std::collections::BTreeSet<(i64, i64)> = mm.iter().flatten().map(|(x, y)| ((x * 1e3).round() as i64, (y * 1e3).round() as i64)).collect();
+        if cells.len() < 2 {
+            return None;
+        }
+        let (Some(x), Some(y)) = (crate::imaging::fit_axis(&xs), crate::imaging::fit_axis(&ys)) else {
+            log::warn!("MassLynx: {} scans state a laser position, but the positions lie on no raster; no pixel positions written", xs.len());
+            return None;
+        };
+        let positions = mm.iter().map(|p| p.map(|(a, b)| (x.index(a), y.index(b)))).collect();
+        log::info!(
+            "Waters imaging: {} scans, grid {} x {} at {:?} x {:?} mm",
+            xs.len(), x.count, y.count, x.pitch, y.pitch
+        );
+        Some(WatersImaging { x, y, positions, names })
+    }
+
+    /// The pixel of spectrum `i`.
+    pub fn position(&self, i: usize) -> Option<(i64, i64)> {
+        self.positions.get(i).copied().flatten()
+    }
+
+    /// The grid: pixel counts always; pixel size (the step, µm) and max dimension on an axis with a step.
+    pub fn scan_settings(&self) -> mzdata::meta::ScanSettings {
+        let mut s = mzdata::meta::ScanSettings { id: "scansettings1".into(), ..Default::default() };
+        let p = |name: &str, curie, v: mzdata::params::Value, unit| Param::builder().name(name).curie(curie).value(v).unit(unit).build();
+        s.params.push(p("max count of pixels x", mzdata::curie!(IMS:1000042), self.x.count.into(), Unit::Unknown));
+        s.params.push(p("max count of pixels y", mzdata::curie!(IMS:1000043), self.y.count.into(), Unit::Unknown));
+        if let (Some(px), Some(py)) = (self.x.pitch, self.y.pitch) {
+            let (ux, uy) = (px * 1000.0, py * 1000.0);
+            s.params.push(p("pixel size (x)", mzdata::curie!(IMS:1000046), ux.into(), Unit::Micrometer));
+            s.params.push(p("pixel size y", mzdata::curie!(IMS:1000047), uy.into(), Unit::Micrometer));
+            s.params.push(p("max dimension x", mzdata::curie!(IMS:1000044), (self.x.count as f64 * ux).into(), Unit::Micrometer));
+            s.params.push(p("max dimension y", mzdata::curie!(IMS:1000045), (self.y.count as f64 * uy).into(), Unit::Micrometer));
+        }
+        s
+    }
+
+    /// The `waters_imaging` index block: where the positions came from and how well they fit.
+    pub fn block(&self) -> serde_json::Value {
+        let axis = |a: &crate::imaging::GridAxis| serde_json::json!({
+            "origin_mm": a.origin, "pitch_mm": a.pitch, "count": a.count, "max_residual_mm": a.max_residual,
+        });
+        serde_json::json!({
+            "source": format!("MassLynx scan items {:?} / {:?} (laser aim position, mm)", self.names.0, self.names.1),
+            "positions": "grid index = round((position − origin) / pitch) + 1",
+            "scans_with_position": self.positions.iter().flatten().count(),
+            "x": axis(&self.x),
+            "y": axis(&self.y),
+        })
+    }
+
+    /// The `provenance` of the `metadata.imaging` marker.
+    pub fn provenance(&self) -> serde_json::Value {
+        serde_json::json!({
+            "detected_from": "laser aim positions in the MassLynx scan items",
+            "positions": "grid indices fitted to the positions in mm (waters_imaging)",
+            "origin_mm": {"x": self.x.origin, "y": self.y.origin},
+            "pixel_size": if self.x.pitch.is_some() && self.y.pitch.is_some() { "the fitted step" } else { "not written: a single row or column" },
+        })
+    }
+}
+
+/// Does a MassLynx scan-item name (upper-cased, `_`/`-` as spaces) name the `axis` position?
+/// `LASERAIM_XPOS`, `X Pos`, `X Position`; not `MAX POS…`.
+fn names_position(u: &str, axis: char) -> bool {
+    let words: Vec<&str> = u.split_whitespace().collect();
+    let pos = |w: &str| w == "POS" || w == "POSITION";
+    words.iter().any(|w| w.strip_prefix(axis).is_some_and(pos))
+        || words.windows(2).any(|w| w[0].len() == 1 && w[0].starts_with(axis) && pos(w[1]))
 }
 
 /// What MassLynx states about one function, resolved once at open.
@@ -275,6 +387,8 @@ pub struct WatersReader {
     /// Scans [`Self::spectrum`] read as a SONAR function's quadrupole bins summed (`readScan`).
     /// Shared the same way, declaring [`SONAR_SUMMED`].
     sonar_summed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The pixel grid of an imaging run (laser aim positions); `None` otherwise.
+    imaging: Option<WatersImaging>,
 }
 
 impl WatersReader {
@@ -385,6 +499,7 @@ impl WatersReader {
             .or_else(|| reference_functions_from_extern_inf(input).first().copied());
         // The scan items the DLL records, by NAME, so the ids do not depend on the enum base.
         let mut item_ids = ScanItemIds::default();
+        let mut laser_names = (String::new(), String::new());
         if let Some(api) = scan_items {
             let ids = api.available(info_reader, 0);
             let named = api.names(info_reader, &ids);
@@ -401,6 +516,12 @@ impl WatersReader {
                     item_ids.collision_energy = Some(*id);
                 } else if u.contains("SONAR") && item_ids.sonar.is_none() {
                     item_ids.sonar = Some(*id);
+                } else if names_position(&u, 'X') && item_ids.laser_x.is_none() {
+                    item_ids.laser_x = Some(*id);
+                    laser_names.0 = name.clone();
+                } else if names_position(&u, 'Y') && item_ids.laser_y.is_none() {
+                    item_ids.laser_y = Some(*id);
+                    laser_names.1 = name.clone();
                 }
             }
             if named.is_empty() {
@@ -409,7 +530,10 @@ impl WatersReader {
                     set_mass: Some(SCAN_ITEM_FIRST + 76),
                     collision_energy: Some(SCAN_ITEM_FIRST + 61),
                     sonar: Some(SCAN_ITEM_FIRST + 80),
+                    laser_x: Some(SCAN_ITEM_FIRST + 8),
+                    laser_y: Some(SCAN_ITEM_FIRST + 9),
                 };
+                laser_names = ("LASERAIM_XPOS".into(), "LASERAIM_YPOS".into());
             }
             log::info!("MassLynx scan item ids: {item_ids:?}; lock-mass function: {:?}", lockmass_function.map(|f| f + 1));
         }
@@ -660,6 +784,12 @@ impl WatersReader {
             return Err(close(format!("Waters .raw {} has no readable scans", input.display())));
         }
 
+        // Imaging (MALDI / DESI): every scan's laser aim position, fitted to a pixel grid.
+        let imaging = match (scan_items, item_ids.laser_x, item_ids.laser_y) {
+            (Some(api), Some(x), Some(y)) => WatersImaging::read(api, info_reader, &index, [x, y], laser_names),
+            _ => None,
+        };
+
         if let Some(level) = std::env::var("MZPC_WATERS_PROBE_QUAD").ok().filter(|v| !v.is_empty() && v != "0") {
             probe_quad_windows(&lib, info_reader, scan_reader, functions.len(), &index, scan_items, &level);
         }
@@ -682,12 +812,18 @@ impl WatersReader {
             keep_collapsed,
             resorted: Default::default(),
             sonar_summed: Default::default(),
+            imaging,
         };
         Ok(reader)
     }
 
     pub fn len(&self) -> usize {
         self.index.len()
+    }
+
+    /// The pixel grid, when this is an imaging run.
+    pub fn imaging(&self) -> Option<&WatersImaging> {
+        self.imaging.as_ref()
     }
 
     /// Does any function carry a drift dimension (and so does the archive carry frames)?
@@ -894,6 +1030,10 @@ impl WatersReader {
             );
         }
         let mut event = ScanEvent { start_time: rt_minutes as f64, ..Default::default() };
+        if let Some((x, y)) = self.imaging.as_ref().and_then(|im| im.position(i)) {
+            event.add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(x).build());
+            event.add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(y).build());
+        }
         if let Some((lo, hi)) = fi.mass_range {
             event.scan_windows.push(ScanWindow::new(lo, hi));
         }
@@ -954,11 +1094,11 @@ impl WatersReader {
         let (ions, isolation_window) = if set_mass > 0.0 {
             (
                 vec![SelectedIon { mz: set_mass, ..Default::default() }],
-                IsolationWindow { target: set_mass as f32, lower_bound: 0.0, upper_bound: 0.0, flags: IsolationWindowState::Complete },
+                IsolationWindow::new(set_mass as f32, 0.0, 0.0, IsolationWindowState::Complete),
             )
         } else if let Some((lo, hi)) = fi.mass_range.filter(|(lo, hi)| hi > lo) {
             activation.add_param(Param::new_key_value("isolation window source", "acquisition mass range (MSe: no quadrupole isolation; ProteoWizard's convention)"));
-            (Vec::new(), IsolationWindow { target: (lo + hi) / 2.0, lower_bound: lo, upper_bound: hi, flags: IsolationWindowState::Complete })
+            (Vec::new(), IsolationWindow::new((lo + hi) / 2.0, lo, hi, IsolationWindowState::Complete))
         } else {
             (Vec::new(), IsolationWindow::default())
         };
@@ -1407,6 +1547,16 @@ fn prepend_dir_to_path(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn laser_position_items_are_found_by_name() {
+        let u = |n: &str| n.to_ascii_uppercase().replace(['_', '-'], " ");
+        assert!(names_position(&u("LASERAIM_XPOS"), 'X') && !names_position(&u("LASERAIM_XPOS"), 'Y'));
+        assert!(names_position(&u("LASERAIM_YPOS"), 'Y'));
+        assert!(names_position(&u("Laser Aim X Position"), 'X'));
+        assert!(!names_position(&u("RAMP MAX POS"), 'X'), "MAX POS is not an x position");
+        assert!(!names_position(&u("COLLISION ENERGY"), 'X'));
+    }
 
     fn fi(code: Option<c_int>, bins: c_int, ce: Option<f64>) -> FunctionInfo {
         FunctionInfo { type_code: code, drift_bins: bins, collision_energy_0: ce, ion_mode: Some("ES+".into()), mass_range: Some((50.0, 600.0)), ..Default::default() }

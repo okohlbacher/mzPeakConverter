@@ -8,10 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 **Output change (mzML).** Every mzML the tool writes records its conversion as the default
 processing of both lists, which mzML 1.1 requires and stock OpenMS 3.5.0 needs to read the file — it
-refused every export of a raw file or an archive. A timsTOF `.d` → mzML writes its diaPASEF window
-limits in order and on the vendor mobility model; an archive → mzML carries each peak's mobility.
-**Output change (Bruker TDF, `--no-ims-compact`).** The window limits and the scan and precursor
-1/K0 params move by at most two bits in the last place, onto the exact values of the arrays.
+refused every export of a raw file or an archive through 0.16.0. A timsTOF `.d` → mzML writes its
+diaPASEF window limits in order and on the vendor mobility model; an archive → mzML carries each
+peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).** The window limits and the scan
+and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the arrays (PXD059079
+2485.d: 49,126 of 79,885 values move).
 
 ### Fixed
 
@@ -33,16 +34,20 @@ limits in order and on the vendor mobility model; an archive → mzML carries ea
   from `pwiz_processing` to `CompassXtract_x0020_processing`). The source's entries stay listed after
   the step; an array's redundant reference to the source's default is left out, so it inherits the
   step that extends it. A re-export of this tool's own mzML reuses its software entry and gives the
-  step a fresh id (`mzpeak_convert_to_mzml_2`). On a timsTOF diaPASEF run capped at 20,000 spectra,
-  `FileInfo` refuses the 0.12.5 export and reads this one; OpenSWATH assigns its precursors. This
-  is the processing requirement, not full XSD validity: mzdata's writer still gives the run the id
-  `1` (not an NCName), writes an empty `precursorList` and an empty `softwareRef` where a source
-  states nothing, as 0.13.0 does.
+  step a fresh id (`mzpeak_convert_to_mzml_2`). OpenMS 3.5 `FileInfo` refuses the 0.16.0 exports of
+  PXD059079 2485.d, of both its archive kinds and of a Thermo `.raw`, and reads all of this
+  version's (the `.d`: 16,377 spectra); on a timsTOF diaPASEF run capped at 20,000 spectra,
+  OpenSWATH assigns the precursors of the export. This is the processing requirement, not full XSD
+  validity: mzdata's writer still gives the run the id `1` (not an NCName), writes an empty
+  `precursorList` on every MS1 spectrum and an empty `softwareRef` where a source states nothing,
+  as 0.16.0 does.
 - **A timsTOF `.d` → mzML writes each diaPASEF window's 1/K0 limits in order, on the vendor
   model, bracketing the window's own peaks.** `--to mzml` wrote mzdata's TDF params as they come:
   the spectrum-level `ion mobility lower limit` from the window's first scan, the larger 1/K0
-  (1.3674 over an upper limit of 1.1931), on every MS2 spectrum — OpenSWATH assigns precursors with
-  a strict `lower < IM < upper` and matched none — and on timsrust's linear map, while the
+  (1.3437 over an upper limit of 1.2910 for the first window of PXD059079 2485.d), on every MS2
+  spectrum — OpenSWATH assigns precursors with a strict `lower < IM < upper` and matched none; on
+  2485.d all 15,977 windows were inverted and all 6,752,874 MS2 peaks outside — and on timsrust's
+  linear map, while the
   spectrum's mobility array is on mzdata's ModelType-2 calibration. The lane now applies
   `bruker_native::TdfMobilityRemap`, as the `--no-ims-compact` archive lane has since 0.9.6: the
   pair ordered, it and the scan and selected-ion 1/K0 on the ModelType-2 model (1.305615 < 1.332387
@@ -52,10 +57,12 @@ limits in order and on the vendor mobility model; an archive → mzML carries ea
   limits. The remap now also evaluates the model in mzdata's own arithmetic, at the scan snapped
   back onto the half-scan grid the linear round trip leaves by ~1e-13: a window's upper limit is
   bit for bit the array value of its first scan. Evaluated in the SDK's order, as the remap did,
-  the limit fell a bit or two short at about half of all scans, and 1.5 million of the 2.2 billion
-  MS2 peaks of a full diaPASEF run lay above their window by up to 2.2e-16; now none lies outside,
-  with no tolerance. `--no-tims-recalibration` stays inert on this lane (and says so): the arrays
-  cannot leave the model, and limits on the linear map would miss 9 % of the peaks.
+  the limit fell 1 to 4 ulp short at half to two thirds of all scans, and 1.5 million of the 2.2
+  billion MS2 peaks of a full diaPASEF run lay above their window by up to 2.2e-16 (a 0.16.0
+  `--no-ims-compact` archive of 2485.d: 8,624 peaks in 4,885 windows); now none lies outside, with
+  no tolerance, and 11,011 of 2485.d's 15,977 windows have a peak on the upper limit.
+  `--no-tims-recalibration` stays inert on this lane (and says so; the export is identical): the
+  arrays cannot leave the model, and limits on the linear map would miss 9 % of the peaks.
 - **The mzML `<scan>` of a diaPASEF spectrum lists its cvParams first.** mzdata's TDF reader puts the
   `window group` userParam before the MS:1002815 cvParam, which the mzML schema forbids (one XSD
   error per MS2 scan). Every mzML lane that demotes MZP params now also puts each param list's
@@ -65,12 +72,16 @@ limits in order and on the vendor mobility model; an archive → mzML carries ea
   archive holding a mobility array per peak — wrote m/z and intensity only. Such a spectrum is now
   exported from the facet's arrays (MS:1003006 `mean inverse reduced ion mobility array`, m/z
   ordered, 32-bit float intensities as before). A `--no-ims-compact` archive holds one spectrum per
-  diaPASEF window and now exports like the `.d`. An ims-compact archive holds whole frames: each is
-  exported as one spectrum, with every window's precursor and no mobility limits of its own, and
-  the export warns that a reader assigning precursors by mobility window (OpenSWATH's diaPASEF
-  mode) needs the `.d` exported with `--to mzml`, or a `--no-ims-compact` archive. Through 0.13.0
-  the export wrote the same frames without mobility, and OpenMS refused them for want of a default
-  processing.
+  diaPASEF window and now exports like the `.d` (2485.d: the same 15,977 windows and limits, every
+  peak inside). An ims-compact archive holds whole frames, on the chunk grid since 0.14.0: each is
+  exported as one spectrum, with every window's precursor and no mobility limits of its own
+  (2485.d: 3,594 MS2 frames, 9,226,605 peaks, each with its 1/K0; the corpus's 0.15.0 archive
+  exports the same), and the export warns that a reader assigning precursors by mobility window
+  (OpenSWATH's diaPASEF mode) needs the `.d` exported with `--to mzml`, or a `--no-ims-compact`
+  archive. Through 0.16.0 the export wrote the same frames without mobility, and OpenMS refused
+  them for want of a default processing. Such a spectrum's peaks are read twice, as a peak list and
+  as arrays: the `--no-ims-compact` archive of 2485.d exports in 211 s instead of 139 s, the
+  ims-compact one in 37 s instead of 29 s.
 - **A file name that is not Unicode no longer aborts a conversion.** The recorded `conversion
   options` came from `std::env::args`, which panics on such an argument (a Latin-1 name on Linux):
   every archive conversion of the file aborted, and recording the mzML step would have aborted every
@@ -93,6 +104,279 @@ limits in order and on the vendor mobility model; an archive → mzML carries ea
   lane's per-spectrum step through the mzML writer; the remap bit for bit against mzdata's model at
   every scan of two runs; the recorded command line. The mzML reader they share is
   `tests/common/mzml_meta.rs`.
+
+## [0.16.0] — 2026-09-30
+
+**Output change (imaging).** Imaging archives follow the imaging profile (HUPO-PSI/mzPeak-specification#24):
+the position columns are renamed from `opt_IMS_1000050_position_x` / `…_y` / `…_z` to `position_x` /
+`position_y` / `position_z`, and every detected imaging run carries the `metadata.imaging` marker.
+Bruker MALDI runs gain pixel positions, counted from 1; imzML archives gain their file provenance in
+`file_description` and, where the header needed it, a checked pixel size. The IMS vocabulary entry
+names a pinned commit. Readers that look for the old column names (mzPeakValidator ≤ 0.9.22, the
+viewer) need their update. Waters MALDI/DESI runs gain pixel positions fitted to their laser
+positions. Also: archives rewritten from an `.mzpeak` carry correct member checksums again, the `MZP`
+vocabulary entry names a fixed snapshot (tag `mzp-cv-0.2.0`), and a conversion no longer logs two
+spurious vocabulary ERROR lines.
+
+### Added
+
+- **Bruker MALDI imaging positions** (HUPO-PSI/mzPeak-specification#23). A timsTOF fleX run converted
+  straight from the `.d` had no pixel positions, so the image could not be rebuilt. `MaldiFrameInfo`
+  (`XIndexPos`, `YIndexPos`) now becomes the same `IMS:1000050/51` position columns the imzML path
+  writes, on the TSF lane and every TDF lane (ims-compact native and SDK, `--no-ims-compact`), with the
+  IMS vocabulary. Bruker's indices are absolute on the target; they are shifted so the run's smallest
+  is 1 (declared `bruker:raster-index-shifted-to-base-1`; the constant subtracted is
+  `metadata.imaging.position_offset`, as the imaging profile has it), and the grid —
+  `IMS:1000042/43` pixel counts, and with a pixel size the max dimension `IMS:1000044/45` — is written.
+  A `bruker_maldi` index block keeps regions, raw index ranges and beam scan size; the beam scan size
+  is written as the pixel size and declared (`bruker:pixel-size-from-beam-scan-size`), as the `.mis`
+  raster step is not part of the `.d`.
+- **Imaging detection and the `metadata.imaging` marker.** One detector decides which runs are imaging:
+  imzML always, a Bruker `.d` with `MaldiFrameInfo` positions, and any other input whose spectra state
+  `IMS:1000050/51` (so an imaging archive exported to mzML converts back as imaging). Each gets the
+  imaging profile's `metadata.imaging` block — `is_imaging`, `coordinate_base: 1`, `pixel_count`,
+  `pixel_size_um` and a `provenance` record — without `--image`, which now adds its `images[]` to that
+  block instead of replacing it (and takes the grid from it, so `--image` works on a MALDI `.d` through
+  `--no-ims-compact`). An input with positions but no pixel counts gets them from its largest
+  positions (`imaging:pixel-count-from-positions`).
+- **imzML pixel-size check** by the issue author's rule: x and y with a unit are kept; without a unit,
+  micrometre is assumed; a single value is an area when `√value × count = extent` (its square root is
+  written) and a length when `value × count = extent`; anything else is dropped. Every action is a
+  `transformations` entry (`imzml:pixel-size-unit-assumed-um`, `-area-to-length`, `-dropped`) and a row
+  of the new `imaging_pixel_size` index block, which also reports unit accessions that disagree with
+  their unit names (`imzml:unit-accession-replaced-by-name` when the unit written is not the stated
+  accession).
+- imzML position z (`IMS:1000052`) gets a column when the file states one.
+- **Bruker pixel size from the FlexImaging `.mis`.** The `<stem>.mis` beside the `.d` gives each
+  region's raster step and name (`RegionNumber` n is the n-th `<Area>`, checked against timsControl's
+  poslog and flexImaging's spot list on MassIVE MSV000088438). The step is the pixel size when every
+  acquired region shares it; regions on different steps get none; without a `.mis` the beam scan size
+  stays the declared fallback. Region names and steps are in `bruker_maldi.regions`.
+- **Waters imaging positions** (MALDI / DESI, native lane). MassLynx states each scan's laser aim
+  position in mm; a grid is fitted (step = the most common gap, every position within a quarter step)
+  and each spectrum gets its grid index, declared `waters:laser-position-fitted-to-grid`, with the fit
+  in a `waters_imaging` block and the step as the pixel size. Checked on MetaboLights MTBLS14771 (Xevo
+  MRT DESI, 10,712 scans on 104 × 103 pixels of 100 µm): every scan lands on the pixel Waters HDI
+  gives it.
+
+### Fixed
+
+- **A conversion wrote into the raw data folder.** A read-only SQLite open of a WAL-mode database — a
+  Bruker MALDI `analysis.tsf` — created `analysis.tsf-shm` / `-wal` beside it and left them there.
+  Every vendor database is now opened with `immutable=1`. A `-wal` the acquisition software left
+  non-empty holds committed rows an immutable open would skip, and a read-only open in place creates
+  the `-shm` and never removes it: the database and its WAL are copied into a private scratch
+  directory, read into memory from there, and the scratch directory is removed. (timsrust 0.4.1
+  opens the TDF read-write and mzdata's TDF reader read-only but not immutable; not covered.)
+- **Rewritten archives carried stale checksums** (the `.mzpeak → .mzpeak` lane: `--rt`, `--ms-level`,
+  `--drop-aux`, `--image`/`--sdrf` injection). Every Parquet member is re-encoded, but kept the
+  source's SHA-512 in the index: 9 of 12 members of a filtered MALDI archive failed conformance.md's
+  integrity check. The rewritten bytes are hashed now. (mzPeakValidator does not check member
+  checksums, so it passed those archives.)
+- **The imzML UUID was re-spelled.** It was written from mzdata's parse, so `686ec248…` became
+  `{686EC248-…}` without a declaration (fidelity level L0 keeps the identifier as stated). Storage
+  mode, UUID and `.ibd` checksum are now copied from the header exactly as it states them.
+- **Image members are listed as the imaging profile has them**: `entity_type` `image`, `data_kind`
+  `other` (was `proprietary`).
+- **imzML file provenance was dropped.** Storage mode (`IMS:1000030/31`), UUID (`IMS:1000080`) and the
+  `.ibd` checksum (`IMS:1000090/91/92`) are consumed by mzdata and never reached `file_description`;
+  they are written back.
+- The obsolete imzML scan term "one way" (`IMS:1000411`) is written as flyback (`IMS:1000413`), its
+  stated replacement, and declared (`imzml:one-way-as-flyback`).
+- **Two spurious ERROR lines on every conversion** (since 0.14.0): "Error while initializing MS
+  vocabulary database: CV cache file could not be openend" / "Default path does not exist". The vendored
+  writer asked mzdata for the PSI-MS vocabulary, which looks for an on-disk cache first and falls back
+  to its embedded copy. The converter now loads the embedded copy at start-up, so nothing is logged and
+  the vocabulary is always the one the binary was built with.
+
+### Changed
+
+- **Position columns renamed** to the imaging profile's `position_x` / `position_y` / `position_z`
+  (were the inflected `opt_IMS_1000050_position_x` / `opt_IMS_1000051_position_y` /
+  `opt_IMS_1000052_position_z`); the column mapping still names each `IMS` term.
+- The IMS vocabulary entry points at `imzML/imzML@2c28b05` instead of `master`, which changed in 2022
+  while still calling itself 1.1.0.
+- **The MZP vocabulary is a fixed snapshot**: `cv/mzpeak.obo` is version 0.2.0 (it grew from 5 to 10
+  terms as "0.1.0") and the `cv_list` entry names the tag `mzp-cv-0.2.0` instead of `main`
+  (conformance.md: a `uri` that identifies a fixed release or snapshot). A test fails when the file
+  changes without a version bump.
+- **The base-1 shift is recorded as `metadata.imaging.position_offset`** — the constant subtracted
+  from each source index (smallest index − 1), as the imaging profile has it — instead of
+  `provenance.origin`; the smallest index stays in `bruker_maldi.origin`.
+
+## [0.15.0] — 2026-09-29
+
+**Output change (native Waters lane).** Each data-facet column is written under the encoding a
+pre-scan of the run measured smallest, instead of fixed encodings.
+
+### Added
+
+- **Encoding pre-scan (native Waters `.raw`).** Before the run is written, a sample (four stretches
+  of consecutive spectra, up to 64 spectra or 2 M points each) is written once per trial through
+  the same writer; each column keeps its smallest arm. Arms: m/z as lossless delta chunks under
+  dictionary, byte-stream split or plain encoding, or numpress-linear (not under `--no-numpress`);
+  intensity as float32 or — when every sampled value is an integer in int32 range — the same values
+  as int32 (MS:1000519), each under byte-stream split or dictionary; ion mobility under dictionary,
+  byte-stream split or plain. A tie keeps the writer default. The `encoding_prescan` index block
+  records the sample, every arm's bytes and the choice. A later spectrum int32 cannot hold exactly
+  makes the conversion write the run again with the smallest float32 arm (`int32_fallback` in the
+  block). `MZPC_ENCODING_PRESCAN=0` keeps the fixed encodings. USER_MANUAL §8, §10.
+- Vendored writer: `DataColumnEncodings` / `MzPeakWriterBuilder::data_column_encodings`, per-role
+  encoding overrides (m/z chunk values, intensity, ion mobility) applied after the writer's own
+  rules — the `WriterProperties` hook proposed upstream. Default: no override, bytes unchanged.
+
+## [0.14.0] — 2026-09-24
+
+**Output change (data facets of every grid lane, timsTOF included).** The converter's own point-layout grid — an
+integer `tof_index` column tagged `MS:1003824`/`MS:1003825` with `mzpeak:transform_params`,
+per-spectrum `tof_c0`/`tof_c1` columns and `tof_calibration` / `mz_calibration` index blocks, written
+since 0.9 by the mzML `--tof-grid` lane, the native SCIEX lane, the Shimadzu `.lcd` lane,
+`--agilent-grid` and (as the Int64 lattice) the generic mzML lane on lattice input — is retired for
+the reference implementation's **chunk grid** (vendoring exit, item 1; owner decision 2026-09-23:
+converge on upstream). Every such archive changes layout; archives of the old layout still read
+(the vendored reader keeps that decode path for this release). Details under **Changed**.
+
+**Output change (metadata facets, every archive).** The vendored reference implementation is
+re-based on upstream `mobiusklein/mzpeak_prototyping@eb08ba0` (18 commits: term markers, SHA512
+file-index checksums, index-range queries, the grid encoding and its `GridPolicy`, the #34 fix), and
+mzdata moves to 0.67.1. Every DATA facet is byte-identical to 0.13.0 (verified on the mzML, imzML,
+Thermo RAW and timsTOF lanes, every spectrum bit-identical through the reader); three METADATA
+facets change shape:
+
+- `spectra_metadata_precursors` / `chromatograms_metadata_precursors`: the `activation` struct gains
+  `dissociation_method` (a CURIE string, e.g. `MS:1000133`) and `collision_energy` (float32, null
+  when the source states none) as columns; both leave `activation.parameters`, which is now empty
+  for the common case. −12 … −62 % on that facet.
+- `spectra_metadata_scans.scan_start_time` is float64 (the exact minute value) instead of float32.
+- `mzpeak_index.json`: every file entry carries a `checksum` (SHA512 of the member). Readers that
+  ignore unknown keys are unaffected; `FileEntry` has no `deny_unknown_fields`.
+
+### Changed
+
+- **The sqrt-grid lanes write the reference implementation's chunk grid.** mzML `--tof-grid`, the
+  native SCIEX `.wiff` lane and the Shimadzu `.lcd` profile facet now hand the writer the grid VALUES
+  `(c0 + c1·k)²` as f64 m/z with the exact per-spectrum model attached to the array as the PSI-MS
+  term `MS:1003825 [c0, c1, 1]` — mzdata's own parameter convention — and upstream's `GridPolicy`
+  turns each spectrum back into the same integer bins (`round((√mz − c0)/c1) == k` on every point,
+  measured on Blind/HEK): one `MS:1003826` chunk row per spectrum, `mz_grid {grid_type, parameters,
+  indices}`, real m/z bounds; a spectrum that did not fit is a raw `MS:1000576` row with its exact
+  f64 m/z. One chunk per spectrum (`GRID_CHUNK_TH`): −7.5 … +6 % against the point layout, where
+  upstream's 50-Th default cost +13 … +30 %. A run-wide fit's anchor `c0²` can lie above a spectrum's
+  lowest m/z; such a spectrum is re-anchored (`c0' = c0 + c1·k_min`) because upstream's `to_index`
+  clamps negative indices to 0 silently — on the SWATH fixture 20 of 201 spectra would have lost
+  their three lowest points to 57.076 Th. Verified against 0.13.0 through the reader: 201/201
+  spectra, intensities exact, worst m/z difference 6.4e-10 ppm (the re-anchoring's rounding).
+  `--agilent-grid` writes the same rows from the vendor's own bin ordinals; MassHunter's polynomial
+  refinement (not a sqrt grid; up to ~7.5 ppm) rides verbatim in a new `agilent_calibration` index
+  block (`calibrations`, the refined-m/z formula, `max_bare_grid_ppm`), selected per spectrum by an
+  `agilent_calibration_id` parameter — the bare grid every reader decodes is what the reference
+  reader decoded from the 0.13 archives too. The `transformations` entries are unchanged
+  (`tof-grid:<ppm>ppm`, `shimadzu:span-trim`); the `tof_calibration` block, the `tof_index`
+  columns and the MZP `tof_c0`/`tof_c1` columns of these lanes are gone (the timsTOF lanes keep
+  theirs, item 2).
+- **Fixed-point-lattice centroids take upstream's fitted linear grid.** The Int64 `point.tof_index`
+  lattice (0.9.7–0.13: `k = round(m/z·scale)`, exact, with an `mz_calibration` block) is the one
+  representation the chunk grid cannot hold — 2³² steps of 1e-9 Da is 4.29 Th per chunk (DIA
+  20 ng +18.7 %, sparse Blind +126 %). When the probe centroids sit on a lattice (Shimadzu
+  `MassHigh`, the LabSolutions mzML export), the peaks facet is now what upstream's
+  `--peak-encoding grid` writes: 50-Th chunk-grid rows under a per-spectrum `MS:1003824` model
+  fitted over 2³² slots of the spectrum's padded range and accepted only within 1e-6 Da (≤ 3e-7 Da
+  in practice), declared as `grid-fit:1e-6Da` in `transformations`; −10.6 % against the lattice on
+  DIA_Hela_20ng, −6.4 % on HEK, +56 % on the sparse Blind run. The native Shimadzu `.lcd` centroids
+  take the same route; `MZPC_SHIMADZU_COARSE_MZ=1` is declared as `shimadzu:coarse-mz` instead of in
+  a block. `--no-mz-lattice` / `MZPC_NO_MZ_LATTICE=1` keep the exact f64 m/z on every lane, as before.
+  The summary columns are derived from the source arrays on both lanes and are identical with the
+  grid on and off (`tests/mz_lattice_mzml.rs`).
+- **The timsTOF ims-compact lanes write the chunk grid natively.** Both the native (timsrust) and
+  the `--bruker-sdk` lane hand the writer each frame's m/z and 1/K0 evaluated through the vendor's
+  own models — the frame's `MzCalibration` row as the reference implementation's `MS:9999002`
+  7-parameter model at the frame's `T1`/`T2`, the `TimsCalibration` row as its `MS:9999001` model —
+  attached to the arrays as Params, and upstream's `GridPolicy` turns them back into the integer TOF
+  bins and scan numbers (`round(invert(convert(k))) == k` for every one of 2485.d's 636,031 bins,
+  `src/bruker_native.rs`). The facet is 0.13.0's grid layout (`tof_encoding: grid`; the corpus
+  archive's TOF bins reproduce frame for frame), now produced in one pass: the 0.12.x TOF-boundary
+  layout (integer TOF bounds, `tof_chunk_values` deltas, the per-frame `opt_MZP_1000003_tof_c0` /
+  `opt_MZP_1000004_tof_c1` columns and `ims_calibration.per_spectrum`), the flat point table of
+  absolute bins (`--no-ims-chunked`) and the second-pass rewrite (`src/tdf_grid.rs`) are gone, and
+  with them `--no-ims-grid`, `--ims-grid` and `--grid-encoding`. `--no-ims-chunked` now means one
+  chunk per frame; the `--bruker-sdk` lane honours `--ims-chunked` / `--no-ims-chunked` /
+  `--chunk-size` like the native one. `ims_calibration` says `exact: true` and keeps the two-point
+  chord only under `chord`, as the model of a frame without a usable calibration row (an
+  `MS:1003825` sqrt model); every frame carries the vendor model, `C2 ≠ 0` rows included. Two
+  differences from the 0.13.0 rewrite: chunk boundaries are upstream's (real-m/z 50-Th bins on the
+  vendor model rather than the 0.12.x chord bins — 127,811 chunk rows vs 127,869 on 2485, the same
+  points per frame), and the chunk bounds keep Parquet's dictionary encoding like every other chunk
+  facet (the rewrite byte-stream-split them). Under `--no-tims-recalibration` 1/K0 is stored as
+  plain values (`ion_mobility_grid.column: null`) instead of falling back to the TOF layout.
+- **Vendored `mzpeak_prototyping` re-based on upstream `eb08ba0`** (was `589d6e3`, 18 commits behind).
+  Of our local delta, everything upstream had meanwhile done or made obsolete was dropped (our
+  grid-decode module, the grid struct handling in the chunk readers, reader visitors made public,
+  parquet-57 renames, an async-reader reversion, rustfmt churn); every bug fix and feature of ours
+  was kept (`delta-categorization.md` in the 2026-09-23 vendor audit lists them). Two things worth
+  knowing: grid index lists get byte-stream-split with the dictionary off (upstream requests
+  `DELTA_BINARY_PACKED` but leaves the dictionary on, so its own files are dictionary-encoded; we
+  measured DELTA at +21 % and BSS at −9.6 % on PXD059079 2485), and a stray `eprintln!` upstream
+  left in the grid decode path is not carried. `src/tdf_grid.rs` now evaluates the timsTOF models
+  through upstream's `TimsTofMzGrid2` / `TimsTofTimsLinearGrid2` (mzdata's own arithmetic); the
+  2485 peaks facet is byte-identical to 0.13.0's.
+- Dependencies refreshed (`cargo update`, 2026-09-24): 77 lockfile bumps within the existing pins
+  (arrow/parquet sub-crates 59.2 → 59.3, clap 4.6.7, rayon/crossbeam, icu, …). `arrow`/`parquet`
+  stay pinned at 59.1.0 (upstream mzpeak_prototyping pins 57; 60.0.0 exists and is a separate
+  decision), `mzdata` at 0.67.1 (the latest release), upstream `mzpeak_prototyping` at `eb08ba0`
+  (its head).
+- **mzdata comes from crates.io again: `=0.67.1`** (with the `cv` feature upstream needs). The
+  `[patch.crates-io]` git fork (`okohlbacher/mzdata@1d53971`, 0.66.6 plus the isolation-window
+  reader fix) is gone — upstream released that fix as mobiusklein/mzdata#58 in 0.66.7.
+  `tests/isolation_window_offset_order.rs` pins it against the released crate. 0.66.7 added
+  `IsolationWindowState::NoIsolation` ("all ions were fragmented on purpose"); the vendored writer
+  writes it as a window with null target and offsets, the same arm as `Unknown`, as upstream does.
+  0.67.1 made `IsolationWindow`'s fields private: the lanes construct it with `IsolationWindow::new`.
+
+### Removed
+
+- The 0.12.x timsTOF TOF layout and its rewrite pass: `src/tdf_grid.rs`, `ims_chunked_peak_schema`,
+  `tof_axis_field`, the exact per-frame pair machinery (`exact_tof_coeffs*`, `ExactTofSummary`,
+  `add_exact_tof_params`, `TOF_C0_CURIE`/`TOF_C1_CURIE`), the flags `--no-ims-grid`, `--ims-grid`,
+  `--grid-encoding` (config `no_ims_grid`). `tests/tdf_exact_tof_calibration.rs` now pins the grid
+  rows against the vendor formula at each frame's own temperature instead of the pair columns.
+- The point-layout grid writers: `tof_index_field`, `tof_index_peak_schema`, `tof_grid_block` and
+  its `MzReconstruction`, the lattice half of `src/mz_lattice.rs` and `src/shimadzu_grid.rs`
+  (`lattice_route`, `lattice_peak_schema`, `mz_calibration_block`), the `VendorHints` point-layout
+  fields and the vendored writer's `write_spectrum_with_peak_arrays`; `tests/shimadzu_lattice_peaks.rs`
+  (it pinned that layout). The detector (`fixed_point_lattice_scale`) and the vendor-lattice fits
+  (`tof_grid.rs`, `shimadzu_grid::fit_spectrum`) stay: they are what makes the indices the vendor's
+  own small integers rather than upstream's 2³²-slot spread (+52 … +94 % on profile facets).
+
+### Fixed
+
+- **timsTOF runs with a ModelType-2 m/z calibration were written with m/z an order of magnitude too
+  low.** 0.13.0 (and mzdata 0.67.1's own TDF reader) read every `MzCalibration` row as ModelType 1.
+  In a ModelType-2 row `C3`/`C4` repeat `C0`/`C2`, so they became a cubic term and an m/z shift: on
+  the corpus's SBA415 timsTOF Pro run m/z 270.18 was stored as 21.03, chunk bounds included, with
+  `ims_calibration.exact: true`. Reported by the mzPeak Viewer side (2026-09-26). The ModelType-2
+  formula is now pinned against Bruker's library to 1e-9 ppm (ten SDK values from OpenTIMS's
+  `test.d`, `tests/fixtures/tdf_modeltype2_sdk_golden.json`): the ModelType-1 quadratic on `C0`–`C2`
+  minus a calibrant polynomial (`C8`…, `C7` coefficients) inside `[C5, C6]`, nothing outside. The
+  reference implementation's `MS:9999002` model cannot express the polynomial, so a ModelType-2 run's
+  rows carry the quadratic (`C3 = C4 = 0`; TOF bins exact) and the archive declares it:
+  `exact: false`, `approximation`, `max_error_ppm` (0.66 ppm on SBA415) and
+  `bruker:mz-calibrant-omitted`. A row of any other model type puts its frames on the chord
+  (`bruker:mz-calibration-chord`). The mzdata lanes (`--no-ims-compact`, the fallback) switch mzdata's
+  m/z model off for such files and read them on timsrust's chord, declared the same way. Only one of
+  33 corpus TDFs is ModelType 2; its 0.13.0 archive must be reconverted (the published 0.12.5 one used
+  the chord and is approximate, not wrong).
+- **A data facet without a Parquet page index read back as empty spectra — exit 0, no error.** The
+  vendored reader located a spectrum's rows only through the offset/column index that parquet-rs always
+  writes; a facet from another writer (pyarrow omits it by default) made every lookup an empty row
+  selection. The reader now falls back to one entry per row group built from the column-chunk
+  statistics — every query stays correct, the pruning is just coarser. `tests/reader_without_page_index.rs`
+  rewrites both facets of a small archive without the index and compares every spectrum.
+- **`tools/box_convert.sh` silently dropped every manifest job after the first one that took the
+  scp path.** `run_pool` feeds its loop from the manifest file, and a job over the 5 GiB S3 relay
+  ceiling runs `scp`/`ssh`, which inherit that file as stdin and drain it; the loop then ends
+  normally and reports `0 job(s) failed`. On 2026-09-23 the 8.6 GB PXD077098 unit sat 12th of 22 and
+  the 10 jobs behind it were never dispatched. Jobs now get `</dev/null`. A corpus box pass that
+  reports success with fewer archives than jobs is the signature of this bug.
 
 ## [0.13.0] — 2026-09-22
 

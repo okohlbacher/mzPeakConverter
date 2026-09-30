@@ -602,7 +602,11 @@ run_pool(){  # manifest job_fn jobs — bounded FIFO pool over path/url<TAB>out<
   while IFS=$'\t' read -r a out opts || [ -n "$a" ]; do
     case "$a" in ''|'#'*) continue;; esac
     [ -z "$out" ] && { echo "skip: manifest line missing out_path for $a" >&2; continue; }
-    "$fn" "$a" "$out" "$opts" & pids+=("$!")
+    # </dev/null or a job that reads stdin (pull_held's scp/ssh) eats the REST OF THE MANIFEST:
+    # the loop is fed by `done < "$mf"`, so the job inherits that fd. On 2026-09-23 the one job
+    # over the 5 GiB ceiling took the scp path and silently swallowed manifest lines 13-22 —
+    # 10 archives never converted, and run_pool still reported "0 job(s) failed".
+    "$fn" "$a" "$out" "$opts" </dev/null & pids+=("$!")
     if [ "${#pids[@]}" -ge "$jobs" ]; then wait "${pids[0]}" || fails=$((fails+1)); pids=("${pids[@]:1}"); fi
   done < "$mf"
   for p in ${pids[@]+"${pids[@]}"}; do wait "$p" || fails=$((fails+1)); done

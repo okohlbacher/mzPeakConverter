@@ -4,8 +4,9 @@
 //! :308-316). mzdata 0.66.6's mzML reader is stateful here: the first offset moves the window to its
 //! `Offset` state, and a second offset arriving in that state fell into a `_ => {}` arm and was dropped,
 //! so every pwiz Waters MSe archive came out with `isolation_window_lower_offset = 0` (Capan2 twin:
-//! 136,400/136,400 rows `{325, 0, 275}` for a window pwiz declares as 325 ± 275). The reader fix lives
-//! in the `[patch.crates-io]` mzdata (see Cargo.toml); this pins what lands in the archive.
+//! 136,400/136,400 rows `{325, 0, 275}` for a window pwiz declares as 325 ± 275). The reader fix is
+//! mobiusklein/mzdata#58, released in mzdata 0.66.7 (carried on a `[patch.crates-io]` fork from
+//! 0.12.4 until then); this pins what lands in the archive, whichever mzdata is linked.
 
 use std::fs::File;
 use std::process::Command;
