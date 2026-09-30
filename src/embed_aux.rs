@@ -53,7 +53,8 @@ const SDRF_DATA_KIND: &str = "sdrf";
 /// writes the `metadata.study` / `metadata.sample_metadata` index blocks. Does NOT call
 /// `zip.finish()` — the caller owns that.
 ///
-/// `input` is the source mzML/imzML path (used for sibling discovery + run-id/accession hints).
+/// `input` is the source mzML/imzML path (used for sibling discovery + run-id/accession hints), or
+/// on the filter lane the source `.mzpeak`, whose carried marker the images join (no sibling lookup).
 ///
 /// STRICTNESS: a missing/unreadable explicit `--image`, an explicit `--image` on a run the lane did
 /// not mark imaging, or the `--sdrf` file ERRORS the conversion; a soft auto-discovered sibling image
@@ -95,7 +96,9 @@ fn embed_optical_images(
     for path in images {
         embed_list.push((path.clone(), EmbedMode::Strict));
     }
-    if let Some(sibling) = discover_sibling_optical_image(input) {
+    // Not beside an existing archive (the filter lane): the run's sibling was looked for when it
+    // was converted, and an archive written next to its imzML would embed that image a second time.
+    if let Some(sibling) = discover_sibling_optical_image(input).filter(|_| !crate::filter::is_mzpeak_input(input)) {
         embed_list.push((sibling, EmbedMode::Soft));
     }
 
@@ -104,29 +107,21 @@ fn embed_optical_images(
     }
 
     // The full-extent affine maps image pixels onto the MS pixel grid Nx×Ny: the grid of the lane's
-    // own `metadata.imaging` marker, written only for a run with pixel positions. Without one the run
-    // is not imaging, and an image must not make it one: the block used to be invented here, from an
-    // imzML header's counts or from nothing (review 2026-09-30 B10). An explicit --image is an error,
-    // an auto-discovered one is skipped.
+    // own `metadata.imaging` marker, written only for a run with pixel positions (on the filter
+    // lane, the source archive's marker, carried before this embed). Without one the run is not
+    // imaging, and an image must not make it one: the block used to be invented here, from an imzML
+    // header's counts or from nothing (review 2026-09-30 B10). An explicit --image is an error, an
+    // auto-discovered one is skipped.
     let marker = zip.index().metadata.get("imaging").cloned();
     let grid = marker
         .as_ref()
         .and_then(|m| Some((m["pixel_count"]["x"].as_i64()?, m["pixel_count"]["y"].as_i64()?)));
     let (Some(mut block), Some((nx, ny))) = (marker, grid) else {
-        // The filter lane (`.mzpeak` input) carries the source's marker only after this embed, so an
-        // imaging archive has none here either: say that, not "no pixel positions".
-        let why = if crate::filter::is_mzpeak_input(input) {
-            "adding an image to an existing archive is not supported yet (the source's imaging marker \
-             is carried only after the image would be placed); pass --image when converting the \
-             imaging run"
-                .to_string()
-        } else {
-            format!(
-                "{} carries no pixel positions (no imaging marker with a pixel grid was written), so \
-                 there is no grid to overlay the image on",
-                input.display()
-            )
-        };
+        let why = format!(
+            "{} carries no pixel positions (no imaging marker with a pixel grid was written), so \
+             there is no grid to overlay the image on",
+            input.display()
+        );
         if let Some((path, _)) = embed_list.iter().find(|(_, m)| *m == EmbedMode::Strict) {
             bail!("--image {}: {why}", path.display());
         }
@@ -135,8 +130,16 @@ fn embed_optical_images(
     };
 
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(embed_list.len());
-    // ordinal advances ONLY on a successful embed, so a skipped soft image leaves no gap.
-    let mut ordinal: usize = 0;
+    // ordinal advances ONLY on a successful embed, so a skipped soft image leaves no gap. It starts
+    // past the images the archive already holds (the filter lane copies them): a reused name would
+    // be a second member under it.
+    let mut ordinal = zip
+        .index()
+        .files
+        .iter()
+        .filter_map(|f| f.name.strip_prefix("images/image_")?.split('.').next()?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |k| k + 1);
     // Dedup canonicalized paths so --image X and a sibling that resolves to X embed once.
     let mut seen: Vec<PathBuf> = Vec::with_capacity(embed_list.len());
 
@@ -156,8 +159,11 @@ fn embed_optical_images(
         return Ok(());
     }
 
-    // metadata.imaging.images[] — match the prototype's block shape — added to the lane's marker.
-    block["images"] = serde_json::json!(entries);
+    // metadata.imaging.images[] — match the prototype's block shape — added to the lane's marker,
+    // after any images it already lists.
+    let mut all = block["images"].as_array().cloned().unwrap_or_default();
+    all.extend(entries);
+    block["images"] = all.into();
     zip.add_index_metadata("imaging", &block)
         .context("writing metadata.imaging index")?;
     Ok(())

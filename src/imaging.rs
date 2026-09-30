@@ -47,6 +47,8 @@ pub const COUNT_RAISED: &str = "imaging:pixel-count-raised-to-positions";
 /// A scan's position was not a pixel index the `UInt32` columns can hold (x or y missing, not
 /// integral, below 1, above `u32::MAX`): all its position params were removed.
 pub const INVALID_POSITION_DROPPED: &str = "imaging:invalid-position-dropped";
+/// A scan's x and y were pixel indices but its z was not: only the z param was removed.
+pub const INVALID_Z_DROPPED: &str = "imaging:invalid-position-z-dropped";
 
 /// `metadata.imaging.pixel_count_source`: the source stated the counts…
 pub const COUNTS_DECLARED: &str = "declared";
@@ -147,24 +149,31 @@ fn pixel_index(p: &Param) -> bool {
 }
 
 /// Remove every position a scan cannot carry as the profile has it (review 2026-09-30 B12): x and y
-/// must both be pixel indices, and z too when stated. The writer used to narrow each value on its
-/// own, so a negative or out-of-range one became null on ONE axis ("both set or both null") and a 0
-/// was written as 0. Returns `(scans keeping a position, scans whose position was removed)`.
-pub fn drop_invalid_positions(d: &mut mzdata::spectrum::SpectrumDescription) -> (usize, usize) {
-    let (mut kept, mut dropped) = (0, 0);
+/// must both be pixel indices, else x, y and z are removed together; a z that is not one is removed
+/// alone, the scan keeping x and y (`position_z` is optional). The writer used to narrow each value
+/// on its own, so a negative or out-of-range one became null on ONE axis ("both set or both null")
+/// and a 0 was written as 0. Returns `(scans keeping a position, scans whose position was removed,
+/// scans whose z alone was removed)`.
+pub fn drop_invalid_positions(d: &mut mzdata::spectrum::SpectrumDescription) -> (usize, usize, usize) {
+    let (mut kept, mut dropped, mut z_dropped) = (0, 0, 0);
     for sc in d.acquisition.scans.iter_mut() {
         let [x, y, z] = POSITIONS.map(|c| sc.get_param_by_curie(&c).map(pixel_index));
         if x.is_none() && y.is_none() && z.is_none() {
             continue;
         }
-        if x == Some(true) && y == Some(true) && z != Some(false) {
-            kept += 1;
-        } else {
-            sc.params_mut().retain(|p| !p.curie().is_some_and(|c| POSITIONS.contains(&c)));
+        let removed: &[CURIE] = if x != Some(true) || y != Some(true) {
             dropped += 1;
-        }
+            &POSITIONS
+        } else if z == Some(false) {
+            (kept, z_dropped) = (kept + 1, z_dropped + 1);
+            &POSITIONS[2..]
+        } else {
+            kept += 1;
+            continue;
+        };
+        sc.params_mut().retain(|p| !p.curie().is_some_and(|c| removed.contains(&c)));
     }
-    (kept, dropped)
+    (kept, dropped, z_dropped)
 }
 
 /// The grid entry of a scan settings list: the one stating the pixel counts (either axis: an entry
@@ -728,7 +737,8 @@ mod tests {
     const Z: CURIE = mzdata::curie!(IMS:1000052);
 
     /// Review 2026-09-30 B12: a position the `UInt32` columns cannot hold as a pixel index leaves the
-    /// scan whole — x, y and z together — instead of becoming null on one axis.
+    /// scan whole — x, y and z together — instead of becoming null on one axis. A z that is not one
+    /// leaves alone: the scan keeps its x and y.
     #[test]
     fn positions_that_are_not_pixel_indices_are_removed() {
         let mut d = mzdata::spectrum::SpectrumDescription::default();
@@ -742,11 +752,14 @@ mod tests {
             scan(&[(X, "4294967296"), (Y, "2")]),
             scan(&[(X, "2"), other]),
             scan(&[(X, "2"), (Y, "2"), (Z, "0")]),
+            scan(&[(X, "2"), (Y, "3"), (Z, "-1")]),
+            scan(&[(X, "0"), (Y, "2"), (Z, "0")]),
+            scan(&[(Z, "1")]),
             scan(&[other]),
         ];
-        assert_eq!(drop_invalid_positions(&mut d), (2, 6));
-        let left: Vec<usize> = d.acquisition.scans.iter().map(|s| s.params().iter().filter(|p| p.curie().is_some_and(|c| POSITIONS.contains(&c))).count()).collect();
-        assert_eq!(left, [2, 3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(drop_invalid_positions(&mut d), (4, 7, 2));
+        let left: Vec<Vec<CURIE>> = d.acquisition.scans.iter().map(|s| s.params().iter().filter_map(|p| p.curie()).filter(|c| POSITIONS.contains(c)).collect()).collect();
+        assert_eq!(left, [vec![X, Y], vec![X, Y, Z], vec![], vec![], vec![], vec![], vec![], vec![X, Y], vec![X, Y], vec![], vec![], vec![]]);
         assert!(d.acquisition.scans[6].get_param_by_curie(&mzdata::curie!(MS:1000016)).is_some(), "other params stay");
     }
 

@@ -657,22 +657,109 @@ fn a_stated_wavelength_range_wins_over_the_computed_one() {
 /// of a filtered MALDI archive mismatched, review 2026-09-30).
 #[test]
 fn rewritten_members_carry_their_own_checksums() {
-    use sha2::{Digest, Sha512};
     let dir = scratch("checksums");
     let src = convert(TINY, &dir);
     for (tag, extra) in [("ms1", &["--ms-level", "1"][..]), ("rt", &["--rt", "0-1"][..])] {
         let out = dir.join(format!("{tag}.mzpeak"));
         ok(&mzpc(&src, &out, extra));
-        let index: serde_json::Value = serde_json::from_slice(&member(&out, "mzpeak_index.json")).unwrap();
-        let mut checked = 0;
-        for f in index["files"].as_array().unwrap() {
-            let name = f["name"].as_str().unwrap();
-            let Some(want) = f["checksum"]["value"].as_str().or_else(|| f["checksum"].as_str()) else { continue };
-            let got: String = Sha512::digest(member(&out, name)).iter().map(|b| format!("{b:02x}")).collect();
-            assert_eq!(got, want, "{tag}: {name} carries a stale checksum");
-            checked += 1;
-        }
-        assert!(checked >= 5, "{tag}: only {checked} members carry a checksum: {index:#}");
+        let checked = checksums_match(&out, tag);
+        assert!(checked >= 5, "{tag}: only {checked} members carry a checksum");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Assert every member the index gives a checksum carries the SHA-512 of its bytes; how many did.
+fn checksums_match(archive: &Path, tag: &str) -> usize {
+    use sha2::{Digest, Sha512};
+    let index: serde_json::Value = serde_json::from_slice(&member(archive, "mzpeak_index.json")).unwrap();
+    let mut checked = 0;
+    for f in index["files"].as_array().unwrap() {
+        let name = f["name"].as_str().unwrap();
+        let Some(want) = f["checksum"]["value"].as_str().or_else(|| f["checksum"].as_str()) else { continue };
+        let got: String = Sha512::digest(member(archive, name)).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, want, "{tag}: {name} carries a stale checksum");
+        checked += 1;
+    }
+    checked
+}
+
+/// An archive's SDRF replaced (`--drop-aux 'sample_metadata/*' --sdrf new.tsv`) is referenced as
+/// the new file. The source's `study` / `sample_metadata` blocks used to be carried AFTER the
+/// embed, over its blocks: the new member was described by the old file's checksum and accession.
+#[test]
+fn a_replaced_sdrf_is_referenced_as_the_new_file() {
+    use sha2::{Digest, Sha256};
+    let dir = scratch("sdrf-replaced");
+    let (old, new) = (dir.join("old.tsv"), dir.join("new.tsv"));
+    std::fs::write(&old, "source name\tassay name\nS1\tA1\n").unwrap();
+    std::fs::write(&new, "source name\tassay name\nS2\tA2\n").unwrap();
+    let src = dir.join("src.mzpeak");
+    ok(&mzpc(Path::new(TINY), &src, &["--sdrf", old.to_str().unwrap()]));
+    let out = dir.join("out.mzpeak");
+    ok(&mzpc(&src, &out, &["--drop-aux", "sample_metadata/*", "--sdrf", new.to_str().unwrap()]));
+    let bytes = std::fs::read(&new).unwrap();
+    assert_eq!(member(&out, "sample_metadata/sdrf.tsv"), bytes);
+    let m = serde_json::from_slice::<serde_json::Value>(&member(&out, "mzpeak_index.json")).unwrap()["metadata"].clone();
+    let sha: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!((&m["sample_metadata"]["sha256"], &m["study"]["dataset_accession"]), (&serde_json::json!(sha), &serde_json::json!("new")), "{m:#}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A PNG header stating `w`×`h`: all the embed reads.
+fn png(w: u32, h: u32) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png.extend_from_slice(&w.to_be_bytes());
+    png.extend_from_slice(&h.to_be_bytes());
+    png.extend_from_slice(&[8, 2, 0, 0, 0]);
+    png
+}
+
+/// `--image` into an imaging archive: the image is placed on the grid of the source's
+/// `metadata.imaging` marker and joins it. The marker used to be carried only after the embed, so
+/// every `--image` here was refused ("no pixel positions"), and carried after it the source's block
+/// would have replaced the embed's `images[]`. The archive was converted beside its sibling image,
+/// as the HR2MSI corpus runs are: that image is kept, not embedded a second time, and the new one
+/// takes the next member name.
+#[test]
+fn an_image_joins_the_marker_of_an_imaging_archive() {
+    const IMZML: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid");
+    let dir = scratch("image");
+    for ext in ["imzML", "ibd"] {
+        std::fs::copy(format!("{IMZML}.{ext}"), dir.join(format!("grid.{ext}"))).unwrap();
+    }
+    std::fs::write(dir.join("grid-opticalimage.png"), png(8, 4)).unwrap();
+    let src = dir.join("grid.mzpeak");
+    ok(&mzpc(&dir.join("grid.imzML"), &src, &[]));
+    let slide = dir.join("slide.png");
+    std::fs::write(&slide, png(16, 12)).unwrap();
+    let out = dir.join("with.mzpeak");
+    ok(&mzpc(&src, &out, &["--image", slide.to_str().unwrap()]));
+
+    let imaging = |a: &Path| serde_json::from_slice::<serde_json::Value>(&member(a, "mzpeak_index.json")).unwrap()["metadata"]["imaging"].clone();
+    let (was, is) = (imaging(&src), imaging(&out));
+    for key in ["is_imaging", "coordinate_base", "pixel_count", "pixel_count_source", "pixel_size_um", "provenance"] {
+        assert_eq!(was[key], is[key], "{key}: {is:#}");
+    }
+    assert_eq!(was["pixel_count"], serde_json::json!({"x": 3, "y": 3}));
+    let images = is["images"].as_array().unwrap();
+    assert_eq!((images.len(), &images[0]), (2, &was["images"][0]), "{is:#}");
+    assert_eq!(images[1]["archive_path"], "images/image_0001.png");
+    assert_eq!(images[1]["source_name"], "slide.png");
+    let matrix: Vec<f64> = images[1]["affine"]["matrix"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let want = [2.0 / 15.0, 0.0, 1.0, 0.0, 2.0 / 11.0, 1.0];
+    assert!(matrix.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-12), "16×12 onto 3×3: {matrix:?}");
+    assert_eq!(member(&out, "images/image_0000.png"), png(8, 4));
+    assert_eq!(member(&out, "images/image_0001.png"), png(16, 12));
+    assert!(checksums_match(&out, "image") >= 6);
+
+    // Replaced: the dropped image leaves `images[]` with its member (it stayed listed, beside the
+    // new one under the same name).
+    let replaced = dir.join("replaced.mzpeak");
+    ok(&mzpc(&src, &replaced, &["--drop-aux", "images/*", "--image", slide.to_str().unwrap()]));
+    let images = imaging(&replaced)["images"].as_array().unwrap().clone();
+    assert_eq!(images.len(), 1, "{images:#?}");
+    assert_eq!((&images[0]["archive_path"], &images[0]["source_name"]), (&serde_json::json!("images/image_0000.png"), &serde_json::json!("slide.png")));
+    assert_eq!(member(&replaced, "images/image_0000.png"), png(16, 12));
+    assert!(checksums_match(&replaced, "replaced") >= 6);
     let _ = std::fs::remove_dir_all(&dir);
 }

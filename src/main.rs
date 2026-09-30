@@ -1395,7 +1395,8 @@ fn conversion_route_block(route: &str, reader: &str, reason: Option<&str>) -> (S
 /// the enum only exists so the refusal happens BEFORE any reader is opened.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Lane {
-    /// `.mzpeak` input → re-packed `.mzpeak` (RT / MS-level / aux filter, image + SDRF inject).
+    /// `.mzpeak` input → re-packed `.mzpeak` (RT / MS-level / aux filter, SDRF inject, image inject
+    /// into an imaging archive).
     Filter,
     /// `.mzpeak` input → mzML export of the surviving spectra.
     FilterToMzml,
@@ -1438,8 +1439,9 @@ impl Lane {
             ),
             Lane::AgilentGrid => (
                 "the --agilent-grid file-direct lane",
-                "drop them, or drop --agilent-grid; images/SDRF can be added afterwards with a \
-                 second run on the archive (`mzpeak-convert out.mzpeak -o with.mzpeak --sdrf …`)",
+                "drop them, or drop --agilent-grid; an SDRF can be added afterwards with a second \
+                 run on the archive (`mzpeak-convert out.mzpeak -o with.mzpeak --sdrf …`), an image \
+                 cannot: an Agilent run has no pixel positions to place it on",
             ),
             Lane::ViaMsconvert => (
                 "the --via-msconvert lane (the intermediate mzML is the source, so no vendor \
@@ -1449,22 +1451,27 @@ impl Lane {
             Lane::SdkImsCompact => (
                 "the --bruker-sdk ims-compact lane",
                 "drop --bruker-sdk (the native timsTOF lane honours --ims-chunked and \
-                 --no-tims-recalibration), and add images/SDRF with a second run on the archive",
+                 --no-tims-recalibration), and add them with a second run on the archive: \
+                 `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (--image only when \
+                 the archive is imaging, a MALDI run)",
             ),
             Lane::BrukerSdk => (
                 "the --bruker-sdk f64 lane",
-                "drop --bruker-sdk, or drop the options; images/SDRF can be added with a second \
-                 run on the archive",
+                "drop --bruker-sdk, or drop the options; --image/--sdrf can be added with a second \
+                 run on the archive: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` \
+                 (--image only when the archive is imaging, a MALDI run)",
             ),
             Lane::ImsCompact => (
                 "the timsTOF ims-compact lane",
                 "convert first, then add them on the archive: \
-                 `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …`",
+                 `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (--image only when \
+                 the archive is imaging, a MALDI run)",
             ),
             Lane::VendorReader => (
                 "the native vendor-reader lane",
                 "convert first, then add them on the archive: \
-                 `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …`",
+                 `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (--image only when \
+                 the archive is imaging: a Bruker MALDI or Waters imaging run)",
             ),
             Lane::Standard => ("the standard lane", ""),
         }
@@ -4142,21 +4149,22 @@ fn convert_file(
     let mut writer = builder.build(handle, true);
 
     // Positions stated as scan cvParams (imzML, an mzML with positions) are promoted to the
-    // `position_*` columns; the IMS vocabulary is declared after the write, once a position was
-    // written (an imzML's header states IMS terms anyway). A MALDI `.d` goes through
-    // `enable_bruker_imaging` below.
+    // `position_*` columns. Their column mappings name IMS terms, so the IMS vocabulary is declared
+    // with them (conformance rule 3), whether or not a position survives; the marker waits for one.
+    // A MALDI `.d` goes through `enable_bruker_imaging` below.
     let (maldi, scan_positions) = match detected {
         Some(imaging::Detected::BrukerMaldi(m)) => (Some(m), None),
         Some(d) => (None, Some(d)),
         None => (None, None),
     };
     if scan_positions.is_some() {
-        log::info!("imaging input: adding position columns");
+        log::info!("imaging input: adding position columns + IMS cv");
         writer.spectrum_entry_buffer_mut().add_imaging_position_visitors();
         // Position z only when the file states one: a column of nulls on every other archive.
         if stated_z {
             writer.spectrum_entry_buffer_mut().add_imaging_position_z_visitor();
         }
+        writer.controlled_vocabularies_mut().push(ControlledVocabulary::IMS.into());
     }
 
     writer.copy_metadata_from(&reader);
@@ -4248,8 +4256,9 @@ fn convert_file(
     // reader knows the stored point order is not the source's.
     let mut resorted = false;
     let mut extent = imaging::Extent::default();
-    // Scans written with a position, and scans whose position was removed (`drop_invalid_positions`).
-    let (mut positioned, mut unpositioned) = (0usize, 0usize);
+    // Scans written with a position, scans whose position was removed, and scans whose z alone was
+    // (`drop_invalid_positions`).
+    let (mut positioned, mut unpositioned, mut z_removed) = (0usize, 0usize, 0usize);
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
@@ -4297,11 +4306,14 @@ fn convert_file(
             m.attach(&mut entry);
         }
         if scan_positions.is_some() {
-            let (kept, dropped) = imaging::drop_invalid_positions(entry.description_mut());
+            let (kept, dropped, z) = imaging::drop_invalid_positions(entry.description_mut());
             if dropped > 0 && unpositioned == 0 {
-                log::warn!("spectrum {}: a scan position is not a pixel index (x and y integers from 1 to 2^32 − 1); removed", entry.id());
+                log::warn!("spectrum {}: a scan position is not a pixel index (x and y must both be integers from 1 to 2^32 − 1); removed", entry.id());
             }
-            (positioned, unpositioned) = (positioned + kept, unpositioned + dropped);
+            if z > 0 && z_removed == 0 {
+                log::warn!("spectrum {}: a scan's position z is not a pixel index (an integer from 1 to 2^32 − 1); z removed, x and y kept", entry.id());
+            }
+            (positioned, unpositioned, z_removed) = (positioned + kept, unpositioned + dropped, z_removed + z);
             extent.observe(entry.description());
         }
         if let Some(g) = thermo_windows.as_mut() {
@@ -4340,9 +4352,9 @@ fn convert_file(
             log::warn!("{unpositioned} scans stated a position that is not a pixel index; their positions were removed");
             imaging_applied.push(imaging::INVALID_POSITION_DROPPED);
         }
-        // An imzML header states IMS terms (storage mode, grid) whether or not a position survived.
-        if is_imzml || positioned > 0 {
-            writer.controlled_vocabularies_mut().push(ControlledVocabulary::IMS.into());
+        if z_removed > 0 {
+            log::warn!("{z_removed} scans stated a position z that is not a pixel index; their z was removed, x and y kept");
+            imaging_applied.push(imaging::INVALID_Z_DROPPED);
         }
         if positioned == 0 {
             log::warn!("{}: no scan carries a pixel position; the archive is not marked imaging", input.display());
@@ -4355,8 +4367,8 @@ fn convert_file(
             let grid = imaging::grid(list).cloned();
             let provenance = serde_json::json!({
                 "detected_from": if matches!(d, imaging::Detected::ImzML) { "imzML input" } else { "IMS:1000050/51 on the input's scans" },
-                "positions": if unpositioned > 0 {
-                    "IMS:1000050/51 of each spectrum, as stated; positions that are not pixel indices removed"
+                "positions": if unpositioned + z_removed > 0 {
+                    "IMS:1000050/51 of each spectrum, as stated; positions that are not pixel indices removed (a z alone when only it is not)"
                 } else {
                     "IMS:1000050/51 of each spectrum, as stated"
                 },
@@ -11284,6 +11296,21 @@ mod tests {
         assert!(refuse_unsupported_flags(Lane::ImsCompact, &s).is_ok(), "a profile's sdrf must not refuse a lane");
     }
 
+    /// Every lane refusing `--image` names a remedy that works: the second run on the archive, which
+    /// takes an image into an imaging archive only (tests/filter_lane.rs), or none where the run
+    /// cannot be imaging. They used to prescribe `--image` on any archive, when the filter lane
+    /// refused it on every one.
+    #[test]
+    fn image_refusals_name_a_remedy_that_works() {
+        for lane in [Lane::AgilentGrid, Lane::SdkImsCompact, Lane::BrukerSdk, Lane::ImsCompact, Lane::VendorReader] {
+            assert!(super::dropped_flags_for(lane).contains(&"--image"), "{lane:?}");
+            let (_, remedy) = lane.describe();
+            let second_run = remedy.contains("-o with.mzpeak --image … --sdrf …`");
+            assert!(second_run == remedy.contains("--image only when the archive is imaging"), "{lane:?}: {remedy}");
+            assert!(second_run || remedy.contains("an image cannot"), "{lane:?}: {remedy}");
+        }
+    }
+
     /// `--ims-chunked` shapes only the timsTOF ims-compact archive. When that lane falls back to the
     /// mzdata (standard) lane on a TDF timsrust cannot decompress, it re-checks the flags against
     /// the standard lane, which lists it as inert: a warning, not a refusal, and not silence.
@@ -11803,7 +11830,8 @@ mod tests {
     /// Review 2026-09-30 B11: positions stated only on spectra the six probes skip (201 spectra,
     /// probes every 33rd) are found by the full-input search: the columns, the grid counted from
     /// them into a scan settings entry the input did not have, the marker, the IMS entry. When no
-    /// stated position is a pixel index, nothing is marked imaging.
+    /// stated position is a pixel index, nothing is marked imaging, but the IMS entry stays: the
+    /// position columns' mappings name IMS terms (conformance rule 3).
     #[test]
     fn positions_beyond_the_probes_are_found() {
         let dir = scratch("unsampled-positions");
@@ -11822,14 +11850,18 @@ mod tests {
         let set: Vec<(usize, (Option<u32>, Option<u32>))> = rows.into_iter().enumerate().filter(|(_, r)| r.0.is_some() || r.1.is_some()).collect();
         assert_eq!(set, [(1, (Some(4), Some(1))), (2, (Some(5), Some(2)))]);
 
-        // Stated, but not one of them a pixel index: removed and declared, no marker, no IMS entry.
+        // Stated, but not one of them a pixel index: removed and declared, no marker; the empty
+        // columns' IMS mappings keep the IMS entry.
         let src = swath_variant(&dir, "invalid", "", |k| if k == 1 { position(0, 1) } else { String::new() });
         let out = dir.join("invalid.mzpeak");
         let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
         assert!(ok, "{err}");
         let m = index_metadata(&out);
         assert!(m.get("imaging").is_none(), "{:#}", m["imaging"]);
-        assert!(!m["cv_list"].to_string().contains("\"IMS\""), "{:#}", m["cv_list"]);
+        let mut index = String::new();
+        zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap().by_name("mzpeak_index.json").unwrap().read_to_string(&mut index).unwrap();
+        assert!(index.contains(r#""accession":"IMS:1000050""#) || index.contains(r#""accession": "IMS:1000050""#), "{index}");
+        assert_eq!(m["cv_list"].as_array().unwrap().iter().filter(|c| c["id"] == "IMS").count(), 1, "{:#}", m["cv_list"]);
         assert!(m["transformations"].to_string().contains(super::imaging::INVALID_POSITION_DROPPED), "{:#}", m["transformations"]);
         assert!(scan_positions(&out).unwrap().iter().all(|r| *r == (None, None)));
         let _ = fs::remove_dir_all(&dir);
@@ -11912,6 +11944,20 @@ mod tests {
         let rows = scan_positions(&bad).unwrap();
         assert_eq!(&rows[..5], [(None, None), (None, None), (None, None), (None, None), (Some(2), Some(2))]);
 
+        // A z that is no pixel index (0, −1) on every scan: only z goes, the run stays imaging.
+        let z = (1..=3).fold(base.clone(), |t, v| {
+            let y = format!(r#"<cvParam cvRef="IMS" accession="IMS:1000051" name="position y" value="{v}"/>"#);
+            t.replace(&y, &format!(r#"{y}<cvParam cvRef="IMS" accession="IMS:1000052" name="position z" value="{}"/>"#, v as i64 - 2))
+        });
+        let z = convert("z", z);
+        let m = index_metadata(&z);
+        let applied = m["transformations"].to_string();
+        assert!(applied.contains(super::imaging::INVALID_Z_DROPPED) && !applied.contains(super::imaging::INVALID_POSITION_DROPPED), "{applied}");
+        assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 3, "y": 3}), "{:#}", m["imaging"]);
+        assert!(scan_positions(&z).unwrap().iter().all(|r| r.0.is_some() && r.1.is_some()));
+        let zs = scan_position_z(&z).expect("a position_z column");
+        assert_eq!((zs.len(), zs.iter().flatten().count()), (9, 3), "z = 1 on row y = 3 is a pixel index: {zs:?}");
+
         let beyond = convert("beyond", with(&[at(8, "5", "3")]));
         let m = index_metadata(&beyond);
         assert!(m["transformations"].to_string().contains(super::imaging::COUNT_RAISED), "{:#}", m["transformations"]);
@@ -11966,10 +12012,12 @@ mod tests {
         let img = &index_metadata(&out)["imaging"];
         assert_eq!((&img["images"][0]["archive_path"], &img["pixel_count_source"]), (&serde_json::json!("images/image_0000.png"), &serde_json::json!("declared")), "{img:#}");
 
-        // The filter lane cannot add one yet (its marker is carried after the embed): refused, but
-        // not with a claim that this imaging archive has no positions.
-        let (ok, _, err) = run_bin(&[out.as_os_str(), "-o".as_ref(), dir.join("re.mzpeak").as_os_str(), "--force".as_ref(), "--image".as_ref(), image.as_os_str()], &[]);
-        assert!(!ok && err.contains("existing archive") && !err.contains("no pixel positions"), "{err}");
+        // The filter lane holds to the same: an archive with no marker takes no image (an imaging
+        // one does, tests/filter_lane.rs).
+        let re = dir.join("re.mzpeak");
+        let (ok, _, err) = run_bin(&[dir.join("sibling.mzpeak").as_os_str(), "-o".as_ref(), re.as_os_str(), "--force".as_ref(), "--image".as_ref(), image.as_os_str()], &[]);
+        assert!(!ok && err.contains("carries no pixel positions"), "{err}");
+        assert!(!re.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }
