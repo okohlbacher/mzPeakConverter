@@ -14,8 +14,9 @@
 //!   `ImzMLFileMetadata` and leaves them out of `file_description`; [`provenance_params`] puts them
 //!   back from the header ([`read_file_content`]), values as stated.
 //!
-//! mzdata keeps a unit by its accession only, so the unit NAME the file states — needed to see an
-//! accession/name disagreement — is read from the header here ([`read_scan_settings`]).
+//! mzdata keeps one unit per param (the name's when it knows the name, else the accession's), so
+//! the unit accession AND name the file states — needed to see a disagreement — are read from the
+//! header here ([`read_scan_settings`]).
 //!
 //! **Which runs are imaging** is decided by [`detect`], the one detector every lane calls: imzML
 //! input always; a Bruker `.d` with `MaldiFrameInfo` positions; any other input whose spectra state
@@ -35,8 +36,8 @@ pub const UNIT_ASSUMED: &str = "imzml:pixel-size-unit-assumed-um";
 pub const AREA_TO_LENGTH: &str = "imzml:pixel-size-area-to-length";
 pub const DROPPED: &str = "imzml:pixel-size-dropped";
 pub const ONE_WAY_AS_FLYBACK: &str = "imzml:one-way-as-flyback";
-/// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes whichever of
-/// `unitAccession` / `unitName` comes last, so a disagreeing pair resolves by attribute order).
+/// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes the
+/// `unitName` when it names a unit mzdata knows, whatever the attribute order).
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
 /// The input states positions but no pixel counts: `IMS:1000042/43` are the largest positions.
 pub const COUNT_FROM_POSITIONS: &str = "imaging:pixel-count-from-positions";
@@ -291,6 +292,19 @@ fn normalized_unit_name(name: &str) -> String {
     name.trim().to_lowercase().replace("metre", "meter").replace("µm", "micrometer").replace("μm", "micrometer")
 }
 
+/// The unit a param is written in: its unit NAME's when mzdata knows the name — mzdata lets a known
+/// name override the accession, whatever the attribute order — else its unit accession as stated.
+/// The pixel-size rule tests and keeps this unit, so a tested value is written in the unit it
+/// passed in (review 2026-09-30: tested by accession, a centimetre accession named "micrometer"
+/// passed as 0.01 cm and was written as 0.01 µm).
+///
+/// ponytail: an accession mzdata does not know (metre, UO:0000008) counts as stated, though mzdata
+/// writes that param without a unit; no corpus imzML states one.
+fn written_unit(q: &RawParam) -> Option<String> {
+    let by_name = q.unit_name.as_deref().and_then(|n| Unit::from_name(n).to_curie());
+    by_name.map(|c| c.to_string()).or_else(|| q.unit_accession.clone())
+}
+
 /// What the pixel-size rule did to one `<scanSettings>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PixelSizeFix {
@@ -302,10 +316,9 @@ pub struct PixelSizeFix {
     /// Pixel sizes to write: accession (`IMS:1000046`/`47`), value, and whether its unit is set to
     /// micrometre. An accession absent here is removed.
     pub write: Vec<(&'static str, f64, bool)>,
-    /// The unit accession each `write` value is in: micrometre where set, else as the file states it
+    /// The unit accession each `write` value is in: micrometre where set, else [`written_unit`]'s
     /// (an area's root keeps a stated length unit, so the values are not all µm) — until
-    /// [`check_written_units`] replaces it by the unit actually written, which differs where the
-    /// stated accession and name disagree.
+    /// [`check_written_units`] replaces it by the unit the writer's param actually carries.
     pub write_units: Vec<Option<String>>,
     /// Unit accession/name disagreements seen on the pixel-size and extent params.
     pub unit_mismatches: Vec<String>,
@@ -354,7 +367,7 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
         transformation,
         write_units: write
             .iter()
-            .map(|&(a, _, um)| if um { Some("UO:0000017".into()) } else { get(a).and_then(|p| p.unit_accession.clone()) })
+            .map(|&(a, _, um)| if um { Some("UO:0000017".into()) } else { get(a).and_then(written_unit) })
             .collect(),
         write,
         unit_mismatches: unit_mismatches.clone(),
@@ -369,14 +382,15 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
             let (Some(vx), Some(vy)) = (num(PIXEL_X), num(PIXEL_Y)) else {
                 return Some(fix("x and y not numeric", Some(DROPPED), vec![], format!("x={:?} y={:?}", px.value, py.value)));
             };
-            if px.unit_accession.is_some() && py.unit_accession.is_some() {
+            let (ux, uy) = (written_unit(px), written_unit(py));
+            if ux.is_some() && uy.is_some() {
                 Some(fix("x and y with a unit", None, vec![(PIXEL_X, vx, false), (PIXEL_Y, vy, false)], String::new()))
                     .filter(|f| !f.unit_mismatches.is_empty())
             } else {
                 Some(fix(
                     "x and y without a unit: micrometre assumed",
                     Some(UNIT_ASSUMED),
-                    vec![(PIXEL_X, vx, px.unit_accession.is_none()), (PIXEL_Y, vy, py.unit_accession.is_none())],
+                    vec![(PIXEL_X, vx, ux.is_none()), (PIXEL_Y, vy, uy.is_none())],
                     format!("x={vx} y={vy}"),
                 ))
             }
@@ -403,11 +417,11 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
                     format!("{acc}={v}; no pixel count and max dimension to test it against"),
                 ));
             };
-            // Value and extent compared in µm, each by its unit accession (B17: the units were
+            // Value and extent compared in µm, each in the unit it is written in (B17: the units were
             // ignored); a param without a known length unit is tested as µm, and the detail says so.
             let mut assumed = Vec::new();
             let mut unit = |q: &RawParam| {
-                q.unit_accession.as_deref().and_then(length_unit).unwrap_or_else(|| {
+                written_unit(q).as_deref().and_then(length_unit).unwrap_or_else(|| {
                     assumed.push(q.accession.clone());
                     ("micrometer", 1.0)
                 })
@@ -428,7 +442,7 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
             } else if approx(v * v_size * count, extent_um) {
                 // A stated unit stays even when it is no length, as in the two-value case:
                 // micrometre is written only where none is stated.
-                let unit_assumed = p.unit_accession.is_none();
+                let unit_assumed = written_unit(p).is_none();
                 Some(fix(
                     "one value: a length (value × count = extent)",
                     unit_assumed.then_some(UNIT_ASSUMED),
@@ -761,6 +775,34 @@ mod tests {
         assert_eq!(units, ["UO:0000017", "UO:0000017"]);
         let fine = Some(("UO:0000017", "micrometre"));
         assert_eq!(pixel_size_fix(&settings(&[("IMS:1000046", "50", fine), ("IMS:1000047", "50", fine)])), None);
+    }
+
+    /// Review 2026-09-30: a single value is tested in the unit mzdata writes it in — the unit
+    /// name's when mzdata knows the name — not by its accession, so what passes is written as it
+    /// passed. The extent is 3 px × 300 µm throughout.
+    #[test]
+    fn one_value_is_tested_in_the_unit_it_is_written_in() {
+        let one_y = |v: &str, unit: Option<(&str, &str)>| {
+            pixel_size_fix(&settings(&[("IMS:1000047", v, unit), ("IMS:1000043", "3", None), ("IMS:1000045", "300", UM)])).unwrap()
+        };
+        let cm_named_um = Some(("UO:0000015", "micrometer"));
+        // Written as 100 µm: a length. By accession (100 cm) it was dropped.
+        let kept = one_y("100", cm_named_um);
+        assert_eq!((kept.transformation, kept.write.clone(), kept.write_units.clone()), (None, vec![(PIXEL_Y, 100.0, false)], vec![Some("UO:0000017".into())]));
+        // Written as 0.01 µm: dropped. By accession (0.01 cm × 3 = 300 µm) it passed and was
+        // written as 0.01 µm.
+        assert_eq!(one_y("0.01", cm_named_um).transformation, Some(DROPPED));
+        // The micrometre accession named "millimeter" is written as mm: 100 mm is no 100 µm pixel.
+        assert_eq!(one_y("100", Some(("UO:0000017", "millimeter"))).transformation, Some(DROPPED));
+        // A unit stated by its name alone is a unit: 0.1 mm, kept in mm, nothing assumed.
+        let mut s = settings(&[("IMS:1000047", "0.1", Some(("", "millimeter"))), ("IMS:1000043", "3", None), ("IMS:1000045", "300", UM)]);
+        s.params[0].unit_accession = None;
+        let by_name = pixel_size_fix(&s).unwrap();
+        assert_eq!((by_name.transformation, by_name.write.clone(), by_name.write_units), (None, vec![(PIXEL_Y, 0.1, false)], vec![Some("UO:0000016".into())]));
+        // So is it for x and y: kept as stated, no micrometre over it.
+        let mut xy = settings(&[("IMS:1000046", "0.1", Some(("", "millimeter"))), ("IMS:1000047", "0.1", Some(("", "millimeter")))]);
+        xy.params.iter_mut().for_each(|p| p.unit_accession = None);
+        assert_eq!(pixel_size_fix(&xy), None);
     }
 
     #[test]

@@ -11528,7 +11528,7 @@ mod tests {
         // The centimetre accession labelled micrometer: reported, not rewritten.
         let cm = |l: &str| l.replace("UO:0000017", "UO:0000015");
         let m = convert("cm", base.replace(px, &cm(px)).replace(py, &cm(py)));
-        // mzdata takes the unit from whichever attribute comes last (here the name): the archive
+        // mzdata takes the unit from the name when it knows the name, whatever the order: the archive
         // says which unit it wrote, and declares that it is not the stated accession.
         assert_eq!(m["imaging_pixel_size"][0]["unit_mismatches"].as_array().unwrap().len(), 2, "{:#}", m["imaging_pixel_size"]);
         let written = param(&m["scan_settings_list"][0], "IMS:1000046").unwrap()["unit"].clone();
@@ -11540,6 +11540,17 @@ mod tests {
         for row in rows {
             let acc = row["accession"].as_str().unwrap();
             assert_eq!(row["unit"], param(&m["scan_settings_list"][0], acc).unwrap()["unit"], "{acc}: {:#}", m["imaging_pixel_size"]);
+        }
+        // A single y in that unit pair is tested in the unit written (µm): 100 × 3 = 300 µm is kept,
+        // 0.01 is dropped — by accession it passed as 0.01 cm and was written as 0.01 µm.
+        for (name, value, kept) in [("cm_y", "100.0", true), ("cm_y_small", "0.01", false)] {
+            let m = convert(name, base.replace(px, "").replace(py, &cm(py).replace("100.0", value)));
+            let written = param(&m["scan_settings_list"][0], "IMS:1000047");
+            assert_eq!(written.is_some(), kept, "{name}: {:#}", m["imaging_pixel_size"]);
+            assert_eq!(declared(&m, super::imaging::DROPPED), !kept, "{name}: {:#}", m["transformations"]);
+            if let Some(w) = written {
+                assert_eq!((&w["value"], &w["unit"]), (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}");
+            }
         }
 
         // "one way" becomes flyback; a stated position z gets a column.
