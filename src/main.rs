@@ -6085,15 +6085,11 @@ fn convert_shimadzu(
     // implementation's fitted linear grid (`lattice_fit_grid_policy`; the same treatment the mzML
     // lane gives the LabSolutions export of these files). `--no-mz-lattice` (config `no_mz_lattice`,
     // `$MZPC_NO_MZ_LATTICE`) keeps f64 m/z here too, so the flag means the same thing on every lane.
-    if chunk.is_some() && rep != shimadzu::Representation::Profile && mz_lattice_enabled() {
+    let lattice = chunk.is_some() && rep != shimadzu::Representation::Profile && mz_lattice_enabled();
+    if lattice {
         hints.peak_grid = Some(lattice_fit_grid_policy());
-        hints.transformations.push(GRID_FIT_TRANSFORMATION.to_string());
-        if shimadzu_grid::coarse_mz_requested() {
-            // The coarse 1e-4 `Mass` field was read instead of `MassHigh`: a 100× coarser value,
-            // declared so the archive names the field the glue actually read.
-            hints.transformations.push("shimadzu:coarse-mz".to_string());
-        }
     }
+    hints.transformations.extend(shimadzu_mz_transformations(lattice, shimadzu_grid::coarse_mz_requested()));
     // The per-facet totals ("N spectra on the sqrt grid") are counted by
     // `convert_vendor_reader` over the written spectra and logged there (`FacetTally::report`);
     // this closure only reports each spectrum's route.
@@ -6288,6 +6284,25 @@ fn shimadzu_model_term(model: &str) -> Param {
         .max_by_key(|t| t.name.len())
         .map(|t| Param::builder().name(t.name.as_ref()).curie(t.curie()).build())
         .unwrap_or_else(|| run_metadata::term_str(1000124, "Shimadzu instrument model", model))
+}
+
+/// The m/z transformations the native Shimadzu lane declares: the fitted centroid grid when the
+/// lattice is armed, and the coarse 1e-4 `Mass` field (a 100× coarser value than `MassHigh`)
+/// whenever the glue read it. `Glue.cs` (`DecideMassScale`) reads `Mass` on the env var alone, for
+/// profile and centroids, under any layout and lattice setting, so the declaration depends on
+/// nothing else; it once sat inside the lattice guard and went missing under `--layout point`,
+/// `--no-mz-lattice` and `--representation profile` (review 2026-09-30 §E). Host-independent so it
+/// is testable anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shimadzu_mz_transformations(lattice: bool, coarse_mz: bool) -> Vec<String> {
+    let mut declared = Vec::new();
+    if lattice {
+        declared.push(GRID_FIT_TRANSFORMATION.to_string());
+    }
+    if coarse_mz {
+        declared.push("shimadzu:coarse-mz".to_string());
+    }
+    declared
 }
 
 /// Instrument configuration from what the vendor API states — and only that. `SystemName()` is the
@@ -9416,6 +9431,17 @@ mod tests {
         let family = |value: &str| (Some("MS:1000124".to_string()), "Shimadzu instrument model".to_string(), value.to_string());
         assert_eq!(term("LCMS-90300"), family("LCMS-90300"));
         assert_eq!(term("neo-ms"), family("neo-ms"));
+    }
+
+    /// The coarse `Mass` read is declared whatever the lattice does: under `--layout point`,
+    /// `--no-mz-lattice` or a profile-only run the glue still reads it.
+    #[test]
+    fn shimadzu_coarse_mz_is_declared_without_the_lattice() {
+        let t = super::shimadzu_mz_transformations;
+        assert_eq!(t(false, true), ["shimadzu:coarse-mz"]);
+        assert_eq!(t(true, true), [super::GRID_FIT_TRANSFORMATION, "shimadzu:coarse-mz"]);
+        assert_eq!(t(true, false), [super::GRID_FIT_TRANSFORMATION]);
+        assert!(t(false, false).is_empty());
     }
 
     /// A DUAL scan (gridded profile in the data facet + a centroid `PeakSet` alongside) states a
