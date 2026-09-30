@@ -26,6 +26,10 @@
 # On every invocation the box converter is brought to the newest RELEASE TAG before any job runs
 # (BOX_AUTOUPDATE=1|check|0, BOX_CONVERTER_VERSION=vX.Y.Z, BOX_REQUIRE_VERSION=1 to abort if stale).
 #
+# Each job's JSON goes to the box as a FILE (scp), and each job runs under a wall-clock cap,
+# BOX_JOB_TIMEOUT seconds (default 21600); the box's stderr for a job is kept in
+# ${TMPDIR:-/tmp}/bxc-<uuid>.stderr and its tail printed when the job fails.
+#
 # The raw is pulled from its URL ON THE BOX, converted in an isolated temp dir, and the .mzpeak is
 # relayed through S3 (box uploads via a presigned PUT; host downloads, verifies size+md5, deletes).
 # Config (env or a gitignored tools/box.env): BOX_SSH BOX_JUMP BOX_SSH_KEY [BOX_CONVERTER]
@@ -93,12 +97,24 @@ trap 'cleanup; trap - EXIT; exit 143' TERM
 
 uuid(){ python3 -c 'import uuid;print(uuid.uuid4().hex)'; }
 
+scp_up(){  # local remote-path -> copy a small file to the box, never hanging
+  # scp has no timeout: on 2026-09-30 stage_remote's upload sat for 2 h 17 min on a stalled link. A
+  # keepalive cut-off ends a dead connection, the wall-clock cap (BOX_SCP_TIMEOUT, default 300 s) a
+  # live one that makes no progress.
+  scp -q -i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o "$PROXY" \
+      "$1" "$BOX_SSH:$2" </dev/null >/dev/null 2>&1 & local p=$!
+  ( sleep "${BOX_SCP_TIMEOUT:-300}"; kill -TERM "$p" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
+  wait "$p"; local rc=$?
+  kill "$w" 2>/dev/null; pkill -P "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  return $rc
+}
+
 stage_remote(){  # push the current remote scripts once (idempotent)
   # Both, always: host and box logic must never drift apart.
   local f
   for f in box_convert_remote.ps1 box_update_remote.ps1; do
-    scp -i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o "$PROXY" \
-      "$here/$f" "$BOX_SSH:C:\\Users\\User\\$f" >/dev/null 2>&1 \
+    scp_up "$here/$f" "C:\\Users\\User\\$f" \
       || { echo "FATAL: could not stage $f to the box" >&2; return 1; }
   done
 }
@@ -262,12 +278,34 @@ if d:
 print(json.dumps(j))
 PY
 )"
-  local resp
-  resp="$(printf '%s' "$job" | "${SSH[@]}" "$BOX_SSH" \
-            "powershell -NoProfile -ExecutionPolicy Bypass -File $REMOTE_PS" 2>/dev/null)"
+  # The job reaches the box as a FILE, not on ssh's stdin: from some networks the piped stdin never
+  # arrives, and the box's ReadToEnd() then waited forever with no watchdog to end it (2026-09-29/30:
+  # every job of a corpus rebuild hung). The JSON carries presigned URLs, so the host copy is private
+  # (mktemp, removed at once), the box copy is randomly named in the per-user temp dir, and the box
+  # script deletes it the moment it has read it.
+  local jobfile rjob errlog resp rc
+  jobfile="$(mktemp "${TMPDIR:-/tmp}/bxc-job.XXXXXX")" || { echo "[$tag] FAIL: mktemp" >&2; return 1; }
+  printf '%s' "$job" > "$jobfile"
+  rjob="C:\\Users\\User\\AppData\\Local\\Temp\\bxc-job-$uid-${jobfile##*.}.json"
+  if ! scp_up "$jobfile" "$rjob"; then
+    rm -f "$jobfile"; echo "[$tag] FAIL: could not copy the job to the box (scp)" >&2; return 1
+  fi
+  rm -f "$jobfile"
+  # Bounded: a hung download, conversion or upload used to hang the whole pool.
+  errlog="${TMPDIR:-/tmp}/bxc-$uid.stderr"
+  resp="$(ssh_watchdog "${BOX_JOB_TIMEOUT:-21600}" \
+            "powershell -NoProfile -ExecutionPolicy Bypass -File $REMOTE_PS -JobFile $rjob" 2>"$errlog")"; rc=$?
   local b64
   b64="$(printf '%s\n' "$resp" | sed -n '/<<<BOXRESULT/,/BOXRESULT>>>/p' | sed '1d;$d' | tr -d '\r\n ')"
-  [ -z "$b64" ] && { echo "[$tag] FAIL: no result from box (ssh/powershell)" >&2; return 1; }
+  if [ -z "$b64" ]; then
+    case "$rc" in
+      143|137) echo "[$tag] FAIL: no result from box within BOX_JOB_TIMEOUT=${BOX_JOB_TIMEOUT:-21600} s" >&2 ;;
+      *) echo "[$tag] FAIL: no result from box (ssh/powershell, exit $rc)" >&2 ;;
+    esac
+    [ -s "$errlog" ] && { echo "[$tag] box stderr ($errlog):" >&2; tail -n 5 "$errlog" | sed "s/^/[$tag]   /" >&2; }
+    return 1
+  fi
+  [ -s "$errlog" ] || rm -f "$errlog"
   # decode base64(json) -> one scalar field PER LINE (newline-delimited preserves empty fields,
   # which a tab/whitespace-IFS read would collapse). uploaded normalised to 1/0; values stripped of
   # CR/LF/TAB so each is exactly one line.
@@ -597,8 +635,8 @@ local_job(){  # local-path out opts — stage a LOCAL unit to S3, convert via it
   return $rc
 }
 
-run_pool(){  # manifest job_fn jobs — bounded FIFO pool over path/url<TAB>out<TAB>opts lines
-  local mf="$1" fn="$2" jobs="$3" pids=() fails=0 a out opts
+run_pool(){  # manifest job_fn jobs — bounded pool over path/url<TAB>out<TAB>opts lines
+  local mf="$1" fn="$2" jobs="$3" pids=() fails=0 a out opts i reaped
   while IFS=$'\t' read -r a out opts || [ -n "$a" ]; do
     case "$a" in ''|'#'*) continue;; esac
     [ -z "$out" ] && { echo "skip: manifest line missing out_path for $a" >&2; continue; }
@@ -607,7 +645,19 @@ run_pool(){  # manifest job_fn jobs — bounded FIFO pool over path/url<TAB>out<
     # over the 5 GiB ceiling took the scp path and silently swallowed manifest lines 13-22 —
     # 10 archives never converted, and run_pool still reported "0 job(s) failed".
     "$fn" "$a" "$out" "$opts" </dev/null & pids+=("$!")
-    if [ "${#pids[@]}" -ge "$jobs" ]; then wait "${pids[0]}" || fails=$((fails+1)); pids=("${pids[@]:1}"); fi
+    # A slot frees when ANY job ends. Waiting on the oldest kept the other slots idle behind one
+    # long unit (0.15.0 rebuild). ponytail: polls every 2 s — bash 3.2 (/bin/bash on macOS) has no
+    # `wait -n`.
+    while [ "${#pids[@]}" -ge "$jobs" ]; do
+      reaped=
+      for i in "${!pids[@]}"; do
+        if ! kill -0 "${pids[$i]}" 2>/dev/null; then
+          wait "${pids[$i]}" || fails=$((fails+1))
+          unset "pids[$i]"; pids=(${pids[@]+"${pids[@]}"}); reaped=1; break
+        fi
+      done
+      [ -n "$reaped" ] || sleep 2
+    done
   done < "$mf"
   for p in ${pids[@]+"${pids[@]}"}; do wait "$p" || fails=$((fails+1)); done
   echo "manifest done: $fails job(s) failed" >&2

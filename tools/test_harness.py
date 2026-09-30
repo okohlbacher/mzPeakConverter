@@ -259,8 +259,9 @@ class BoxScripts(unittest.TestCase):
 
 # ---- box_convert.sh ---------------------------------------------------------------------------
 # Its functions run in a bash with every network edge replaced: `box` answers the ssh call with a
-# canned BOXRESULT (and records Remove-Item calls), `relay` stands in for s3_relay.py, and `scp`
-# copies a local file.
+# canned BOXRESULT (and records Remove-Item calls; BOX_HANG=<s> makes it hang first), `relay` stands
+# in for s3_relay.py, and `scp` either takes a job file up to the box (kept as $T/job.json) or
+# copies a local file down.
 DRIVER = r"""
 set -uo pipefail
 RELAY=(relay); SSH=(box)
@@ -276,10 +277,17 @@ box(){
   shift
   case "$*" in
     *Remove-Item*) printf '%s\n' "$*" >> "$T/removed" ;;
-    *) cat > "$T/job.json"; printf '<<<BOXRESULT\n%s\nBOXRESULT>>>\n' "$RESULT_B64" ;;
+    *) printf '%s\n' "$*" >> "$T/remote"; [ -n "${BOX_HANG:-}" ] && exec sleep "$BOX_HANG"  # one process, like ssh
+       printf '<<<BOXRESULT\n%s\nBOXRESULT>>>\n' "$RESULT_B64" ;;
   esac
 }
-scp(){ printf '%s\n' "${@: -2:1}" >> "$T/scp"; cp "$FAKE_OBJECT" "${@: -1}"; }
+scp(){
+  [ -n "${SCP_HANG:-}" ] && exec sleep "$SCP_HANG"
+  case "${@: -1}" in
+    *@*:*) cp "${@: -2:1}" "$T/job.json"; printf '%s\n' "${@: -1}" >> "$T/scp_up" ;;
+    *) printf '%s\n' "${@: -2:1}" >> "$T/scp"; cp "$FAKE_OBJECT" "${@: -1}" ;;
+  esac
+}
 BOX_SSH=user@box BOX_SSH_KEY=/dev/null PROXY=ProxyCommand=true REMOTE_PS='C:\box_convert_remote.ps1'
 ARCHIVE=false PUT_EXPIRES=60 CORPUS_ROOT="$T/corpus" PENDING_DIR="$T/pending" FETCH_LIST="$T/fetch"
 mkdir -p "$PENDING_DIR"
@@ -321,9 +329,38 @@ class BoxJob(Shell):
         (self.tmp / "object").write_bytes(obj)
         result = {"stage": "done", "exit": 0, "uploaded": True, "size": len(obj),
                   "md5": hashlib.md5(obj).hexdigest(), "error": "", "note": "", **result}
-        script = DRIVER + shell_functions("pull_held", "run_job") + '\nrun_job raw "$OUT" "$OPTS" box-convert/k.mzpeak 0123abcd; echo "rc=$?"\n'
-        return self.bash(script, **env, FAKE_OBJECT=str(self.tmp / "object"), OUT=out, OPTS=opts,
-                         RESULT_B64=base64.b64encode(json.dumps(result).encode()).decode())
+        script = DRIVER + shell_functions("pull_held", "scp_up", "ssh_watchdog", "run_job") + '\nrun_job raw "$OUT" "$OPTS" box-convert/k.mzpeak 0123abcd; echo "rc=$?"\n'
+        (self.tmp / "tmp").mkdir(exist_ok=True)
+        return self.bash(script, **{"TMPDIR": str(self.tmp / "tmp"), **env}, FAKE_OBJECT=str(self.tmp / "object"),
+                         OUT=out, OPTS=opts, RESULT_B64=base64.b64encode(json.dumps(result).encode()).decode())
+
+    def test_the_job_goes_to_the_box_as_a_file(self):
+        # ssh's stdin never reached the box from some networks, and ReadToEnd() waited forever.
+        rc, log = self.run_job({}, str(self.tmp / "run.mzpeak"), "--no-vendor")
+        self.assertEqual(rc, 0, log)
+        job = json.loads((self.tmp / "job.json").read_text())
+        self.assertEqual(job["put_url"], "https://relay.invalid/put")
+        (dst,) = (self.tmp / "scp_up").read_text().splitlines()
+        self.assertRegex(dst, r"^user@box:C:\\Users\\User\\AppData\\Local\\Temp\\bxc-job-0123abcd-\w+\.json$")
+        self.assertIn(f"-JobFile {dst.split(':', 1)[1]}", (self.tmp / "remote").read_text())
+        self.assertEqual(list((self.tmp / "tmp").iterdir()), [], "the host copy (presigned URLs) is removed")
+
+    def test_a_stalled_job_upload_fails_instead_of_hanging(self):
+        import time
+        t0 = time.monotonic()
+        rc, log = self.run_job({}, str(self.tmp / "run.mzpeak"), "--no-vendor", SCP_HANG="60", BOX_SCP_TIMEOUT="2")
+        self.assertEqual(rc, 1, log)
+        self.assertIn("could not copy the job to the box", log)
+        self.assertLess(time.monotonic() - t0, 30)
+        self.assertEqual(list((self.tmp / "tmp").iterdir()), [], "the host copy is removed on failure too")
+
+    def test_a_job_that_hangs_is_ended_by_the_watchdog(self):
+        import time
+        t0 = time.monotonic()
+        rc, log = self.run_job({}, str(self.tmp / "run.mzpeak"), "--no-vendor", BOX_HANG="60", BOX_JOB_TIMEOUT="2")
+        self.assertEqual(rc, 1, log)
+        self.assertIn("no result from box within BOX_JOB_TIMEOUT=2 s", log)
+        self.assertLess(time.monotonic() - t0, 30)
 
     def test_the_bench_row_names_the_options_that_ran(self):
         out, bench = self.tmp / "run.mzpeak", self.tmp / "bench.tsv"
@@ -360,6 +397,23 @@ class BoxJob(Shell):
         self.assertEqual(rc, 1, log)
         self.assertNotIn("hold_oversize", json.loads((self.tmp / "job.json").read_text()))
         self.assertFalse((self.tmp / "scp").exists())
+
+
+class Pool(Shell):
+    def test_a_slot_frees_when_any_job_ends(self):
+        # The pool used to wait on its OLDEST job, so one long unit kept the other slots idle.
+        mf = self.tmp / "jobs.tsv"
+        mf.write_text("slow\tout0\n" + "".join(f"quick{i}\tout{i}\n" for i in range(1, 5)))
+        script = shell_functions("run_pool") + r"""
+job(){ date +%s.%N > "$T/start-$1" 2>/dev/null || python3 -c 'import time;print(time.time())' > "$T/start-$1"
+       case "$1" in slow) sleep 8 ;; *) sleep 1 ;; esac
+       python3 -c 'import time;print(time.time())' > "$T/end-$1"; }
+run_pool "$MF" job 2; echo "rc=$?"
+"""
+        rc, log = self.bash(script, MF=str(mf))
+        self.assertEqual(rc, 0, log)
+        t = lambda kind, name: float((self.tmp / f"{kind}-{name}").read_text().strip().replace("N", "0"))
+        self.assertLess(t("start", "quick4"), t("end", "slow"), "quick4 waited for the slow job")
 
 
 class SyncBox(Shell):
