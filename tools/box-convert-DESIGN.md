@@ -43,7 +43,8 @@ JSON crosses the SSH channel.
    `s3_relay delete` (trap). `xargs -P`/bounded fan-out for `--jobs`.
 
 ## Config (no secrets, no institutional names committed)
-Sourced from env or a gitignored `tools/box.env` if present:
+Sourced from env or a gitignored `tools/box.env` if present (a git worktree, which has none, uses
+the main checkout's and says so):
 `BOX_SSH` (user@host), `BOX_JUMP` (jump user@host), `BOX_SSH_KEY`, `BOX_CONVERTER` (exe path on box),
 `BOX_WORKROOT`; `S3_BUCKET/S3_PREFIX/S3_ENDPOINT/S3_REGION/AWS_PROFILE`.
 

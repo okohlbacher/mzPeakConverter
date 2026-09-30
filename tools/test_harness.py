@@ -517,6 +517,25 @@ case "$2" in presign-put) echo https://relay.invalid/put ;; delete) ;; *) exit 1
         rc, out = self.run_script(tools, **self.BOX, BOX_REPORTS="0.11.5")
         self.assertTrue(self.dispatched(), out)
 
+    def test_a_worktree_uses_the_main_checkouts_box_env_and_says_so(self):
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"]
+        main, wt = self.tmp / "main", self.tmp / "wt"
+        subprocess.run([*git, "init", "-q", str(main)], check=True)
+        subprocess.run([*git, "-C", str(main), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        subprocess.run([*git, "-C", str(main), "worktree", "add", "-q", "--detach", str(wt)], check=True)
+        env_file = self.checkout(main) / "box.env"
+        env_file.write_text("".join(f"{k}={v}\n" for k, v in self.BOX.items()))
+        rc, out = self.run_script(self.checkout(wt), BOX_REPORTS="0.11.5")
+        self.assertIn(f"using the main checkout's {env_file.resolve()}", out)
+        self.assertTrue(self.dispatched(), out)
+        self.assertIn("user@box", (self.tmp / "ssh").read_text())
+
+        (self.tmp / "ssh").unlink()
+        (wt / "tools" / "box.env").write_text(env_file.read_text())
+        rc, out = self.run_script(wt / "tools", BOX_REPORTS="0.11.5")
+        self.assertNotIn("main checkout", out, "a worktree's own box.env wins")
+        self.assertTrue(self.dispatched(), out)
+
 
 if __name__ == "__main__":
     unittest.main()

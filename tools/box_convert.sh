@@ -37,9 +37,21 @@
 # relayed through S3 (box uploads via a presigned PUT; host downloads, verifies size+md5, deletes).
 # Config (env or a gitignored tools/box.env): BOX_SSH BOX_JUMP BOX_SSH_KEY [BOX_CONVERTER]
 # [S3_PREFIX] [PUT_EXPIRES] [ARCHIVE=true]  plus s3_relay's S3_BUCKET/S3_ENDPOINT/S3_REGION/AWS_PROFILE.
+# A git worktree has no tools/box.env (gitignored); it then uses the main checkout's, and says so.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-[ -f "$here/box.env" ] && . "$here/box.env"
+
+box_env(){  # -> the box.env to source: this checkout's, else the main checkout's; rc 1 if neither
+  # A worktree shares the main checkout's git dir (--git-common-dir) but not its untracked files,
+  # so `--box` from a worktree died on "set BOX_SSH" until someone copied the file across.
+  local common
+  [ -f "$here/box.env" ] && { printf '%s\n' "$here/box.env"; return 0; }
+  common="$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ -f "${common%/*}/tools/box.env" ] || return 1
+  echo "box_convert: no tools/box.env in this checkout; using the main checkout's ${common%/*}/tools/box.env" >&2
+  printf '%s\n' "${common%/*}/tools/box.env"
+}
+box_env_file="$(box_env)" && . "$box_env_file"
 
 usage(){ sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
