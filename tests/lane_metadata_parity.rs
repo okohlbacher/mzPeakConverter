@@ -72,19 +72,32 @@ enum Vendor {
     Waters,
 }
 
-/// The vendor of a NATIVE archive, from the instrument family term its lane states beside the model
-/// string (`instrument.param_accessions`). `None` when it states none (a Bruker file whose
-/// `InstrumentName` does not say timsTOF): no vendor-scoped rule applies, its differences fail as NEW.
+/// The vendor of a NATIVE archive, from the instrument term its lane states beside the model string
+/// (`instrument.param_accessions`): the family term, or for Shimadzu the model's own term. `None`
+/// when it states none (a Bruker file whose `InstrumentName` does not say timsTOF): no vendor-scoped
+/// rule applies, its differences fail as NEW.
 fn vendor_of(native: &Surface) -> Option<Vendor> {
     const FAMILY: &[(&str, Vendor)] = &[
         ("MS:1000490", Vendor::Agilent),
         ("MS:1003123", Vendor::Bruker),
         ("MS:1000121", Vendor::Sciex),
-        ("MS:1002998", Vendor::Shimadzu),
         ("MS:1000126", Vendor::Waters),
     ];
-    let accs = native.get("instrument.param_accessions")?;
-    FAMILY.iter().find(|(acc, _)| accs.split(',').any(|a| a == *acc)).map(|(_, v)| *v)
+    let accs: Vec<&str> = native.get("instrument.param_accessions")?.split(',').collect();
+    if let Some((_, v)) = FAMILY.iter().find(|(acc, _)| accs.contains(acc)) {
+        return Some(*v);
+    }
+    // The Shimadzu lane states the model's PSI-MS term, a descendant of MS:1000124 "Shimadzu
+    // instrument model" (MS:1002998 on the corpus LCMS-9030s), or MS:1000124 itself for a model the
+    // vocabulary lacks (review 2026-09-30 §E; until 0.16.0 it was MS:1002998 on every `.lcd`).
+    use mzdata::params::MSVocabulary;
+    MSVocabulary::init_static();
+    let shimadzu: Vec<String> = MSVocabulary::children_of_recursive(mzdata::curie!(MS:1000124))
+        .into_iter()
+        .map(|c| c.0.to_string())
+        .chain(["MS:1000124".to_string()])
+        .collect();
+    accs.iter().any(|a| shimadzu.iter().any(|s| s == a)).then_some(Vendor::Shimadzu)
 }
 
 const EXPECTED: &[Expected] = &[
@@ -122,7 +135,7 @@ const EXPECTED: &[Expected] = &[
         key: "instrument.param_accessions",
         vendors: None,
         kind: Kind::ByDesign,
-        reason: "the native lanes carry the vendor's model string as the MS:1000031 value beside the family term (MS:1000490 Agilent, MS:1002998 Shimadzu, MS:1000126 Waters, MS:1003123 timsTOF, MS:1000121 SciEX) and the file's model number / instrument name as user params; ProteoWizard maps the string to a specific CV term through a hand-curated table and drops the string.",
+        reason: "the native lanes carry the vendor's model string as the MS:1000031 value beside the family term (MS:1000490 Agilent, MS:1000126 Waters, MS:1003123 timsTOF, MS:1000121 SciEX) and the file's model number / instrument name as user params; ProteoWizard maps the string to a specific CV term through a hand-curated table and drops the string. The Shimadzu lane states the model's own term, resolved against the PSI-MS vocabulary (MS:1002998 for an LCMS-9030, MS:1000124 with the name as its value when the vocabulary lacks the model), beside the same MS:1000031 string.",
     },
     Expected {
         key: "chromatograms.inventory",
@@ -805,6 +818,11 @@ fn wildcard_rules_name_their_vendors() {
     }
     let waters: Surface = [("instrument.param_accessions".to_string(), "MS:1000031,MS:1000126".to_string())].into();
     assert_eq!(vendor_of(&waters), Some(Vendor::Waters));
+    // Shimadzu by any model term under MS:1000124, or by that term itself (a model PSI-MS lacks).
+    for acc in ["MS:1002998", "MS:1003568", "MS:1000124"] {
+        let shimadzu: Surface = [("instrument.param_accessions".to_string(), format!("MS:1000031,{acc}"))].into();
+        assert_eq!(vendor_of(&shimadzu), Some(Vendor::Shimadzu), "{acc}");
+    }
     // The frames-vs-drift-bins rule accepts a Waters population difference, and no other lane's.
     let key = "spectra_metadata.ms_level.nonnull";
     assert!(expected_rule(key, Some(Vendor::Waters)).is_some());

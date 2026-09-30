@@ -602,9 +602,14 @@ impl From<ScanTargetRepr> for ScanTarget {
 pub struct ScanSettings {
     /// A unique identifier
     pub id: String,
-    /// List with the source files containing the acquisition settings
+    /// List with the source files containing the acquisition settings. DELIBERATE DEVIATION (not
+    /// upstream), review 2026-09-30 §E: written under the schema's `source_file_references`
+    /// (`scan_settings_list.json`) where upstream writes the field name `source_file_refs`; both
+    /// read, and the schema makes the key optional.
+    #[serde(rename = "source_file_references", alias = "source_file_refs", default)]
     pub source_file_refs: Vec<String>,
-    /// Target list (or 'inclusion list') configured prior to the run
+    /// Target list (or 'inclusion list') configured prior to the run; optional in the schema too
+    #[serde(default)]
     pub targets: Vec<ScanTarget>,
     /// The controlled vocabulary and user parameters of the settings
     pub parameters: Vec<MetaParam>,

@@ -358,8 +358,9 @@ where
 /// (first, 100th, quarter, half, three-quarter). If every one of them is empty -- routine
 /// for ion-mobility data, which is mostly zero-length ramp slots -- it falls back to scanning
 /// forward for the first few spectra that actually carry data, because an empty array schema
-/// silently degrades a chunked buffer to point-shaped defaults. Smaller sources are read in
-/// full.
+/// leaves a chunked buffer with only the default arrays (f64 m/z, f32 intensity) as chunk
+/// columns, and every other array of the real spectra spills to `auxiliary_arrays`. Smaller
+/// sources are read in full.
 ///
 /// # Arguments
 /// `reader`: The stream of spectra to read from
@@ -400,11 +401,11 @@ pub fn sample_array_types_from_spectrum_source<
         // This is routine for ion-mobility data: a PASEF/IMS mzML is mostly empty ramp slots
         // (~80% of `Hela_QC_PASEF_Slot1-first-6-frames.mzML` has `defaultArrayLength="0"`), and
         // the control points are fixed positions that can all miss the data. An empty field set
-        // is NOT harmless: `ArrayBufferBuilder::build_chunked` then falls back to
-        // `add_default_fields_for_context`, which is layout-blind and installs the POINT-shaped
-        // scalars `mz: Float64` / `intensity: Float32` into a *chunked* buffer. The writer
-        // panics ("expected Float32 but found LargeList(Float32)") the moment a real spectrum
-        // produces list-typed chunk columns.
+        // is NOT harmless: `ArrayBufferBuilder::build_chunked` then declares only the default
+        // arrays (f64 m/z, f32 intensity), and every other array of the real spectra spills to
+        // `auxiliary_arrays`. (Until review 2026-09-30 it installed POINT-shaped scalars, and the
+        // writer panicked — "expected Float32 but found LargeList(Float32)" — on the first real
+        // spectrum.)
         //
         // Widening or reshuffling `pts` cannot fix this — a file whose only non-empty spectrum
         // sits at an unprobed index still defeats any fixed probe set. Scan instead, and stop as
@@ -422,8 +423,8 @@ pub fn sample_array_types_from_spectrum_source<
         let fields = ArrayTypesSampler::new(overrides, use_chunked_encoding, grid_policies)
             .sample_spectrum_array_types(it, prefer_peaks);
         if fields.is_empty() {
-            // The file genuinely has no signal anywhere. No chunk batch is ever produced, so the
-            // point-shaped default schema is inert rather than wrong.
+            // The file genuinely has no signal anywhere. No chunk batch is ever produced;
+            // `build_chunked` gives the empty facet a default-typed chunk schema.
             log::debug!("no spectrum in this source carries any data; array schema left empty");
         }
         fields
@@ -628,8 +629,9 @@ impl MzPeakWriterBuilder {
     /// (first, 100th, quarter, half, three-quarter). If every one of them is empty -- routine
     /// for ion-mobility data, which is mostly zero-length ramp slots -- it falls back to scanning
     /// forward for the first few spectra that actually carry data, because an empty array schema
-    /// silently degrades a chunked buffer to point-shaped defaults. Smaller sources are read in
-    /// full.
+    /// leaves a chunked buffer with only the default arrays (f64 m/z, f32 intensity) as chunk
+    /// columns, and every other array of the real spectra spills to `auxiliary_arrays`. Smaller
+    /// sources are read in full.
     ///
     /// # Arguments
     /// `reader`: The stream of spectra to read from

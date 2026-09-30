@@ -4058,8 +4058,10 @@ fn convert_file(
     // upstream's own encoding. It supersedes NOTHING on the data facet: profile arrays keep `chunk`
     // exactly as refined above, including the `--no-numpress` / `--layout point` / explicit-strategy
     // choices, so a profile-only lattice input is byte-identical to before (the route needs
-    // centroids to fire). `--no-mz-lattice` (or $MZPC_NO_MZ_LATTICE) opts out.
-    let lattice = mz_lattice_enabled() && probe_lattice_scale(&probes).is_some();
+    // centroids to fire). `--no-mz-lattice` (or $MZPC_NO_MZ_LATTICE) opts out, and so does
+    // `--layout point` (`chunk` is `None`): the grid is a chunk layout, and a chunked peaks facet
+    // beside the point data facet mixed two layout families in one entity (review 2026-09-30 §E).
+    let lattice = chunk.is_some() && mz_lattice_enabled() && probe_lattice_scale(&probes).is_some();
     if lattice {
         log::info!(
             "centroid m/z is on a fixed-point lattice; storing the peaks facet on the fitted linear \
@@ -6077,7 +6079,12 @@ fn convert_shimadzu(
     // keeps f64 m/z as a raw chunk row. Within vendor rounding, NOT bit-exact: the axis is the
     // vendor's own sqrt lattice and the fit is accepted only when it reproduces every m/z to within
     // `shimadzu_grid::TOL` (1e-9 Da: the vendor's ±5e-10 rounding plus f64 slack).
-    let grid_step = shimadzu_grid_step(&reader);
+    //
+    // Neither grid (this one or the centroid lattice below) under `--layout point` (`chunk` is
+    // `None`): both are chunk layouts, and either one beside the point layout on the other facet
+    // mixed two layout families in one entity (review 2026-09-30 §E). The point layout stores the
+    // f64 m/z the vendor library returns.
+    let grid_step = if chunk.is_some() { shimadzu_grid_step(&reader) } else { None };
     if let Some(step) = grid_step {
         hints.data_grid = Some(exact_sqrt_grid_policy());
         log::info!(
@@ -6090,15 +6097,11 @@ fn convert_shimadzu(
     // implementation's fitted linear grid (`lattice_fit_grid_policy`; the same treatment the mzML
     // lane gives the LabSolutions export of these files). `--no-mz-lattice` (config `no_mz_lattice`,
     // `$MZPC_NO_MZ_LATTICE`) keeps f64 m/z here too, so the flag means the same thing on every lane.
-    if rep != shimadzu::Representation::Profile && mz_lattice_enabled() {
+    let lattice = chunk.is_some() && rep != shimadzu::Representation::Profile && mz_lattice_enabled();
+    if lattice {
         hints.peak_grid = Some(lattice_fit_grid_policy());
-        hints.transformations.push(GRID_FIT_TRANSFORMATION.to_string());
-        if shimadzu_grid::coarse_mz_requested() {
-            // The coarse 1e-4 `Mass` field was read instead of `MassHigh`: a 100× coarser value,
-            // declared so the archive names the field the glue actually read.
-            hints.transformations.push("shimadzu:coarse-mz".to_string());
-        }
     }
+    hints.transformations.extend(shimadzu_mz_transformations(lattice, shimadzu_grid::coarse_mz_requested()));
     // The per-facet totals ("N spectra on the sqrt grid") are counted by
     // `convert_vendor_reader` over the written spectra and logged there (`FacetTally::report`);
     // this closure only reports each spectrum's route.
@@ -6270,11 +6273,55 @@ fn shimadzu_grid_route(
     (out, Some(true), trimmed)
 }
 
+/// The PSI-MS term for the Shimadzu model a `.lcd` states: the descendant of MS:1000124 "Shimadzu
+/// instrument model" in the vocabulary mzdata embeds whose name the stated model is, or begins with
+/// before a non-alphanumeric — `LCMS-9030 wo PDA` is an LCMS-9030 (MS:1002998); the longest such name
+/// wins, so an `LCMS-8030 Plus` is not an LCMS-8030. A model the vocabulary does not know keeps the
+/// family term, the stated name as its value. Until 0.16.0 every `.lcd` was written MS:1002998 (the
+/// LCMS-9030) under the family's name, whatever its model (review 2026-09-30 §E). Host-independent
+/// (only the `.lcd` reader is Windows-only) so it is testable anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shimadzu_model_term(model: &str) -> Param {
+    use mzdata::params::MSVocabulary;
+    // What `main` does first; a unit test has no `main`.
+    MSVocabulary::init_static();
+    let stated = model.trim().to_lowercase();
+    let names_it = |name: &str| {
+        stated.strip_prefix(name.to_lowercase().as_str()).is_some_and(|rest| !rest.starts_with(char::is_alphanumeric))
+    };
+    MSVocabulary::children_of_recursive(curie!(MS:1000124))
+        .into_iter()
+        .filter_map(|c| MSVocabulary::get(c.0))
+        .filter(|t| names_it(&t.name))
+        .max_by_key(|t| t.name.len())
+        .map(|t| Param::builder().name(t.name.as_ref()).curie(t.curie()).build())
+        .unwrap_or_else(|| run_metadata::term_str(1000124, "Shimadzu instrument model", model))
+}
+
+/// The m/z transformations the native Shimadzu lane declares: the fitted centroid grid when the
+/// lattice is armed, and the coarse 1e-4 `Mass` field (a 100× coarser value than `MassHigh`)
+/// whenever the glue read it. `Glue.cs` (`DecideMassScale`) reads `Mass` on the env var alone, for
+/// profile and centroids, under any layout and lattice setting, so the declaration depends on
+/// nothing else; it once sat inside the lattice guard and went missing under `--layout point`,
+/// `--no-mz-lattice` and `--representation profile` (review 2026-09-30 §E). Host-independent so it
+/// is testable anywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shimadzu_mz_transformations(lattice: bool, coarse_mz: bool) -> Vec<String> {
+    let mut declared = Vec::new();
+    if lattice {
+        declared.push(GRID_FIT_TRANSFORMATION.to_string());
+    }
+    if coarse_mz {
+        declared.push("shimadzu:coarse-mz".to_string());
+    }
+    declared
+}
+
 /// Instrument configuration from what the vendor API states — and only that. `SystemName()` is the
 /// model; `DeviceID = MSID_QTFL` names the Q-TOF family, so the quadrupole + TOF analysers are not
 /// in doubt; the ion source is asserted only when the spectra say `ESI`. No detector is invented.
 #[cfg(windows)]
-/// The instrument configuration of a `.lcd`: the family term ProteoWizard states, the model — the MS
+/// The instrument configuration of a `.lcd`: the model's PSI-MS term (`shimadzu_model_term`), the model — the MS
 /// unit's name from the file's system configuration (`LCMS-9030`) when `stated_model` has it, else the
 /// vendor library's `SystemName()`, which is the operator's name for the whole system (`neo-ms`) and is
 /// then kept as a user param — and the components ProteoWizard's Reader_Shimadzu states for the QTFL
@@ -6285,7 +6332,7 @@ fn shimadzu_instrument(info: &shimadzu::ShimadzuInstrumentInfo, stated_model: Op
     let system_name = info.system_name.clone();
     let model = stated_model.map(str::to_string).or_else(|| system_name.clone())?;
     let mut cfg = InstrumentConfiguration { id: 0, ..Default::default() };
-    cfg.params.push(run_metadata::term(1002998, "Shimadzu instrument model"));
+    cfg.params.push(shimadzu_model_term(&model));
     cfg.params.push(Param::builder().name("instrument model").curie(curie!(MS:1000031)).value(model.clone()).build());
     if let Some(name) = system_name.filter(|n| *n != model) {
         cfg.params.push(Param::new_key_value("system name", name));
@@ -9375,6 +9422,40 @@ mod tests {
         assert_eq!(ms1.tic[0], col_tic, "TIC must equal the total_ion_current column");
         assert_eq!(ms1.bpc[0], 5.0);
         assert_eq!(ms1.tic[0], 399.0 + 5.0);
+    }
+
+    /// The Shimadzu model term comes from the vocabulary, not from a constant: until 0.16.0 every
+    /// `.lcd` was written MS:1002998 (the LCMS-9030) whatever its model.
+    #[test]
+    fn shimadzu_model_resolves_against_the_psi_ms_vocabulary() {
+        let term = |model: &str| {
+            let p = super::shimadzu_model_term(model);
+            (p.curie().map(|c| c.to_string()), p.name.clone(), p.value.to_string())
+        };
+        let known = |acc: &str, name: &str| (Some(acc.to_string()), name.to_string(), String::new());
+        assert_eq!(term("LCMS-9030"), known("MS:1002998", "LCMS-9030"));
+        // What the file's system configuration states on the corpus 9030s, and the case of it.
+        assert_eq!(term("LCMS-9030 wo PDA"), known("MS:1002998", "LCMS-9030"));
+        assert_eq!(term("lcms-9050"), known("MS:1003568", "LCMS-9050"));
+        // The longest name wins, and a prefix must end at a word: 8030 Plus, not 8030; 2010EV, not 2010.
+        assert_eq!(term("LCMS-8030 Plus"), known("MS:1003486", "LCMS-8030 Plus"));
+        assert_eq!(term("LCMS-2010EV"), known("MS:1000605", "LCMS-2010EV"));
+        // Not in the vocabulary (a digit continues the name; the operator's system name): the family
+        // term, carrying what the file states.
+        let family = |value: &str| (Some("MS:1000124".to_string()), "Shimadzu instrument model".to_string(), value.to_string());
+        assert_eq!(term("LCMS-90300"), family("LCMS-90300"));
+        assert_eq!(term("neo-ms"), family("neo-ms"));
+    }
+
+    /// The coarse `Mass` read is declared whatever the lattice does: under `--layout point`,
+    /// `--no-mz-lattice` or a profile-only run the glue still reads it.
+    #[test]
+    fn shimadzu_coarse_mz_is_declared_without_the_lattice() {
+        let t = super::shimadzu_mz_transformations;
+        assert_eq!(t(false, true), ["shimadzu:coarse-mz"]);
+        assert_eq!(t(true, true), [super::GRID_FIT_TRANSFORMATION, "shimadzu:coarse-mz"]);
+        assert_eq!(t(true, false), [super::GRID_FIT_TRANSFORMATION]);
+        assert!(t(false, false).is_empty());
     }
 
     /// A DUAL scan (gridded profile in the data facet + a centroid `PeakSet` alongside) states a
