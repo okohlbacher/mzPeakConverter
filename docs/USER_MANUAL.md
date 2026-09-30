@@ -551,7 +551,9 @@ jittered positions, a serpentine lag, regions rastered from origins off one latt
 rasters fit no lattice and need the declared step; positions recorded at 3 µm or coarser, or lagging
 by a whole finer step, fit that finer lattice, each at its own pixel. A lattice that is a fraction of
 a coarser one, needed only by columns holding at most half the scans of the coarser lattice's
-median column (strays, not raster columns), is refused too. Lock-mass scans get no
+median column (strays, not raster columns), is refused too; a row acquired twice or a one-row
+region is not such a coarser lattice, but tiny plus-shaped cores (1, 3, 1 scans per column) are
+refused. Lock-mass scans get no
 position. Up to 1 % of the positioned scans may lie off the grid, or far outside the raster at one
 position (a parked scan, even one on the grid by chance): they get no position
 (`waters:off-grid-position-dropped`). A group far outside that spans columns (a QC region) is part
