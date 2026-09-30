@@ -358,8 +358,9 @@ where
 /// (first, 100th, quarter, half, three-quarter). If every one of them is empty -- routine
 /// for ion-mobility data, which is mostly zero-length ramp slots -- it falls back to scanning
 /// forward for the first few spectra that actually carry data, because an empty array schema
-/// silently degrades a chunked buffer to point-shaped defaults. Smaller sources are read in
-/// full.
+/// leaves a chunked buffer with only the default arrays (f64 m/z, f32 intensity) as chunk
+/// columns, and every other array of the real spectra spills to `auxiliary_arrays`. Smaller
+/// sources are read in full.
 ///
 /// # Arguments
 /// `reader`: The stream of spectra to read from
@@ -628,8 +629,9 @@ impl MzPeakWriterBuilder {
     /// (first, 100th, quarter, half, three-quarter). If every one of them is empty -- routine
     /// for ion-mobility data, which is mostly zero-length ramp slots -- it falls back to scanning
     /// forward for the first few spectra that actually carry data, because an empty array schema
-    /// silently degrades a chunked buffer to point-shaped defaults. Smaller sources are read in
-    /// full.
+    /// leaves a chunked buffer with only the default arrays (f64 m/z, f32 intensity) as chunk
+    /// columns, and every other array of the real spectra spills to `auxiliary_arrays`. Smaller
+    /// sources are read in full.
     ///
     /// # Arguments
     /// `reader`: The stream of spectra to read from
