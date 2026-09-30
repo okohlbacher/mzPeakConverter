@@ -852,6 +852,14 @@ The vocabulary:
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
 
+**The list in `data_processing_method_list`.** The same entries are mirrored into the conversion's
+own processing method (`mzpeak_convert_conversion`, software `mzpeak-convert`), so a reader of the
+processing list alone learns what the conversion applied: each entry as a `transformation`
+userParam carrying it verbatim, and, when `zero-run-mask`, `shimadzu:span-trim` or
+`agilent:drop-zero-samples` is among them, PSI-MS `MS:1003901` `zero intensity point trimming` first
+— the one kind PSI-MS has a term for. A conversion with no entry leaves the method as before.
+Archives written through 0.16.0 hold the list only in `transformations`.
+
 Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
 decompress a frame; the recorded command line is the same on both routes). Only those lanes write

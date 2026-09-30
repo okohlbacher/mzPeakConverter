@@ -5992,6 +5992,8 @@ fn convert_ims_compact_sdk(
 /// `sciex:truncate-unequal-arrays` (`sciex_run::GlueValueChanges`). An entry names the
 /// transformation and never how often it was applied, which the run's warning says;
 /// `tof-grid:<ppm>ppm` is the one entry with a parameter, the bound its grid was accepted within.
+/// [`finish_archive`] mirrors the list into this conversion's processing method
+/// ([`mirror_transformations`]).
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -6066,7 +6068,7 @@ struct AuxInputs<'a> {
 /// puts it first. The rename is last: a failure anywhere above leaves `output` untouched and the
 /// `TmpGuard` removes the partial file.
 fn finish_archive(
-    writer: MzPeakWriterType<fs::File>,
+    mut writer: MzPeakWriterType<fs::File>,
     tmp_guard: TmpGuard,
     output: &Path,
     input: &Path,
@@ -6074,6 +6076,12 @@ fn finish_archive(
     aux: Option<AuxInputs<'_>>,
     index_blocks: &[(String, serde_json::Value)],
 ) -> Result<()> {
+    // The lane's `transformations` block, mirrored into its processing method before the metadata
+    // is written: here, so no lane can declare one without the other.
+    if let Some((_, block)) = index_blocks.iter().find(|(key, _)| key == "transformations") {
+        let applied: Vec<&str> = block.as_array().into_iter().flatten().filter_map(serde_json::Value::as_str).collect();
+        mirror_transformations(&mut writer, &applied);
+    }
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     for (key, block) in index_blocks {
         zip.add_index_metadata(key, block)
@@ -8276,6 +8284,10 @@ fn demote_mzp_in(params: &mut [Param]) {
     params.sort_by_key(|p| !p.is_controlled());
 }
 
+/// The id of the `data_processing_method_list` entry an archive lane records its conversion under
+/// ([`add_processing_metadata`]); its method is the one [`mirror_transformations`] extends.
+const CONVERSION_PROCESSING_ID: &str = "mzpeak_convert_conversion";
+
 fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
     writer.softwares_mut().push(Software::new(
         "mzpeak-convert".into(),
@@ -8283,13 +8295,47 @@ fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
         vec![custom_software_name("mzpeak-convert")],
     ));
     writer.data_processings_mut().push(DataProcessing {
-        id: "mzpeak_convert_conversion".to_string(),
+        id: CONVERSION_PROCESSING_ID.to_string(),
         methods: vec![ProcessingMethod {
             order: 1,
             software_reference: "mzpeak-convert".to_string(),
             params: vec![conversion_options_param()],
         }],
     });
+}
+
+/// The `transformations` entries that are PSI-MS's MS:1003901 `zero intensity point trimming`
+/// ("remove excess zero intensity value data points from a spectrum"): the writer's zero-run mask,
+/// which keeps the zeros flanking signal as the term's definition describes, the Shimadzu profile
+/// route's scan-window pad trim, and the Agilent profile grid reader's dropped zero samples.
+const ZERO_INTENSITY_TRIMMING: [&str; 3] = ["zero-run-mask", "shimadzu:span-trim", "agilent:drop-zero-samples"];
+
+/// Mirror the `transformations` index block into this conversion's own processing method, so a
+/// reader of `data_processing_method_list` alone learns what the conversion applied (review
+/// 2026-09-30 §E; the block itself is decision D15's). Each entry becomes a `transformation`
+/// userParam carrying the entry verbatim, `tof-grid:5ppm` included; PSI-MS has a term for one kind
+/// only, MS:1003901, added once, first, when any [`ZERO_INTENSITY_TRIMMING`] entry is present — a
+/// child of MS:1000452 `data transformation`, which is where the spec's CvMapping puts a method's
+/// terms. No other entry has an exact term (a re-sort, a codec, a unit or a grid is not a data
+/// transformation PSI-MS names), and a userParam leaves the CvMapping rules untouched. An archive
+/// with no entry keeps the method as it was. Run on the writer before `finish_parquet`, which copies
+/// the list into the index and every metadata footer.
+fn mirror_transformations(target: &mut impl MSDataFileMetadata, applied: &[&str]) {
+    let Some(method) = target
+        .data_processings_mut()
+        .iter_mut()
+        .rev()
+        .find(|dp| dp.id == CONVERSION_PROCESSING_ID)
+        .and_then(|dp| dp.methods.iter_mut().find(|m| m.software_reference == "mzpeak-convert"))
+    else {
+        return;
+    };
+    if applied.iter().any(|t| ZERO_INTENSITY_TRIMMING.contains(t)) {
+        method.params.insert(0, Param::builder().name("zero intensity point trimming").curie(curie!(MS:1003901)).build());
+    }
+    method.params.extend(
+        applied.iter().map(|t| Param::new_key_value("transformation", mzdata::params::Value::String(t.to_string()))),
+    );
 }
 
 /// The `conversion options` param every conversion records (the archive lanes'
@@ -11122,6 +11168,71 @@ mod tests {
         let commit = ims.uri.split('/').nth(5).unwrap_or_default();
         assert!(commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()), "IMS is pinned to a commit: {}", ims.uri);
         assert_eq!(ims.version.as_deref(), Some("1.1.0"), "imagingMS.obo at that commit states data-version 1.1.0");
+    }
+
+    /// The `transformations` block reaches `data_processing_method_list`: this conversion's method
+    /// carries each entry as a `transformation` userParam, and MS:1003901 first when an entry is a
+    /// zero-intensity trim — in the index and in the metadata footers alike. Every term it holds is in
+    /// the embedded vocabulary and every method keeps a child of MS:1000452 (the spec's
+    /// `processingmethod_must`). An archive with no transformation keeps the method as it was.
+    #[test]
+    fn transformations_are_mirrored_into_the_conversion_s_processing_method() {
+        use super::{convert_vendor_reader_tallied, VendorHints};
+        use mzdata::params::MSVocabulary;
+
+        let dir = scratch("mirror");
+        let method = |archive: &std::path::Path| -> serde_json::Value {
+            let meta = index_metadata(archive);
+            let dp = meta["data_processing_method_list"].as_array().unwrap().iter().find(|dp| dp["id"] == "mzpeak_convert_conversion").cloned().unwrap();
+            // The spectra_metadata footer carries the same list.
+            let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+            let footer = parquet::file::reader::SerializedFileReader::new(bytes::Bytes::from({
+                let mut v = Vec::new();
+                zip.by_name("spectra_metadata.parquet").unwrap().read_to_end(&mut v).unwrap();
+                v
+            }))
+            .unwrap();
+            use parquet::file::reader::FileReader;
+            let kv = footer.metadata().file_metadata().key_value_metadata().unwrap().iter().find(|kv| kv.key == "data_processing_method_list").unwrap().value.clone().unwrap();
+            let listed: serde_json::Value = serde_json::from_str(&kv).unwrap();
+            assert_eq!(listed, meta["data_processing_method_list"], "footer and index disagree");
+            for m in meta["data_processing_method_list"].as_array().unwrap().iter().flat_map(|dp| dp["methods"].as_array().unwrap()) {
+                let terms: Vec<mzdata::params::CURIE> =
+                    m["parameters"].as_array().unwrap().iter().filter_map(|p| p["accession"].as_str()).map(|a| a.parse().unwrap()).collect();
+                assert!(terms.iter().all(|t| MSVocabulary::get(*t).is_some()), "{terms:?}");
+                assert!(terms.iter().any(|t| MSVocabulary::is_child_of(*t, mzdata::curie!(MS:1000452))), "{m:#}");
+            }
+            dp["methods"][0].clone()
+        };
+        let user_params = |m: &serde_json::Value| -> Vec<String> {
+            m["parameters"].as_array().unwrap().iter().filter(|p| p["name"] == "transformation").map(|p| p["value"].as_str().unwrap().to_string()).collect()
+        };
+        let convert = |name: &str, mzs: &'static [f64], intens: &'static [f32]| {
+            let out = dir.join(format!("{name}.mzpeak"));
+            convert_vendor_reader_tallied(std::path::Path::new(TINY), &out, None, 1, None, false, VendorHints::default(), 4, |i| {
+                Ok(spec_from(mzs, intens, i))
+            })
+            .unwrap();
+            out
+        };
+        let masked = method(&convert("zero-run", &[100.0, 100.5, 101.0, 101.5, 102.0, 102.5], &[5.0, 0.0, 0.0, 0.0, 0.0, 9.0]));
+        assert_eq!(masked["parameters"][0]["accession"], "MS:1003901", "{masked:#}");
+        assert_eq!(masked["parameters"][0]["name"], "zero intensity point trimming");
+        assert_eq!(user_params(&masked), ["zero-run-mask"]);
+        let unsorted = method(&convert("unsorted", &[101.0, 100.0, 102.0, 103.0], &[5.0, 6.0, 7.0, 9.0]));
+        assert_eq!(user_params(&unsorted), ["sort-by-mz"]);
+        assert!(!unsorted.to_string().contains("MS:1003901"), "{unsorted:#}");
+        let verbatim = method(&convert("verbatim", &[100.0, 100.5, 101.0, 101.5], &[5.0, 0.0, 7.0, 9.0]));
+        let names: Vec<&str> = verbatim["parameters"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["conversion options", "file format conversion"], "{verbatim:#}");
+
+        // The mzML lane, whose block holds three entries: the same three, in its order.
+        let out = dir.join("tiny.mzpeak");
+        let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let applied: Vec<String> = index_metadata(&out)["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert_eq!(user_params(&method(&out)), applied);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Two conversions of inputs with one stem in one process get a private copy each: the gunzip,
