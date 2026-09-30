@@ -2391,23 +2391,24 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let cap = max_spectra();
 
     // The surviving indices, known up front for the spectrumList `count` attribute: the indices the
-    // archive holds, ascending, up to MZPC_MAX_SPECTRA of them (not `0..total`: an archive rewritten
-    // with --rt or --ms-level keeps each survivor's original index, and counting up from 0 asked for
-    // spectra that were filtered out while never reaching the last ones), and of those, when something
-    // filters, the ones one scan of the `time` / `ms_level` columns keeps. This was a metadata-only
-    // read of every spectrum, filtered or not, before the survivors were read again in full: 265 s for
-    // the 32,700 spectra of MSV000099123's `…_8225.mzpeak` before a first write.
+    // archive holds, ascending, up to MZPC_MAX_SPECTRA of them (not `0..total`: an archive an older
+    // rewrite filtered with --rt or --ms-level keeps each survivor's original index, and counting up
+    // from 0 asked for spectra that were filtered out while never reaching the last ones), and of
+    // those, when something filters, the ones one scan of the `time` / `ms_level` columns keeps. This
+    // was a metadata-only read of every spectrum, filtered or not, before the survivors were read
+    // again in full: 265 s for the 32,700 spectra of MSV000099123's `…_8225.mzpeak` before a first
+    // write.
     let mut indices: Vec<usize> = reader.get_index().iter().map(|(_, i)| *i as usize).collect();
     indices.sort_unstable();
     // The wavelength (UV/PDA) spectra live in facets of their own, which this export never read: a
     // PDA run's archive came out without its 8 (Waters) or 520 (Agilent) UV spectra, and no warning.
-    let wavelength = exported_wavelength_spectra(input, reader.len_wavelength_spectra(), opts)?;
+    let wavelength = exported_wavelength_spectra(&reader, opts)?;
     let wavelength_time: std::collections::HashMap<u64, Option<f64>> = wavelength.iter().copied().collect();
     let mut items: Vec<ExportItem> = if wavelength.is_empty() {
         indices.iter().map(|&i| ExportItem::Mass(i)).collect()
     } else {
         let times: std::collections::HashMap<u64, Option<f64>> =
-            filter::metadata_index_times(input, false)?.unwrap_or_default().into_iter().collect();
+            filter::metadata_index_times(&reader, false)?.unwrap_or_default().into_iter().collect();
         let mass: Vec<(usize, Option<f64>)> = indices.iter().map(|&i| (i, times.get(&(i as u64)).copied().flatten())).collect();
         interleave_by_time(&mass, &wavelength)
     };
@@ -2415,9 +2416,9 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // mass spectra were exported; a wavelength spectrum counts toward it, as in every import lane.
     items.truncate(cap.unwrap_or(usize::MAX));
     if filtering {
-        let kept = filter::surviving_spectra(input, opts)?;
+        let kept = filter::surviving_spectra(&reader, opts)?.kept;
         items.retain(|item| match *item {
-            ExportItem::Mass(i) => kept.contains(&(i as u64)),
+            ExportItem::Mass(i) => kept.contains(i as u64),
             ExportItem::Wavelength(k) => opts.rt.is_none_or(|(lo, hi)| wavelength_time[&k].is_some_and(|t| t >= lo && t <= hi)),
         });
         let mass = items.iter().filter(|item| matches!(item, ExportItem::Mass(_))).count();
@@ -2431,6 +2432,15 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     } else {
         reader.get_index().iter().map(|(id, _)| id.to_string()).collect()
     };
+    // The archive's spectra this export leaves out, by id. A precursor or scan naming one wrote a
+    // `spectrumRef` to an element the mzML does not hold (small.RAW's MS2 spectra all named their
+    // filtered-out MS1 under `--ms-level 2`), where rewriting the archive nulls the reference. Empty
+    // when every spectrum is written.
+    let written: std::collections::HashSet<usize> =
+        items.iter().filter_map(|item| if let ExportItem::Mass(i) = *item { Some(i) } else { None }).collect();
+    let left_out: std::collections::HashSet<String> =
+        reader.get_index().iter().filter(|&(_, &i)| !written.contains(&(i as usize))).map(|(id, _)| id.to_string()).collect();
+    let mut unreferenced = 0usize;
 
     // Guard before writer: `w` is dropped first (the handle closes), then the guard removes the tmp.
     // Sibling mzML prologues — change one, look at the other three: `convert_to_mzml`,
@@ -2453,6 +2463,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
                 demote_mzp_params(spec.description_mut());
+                unreferenced += drop_references_to(spec.description_mut(), &left_out);
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
                 }
@@ -2493,6 +2504,12 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
             }
         }
     }
+    if unreferenced > 0 {
+        log::warn!(
+            "{unreferenced} precursor or scan references named a spectrum this export leaves out; their \
+             spectrumRef is not written"
+        );
+    }
 
     // Carry the archive's chromatograms across. Without this the lane emitted ONLY the writer's
     // synthesized TIC/base-peak summary: on a 300-chromatogram SIM/SRM run, 299 quantitative traces
@@ -2516,6 +2533,25 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     finish_mzml(w, tmp_guard, output)
 }
 
+/// Clear the spectrum references of `descr` that name one of `left_out` — a precursor's
+/// `precursor_id` and a scan's `spectrum_reference`, each written as a `spectrumRef`. How many.
+fn drop_references_to(descr: &mut mzdata::spectrum::SpectrumDescription, left_out: &std::collections::HashSet<String>) -> usize {
+    let mut dropped = 0;
+    for precursor in descr.precursor.iter_mut() {
+        if precursor.precursor_id.as_deref().is_some_and(|id| left_out.contains(id)) {
+            precursor.precursor_id = None;
+            dropped += 1;
+        }
+    }
+    for scan in descr.acquisition.scans.iter_mut() {
+        if scan.spectrum_reference.as_deref().is_some_and(|id| left_out.contains(id)) {
+            scan.spectrum_reference = None;
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
 /// Summary values the vendored writer computes for every wavelength spectrum from its arrays, and its
 /// reader hands back as parameters: total ion current, base peak intensity, base peak m/z, lambda max.
 const IMPORT_COMPUTED_WAVELENGTH_SUMMARIES: [mzdata::params::CURIE; 4] =
@@ -2535,13 +2571,14 @@ enum ExportItem {
 /// search engine one reads as MS1 profile data with its wavelengths as m/z (OpenMS takes a spectrum
 /// stating no level for level 1). `--rt` keeps those inside the window (`filter_mzpeak_to_mzml`).
 /// Filtering into an archive applies the same two rules (`filter::run`).
-fn exported_wavelength_spectra(input: &Path, listed: usize, opts: &filter::FilterOpts) -> Result<Vec<(u64, Option<f64>)>> {
+fn exported_wavelength_spectra(reader: &mzpeak_prototyping::MzPeakReader, opts: &filter::FilterOpts) -> Result<Vec<(u64, Option<f64>)>> {
+    let listed = reader.len_wavelength_spectra();
     if listed == 0 {
         return Ok(Vec::new());
     }
     // `--drop-aux` can take one wavelength member and leave the others, and the reader panics on the
     // arrays it then cannot find.
-    if !filter::archive_has_member(input, "wavelength_spectra_data.parquet")? {
+    if !filter::archive_has_member(reader, "wavelength_spectra_data.parquet") {
         log::warn!("{listed} wavelength (UV/PDA) spectra are listed, but the archive holds no wavelength_spectra_data.parquet: they are not exported");
         return Ok(Vec::new());
     }
@@ -2549,7 +2586,7 @@ fn exported_wavelength_spectra(input: &Path, listed: usize, opts: &filter::Filte
         log::warn!("--ms-level leaves out the {listed} wavelength (UV/PDA) spectra, which have no MS level");
         return Ok(Vec::new());
     }
-    Ok(filter::metadata_index_times(input, true)?.unwrap_or_default())
+    Ok(filter::metadata_index_times(reader, true)?.unwrap_or_default())
 }
 
 /// The export's spectrum order: the wavelength spectra in time order, each before the first mass

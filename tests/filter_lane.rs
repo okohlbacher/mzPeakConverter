@@ -7,13 +7,15 @@
 //!   * `--drop-aux` could delete a core facet and exit 0;
 //!   * `--ms-level` / `--rt` defaulted a missing or retyped column (level 0 / NaN) and kept nothing;
 //!   * `--rt` never refreshed `number_of_data_points` in the flat `chromatograms_metadata`;
-//!   * an archive it wrote with `--ms-level` / `--rt` could not be read back.
+//!   * an archive it wrote with `--ms-level` / `--rt` could not be read back;
+//!   * the survivors kept their sparse original indices, where the spec numbers spectra 0..n-1 (the
+//!     HUPO reference reader raised KeyError on such an archive).
 //!
 //! Each test converts its fixture into a scratch directory that belongs to that test alone.
 
-use arrow::array::{Array, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,6 +23,9 @@ use std::process::{Command, Output};
 
 const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwiz.1.1.mzML");
 const PDA_UV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pda_uv.pwiz.mzML");
+/// mzdata's 48-spectrum Thermo run (tests/fixtures/README.md): MS1 survey scans, each followed by its
+/// MS2 spectra, which name it as their precursor; the Thermo lane adds the trailer facets.
+const SMALL_RAW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/small.RAW");
 
 /// A fresh directory for ONE test. The tests in a binary run in parallel under a single process id,
 /// so a pid-only name let one test's cleanup delete another test's archive mid-run.
@@ -80,7 +85,44 @@ fn column<T: From<arrow::array::ArrayData>>(t: &RecordBatch, name: &str) -> T {
     T::from(t.column_by_name(name).unwrap_or_else(|| panic!("no `{name}` in {:?}", t.schema())).to_data())
 }
 
-/// (a) `--ms-level 2` keeps the one MS2 spectrum and nulls its reference to the MS1 it came from.
+/// A top-level column, or a struct's child as `struct.child`.
+fn leaf(t: &RecordBatch, path: &str) -> ArrayRef {
+    match path.split_once('.') {
+        Some((top, child)) => column::<StructArray>(t, top).column_by_name(child).unwrap_or_else(|| panic!("no `{path}`")).clone(),
+        None => t.column_by_name(path).unwrap_or_else(|| panic!("no `{path}` in {:?}", t.schema())).clone(),
+    }
+}
+
+/// An integer index column ([`leaf`]), whatever its width.
+fn indices(t: &RecordBatch, path: &str) -> Vec<Option<u64>> {
+    let values = arrow::compute::cast(&leaf(t, path), &arrow::datatypes::DataType::UInt64).unwrap();
+    UInt64Array::from(values.to_data()).iter().collect()
+}
+
+/// Every leaf of `t` but the `skip` ones, a data facet's struct children as `struct.child`.
+fn leaves_but(t: &RecordBatch, skip: &[&str]) -> Vec<(String, ArrayRef)> {
+    let mut out = Vec::new();
+    for (field, c) in t.schema().fields().iter().zip(t.columns()) {
+        match c.as_any().downcast_ref::<StructArray>() {
+            Some(s) if matches!(field.name().as_str(), "point" | "chunk") => {
+                for (child, values) in s.fields().iter().zip(s.columns()) {
+                    out.push((format!("{}.{}", field.name(), child.name()), values.clone()));
+                }
+            }
+            _ => out.push((field.name().clone(), c.clone())),
+        }
+    }
+    out.retain(|(name, _)| !skip.contains(&name.as_str()));
+    out
+}
+
+/// The `renumbered` list of the index's `filter` block.
+fn renumbered(archive: &Path) -> serde_json::Value {
+    serde_json::from_slice::<serde_json::Value>(&member(archive, "mzpeak_index.json")).unwrap()["metadata"]["filter"]["renumbered"].clone()
+}
+
+/// (a) `--ms-level 2` keeps the one MS2 spectrum, numbers it 0, and nulls its reference to the MS1 it
+/// came from.
 #[test]
 fn ms_level_keeps_matching_spectra_and_nulls_dropped_parent_refs() {
     let dir = scratch("ms_level");
@@ -91,10 +133,142 @@ fn ms_level_keeps_matching_spectra_and_nulls_dropped_parent_refs() {
     let meta = table(&out, "spectra_metadata.parquet");
     assert_eq!(meta.num_rows(), 1);
     assert_eq!(column::<UInt8Array>(&meta, "ms_level").value(0), 2);
+    assert_eq!((indices(&meta, "index"), column::<LargeStringArray>(&meta, "id").value(0)), (vec![Some(0)], "scan=20"), "tiny's index 1, renumbered");
 
     let precursors = table(&out, "spectra_metadata_precursors.parquet");
     assert_eq!(precursors.num_rows(), 1);
+    assert_eq!(indices(&precursors, "source_index"), [Some(0)]);
     assert!(column::<UInt64Array>(&precursors, "precursor_index").is_null(0), "the MS1 parent was filtered out");
+    assert!(column::<LargeStringArray>(&precursors, "precursor_id").is_null(0), "and its id with it");
+    assert_eq!(renumbered(&out), serde_json::json!(["spectrum"]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rewrite numbers what it keeps 0..n-1, as the spec's `index` requires, in every facet holding a
+/// spectrum index: the metadata, the scans (their own `scan_index` too), the precursors and selected
+/// ions (`source_index`, and `precursor_index` to a kept parent), both data facets in the chunk and in
+/// the point layout, and the Thermo trailer facets (`ordinal`). A precursor whose parent was filtered
+/// out loses its reference. Everything else is the source's kept rows, row for row. The survivors
+/// used to keep their sparse original indices, on which the HUPO reference reader, reading spectrum i
+/// for every i below the row count, raised KeyError. On small.RAW `--rt 0.03-0.2` keeps indices
+/// 4-19: three MS2 spectra of the dropped MS1 at index 1, then the MS1 at 8 and 15 with theirs.
+#[test]
+fn a_rewrite_numbers_what_it_keeps_from_zero_in_every_facet() {
+    let dir = scratch("renumber");
+    for layout in ["chunked", "point"] {
+        let src = dir.join(format!("{layout}.mzpeak"));
+        ok(&mzpc(Path::new(SMALL_RAW), &src, &["--layout", layout]));
+        let out = dir.join(format!("{layout}.rt.mzpeak"));
+        ok(&mzpc(&src, &out, &["--rt", "0.03-0.2"]));
+
+        let meta = table(&src, "spectra_metadata.parquet");
+        let (time, index) = (column::<Float64Array>(&meta, "time"), indices(&meta, "index"));
+        let kept: Vec<u64> = (0..meta.num_rows()).filter(|&r| (0.03..=0.2).contains(&time.value(r))).map(|r| index[r].unwrap()).collect();
+        assert_eq!(kept, (4..20).collect::<Vec<u64>>(), "{layout}: the window");
+        let new = |old: u64| kept.iter().position(|&k| k == old).map(|at| at as u64);
+
+        let data_key = if layout == "point" { "point.spectrum_index" } else { "chunk.spectrum_index" };
+        for (facet, key) in [
+            ("spectra_metadata.parquet", "index"),
+            ("spectra_metadata_scans.parquet", "source_index"),
+            ("spectra_metadata_precursors.parquet", "source_index"),
+            ("spectra_metadata_selected_ions.parquet", "source_index"),
+            ("spectra_data.parquet", data_key),
+            ("spectra_peaks.parquet", data_key),
+            ("vendor_scan_trailers.parquet", "ordinal"),
+            ("vendor_scan_trailers_wide.parquet", "ordinal"),
+        ] {
+            let (s, o) = (table(&src, facet), table(&out, facet));
+            let keep: BooleanArray = indices(&s, key).iter().map(|v| Some(v.is_some_and(|v| new(v).is_some()))).collect();
+            let s = arrow::compute::filter_record_batch(&s, &keep).unwrap();
+            assert!(o.num_rows() > 0, "{layout}: {facet} kept nothing");
+            let want: Vec<Option<u64>> = indices(&s, key).into_iter().map(|v| v.and_then(new)).collect();
+            assert_eq!(indices(&o, key), want, "{layout}: {facet} `{key}` is not the kept rows' renumbered");
+            let moved = [key, "scan_index", "precursor_index", "precursor_id"];
+            assert!(leaves_but(&o, &moved) == leaves_but(&s, &moved), "{layout}: {facet} holds other rows than the source's kept ones");
+        }
+
+        let scans = table(&out, "spectra_metadata_scans.parquet");
+        assert_eq!(indices(&scans, "scan_index"), (0..16).map(Some).collect::<Vec<_>>(), "{layout}: scan_index");
+        let ids = column::<LargeStringArray>(&table(&out, "spectra_metadata.parquet"), "id");
+        for facet in ["spectra_metadata_precursors.parquet", "spectra_metadata_selected_ions.parquet"] {
+            let parents = indices(&table(&out, facet), "precursor_index");
+            let want: Vec<Option<u64>> = [None; 3].into_iter().chain([Some(4); 5]).chain([Some(11); 4]).collect();
+            assert_eq!(parents, want, "{layout}: {facet} precursor_index (the MS1 at 8 and 15 are now 4 and 11)");
+        }
+        let precursors = table(&out, "spectra_metadata_precursors.parquet");
+        let (parents, parent_ids) = (indices(&precursors, "precursor_index"), column::<LargeStringArray>(&precursors, "precursor_id"));
+        for (r, parent) in parents.iter().enumerate() {
+            match parent {
+                Some(p) => assert_eq!(parent_ids.value(r), ids.value(*p as usize), "{layout}: precursor {r} and its id disagree"),
+                None => assert!(parent_ids.is_null(r), "{layout}: precursor {r} names a spectrum that is gone"),
+            }
+        }
+        // One past the largest index left: the MS1 profile spectra end at 11, the MS2 peak lists at 15.
+        assert_eq!(footer(&out, "spectra_data.parquet", "spectrum_count").as_deref(), Some("12"), "{layout}");
+        assert_eq!(footer(&out, "spectra_peaks.parquet", "spectrum_count").as_deref(), Some("16"), "{layout}");
+        assert_eq!(footer(&out, "spectra_metadata.parquet", "spectrum_count").as_deref(), Some("16"), "{layout}");
+        assert_eq!(renumbered(&out), serde_json::json!(["spectrum"]), "{layout}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A window from the first spectrum moves no index, and the archive says it renumbered nothing.
+#[test]
+fn a_leading_window_renumbers_nothing() {
+    let dir = scratch("leading");
+    let src = dir.join("small.mzpeak");
+    ok(&mzpc(Path::new(SMALL_RAW), &src, &[]));
+    let out = dir.join("f.mzpeak");
+    ok(&mzpc(&src, &out, &["--rt", "0-0.1"]));
+    assert_eq!(indices(&table(&out, "spectra_metadata.parquet"), "index"), (0..11).map(Some).collect::<Vec<_>>());
+    assert_eq!(renumbered(&out), serde_json::json!([]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A filtered export writes no `spectrumRef` to a spectrum it leaves out. Under `--ms-level 2` each of
+/// small.RAW's 34 MS2 spectra named its MS1 survey scan, none of them in the file (`scan=9` was the
+/// example of the 2026-09-11 review), where the rewrite route nulled the reference. A reference to a
+/// spectrum the export keeps stays, and the direct export and the rewrite-then-export agree.
+#[test]
+fn a_filtered_export_refers_only_to_spectra_it_holds() {
+    let refs = |mzml: &Path| -> Vec<String> {
+        let xml = std::fs::read_to_string(mzml).unwrap();
+        xml.split("spectrumRef=\"").skip(1).map(|s| s.split('"').next().unwrap().to_string()).collect()
+    };
+    let dir = scratch("spectrum-ref");
+    let src = dir.join("small.mzpeak");
+    ok(&mzpc(Path::new(SMALL_RAW), &src, &[]));
+    for (tag, args, kept) in [("ms2", ["--ms-level", "2"], 0), ("rt", ["--rt", "0.03-0.2"], 9)] {
+        let direct = dir.join(format!("{tag}.mzML"));
+        ok(&mzpc(&src, &direct, &args));
+        let held: HashSet<String> = spectrum_ids(&direct).into_iter().collect();
+        let direct_refs = refs(&direct);
+        assert_eq!(direct_refs.len(), kept, "{tag}: {direct_refs:?}");
+        assert!(direct_refs.iter().all(|r| held.contains(r)), "{tag}: a spectrumRef to a spectrum the file does not hold: {direct_refs:?}");
+        let archive = dir.join(format!("{tag}.mzpeak"));
+        ok(&mzpc(&src, &archive, &args));
+        let two_step = dir.join(format!("{tag}.two-step.mzML"));
+        ok(&mzpc(&archive, &two_step, &[]));
+        assert_eq!(refs(&two_step), direct_refs, "{tag}: the two routes disagree");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The filtered export parses the archive's index once. It opened the archive a second time to find
+/// the survivors, and every warning of that parse came twice: one per `vendor/` member of a timsTOF
+/// archive (21 became 42 on PXD059079's 2485), here the one an SDRF member's entity type draws.
+#[test]
+fn a_filtered_export_parses_the_index_once() {
+    let dir = scratch("parse-once");
+    let sdrf = dir.join("s.tsv");
+    std::fs::write(&sdrf, "source name\tassay name\nS1\tA1\n").unwrap();
+    let src = dir.join("src.mzpeak");
+    ok(&mzpc(Path::new(TINY), &src, &["--sdrf", sdrf.to_str().unwrap()]));
+    let r = mzpc(&src, &dir.join("f.mzML"), &["--ms-level", "2"]);
+    ok(&r);
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert_eq!(stderr.matches("Found entity type sample-metadata").count(), 1, "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -152,9 +326,9 @@ fn mzml_output_applies_the_same_filters() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A filtered archive keeps each survivor's original, now sparse, `index`. Reading one back aborted
-/// (the reader sized its per-spectrum tables by row count), and the export walked `0..len`, which
-/// asks for spectra that are gone. Each archive must export exactly the spectra it holds.
+/// A filtered archive reads back and exports exactly the spectra it holds. When a rewrite kept each
+/// survivor's original, sparse `index`, reading one back aborted (the reader sized its per-spectrum
+/// tables by row count), and the export walked `0..len`, which asked for spectra that were gone.
 #[test]
 fn filtered_archives_read_back() {
     let dir = scratch("read_back");
@@ -176,16 +350,18 @@ fn filtered_archives_read_back() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A rewrite keeps the survivors' original indices, so its data facets are sparse as well: their
-/// `spectrum_count` is one past the largest index left, the bound a reader iterates to, not the
-/// number of spectra left. On tiny, spectrum 1 is the profile spectrum in spectra_data, and
-/// spectra_peaks holds 0 and 3 (2 is an empty centroid spectrum).
+/// A rewritten data facet's `spectrum_count` is one past the largest (renumbered) index left in it,
+/// the bound a reader iterates to (issue #1, D1), not the number of spectra it holds: a data facet
+/// holds only the spectra with points in it. On tiny, spectrum 1 is the profile spectrum in
+/// spectra_data, and spectra_peaks holds 0 and 3 (2 is an empty centroid spectrum). `--ms-level 1`
+/// keeps 0, 2 and 3 as 0, 1 and 2; `--rt 0-1` keeps 2 and 3 as 0 and 1; `--ms-level 2` keeps 1 as 0.
+/// With the sparse indices a rewrite used to keep, these were 4, 4 and 2.
 #[test]
 fn rewritten_data_facets_declare_an_index_bound() {
     let dir = scratch("count_bound");
     let src = convert(TINY, &dir);
     let out = dir.join("f.mzpeak");
-    for (args, data, peaks) in [(["--ms-level", "1"], "0", "4"), (["--rt", "0-1"], "0", "4"), (["--ms-level", "2"], "2", "0")] {
+    for (args, data, peaks) in [(["--ms-level", "1"], "0", "3"), (["--rt", "0-1"], "0", "2"), (["--ms-level", "2"], "1", "0")] {
         ok(&mzpc(&src, &out, &args));
         assert_eq!(footer(&out, "spectra_data.parquet", "spectrum_count").as_deref(), Some(data), "{args:?}: spectra_data");
         assert_eq!(footer(&out, "spectra_peaks.parquet", "spectrum_count").as_deref(), Some(peaks), "{args:?}: spectra_peaks");
@@ -275,8 +451,9 @@ fn wavelength_archive_filters_by_ms_level_and_takes_an_sdrf() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `--rt` keeps the wavelength spectra inside the window in all three of their facets, and their
-/// footer counts follow: the entity count one past the largest index left, as for mass spectra.
+/// `--rt` keeps the wavelength spectra inside the window in all three of their facets, numbered 0..n-1
+/// as the mass spectra are, and their footer counts follow: the entity count one past the largest
+/// index left (it said 7 while indices 4-6 were kept as they were).
 #[test]
 fn an_rt_archive_filter_keeps_the_wavelength_spectra_in_the_window() {
     let dir = scratch("wavelength-rt");
@@ -284,14 +461,22 @@ fn an_rt_archive_filter_keeps_the_wavelength_spectra_in_the_window() {
     let out = dir.join("f.mzpeak");
     ok(&mzpc(&src, &out, &["--rt", "0.003-0.0055"]));
     let meta = table(&out, "wavelength_spectra_metadata.parquet");
-    assert_eq!(column::<UInt64Array>(&meta, "index").values().as_ref(), &[4u64, 5, 6], "scans 5, 6 and 7 lie in the window");
-    assert_eq!(table(&out, "wavelength_spectra_metadata_scans.parquet").num_rows(), 3);
-    assert_eq!(table(&out, "wavelength_spectra_data.parquet").num_rows(), 3 * 191);
+    assert_eq!(column::<UInt64Array>(&meta, "index").values().as_ref(), &[0u64, 1, 2], "scans 5, 6 and 7 lie in the window");
+    let ids: Vec<String> = column::<LargeStringArray>(&meta, "id").iter().map(|id| id.unwrap().to_string()).collect();
+    assert_eq!(ids, ["function=3 process=0 scan=5", "function=3 process=0 scan=6", "function=3 process=0 scan=7"]);
+    let scans = table(&out, "wavelength_spectra_metadata_scans.parquet");
+    assert_eq!(indices(&scans, "source_index"), [Some(0), Some(1), Some(2)]);
+    let data = table(&out, "wavelength_spectra_data.parquet");
+    assert_eq!(data.num_rows(), 3 * 191);
+    let data_key = leaves_but(&data, &[]).into_iter().find(|(name, _)| name.ends_with(".wavelength_spectrum_index")).unwrap().0;
+    assert_eq!(indices(&data, &data_key).into_iter().collect::<HashSet<_>>(), [Some(0), Some(1), Some(2)].into());
     let count = |name: &str, key: &str| footer(&out, name, key);
     assert_eq!(count("wavelength_spectra_metadata.parquet", "wavelength_spectrum_count").as_deref(), Some("3"));
     assert_eq!(count("wavelength_spectra_metadata.parquet", "wavelength_spectrum_data_point_count").as_deref(), Some("573"));
-    assert_eq!(count("wavelength_spectra_data.parquet", "wavelength_spectrum_count").as_deref(), Some("7"));
+    assert_eq!(count("wavelength_spectra_data.parquet", "wavelength_spectrum_count").as_deref(), Some("3"));
     assert_eq!(count("wavelength_spectra_data.parquet", "wavelength_spectrum_data_point_count").as_deref(), Some("573"));
+    // The mass spectra: the MS1 at index 0 lies outside the window, the MS2 at 1 inside.
+    assert_eq!(renumbered(&out), serde_json::json!(["spectrum", "wavelength_spectrum"]));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

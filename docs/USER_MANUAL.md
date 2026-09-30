@@ -241,6 +241,20 @@ them, and `--rt` keeps those whose time lies in the window. The archive → mzML
 same two rules, so filtering into an archive and exporting that writes the spectra a filtered export
 does. The export places them among the mass spectra by retention time.
 
+The spectra a filtered archive keeps are numbered 0..n-1 in their stored order, as the spec's
+`index` requires, and every column that holds a spectrum index follows: each metadata facet's
+`source_index`, the data facets' `spectrum_index`, the Thermo trailer facets' `ordinal`, and a
+precursor's or selected ion's `precursor_index` (its parent spectrum). A scans facet's own
+`scan_index` restarts at 0 as well, and the wavelength spectra are numbered the same way. The ids are
+the source's, so a spectrum is found in the source by its `id`. A precursor whose parent spectrum was
+filtered out loses its `precursor_index` and `precursor_id`, and a reference by id to a spectrum that
+is gone (`precursor_id`, a scan's `spectrum_reference`) is nulled; the mzML export writes no
+`spectrumRef` to a spectrum it leaves out either. The index's `filter` block lists what was
+renumbered under `renumbered` (`spectrum`, `wavelength_spectrum`; empty when a window starts at the
+first spectrum and nothing moved). An archive filtered by 0.16 or earlier keeps sparse indices;
+filtering it again numbers what it keeps 0..n-1, while `--drop-aux`, `--sdrf` and `--image` alone
+copy the spectra as they are.
+
 ### 4.3 Embedding sample metadata and images (`--sdrf`, `--image`)
 
 `--sdrf <file.tsv>` embeds an SDRF verbatim as `sample_metadata/sdrf.tsv` and adds
