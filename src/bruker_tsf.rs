@@ -121,8 +121,8 @@ impl TsfReader {
         let conn = crate::vendor_sqlite::open(&tsf)
             .with_context(|| format!("opening {}", tsf.display()))?;
 
-        // Calibration from GlobalMetadata. SQLite's own error stays in the chain: a read-only open of a
-        // file with a hot journal fails here, and "missing/invalid" would have misreported it.
+        // Calibration from GlobalMetadata. SQLite's own error stays in the chain for a database that
+        // cannot be read, which "missing/invalid" would have misreported.
         let meta = |key: &str| -> Result<f64> {
             let v: String = conn
                 .query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [key], |r| r.get(0))

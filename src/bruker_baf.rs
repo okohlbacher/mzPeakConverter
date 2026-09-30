@@ -11,7 +11,9 @@
 //! the actual m/z + intensity doubles are then read out of the storage handle
 //! via FFI. We:
 //!   * dynamically load `baf2sql_c` (via `libloading`),
-//!   * ask it for the SQLite cache path and open that read-only with `rusqlite`,
+//!   * ask it for the SQLite cache path — the library creates that cache inside the `.d` when the
+//!     run has none, so a BAF conversion can leave it in the raw folder (the library's placement;
+//!     review 2026-09-30) — and open it through [`crate::vendor_sqlite`],
 //!   * read the `Spectra`/`AcquisitionKeys` tables for rt / MS level / polarity /
 //!     array IDs,
 //!   * pull the calibrated (or raw) double arrays through the FFI per spectrum,

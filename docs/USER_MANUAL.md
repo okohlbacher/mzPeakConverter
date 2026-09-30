@@ -520,8 +520,12 @@ in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter
 the step is the most common gap, origin the smallest position, and every position must lie within a
 quarter step of its grid point or the run gets no positions — and writes the grid index, declared
 (`waters:laser-position-fitted-to-grid`), with the fit (origin, step, count, largest residual) in the
-`waters_imaging` block and the step as the pixel size. Vendor SQLite databases are opened immutable, so a conversion
-writes nothing into the `.d` (a read-only open of a WAL-mode MALDI TSF used to leave `-shm`/`-wal`).
+`waters_imaging` block and the step as the pixel size. The vendor SQLite databases the converter
+opens itself are opened immutable — or, when a `-wal` beside one still holds rows or its `-journal`
+is hot, read from a scratch copy — so those reads write nothing into the `.d` (a read-only open of a
+WAL-mode MALDI TSF used to leave `-shm`/`-wal`). A BAF `.d` is the exception: Bruker's baf2sql
+library, which the BAF lane reads through, creates its `analysis.sqlite` cache beside `analysis.baf`
+when the run has none.
 
 **Waters encodings come from a pre-scan.** Before the run is written, a sample of it (four stretches
 of consecutive spectra spread over the run, up to 64 spectra or 2 M points each) is written once per
@@ -581,8 +585,8 @@ value array in the unit HyStar states and each chromatogram type also as a param
 export states it (a trace in bar is stated in pascal as 64-bit floats, declared
 `bruker:trace-unit-rescale`; a trace stored in overlapping chunks is written in time order with
 each repeated sample once, declared `bruker:trace-sort-dedup`). HyStar's own MS traces, its
-MS/MS TIC `TIC,±AllMS/MS` among them, give way to the synthesized TIC/BPC, and a database in WAL
-mode is skipped with a warning, since SQLite cannot read one without writing into the input.
+MS/MS TIC `TIC,±AllMS/MS` among them, give way to the synthesized TIC/BPC. A database in WAL mode
+is read like one with a rollback journal, without writing into the input.
 
 **Mapped metadata (into the archive's typed columns).** Where a vendor value has a
 PSI controlled-vocabulary meaning, it is mapped onto the standard
