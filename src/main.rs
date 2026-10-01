@@ -2605,10 +2605,22 @@ fn convert_to_mzml(
     // fails to transition into the chromatogramList.
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
 
+    // A TDF: the points handed over per frame against `Frames.NumPeaks`, as the `--no-ims-compact`
+    // archive lane counts them (`convert_file`), with the lane's point count per spectrum.
+    let mut tdf_points = tdf_frame_points(&reader, input);
+    let mut points = fidelity::SourceTally::new(false);
+    let mut ran_out = true;
     let mut written = 0usize;
     for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
+            if let Some(a) = tdf_points.as_mut() {
+                a.finish(Some(spec.id()));
+            }
+            ran_out = false;
             break;
+        }
+        if let Some(a) = tdf_points.as_mut() {
+            a.observe(spec.id(), points.observe_points(&spec));
         }
         // mzdata's mzML writer panics on an array without a data type (`require_typed_arrays`).
         if scan_lane {
@@ -2634,6 +2646,14 @@ fn convert_to_mzml(
                 .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
         }
         written += 1;
+    }
+    if let (true, Some(a)) = (ran_out, tdf_points.as_mut()) {
+        a.finish(None);
+    }
+    // The archive lane declares this as `bruker:out-of-window-points-dropped`; an mzML has no
+    // transformations list, and its header was written before the first frame was read.
+    if let Some(msg) = tdf_points.as_ref().and_then(bruker_native::FramePointAccount::warning) {
+        log::warn!("{msg}; mzML has no transformations list to declare {} in", bruker_native::OUT_OF_WINDOW_DROPPED);
     }
     if let Some(g) = &thermo_windows {
         g.report();
@@ -3781,10 +3801,21 @@ fn convert_file_tof_grid(
     let mut n_f64 = 0usize;
     // Spectra carrying a scan start time other than 0 (`states_scan_times`).
     let mut timed = 0usize;
+    // The largest error the grid left on a gridded point: the tolerance is what a point had to
+    // stay within, this is what the points did.
+    let mut grid_error = fidelity::ObservedMzError::default();
+    // A TDF through mzdata's reader: the points handed over per frame against `Frames.NumPeaks`,
+    // as `convert_file` counts them.
+    let mut tdf_points = tdf_frame_points(&reader, input);
+    let mut ran_out = true;
     let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
         .then(|| thermo_isolation::UnstatedWidthGuard::open(read_path));
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
+            if let Some(a) = tdf_points.as_mut() {
+                source_tally.add_not_handed_over(a.finish(Some(entry.id())));
+            }
+            ran_out = false;
             break;
         }
         if let Some(g) = thermo_windows.as_mut() {
@@ -3794,15 +3825,31 @@ fn convert_file_tof_grid(
             r.check_spectrum(entry.description_mut());
         }
         timed += usize::from(entry.description().acquisition.scans.iter().any(|sc| sc.start_time != 0.0));
-        // The source's points, before the grid route re-shapes the arrays.
-        source_tally.observe(&entry);
+        // The source's points, before the grid route re-shapes the arrays. What the route hands
+        // the writer carries no peak set, so the intensities are counted below, by route.
+        let counted = source_tally.observe_points(&entry);
+        if let Some(a) = tdf_points.as_mut() {
+            source_tally.add_not_handed_over(a.observe(entry.id(), counted));
+        }
         let spec = match tof_grid_spectrum(&entry, &grid)? {
             TofRoute::Gridded(s) => {
                 n_gridded += 1;
+                // What the accepted grid left of this spectrum: the m/z it stores against the m/z
+                // read, point for point, and the intensities the grid row's float32 does not hold.
+                if let (Some(source), Some(stored)) = (entry.arrays.as_ref(), s.arrays.as_ref()) {
+                    if let (Ok(source), Ok(stored)) = (source.mzs(), stored.mzs()) {
+                        grid_error.observe(&source, &stored);
+                    }
+                    source_tally.add_intensity_rounded(fidelity::f32_cast_changes(source));
+                }
                 s
             }
             TofRoute::F64(s) => {
                 n_f64 += 1;
+                // The source arrays as they are: the writer casts them to its columns' types.
+                if let Some(arrays) = s.arrays.as_ref() {
+                    source_tally.add_intensities_taken(arrays);
+                }
                 s
             }
         };
@@ -3812,7 +3859,17 @@ fn convert_file_tof_grid(
         writer.write_spectrum(&spec)?;
         n += 1;
     }
-    log::info!("TOF-grid wrote {n} spectra: {n_gridded} gridded (tof_index), {n_f64} kept f64 m/z");
+    log::info!(
+        "TOF-grid wrote {n} spectra: {n_gridded} gridded (tof_index), {n_f64} kept f64 m/z; largest grid error {:.3e} ppm",
+        grid_error.max_rel_ppm
+    );
+    if let (true, Some(a)) = (ran_out, tdf_points.as_mut()) {
+        source_tally.add_not_handed_over(a.finish(None));
+    }
+    let out_of_window = tdf_points.as_ref().and_then(bruker_native::FramePointAccount::warning);
+    if let Some(msg) = &out_of_window {
+        log::warn!("{msg}; declared as {}", bruker_native::OUT_OF_WINDOW_DROPPED);
+    }
     if let Some(g) = &thermo_windows {
         g.report();
     }
@@ -3831,8 +3888,15 @@ fn convert_file_tof_grid(
         .or_else(|| mzml_start_time(&mut writer, source_refs.as_ref().and_then(|r| r.start_time_stamp()), reader_format(&reader)));
     let mut applied = base_transformations(&writer);
     applied.extend(chromatogram_transforms);
+    if out_of_window.is_some() {
+        declare(&mut applied, bruker_native::OUT_OF_WINDOW_DROPPED);
+    }
+    // The lane's fidelity block; with a gridded spectrum, the error the grid left beside it.
+    let mut lane_fidelity = source_tally.block();
     if n_gridded > 0 {
-        applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
+        let entry = format!("tof-grid:{}ppm", tof_grid::ppm_tol());
+        lane_fidelity = fidelity::with_observed(lane_fidelity, &entry, grid_error);
+        applied.push(entry);
     }
     applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
     if tdf_chord {
@@ -3847,7 +3911,7 @@ fn convert_file_tof_grid(
         .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&applied)))
-        .chain(std::iter::once(source_tally.block()))
+        .chain(std::iter::once(lane_fidelity))
         .collect();
     finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
 }
@@ -5125,6 +5189,10 @@ fn convert_file(
     // The fidelity block's source side: points and, for mzML and imzML (whose arrays arrive at
     // their declared binary types), the numeric types.
     let mut source_tally = fidelity::SourceTally::new(matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)));
+    // A TDF through mzdata's reader (`--no-ims-compact`): the points handed over per frame against
+    // `Frames.NumPeaks`. The reader yields one spectrum per isolation window of a PASEF frame and
+    // nothing for the scans outside them, so its own count cannot show what it left out.
+    let mut tdf_points = tdf_frame_points(&reader, input);
     // Whether any spectrum was actually re-ordered below — declared in `transformations` so a
     // reader knows the stored point order is not the source's.
     let mut resorted = false;
@@ -5135,8 +5203,14 @@ fn convert_file(
     // How many spectra carry a scan start time other than 0, which mzdata also gives a scan that
     // states none.
     let mut timed = 0usize;
+    let mut ran_out = true;
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
+            // The frame the cap cut through is not held against the reader.
+            if let Some(a) = tdf_points.as_mut() {
+                source_tally.add_not_handed_over(a.finish(Some(entry.id())));
+            }
+            ran_out = false;
             break;
         }
         if scan_lane {
@@ -5208,11 +5282,23 @@ fn convert_file(
         if synth_chroms {
             ms1.observe(&entry);
         }
-        source_tally.observe(&entry);
+        let counted = source_tally.observe(&entry);
+        // The frame this spectrum ended, when it starts another: `source_points` is the file's
+        // count, so the points the reader left out of it are added to the source side.
+        if let Some(a) = tdf_points.as_mut() {
+            source_tally.add_not_handed_over(a.observe(entry.id(), counted));
+        }
         writer.write_spectrum(&entry)?;
         n += 1;
     }
     log::debug!("wrote {n} spectra");
+    if let (true, Some(a)) = (ran_out, tdf_points.as_mut()) {
+        source_tally.add_not_handed_over(a.finish(None));
+    }
+    let out_of_window = tdf_points.as_ref().and_then(bruker_native::FramePointAccount::warning);
+    if let Some(msg) = &out_of_window {
+        log::warn!("{msg}; declared as {}", bruker_native::OUT_OF_WINDOW_DROPPED);
+    }
     if let Some(g) = &thermo_windows {
         g.report();
     }
@@ -5369,6 +5455,9 @@ fn convert_file(
             if tdf_chord {
                 declare(&mut applied, TDF_CHORD_TRANSFORMATION);
             }
+            if out_of_window.is_some() {
+                declare(&mut applied, bruker_native::OUT_OF_WINDOW_DROPPED);
+            }
             applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
             applied.extend(source_refs.as_ref().and_then(mzml_refs::DanglingRefs::transformation).map(str::to_string));
             applied.extend(chromatogram_transforms);
@@ -5377,6 +5466,18 @@ fn convert_file(
         .chain(std::iter::once(source_tally.block()))
         .collect();
     finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
+}
+
+/// The per-frame point account of a TDF read through mzdata's reader
+/// ([`bruker_native::FramePointAccount`]); `None` for any other reader, and, with a warning, when
+/// `Frames.NumPeaks` cannot be read: the conversion goes on without the check.
+fn tdf_frame_points(reader: &MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>, input: &Path) -> Option<bruker_native::FramePointAccount> {
+    if !matches!(reader, MZReaderType::BrukerTDF(_)) {
+        return None;
+    }
+    bruker_native::FramePointAccount::open(input)
+        .inspect_err(|e| log::warn!("Frames.NumPeaks unreadable ({e:#}); points outside the isolation windows of a frame are not counted"))
+        .ok()
 }
 
 /// `--lossless`: a spectrum without the peak sets mzdata built from its arrays, so the writer stores
@@ -6991,29 +7092,80 @@ fn finish_archive(
     aux: Option<AuxInputs<'_>>,
     index_blocks: &[(String, serde_json::Value)],
 ) -> Result<()> {
-    // The lane's `transformations` block, mirrored into its processing method before the metadata
-    // is written: here, so no lane can declare one without the other.
-    if let Some((_, block)) = index_blocks.iter().find(|(key, _)| key == "transformations") {
-        let applied: Vec<&str> = block.as_array().into_iter().flatten().filter_map(serde_json::Value::as_str).collect();
-        mirror_transformations(&mut writer, &applied);
-    }
-    let applied: Vec<&str> = index_blocks
+    // The lane's block, its intensity counts resolved against the type each facet's intensity
+    // column has in the writer's schema: a spectrum whose array is of another type was cast into it.
+    let schemas = writer.spectrum_facet_schemas();
+    let lane_fidelity = index_blocks
+        .iter()
+        .find(|(key, _)| key == fidelity::BLOCK)
+        .map(|(_, block)| fidelity::resolve_intensities(block, [schemas[0].as_deref(), schemas[1].as_deref()]));
+    let lane_fidelity = lane_fidelity.as_ref();
+    // Three entries are declared here, for every lane, from the evidence the `fidelity` block is
+    // then written from, so `transformations` cannot stay silent where that block reports a
+    // change: `delta-ulp` (the writer's count of delta chunks that are not exact by construction,
+    // per facet, against the lane's source types), `intensity-f32-rounding` and
+    // `intensity-type-narrowing` (the lane's counts of source intensities the stored column does
+    // not hold: stored as the nearest float32, or cast into a column of another type).
+    let mut declared: Vec<String> = index_blocks
         .iter()
         .find(|(key, _)| key == "transformations")
         .and_then(|(_, block)| block.as_array())
         .into_iter()
         .flatten()
-        .filter_map(serde_json::Value::as_str)
+        .filter_map(|t| t.as_str().map(str::to_string))
         .collect();
+    let at_risk = writer.spectrum_signal_tally_by_facet().map(|t| t.delta_chunks_at_risk);
+    if fidelity::delta_ulp_declared(lane_fidelity, at_risk) {
+        log::info!(
+            "{} delta-encoded m/z chunks span more than a factor of two: a decoded 64-bit m/z can be one unit in the \
+             last place off its source (declared as {}; --lossless stores every value exactly)",
+            at_risk.iter().sum::<u64>(),
+            fidelity::DELTA_ULP
+        );
+        declare(&mut declared, fidelity::DELTA_ULP);
+    }
+    let (rounded, narrowed) = fidelity::intensities_changed(lane_fidelity);
+    if rounded > 0 {
+        log::warn!(
+            "{rounded} intensities are stored as the nearest float32 of a source value no float32 holds \
+             (declared as {}; --lossless stores the source's type)",
+            fidelity::INTENSITY_F32_ROUNDING
+        );
+        declare(&mut declared, fidelity::INTENSITY_F32_ROUNDING);
+    }
+    if narrowed > 0 {
+        log::warn!(
+            "{narrowed} intensities are stored in a column whose type does not hold their source value: the input's \
+             intensity arrays change type, and a facet has one intensity column (declared as {}; --lossless stores \
+             a type that holds every value, or fails)",
+            fidelity::INTENSITY_TYPE_NARROWING
+        );
+        declare(&mut declared, fidelity::INTENSITY_TYPE_NARROWING);
+    }
+    // The (amended) `transformations` block, mirrored into the conversion's processing method
+    // before the metadata is written: here, so no lane can declare one without the other. A lane
+    // that handed over no block gets one only when there is something to say.
+    let has_block = index_blocks.iter().any(|(key, _)| key == "transformations");
+    let amended = transformations_block(&declared);
+    let index_blocks: Vec<&(String, serde_json::Value)> = index_blocks
+        .iter()
+        .map(|block| if block.0 == "transformations" { &amended } else { block })
+        .chain((!has_block && !declared.is_empty()).then_some(&amended))
+        .collect();
+    let applied: Vec<&str> = declared.iter().map(String::as_str).collect();
+    if has_block || !applied.is_empty() {
+        mirror_transformations(&mut writer, &applied);
+    }
+    // The bound a ModelType-2 timsTOF lane states for the calibrant polynomial it leaves out.
+    let calibrant_ppm = index_blocks.iter().find(|(key, _)| key == "ims_calibration").and_then(|(_, cal)| cal["max_error_ppm"].as_f64());
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
     zip.flush().context("flushing the archive before its signal facets are read back")?;
     // The fidelity block: the lane's count of what the reader handed over (when the lane counts),
     // completed from the two signal facets as they now sit in the archive. A record, so a failure
     // to read them back costs the block and a warning, not the conversion; under `--lossless` it
     // is the evidence, and its absence fails the run.
-    let lane_fidelity = index_blocks.iter().find(|(key, _)| key == fidelity::BLOCK).map(|(_, block)| block);
     let started = std::time::Instant::now();
-    let fidelity_block = match fidelity::complete(lane_fidelity, tmp_guard.path(), &applied) {
+    let fidelity_block = match fidelity::complete(lane_fidelity, tmp_guard.path(), &applied, calibrant_ppm) {
         Ok(block) => {
             log::debug!("fidelity block: signal facets read back in {:.3} s", started.elapsed().as_secs_f64());
             Some(block)
@@ -7830,14 +7982,21 @@ fn convert_sciex_grid(
     // The per-spectrum fit is accepted within a ppm bound (`max_ppm` is this run's worst case; it
     // has run at ~5 ppm on the published MSV000095995 archive), and the archive says so. No
     // `tof_calibration` block since the chunk-grid layout: the model rides on every grid row.
+    // The lane does not count its source (Clearcore2's arrays are the glue's choice), so its
+    // fidelity block holds only what the fits measured: `max_ppm`, the worst accepted fit.
+    let mut lane_fidelity = None;
     if n_grid > 0 {
-        applied.push(format!("tof-grid:{}ppm", tof_grid::ppm_tol()));
+        let entry = format!("tof-grid:{}ppm", tof_grid::ppm_tol());
+        let observed = fidelity::ObservedMzError { max_abs: None, max_rel_ppm: max_ppm };
+        lane_fidelity = Some(fidelity::with_observed((fidelity::BLOCK.to_string(), serde_json::json!({})), &entry, observed));
+        applied.push(entry);
     }
     applied.extend(value_changes.transformations());
     let index_blocks: Vec<(String, serde_json::Value)> = acquisition_block
         .into_iter()
         .chain(std::iter::once(transformations_block(&applied)))
         .chain(partial_marker(input, max_spectra(), len))
+        .chain(lane_fidelity)
         .collect();
     // A `.wiff` is a FILE: `vendor::embed_into_archive` walks a vendor DIRECTORY, so this lane has
     // no side-files to embed and passes no policy (hence the `_vendor` parameter). No aux either —
@@ -13090,7 +13249,11 @@ mod tests {
         // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run. Its
         // `sic` is in seconds, stored in minutes.
         assert_eq!(applied, ["numpress-linear", "sort-by-time", "chromatogram-time-to-minutes"], "{applied:?}");
-        // The lossless request drops the codec entry — the list follows the choice, not the lane.
+        // `--no-numpress` drops the codec entry — the list follows the choice, not the lane — and
+        // delta brings its own: the fixture's spectra are sparse lists (m/z 0 to 20 in steps of 1
+        // or 2), so their delta chunks span more than a factor of two and are declared, in the
+        // list and, with the bound, in `fidelity.mz_error`. Through 0.17.0-rc.1 only the block
+        // said so.
         let out2 = dir.join("tiny-delta.mzpeak");
         let args: Vec<&std::ffi::OsStr> = vec![
             TINY.as_ref(), "-o".as_ref(), out2.as_os_str(), "--force".as_ref(), "--no-numpress".as_ref(),
@@ -13100,7 +13263,9 @@ mod tests {
         let meta = index_metadata(&out2);
         let applied: Vec<&str> =
             meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(applied, ["sort-by-time", "chromatogram-time-to-minutes"], "{applied:?}");
+        assert_eq!(applied, ["sort-by-time", "chromatogram-time-to-minutes", "delta-ulp"], "{applied:?}");
+        let delta: Vec<&serde_json::Value> = meta["fidelity"]["mz_error"].as_array().unwrap().iter().filter(|e| e["encoding"] == "delta").collect();
+        assert!(!delta.is_empty() && delta.iter().all(|e| e["chunks_not_exact_by_construction"].as_u64() > Some(0)), "{}", meta["fidelity"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

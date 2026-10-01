@@ -8,8 +8,11 @@
 //!   `zero-run-mask`, and gives the pixels of a continuous-mode run one decoded m/z axis;
 //! * `--lossless` writes an archive whose stored arrays equal the source arrays bit for bit, at
 //!   the declared types, or fails and writes nothing;
-//! * `--no-numpress` (delta) is NOT bit-exact on sparse 64-bit m/z, at any mass, and the block
-//!   bounds the error at one unit in the last place;
+//! * `--no-numpress` (delta) is NOT bit-exact on sparse 64-bit m/z, at any mass, the block bounds
+//!   the error at one unit in the last place, and `transformations` declares it (`delta-ulp`);
+//! * a centroid intensity no float32 holds is stored as the nearest float32 on the default lanes,
+//!   declared (`intensity-f32-rounding`) and counted, also where the column is a float64; and so
+//!   is every intensity cast into a column of another type than its own, by what the column holds;
 //! * a facet whose m/z are grid indices says so in `stored_types`, and the grid fit's tolerance
 //!   holds for every decoded value;
 //! * the `.mzpeak` filter carries the block, or drops it when it removes spectra.
@@ -73,6 +76,21 @@ fn metadata(archive: &Path) -> Value {
 
 fn transformations(archive: &Path) -> Vec<String> {
     metadata(archive)["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect()
+}
+
+/// The `transformation` userParams of the conversion's own processing method: the list
+/// `transformations` holds, as a reader of `data_processing_method_list` alone sees it.
+fn mirrored_transformations(archive: &Path) -> Vec<String> {
+    metadata(archive)["data_processing_method_list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|dp| dp["id"] == "mzpeak_convert_conversion")
+        .flat_map(|dp| dp["methods"].as_array().unwrap().iter())
+        .flat_map(|m| m["parameters"].as_array().unwrap().iter())
+        .filter(|p| p["name"] == "transformation")
+        .map(|p| p["value"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// A source array at its declared binary type.
@@ -600,7 +618,11 @@ fn delta_on_sparse_64_bit_mz_is_off_by_an_ulp_and_the_block_bounds_it() {
     let input = write_imzml(&dir, "f64", &spectra, true, false);
     let out = dir.join("f64.mzpeak");
     convert(&input, &out, &["--no-numpress"]);
-    assert!(transformations(&out).iter().all(|t| t == "mzml:dangling-reference-dropped"), "{:?}", transformations(&out));
+    // The value change is declared, in `transformations` and in the processing method that mirrors
+    // it: through 0.17.0-rc.1 the list was empty while `mz_error` reported the ulp.
+    let declared = transformations(&out);
+    assert!(declared.contains(&"delta-ulp".to_string()) && declared.iter().all(|t| t == "delta-ulp" || t == "mzml:dangling-reference-dropped"), "{declared:?}");
+    assert_eq!(mirrored_transformations(&out), declared);
     let errors = metadata(&out)["fidelity"]["mz_error"].clone();
     let e = &errors[0];
     assert_eq!((errors.as_array().unwrap().len(), &e["encoding"], &e["facet"], &e["basis"]), (1, &"delta".into(), &"spectra_data".into(), &"bound".into()), "{errors}");
@@ -636,7 +658,7 @@ fn delta_on_sparse_64_bit_mz_is_off_by_an_ulp_and_the_block_bounds_it() {
         assert_eq!(bits(&stored[&(i as u64)].0), bits(mz), "spectrum {i}");
     }
 
-    // 32-bit m/z: delta is exact, and the block has nothing to report.
+    // 32-bit m/z: delta is exact, and neither the block nor `transformations` has anything to report.
     let spectra = build(true, &mut rng);
     let input = write_imzml(&dir, "f32", &spectra, true, false);
     let out = dir.join("f32.mzpeak");
@@ -645,6 +667,368 @@ fn delta_on_sparse_64_bit_mz_is_off_by_an_ulp_and_the_block_bounds_it() {
         assert_eq!(d, &mz.as_f64());
     }
     assert_eq!(metadata(&out)["fidelity"]["mz_error"], serde_json::json!([]));
+    assert!(!transformations(&out).contains(&"delta-ulp".to_string()), "{:?}", transformations(&out));
+
+    // Dense 64-bit m/z (every chunk within a factor of two): delta chunks, none at risk, no entry.
+    let dense: Vec<(Arr, Arr)> = (0..4)
+        .map(|_| {
+            let mz: Vec<f64> = (0..200).map(|i| 400.0 + 0.37 * f64::from(i) + 0.1 * rng.next()).collect();
+            let it = f32s(&intensities(&mut rng, mz.len(), false));
+            (Arr::F64(mz), Arr::F32(it))
+        })
+        .collect();
+    let input = write_imzml(&dir, "dense", &dense, true, false);
+    let out = dir.join("dense.mzpeak");
+    convert(&input, &out, &["--no-numpress"]);
+    assert_eq!(metadata(&out)["fidelity"]["mz_error"], serde_json::json!([]));
+    assert!(!transformations(&out).contains(&"delta-ulp".to_string()), "{:?}", transformations(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The intensity column of one facet in row order (spectrum by spectrum, each in m/z order), as
+/// f64, with its value type: the list items of a chunked facet, the column of a point facet.
+fn stored_intensities(archive: &Path, name: &str) -> (DataType, Vec<f64>) {
+    use arrow::datatypes::{Int32Type, Int64Type};
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(member(archive, name))).unwrap().build().unwrap();
+    let (mut dtype, mut out) = (None, Vec::new());
+    for batch in reader {
+        let batch = batch.unwrap();
+        let values = match (batch.column_by_name("chunk"), batch.column_by_name("point")) {
+            (Some(chunk), _) => chunk.as_struct().column_by_name("intensity").unwrap().as_list::<i64>().values().clone(),
+            (_, Some(point)) => point.as_struct().column_by_name("intensity").unwrap().clone(),
+            _ => panic!("{name} is neither chunked nor in the point layout"),
+        };
+        assert_eq!(values.null_count(), 0, "{name}: null intensities");
+        dtype = Some(values.data_type().clone());
+        match values.data_type() {
+            DataType::Float32 => out.extend(values.as_primitive::<Float32Type>().values().iter().map(|x| f64::from(*x))),
+            DataType::Float64 => out.extend(values.as_primitive::<Float64Type>().values().iter().copied()),
+            DataType::Int32 => out.extend(values.as_primitive::<Int32Type>().values().iter().map(|x| f64::from(*x))),
+            DataType::Int64 => out.extend(values.as_primitive::<Int64Type>().values().iter().map(|x| *x as f64)),
+            other => panic!("{name}: a {other} intensity column"),
+        }
+    }
+    (dtype.unwrap_or_else(|| panic!("{name} holds no rows")), out)
+}
+
+/// A centroid spectrum's intensities reach the peak facet through mzdata's peak set, which holds
+/// them as float32 whatever the file declares. Where a source value is no float32 the stored one
+/// is another number: the conversion says so (`intensity-f32-rounding`, mirrored into the
+/// processing method), the facet's `intensity_values_rounded` counts the values, and a warning
+/// gives the count. Through 0.17.0-rc.1 `transformations` was empty for it, and where the peak
+/// facet's column is a float64 (profile spectra first in the file: the schema is sampled from
+/// them) the block showed nothing either — float64 in, float64 out, every value rounded.
+#[test]
+fn centroid_intensities_no_float32_holds_are_declared_and_counted() {
+    let dir = scratch("f32-rounding");
+    let mut rng = Lcg(77);
+    let mz = |rng: &mut Lcg, n: usize| -> Vec<f64> {
+        let mut mz: Vec<f64> = (0..n).map(|_| 100.0 + 900.0 * rng.next()).collect();
+        mz.sort_by(f64::total_cmp);
+        mz
+    };
+    // 64-bit intensities: four per spectrum that a float32 holds, the rest that none does.
+    let spectra: Vec<(Arr, Arr)> = (0..6)
+        .map(|_| {
+            let m = mz(&mut rng, 40);
+            let mut it = intensities(&mut rng, m.len(), false);
+            it[..4].copy_from_slice(&[1.0, 1024.5, 16777216.0, 0.25]);
+            (Arr::F64(m), Arr::F64(it))
+        })
+        .collect();
+    let source: Vec<f64> = spectra.iter().flat_map(|(_, it)| it.as_f64()).collect();
+    let not_f32 = source.iter().filter(|x| f64::from(**x as f32) != **x).count() as u64;
+    assert_eq!(not_f32, 6 * 36, "the premise: 36 of each spectrum's 40 intensities are not float32 values");
+    let input = write_imzml(&dir, "wide", &spectra, false, false);
+
+    for (args, layout) in [(&[][..], "chunked"), (&["--no-numpress"][..], "chunked"), (&["--layout", "point"][..], "point")] {
+        let out = dir.join(format!("wide-{}.mzpeak", args.join("")));
+        let r = run(&input, &out, args, false);
+        assert!(r.status.success(), "{args:?}: {}", String::from_utf8_lossy(&r.stderr));
+        let declared = transformations(&out);
+        assert!(declared.contains(&"intensity-f32-rounding".to_string()), "{args:?}: {declared:?}");
+        assert_eq!(mirrored_transformations(&out), declared, "{args:?}");
+        let facet = metadata(&out)["fidelity"]["spectra_peaks"].clone();
+        assert_eq!((&facet["layout"], facet["intensity_values_rounded"].as_u64()), (&layout.into(), Some(not_f32)), "{args:?}: {facet}");
+        assert_eq!((&facet["source_types"]["intensity"], &facet["stored_types"]["intensity"]), (&serde_json::json!(["float64"]), &"float32".into()), "{facet}");
+        // What is stored: the float32 nearest each source value, which is what the entry says.
+        if layout == "chunked" {
+            let (dtype, stored) = stored_intensities(&out, "spectra_peaks.parquet");
+            assert_eq!(dtype, DataType::Float32);
+            assert_eq!(stored, source.iter().map(|x| f64::from(*x as f32)).collect::<Vec<_>>(), "{args:?}");
+        }
+    }
+
+    // The count goes to the run's warning (without `-q`).
+    let loud = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&input)
+        .arg("-o")
+        .arg(dir.join("wide-loud.mzpeak"))
+        .env_remove("MZPC_KEEP_ZERO_RUNS")
+        .env_remove("MZPC_MAX_SPECTRA")
+        .output()
+        .expect("failed to run mzpeak-convert");
+    let err = String::from_utf8_lossy(&loud.stderr);
+    assert!(loud.status.success() && err.contains(&format!("{not_f32} intensities")) && err.contains("intensity-f32-rounding"), "{err}");
+
+    // `--lossless` stores the source's type and declares nothing.
+    let exact = dir.join("wide-lossless.mzpeak");
+    convert(&input, &exact, &["--lossless"]);
+    assert!(!transformations(&exact).contains(&"intensity-f32-rounding".to_string()));
+    let facet = metadata(&exact)["fidelity"]["spectra_peaks"].clone();
+    assert!(facet.get("intensity_values_rounded").is_none() && facet["stored_types"]["intensity"] == "float64", "{facet}");
+
+    // 64-bit intensities that are all float32 values (what the corpus's 14 such archives hold),
+    // and 32-bit ones: nothing is changed and nothing is declared.
+    for (stem, as64) in [("representable", true), ("narrow", false)] {
+        let spectra: Vec<(Arr, Arr)> = (0..4)
+            .map(|_| {
+                let m = mz(&mut rng, 40);
+                let it = f32s(&intensities(&mut rng, m.len(), false));
+                (Arr::F64(m), if as64 { Arr::F64(it.iter().map(|x| f64::from(*x)).collect()) } else { Arr::F32(it) })
+            })
+            .collect();
+        let input = write_imzml(&dir, stem, &spectra, false, false);
+        let out = dir.join(format!("{stem}.mzpeak"));
+        convert(&input, &out, &[]);
+        assert!(!transformations(&out).contains(&"intensity-f32-rounding".to_string()), "{stem}: {:?}", transformations(&out));
+        assert!(metadata(&out)["fidelity"]["spectra_peaks"].get("intensity_values_rounded").is_none(), "{stem}");
+    }
+
+    // Profile spectra first, centroid ones after, all with 64-bit intensities, as an mzML: the
+    // peak facet's intensity column is a float64 (sampled from the profile arrays) and holds the
+    // float32-rounded values of the centroid spectra. The block alone reads float64 → float64.
+    let mixed = dir.join("mixed.mzML");
+    let profile: Vec<(Vec<f64>, Vec<f64>)> = (0..3).map(|_| ((0..300).map(|i| 200.0 + 0.01 * f64::from(i)).collect(), intensities(&mut rng, 300, false))).collect();
+    let centroid: Vec<(Vec<f64>, Vec<f64>)> = (0..3).map(|_| (mz(&mut rng, 50), intensities(&mut rng, 50, false))).collect();
+    write_mzml_f64(&mixed, &profile, &centroid);
+    let out = dir.join("mixed.mzpeak");
+    convert(&mixed, &out, &[]);
+    let facet = metadata(&out)["fidelity"]["spectra_peaks"].clone();
+    let rounded = centroid.iter().flat_map(|(_, it)| it).filter(|x| f64::from(**x as f32) != **x).count() as u64;
+    assert_eq!(rounded, 150);
+    assert_eq!((&facet["source_types"]["intensity"], &facet["stored_types"]["intensity"]), (&serde_json::json!(["float64"]), &"float64".into()), "{facet}");
+    assert_eq!(facet["intensity_values_rounded"].as_u64(), Some(rounded), "{facet}");
+    assert!(transformations(&out).contains(&"intensity-f32-rounding".to_string()), "{:?}", transformations(&out));
+    let (dtype, stored) = stored_intensities(&out, "spectra_peaks.parquet");
+    assert_eq!(dtype, DataType::Float64);
+    assert_eq!(stored, centroid.iter().flat_map(|(_, it)| it.iter().map(|x| f64::from(*x as f32))).collect::<Vec<_>>());
+    // The profile arrays keep their 64-bit values, and are not counted.
+    assert!(metadata(&out)["fidelity"]["spectra_data"].get("intensity_values_rounded").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An mzML of `profile` spectra followed by `centroid` ones, m/z and intensity both declared and
+/// written as 64-bit floats.
+fn write_mzml_f64(path: &Path, profile: &[(Vec<f64>, Vec<f64>)], centroid: &[(Vec<f64>, Vec<f64>)]) {
+    let spectrum = |profile: bool, (mz, intensity): &(Vec<f64>, Vec<f64>)| MzmlSpectrum { profile, mz: mz.clone(), intensity: Intensity::F64(intensity.clone()), charge: false };
+    let spectra: Vec<MzmlSpectrum> = profile.iter().map(|s| spectrum(true, s)).chain(centroid.iter().map(|s| spectrum(false, s))).collect();
+    write_mzml(path, &spectra);
+}
+
+/// An intensity array at its declared binary type.
+#[derive(Clone)]
+enum Intensity {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    I32(Vec<i32>),
+}
+
+impl Intensity {
+    fn as_f64(&self) -> Vec<f64> {
+        match self {
+            Intensity::F32(v) => v.iter().map(|x| f64::from(*x)).collect(),
+            Intensity::F64(v) => v.clone(),
+            Intensity::I32(v) => v.iter().map(|x| f64::from(*x)).collect(),
+        }
+    }
+}
+
+/// One spectrum of [`write_mzml`]: 64-bit m/z, the intensities at their own type, and a charge
+/// array beside them when `charge` (a third per-peak array: the writer then stores the arrays,
+/// not mzdata's peak set).
+struct MzmlSpectrum {
+    profile: bool,
+    mz: Vec<f64>,
+    intensity: Intensity,
+    charge: bool,
+}
+
+/// An mzML of `spectra` in order (mzdata's writer keeps each array's own type).
+fn write_mzml(path: &Path, spectra: &[MzmlSpectrum]) {
+    use mzdata::io::mzml::MzMLWriter;
+    use mzdata::mzpeaks::{CentroidPeak, DeconvolutedPeak};
+    use mzdata::prelude::*;
+    use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray};
+    use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum, SignalContinuity, SpectrumDescription};
+    let mut w = MzMLWriter::new(std::fs::File::create(path).unwrap());
+    w.set_spectrum_count(spectra.len() as u64);
+    for (i, s) in spectra.iter().enumerate() {
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz.update_buffer(&s.mz).unwrap();
+        arrays.add(mz);
+        let intensity = match &s.intensity {
+            Intensity::F32(v) => {
+                let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+                a.update_buffer(v).unwrap();
+                a
+            }
+            Intensity::F64(v) => {
+                let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new());
+                a.update_buffer(v).unwrap();
+                a
+            }
+            Intensity::I32(v) => {
+                let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+                a.update_buffer(v).unwrap();
+                a
+            }
+        };
+        arrays.add(intensity);
+        if s.charge {
+            let mut a = DataArray::wrap(&ArrayType::ChargeArray, BinaryDataArrayType::Int32, Vec::new());
+            a.update_buffer(&vec![2i32; s.mz.len()]).unwrap();
+            arrays.add(a);
+        }
+        let continuity = if s.profile { SignalContinuity::Profile } else { SignalContinuity::Centroid };
+        let description = SpectrumDescription { index: i, id: format!("scan={}", i + 1), ms_level: 1, signal_continuity: continuity, ..Default::default() };
+        let spectrum: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(description, Some(arrays), None, None);
+        w.write(&spectrum).unwrap();
+    }
+    w.close().unwrap();
+}
+
+/// A facet's intensity column has ONE type, fixed from the spectra the writer samples before the
+/// first is written, and a spectrum whose array is of another type is cast into it. The first
+/// version of the `intensity-f32-rounding` count took every array the writer stores as it is
+/// (profile signal, a centroid spectrum with a third per-peak array) for exact, which holds only
+/// in a column of the array's own type: a file whose first spectra carry 32-bit intensities and
+/// later ones 64-bit had the later ones rounded with nothing declared, or too few counted.
+///
+/// Whatever the file mixes and whichever layout stores it, the block's counts are the number of
+/// stored intensities that differ from the source's, read straight from the facet:
+/// `intensity_values_rounded` where they went through or into a float32 (`intensity-f32-rounding`),
+/// `intensity_values_narrowed` where an integer column cut them (`intensity-type-narrowing`).
+#[test]
+fn intensities_cast_into_a_column_of_another_type_are_declared_and_counted() {
+    let dir = scratch("column-cast");
+    let mut rng = Lcg(404);
+    let centroid_mz = |rng: &mut Lcg| -> Vec<f64> {
+        let mut mz: Vec<f64> = (0..40).map(|_| 100.0 + 900.0 * rng.next()).collect();
+        mz.sort_by(f64::total_cmp);
+        mz
+    };
+    let profile_mz = || -> Vec<f64> { (0..300).map(|i| 200.0 + 0.01 * f64::from(i)).collect() };
+    // No float32 holds these, and none is an integer.
+    let wide = |rng: &mut Lcg, n: usize| Intensity::F64(intensities(rng, n, false));
+    let narrow = |rng: &mut Lcg, n: usize| Intensity::F32(f32s(&intensities(rng, n, false)));
+    let counts = |rng: &mut Lcg, n: usize| Intensity::I32((0..n).map(|_| 1 + (1000.0 * rng.next()) as i32).collect());
+    let not_f32 = |spectra: &[MzmlSpectrum]| spectra.iter().flat_map(|s| s.intensity.as_f64()).filter(|x| f64::from(*x as f32) != *x).count() as u64;
+    let n = 3;
+
+    // (name, the spectra, the facet they all go to, and under the default layout: the column's
+    // type, the rounded and the narrowed count)
+    let mut cases: Vec<(&str, Vec<MzmlSpectrum>, &str, DataType, u64, u64)> = Vec::new();
+    // Plain 32-bit centroid spectra, then 64-bit ones with a charge array, whose arrays the
+    // writer takes: a float32 column, the later spectra rounded. Declared nothing through rc.1
+    // and in the first version of the count.
+    let spectra: Vec<MzmlSpectrum> = (0..2 * n)
+        .map(|i| {
+            let mz = centroid_mz(&mut rng);
+            let intensity = if i < n { narrow(&mut rng, mz.len()) } else { wide(&mut rng, mz.len()) };
+            MzmlSpectrum { profile: false, mz, intensity, charge: i >= n }
+        })
+        .collect();
+    let rounded = not_f32(&spectra[n..]);
+    cases.push(("narrow-then-wide-with-charge", spectra, "spectra_peaks", DataType::Float32, rounded, 0));
+    // Plain 64-bit centroid spectra (stored from the float32 peak set), then the same with a
+    // charge array (cast into the float32 column): every value rounded. The first version counted
+    // the first half only.
+    let spectra: Vec<MzmlSpectrum> = (0..2 * n)
+        .map(|i| {
+            let mz = centroid_mz(&mut rng);
+            let intensity = wide(&mut rng, mz.len());
+            MzmlSpectrum { profile: false, mz, intensity, charge: i >= n }
+        })
+        .collect();
+    let rounded = not_f32(&spectra);
+    cases.push(("wide-then-wide-with-charge", spectra, "spectra_peaks", DataType::Float32, rounded, 0));
+    // Profile spectra, 32-bit intensities first: the data facet's column is a float32 too.
+    let spectra: Vec<MzmlSpectrum> = (0..2 * n)
+        .map(|i| MzmlSpectrum { profile: true, mz: profile_mz(), intensity: if i < n { narrow(&mut rng, 300) } else { wide(&mut rng, 300) }, charge: false })
+        .collect();
+    let rounded = not_f32(&spectra[n..]);
+    cases.push(("profile-narrow-then-wide", spectra, "spectra_data", DataType::Float32, rounded, 0));
+    // Integer intensities first: an int32 column, and the floats that follow are cut to integers.
+    let spectra: Vec<MzmlSpectrum> = (0..2 * n)
+        .map(|i| MzmlSpectrum { profile: true, mz: profile_mz(), intensity: if i < n { counts(&mut rng, 300) } else { wide(&mut rng, 300) }, charge: false })
+        .collect();
+    let narrowed = (n * 300) as u64;
+    cases.push(("profile-integer-then-float", spectra, "spectra_data", DataType::Int32, 0, narrowed));
+    // 64-bit profile intensities first: a float64 column holds the 32-bit ones that follow.
+    let spectra: Vec<MzmlSpectrum> = (0..2 * n)
+        .map(|i| MzmlSpectrum { profile: true, mz: profile_mz(), intensity: if i < n { wide(&mut rng, 300) } else { narrow(&mut rng, 300) }, charge: false })
+        .collect();
+    cases.push(("profile-wide-then-narrow", spectra, "spectra_data", DataType::Float64, 0, 0));
+
+    for (name, spectra, facet, column, rounded, narrowed) in &cases {
+        assert!(*rounded + *narrowed > 0 || *column == DataType::Float64, "{name}: the premise");
+        let input = dir.join(format!("{name}.mzML"));
+        write_mzml(&input, spectra);
+        let source: Vec<f64> = spectra.iter().flat_map(|s| s.intensity.as_f64()).collect();
+        for layout in ["chunked", "point"] {
+            let out = dir.join(format!("{name}-{layout}.mzpeak"));
+            convert(&input, &out, &["--layout", layout]);
+            let block = metadata(&out)["fidelity"].clone();
+            let (dtype, stored) = stored_intensities(&out, &format!("{facet}.parquet"));
+            assert_eq!(stored.len(), source.len(), "{name}, {layout}");
+            // What the facet holds against what the file holds, value by value.
+            let changed = stored.iter().zip(&source).filter(|(a, b)| a != b).count() as u64;
+            let count = |key: &str| block[*facet][key].as_u64().unwrap_or(0);
+            let (r, w) = (count("intensity_values_rounded"), count("intensity_values_narrowed"));
+            assert_eq!(r + w, changed, "{name}, {layout}: {} stores {dtype}, {changed} of {} values changed; the block: {}", facet, source.len(), block[*facet]);
+            let declared = transformations(&out);
+            assert_eq!(declared.contains(&"intensity-f32-rounding".to_string()), r > 0, "{name}, {layout}: {declared:?}");
+            assert_eq!(declared.contains(&"intensity-type-narrowing".to_string()), w > 0, "{name}, {layout}: {declared:?}");
+            assert_eq!(mirrored_transformations(&out), declared, "{name}, {layout}");
+            // A count is of what the stored type does: none under a type that holds every value.
+            let other = if *facet == "spectra_data" { "spectra_peaks" } else { "spectra_data" };
+            assert!(block[other].get("intensity_values_rounded").is_none() && block[other].get("intensity_values_narrowed").is_none(), "{name}: {block}");
+            if layout == "chunked" {
+                assert_eq!((&dtype, r, w), (column, *rounded, *narrowed), "{name}: {}", block[*facet]);
+                if *column == DataType::Float32 {
+                    assert_eq!(stored, source.iter().map(|x| f64::from(*x as f32)).collect::<Vec<_>>(), "{name}: the nearest float32 of each");
+                }
+            }
+        }
+    }
+
+    // The warning names the count of each kind.
+    let loud = |name: &str| {
+        let r = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+            .arg(dir.join(format!("{name}.mzML")))
+            .arg("-o")
+            .arg(dir.join(format!("{name}-loud.mzpeak")))
+            .env_remove("MZPC_KEEP_ZERO_RUNS")
+            .env_remove("MZPC_MAX_SPECTRA")
+            .output()
+            .expect("failed to run mzpeak-convert");
+        assert!(r.status.success());
+        String::from_utf8_lossy(&r.stderr).to_string()
+    };
+    let err = loud("profile-narrow-then-wide");
+    assert!(err.contains(&format!("{} intensities are stored as the nearest float32", cases[2].4)) && err.contains("intensity-f32-rounding"), "{err}");
+    let err = loud("profile-integer-then-float");
+    assert!(err.contains(&format!("{} intensities are stored in a column whose type does not hold", cases[3].5)) && err.contains("intensity-type-narrowing"), "{err}");
+
+    // `--lossless` on the mixed-width file: the source's widest type, nothing changed or declared.
+    let exact = dir.join("lossless.mzpeak");
+    convert(&dir.join("narrow-then-wide-with-charge.mzML"), &exact, &["--lossless"]);
+    let (dtype, stored) = stored_intensities(&exact, "spectra_peaks.parquet");
+    let source: Vec<f64> = cases[0].1.iter().flat_map(|s| s.intensity.as_f64()).collect();
+    assert_eq!((dtype, stored), (DataType::Float64, source));
+    assert!(!transformations(&exact).iter().any(|t| t.starts_with("intensity-")), "{:?}", transformations(&exact));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

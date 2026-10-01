@@ -6,10 +6,16 @@
 //!   * attach the isolation window's 1/K0 band to EVERY selected ion as MZP:1000006/7
 //!     (`cv/mzpeak.obo`), unit MS:1002814, with `lower <= ion_mobility_value <= upper`, and list
 //!     the MZP vocabulary in the archive's `cv_list`;
-//!   * agree on the selected ion's 1/K0 and band for the same window. They used to differ by
-//!     0.015 Vs/cm² (1.332387 vs 1.317349 on frame 2 / m/z 1276.05 of this file): mzdata's
-//!     precursor params are timsrust-linear while its arrays — and the native lane — use the
-//!     vendor ModelType-2 model;
+//!   * agree on the selected ion's 1/K0 and band for the same window, bit for bit: both evaluate
+//!     the vendor's ModelType-2 model as the mobility arrays (mzdata lane) and the mobility grid
+//!     (ims-compact) are evaluated, so a window's limits are the values its boundary scans' points
+//!     carry. They used to differ by 0.015 Vs/cm² (1.332387 vs 1.317349 on frame 2 / m/z 1276.05
+//!     of this file: mzdata's precursor params are timsrust-linear while its arrays use the vendor
+//!     model), and through 0.17.0-rc.1 by 1 to 4 ulp (the ims-compact lane evaluated its limits in
+//!     the SDK's order of operations);
+//!   * say what the mzdata lane leaves out: the points of an MS2 frame outside every isolation
+//!     window (`bruker:out-of-window-points-dropped`), with the frames' own count as
+//!     `source_points`;
 //!   * export the archive to mzML without panicking on the non-PSI accession (it becomes a
 //!     `userParam`).
 //!
@@ -210,19 +216,67 @@ fn collect(archive: &Path, dir: &Path) -> (HashMap<(i64, i64), (f64, f64, f64)>,
     (out, limits.len())
 }
 
-fn cv_ids(archive: &Path) -> Vec<String> {
+const OUT_OF_WINDOW: &str = "bruker:out-of-window-points-dropped";
+
+/// The archive's index `metadata`.
+fn index_metadata(archive: &Path) -> serde_json::Value {
     let f = std::fs::File::open(archive).unwrap();
     let mut z = zip::ZipArchive::new(f).unwrap();
     let mut e = z.by_name("mzpeak_index.json").unwrap();
     let mut s = String::new();
     std::io::Read::read_to_string(&mut e, &mut s).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-    v["metadata"]["cv_list"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["id"].as_str().unwrap().to_string())
-        .collect()
+    serde_json::from_str::<serde_json::Value>(&s).unwrap()["metadata"].clone()
+}
+
+fn cv_ids(archive: &Path) -> Vec<String> {
+    index_metadata(archive)["cv_list"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()).collect()
+}
+
+/// mzdata's TDF reader hands a diaPASEF frame over as one spectrum per window, and the points in
+/// the TIMS scans between and around the windows are in none. The first 120 spectra of 2485.d are
+/// 28 whole frames (3 MS1, 25 MS2) and the first two windows of a 29th: the frames' own count
+/// (`Frames.NumPeaks`) is 677,468, the reader hands over 666,854 of them, and 10,614 points of
+/// the 25 MS2 frames (26.5 % of their 40,001) are dropped. Through 0.17.0-rc.1 the archive said
+/// `source_points == stored_points` and declared nothing; the direct mzML export drops the same
+/// points and now warns with the same count.
+#[test]
+#[ignore = "needs the 142 MB 2485.d timsTOF corpus fixture (MZPEAK_CORPUS); run with --include-ignored"]
+fn the_mzdata_lane_declares_the_points_outside_every_isolation_window() {
+    let Some(dot_d) = corpus::corpus_path(DOT_D) else { return };
+    let tmp = std::env::temp_dir().join(format!("mzpc-outofwindow-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let d = dot_d.to_str().unwrap();
+    let convert = |args: &[&str]| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert")).args(args).env("MZPC_MAX_SPECTRA", "120").output().expect("failed to run mzpeak-convert");
+        assert!(out.status.success(), "mzpeak-convert {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    const COUNT: &str = "10614 of the 677468 points of the 28 frames read lie outside every isolation window of their frame (25 frames)";
+
+    let noims = tmp.join("noims.mzpeak");
+    let err = convert(&[d, "--no-ims-compact", "-o", noims.to_str().unwrap(), "--force", "--no-vendor"]);
+    assert!(err.contains(COUNT) && err.contains(OUT_OF_WINDOW), "{err}");
+    let meta = index_metadata(&noims);
+    assert!(meta["transformations"].as_array().unwrap().iter().any(|t| t == OUT_OF_WINDOW), "{}", meta["transformations"]);
+    // 677,468 of the 28 whole frames + the 414 points read of the frame the cap cut through.
+    let facet = &meta["fidelity"]["spectra_peaks"];
+    assert_eq!((facet["source_points"].as_u64(), facet["stored_points"].as_u64()), (Some(677_882), Some(667_268)), "{facet}");
+    // Mirrored into the conversion's processing method, like every entry.
+    let mirrored = meta["data_processing_method_list"].to_string();
+    assert!(mirrored.contains(OUT_OF_WINDOW), "{mirrored}");
+
+    // The default lane stores the same frames whole and declares nothing of the kind.
+    let compact = tmp.join("compact.mzpeak");
+    let err = convert(&[d, "-o", compact.to_str().unwrap(), "--force", "--no-vendor"]);
+    assert!(!err.contains("outside every isolation window"), "{err}");
+    let meta = index_metadata(&compact);
+    assert!(!meta["transformations"].as_array().unwrap().iter().any(|t| t == OUT_OF_WINDOW), "{}", meta["transformations"]);
+
+    // The direct export reads the same way: it warns, having no list to declare it in.
+    let mzml = tmp.join("direct.mzML");
+    let err = convert(&[d, "-o", mzml.to_str().unwrap(), "--force"]);
+    assert!(err.contains(COUNT) && err.contains("mzML has no transformations list"), "{err}");
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -247,14 +301,27 @@ fn both_timstof_lanes_carry_the_mzp_band_and_agree_on_precursor_mobility() {
     assert_eq!(a.len(), WINDOWS, "ims-compact: one selected ion per dia-PASEF window");
     assert_eq!(b.len(), WINDOWS, "--no-ims-compact: one selected ion per dia-PASEF window");
     assert_eq!(b_limits, WINDOWS, "--no-ims-compact: every window spectrum carries the ordered pair");
-    let mut worst = 0.0f64;
+    // Bit for bit: the mzdata lane's limits are its mobility arrays' own values (0.17.0), and the
+    // ims-compact lane's are what its mobility grid decodes to. Through 0.17.0-rc.1 the ims-compact
+    // limits were evaluated in the SDK's order of operations and differed by 1 to 4 ulp in 6,788
+    // lower and 7,591 upper limits of the 15,977 windows.
+    let mut differing = 0usize;
     for (k, va) in &a {
         let vb = b.get(k).unwrap_or_else(|| panic!("window {k:?} missing from --no-ims-compact"));
-        for (x, y) in [(va.0, vb.0), (va.1, vb.1), (va.2, vb.2)] {
-            worst = worst.max((x - y).abs());
-        }
+        differing += usize::from([(va.0, vb.0), (va.1, vb.1), (va.2, vb.2)].iter().any(|(x, y)| x.to_bits() != y.to_bits()));
     }
-    assert!(worst < 1e-9, "lanes disagree on a selected ion's 1/K0 or band by {worst}");
+    assert_eq!(differing, 0, "of {WINDOWS} windows, the lanes state another 1/K0 or band limit for {differing}");
+
+    // What the mzdata lane leaves out is declared, and its `source_points` is the file's count:
+    // the ims-compact archive stores every point of every frame (SUM(Frames.NumPeaks)).
+    let (compact_meta, noims_meta) = (index_metadata(&compact), index_metadata(&noims));
+    let every_point = compact_meta["fidelity"]["spectra_peaks"]["stored_points"].as_u64().expect("ims-compact stored_points");
+    let facet = &noims_meta["fidelity"]["spectra_peaks"];
+    let (source, stored) = (facet["source_points"].as_u64().unwrap(), facet["stored_points"].as_u64().unwrap());
+    assert_eq!(source, every_point, "--no-ims-compact source_points is not the frames' own count");
+    assert!(stored < source, "--no-ims-compact stores {stored} of {source} points: nothing was outside a window?");
+    let declared = |m: &serde_json::Value| m["transformations"].as_array().unwrap().iter().any(|t| t == OUT_OF_WINDOW);
+    assert!(declared(&noims_meta) && !declared(&compact_meta), "{} / {}", noims_meta["transformations"], compact_meta["transformations"]);
     // The regression: frame 2, isolation m/z 1276.05 (first window of the first MS2 frame) on the
     // vendor ModelType-2 model at the window midpoint — not timsrust's linear 1.317349.
     let (im, lo, hi) = a[&(2, 1_276_051)];

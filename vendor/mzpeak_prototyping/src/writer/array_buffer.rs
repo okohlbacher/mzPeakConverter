@@ -298,6 +298,11 @@ pub struct SignalTally {
     pub numpress_chunks: u64,
     /// Series that arrived out of main-axis order and were re-sorted before they were stored.
     pub resorted: u64,
+    /// DELIBERATE DEVIATION (mzPeakConverter, fidelity declarations): delta-encoded m/z chunk rows
+    /// whose last value is more than twice their first, or that do not start above zero
+    /// ([`delta_chunks_at_risk`]). In such a chunk `b + fl(a − b) == a` is not guaranteed for
+    /// 64-bit values, so a decoded m/z can be one unit in the last place off.
+    pub delta_chunks_at_risk: u64,
 }
 
 impl std::ops::AddAssign for SignalTally {
@@ -305,7 +310,33 @@ impl std::ops::AddAssign for SignalTally {
         self.zero_runs_masked += rhs.zero_runs_masked;
         self.numpress_chunks += rhs.numpress_chunks;
         self.resorted += rhs.resorted;
+        self.delta_chunks_at_risk += rhs.delta_chunks_at_risk;
     }
+}
+
+/// DELIBERATE DEVIATION (mzPeakConverter, fidelity declarations): how many rows of a batch of chunk
+/// columns are delta-encoded (`MS:1003089`) m/z chunks that are not exact by construction: bounds
+/// `[start, end]` with `end > 2·start`, or `start` not above zero. The rule and the columns are the
+/// ones the converter's `fidelity` block reads back from the finished facet (64-bit float
+/// `mz_chunk_start` / `mz_chunk_end`, `chunk_encoding`), so the count taken here, before the facet
+/// is closed, is the count that block reports. Zero for a batch without those columns.
+fn delta_chunks_at_risk(fields: &Fields, arrays: &[ArrayRef]) -> u64 {
+    let column = |name: &str| fields.iter().position(|f| f.name() == name).and_then(|i| arrays.get(i));
+    let (Some(starts), Some(ends), Some(encodings)) = (column("mz_chunk_start"), column("mz_chunk_end"), column("chunk_encoding")) else {
+        return 0;
+    };
+    let (Some(starts), Some(ends), Some(encodings)) = (
+        starts.as_primitive_opt::<arrow::datatypes::Float64Type>(),
+        ends.as_primitive_opt::<arrow::datatypes::Float64Type>(),
+        encodings.as_string_opt::<i32>(),
+    ) else {
+        return 0;
+    };
+    let delta = crate::param::curie_to_string(&crate::chunk_series::DELTA_ENCODE);
+    (0..encodings.len())
+        .filter(|&i| !(starts.is_null(i) || ends.is_null(i) || encodings.is_null(i)) && encodings.value(i) == delta)
+        .filter(|&i| !(starts.value(i) > 0.0 && ends.value(i) <= 2.0 * starts.value(i)))
+        .count() as u64
 }
 
 /// The series index carried by an `add_arrays` batch: the (constant) `<entity>_index` column's
@@ -819,6 +850,9 @@ impl ArrayBufferWriter for ChunkBuffers {
         if matches!(self.chunking_strategy, ChunkingStrategy::NumpressLinear { .. }) && self.mz_boundary.is_none() {
             self.tally.numpress_chunks += arrays.first().map_or(0, |a| a.len()) as u64;
         }
+        // DELIBERATE DEVIATION (mzPeakConverter, fidelity declarations): delta rows that are not
+        // exact by construction, counted from the rows themselves.
+        self.tally.delta_chunks_at_risk += delta_chunks_at_risk(&fields, &arrays);
         self.chunk_buffer
             .push(StructArray::new(fields, arrays, None));
         self.is_profile_buffer.push(is_profile);
