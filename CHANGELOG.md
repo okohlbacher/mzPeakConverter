@@ -37,8 +37,12 @@ the dictionary off. The values are unchanged; the row-group boundaries and the b
 PXD059079 2485's grid facet −0.6 %, a Thermo profile facet −0.4 %, QC01's centroid facet +0.06 %;
 point-layout facets are byte-identical. **Output change (`.mzpeak` → `.mzpeak` filter).** A filtered
 archive numbers the spectra it keeps 0..n-1, which reverses 0.5.0's "index-stable — spectra are never
-renumbered". Its rewritten facets keep the source's column encodings and Parquet layout, and `--rt`
-cuts chromatograms stored with float32 times.
+renumbered". Its rewritten facets keep the source's column encodings and Parquet layout — but for
+the chunk bounds (`*_chunk_start`/`_end`) of a source written by 0.16.0 or earlier, which are
+re-encoded the converter's way (byte-stream split, dictionary off; the corpus Lumos peak facet
+−0.98 % against its source, where followed it grew 1.19 %; a 0.16.0 QC01 archive, whose bounds
+repeat, +0.07 %, both below the source; owner decision D16) — and `--rt` cuts chromatograms stored
+with float32 times.
 
 **Imaging follow-ups** (HUPO-PSI/mzPeak-specification#23, the issue author's five pixel-size test
 files, the Open Questions doc). A confirmed single pixel size is written for both axes, the `.ibd` is
@@ -46,7 +50,8 @@ hashed against its stated checksum, the obsolete integer type terms no longer cr
 Bruker's beam-size fallback reads the table that holds it, and the `--image` affine maps extents.
 **New, opt-in:** `--keep-zero-runs`, and `--lossless` — a bit-exact archive or none. **Every archive
 gains a `fidelity` index block** stating source and stored point counts, numeric types, and the
-measured m/z error of each lossy transform. Default signal output is unchanged.
+measured m/z error of each lossy transform. Default signal output was unchanged by these; the
+decisions of 2026-10-01 below change it.
 
 **Found by rebuilding and auditing the corpus with a release candidate** (200 units, every finding
 reproduced independently). **Output change (mzML export).** An export states the run — its id,
@@ -60,6 +65,67 @@ itself as its precursor spectrum, and every value change is declared where the `
 reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
 `bruker:out-of-window-points-dropped`). timsTOF window limits equal the mobility grid's values.
 **Native SciEX runs with empty spectra convert again** (they aborted since 0.14.0).
+
+**Decided on 2026-10-01** (the imaging plan's §10–§11, after the second corpus audit and
+HUPO-PSI/mzPeak-specification#23): the default output is exact wherever an exact encoding is as
+small, lossy only where it saves bytes; a questionable source is corrected when the file proves
+it, declared, and refused only when the data could be the wrong data. The paragraphs below are
+the output changes those decisions make; the entries under Added, Changed and Fixed carry them.
+
+**Output change (the default m/z encoding).** Through 0.16.0 every chunked facet stored m/z with the
+lossy numpress-linear codec, exact delta chunks only under `--no-numpress`. The converter now
+decides from a sample of the run (exact where it costs nothing, D1/D13): delta without a trial
+when every sampled m/z is a 32-bit float value — such values come back exactly whatever their
+spacing, and delta was smaller than numpress on every such file measured — else the sample is
+written both ways and the smaller arm kept, exact on a tie. With defaults against rc.2: QC01
+−21.9 % (50.9 → 39.8 MB), SZB8102938 −16.9 %, PXD009465 t04176 −11.9 %, Example_Continuous
+−9.3 % (its zero runs now kept, below), ltpmsi-chilli −38.1 %, the decoded m/z bit-equal to the
+source; numpress-linear stays on
+the Bruker microTOF neg_01_Fistax run (delta would be 2.1× its size) and on the PXD001283 bladder
+imzML (3.6×), both unchanged. The `encoding_prescan` index block states the sample, the bytes per
+arm and the basis; `transformations` and `fidelity` name only what was written — `numpress-linear`
+with its bound where the codec was kept, `delta-ulp` where delta chunks are at risk on 64-bit
+values, nothing where delta is exact. A facet whose 64-bit arrays hold 32-bit values (QC01, t04176)
+no longer declares `delta-ulp` from the declared type alone: the fidelity block records
+`mz_values_32bit` per facet. Lanes with their own grids (timsTOF ims-compact, Shimadzu,
+`--tof-grid`) are unchanged; `--no-numpress`, `--layout point` and `MZPC_ENCODING_PRESCAN=0` keep
+their meaning. The trial writes its sample with the zero-run mask the run writes with.
+
+**Output change (Bruker TSF).** The native TSF lane wrote numpress-linear m/z and embedded
+`analysis.tsf_bin` — 24.2 MB of the 25.1 MB archive of the MSV000088438 MALDI run. It now stores
+every frame's m/z exactly on every path (D9): delta chunks or the point layout, whichever the
+sample shows smaller, never numpress-linear; the point layout under `MZPC_ENCODING_PRESCAN=0`, and
+`--no-numpress` is inert there (a log line says so). The bin is dropped by default and the drop
+recorded in `vendor_files` (`action: drop`, with its bytes); `--aux 'analysis.tsf_bin=embed'`
+keeps it. The MALDI run: 25,107,530 → 884,464 B (−96.5 %) before its sequence image (below), point
+layout, 74,188 m/z bit-equal to the lane's `--layout point` archive, `mz_error` empty. The
+`--bruker-sdk` TSF route is unchanged.
+
+**Output change (imaging).** A continuous-mode imzML (`IMS:1000030`) keeps its zero runs without
+`--keep-zero-runs`, so every pixel decodes to the one m/z axis the file stores, and its marker
+states `storage_mode`, `shared_mz_axis` and `mz_range` (D2, D10); an MS1-typed spectrum that
+states `ms level` 0 is written at level 1 (D6); an `.ibd` that begins with another UUID than the
+header states is refused unless `--force` (D7); a pixel-size unit the accession and the name
+disagree on is read both ways and the reading the extent confirms is kept (D4); `--pixel-size`
+fills a size the source settles none of (D3), and `metadata.imaging.pixel_size_source` says how
+every size was settled; a Waters run writes its absolute position offset (A6); a Bruker MALDI run
+converted beside its FlexImaging `.mis` embeds the sequence's photo, registered by its teach
+points (D8). Imaging archives need a rebuild to carry these.
+
+**Output change (mzML export).** An archive's 32- and 64-bit integer intensities — a spectrum's
+and a chromatogram's — leave with every value, as 64-bit floats: OpenMS 3.5 refuses an
+integer-encoded intensity array, and the reader's 32-bit peak list changed every integer above
+2^24 (80,299,922 → 80,299,920). A spectrum's type term is written once per spectrum on both
+routes, and the direct mzML/imzML → mzML lane reads the source's text once.
+
+**Output change (intensity columns).** A facet's intensity column takes a type that holds every
+type the sampled spectra show (D12), the peak facet's from the centroid spectra it stores, and an
+array of another type after the sampled spectra is cast into the column in both layouts, clamped
+at an integer column's range (through rc.2 the chunked layout spilled it and the point layout
+stored nulls). Default flags: MFA381 −0.30 %, D2_Nat_2 −0.28 %, every decoded value equal.
+
+**Output change (corpus harness).** The box's `--no-vendor` default reaches only units no
+descriptor governs, and an archive stamped on another lane than its descriptor pins is stale.
 
 ### Added
 
@@ -101,7 +167,9 @@ reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
     different axes (`Example_Continuous`: 36,856 of 75,591 points stored, 9 decoded axes for 9
     pixels, m/z 171.33333 decoding to 8 values).
   - Now: with the flag no profile point is dropped and `zero-run-mask` is not declared
-    (`Example_Continuous`: 75,591 of 75,591 points, one decoded axis). The default is unchanged.
+    (`Example_Continuous`: 75,591 of 75,591 points, one decoded axis). The default is unchanged
+    for processed-mode input; a continuous-mode imzML keeps its zero runs without the flag
+    (Changed, below).
   - Refused on `--agilent-grid`, whose reader drops the zero samples itself; inert with a warning
     on the timsTOF ims-compact lanes, the `.mzpeak` filter and the mzML export.
   - Cost on the HR2MSI bladder imzML (67,916,471 points): 193.6 MB against 173.8 MB (+11 %).
@@ -117,8 +185,9 @@ reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
     config file too, with `--layout chunked`, `--tof-grid auto|on`, `--agilent-grid` or an mzML
     output, and while `MZPC_MAX_SPECTRA` is set.
   - Measured: bladder 67,916,471 of 67,916,471 m/z and intensities equal to the `.ibd`, 409.8 MB
-    (2.4× the default); `Example_Continuous` 230 kB against 263 kB by default, m/z kept as
-    float32; a corpus Orbitrap mzML 456,131 of 456,131 points bit-equal.
+    (2.4× the default); `Example_Continuous` 233 kB against 238 kB by default (263 kB masked and
+    numpress-encoded, as rc.2 wrote it), m/z kept as float32; a corpus Orbitrap mzML 456,131 of
+    456,131 points bit-equal.
 - **`metadata.fidelity` says by how much a conversion changed the signal.** `transformations`
   names what changed; the new index block gives the numbers, read back from the two signal facets
   at close.
@@ -157,9 +226,10 @@ reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
   from the file's (generated mzML, both layouts: 15,000 of 15,000 on 64-bit centroid intensities;
   6,000 of 12,000 where 32-bit spectra come first and 64-bit ones with a charge array follow;
   40,000 of 80,000 on profile spectra that turn from 32-bit to 64-bit). `intensity-type-narrowing`
-  is the case of a file that mixes integer and float intensities: the column can come out as an
-  integer one, and the floats are cut to integers (40,000 of 80,000 on a generated file, stored
-  clamped at 2,147,483,647). What is stored is unchanged; it was silent and is now declared.
+  is the case of a file that mixes integer and float intensities after the sampled spectra: the
+  column takes a type that holds every sampled type (Fixed, below: through rc.2 the first sampled
+  spectrum's type won, and 40,000 of 80,000 floats of a generated file were stored as the int32
+  maximum), so a later array of another type is cast into it, counted and declared.
   64-bit intensities that are all float32 values (every such file of the example corpus) declare
   nothing. `agilent:intensity-f32-rounding` keeps its name.
 - **`bruker:out-of-window-points-dropped`.** `--no-ims-compact` on a diaPASEF run stores what
@@ -173,7 +243,61 @@ reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
 - **`fidelity.mz_error` states what a TOF grid left**, not only the tolerance a fit is accepted
   within: `observed_max_rel_error_ppm` and `observed_max_abs_error`, measured over every gridded
   point while the archive is written (a SCIEX slice of 16.5 million points: 0.865 ppm of the
-  5 ppm allowed).
+    5 ppm allowed).
+- **`--pixel-size X[,Y]` (config `pixel_size`), owner decision D3.** An imaging run whose source
+  settles no pixel size had no way to get one. The size (µm) is written into the grid
+  (`IMS:1000046/47`, with `IMS:1000044/45` from the pixel counts) where the source settles none: an
+  imzML/mzML header without a size or one the pixel-size rule drops, a Bruker MALDI `.d` without a
+  `.mis` raster step or beam size, the missing axis of a Waters single row, or an existing `.mzpeak`
+  archive (the rewrite lane: the archive gains the size, its data members untouched). A stated size
+  that agrees (to 1e-6, any length unit) is kept; one that differs is an error naming both values —
+  as is, on an axis stating no size, a stated max dimension that is not pixel count × supplied size
+  (the evidence the rule settles a size by); `--force` on the command line writes the supplied size
+  over it and recomputes the max dimension (a config file's `force: true` overwrites outputs only).
+  Declared `imaging:pixel-size-user-supplied`, recorded in `imaging_pixel_size` (`stated`,
+  `overridden`, `max_dimension` with the stated extent) and in `metadata.imaging`
+  (`pixel_size_source: user_supplied`, `provenance.pixel_size`). Refused on an mzML output, the two
+  `--bruker-sdk` lanes and `--agilent-grid` (no grid), a run or archive that is not imaging, and
+  when malformed. Bladder imzML (260 × 134): `--pixel-size 10` adds 5,676 B of metadata to a
+  174.4 MB archive, `spectra_data.parquet` identical.
+- **`metadata.imaging.pixel_size_source`** (converter-defined, P4; proposed on
+  HUPO-PSI/mzPeak-specification#25): `declared` | `unit_assumed` | `derived_from_area` |
+  `user_supplied` | `derived_from_positions` (a Waters step fitted) | `derived_from_beam_size`
+  (Bruker fallback) | `unknown` whenever the block states no `pixel_size_um` (a lone y, a Waters
+  single row, a dropped size).
+- **Waters imaging: `IMS:1000053/54` (absolute position offset, µm), owner decision A6.** The
+  image's top-left corner on the stage, `(origin − step / 2) × 1000` per axis with a step; omitted
+  without one and when the corner is negative (the terms are `xsd:nonNegativeFloat`), which
+  `waters_imaging` records. Bruker writes none (stage offset unknown).
+- **`--keep-contact`** (config `keep_contact`, owner decision D11): the mzML/imzML header's
+  `<contact>` — name `MS:1000586`, affiliation `MS:1000590`, address, URL, e-mail — is carried into
+  the archive's `file_description.contacts` (the spec's slot) and as `<contact>` after
+  `</sourceFileList>` in both mzML exports. The default still drops it, now with one info line
+  naming the contact (Example_Continuous: Thorsten Schramm; bladder: Andreas Roempp).
+- **The FlexImaging sequence's image, registered by its teach points (D8).** A Bruker MALDI run
+  converted beside its `<stem>.mis` lost the photo its regions were drawn on, and an `--image` on
+  such an archive got no placement at all (0.16.x): the pixel grid is the bounding box of the
+  acquired regions, not the photo's extent, so the full-extent assumption would misplace it by up
+  to 11.5 MS pixels. Every timsTOF lane (TSF, TDF native, `--bruker-sdk`, `--no-ims-compact`) now
+  embeds the `<ImageFile>` found beside the `.mis` verbatim as `images/image_0000.<ext>` with an
+  affine `image_px -> ms_px` computed from the `<TeachPoint>`s (image px → stage µm), the frames'
+  raster indices and `MotorPositionX/Y` (least-squares lattice, rotated or mirrored stages
+  included) and the `<ReferencePoint>` laid on the one raster node that keeps every acquired spot
+  inside its `<Area>`: `registration_quality: teach_points`, with the teach points, the reference
+  point, both affines, the stage − motor translation, the fitted step and the residuals recorded
+  under `registration` so a reader can redo it. Both MSV000088438 runs land within 0.001 MS px of
+  flexImaging's own spot lists (276 and 240 spots). A missing image, an `<ImageFile>` with a path,
+  fewer than three or collinear teach points, frames without motor positions or an ambiguous
+  placement warn once and are recorded in `bruker_maldi` (`sequence_image`, `registration`,
+  `not_registered`); nothing is embedded then. The photo is large next to the signal: 8.9 MB, 91 %
+  of MSV000088438's TSF archive (9.8 MB, now that the lane drops `analysis.tsf_bin`) and 62 % of
+  the native TDF one (14.2 MB; 5.4 MB without it); `--drop-aux 'images/*'` removes it. Exactly one
+  image carries the registration: a later `--image` gets it only as the sequence's own image,
+  supplied by its `<ImageFile>` name on the `.mzpeak` → `.mzpeak` lane when it was not beside the
+  `.mis`; every other image, a same-sized one included, is embedded without an affine and a warning
+  says why (a photo of another target proves nothing by its size: both MSV000088438 photos are
+  8064 × 6048 `IMG_0000.jpg`). An image the archive already holds (same SHA-256) is not embedded
+  twice. Manual §4.3, §8.
 
 ### Changed
 
@@ -245,10 +369,13 @@ reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
     archive this version wrote, a rewritten spectrum signal facet is 1.9 % smaller to 0.3 % larger
     than its source, and a timsTOF grid facet 4.2 % larger; at the source's own level the chunked
     facets match their source to 0.08 %.
-  - A chunked archive written by 0.16.0 or earlier keeps its dictionary-encoded bounds, which every
-    byte-capped row group pays for again: the corpus Lumos peak facet grows by 1.2 % (0.9 % with
-    0.16.0), MFA381's by 2.3 % (6.7 %). Rebuilt from the raw file, both are 1.1 % smaller than in the
-    corpus.
+  - The one column group not followed: a chunked archive written by 0.16.0 or earlier holds its
+    chunk bounds (`*_chunk_start`/`_end`) dictionary-encoded, and followed, every row group the
+    byte cap makes paid for that dictionary again (the corpus Lumos peak facet +1.19 %, MFA381's
+    +2.3 %). Those two columns are re-encoded the converter's way — byte-stream split, dictionary
+    off (owner decision D16; the Lumos facet −0.98 % against its source; not on every archive the
+    smaller choice: a 0.16.0 QC01 archive comes out +0.07 % against followed, both below the
+    source) — while every other column still follows the source and the values are unchanged.
 - **imzML: a single pixel size the rule keeps is written on both axes.** The IMS vocabulary
   defines `IMS:1000046` as the y size too when no `IMS:1000047` is stated, but a reader that
   does not know that default saw no pixel size at all, and `metadata.imaging.pixel_size_um` was
@@ -295,6 +422,79 @@ reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
   boundary points outside, now 0 and 0). They are evaluated as the grid is, as the
   `--no-ims-compact` lane's already are. Measured on the native reader; the `--bruker-sdk`
   reader carries the same change. ims-compact archives need a rebuild to carry it.
+- **A continuous-mode imzML keeps its zero runs and its one m/z axis** (owner decision D2). When
+  the header states `IMS:1000030` (continuous: every pixel the same m/z array), the zero-run mask
+  that is right for processed data cut each pixel to a different subset of that array, under its
+  own numpress fixed points, so one source m/z decoded to several values (171.33333 → 8 values on
+  Example_Continuous). The mask is now off for continuous input (no `zero-run-mask` is declared
+  because none is applied; `--keep-zero-runs` stays the manual override for processed input), and
+  the marker gains `metadata.imaging.storage_mode` (`continuous` | `processed`, from the header)
+  and, for continuous input, `shared_mz_axis` — true when every spectrum's m/z array is
+  bit-identical, false with a warning counting the spectra that differ. Example_Continuous:
+  262,812 → 238,454 B (−9.3 %), all 9 pixels decode to the one 8,399-point axis, intensities and
+  m/z equal to the source (its axis is 32-bit values, so the m/z default above chooses exact
+  delta; `--no-numpress` 238,133 B, `--lossless` 232,518 B). Processed inputs (bladder, chilli,
+  GBM, DESI, Example_Processed) change by the index alone under the mask (bladder +111 B on the
+  unit's branch; the m/z default applies to them as to any input).
+- **`ms level` 0 on an MS1-typed spectrum is written as level 1** (owner decision D6). The 2012
+  ms-imaging.org example files, the DESI set and GBM Test_P15_r2 type their spectra `MS:1000579`
+  and state `ms level` 0, which readers' MS1 filters and the summed TIC/BPC pair (MS1 spectra that
+  state a time) skipped. Such a spectrum is now stored (and exported) at level 1, declared
+  `imzml:ms-level-0-as-1` and warned about once with the count (Example files 9, GBM 2,826, DESI
+  17,952).
+- **An `.ibd` that does not begin with the stated UUID is refused** (owner decision D7). The two
+  files are not the pair the imzML describes and the signal could be another run's; 0.17.0-rc.2
+  warned and converted. Nothing is written now, on the archive lane and the direct mzML export
+  alike, with a message naming both UUIDs (an empty or truncated `.ibd` is named by its length:
+  "no UUID (the .ibd is 0 bytes long)"); `--force` converts anyway — the option's help and §4 row
+  now say so — warned, declared `imzml:ibd-uuid-mismatch`, `provenance.ibd_uuid_found` recorded.
+  A checksum mismatch alone (chilli) keeps warning, recording and converting.
+- **`metadata.imaging.mz_range`** is `[min, max]` of the **stored** m/z arrays over the run (the
+  mask's own rule, per spectrum) on the imzML and mzML-with-positions lanes (owner decision D10);
+  bladder `[400.00003, 999.99868]` (on 34,839 of its 34,840 spectra the mask moves the first or
+  last stored point inward). The manual explains that a TIC image is a join of
+  `spectra_metadata.total_ion_current` with the scan positions (bladder: 0.16 s, 0.9 % of the
+  bytes).
+- **imzML pixel-size rule: a contradicted unit is read both ways (owner decision D4).** 31 of 479
+  public files state `UO:0000015` (centimetre) named "micrometer"; only the name's reading was
+  tested, so 0.005 cm × 3 px = 150 µm was dropped. Both readings are tested against pixel count ×
+  max dimension; the one that passes is written (the accession's in µm, declared
+  `imzml:pixel-size-unit-from-accession`); neither passing, or nothing to test, drops the size
+  (`imzml:pixel-size-dropped`, naming both readings) — through rc.2 a two-value pair in that state
+  was written in the name's unit. Theodoros's unit_contradiction fixture stays dropped.
+- **Waters single row (owner decision D5):** the lone `IMS:1000046` stays and the marker still
+  writes no `pixel_size_um`; `waters_imaging.y.step_source` and `provenance.pixel_size.y` now
+  record that the y size is the vocabulary's default of x, not measured.
+- **The direct mzML/imzML → mzML lane reads the source's text once** (stated zeros, each
+  spectrum's `sourceFileRef`, the imaging term) and skips each spectrum's arrays; through rc.2
+  these were three passes. Fixed cost per run −18…−24 % vs rc.2; the lane still takes 35–50 %
+  longer than 0.16.0 on the same file, per spectrum (the source's arrays written as held, the
+  byte sinks, `<fileChecksum>`), stated in the manual's §4.1.
+- **The chromatogram placeholder row is marked.** The one row a time-less run gets (it holds
+  `chromatograms_data` open) carries the user param `placeholder chromatogram`;
+  `mzpeak-convert <archive>` says `chromatograms: 0 (one placeholder row: the run has no
+  chromatogram)`; the export skips it by the marker (by its empty id for older archives). The
+  footers stay as they were — `chromatograms_metadata` 1 (the validator's
+  `chromatogram_count_agreement` requires footer = rows), `chromatograms_data` 0 (D1: max index
+  + 1, 0 when empty) — the same pair a centroid-only run has on `spectra_metadata`/`spectra_data`.
+- **Corpus harness: the box's `--no-vendor` default reaches only units no descriptor governs; an
+  archive stamped on another lane than its descriptor pins is stale; `--restamp`.** The default
+  used to apply to every recipe without flags, so ten corpus archives carry a flag their
+  descriptors never asked for and a unit the box built bare (the BAF unit, D17) could not be pinned
+  to what built it. A described dataset without flags now converts with the converter's defaults
+  on the box as it always did on the host. `is_current` trusted an existing stamp on version and
+  recipe alone, so three SciEX archives stamped with the box's msconvert fallback
+  (`--via-msconvert --tof-grid auto`) under descriptors pinning no lane counted as current
+  (PXD065872 241213_Ozaki_Brain_1_SWATH, MSV000095995 20240826_RNAseB_Reduced_50ngul_1ul_MRM_03,
+  PXD071869 08_SWATH_1E_1H): the stamp's `options` line is now compared with the descriptor's
+  flags through the same check as the stamp step (`LANE_FLAGS`), a mismatch is printed once per
+  run and the archive rebuilt or reported, and the recorded argv is split on whitespace where the
+  shell splitter rejects it (an apostrophe in a vendor folder's name raised ValueError out of the
+  stamp step); the stamp reads the archive's LAST conversion, so an export of an older archive
+  converted again is stamped with the version that ran. `tools/corpus_reconvert.py --restamp`
+  re-stamps an archive whose recorded `conversion options` already equal its edited recipe (lane
+  check included), so a descriptor re-pinned to what the box built does not force a no-op
+  rebuild. Dry run over the 200 corpus stamps: exactly those three lane mismatches.
 
 ### Fixed
 
@@ -668,10 +868,11 @@ reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
   (1-based) with the image extent equal to the grid extent: `a = Nx/W`, `c = 0.5 + 0.5·Nx/W`, the
   same on y (28 × 24 pixels under an 8064 × 6048 image: `[0.0034722, 0, 0.501736, 0, 0.0039683,
   0.501984]`). Archives written earlier keep their matrix.
-- **`--image` on a FlexImaging run writes no affine.** The grid of such a run is the bounding box
-  of its regions and the photo covers the slide, so `assumed_full_extent` was off by up to 11 MS
-  pixels on MSV000088438. When the archive's `bruker_maldi` block names a `.mis`, the image is
-  embedded without `affine` and a warning points at the planned teach-point registration.
+- **`--image` on a FlexImaging run writes no full-extent affine.** The grid of such a run is the
+  bounding box of its regions and the photo covers the slide, so `assumed_full_extent` was off by
+  up to 11 MS pixels on MSV000088438. When the archive's `bruker_maldi` block names a `.mis`, an
+  image is embedded without `affine` and a warning says why — unless it is the sequence's own
+  image, which the teach-point registration places (Added, D8).
 - **An output whose extension names no format is refused.** `-o x.imzML`, or any other unknown
   extension, silently wrote a ZIP archive. Without `--to`, the output must end in `.mzpeak`,
   `.mzML` or `.mzML.gz` (any case); anything else exits 1 naming the two formats and writes
@@ -854,13 +1055,61 @@ commit is reverted.)
   drops those spectra. Four corpus units: PXD071869 `08_SWATH_1E_1H` (native 1.93 GB, fallback
   2.57 GB), PXD053710 Exposome zSWATH, PXD065872 Ozaki SWATH and MSV000095995 `MRM_03` (fallback:
   6,856 of 23,646 spectra). An empty array now gets no grid model, as an empty peak list does.
-- **An archive's 64-bit peak intensities are exported as stored.** The export of a `--lossless`
-  archive narrowed them to 32 bits (15.1 came out as 15.100000381) with nothing declared; a peak
-  facet with a float64 intensity column is now exported from the facet's arrays.
+- **An archive's 64-bit peak intensities are exported as stored, and its integer intensities with
+  every value.** The export of a `--lossless` archive narrowed 64-bit floats to 32 bits (15.1 came
+  out as 15.100000381) with nothing declared; a peak facet with a float64 intensity column is now
+  exported from the facet's arrays. An archive's 32- and 64-bit integer intensities — a spectrum's
+  and a chromatogram's — are exported as 64-bit floats (exact for every 32-bit integer and every
+  64-bit one below 2^53; the run warns with a count of any beyond). Through 0.17.0-rc.2 a peak
+  facet's integers went through the reader's 32-bit float peak list, which changed every value
+  above 2^24 silently (80,299,922 → 80,299,920), and a profile or chromatogram facet's were written
+  as integers, which OpenMS 3.5 refuses (`Encoding intensity array as integer is not allowed`; a
+  chromatogram's it decodes as empty and refuses over the length). A `--lossless` archive of a
+  float32-m/z source now exports float32 m/z, bit-exact to the source. A spectrum without a point
+  gets arrays of length 0 in the types a spectrum of its kind with points is written in.
+- **A spectrum's type term is written once per spectrum** (any child of MS:1000559, 19 terms) on
+  both routes: rc.2 wrote `SRM spectrum` ×2 directly and ×3 from an archive, and `MS1 spectrum` ×2
+  on an ms-level-0 imzML pixel.
 - **The mzML exports agree on a run that states no times.** No summed TIC/BPC is written over
   spectra without a time on either route; a spectrum `sourceFileRef` resolves in an archive's export
   and is dropped and counted on the direct lane when it names no listed file; a dangling
   `dataProcessingRef` on an array is cleared on the direct lane.
+- **The intensity column takes a type that holds every sampled type** (owner decision D12). A
+  facet has one intensity column, typed from the spectra the writer samples before the first is
+  written; the builder's collision rule kept the "wider" of two sampled types, which ties int32
+  with float32 and int64 with float64, so the first sampled spectrum's type survived and every
+  later value of another type was cast into it: 40,000 of 80,000 floats of a generated file (int32
+  counts first, 64-bit floats above 2^31 later) were stored as the int32 maximum, declared since
+  rc.2 as `intensity-type-narrowing`. The column now holds both sampled types — both integer widths
+  → int64, both float widths → float64, an integer type beside a float type → float64; a file of
+  one type keeps it — and the declaration stays the backstop for a switch after the sampled
+  spectra.
+- **An intensity array of another type than the column's is cast into it, in both layouts, and a
+  value out of an integer column's range is clamped.** The chunked layout routed a float array of
+  another width onto its column but filed an integer one in the spectrum's `auxiliary_arrays` with
+  the facet row left empty ("BUG: signal array ... spilled" in the log); the point layout cast with
+  arrow's safe cast, which stored a NULL for every value the column does not hold, and the reader
+  takes an all-null intensity list as absent — the mzML export of such an archive wrote the spectrum
+  with an m/z array and no intensity array. Both layouts now cast the array into the column and
+  saturate at an integer column's range, count the values that differ (`intensity_values_narrowed`,
+  `intensity_values_rounded`) and declare them (`intensity-type-narrowing`,
+  `intensity-f32-rounding`). Generated mzML, 200 spectra of 300 points switching after the 160th
+  to 64-bit integers above 2^31,
+  below −2^31, or 64-bit floats above 2^31, under an int32 column: 12,000 of 60,000 values clamped
+  and 0 nulls in either layout (through rc.2: 12,000 values missing from the chunked facet, 12,000
+  nulls in the point one); the export carries every intensity array.
+- **The peak facet's intensity column is typed from the spectra it stores.** Its schema was sampled
+  from every sampled spectrum, a profile one's arrays included although the writer stores those in
+  `spectra_data`, so a 64-bit profile spectrum typed the peak column float64 for a run whose
+  centroid spectra reach it as float32 peak-set values: larger and no more exact — through rc.2
+  whenever a profile spectrum came first among the sampled ones (MFA381, D2_Nat_2), and with the
+  sampled types merging whenever one was sampled at all. The sampler now leaves out a spectrum the
+  write path routes to the data facet alone (profile or unknown continuity without a centroid peak
+  set); a file of more than 50 spectra whose five sampled ones are all profile gives the facet the
+  columns a peak set fills, a float64 m/z and a float32 intensity. Default flags: MFA381 310,798,351
+  → 309,853,540 B (−0.30 %), D2_Nat_2 304,216,418 → 303,353,531 B (−0.28 %), the peak column double
+  → float with every decoded value equal; four other mzML, six imzML, a timsTOF `.d` and a MALDI TSF
+  `.d` byte-identical.
 
 ### Documentation
 
@@ -868,9 +1117,19 @@ commit is reverted.)
   module docs and the user manual state this exception instead of claiming a conversion writes
   nothing into the `.d`.
 - The manual lists what an mzML or imzML conversion keeps as stated and what it does not carry (§8):
-  `fileDescription/<contact>`, a spectrum's `spotID`, and a scan's or precursor's `sourceFileRef` /
-  `externalSpectrumID` are not carried. It describes the chromatogram facet's placeholder row (§7)
-  and where an archive export's `sourceFileRef` ids resolve (§4.1).
+  `fileDescription/<contact>` is dropped unless `--keep-contact` (Added); a spectrum's `spotID`, and
+  a scan's or precursor's `sourceFileRef` / `externalSpectrumID` are not carried. It describes the
+  chromatogram facet's placeholder row (§7) and where an archive export's `sourceFileRef` ids
+  resolve (§4.1).
+- §4.1 'Different by design', from the second corpus audit: per-spectrum values mzdata holds as
+  32-bit floats (scan window limits, isolation window target/offsets, collision energy, selected-ion
+  intensity) come back within ~1e-7 relative on both routes; the direct export drops
+  `isolationWindow`/`scanWindow` userParams, the unit UO:0000324 and a unit spelled by a name mzdata
+  does not know; the export of an ims-compact diaPASEF archive writes no precursor `spectrumRef`
+  (`precursor_index` stays null by the 2026-09-03 decision) where the `.d` export does; mzdata logs
+  an ERROR for a zone-less imzML `startTimeStamp` though the clock is kept. §8: the HUPO Python
+  reference reader fails on multi-precursor spectra without a parent and on the time column.
+  docs/PLATFORM_SUPPORT.md: the native Agilent lane's m/z goes through the sample-based choice.
 
 ## [0.16.0] — 2026-09-30
 
