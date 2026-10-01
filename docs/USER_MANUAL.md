@@ -399,7 +399,10 @@ Contents:
   reduced to the bare `file://` authority; non-`file` URL schemes are kept), `run.id` is never a
   path, and `default_instrument_id` always resolves: a run without an instrument record gets one
   empty configuration `0` to point at (the spec requires the integer; 0.10.0 briefly wrote `null`,
-  which the validator's schema check refuses — fixed in 0.10.2).
+  which the validator's schema check refuses — fixed in 0.10.2). `cv_list` declares for `MS` the
+  `data-version` of the PSI-MS vocabulary mzdata embeds, which every CURIE resolves against, read from
+  that copy (4.1.258 with mzdata 0.67.1; archives through 0.16.0 declared 4.1.249); `UO` and `IMS`,
+  which mzdata holds no copy of, stay pinned to one release or commit each.
 - `spectra_metadata.parquet` — per-spectrum descriptors (id, index, MS level,
   polarity, scan time, precursor info, …).
 - `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point): profile
@@ -848,6 +851,15 @@ The vocabulary:
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
+| `mzml:dangling-reference-dropped` | a reference the source states between its own lists names no entry of them, and was dropped: a scan's `instrumentConfigurationRef` (its `instrument_configuration_id` is null), a processing method's or an instrument configuration's `softwareRef` (empty), the run's `defaultInstrumentConfigurationRef` or `defaultSourceFileRef` or the spectrum list's `defaultDataProcessingRef` (each then names the first entry of its list, as for a source that states none — the spec requires all three). A self-closing `<software/>`, `<sourceFile/>` or `<instrumentConfiguration/>`, which mzdata skips, is read back from the header first and put back where the source states it, so a reference to it resolves and is kept. The run's warning counts each kind and names the ids as the source states them | mzML, imzML |
+
+**The list in `data_processing_method_list`.** The same entries are mirrored into the conversion's
+own processing method (`mzpeak_convert_conversion`, software `mzpeak-convert`), so a reader of the
+processing list alone learns what the conversion applied: each entry as a `transformation`
+userParam carrying it verbatim, and, when `zero-run-mask`, `shimadzu:span-trim` or
+`agilent:drop-zero-samples` is among them, PSI-MS `MS:1003901` `zero intensity point trimming` first
+— the one kind PSI-MS has a term for. A conversion with no entry leaves the method as before.
+Archives written through 0.16.0 hold the list only in `transformations`.
 
 Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not

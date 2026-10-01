@@ -333,19 +333,32 @@ impl ControlledVocabularyEntry {
     }
 }
 
+/// The `cv_list` entry for PSI-MS. DELIBERATE DEVIATION (not upstream, which pins a release by
+/// hand): the version is the `data-version` of the vocabulary CURIEs resolve against — the copy
+/// mzdata embeds, or the one a caller filled mzdata's singleton with first, the vocabulary in use
+/// either way — read from it rather than typed here, so it cannot go stale on an mzdata bump:
+/// archives declared 4.1.249 through 0.16.0 while mzdata 0.67.1 embeds 4.1.258 (review
+/// 2026-09-30). The URI is that release's tagged GitHub raw file, which resolves for every release
+/// (the versioned purl form, `obo/ms/<v>/ms.obo`, 404s). A vocabulary stating no `data-version` is
+/// named by its `date` behind the unversioned purl, since `cv_list` requires a version.
+pub fn ms_cv_entry() -> ControlledVocabularyEntry {
+    let v = mzdata::params::MSVocabulary::init_static().version();
+    let uri = match &v.version {
+        Some(data_version) => format!("https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/v{data_version}/psi-ms.obo"),
+        None => "http://purl.obolibrary.org/obo/ms.obo".to_string(),
+    };
+    ControlledVocabularyEntry::new(
+        "MS",
+        "Proteomics Standards Initiative Mass Spectrometry Ontology",
+        uri,
+        v.version.clone().or_else(|| v.last_updated()),
+    )
+}
+
 impl From<mzdata::params::ControlledVocabulary> for ControlledVocabularyEntry {
     fn from(value: mzdata::params::ControlledVocabulary) -> Self {
         match value {
-            mzdata::params::ControlledVocabulary::MS => ControlledVocabularyEntry::new(
-                "MS",
-                "Proteomics Standards Initiative Mass Spectrometry Ontology",
-                // The version CURIEs actually resolve against is the psi-ms CV bundled in the
-                // mzdata we link (4.1.249) — declaring anything else makes the archive's own
-                // provenance wrong. The versioned OBO purl form (obo/ms/<v>/ms.obo) 404s for every
-                // release, so pin the tagged GitHub raw URL, which does resolve.
-                "https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/v4.1.249/psi-ms.obo",
-                Some("4.1.249"),
-            ),
+            mzdata::params::ControlledVocabulary::MS => ms_cv_entry(),
             mzdata::params::ControlledVocabulary::UO => ControlledVocabularyEntry::new(
                 "UO",
                 "Units of measurement ontology",
