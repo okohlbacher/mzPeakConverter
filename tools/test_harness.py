@@ -180,6 +180,42 @@ class Stamps(Harness):
         self.run_main(root)
         self.assertEqual(self.runs(), 3, "a stamp naming no recipe counted as current")
 
+    def test_a_stamp_recording_another_lane_than_the_descriptor_is_stale(self):
+        cv = {"input": "auto", "flags": "--zstd-level 12"}
+        root = make_corpus(self.tmp, {"general-ms/ds/ds.yaml": {"convert": cv}}, {"general-ms/ds/a.mzML": b"x"})
+        stamp = root / "general-ms/ds/a.mzpeak.built"
+        self.run_main(root)
+        lines = stamp.read_text().splitlines()
+        # the box's msconvert fallback, recorded under a descriptor pinning no lane: three SciEX
+        # archives of the corpus were stamped so before the check and counted as current
+        stamp.write_text("\n".join(lines[:2] + [lines[2] + " --via-msconvert --tof-grid auto"]) + "\n")
+        rc, out = self.run_main(root)
+        self.assertEqual(self.runs(), 2, "an archive stamped on another lane than its descriptor pins counted as current")
+        self.assertIn("stale     : a.mzpeak: lane mismatch: the descriptor pins no lane flag, the archive ran with "
+                      "--tof-grid auto --via-msconvert (options: ", out)
+        self.assertRegex(stamp.read_text().splitlines()[2], r"^options .* --zstd-level 12$")
+        self.run_main(root)
+        self.assertEqual(self.runs(), 2, "the rebuilt archive is current")
+        # the reverse: the descriptor pins a lane the stamp does not record
+        (root / "general-ms/ds/ds.yaml").write_text(json.dumps({"convert": {**cv, "flags": "--zstd-level 12 --via-msconvert"}}))
+        self.run_main(root)
+        self.assertEqual(self.runs(), 3, "a recipe change rebuilds")
+        lines = stamp.read_text().splitlines()
+        self.assertIn(" --via-msconvert", lines[2])
+        stamp.write_text("\n".join(lines[:2] + [lines[2].replace(" --via-msconvert", "")]) + "\n")
+        rc, out = self.run_main(root)
+        self.assertEqual(self.runs(), 4)
+        self.assertIn("lane mismatch: the descriptor pins --via-msconvert, the archive ran with no lane flag", out)
+        # a stamp without an options line is current under a descriptor pinning no lane, stale under one that does
+        stamp.write_text("\n".join(lines[:2]) + "\n")
+        self.run_main(root)
+        self.assertEqual(self.runs(), 5)
+        (root / "general-ms/ds/ds.yaml").write_text(json.dumps({"convert": cv}))
+        self.run_main(root)   # the recipe changed back: one rebuild ...
+        stamp.write_text("\n".join(stamp.read_text().splitlines()[:2]) + "\n")
+        self.run_main(root)   # ... and the stamp without an options line is current
+        self.assertEqual(self.runs(), 6)
+
     def test_box_archives_are_stamped_from_their_own_index(self):
         lane = {"input": "auto", "flags": "--via-msconvert --tof-grid auto"}
         root = make_corpus(self.tmp, {
@@ -264,6 +300,15 @@ class StampChecks(Harness):
         self.assertEqual(cr.write_stamp(native, "mzpeak-convert 0.0.1", "r", []),
                          f"built by mzpeak-convert {VERSION}, not mzpeak-convert 0.0.1")
         self.assertEqual(sorted(p.name for p in self.tmp.glob("*.built")), ["native.mzpeak.built", "pwiz.mzpeak.built", "sdk.mzpeak.built"])
+
+    def test_a_recorded_argv_the_shell_splitter_rejects_is_split_on_whitespace(self):
+        # an apostrophe in a vendor folder's name: `shlex.split` raises "No closing quotation"
+        self.assertEqual(cr.argv_of("O'Neil.d --via-msconvert -o out.mzpeak"), ["O'Neil.d", "--via-msconvert", "-o", "out.mzpeak"])
+        self.assertEqual(cr.argv_of('"My Run.d" --bruker-sdk -o out.mzpeak'), ["My Run.d", "--bruker-sdk", "-o", "out.mzpeak"])
+        v = f"mzpeak-convert {VERSION}"
+        quoted = self.stub("quoted.mzpeak", "O'Neil.d --via-msconvert -o out.mzpeak --force")
+        self.assertIsNone(cr.write_stamp(quoted, v, "r", ["--via-msconvert"]))
+        self.assertIn("the archive ran with --via-msconvert", cr.write_stamp(quoted, v, "r", []))
 
     def test_the_version_and_argv_are_the_last_conversions_whatever_its_software_id(self):
         v = f"mzpeak-convert {VERSION}"
