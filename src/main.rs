@@ -9150,6 +9150,7 @@ mod tests {
         std::fs::create_dir_all(&input).unwrap();
         let pixel = |i: usize| {
             let mut spec = spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i);
+            spec.description_mut().id = format!("scan={}", i + 1); // the index is keyed by id
             let mut scan = mzdata::spectrum::ScanEvent::default();
             scan.add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(i as i64 + 1).build());
             scan.add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(1).build());
