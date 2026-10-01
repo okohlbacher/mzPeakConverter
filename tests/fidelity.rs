@@ -1139,7 +1139,7 @@ fn intensity_types_mixed_among_the_sampled_spectra_take_a_column_that_holds_them
 /// left empty ("BUG: signal array ... spilled" in the log): the archive held fewer intensities
 /// than the file, and nothing was declared. It is cast into the column now, as a float of another
 /// type always was, and the cast is counted and declared: an int32 column clamps a 64-bit integer
-/// out of its range to the range (`intensity-type-narrowing`; the cast wrapped it before), a
+/// out of its range to the range (`intensity-type-narrowing`; mzdata's cast alone would wrap it), a
 /// float32 column rounds an integer above 2^24 (`intensity-f32-rounding`).
 #[test]
 fn an_integer_array_of_another_type_after_the_sampled_spectra_is_cast_and_declared_not_spilled() {
