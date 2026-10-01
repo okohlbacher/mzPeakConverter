@@ -598,10 +598,12 @@ pub(crate) mod tests {
         let err = register(&info, &moved).unwrap_err();
         assert!(err.contains("no placement of the raster lattice"), "{err}");
         // A uniform shift of every motor position is no inconsistency: the lattice fit absorbs it
-        // and the matrix is the same.
+        // and the matrix is the same (to rounding: the fit's sums run in another order on x86-64
+        // than on arm64, 1e-15 relative).
         let mut shifted = info.clone();
         shifted.spots.values_mut().for_each(|s| s.motor = s.motor.map(|(x, y)| (x + 500.0, y - 250.0)));
-        assert_eq!(register(&shifted, &mis).unwrap().matrix, register(&info, &mis).unwrap().matrix);
+        let (a, b) = (register(&shifted, &mis).unwrap().matrix, register(&info, &mis).unwrap().matrix);
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-9 * (1.0 + x.abs())), "{a:?} vs {b:?}");
         // One region only, its spots a single row: the lattice needs two dimensions.
         let c = Connection::open_in_memory().unwrap();
         table(&c, &TDF.rows[..2]);
