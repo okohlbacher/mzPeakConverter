@@ -9,9 +9,9 @@ All notable changes to this project are documented here. The format follows
 **Fixes from the adversarial review of 2026-09-30.** Imaging input keeps its imaging on every lane,
 pixel positions are checked before they are written, the Waters grid fit refuses rather than
 guesses, Bruker MALDI trusts a FlexImaging `.mis` only when the regions map onto it, vendor SQLite
-reads roll a hot journal back in a copy, and an empty chunked facet is a chunked facet. Archives with
-imaging, empty chunked facets or a native Shimadzu model term change; rebuilding from the raw file
-applies the fixes (the `.mzpeak` → `.mzpeak` filter keeps member schemas as they are).
+reads roll a hot journal back in a copy, and an empty chunked facet is a chunked facet. Archives
+with imaging, empty chunked facets or a native Shimadzu model term change; rebuilding from the raw
+file applies the fixes (the `.mzpeak` → `.mzpeak` filter keeps member schemas as they are).
 
 **Output change (mzML).** Every mzML the tool writes records its conversion as the default
 processing of both lists, which mzML 1.1 requires and stock OpenMS 3.5.0 needs to read the file — it
@@ -22,25 +22,108 @@ carries each peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).*
 limits and the scan and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the
 arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
 
-**Output change (mzML export of an archive).** An archive's export states each precursor's dissociation method and collision energy, each chromatogram precursor's isolation window, each chromatogram's polarity, and 1/K0 under its PSI-MS name once per element, as the direct export of the source does. Summed TIC and base-peak chromatograms are in time order on every mzML lane. These apply to existing archives. **Output change (Bruker TDF, ims-compact and `--bruker-sdk`).** Each frame's scan stores its ion injection time and the acquisition m/z range; rebuild an archive to gain them.
+**Output change (mzML export of an archive).** An archive's export states each precursor's
+dissociation method and collision energy, each chromatogram precursor's isolation window, each
+chromatogram's polarity, and 1/K0 under its PSI-MS name once per element, as the direct export of
+the source does. Summed TIC and base-peak chromatograms are in time order on every mzML lane. These
+apply to existing archives. **Output change (Bruker TDF, ims-compact and `--bruker-sdk`).** Each
+frame's scan stores its ion injection time and the acquisition m/z range; rebuild an archive to gain
+them.
+
+**Output change (signal facets).** A signal facet's row groups end at 48 MiB of Arrow buffers as
+well as at their row cap (`MZPC_ROW_GROUP_MB`), and a chunk's m/z bounds are byte-stream-split with
+the dictionary off. The values are unchanged; the row-group boundaries and the bytes are not. Against
+0.16.0, content identical: a Lumos centroid peak facet −1.1 % (1 → 4 row groups), MFA381's −1.8 %,
+PXD059079 2485's grid facet −0.6 %, a Thermo profile facet −0.4 %, QC01's centroid facet +0.06 %;
+point-layout facets are byte-identical. **Output change (`.mzpeak` → `.mzpeak` filter).** A filtered
+archive numbers the spectra it keeps 0..n-1, which reverses 0.5.0's "index-stable — spectra are never
+renumbered". Its rewritten facets keep the source's column encodings and Parquet layout, and `--rt`
+cuts chromatograms stored with float32 times.
 
 ### Added
 
 - `metadata.imaging.pixel_count_source` (imaging profile, review B18): `declared` when the source
   stated the counts, `observed_max` when they were derived from or raised to the largest positions.
   Always `observed_max` on the Bruker MALDI and Waters lanes.
+- `MZPC_ROW_GROUP_MB=<MiB>`: the byte cap of a signal-facet row group, in MiB of Arrow buffers
+  (default 48, three quarters of the validator's 64 MiB `data_row_group_not_monolithic` threshold),
+  read by the vendored writer and the filter lane. `MZPC_TIMING` also reports, at the end, the row
+  groups and how many encode jobs ran at once, on average by wall clock and at most.
 
 ### Changed
 
-- **The transformations a conversion applied are mirrored into its processing method.** The index `transformations` list (D15) had no counterpart in `data_processing_method_list`.
-  - Each entry is now a `transformation` userParam of `mzpeak_convert_conversion`'s method, in the index and in every metadata footer.
-  - MS:1003901 `zero intensity point trimming` is added first when a zero-trimming entry is present (`zero-run-mask`, `shimadzu:span-trim`, `agilent:drop-zero-samples`).
-  - The validator's processing-method cv_mapping rule still passes: 6/6 PASS on the real-data and fixture archives.
-- **The box harness checks the box converter's version before dispatching any job, with `BOX_AUTOUPDATE=0` too.**
-  - What was wrong: with the updater off, which is the documented workaround when it fails, box_convert.sh did not check the version at all. A stale exe converted the whole manifest, and only corpus_reconvert's stamp check noticed afterwards (`built by mzpeak-convert X, not Y`).
-  - What happens now: it asks the exe the jobs will run for `--version` (one ssh command, no update). If the box answers another version or none, it exits 3 with "no job dispatched" under `BOX_REQUIRE_VERSION=1` (corpus runs set this), and only warns otherwise.
+- **The transformations a conversion applied are mirrored into its processing method.** The index
+  `transformations` list (D15) had no counterpart in `data_processing_method_list`.
+  - Each entry is now a `transformation` userParam of `mzpeak_convert_conversion`'s method, in the
+    index and in every metadata footer.
+  - MS:1003901 `zero intensity point trimming` is added first when a zero-trimming entry is present
+    (`zero-run-mask`, `shimadzu:span-trim`, `agilent:drop-zero-samples`).
+  - The validator's processing-method cv_mapping rule still passes: 6/6 PASS on the real-data and
+    fixture archives.
+- **The box harness checks the box converter's version before dispatching any job, with
+  `BOX_AUTOUPDATE=0` too.**
+  - What was wrong: with the updater off, which is the documented workaround when it fails,
+    box_convert.sh did not check the version at all. A stale exe converted the whole manifest, and
+    only corpus_reconvert's stamp check noticed afterwards (`built by mzpeak-convert X, not Y`).
+  - What happens now: it asks the exe the jobs will run for `--version` (one ssh command, no
+    update). If the box answers another version or none, it exits 3 with "no job dispatched" under
+    `BOX_REQUIRE_VERSION=1` (corpus runs set this), and only warns otherwise.
   - Measured: the live box's exe reports 0.15.0, so a run that requires v0.16.0 gets no job.
-- **The box tools work from a git worktree.** `tools/box.env` is gitignored, so `--box` (box_convert.sh) and box_convert_scp.sh died in a worktree on `BOX_SSH: parameter null or not set` until someone copied the file across. Both now use the main checkout's `tools/box.env`, found with `git rev-parse --git-common-dir`, and say which file they used. A worktree's own file still wins.
+- **The box tools work from a git worktree.** `tools/box.env` is gitignored, so `--box`
+  (box_convert.sh) and box_convert_scp.sh died in a worktree on `BOX_SSH: parameter null or not set`
+  until someone copied the file across. Both now use the main checkout's `tools/box.env`, found with
+  `git rev-parse --git-common-dir`, and say which file they used. A worktree's own file still wins.
+- **Signal row groups are bounded by bytes as well as rows.** In the chunked layout a row is a whole
+  chunk, so a row cap alone did not bound a group: 8192 timsTOF grid chunks came to 270–460 MiB of
+  uncompressed pages per group (PXD076703), a Shimadzu profile facet sat in one 85 MiB group (the
+  validator's `data_row_group_not_monolithic`), and the peak facet had no byte bound at all.
+  - A group now ends at its row cap or at 48 MiB of Arrow buffers, whichever comes first, decided
+    from the input batches alone. A conversion writes a spectrum as one batch and starts a new group
+    rather than split a spectrum that fits one; only a batch larger than a group is split.
+  - Every signal facet follows it: `spectra_data` (beside its 16 MB compressed flush),
+    `spectra_peaks` (the serial and parallel encoders share one cutter and stay byte-identical; the
+    serial path's 64 MB flush is gone), `chromatograms_data`, wavelength data, the point-column prune
+    rewrite, and the filter lane. The filter lane and the prune rewrite cut 1024-row reader batches,
+    so their cuts can fall inside a spectrum, as the row cap's always could.
+- **A chunk's m/z bounds are byte-stream-split with the dictionary off.** Nearly every bound of an
+  LC-MS run is distinct, so the dictionary held the values again, once per row group: at 1 → 4
+  groups the Lumos peak facet's two bound columns grew 21 % each. Without the dictionary the bounds
+  are 23–38 % smaller and the facets above shrink. A centroid facet with few distinct bounds grows
+  slightly (QC01 +0.05 %, the ltpmsi-chilli imaging run +0.10 %). The reference implementation leaves
+  the bounds to the dictionary; this is a deliberate deviation.
+- **A filtered archive numbers what it keeps 0..n-1.** A rewrite with `--rt` / `--ms-level` kept each
+  survivor's original, sparse index, but the spec numbers spectra 0..n-1, and the HUPO reference
+  reader (row count, lookup by index) raised `KeyError` on such an archive. This reverses the promise
+  of 0.5.0, "index-stable — spectra are never renumbered".
+  - The kept spectra are renumbered in index order in every facet that holds a spectrum index:
+    `spectra_metadata.index`, the secondaries' `source_index`, `precursor_index` (the parent's new
+    index, null when the parent was filtered out), the data facets' `spectrum_index` (point and chunk
+    layout, the timsTOF grid facet included) and the Thermo trailer facets' `ordinal`. A scans
+    facet's `scan_index` and `product_index` restart at 0; wavelength spectra are renumbered the
+    same way. Ids stay the source's.
+  - A `precursor_id` or scan `spectrum_reference` naming a filtered-out spectrum is nulled, in the
+    chromatograms' precursor facets too, with one warning per facet giving the count; one the archive
+    cannot resolve is kept. `encoding_prescan`'s `int32_fallback.spectrum_index` takes the new index,
+    null when its spectrum was filtered out.
+  - The index's `filter` block lists the renumbered entities under `renumbered`. Footer counts keep
+    their definitions.
+- **A filtered facet keeps its source's encodings and Parquet layout.** Through 0.16.0 the rewrite
+  took Parquet's defaults beside fixed rules that the default dictionary overrode: every column came
+  out dictionary-encoded, in format 1.0, in pages of at most 20,000 rows, with no sort order. Each
+  column now takes its source column's dictionary setting and value encoding, and each facet its
+  source's format version, sorting columns and bloom filters and the page limits a conversion gives
+  it. Keeping every spectrum (`--rt 0-100000`), content identical, against the source:
+  - QC01 point peak facet: +26.9 % with 0.16.0, −1.9 % now; a Thermo point profile facet +44.5 % →
+    −1.9 %; PXD059079 2485's grid facet +16.8 % → +4.2 %; the MFA381 archive +10.2 % → +1.2 %; a
+    chunked Thermo archive +2.2 % → −1.1 %.
+  - The lane writes at zstd level 5, the converter at 3 (22 on the chunked timsTOF facet). On an
+    archive this version wrote, a rewritten spectrum signal facet is 1.9 % smaller to 0.3 % larger
+    than its source, and a timsTOF grid facet 4.2 % larger; at the source's own level the chunked
+    facets match their source to 0.08 %.
+  - A chunked archive written by 0.16.0 or earlier keeps its dictionary-encoded bounds, which every
+    byte-capped row group pays for again: the corpus Lumos peak facet grows by 1.2 % (0.9 % with
+    0.16.0), MFA381's by 2.3 % (6.7 %). Rebuilt from the raw file, both are 1.1 % smaller than in the
+    corpus.
 
 ### Fixed
 
@@ -50,7 +133,8 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
     vocabulary and no marker. Such a run is converted on the standard lane with f64 m/z, with a
     warning.
   - An optical image never marks a run imaging. `--image` on a run with no pixel positions is an
-    error, and an auto-discovered `<stem>-opticalimage.*` beside such a run is skipped with a warning.
+    error, and an auto-discovered `<stem>-opticalimage.*` beside such a run is skipped with a
+    warning.
     Before, both invented `is_imaging: true` from an imzML header's counts, or from nothing.
   - Positions the six probe spectra miss are no longer lost. An mzML whose probes state no position
     is searched in full for `IMS:1000050/51` (a byte search, 2.5 s on a 6.4 GB mzML); a
@@ -63,7 +147,8 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   - A stated z that is not a pixel index is removed alone, declared
     `imaging:invalid-position-z-dropped`.
   - Pixel counts derived from the positions go into the scan-settings entry that states the pixel
-    size, or into a new entry under an unused id (before, `scansettings1` was reused), and take every
+    size, or into a new entry under an unused id (before, `scansettings1` was reused), and take
+    every
     positioned scan into account. An entry stating one axis's count is the grid entry.
   - A stated count that does not bound the written positions is set to the largest position and
     declared `imaging:pixel-count-raised-to-positions`.
@@ -76,13 +161,15 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   file's SHA-256 and accession.
 - **The Waters imaging grid fit is fail-safe** (review B14/B15): the step the method declares, or an
   exact lattice, or no grid at all.
-  - **Declared step:** `methodfile.xml` `DesiXStep` / `DesiYStep`, or any setting ending in `XStep` /
+  - **Declared step:** `methodfile.xml` `DesiXStep` / `DesiYStep`, or any setting ending in `XStep`
+    /
     `YStep` (case-sensitive, in mm), when the laser positions lie within a quarter step of it.
   - **Otherwise an exact lattice,** as the stage's float32 set points are: positions within 1 µm are
     one; the step is the largest gap of 3 µm or more between neighbouring distinct positions whose
     lattice, laid at that gap, holds all but 1 % of the scans in one 1 µm window; a position within
     half a µm of its grid point is on it; the pitch is refined within float noise only.
-  - **Fixed by it:** exact sparse rasters no longer lose every position; spot arrays, tissue-microarray
+  - **Fixed by it:** exact sparse rasters no longer lose every position; spot arrays,
+    tissue-microarray
     cores and regions one or two columns wide keep their step; a stray a fraction of a step off no
     longer seats that fraction; float32 noise is snapped off (3 µm steps included); a 33.33 µm step
     is not rounded to 33.3 µm where the positions tell them apart.
@@ -101,20 +188,27 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   are written without a position, counted (`off_grid_scans_dropped`) and declared
   `waters:off-grid-position-dropped`. A region far off the raster that spans columns (a QC spot)
   keeps its pixels.
-- **Bruker MALDI, beam-size fallback** (B16): `BeamScanSizeX/Y` becomes the pixel size only when every
+- **Bruker MALDI, beam-size fallback** (B16): `BeamScanSizeX/Y` becomes the pixel size only when
+  every
   positioned frame states the same finite, positive size (before, a NULL on some frames was skipped
   and +inf passed). A beam size that is not a number counts as unstated instead of dropping the
   frame's position; `bruker_maldi.frames_without_beam_scan_size` counts them.
-- **Bruker MALDI, FlexImaging `.mis` plausibility** (B16): a `.mis` the regions do not map onto is not
+- **Bruker MALDI, FlexImaging `.mis` plausibility** (B16): a `.mis` the regions do not map onto is
+  not
   used — neither its region names nor its raster step — with a warning and
-  `bruker_maldi.mis_rejected` (file, reason). It is rejected when a `RegionNumber` has no `<Area>`, or
+  `bruker_maldi.mis_rejected` (file, reason). It is rejected when a `RegionNumber` has no `<Area>`,
+  or
   when no single offset puts every region's `MotorPositionX/Y` inside its area's stage bounding box
   (a rectangle's four corners or a polygon's vertices, placed by the teach points) within half a
-  raster step. Both MassIVE MSV000088438 runs pass; every other order of their four areas is rejected.
-- **timsTOF native lane, empty frames** (B16): an empty frame (`NumPeaks = 0`) takes its `Frames.Id` as
-  its spectrum id, not its position + 1, so gapped ids no longer collide and a MALDI frame's position
+  raster step. Both MassIVE MSV000088438 runs pass; every other order of their four areas is
+  rejected.
+- **timsTOF native lane, empty frames** (B16): an empty frame (`NumPeaks = 0`) takes its `Frames.Id`
+  as
+  its spectrum id, not its position + 1, so gapped ids no longer collide and a MALDI frame's
+  position
   attaches.
-- **imzML pixel size** (B17): a single value is tested against its own axis's count and max dimension
+- **imzML pixel size** (B17): a single value is tested against its own axis's count and max
+  dimension
   (the other axis only when its own states none), both in one length unit, each in the unit it is
   written in (the unit name's when mzdata knows it, else the accession's); a value without a length
   unit is tested as micrometre; the square root of an area keeps the area's length unit (mm² → mm).
@@ -126,19 +220,24 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   like a non-empty `-wal`: database and journal are copied into a private scratch directory, rolled
   back there, read into memory, and the scratch directory removed — also when the raw files are
   read-only. A zero-byte or zeroed-header journal (the 32 HyStar journals in the corpus) is not hot.
-- **Unix file names holding a `\` or not in UTF-8 open the right file**: the SQLite URI is built from
+- **Unix file names holding a `\` or not in UTF-8 open the right file**: the SQLite URI is built
+  from
   the path's bytes, percent-encoded. Only Windows paths turn `\` into `/`; drive letters and UNC
   paths are unchanged.
-- **WAL-mode HyStar databases** (`chromatography-data.sqlite`) are read for their device traces, which
+- **WAL-mode HyStar databases** (`chromatography-data.sqlite`) are read for their device traces,
+  which
   were skipped with a warning.
-- **No spurious "removed incomplete …mzpeak.prescan{k}.tmp" warnings**: every Waters conversion logged
+- **No spurious "removed incomplete …mzpeak.prescan{k}.tmp" warnings**: every Waters conversion
+  logged
   four for the encoding pre-scan's trial archives; they are now removed quietly.
-- **An empty chunked spectrum facet is a chunked facet.** A spectrum facet with nothing written to it
+- **An empty chunked spectrum facet is a chunked facet.** A spectrum facet with nothing written to
+  it
   got point columns (`mz`, `intensity`) and `point` array-index entries under the `chunk` prefix —
   every spectrum facet of an SRM/MRM run with empty spectra, and the profile facet of a
   centroid-only Thermo run (66 facets in 35 corpus archives, all with zero rows). They now carry the
   chunk columns a default-typed spectrum would have. Archives from earlier releases still read.
-- **`--layout point` stays point on lattice data**: a centroid list on a fixed-point lattice no longer
+- **`--layout point` stays point on lattice data**: a centroid list on a fixed-point lattice no
+  longer
   gets the fitted linear grid (a chunked peaks facet beside the point data facet); the native
   Shimadzu lane applies neither of its grids under `--layout point`.
 - **`shimadzu:coarse-mz` is declared whenever the glue read the coarse field**
@@ -150,7 +249,8 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   vocabulary mzdata embeds (`LCMS-9030 wo PDA` → MS:1002998, `LCMS-9050` → MS:1003568); a model the
   vocabulary lacks gets MS:1000124 with the stated name as its value. Every `.lcd` used to be
   MS:1002998.
-- **Box harness** (`tools/box_convert.sh`): a job goes to the Windows box as a file (`-JobFile`), not
+- **Box harness** (`tools/box_convert.sh`): a job goes to the Windows box as a file (`-JobFile`),
+  not
   over ssh stdin, which stalled on slow links; every job is capped by a watchdog
   (`BOX_JOB_TIMEOUT`, default 6 h) and every upload by `BOX_SCP_TIMEOUT` (default 300 s); a pool
   slot frees when any job ends, not only the oldest.
@@ -166,10 +266,12 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   runs). The prologue all four mzML lanes share (`fixup_mzml_run_metadata`) now puts
   `mzpeak_convert_to_mzml` first: software `mzpeak-convert` (this version) doing MS:1000544
   `Conversion to mzML`, with the path-free `conversion options` the archive lanes record, after the
-  methods of the processing a source's spectra point at by default, as msconvert extends a re-written
+  methods of the processing a source's spectra point at by default, as msconvert extends a
+  re-written
   mzML's history. That also ends a drift older than this fix: the writer ignores the default an mzML
   source declares, so its spectra moved to whatever processing came first (`tiny.pwiz.1.1.mzML`:
-  from `pwiz_processing` to `CompassXtract_x0020_processing`). The source's entries stay listed after
+  from `pwiz_processing` to `CompassXtract_x0020_processing`). The source's entries stay listed
+  after
   the step; an array's redundant reference to the source's default is left out, so it inherits the
   step that extends it. A re-export of this tool's own mzML reuses its software entry and gives the
   step a fresh id (`mzpeak_convert_to_mzml_2`). OpenMS 3.5 `FileInfo` refuses the 0.16.0 exports of
@@ -201,7 +303,8 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   the upper limit. `--no-tims-recalibration` stays inert on this lane (and says so; the export is
   identical): the arrays cannot leave the model, and limits on the linear map would miss 9 % of
   the peaks.
-- **The mzML `<scan>` of a diaPASEF spectrum lists its cvParams first.** mzdata's TDF reader puts the
+- **The mzML `<scan>` of a diaPASEF spectrum lists its cvParams first.** mzdata's TDF reader puts
+  the
   `window group` userParam before the MS:1002815 cvParam, which the mzML schema forbids (one XSD
   error per MS2 scan). Every mzML lane that demotes MZP params now also puts each param list's
   cvParams first, keeping each kind's order.
@@ -258,32 +361,108 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   through the mzML writer; the remap bit for bit against mzdata's model at every scan of two runs,
   and within 4 ulp of the SDK order; the recorded command line. The mzML reader they share is
   `tests/common/mzml_meta.rs`.
-- **Two conversions of same-named inputs in one process no longer share a temp copy.** The UTF-8 transcode, gunzip and sanitized copies were named `<prefix>-<pid>-<stem>`, so a second conversion of a file with the same stem in the same process wrote into the first one's copy ("writing transcoded …: Invalid argument"; an in-process test flaked once). Each copy is now `<prefix>-<pid>-<n>-<name>`, where n is a process-wide counter, and it is created exclusively. Cleanup is unchanged.
-- **Archives declare the PSI-MS version they actually resolve terms against.** `cv_list` stated MS 4.1.249, a string hard-coded in the vendored writer since 0.7.3, while mzdata 0.67.1 embeds 4.1.258. The validator reported "the archive declares MS 4.1.249". The version and the tag-pinned URI (`…/psi-ms-CV/v4.1.258/psi-ms.obo`) are now read from mzdata's embedded vocabulary, so archives and mzML exports agree on 4.1.258. UO and IMS have no copy inside mzdata and stay pinned; a test checks that each declared version names the release its URI pins.
-- **mzML/imzML cross-references that name nothing are dropped and declared.** A scan's `instrumentConfigurationRef`, a processing method's or instrument configuration's `softwareRef`, and the run's default configuration, processing and source file used to pass into the archive whether or not the source's lists held the id. GBM `Test_P15_r2` stored all 2826 scans as configuration 1 of a list holding only 0, and the synthetic imzML named processing `dp1`, which it does not have.
-  - Each such reference is now dropped: a scan's configuration becomes null, a softwareRef becomes empty, and a run default names the first entry of its list.
-  - The archive declares `mzml:dangling-reference-dropped`, and the run warns once, counting each kind and naming the ids as the source states them.
-  - Entries mzdata skips for being self-closing (`<software/>`, `<sourceFile/>`, `<instrumentConfiguration/>`) are read back from the header first, so a reference to one is kept. LA-ESI `Thaliana`'s MALDIquantForeign 0.12 is back in the software list.
-  - The 146 corpus mzML/imzML inputs under 40 MB convert unchanged; Test_P15_r2 is the only corpus source with a real dangling reference.
-- **An archive's mzML export keeps every precursor's activation.** The vendored reader read only an activation's `parameters`, but the writer keeps the dissociation method and the collision energy in columns of their own. So every precursor of every archive came back with no method and an energy of 0. The exports of PXD059079 2485's archives (ims-compact and `--no-ims-compact`) wrote `collision energy 0` and no CID on all 15,977 precursors, where the `.d`'s export states CID at 25.0–49.3 eV. Both columns are now read (a deliberate deviation from the reference reader). The 15,977 precursors match the `.d`'s export field for field, and OpenMS FileInfo counts 15,977 CID activations on each export (0 before).
-- **An exported chromatogram's precursor keeps its isolation window.** The reader looked the window's columns up in an empty column mapping. Every SRM/SIM trace was exported with a window of target 0 and no activation: all 201 traces of the Agilent 6490 corpus file `PC_Allan1`, all 4 of pwiz's `MRM Neg C5`, and `tiny.pwiz.1.1`'s selected ion current trace (456.7). An SRM trace's product (Q3) window is still not stored in the archive, so it is still not exported.
-- **Summed TIC and base-peak chromatograms are in time order.** The mzML writer sums them in spectrum order, so a run whose spectra are not in time order got an unsorted time array (`tiny.pwiz.1.1`'s base-peak trace: 5.8905, 5.9905, 0.0, 0.7008 min). This happened on every `--to mzml` lane, the Agilent profile lane included, and on the export of an archive that holds no chromatogram of that kind. An archive's stored chromatograms go across as stored, as they have since 0.12.4.
-- **A chromatogram's polarity reaches the mzML.** mzdata's writer writes none, so `negative scan` was dropped from every SRM trace of a negative-mode run on both routes (all 4 of `MRM Neg C5`). The reader also read a null chromatogram polarity from the value slot under it, which would have made a TIC beside a negative trace negative.
+- **Two conversions of same-named inputs in one process no longer share a temp copy.** The UTF-8
+  transcode, gunzip and sanitized copies were named `<prefix>-<pid>-<stem>`, so a second conversion
+  of a file with the same stem in the same process wrote into the first one's copy ("writing
+  transcoded …: Invalid argument"; an in-process test flaked once). Each copy is now
+  `<prefix>-<pid>-<n>-<name>`, where n is a process-wide counter, and it is created exclusively.
+  Cleanup is unchanged.
+- **Archives declare the PSI-MS version they actually resolve terms against.** `cv_list` stated MS
+  4.1.249, a string hard-coded in the vendored writer since 0.7.3, while mzdata 0.67.1 embeds
+  4.1.258. The validator reported "the archive declares MS 4.1.249". The version and the tag-pinned
+  URI (`…/psi-ms-CV/v4.1.258/psi-ms.obo`) are now read from mzdata's embedded vocabulary, so
+  archives and mzML exports agree on 4.1.258. UO and IMS have no copy inside mzdata and stay pinned;
+  a test checks that each declared version names the release its URI pins.
+- **mzML/imzML cross-references that name nothing are dropped and declared.** A scan's
+  `instrumentConfigurationRef`, a processing method's or instrument configuration's `softwareRef`,
+  and the run's default configuration, processing and source file used to pass into the archive
+  whether or not the source's lists held the id. GBM `Test_P15_r2` stored all 2826 scans as
+  configuration 1 of a list holding only 0, and the synthetic imzML named processing `dp1`, which it
+  does not have.
+  - Each such reference is now dropped: a scan's configuration becomes null, a softwareRef becomes
+    empty, and a run default names the first entry of its list.
+  - The archive declares `mzml:dangling-reference-dropped`, and the run warns once, counting each
+    kind and naming the ids as the source states them.
+  - Entries mzdata skips for being self-closing (`<software/>`, `<sourceFile/>`,
+    `<instrumentConfiguration/>`) are read back from the header first, so a reference to one is
+    kept. LA-ESI `Thaliana`'s MALDIquantForeign 0.12 is back in the software list.
+  - The 146 corpus mzML/imzML inputs under 40 MB convert unchanged; Test_P15_r2 is the only corpus
+    source with a real dangling reference.
+- **An archive's mzML export keeps every precursor's activation.** The vendored reader read only an
+  activation's `parameters`, but the writer keeps the dissociation method and the collision energy
+  in columns of their own. So every precursor of every archive came back with no method and an
+  energy of 0. The exports of PXD059079 2485's archives (ims-compact and `--no-ims-compact`) wrote
+  `collision energy 0` and no CID on all 15,977 precursors, where the `.d`'s export states CID at
+  25.0–49.3 eV. Both columns are now read (a deliberate deviation from the reference reader). The
+  15,977 precursors match the `.d`'s export field for field, and OpenMS FileInfo counts 15,977 CID
+  activations on each export (0 before).
+- **An exported chromatogram's precursor keeps its isolation window.** The reader looked the
+  window's columns up in an empty column mapping. Every SRM/SIM trace was exported with a window of
+  target 0 and no activation: all 201 traces of the Agilent 6490 corpus file `PC_Allan1`, all 4 of
+  pwiz's `MRM Neg C5`, and `tiny.pwiz.1.1`'s selected ion current trace (456.7). An SRM trace's
+  product (Q3) window is still not stored in the archive, so it is still not exported.
+- **Summed TIC and base-peak chromatograms are in time order.** The mzML writer sums them in
+  spectrum order, so a run whose spectra are not in time order got an unsorted time array
+  (`tiny.pwiz.1.1`'s base-peak trace: 5.8905, 5.9905, 0.0, 0.7008 min). This happened on every `--to
+  mzml` lane, the Agilent profile lane included, and on the export of an archive that holds no
+  chromatogram of that kind. An archive's stored chromatograms go across as stored, as they have
+  since 0.12.4.
+- **A chromatogram's polarity reaches the mzML.** mzdata's writer writes none, so `negative scan`
+  was dropped from every SRM trace of a negative-mode run on both routes (all 4 of `MRM Neg C5`).
+  The reader also read a null chromatogram polarity from the value slot under it, which would have
+  made a TIC beside a negative trace negative.
 - **1/K0 is MS:1002815 `inverse reduced ion mobility`, once.** An archive's export:
-  - named every selected ion's and scan's 1/K0 `inverse reduced ion mobility drift time`, a label PSI-MS does not have (15,977 selected ions of 2485);
+  - named every selected ion's and scan's 1/K0 `inverse reduced ion mobility drift time`, a label
+    PSI-MS does not have (15,977 selected ions of 2485);
   - stated a `--no-ims-compact` archive's scan 1/K0 twice (15,977 of 16,377 scans);
   - stated every spectrum's `scan start time` a second time at the spectrum level.
 
-  That copy is now dropped. On a scan without a time it becomes the scan's time, converted from its own unit.
-- **timsTOF frames store their ion injection time and scan window.** An ims-compact archive stored neither, on the native and the `--bruker-sdk` lane, and so did the SDK lane's `--no-ims-compact` frames. Their export stated `ion injection time 0` and no scan window on all 3,994 frames of 2485, where the `.d`'s export states 165.957 ms and 99.99–1700 m/z. `Frames.AccumulationTime` and the run's `MzAcqRangeLower`/`MzAcqRangeUpper` are stored now. For an otofControl acquisition the range is widened by 5 Th as timsrust widens it, which gives 94.99–1705 on MSV000092457's 13373.d on every lane. This adds 111 bytes to 2485's 118.7 MB archive, and the validator passes it as before. The `--bruker-sdk` half is not yet confirmed against `timsdata`.
-- **A timsTOF `.d` copied from a Mac to NTFS, exFAT or SMB now names its AppleDouble companion instead of failing with "file is not a database".**
-  - What was wrong: copying a `.d` that way leaves a 163-byte `._*` file of Finder metadata beside every file. timsrust 0.4.1 opens the first entry whose name *ends with* `analysis.tdf` / `analysis.tdf_bin`. NTFS and APFS list `._analysis.tdf` first, so the default lane, `--no-ims-compact`, `--to mzml` and inspection all read the companion and failed without naming the cause. `--bruker-sdk` converted the same copy (2485.d on the box).
-  - What happens now: each of these lanes reads the directory listing in the order timsrust walks it.
-    - A companion timsrust would take is refused before the open, with the file and the fix named: remove the `._*` files (on a Mac, copy the `.d` to APFS instead), or use `--bruker-sdk`.
-    - A companion listed after its file, as on a fresh copy onto exFAT, is never reached. That `.d` converts as before, with a warning. On PXD059079 2486.d every Parquet member equals the APFS conversion.
-    - On a Mac, macOS writes `._analysis.tdf` into a `.d` on exFAT as soon as timsrust opens the database read-write. A failed open now names a companion that appeared that way.
+  That copy is now dropped. On a scan without a time it becomes the scan's time, converted from its
+  own unit.
+- **timsTOF frames store their ion injection time and scan window.** An ims-compact archive stored
+  neither, on the native and the `--bruker-sdk` lane, and so did the SDK lane's `--no-ims-compact`
+  frames. Their export stated `ion injection time 0` and no scan window on all 3,994 frames of 2485,
+  where the `.d`'s export states 165.957 ms and 99.99–1700 m/z. `Frames.AccumulationTime` and the
+  run's `MzAcqRangeLower`/`MzAcqRangeUpper` are stored now. For an otofControl acquisition the range
+  is widened by 5 Th as timsrust widens it, which gives 94.99–1705 on MSV000092457's 13373.d on
+  every lane. This adds 111 bytes to 2485's 118.7 MB archive, and the validator passes it as before.
+  The `--bruker-sdk` half is not yet confirmed against `timsdata`.
+- **A timsTOF `.d` copied from a Mac to NTFS, exFAT or SMB now names its AppleDouble companion
+  instead of failing with "file is not a database".**
+  - What was wrong: copying a `.d` that way leaves a 163-byte `._*` file of Finder metadata beside
+    every file. timsrust 0.4.1 opens the first entry whose name *ends with* `analysis.tdf` /
+    `analysis.tdf_bin`. NTFS and APFS list `._analysis.tdf` first, so the default lane,
+    `--no-ims-compact`, `--to mzml` and inspection all read the companion and failed without naming
+    the cause. `--bruker-sdk` converted the same copy (2485.d on the box).
+  - What happens now: each of these lanes reads the directory listing in the order timsrust walks
+    it.
+    - A companion timsrust would take is refused before the open, with the file and the fix named:
+      remove the `._*` files (on a Mac, copy the `.d` to APFS instead), or use `--bruker-sdk`.
+    - A companion listed after its file, as on a fresh copy onto exFAT, is never reached. That `.d`
+      converts as before, with a warning. On PXD059079 2486.d every Parquet member equals the APFS
+      conversion.
+    - On a Mac, macOS writes `._analysis.tdf` into a `.d` on exFAT as soon as timsrust opens the
+      database read-write. A failed open now names a companion that appeared that way.
   - The converter never deletes anything.
-- **Embedded vendor side-files now leave out AppleDouble `._*` companions.** The preserve-by-default catch-all embedded every `._*` file, and a signal file's companion (`._FUNC001.DAT`) survived even when that file itself was dropped. A fresh exFAT copy of 2486.d embedded 23 `vendor/._*` files; it now embeds none. They are recorded in `vendor_files`, and `--aux '._*=embed'` keeps them. No corpus unit holds a `._*` file outside `__MACOSX`, so no published archive changes.
+- **Embedded vendor side-files now leave out AppleDouble `._*` companions.** The preserve-by-default
+  catch-all embedded every `._*` file, and a signal file's companion (`._FUNC001.DAT`) survived even
+  when that file itself was dropped. A fresh exFAT copy of 2486.d embedded 23 `vendor/._*` files; it
+  now embeds none. They are recorded in `vendor_files`, and `--aux '._*=embed'` keeps them. No
+  corpus unit holds a `._*` file outside `__MACOSX`, so no published archive changes.
+- **Oversized row groups no longer encode one at a time.** The parallel peak encoder admitted a group
+  larger than its in-flight budget only once nothing else was in flight, so a run of them encoded on
+  one core (2 h 20 min for PXD076703). A group is now charged at most the budget's per-thread share
+  and encodes on its own worker. Memory in flight is at most `max(budget, threads × largest group)`;
+  on a small host, `MZPC_ENCODE_THREADS` or `MZPC_ROW_GROUP_MB` bound it.
+- **A filtered mzML export writes no dangling `spectrumRef`.** The archive → mzML export wrote a
+  reference to every filtered-out parent (small.RAW `--ms-level 2`: 34 references to 14 absent MS1
+  spectra) and kept a chromatogram precursor's id naming a spectrum it left out. It also opened the
+  archive twice and parsed its index twice (each entity-type warning printed twice: 42 instead of 21
+  on PXD059079 2485).
+- **`--rt` cuts chromatograms whose time axis is float32**, as a PDA or DAD run's mzML stores them;
+  through 0.16.0 they were copied whole with "no recognizable time axis". The column keeps its type
+  and `number_of_data_points` follows: the corpus Waters PDA archive under `--rt 0.5-1.0` keeps 1,449
+  of 4,344 points, the Agilent DAD archive under `--rt 1-2` 272 of 950.
 
 ### Documentation
 
