@@ -21,10 +21,22 @@
 //!   the fallback, declared as such ([`PIXEL_FROM_BEAM`]), and only when every positioned frame
 //!   states the same finite size. Either way written as `IMS:1000046/47`, with `IMS:1000044/45` max
 //!   dimension = count × size.
+//! * The acquisition region: each positioned frame's `RegionNumber` is a parameter of its scan
+//!   ([`REGION_PARAM`], no accession: the imaging profile names no region column yet), which the
+//!   block's `regions` list maps to the region's name. The bounding boxes there cannot tell the
+//!   regions apart once two overlap, and two of the four MSV000088438 areas are polygons.
+//! * A frame without a `MaldiFrameInfo` row, or with a NULL index, has no position: its spectrum is
+//!   written with null `position_x` / `position_y`, which the profile allows; such frames are
+//!   counted (`frames_without_position`) and warned about once ([`read_dot_d`]). An empty frame
+//!   (`NumPeaks = 0`) that has a row keeps its pixel.
 //!
 //! Column names are Bruker's (`MaldiFrameInfo(Frame, …, RegionNumber, XIndexPos, YIndexPos, …,
-//! BeamScanSizeX, BeamScanSizeY)`), confirmed by the issue author on a real acquisition; the corpus
-//! holds none, so the tests build the table.
+//! LaserInfo)`), read off MassIVE MSV000088438 (TSF schema 3.3, TDF schema 3.5). There the beam scan
+//! size is not a column of `MaldiFrameInfo` but of `MaldiFrameLaserInfo(Id, …, BeamScan,
+//! BeamScanSizeX, BeamScanSizeY, …)`, which `MaldiFrameInfo.LaserInfo` references, and `BeamScan = 0`
+//! (both runs) says the beam was not scanned: the sizes beside it (0.0) are then no pixel size. A
+//! schema with `BeamScanSizeX/Y` on `MaldiFrameInfo` itself, as the issue author described his, is
+//! read from there. The corpus holds no MALDI run, so the tests build the tables.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -48,6 +60,10 @@ pub enum PixelSource {
 }
 /// Positions are the raster indices minus the run's smallest index plus 1.
 pub const SHIFTED_TO_BASE_1: &str = "bruker:raster-index-shifted-to-base-1";
+/// The name of the scan parameter holding a frame's `MaldiFrameInfo.RegionNumber`. A parameter
+/// without an accession, in the scan's `parameters` list: the imaging profile has a region column
+/// as an open item (HUPO-PSI/mzPeak-specification#25) and no term names one.
+pub const REGION_PARAM: &str = "acquisition region";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spot {
@@ -69,6 +85,12 @@ pub struct MaldiInfo {
     /// enough to rule the beam fallback out (review 2026-09-30 B16: NULLs were skipped and +inf
     /// passed).
     pub beam_unstated: usize,
+    /// Where the beam scan size was read: `MaldiFrameInfo`'s own columns, `MaldiFrameLaserInfo`
+    /// through `LaserInfo`, or nowhere (neither has the columns).
+    pub beam_source: Option<&'static str>,
+    /// Frames with no position: of the `Frames` table, those without a `MaldiFrameInfo` row or with
+    /// a NULL `XIndexPos` / `YIndexPos` there (without a `Frames` table, the rows with a NULL index).
+    pub unpositioned: usize,
     /// Smallest and largest `(XIndexPos, YIndexPos)` of the run: `min` becomes position (1, 1).
     pub min: (i64, i64),
     pub max: (i64, i64),
@@ -168,23 +190,38 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
 
 /// `MaldiFrameInfo` of an open TSF/TDF database; `None` without the table or its position columns.
 pub fn read(conn: &Connection) -> Option<MaldiInfo> {
-    let cols: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('MaldiFrameInfo')")
-        .ok()?
-        .query_map([], |r| r.get::<_, String>(0))
-        .ok()?
-        .flatten()
-        .collect();
+    let columns = |table: &str| -> Vec<String> {
+        let Ok(mut stmt) = conn.prepare("SELECT name FROM pragma_table_info(?1)") else { return Vec::new() };
+        stmt.query_map([table], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    };
+    let cols = columns("MaldiFrameInfo");
     let has = |c: &str| cols.iter().any(|x| x == c);
     if !(has("Frame") && has("XIndexPos") && has("YIndexPos")) {
         return None;
     }
-    let opt = |c: &str| if has(c) { c.to_string() } else { "NULL".to_string() };
+    let opt = |c: &str| if has(c) { format!("m.{c}") } else { "NULL".to_string() };
+    // The beam scan size: on `MaldiFrameInfo` itself where that has the columns; else in
+    // `MaldiFrameLaserInfo`, the row `LaserInfo` names (both MSV000088438 runs — through 0.16.0 only
+    // the first was tried, so the fallback could not fire on a real file). `BeamScan = 0` there
+    // means the beam was not scanned: the sizes beside it are unstated.
+    let laser = columns("MaldiFrameLaserInfo");
+    let in_laser = |c: &str| laser.iter().any(|x| x == c);
+    let (beam_x, beam_y, join, beam_source) = if has("BeamScanSizeX") || has("BeamScanSizeY") {
+        (opt("BeamScanSizeX"), opt("BeamScanSizeY"), "", Some("MaldiFrameInfo.BeamScanSizeX/Y"))
+    } else if has("LaserInfo") && in_laser("Id") && in_laser("BeamScanSizeX") && in_laser("BeamScanSizeY") {
+        let scanned = |c: &str| if in_laser("BeamScan") { format!("CASE WHEN l.BeamScan = 0 THEN NULL ELSE l.{c} END") } else { format!("l.{c}") };
+        (
+            scanned("BeamScanSizeX"),
+            scanned("BeamScanSizeY"),
+            " LEFT JOIN MaldiFrameLaserInfo l ON l.Id = m.LaserInfo",
+            Some("MaldiFrameLaserInfo.BeamScanSizeX/Y of the row MaldiFrameInfo.LaserInfo names (unstated where BeamScan = 0)"),
+        )
+    } else {
+        ("NULL".to_string(), "NULL".to_string(), "", None)
+    };
     let sql = format!(
-        "SELECT Frame, XIndexPos, YIndexPos, {}, {}, {}, {}, {} FROM MaldiFrameInfo",
+        "SELECT m.Frame, m.XIndexPos, m.YIndexPos, {}, {beam_x}, {beam_y}, {}, {} FROM MaldiFrameInfo m{join}",
         opt("RegionNumber"),
-        opt("BeamScanSizeX"),
-        opt("BeamScanSizeY"),
         opt("MotorPositionX"),
         opt("MotorPositionY")
     );
@@ -198,15 +235,24 @@ pub fn read(conn: &Connection) -> Option<MaldiInfo> {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?, f(4), f(5), f(6), f(7)))
         })
         .ok()?;
-    let mut info = MaldiInfo::default();
+    let mut info = MaldiInfo { beam_source, ..Default::default() };
     for (frame, x, y, region, bx, by, mx, my) in rows.flatten() {
-        let (Some(x), Some(y)) = (x, y) else { continue };
+        let (Some(x), Some(y)) = (x, y) else {
+            info.unpositioned += 1;
+            continue;
+        };
         let motor = mx.zip(my).filter(|(x, y)| x.is_finite() && y.is_finite());
         info.spots.insert(frame, Spot { x, y, region, motor });
         match bx.zip(by).filter(|&(bx, by)| bx.is_finite() && by.is_finite() && bx > 0.0 && by > 0.0) {
             Some(b) if !info.beam.contains(&b) => info.beam.push(b),
             Some(_) => {}
             None => info.beam_unstated += 1,
+        }
+    }
+    // Every frame is a spectrum, with or without a `MaldiFrameInfo` row: count against `Frames`.
+    if let Ok(mut frames) = conn.prepare("SELECT Id FROM Frames") {
+        if let Ok(ids) = frames.query_map([], |r| r.get::<_, i64>(0)) {
+            info.unpositioned = ids.flatten().filter(|id| !info.spots.contains_key(id)).count();
         }
     }
     let (xs, ys) = (info.spots.values().map(|s| s.x), info.spots.values().map(|s| s.y));
@@ -227,13 +273,22 @@ pub fn read_dot_d(dot_d: &Path) -> Option<MaldiInfo> {
     })?;
     info.mis = read_mis(&dot_d.with_extension("mis"));
     info.check_mis();
+    // Once per conversion: every lane reads the run's positions here, once.
+    if info.unpositioned > 0 {
+        log::warn!(
+            "Bruker MALDI: {} of {} frames have no raster position (no MaldiFrameInfo row, or a NULL \
+             XIndexPos/YIndexPos); their spectra are written with a null position",
+            info.unpositioned,
+            info.spots.len() + info.unpositioned
+        );
+    }
     Some(info)
 }
 
 impl MaldiInfo {
-    /// Put the frame's position on the spectrum's first scan. Spectra are matched by the
-    /// `frame=<Frames.Id>` token of their id: the whole id on the TSF, native TDF and SDK lanes,
-    /// `merged=… frame=… startScan=…` through mzdata.
+    /// Put the frame's position, and its region when the frame states one ([`REGION_PARAM`]), on the
+    /// spectrum's first scan. Spectra are matched by the `frame=<Frames.Id>` token of their id: the
+    /// whole id on the TSF, native TDF and SDK lanes, `merged=… frame=… startScan=…` through mzdata.
     pub fn attach(&self, spec: &mut MultiLayerSpectrum) -> bool {
         let frame = spec.id().split_whitespace().find_map(|t| t.strip_prefix("frame=")?.parse::<i64>().ok());
         let Some(frame) = frame else { return false };
@@ -245,6 +300,9 @@ impl MaldiInfo {
         let (x, y) = (spot.x - self.min.0 + 1, spot.y - self.min.1 + 1);
         scans[0].add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(x).build());
         scans[0].add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(y).build());
+        if let Some(region) = spot.region {
+            scans[0].add_param(Param::builder().name(REGION_PARAM).value(region).build());
+        }
         true
     }
 
@@ -429,14 +487,16 @@ impl MaldiInfo {
             regions.entry(s.region).or_default().push(s);
         }
         serde_json::json!({
-            "source": "analysis.tsf/.tdf MaldiFrameInfo (XIndexPos, YIndexPos, RegionNumber, BeamScanSizeX/Y)",
+            "source": "analysis.tsf/.tdf MaldiFrameInfo (XIndexPos, YIndexPos, RegionNumber); the beam scan size as beam_scan_size_source says",
             "coordinates": "positions are XIndexPos/YIndexPos − origin + 1 (metadata.imaging.position_offset = origin − 1); x_index/y_index and the regions give the raw indices",
             "origin": {"x": self.min.0, "y": self.min.1},
             "frames_with_position": self.spots.len(),
+            "frames_without_position": self.unpositioned,
             "x_index": range(|s| s.x, &mut self.spots.values()),
             "y_index": range(|s| s.y, &mut self.spots.values()),
             "mis": self.mis.as_ref().map(|m| &m.file),
             "mis_rejected": self.mis_rejected.as_ref().map(|(file, reason)| serde_json::json!({"file": file, "reason": reason})),
+            "region_parameter": self.spots.values().any(|s| s.region.is_some()).then(|| format!("each positioned frame's scan states its region_number as the parameter '{REGION_PARAM}'")),
             "regions": regions.iter().map(|(r, spots)| serde_json::json!({
                 "region_number": r,
                 "name": self.region_name(*r),
@@ -446,6 +506,7 @@ impl MaldiInfo {
                 "y_index": range(|s| s.y, &mut spots.iter().copied()),
             })).collect::<Vec<_>>(),
             "beam_scan_size_um": self.beam.iter().map(|(x, y)| serde_json::json!({"x": x, "y": y})).collect::<Vec<_>>(),
+            "beam_scan_size_source": self.beam_source,
             "frames_without_beam_scan_size": self.beam_unstated,
             "pixel_size": self.pixel_size_note(),
         })
@@ -550,6 +611,114 @@ mod tests {
         let info = read(&c).unwrap();
         assert_eq!((info.pixel_size(), info.beam_unstated), (Some((20.0, 20.0)), 0));
         assert_eq!(info.block()["frames_without_beam_scan_size"], 0);
+    }
+
+    /// The tables of a real run (MassIVE MSV000088438, TSF schema 3.3 and TDF schema 3.5): the beam
+    /// scan size is a column of `MaldiFrameLaserInfo`, which `MaldiFrameInfo.LaserInfo` references.
+    fn laser_tables(conn: &Connection, laser_rows: &str) {
+        conn.execute_batch(&format!(
+            "CREATE TABLE MaldiFrameLaserInfo (Id INTEGER PRIMARY KEY, LaserApplicationName TEXT, BeamScan INTEGER NOT NULL,
+                                               BeamScanSizeX REAL, BeamScanSizeY REAL, SpotSize REAL);
+             INSERT INTO MaldiFrameLaserInfo VALUES {laser_rows};
+             CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY NOT NULL, Chip INTEGER NOT NULL, SpotName TEXT, RegionNumber INTEGER,
+                                          XIndexPos INTEGER, YIndexPos INTEGER, MotorPositionX REAL, MotorPositionY REAL,
+                                          LaserInfo INTEGER NOT NULL);
+             INSERT INTO MaldiFrameInfo VALUES (1, 0, 'R00X019Y012', 0, 19, 12, 1.0, 2.0, 1),
+                                               (2, 0, 'R00X020Y012', 0, 20, 12, 1.0, 2.0, 1),
+                                               (3, 0, 'R01X021Y013', 1, 21, 13, 1.0, 2.0, 2);"
+        ))
+        .unwrap();
+    }
+
+    /// The beam fallback on the real schema. Through 0.16.0 the sizes were selected from
+    /// `MaldiFrameInfo`, which does not have them there, so every frame counted as stating none and
+    /// the fallback could not fire on a real file. `BeamScan = 0` (both MSV000088438 runs, with
+    /// sizes 0.0) says the beam was not scanned: unstated, whatever the sizes beside it.
+    #[test]
+    fn the_beam_scan_size_is_read_through_laser_info() {
+        let read_with = |laser_rows: &str| {
+            let c = Connection::open_in_memory().unwrap();
+            laser_tables(&c, laser_rows);
+            read(&c).unwrap()
+        };
+        let info = read_with("(1, 'Custom', 1, 20.0, 20.0, 950.0), (2, 'Custom', 1, 20.0, 20.0, 950.0)");
+        assert_eq!((info.beam.clone(), info.beam_unstated), (vec![(20.0, 20.0)], 0));
+        assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)));
+        assert!(info.index_blocks().1.contains(&PIXEL_FROM_BEAM));
+        let b = info.block();
+        assert_eq!(b["beam_scan_size_um"], serde_json::json!([{"x": 20.0, "y": 20.0}]));
+        assert!(b["beam_scan_size_source"].as_str().unwrap().starts_with("MaldiFrameLaserInfo"), "{}", b["beam_scan_size_source"]);
+        assert_eq!(info.spots[&3], Spot { x: 21, y: 13, region: Some(1), motor: Some((1.0, 2.0)) }, "the join loses nothing else");
+
+        // Still only when EVERY positioned frame states the same finite positive size.
+        for (laser_rows, why) in [
+            ("(1, 'Custom', 0, 0.0, 0.0, 950.0), (2, 'Custom', 0, 0.0, 0.0, 950.0)", "the real runs: beam not scanned"),
+            ("(1, 'Custom', 0, 20.0, 20.0, 950.0), (2, 'Custom', 0, 20.0, 20.0, 950.0)", "BeamScan = 0 beside a size"),
+            ("(1, 'Custom', 1, 20.0, 20.0, 950.0), (2, 'Custom', 0, 20.0, 20.0, 950.0)", "one laser setting not scanned"),
+            ("(1, 'Custom', 1, 20.0, 20.0, 950.0), (2, 'Custom', 1, 50.0, 50.0, 950.0)", "two sizes"),
+            ("(1, 'Custom', 1, 20.0, 20.0, 950.0)", "a frame whose LaserInfo names no row"),
+            ("(1, 'Custom', 1, 20.0, NULL, 950.0), (2, 'Custom', 1, 20.0, NULL, 950.0)", "no y"),
+        ] {
+            let info = read_with(laser_rows);
+            assert_eq!(info.pixel_size(), None, "{why}");
+            assert!(info.beam_unstated > 0 || info.beam.len() > 1, "{why}");
+            assert_eq!(info.spots.len(), 3, "{why}: every positioned frame is kept");
+            assert!(!info.index_blocks().1.contains(&PIXEL_FROM_BEAM), "{why}");
+        }
+
+        // A laser table without the BeamScan flag: the sizes as they are.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE MaldiFrameLaserInfo (Id INTEGER PRIMARY KEY, BeamScanSizeX REAL, BeamScanSizeY REAL);
+             INSERT INTO MaldiFrameLaserInfo VALUES (7, 10.0, 15.0);
+             CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, XIndexPos INTEGER, YIndexPos INTEGER, LaserInfo INTEGER);
+             INSERT INTO MaldiFrameInfo VALUES (1, 1, 1, 7), (2, 2, 1, 7);",
+        )
+        .unwrap();
+        assert_eq!(read(&c).unwrap().pixel_size(), Some((10.0, 15.0)));
+
+        // Columns on MaldiFrameInfo itself win: the schema the fallback was written for.
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c);
+        c.execute_batch(
+            "CREATE TABLE MaldiFrameLaserInfo (Id INTEGER PRIMARY KEY, BeamScan INTEGER, BeamScanSizeX REAL, BeamScanSizeY REAL);
+             INSERT INTO MaldiFrameLaserInfo VALUES (1, 1, 99.0, 99.0);",
+        )
+        .unwrap();
+        let info = read(&c).unwrap();
+        assert_eq!((info.pixel_size(), info.beam_source), (Some((20.0, 20.0)), Some("MaldiFrameInfo.BeamScanSizeX/Y")));
+        // Neither table has them: no source, every frame unstated.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, XIndexPos INTEGER, YIndexPos INTEGER); INSERT INTO MaldiFrameInfo VALUES (1, 1, 1);").unwrap();
+        let info = read(&c).unwrap();
+        assert_eq!((info.beam_source, info.beam_unstated, info.block()["beam_scan_size_source"].clone()), (None, 1, serde_json::Value::Null));
+    }
+
+    /// Frames without a position are counted: against `Frames` (a frame with no `MaldiFrameInfo` row
+    /// at all, a row with a NULL index), and without that table the NULL-index rows. They used to
+    /// be skipped with no trace but the difference to the spectrum count.
+    #[test]
+    fn frames_without_a_position_are_counted() {
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c); // frames 1-3
+        assert_eq!((read(&c).unwrap().unpositioned, read(&c).unwrap().block()["frames_without_position"].clone()), (0, serde_json::json!(0)));
+        c.execute_batch(
+            "INSERT INTO MaldiFrameInfo VALUES (4, 0, 'calib', NULL, NULL, NULL, 0.0, 0.0, NULL, NULL);
+             INSERT INTO MaldiFrameInfo VALUES (5, 0, 'half', 0, 671, NULL, 0.0, 0.0, 20.0, 20.0);",
+        )
+        .unwrap();
+        let info = read(&c).unwrap();
+        assert_eq!((info.spots.len(), info.unpositioned), (3, 2), "no Frames table: the rows with a NULL index");
+        c.execute_batch(
+            "CREATE TABLE Frames (Id INTEGER PRIMARY KEY, NumPeaks INTEGER);
+             INSERT INTO Frames VALUES (1, 5), (2, 0), (3, 5), (4, 5), (5, 5), (6, 5), (7, 0);",
+        )
+        .unwrap();
+        let info = read(&c).unwrap();
+        assert_eq!((info.spots.len(), info.unpositioned), (3, 4), "frames 4 and 5 (NULL index), 6 and 7 (no row)");
+        assert!(info.spots.contains_key(&2), "an empty frame with a row keeps its position");
+        let b = info.block();
+        assert_eq!((b["frames_with_position"].clone(), b["frames_without_position"].clone()), (serde_json::json!(3), serde_json::json!(4)));
     }
 
     /// A motor position or beam size that is no number (SQLite keeps text in a REAL column) is
@@ -740,6 +909,13 @@ mod tests {
             (v(mzdata::curie!(IMS:1000050)), v(mzdata::curie!(IMS:1000051)))
         };
         assert_eq!(pos(&spec), (2, 1), "index (670, 700) on a run starting at (669, 700)");
+        // The frame's RegionNumber, as a parameter without an accession.
+        let region = |s: &MultiLayerSpectrum| {
+            let p: Vec<_> = s.description().acquisition.scans[0].params().iter().filter(|p| p.name == REGION_PARAM).collect();
+            assert!(p.len() <= 1 && p.iter().all(|p| p.accession.is_none()), "{p:?}");
+            p.first().map(|p| p.value.to_i64().unwrap())
+        };
+        assert_eq!(region(&spec), Some(0));
         spec.description_mut().id = "frame=99".into();
         assert!(!MaldiInfo::default().attach(&mut spec));
         spec.description_mut().id = "scan=2".into();
@@ -748,5 +924,15 @@ mod tests {
         merged.description_mut().id = "merged=0 frame=3 startScan=1 endScan=900".into();
         assert!(info.attach(&mut merged), "mzdata's TDF ids carry the frame as a token");
         assert_eq!(pos(&merged), (169, 113));
+        assert_eq!(region(&merged), Some(1));
+        // A run whose table states no region: the position alone.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, XIndexPos INTEGER, YIndexPos INTEGER); INSERT INTO MaldiFrameInfo VALUES (1, 4, 4);").unwrap();
+        let info = read(&c).unwrap();
+        let mut spec = MultiLayerSpectrum::default();
+        spec.description_mut().id = "frame=1".into();
+        assert!(info.attach(&mut spec));
+        assert_eq!((pos(&spec), region(&spec)), ((1, 1), None));
+        assert_eq!(info.block()["region_parameter"], serde_json::Value::Null);
     }
 }

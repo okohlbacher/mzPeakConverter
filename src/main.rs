@@ -12790,6 +12790,10 @@ mod tests {
     /// smallest is 1 (declared, origin recorded); the archive is marked imaging, names the IMS
     /// vocabulary, states the grid and says where its pixel size came from; and the conversion leaves
     /// the `.d` exactly as it found it (no `-shm` / `-wal`).
+    ///
+    /// Frame 4 is empty (`NumPeaks = 0`) and keeps its pixel; frame 5 has no `MaldiFrameInfo` row
+    /// and gets a null position, counted and warned about once — through 0.16.0 with no trace. Each
+    /// positioned frame's scan states its `RegionNumber`.
     #[test]
     fn bruker_maldi_tsf_carries_its_pixel_positions() {
         use arrow::array::{Array, UInt32Array};
@@ -12799,7 +12803,7 @@ mod tests {
         // tsf_bin: per frame an 8-byte [padded][compressed] header, then zstd([tof f64 × n][intensity f32 × n]).
         let mut bin = Vec::new();
         let mut frames = Vec::new();
-        for (id, n) in [(1i64, 3usize), (2, 2), (3, 4)] {
+        for (id, n) in [(1i64, 3usize), (2, 2), (3, 4), (4, 0), (5, 2)] {
             let mut raw = Vec::new();
             for k in 0..n {
                 raw.extend_from_slice(&(1000.0 * (k + 1) as f64 + id as f64).to_le_bytes());
@@ -12827,7 +12831,8 @@ mod tests {
                                           XIndexPos INTEGER, YIndexPos INTEGER, BeamScanSizeX REAL, BeamScanSizeY REAL);
              INSERT INTO MaldiFrameInfo VALUES (1, 0, 'R00X669Y700', 0, 669, 700, 20.0, 20.0),
                                                (2, 0, 'R00X670Y700', 0, 670, 700, 20.0, 20.0),
-                                               (3, 0, 'R01X837Y812', 1, 837, 812, 20.0, 20.0);",
+                                               (3, 0, 'R01X837Y812', 1, 837, 812, 20.0, 20.0),
+                                               (4, 0, 'R01X836Y812', 1, 836, 812, 20.0, 20.0);",
             frames.join(", ")
         ))
         .unwrap();
@@ -12839,11 +12844,13 @@ mod tests {
         assert!(ok, "{err}");
         let after: std::collections::BTreeSet<_> = std::fs::read_dir(&dot_d).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(before, after, "the conversion wrote into the .d");
+        assert_eq!(err.matches("1 of 5 frames have no raster position").count(), 1, "warned, once: {err}");
 
         let m = index_metadata(&out);
         assert!(m["cv_list"].to_string().contains("\"IMS\""), "{:#}", m["cv_list"]);
         assert_eq!(m["bruker_maldi"]["x_index"], serde_json::json!([669, 837]), "{:#}", m["bruker_maldi"]);
         assert_eq!(m["bruker_maldi"]["regions"].as_array().unwrap().len(), 2);
+        assert_eq!((&m["bruker_maldi"]["frames_with_position"], &m["bruker_maldi"]["frames_without_position"]), (&serde_json::json!(4), &serde_json::json!(1)));
         assert!(m["transformations"].to_string().contains(super::bruker_maldi::PIXEL_FROM_BEAM));
         assert!(m["transformations"].to_string().contains(super::bruker_maldi::SHIFTED_TO_BASE_1));
         let grid = |acc: &str| m["scan_settings_list"][0]["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == acc).unwrap().clone();
@@ -12874,8 +12881,33 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(col("position_x"), vec![1, 2, 169]);
-        assert_eq!(col("position_y"), vec![1, 1, 113]);
+        assert_eq!(col("position_x"), vec![1, 2, 169, 168]);
+        assert_eq!(col("position_y"), vec![1, 1, 113, 113]);
+        let rows = scan_positions(&out).unwrap();
+        assert_eq!(rows[3], (Some(168), Some(113)), "the empty frame keeps its pixel");
+        assert_eq!(rows[4], (None, None), "the frame without a MaldiFrameInfo row has none");
+        // Each positioned frame's region, in the scan's parameter list; none on the row-less frame.
+        let regions: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|b| {
+                use arrow::array::{Int64Array, LargeListArray, LargeStringArray, StructArray};
+                let params = b.column_by_name("parameters").unwrap().as_any().downcast_ref::<LargeListArray>().unwrap().clone();
+                (0..params.len())
+                    .map(|i| {
+                        let row = params.value(i);
+                        let row = row.as_any().downcast_ref::<StructArray>().unwrap();
+                        let name = row.column_by_name("name").unwrap().as_any().downcast_ref::<LargeStringArray>().unwrap();
+                        let value = row.column_by_name("value").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
+                        let int = value.column_by_name("integer").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+                        let hit: Vec<i64> = (0..row.len()).filter(|&k| name.value(k) == super::bruker_maldi::REGION_PARAM).map(|k| int.value(k)).collect();
+                        assert!(hit.len() <= 1, "one region per scan");
+                        assert!((0..row.len()).all(|k| name.value(k) != super::bruker_maldi::REGION_PARAM || row.column_by_name("accession").unwrap().is_null(k)), "no accession");
+                        hit.first().copied()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(regions, [Some(0), Some(0), Some(1), Some(1), None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

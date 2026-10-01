@@ -586,9 +586,18 @@ describes one grid). A `.mis` the regions do not map onto — a region number wi
 regions whose `MotorPositionX/Y` no single offset places inside their areas' bounding boxes (within
 half a raster step) as the `.mis` teach points locate them — is not used, with a warning and the
 reason in the block. Without a usable `.mis` the frames' beam scan size is the fallback, declared as
-such, when every positioned frame states the same finite one. The max dimension `IMS:1000044/45` is
-count × size. The `bruker_maldi` index block holds the regions (number, name, raster step, frames,
-raw index ranges), the `.mis` it read (or rejected, and why) and the beam scan size.
+such, when every positioned frame states the same finite one: `BeamScanSizeX/Y` of the
+`MaldiFrameLaserInfo` row the frame's `MaldiFrameInfo.LaserInfo` names (of `MaldiFrameInfo` itself in
+a schema that has the columns there), unstated where that row's `BeamScan` is 0 — the beam was not
+scanned, as on both MSV000088438 runs. The max dimension `IMS:1000044/45` is
+count × size. Each positioned frame's scan states its acquisition region, `MaldiFrameInfo.RegionNumber`,
+as the parameter `acquisition region` in its `parameters` list (a parameter without an accession: the
+imaging profile names no region column yet), on every timsTOF lane. A frame without a
+`MaldiFrameInfo` row, or with a NULL index, has no position: its scan is written with null
+`position_x` / `position_y`, the block counts such frames (`frames_without_position`) and the
+conversion warns once. An empty frame that has a row keeps its pixel. The `bruker_maldi` index block
+holds the regions (number, name, raster step, frames, raw index ranges), the `.mis` it read (or
+rejected, and why), the beam scan size and where it was read (`beam_scan_size_source`).
 A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
 in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them
 and writes the grid index, declared (`waters:laser-position-fitted-to-grid`), with the fit (origin,
@@ -852,7 +861,7 @@ The vocabulary:
 | `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
 | `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata takes the unit name when it names a unit mzdata knows, whatever the attribute order) | imzML |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
-| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
+| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y` (`MaldiFrameLaserInfo`, through `MaldiFrameInfo.LaserInfo`), not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
 | `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid, or far outside the raster at one position (a scan taken with the stage parked off it), and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
 | `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |
