@@ -2554,20 +2554,29 @@ fn convert_to_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
+    // An mzML or imzML source: everything this lane reads from the source's own text beside what
+    // mzdata hands over, in ONE streamed pass over its bytes ([`mzml_unstated::SourceText`]) —
+    // which spectra and chromatograms state a zero of the four terms mzdata's model holds as plain
+    // numbers (`stated`, below), each spectrum's `sourceFileRef` (`source_refs`, below) and whether
+    // an imaging term is mentioned (`ims`). Through 0.17.0-rc.2 these were three passes over the
+    // text, 0.04–0.21 s of every export of a 40–180 MB mzML (the audit of 2026-10-01).
+    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    let mut text = scan_lane.then(|| mzml_unstated::SourceText::read(&read_path, ["IMS:1"])).transpose().unwrap_or_else(|e| {
+        log::warn!(
+            "{}: its text was not read ({e}): the IMS vocabulary is not declared, no spectrum's sourceFileRef is kept, and \
+             every `scan start time`, `ion injection time`, `peak intensity` and `collision energy` of 0 is written, stated \
+             by the source or not",
+            input.display()
+        );
+        None
+    });
     // Imaging terms need their vocabulary in the cvList, which mzdata's writer fills with MS and UO
     // alone: an imzML always states some; an mzML is searched for one (pixel positions on its
-    // scans, a grid in its scan settings — one streamed byte search, as the archive lane makes for
-    // the positions). Through 0.16.0 every `cvRef="IMS"` of an export named a vocabulary the
-    // document did not declare.
+    // scans, a grid in its scan settings). Through 0.16.0 every `cvRef="IMS"` of an export named a
+    // vocabulary the document did not declare.
     let ims = match &reader {
         MZReaderType::IMzML(_) => true,
-        MZReaderType::MzML(_) => imaging::file_mentions(&read_path, ["IMS:1"]).map_or_else(
-            |e| {
-                log::warn!("{}: not searched for imaging terms ({e}); the IMS vocabulary is not declared", input.display());
-                false
-            },
-            |[found]| found,
-        ),
+        MZReaderType::MzML(_) => text.as_ref().is_some_and(|t| t.mentions[0]),
         _ => false,
     };
     let run = mzml_header::RunCell::default();
@@ -2581,14 +2590,14 @@ fn convert_to_mzml(
     // its own lists ([`mzml_refs`]) — the entries mzdata skips for being self-closing put back, a
     // reference that names nothing dropped, one warning — and with it what else that lane reads
     // back from the header: the source files' checksums as the text stated (mzdata reads a digest
-    // of digits as a number) and each spectrum's `sourceFileRef`. The ids are decoded for it as that
-    // lane decodes them and written escaped again ([`encode_xml_ids`]). Through 0.17.0-rc.1 this lane
-    // copied each reference as mzdata read it: a scan naming a configuration the source does not
-    // state was written naming one the export did not declare either.
-    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    // of digits as a number) and each spectrum's `sourceFileRef` (read above). The ids are decoded
+    // for it as that lane decodes them and written escaped again ([`encode_xml_ids`]). Through
+    // 0.17.0-rc.1 this lane copied each reference as mzdata read it: a scan naming a configuration
+    // the source does not state was written naming one the export did not declare either.
     let mut source_refs = scan_lane.then(|| {
         decode_pwiz_ids(&mut w);
-        let mut refs = mzml_refs::DanglingRefs::check(&read_path, &mut w);
+        let spectrum_files = text.as_mut().map(|t| std::mem::take(&mut t.spectrum_files)).unwrap_or_default();
+        let mut refs = mzml_refs::DanglingRefs::check_with_spectrum_files(&read_path, &mut w, spectrum_files);
         refs.number_scans_ahead(&mut w);
         refs
     });
@@ -2623,18 +2632,12 @@ fn convert_to_mzml(
     // The zeros the source states in its own text, which stay; every other 0 of those terms is
     // mzdata's default for "not stated" and is not written ([`mzml_unstated`]). Only an mzML or
     // imzML can state one, or leave a scan without a time: a vendor reader gives every scan its
-    // time and has no way to say "measured, and 0" of the others.
-    let stated = if scan_lane {
-        mzml_unstated::StatedZeros::read(&read_path).unwrap_or_else(|e| {
-            log::warn!(
-                "{}: not searched for the zeros it states ({e}); every `scan start time`, `ion injection time`, \
-                 `peak intensity` and `collision energy` of 0 is written, stated by the source or not",
-                input.display()
-            );
-            mzml_unstated::StatedZeros::everything()
-        })
-    } else {
-        Default::default()
+    // time and has no way to say "measured, and 0" of the others. A source whose text could not be
+    // read (warned about above) keeps every 0.
+    let stated = match (scan_lane, text.take()) {
+        (true, Some(text)) => text.zeros,
+        (true, None) => mzml_unstated::StatedZeros::everything(),
+        (false, _) => Default::default(),
     };
     if stated.count() > 0 {
         log::info!(
@@ -2942,13 +2945,26 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // and the reader's peak list has no room for it: through 0.16.0 every such spectrum was exported
     // with m/z and intensity only. Such a spectrum is exported from the facet's arrays instead.
     let peak_mobility = reader.metadata.peak_array_indices().is_some_and(|a| a.has_ion_mobility());
-    // So is a spectrum of a peak facet whose intensity column is 64-bit — a `--lossless` archive,
-    // which stores a centroid spectrum's own arrays, or one whose first spectra were profile: the
-    // peak list's intensity is a 32-bit float, and the export of an archive that holds 15.1 wrote
-    // 15.100000381, of a `--lossless` archive included, without a word.
+    // So is a spectrum of a peak facet whose intensity column is not a 32-bit float — 64-bit floats
+    // in a `--lossless` archive, which stores a centroid spectrum's own arrays, or one whose first
+    // spectra were profile; 32- or 64-bit integers in a `--lossless` archive of an integer source or
+    // a timsTOF archive: the peak list's intensity is a 32-bit float, and the export of an archive
+    // that holds 15.1 wrote 15.100000381, of one that holds the 32-bit integer 80,299,922 wrote
+    // 80,299,920 as a 32-bit float (every integer above 2^24 is at risk), without a word. The
+    // integers are written as 64-bit floats ([`widen_integer_intensities`]).
     let peak_wide = reader.metadata.peak_array_indices().is_some_and(|a| {
-        a.iter().any(|e| e.array_type == ArrayType::IntensityArray && e.data_type == DataType::Float64)
+        a.iter().any(|e| e.array_type == ArrayType::IntensityArray && matches!(e.data_type, DataType::Float64 | DataType::Int32 | DataType::Int64))
     });
+    // A spectrum without a peak gets arrays of length 0 in the types a spectrum of its kind with
+    // peaks is exported in: a profile spectrum's are its data facet's columns; a centroid spectrum's
+    // are its peak facet's where the export takes the facet's arrays (`peak_mobility`, `peak_wide`)
+    // and the reader's peak list's (64-bit m/z, 32-bit intensity) otherwise; through 0.17.0-rc.2
+    // every empty spectrum got a 64-bit m/z and a 32-bit float intensity array whatever its facet
+    // holds.
+    let empty_types = (
+        facet_array_types(Some(reader.metadata.spectrum_array_indices()), true),
+        facet_array_types(reader.metadata.peak_array_indices(), peak_mobility || peak_wide),
+    );
     // MS2 spectra that are whole frames (an ims-compact archive): precursors, but no window limits
     // of their own. Counted, and named once the export is done. Only such an archive is counted —
     // the ims-compact lanes are the one writer of the `ims_calibration` block: an MS2 spectrum of
@@ -2957,6 +2973,9 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // `--no-ims-compact` archive) does not apply to it.
     let ims_compact = reader.file_index().metadata.contains_key("ims_calibration");
     let mut whole_frames = 0usize;
+    // 64-bit integer intensities beyond 2^53, which the 64-bit floats they are written as cannot
+    // hold exactly ([`widen_integer_intensities`]).
+    let mut inexact_intensities = 0usize;
     // An archive holds a 0 injection time, selected-ion intensity or collision energy as null: none
     // is stated. It stores a time for every spectrum, 0 where the source stated none, and only an
     // imaging archive's marker says which it is (`imaging.provenance.time`, for the run as a whole):
@@ -2970,6 +2989,14 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
                 let from_arrays = (peak_mobility || peak_wide) && with_peak_facet_arrays(&mut reader, i, &mut spec, peak_wide)?;
+                if !from_arrays && spec.peaks.as_ref().is_none_or(|p| p.is_empty()) && spec.arrays.as_ref().is_none_or(|a| a.is_empty()) {
+                    let (mz, intensity) = match spec.signal_continuity() {
+                        mzdata::spectrum::SignalContinuity::Profile => empty_types.0,
+                        _ => empty_types.1,
+                    };
+                    spec.peaks = None;
+                    spec.arrays = Some(empty_signal_arrays(mz, intensity));
+                }
                 if from_arrays && peak_mobility && ims_compact {
                     let d = spec.description();
                     if !d.precursor.is_empty() && !d.params.iter().any(|p| p.name == "ion mobility lower limit") {
@@ -2985,6 +3012,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 unreferenced += drop_references_to(spec.description_mut(), &left_out);
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
+                    inexact_intensities += widen_integer_intensities(arrays).map_err(|e| anyhow!("spectrum {i}: intensity array: {e}"))?;
                 }
                 write_mzml_spectrum(&mut w, &mut spec, stated).map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
             }
@@ -3044,19 +3072,32 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // The archive's own TIC/base-peak go across too; the writer's summary is added only for the
     // kind the archive lacks.
     let n_chrom = mzdata::prelude::ChromatogramSource::count_chromatograms(&reader);
-    let chroms: Vec<Chromatogram> = (0..n_chrom)
-        .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
-        .map(|mut c| {
-            c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
-            mzml_unstated::mark_precursors(c.description_mut().precursor.iter_mut(), mzml_unstated::Zeros::NONE);
-            demote_mzp_params_chrom(c.description_mut());
-            unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
-            if let Some(window) = opts.rt {
-                cut_chromatogram_to_window(&mut c, window);
-            }
-            c
-        })
-        .collect();
+    let mut chroms: Vec<Chromatogram> = Vec::with_capacity(n_chrom);
+    for i in 0..n_chrom {
+        let Some(mut c) = mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i) else { continue };
+        c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
+        mzml_unstated::mark_precursors(c.description_mut().precursor.iter_mut(), mzml_unstated::Zeros::NONE);
+        demote_mzp_params_chrom(c.description_mut());
+        unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
+        if let Some(window) = opts.rt {
+            cut_chromatogram_to_window(&mut c, window);
+        }
+        // The chromatogram facet's integer intensity column (an mzML source's integer chromatograms
+        // keep their type in a default archive as in a `--lossless` one) leaves as 64-bit floats like
+        // a spectrum's: OpenMS 3.5 decodes an integer-encoded chromatogram intensity array as empty
+        // and refuses the file (`The length of RT and intensity values of chromatogram ... differ`);
+        // through 0.17.0-rc.2 the export wrote the integers.
+        inexact_intensities +=
+            widen_integer_intensities(&mut c.arrays).map_err(|e| anyhow!("chromatogram {:?}: intensity array: {e}", c.id()))?;
+        chroms.push(c);
+    }
+    if inexact_intensities > 0 {
+        log::warn!(
+            "{inexact_intensities} 64-bit integer intensities exceed 2^53 and are rounded to the nearest 64-bit float: \
+             mzML consumers (OpenMS 3.5) refuse an integer-encoded intensity array, so an archive's integer intensities \
+             are exported as 64-bit floats"
+        );
+    }
     if unreferenced > 0 {
         log::warn!(
             "{unreferenced} precursor or scan references named a spectrum this export leaves out; their \
@@ -3096,12 +3137,14 @@ fn drop_precursor_references(precursors: &mut [mzdata::spectrum::Precursor], lef
 
 /// Give a spectrum read from an archive's peak facet that facet's ARRAYS in place of the reader's
 /// peak list when they hold each peak's ion mobility, which the list (`CentroidPeak`: m/z,
-/// intensity) has no room for, or — `wide` — a 64-bit intensity, which the list's 32-bit float
-/// would round. Returns whether the spectrum's signal was replaced. The arrays come
-/// back in the facet's own order and types: they are put in m/z order, as the peak list was, and a
-/// TOF lane's integer intensities become the 32-bit floats the peak list held; the m/z and 1/K0
-/// arrays are the ones the reader decodes for the peak list too (on a timsTOF archive, from the
-/// grid rows through the frame's vendor models).
+/// intensity) has no room for, or — `wide` — an intensity that is not a 32-bit float (a 64-bit
+/// float, a 32- or 64-bit integer), which the list's 32-bit float would round. Returns whether the
+/// spectrum's signal was replaced. The arrays come back in the facet's own order and types: they
+/// are put in m/z order, as the peak list was, and keep their types here (the caller widens an
+/// integer intensity array to 64-bit floats, [`widen_integer_intensities`]; through 0.17.0-rc.2 it
+/// became the 32-bit floats the peak list held, which changes every value above 2^24); the m/z and
+/// 1/K0 arrays are the ones the reader decodes for the peak list too (on a timsTOF archive, from
+/// the grid rows through the frame's vendor models).
 fn with_peak_facet_arrays(
     reader: &mut mzpeak_prototyping::MzPeakReader,
     index: usize,
@@ -3121,13 +3164,6 @@ fn with_peak_facet_arrays(
         return Ok(false);
     }
     strip_grid_axis(&mut arrays);
-    if let Some(intensity) = arrays.get_mut(&ArrayType::IntensityArray)
-        && matches!(intensity.dtype, BinaryDataArrayType::Int32 | BinaryDataArrayType::Int64)
-    {
-        intensity
-            .store_as(BinaryDataArrayType::Float32)
-            .map_err(|e| anyhow!("spectrum {index}: intensity array: {e}"))?;
-    }
     let sorted = arrays
         .mzs()
         .map_err(|e| anyhow!("spectrum {index}: m/z array: {e}"))?
@@ -3269,14 +3305,69 @@ fn mzml_signal(spec: &mut MultiLayerSpectrum) -> Vec<(ArrayType, BinaryDataArray
     spec.deconvoluted_peaks = None;
     let arrays = spec.arrays.get_or_insert_with(BinaryArrayMap::new);
     if arrays.is_empty() {
-        let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
-        mz.unit = Unit::MZ;
-        arrays.add(mz);
-        let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        intensity.unit = Unit::DetectorCounts;
-        arrays.add(intensity);
+        *arrays = empty_signal_arrays(BinaryDataArrayType::Float64, BinaryDataArrayType::Float32);
     }
     empty_arrays_for_mzml(arrays)
+}
+
+/// An m/z and an intensity array of length 0, in the given types: the signal of a spectrum without
+/// a peak ([`mzml_signal`]; an archive's export gives them the types of the spectrum's facet).
+fn empty_signal_arrays(mz: BinaryDataArrayType, intensity: BinaryDataArrayType) -> BinaryArrayMap {
+    let mut arrays = BinaryArrayMap::new();
+    let mut mz = DataArray::wrap(&ArrayType::MZArray, mz, Vec::new());
+    mz.unit = Unit::MZ;
+    arrays.add(mz);
+    let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, intensity, Vec::new());
+    intensity.unit = Unit::DetectorCounts;
+    arrays.add(intensity);
+    arrays
+}
+
+/// The binary types a spectrum of an archive facet is exported in. Where the facet's arrays are what
+/// is exported (`from_arrays`: every profile spectrum; a centroid spectrum of a peak facet that holds
+/// a mobility column or an intensity column that is no 32-bit float, [`with_peak_facet_arrays`]) —
+/// the m/z and intensity column's own type where it is a 32- or 64-bit float, 64-bit float where it
+/// is a 32- or 64-bit integer ([`widen_integer_intensities`]), and the types the reader's peak list
+/// has (64-bit m/z, 32-bit intensity) for any other column (a grid facet's integer `tof` axis, which
+/// the reader decodes to 64-bit m/z) or no facet at all. Otherwise the peak list's types, which every
+/// centroid spectrum of the archive with a peak is written in (a `--lossless` archive of a 32-bit
+/// source: its empty centroid spectrum gets the 64-bit m/z its siblings with peaks get, not the
+/// facet's 32-bit).
+fn facet_array_types(
+    index: Option<&mzpeak_prototyping::buffer_descriptors::ArrayIndex>,
+    from_arrays: bool,
+) -> (BinaryDataArrayType, BinaryDataArrayType) {
+    let typed = |kind: ArrayType, fallback: BinaryDataArrayType| {
+        index
+            .filter(|_| from_arrays)
+            .and_then(|a| a.iter().find(|e| e.array_type == kind && e.transform.is_none()))
+            .and_then(|e| match e.data_type {
+                DataType::Float32 => Some(BinaryDataArrayType::Float32),
+                DataType::Float64 | DataType::Int32 | DataType::Int64 => Some(BinaryDataArrayType::Float64),
+                _ => None,
+            })
+            .unwrap_or(fallback)
+    };
+    (typed(ArrayType::MZArray, BinaryDataArrayType::Float64), typed(ArrayType::IntensityArray, BinaryDataArrayType::Float32))
+}
+
+/// Write an archive's 32- or 64-bit integer intensity array, a spectrum's or a chromatogram's, as
+/// 64-bit floats — exact for every 32-bit integer and every 64-bit one below 2^53; returns how many
+/// values are beyond that. mzML allows an integer-encoded array, but OpenMS 3.5 refuses the file
+/// (`Encoding intensity array as integer is not allowed` for a spectrum's, the source mzML with such
+/// arrays included; a chromatogram's it decodes as empty and refuses over the length), and an
+/// archive's export has to load there. Through 0.17.0-rc.2 a peak facet's integers became 32-bit
+/// floats through the reader's peak list (every value above 2^24 changed) and a profile or
+/// chromatogram facet's were written as the integers they are.
+fn widen_integer_intensities(arrays: &mut BinaryArrayMap) -> Result<usize> {
+    let Some(intensity) = arrays.get_mut(&ArrayType::IntensityArray) else { return Ok(0) };
+    let inexact = match intensity.dtype {
+        BinaryDataArrayType::Int32 => 0,
+        BinaryDataArrayType::Int64 => intensity.to_i64()?.iter().filter(|v| v.unsigned_abs() > (1u64 << 53)).count(),
+        _ => return Ok(0),
+    };
+    intensity.store_as(BinaryDataArrayType::Float64)?;
+    Ok(inexact)
 }
 
 /// Give every array of length 0 an empty payload, and say which they are: written through
@@ -3763,8 +3854,8 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
         .map(readable_chromatogram_arrays)
         // A device trace's unit, which the writer states for no `intensity array`.
         .map(unit_keeping_chromatogram_arrays)
-        // The empty, id-less chromatogram an archive holds when it had none (`write_empty_chromatogram`).
-        .filter(|c| !(c.id().is_empty() && c.arrays.get(&ArrayType::TimeArray).is_none_or(|t| t.data_len().unwrap_or(0) == 0)))
+        // The placeholder row an archive holds when it had no chromatogram (`write_empty_chromatogram`).
+        .filter(|c| !is_placeholder_chromatogram(c))
         .filter(|c| {
             // mzdata's writer `unwrap`s a chromatogram's time array, and this binary aborts on panic.
             let timed = c.arrays.has_array(&ArrayType::TimeArray);
@@ -8958,17 +9049,38 @@ fn convert_tsf(
     )
 }
 
+/// The name of the parameter that marks the placeholder row of a run without a chromatogram
+/// ([`write_empty_chromatogram`]): a reader that finds it on a `chromatograms_metadata` row skips
+/// the row. Its value says why the row is there.
+const CHROMATOGRAM_PLACEHOLDER: &str = "placeholder chromatogram";
+
 /// Write one empty chromatogram (zero data points, no fabricated TIC). Mirrors mzML2mzPeak's
 /// `ensure_chromatogram_facet`: keeps the archive openable by the reference reader AND triggers
-/// the writer's index-metadata finalization. The (zero-length) TimeArray + IntensityArray are
-/// required because the writer unwraps the TimeArray on the chromatogram path.
+/// the writer's index-metadata finalization — the vendored writer emits `chromatograms_metadata`
+/// only when it holds a row, and the vendored reader counts 2 chromatograms where the member is
+/// absent. The (zero-length) TimeArray + IntensityArray are required because the writer unwraps
+/// the TimeArray on the chromatogram path.
+///
+/// The row is an id-less entry with no points and the [`CHROMATOGRAM_PLACEHOLDER`] parameter, so a
+/// reader can tell it from a chromatogram. The footers count it as the facets count: the metadata
+/// facet's `chromatogram_count` is its rows (1), the data facet's one past the largest index with a
+/// row in that file (0, decision D1): the same pair an empty spectrum leaves on the spectrum facets.
 fn write_empty_chromatogram(writer: &mut MzPeakWriterType<fs::File>) -> Result<()> {
     let mut arrays = BinaryArrayMap::new();
     arrays.add(DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new()));
     arrays.add(DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new()));
-    let empty = Chromatogram::new(ChromatogramDescription::default(), arrays);
+    let mut description = ChromatogramDescription::default();
+    description.add_param(Param::new_key_value(CHROMATOGRAM_PLACEHOLDER, "the run has no chromatogram: this row holds the facet open and is not one"));
+    let empty = Chromatogram::new(description, arrays);
     writer.write_chromatogram(&empty)?;
     Ok(())
+}
+
+/// Whether a chromatogram read from an archive is the placeholder row of a run without one
+/// ([`write_empty_chromatogram`]): marked since 0.17.0, before that an id-less row without a point.
+fn is_placeholder_chromatogram(chrom: &Chromatogram) -> bool {
+    chrom.params().iter().any(|p| !p.is_controlled() && p.name == CHROMATOGRAM_PLACEHOLDER)
+        || (chrom.id().is_empty() && chrom.arrays.get(&ArrayType::TimeArray).is_none_or(|t| t.data_len().unwrap_or(0) == 0))
 }
 
 /// The `(total_ion_current, base_peak_intensity)` pair behind the synthesized TIC/BPC chromatograms.

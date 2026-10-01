@@ -39,7 +39,18 @@
 //! leave it out (2 of the corpus's 153 mzML/imzML sources state `collision energy` 0; the imzML
 //! of the Thaliana run, `Test_P15_r2` and `Example_Continuous` state no `scan start time` at all),
 //! so the direct mzML lane reads which spectra and chromatograms state which 0 ([`StatedZeros`])
-//! and keeps those.
+//! and keeps those. That read is one streamed pass over the source's bytes ([`SourceText`]), which
+//! also answers the two other questions the lane asks of the text — each spectrum's `sourceFileRef`
+//! and whether an imaging term is mentioned — and skips each spectrum's arrays; through 0.17.0-rc.2
+//! they were three passes, 0.04–0.21 s of every export of a 40–180 MB mzML.
+//!
+//! The sink also writes a spectrum's type term once. mzdata's writer prints the model's term
+//! (`spectrum_type()`, read from the spectrum's own params, or `MS1 spectrum` / `MSn spectrum` from
+//! the ms level) and then every param, leaving out only `MS1 spectrum` and `MSn spectrum` on a
+//! spectrum whose ms level is above 0: every SRM spectrum came out as `SRM spectrum` twice
+//! (ProteoWizard's Enolase `srmSpectra`: 202 for 101 spectra) and three times from its archive,
+//! whose `spectrum_type` column the reader hands back beside the stored list, and every pixel of an
+//! imzML that states `ms level` 0 as `MS1 spectrum` twice ([`SPECTRUM_TYPES`]).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -149,8 +160,8 @@ pub fn mark_precursors<'a>(precursors: impl Iterator<Item = &'a mut Precursor>, 
 
 /// The zeros an mzML or imzML states in its own text, by the id of the spectrum or chromatogram
 /// that states them — in a `cvParam` of its own or of a `referenceableParamGroup` it refers to
-/// (an imzML states most of a spectrum through two or three of those). One streamed pass over the
-/// file's tags; the binary payloads hold no `<`.
+/// (an imzML states most of a spectrum through two or three of those). Read by [`SourceText`], one
+/// streamed pass over the file's tags; the binary payloads hold no `<`.
 ///
 /// Per element, not per scan or precursor: a spectrum that states one `collision energy` of 0
 /// keeps every 0 of that term.
@@ -164,16 +175,30 @@ pub struct StatedZeros {
     all: bool,
 }
 
-/// The start tags the pass reads, by element name: a name counts when XML whitespace follows it
-/// (`<spectrum` then a line break is a spectrum, `<spectrumList` is not).
-const TAGS: [&[u8]; 5] =
-    [b"<spectrum", b"<chromatogram", b"<referenceableParamGroup", b"<cvParam", b"<referenceableParamGroupRef"];
+/// The start tags the pass reads, by element name: a name counts when XML whitespace or the tag's
+/// end follows it (`<spectrum` then a line break is a spectrum, `<spectrumList` is not).
+const TAGS: [&[u8]; 6] = [
+    b"<spectrum",
+    b"<chromatogram",
+    b"<referenceableParamGroup",
+    b"<cvParam",
+    b"<referenceableParamGroupRef",
+    b"<binaryDataArrayList",
+];
+const SPECTRUM: usize = 0;
 const CHROMATOGRAM: usize = 1;
 const GROUP: usize = 2;
 const CV_PARAM: usize = 3;
 const GROUP_REF: usize = 4;
+/// A spectrum's or chromatogram's arrays: everything the element states comes before them, so the
+/// pass skips to the element's end tag ([`SourceText::skip`]) instead of classifying each array's
+/// tags.
+const ARRAYS: usize = 5;
 /// The end tags after which a `cvParam` is no spectrum's, chromatogram's or group's.
 const ENDS: [&[u8]; 3] = [b"</spectrum", b"</chromatogram", b"</referenceableParamGroup"];
+/// The bytes a block keeps while skipping arrays: the longer of the two end tags skipped to, so
+/// one the block cuts short — its `>` not read yet — is found whole in the next.
+const SKIP_TAIL: usize = b"</chromatogram".len();
 
 /// What the bytes at a `<` begin.
 enum Tag {
@@ -196,7 +221,7 @@ fn classify(rest: &[u8]) -> Tag {
         }
         cut.then_some(None)
     };
-    match (named(&TAGS, b" \t\r\n"), named(&ENDS, b"> \t\r\n")) {
+    match (named(&TAGS, b" \t\r\n>"), named(&ENDS, b"> \t\r\n")) {
         (Some(Some(kind)), _) => Tag::Start(kind),
         (_, Some(Some(_))) => Tag::End,
         (Some(None), _) | (_, Some(None)) => Tag::Cut,
@@ -204,33 +229,87 @@ fn classify(rest: &[u8]) -> Tag {
     }
 }
 
-impl StatedZeros {
-    /// For a source whose text could not be searched: nothing is blanked.
-    pub fn everything() -> Self {
-        Self { all: true, ..Default::default() }
-    }
+/// Where the pass stands between two blocks.
+#[derive(Debug, Default)]
+struct Cursor {
+    /// The spectrum, chromatogram or param group whose tags are being read: its kind and id.
+    current: Option<(usize, String)>,
+    /// Inside the arrays of `current`: nothing is read until its end tag, which a later block may
+    /// hold.
+    skipping: bool,
+}
 
-    pub fn read(path: &Path) -> io::Result<Self> {
+/// What the direct mzML export reads from an mzML or imzML source's own text, in one streamed pass
+/// over its bytes: the zeros it states ([`StatedZeros`]), the `sourceFileRef` of each `<spectrum>`
+/// that names one (`crate::mzml_refs`), and whether each of `N` byte strings occurs anywhere in the
+/// file (the question `crate::imaging::file_mentions` answers with a pass of its own). Each
+/// spectrum's and chromatogram's arrays are skipped: everything the element states comes before
+/// them. Through 0.17.0-rc.2 the lane made three passes over the text for the three answers, beside
+/// mzdata's read.
+#[derive(Debug)]
+pub struct SourceText<const N: usize> {
+    pub zeros: StatedZeros,
+    /// The `sourceFileRef` attribute of each `<spectrum>` that states one, by spectrum id, both as
+    /// mzdata would read them (entities resolved); empty for a source that states none.
+    pub spectrum_files: HashMap<String, String>,
+    /// Whether each needle occurs in the file's bytes, in the needles' order.
+    pub mentions: [bool; N],
+}
+
+impl<const N: usize> SourceText<N> {
+    pub fn read(path: &Path, needles: [&str; N]) -> io::Result<Self> {
         let mut file = std::fs::File::open(path)?;
-        let mut stated = Self::default();
-        let mut current: Option<(usize, String)> = None;
+        let mut this = Self { zeros: StatedZeros::default(), spectrum_files: HashMap::new(), mentions: [false; N] };
+        let mut cursor = Cursor::default();
         let mut held: Vec<u8> = Vec::new();
         let mut block = vec![0u8; 1 << 20];
+        // A needle the block boundary cuts in two is found across it: each block is searched with
+        // the previous block's last `keep` bytes in front.
+        let keep = needles.iter().map(|n| n.len()).max().unwrap_or(1).saturating_sub(1);
+        let mut carry: Vec<u8> = Vec::new();
         loop {
             let n = file.read(&mut block)?;
             if n == 0 {
-                return Ok(stated);
+                return Ok(this);
+            }
+            this.mention(&needles, &carry, &block[..n]);
+            if n >= keep {
+                carry.clear();
+                carry.extend_from_slice(&block[n - keep..n]);
+            } else {
+                carry.extend_from_slice(&block[..n]);
+                let cut = carry.len().saturating_sub(keep);
+                carry.drain(..cut);
             }
             held.extend_from_slice(&block[..n]);
-            let keep = stated.scan(&held, &mut current);
-            held.drain(..keep);
+            let done = this.scan(&held, &mut cursor);
+            held.drain(..done);
+        }
+    }
+
+    /// Note which needles `block` holds, or the boundary between `carry` and `block` does.
+    fn mention(&mut self, needles: &[&str; N], carry: &[u8], block: &[u8]) {
+        if self.mentions.iter().all(|found| *found) {
+            return;
+        }
+        let edge: Vec<u8> = carry.iter().chain(block.iter().take(carry.len())).copied().collect();
+        for (found, needle) in self.mentions.iter_mut().zip(needles) {
+            if !*found {
+                *found = find(block, needle.as_bytes()).is_some() || find(&edge, needle.as_bytes()).is_some();
+            }
         }
     }
 
     /// Read the tags of `held`; how many of its bytes are done with — up to the first tag the block
     /// cuts short, which waits for the next block.
-    fn scan(&mut self, held: &[u8], current: &mut Option<(usize, String)>) -> usize {
+    fn scan(&mut self, held: &[u8], cursor: &mut Cursor) -> usize {
         let mut at = 0;
+        if cursor.skipping {
+            match self.skip(held, cursor) {
+                Some(end) => at = end,
+                None => return held.len().saturating_sub(SKIP_TAIL),
+            }
+        }
         loop {
             let Some(lt) = held[at..].iter().position(|&b| b == b'<').map(|i| at + i) else {
                 return held.len();
@@ -240,15 +319,22 @@ impl StatedZeros {
                 Tag::Cut => return lt,
                 Tag::Other => at = lt + 1,
                 Tag::End => {
-                    *current = None;
+                    cursor.current = None;
                     at = lt + 1;
+                }
+                Tag::Start(ARRAYS) if cursor.current.is_some() => {
+                    cursor.skipping = true;
+                    match self.skip(rest, cursor) {
+                        Some(end) => at = lt + end,
+                        None => return held.len().saturating_sub(SKIP_TAIL),
+                    }
                 }
                 Tag::Start(kind) => {
                     let Some(end) = tag_end(rest) else {
                         return lt;
                     };
                     if let Ok(tag) = std::str::from_utf8(&rest[..end]) {
-                        self.tag(kind, tag, current);
+                        self.tag(kind, tag, cursor);
                     }
                     at = lt + end;
                 }
@@ -256,15 +342,43 @@ impl StatedZeros {
         }
     }
 
-    fn tag(&mut self, kind: usize, tag: &str, current: &mut Option<(usize, String)>) {
+    /// Inside the arrays of the current element: where its end tag ends in `held`, the skip over,
+    /// or `None` when the bytes end first (the tag may be cut: the caller keeps [`SKIP_TAIL`]).
+    fn skip(&mut self, held: &[u8], cursor: &mut Cursor) -> Option<usize> {
+        let end: &[u8] = match cursor.current {
+            Some((CHROMATOGRAM, _)) => b"</chromatogram",
+            _ => b"</spectrum",
+        };
+        let mut from = 0;
+        while let Some(i) = find(&held[from..], end).map(|i| from + i) {
+            match held.get(i + end.len()) {
+                Some(b'>' | b' ' | b'\t' | b'\r' | b'\n') => {
+                    cursor.skipping = false;
+                    cursor.current = None;
+                    return Some(i + end.len());
+                }
+                None => return None,
+                _ => from = i + 1,
+            }
+        }
+        None
+    }
+
+    fn tag(&mut self, kind: usize, tag: &str, cursor: &mut Cursor) {
         let unescaped = |v: &str| quick_xml::escape::unescape(v).map_or_else(|_| v.to_string(), |v| v.into_owned());
         if kind < CV_PARAM {
-            *current = attribute(tag, "id").map(|id| (kind, unescaped(id)));
+            let id = attribute(tag, "id").map(unescaped);
+            if kind == SPECTRUM
+                && let (Some(id), Some(file)) = (id.as_ref(), attribute(tag, "sourceFileRef"))
+            {
+                self.spectrum_files.insert(id.clone(), unescaped(file));
+            }
+            cursor.current = id.map(|id| (kind, id));
             return;
         }
-        let Some((element, id)) = current.as_ref() else { return };
+        let Some((element, id)) = cursor.current.as_ref() else { return };
         let bits = if kind == GROUP_REF {
-            attribute(tag, "ref").and_then(|group| self.groups.get(&unescaped(group))).map_or(0, |z| z.0)
+            attribute(tag, "ref").and_then(|group| self.zeros.groups.get(&unescaped(group))).map_or(0, |z| z.0)
         } else {
             let (accession, name) = (attribute(tag, "accession"), attribute(tag, "name"));
             let term = TERMS.iter().find(|(a, n, _)| accession == Some(a) || name == Some(n));
@@ -273,12 +387,19 @@ impl StatedZeros {
         };
         if bits != 0 {
             let map = match *element {
-                CHROMATOGRAM => &mut self.chromatograms,
-                GROUP => &mut self.groups,
-                _ => &mut self.spectra,
+                CHROMATOGRAM => &mut self.zeros.chromatograms,
+                GROUP => &mut self.zeros.groups,
+                _ => &mut self.zeros.spectra,
             };
             map.entry(id.clone()).or_default().0 |= bits;
         }
+    }
+}
+
+impl StatedZeros {
+    /// For a source whose text could not be searched: nothing is blanked.
+    pub fn everything() -> Self {
+        Self { all: true, ..Default::default() }
     }
 
     pub fn spectrum(&self, id: &str) -> Zeros {
@@ -334,9 +455,38 @@ const EMPTY_LIST_END: &[u8] = b"</chromatogramList>";
 /// Everything the writer states about a spectrum or a chromatogram comes before its arrays.
 const HEAD_END: &[u8] = b"<binaryDataArrayList";
 
+/// The spectrum-type terms: the children of MS:1000559 `spectrum type` in PSI-MS 4.1.155, the two
+/// obsolete ones (`product ion spectrum`, `PDA spectrum`) included, since a source may still state
+/// them. An export states a spectrum's type once: the first copy of a term stays, a repeat of the
+/// same term at spectrum level is blanked. mzdata's writer prints the model's term and then every
+/// param, filtering out only `MS1 spectrum` and `MSn spectrum` on a spectrum whose ms level is above
+/// 0, so every other type — and MS1 on a spectrum of ms level 0 — came out twice (module docs).
+const SPECTRUM_TYPES: [&str; 19] = [
+    "MS:1000294",
+    "MS:1000322",
+    "MS:1000325",
+    "MS:1000326",
+    "MS:1000328",
+    "MS:1000341",
+    "MS:1000343",
+    "MS:1000579",
+    "MS:1000580",
+    "MS:1000581",
+    "MS:1000582",
+    "MS:1000583",
+    "MS:1000620",
+    "MS:1000789",
+    "MS:1000790",
+    "MS:1000804",
+    "MS:1000805",
+    "MS:1000806",
+    "MS:1000928",
+];
+
 /// A byte sink for `MzMLWriter` that blanks what [`mark_spectrum`] and [`mark_precursors`] marked,
-/// an empty `<precursorList>` or `<selectedIonList>`, the lists around a chromatogram's precursor
-/// and product, and a `<chromatogramList>` without a chromatogram.
+/// a repeated spectrum-type term, an empty `<precursorList>` or `<selectedIonList>`, the lists
+/// around a chromatogram's precursor and product, and a `<chromatogramList>` without a
+/// chromatogram.
 pub struct UnstatedTerms<W: Write> {
     inner: W,
     /// Bytes not passed on yet: a `<spectrum>` or `<chromatogram>` element whose head is still
@@ -344,12 +494,24 @@ pub struct UnstatedTerms<W: Write> {
     held: Vec<u8>,
     spectra: usize,
     no_polarity: usize,
+    /// Spectrum-type terms blanked as repeats.
+    repeated_types: usize,
 }
 
 impl<W: Write> UnstatedTerms<W> {
     pub fn new(inner: W) -> Self {
-        Self { inner, held: Vec::new(), spectra: 0, no_polarity: 0 }
+        Self { inner, held: Vec::new(), spectra: 0, no_polarity: 0, repeated_types: 0 }
     }
+}
+
+/// What [`unstated`] found in one element's head.
+#[derive(Debug, Default)]
+struct Blanks {
+    spans: Vec<Range<usize>>,
+    /// A spectrum without a polarity.
+    no_polarity: bool,
+    /// Spectrum-type terms repeated at spectrum level.
+    repeated_types: usize,
 }
 
 impl<W: Write> Write for UnstatedTerms<W> {
@@ -377,12 +539,13 @@ impl<W: Write> Write for UnstatedTerms<W> {
                 break;
             };
             if let Ok(head) = std::str::from_utf8(&self.held[open..head_end]) {
-                let (spans, no_polarity) = unstated(head, chromatogram);
-                for span in spans {
+                let blanks = unstated(head, chromatogram);
+                for span in blanks.spans {
                     self.held[open + span.start..open + span.end].fill(b' ');
                 }
                 self.spectra += usize::from(!chromatogram);
-                self.no_polarity += usize::from(no_polarity);
+                self.no_polarity += usize::from(blanks.no_polarity);
+                self.repeated_types += blanks.repeated_types;
             }
             done = head_end;
         }
@@ -412,6 +575,9 @@ impl<W: Write> Drop for UnstatedTerms<W> {
                 self.no_polarity,
                 self.spectra
             );
+        }
+        if self.repeated_types > 0 {
+            log::info!("{} repeated spectrum-type terms are written once (mzdata's writer states a spectrum's type beside the param)", self.repeated_types);
         }
     }
 }
@@ -446,21 +612,32 @@ fn elements<'a>(head: &'a str, open: &'a str) -> impl Iterator<Item = Range<usiz
 /// * each `scan start time`, `ion injection time`, `peak intensity` and `collision energy` whose
 ///   value is NaN;
 /// * the polarity marker and, with it, the spectrum's `positive scan`;
+/// * a repeat of a spectrum-type term ([`SPECTRUM_TYPES`]) at spectrum level: the first copy stays;
 /// * a `<precursorList count="0">` and a `<selectedIonList count="0">` up to their end tags (the
 ///   schema wants a member in each; a precursor may go without its selected ions);
 /// * in a chromatogram, the start and end tags of the lists around its precursor and product,
 ///   whatever they count.
-fn unstated(head: &str, chromatogram: bool) -> (Vec<Range<usize>>, bool) {
-    let mut spans = Vec::new();
+fn unstated(head: &str, chromatogram: bool) -> Blanks {
+    let mut blanks = Blanks::default();
+    let spans = &mut blanks.spans;
     let scan_list = head.find("<scanList").unwrap_or(head.len());
     let marker = elements(head, "<userParam ")
         .find(|span| span.start < scan_list && attribute(&head[span.clone()], "name") == Some(POLARITY_NOT_STATED));
+    let mut types: Vec<&str> = Vec::new();
     for span in elements(head, "<cvParam ") {
         let param = &head[span.clone()];
         let Some(accession) = attribute(param, "accession") else { continue };
         let nan = attribute(param, "value") == Some("NaN") && TERMS[..WRITTEN].iter().any(|(a, _, _)| *a == accession);
         let polarity = marker.is_some() && accession == "MS:1000130" && span.start < scan_list;
-        if nan || polarity {
+        let repeated = !chromatogram && span.start < scan_list && SPECTRUM_TYPES.contains(&accession) && {
+            let seen = types.contains(&accession);
+            if !seen {
+                types.push(accession);
+            }
+            seen
+        };
+        blanks.repeated_types += usize::from(repeated);
+        if nan || polarity || repeated {
             spans.push(span);
         }
     }
@@ -477,9 +654,9 @@ fn unstated(head: &str, chromatogram: bool) -> (Vec<Range<usize>>, bool) {
             spans.extend(head.match_indices(tag).filter_map(|(at, _)| Some(at..at + head[at..].find('>')? + 1)));
         }
     }
-    let no_polarity = marker.is_some();
+    blanks.no_polarity = marker.is_some();
     spans.extend(marker);
-    (spans, no_polarity)
+    blanks
 }
 
 #[cfg(test)]
@@ -664,7 +841,7 @@ mod tests {
         let head = "<chromatogram id=\"x\" index=\"0\">\n<precursorList count=\"2\">\n<precursor><selectedIonList count=\"1\"><selectedIon/></selectedIonList></precursor>\n<precursor/>\n</precursorList>\n<productList count=\"12\"><product/></productList>\n";
         let blanked = |head: &str, chromatogram: bool| {
             let mut out = head.as_bytes().to_vec();
-            for span in unstated(head, chromatogram).0 {
+            for span in unstated(head, chromatogram).spans {
                 out[span].fill(b' ');
             }
             String::from_utf8(out).unwrap()
@@ -772,7 +949,9 @@ mod tests {
 
     /// The zeros a source states itself are found by element, whatever the attribute order, the
     /// quotes and the white space after the element's name, across the read blocks, and through the
-    /// param groups an element refers to; a 0 outside a spectrum or chromatogram is nobody's.
+    /// param groups an element refers to; a 0 outside a spectrum or chromatogram is nobody's, and
+    /// one inside an element's arrays is not read (the pass skips them). The same pass reads each
+    /// spectrum's `sourceFileRef` and finds a needle wherever it is, a block boundary included.
     #[test]
     fn stated_zeros_are_read_from_the_source_text() {
         let dir = std::env::temp_dir().join(format!("mzpc-stated-zeros-{}", std::process::id()));
@@ -783,41 +962,118 @@ mod tests {
         doc.push_str("<referenceableParamGroup\n id=\"timed\"><cvParam accession=\"MS:1000016\" value=\"1.5\"/><cvParam accession=\"MS:1000927\" value=\"0\"/></referenceableParamGroup></referenceableParamGroupList>\n");
         // After a group has ended, a 0 is not the group's: `late` refers to `timed` and gains nothing from this one.
         doc.push_str("<instrumentConfiguration id=\"IC\"><cvParam accession=\"MS:1000042\" value=\"0\"/></instrumentConfiguration><spectrumList>\n");
-        doc.push_str("<spectrum index=\"0\" id=\"scan=1 a&gt;b\" defaultArrayLength=\"0\"><cvParam cvRef=\"MS\" accession=\"MS:1000927\" name=\"ion injection time\" value=\"0.0\"/>");
-        // Longer than one read block of binary, so the next spectrum's tags straddle a boundary.
-        doc.push_str(&format!("<binary>{}</binary></spectrum>\n", "A".repeat((1 << 20) + 5)));
+        doc.push_str("<spectrum index=\"0\" id=\"scan=1 a&gt;b\" defaultArrayLength=\"0\" sourceFileRef=\"raw&amp;1\"><cvParam cvRef=\"MS\" accession=\"MS:1000927\" name=\"ion injection time\" value=\"0.0\"/>");
+        // Longer than one read block of binary, so the next spectrum's tags straddle a boundary; the
+        // needle sits right on that boundary (`IMS:1` from byte 2^20 − 2).
+        let a_run = (1 << 20) - doc.len() - 36;
+        doc.push_str(&format!("<binary>{}</binary></spectrum>\n", "A".repeat(a_run)));
+        assert_eq!(doc.len(), (1 << 20) - 7, "the fixture's boundary moved");
+        doc.push_str("<!-- IMS:1 -->");
         doc.push_str("<spectrum id='scan=2' index='1'><cvParam value='0' name='collision energy' accession='MS:1000045'/><cvParam accession=\"MS:1000042\" value=\"12\"/></spectrum>\n");
         // Between two spectra a 0 is neither's.
         doc.push_str("<cvParam accession=\"MS:1000042\" value=\"0\"/>\n");
-        doc.push_str("<spectrum id=\"scan=3\"><cvParam accession=\"MS:1000045\" value=\"35\"/><userParam name=\"x\" value=\"0\"/></spectrum>\n");
+        // A 0 inside the arrays is not read: the skip runs to the spectrum's end tag, and the
+        // `</spectrumList` that follows is not taken for it.
+        doc.push_str("<spectrum id=\"scan=3\"><cvParam accession=\"MS:1000045\" value=\"35\"/><userParam name=\"x\" value=\"0\"/><binaryDataArrayList count=\"1\"><binaryDataArray><cvParam accession=\"MS:1000042\" value=\"0\"/><binary>AA==</binary></binaryDataArray></binaryDataArrayList></spectrum>\n");
         doc.push_str("<spectrum\r\n\tid=\"scan=4\"><scanList><scan><referenceableParamGroupRef ref=\"scan&amp;1\"/></scan></scanList></spectrum>\n");
         doc.push_str("<spectrum id=\"late\"><referenceableParamGroupRef\n ref=\"timed\"/><referenceableParamGroupRef ref=\"absent\"/><cvParam\n accession=\"MS:1000045\"\n value=\"0\"/></spectrum></spectrumList>\n");
-        doc.push_str("<chromatogramList><chromatogram\tid=\"srm\"><cvParam accession=\"MS:1000509\" name=\"activation energy\" value=\"0e0\"/><cvParam name=\"peak intensity\" value=\"-0\"/></chromatogram></chromatogramList></mzML>");
+        doc.push_str("<chromatogramList><chromatogram\tid=\"srm\"><cvParam accession=\"MS:1000509\" name=\"activation energy\" value=\"0e0\"/><cvParam name=\"peak intensity\" value=\"-0\"/><binaryDataArrayList count=\"1\"><binaryDataArray><cvParam accession=\"MS:1000016\" value=\"0\"/></binaryDataArray></binaryDataArrayList></chromatogram></chromatogramList></mzML>");
         std::fs::write(&path, &doc).unwrap();
-        let stated = StatedZeros::read(&path).unwrap();
+        let text = SourceText::read(&path, ["IMS:1", "sourceFileRef=", "nowhere"]).unwrap();
+        let stated = &text.zeros;
         assert_eq!(stated.count(), 5, "{stated:?}");
         assert_eq!(stated.spectrum("scan=1 a>b"), Zeros(Zeros::INJECTION_TIME));
         assert_eq!(stated.spectrum("scan=2"), Zeros(Zeros::COLLISION_ENERGY));
-        assert_eq!(stated.spectrum("scan=3"), Zeros::NONE);
+        assert_eq!(stated.spectrum("scan=3"), Zeros::NONE, "the 0 in its arrays is not read");
         assert_eq!(stated.spectrum("scan=4"), Zeros::TIME, "through its scan's param group");
         assert_eq!(stated.spectrum("late"), Zeros(Zeros::INJECTION_TIME | Zeros::COLLISION_ENERGY), "a group's 0 and its own");
-        assert_eq!(stated.chromatogram("srm"), Zeros(Zeros::COLLISION_ENERGY | Zeros::PEAK_INTENSITY));
+        assert_eq!(stated.chromatogram("srm"), Zeros(Zeros::COLLISION_ENERGY | Zeros::PEAK_INTENSITY), "not the 0 in its arrays");
         assert_eq!(stated.chromatogram("scan=2"), Zeros::NONE, "a spectrum's id is not a chromatogram's");
+        assert_eq!(text.spectrum_files, HashMap::from([("scan=1 a>b".to_string(), "raw&1".to_string())]));
+        assert_eq!(text.mentions, [true, true, false]);
         assert_eq!(StatedZeros::everything().spectrum("anything"), Zeros::ALL);
-        assert!(StatedZeros::read(&dir.join("absent.mzML")).is_err());
-        // The same text in blocks that end anywhere: a tag name cut in two is read whole.
-        let small: String = doc.replace(&"A".repeat((1 << 20) + 5), "AAAA");
+        assert!(SourceText::read(&dir.join("absent.mzML"), ["x"]).is_err());
+        // The same text in blocks that end anywhere: a tag name cut in two is read whole, an end
+        // tag cut while the arrays are skipped too.
+        let small: String = doc.replacen(&"A".repeat(a_run), "AAAA", 1);
+        assert!(small.len() < 2500, "{}", small.len());
         for cut in 0..small.len() {
-            let mut stated = StatedZeros::default();
-            let mut current = None;
+            let mut text = SourceText::<0> { zeros: StatedZeros::default(), spectrum_files: HashMap::new(), mentions: [] };
+            let mut cursor = Cursor::default();
             let mut held = Vec::new();
             for block in [&small.as_bytes()[..cut], &small.as_bytes()[cut..]] {
                 held.extend_from_slice(block);
-                let keep = stated.scan(&held, &mut current);
+                let keep = text.scan(&held, &mut cursor);
                 held.drain(..keep);
             }
-            assert_eq!((stated.count(), stated.spectrum("scan=4"), stated.spectrum("late").0, stated.chromatogram("srm").0), (5, Zeros::TIME, 5, 6), "cut at {cut}");
+            let stated = &text.zeros;
+            assert_eq!(
+                (stated.count(), stated.spectrum("scan=3"), stated.spectrum("scan=4"), stated.spectrum("late").0, stated.chromatogram("srm").0),
+                (5, Zeros::NONE, Zeros::TIME, 5, 6),
+                "cut at {cut}"
+            );
+            assert_eq!(text.spectrum_files.len(), 1, "cut at {cut}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spectrum's type term is written once. mzdata's writer prints the model's term and then the
+    /// spectrum's params, leaving out only `MS1 spectrum` / `MSn spectrum` on a spectrum of ms level
+    /// 1 or more: an SRM spectrum came out as `SRM spectrum` twice, a spectrum of ms level 0 (an
+    /// imzML pixel) as `MS1 spectrum` twice. A spectrum that states two type terms gets the first
+    /// (`mass spectrum`) from the model and again from its params, and the writer itself leaves the
+    /// stated `MS1 spectrum` out: the sink leaves one `mass spectrum`.
+    #[test]
+    fn a_spectrum_type_term_is_written_once() {
+        use mzdata::params::ControlledVocabulary;
+        let typed = |i: usize, level: u8, terms: &[(&'static str, u32)]| {
+            let mut spec = spectra().remove(1);
+            let d = spec.description_mut();
+            d.id = format!("typed={i}");
+            d.index = i;
+            d.ms_level = level;
+            for (name, accession) in terms {
+                d.add_param(ControlledVocabulary::MS.const_param_ident(name, *accession).into());
+            }
+            spec
+        };
+        let typed_spectra = vec![
+            typed(0, 2, &[("SRM spectrum", 1000583)]),
+            typed(1, 0, &[("MS1 spectrum", 1000579)]),
+            typed(2, 1, &[("mass spectrum", 1000294), ("MS1 spectrum", 1000579)]),
+            typed(3, 2, &[]),
+        ];
+        let document = |sink: Box<dyn Write>| {
+            let mut w = mzdata::io::mzml::MzMLWriter::new(sink);
+            w.set_spectrum_count(typed_spectra.len() as u64);
+            for mut spec in typed_spectra.clone() {
+                mark_spectrum(spec.description_mut(), Zeros::NONE);
+                w.write(&spec).unwrap();
+            }
+            w.chromatogram_count = 0;
+            w.wrote_summaries = true;
+            w.close().unwrap();
+        };
+        let raw = Shared::default();
+        document(Box::new(raw.clone()));
+        let raw = String::from_utf8(raw.0.take()).unwrap();
+        let out = Shared::default();
+        document(Box::new(UnstatedTerms::new(out.clone())));
+        let doc = String::from_utf8(out.0.take()).unwrap();
+        assert_eq!(doc.len(), raw.len(), "blanked in place");
+        let per_spectrum = |text: &str, accession: &str| -> Vec<usize> {
+            text.match_indices("<spectrum ").map(|(at, _)| text[at..at + text[at..].find("</spectrum>").unwrap()].matches(accession).count()).collect()
+        };
+        assert_eq!(per_spectrum(&raw, "MS:1000583"), [2, 0, 0, 0], "the writer's SRM spectrum twice\n{raw}");
+        assert_eq!(per_spectrum(&raw, "MS:1000579"), [0, 2, 0, 0], "MS1 spectrum twice on ms level 0; the writer drops the stated one on ms level 1");
+        assert_eq!(per_spectrum(&raw, "MS:1000294"), [0, 0, 2, 0], "the first of two stated types, twice");
+        assert_eq!(per_spectrum(&doc, "MS:1000583"), [1, 0, 0, 0], "{doc}");
+        assert_eq!(per_spectrum(&doc, "MS:1000579"), [0, 1, 0, 0], "{doc}");
+        assert_eq!(per_spectrum(&doc, "MS:1000294"), [0, 0, 1, 0], "{doc}");
+        assert_eq!(per_spectrum(&doc, "MS:1000580"), [0, 0, 0, 1], "a spectrum without a type gets the writer's, once");
+        let mut reader = mzdata::io::mzml::MzMLReader::new_indexed(std::io::Cursor::new(doc.into_bytes()));
+        let read: Vec<_> = reader.iter().map(|s| s.spectrum_type()).collect();
+        use mzdata::meta::SpectrumType;
+        assert_eq!(read, [Some(SpectrumType::SRMSpectrum), Some(SpectrumType::MS1Spectrum), Some(SpectrumType::MassSpectrum), Some(SpectrumType::MSnSpectrum)]);
     }
 }
