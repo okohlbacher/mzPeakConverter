@@ -61,15 +61,19 @@ archive(args[args.index("-o") + 1], "{version}", " ".join(args))
 """
 
 # Stand-in for `box_convert.sh [--overwrite] --local-manifest MF --jobs N`: keeps the manifest and
-# "converts" every job the way the box does, native first with the lane flags stripped. A unit named
-# *undelivered* never comes back; one named *stale* comes back built by another converter version.
+# "converts" every job, recording the argv that ran the way the box does. A unit named *native* was
+# read natively, the mzML-lane flags (`--via-msconvert`, `--tof-grid <mode>`) stripped as the box's
+# native-first attempt strips them; any other unit records the job's opts as given (a native lane
+# the job pinned, or the msconvert fallback with the flags it adds). A unit named *undelivered*
+# never comes back; one named *stale* comes back built by another converter version.
 FAKE_BOX = """#!/usr/bin/env bash
 while [ "$1" != "--local-manifest" ]; do shift; done
 mf="$2"; cp "$mf" "$FAKE_MANIFEST"; rc=0
 while IFS="$(printf '\\t')" read -r unit out opts; do
   case "$unit$out" in *undelivered*|*s3://*) rc=1; continue ;; esac
   ver="{version}"; case "$unit" in *stale*) ver=0.0.1 ;; esac
-  "$MZPEAK_CONVERT" --write-archive "$out" "$ver" "$(basename "$unit") --no-vendor -o out.mzpeak --force"
+  ran=" $opts"; case "$unit" in *native*) ran=$(printf ' %s' $opts | sed -E 's/ --via-msconvert//; s/ --tof-grid [^ ]+//') ;; esac
+  "$MZPEAK_CONVERT" --write-archive "$out" "$ver" "$(basename "$unit")$ran -o out.mzpeak --force"
 done < "$mf"
 exit $rc
 """
@@ -176,25 +180,197 @@ class Stamps(Harness):
         self.run_main(root)
         self.assertEqual(self.runs(), 3, "a stamp naming no recipe counted as current")
 
+    def test_a_stamp_recording_another_lane_than_the_descriptor_is_stale(self):
+        cv = {"input": "auto", "flags": "--zstd-level 12"}
+        root = make_corpus(self.tmp, {"general-ms/ds/ds.yaml": {"convert": cv}}, {"general-ms/ds/a.mzML": b"x"})
+        stamp = root / "general-ms/ds/a.mzpeak.built"
+        self.run_main(root)
+        lines = stamp.read_text().splitlines()
+        # the box's msconvert fallback, recorded under a descriptor pinning no lane: three SciEX
+        # archives of the corpus were stamped so before the check and counted as current
+        stamp.write_text("\n".join(lines[:2] + [lines[2] + " --via-msconvert --tof-grid auto"]) + "\n")
+        rc, out = self.run_main(root)
+        self.assertEqual(self.runs(), 2, "an archive stamped on another lane than its descriptor pins counted as current")
+        self.assertIn("stale     : a.mzpeak: lane mismatch: the descriptor pins no lane flag, the archive ran with "
+                      "--tof-grid auto --via-msconvert (options: ", out)
+        self.assertRegex(stamp.read_text().splitlines()[2], r"^options .* --zstd-level 12$")
+        self.run_main(root)
+        self.assertEqual(self.runs(), 2, "the rebuilt archive is current")
+        # the reverse: the descriptor pins a lane the stamp does not record
+        (root / "general-ms/ds/ds.yaml").write_text(json.dumps({"convert": {**cv, "flags": "--zstd-level 12 --via-msconvert"}}))
+        self.run_main(root)
+        self.assertEqual(self.runs(), 3, "a recipe change rebuilds")
+        lines = stamp.read_text().splitlines()
+        self.assertIn(" --via-msconvert", lines[2])
+        stamp.write_text("\n".join(lines[:2] + [lines[2].replace(" --via-msconvert", "")]) + "\n")
+        rc, out = self.run_main(root)
+        self.assertEqual(self.runs(), 4)
+        self.assertIn("lane mismatch: the descriptor pins --via-msconvert, the archive ran with no lane flag", out)
+        # a stamp without an options line is current under a descriptor pinning no lane, stale under one that does
+        stamp.write_text("\n".join(lines[:2]) + "\n")
+        self.run_main(root)
+        self.assertEqual(self.runs(), 5)
+        (root / "general-ms/ds/ds.yaml").write_text(json.dumps({"convert": cv}))
+        self.run_main(root)   # the recipe changed back: one rebuild ...
+        stamp.write_text("\n".join(stamp.read_text().splitlines()[:2]) + "\n")
+        self.run_main(root)   # ... and the stamp without an options line is current
+        self.assertEqual(self.runs(), 6)
+
+    def test_restamp_keeps_an_archive_whose_recorded_options_equal_its_edited_recipe(self):
+        cv = {"input": "auto", "flags": "--zstd-level 12"}
+        root = make_corpus(self.tmp, {"general-ms/ds/ds.yaml": {"convert": cv}}, {"general-ms/ds/a.mzML": b"x"})
+        desc, stamp = root / "general-ms/ds/ds.yaml", root / "general-ms/ds/a.mzpeak.built"
+        self.run_main(root)
+        # a convert.* edit that leaves the flags alone (a re-pin to what the archive records, a note):
+        # the recipe id changes, the archive does not -> re-stamped, not rebuilt
+        same = {**cv, "note": "re-pinned 2026-10-01 to what the archive records"}
+        desc.write_text(json.dumps({"convert": same}))
+        rc, out = self.run_main(root, "--restamp", "--report-only")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("restamped : 1 archive(s)", out)
+        self.assertEqual(stamp.read_text().splitlines()[1], f"recipe {cr.recipe_id(same)}")
+        self.run_main(root)
+        self.assertEqual(self.runs(), 1, "a re-stamped archive was rebuilt")
+        # a flags edit is a different archive: nothing to re-stamp, the next pass rebuilds
+        desc.write_text(json.dumps({"convert": {**cv, "flags": "--zstd-level 9"}}))
+        rc, out = self.run_main(root, "--restamp", "--report-only")
+        self.assertIn("restamped : 0 archive(s)", out)
+        self.run_main(root)
+        self.assertEqual(self.runs(), 2, "an archive recording other flags was re-stamped as current")
+        # the recorded-options reading: box and host argv orders, -o/-f/--force and the input dropped,
+        # a path-valued flag compared by its last component
+        self.assertEqual(cr.recorded_flags("run.wiff --zstd-level 12 --via-msconvert --tof-grid auto -o out.mzpeak --force"),
+                         ["--zstd-level 12", "--via-msconvert", "--tof-grid auto"])
+        self.assertEqual(cr.recorded_flags("/x/My Run 1.raw -o /x/My Run 1.mzpeak -f --image /x/img/CHJ 2.png"),
+                         ["--image CHJ 2.png"])
+        self.assertEqual(cr.recorded_flags("FM_1-1_01_20254.d -o out.mzpeak --force"), [])
+        self.assertEqual(cr.flag_chunks("--image /abs/dir/CHJ2.png --sample 2"), ["--image CHJ2.png", "--sample 2"])
+
     def test_box_archives_are_stamped_from_their_own_index(self):
         lane = {"input": "auto", "flags": "--via-msconvert --tof-grid auto"}
         root = make_corpus(self.tmp, {
             "general-ms/sciex/sciex.yaml": {"convert": lane},
+            # pins the msconvert lane; the box reads the unit natively (D17: agilent-qtof)
+            "general-ms/agilent/agilent.yaml": {"convert": {"input": "auto", "flags": "--via-msconvert --zstd-level 12"}},
             "general-ms/old/old.yaml": {"convert": {"input": "auto"}},
         }, {
             "general-ms/sciex/run.wiff": b"x",
             "general-ms/sciex/run.wiff.scan": b"x",
+            "general-ms/agilent/native.wiff": b"x",
+            "general-ms/agilent/native.wiff.scan": b"x",
             "general-ms/old/stale.wiff": b"x",
         })
         rc, out = self.run_main(root, "--box", "--no-s3-first")
         self.assertEqual(self.manifest()["run.mzpeak"][1], "--via-msconvert --tof-grid auto")
         self.assertEqual((root / "general-ms/sciex/run.mzpeak.built").read_text().splitlines(),
                          [f"mzpeak-convert {VERSION}", f"recipe {cr.recipe_id(lane)}",
-                          "options run.wiff --no-vendor -o out.mzpeak --force"])
+                          "options run.wiff --via-msconvert --tof-grid auto -o out.mzpeak --force"])
+        self.assertTrue((root / "general-ms/agilent/native.mzpeak").exists())
+        self.assertFalse((root / "general-ms/agilent/native.mzpeak.built").exists(),
+                         "an archive built on another lane than its descriptor pins was stamped current")
+        self.assertIn("native.mzpeak arrived but is left unstamped: lane mismatch: the descriptor pins "
+                      "--via-msconvert, the archive ran with no lane flag "
+                      "(options: native.wiff --zstd-level 12 -o out.mzpeak --force)", out)
         self.assertTrue((root / "general-ms/old/stale.mzpeak").exists())
         self.assertFalse((root / "general-ms/old/stale.mzpeak.built").exists(),
                          "an archive another converter version built was stamped current")
         self.assertIn("built by mzpeak-convert 0.0.1", out)
+        self.assertEqual(rc, 1, out)
+
+
+def edit_index(archive: Path, edit) -> None:
+    """Rewrite `archive`'s index metadata through `edit(metadata)`, the other members kept."""
+    with zipfile.ZipFile(archive) as z:
+        members = {n: z.read(n) for n in z.namelist()}
+    index = json.loads(members["mzpeak_index.json"])
+    edit(index["metadata"])
+    members["mzpeak_index.json"] = json.dumps(index).encode()
+    with zipfile.ZipFile(archive, "w") as z:
+        for n, body in members.items():
+            z.writestr(n, body)
+
+
+class StampChecks(Harness):
+    """`write_stamp` against stub archives: the fixture converter writes one with a given argv
+    (`--write-archive`), and `edit_index` changes what its index records."""
+
+    def stub(self, name: str, options: str, version: str = VERSION) -> Path:
+        out = self.tmp / name
+        subprocess.run([os.environ["MZPEAK_CONVERT"], "--write-archive", str(out), version, options], check=True)
+        return out
+
+    def test_the_descriptor_lane_must_be_the_one_the_archive_ran_and_no_other(self):
+        v = f"mzpeak-convert {VERSION}"
+        native = self.stub("native.mzpeak", "x.d --zstd-level 12 -o out.mzpeak --force")
+        self.assertIsNone(cr.write_stamp(native, v, "r", ["--zstd-level", "12"]))
+        self.assertEqual(cr.stamp_for(native).read_text().splitlines()[2], "options x.d --zstd-level 12 -o out.mzpeak --force")
+        # a flag outside the lane set is the recipe hash's business, not the stamp's
+        self.assertIsNone(cr.write_stamp(native, v, "r", []))
+        self.assertIsNone(cr.write_stamp(native, v, "r", ["--zstd-level", "9", "--sample", "2"]))
+        # agilent-qtof: the descriptor pins the msconvert lane, the box built the archive natively
+        self.assertEqual(cr.write_stamp(native, v, "r", ["--via-msconvert", "--tof-grid", "auto", "--zstd-level", "12"]),
+                         "lane mismatch: the descriptor pins --tof-grid auto --via-msconvert, the archive ran with "
+                         "no lane flag (options: x.d --zstd-level 12 -o out.mzpeak --force)")
+        pwiz = self.stub("pwiz.mzpeak", "x.d --via-msconvert --tof-grid auto -o out.mzpeak --force")
+        self.assertIsNone(cr.write_stamp(pwiz, v, "r", ["--via-msconvert", "--tof-grid", "auto"]))
+        self.assertIsNone(cr.write_stamp(pwiz, v, "r", ["--tof-grid=auto", "--via-msconvert"]), "one pin, two spellings")
+        # the reverse: the msconvert fallback ran under a descriptor pinning nothing ...
+        self.assertEqual(cr.write_stamp(pwiz, v, "r", []),
+                         "lane mismatch: the descriptor pins no lane flag, the archive ran with --tof-grid auto "
+                         "--via-msconvert (options: x.d --via-msconvert --tof-grid auto -o out.mzpeak --force)")
+        # ... or under agilent-6490-triplequad's, which pins the lane but not the fallback's grid
+        self.assertIn("the descriptor pins --via-msconvert, the archive ran with --tof-grid auto --via-msconvert",
+                      cr.write_stamp(pwiz, v, "r", ["--via-msconvert"]))
+        self.assertIn("lane mismatch", cr.write_stamp(pwiz, v, "r", ["--via-msconvert", "--tof-grid", "on"]))
+        sdk = self.stub("sdk.mzpeak", "x.d --bruker-sdk --no-vendor -o out.mzpeak --force")
+        self.assertIsNone(cr.write_stamp(sdk, v, "r", ["--bruker-sdk"]))
+        self.assertIn("the descriptor pins --via-msconvert, the archive ran with --bruker-sdk",
+                      cr.write_stamp(sdk, v, "r", ["--via-msconvert"]))
+        # the version check comes first and is unchanged
+        self.assertEqual(cr.write_stamp(native, "mzpeak-convert 0.0.1", "r", []),
+                         f"built by mzpeak-convert {VERSION}, not mzpeak-convert 0.0.1")
+        self.assertEqual(sorted(p.name for p in self.tmp.glob("*.built")), ["native.mzpeak.built", "pwiz.mzpeak.built", "sdk.mzpeak.built"])
+
+    def test_a_recorded_argv_the_shell_splitter_rejects_is_split_on_whitespace(self):
+        # an apostrophe in a vendor folder's name: `shlex.split` raises "No closing quotation"
+        self.assertEqual(cr.argv_of("O'Neil.d --via-msconvert -o out.mzpeak"), ["O'Neil.d", "--via-msconvert", "-o", "out.mzpeak"])
+        self.assertEqual(cr.argv_of('"My Run.d" --bruker-sdk -o out.mzpeak'), ["My Run.d", "--bruker-sdk", "-o", "out.mzpeak"])
+        v = f"mzpeak-convert {VERSION}"
+        quoted = self.stub("quoted.mzpeak", "O'Neil.d --via-msconvert -o out.mzpeak --force")
+        self.assertIsNone(cr.write_stamp(quoted, v, "r", ["--via-msconvert"]))
+        self.assertIn("the archive ran with --via-msconvert", cr.write_stamp(quoted, v, "r", []))
+
+    def test_the_version_and_argv_are_the_last_conversions_whatever_its_software_id(self):
+        v = f"mzpeak-convert {VERSION}"
+        # an mzML this tool exported from a 0.16.0 archive, converted again: the source brings the
+        # earlier conversion's software entry and method along, and the new ones are numbered
+        twice = self.stub("twice.mzpeak", "old.raw -o a.mzpeak")
+        conversion = lambda n, ref, options: {"id": f"mzpeak_convert_conversion{n}", "methods": [
+            {"order": 1, "software_reference": ref, "parameters": [{"name": "conversion options", "value": options}]}]}
+
+        def numbered(md):
+            md["software_list"] = [{"id": "pwiz", "version": "3"}, {"id": "mzpeak-convert", "version": "0.16.0"},
+                                   {"id": "mzpeak-convert_2", "version": VERSION}]
+            md["data_processing_method_list"] = [conversion("", "mzpeak-convert", "old.raw -o a.mzpeak"),
+                                                 conversion("_2", "mzpeak-convert_2", "a.mzML --via-msconvert -o b.mzpeak")]
+        edit_index(twice, numbered)
+        self.assertIsNone(cr.write_stamp(twice, v, "r", ["--via-msconvert"]))
+        self.assertEqual(cr.stamp_for(twice).read_text().splitlines(),
+                         [v, "recipe r", "options a.mzML --via-msconvert -o b.mzpeak"])
+        self.assertEqual(cr.write_stamp(twice, "mzpeak-convert 0.16.0", "r", []), f"built by mzpeak-convert {VERSION}, not mzpeak-convert 0.16.0")
+        # the same version converting its own export reuses the plain id; a method without a
+        # software reference falls back to the last of this tool's entries
+        def unreferenced(md):
+            md["software_list"] = [{"id": "mzpeak-convert", "version": "0.16.0"}, {"id": "mzpeak-convert_2", "version": VERSION}]
+            for dp in md["data_processing_method_list"]:
+                for m in dp["methods"]:
+                    m.pop("software_reference", None)
+        edit_index(twice, unreferenced)
+        self.assertIsNone(cr.write_stamp(twice, v, "r", ["--via-msconvert"]))
+        # an index recording no conversion at all is refused, as before
+        plain = self.stub("plain.mzpeak", "x.mzML -o x.mzpeak")
+        edit_index(plain, lambda md: md.update(software_list=[], data_processing_method_list=[]))
+        self.assertEqual(cr.write_stamp(plain, v, "r", []), f"built by mzpeak-convert <unrecorded>, not {v}")
 
 
 @unittest.skipIf(yaml is None, "PyYAML not installed")
@@ -228,6 +404,27 @@ class BoxPhase(Harness):
             self.run_main(root, "--box", "--publish-s3")
         self.assertEqual(self.manifest()["run.mzpeak"][0], "s3://v09/general-ms/ds/run.mzpeak")
 
+    def test_the_box_no_vendor_default_reaches_only_undescribed_units(self):
+        # A described dataset without flags converts with the converter's defaults (HOW-TO-ADD-DATA:
+        # "omit to convert with defaults"), as the host path always did. The old `flags or
+        # ['--no-vendor']` gave ten box archives a flag no descriptor asked for, and left no way to
+        # pin a unit the box built bare (D17, the BAF unit).
+        root = make_corpus(self.tmp, {
+            "general-ms/bare/bare.yaml": {"convert": {"input": "auto"}},
+            "general-ms/plain/plain.yaml": {"title": "no convert block at all"},
+            "pwiz-examples/px/px.yaml": {"convert": {"input": "auto"}},   # multi-unit tile: no recipe
+        }, {
+            "general-ms/bare/run.wiff": b"x",
+            "general-ms/plain/other.wiff": b"x",
+            "pwiz-examples/px/px.wiff": b"x",
+        })
+        rc, out = self.run_main(root, "--box")
+        self.assertEqual(rc, 0, out)
+        jobs = self.manifest()
+        self.assertEqual(jobs["run.mzpeak"][1], "", "a described, flag-less dataset got the box default")
+        self.assertEqual(jobs["other.mzpeak"][1], "", "a descriptor without a convert block got the box default")
+        self.assertEqual(jobs["px.mzpeak"][1], "--no-vendor", "an undescribed unit lost the box default")
+
     def test_convert_samples_builds_one_archive_per_sample(self):
         sciex = self.tmp / "data/general-ms/sciex"
         root = make_corpus(self.tmp, {"general-ms/sciex/sciex.yaml": {"convert": {"input": "En_PPY.wiff",
@@ -238,8 +435,8 @@ class BoxPhase(Harness):
         rc, out = self.run_main(root, "--box")
         jobs = self.manifest()
         self.assertEqual(sorted(jobs), ["En_PPY.sample117.mzpeak", "En_PPY.sample2.mzpeak"])
-        self.assertEqual(jobs["En_PPY.sample2.mzpeak"], (str(sciex / "En_PPY.sample2.mzpeak"), "--no-vendor --sample 2"))
-        self.assertEqual(jobs["En_PPY.sample117.mzpeak"][1], "--no-vendor --sample 117")
+        self.assertEqual(jobs["En_PPY.sample2.mzpeak"], (str(sciex / "En_PPY.sample2.mzpeak"), "--sample 2"))
+        self.assertEqual(jobs["En_PPY.sample117.mzpeak"][1], "--sample 117")
         for n in (2, 117):
             self.assertTrue((sciex / f"En_PPY.sample{n}.mzpeak.built").exists(), out)
         # the single archive the samples replace must not stay beside them, publishable, in silence

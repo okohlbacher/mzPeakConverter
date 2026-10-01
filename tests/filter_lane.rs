@@ -1177,3 +1177,128 @@ fn nulled_references_are_reported_once_per_facet() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The encodings of one Parquet column, per row group.
+fn column_encodings(archive: &Path, name: &str, column: &str) -> Vec<Vec<parquet::basic::Encoding>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let reader = SerializedFileReader::new(bytes::Bytes::from(member(archive, name))).unwrap();
+    let meta = reader.metadata();
+    let i = meta
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|c| c.path().string() == column)
+        .unwrap_or_else(|| panic!("{name} has no column {column}"));
+    meta.row_groups().iter().map(|rg| rg.column(i).encodings().collect()).collect()
+}
+
+fn is_dictionary(e: &parquet::basic::Encoding) -> bool {
+    matches!(e, parquet::basic::Encoding::RLE_DICTIONARY | parquet::basic::Encoding::PLAIN_DICTIONARY)
+}
+
+/// `archive` as `dst`, with the Parquet members named in `dictionary` rewritten so that the listed
+/// columns are dictionary-encoded, as the facets of an archive written by 0.16.0 or earlier are
+/// (the chunk bounds under parquet's global dictionary); everything else about the member — its
+/// rows, schema and footer key-value metadata — stays as it was.
+fn with_dictionary_columns(archive: &Path, dst: &Path, dictionary: &[(&str, &[&str])]) {
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, Encoding, ZstdLevel};
+    use parquet::file::properties::{WriterProperties, WriterVersion};
+    use std::io::Write;
+    let mut zin = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+    let mut zout = zip::ZipWriter::new(File::create(dst).unwrap());
+    for i in 0..zin.len() {
+        let entry = zin.by_index(i).unwrap();
+        let Some((_, columns)) = dictionary.iter().find(|(name, _)| *name == entry.name()) else {
+            zout.raw_copy_file(entry).unwrap();
+            continue;
+        };
+        let name = entry.name().to_string();
+        drop(entry);
+        let bytes = member(archive, &name);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+        let schema = std::sync::Arc::new(builder.schema().as_ref().clone().with_metadata(Default::default()));
+        let kv: Vec<_> = builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .map(|v| v.iter().filter(|kv| kv.key != "ARROW:schema").cloned().collect())
+            .unwrap_or_default();
+        let mut props = WriterProperties::builder()
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+            .set_key_value_metadata(Some(kv))
+            .set_dictionary_enabled(false);
+        for c in columns.iter() {
+            let path: parquet::schema::types::ColumnPath = c.split('.').map(str::to_string).collect::<Vec<_>>().into();
+            props = props.set_column_dictionary_enabled(path.clone(), true).set_column_encoding(path, Encoding::PLAIN);
+        }
+        let mut out = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut out, schema, Some(props.build())).unwrap();
+        for batch in builder.build().unwrap() {
+            writer.write(&batch.unwrap()).unwrap();
+        }
+        writer.close().unwrap();
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zout.start_file(name, opts).unwrap();
+        zout.write_all(&out).unwrap();
+    }
+    zout.finish().unwrap();
+}
+
+/// A chunk facet's float bounds the source holds dictionary-encoded (every archive written by 0.16.0
+/// or earlier) are re-encoded the converter's way — byte-stream split, dictionary off — while every
+/// other column still follows the source: here an intensity column the source holds under a
+/// dictionary keeps it. Followed, the bounds' dictionary was paid once per row group the byte cap
+/// made (the corpus Lumos peak facet +1.19 %); re-encoded, that facet is 0.98 % smaller than its
+/// source (owner decision D16, 2026-10-01). The bound values are unchanged.
+#[test]
+fn dictionary_chunk_bounds_of_an_older_archive_are_re_encoded_the_converters_way() {
+    let dir = scratch("legacy-bounds");
+    let src = convert(TINY, &dir);
+    let legacy = dir.join("legacy.mzpeak");
+    const BOUNDS: [&str; 2] = ["chunk.mz_chunk_start", "chunk.mz_chunk_end"];
+    const INTENSITY: &str = "chunk.intensity.list.item";
+    let members = ["spectra_data.parquet", "spectra_peaks.parquet"];
+    with_dictionary_columns(&src, &legacy, &[(members[0], &["chunk.mz_chunk_start", "chunk.mz_chunk_end", INTENSITY]), (members[1], &["chunk.mz_chunk_start", "chunk.mz_chunk_end", INTENSITY])]);
+    for m in members {
+        for c in BOUNDS.iter().chain([INTENSITY].iter()) {
+            assert!(column_encodings(&legacy, m, c).iter().all(|e| e.iter().any(is_dictionary)), "{m} {c}: the legacy stand-in is not dictionary-encoded");
+        }
+    }
+    // A filter that keeps every spectrum: the facets are rewritten, nothing is dropped.
+    let out = dir.join("filtered.mzpeak");
+    ok(&mzpc(&legacy, &out, &["--rt", "0-100000"]));
+    for m in members {
+        for c in BOUNDS {
+            for encodings in column_encodings(&out, m, c) {
+                assert!(
+                    encodings.contains(&parquet::basic::Encoding::BYTE_STREAM_SPLIT) && !encodings.iter().any(is_dictionary),
+                    "{m} {c}: dictionary bounds must come out byte-stream split without a dictionary, got {encodings:?}"
+                );
+            }
+        }
+        assert!(column_encodings(&out, m, INTENSITY).iter().all(|e| e.iter().any(is_dictionary)), "{m} {INTENSITY}: every other column follows the source");
+        // The bounds themselves are the source's.
+        let (before, after) = (table(&legacy, m), table(&out, m));
+        assert_eq!(before.num_rows(), after.num_rows(), "{m}: rows");
+        let chunk = |t: &RecordBatch| t.column_by_name("chunk").unwrap().as_any().downcast_ref::<StructArray>().unwrap().clone();
+        let (b, a) = (chunk(&before), chunk(&after));
+        for c in ["mz_chunk_start", "mz_chunk_end"] {
+            let f = |s: &StructArray| s.column_by_name(c).unwrap().as_any().downcast_ref::<Float64Array>().unwrap().values().to_vec();
+            assert_eq!(f(&b), f(&a), "{m} {c}: values");
+        }
+    }
+    // A filter of an archive this version wrote (bounds already byte-stream split) is unchanged.
+    let fresh = dir.join("fresh.mzpeak");
+    ok(&mzpc(&src, &fresh, &["--rt", "0-100000"]));
+    for m in members {
+        for c in BOUNDS {
+            for encodings in column_encodings(&fresh, m, c) {
+                assert!(encodings.contains(&parquet::basic::Encoding::BYTE_STREAM_SPLIT) && !encodings.iter().any(is_dictionary), "{m} {c}: {encodings:?}");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

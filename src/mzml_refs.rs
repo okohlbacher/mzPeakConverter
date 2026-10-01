@@ -312,15 +312,23 @@ impl DanglingRefs {
     /// outside the list are later read back from `path`. After `decode_pwiz_ids`, before this
     /// conversion adds its own entries.
     pub fn check(path: &Path, target: &mut impl MSDataFileMetadata) -> Self {
+        let spectrum_files = spectrum_source_files(path).unwrap_or_else(|e| {
+            log::warn!("{}: the spectra's sourceFileRef attributes were not read: {e:#}", path.display());
+            HashMap::new()
+        });
+        Self::check_with_spectrum_files(path, target, spectrum_files)
+    }
+
+    /// [`Self::check`] for a lane that has read the spectra's `sourceFileRef` attributes already
+    /// (the direct mzML export, in `crate::mzml_unstated::SourceText`'s one pass over the text):
+    /// the header is read, the spectra are not.
+    pub fn check_with_spectrum_files(path: &Path, target: &mut impl MSDataFileMetadata, spectrum_files: HashMap<String, String>) -> Self {
         let header = Header::read(path)
             .inspect_err(|e| log::warn!("{}: header lists not read back, references are checked as mzdata read them: {e:#}", path.display()))
             .ok();
         let mut this = Self::check_metadata(target, header.as_ref());
         this.source = Some(path.to_path_buf());
-        this.spectrum_files = spectrum_source_files(path).unwrap_or_else(|e| {
-            log::warn!("{}: the spectra's sourceFileRef attributes were not read: {e:#}", path.display());
-            HashMap::new()
-        });
+        this.spectrum_files = spectrum_files;
         if !this.spectrum_files.is_empty() {
             log::info!("{} spectra name a source file (sourceFileRef); kept as the spectrum parameter {SOURCE_FILE_REF:?}", this.spectrum_files.len());
         }

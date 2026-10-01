@@ -69,6 +69,50 @@ fn dtype_width_rank(dt: &DataType) -> u8 {
     }
 }
 
+/// DELIBERATE DEVIATION (not upstream): the field that survives when `new` collides with
+/// `existing` on one logical array at equal priority. Upstream keeps the wider dtype, which ties
+/// int32 with float32 and int64 with float64 and ranks a chunked `LargeList` at nothing, so the
+/// first sampled spectrum's type survived and every later value of another type was cast into it:
+/// 40,000 of 80,000 floats of a file whose intensity arrays switch from 32-bit integers to 64-bit
+/// floats were stored as the int32 maximum. The survivor's value type (the list item of a chunked
+/// field, the column of a point field) holds both sampled types: both integer widths → int64, both
+/// float widths → float64, an integer type beside a float type → float64. Where neither field has
+/// that type, one is rebuilt from `new`'s [`BufferName`] with it (`intensity_f64_dc` for an
+/// `intensity_i32_dc` beside an `intensity_f32_dc`). Other shapes keep the width rule.
+fn holding_field(context: BufferContext, existing: &FieldRef, new: &FieldRef) -> FieldRef {
+    fn value_type(field: &FieldRef) -> (&DataType, Option<&FieldRef>) {
+        match field.data_type() {
+            DataType::LargeList(item) => (item.data_type(), Some(item)),
+            other => (other, None),
+        }
+    }
+    let is_int = |t: &DataType| matches!(t, DataType::Int32 | DataType::Int64);
+    let is_float = |t: &DataType| matches!(t, DataType::Float32 | DataType::Float64);
+    let ((have, _), (seen, item)) = (value_type(existing), value_type(new));
+    if !((is_int(have) || is_float(have)) && (is_int(seen) || is_float(seen))) {
+        return if dtype_width_rank(new.data_type()) > dtype_width_rank(existing.data_type()) { new.clone() } else { existing.clone() };
+    }
+    let (merged, dtype) = if is_int(have) && is_int(seen) {
+        (DataType::Int64, mzdata::spectrum::BinaryDataArrayType::Int64)
+    } else {
+        (DataType::Float64, mzdata::spectrum::BinaryDataArrayType::Float64)
+    };
+    if *have == merged {
+        return existing.clone();
+    }
+    if *seen == merged {
+        return new.clone();
+    }
+    let Some(mut name) = BufferName::from_field(context, new.clone()) else { return new.clone() };
+    name.dtype = dtype;
+    let data_type = match item {
+        Some(item) => DataType::LargeList(Arc::new(item.as_ref().clone().with_data_type(merged))),
+        None => merged,
+    };
+    log::debug!("{} and {} sampled for one array: the column is {data_type}", existing.name(), new.name());
+    Arc::new(Field::new(name.to_string(), data_type, new.is_nullable()).with_metadata(name.as_field_metadata()))
+}
+
 pub trait ArrayBufferWriter {
     /// Whether the buffer describes a spectrum or chromatogram
     fn buffer_context(&self) -> BufferContext;
@@ -451,7 +495,7 @@ impl PointBuffers {
                 let arr = if arr.data_type() == &dt {
                     arr
                 } else {
-                    arrow::compute::cast(&arr, &dt).unwrap_or(arr)
+                    crate::peak_series::cast_saturating(&arr, &dt).unwrap_or(arr)
                 };
                 log::debug!("Routing variant field {label} to canonical column {key}");
                 (key, arr)
@@ -1363,23 +1407,23 @@ impl ArrayBuffersBuilder {
     ///
     /// #1 (one column per logical array): a facet MUST hold at most one column per logical array,
     /// keyed by `(array_accession, buffer_format)`. On a collision, keep the higher-priority column
-    /// (primary > secondary > unmarked); on a tie, keep the wider dtype so any write-time coercion
-    /// widens (lossless) rather than narrows. This deletes alternate-precision twins (e.g. a sampled
-    /// `intensity_f64` beside the f32 `intensity`, both `array_name="intensity array"`,
-    /// `buffer_format=point`) that would otherwise reuse one `array_name` and blank readers keyed on
-    /// it — while leaving a chunked array's distinct-format component columns (chunk_start/end/values/
-    /// transform) untouched. Fields with no `array_accession` (structural columns like the index)
-    /// fall back to name-based dedup.
+    /// (primary > secondary > unmarked); on a tie, keep a dtype that holds both ([`holding_field`])
+    /// so any write-time coercion widens (lossless) rather than narrows. This deletes
+    /// alternate-precision twins (e.g. a sampled `intensity_f64` beside the f32 `intensity`, both
+    /// `array_name="intensity array"`, `buffer_format=point`) that would otherwise reuse one
+    /// `array_name` and blank readers keyed on it — while leaving a chunked array's distinct-format
+    /// component columns (chunk_start/end/values/transform) untouched. Fields with no
+    /// `array_accession` (structural columns like the index) fall back to name-based dedup.
     pub fn add_field(mut self, field: FieldRef) -> Self {
         if let Some(key) = logical_array_key(&field) {
             if let Some(pos) =
                 self.array_fields.iter().position(|f| logical_array_key(f) == Some(key))
             {
                 let existing = &self.array_fields[pos];
-                let stronger = (field_priority_rank(&field), dtype_width_rank(field.data_type()))
-                    > (field_priority_rank(existing), dtype_width_rank(existing.data_type()));
-                if stronger {
-                    self.array_fields[pos] = field;
+                match field_priority_rank(&field).cmp(&field_priority_rank(existing)) {
+                    Ordering::Greater => self.array_fields[pos] = field,
+                    Ordering::Equal => self.array_fields[pos] = holding_field(self.buffer_context, existing, &field),
+                    Ordering::Less => {}
                 }
                 self.apply_overrides();
                 return self;

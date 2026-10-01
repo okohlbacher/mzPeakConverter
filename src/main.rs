@@ -79,6 +79,8 @@ mod fidelity;
 mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
+mod mzml_contact;
+mod mis_registration;
 mod mzml_header;
 mod mzml_index;
 mod mzml_isolation;
@@ -247,6 +249,23 @@ fn lossless() -> bool {
     *LOSSLESS.get().unwrap_or(&false)
 }
 
+/// `--force`, published like [`LOSSLESS`]: beyond overwriting an existing output it lets a
+/// conversion go on where the lane would otherwise refuse the input as possibly the wrong data (an
+/// imzML whose `.ibd` begins with another UUID, owner decision D7).
+static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn force() -> bool {
+    *FORCE.get().unwrap_or(&false)
+}
+
+/// `--keep-contact` (config `keep_contact`), published like [`LOSSLESS`]: carry an mzML or imzML
+/// header's `<contact>` into the archive and the exports ([`mzml_contact`]). Default off: dropped.
+static KEEP_CONTACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn keep_contact() -> bool {
+    *KEEP_CONTACT.get().unwrap_or(&false)
+}
+
 /// CLI spelling of the signal representation to read. Mirrors `shimadzu::Representation`, and is
 /// also what the Bruker BAF lane consumes directly (that module builds on Linux too, where the
 /// `cfg(windows)` shimadzu enum does not exist).
@@ -315,13 +334,16 @@ struct Cli {
     #[arg(long, value_enum)]
     to: Option<OutputFormat>,
 
-    /// Delta m/z chunking instead of the default lossy numpress-linear. Each m/z is stored as its
-    /// difference from the one before, which gives the value back exactly when m/z are 32-bit
-    /// values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor. A 64-bit
-    /// m/z more than twice its predecessor in the same chunk, which happens at any mass in sparse
-    /// centroid spectra, can come back one unit in the last place off (1e-15 Da near m/z 10,
-    /// 5e-13 Da near m/z 4000), as can the values after it in that chunk; and profile zero runs
-    /// are still masked. For an archive that is bit-exact, use `--lossless`.
+    /// Delta m/z chunking whatever a sample of the run says. By default the converter samples the
+    /// run: delta when every sampled m/z is a 32-bit value (exact and smaller there), else the
+    /// smaller of delta and the lossy numpress-linear on the sample (exact on a tie; the
+    /// `encoding_prescan` index block states the choice). Delta stores each m/z as its difference
+    /// from the one before, which gives the value back exactly when m/z are 32-bit values (most
+    /// imzML) and wherever a 64-bit m/z is at most twice its predecessor. A 64-bit m/z more than
+    /// twice its predecessor in the same chunk, which happens at any mass in sparse centroid
+    /// spectra, can come back one unit in the last place off (1e-15 Da near m/z 10, 5e-13 Da near
+    /// m/z 4000), as can the values after it in that chunk; and profile zero runs are still
+    /// masked. For an archive that is bit-exact, use `--lossless`.
     #[arg(long)]
     no_numpress: bool,
 
@@ -331,9 +353,19 @@ struct Cli {
     /// flag no profile point is dropped and `zero-run-mask` is not declared; continuous-mode
     /// imaging data, whose pixels share one m/z axis, decodes to one shared axis only this way.
     /// `MZPC_KEEP_ZERO_RUNS=1` does the same from the environment. Refused on `--agilent-grid`,
-    /// whose reader leaves the zero samples out itself.
+    /// whose reader leaves the zero samples out itself. A continuous-mode imzML (`IMS:1000030`)
+    /// keeps its zero runs without this flag, so its pixels decode to the one m/z axis the file
+    /// stores; the flag remains the override for processed-mode input.
     #[arg(long)]
     keep_zero_runs: bool,
+
+    /// Carry the `<contact>` of an mzML or imzML header (contact name, affiliation, address, URL,
+    /// e-mail: `MS:1000586`–`MS:1000590`) into the archive's `file_description.contacts` and into
+    /// the mzML export. By default it is dropped, with a note when the header states one: an
+    /// archive is copied and published, and a name, an e-mail and a street address would travel
+    /// with every copy. The export of an archive writes whatever its index holds, flag or not.
+    #[arg(long)]
+    keep_contact: bool,
 
     /// A bit-exact archive, or no archive: every point of the input stored in the input's order,
     /// each m/z and intensity with exactly the value the input holds. Selects the point layout
@@ -374,9 +406,24 @@ struct Cli {
     #[arg(long)]
     zstd_level: Option<i32>,
 
-    /// Overwrite the output if it already exists.
+    /// Overwrite the output if it already exists; also converts an imzML whose .ibd begins with
+    /// another UUID than the header states (refused otherwise: the two files may not be a pair);
+    /// with `--pixel-size`, also writes the supplied size over one the source states.
     #[arg(short, long)]
     force: bool,
+
+    /// Imaging runs only: the pixel size in micrometres, `X` for square pixels or `X,Y`, written
+    /// into the grid (`IMS:1000046/47`, with the max dimension from the pixel counts) when the
+    /// source settles none — an imzML or mzML whose header states no size or one the pixel-size
+    /// rule drops, a Bruker MALDI `.d` without a FlexImaging `.mis` raster step or a beam scan
+    /// size, a Waters single row's missing axis, or an existing `.mzpeak` archive (the rewrite lane:
+    /// the archive gains the size). A size the source does state is kept when it agrees and is an
+    /// ERROR naming both values when it differs; with `--force` the supplied size is written over
+    /// it. Declared `imaging:pixel-size-user-supplied`, recorded in `imaging_pixel_size` and as
+    /// `metadata.imaging.pixel_size_source: user_supplied`. Refused on an mzML output and on a run
+    /// that is not imaging. Config key `pixel_size`.
+    #[arg(long, value_name = "X[,Y]")]
+    pixel_size: Option<String>,
 
     /// Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and
     /// write standard f64 m/z instead.
@@ -641,7 +688,9 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// the bytes as they are stored — after every rewrite above it — [`mzml_index::IndexFixes`] points
 /// each offset of the index at its element, leaves out an index without an offset and writes the
 /// checksum of what the file holds.
-fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>, run: &mzml_header::RunCell) -> Result<Box<dyn Write>> {
+/// `contacts` are the `<contact>` elements the header gets ([`mzml_contact::Contact::xml`]; none
+/// unless `--keep-contact` found some, or an archive's index holds them).
+fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>, run: &mzml_header::RunCell, contacts: Vec<String>) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let sink: Box<dyn Write> = if has_gz_suffix(output) {
         log::info!("output name ends in .gz: gzip-compressing the mzML as it is written");
@@ -649,9 +698,95 @@ fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>, run: &mzml_header::RunC
     } else {
         Box::new(file)
     };
-    let sink = mzml_header::HeaderFixes::with_run(mzml_index::IndexFixes::new(sink), cv, run.clone());
+    let sink = mzml_header::HeaderFixes::with_run(mzml_index::IndexFixes::new(sink), cv, run.clone(), contacts);
     let sink = mzml_unstated::UnstatedTerms::new(mzml_wavelength::WavelengthSpectra::new(sink));
     Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(sink)))
+}
+
+/// The `<contact>` elements of an mzML or imzML header ([`mzml_contact`]) for the lanes that can
+/// carry them: read and handed over under `--keep-contact`; otherwise none, with one note when the
+/// header states some (the default drops them, owner decision D11). `scan_lane`: the input is an
+/// mzML or imzML — nothing else has a header to read.
+fn header_contacts(input: &Path, read_path: &Path, scan_lane: bool) -> Vec<mzml_contact::Contact> {
+    if !scan_lane {
+        if keep_contact() {
+            log::info!("--keep-contact: {} is not an mzML or imzML, and no other input states a contact", input.display());
+        }
+        return Vec::new();
+    }
+    let contacts = match mzml_contact::read(read_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("{}: the header's <contact> was not read ({e:#}); none carried", input.display());
+            return Vec::new();
+        }
+    };
+    if contacts.is_empty() {
+        return contacts;
+    }
+    let names: Vec<String> = contacts.iter().map(mzml_contact::Contact::summary).collect();
+    if keep_contact() {
+        log::info!("--keep-contact: {} contact(s) of the header carried ({})", contacts.len(), names.join(", "));
+        contacts
+    } else {
+        log::info!(
+            "the header's <contact> ({}) is not carried: a name, an e-mail or an address would travel with every copy of the \
+             output; --keep-contact carries it",
+            names.join(", ")
+        );
+        Vec::new()
+    }
+}
+
+/// The refusal of an imzML whose `.ibd` begins with another UUID than its header states
+/// (`IMS:1000080`): the two files are not the pair the imzML describes, and the signal could be
+/// another run's — the one case the imaging checks refuse rather than declare (owner decision D7).
+/// `--force` converts anyway, warned and recorded. An `.ibd` shorter than a UUID (empty, truncated)
+/// begins with none: the message says so, with the file's length ([`imaging::found_uuid_text`]).
+fn ibd_uuid_mismatch_error(ibd: &Path, stated: &str, found: &str) -> anyhow::Error {
+    anyhow!(
+        "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the imzML describes, and \
+         the signal could be another run's. Not converted. Pass --force to convert anyway: the mismatch is then warned \
+         about, the stated UUID kept, and (in an archive) declared as {} with the UUID found in metadata.imaging.provenance",
+        ibd.display(),
+        imaging::found_uuid_text(found),
+        imaging::IBD_UUID_MISMATCH
+    )
+}
+
+/// The index key of the writer's `file_description` block, which [`finish_archive`] completes with
+/// a lane's additions under the same key ([`contacts_block`]).
+const FILE_DESCRIPTION_BLOCK: &str = mzpeak_prototyping::constants::FILE_DESCRIPTION_KEY;
+
+/// The lane's addition to `file_description`: the header's contacts, as the spec's `contacts`
+/// array ([`mzml_contact::Contact::index_json`]); nothing when there are none.
+fn contacts_block(contacts: &[mzml_contact::Contact]) -> Option<(String, serde_json::Value)> {
+    (!contacts.is_empty())
+        .then(|| (FILE_DESCRIPTION_BLOCK.to_string(), serde_json::json!({"contacts": contacts.iter().map(mzml_contact::Contact::index_json).collect::<Vec<_>>()})))
+}
+
+/// The signal a spectrum hands the writer, for the imaging marker: its m/z array against the run's
+/// one axis (`shared`, a continuous-mode imzML) and the range the writer stores (`range`; `masked`:
+/// the zero-run mask is on, which applies to a profile spectrum). The writer takes a centroid
+/// spectrum's peak set, which mzdata built from the same arrays, so the arrays are the values
+/// either way; a spectrum without arrays gives the peak set's m/z, and without either an empty one.
+fn observe_stored_signal(entry: &MultiLayerSpectrum, shared: Option<&mut imaging::SharedAxis>, range: &mut imaging::StoredRange, masked: bool) {
+    let profile = entry.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile;
+    if let Some(arrays) = entry.arrays.as_ref() {
+        let mzs = arrays.mzs().ok();
+        let mzs: &[f64] = mzs.as_deref().unwrap_or(&[]);
+        if let Some(s) = shared {
+            s.observe(mzs);
+        }
+        let intensities = arrays.get(&ArrayType::IntensityArray).and_then(|a| a.to_f64().ok());
+        range.observe(mzs, intensities.as_deref(), masked && profile);
+    } else {
+        let mzs: Vec<f64> = entry.peaks.as_ref().map(|p| p.iter().map(|peak| peak.mz).collect()).unwrap_or_default();
+        if let Some(s) = shared {
+            s.observe(&mzs);
+        }
+        range.observe(&mzs, None, false);
+    }
 }
 
 /// When to apply the statistically-DETECTED TOF-grid m/z encoding (strategy A). This
@@ -683,6 +818,7 @@ struct FileConfig {
     layout: Option<Layout>,
     no_numpress: Option<bool>,
     keep_zero_runs: Option<bool>,
+    keep_contact: Option<bool>,
     lossless: Option<bool>,
     no_mz_lattice: Option<bool>,
     chunk_size: Option<f64>,
@@ -712,6 +848,27 @@ struct FileConfig {
     quiet: Option<bool>,
     // Missing from 0.11.3, when `--sample` arrived, until this key: rejected as an unknown field.
     sample: Option<u32>,
+    pixel_size: Option<PixelSizeConfig>,
+}
+
+/// `pixel_size:` in the config file: `10`, `"10,20"` or `[10, 20]`, in micrometres — parsed as the
+/// command line's `X[,Y]` is.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum PixelSizeConfig {
+    Number(f64),
+    Text(String),
+    Pair([f64; 2]),
+}
+
+impl PixelSizeConfig {
+    fn text(&self) -> String {
+        match self {
+            PixelSizeConfig::Number(n) => n.to_string(),
+            PixelSizeConfig::Text(t) => t.clone(),
+            PixelSizeConfig::Pair([x, y]) => format!("{x},{y}"),
+        }
+    }
 }
 
 /// Effective settings after merging CLI over config-file over defaults.
@@ -722,6 +879,8 @@ struct Settings {
     no_numpress: bool,
     /// `--keep-zero-runs` (or `--lossless`): the writer's zero-run mask off.
     keep_zero_runs: bool,
+    /// `--keep-contact`: an mzML/imzML header's `<contact>` carried ([`KEEP_CONTACT`]).
+    keep_contact: bool,
     /// `--lossless`: a bit-exact archive or a failed conversion. Already folded into `layout`,
     /// `no_numpress`, `keep_zero_runs`, `no_mz_lattice` and `tof_grid` by `resolve`.
     lossless: bool,
@@ -758,6 +917,9 @@ struct Settings {
     quiet: bool,
     /// `--sample`: which sample of a multi-sample SciEX `.wiff` (1-based), published as `SCIEX_SAMPLE`.
     sample: Option<u32>,
+    /// `--pixel-size X[,Y]` (config `pixel_size`), with `--force` folded in: an imaging grid the
+    /// source leaves unsized gets this size (`imaging::apply_user_pixel_size`).
+    pixel_size: Option<imaging::UserPixelSize>,
     /// The options the user supplied ON THE COMMAND LINE (a config-file value is a standing default
     /// and is never counted here — see `resolve`), by
     /// their command-line spelling. [`refuse_unsupported_flags`] checks these, and only these,
@@ -800,6 +962,7 @@ impl Settings {
         note(cli.layout.is_some(), "--layout");
         note(cli.no_numpress, "--no-numpress");
         note(cli.keep_zero_runs, "--keep-zero-runs");
+        note(cli.keep_contact, "--keep-contact");
         note(cli.lossless, "--lossless");
         note(cli.no_mz_lattice, "--no-mz-lattice");
         note(cli.chunk_size.is_some(), "--chunk-size");
@@ -827,6 +990,16 @@ impl Settings {
         }
         note(cli.via_msconvert, "--via-msconvert");
         note(cli.msconvert_path.is_some(), "--msconvert-path");
+        note(cli.pixel_size.is_some(), "--pixel-size");
+        let force = cli.force || fc.force.unwrap_or(false);
+        // Parsed here, so a malformed size is refused before any lane opens the input. Only the
+        // command line's --force writes the supplied size over one the source states: a config
+        // file's standing `force: true` overwrites outputs, and acknowledges no contradiction of
+        // this run (owner principle P3).
+        let pixel_size = match cli.pixel_size.clone().or_else(|| fc.pixel_size.as_ref().map(PixelSizeConfig::text)) {
+            Some(text) => Some(imaging::UserPixelSize::parse(&text, cli.force)?),
+            None => None,
+        };
         // `--lossless` is an umbrella: it IS the point layout with zero runs kept and no m/z grid
         // of any kind. A setting that asks for the opposite, on the command line or in the config
         // file, is a contradiction to refuse, not a preference to override in silence.
@@ -859,6 +1032,7 @@ impl Settings {
             layout: if lossless { Layout::Point } else { layout.unwrap_or(Layout::Chunked) },
             no_numpress: lossless || cli.no_numpress || fc.no_numpress.unwrap_or(false),
             keep_zero_runs: lossless || cli.keep_zero_runs || fc.keep_zero_runs.unwrap_or(false),
+            keep_contact: cli.keep_contact || fc.keep_contact.unwrap_or(false),
             lossless,
             no_mz_lattice: lossless || cli.no_mz_lattice || fc.no_mz_lattice.unwrap_or(false),
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
@@ -867,7 +1041,7 @@ impl Settings {
             // measured gain over level 5 (1.4% on 2485.d) is worth the encode time on a corpus that
             // is distributed. `--zstd-level` still overrides it for every lane.
             ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(22),
-            force: cli.force || fc.force.unwrap_or(false),
+            force,
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
             // Chunked is the default since 0.12.1. `--no-ims-chunked` (or `no_ims_chunked: true`,
             // or the older `ims_chunked: false`) goes to one chunk per frame.
@@ -896,6 +1070,7 @@ impl Settings {
             verbose: if cli.verbose > 0 { cli.verbose } else { fc.verbose.unwrap_or(0) },
             quiet: cli.quiet || fc.quiet.unwrap_or(false),
             sample: cli.sample.or(fc.sample),
+            pixel_size,
             given,
         })
     }
@@ -1234,6 +1409,8 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     let _ = NO_MZ_LATTICE.set(cfg.no_mz_lattice);
     let _ = KEEP_ZERO_RUNS.set(cfg.keep_zero_runs);
     let _ = LOSSLESS.set(cfg.lossless);
+    let _ = FORCE.set(cfg.force);
+    let _ = KEEP_CONTACT.set(cfg.keep_contact);
     let verbose = cfg.verbose > 0;
 
     // Inspection report: always when there is no output (the whole job is "inspect"), and also as a
@@ -1310,6 +1487,9 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         );
     }
 
+    // `--pixel-size`, for every lane that writes an imaging grid (`imaging::user_pixel_size`).
+    imaging::set_user_pixel_size(cfg.pixel_size);
+
     // mzPeak input → filter path. A `.mzpeak` (or any ZIP with mzpeak_index.json) cannot be read by
     // mzdata; instead of the convert lanes below, route to the mzPeak→mzPeak filter (RT / MS-level /
     // aux drop+inject). This supersedes the old "mzdata can't read it" error.
@@ -1334,6 +1514,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
             drop_aux,
             images: cfg.image.clone(),
             sdrf: cfg.sdrf.clone(),
+            pixel_size: cfg.pixel_size,
         };
         // mzML output: read the `.mzpeak` with the sync reader (which decodes every buffer transform,
         // incl. the timsTOF tof→m/z) and write the RT / MS-level survivors to a real mzML — the "slice
@@ -1430,9 +1611,12 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
 
     let vendor = if cfg.no_vendor {
         None
-    } else if use_ims_compact {
+    } else if use_ims_compact || (is_tsf_dir(&cli.input) && !use_bruker_sdk) {
         // The lossless ims-compact facet already encodes the exact signal, so drop the redundant raw
-        // `*_bin` bulk binary by default (was ~39% of the TDF archive, a verbatim copy).
+        // `*_bin` bulk binary by default (was ~39% of the TDF archive, a verbatim copy). The native
+        // TSF lane stores every frame's m/z exactly since 0.17.0 (owner decision D9), so its
+        // `analysis.tsf_bin` — 96 % of a TSF archive — is redundant there too; `--aux
+        // 'analysis.tsf_bin=embed'` keeps it, and the drop is recorded in `vendor_files`.
         Some(vendor::VendorPolicy::load_lossless(None, &cfg.aux)?)
     } else {
         Some(vendor::VendorPolicy::load(None, &cfg.aux)?)
@@ -1619,14 +1803,15 @@ impl Lane {
             ),
             Lane::SdkImsCompact => (
                 "the --bruker-sdk ims-compact lane",
-                "drop --bruker-sdk (the native timsTOF lane honours --ims-chunked and \
-                 --no-tims-recalibration), and add them with a second run on the archive: \
+                "drop --bruker-sdk (the native timsTOF lane honours --ims-chunked, \
+                 --no-tims-recalibration and --pixel-size), and add them with a second run on the archive: \
                  `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (--image only when \
                  the archive is imaging, a MALDI run)",
             ),
             Lane::BrukerSdk => (
                 "the --bruker-sdk f64 lane",
-                "drop --bruker-sdk, or drop the options; --image/--sdrf can be added with a second \
+                "drop --bruker-sdk (the native lanes honour them), or drop the options; --image/--sdrf, \
+                 and --pixel-size on an imaging archive, can be added with a second \
                  run on the archive: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` \
                  (--image only when the archive is imaging, a MALDI run)",
             ),
@@ -1657,19 +1842,23 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
     match lane {
         // Re-packs Parquet members verbatim: nothing the convert flags name is lost, only unused.
         Lane::Filter => &[],
-        // mzML cannot carry an embedded image/SDRF/aux member at all.
-        Lane::FilterToMzml => &["--image", "--sdrf", "--aux"],
+        // mzML cannot carry an embedded image/SDRF/aux member at all; `--pixel-size` writes an
+        // archive's grid and its declaration, which an mzML has no transformations list for.
+        Lane::FilterToMzml => &["--image", "--sdrf", "--aux", "--pixel-size"],
         // The mzML dispatch runs before SDK selection, so `--bruker-sdk` picks a backend the export
         // never consults — that is a choice silently overridden, not an inert flag.
-        Lane::MzmlExport => &["--image", "--sdrf", "--aux", "--bruker-sdk"],
+        Lane::MzmlExport => &["--image", "--sdrf", "--aux", "--bruker-sdk", "--pixel-size"],
         // `--keep-zero-runs`: the file-direct reader leaves the zero samples out of its point lists
-        // itself (`agilent:drop-zero-samples`), so the archive would come out without them.
-        Lane::AgilentGrid => &["--image", "--sdrf", "--via-msconvert", "--keep-zero-runs"],
+        // itself (`agilent:drop-zero-samples`), so the archive would come out without them. An
+        // Agilent profile `.d` is no imaging run: `--pixel-size` has no grid there.
+        Lane::AgilentGrid => &["--image", "--sdrf", "--via-msconvert", "--keep-zero-runs", "--pixel-size"],
         // Lane selection puts msconvert before every native backend, so these four would be
         // silently overridden — the user chose a reader and gets a different one.
         Lane::ViaMsconvert => &["--aux", "--bruker-sdk", "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
-        Lane::SdkImsCompact => &["--image", "--sdrf", "--no-tims-recalibration"],
-        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
+        // The SDK lanes mark no MALDI run imaging and write no pixel grid: `--pixel-size` would size
+        // nothing (the native lanes write the grid, and the archive can be sized afterwards).
+        Lane::SdkImsCompact => &["--image", "--sdrf", "--no-tims-recalibration", "--pixel-size"],
+        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration", "--pixel-size"],
         Lane::ImsCompact => &["--image", "--sdrf"],
         Lane::VendorReader => &["--image", "--sdrf"],
         Lane::Standard => &[],
@@ -1682,14 +1871,16 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
 fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
     const CODEC: &[&str] = &["--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level"];
     match lane {
+        // `--keep-contact`: an archive carries the contacts its index holds, or none; the flag
+        // decided that when the archive was written.
         Lane::Filter => &[
-            "--layout", "--no-numpress", "--keep-zero-runs", "--no-mz-lattice", "--chunk-size", "--zstd-level",
+            "--layout", "--no-numpress", "--keep-zero-runs", "--keep-contact", "--no-mz-lattice", "--chunk-size", "--zstd-level",
             "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--aux", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
         ],
         Lane::FilterToMzml => &[
-            "--layout", "--no-numpress", "--keep-zero-runs", "--no-mz-lattice", "--chunk-size", "--zstd-level",
+            "--layout", "--no-numpress", "--keep-zero-runs", "--keep-contact", "--no-mz-lattice", "--chunk-size", "--zstd-level",
             "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
@@ -2087,7 +2278,8 @@ fn is_agilent_ims_d(input: &Path) -> bool {
 /// Refine a requested chunking strategy against real m/z values: numpress-linear's floating-point
 /// prediction fights a fixed-point lattice, so swap it for delta when the data is on one (exact
 /// wherever a value is at most twice its predecessor, see `Cli::no_numpress`). An explicitly
-/// requested delta (`--no-numpress`) is left alone.
+/// requested delta (`--no-numpress`) is left alone. What is still numpress-linear afterwards goes
+/// to the default rule, [`choose_mz_encoding`], which decides from a larger sample.
 ///
 /// The detector itself moved to [`mz_lattice::fixed_point_lattice_scale`] (formerly the local
 /// `is_fixed_point_lattice`, returning a bool) because the lattice ROUTE needs the matched scale,
@@ -2554,24 +2746,65 @@ fn convert_to_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
+    // An mzML or imzML source: everything this lane reads from the source's own text beside what
+    // mzdata hands over, in ONE streamed pass over its bytes ([`mzml_unstated::SourceText`]) —
+    // which spectra and chromatograms state a zero of the four terms mzdata's model holds as plain
+    // numbers (`stated`, below), each spectrum's `sourceFileRef` (`source_refs`, below) and whether
+    // an imaging term is mentioned (`ims`). Through 0.17.0-rc.2 these were three passes over the
+    // text, 0.04–0.21 s of every export of a 40–180 MB mzML (the audit of 2026-10-01).
+    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    let mut text = scan_lane.then(|| mzml_unstated::SourceText::read(&read_path, ["IMS:1"])).transpose().unwrap_or_else(|e| {
+        log::warn!(
+            "{}: its text was not read ({e}): the IMS vocabulary is not declared, no spectrum's sourceFileRef is kept, and \
+             every `scan start time`, `ion injection time`, `peak intensity` and `collision energy` of 0 is written, stated \
+             by the source or not",
+            input.display()
+        );
+        None
+    });
     // Imaging terms need their vocabulary in the cvList, which mzdata's writer fills with MS and UO
     // alone: an imzML always states some; an mzML is searched for one (pixel positions on its
-    // scans, a grid in its scan settings — one streamed byte search, as the archive lane makes for
-    // the positions). Through 0.16.0 every `cvRef="IMS"` of an export named a vocabulary the
-    // document did not declare.
+    // scans, a grid in its scan settings). Through 0.16.0 every `cvRef="IMS"` of an export named a
+    // vocabulary the document did not declare.
     let ims = match &reader {
         MZReaderType::IMzML(_) => true,
-        MZReaderType::MzML(_) => imaging::file_mentions(&read_path, ["IMS:1"]).map_or_else(
-            |e| {
-                log::warn!("{}: not searched for imaging terms ({e}); the IMS vocabulary is not declared", input.display());
-                false
-            },
-            |[found]| found,
-        ),
+        MZReaderType::MzML(_) => text.as_ref().is_some_and(|t| t.mentions[0]),
         _ => false,
     };
+    // imzML: the header's file content (storage mode, UUID, checksum), read once for the UUID check
+    // here and the provenance params below. An `.ibd` that begins with another UUID than the
+    // header states is not this imzML's: refused before the output exists unless `--force`, as the
+    // archive lane refuses it (owner decision D7); forced, the warning is the declaration — mzML
+    // has no transformations list.
+    let imzml_content: Option<Vec<imaging::RawParam>> = matches!(reader, MZReaderType::IMzML(_)).then(|| {
+        imaging::read_file_content(&read_path).unwrap_or_else(|e| {
+            log::warn!("imzML file provenance not read: {e:#}");
+            Vec::new()
+        })
+    });
+    if let Some(content) = &imzml_content {
+        if let Some(ibd) = imaging::ibd_beside(input).or_else(|| imaging::ibd_beside(&read_path)) {
+            match imaging::ibd_uuid(&ibd) {
+                Ok(found) => {
+                    if let Some((stated, found)) = imaging::uuid_mismatch(content, &found) {
+                        if !force() {
+                            return Err(ibd_uuid_mismatch_error(&ibd, stated, found));
+                        }
+                        log::warn!(
+                            "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the imzML \
+                             describes; exported under --force, the stated value kept (mzML has no transformations list to declare it in)",
+                            ibd.display(),
+                            imaging::found_uuid_text(found)
+                        );
+                    }
+                }
+                Err(e) => log::warn!("the .ibd UUID was not checked: {e:#}"),
+            }
+        }
+    }
+    let contacts: Vec<String> = header_contacts(input, &read_path, scan_lane).iter().map(mzml_contact::Contact::xml).collect();
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims), &run)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims), &run, contacts)?);
     w.copy_metadata_from(&reader);
     // The source's scan settings (an imaging run's grid and pixel size, an inclusion list): the
     // writer holds the list, but its metadata trait does not reach it, so `copy_metadata_from`
@@ -2581,14 +2814,14 @@ fn convert_to_mzml(
     // its own lists ([`mzml_refs`]) — the entries mzdata skips for being self-closing put back, a
     // reference that names nothing dropped, one warning — and with it what else that lane reads
     // back from the header: the source files' checksums as the text stated (mzdata reads a digest
-    // of digits as a number) and each spectrum's `sourceFileRef`. The ids are decoded for it as that
-    // lane decodes them and written escaped again ([`encode_xml_ids`]). Through 0.17.0-rc.1 this lane
-    // copied each reference as mzdata read it: a scan naming a configuration the source does not
-    // state was written naming one the export did not declare either.
-    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    // of digits as a number) and each spectrum's `sourceFileRef` (read above). The ids are decoded
+    // for it as that lane decodes them and written escaped again ([`encode_xml_ids`]). Through
+    // 0.17.0-rc.1 this lane copied each reference as mzdata read it: a scan naming a configuration
+    // the source does not state was written naming one the export did not declare either.
     let mut source_refs = scan_lane.then(|| {
         decode_pwiz_ids(&mut w);
-        let mut refs = mzml_refs::DanglingRefs::check(&read_path, &mut w);
+        let spectrum_files = text.as_mut().map(|t| std::mem::take(&mut t.spectrum_files)).unwrap_or_default();
+        let mut refs = mzml_refs::DanglingRefs::check_with_spectrum_files(&read_path, &mut w, spectrum_files);
         refs.number_scans_ahead(&mut w);
         refs
     });
@@ -2598,11 +2831,8 @@ fn convert_to_mzml(
     // imzML: the file provenance mzdata consumes (storage mode, UUID, `.ibd` checksum), put back
     // as the archive lane does, and that lane's rules for the scan settings, so the direct export
     // and the export of the archive state the same.
-    if let MZReaderType::IMzML(_) = &reader {
-        match imaging::read_file_content(&read_path) {
-            Ok(content) => w.file_description_mut().contents.extend(imaging::provenance_params(&content)),
-            Err(e) => log::warn!("imzML file provenance not read: {e:#}"),
-        }
+    if let Some(content) = &imzml_content {
+        w.file_description_mut().contents.extend(imaging::provenance_params(content));
         imzml_scan_settings_for_mzml(input, &read_path, &mut w.scan_settings);
     }
     prepare_mzml_header(&mut w, input, wall_clock, &run);
@@ -2623,18 +2853,12 @@ fn convert_to_mzml(
     // The zeros the source states in its own text, which stay; every other 0 of those terms is
     // mzdata's default for "not stated" and is not written ([`mzml_unstated`]). Only an mzML or
     // imzML can state one, or leave a scan without a time: a vendor reader gives every scan its
-    // time and has no way to say "measured, and 0" of the others.
-    let stated = if scan_lane {
-        mzml_unstated::StatedZeros::read(&read_path).unwrap_or_else(|e| {
-            log::warn!(
-                "{}: not searched for the zeros it states ({e}); every `scan start time`, `ion injection time`, \
-                 `peak intensity` and `collision energy` of 0 is written, stated by the source or not",
-                input.display()
-            );
-            mzml_unstated::StatedZeros::everything()
-        })
-    } else {
-        Default::default()
+    // time and has no way to say "measured, and 0" of the others. A source whose text could not be
+    // read (warned about above) keeps every 0.
+    let stated = match (scan_lane, text.take()) {
+        (true, Some(text)) => text.zeros,
+        (true, None) => mzml_unstated::StatedZeros::everything(),
+        (false, _) => Default::default(),
     };
     if stated.count() > 0 {
         log::info!(
@@ -2645,6 +2869,10 @@ fn convert_to_mzml(
     }
     let stated_by = |id: &str| if scan_lane { stated.spectrum(id) } else { mzml_unstated::Zeros::TIME };
     let mut written = 0usize;
+    // imzML spectra typed MS1 at `ms level` 0, written at level 1 as the archive lane writes them
+    // (owner decision D6, `imaging::ms_level_zero_as_one`); mzML has no transformations list, so
+    // the warning after the loop is the declaration.
+    let mut ms_level_raised = 0usize;
     for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             if let Some(a) = tdf_points.as_mut() {
@@ -2655,6 +2883,9 @@ fn convert_to_mzml(
         }
         if let Some(a) = tdf_points.as_mut() {
             a.observe(spec.id(), points.observe_points(&spec));
+        }
+        if imzml_content.is_some() && imaging::ms_level_zero_as_one(spec.description_mut()) {
+            ms_level_raised += 1;
         }
         // mzdata's mzML writer panics on an array without a data type (`require_typed_arrays`).
         if scan_lane {
@@ -2704,6 +2935,13 @@ fn convert_to_mzml(
     }
     if let Some(g) = &thermo_windows {
         g.report();
+    }
+    if ms_level_raised > 0 {
+        log::warn!(
+            "{ms_level_raised} spectra typed MS1 spectrum (MS:1000579) state ms level 0; written with ms level 1 (mzML has \
+             no transformations list to declare {} in)",
+            imaging::MS_LEVEL_0_AS_1
+        );
     }
     configurations.report();
     // Same truncated-source cross-check the mzPeak lanes make; the `?` drops the writer and then
@@ -2762,9 +3000,9 @@ fn imzml_scan_settings_for_mzml(input: &Path, read_path: &Path, list: &mut [mzda
         for m in f.unit_mismatches.iter().chain(&f.written_units).chain(&f.extent_mismatches) {
             log::warn!("imzML scan settings {}: {m}", f.settings_id);
         }
-        if let Some(t) = f.transformation {
+        if !f.transformations.is_empty() {
             log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
-            applied.push(t);
+            applied.extend(f.transformations.iter().copied());
         }
     }
     if !applied.is_empty() {
@@ -2905,7 +3143,13 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         (marked || contents.iter().any(is_ims) || scan_settings.iter().any(|s| s.iter_params().any(is_ims))).then(mzml_header::Cv::ims)
     });
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims, &run)?);
+    // The contacts the archive holds (`file_description.contacts`, written under `--keep-contact`):
+    // the export states them as the archive does, flag or not.
+    let contacts: Vec<String> = mzml_contact::from_index(reader.file_index().metadata.get("file_description")).iter().map(mzml_contact::Contact::xml).collect();
+    if !contacts.is_empty() {
+        log::info!("{} contact(s) of the archive's file_description are written into the export's <fileDescription>", contacts.len());
+    }
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims, &run, contacts)?);
     w.copy_metadata_from(&archived);
     w.scan_settings = scan_settings;
     // The archive itself is a source of this file too: listed after the files it lists, with its
@@ -2942,13 +3186,26 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // and the reader's peak list has no room for it: through 0.16.0 every such spectrum was exported
     // with m/z and intensity only. Such a spectrum is exported from the facet's arrays instead.
     let peak_mobility = reader.metadata.peak_array_indices().is_some_and(|a| a.has_ion_mobility());
-    // So is a spectrum of a peak facet whose intensity column is 64-bit — a `--lossless` archive,
-    // which stores a centroid spectrum's own arrays, or one whose first spectra were profile: the
-    // peak list's intensity is a 32-bit float, and the export of an archive that holds 15.1 wrote
-    // 15.100000381, of a `--lossless` archive included, without a word.
+    // So is a spectrum of a peak facet whose intensity column is not a 32-bit float — 64-bit floats
+    // in a `--lossless` archive, which stores a centroid spectrum's own arrays, or one whose first
+    // spectra were profile; 32- or 64-bit integers in a `--lossless` archive of an integer source or
+    // a timsTOF archive: the peak list's intensity is a 32-bit float, and the export of an archive
+    // that holds 15.1 wrote 15.100000381, of one that holds the 32-bit integer 80,299,922 wrote
+    // 80,299,920 as a 32-bit float (every integer above 2^24 is at risk), without a word. The
+    // integers are written as 64-bit floats ([`widen_integer_intensities`]).
     let peak_wide = reader.metadata.peak_array_indices().is_some_and(|a| {
-        a.iter().any(|e| e.array_type == ArrayType::IntensityArray && e.data_type == DataType::Float64)
+        a.iter().any(|e| e.array_type == ArrayType::IntensityArray && matches!(e.data_type, DataType::Float64 | DataType::Int32 | DataType::Int64))
     });
+    // A spectrum without a peak gets arrays of length 0 in the types a spectrum of its kind with
+    // peaks is exported in: a profile spectrum's are its data facet's columns; a centroid spectrum's
+    // are its peak facet's where the export takes the facet's arrays (`peak_mobility`, `peak_wide`)
+    // and the reader's peak list's (64-bit m/z, 32-bit intensity) otherwise; through 0.17.0-rc.2
+    // every empty spectrum got a 64-bit m/z and a 32-bit float intensity array whatever its facet
+    // holds.
+    let empty_types = (
+        facet_array_types(Some(reader.metadata.spectrum_array_indices()), true),
+        facet_array_types(reader.metadata.peak_array_indices(), peak_mobility || peak_wide),
+    );
     // MS2 spectra that are whole frames (an ims-compact archive): precursors, but no window limits
     // of their own. Counted, and named once the export is done. Only such an archive is counted —
     // the ims-compact lanes are the one writer of the `ims_calibration` block: an MS2 spectrum of
@@ -2957,6 +3214,9 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // `--no-ims-compact` archive) does not apply to it.
     let ims_compact = reader.file_index().metadata.contains_key("ims_calibration");
     let mut whole_frames = 0usize;
+    // 64-bit integer intensities beyond 2^53, which the 64-bit floats they are written as cannot
+    // hold exactly ([`widen_integer_intensities`]).
+    let mut inexact_intensities = 0usize;
     // An archive holds a 0 injection time, selected-ion intensity or collision energy as null: none
     // is stated. It stores a time for every spectrum, 0 where the source stated none, and only an
     // imaging archive's marker says which it is (`imaging.provenance.time`, for the run as a whole):
@@ -2970,6 +3230,14 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
                 let from_arrays = (peak_mobility || peak_wide) && with_peak_facet_arrays(&mut reader, i, &mut spec, peak_wide)?;
+                if !from_arrays && spec.peaks.as_ref().is_none_or(|p| p.is_empty()) && spec.arrays.as_ref().is_none_or(|a| a.is_empty()) {
+                    let (mz, intensity) = match spec.signal_continuity() {
+                        mzdata::spectrum::SignalContinuity::Profile => empty_types.0,
+                        _ => empty_types.1,
+                    };
+                    spec.peaks = None;
+                    spec.arrays = Some(empty_signal_arrays(mz, intensity));
+                }
                 if from_arrays && peak_mobility && ims_compact {
                     let d = spec.description();
                     if !d.precursor.is_empty() && !d.params.iter().any(|p| p.name == "ion mobility lower limit") {
@@ -2985,6 +3253,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 unreferenced += drop_references_to(spec.description_mut(), &left_out);
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
+                    inexact_intensities += widen_integer_intensities(arrays).map_err(|e| anyhow!("spectrum {i}: intensity array: {e}"))?;
                 }
                 write_mzml_spectrum(&mut w, &mut spec, stated).map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
             }
@@ -3044,19 +3313,32 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // The archive's own TIC/base-peak go across too; the writer's summary is added only for the
     // kind the archive lacks.
     let n_chrom = mzdata::prelude::ChromatogramSource::count_chromatograms(&reader);
-    let chroms: Vec<Chromatogram> = (0..n_chrom)
-        .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
-        .map(|mut c| {
-            c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
-            mzml_unstated::mark_precursors(c.description_mut().precursor.iter_mut(), mzml_unstated::Zeros::NONE);
-            demote_mzp_params_chrom(c.description_mut());
-            unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
-            if let Some(window) = opts.rt {
-                cut_chromatogram_to_window(&mut c, window);
-            }
-            c
-        })
-        .collect();
+    let mut chroms: Vec<Chromatogram> = Vec::with_capacity(n_chrom);
+    for i in 0..n_chrom {
+        let Some(mut c) = mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i) else { continue };
+        c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
+        mzml_unstated::mark_precursors(c.description_mut().precursor.iter_mut(), mzml_unstated::Zeros::NONE);
+        demote_mzp_params_chrom(c.description_mut());
+        unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
+        if let Some(window) = opts.rt {
+            cut_chromatogram_to_window(&mut c, window);
+        }
+        // The chromatogram facet's integer intensity column (an mzML source's integer chromatograms
+        // keep their type in a default archive as in a `--lossless` one) leaves as 64-bit floats like
+        // a spectrum's: OpenMS 3.5 decodes an integer-encoded chromatogram intensity array as empty
+        // and refuses the file (`The length of RT and intensity values of chromatogram ... differ`);
+        // through 0.17.0-rc.2 the export wrote the integers.
+        inexact_intensities +=
+            widen_integer_intensities(&mut c.arrays).map_err(|e| anyhow!("chromatogram {:?}: intensity array: {e}", c.id()))?;
+        chroms.push(c);
+    }
+    if inexact_intensities > 0 {
+        log::warn!(
+            "{inexact_intensities} 64-bit integer intensities exceed 2^53 and are rounded to the nearest 64-bit float: \
+             mzML consumers (OpenMS 3.5) refuse an integer-encoded intensity array, so an archive's integer intensities \
+             are exported as 64-bit floats"
+        );
+    }
     if unreferenced > 0 {
         log::warn!(
             "{unreferenced} precursor or scan references named a spectrum this export leaves out; their \
@@ -3096,12 +3378,14 @@ fn drop_precursor_references(precursors: &mut [mzdata::spectrum::Precursor], lef
 
 /// Give a spectrum read from an archive's peak facet that facet's ARRAYS in place of the reader's
 /// peak list when they hold each peak's ion mobility, which the list (`CentroidPeak`: m/z,
-/// intensity) has no room for, or — `wide` — a 64-bit intensity, which the list's 32-bit float
-/// would round. Returns whether the spectrum's signal was replaced. The arrays come
-/// back in the facet's own order and types: they are put in m/z order, as the peak list was, and a
-/// TOF lane's integer intensities become the 32-bit floats the peak list held; the m/z and 1/K0
-/// arrays are the ones the reader decodes for the peak list too (on a timsTOF archive, from the
-/// grid rows through the frame's vendor models).
+/// intensity) has no room for, or — `wide` — an intensity that is not a 32-bit float (a 64-bit
+/// float, a 32- or 64-bit integer), which the list's 32-bit float would round. Returns whether the
+/// spectrum's signal was replaced. The arrays come back in the facet's own order and types: they
+/// are put in m/z order, as the peak list was, and keep their types here (the caller widens an
+/// integer intensity array to 64-bit floats, [`widen_integer_intensities`]; through 0.17.0-rc.2 it
+/// became the 32-bit floats the peak list held, which changes every value above 2^24); the m/z and
+/// 1/K0 arrays are the ones the reader decodes for the peak list too (on a timsTOF archive, from
+/// the grid rows through the frame's vendor models).
 fn with_peak_facet_arrays(
     reader: &mut mzpeak_prototyping::MzPeakReader,
     index: usize,
@@ -3121,13 +3405,6 @@ fn with_peak_facet_arrays(
         return Ok(false);
     }
     strip_grid_axis(&mut arrays);
-    if let Some(intensity) = arrays.get_mut(&ArrayType::IntensityArray)
-        && matches!(intensity.dtype, BinaryDataArrayType::Int32 | BinaryDataArrayType::Int64)
-    {
-        intensity
-            .store_as(BinaryDataArrayType::Float32)
-            .map_err(|e| anyhow!("spectrum {index}: intensity array: {e}"))?;
-    }
     let sorted = arrays
         .mzs()
         .map_err(|e| anyhow!("spectrum {index}: m/z array: {e}"))?
@@ -3269,14 +3546,69 @@ fn mzml_signal(spec: &mut MultiLayerSpectrum) -> Vec<(ArrayType, BinaryDataArray
     spec.deconvoluted_peaks = None;
     let arrays = spec.arrays.get_or_insert_with(BinaryArrayMap::new);
     if arrays.is_empty() {
-        let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
-        mz.unit = Unit::MZ;
-        arrays.add(mz);
-        let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
-        intensity.unit = Unit::DetectorCounts;
-        arrays.add(intensity);
+        *arrays = empty_signal_arrays(BinaryDataArrayType::Float64, BinaryDataArrayType::Float32);
     }
     empty_arrays_for_mzml(arrays)
+}
+
+/// An m/z and an intensity array of length 0, in the given types: the signal of a spectrum without
+/// a peak ([`mzml_signal`]; an archive's export gives them the types of the spectrum's facet).
+fn empty_signal_arrays(mz: BinaryDataArrayType, intensity: BinaryDataArrayType) -> BinaryArrayMap {
+    let mut arrays = BinaryArrayMap::new();
+    let mut mz = DataArray::wrap(&ArrayType::MZArray, mz, Vec::new());
+    mz.unit = Unit::MZ;
+    arrays.add(mz);
+    let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, intensity, Vec::new());
+    intensity.unit = Unit::DetectorCounts;
+    arrays.add(intensity);
+    arrays
+}
+
+/// The binary types a spectrum of an archive facet is exported in. Where the facet's arrays are what
+/// is exported (`from_arrays`: every profile spectrum; a centroid spectrum of a peak facet that holds
+/// a mobility column or an intensity column that is no 32-bit float, [`with_peak_facet_arrays`]) —
+/// the m/z and intensity column's own type where it is a 32- or 64-bit float, 64-bit float where it
+/// is a 32- or 64-bit integer ([`widen_integer_intensities`]), and the types the reader's peak list
+/// has (64-bit m/z, 32-bit intensity) for any other column (a grid facet's integer `tof` axis, which
+/// the reader decodes to 64-bit m/z) or no facet at all. Otherwise the peak list's types, which every
+/// centroid spectrum of the archive with a peak is written in (a `--lossless` archive of a 32-bit
+/// source: its empty centroid spectrum gets the 64-bit m/z its siblings with peaks get, not the
+/// facet's 32-bit).
+fn facet_array_types(
+    index: Option<&mzpeak_prototyping::buffer_descriptors::ArrayIndex>,
+    from_arrays: bool,
+) -> (BinaryDataArrayType, BinaryDataArrayType) {
+    let typed = |kind: ArrayType, fallback: BinaryDataArrayType| {
+        index
+            .filter(|_| from_arrays)
+            .and_then(|a| a.iter().find(|e| e.array_type == kind && e.transform.is_none()))
+            .and_then(|e| match e.data_type {
+                DataType::Float32 => Some(BinaryDataArrayType::Float32),
+                DataType::Float64 | DataType::Int32 | DataType::Int64 => Some(BinaryDataArrayType::Float64),
+                _ => None,
+            })
+            .unwrap_or(fallback)
+    };
+    (typed(ArrayType::MZArray, BinaryDataArrayType::Float64), typed(ArrayType::IntensityArray, BinaryDataArrayType::Float32))
+}
+
+/// Write an archive's 32- or 64-bit integer intensity array, a spectrum's or a chromatogram's, as
+/// 64-bit floats — exact for every 32-bit integer and every 64-bit one below 2^53; returns how many
+/// values are beyond that. mzML allows an integer-encoded array, but OpenMS 3.5 refuses the file
+/// (`Encoding intensity array as integer is not allowed` for a spectrum's, the source mzML with such
+/// arrays included; a chromatogram's it decodes as empty and refuses over the length), and an
+/// archive's export has to load there. Through 0.17.0-rc.2 a peak facet's integers became 32-bit
+/// floats through the reader's peak list (every value above 2^24 changed) and a profile or
+/// chromatogram facet's were written as the integers they are.
+fn widen_integer_intensities(arrays: &mut BinaryArrayMap) -> Result<usize> {
+    let Some(intensity) = arrays.get_mut(&ArrayType::IntensityArray) else { return Ok(0) };
+    let inexact = match intensity.dtype {
+        BinaryDataArrayType::Int32 => 0,
+        BinaryDataArrayType::Int64 => intensity.to_i64()?.iter().filter(|v| v.unsigned_abs() > (1u64 << 53)).count(),
+        _ => return Ok(0),
+    };
+    intensity.store_as(BinaryDataArrayType::Float64)?;
+    Ok(inexact)
 }
 
 /// Give every array of length 0 an empty payload, and say which they are: written through
@@ -3417,7 +3749,7 @@ fn write_native_mzml_with(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()), &run)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()), &run, Vec::new())?);
     w.scan_settings.extend(grid);
     prepare_mzml_header(&mut w, input, None, &run);
     let n = max_spectra().map_or(len, |m| m.min(len));
@@ -3459,7 +3791,7 @@ fn write_agilent_profile_mzml(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None, &run)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None, &run, Vec::new())?);
     prepare_mzml_header(&mut w, input, None, &run);
     // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
     // (matches write_native_mzml, which also uses the reader's record count).
@@ -3763,8 +4095,8 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
         .map(readable_chromatogram_arrays)
         // A device trace's unit, which the writer states for no `intensity array`.
         .map(unit_keeping_chromatogram_arrays)
-        // The empty, id-less chromatogram an archive holds when it had none (`write_empty_chromatogram`).
-        .filter(|c| !(c.id().is_empty() && c.arrays.get(&ArrayType::TimeArray).is_none_or(|t| t.data_len().unwrap_or(0) == 0)))
+        // The placeholder row an archive holds when it had no chromatogram (`write_empty_chromatogram`).
+        .filter(|c| !is_placeholder_chromatogram(c))
         .filter(|c| {
             // mzdata's writer `unwrap`s a chromatogram's time array, and this binary aborts on panic.
             let timed = c.arrays.has_array(&ArrayType::TimeArray);
@@ -5126,6 +5458,11 @@ fn convert_file(
             imaging::Detected::ScanPositions
         })
     });
+    // `--pixel-size` sizes a pixel grid: a run that has none is refused before anything is written.
+    let user_pixel_size = imaging::user_pixel_size();
+    if let (Some(u), None) = (&user_pixel_size, &detected) {
+        bail!("--pixel-size {}: {} is not an imaging run (no pixel positions were found): there is no grid to size", u.text(), input.display());
+    }
     // A z the probes miss is searched for the same way (an imzML's text is its header and scans, the
     // arrays live in the `.ibd`); it used to stay a generic scan param with no `position_z` column.
     if scan_lane && detected.is_some() && !searched && !stated_z {
@@ -5185,6 +5522,48 @@ fn convert_file(
         }
     }
 
+    // imzML: the header's file content (storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the
+    // `.ibd` checksum), read once here for two decisions taken before the output exists and reused
+    // below for the provenance. The `.ibd` is where mzdata looks for it.
+    let imzml_content: Option<Vec<imaging::RawParam>> = is_imzml.then(|| {
+        imaging::read_file_content(read_path).unwrap_or_else(|e| {
+            log::warn!("imzML file provenance not read: {e:#}");
+            Vec::new()
+        })
+    });
+    let ibd_path = is_imzml.then(|| imaging::ibd_beside(input).or_else(|| imaging::ibd_beside(read_path))).flatten();
+    // An `.ibd` that begins with another UUID than the header states is not this imzML's, and its
+    // signal could be another run's: refused, before anything is written, unless `--force` (owner
+    // decision D7; the full hash check below then warns and declares it). The one imaging check
+    // that refuses: a wrong checksum means a damaged copy of the right data, a wrong UUID may mean
+    // the wrong data.
+    if let (Some(content), Some(ibd), false) = (&imzml_content, &ibd_path, force()) {
+        match imaging::ibd_uuid(ibd) {
+            Ok(found) => {
+                if let Some((stated, found)) = imaging::uuid_mismatch(content, &found) {
+                    return Err(ibd_uuid_mismatch_error(ibd, stated, found));
+                }
+            }
+            Err(e) => log::warn!("the .ibd UUID was not checked before writing: {e:#}"),
+        }
+    }
+    // A continuous-mode imzML stores one m/z array for every pixel. Masked, each pixel kept a
+    // different subset of it, under its own numpress fixed points, and one source m/z decoded to
+    // several values across pixels (171.33333 → 8 values in the 9 pixels of `Example_Continuous`,
+    // HUPO-PSI/mzPeak-specification#23); the zero runs are kept on such a file without being asked
+    // (owner decision D2), and whether every spectrum did hold the same array is checked in the
+    // write loop (`metadata.imaging.shared_mz_axis`). `--keep-zero-runs` stays the override for
+    // processed-mode input.
+    let storage_mode = imzml_content.as_deref().and_then(imaging::storage_mode);
+    let continuous = storage_mode == Some("continuous");
+    let mask_off = keep_zero_runs() || continuous;
+    if continuous && !keep_zero_runs() {
+        log::info!(
+            "continuous-mode imzML (IMS:1000030): zero runs kept, so every pixel decodes to the one m/z axis the file \
+             stores; no zero-run-mask (as under --keep-zero-runs)"
+        );
+    }
+
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
     let handle = fs::File::create(&tmp)
@@ -5194,6 +5573,19 @@ fn convert_file(
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
 
     let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
+    // The default m/z encoding, from a sample of the run: delta where every sampled m/z is a 32-bit
+    // value, else the smaller of delta and numpress-linear (`choose_mz_encoding`; the block states
+    // the choice). An explicit `--no-numpress` or `--layout point` is left alone. The trial writes
+    // its sample with the mask this run writes with (`mask_off`: `--keep-zero-runs`, or a
+    // continuous-mode imzML), so the bytes it weighs are the bytes the archive gets.
+    let (chunk, mz_block) = {
+        let n = reader.len();
+        let sample_len = max_spectra().map_or(n, |m| m.min(n));
+        let mut by_index = |i: usize| reader.get_spectrum_by_index(i).ok_or_else(|| anyhow!("spectrum {i} could not be read"));
+        let decided = choose_mz_encoding(chunk, &probes, sample_len, &mut by_index, level, mask_off, output, false)?;
+        reader.reset();
+        decided
+    };
 
     // FIXED-POINT m/z LATTICE (see `mz_lattice`). The same probes decide, from the CENTROID values
     // only, whether this run's peaks are vendor integers over a power of ten (Shimadzu `MassHigh`
@@ -5259,8 +5651,9 @@ fn convert_file(
     };
     builder = builder.sample_array_types_from_chromatograms(chromatogram_schema_samples(&mut reader, read_path));
 
-    // The zero-run mask, unless `--keep-zero-runs` / `--lossless` keeps every profile point.
-    let mut writer = builder.build(handle, !keep_zero_runs());
+    // The zero-run mask, unless `--keep-zero-runs` / `--lossless` keeps every profile point, or
+    // the input is a continuous-mode imzML (`mask_off`, above).
+    let mut writer = builder.build(handle, !mask_off);
 
     // Positions stated as scan cvParams (imzML, an mzML with positions) are promoted to the
     // `position_*` columns. Their column mappings name IMS terms, so the IMS vocabulary is declared
@@ -5286,6 +5679,8 @@ fn convert_file(
     // obsolete scan term "one way" as flyback — each change declared (`imaging`).
     let mut imaging_applied: Vec<&'static str> = Vec::new();
     let mut imaging_block: Option<serde_json::Value> = None;
+    // The imzML rule's word on each `<scanSettings>`: how the size it kept was settled, by id.
+    let mut fix_sources: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
     // Whether the pixel-size rule read this input's scan settings (imzML only): a lone `IMS:1000046`
     // still there afterwards is one the rule kept. On any other lane nothing tested it.
     let mut pixel_size_checked = false;
@@ -5295,16 +5690,14 @@ fn convert_file(
         if typed.is_some() {
             imaging_applied.push(imaging::INTEGER_TYPE_AS_PSI_MS);
         }
-        let content = imaging::read_file_content(read_path).unwrap_or_else(|e| {
-            log::warn!("imzML file provenance not read: {e:#}");
-            Vec::new()
-        });
-        writer.file_description_mut().contents.extend(imaging::provenance_params(&content));
+        let content: &[imaging::RawParam] = imzml_content.as_deref().unwrap_or(&[]);
+        writer.file_description_mut().contents.extend(imaging::provenance_params(content));
         // The `.ibd` against the checksum the header states. The stated value stays as written
         // (fidelity L0, above); a mismatch is declared, with the hash found in the marker — the
-        // conversion goes on (owner decision D7), as it does on mzdata's UUID warning.
-        if let Some(path) = imaging::ibd_beside(input).or_else(|| imaging::ibd_beside(read_path)) {
-            match imaging::check_ibd(&path, &content) {
+        // conversion goes on (owner decision D7: a wrong checksum is a damaged copy of the right
+        // data). A UUID mismatch got here only under `--force` (refused above without it).
+        if let Some(path) = ibd_path.clone() {
+            match imaging::check_ibd(&path, content) {
                 Ok(check) => {
                     let mismatches: Vec<String> = check
                         .mismatches()
@@ -5319,12 +5712,15 @@ fn convert_file(
                         );
                         imaging_applied.push(imaging::IBD_CHECKSUM_MISMATCH);
                     }
-                    // The UUID pairs the two files; handled as the checksum is (owner decision D7).
+                    // The UUID pairs the two files: a mismatch was refused above unless `--force`,
+                    // and forced it is warned about, declared and recorded (owner decision D7).
                     if let Some((stated, found)) = check.uuid_mismatch() {
                         log::warn!(
-                            "{}: the .ibd begins with UUID {found}, the imzML states {stated}: they are not the pair the \
-                             imzML describes; the stated value is kept, declared as {}",
+                            "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the \
+                             imzML describes; converted under --force, the stated value kept, declared as {} (the UUID found \
+                             is in metadata.imaging.provenance.ibd_uuid_found)",
                             path.display(),
+                            imaging::found_uuid_text(found),
                             imaging::IBD_UUID_MISMATCH
                         );
                         imaging_applied.push(imaging::IBD_UUID_MISMATCH);
@@ -5364,20 +5760,30 @@ fn convert_file(
             for m in &f.extent_mismatches {
                 log::warn!("imzML scan settings {}: pixel size written as stated, but {m} (listed in imaging_pixel_size)", f.settings_id);
             }
-            if let Some(t) = f.transformation {
+            if !f.transformations.is_empty() {
                 log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
-                imaging_applied.push(t);
+                imaging_applied.extend(f.transformations.iter().copied());
             }
         }
         if !fixes.is_empty() {
             imaging_block = Some(fixes.iter().map(imaging::fix_json).collect());
         }
+        fix_sources = fixes.iter().map(|f| (f.settings_id.clone(), f.source())).collect();
+    }
+    // `--pixel-size` against what the source states (after the imzML rule): a contradiction is
+    // refused here, before any spectrum is written; the size itself is written once the pixel
+    // counts are known, below.
+    if let Some(u) = &user_pixel_size {
+        imaging::check_user_pixel_size(writer.scan_settings().and_then(|l| imaging::grid(l)), u, "the source's scan settings")?;
     }
     let mut source_refs = None;
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
         source_refs = Some(mzml_refs::DanglingRefs::check(read_path, &mut writer));
     }
+    // The header's `<contact>`, which mzdata's model drops: carried into `file_description.contacts`
+    // under `--keep-contact` ([`finish_archive`] merges the block), else noted and left out.
+    let contacts = header_contacts(input, read_path, scan_lane);
     add_processing_metadata(&mut writer);
 
     // Keep the ion-mobility dimension for TDF (do not flatten 3D frames).
@@ -5408,7 +5814,7 @@ fn convert_file(
     };
     // A MALDI timsTOF run through mzdata (`--no-ims-compact`): each frame's raster position.
     if let Some(m) = &maldi {
-        enable_bruker_imaging(&mut writer, m);
+        enable_bruker_imaging(&mut writer, m)?;
     }
     // Thermo precursor windows the reader library computed without a stated width are written
     // target-only (`thermo_isolation`); the count is declared in `transformations` below.
@@ -5435,6 +5841,12 @@ fn convert_file(
     // How many spectra carry a scan start time other than 0, which mzdata also gives a scan that
     // states none.
     let mut timed = 0usize;
+    // imzML spectra typed MS1 at `ms level` 0, written at level 1 (owner decision D6).
+    let mut ms_level_raised = 0usize;
+    // The imaging marker's account of the stored signal: whether a continuous-mode imzML's spectra
+    // all hold one m/z array (`shared_mz_axis`), and the range the writer stores (`mz_range`).
+    let mut shared_axis = continuous.then(imaging::SharedAxis::default);
+    let mut stored_range = imaging::StoredRange::default();
     let mut ran_out = true;
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
@@ -5503,6 +5915,12 @@ fn convert_file(
             }
             (positioned, unpositioned, z_removed) = (positioned + kept, unpositioned + dropped, z_removed + z);
             extent.observe(entry.description());
+            // After the sort above: the arrays as the writer gets them.
+            observe_stored_signal(&entry, shared_axis.as_mut(), &mut stored_range, !mask_off);
+        }
+        // Before the TIC/BPC collector and the source tally see the spectrum.
+        if is_imzml && imaging::ms_level_zero_as_one(entry.description_mut()) {
+            ms_level_raised += 1;
         }
         timed += usize::from(entry.description().acquisition.scans.iter().any(|sc| sc.start_time != 0.0));
         if let Some(g) = thermo_windows.as_mut() {
@@ -5524,6 +5942,14 @@ fn convert_file(
         n += 1;
     }
     log::debug!("wrote {n} spectra");
+    if ms_level_raised > 0 {
+        log::warn!(
+            "{ms_level_raised} spectra typed MS1 spectrum (MS:1000579) state ms level 0; written with ms_level 1, declared \
+             as {}",
+            imaging::MS_LEVEL_0_AS_1
+        );
+        imaging_applied.push(imaging::MS_LEVEL_0_AS_1);
+    }
     if let (true, Some(a)) = (ran_out, tdf_points.as_mut()) {
         source_tally.add_not_handed_over(a.finish(None));
     }
@@ -5597,6 +6023,9 @@ fn convert_file(
             imaging_applied.push(imaging::INVALID_Z_DROPPED);
         }
         if positioned == 0 {
+            if let Some(u) = &user_pixel_size {
+                bail!("--pixel-size {}: no scan of {} carries a pixel position, so no grid is written: there is nothing to size", u.text(), input.display());
+            }
             log::warn!("{}: no scan carries a pixel position; the archive is not marked imaging", input.display());
         } else {
             // mzdata's `FileMetadataConfig` behind the writer always holds a list, empty when the
@@ -5604,6 +6033,14 @@ fn convert_file(
             let list = writer.scan_settings_mut().expect("the writer holds a scan settings list");
             let counts = extent.bound(list);
             imaging_applied.extend(counts);
+            // `--pixel-size`, on the grid entry the counts are now in (the lanes' one rule).
+            let mut user_row = None;
+            if let (Some(u), Some(g)) = (&user_pixel_size, imaging::grid_mut(list)) {
+                user_row = imaging::apply_user_pixel_size(g, u, "the source's scan settings")?;
+            }
+            if user_row.is_some() {
+                imaging_applied.push(imaging::USER_SUPPLIED);
+            }
             let grid = imaging::grid(list).cloned();
             // mzdata gives a scan without `MS:1000016` the start time 0, and the writer stores it
             // (a null time is a question for the core spec): the marker says which it is, and for
@@ -5627,7 +6064,9 @@ fn convert_file(
                     Some(_) => "the input's scan settings, a count that did not bound the positions set to the largest",
                     None => "the input's scan settings",
                 },
-                "pixel_size": if imaging_block.is_some() {
+                "pixel_size": if user_row.is_some() {
+                    imaging::USER_SUPPLIED_PROVENANCE
+                } else if imaging_block.is_some() {
                     "checked, see imaging_pixel_size"
                 } else if imaging::states_pixel_size(grid.as_ref()) {
                     "as stated"
@@ -5654,11 +6093,49 @@ fn convert_file(
             // "pixel size" may be the area the term named until 2017 — 2500 µm² would be reported
             // as 2500 µm on both axes. The scan settings keep it as stated either way.
             let lone_x = if pixel_size_checked { imaging::LoneX::AlsoY } else { imaging::LoneX::XOnly };
-            imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), source, lone_x, provenance)));
+            // How the size was settled: `--pixel-size`; the imzML rule's word on this entry; else a
+            // stated size is declared and none is unknown (an mzML's untested lone x gives the
+            // marker no size, and the marker says unknown of it).
+            let pixel_size_source = if user_row.is_some() {
+                imaging::SOURCE_USER_SUPPLIED
+            } else if let Some(s) = grid.as_ref().and_then(|g| fix_sources.get(&g.id)) {
+                s
+            } else if imaging::states_pixel_size(grid.as_ref()) {
+                imaging::SOURCE_DECLARED
+            } else {
+                imaging::SOURCE_UNKNOWN
+            };
+            if let Some(row) = user_row.take() {
+                imaging_block.get_or_insert_with(|| serde_json::json!([])).as_array_mut().expect("a list of rows").push(row);
+            }
+            let mut block = imaging::marker_block(grid.as_ref(), source, lone_x, pixel_size_source, provenance);
+            // imzML: the binary mode the header states, and on a continuous-mode file whether every
+            // spectrum did hold one m/z array (owner decision D2). Converter-first keys inside the
+            // marker (P4), documented in the manual's §8.
+            if let Some(mode) = storage_mode {
+                block["storage_mode"] = mode.into();
+            }
+            if let Some(axis) = &shared_axis {
+                block["shared_mz_axis"] = axis.shared().into();
+                if !axis.shared() {
+                    log::warn!(
+                        "continuous-mode imzML (IMS:1000030) whose spectra do not all hold one m/z array: {} of {} differ \
+                         from the first; metadata.imaging.shared_mz_axis is false",
+                        axis.differing(),
+                        axis.spectra()
+                    );
+                }
+            }
+            // The stored arrays' range (owner decision D10): what a reader can ask for, not the
+            // source's observed-m/z terms (the mask leaves edge zero runs out).
+            if let Some(range) = stored_range.json() {
+                block["mz_range"] = range;
+            }
+            imaging_blocks.push(("imaging".into(), block));
         }
     }
     if let Some(m) = &maldi {
-        let (blocks, applied) = m.index_blocks();
+        let (blocks, applied) = m.index_blocks()?;
         imaging_blocks.extend(blocks);
         imaging_applied.extend(applied);
     }
@@ -5672,6 +6149,8 @@ fn convert_file(
         .chain(route)
         .chain(imaging_block.map(|b| ("imaging_pixel_size".to_string(), b)))
         .chain(imaging_blocks)
+        .chain(contacts_block(&contacts))
+        .chain(mz_block.map(|b| ("encoding_prescan".to_string(), b)))
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
             for t in &imaging_applied {
@@ -6906,8 +7385,9 @@ where
     ensure_mzp_cv(&mut writer);
     // MALDI imaging (timsTOF fleX): each frame's raster position (`imaging::detect`, `bruker_maldi`).
     let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
+    refuse_user_pixel_size_without_grid(input, maldi.is_some())?;
     if let Some(m) = &maldi {
-        enable_bruker_imaging(&mut writer, m);
+        enable_bruker_imaging(&mut writer, m)?;
     }
 
     let mut ms1 = Ms1Chroms::default();
@@ -7074,7 +7554,7 @@ where
     if let Some(entry) = mz_summary.transformation {
         declare(&mut applied, entry);
     }
-    let (maldi_blocks, maldi_applied) = maldi.as_ref().map(|m| m.index_blocks()).unwrap_or_default();
+    let (maldi_blocks, maldi_applied) = maldi.as_ref().map(|m| m.index_blocks()).transpose()?.unwrap_or_default();
     for t in maldi_applied {
         declare(&mut applied, t);
     }
@@ -7302,7 +7782,8 @@ struct AuxInputs<'a> {
 /// **The one archive epilogue.** Every lane that writes an `.mzpeak` ends here: flush Parquet, read
 /// the two signal facets back for the `fidelity` block (and, under `--lossless`, fail unless they
 /// are bit-exact), write the lane's index blocks IN ORDER, stream-embed vendor side-files + vendor
-/// metadata, then optical images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding
+/// metadata, then a FlexImaging sequence's registered image (every lane; `embed_sequence_image`),
+/// then optical images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding
 /// the `metadata.imaging` / `metadata.study` / `metadata.sample_metadata` blocks — close the ZIP,
 /// and only then rename the temporary onto `output`.
 ///
@@ -7411,7 +7892,20 @@ fn finish_archive(
     if let (true, Some(block)) = (lossless(), &fidelity_block) {
         fidelity::check_lossless(block, &applied)?;
     }
-    for (key, block) in index_blocks.iter().filter(|(key, _)| key != fidelity::BLOCK) {
+    // A lane's additions to `file_description` (the contacts, `--keep-contact`): merged into the
+    // block the writer copied to the index at close — its own model has no slot for them, so the
+    // block is completed here rather than in vendored code — key by key, nothing of the writer's
+    // replaced.
+    if let Some((_, extra)) = index_blocks.iter().find(|(key, _)| key == FILE_DESCRIPTION_BLOCK) {
+        let mut description = zip.index().metadata.get(FILE_DESCRIPTION_BLOCK).cloned().unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(description), Some(extra)) = (description.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                description.insert(key.clone(), value.clone());
+            }
+        }
+        zip.add_index_metadata(FILE_DESCRIPTION_BLOCK, &description).context("writing the file_description index block")?;
+    }
+    for (key, block) in index_blocks.iter().filter(|(key, _)| key != fidelity::BLOCK && key != FILE_DESCRIPTION_BLOCK) {
         zip.add_index_metadata(key, block)
             .with_context(|| format!("writing {key} index block"))?;
     }
@@ -7419,6 +7913,9 @@ fn finish_archive(
         zip.add_index_metadata(fidelity::BLOCK, block).context("writing fidelity index block")?;
     }
     embed_vendor_members(&mut zip, input, vendor)?;
+    // The FlexImaging sequence's image with its teach-point registration, on every lane that read
+    // a `.mis` (the `bruker_maldi` block says), before any `--image`: it is `images/image_0000`.
+    embed_aux::embed_sequence_image(&mut zip, input).context("embedding the FlexImaging sequence's image")?;
     if let Some(aux) = aux {
         embed_aux::embed_into_archive(&mut zip, input, aux.images, aux.sdrf)
             .context("embedding optical images / SDRF")?;
@@ -8320,7 +8817,7 @@ fn convert_waters(
     // Imaging (MALDI / DESI): the reader attaches each scan's pixel, fitted to its laser positions —
     // the Waters branch of imaging detection, which needs MassLynx open.
     if let Some(im) = reader.imaging() {
-        waters_imaging_hints(im, &mut hints);
+        waters_imaging_hints(im, &mut hints)?;
     }
     if let Some(block) = reader.drift_block() {
         hints.index_blocks.push(("waters_drift".to_string(), block));
@@ -8340,17 +8837,26 @@ fn convert_waters(
 /// `waters_imaging` block; laser positions that fit no grid get the block alone, saying why — no
 /// positions, no marker (review 2026-09-30 B14). Outside `convert_waters` so every host compiles it.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn waters_imaging_hints(im: &waters::WatersImaging, hints: &mut VendorHints) {
-    let Some(grid) = im.scan_settings() else {
+fn waters_imaging_hints(im: &waters::WatersImaging, hints: &mut VendorHints) -> Result<()> {
+    let Some(mut grid) = im.scan_settings() else {
         hints.index_blocks.push(("waters_imaging".to_string(), im.block()));
-        return;
+        return Ok(());
     };
-    let marker = im.marker(&grid);
-    hints.imaging = Some(ImagingHints {
-        grid,
-        blocks: vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())],
-        transformations: im.transformations(),
-    });
+    // `--pixel-size`, the lanes' one rule: a single row's lone x step gets its y, steps that agree
+    // are left alone, a differing size is refused unless --force.
+    let user_row = match imaging::user_pixel_size() {
+        Some(u) => imaging::apply_user_pixel_size(&mut grid, &u, "the grid fitted to the MassLynx laser positions")?,
+        None => None,
+    };
+    let marker = im.marker(&grid, user_row.as_ref());
+    let mut blocks = vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())];
+    let mut transformations = im.transformations();
+    if let Some(row) = user_row {
+        blocks.push(("imaging_pixel_size".to_string(), serde_json::json!([row])));
+        transformations.push(imaging::USER_SUPPLIED);
+    }
+    hints.imaging = Some(ImagingHints { grid, blocks, transformations });
+    Ok(())
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak through the net48 MHDAC host (`agilent.rs`;
@@ -8425,6 +8931,11 @@ struct VendorHints {
     /// written under the encoding a sample of the run compressed best under. The Waters lane sets
     /// it; `MZPC_ENCODING_PRESCAN=0` turns it off.
     encoding_prescan: bool,
+    /// The lane stores m/z exactly (the Bruker TSF lane, owner decision D9): numpress-linear is
+    /// never written; the default rule weighs delta against the point layout on the sample and
+    /// keeps the smaller EXACT arm, and without the trial (`MZPC_ENCODING_PRESCAN=0`) the point
+    /// layout is written (`choose_mz_encoding`), so the archive is exact on every path.
+    exact_mz: bool,
     /// An imaging run whose reader attaches each spectrum's pixel itself (Waters laser positions).
     imaging: Option<ImagingHints>,
 }
@@ -8547,6 +9058,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         chromatograms,
         source_file_params,
         encoding_prescan,
+        exact_mz,
         imaging: imaging_hints,
     } = hints;
     let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
@@ -8554,6 +9066,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     let keep_zero_runs = keep_zero_runs || crate::keep_zero_runs();
     // MALDI imaging from a Bruker `.d` (the TSF lane): each frame's raster position.
     let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
+    refuse_user_pixel_size_without_grid(input, maldi.is_some() || imaging_hints.is_some())?;
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
@@ -8591,16 +9104,23 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         Some(ChunkingStrategy::NumpressLinear { chunk_size } | ChunkingStrategy::Delta { chunk_size }) => Some(chunk_size),
         _ => None,
     };
-    if let Some(width) = chunk_width.filter(|_| encoding_prescan && data_grid.is_none() && peak_grid.is_none()) {
+    // The lanes without a full pre-scan decide the m/z arm alone, by the default rule
+    // (`choose_mz_encoding`); the block goes under the same key.
+    let mut mz_block: Option<serde_json::Value> = None;
+    let no_grid = data_grid.is_none() && peak_grid.is_none();
+    if let Some(width) = chunk_width.filter(|_| encoding_prescan && no_grid) {
         let numpress = matches!(chunk, Some(ChunkingStrategy::NumpressLinear { .. }));
         let sample = prescan_sample(len, &mut spectrum);
         if !sample.is_empty() {
             let started = std::time::Instant::now();
             let int32 = sample.iter().chain(&probes).all(encoding_prescan::intensities_fit_int32);
-            let arms = encoding_prescan::Arms::new(numpress, int32);
+            // 32-bit m/z (every Waters value): delta returns them exactly, so the lossy arm is not
+            // offered — the first half of the default rule.
+            let all_32bit = encoding_prescan::all_32bit(sample_mz_values(sample.iter().chain(&probes)));
+            let arms = encoding_prescan::Arms::new(numpress && !all_32bit, int32);
             let mut results = Vec::new();
             for (k, trial) in arms.trials().into_iter().enumerate() {
-                let measured = prescan_trial(&sample, &probes, trial, width, level, keep_zero_runs, output, k)
+                let (measured, _) = prescan_trial(&sample, &probes, trial, width, level, keep_zero_runs, output, k)
                     .with_context(|| format!("encoding pre-scan trial {k}"))?;
                 results.push((trial, measured));
             }
@@ -8620,10 +9140,17 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
                     String::new()
                 },
             );
-            chunk = Some(prescan_chunk(chosen.mz, width));
-            let block = encoding_prescan::block(&results, chosen, sample.len(), points, has_mobility, int32);
+            chunk = prescan_chunk(chosen.mz, width);
+            let mut block = encoding_prescan::block(&results, chosen, sample.len(), points, has_mobility, int32);
+            if numpress && all_32bit {
+                block["numpress_linear_excluded"] = encoding_prescan::Basis::ThirtyTwoBit.label().into();
+            }
             prescan = Some((chosen, encoding_prescan::best_float_intensity(&results), block));
         }
+    } else if no_grid {
+        let (chosen, block) = choose_mz_encoding(chunk, &probes, len, &mut spectrum, level, keep_zero_runs, output, exact_mz)?;
+        chunk = chosen;
+        mz_block = block;
     }
     // A facet under a grid policy takes the reference implementation's chunk grid: one chunk per
     // spectrum for the profile facet (the model is per spectrum), its 50-Th default for the peaks.
@@ -8654,7 +9181,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         let mut writer = builder.build(handle, !keep_zero_runs);
         add_processing_metadata(&mut writer);
         if let Some(m) = &maldi {
-            enable_bruker_imaging(&mut writer, m);
+            enable_bruker_imaging(&mut writer, m)?;
         }
         if let Some(h) = &imaging_hints {
             enable_imaging(&mut writer, h.grid.clone());
@@ -8709,6 +9236,8 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             });
         }
         index_blocks.push(("encoding_prescan".to_string(), block));
+    } else if let Some(block) = mz_block {
+        index_blocks.push(("encoding_prescan".to_string(), block));
     }
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, chromatograms.into_iter(), synth_chroms)?;
     if let Some(hex) = source_sha1 {
@@ -8750,7 +9279,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // A lane that keeps zero runs built the writer with the mask off, so its tally has none to report.
     let mut applied = base_transformations(&writer);
     if let Some(m) = &maldi {
-        let (blocks, maldi_applied) = m.index_blocks();
+        let (blocks, maldi_applied) = m.index_blocks()?;
         for t in maldi_applied {
             declare(&mut applied, t);
         }
@@ -8797,9 +9326,25 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
 /// Turn a writer into an imaging one for a Bruker MALDI run: the position columns the imzML path
 /// writes, the IMS vocabulary, and the grid (pixel counts; pixel size from the beam scan size when
 /// there is one).
-fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) {
+fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) -> Result<()> {
     log::info!("Bruker MALDI imaging: {} frames carry a raster position", maldi.spots.len());
-    enable_imaging(writer, maldi.scan_settings());
+    // `--pixel-size` is applied (or refused) here, before any spectrum is written.
+    let (grid, _) = maldi.grid()?;
+    enable_imaging(writer, grid);
+    Ok(())
+}
+
+/// `--pixel-size` on a lane whose run turned out not to be imaging: refused before anything is
+/// written, rather than accepted for a grid that is never written.
+fn refuse_user_pixel_size_without_grid(input: &Path, imaging: bool) -> Result<()> {
+    match imaging::user_pixel_size() {
+        Some(u) if !imaging => bail!(
+            "--pixel-size {}: {} is not an imaging run (no pixel grid is written for it): there is no grid to size",
+            u.text(),
+            input.display()
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Turn a writer into an imaging one: the position columns, the IMS vocabulary and the grid.
@@ -8843,9 +9388,23 @@ fn vendor_writer_builder(
         .data_column_encodings(encodings)
 }
 
-/// Points in a spectrum's raw arrays (0 without them).
+/// The m/z a spectrum hands the writer: its raw arrays' when they hold an m/z array, else its
+/// centroid peak set's (a Thermo `.raw` through mzdata), else none (a wavelength spectrum). The
+/// peak set is read as the field, not through `peaks()`, whose raw-array dispatch panics on arrays
+/// without an m/z array.
+fn spectrum_mzs(spec: &MultiLayerSpectrum) -> Vec<f64> {
+    match spec.raw_arrays().and_then(|a| a.mzs().ok()) {
+        Some(m) => m.to_vec(),
+        None => spec.peaks.as_ref().map(|p| p.iter().map(|p| p.mz).collect()).unwrap_or_default(),
+    }
+}
+
+/// Points in a spectrum's m/z array, or in its centroid peak set without one (0 with neither).
 fn point_count(spec: &MultiLayerSpectrum) -> usize {
-    spec.raw_arrays().and_then(|a| a.mzs().ok()).map_or(0, |m| m.len())
+    match spec.raw_arrays().and_then(|a| a.mzs().ok()) {
+        Some(m) => m.len(),
+        None => spec.peaks.as_ref().map_or(0, |p| p.len()),
+    }
 }
 
 /// The spectra the encoding pre-scan writes: four stretches of consecutive spectra spread over the
@@ -8876,16 +9435,18 @@ fn prescan_sample<S: Into<VendorSpectrum>>(
     sample
 }
 
-/// The chunking strategy an m/z arm writes with.
-fn prescan_chunk(arm: encoding_prescan::MzArm, chunk_size: f64) -> ChunkingStrategy {
+/// The chunking strategy an m/z arm writes with (`None`: the point layout).
+fn prescan_chunk(arm: encoding_prescan::MzArm, chunk_size: f64) -> Option<ChunkingStrategy> {
     match arm {
-        encoding_prescan::MzArm::Numpress => ChunkingStrategy::NumpressLinear { chunk_size },
-        encoding_prescan::MzArm::Delta(_) => ChunkingStrategy::Delta { chunk_size },
+        encoding_prescan::MzArm::Numpress => Some(ChunkingStrategy::NumpressLinear { chunk_size }),
+        encoding_prescan::MzArm::Delta(_) => Some(ChunkingStrategy::Delta { chunk_size }),
+        encoding_prescan::MzArm::Point => None,
     }
 }
 
 /// Write the pre-scan sample under one trial's arms to a scratch archive beside `output` and
-/// return each column group's compressed bytes. The scratch file is removed on return.
+/// return each column group's compressed bytes, with the writer's count of delta chunks at risk
+/// in the sample (over both facets). The scratch file is removed on return.
 fn prescan_trial(
     sample: &[MultiLayerSpectrum],
     probes: &[MultiLayerSpectrum],
@@ -8895,7 +9456,7 @@ fn prescan_trial(
     keep_zero_runs: bool,
     output: &Path,
     k: usize,
-) -> Result<encoding_prescan::Measured> {
+) -> Result<(encoding_prescan::Measured, u64)> {
     let convert = |spectra: &[MultiLayerSpectrum]| -> Vec<MultiLayerSpectrum> {
         let mut spectra = spectra.to_vec();
         if trial.intensity.int32 {
@@ -8908,16 +9469,105 @@ fn prescan_trial(
     let path = output.with_extension(format!("mzpeak.prescan{k}.tmp"));
     let guard = TmpGuard::new(&path);
     let handle = fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    let chunk = Some(prescan_chunk(trial.mz, chunk_size));
+    let chunk = prescan_chunk(trial.mz, chunk_size);
     let mut writer = vendor_writer_builder(chunk.clone(), chunk, level, &convert(probes), trial.encodings())
         .build(handle, !keep_zero_runs);
     for spec in convert(sample) {
         writer.write_spectrum(&spec)?;
     }
+    let at_risk = writer.spectrum_signal_tally_by_facet().iter().map(|t| t.delta_chunks_at_risk).sum();
     writer.finish_parquet()?.finish().map_err(|e| anyhow!("finalizing the pre-scan archive: {e}"))?;
-    let measured = facet_column_bytes(&path);
+    let measured = facet_column_bytes(&path)?;
     guard.discard();
-    measured
+    Ok((measured, at_risk))
+}
+
+/// Every m/z these spectra hand the writer ([`spectrum_mzs`]), flattened.
+fn sample_mz_values<'a>(spectra: impl IntoIterator<Item = &'a MultiLayerSpectrum>) -> impl Iterator<Item = f64> {
+    spectra.into_iter().flat_map(spectrum_mzs)
+}
+
+/// The default m/z encoding of a chunked facet, from a sample of the run (owner decision D1/D13,
+/// principle P2; the rule in [`encoding_prescan::pick_mz`]). `chunk` is the strategy requested so
+/// far: only numpress-linear, the default, is open to the rule — an explicit `--no-numpress` is the
+/// user's choice and `--layout point` has no chunk — except on a lane that stores m/z exactly
+/// (`exact`, the Bruker TSF lane), which never writes numpress and weighs delta against the point
+/// layout whether numpress or delta was requested (`--no-numpress` is inert there, and says so).
+/// Returns the strategy to write with and the `encoding_prescan` block that says why, or `None`
+/// where nothing was decided. The sample is [`prescan_sample`]'s (up to four stretches of 64
+/// spectra or 2 M points); the trials are [`prescan_trial`]'s, through the archive writer.
+/// `MZPC_ENCODING_PRESCAN=0` skips the rule: numpress as requested, or on an exact lane the point
+/// layout without a trial — the one layout exact on any data, so the lane's archive is exact on
+/// every path and dropping the vendor's binary copy of the signal (`run`) stays sound.
+#[allow(clippy::too_many_arguments)]
+fn choose_mz_encoding<S: Into<VendorSpectrum>>(
+    chunk: Option<ChunkingStrategy>,
+    probes: &[MultiLayerSpectrum],
+    len: usize,
+    spectrum: &mut impl FnMut(usize) -> Result<S>,
+    level: ZstdLevel,
+    keep_zero_runs: bool,
+    output: &Path,
+    exact: bool,
+) -> Result<(Option<ChunkingStrategy>, Option<serde_json::Value>)> {
+    use encoding_prescan::{Basis, MzArm, MzTrial};
+    use mzpeak_prototyping::writer::ColumnEncoding;
+    let width = match chunk {
+        Some(ChunkingStrategy::NumpressLinear { chunk_size }) => chunk_size,
+        Some(ChunkingStrategy::Delta { chunk_size }) if exact => chunk_size,
+        _ => return Ok((chunk, None)),
+    };
+    let delta = Some(ChunkingStrategy::Delta { chunk_size: width });
+    if exact && matches!(chunk, Some(ChunkingStrategy::Delta { .. })) {
+        log::info!(
+            "--no-numpress is inert on this lane: it never writes numpress-linear; delta chunks are weighed against \
+             the point layout as by default, and the smaller exact one is written (--layout point selects the point \
+             layout outright)"
+        );
+    }
+    // No trial: numpress as requested, or on an exact lane the point layout (exact on any data).
+    let untested = if exact { None } else { chunk };
+    if !env_flag("MZPC_ENCODING_PRESCAN").unwrap_or(true) {
+        return Ok((untested, None));
+    }
+    let sample = prescan_sample(len, spectrum);
+    if sample.is_empty() {
+        return Ok((untested, None));
+    }
+    let points: usize = sample.iter().map(point_count).sum();
+    if encoding_prescan::all_32bit(sample_mz_values(sample.iter().chain(probes))) {
+        log::info!(
+            "m/z encoding: every sampled m/z ({} spectra, {points} points) is a 32-bit value; delta chunks, which return \
+             them exactly and are smaller than numpress-linear on such data",
+            sample.len()
+        );
+        return Ok((delta, Some(encoding_prescan::mz_block(sample.len(), points, &[], MzArm::Delta(ColumnEncoding::Writer), Basis::ThirtyTwoBit, exact))));
+    }
+    let started = std::time::Instant::now();
+    let arms = if exact { [MzArm::Delta(ColumnEncoding::Writer), MzArm::Point] } else { [MzArm::Delta(ColumnEncoding::Writer), MzArm::Numpress] };
+    let mut trials = Vec::new();
+    for (k, arm) in arms.into_iter().enumerate() {
+        let trial = encoding_prescan::Trial {
+            mz: arm,
+            intensity: encoding_prescan::IntensityArm { int32: false, encoding: ColumnEncoding::Writer },
+            ion_mobility: ColumnEncoding::Writer,
+        };
+        let (measured, at_risk) = prescan_trial(&sample, probes, trial, width, level, keep_zero_runs, output, k)
+            .with_context(|| format!("m/z encoding trial {k} ({})", encoding_prescan::mz_label(arm)))?;
+        // Against numpress only the m/z columns move; against the point layout every column does.
+        let bytes = if exact { measured.mz + measured.intensity + measured.ion_mobility } else { measured.mz };
+        trials.push(MzTrial { arm, bytes, delta_chunks_at_risk: at_risk });
+    }
+    let (chosen, basis) = encoding_prescan::pick_mz(&trials, exact);
+    log::info!(
+        "m/z encoding ({} spectra, {points} points, {:.1} s): {}; {} — {}",
+        sample.len(),
+        started.elapsed().as_secs_f64(),
+        trials.iter().map(|t| format!("{} {} B{}", encoding_prescan::mz_label(t.arm), t.bytes, if t.delta_chunks_at_risk > 0 { format!(" ({} chunks at risk)", t.delta_chunks_at_risk) } else { String::new() })).collect::<Vec<_>>().join(", "),
+        encoding_prescan::mz_label(chosen),
+        basis.label()
+    );
+    Ok((prescan_chunk(chosen, width), Some(encoding_prescan::mz_block(sample.len(), points, &trials, chosen, basis, exact))))
 }
 
 /// Compressed bytes of the spectrum data and peak facets of an archive, by column group.
@@ -8952,23 +9602,47 @@ fn convert_tsf(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_tsf::TsfReader::open(input)?;
+    // The frames' m/z are stored exactly (owner decision D9, 2026-10-01): the archive then holds
+    // the signal `analysis.tsf_bin` holds, and the policy drops that file by default (`run`).
+    let hints = VendorHints { exact_mz: true, ..VendorHints::default() };
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
+        input, output, chunk, zstd_level, vendor, synth_chroms, hints,
         reader.len(), |i| reader.spectrum(i),
     )
 }
 
+/// The name of the parameter that marks the placeholder row of a run without a chromatogram
+/// ([`write_empty_chromatogram`]): a reader that finds it on a `chromatograms_metadata` row skips
+/// the row. Its value says why the row is there.
+const CHROMATOGRAM_PLACEHOLDER: &str = "placeholder chromatogram";
+
 /// Write one empty chromatogram (zero data points, no fabricated TIC). Mirrors mzML2mzPeak's
 /// `ensure_chromatogram_facet`: keeps the archive openable by the reference reader AND triggers
-/// the writer's index-metadata finalization. The (zero-length) TimeArray + IntensityArray are
-/// required because the writer unwraps the TimeArray on the chromatogram path.
+/// the writer's index-metadata finalization — the vendored writer emits `chromatograms_metadata`
+/// only when it holds a row, and the vendored reader counts 2 chromatograms where the member is
+/// absent. The (zero-length) TimeArray + IntensityArray are required because the writer unwraps
+/// the TimeArray on the chromatogram path.
+///
+/// The row is an id-less entry with no points and the [`CHROMATOGRAM_PLACEHOLDER`] parameter, so a
+/// reader can tell it from a chromatogram. The footers count it as the facets count: the metadata
+/// facet's `chromatogram_count` is its rows (1), the data facet's one past the largest index with a
+/// row in that file (0, decision D1): the same pair an empty spectrum leaves on the spectrum facets.
 fn write_empty_chromatogram(writer: &mut MzPeakWriterType<fs::File>) -> Result<()> {
     let mut arrays = BinaryArrayMap::new();
     arrays.add(DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new()));
     arrays.add(DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new()));
-    let empty = Chromatogram::new(ChromatogramDescription::default(), arrays);
+    let mut description = ChromatogramDescription::default();
+    description.add_param(Param::new_key_value(CHROMATOGRAM_PLACEHOLDER, "the run has no chromatogram: this row holds the facet open and is not one"));
+    let empty = Chromatogram::new(description, arrays);
     writer.write_chromatogram(&empty)?;
     Ok(())
+}
+
+/// Whether a chromatogram read from an archive is the placeholder row of a run without one
+/// ([`write_empty_chromatogram`]): marked since 0.17.0, before that an id-less row without a point.
+fn is_placeholder_chromatogram(chrom: &Chromatogram) -> bool {
+    chrom.params().iter().any(|p| !p.is_controlled() && p.name == CHROMATOGRAM_PLACEHOLDER)
+        || (chrom.id().is_empty() && chrom.arrays.get(&ArrayType::TimeArray).is_none_or(|t| t.data_len().unwrap_or(0) == 0))
 }
 
 /// The `(total_ion_current, base_peak_intensity)` pair behind the synthesized TIC/BPC chromatograms.
@@ -11136,7 +11810,7 @@ mod tests {
         let output = dir.join("out.mzML");
         let tmp = super::mzml_tmp_path(&output);
         let guard = super::TmpGuard::new(&tmp);
-        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None, &Default::default()).unwrap());
+        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None, &Default::default(), Vec::new()).unwrap());
         w.set_spectrum_count(3);
         for (i, (time, intensity)) in [(5.8905, 30.0f32), (0.0, 10.0), (0.7008, 20.0)].into_iter().enumerate() {
             let mut descr = SpectrumDescription { id: format!("scan={}", i + 1), index: i, ms_level: 1, ..Default::default() };
@@ -13466,18 +14140,22 @@ mod tests {
     }
 
     /// The `transformations` index block (invariant: every transformation declared) lists what was
-    /// applied, not what was configured. On the fixture the generic lane numpresses m/z and masks
-    /// nothing: its one profile spectrum (scan=20, 10 points) holds no run of zeros, so the mask the
-    /// writer was built with never shortened a spectrum. Its MS1 spectra arrive out of time order
-    /// (scan=19 at 5.89 min, scan=21 with no start time, cycle 22 at 42.05 s), so the synthesized TIC
-    /// and base-peak traces reach the writer unsorted and its backstop re-sorts them by time.
+    /// applied, not what was configured. On the fixture the generic lane masks nothing: its one
+    /// profile spectrum (scan=20, 10 points) holds no run of zeros, so the mask the writer was built
+    /// with never shortened a spectrum. Its MS1 spectra arrive out of time order (scan=19 at 5.89
+    /// min, scan=21 with no start time, cycle 22 at 42.05 s), so the synthesized TIC and base-peak
+    /// traces reach the writer unsorted and its backstop re-sorts them by time. The m/z encoding is
+    /// the sample's choice: numpress-linear where the rule is skipped (`MZPC_ENCODING_PRESCAN=0`),
+    /// delta otherwise — the fixture's 64-bit arrays hold integer m/z (0 to 20 in steps of 1 or 2),
+    /// 32-bit values, which delta returns exactly although its chunks span more than a factor of
+    /// two, so nothing is declared for it (through rc.2 `delta-ulp` was, from the declared type).
     #[test]
     fn transformations_block_declares_what_the_lane_applied() {
         let dir = scratch("transformations");
         let out = dir.join("tiny.mzpeak");
         let args: Vec<&std::ffi::OsStr> =
             vec![TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()];
-        let (ok, _, err) = run_bin(&args, &[]);
+        let (ok, _, err) = run_bin(&args, &[("MZPC_ENCODING_PRESCAN", "0")]);
         assert!(ok, "{err}");
         let meta = index_metadata(&out);
         let applied: Vec<&str> = meta["transformations"]
@@ -13490,23 +14168,34 @@ mod tests {
         // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run. Its
         // `sic` is in seconds, stored in minutes.
         assert_eq!(applied, ["numpress-linear", "sort-by-time", "chromatogram-time-to-minutes"], "{applied:?}");
-        // `--no-numpress` drops the codec entry — the list follows the choice, not the lane — and
-        // delta brings its own: the fixture's spectra are sparse lists (m/z 0 to 20 in steps of 1
-        // or 2), so their delta chunks span more than a factor of two and are declared, in the
-        // list and, with the bound, in `fidelity.mz_error`. Through 0.17.0-rc.1 only the block
-        // said so.
-        let out2 = dir.join("tiny-delta.mzpeak");
-        let args: Vec<&std::ffi::OsStr> = vec![
-            TINY.as_ref(), "-o".as_ref(), out2.as_os_str(), "--force".as_ref(), "--no-numpress".as_ref(),
-        ];
-        let (ok, _, err) = run_bin(&args, &[]);
-        assert!(ok, "{err}");
-        let meta = index_metadata(&out2);
-        let applied: Vec<&str> =
-            meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(applied, ["sort-by-time", "chromatogram-time-to-minutes", "delta-ulp"], "{applied:?}");
-        let delta: Vec<&serde_json::Value> = meta["fidelity"]["mz_error"].as_array().unwrap().iter().filter(|e| e["encoding"] == "delta").collect();
-        assert!(!delta.is_empty() && delta.iter().all(|e| e["chunks_not_exact_by_construction"].as_u64() > Some(0)), "{}", meta["fidelity"]);
+        assert!(meta.get("encoding_prescan").is_none(), "the skipped rule leaves no block: {meta:#}");
+        // The default (the rule) and `--no-numpress` alike store the fixture's m/z as delta chunks:
+        // the codec entry goes — the list follows the choice, not the lane — and delta declares
+        // nothing, since every value is a 32-bit one (`mz_values_32bit`), though the chunks span
+        // more than a factor of two. The rule says why; the explicit flag writes no block.
+        for (tag, flag, env) in [("default", None, &[][..]), ("flag", Some("--no-numpress"), &[("MZPC_ENCODING_PRESCAN", "1")][..])] {
+            let out2 = dir.join(format!("tiny-delta-{tag}.mzpeak"));
+            let mut args: Vec<&std::ffi::OsStr> = vec![TINY.as_ref(), "-o".as_ref(), out2.as_os_str(), "--force".as_ref()];
+            args.extend(flag.map(std::ffi::OsStr::new));
+            let (ok, _, err) = run_bin(&args, env);
+            assert!(ok, "{tag}: {err}");
+            let meta = index_metadata(&out2);
+            let applied: Vec<&str> =
+                meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            assert_eq!(applied, ["sort-by-time", "chromatogram-time-to-minutes"], "{tag}: {applied:?}");
+            assert_eq!(meta["fidelity"]["mz_error"], serde_json::json!([]), "{tag}: {}", meta["fidelity"]);
+            for facet in ["spectra_data", "spectra_peaks"] {
+                assert_eq!((&meta["fidelity"][facet]["source_types"]["mz"], &meta["fidelity"][facet]["mz_values_32bit"]), (&serde_json::json!(["float64"]), &serde_json::json!(true)), "{tag} {facet}: {}", meta["fidelity"]);
+            }
+            let block = meta.get("encoding_prescan");
+            if flag.is_none() {
+                let block = block.expect("the rule states its choice");
+                assert_eq!((&block["chosen"]["mz"], &block["basis"]), (&serde_json::json!("delta"), &serde_json::json!(super::encoding_prescan::Basis::ThirtyTwoBit.label())), "{block:#}");
+                assert!(block.get("measured_bytes").is_none(), "no trial was needed: {block:#}");
+            } else {
+                assert!(block.is_none(), "{tag}: an explicit choice is not a measured one: {meta:#}");
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -14336,6 +15025,17 @@ mod tests {
         for lane in [Lane::Standard, Lane::ViaMsconvert, Lane::VendorReader, Lane::BrukerSdk] {
             assert!(!super::inert_flags_for(lane).contains(&flag) && !super::dropped_flags_for(lane).contains(&flag), "{lane:?} honours it");
         }
+        // `--pixel-size` sizes an imaging grid: refused by every lane that writes none (the two SDK
+        // lanes mark no MALDI run imaging — through this unit's first cut they took the flag and
+        // exited 0 — the Agilent grid, the two mzML outputs); the rest honour it or refuse it at
+        // run time, on the run that turns out not to be imaging.
+        let flag = "--pixel-size";
+        for lane in [Lane::AgilentGrid, Lane::SdkImsCompact, Lane::BrukerSdk, Lane::FilterToMzml, Lane::MzmlExport] {
+            assert!(super::dropped_flags_for(lane).contains(&flag), "{lane:?}");
+        }
+        for lane in [Lane::Filter, Lane::Standard, Lane::ViaMsconvert, Lane::ImsCompact, Lane::VendorReader] {
+            assert!(!super::dropped_flags_for(lane).contains(&flag) && !super::inert_flags_for(lane).contains(&flag), "{lane:?} honours it");
+        }
     }
 
     /// Every lane refusing `--image` names a remedy that works: the second run on the archive, which
@@ -14505,6 +15205,8 @@ mod tests {
     /// The pre-scan writes a sample once per arm and keeps each column's smallest arm; whatever it
     /// chooses, every m/z, intensity and drift time reads back as written. Its trial archives are
     /// removed without the "removed incomplete" warning a failed conversion gets (review 2026-09-30).
+    /// The frames' m/z are 32-bit values, as every Waters value is, so the lossy numpress arm is
+    /// not offered (the default rule's first half) and the block says why.
     #[test]
     fn encoding_prescan_keeps_each_columns_smallest_arm_and_the_values() {
         use super::{convert_vendor_reader_tallied, VendorHints};
@@ -14523,7 +15225,9 @@ mod tests {
         assert!(warned.is_empty(), "{warned:?}");
 
         let block = index_metadata(&out)["encoding_prescan"].clone();
-        assert_eq!(block["measured_bytes"]["mz"].as_object().unwrap().len(), 4, "{block:#}");
+        assert_eq!(block["measured_bytes"]["mz"].as_object().unwrap().len(), 3, "{block:#}");
+        assert!(!block["measured_bytes"]["mz"].as_object().unwrap().contains_key("numpress-linear"), "{block:#}");
+        assert_eq!(block["numpress_linear_excluded"], super::encoding_prescan::Basis::ThirtyTwoBit.label(), "{block:#}");
         assert_eq!(block["measured_bytes"]["intensity"].as_object().unwrap().len(), 4, "{block:#}");
         assert_eq!(block["measured_bytes"]["ion_mobility"].as_object().unwrap().len(), 3, "{block:#}");
         assert_eq!(block["int32_intensity_eligible"], true);
@@ -14750,15 +15454,31 @@ mod tests {
             let acc = row["accession"].as_str().unwrap();
             assert_eq!(row["unit"], param(&m["scan_settings_list"][0], acc).unwrap()["unit"], "{acc}: {:#}", m["imaging_pixel_size"]);
         }
-        // A single y in that unit pair is tested in the unit written (µm): 100 × 3 = 300 µm is kept,
-        // 0.01 is dropped — by accession it passed as 0.01 cm and was written as 0.01 µm.
-        for (name, value, kept) in [("cm_y", "100.0", true), ("cm_y_small", "0.01", false)] {
-            let m = convert(name, base.replace(px, "").replace(py, &cm(py).replace("100.0", value)));
-            let written = param(&m["scan_settings_list"][0], "IMS:1000047");
-            assert_eq!(written.is_some(), kept, "{name}: {:#}", m["imaging_pixel_size"]);
-            assert_eq!(declared(&m, super::imaging::DROPPED), !kept, "{name}: {:#}", m["transformations"]);
-            if let Some(w) = written {
-                assert_eq!((&w["value"], &w["unit"]), (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}");
+        // A single value in that unit pair is read both ways against the extent (owner decision D4):
+        // 100 "micrometer" × 3 = 300 µm passes by the name and is kept as it was; 0.01 passes only
+        // as 0.01 cm (the accession) and is written as 100 µm, declared (it was dropped through
+        // 0.17.0-rc.2; before review B17 it passed by accession and was written as 0.01 µm). A lone
+        // x gives y too (the vocabulary's default), so the marker reads both and says `declared`;
+        // a lone y says nothing about x: the marker has no `pixel_size_um` and says `unknown`, by
+        // its own rule (the first cut of this unit asserted `declared` of the lone y).
+        for (name, lone_x, value, by_accession) in [("cm_x", true, "100.0", false), ("cm_x_small", true, "0.01", true), ("cm_y", false, "100.0", false), ("cm_y_small", false, "0.01", true)] {
+            let header = if lone_x { base.replace(py, "").replace(px, &cm(px).replace("100.0", value)) } else { base.replace(px, "").replace(py, &cm(py).replace("100.0", value)) };
+            let m = convert(name, header);
+            let s = &m["scan_settings_list"][0];
+            assert!(!declared(&m, super::imaging::DROPPED), "{name}: {:#}", m["transformations"]);
+            assert_eq!(declared(&m, super::imaging::UNIT_FROM_ACCESSION), by_accession, "{name}: {:#}", m["transformations"]);
+            let written: Vec<&str> = if lone_x { vec!["IMS:1000046", "IMS:1000047"] } else { vec!["IMS:1000047"] };
+            for acc in ["IMS:1000046", "IMS:1000047"] {
+                match param(s, acc) {
+                    Some(w) => assert!(written.contains(&acc) && (&w["value"], &w["unit"]) == (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}: {acc} {w:#}"),
+                    None => assert!(!written.contains(&acc), "{name}: no {acc}: {s:#}"),
+                }
+            }
+            if lone_x {
+                assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"]), (&serde_json::json!({"x": 100.0, "y": 100.0}), &serde_json::json!("declared")), "{name}: {:#}", m["imaging"]);
+            } else {
+                assert!(m["imaging"].get("pixel_size_um").is_none(), "{name}: {:#}", m["imaging"]);
+                assert_eq!(m["imaging"]["pixel_size_source"], "unknown", "{name}: {:#}", m["imaging"]);
             }
         }
 
@@ -14795,6 +15515,140 @@ mod tests {
         assert_eq!(m["imaging"]["provenance"]["detected_from"], "IMS:1000050/51 on the input's scans");
         assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 3, "y": 3}), "{:#}", m["imaging"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--pixel-size` (owner decision D3, 2026-10-01): written where the source settles no size,
+    /// kept where it states the same, refused where it states another unless `--force`; declared
+    /// and recorded on the imzML lane and on the rewrite of an archive; refused where there is no
+    /// grid to size (a run that is not imaging, an mzML output) and when malformed; the config key
+    /// in its three spellings.
+    #[test]
+    fn a_user_pixel_size_is_written_where_the_source_settles_none() {
+        let dir = scratch("pixel-size-flag");
+        let thyra = |name: &str| std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/thyra")).join(format!("pixel_size_{name}.imzML"));
+        let convert = |input: &std::path::Path, out: &str, extra: &[&str]| -> (bool, serde_json::Value, String) {
+            let out = dir.join(out);
+            let mut args: Vec<&std::ffi::OsStr> = vec![input.as_os_str(), "-o".as_ref(), out.as_os_str()];
+            args.extend(extra.iter().map(std::ffi::OsStr::new));
+            let (ok, _, err) = run_bin(&args, &[]);
+            (ok, if ok { index_metadata(&out) } else { serde_json::Value::Null }, err)
+        };
+        let sizes = |m: &serde_json::Value| -> Vec<(String, f64, String)> {
+            let mut v: Vec<(String, f64, String)> = m["scan_settings_list"][0]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| ["IMS:1000046", "IMS:1000047", "IMS:1000044", "IMS:1000045"].contains(&p["accession"].as_str().unwrap_or("")))
+                .map(|p| (p["accession"].as_str().unwrap().into(), p["value"].as_f64().unwrap(), p["unit"].as_str().unwrap_or("").into()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let um = |acc: &str, v: f64| (acc.to_string(), v, "UO:0000017".to_string());
+        let user_supplied = serde_json::json!(super::imaging::USER_SUPPLIED);
+        // The unit contradiction without an extent: the rule drops the stated 50; --pixel-size 50
+        // fills it (declared, recorded, the max dimension from the 3 × 2 counts).
+        let (ok, m, err) = convert(&thyra("unit_contradiction"), "filled.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"]), (&serde_json::json!({"x": 50.0, "y": 50.0}), &serde_json::json!("user_supplied")), "{:#}", m["imaging"]);
+        assert_eq!(m["imaging"]["provenance"]["pixel_size"], "user supplied (--pixel-size)");
+        let declared = m["transformations"].as_array().unwrap();
+        assert!(declared.contains(&user_supplied) && declared.contains(&serde_json::json!(super::imaging::DROPPED)), "the rule's drop stays declared beside the fill: {declared:?}");
+        let rows = m["imaging_pixel_size"].as_array().unwrap();
+        assert_eq!((rows.len(), rows[0]["case"].as_str(), rows[1]["case"].as_str()), (2, Some("one value, untestable"), Some("user supplied (--pixel-size)")), "{rows:#?}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 150.0), um("IMS:1000045", 100.0), um("IMS:1000046", 50.0), um("IMS:1000047", 50.0)]);
+        // The declared 50 µm: 50 agrees (nothing declared), 20 is refused naming both, --force
+        // writes 20 × 25 over it and recomputes the stated max dimension.
+        let (ok, m, err) = convert(&thyra("unit_declared"), "agrees.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert!(m["imaging"]["pixel_size_source"] == "declared" && m.get("imaging_pixel_size").is_none() && !m["transformations"].as_array().unwrap().contains(&user_supplied), "{m:#}");
+        let (ok, _, err) = convert(&thyra("unit_declared"), "refused.mzpeak", &["--pixel-size", "20"]);
+        assert!(!ok && err.contains("--pixel-size 20 µm") && err.contains("(IMS:1000046) = 50 µm") && err.contains("--force"), "{err}");
+        assert!(!dir.join("refused.mzpeak").exists(), "nothing written");
+        let (ok, m, err) = convert(&thyra("unit_declared"), "forced.mzpeak", &["--pixel-size", "20,25", "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"]), (&serde_json::json!({"x": 20.0, "y": 25.0}), &serde_json::json!("user_supplied")));
+        let row = &m["imaging_pixel_size"][0];
+        assert_eq!((&row["overridden"], row["stated"].as_array().unwrap().len()), (&serde_json::json!(true), 2), "{row:#}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 60.0), um("IMS:1000045", 50.0), um("IMS:1000046", 20.0), um("IMS:1000047", 25.0)]);
+        // The rewrite lane: an archive without a size gains it, marker, declaration and row with it;
+        // its mzML export then states the size; an archive with another size refuses it.
+        let (ok, m, err) = convert(&thyra("unit_contradiction"), "unsized.mzpeak", &[]);
+        assert!(ok && m["imaging"].get("pixel_size_um").is_none() && m["imaging"]["pixel_size_source"] == "unknown", "{err} {:#}", m["imaging"]);
+        let (ok, m, err) = convert(&dir.join("unsized.mzpeak"), "rewritten.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert_eq!(
+            (&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"], &m["imaging"]["provenance"]["pixel_size"]),
+            (&serde_json::json!({"x": 50.0, "y": 50.0}), &serde_json::json!("user_supplied"), &serde_json::json!("user supplied (--pixel-size)")),
+            "{:#}",
+            m["imaging"]
+        );
+        assert!(m["transformations"].as_array().unwrap().contains(&user_supplied) && m["filter"].is_object(), "{m:#}");
+        assert_eq!(m["imaging_pixel_size"].as_array().unwrap().len(), 2, "{:#}", m["imaging_pixel_size"]);
+        assert_eq!(sizes(&m), [um("IMS:1000044", 150.0), um("IMS:1000045", 100.0), um("IMS:1000046", 50.0), um("IMS:1000047", 50.0)]);
+        let mzml = dir.join("rewritten.mzML");
+        let (ok, _, err) = run_bin(&[dir.join("rewritten.mzpeak").as_os_str(), "-o".as_ref(), mzml.as_os_str()], &[]);
+        assert!(ok, "{err}");
+        let text = std::fs::read_to_string(&mzml).unwrap();
+        assert!(text.contains(r#"accession="IMS:1000046""#) && text.contains(r#"accession="IMS:1000047""#), "the export states the size");
+        let (ok, _, err) = convert(&dir.join("forced.mzpeak"), "refused2.mzpeak", &["--pixel-size", "50"]);
+        assert!(!ok && err.contains("the archive's scan settings states a pixel size that differs"), "{err}");
+        // Refused where there is no grid: a run that is not imaging, an archive that is not, an mzML output.
+        let (ok, _, err) = convert(std::path::Path::new(TINY), "tiny.mzpeak", &["--pixel-size", "10"]);
+        assert!(!ok && err.contains("is not an imaging run"), "{err}");
+        let (ok, _, err) = convert(std::path::Path::new(TINY), "tiny-plain.mzpeak", &[]);
+        assert!(ok, "{err}");
+        let (ok, _, err) = convert(&dir.join("tiny-plain.mzpeak"), "tiny-rewritten.mzpeak", &["--pixel-size", "10"]);
+        assert!(!ok && err.contains("is not an imaging archive"), "{err}");
+        let (ok, _, err) = convert(&thyra("unit_contradiction"), "out.mzML", &["--pixel-size", "10"]);
+        assert!(!ok && err.contains("--pixel-size is not honoured"), "{err}");
+        // Malformed sizes are refused before any lane opens the input (`=`: clap takes a bare `-5`
+        // for a flag of its own and refuses it itself).
+        for bad in ["0", "abc", "1,2,3", "-5", "inf"] {
+            let flag = format!("--pixel-size={bad}");
+            let (ok, _, err) = convert(&thyra("unit_contradiction"), "bad.mzpeak", &[&flag]);
+            assert!(!ok && err.contains("--pixel-size") && !dir.join("bad.mzpeak").exists(), "{bad}: {err}");
+        }
+        // An axis stating no size but a count and a max dimension — the evidence D4 settles a size
+        // by — tests the supplied size the other way round (this unit's first cut wrote 20 µm beside
+        // a 150 µm × 3 px axis in silence): 50 fills and keeps the extents, 20 is refused naming the
+        // extent before anything is written, --force writes 20 with the extents recomputed.
+        let header = std::fs::read_to_string(thyra("unit_contradiction")).unwrap();
+        let size_line = r#"<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size" value="50" unitCvRef="UO" unitAccession="UO:0000015" unitName="micrometer"/>"#;
+        assert!(header.contains(size_line), "{header}");
+        let extents = r#"<cvParam cvRef="IMS" accession="IMS:1000044" name="max dimension x" value="150" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/><cvParam cvRef="IMS" accession="IMS:1000045" name="max dimension y" value="100" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#;
+        std::fs::write(dir.join("extent_only.imzML"), header.replace(size_line, extents)).unwrap();
+        std::fs::copy(thyra("unit_contradiction").with_extension("ibd"), dir.join("extent_only.ibd")).unwrap();
+        let (ok, _, err) = convert(&dir.join("extent_only.imzML"), "extent-refused.mzpeak", &["--pixel-size", "20"]);
+        assert!(!ok && err.contains("max dimension x (IMS:1000044) = 150 µm over 3 pixels, not 3 × 20 µm = 60 µm") && err.contains("--force"), "{err}");
+        assert!(!dir.join("extent-refused.mzpeak").exists(), "nothing written");
+        let (ok, m, err) = convert(&dir.join("extent_only.imzML"), "extent-filled.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 150.0), um("IMS:1000045", 100.0), um("IMS:1000046", 50.0), um("IMS:1000047", 50.0)]);
+        assert_eq!((&m["imaging"]["pixel_size_source"], &m["imaging_pixel_size"][0]["max_dimension"]), (&serde_json::json!("user_supplied"), &serde_json::json!([])), "{:#}", m["imaging_pixel_size"]);
+        let (ok, m, err) = convert(&dir.join("extent_only.imzML"), "extent-forced.mzpeak", &["--pixel-size", "20", "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 60.0), um("IMS:1000045", 40.0), um("IMS:1000046", 20.0), um("IMS:1000047", 20.0)]);
+        let row = &m["imaging_pixel_size"][0];
+        assert_eq!((&row["overridden"], row["stated"].as_array().unwrap().len(), row["max_dimension"].as_array().unwrap().len()), (&serde_json::json!(true), 0, 2), "{row:#}");
+        // The config key, in its three spellings; --force on the command line still folds in.
+        for (yaml, want) in [("pixel_size: 50", (50.0, 50.0)), ("pixel_size: \"50,60\"", (50.0, 60.0)), ("pixel_size: [50, 60]", (50.0, 60.0))] {
+            let cfg = dir.join("cfg.yaml");
+            std::fs::write(&cfg, yaml).unwrap();
+            let (ok, m, err) = convert(&thyra("unit_contradiction"), "cfg.mzpeak", &["-c", cfg.to_str().unwrap(), "--force"]);
+            assert!(ok, "{yaml}: {err}");
+            assert_eq!(m["imaging"]["pixel_size_um"], serde_json::json!({"x": want.0, "y": want.1}), "{yaml}");
+        }
+        // A config file's standing `force: true` overwrites outputs; it does not write over a stated
+        // size — that acknowledgement is the command line's --force alone (it did, in silence).
+        let cfg = dir.join("cfg-force.yaml");
+        std::fs::write(&cfg, "pixel_size: 20\nforce: true\n").unwrap();
+        let (ok, _, err) = convert(&thyra("unit_declared"), "cfg-force.mzpeak", &["-c", cfg.to_str().unwrap()]);
+        assert!(!ok && err.contains("(IMS:1000046) = 50 µm") && err.contains("--force"), "{err}");
+        let (ok, m, err) = convert(&thyra("unit_declared"), "cfg-force.mzpeak", &["-c", cfg.to_str().unwrap(), "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging_pixel_size"][0]["overridden"]), (&serde_json::json!({"x": 20.0, "y": 20.0}), &serde_json::json!(true)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The `.ibd` is hashed against the checksum the imzML states (HUPO-PSI/mzPeak-specification#23:
@@ -14869,6 +15723,372 @@ mod tests {
         let (m, _) = convert("sha256", &format!(r#"<cvParam cvRef="IMS" accession="IMS:1000092" name="ibd SHA-256" value="{sha256}"/>"#));
         assert_eq!(m["imaging"]["provenance"]["ibd_checksum"], "verified");
         ibd_source(&m, "sha256");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 2 × 2 profile imzML written for the test in the binary mode `mode` (`continuous` or
+    /// `processed`): one 12-point m/z axis (64-bit float, `100 + i`) and per spectrum 12 float32
+    /// intensities with an all-zero stretch at each end and one inside (`[0,0,0, 5+k, 7, 0,0,0, 3,
+    /// 0,0,0]`), so the writer's mask keeps indices 2..=9. In continuous mode every spectrum's m/z
+    /// array is the one at offset 16, as the mode defines it; with `odd_axis` the last spectrum
+    /// points at an array of its own (`axis + 0.5`), which the mode forbids. The `.ibd`'s SHA-1 and
+    /// UUID are stated. Returns the path and the axis.
+    fn profile_imzml(dir: &std::path::Path, name: &str, mode: &str, odd_axis: bool) -> (std::path::PathBuf, Vec<f64>) {
+        use sha1::{Digest, Sha1};
+        let template = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let head = &template[..template.find("<spectrumList").unwrap()];
+        let centroid = r#"accession="MS:1000127" name="centroid spectrum""#;
+        let processed = r#"<cvParam cvRef="IMS" accession="IMS:1000031" name="processed"/>"#;
+        assert!(head.matches(centroid).count() == 2 && head.contains(processed) && head.contains("fd5c5dae18095ba7ab55a6ad1bd1175180b292a8"));
+        let axis: Vec<f64> = (0..12).map(|i| 100.0 + i as f64).collect();
+        let mut ibd: Vec<u8> = vec![0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0x03, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9];
+        let shared_at = ibd.len();
+        axis.iter().for_each(|v| ibd.extend(v.to_le_bytes()));
+        let array = |group: &str, offset: usize, bytes: usize| {
+            format!(
+                r#"<binaryDataArray encodedLength="0"><referenceableParamGroupRef ref="{group}"/>
+            <cvParam cvRef="IMS" accession="IMS:1000103" name="external array length" value="12"/>
+            <cvParam cvRef="IMS" accession="IMS:1000102" name="external offset" value="{offset}"/>
+            <cvParam cvRef="IMS" accession="IMS:1000104" name="external encoded length" value="{bytes}"/>
+            <binary/></binaryDataArray>"#
+            )
+        };
+        let mut spectra = String::new();
+        for k in 0..4usize {
+            let mz_at = if odd_axis && k == 3 {
+                let at = ibd.len();
+                axis.iter().for_each(|v| ibd.extend((v + 0.5).to_le_bytes()));
+                at
+            } else if mode == "continuous" {
+                shared_at
+            } else {
+                let at = ibd.len();
+                axis.iter().for_each(|v| ibd.extend(v.to_le_bytes()));
+                at
+            };
+            let intensity_at = ibd.len();
+            for v in [0.0f32, 0.0, 0.0, 5.0 + k as f32, 7.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0] {
+                ibd.extend(v.to_le_bytes());
+            }
+            spectra.push_str(&format!(
+                r#"<spectrum id="Scan={}" defaultArrayLength="0" index="{k}">
+        <referenceableParamGroupRef ref="spectrum1"/>
+        <scanList count="1"><cvParam cvRef="MS" accession="MS:1000795" name="no combination"/>
+          <scan>{}</scan></scanList>
+        <binaryDataArrayList count="2">{}{}</binaryDataArrayList></spectrum>
+"#,
+                k + 1,
+                position(k % 2 + 1, k / 2 + 1),
+                array("mzArray", mz_at, 96),
+                array("intensityArray", intensity_at, 48),
+            ));
+        }
+        let sha1: String = Sha1::digest(&ibd).iter().map(|b| format!("{b:02x}")).collect();
+        let text = format!(
+            "{}<spectrumList count=\"4\" defaultDataProcessingRef=\"dp1\">\n{spectra}</spectrumList></run></mzML>\n",
+            head.replace(centroid, r#"accession="MS:1000128" name="profile spectrum""#)
+                .replace(processed, &format!(r#"<cvParam cvRef="IMS" accession="IMS:10000{}" name="{mode}"/>"#, if mode == "continuous" { "30" } else { "31" }))
+                .replace("fd5c5dae18095ba7ab55a6ad1bd1175180b292a8", &sha1)
+        );
+        std::fs::write(dir.join(format!("{name}.ibd")), ibd).unwrap();
+        let path = dir.join(format!("{name}.imzML"));
+        std::fs::write(&path, text).unwrap();
+        (path, axis)
+    }
+
+    /// The m/z arrays of the first `n` spectra of an archive, as the reader decodes them.
+    fn stored_mz(archive: &std::path::Path, n: usize) -> Vec<Vec<f64>> {
+        use mzpeak_prototyping::MzPeakReader;
+        let mut r = MzPeakReader::new(archive).unwrap();
+        (0..n).map(|i| r.get_spectrum(i).unwrap().arrays.as_ref().unwrap().mzs().unwrap().to_vec()).collect()
+    }
+
+    /// Owner decision D2 (2026-10-01): a continuous-mode imzML (`IMS:1000030`) is written with the
+    /// zero runs kept without being asked, so every pixel decodes to the one m/z axis the file
+    /// stores — masked, each pixel kept a different subset of it and one source m/z decoded to
+    /// several values across pixels (171.33333 → 8 values in the 9 pixels of `Example_Continuous`,
+    /// HUPO-PSI/mzPeak-specification#23) — nothing lossy is declared that did not happen, and the
+    /// marker states the mode and whether every spectrum did hold the same array. A processed-mode
+    /// file is masked as before, `--keep-zero-runs` its override. Decision D10 beside it: the
+    /// marker's `mz_range` is the STORED arrays' range, which the mask narrows on such a file.
+    #[test]
+    fn imzml_continuous_mode_keeps_zero_runs_and_states_the_shared_axis() {
+        let dir = scratch("imzml-continuous");
+        let convert = |name: &str, src: &std::path::Path, flags: &[&str]| -> (std::path::PathBuf, serde_json::Value, String) {
+            let out = dir.join(format!("{name}.mzpeak"));
+            let mut args: Vec<&std::ffi::OsStr> = vec![src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()];
+            args.extend(flags.iter().map(|f| std::ffi::OsStr::new(f)));
+            let (ok, _, err) = run_bin(&args, &[]);
+            assert!(ok, "{name}: {err}");
+            let m = index_metadata(&out);
+            (out, m, err)
+        };
+        let masked = |m: &serde_json::Value| m["transformations"].to_string().contains("zero-run-mask");
+        let points = |m: &serde_json::Value| (m["fidelity"]["spectra_data"]["source_points"].as_u64(), m["fidelity"]["spectra_data"]["stored_points"].as_u64());
+
+        // Continuous: kept, said so, the mode and the verified shared axis in the marker, and the
+        // four pixels decode to one axis — the source's, exactly: the axis is 32-bit values, so the
+        // default m/z encoding is delta (P2, the sample-based rule), and nothing lossy is declared.
+        let (src, axis) = profile_imzml(&dir, "cont", "continuous", false);
+        let (out, m, log) = convert("cont", &src, &[]);
+        assert!(!masked(&m), "{:#}", m["transformations"]);
+        assert!(log.contains("continuous-mode imzML (IMS:1000030): zero runs kept"), "{log}");
+        assert_eq!((m["imaging"]["storage_mode"].as_str(), m["imaging"]["shared_mz_axis"].as_bool()), (Some("continuous"), Some(true)), "{:#}", m["imaging"]);
+        assert_eq!(points(&m), (Some(48), Some(48)), "{:#}", m["fidelity"]);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.0]));
+        let decoded = stored_mz(&out, 4);
+        assert!(decoded.iter().all(|d| d == &decoded[0]), "one axis for every pixel: {decoded:?}");
+        assert_eq!(decoded[0].len(), 12);
+        assert_eq!(decoded[0], axis, "the one axis, exactly");
+        let applied = m["transformations"].to_string();
+        assert!(!applied.contains("numpress-linear") && !applied.contains("delta-ulp"), "an exact encoding, nothing lossy declared: {:#}", m["transformations"]);
+        assert_eq!(m["fidelity"]["mz_error"], serde_json::json!([]), "{:#}", m["fidelity"]);
+        assert_eq!(m["encoding_prescan"]["chosen"]["mz"], "delta", "{:#}", m["encoding_prescan"]);
+
+        // Continuous by its header, but one spectrum holds another array: kept all the same (the
+        // header's claim decided the mask), `shared_mz_axis` false, one warning with the count.
+        let (src, _) = profile_imzml(&dir, "odd", "continuous", true);
+        let (_, m, log) = convert("odd", &src, &[]);
+        assert!(!masked(&m));
+        assert_eq!(m["imaging"]["shared_mz_axis"], false, "{:#}", m["imaging"]);
+        assert!(log.contains("1 of 4 differ from the first; metadata.imaging.shared_mz_axis is false"), "{log}");
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.5]));
+
+        // Processed: masked as before, the mode stated, no shared-axis claim; the stored range is
+        // what the mask left (the edge runs go, index 2 to 9); `--keep-zero-runs` is the override.
+        let (src, _) = profile_imzml(&dir, "proc", "processed", false);
+        let (_, m, log) = convert("proc", &src, &[]);
+        assert!(masked(&m), "{:#}", m["transformations"]);
+        assert!(!log.contains("zero runs kept"), "{log}");
+        assert_eq!(m["imaging"]["storage_mode"], "processed");
+        assert!(m["imaging"].get("shared_mz_axis").is_none(), "{:#}", m["imaging"]);
+        assert_eq!(points(&m), (Some(48), Some(28)), "7 of 12 points per spectrum: {:#}", m["fidelity"]);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([102.0, 109.0]), "{:#}", m["imaging"]);
+        let (_, m, _) = convert("proc_keep", &src, &["--keep-zero-runs"]);
+        assert!(!masked(&m));
+        assert_eq!(points(&m), (Some(48), Some(48)));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.0]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owner decision D6 (2026-10-01): a spectrum typed `MS1 spectrum` (MS:1000579) that states
+    /// `ms level` 0 — the ms-imaging.org example files, the DESI set and the GBM set all do, in
+    /// their shared `spectrum1` group — is written with `ms_level` 1, declared, warned once with the
+    /// count; the direct mzML export writes level 1 too, with the warning as its declaration. A
+    /// file stating level 1 declares nothing.
+    #[test]
+    fn imzml_ms_level_zero_on_ms1_spectra_is_written_as_one() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        let one = r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>"#;
+        assert!(base.contains(one));
+        let dir = scratch("imzml-ms-level-0");
+        let levels = |archive: &std::path::Path| -> Vec<i64> {
+            let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+            let meta = extract_zip_entry(&mut zip, "spectra_metadata.parquet", &dir);
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&meta).unwrap()).unwrap().build().unwrap();
+            let mut levels = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let level = arrow::compute::cast(batch.column_by_name("ms_level").unwrap(), &arrow::datatypes::DataType::Int64).unwrap();
+                levels.extend(level.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().iter().map(|v| v.unwrap()));
+            }
+            levels
+        };
+        for (name, level, raised) in [("zero", r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="0"/>"#, true), ("one", one, false)] {
+            std::fs::write(dir.join(format!("{name}.imzML")), base.replace(one, level)).unwrap();
+            std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
+            let src = dir.join(format!("{name}.imzML"));
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            let m = index_metadata(&out);
+            assert_eq!(m["transformations"].to_string().contains(super::imaging::MS_LEVEL_0_AS_1), raised, "{name}: {:#}", m["transformations"]);
+            assert_eq!(err.matches("state ms level 0; written with ms_level 1").count(), usize::from(raised), "{name}: {err}");
+            if raised {
+                assert!(err.contains("9 spectra typed MS1 spectrum (MS:1000579) state ms level 0"), "{err}");
+            }
+            assert_eq!(levels(&out), vec![1; 9], "{name}");
+            // The direct export: level 1 in the text, the warning its declaration.
+            let mzml = dir.join(format!("{name}.mzML"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            let text = std::fs::read_to_string(&mzml).unwrap();
+            assert_eq!(text.matches(r#"name="ms level" value="1""#).count(), 9, "{name}");
+            assert!(!text.contains(r#"name="ms level" value="0""#), "{name}");
+            assert_eq!(err.contains("state ms level 0; written with ms level 1"), raised, "{name}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owner decision D7 (2026-10-01): an `.ibd` that begins with another UUID than the imzML states
+    /// is not the pair the imzML describes — the signal could be another run's — and is refused,
+    /// before anything is written, with both UUIDs in the message; `--force` converts it anyway,
+    /// warned, declared and recorded as rc.2 did. A checksum mismatch alone goes on converting
+    /// (a damaged copy of the right data). Both lanes: the archive and the direct mzML export. An
+    /// `.ibd` shorter than a UUID is refused the same way, the message giving its length.
+    #[test]
+    fn imzml_ibd_uuid_mismatch_refuses_unless_forced() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        const STATED: &str = "{1a2b3c4d-5e6f-7081-9203-b4c5d6e7f8a9}";
+        const OTHER: &str = "{2487DB05-6594-49DA-8B16-D4C1FA24CA57}";
+        const SHA1: &str = "fd5c5dae18095ba7ab55a6ad1bd1175180b292a8";
+        assert!(base.contains(STATED) && base.contains(SHA1));
+        let dir = scratch("imzml-ibd-uuid");
+        std::fs::write(dir.join("bad.imzML"), base.replace(STATED, OTHER)).unwrap();
+        std::fs::copy(ibd, dir.join("bad.ibd")).unwrap();
+        std::fs::write(dir.join("sum.imzML"), base.replace(SHA1, "173bdf1701ab791b462fdfcbfd2f4ad6c5b26168")).unwrap();
+        std::fs::copy(ibd, dir.join("sum.ibd")).unwrap();
+        let src = dir.join("bad.imzML");
+        for ext in ["mzpeak", "mzML"] {
+            let out = dir.join(format!("bad.{ext}"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str()], &[]);
+            assert!(!ok, "{ext}: refused: {err}");
+            assert!(err.contains("the .ibd begins with UUID 1a2b3c4d5e6f70819203b4c5d6e7f8a9, the imzML states {2487DB05-6594-49DA-8B16-D4C1FA24CA57}"), "{ext}: {err}");
+            assert!(err.contains("Not converted. Pass --force"), "{ext}: {err}");
+            assert!(!out.exists(), "{ext}: nothing written");
+            assert!(fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp")), "{ext}: no temp left");
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{ext}: forced: {err}");
+            assert!(err.contains("they are not the pair the imzML describes") && err.contains("--force"), "{ext}: {err}");
+            assert!(out.exists());
+        }
+        let m = index_metadata(&dir.join("bad.mzpeak"));
+        let p = &m["imaging"]["provenance"];
+        assert_eq!((p["ibd_uuid"].as_str(), p["ibd_uuid_found"].as_str()), (Some("mismatch"), Some("1a2b3c4d5e6f70819203b4c5d6e7f8a9")), "{p:#}");
+        assert!(m["transformations"].to_string().contains(super::imaging::IBD_UUID_MISMATCH), "{:#}", m["transformations"]);
+        let uuid = m["file_description"]["contents"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000080").unwrap();
+        assert_eq!(uuid["value"], OTHER, "the stated value stays");
+        // A checksum mismatch alone: converted, declared, no --force needed.
+        let out = dir.join("sum.mzpeak");
+        let (ok, _, err) = run_bin(&[dir.join("sum.imzML").as_os_str(), "-o".as_ref(), out.as_os_str()], &[]);
+        assert!(ok, "{err}");
+        let m = index_metadata(&out);
+        assert_eq!((m["imaging"]["provenance"]["ibd_checksum"].as_str(), m["imaging"]["provenance"]["ibd_uuid"].as_str()), (Some("mismatch"), Some("verified")));
+        // An `.ibd` shorter than a UUID (empty, truncated) begins with no UUID: refused, the message
+        // giving the length instead of an empty UUID.
+        for (name, bytes) in [("empty", 0usize), ("short", 5)] {
+            let src = dir.join(format!("{name}.imzML"));
+            std::fs::write(&src, &base).unwrap();
+            std::fs::write(dir.join(format!("{name}.ibd")), vec![0u8; bytes]).unwrap();
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str()], &[]);
+            assert!(!ok, "{name}: refused: {err}");
+            assert!(err.contains(&format!("the .ibd begins with no UUID (the .ibd is {bytes} bytes long), the imzML states {STATED}")), "{name}: {err}");
+            assert!(!out.exists(), "{name}: nothing written");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owner decision D11 (2026-10-01): the header's `<contact>` is dropped by default, with a note,
+    /// and carried under `--keep-contact` (config `keep_contact` too) into the archive's
+    /// `file_description.contacts` — the spec's slot: `contact_name`, `contact_affiliation`, every
+    /// param — and into both mzML exports, as `<contact>` after the source files. The export of an
+    /// archive writes what the archive holds, flag or not. The test header is Latin-1, as the
+    /// ms-imaging.org example files are (Thorsten Schramm's affiliation has an umlaut).
+    #[test]
+    fn keep_contact_carries_the_contact_into_the_archive_and_both_exports() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        const AFFILIATION: &str = "Institut f\u{fc}r Anorganische und Analytische Chemie";
+        let contact = format!(
+            r#"    <contact>
+      <cvParam cvRef="MS" accession="MS:1000586" name="contact name" value="Thorsten Schramm"/>
+      <cvParam cvRef="MS" accession="MS:1000590" name="contact organization" value="{AFFILIATION}"/>
+      <cvParam cvRef="MS" accession="MS:1000587" name="contact address" value="Schubertstraße 60, Gießen, Germany"/>
+      <cvParam cvRef="MS" accession="MS:1000588" name="contact URL" value="https://example.org/~schramm"/>
+      <cvParam cvRef="MS" accession="MS:1000589" name="contact email" value="thorsten.schramm@example.org"/>
+    </contact>
+  </fileDescription>"#
+        );
+        assert!(base.contains("  </fileDescription>") && base.contains(r#"encoding="ISO-8859-1""#));
+        let dir = scratch("keep-contact");
+        // Written as the Latin-1 bytes the declaration promises.
+        let latin1: Vec<u8> = base.replace("  </fileDescription>", &contact).chars().map(|c| u8::try_from(u32::from(c)).expect("Latin-1")).collect();
+        std::fs::write(dir.join("c.imzML"), latin1).unwrap();
+        std::fs::copy(ibd, dir.join("c.ibd")).unwrap();
+        let src = dir.join("c.imzML");
+        let run = |out: &std::path::Path, flags: &[&str], envs: &[(&str, &str)]| -> String {
+            let mut args: Vec<&std::ffi::OsStr> = vec![src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()];
+            args.extend(flags.iter().map(|f| std::ffi::OsStr::new(f)));
+            let (ok, _, err) = run_bin(&args, envs);
+            assert!(ok, "{}: {err}", out.display());
+            err
+        };
+        let accessions = |c: &serde_json::Value| -> Vec<String> { c["parameters"].as_array().unwrap().iter().map(|p| p["accession"].as_str().unwrap().to_string()).collect() };
+
+        // Default: dropped, one note naming the contact.
+        let plain = dir.join("plain.mzpeak");
+        let log = run(&plain, &[], &[]);
+        let m = index_metadata(&plain);
+        assert!(m["file_description"].get("contacts").is_none(), "{:#}", m["file_description"]);
+        assert!(log.contains("the header's <contact> (Thorsten Schramm) is not carried") && log.contains("--keep-contact carries it"), "{log}");
+
+        // --keep-contact: the spec's contact object, every param, the umlaut decoded.
+        let kept = dir.join("kept.mzpeak");
+        let log = run(&kept, &["--keep-contact"], &[]);
+        assert!(log.contains("--keep-contact: 1 contact(s) of the header carried (Thorsten Schramm)"), "{log}");
+        let m = index_metadata(&kept);
+        let contacts = m["file_description"]["contacts"].as_array().unwrap_or_else(|| panic!("{:#}", m["file_description"]));
+        assert_eq!(contacts.len(), 1);
+        let c = &contacts[0];
+        assert_eq!((c["contact_name"].as_str(), c["contact_affiliation"].as_str()), (Some("Thorsten Schramm"), Some(AFFILIATION)), "{c:#}");
+        assert_eq!(accessions(c), ["MS:1000586", "MS:1000590", "MS:1000587", "MS:1000588", "MS:1000589"]);
+        assert_eq!(c["parameters"][4]["value"], "thorsten.schramm@example.org");
+        // The rest of the block is the writer's, untouched.
+        assert!(m["file_description"]["contents"].as_array().is_some_and(|c| !c.is_empty()) && m["file_description"]["source_files"].as_array().is_some_and(|s| s.len() == 2), "{:#}", m["file_description"]);
+        // The config key.
+        std::fs::write(dir.join("keep.yaml"), "keep_contact: true\n").unwrap();
+        let by_config = dir.join("config.mzpeak");
+        run(&by_config, &["--config", dir.join("keep.yaml").to_str().unwrap()], &[]);
+        assert_eq!(index_metadata(&by_config)["file_description"]["contacts"].as_array().map(Vec::len), Some(1));
+
+        // The exports: the direct one under the flag, the archive's from what it holds.
+        let contact_in = |mzml: &std::path::Path, expected: bool| {
+            let text = std::fs::read_to_string(mzml).unwrap();
+            let header = &text[..text.find("<run ").unwrap()];
+            assert_eq!(header.contains("<contact>"), expected, "{}: {header}", mzml.display());
+            if expected {
+                let fd = &header[header.find("<fileDescription>").unwrap()..header.find("</fileDescription>").unwrap()];
+                let at = fd.find("<contact>").unwrap();
+                assert!(fd.contains(&format!(r#"<cvParam cvRef="MS" accession="MS:1000590" name="contact organization" value="{AFFILIATION}"/>"#)), "{fd}");
+                for acc in ["MS:1000586", "MS:1000590", "MS:1000587", "MS:1000588", "MS:1000589"] {
+                    assert_eq!(fd[at..].matches(&format!("accession=\"{acc}\"")).count(), 1, "{acc}: {fd}");
+                }
+                assert!(fd.find("</fileContent>").is_some_and(|c| c < at) && fd.find("</sourceFileList>").is_none_or(|s| s < at), "after the content and the source files: {fd}");
+                assert_eq!(header.matches("<contact>").count(), 1, "one contact");
+            }
+            // The index still points at its elements.
+            for (at, _) in text.match_indices("<offset idRef=\"") {
+                let rest = &text[at..];
+                let n: usize = rest.split_once("\">").unwrap().1.split_once('<').unwrap().0.parse().unwrap();
+                let element = text[n..].trim_start();
+                assert!(element.starts_with("<spectrum ") || element.starts_with("<chromatogram "), "{}: offset {n}", mzml.display());
+            }
+            let n: usize = text.split_once("<indexListOffset>").unwrap().1.split_once('<').unwrap().0.parse().unwrap();
+            assert!(text[n..].trim_start().starts_with("<indexList "));
+        };
+        let direct = dir.join("direct.mzML");
+        run(&direct, &["--keep-contact"], &[]);
+        contact_in(&direct, true);
+        let direct_plain = dir.join("direct_plain.mzML");
+        let log = run(&direct_plain, &[], &[]);
+        contact_in(&direct_plain, false);
+        assert!(log.contains("is not carried"), "{log}");
+        for (archive, expected) in [(&kept, true), (&plain, false)] {
+            let mzml = dir.join(format!("{}.mzML", archive.file_stem().unwrap().to_str().unwrap()));
+            let (ok, _, err) = run_bin(&[archive.as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{err}");
+            contact_in(&mzml, expected);
+        }
+        // An mzML export with the contact reads as mzML, and the round trip keeps it under the flag.
+        let reader = super::MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&direct).unwrap();
+        assert_eq!(reader.len(), 9);
+        let back = dir.join("back.mzpeak");
+        let (ok, _, err) = run_bin(&[direct.as_os_str(), "-o".as_ref(), back.as_os_str(), "--force".as_ref(), "--keep-contact".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert_eq!(index_metadata(&back)["file_description"]["contacts"][0]["contact_name"], "Thorsten Schramm");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15201,6 +16421,130 @@ mod tests {
             .collect();
         assert_eq!(regions, [Some(0), Some(0), Some(1), Some(1), None]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The FlexImaging sequence's image (owner decision D8): a `.d` whose `.mis` names an
+    /// `<ImageFile>` beside it — MSV000088438's TDF sequence, its 13 extreme spots as the frames —
+    /// embeds the image as `images/image_0000.png` with the teach-point affine (the auditors'
+    /// all-spot matrix within 1e-4 MS px over the whole image), `registration_quality:
+    /// teach_points`, and the registration record (teach points, reference point and its raster
+    /// node) in the entry and in the `bruker_maldi` block. Without the image file: one warning, no
+    /// member, the registration kept for a later `--image`. Without teach points: no image, the
+    /// reason recorded. Through 0.16.0 no lane embedded the sequence's image.
+    #[test]
+    fn a_fleximaging_sequence_image_is_embedded_with_its_teach_point_registration() {
+        use crate::mis_registration::{apply, tests::TDF};
+        use serde_json::json;
+        let dir = scratch("maldi-mis-image");
+        let build = |tag: &str, mis: &str, with_image: bool| -> (std::path::PathBuf, String) {
+            let d = dir.join(tag);
+            let dot_d = d.join("run.d");
+            fs::create_dir_all(&dot_d).unwrap();
+            // tsf_bin: per frame an 8-byte [padded][compressed] header, then zstd([tof f64 × n][intensity f32 × n]).
+            let (mut bin, mut frames, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+            for (i, (region, x, y, mx, my, name)) in TDF.rows.iter().enumerate() {
+                let id = i as i64 + 1;
+                let mut raw = Vec::new();
+                for k in 0..2 {
+                    raw.extend_from_slice(&(1000.0 * (k + 1) as f64 + id as f64).to_le_bytes());
+                }
+                for k in 0..2 {
+                    raw.extend_from_slice(&(10.0 * (k + 1) as f32).to_le_bytes());
+                }
+                let z = zstd::encode_all(&raw[..], 3).unwrap();
+                let offset = bin.len();
+                bin.extend_from_slice(&((z.len() + 8) as u32).to_le_bytes());
+                bin.extend_from_slice(&(z.len() as u32).to_le_bytes());
+                bin.extend_from_slice(&z);
+                frames.push(format!("({id}, {}, 0, '+', 2, {offset})", id as f64 * 0.5));
+                rows.push(format!("({id}, 0, '{name}', {region}, {x}, {y}, {mx}, {my})"));
+            }
+            fs::write(dot_d.join("analysis.tsf_bin"), &bin).unwrap();
+            let db = rusqlite::Connection::open(dot_d.join("analysis.tsf")).unwrap();
+            db.execute_batch(&format!(
+                "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+                 INSERT INTO GlobalMetadata VALUES ('MzAcqRangeLower', '100'), ('MzAcqRangeUpper', '1000'),
+                                                   ('DigitizerNumSamples', '100000'), ('AcquisitionSoftware', 'timsControl');
+                 CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, MsMsType INTEGER, Polarity TEXT, NumPeaks INTEGER, TimsId INTEGER);
+                 INSERT INTO Frames VALUES {};
+                 CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, Chip INTEGER, SpotName TEXT, RegionNumber INTEGER,
+                                              XIndexPos INTEGER, YIndexPos INTEGER, MotorPositionX REAL, MotorPositionY REAL);
+                 INSERT INTO MaldiFrameInfo VALUES {};",
+                frames.join(", "),
+                rows.join(", ")
+            ))
+            .unwrap();
+            drop(db);
+            fs::write(d.join("run.mis"), mis).unwrap();
+            if with_image {
+                // A PNG header stating the real photo's size; the bytes are copied, never decoded.
+                let mut png = Vec::new();
+                png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+                png.extend_from_slice(&13u32.to_be_bytes());
+                png.extend_from_slice(b"IHDR");
+                png.extend_from_slice(&8064u32.to_be_bytes());
+                png.extend_from_slice(&6048u32.to_be_bytes());
+                png.extend_from_slice(&[8, 2, 0, 0, 0]);
+                png.extend_from_slice(&[7u8; 1000]);
+                fs::write(d.join("IMG_0000.png"), &png).unwrap();
+            }
+            let out = d.join("run.mzpeak");
+            let (ok, _, err) = run_bin(&[dot_d.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{tag}: {err}");
+            (out, err)
+        };
+        let mis = TDF.mis.replace("IMG_0000.jpg", "IMG_0000.png");
+
+        // The image beside the sequence: embedded first, registered, recorded twice.
+        let (out, err) = build("image", &mis, true);
+        assert!(!err.contains("not beside") && !err.contains("cannot be registered"), "{err}");
+        assert!(zip_members(&out).contains(&"images/image_0000.png".to_string()), "{:?}", zip_members(&out));
+        let m = index_metadata(&out);
+        let images = m["imaging"]["images"].as_array().cloned().unwrap_or_default();
+        assert_eq!(images.len(), 1, "{:#}", m["imaging"]);
+        let e = &images[0];
+        assert_eq!((&e["source_name"], &e["width"], &e["height"], &e["media_type"], &e["size_bytes"]), (&json!("IMG_0000.png"), &json!(8064), &json!(6048), &json!("image/png"), &json!(1029)));
+        assert_eq!((&e["affine"]["registration_quality"], &e["affine"]["maps"], &e["affine"]["type"]), (&json!("teach_points"), &json!("image_px -> ms_px"), &json!("affine")));
+        assert!(e["source"].as_str().unwrap().contains("run.mis"), "{e:#}");
+        let matrix: Vec<f64> = e["affine"]["matrix"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        let matrix: [f64; 6] = matrix.try_into().unwrap();
+        for corner in [(0.0, 0.0), (8063.0, 0.0), (0.0, 6047.0), (8063.0, 6047.0)] {
+            let (ax, ay) = apply(&matrix, corner);
+            let (ex, ey) = apply(&TDF.expect, corner);
+            assert!((ax - ex).abs() < 1e-4 && (ay - ey).abs() < 1e-4, "{corner:?}: {:?} vs the auditors' {:?}", (ax, ay), (ex, ey));
+        }
+        let reg = &e["registration"];
+        assert_eq!(reg["teach_points"].as_array().map(Vec::len), Some(3));
+        assert_eq!(reg["teach_points"][0], json!({"image_px": [1204.0, 778.0], "stage_um": [-22965.0, 15855.0]}));
+        assert_eq!(reg["reference_point"], json!({"image_px": [1204.0, 778.0], "raster_index": [9, 6]}));
+        assert_eq!((&reg["matrix"], &reg["sequence"], &reg["spots_checked"]), (&e["affine"]["matrix"], &json!("run.mis"), &json!(13)));
+        assert_eq!(m["bruker_maldi"]["registration"], *reg, "the block keeps the same record");
+        assert_eq!(m["bruker_maldi"]["sequence_image"], json!({"file": "IMG_0000.png", "found": true, "other_images": [{"file": "IMG_1390.jpg", "found": false}]}));
+        assert!(m["bruker_maldi"]["not_registered"].is_null());
+        assert_eq!(m["imaging"]["pixel_size_um"], json!({"x": 1000.0, "y": 1000.0}), "the raster step, as before");
+        let listed = zip_members(&out).iter().filter(|n| n.starts_with("images/")).count();
+        assert_eq!(listed, 1);
+
+        // The image not beside the sequence: a warning, no member, the registration kept.
+        let (out, err) = build("missing", &mis, false);
+        assert!(!zip_members(&out).iter().any(|n| n.starts_with("images/")), "{:?}", zip_members(&out));
+        assert_eq!(err.matches("names the image IMG_0000.png, which is not beside it").count(), 1, "{err}");
+        let m = index_metadata(&out);
+        assert!(m["imaging"]["images"].as_array().is_none_or(Vec::is_empty), "{:#}", m["imaging"]);
+        assert_eq!(m["bruker_maldi"]["sequence_image"]["found"], false);
+        assert_eq!(m["bruker_maldi"]["registration"]["reference_point"]["raster_index"], json!([9, 6]), "kept for a later --image");
+
+        // A sequence without teach points: the image is beside it, but no image goes in.
+        let bare: String = mis.lines().filter(|l| !l.contains("TeachPoint") && !l.contains("ReferencePoint")).collect::<Vec<_>>().join("\r\n");
+        let (out, err) = build("noteach", &bare, true);
+        assert!(!zip_members(&out).iter().any(|n| n.starts_with("images/")), "{:?}", zip_members(&out));
+        assert_eq!(err.matches("which is not embedded: it cannot be registered on the pixel grid").count(), 1, "{err}");
+        let m = index_metadata(&out);
+        assert!(m["bruker_maldi"]["registration"].is_null(), "{:#}", m["bruker_maldi"]);
+        assert!(m["bruker_maldi"]["not_registered"].as_str().unwrap().contains("0 teach point(s)"), "{}", m["bruker_maldi"]["not_registered"]);
+        assert_eq!(m["bruker_maldi"]["sequence_image"]["found"], true);
+        assert_eq!(m["imaging"]["pixel_size_um"], json!({"x": 1000.0, "y": 1000.0}), "the sequence is still used for the step and the names");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Each scan row's `(position_x, position_y)`, `None` for a null; `None` for the whole when the

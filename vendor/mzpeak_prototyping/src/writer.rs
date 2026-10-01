@@ -236,6 +236,25 @@ impl<'a> ArrayTypesSampler<'a> {
         }
 
         if prefer_peaks {
+            // DELIBERATE DEVIATION (not upstream): a spectrum the write path routes to the data
+            // facet alone — profile or unknown continuity without a centroid peak set
+            // (`AbstractMzPeakWriter::write_spectrum`) — describes nothing of the peak facet, and
+            // is left out of its sample. Upstream sampled its raw arrays into the peak facet's
+            // schema, so a profile spectrum's 64-bit intensity array typed the peak column of a
+            // run whose centroid spectra reach it as float32 peak-set values: a float64 column
+            // holding float32 values, larger and no more exact (every DDA run with profile MS1 and
+            // centroid MS2 whose first sampled spectrum was profile; with the sampled types merging
+            // in `holding_field`, every such run). A profile spectrum carrying a centroid peak set
+            // is written to both facets, and its peak set is sampled here as it is written.
+            let has_peak_set = matches!(
+                s.peaks(),
+                mzdata::spectrum::RefPeakDataLevel::Centroid(_)
+                    | mzdata::spectrum::RefPeakDataLevel::Deconvoluted(_)
+            );
+            if s.signal_continuity() != SignalContinuity::Centroid && !has_peak_set {
+                log::trace!("{} does not reach the peak facet; not sampled for it", s.id());
+                return None;
+            }
             // Same rule as the write path: a centroid peak set that is only part of the raw
             // arrays is sampled from the raw arrays, so the extra dimension gets a column.
             if let Some(map) = centroid_arrays_beyond_peaks(&s) {
@@ -418,8 +437,8 @@ pub fn sample_array_types_from_spectrum_source<
         // on the happy path above we never get here, and here we read only up to the first few
         // non-empty spectra.
         log::debug!(
-            "control points {pts:?} yielded no array fields (all sampled spectra empty); \
-             scanning forward for spectra with data"
+            "control points {pts:?} yielded no array fields (all sampled spectra empty, or none \
+             this facet stores); scanning forward for spectra with data"
         );
         let it = (0..n)
             .flat_map(|i| reader.get_spectrum_by_index(i))

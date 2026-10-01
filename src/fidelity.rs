@@ -26,9 +26,10 @@
 //!   would need the source values next to the decoded ones, which no single point of the write
 //!   path holds without vendored changes; the bound is tight to one part in 1e6 on real data.
 //! * **delta** stores `fl(a − b)`, and `b + fl(a − b) == a` is guaranteed only for `a ≤ 2b`
-//!   (Sterbenz) or for m/z that are 32-bit values. A chunk whose last m/z is at most twice its
-//!   first is therefore exact by construction; the others are counted, with the largest m/z at
-//!   risk. Their error is a BOUND as well, one unit in the last place of the value ([`ulp`]): the
+//!   (Sterbenz) or for m/z that are 32-bit values (declared so, or 64-bit arrays holding only
+//!   such values: the lane records `mz_values_32bit` per facet). A chunk whose last m/z is at most
+//!   twice its first is therefore exact by construction; the others are counted, with the largest
+//!   m/z at risk. Their error is a BOUND as well, one unit in the last place of the value ([`ulp`]): the
 //!   decoder adds the stored differences up from the chunk's first m/z, and a decoded value `y`
 //!   stays within `ulp(x)` of its source `x` through the chunk, by induction over its two kinds of
 //!   step. Where `x' ≤ 2x` the difference is exact and `y' = fl(x' + (y − x))`, which rounding
@@ -184,9 +185,11 @@ struct IntensityTally {
     /// are not an int32 / int64: cut to one, or clamped, in an integer column.
     float_not_i32: u64,
     float_not_i64: u64,
-    /// Integer values of arrays the writer takes that a float32 / float64 / int32 does not hold.
-    /// The point layout casts them into the column; the chunked layout files an integer array of
-    /// another type than the column's as an auxiliary array, at its own type, and changes nothing.
+    /// Integer values of arrays the writer takes that a float32 / float64 / int32 does not hold:
+    /// rounded, or clamped to the int32 range, in such a column. Both layouts cast an integer
+    /// array of another type into the column and clamp what is out of range; through 0.17.0-rc.2
+    /// the chunked layout filed such an array as an auxiliary array, and the point layout stored
+    /// a null for each out-of-range value (arrow's safe cast), which the reader takes as absent.
     int_not_f32: u64,
     int_not_f64: u64,
     int_not_i32: u64,
@@ -285,16 +288,17 @@ impl IntensityTally {
         }
     }
 
-    /// `(rounded, narrowed)` in a facet of `layout` whose intensity column is a `stored` (the names
+    /// `(rounded, narrowed)` in a facet whose intensity column is a `stored` (the names
     /// [`stored_type`] gives): the values stored as the nearest float32, and those a column of
     /// another type does not hold. Without a column of a known type, what the peak sets rounded.
-    fn resolve(&self, layout: &str, stored: Option<&str>) -> (u64, u64) {
-        // The chunk builder casts floats only; an integer array of another type is not cast.
-        let cast = |n: u64| if layout == "point" { n } else { 0 };
+    /// Both layouts cast an array of another type into the column, integers included: through
+    /// 0.17.0-rc.2 the chunk builder cast floats only and filed an integer array of another type
+    /// in `auxiliary_arrays`, so the integer counts applied to the point layout alone.
+    fn resolve(&self, stored: Option<&str>) -> (u64, u64) {
         match stored {
-            Some("float32") => (self.rounded + self.float_not_f32 + cast(self.int_not_f32), 0),
-            Some("float64") => (self.rounded, cast(self.int_not_f64)),
-            Some("int32") => (self.rounded, self.float_not_i32 + cast(self.int_not_i32)),
+            Some("float32") => (self.rounded + self.float_not_f32 + self.int_not_f32, 0),
+            Some("float64") => (self.rounded, self.int_not_f64),
+            Some("int32") => (self.rounded, self.float_not_i32 + self.int_not_i32),
             Some("int64") => (self.rounded, self.float_not_i64),
             _ => (self.rounded, 0),
         }
@@ -347,6 +351,15 @@ const INTENSITY_ROUNDED: &str = "intensity_values_rounded";
 /// hold them ([`INTENSITY_TYPE_NARROWING`]).
 const INTENSITY_NARROWED: &str = "intensity_values_narrowed";
 
+/// Facet key: every m/z value the reader handed over is a 32-bit float value
+/// (`(x as f32) as f64 == x`), whatever type the source declares. Delta returns such values exactly
+/// whatever their spacing (two 24-bit mantissas differ exactly in 64-bit arithmetic, and the
+/// decoder's running sum is again a 32-bit value at every step), so a facet with this fact true
+/// gets no `delta` entry and no [`DELTA_ULP`], like one declared 32-bit: ProteoWizard writes the
+/// 32-bit values of a Waters or Bruker export into 64-bit arrays (QC01, PXD009465 t04176), and
+/// through 0.17.0-rc.2 such an archive declared a change that could not happen.
+const MZ_VALUES_32BIT: &str = "mz_values_32bit";
+
 /// What the reader handed over for one facet.
 #[derive(Default)]
 struct FacetSource {
@@ -355,6 +368,14 @@ struct FacetSource {
     intensity: BTreeSet<&'static str>,
     /// What the facet's intensity column does to the values, for each type it can have.
     intensities: IntensityTally,
+    /// An m/z value that is not a 32-bit float value was handed over ([`MZ_VALUES_32BIT`] is its
+    /// negation, once there are points).
+    mz_wider: bool,
+}
+
+/// Is every m/z of these arrays a 32-bit float value? True without an m/z array.
+fn mz_values_32bit(arrays: &BinaryArrayMap) -> bool {
+    arrays.mzs().map_or(true, |v| v.iter().all(|x| (*x as f32) as f64 == *x))
 }
 
 impl FacetSource {
@@ -370,6 +391,7 @@ impl FacetSource {
         if types && n > 0 {
             self.add_types(arrays);
         }
+        self.mz_wider |= !mz_values_32bit(arrays);
         n as u64
     }
 
@@ -386,6 +408,9 @@ impl FacetSource {
         let mut out = json!({"source_points": self.points});
         if types && !(self.mz.is_empty() && self.intensity.is_empty()) {
             out["source_types"] = json!({"mz": self.mz, "intensity": self.intensity});
+        }
+        if self.points > 0 {
+            out[MZ_VALUES_32BIT] = json!(!self.mz_wider);
         }
         if !self.intensities.is_empty() {
             out[INTENSITY_TALLY] = self.intensities.json();
@@ -468,6 +493,7 @@ impl SourceTally {
                 let n = peaks.len();
                 let centroid_set = matches!(peaks, RefPeakDataLevel::Centroid(_)) && continuity == SignalContinuity::Centroid;
                 self.peaks.points += n as u64;
+                self.peaks.mz_wider |= peaks.iter().any(|p| (p.mz() as f32) as f64 != p.mz());
                 self.last = Filed::Peaks;
                 let mut counted = n as u64;
                 if let Some(arrays) = spec.raw_arrays() {
@@ -779,8 +805,8 @@ pub fn resolve_intensities(lane: &Value, schemas: [Option<&Schema>; 2]) -> Value
     for ((_, key), schema) in FACETS.iter().zip(schemas) {
         let Some(facet) = lane.get_mut(*key).and_then(Value::as_object_mut) else { continue };
         let Some(tally) = facet.remove(INTENSITY_TALLY) else { continue };
-        let (layout, stored) = schema.and_then(intensity_column).unwrap_or_default();
-        let (rounded, narrowed) = IntensityTally::from_json(&tally).resolve(&layout, stored.as_deref());
+        let (_, stored) = schema.and_then(intensity_column).unwrap_or_default();
+        let (rounded, narrowed) = IntensityTally::from_json(&tally).resolve(stored.as_deref());
         if rounded > 0 {
             facet.insert(INTENSITY_ROUNDED.to_string(), rounded.into());
         }
@@ -923,24 +949,28 @@ fn entry_bound(entry: &str, prefix: &str, suffix: &str) -> Option<f64> {
     entry.strip_prefix(prefix)?.strip_suffix(suffix)?.parse().ok()
 }
 
-/// Does the lane's source declare nothing but 32-bit m/z for the facet `key`? Such values survive
-/// delta exactly whatever their spacing (the differences are taken in 64-bit arithmetic).
-fn mz_source_is_f32(lane: Option<&Value>, key: &str) -> bool {
-    lane.and_then(|l| l.get(key))
+/// Are the facet `key`'s source m/z all 32-bit values: declared nothing but 32-bit by the lane's
+/// source, or every value handed over a 32-bit float value ([`MZ_VALUES_32BIT`])? Such values
+/// survive delta exactly whatever their spacing (the differences are taken in 64-bit arithmetic).
+fn mz_source_is_32bit(lane: Option<&Value>, key: &str) -> bool {
+    let facet = lane.and_then(|l| l.get(key));
+    let declared = facet
         .and_then(|s| s.get("source_types"))
         .and_then(|t| t["mz"].as_array())
-        .is_some_and(|t| !t.is_empty() && t.iter().all(|v| v == "float32"))
+        .is_some_and(|t| !t.is_empty() && t.iter().all(|v| v == "float32"));
+    declared || facet.and_then(|s| s.get(MZ_VALUES_32BIT)).and_then(Value::as_bool) == Some(true)
 }
 
 /// Whether the archive about to be finished gets a `delta` entry in `mz_error`, and with it
 /// [`DELTA_ULP`] in `transformations`: a facet holds delta chunks that are not exact by
-/// construction and its source m/z are not all 32-bit. `at_risk` is the writer's count of such
+/// construction and its source m/z are not all 32-bit values ([`mz_source_is_32bit`]: declared
+/// so, or so by value). `at_risk` is the writer's count of such
 /// chunk rows per facet, in [`FACETS`] order (`spectra_data`, `spectra_peaks`), taken as the rows
 /// were buffered with the rule [`ChunkStats::delta`] applies to them when [`complete`] reads them
 /// back; `lane` is the lane's block. The entry is decided before the facets are closed because
 /// the processing method that mirrors it is written with them.
 pub fn delta_ulp_declared(lane: Option<&Value>, at_risk: [u64; 2]) -> bool {
-    FACETS.iter().zip(at_risk).any(|((_, key), n)| n > 0 && !mz_source_is_f32(lane, key))
+    FACETS.iter().zip(at_risk).any(|((_, key), n)| n > 0 && !mz_source_is_32bit(lane, key))
 }
 
 /// `(rounded, narrowed)` over both facets of a lane block that [`resolve_intensities`] resolved:
@@ -1022,6 +1052,9 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str], cali
         if let Some(t) = source_types {
             entry["source_types"] = t.clone();
         }
+        if let Some(v) = source.and_then(|s| s.get(MZ_VALUES_32BIT)) {
+            entry[MZ_VALUES_32BIT] = v.clone();
+        }
         entry["stored_types"] = json!({"mz": facet.mz_type, "intensity": facet.intensity_type});
         for count in [INTENSITY_ROUNDED, INTENSITY_NARROWED] {
             if let Some(n) = source.and_then(|s| s.get(count)) {
@@ -1047,7 +1080,7 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str], cali
         }
         // 32-bit m/z values survive delta exactly whatever their spacing. The same test, on the
         // writer's count of the same rows, declares `delta-ulp` ([`delta_ulp_declared`]).
-        if c.delta_chunks > 0 && c.delta_at_risk > 0 && !mz_source_is_f32(lane, key) {
+        if c.delta_chunks > 0 && c.delta_at_risk > 0 && !mz_source_is_32bit(lane, key) {
             // One unit in the last place of the value (the module docs have the proof): of the
             // largest m/z at risk in absolute terms, 2⁻⁵² of any value in relative ones.
             let bounded = c.delta_unbounded == 0;
@@ -1345,7 +1378,9 @@ mod tests {
             "chromatogram-time-to-minutes",
             "sort-by-time",
             "imzml:pixel-size-unit-assumed-um",
+            "imzml:pixel-size-unit-from-accession",
             "imaging:pixel-count-from-positions",
+            "imaging:pixel-size-user-supplied",
             "thermo:target-only-isolation-window",
             "bruker:trace-unit-rescale",
         ] {
@@ -1489,7 +1524,7 @@ mod tests {
             assert_eq!(changed(&tally, layout, DataType::Int32), [(0, 0), (2, 1)], "{layout}");
         }
         let lane = resolve_intensities(&tally.block().1, [None, Some(&facet_schema("chunk", DataType::Float32))]);
-        assert_eq!(lane["spectra_peaks"], json!({"source_points": 4, "source_types": {"mz": ["float64"], "intensity": ["float64"]}, "intensity_values_rounded": 2}));
+        assert_eq!(lane["spectra_peaks"], json!({"source_points": 4, "source_types": {"mz": ["float64"], "intensity": ["float64"]}, "mz_values_32bit": true, "intensity_values_rounded": 2}));
         assert_eq!(intensities_changed(Some(&lane)), (2, 0));
         assert_eq!(intensities_changed(None), (0, 0));
 
@@ -1516,15 +1551,15 @@ mod tests {
         assert_eq!((changed(&tally, "chunk", DataType::Float32)[1], changed(&tally, "point", DataType::Float64)[1]), ((0, 0), (0, 0)));
         assert_eq!(changed(&tally, "chunk", DataType::Int32)[1], (0, 1), "3.5 in an integer column");
 
-        // Integer arrays the writer takes. The point layout casts them into the column; the chunk
-        // builder files an integer array of another type as an auxiliary array, unchanged.
+        // Integer arrays the writer takes: cast into the column in both layouts (the chunk builder
+        // filed an integer array of another type as an auxiliary array, unchanged, through rc.2, and
+        // the counts applied to the point layout alone).
         let tally = tally_of(&spectrum(SignalContinuity::Profile, &mz, intensity_array!(Int64, [16777217i64, (1 << 53) + 1, 1 << 40, 7]), false, false));
-        assert_eq!(changed(&tally, "point", DataType::Float32)[0], (2, 0), "16777217 and 2^53 + 1");
-        assert_eq!(changed(&tally, "point", DataType::Float64)[0], (0, 1), "2^53 + 1");
-        assert_eq!(changed(&tally, "point", DataType::Int32)[0], (0, 2), "2^53 + 1 and 2^40");
-        assert_eq!(changed(&tally, "point", DataType::Int64)[0], (0, 0));
-        for dtype in [DataType::Float32, DataType::Float64, DataType::Int32, DataType::Int64] {
-            assert_eq!(changed(&tally, "chunk", dtype.clone())[0], (0, 0), "chunked, {dtype}");
+        for layout in ["chunk", "point"] {
+            assert_eq!(changed(&tally, layout, DataType::Float32)[0], (2, 0), "{layout}: 16777217 and 2^53 + 1");
+            assert_eq!(changed(&tally, layout, DataType::Float64)[0], (0, 1), "{layout}: 2^53 + 1");
+            assert_eq!(changed(&tally, layout, DataType::Int32)[0], (0, 2), "{layout}: 2^53 + 1 and 2^40");
+            assert_eq!(changed(&tally, layout, DataType::Int64)[0], (0, 0), "{layout}");
         }
 
         // A peak set of another length is not a copy of the arrays.

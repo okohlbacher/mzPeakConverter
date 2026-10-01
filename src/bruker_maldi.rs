@@ -21,6 +21,13 @@
 //!   the fallback, declared as such ([`PIXEL_FROM_BEAM`]), and only when every positioned frame
 //!   states the same finite size. Either way written as `IMS:1000046/47`, with `IMS:1000044/45` max
 //!   dimension = count × size.
+//! * The sequence's image: a used `.mis` names the photo its areas and teach points are drawn on
+//!   (`<ImageFile>`, beside the `.mis`). It is embedded as `images/image_NNNN.<ext>` with the
+//!   affine the teach points, the raster lattice and the frames' motor positions fix
+//!   ([`crate::mis_registration`], `registration_quality: teach_points`); the teach points go into
+//!   the archive with it. An image that is not beside the sequence, or a sequence that cannot be
+//!   registered, is warned about and recorded ([`SequenceImage`], `registration` /
+//!   `not_registered` in the block).
 //! * The acquisition region: each positioned frame's `RegionNumber` is a parameter of its scan
 //!   ([`REGION_PARAM`], no accession: the imaging profile names no region column yet), which the
 //!   block's `regions` list maps to the region's name. The bounding boxes there cannot tell the
@@ -98,6 +105,16 @@ pub struct MaldiInfo {
     pub mis: Option<Mis>,
     /// A `.mis` beside the `.d` that is not used, and why ([`Self::mis_mismatch`]).
     pub mis_rejected: Option<(String, String)>,
+    /// `--pixel-size`, read once by [`read_dot_d`]: written by [`Self::grid`] where neither the
+    /// `.mis` nor the beam scan size settles a size (refused, or written over under `--force`, where
+    /// one does — the lanes' one rule, [`crate::imaging::apply_user_pixel_size`]).
+    pub user: Option<crate::imaging::UserPixelSize>,
+    /// The image the used sequence names ([`SequenceImage`]), when it names one.
+    pub sequence_image: Option<SequenceImage>,
+    /// The teach-point registration of that image onto the pixel grid
+    /// ([`crate::mis_registration::register`]), or why there is none.
+    pub registration: Option<crate::mis_registration::Registration>,
+    pub registration_failed: Option<String>,
 }
 
 /// One `<Area>` of a FlexImaging `.mis`: its name, raster step (µm) and outline.
@@ -120,6 +137,25 @@ pub struct Mis {
     pub areas: Vec<MisArea>,
     /// The `<TeachPoint>`s, `imgx,imgy;stagex,stagey`: image px and stage µm of the same point.
     pub teach: Vec<((f64, f64), (f64, f64))>,
+    /// `<ReferencePoint>`, image px: the teach point the raster lattice is laid through.
+    pub reference: Option<(f64, f64)>,
+    /// `<ImageFile>`: the image the areas and teach points are drawn on, a name beside the `.mis`.
+    pub image_file: Option<String>,
+    /// `<OriginalImage>`: the file `<ImageFile>` was made from, its name alone (the element holds
+    /// the acquisition PC's path; MSV000088438's `IMG_0000.jpg` is the original at twice its size).
+    pub original_image: Option<String>,
+}
+
+/// The image a sequence names, resolved beside the `.mis`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SequenceImage {
+    /// `<ImageFile>` as named.
+    pub file: String,
+    /// Where it is, when it is beside the `.mis`.
+    pub path: Option<std::path::PathBuf>,
+    /// The sequence's other image names (`<OriginalImage>`), each with whether it is beside the
+    /// `.mis`: recorded, not embedded (the teach points are in `<ImageFile>`'s pixels).
+    pub others: Vec<(String, bool)>,
 }
 
 /// Read a `.mis`; `None` when it cannot be read or has no `<Area>`.
@@ -163,6 +199,12 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
                             mis.teach.extend(pair(image).zip(pair(stage)));
                         }
                     }
+                    (b"ReferencePoint", _) if !in_area => mis.reference = pair(&text),
+                    // Names only: `<OriginalImage>` holds a path on the acquisition PC
+                    // (`C:\Users\…\IMG_1357.jpg`), and a name with a separator would leave the
+                    // directory the `.mis` is in.
+                    (b"ImageFile", _) if !in_area => mis.image_file = file_name_of(&text),
+                    (b"OriginalImage", _) if !in_area => mis.original_image = file_name_of(&text),
                     _ => {}
                 }
             }
@@ -186,6 +228,13 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
         buf.clear();
     }
     (!mis.areas.is_empty()).then_some(mis)
+}
+
+/// The last path component of a Windows or POSIX path in a `.mis` text element, trimmed; `None`
+/// when empty.
+fn file_name_of(text: &str) -> Option<String> {
+    let name = text.trim().rsplit(['\\', '/']).next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// `MaldiFrameInfo` of an open TSF/TDF database; `None` without the table or its position columns.
@@ -273,6 +322,8 @@ pub fn read_dot_d(dot_d: &Path) -> Option<MaldiInfo> {
     })?;
     info.mis = read_mis(&dot_d.with_extension("mis"));
     info.check_mis();
+    info.user = crate::imaging::user_pixel_size();
+    info.register_sequence_image(dot_d.parent().unwrap_or(Path::new("")));
     // Once per conversion: every lane reads the run's positions here, once.
     if info.unpositioned > 0 {
         log::warn!(
@@ -397,8 +448,89 @@ impl MaldiInfo {
         self.mis_rejected = Some((file, reason));
     }
 
+    /// Register the used sequence's image on the pixel grid
+    /// ([`crate::mis_registration::register`]) and find the image beside the `.mis` in `dir`.
+    /// Warned once here, like the positions: an image that is not beside the sequence, and a
+    /// sequence whose image cannot be registered (no image is embedded then: an unplaced photo
+    /// of the target says nothing a reader can use, and `--image` can still add it).
+    pub fn register_sequence_image(&mut self, dir: &Path) {
+        let Some(mis) = &self.mis else { return };
+        self.sequence_image = mis.image_file.as_ref().map(|file| {
+            let path = dir.join(file);
+            SequenceImage {
+                file: file.clone(),
+                path: path.is_file().then_some(path),
+                others: mis.original_image.iter().filter(|o| *o != file).map(|o| (o.clone(), dir.join(o).is_file())).collect(),
+            }
+        });
+        match crate::mis_registration::register(self, mis) {
+            Ok(reg) => {
+                log::info!(
+                    "Bruker MALDI: {} registers {} on the pixel grid through its {} teach points (reference point on raster node {:?}; {} spots checked)",
+                    mis.file,
+                    mis.image_file.as_deref().unwrap_or("no image"),
+                    mis.teach.len(),
+                    reg.reference_index,
+                    reg.spots_checked
+                );
+                self.registration = Some(reg);
+            }
+            Err(reason) => {
+                if let Some(img) = &self.sequence_image {
+                    log::warn!("Bruker MALDI: {} names the image {}, which is not embedded: it cannot be registered on the pixel grid ({reason})", mis.file, img.file);
+                }
+                self.registration_failed = Some(reason);
+            }
+        }
+        if let Some(img) = self.sequence_image.as_ref().filter(|i| i.path.is_none()) {
+            // The timsTOF lanes refuse --image (all but --no-ims-compact): the way in is the
+            // .mzpeak → .mzpeak lane, which places an image of the sequence's name by the record.
+            let then = if self.registration.is_some() {
+                format!(
+                    "the registration is recorded; add the image later on the .mzpeak → .mzpeak lane, which places an image of that name by it: mzpeak-convert <out>.mzpeak -o <with-image>.mzpeak --image {}",
+                    img.file
+                )
+            } else {
+                "nor could it be registered".to_string()
+            };
+            log::warn!("Bruker MALDI: {} names the image {}, which is not beside it: no image is embedded ({then})", mis.file, img.file);
+        }
+    }
+
     pub fn pixel_size(&self) -> Option<(f64, f64)> {
         self.pixel_size_from().map(|(p, _)| p)
+    }
+
+    /// `metadata.imaging.pixel_size_source` of the grid: how [`Self::grid`] settled the size.
+    pub fn pixel_size_source(&self, user_row: Option<&serde_json::Value>) -> &'static str {
+        use crate::imaging::{SOURCE_DECLARED, SOURCE_FROM_BEAM, SOURCE_UNKNOWN, SOURCE_USER_SUPPLIED};
+        match (user_row, self.pixel_size_from()) {
+            (Some(_), _) => SOURCE_USER_SUPPLIED,
+            (None, Some((_, PixelSource::Mis))) => SOURCE_DECLARED,
+            (None, Some((_, PixelSource::Beam))) => SOURCE_FROM_BEAM,
+            (None, None) => SOURCE_UNKNOWN,
+        }
+    }
+
+    /// What settles the pixel size, for `--pixel-size`'s refusal.
+    fn settled_by(&self) -> String {
+        match (self.pixel_size_from(), &self.mis) {
+            (Some((_, PixelSource::Mis)), Some(m)) => format!("the FlexImaging sequence {}'s raster step", m.file),
+            (Some((_, PixelSource::Beam)), _) => "the frames' beam scan size (MaldiFrameInfo)".to_string(),
+            _ => "the Bruker MALDI run".to_string(),
+        }
+    }
+
+    /// The grid the lanes write: [`Self::scan_settings`] with `--pixel-size` applied by the lanes'
+    /// one rule — written where the `.d` settles no size, refused where it settles a different one
+    /// unless `--force` — and the `imaging_pixel_size` row that records it, if it did anything.
+    pub fn grid(&self) -> anyhow::Result<(ScanSettings, Option<serde_json::Value>)> {
+        let mut s = self.scan_settings();
+        let row = match &self.user {
+            Some(u) => crate::imaging::apply_user_pixel_size(&mut s, u, &self.settled_by())?,
+            None => None,
+        };
+        Ok((s, row))
     }
 
     /// The distinct raster steps of the acquired regions; `None` when there is no `.mis` or a region
@@ -421,11 +553,20 @@ impl MaldiInfo {
             (Some(m), _) => format!("{} gives no raster step for every region", m.file),
             _ => "no FlexImaging .mis beside the .d".into(),
         };
-        match (self.pixel_size_from(), &self.mis) {
+        let settled = match (self.pixel_size_from(), &self.mis) {
             (Some((_, PixelSource::Mis)), Some(m)) => format!("the raster step in {}", m.file),
             (Some((_, PixelSource::Beam)), _) => format!("the beam scan size ({no_mis})"),
             (None, Some(m)) if self.mis_rasters().is_some() => format!("not written: the regions of {} have different raster steps", m.file),
             _ => format!("not written: {no_mis}, and the positioned frames do not all state one finite beam scan size"),
+        };
+        // `--pixel-size`: what the run settles, and what the user's size did about it (the lanes'
+        // one rule: fills where none is settled, agrees, or writes over under `--force`).
+        match (&self.user, self.pixel_size()) {
+            (None, _) => settled,
+            (Some(_), None) => format!("{}; the source: {}", crate::imaging::USER_SUPPLIED_PROVENANCE, settled.replacen("not written: ", "", 1)),
+            (Some(u), Some(_)) if crate::imaging::user_pixel_size_differences(Some(&self.scan_settings()), u).is_empty() => format!("{settled} (--pixel-size states the same)"),
+            (Some(u), Some((x, y))) if u.force => format!("{} (--force), written over {settled} = {x} × {y} µm", crate::imaging::USER_SUPPLIED_PROVENANCE),
+            (Some(_), Some(_)) => settled,
         }
     }
 
@@ -450,21 +591,29 @@ impl MaldiInfo {
         s
     }
 
-    /// The `metadata.imaging` marker block, the `bruker_maldi` block, and the transformations to
-    /// declare.
-    pub fn index_blocks(&self) -> (Vec<(String, serde_json::Value)>, Vec<&'static str>) {
+    /// The `metadata.imaging` marker block, the `bruker_maldi` block (and, under `--pixel-size`, the
+    /// `imaging_pixel_size` row), and the transformations to declare. `Err` is `--pixel-size`'s
+    /// refusal ([`Self::grid`]), which the lane's `enable_bruker_imaging` has raised before this.
+    pub fn index_blocks(&self) -> anyhow::Result<(Vec<(String, serde_json::Value)>, Vec<&'static str>)> {
         let mut applied = Vec::new();
         if self.min != (1, 1) {
             applied.push(SHIFTED_TO_BASE_1);
         }
-        if matches!(self.pixel_size_from(), Some((_, PixelSource::Beam))) {
+        let (grid, user_row) = self.grid()?;
+        // The beam fallback declares itself unless the user's size was written over it.
+        let overridden = user_row.as_ref().is_some_and(|r| r["overridden"] == true);
+        if matches!(self.pixel_size_from(), Some((_, PixelSource::Beam))) && !overridden {
             applied.push(PIXEL_FROM_BEAM);
         }
+        if user_row.is_some() {
+            applied.push(crate::imaging::USER_SUPPLIED);
+        }
         let mut marker = crate::imaging::marker_block(
-            Some(&self.scan_settings()),
+            Some(&grid),
             crate::imaging::COUNTS_OBSERVED_MAX,
             // Both sizes or none are written above: a lone x does not occur.
             crate::imaging::LoneX::XOnly,
+            self.pixel_size_source(user_row.as_ref()),
             serde_json::json!({
                 "detected_from": "MaldiFrameInfo in analysis.tsf/.tdf",
                 "positions": "XIndexPos/YIndexPos − position_offset",
@@ -476,7 +625,11 @@ impl MaldiInfo {
         if self.min != (1, 1) {
             marker["position_offset"] = serde_json::json!({"x": self.min.0 - 1, "y": self.min.1 - 1});
         }
-        (vec![("imaging".into(), marker), ("bruker_maldi".into(), self.block())], applied)
+        let mut blocks = vec![("imaging".to_string(), marker), ("bruker_maldi".to_string(), self.block())];
+        if let Some(row) = user_row {
+            blocks.push(("imaging_pixel_size".to_string(), serde_json::json!([row])));
+        }
+        Ok((blocks, applied))
     }
 
     /// The `bruker_maldi` index block.
@@ -498,6 +651,15 @@ impl MaldiInfo {
             "y_index": range(|s| s.y, &mut self.spots.values()),
             "mis": self.mis.as_ref().map(|m| &m.file),
             "mis_rejected": self.mis_rejected.as_ref().map(|(file, reason)| serde_json::json!({"file": file, "reason": reason})),
+            // The sequence's image and its teach-point registration (D8): the matrix lives here
+            // even when the image was not beside the sequence, so `--image` can place it later.
+            "sequence_image": self.sequence_image.as_ref().map(|i| serde_json::json!({
+                "file": i.file,
+                "found": i.path.is_some(),
+                "other_images": i.others.iter().map(|(name, found)| serde_json::json!({"file": name, "found": found})).collect::<Vec<_>>(),
+            })),
+            "registration": self.registration.as_ref().zip(self.mis.as_ref()).map(|(r, m)| r.json(&m.file)),
+            "not_registered": self.registration_failed,
             "region_parameter": self.spots.values().any(|s| s.region.is_some()).then(|| format!("each positioned frame's scan states its region_number as the parameter '{REGION_PARAM}'")),
             "regions": regions.iter().map(|(r, spots)| serde_json::json!({
                 "region_number": r,
@@ -552,8 +714,9 @@ mod tests {
         assert_eq!(get("IMS:1000046"), Some((20.0, Unit::Micrometer)));
         assert_eq!(get("IMS:1000044"), Some((3380.0, Unit::Micrometer)));
         assert_eq!(get("IMS:1000045"), Some((2260.0, Unit::Micrometer)));
-        let (blocks, applied) = info.index_blocks();
+        let (blocks, applied) = info.index_blocks().unwrap();
         assert_eq!(applied, vec![SHIFTED_TO_BASE_1, PIXEL_FROM_BEAM]);
+        assert_eq!(blocks[0].1["pixel_size_source"], "derived_from_beam_size");
         let marker = &blocks[0].1;
         assert_eq!((blocks[0].0.as_str(), &marker["is_imaging"], &marker["coordinate_base"]), ("imaging", &serde_json::json!(true), &serde_json::json!(1)));
         assert_eq!(marker["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
@@ -569,7 +732,7 @@ mod tests {
              INSERT INTO MaldiFrameInfo VALUES (1, 1, 1), (2, 2, 1);",
         )
         .unwrap();
-        let (blocks, applied) = read(&c).unwrap().index_blocks();
+        let (blocks, applied) = read(&c).unwrap().index_blocks().unwrap();
         assert!(blocks[0].1.get("position_offset").is_none(), "absent when nothing was shifted");
         assert!(applied.is_empty());
     }
@@ -583,7 +746,58 @@ mod tests {
         assert!(info.pixel_size().is_none());
         let accs: Vec<String> = info.scan_settings().params.iter().map(|p| p.curie().unwrap().to_string()).collect();
         assert_eq!(accs, ["IMS:1000042", "IMS:1000043"]);
-        assert_eq!(info.index_blocks().1, vec![SHIFTED_TO_BASE_1]);
+        let (blocks, applied) = info.index_blocks().unwrap();
+        assert_eq!(applied, vec![SHIFTED_TO_BASE_1]);
+        assert_eq!(blocks[0].1["pixel_size_source"], "unknown");
+    }
+
+    /// `--pixel-size` on the Bruker lane goes through the lanes' one rule: it fills the grid where
+    /// neither the `.mis` nor the beam scan size settles a size (declared, recorded, max dimension
+    /// from the counts), agrees in silence with a size the run settles, is refused where that size
+    /// differs, and writes over it under `--force` with the beam fallback no longer declared.
+    #[test]
+    fn a_user_pixel_size_fills_what_the_run_does_not_settle() {
+        use crate::imaging::{UserPixelSize, USER_SUPPLIED};
+        let user = |x: f64, y: f64, force: bool| Some(UserPixelSize { x, y, force });
+        // No beam size settles it: filled.
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c);
+        c.execute_batch("UPDATE MaldiFrameInfo SET BeamScanSizeX = 10.0 WHERE Frame = 3;").unwrap();
+        let mut info = read(&c).unwrap();
+        info.user = user(25.0, 30.0, false);
+        let (grid, row) = info.grid().unwrap();
+        let get = |s: &ScanSettings, acc: &str| s.params.iter().find(|p| p.curie().unwrap().to_string() == acc).map(|p| (p.value.to_f64().unwrap(), p.unit));
+        assert_eq!((get(&grid, "IMS:1000046"), get(&grid, "IMS:1000047")), (Some((25.0, Unit::Micrometer)), Some((30.0, Unit::Micrometer))));
+        assert_eq!((get(&grid, "IMS:1000044"), get(&grid, "IMS:1000045")), (Some((169.0 * 25.0, Unit::Micrometer)), Some((113.0 * 30.0, Unit::Micrometer))), "max dimension from the counts");
+        let row = row.expect("a row");
+        assert_eq!((&row["transformation"], &row["overridden"]), (&serde_json::json!(USER_SUPPLIED), &serde_json::json!(false)));
+        let (blocks, applied) = info.index_blocks().unwrap();
+        assert_eq!(applied, vec![SHIFTED_TO_BASE_1, USER_SUPPLIED]);
+        assert_eq!((&blocks[0].1["pixel_size_um"], &blocks[0].1["pixel_size_source"]), (&serde_json::json!({"x": 25.0, "y": 30.0}), &serde_json::json!("user_supplied")));
+        assert!(blocks[0].1["provenance"]["pixel_size"].as_str().unwrap().starts_with("user supplied (--pixel-size); the source: "), "{}", blocks[0].1["provenance"]["pixel_size"]);
+        assert_eq!(blocks[2].0, "imaging_pixel_size");
+        assert_eq!(blocks[2].1[0]["written_um"].as_array().unwrap().len(), 2);
+        // The beam scan size settles 20 µm: the same size is nothing to write, a different one is
+        // refused naming both, and --force writes it over the beam size.
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c);
+        let mut info = read(&c).unwrap();
+        info.user = user(20.0, 20.0, false);
+        let (grid, row) = info.grid().unwrap();
+        assert!(row.is_none() && get(&grid, "IMS:1000046") == Some((20.0, Unit::Micrometer)));
+        assert_eq!(info.index_blocks().unwrap().1, vec![SHIFTED_TO_BASE_1, PIXEL_FROM_BEAM], "the beam fallback stays declared");
+        assert!(info.block()["pixel_size"].as_str().unwrap().ends_with("(--pixel-size states the same)"), "{}", info.block()["pixel_size"]);
+        info.user = user(50.0, 50.0, false);
+        let e = info.grid().unwrap_err().to_string();
+        assert!(e.contains("--pixel-size 50 µm") && e.contains("beam scan size") && e.contains("= 20 µm") && e.contains("--force"), "{e}");
+        assert!(info.index_blocks().is_err());
+        info.user = user(50.0, 50.0, true);
+        let (grid, row) = info.grid().unwrap();
+        assert_eq!((get(&grid, "IMS:1000046"), get(&grid, "IMS:1000044")), (Some((50.0, Unit::Micrometer)), Some((169.0 * 50.0, Unit::Micrometer))), "written over, the max dimension recomputed");
+        assert_eq!(row.unwrap()["overridden"], true);
+        let (blocks, applied) = info.index_blocks().unwrap();
+        assert_eq!(applied, vec![SHIFTED_TO_BASE_1, USER_SUPPLIED], "no beam fallback declared for a size that is not the beam's");
+        assert!(blocks[0].1["provenance"]["pixel_size"].as_str().unwrap().contains("(--force), written over the beam scan size"), "{}", blocks[0].1["provenance"]["pixel_size"]);
     }
 
     /// The beam fallback needs EVERY positioned frame to state the same finite size (review
@@ -603,7 +817,7 @@ mod tests {
             assert_eq!(info.pixel_size(), None, "{why}");
             assert!(info.beam.iter().all(|(x, y)| x.is_finite() && y.is_finite()), "{why}: {:?}", info.beam);
             assert!(info.beam_unstated > 0, "{why}");
-            assert!(!info.index_blocks().1.contains(&PIXEL_FROM_BEAM), "{why}");
+            assert!(!info.index_blocks().unwrap().1.contains(&PIXEL_FROM_BEAM), "{why}");
             assert!(info.block()["pixel_size"].as_str().unwrap().starts_with("not written"), "{why}");
         }
         // A frame without a position does not count.
@@ -646,7 +860,7 @@ mod tests {
         let info = read_with("(1, 'Custom', 1, 20.0, 20.0, 950.0), (2, 'Custom', 1, 20.0, 20.0, 950.0)");
         assert_eq!((info.beam.clone(), info.beam_unstated), (vec![(20.0, 20.0)], 0));
         assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)));
-        assert!(info.index_blocks().1.contains(&PIXEL_FROM_BEAM));
+        assert!(info.index_blocks().unwrap().1.contains(&PIXEL_FROM_BEAM));
         let b = info.block();
         assert_eq!(b["beam_scan_size_um"], serde_json::json!([{"x": 20.0, "y": 20.0}]));
         assert!(b["beam_scan_size_source"].as_str().unwrap().starts_with("MaldiFrameLaserInfo"), "{}", b["beam_scan_size_source"]);
@@ -665,7 +879,7 @@ mod tests {
             assert_eq!(info.pixel_size(), None, "{why}");
             assert!(info.beam_unstated > 0 || info.beam.len() > 1, "{why}");
             assert_eq!(info.spots.len(), 3, "{why}: every positioned frame is kept");
-            assert!(!info.index_blocks().1.contains(&PIXEL_FROM_BEAM), "{why}");
+            assert!(!info.index_blocks().unwrap().1.contains(&PIXEL_FROM_BEAM), "{why}");
         }
 
         // A laser table without the BeamScan flag: the sizes as they are.
@@ -762,7 +976,7 @@ mod tests {
         assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)), "no .mis: the beam scan size");
         info.mis = Some(mis.clone());
         assert_eq!(info.pixel_size_from(), Some(((1000.0, 1000.0), PixelSource::Mis)), "the raster step wins");
-        assert_eq!(info.index_blocks().1, vec![SHIFTED_TO_BASE_1], "a stated step is not declared as a fallback");
+        assert_eq!(info.index_blocks().unwrap().1, vec![SHIFTED_TO_BASE_1], "a stated step is not declared as a fallback");
         let b = info.block();
         assert_eq!(b["mis"], "run.mis");
         assert_eq!(b["regions"][0]["name"], "vc_rugose_1");
@@ -777,8 +991,21 @@ mod tests {
         assert_eq!(info.pixel_size_from(), None);
         assert!(info.block()["pixel_size"].as_str().unwrap().contains("different raster steps"));
         // A .mis the regions do not map onto is ignored.
-        info.mis = Some(Mis { file: "other.mis".into(), areas: vec![mis.areas[0].clone()], teach: vec![] });
+        info.mis = Some(Mis { file: "other.mis".into(), areas: vec![mis.areas[0].clone()], ..Default::default() });
         assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)));
+    }
+
+    /// `<ImageFile>`, `<OriginalImage>` (a path on the acquisition PC: its name alone) and
+    /// `<ReferencePoint>` are read; a sequence without them has none.
+    #[test]
+    fn the_mis_names_its_image_and_reference_point() {
+        let mis = read_mis_from("run.mis", crate::mis_registration::tests::TSF.mis.as_bytes()).unwrap();
+        assert_eq!((mis.image_file.as_deref(), mis.original_image.as_deref(), mis.reference), (Some("IMG_0000.jpg"), Some("IMG_1357.jpg"), Some((1252.0, 776.0))));
+        assert_eq!((mis.teach.len(), mis.areas.len()), (3, 4));
+        let bare = read_mis_from("run.mis", MIS.as_bytes()).unwrap();
+        assert_eq!((bare.image_file, bare.original_image, bare.reference), (None, None, None));
+        assert_eq!(file_name_of(" ../up/x.png "), Some("x.png".into()), "a name, never a path");
+        assert_eq!(file_name_of("C:\\dir\\"), None);
     }
 
     /// A region number with no `<Area>`: the `.mis` is not used at all — no names, no raster step —

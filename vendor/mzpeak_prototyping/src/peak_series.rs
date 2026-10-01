@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, UInt8Array,
-    UInt64Array,
+    ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray,
+    UInt8Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Fields};
 use mzdata::params::Unit;
@@ -39,10 +39,46 @@ pub fn data_array_to_arrow_array(
         BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(data_array.to_f64()?.to_vec())),
         BinaryDataArrayType::Float32 => Arc::new(Float32Array::from(data_array.to_f32()?.to_vec())),
         BinaryDataArrayType::Int64 => Arc::new(Int64Array::from(data_array.to_i64()?.to_vec())),
+        // DELIBERATE DEVIATION (not upstream): a 64-bit integer array cast into an int32 column
+        // saturates, as a float cast into an integer column does (`to_i32` is an `as` cast, which
+        // wraps an integer out of range into another value). The writer's schema sampler keeps the
+        // case to an array of a type the sampled spectra did not show, and the converter counts the
+        // values the column does not hold.
+        BinaryDataArrayType::Int32 if data_array.dtype() == BinaryDataArrayType::Int64 => Arc::new(Int32Array::from(
+            data_array
+                .to_i64()?
+                .iter()
+                .map(|x| i32::try_from(*x).unwrap_or(if *x < 0 { i32::MIN } else { i32::MAX }))
+                .collect::<Vec<i32>>(),
+        )),
         BinaryDataArrayType::Int32 => Arc::new(Int32Array::from(data_array.to_i32()?.to_vec())),
         BinaryDataArrayType::ASCII => Arc::new(ascii_array(&data_array)),
     };
     Ok(array)
+}
+
+/// DELIBERATE DEVIATION (not upstream): cast `arr` to the column type `dt`, saturating at an
+/// integer column's range. Upstream casts with arrow's safe `cast`, which stores a NULL for every
+/// value the target does not hold — a 64-bit integer or a float above 2^31 into an int32 column —
+/// and the reader takes an all-null intensity list as absent: the mzML export of such an archive
+/// wrote spectra with an m/z array and no intensity array. The chunked layout clamps such a value
+/// (`data_array_to_arrow_array` above), so the point layout does too — here, where an array is
+/// matched to the facet's column, and in `ArrayBufferWriter::route_unexpected` — and the converter's
+/// `intensity-type-narrowing` count, the number of stored values that differ from the file's, means
+/// the same in both. A float into an integer column is truncated toward zero as before. Any other
+/// pair of types takes arrow's cast.
+pub(crate) fn cast_saturating(arr: &ArrayRef, dt: &DataType) -> Option<ArrayRef> {
+    use arrow::datatypes::{Float32Type, Float64Type, Int32Type, Int64Type};
+    let to_i32 = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    let out: ArrayRef = match (arr.data_type(), dt) {
+        (DataType::Int64, DataType::Int32) => Arc::new(arr.as_primitive::<Int64Type>().unary::<_, Int32Type>(to_i32)),
+        (DataType::Float64, DataType::Int32) => Arc::new(arr.as_primitive::<Float64Type>().unary::<_, Int32Type>(|v| v as i32)),
+        (DataType::Float32, DataType::Int32) => Arc::new(arr.as_primitive::<Float32Type>().unary::<_, Int32Type>(|v| v as i32)),
+        (DataType::Float64, DataType::Int64) => Arc::new(arr.as_primitive::<Float64Type>().unary::<_, Int64Type>(|v| v as i64)),
+        (DataType::Float32, DataType::Int64) => Arc::new(arr.as_primitive::<Float32Type>().unary::<_, Int64Type>(|v| v as i64)),
+        _ => return arrow::compute::cast(arr, dt).ok(),
+    };
+    Some(out)
 }
 
 /// Convert `mzdata`'s [`BinaryDataArrayType`] to `arrow`'s [`DataType`]
@@ -142,7 +178,7 @@ pub fn array_map_to_schema_arrays_and_excess(
         // failing record-batch assembly. Widening (f32->f64 m/z) is lossless; narrowing to the
         // format's convention precision (f64->f32 intensity) matches the declared column type.
         if array.data_type() != fieldref.data_type() {
-            array = arrow::compute::cast(&array, fieldref.data_type()).unwrap_or(array);
+            array = cast_saturating(&array, fieldref.data_type()).unwrap_or(array);
         }
 
         arrays.push(array);

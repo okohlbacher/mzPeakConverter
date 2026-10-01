@@ -13,14 +13,24 @@ checkout or a copy:
     (or any other `convert.*` key) rebuilds the archive without waiting for a converter release.
 
 The `.built` stamp is read out of the archive it describes, never written from the request:
-    mzpeak-convert <version>     the archive's own software_list entry; another version is refused
+    mzpeak-convert <version>     the software_list entry of the archive's last conversion step;
+                                 another version is refused
     recipe <hash>                the descriptor recipe it was built under
     options <argv>               the archive's own `conversion options`, i.e. what actually ran
-The box strips lane flags and may fall back to msconvert, so only the archive knows what built it.
+The box strips lane flags and may fall back to msconvert, so only the archive knows what built it,
+and an archive whose recorded lane disagrees with the descriptor's `convert.flags` is refused too
+(LANE_FLAGS): a descriptor pinning `--via-msconvert` over a natively built archive, or an archive
+the msconvert fallback built under a descriptor pinning none, is reported, not stamped current;
+a stamp already written whose `options` line runs another lane than the descriptor pins is stale.
 A stamp from before the recipe line counts as stale.
 
 `--clean` deletes every `.mzpeak` (and stamp) first. It reaches the same end state as the default
 idempotent pass, only slower, so prefer the default unless you specifically want a from-scratch run.
+
+`--restamp` first re-stamps every archive whose recorded `conversion options` are exactly what its
+edited recipe asks for (same converter version, same flags in whichever order the host or the box
+passed them). A descriptor re-pinned to what the box actually built (D17) then stays current
+instead of forcing a no-op rebuild; any other difference leaves the archive stale.
 
 Units that cannot convert on this host (vendor SDKs that are Windows-only, or a missing msconvert)
 are reported as SKIPPED, never counted as complete — completeness has to mean something. With
@@ -35,7 +45,7 @@ each as `<stem>.sample<N>.mzpeak`, converted with `--sample N`. The unit's forme
 reported as SUPERSEDED ON DISK, failing the run, until it is removed.
 
 Usage:
-    tools/corpus_reconvert.py [ROOT] [--clean] [--jobs N] [--dry-run] [--report-only]
+    tools/corpus_reconvert.py [ROOT] [--clean] [--jobs N] [--dry-run] [--report-only] [--restamp]
                               [--box [--box-jobs N] [--publish-s3]]
 
 Release day, once the tag is pushed and `mzpeak-convert --version` names it:
@@ -51,6 +61,8 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -210,6 +222,7 @@ class Recipe(NamedTuple):
     flags: list[str]  # convert.flags, path-valued arguments absolutised
     rid: str          # recipe_id of the descriptor's `convert` block: what a .built stamp must name
     samples: tuple[int, ...] = ()   # convert.samples: one archive per listed sample of a multi-sample WIFF
+    described: bool = True          # False only for UNDESCRIBED: no descriptor governs the unit at all
 
 
 def recipe_id(cv: dict) -> str:
@@ -219,7 +232,7 @@ def recipe_id(cv: dict) -> str:
     return hashlib.sha256(json.dumps(cv, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-UNDESCRIBED = Recipe([], recipe_id({}))
+UNDESCRIBED = Recipe([], recipe_id({}), described=False)
 
 
 def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[Path], set[Path]]:
@@ -233,7 +246,6 @@ def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[
     except ImportError:
         print("warn      : PyYAML unavailable — descriptors not read, falling back to every-unit walk")
         return {}, {}, set(), set()
-    import shlex  # noqa: PLC0415
     recipes: dict[Path, Recipe] = {}
     pinned: dict[Path, Path] = {}
     skipped: set[Path] = set()
@@ -391,9 +403,13 @@ def compatible_versions(version: str) -> set[str]:
     return out
 
 
-def is_current(archive: Path, version: str, rid: str) -> bool:
+def is_current(archive: Path, version: str, rid: str, flags: list[str] | None = None) -> bool:
     """True when `archive` was produced by `version` (or an output-identical release) under recipe
-    `rid` AND uses the split-facet layout. A stamp with no recipe line predates recipes: stale."""
+    `rid`, on the lane the descriptor's `flags` pin, AND uses the split-facet layout. A stamp with no
+    recipe line predates recipes: stale. The stamp's `options` line is the argv the archive records,
+    and a lane it names that the descriptor does not (or the reverse) makes the archive stale, once
+    printed: three corpus archives stamped before this check record the box's msconvert fallback
+    under descriptors pinning no lane (SWATH and MRM SciEX units), and counted as current."""
     if not archive.exists():
         return False
     try:
@@ -404,10 +420,117 @@ def is_current(archive: Path, version: str, rid: str) -> bool:
         return False  # unreadable/truncated -> rebuild
     stamp = stamp_for(archive)
     lines = stamp.read_text().splitlines() if stamp.exists() else []
-    return bool(lines) and lines[0].strip() in compatible_versions(version) and f"recipe {rid}" in lines[1:]
+    if not (lines and lines[0].strip() in compatible_versions(version) and f"recipe {rid}" in lines[1:]):
+        return False
+    options = next((ln[len("options "):] for ln in lines[1:] if ln.startswith("options ")), "")
+    why = lane_mismatch(flags, options)
+    if why:
+        if archive not in _lane_stale_reported:   # once per run: the report asks again
+            _lane_stale_reported.add(archive)
+            print(f"stale     : {archive.name}: {why}")
+        return False
+    return True
 
 
-def write_stamp(archive: Path, version: str, rid: str) -> str | None:
+_lane_stale_reported: set[Path] = set()
+
+
+# Flags that choose the lane a conversion runs on (the reader and the encoder), with whether the
+# flag takes a value. The box strips these for its native-first attempt and adds its own on the
+# msconvert fallback (`--via-msconvert --tof-grid <mode>`), so an archive can record a lane its
+# descriptor never pinned, and a descriptor can pin one its archive never ran: on 2026-10-01 three
+# corpus descriptors did (agilent-qtof pinned `--via-msconvert --tof-grid auto` over a native
+# archive; agilent-6490-triplequad pinned `--via-msconvert` over the fallback's `--tof-grid auto`),
+# and three SciEX archives recorded the fallback under descriptors pinning nothing. `write_stamp`
+# refuses the stamp on either mismatch and `is_current` calls a stamped archive stale on it, each
+# printing both sides, so no archive its descriptor misdescribes counts as current (D17).
+LANE_FLAGS: dict[str, bool] = {
+    "--via-msconvert": False,
+    "--agilent-grid": False,
+    "--bruker-sdk": False,
+    "--no-ims-compact": False,
+    "--ims-chunked": False,
+    "--no-ims-chunked": False,
+    "--tof-grid": True,
+}
+
+
+def lane_pins(tokens: list[str]) -> list[str]:
+    """The lane flags among argv `tokens`, each with its value when it takes one, sorted:
+    `["--tof-grid auto", "--via-msconvert"]`. `--tof-grid=auto` and `--tof-grid auto` are one pin."""
+    pins: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        flag, eq, value = tokens[i].partition("=")
+        if flag in LANE_FLAGS:
+            if LANE_FLAGS[flag] and not eq:
+                value = tokens[i + 1] if i + 1 < len(tokens) else ""
+                i += 1
+            pins.add(f"{flag} {value}".strip() if LANE_FLAGS[flag] else flag)
+        i += 1
+    return sorted(pins)
+
+
+def argv_of(options: str) -> list[str]:
+    """The recorded `conversion options` line as argv. Shell-split, so a quoted input name holds
+    together; a line the splitter rejects (an apostrophe in a vendor folder's name, `O'Neil.d`) is
+    split on whitespace instead of failing the stamp -- no lane flag contains a space."""
+    try:
+        return shlex.split(options)
+    except ValueError:
+        return options.split()
+
+
+def lane_mismatch(flags: list[str] | None, options: str) -> str | None:
+    """Why the lane the descriptor's `flags` pin is not the one the recorded argv `options` ran, or
+    None when they agree: `"lane mismatch: the descriptor pins --via-msconvert, the archive ran with
+    no lane flag (options: ...)"`."""
+    pinned, ran = lane_pins(list(flags or [])), lane_pins(argv_of(options))
+    if pinned == ran:
+        return None
+    return (f"lane mismatch: the descriptor pins {' '.join(pinned) or 'no lane flag'}, "
+            f"the archive ran with {' '.join(ran) or 'no lane flag'} (options: {options})")
+
+
+def recorded_conversion(md: dict) -> tuple[str | None, str]:
+    """(converter version, argv) of the conversion that wrote an archive, from its index metadata.
+
+    The LAST processing method carrying `conversion options` is that conversion: a source this tool
+    exported from an archive brings the earlier archive's method and software entry along, and the
+    new conversion is recorded after them under the next free ids (`mzpeak_convert_conversion_2`,
+    and the software `mzpeak-convert_2` when the versions differ). The method's `software_reference`
+    names the entry of the version that ran; without one, the last entry under `mzpeak-convert` or
+    a numbered `mzpeak-convert_N`. Looking up the plain id alone stamped such an archive with the
+    SOURCE's version and refused it as built by another converter.
+    """
+    methods = [m for dp in md.get("data_processing_method_list") or [] for m in dp.get("methods") or []]
+    conversions = [(m, p.get("value")) for m in methods for p in m.get("parameters") or []
+                   if p.get("name") == "conversion options"]
+    method, options = conversions[-1] if conversions else ({}, None)
+    softwares = md.get("software_list") or []
+    ref = method.get("software_reference")
+    ours = [s for s in softwares if s.get("id") == ref] if ref else []
+    if not ours:
+        ours = [s for s in softwares if re.fullmatch(r"mzpeak-convert(_\d+)?", s.get("id") or "")]
+    return (ours[-1].get("version") if ours else None), (options or "")
+
+
+def archive_record(archive: Path) -> tuple[str | None, str, str | None]:
+    """What `archive` says built it: (converter version, `conversion options`, problem) of its LAST
+    conversion ([`recorded_conversion`]). `problem` is set, and the rest empty, when the archive
+    cannot answer (no split-facet layout, an unreadable index)."""
+    try:
+        with zipfile.ZipFile(archive) as z:
+            if not any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
+                return None, "", "no split-facet layout"
+            md = json.loads(z.read("mzpeak_index.json")).get("metadata") or {}
+    except Exception as e:  # truncated zip, no index, unparsable index
+        return None, "", f"unreadable archive index ({e})"
+    built, options = recorded_conversion(md)
+    return built, options, None
+
+
+def write_stamp(archive: Path, version: str, rid: str, flags: list[str] | None = None) -> str | None:
     """Stamp `archive` from its OWN index; -> None, or why it was left unstamped.
 
     What was requested says nothing reliable about what built an archive: the box strips lane flags
@@ -416,23 +539,71 @@ def write_stamp(archive: Path, version: str, rid: str) -> str | None:
     the host's version string used to be written beside whatever the box's exe produced. The archive
     records its converter (software_list) and its argv (`conversion options`), so the stamp copies
     those, and an archive another converter version built is refused rather than labelled current.
+    So is one whose recorded argv runs another lane than the descriptor's `flags` pin (LANE_FLAGS):
+    the refusal names both, and the unit stays failed until the descriptor or the archive changes.
     """
-    try:
-        with zipfile.ZipFile(archive) as z:
-            if not any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
-                return "no split-facet layout"
-            md = json.loads(z.read("mzpeak_index.json")).get("metadata") or {}
-    except Exception as e:  # truncated zip, no index, unparsable index
-        return f"unreadable archive index ({e})"
-    built = next((s.get("version") for s in md.get("software_list") or []
-                  if s.get("id") == "mzpeak-convert"), None)
-    options = next((p.get("value") for dp in md.get("data_processing_method_list") or []
-                    for m in dp.get("methods") or [] for p in m.get("parameters") or []
-                    if p.get("name") == "conversion options"), None) or ""
+    built, options, problem = archive_record(archive)
+    if problem:
+        return problem
     if built != version.split()[-1]:
         return f"built by mzpeak-convert {built or '<unrecorded>'}, not {version}"
+    why = lane_mismatch(flags, options)
+    if why:
+        return why
     stamp_for(archive).write_text(f"{version}\nrecipe {rid}\noptions {options}\n")
     return None
+
+
+def flag_chunks(argv_text: str) -> list[str]:
+    """`argv_text` as one chunk per flag with its value ("--zstd-level 12", "--image CHJ2.png"),
+    path-shaped tokens reduced to their last component the way `conversion options` records them.
+    Split at flag boundaries, not on whitespace: a value may hold spaces, and so may the input."""
+    chunks = re.split(r"\s+(?=--?[A-Za-z])", argv_text.strip())
+    out = []
+    for c in chunks:
+        if not c:
+            continue
+        toks = [t.rsplit("/", 1)[-1].rstrip("/") if "/" in t else t for t in c.split()]
+        out.append(" ".join(toks))
+    return out
+
+
+def recorded_flags(options: str) -> list[str]:
+    """The flags inside an archive's `conversion options`: the input positional (first chunk), the
+    output (`-o`/`--output <path>`) and the overwrite switch (`-f`/`--force`) dropped. The box writes
+    `<unit> <flags> -o out.mzpeak --force`, the host `<unit> -o <out> -f <flags>`; both reduce to the
+    same chunks, which is what a recipe's flags are compared with."""
+    chunks = flag_chunks(options)[1:]
+    return [c for c in chunks if c not in ("-f", "--force")
+            and not c.startswith("-o ") and not c.startswith("--output ") and c not in ("-o", "--output")]
+
+
+def restamp(groups: dict, recipes: dict[Path, Recipe], version: str, root: Path) -> int:
+    """Re-stamp every archive whose recorded `conversion options` are exactly its recipe's flags, so
+    an edited recipe that names what the box actually built (a D17 re-pin, an added comment, a key
+    other than `flags`) does not force a no-op rebuild. -> how many were re-stamped.
+
+    Only the stamp's recipe line changes, and only for an archive that is current in every other
+    respect: built by this converter version (`write_stamp` refuses another) and recording the
+    recipe's flags, in whichever order the host or the box passed them. A flag the recipe asks for
+    that the archive does not record, or the reverse, leaves the archive stale: that archive IS
+    different from what the recipe builds, and only a rebuild can say so honestly.
+    """
+    done = 0
+    for t, cands in groups.items():
+        u, n = cands[0]
+        r = recipe_for(u, recipes)
+        if not r.described or not t.exists() or is_current(t, version, r.rid, r.flags):
+            continue
+        built, options, problem = archive_record(t)
+        if problem or built != version.split()[-1]:
+            continue
+        if sorted(recorded_flags(options)) != sorted(flag_chunks(" ".join([*r.flags, *sample_flags(n)]))):
+            continue
+        if write_stamp(t, version, r.rid, r.flags) is None:
+            print(f"restamped : {t.relative_to(root)}  recipe {r.rid}  ({options})")
+            done += 1
+    return done
 
 
 def convert(unit: Path, out: Path, binary: str, version: str, dry: bool,
@@ -470,7 +641,7 @@ def convert(unit: Path, out: Path, binary: str, version: str, dry: bool,
             f"exit {proc.returncode}",
         )
         return unit, "failed", first.strip()[:200]
-    why = write_stamp(out, version, rid)
+    why = write_stamp(out, version, rid, extra)
     if why:
         return unit, "failed", f"not stamped: {why}"
     return unit, "converted", ""
@@ -514,9 +685,15 @@ def run_box(jobs: list[tuple[Path, Path, int | None]], root: Path, version: str,
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("w") as fh:
         for u, t, n in jobs:
-            # The descriptor's own flags, so a box-built archive matches its host-built recipe
-            # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
-            flags = (recipe_for(u, recipes or {}).flags or ['--no-vendor']) + sample_flags(n)
+            # The descriptor's own flags, so a box-built archive matches its host-built recipe (an SDRF
+            # demonstrator keeps `--sdrf`). `--no-vendor` only where NO descriptor governs the unit
+            # (pwiz-examples, an ungoverned tile): a described dataset without flags converts with the
+            # converter's defaults, as HOW-TO-ADD-DATA.txt says and as the host path has always done.
+            # Until 2026-10-01 the default applied to any flag-less recipe, so ten box archives carry
+            # `--no-vendor` their descriptors never asked for, and a pin that names what the box built
+            # bare (D17, the BAF unit) could not be written at all.
+            r = recipe_for(u, recipes or {})
+            flags = (r.flags if r.described else ['--no-vendor']) + sample_flags(n)
             # The archive comes back to the host by default: box_convert.sh relays it through a
             # staging key that it verifies and deletes. --publish-s3 names the DURABLE corpus key
             # instead, and box_convert.sh then copies the verified object onto s3://v09/..., the
@@ -565,7 +742,8 @@ def run_box(jobs: list[tuple[Path, Path, int | None]], root: Path, version: str,
         if before.get(out) == now:
             unchanged.append(out.name)
             continue
-        why = write_stamp(out, version, recipe_for(u, recipes or {}).rid)
+        r = recipe_for(u, recipes or {})
+        why = write_stamp(out, version, r.rid, r.flags)
         if why:
             print(f"box       : {out.name} arrived but is left unstamped: {why}")
             unchanged.append(out.name)
@@ -598,12 +776,16 @@ def convert_target(target: Path, cands: list[tuple[Path, int | None]], binary: s
 
 
 def main(argv: list[str] | None = None) -> int:
+    _lane_stale_reported.clear()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", nargs="?", default=os.path.expanduser("~/Claude/mzpeak-example-data/data"))
     ap.add_argument("--clean", action="store_true", help="delete every .mzpeak first, then convert all")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--report-only", action="store_true", help="audit completeness, convert nothing")
+    ap.add_argument("--restamp", action="store_true",
+                    help="first re-stamp archives whose recorded conversion options already equal their "
+                         "(edited) recipe, so a re-pin to what the box built does not rebuild; then continue")
     ap.add_argument("--box", action="store_true",
                     help="also convert host-unsupported vendor units on the flash workstation")
     # Was 1, because every box job re-downloaded its own raw and N of those at once thrashed the box
@@ -655,8 +837,11 @@ def main(argv: list[str] | None = None) -> int:
               f"native one and skipping the duplicate(s)")
         for t, c in dup.items():
             print(f"            {t.name}  <- {', '.join(x.name for x, _ in c)}")
-    rid = {t: recipe_for(c[0][0], recipes).rid for t, c in groups.items()}
-    todo = [t for t in groups if not is_current(t, version, rid[t])]
+    recipe = {t: recipe_for(c[0][0], recipes) for t, c in groups.items()}
+    if args.restamp:
+        print(f"restamped : {restamp(groups, recipes, version, root)} archive(s) whose recorded options "
+              f"already equal their recipe")
+    todo = [t for t in groups if not is_current(t, version, recipe[t].rid, recipe[t].flags)]
     fresh = len(groups) - len(todo)
     print(f"archives  : {len(groups)} (from {len(units)} units)\nalready ok: {fresh}\nto convert: {len(todo)}\n")
 
@@ -693,7 +878,7 @@ def main(argv: list[str] | None = None) -> int:
                                       publish_s3=args.publish_s3)
 
     # ---- report -------------------------------------------------------------
-    have = [t for t in groups if is_current(t, version, rid[t])]
+    have = [t for t in groups if is_current(t, version, recipe[t].rid, recipe[t].flags)]
     print("\n" + "=" * 72)
     print(f"COMPLETENESS  {len(have)}/{len(groups)} archives current"
           f"  ({100.0 * len(have) / max(1, len(groups)):.1f}%)   [from {len(units)} raw units]")

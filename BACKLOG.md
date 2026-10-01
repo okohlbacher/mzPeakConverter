@@ -382,17 +382,15 @@ equal to rc.1, no row group over 64 MiB. The archives are stamped with the rc ve
 rebuilt once more by the release. Decisions the audit raised are D11–D18 in
 `~/Claude/mzPeak/output/imaging-plan-2026-10-01.md` §9.
 
-- **Left open by the audit, converter side:** a spectrum that states no scan time is stored as time 0
-  and exported so on the archive route (D14); the direct mzML lane makes up to four passes over the
-  source text and is ~45 % slower than rc.1 on a 182 MB file (copy the source's encoded payloads
-  through instead of re-encoding); integer peak-intensity columns still go through the reader's
-  float32 peak list on export (a5e5b0e covers float64 only); the SciEX glue narrows Clearcore2's
-  doubles to float32 before the lane counts them (count `(float)x != x` in the glue); `--lossless`
-  refuses whenever `MZPC_MAX_SPECTRA` is set, even a cap that would not bite; the native SciEX lane
-  logs one vendored "Failed to construct satisfactory model" WARN per spectrum kept as f64 (771 on
-  `08_SWATH_1E_1H`) — noise, since tolerance `Da(0.0)` only passes an exact fit; the box's canonical
-  checkout holds a CRLF copy of `tests/fixtures/tiny.pwiz.1.1.mzML` (checked out before the `-text`
-  rule), which fails one unit test there — refresh the working copy, no commit.
+- **Left open by the audit, converter side:** a spectrum that states no scan time is stored as time
+  0 and exported so on the archive route (D14); the SciEX glue narrows Clearcore2's doubles to
+  float32 before the lane counts them (count `(float)x != x` in the glue); `--lossless` refuses
+  whenever `MZPC_MAX_SPECTRA` is set, even a cap that would not bite; the native SciEX lane logs one
+  vendored "Failed to construct satisfactory model" WARN per spectrum kept as f64 (771 on
+  `08_SWATH_1E_1H`) — noise, since tolerance `Da(0.0)` only passes an exact fit. Closed by 0.17.0:
+  integer peak-intensity columns are exported as stored; the direct mzML lane's extra passes over
+  the source (what remains is in the next section); the box's CRLF copy of
+  `tests/fixtures/tiny.pwiz.1.1.mzML` was refreshed on 2026-10-02 without a commit.
 - **Upstream reports to file (no converter change):** arrow-rs writes a page index that marks pages of
   list-of-struct `parameters` columns as all-null (parquet-rs 59.1.0); the HUPO Python reference
   reader fails on multi-precursor spectra without a parent (whole-frame diaPASEF, MSX) and on the
@@ -402,9 +400,67 @@ rebuilt once more by the release. Decisions the audit raised are D11–D18 in
   SRM spectrum unconditionally; SRM product (Q3) windows have no facet in the archive
   (`chromatograms_metadata_products` is unwritten by every writer and `todo!()` in the reference
   reader); the `one_over_k0` SDK/model 1–4 ulp difference.
-- **Corpus descriptors:** three pinned descriptors state lane flags their archives were not built
-  with (D17); `example1-continuous.yaml` should add `--keep-zero-runs` so the continuous example
-  decodes to one axis (D2); bladder units `--pixel-size 10` once D3 is decided.
+- **Corpus descriptors:** the D17 re-pins and the bladder `--pixel-size 10` sit on the corpus branch
+  `descriptors-2026-10-01`, to be merged with the 0.17.0 rebuild (`--pixel-size` ships in 0.17.0);
+  `example1-continuous.yaml` needs no `--keep-zero-runs` — a continuous-mode imzML keeps its zero
+  runs by default since 0.17.0 (D2); owner decision on corpus commit 709b0c1: keep the ten
+  `--no-vendor` declarations or let those archives converge on the defaults.
+
+## After the wave-5 merge (2026-10-02, release 0.17.0)
+
+Wave 5 implemented the owner's decisions of 2026-10-01 (plan §10: P1–P4, D1–D18) in six units, each
+adversarially verified, and merged through `wave5/integration` (PR #41). What the units and the
+merge verifier left open, none of it blocking the release:
+
+- **m/z trial, point arm (P2 follow-up):** the generic lane's sample trial weighs delta against
+  numpress only; the TSF lane also tries the point layout, which on sparse centroid data beats exact
+  delta (SZB8102938 3,323,120 B delta vs 3,154,925 B `--layout point`, −5.1 %, m/z bit-identical).
+  Adding the arm changes the default layout of ordinary mzML archives — its own measurement pass.
+- **Direct mzML → mzML lane speed:** still +35–50 % against 0.16.0, now per spectrum (zlib deflate
+  55 %, byte sinks 7 %, SHA-1 4 % of the profile). Candidates: pass a source array's compressed
+  payload through when type and compression match; hash while writing.
+- **Direct lane and integer intensities:** the direct lane writes a source's integer intensity
+  arrays as held (manual §4.1), while the archive route exports them as 64-bit floats since 0.17.0 —
+  widen there too, or stay faithful? Open.
+- **Chromatogram column type vs the summed BPC (mzML lane, pre-existing):** an int32 chromatogram
+  column typed from the source's chromatograms cannot hold the synthesized BPC (values to 4.6e18):
+  stored as 44 nulls, exported with a time array and no intensity array. Type the column from the
+  summaries too, or declare and clamp like the TIC (reproducer: an i64-intensity mzML → `--lossless`
+  → export).
+- **Chromatogram placeholder row:** removing it (both footers 0) needs a vendored-writer change (the
+  facet is emitted only with a row; the vendored reader returns two chromatograms when the member is
+  absent) and a HUPO Python reader that indexes an empty frame — or the validator's
+  `chromatogram_count_agreement` moves. Marked in the archive since 0.17.0 (plan §11).
+- **Data-facet schema sampled from centroid spectra (symmetric to the 0.17.0 peak-facet fix):**
+  `spectra_data`'s schema is still sampled from every spectrum, so a centroid spectrum's intensity
+  type or extra per-peak arrays can type or add data-facet columns the facet never fills; the same
+  skip-routed-spectra fix applies but changes the schemas of existing archives.
+- **timsTOF archive export fails XSD validation (pre-existing, identical in rc.2):** `componentList`
+  writes `<analyzer>` where `mzML1.1.2_idx.xsd` expects `<source>` first; write a `<source>`
+  component or an empty list.
+- **Filter lane re-pack of a native TDF archive:** a plain re-pack re-encodes
+  `spectra_peaks.parquet` 4,966,199 → 5,115,676 B (+150 KB) while the other members move ±1 KB;
+  pre-existing.
+- **FlexImaging sequence image, two small things:** a BMP sequence image is recorded as 0 × 0
+  (dimension reading covers PNG/JPEG/TIFF); owner choice whether a same-sized later `--image` may
+  inherit the sequence registration under a declared distinct quality (e.g.
+  `assumed_sequence_image_frame` + `registration.inherited_from`, with a WARN) — today it is
+  embedded without an affine (P3 reading).
+- **`--pixel-size` scoping (owner choice):** the extent test applies only to an axis that states no
+  pixel size, so `--pixel-size 100,2500` on a header stating y = 2500 µm beside a 300 µm extent is
+  accepted as agreeing (the source's own mismatch sits in `extent_mismatches`); a two-line change if
+  the stricter reading is preferred. Waters: a corner within 1e-6 µm below zero is written as 0
+  (float noise), larger negatives omitted and recorded.
+- **Spec PR #25 proposals (P4, converter-defined since 0.17.0):**
+  `metadata.imaging.pixel_size_source` values (declared | unit_assumed | derived_from_area |
+  user_supplied | derived_from_positions | derived_from_beam_size | unknown); `registration_quality:
+  teach_points` and the `registration` record (teach points, reference point, both affines, stage −
+  motor translation, step, residuals) inside `metadata.imaging.images[]`.
+- **Upstream, mzdata:** the mzML reader drops userParams under `isolationWindow`/`scanWindow`; the
+  unit UO:0000324 of a collision cross section is lost; a unit spelled by a name mzdata has no Unit
+  for (`number of counts` for MS:1000131) reads as unknown; `startTimeStamp` without a zone on an
+  imzML logs an ERROR although the value is used. The HUPO Python reader items stand (previous
+  section).
 
 ## Vendoring exit — `vendor/mzpeak_prototyping` (opened 2026-09-23)
 

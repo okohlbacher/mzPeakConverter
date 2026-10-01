@@ -15,7 +15,10 @@
 //! * states the run as `<run id="1">` with the LOWEST-numbered instrument configuration and the
 //!   FIRST source file as its defaults and no `startTimeStamp`, whatever its run description holds
 //!   (`MRM Neg C5`, acquired 2006-09-10T02:11:56Z from `MSScan.bin`, came out as run `1` of
-//!   `acqmethod.xml`, undated).
+//!   `acqmethod.xml`, undated);
+//! * has no `<contact>`: its model has none ([`crate::mzml_contact`]), so under `--keep-contact`
+//!   the lane hands the sink the elements to write into `<fileDescription>`, after the source
+//!   files, where the schema has them.
 //!
 //! [`HeaderFixes`] sits under that writer, like [`crate::mzml_isolation`] and
 //! [`crate::mzml_wavelength`], holds the header (everything up to the end of the `<run …>` start
@@ -80,7 +83,7 @@ impl From<mzpeak_prototyping::param::ControlledVocabularyEntry> for Cv {
     }
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -127,6 +130,8 @@ pub struct HeaderFixes<W: Write> {
     inner: W,
     cv: Option<Cv>,
     run: RunCell,
+    /// `<contact>` elements to write into `<fileDescription>` ([`crate::mzml_contact::Contact::xml`]).
+    contacts: Vec<String>,
     state: State,
     /// Bytes not passed on yet: the header, a tail that may still become `<indexList`, or an index
     /// element that is still incomplete.
@@ -139,13 +144,13 @@ impl<W: Write> HeaderFixes<W> {
     /// Without a [`Run`]: the run tag stays as mzdata writes it.
     #[cfg(test)]
     pub fn new(inner: W, cv: Option<Cv>) -> Self {
-        Self::with_run(inner, cv, RunCell::default())
+        Self::with_run(inner, cv, RunCell::default(), Vec::new())
     }
 
     /// `run` is read when the header is complete, so the lane may fill it any time before the
-    /// writer's first spectrum.
-    pub fn with_run(inner: W, cv: Option<Cv>, run: RunCell) -> Self {
-        Self { inner, cv, run, state: State::Header, held: Vec::new(), shift: 0 }
+    /// writer's first spectrum; `contacts` are the `<contact>` elements to write (none by default).
+    pub fn with_run(inner: W, cv: Option<Cv>, run: RunCell, contacts: Vec<String>) -> Self {
+        Self { inner, cv, run, contacts, state: State::Header, held: Vec::new(), shift: 0 }
     }
 
     /// Pass on what is complete in `held`; with `end`, everything.
@@ -160,7 +165,7 @@ impl<W: Write> HeaderFixes<W> {
                     let Some(end) = tag_end(&self.held[run..]).map(|len| run + len) else {
                         break;
                     };
-                    let mut header = fix_header(&self.held[..run], self.cv.as_ref());
+                    let mut header = fix_header(&self.held[..run], self.cv.as_ref(), &self.contacts);
                     header.extend(fix_run(&self.held[run..end], self.run.borrow().as_ref()));
                     self.shift = header.len() as i64 - end as i64;
                     self.inner.write_all(&header)?;
@@ -236,7 +241,7 @@ fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// The header as it should read. Not UTF-8 (mzdata writes UTF-8), or nothing to fix: as it is.
-fn fix_header(header: &[u8], cv: Option<&Cv>) -> Vec<u8> {
+fn fix_header(header: &[u8], cv: Option<&Cv>, contacts: &[String]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(header) else {
         return header.to_vec();
     };
@@ -244,10 +249,28 @@ fn fix_header(header: &[u8], cv: Option<&Cv>) -> Vec<u8> {
     if let Some(cv) = cv {
         declare_cv(&mut text, cv);
     }
+    insert_contacts(&mut text, contacts);
     count_scan_settings(&mut text);
     source_file_refs(&mut text);
     drop_empty_elements(&mut text);
     text.into_bytes()
+}
+
+/// Write `contacts` (each a complete `<contact>` element ending in a line break) as the last
+/// children of `<fileDescription>`, on the lines before its end tag — after `<fileContent>` and
+/// `<sourceFileList>`, the order the schema requires. A header without the element (none mzdata
+/// writes) is left as it is.
+fn insert_contacts(text: &mut String, contacts: &[String]) {
+    const END: &str = "</fileDescription>";
+    if contacts.is_empty() {
+        return;
+    }
+    let Some(tag) = text.find(END) else { return };
+    // The start of the end tag's line, when the tag stands on one of its own.
+    let line = text[..tag].rfind('\n').map(|n| n + 1).filter(|&n| text[n..tag].bytes().all(|b| b == b' ' || b == b'\t'));
+    let at = line.unwrap_or(tag);
+    let block: String = contacts.concat();
+    text.insert_str(at, &block);
 }
 
 /// The length of the start tag `tag` begins with, its `>` included: the first `>` outside a quoted
@@ -622,7 +645,7 @@ mod tests {
 
         let run = RunCell::default();
         let out = Shared::default();
-        let sink = HeaderFixes::with_run(out.clone(), None, run.clone());
+        let sink = HeaderFixes::with_run(out.clone(), None, run.clone(), Vec::new());
         // Filled after the sink went into the writer, as the lanes do.
         *run.borrow_mut() = Some(Run {
             id: "MRM_x0020_Neg \"&\" C5".into(),
@@ -656,7 +679,7 @@ mod tests {
         let partial = Run { id: "r".into(), ..Default::default() };
         let whole = {
             let out = Shared::default();
-            let mut sink = HeaderFixes::with_run(out.clone(), None, Rc::new(RefCell::new(Some(partial.clone()))));
+            let mut sink = HeaderFixes::with_run(out.clone(), None, Rc::new(RefCell::new(Some(partial.clone()))), Vec::new());
             sink.write_all(raw.as_bytes()).unwrap();
             sink.flush().unwrap();
             out.0.take()
@@ -665,7 +688,7 @@ mod tests {
         assert!(text.contains("<run id=\"r\" defaultInstrumentConfigurationRef=\"IC1\" defaultSourceFileRef=\"first\">"), "{}", &text[text.find("<run ").unwrap()..][..120]);
         for block in [1, 3, 64] {
             let out = Shared::default();
-            let mut sink = HeaderFixes::with_run(out.clone(), None, Rc::new(RefCell::new(Some(partial.clone()))));
+            let mut sink = HeaderFixes::with_run(out.clone(), None, Rc::new(RefCell::new(Some(partial.clone()))), Vec::new());
             for chunk in raw.as_bytes().chunks(block) {
                 sink.write_all(chunk).unwrap();
                 sink.flush().unwrap();
@@ -694,6 +717,47 @@ mod tests {
         assert_eq!(Cv::from_cv_list(Some(&cv_list), "NCIT"), None);
         assert_eq!(Cv::from_cv_list(None, "IMS"), None);
         assert!(Cv::ims().uri.contains("/2c28b05ca297430303627d8c7d192cac1a2b1374/"), "pinned to a commit: {}", Cv::ims().uri);
+    }
+
+    /// Under `--keep-contact` the lane hands the sink the `<contact>` elements: they land as the
+    /// last children of `<fileDescription>`, on their own lines before its end tag, and the index
+    /// follows the header's growth; without any the header is as it was.
+    #[test]
+    fn contacts_are_written_into_the_file_description_and_the_index_follows() {
+        let contact = "    <contact>\n      <cvParam cvRef=\"MS\" accession=\"MS:1000586\" name=\"contact name\" value=\"A &amp; B\"/>\n    </contact>\n".to_string();
+        let raw = {
+            let out = Shared::default();
+            document(Box::new(out.clone()), 4, true);
+            String::from_utf8(out.0.take()).unwrap()
+        };
+        assert!(raw.contains("\n    </fileDescription>") && !raw.contains("<contact>"), "what mzdata writes: {}", &raw[..raw.find("<run ").unwrap()]);
+        let out = Shared::default();
+        let second = contact.replace("A &amp; B", "C");
+        document(Box::new(HeaderFixes::with_run(out.clone(), None, RunCell::default(), vec![contact.clone(), second.clone()])), 4, true);
+        let doc = String::from_utf8(out.0.take()).unwrap();
+        let header = &doc[..doc.find("<run ").unwrap()];
+        let expected = format!("{contact}{second}    </fileDescription>");
+        assert!(header.contains(&expected), "{header}");
+        assert!(header.find("</sourceFileList>").is_none_or(|s| s < header.find("<contact>").unwrap()), "after the source files: {header}");
+        assert_eq!(header.matches("<contact>").count(), 2);
+        let grew = doc.len() - raw.len();
+        assert_eq!(grew, contact.len() + second.len());
+        for ((id, at), (raw_id, raw_at)) in offsets(&doc).iter().zip(offsets(&raw)) {
+            assert_eq!((id, *at), (&raw_id, raw_at + grew));
+            assert!(doc[*at..].trim_start().starts_with("<spectrum ") || doc[*at..].trim_start().starts_with("<chromatogram "), "{id}");
+        }
+        // The helper on its own: nothing to insert, or no element to insert into.
+        let mut text = "<a>\n  </fileDescription>\n".to_string();
+        insert_contacts(&mut text, &[]);
+        assert_eq!(text, "<a>\n  </fileDescription>\n");
+        insert_contacts(&mut text, &["<contact/>\n".into()]);
+        assert_eq!(text, "<a>\n<contact/>\n  </fileDescription>\n");
+        let mut inline = "<a></fileDescription>".to_string();
+        insert_contacts(&mut inline, &["<contact/>\n".into()]);
+        assert_eq!(inline, "<a><contact/>\n</fileDescription>", "an end tag that does not stand alone on its line");
+        let mut none = "<a/>".to_string();
+        insert_contacts(&mut none, &["<contact/>\n".into()]);
+        assert_eq!(none, "<a/>");
     }
 
     #[test]

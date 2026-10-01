@@ -3,8 +3,9 @@
 //! pixel size stated the five ways public imzML headers state it. `pixel_size_expected.json`, written
 //! by the files' author, says what a reader can conclude from each header: the size on both axes or
 //! none, and how it was settled. The archive must agree — `metadata.imaging.pixel_size_um` with the
-//! size, and its `transformations` with the way (the profile has no `pixel_size_source` field yet;
-//! spec PR #25 is to name it).
+//! size, `metadata.imaging.pixel_size_source` with his word for the way (the converter's key since
+//! 0.17.0; proposed for spec PR #25 with three more values), and its `transformations` with what
+//! the rule did.
 //!
 //! Through 0.16.0 the area file (`IMS:1000046` alone, "pixel size", 2500) was written with a 50 µm x
 //! size only and no `pixel_size_um`, although the vocabulary defines a lone `IMS:1000046` as the y
@@ -90,8 +91,10 @@ fn the_archives_agree_with_pixel_size_expected_json() {
             }
         }
 
-        // `pixel_size_source`, as the archive says it today: the transformation declared, the case
-        // of the rule in the `imaging_pixel_size` block, and the marker's provenance line.
+        // `pixel_size_source`: his word in the marker, and the archive's own account of it — the
+        // transformation declared, the case of the rule in the `imaging_pixel_size` block, and the
+        // marker's provenance line.
+        assert_eq!(img["pixel_size_source"], want["pixel_size_source"], "{case}: {img:#}");
         let declared: Vec<&str> = m["transformations"]
             .as_array()
             .unwrap()

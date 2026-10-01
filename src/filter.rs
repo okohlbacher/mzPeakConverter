@@ -67,6 +67,9 @@ pub struct FilterOpts {
     pub images: Vec<PathBuf>,
     /// Inject an SDRF sample-metadata TSV (verbatim).
     pub sdrf: Option<PathBuf>,
+    /// `--pixel-size`: an imaging archive whose grid states no pixel size gains the supplied one
+    /// ([`apply_user_pixel_size`]).
+    pub pixel_size: Option<crate::imaging::UserPixelSize>,
 }
 
 /// Parse an `--rt MIN-MAX` argument. Either bound may be omitted for an open range (`10-`, `-30`).
@@ -130,9 +133,34 @@ pub fn report_inspect(input: &Path) -> Result<()> {
     }
     if names.iter().any(|n| n == "chromatograms_metadata.parquet") {
         let bytes = read_member(&mut zip, "chromatograms_metadata.parquet")?;
-        println!("chromatograms: {}", parquet_row_count(&bytes)?);
+        let rows = parquet_row_count(&bytes)?;
+        // The one row of a run without a chromatogram is the writer's placeholder (`write_empty_chromatogram`), not one.
+        if rows == 1 && single_row_is_placeholder(&bytes).unwrap_or(false) {
+            println!("chromatograms: 0 (one placeholder row: the run has no chromatogram)");
+        } else {
+            println!("chromatograms: {rows}");
+        }
     }
     Ok(())
+}
+
+/// Whether the one row of a `chromatograms_metadata` facet is the placeholder of a run without a
+/// chromatogram: an empty id (the row carries the `placeholder chromatogram` parameter too, since
+/// 0.17.0; the empty id is what the manual tells a reader to skip on, and what older archives have).
+fn single_row_is_placeholder(bytes: &[u8]) -> Result<bool> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))?.build()?;
+    for batch in reader {
+        let batch = batch?;
+        let Some(view) = facet_view(&batch, "chromatogram") else { return Ok(false) };
+        let Some(ids) = view.column_by_name("id") else { return Ok(false) };
+        let empty = ids
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .map(|a| a.len() == 1 && a.is_valid(0) && a.value(0).is_empty())
+            .or_else(|| ids.as_any().downcast_ref::<arrow::array::StringArray>().map(|a| a.len() == 1 && a.is_valid(0) && a.value(0).is_empty()));
+        return Ok(empty.unwrap_or(false));
+    }
+    Ok(false)
 }
 
 /// Filter `input` (a `.mzpeak`) into `output` (a new `.mzpeak`) per `opts`.
@@ -144,9 +172,14 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     // Parse the original index so we can carry its metadata blocks + per-member FileEntry classes.
     let index_json = read_member(&mut zip, "mzpeak_index.json")
         .context("reading mzpeak_index.json")?;
-    let index: serde_json::Value = serde_json::from_slice(&index_json)
+    let mut index: serde_json::Value = serde_json::from_slice(&index_json)
         .context("parsing mzpeak_index.json")?;
     crate::reject_legacy_tof_delta(input, index.pointer("/metadata/ims_calibration"))?;
+    // `--pixel-size` on the archive's own grid, before anything is re-encoded: a contradiction with
+    // a stated size is refused here.
+    if let Some(user) = &opts.pixel_size {
+        apply_user_pixel_size(&mut index, user, input)?;
+    }
     let orig_files = index_file_entries(&index);
 
     let member_names: Vec<String> = zip.file_names().map(str::to_string).collect();
@@ -1550,6 +1583,15 @@ fn replace_struct_child(s: &StructArray, pos: usize, new_child: ArrayRef) -> Res
 /// larger than the converter wrote it in one 178 MiB group and 20.0 % larger in 11 byte-capped
 /// ones; following the source's encodings in parquet's default layout it was 1.5 % larger (laid
 /// out as the source, at this lane's zstd level, it is 4.2 %: see [`apply_layout`]).
+///
+/// The one column group not followed: a chunk's float bounds (`*_chunk_start` / `*_chunk_end`)
+/// where the source holds them dictionary-encoded, as archives written by 0.16.0 or earlier do.
+/// They are nearly all distinct, so the dictionary is the values over again, and every row group
+/// the byte cap makes pays its own: followed, the corpus Lumos peak facet (1 → 4 groups) grew by
+/// 1.19 %; re-encoded the converter's way (byte-stream split, dictionary off, as the vendored
+/// writer has written them since 0.17.0) it is 0.98 % smaller than the source (owner decision D16,
+/// 2026-10-01). Bounds already byte-stream split, or plain without a dictionary
+/// (`--grid-encoding plain`), are followed as before.
 fn apply_encodings(
     mut props: parquet::file::properties::WriterPropertiesBuilder,
     source: &ParquetMetaData,
@@ -1561,6 +1603,10 @@ fn apply_encodings(
         }
         let path = column.path().clone();
         let dictionary = used.iter().any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY));
+        if dictionary && is_float_chunk_bound(column) {
+            props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, Encoding::BYTE_STREAM_SPLIT);
+            continue;
+        }
         props = props.set_column_dictionary_enabled(path.clone(), dictionary);
         let value = [
             Encoding::BYTE_STREAM_SPLIT,
@@ -1575,6 +1621,14 @@ fn apply_encodings(
         }
     }
     props
+}
+
+/// A chunk facet's float bound column (`<axis>_chunk_start` / `<axis>_chunk_end` of a 32- or
+/// 64-bit float axis): the columns the converter byte-stream-splits with the dictionary off.
+fn is_float_chunk_bound(column: &parquet::schema::types::ColumnDescriptor) -> bool {
+    let name = column.path().string();
+    (name.ends_with("_chunk_start") || name.ends_with("_chunk_end"))
+        && matches!(column.physical_type(), parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT)
 }
 
 /// Lay the facet out as its source was. From the source's footer: its Parquet format version (the
@@ -1604,10 +1658,10 @@ fn apply_encodings(
 ///   with the first 1,024-row reader batch past parquet's 20,000 rows, so that facet is 3.7 %
 ///   (8 KB) larger even at the source's level. A point facet comes out 0.35-0.6 % smaller.
 /// * A chunk facet written by 0.16.0 or earlier has dictionary-encoded bounds, which this rewrite
-///   keeps (the converter now byte-stream-splits them), and once the byte cap splits the facet into
-///   row groups, each group pays its own dictionary: the corpus Lumos peak facet (1 → 4 groups)
-///   grows by 1.2 %, MFA381's (1 → 3) by 2.3 % and that archive by 1.2 %. Rebuilt from the raw
-///   file, both peak facets are 1.1 % smaller than in the corpus.
+///   re-encodes the converter's way ([`apply_encodings`]): followed, and once the byte cap split
+///   the facet into row groups, each group paid its own dictionary (the corpus Lumos peak facet,
+///   1 → 4 groups, +1.2 %; MFA381's, 1 → 3, +2.3 % and that archive +1.2 %); re-encoded, the Lumos
+///   facet is 0.98 % smaller than its source.
 fn apply_layout(
     mut props: parquet::file::properties::WriterPropertiesBuilder,
     source: &ParquetMetaData,
@@ -1711,6 +1765,56 @@ fn carry_index_metadata(
     }
     w.add_index_metadata("filter", &provenance)
         .map_err(|e| anyhow!("index metadata filter: {e}"))?;
+    Ok(())
+}
+
+/// `--pixel-size` on the rewrite lane: the archive's grid entry (`metadata.scan_settings_list`, the
+/// one stating `IMS:1000042/43`) gains the size by the lanes' one rule
+/// ([`crate::imaging::apply_user_pixel_size`]: written where the archive states none, refused where
+/// it states a different one unless `--force`), and the `metadata.imaging` marker
+/// (`pixel_size_um`, `pixel_size_source`, `provenance.pixel_size`), the `transformations` list and
+/// the `imaging_pixel_size` rows are brought along, in the index the rewrite carries. An archive
+/// that is not imaging has no grid to size and is refused.
+fn apply_user_pixel_size(index: &mut serde_json::Value, user: &crate::imaging::UserPixelSize, input: &Path) -> Result<()> {
+    use crate::imaging::{SOURCE_USER_SUPPLIED, USER_SUPPLIED, USER_SUPPLIED_PROVENANCE};
+    let Some(meta) = index.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+        bail!("--pixel-size: {} has no index metadata", input.display());
+    };
+    if !meta.get("imaging").is_some_and(|m| m["is_imaging"] == true) {
+        bail!(
+            "--pixel-size: {} is not an imaging archive (no metadata.imaging marker): there is no pixel grid to size",
+            input.display()
+        );
+    }
+    let list: Vec<mzpeak_prototyping::param::ScanSettings> = match meta.get("scan_settings_list") {
+        Some(v) => serde_json::from_value(v.clone()).context("reading the archive's scan_settings_list")?,
+        None => Vec::new(),
+    };
+    let mut list: Vec<mzdata::meta::ScanSettings> = list.into_iter().map(Into::into).collect();
+    let Some(grid) = crate::imaging::grid_mut(&mut list) else {
+        bail!("--pixel-size: {} states no pixel grid (IMS:1000042/43) in its scan settings: there is no grid to size", input.display());
+    };
+    let Some(row) = crate::imaging::apply_user_pixel_size(grid, user, "the archive's scan settings")? else {
+        return Ok(());
+    };
+    let size = crate::imaging::pixel_size_um(grid);
+    let back: Vec<mzpeak_prototyping::param::ScanSettings> = list.iter().map(Into::into).collect();
+    meta.insert("scan_settings_list".into(), serde_json::to_value(back).context("writing the scan_settings_list")?);
+    if let Some(arr) = meta.entry("transformations").or_insert_with(|| serde_json::json!([])).as_array_mut() {
+        if !arr.iter().any(|e| e == USER_SUPPLIED) {
+            arr.push(USER_SUPPLIED.into());
+        }
+    }
+    if let Some(marker) = meta.get_mut("imaging") {
+        if let Some((x, y)) = size {
+            marker["pixel_size_um"] = serde_json::json!({"x": x, "y": y});
+        }
+        marker["pixel_size_source"] = SOURCE_USER_SUPPLIED.into();
+        marker["provenance"]["pixel_size"] = USER_SUPPLIED_PROVENANCE.into();
+    }
+    if let Some(arr) = meta.entry("imaging_pixel_size").or_insert_with(|| serde_json::json!([])).as_array_mut() {
+        arr.push(row);
+    }
     Ok(())
 }
 

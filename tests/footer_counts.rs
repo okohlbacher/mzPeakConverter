@@ -239,6 +239,25 @@ fn chromatogram_data_count_is_zero_when_nothing_was_written() {
     let _ = std::fs::remove_file(&input);
     assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_count"), (0, 0));
     assert_eq!(facet(&archive, "chromatograms_data.parquet", "chromatogram_data_point_count"), (0, 0));
-    assert_eq!(declared(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), 1);
+    // The metadata facet counts its rows (the validator's `chromatogram_count_agreement`, an
+    // error), the data facet the index bound over the rows it holds (D1): 1 and 0 for a facet
+    // whose one row is the placeholder, as 3 and 0 for a centroid-only run's spectrum facets.
+    assert_eq!(facet(&archive, "chromatograms_metadata.parquet", "chromatogram_count"), (1, 1));
+    // The row says what it is: id-less, without a point, and marked, so a reader can skip it
+    // without the empty-id rule; through 0.17.0-rc.2 nothing on the row told it from a
+    // chromatogram, and the inspection counted it as one.
+    {
+        use mzdata::prelude::*;
+        let mut reader = mzpeak_prototyping::MzPeakReader::new(&archive).unwrap();
+        assert_eq!(reader.len_chromatograms(), 1);
+        let row = reader.get_chromatogram(0).expect("the placeholder row");
+        assert!(row.id().is_empty(), "{:?}", row.id());
+        assert_eq!(row.arrays.get(&mzdata::spectrum::bindata::ArrayType::TimeArray).map(|t| t.data_len().unwrap()), Some(0));
+        let marker = row.params().iter().find(|p| p.name == "placeholder chromatogram").unwrap_or_else(|| panic!("{:?}", row.params()));
+        assert!(!marker.is_controlled() && marker.value.to_string().starts_with("the run has no chromatogram"), "{marker:?}");
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert")).arg(&archive).output().expect("failed to run mzpeak-convert");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains("chromatograms: 0 (one placeholder row: the run has no chromatogram)"), "{stdout}");
     let _ = std::fs::remove_file(&archive);
 }

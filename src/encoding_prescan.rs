@@ -12,15 +12,44 @@
 //! Parquet records its encoding per page, so readers need nothing to read any arm; int32 intensity
 //! is a declared array data type (MS:1000519). The `encoding_prescan` index block states what was
 //! measured and chosen.
+//!
+//! **The default m/z encoding** of every other chunked lane (mzML, imzML, Thermo, the native readers
+//! without a full pre-scan) is decided by the same means, for the m/z column alone ([`pick_mz`],
+//! owner decision D1/D13 of 2026-10-01, principle P2: exact where it costs nothing). Where every
+//! sampled m/z is a 32-bit value ([`all_32bit`]) delta is exact whatever the spacing and smaller
+//! than numpress-linear on every file measured (imzML: chilli −38 %, LA-ESI −36 %, DESI and the
+//! Example files −12 %), so it is chosen without a trial. Otherwise the sample is written under
+//! delta and under numpress-linear and the smaller arm is kept; on a tie the exact one, where delta
+//! counts as exact only when no sampled chunk is at risk (a chunk whose values span more than a
+//! factor of two, where `b + fl(a − b)` can round for 64-bit values: `fidelity`). Measured on the
+//! corpus: delta on QC01, SZB8102938 and PXD009465 t04176 (−14 to −22 % and exact), numpress on a
+//! Bruker microTOF profile run (delta +73 % there). A lane that stores m/z exactly (the Bruker TSF
+//! lane) measures delta against the point layout instead and keeps the smaller EXACT arm.
 
 use mzdata::spectrum::{ArrayType, BinaryDataArrayType, DataArray, MultiLayerSpectrum};
 use mzpeak_prototyping::writer::{ColumnEncoding, DataColumnEncodings};
 
-/// How the m/z axis is stored: delta chunks under a Parquet encoding, or numpress-linear.
+/// How the m/z axis is stored: delta chunks under a Parquet encoding, numpress-linear, or the point
+/// layout (one row per m/z–intensity pair, the f64 value as it is; the arm a lane that stores m/z
+/// exactly measures against delta).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MzArm {
     Delta(ColumnEncoding),
     Numpress,
+    Point,
+}
+
+impl MzArm {
+    /// Does this arm return every 64-bit m/z exactly? Delta does when no chunk is at risk
+    /// (`delta_chunks_at_risk`, the writer's count over the sample), the point layout always,
+    /// numpress-linear never.
+    pub fn is_exact(self, delta_chunks_at_risk: u64) -> bool {
+        match self {
+            MzArm::Delta(_) => delta_chunks_at_risk == 0,
+            MzArm::Point => true,
+            MzArm::Numpress => false,
+        }
+    }
 }
 
 /// How intensities are stored: their float32 values, or the same values as int32.
@@ -44,7 +73,7 @@ impl Trial {
         DataColumnEncodings {
             mz_values: match self.mz {
                 MzArm::Delta(e) => e,
-                MzArm::Numpress => ColumnEncoding::Writer,
+                MzArm::Numpress | MzArm::Point => ColumnEncoding::Writer,
             },
             intensity: self.intensity.encoding,
             ion_mobility: self.ion_mobility,
@@ -181,6 +210,121 @@ pub fn intensity_to_int32(spec: &mut MultiLayerSpectrum) -> bool {
     true
 }
 
+/// Is every one of these m/z a 32-bit float value (`(x as f32) as f64 == x`)? False for no values.
+/// Delta returns such values exactly whatever their spacing: two 24-bit mantissas differ exactly in
+/// 64-bit arithmetic, and the decoder's running sum is again a 32-bit value at every step.
+pub fn all_32bit(mz: impl IntoIterator<Item = f64>) -> bool {
+    let mut any = false;
+    for x in mz {
+        any = true;
+        if (x as f32) as f64 != x {
+            return false;
+        }
+    }
+    any
+}
+
+/// One m/z arm of the default rule, measured: the compressed bytes the sample took under it (the
+/// m/z columns against numpress-linear, the whole facets against the point layout) and the
+/// writer's count of delta chunks at risk in the sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MzTrial {
+    pub arm: MzArm,
+    pub bytes: u64,
+    pub delta_chunks_at_risk: u64,
+}
+
+/// Why the default rule chose its arm, as the index block states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Basis {
+    /// Every sampled m/z is a 32-bit value: delta is exact and smaller, no trial.
+    ThirtyTwoBit,
+    /// The smaller arm.
+    Smaller,
+    /// A tie on bytes: the exact arm.
+    TieExact,
+    /// A tie on bytes between arms none of which is exact: the first listed (delta, whose bound is
+    /// one unit in the last place, before numpress-linear).
+    TieInexact,
+    /// A lane that stores m/z exactly: the exact arm, delta having chunks at risk in the sample.
+    OnlyExact,
+}
+
+impl Basis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Basis::ThirtyTwoBit => "every sampled m/z is a 32-bit value: delta returns them exactly and is smaller",
+            Basis::Smaller => "the smaller arm",
+            Basis::TieExact => "a tie on bytes: the exact arm",
+            Basis::TieInexact => "a tie on bytes between inexact arms: delta, whose bound is one unit in the last place",
+            Basis::OnlyExact => "the exact arm: delta chunks of the sample span more than a factor of two",
+        }
+    }
+}
+
+/// The default rule over measured arms (principle P2): the smallest; on a tie the exact one, delta
+/// counting as exact only when no sampled chunk is at risk; a tie between inexact arms keeps the
+/// first listed. With `exact_only` (a lane that stores m/z exactly) only exact arms compete, and the
+/// first listed arm is returned, under [`Basis::OnlyExact`], when none is.
+pub fn pick_mz(trials: &[MzTrial], exact_only: bool) -> (MzArm, Basis) {
+    let exact = |t: &&MzTrial| t.arm.is_exact(t.delta_chunks_at_risk);
+    let first = trials.first().expect("at least one arm");
+    let candidates: Vec<&MzTrial> = trials.iter().filter(|t| !exact_only || exact(t)).collect();
+    let Some(min) = candidates.iter().map(|t| t.bytes).min() else {
+        return (first.arm, Basis::OnlyExact);
+    };
+    // An inexact arm smaller than every exact one lost on exactness alone.
+    let inexact_min = trials.iter().filter(|t| !exact(t)).map(|t| t.bytes).min();
+    let smallest: Vec<&MzTrial> = candidates.iter().copied().filter(|t| t.bytes == min).collect();
+    match smallest.as_slice() {
+        [one] if exact_only && inexact_min.is_some_and(|m| m < min) => (one.arm, Basis::OnlyExact),
+        [one] => (one.arm, Basis::Smaller),
+        several => match several.iter().find(|t| exact(t)) {
+            Some(t) => (t.arm, Basis::TieExact),
+            None => (several[0].arm, Basis::TieInexact),
+        },
+    }
+}
+
+/// The `encoding_prescan` index block of a lane that decided the m/z arm alone: the sample, each
+/// arm's bytes where arms were written, the delta chunks at risk in the sample, the choice and why.
+/// The bytes go under `measured_bytes.mz` when the trial counted the m/z columns alone (delta
+/// against numpress-linear: nothing else moves) and under `measured_bytes.facets` when it counted
+/// every column of the facets (`whole_facets`: delta against the point layout, which moves them all),
+/// so a reader never takes a whole-facet figure for the m/z column's.
+pub fn mz_block(sample_spectra: usize, sample_points: usize, trials: &[MzTrial], chosen: MzArm, basis: Basis, whole_facets: bool) -> serde_json::Value {
+    let mut block = serde_json::json!({
+        "method": if trials.is_empty() {
+            "every sampled m/z tested for being a 32-bit float value; delta chosen without a trial \
+             when all are (exact whatever their spacing, and smaller than numpress-linear on such data)"
+        } else if whole_facets {
+            "the sample written once per m/z arm through the archive writer; every column's compressed \
+             bytes summed over the spectrum data and peak facets (the point layout moves them all); \
+             the smaller EXACT arm kept (delta is exact when no sampled chunk spans more than a \
+             factor of two)"
+        } else {
+            "the sample written once per m/z arm through the archive writer; the m/z columns' \
+             compressed bytes summed over the spectrum data and peak facets; the smaller arm kept, on \
+             a tie the exact one (delta is exact when no sampled chunk spans more than a factor of two)"
+        },
+        "sample": { "spectra": sample_spectra, "points": sample_points },
+        "chosen": { "mz": mz_label(chosen) },
+        "basis": basis.label(),
+    });
+    if !trials.is_empty() {
+        let mut mz = serde_json::Map::new();
+        for t in trials {
+            mz.insert(mz_label(t.arm), t.bytes.into());
+        }
+        let counted = if whole_facets { "facets" } else { "mz" };
+        block["measured_bytes"] = serde_json::json!({ counted: mz });
+        if let Some(d) = trials.iter().find(|t| matches!(t.arm, MzArm::Delta(_))) {
+            block["delta_chunks_at_risk"] = d.delta_chunks_at_risk.into();
+        }
+    }
+    block
+}
+
 /// A readable label for an arm, as the index block and the log print it.
 pub fn encoding_label(e: ColumnEncoding) -> &'static str {
     match e {
@@ -194,6 +338,9 @@ pub fn encoding_label(e: ColumnEncoding) -> &'static str {
 pub fn mz_label(a: MzArm) -> String {
     match a {
         MzArm::Numpress => "numpress-linear".into(),
+        MzArm::Point => "point".into(),
+        // The writer's own Parquet encoding of the chunk values: the arm the default rule writes.
+        MzArm::Delta(ColumnEncoding::Writer) => "delta".into(),
         MzArm::Delta(e) => format!("delta, {}", encoding_label(e)),
     }
 }
@@ -314,5 +461,47 @@ mod tests {
             let da = s.arrays.as_ref().unwrap().get(&ArrayType::IntensityArray).unwrap();
             assert_eq!(da.dtype, BinaryDataArrayType::Float32, "a refused spectrum is left as it was");
         }
+    }
+
+    /// The default rule's decisions (owner decision D1/D13): a 32-bit sample takes delta without a
+    /// trial; a 64-bit sample takes the smaller arm; a tie takes the exact arm, delta counting as
+    /// exact only when no sampled chunk is at risk; a lane that stores m/z exactly takes the point
+    /// layout when delta has a chunk at risk, and delta when it is exact and smaller.
+    #[test]
+    fn the_default_rule_picks_32bit_delta_the_smaller_arm_and_the_exact_arm_on_ties() {
+        use ColumnEncoding::Writer;
+        // Every value a 32-bit one, including a value no f32 holds in the mix, and no values at all.
+        assert!(all_32bit([100.5f64, 171.33333f32 as f64, 0.0, 4000.25]));
+        assert!(!all_32bit([100.5f64, 171.33333]));
+        assert!(!all_32bit(std::iter::empty()));
+
+        let delta = |bytes, at_risk| MzTrial { arm: MzArm::Delta(Writer), bytes, delta_chunks_at_risk: at_risk };
+        let numpress = |bytes| MzTrial { arm: MzArm::Numpress, bytes, delta_chunks_at_risk: 0 };
+        let point = |bytes| MzTrial { arm: MzArm::Point, bytes, delta_chunks_at_risk: 0 };
+        // A 64-bit sample where numpress is smaller (the microTOF case): numpress.
+        assert_eq!(pick_mz(&[delta(173, 0), numpress(100)], false), (MzArm::Numpress, Basis::Smaller));
+        // Delta smaller, chunks at risk or not: delta (the declaration is the fidelity block's).
+        assert_eq!(pick_mz(&[delta(80, 0), numpress(100)], false), (MzArm::Delta(Writer), Basis::Smaller));
+        assert_eq!(pick_mz(&[delta(80, 3), numpress(100)], false), (MzArm::Delta(Writer), Basis::Smaller));
+        // A tie: the exact arm; with delta at risk neither is exact and delta, listed first, stays.
+        assert_eq!(pick_mz(&[delta(100, 0), numpress(100)], false), (MzArm::Delta(Writer), Basis::TieExact));
+        assert_eq!(pick_mz(&[delta(100, 1), numpress(100)], false), (MzArm::Delta(Writer), Basis::TieInexact));
+        assert_eq!(pick_mz(&[numpress(100), delta(100, 0)], false), (MzArm::Delta(Writer), Basis::TieExact), "order does not decide a tie against an exact arm");
+        // A lane that stores m/z exactly: delta against the point layout.
+        assert_eq!(pick_mz(&[delta(90, 0), point(100)], true), (MzArm::Delta(Writer), Basis::Smaller));
+        assert_eq!(pick_mz(&[delta(90, 2), point(100)], true), (MzArm::Point, Basis::OnlyExact));
+        assert_eq!(pick_mz(&[delta(110, 2), point(100)], true), (MzArm::Point, Basis::Smaller));
+        assert_eq!(pick_mz(&[delta(100, 0), point(100)], true), (MzArm::Delta(Writer), Basis::TieExact));
+        assert_eq!(pick_mz(&[delta(90, 2)], true), (MzArm::Delta(Writer), Basis::OnlyExact), "no exact arm offered: the first stays");
+
+        let block = mz_block(12, 3456, &[delta(80, 3), numpress(100)], MzArm::Delta(Writer), Basis::Smaller, false);
+        assert_eq!(block["measured_bytes"], serde_json::json!({"mz": {"delta": 80, "numpress-linear": 100}}));
+        assert_eq!((&block["delta_chunks_at_risk"], &block["chosen"]["mz"], &block["basis"]), (&serde_json::json!(3), &serde_json::json!("delta"), &serde_json::json!(Basis::Smaller.label())));
+        let block = mz_block(12, 3456, &[], MzArm::Delta(Writer), Basis::ThirtyTwoBit, false);
+        assert!(block.get("measured_bytes").is_none() && block["chosen"]["mz"] == "delta" && block["sample"]["points"] == 3456, "{block}");
+        // The exact lane's trial counts whole facets: the figures are filed as such, not as the m/z column's.
+        let block = mz_block(12, 3456, &[delta(779, 2), point(512)], MzArm::Point, Basis::OnlyExact, true);
+        assert_eq!(block["measured_bytes"], serde_json::json!({"facets": {"delta": 779, "point": 512}}), "{block}");
+        assert!(block["method"].as_str().unwrap().contains("every column"), "{block}");
     }
 }
