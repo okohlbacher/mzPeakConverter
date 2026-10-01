@@ -1282,16 +1282,16 @@ much. Every mzPeak lane writes it at close, from the two signal facets as they s
   peak set hold their rounded values all the same. `intensity_values_narrowed` counts the
   intensities a column of another type does not hold (`intensity-type-narrowing`: floats cut to
   integers in an integer column, integers and floats clamped to an int32 one's range). Both are
-  counted as the spectra are written, by the way each reaches
-  the column and for the type the column has, and equal the number of stored intensities that
-  differ from the file's (tested on files that mix types, in both layouts). The column's type
-  holds every type the sampled spectra show (§8), so the counts arise from a type switch after
-  them. A stored type narrower than a source type with neither count beside it changed no value:
-  every value of the wider arrays is one the column holds. (An archive the chunked layout wrote
-  through 0.17.0-rc.2 may instead hold an integer array of another type than the column's in the
-  spectrum's `auxiliary_arrays`, at its own type, with the facet row empty; one the point layout
-  wrote through rc.2 holds a null for each value out of an int32 column's range, the count beside
-  it, and a spectrum whose intensities are all null reads back without an intensity array.)
+  counted as the spectra are written, by the way each reaches the column and for the type the
+  column has, and equal the number of stored intensities that differ from the file's (tested on
+  files that mix types, in both layouts). The column's type holds every type the sampled spectra
+  show (§8), so the counts arise from a type switch after them. A stored type narrower than a
+  source type with neither count beside it changed no value: every value of the wider arrays is
+  one the column holds. (An archive the chunked layout wrote through 0.17.0-rc.2 may instead hold
+  an integer array of another type than the column's in the spectrum's `auxiliary_arrays`, at its
+  own type, with the facet row empty; one the point layout wrote through rc.2 holds a null for
+  each value out of an int32 column's range, the count beside it, and a spectrum whose intensities
+  are all null reads back without an intensity array.)
 - `mz_error` lists every m/z encoding in the archive that can move a value; an empty list means
   none is present. `max_abs_error` is in m/z units, `max_rel_error_ppm` in ppm, and `basis` says
   what kind of number it is:
