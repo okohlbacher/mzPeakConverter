@@ -294,6 +294,11 @@ pub struct DanglingRefs {
     dropped: BTreeMap<&'static str, (usize, BTreeSet<String>)>,
     /// The ids of the source's source files, once the skipped entries are back.
     files: HashSet<String>,
+    /// The ids of the source's data processings, which an array may name ([`Self::check_arrays`]).
+    processing: HashSet<String>,
+    /// The run's default processing, when it named nothing and was dropped: mzdata hands it to
+    /// every array that states none of its own.
+    dropped_default_processing: Option<String>,
     /// The `sourceFileRef` each `<spectrum>` states, by spectrum id; empty for a source that states
     /// none ([`spectrum_source_files`]).
     spectrum_files: HashMap<String, String>,
@@ -409,6 +414,7 @@ impl DanglingRefs {
         let processing: HashSet<String> = target.data_processings().iter().map(|dp| dp.id.clone()).collect();
         let files: HashSet<String> = target.file_description().source_files.iter().map(|sf| sf.id.clone()).collect();
         this.files = files.clone();
+        this.processing = processing.clone();
         if let Some(run) = target.run_description_mut() {
             if let Some(id) = run.default_instrument_id.filter(|id| !this.configurations.contains(id)) {
                 run.default_instrument_id = None;
@@ -416,6 +422,7 @@ impl DanglingRefs {
                 this.note("defaultInstrumentConfigurationRef", name);
             }
             if let Some(id) = run.default_data_processing_id.take_if(|id| !processing.contains(id.as_str())) {
+                this.dropped_default_processing = Some(id.clone());
                 this.note("defaultDataProcessingRef", id);
             }
             if let Some(id) = run.default_source_file_id.take_if(|id| !files.contains(id.as_str())) {
@@ -470,6 +477,26 @@ impl DanglingRefs {
             descr.params.push(source_file_ref_param(file));
         } else {
             self.note("sourceFileRef", file);
+        }
+    }
+
+    /// Clear the `dataProcessingRef` of each array of a spectrum or chromatogram that names no
+    /// entry of the processing list, for a lane that writes the arrays as the source holds them (an
+    /// mzML output; an archive stores no such reference for a signal array). mzdata gives an array
+    /// that states none its spectrum's, else its list's default: so the list default that was
+    /// dropped already ([`Self::check_metadata`]) comes back on every array and is cleared without
+    /// being counted again, and any other id that names nothing is counted as a `dataProcessingRef`
+    /// of its own. A cleared array is written without the attribute and falls under the output's
+    /// default processing.
+    pub fn check_arrays(&mut self, arrays: &mut mzdata::spectrum::BinaryArrayMap) {
+        for (_, array) in arrays.iter_mut() {
+            let Some(id) = array.data_processing_reference().filter(|id| !self.processing.contains(*id)).map(str::to_string) else {
+                continue;
+            };
+            array.set_data_processing_reference(None);
+            if self.dropped_default_processing.as_deref() != Some(id.as_str()) {
+                self.note("dataProcessingRef", id);
+            }
         }
     }
 
@@ -586,7 +613,8 @@ impl DanglingRefs {
                 "{}: dropped references that name no entry of the {lists}'s lists: {what}; such a scan is \
                  written under the run's default configuration, a run default names the list's first \
                  entry, a software reference is left out (a processing method names `{UNSTATED_SOFTWARE}`), \
-                 and a spectrum's sourceFileRef parameter is not written. \
+                 a spectrum's sourceFileRef parameter is not written, and an array's dataProcessingRef is \
+                 left out (the array falls under the default processing). \
                  mzML has no transformations list to declare this in",
                 input.display()
             );
@@ -847,6 +875,29 @@ mod tests {
             "1 defaultDataProcessingRef (dp1), 1 defaultInstrumentConfigurationRef (an id the reader numbered 3), \
              1 instrumentConfigurationRef (an id the reader numbered 1), 2 softwareRef (ghost, vendor)"
         );
+    }
+
+    /// An array naming a processing the list does not hold is written without the reference: the
+    /// dropped list default, which mzdata hands every array, without a second count; an id of the
+    /// array's own counted; one that resolves kept.
+    #[test]
+    fn an_array_s_dangling_processing_reference_is_cleared() {
+        use mzdata::spectrum::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
+        let mut meta = FileMetadataConfig::default();
+        meta.data_processings_mut().push(DataProcessing { id: "dp".into(), methods: Vec::new() });
+        meta.run_description_mut().unwrap().default_data_processing_id = Some("dp1".into());
+        let mut refs = DanglingRefs::check_metadata(&mut meta, None);
+        assert_eq!(refs.summary().unwrap(), "1 defaultDataProcessingRef (dp1)");
+        let mut arrays = BinaryArrayMap::new();
+        for (name, reference) in [(ArrayType::MZArray, "dp1"), (ArrayType::IntensityArray, "dp"), (ArrayType::ChargeArray, "ghost")] {
+            let mut array = DataArray::wrap(&name, BinaryDataArrayType::Float64, Vec::new());
+            array.set_data_processing_reference(Some(reference.into()));
+            arrays.add(array);
+        }
+        refs.check_arrays(&mut arrays);
+        let named = |name: &ArrayType| arrays.get(name).unwrap().data_processing_reference().map(str::to_string);
+        assert_eq!([named(&ArrayType::MZArray), named(&ArrayType::IntensityArray), named(&ArrayType::ChargeArray)], [None, Some("dp".to_string()), None]);
+        assert_eq!(refs.summary().unwrap(), "1 dataProcessingRef (ghost), 1 defaultDataProcessingRef (dp1)");
     }
 
     /// A run whose configuration list read back empty gets the empty configuration 0, so a scan or a

@@ -743,9 +743,9 @@ fn the_exported_wavelength_arrays_are_the_sources() {
 /// mzdata's writer sums every spectrum it writes into its TIC and base-peak chromatograms, so a PDA
 /// run's absorbance, negative values included, landed in the mass spectrometer's summary: on `--to mzml`
 /// from the source (10 points, -4389 among them) and on the export. The source's own TIC (2,360 points)
-/// is kept as it is on both routes, so the summed one is the base-peak chromatogram alone — the
-/// writer's `BIC` on the direct route, the archive's MS1-summed `BPC` on the export, where the writer
-/// adds nothing.
+/// is kept as it is on both routes, so the summed one is the base-peak chromatogram alone: `BPC`, a
+/// point for the one MS1 spectrum, on both routes (through 0.17.0-rc.1 the direct route's was the
+/// writer's `BIC` over both mass spectra, the archive's the MS1-summed `BPC`).
 #[test]
 fn the_mzml_tic_sums_the_mass_spectra_only() {
     use mzdata::prelude::*;
@@ -755,15 +755,15 @@ fn the_mzml_tic_sums_the_mass_spectra_only() {
     ok(&mzpc(&src, &export, &[]));
     let direct = dir.join("direct.mzML");
     ok(&mzpc(Path::new(PDA_UV), &direct, &[]));
-    for (mzml, bpc, points) in [(&export, "BPC", 1), (&direct, "BIC", 2)] {
+    for (mzml, bpc, points) in [(&export, "BPC", 1), (&direct, "BPC", 1)] {
         let mut reader = mzdata::io::mzml::MzMLReader::open_path(mzml).unwrap();
         let tic = reader.get_chromatogram_by_id("TIC").unwrap_or_else(|| panic!("{}: no TIC", mzml.display()));
         assert_eq!(tic.intensity().unwrap().len(), 2360, "{}: the source's TIC, kept as it is", mzml.display());
         let chrom = reader.get_chromatogram_by_id(bpc).unwrap_or_else(|| panic!("{}: no {bpc}", mzml.display()));
         let intensity = chrom.intensity().unwrap();
-        assert_eq!(intensity.len(), points, "{}: {bpc} has a point per mass spectrum summed, UV excluded", mzml.display());
+        assert_eq!(intensity.len(), points, "{}: {bpc} has a point per MS1 spectrum summed, UV excluded", mzml.display());
         assert!(intensity.iter().all(|&v| v >= 0.0), "{}: {bpc} {intensity:?}", mzml.display());
-        assert!(reader.get_chromatogram_by_id(if bpc == "BPC" { "BIC" } else { "BPC" }).is_none(), "{}: one base-peak chromatogram", mzml.display());
+        assert!(reader.get_chromatogram_by_id("BIC").is_none(), "{}: one base-peak chromatogram", mzml.display());
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -884,26 +884,25 @@ fn an_archive_without_its_wavelength_arrays_still_exports() {
 
 /// MS:1000789 and MS:1000790 are mass spectra, children of MS1 and MSn spectrum. mzdata's
 /// `is_mass_spectrum` tests direct parents only, so a guard keyed on it would take them out of the
-/// writer's summaries — the base-peak one here, the source carrying its own TIC.
+/// summed chromatograms — the base-peak one here, the source carrying its own TIC. The summed
+/// chromatograms hold the MS1 spectra, so it is the fixture's MS1 spectrum that is retyped.
 #[test]
 fn mass_spectra_of_a_child_type_stay_in_the_tic() {
     use mzdata::prelude::*;
     let dir = scratch("child-types");
     let src = std::fs::read_to_string(PDA_UV).unwrap();
-    // The fixture types its MS2 spectrum only (the MS1 is typed by its level): make that one a
-    // time-delayed fragmentation spectrum.
     let retyped = src.replacen(
-        r#"accession="MS:1000580" name="MSn spectrum""#,
-        r#"accession="MS:1000790" name="time-delayed fragmentation spectrum""#,
+        r#"accession="MS:1000579" name="MS1 spectrum""#,
+        r#"accession="MS:1000789" name="enhanced multiply charged spectrum""#,
         1,
     );
-    assert_ne!(retyped, src, "the fixture's MSn spectrum term moved");
+    assert_ne!(retyped, src, "the fixture's MS1 spectrum term moved");
     let input = dir.join("child-types.mzML");
     std::fs::write(&input, retyped).unwrap();
     let out = dir.join("out.mzML");
     ok(&mzpc(&input, &out, &[]));
     let mut reader = mzdata::io::mzml::MzMLReader::open_path(&out).unwrap();
-    assert_eq!(reader.get_chromatogram_by_id("BIC").unwrap().intensity().unwrap().len(), 2);
+    assert_eq!(reader.get_chromatogram_by_id("BPC").unwrap().intensity().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

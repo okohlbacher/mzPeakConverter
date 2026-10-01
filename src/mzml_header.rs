@@ -28,8 +28,8 @@
 //! untouched. A header with nothing to fix (no vocabulary to add, no scan settings, no empty
 //! element, no [`Run`]) leaves the stream byte-identical.
 //!
-//! The `<fileChecksum>` is left as mzdata wrote it: mzdata takes that digest before flushing its own
-//! buffer, so it did not match the file's bytes before this sink existed either.
+//! The `<fileChecksum>` is not this sink's: [`crate::mzml_index::IndexFixes`], the last sink, writes
+//! it over the bytes as they are stored.
 
 use std::cell::RefCell;
 use std::io::{self, Write};

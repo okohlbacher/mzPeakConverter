@@ -1,7 +1,7 @@
 //! What an archive → mzML export (`filter_mzpeak_to_mzml`) states against what the direct `--to mzml`
 //! lane states for the same source, element by element. Through 0.16.0:
 //!
-//!   * the TIC and base-peak chromatogram the mzML writer sums over the spectra came out in spectrum
+//!   * the TIC and base-peak chromatogram summed over the spectra came out in spectrum
 //!     order, so a run whose spectra are not in time order got an unsorted time array
 //!     (`tiny.pwiz.1.1`: 5.8905, 5.9905, 0.0, 0.7008) — on the direct lane, and on an export of an
 //!     archive that holds no chromatogram of that kind;
@@ -92,18 +92,29 @@ fn chromatogram_precursor(chroms: &[Chromatogram], id: &str) -> (f32, Option<Str
     (p.isolation_window.target, p.activation.method().map(|m| m.to_param().name.to_string()), p.activation.energy)
 }
 
-/// (1) `--to mzml`: tiny.pwiz.1.1 carries a TIC but no base-peak chromatogram, so the writer sums
-/// one — in spectrum order, 5.8905, 5.9905, 0.0, 0.7008 min, through 0.16.0. Now in time order, each
-/// point keeping its intensity (the spectra's stated base-peak intensities).
+/// (1) `--to mzml`: tiny.pwiz.1.1 carries a TIC but no base-peak chromatogram, so one is summed —
+/// in spectrum order, 5.8905, 5.9905, 0.0, 0.7008 min, through 0.16.0. Now in time order, each
+/// point keeping its intensity. Since 0.17.0 it is `BPC`, a point per MS1 spectrum (the MS2 one at
+/// 5.9905 min is not in it) from the signal written (the fixture's toy arrays peak at 15, whatever
+/// base peak intensity the spectra state), as a conversion synthesizes it into an archive.
 #[test]
 fn the_summed_base_peak_chromatogram_is_in_time_order() {
     let dir = scratch("direct-bic");
     let mzml = dir.join("direct.mzML");
     convert(Path::new(TINY), &mzml, &[], &[]);
     let chroms = chromatograms(&mzml);
-    let bic = chroms.iter().find(|c| c.id() == "BIC").expect("the writer's base-peak chromatogram");
-    assert_eq!(times(bic), [0.0, 0.7008333333333333, 5.8905, 5.9905]);
-    assert_eq!(intensities(bic), [0.0, 42.0, 120053.0, 23433.0]);
+    assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["tic", "sic", "BPC"]);
+    let bpc = chroms.iter().find(|c| c.id() == "BPC").expect("the summed base-peak chromatogram");
+    assert_eq!(times(bpc), [0.0, 0.7008333333333333, 5.8905]);
+    assert_eq!(intensities(bpc), [0.0, 15.0, 15.0]);
+    // The archive's own, synthesized at conversion: the same trace.
+    let archive = dir.join("tiny.mzpeak");
+    convert(Path::new(TINY), &archive, &[], &[]);
+    let export = dir.join("export.mzML");
+    convert(&archive, &export, &[], &[]);
+    let exported = chromatograms(&export);
+    let stored = exported.iter().find(|c| c.id() == "BPC").expect("the archive's base-peak chromatogram");
+    assert_eq!((times(stored), intensities(stored)), (times(bpc), intensities(bpc)));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -127,13 +138,13 @@ fn an_archive_export_carries_the_stored_chromatograms_and_sorts_what_it_sums() {
     let mzml = dir.join("export.mzML");
     convert(&archive, &mzml, &[], &[]);
     let chroms = chromatograms(&mzml);
-    assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["tic", "sic", "BIC"]);
+    assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["tic", "sic", "BPC"]);
     for (id, t, i) in &stored {
         let c = chroms.iter().find(|c| c.id() == id).unwrap();
         assert_eq!((&times(c), &intensities(c)), (t, i), "{id}: not the archive's arrays");
     }
-    let bic = chroms.iter().find(|c| c.id() == "BIC").unwrap();
-    assert_eq!(times(bic), [0.0, 0.7008333333333333, 5.8905, 5.9905]);
+    let bpc = chroms.iter().find(|c| c.id() == "BPC").unwrap();
+    assert_eq!(times(bpc), [0.0, 0.7008333333333333, 5.8905], "a point per MS1 spectrum exported");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

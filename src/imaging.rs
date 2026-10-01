@@ -684,6 +684,16 @@ pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, lone_
     b
 }
 
+/// `provenance.time` of an imaging marker whose source states no `scan start time` on any spectrum:
+/// the archive stores time 0 for each (a null time is a question for the core spec).
+pub const TIME_NOT_STATED: &str = "not stated by the source; index is the source list order";
+
+/// Whether an archive's imaging marker (`metadata.imaging`) says its source stated no scan start
+/// time: every stored time is then the 0 the reader fills in, and an mzML export states none.
+pub fn states_no_time(marker: &serde_json::Value) -> bool {
+    marker["provenance"]["time"] == TIME_NOT_STATED
+}
+
 /// Whether a grid entry states a pixel size on either axis (`provenance.pixel_size`: "as stated"
 /// only when there is one — it used to say so of a header that states none).
 pub fn states_pixel_size(grid: Option<&ScanSettings>) -> bool {

@@ -665,5 +665,13 @@ fn a_thermo_run_without_ms1_names_no_precursor_spectrum() {
     assert_eq!(text.matches("<precursor>").count() + text.matches("<precursor ").count(), 50);
     assert_eq!(text.matches("<precursor spectrumRef=").count(), 0, "no precursor names a spectrum");
     assert!(log.contains("50 Thermo precursor reference(s)"), "{log}");
+    // The archive's export states the same: each spectrum its precursor, none a spectrum it came
+    // from, and no list without a member.
+    let (back, _) = convert(&archive, &dir, "srm.back.mzML");
+    let text = std::fs::read_to_string(&back).unwrap();
+    assert_eq!(text.matches("<precursor>").count() + text.matches("<precursor ").count(), 50);
+    assert_eq!(text.matches("<precursor spectrumRef=").count(), 0, "no precursor names a spectrum");
+    assert_eq!(text.matches("<precursorList count=\"1\">").count(), 50);
+    assert_eq!(text.matches("<precursorList count=\"0\">").count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -195,8 +195,8 @@ pub fn read(path: &Path) -> Mzml {
 /// `dataProcessing` holding that step. Panics, naming `what`, unless:
 /// * `dataProcessingList` holds at least one `dataProcessing`, as many as its `count` says;
 /// * every `processingMethod`'s `softwareRef` names a `software` of `softwareList`;
-/// * `spectrumList` and `chromatogramList` are there and name the same `dataProcessing` in
-///   `defaultDataProcessingRef`, one whose LAST method does MS:1000544 `Conversion to mzML` with
+/// * `spectrumList` is there, and it and `chromatogramList` (absent from a run without a
+///   chromatogram) name the same `dataProcessing` in `defaultDataProcessingRef`, one whose LAST method does MS:1000544 `Conversion to mzML` with
 ///   the software `mzpeak-convert` of this very version — the export is the last step of the
 ///   default processing;
 /// * every element-level `dataProcessingRef` names an existing `dataProcessing`;
@@ -215,12 +215,18 @@ pub fn assert_processing_contract(m: &Mzml, what: &str) -> String {
     let dp_ids: BTreeSet<&str> = m.data_processings.iter().map(|(id, _)| id.as_str()).collect();
     let mut defaults = Vec::new();
     for (list, default) in [("spectrumList", &m.spectrum_list_default), ("chromatogramList", &m.chromatogram_list_default)] {
-        let default = default.as_ref().unwrap_or_else(|| panic!("{what}: no {list}"));
+        // A run without a chromatogram has no `chromatogramList` (the schema lets a run go without
+        // the list, not the list without a member): nothing is summed over a run without an MS1
+        // spectrum, or over one whose spectra state no time.
+        let Some(default) = default.as_ref() else {
+            assert!(list == "chromatogramList", "{what}: no {list}");
+            continue;
+        };
         let default = default.as_deref().unwrap_or_else(|| panic!("{what}: {list} has no defaultDataProcessingRef"));
         assert!(dp_ids.contains(default), "{what}: {list} defaultDataProcessingRef {default:?} is not a dataProcessing id {dp_ids:?}");
         defaults.push(default);
     }
-    assert_eq!(defaults[0], defaults[1], "{what}: the two lists' default processing");
+    assert!(defaults.iter().all(|d| *d == defaults[0]), "{what}: the two lists' default processing: {defaults:?}");
     let (ours, methods) = m.data_processings.iter().find(|(id, _)| id == defaults[0]).unwrap();
     let last = methods.iter().max_by_key(|meth| meth.order).unwrap();
     assert!(
