@@ -249,16 +249,25 @@ keeping spectra whose retention time is within `--rt MIN-MAX` (same unit as the 
 `spectrum.time`, minutes for every lane this tool writes) and/or whose MS level is in `--ms-level`
 (`--ms-level 1 --ms-level 2` or `--ms-level 1,2`), and dropping archive members that match
 `--drop-aux <glob>` (`--no-vendor` on this lane is shorthand for `--drop-aux 'vendor*'`). `--rt`
-also truncates the chromatograms, in the same minutes. This converter stores every chromatogram
-time in minutes (§8, `chromatogram-time-to-minutes`), and the window is converted into whatever unit
-a chromatogram time axis declares, so an mzML-lane archive converted by 0.11.5 or earlier, whose
-column declares ProteoWizard's seconds, is cut where the window says too. Such an archive holds its
+also truncates the chromatograms, in the same minutes, whether their time axis is stored as 64- or
+32-bit floats (a PDA or DAD run's mzML; through 0.16 such a trace was copied whole). This converter
+stores every chromatogram time in minutes (§8, `chromatogram-time-to-minutes`), and the window is
+converted into whatever unit a chromatogram time axis declares, so an mzML-lane archive converted
+by 0.11.5 or earlier, whose column declares ProteoWizard's seconds, is cut where the window says too. Such an archive holds its
 synthesized TIC/BPC in minutes under that seconds label, so `--rt` cuts those two traces at 60 times
 the times it names: rebuild it first. No published corpus archive has a seconds column. Parquet
 facets are not re-encoded from the signal: the per-spectrum and chromatogram facets a filter can
-change are read and written back (zstd level 5, every column in the encodings the source used, row
-groups bounded as a conversion's, §10 `MZPC_ROW_GROUP_MB`) and run-global facets are copied
-verbatim, so encoder options are inert here — warned about, not refused (see the table above). The same
+change are read and written back (zstd level 5, every column in the encodings the source used, the
+source's Parquet format version, sort order and bloom filters, the page limits a conversion gives
+the facet, row groups bounded as a conversion's, §10 `MZPC_ROW_GROUP_MB`) and run-global facets
+are copied verbatim, so encoder options are inert here — warned about, not refused (see the table above).
+Keeping every spectrum of an archive this version wrote, a rewritten spectrum signal facet comes out
+between 1.9 % smaller and 0.3 % larger than its source, and a chunked timsTOF grid facet 4.2 %
+larger: the lane writes at zstd level 5, the converter at 3 (22 on that facet). A chunked archive
+written by 0.16.0 or earlier keeps its
+dictionary-encoded chunk bounds through the rewrite, and once the byte cap splits its peak facet,
+each row group pays for that dictionary again (MFA381's peak facet +2.3 %); rebuilt from the raw
+file, the bounds are byte-stream-split (§9). The same
 lane injects `--sdrf` into an existing archive — the documented way to add it to an archive from a
 lane that cannot embed it (§4.3; `--image` too, into an imaging archive) — and writes to `<out>.mzpeak.tmp` first, renaming
 into place on success. The three filters on a **raw or exchange** input are a hard error with the
@@ -1010,9 +1019,11 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
     comes first — on a dense run 8192 chunks were 270–460 MiB.
   - **Encodings.** Index lists and intensity are byte-stream-split with the dictionary off (measured
     −9.6 % against the reference implementation's dictionary default on 2485; its DELTA intent on
-    index lists would be +21 %), `spectrum_index` delta-packed, the bounds Parquet's default. Size on
-    2485.d against the vendor `analysis.tdf_bin`: about parity (the 0.13.0 corpus Bruker set measured
-    1.097× with this layout).
+    index lists would be +21 %), `spectrum_index` delta-packed, and the chunk bounds byte-stream-split
+    with the dictionary off, as on every chunk facet: nearly every bound is distinct, so a dictionary
+    only held the values again, once per row group (on 2485 the bounds are 30 % and the facet 0.6 %
+    smaller than with it). Size on 2485.d against the vendor `analysis.tdf_bin`: about parity (the
+    0.13.0 corpus Bruker set measured 1.097× with this layout).
   - **History.** 0.12.x wrote a TOF layout (integer TOF bounds, `tof_chunk_values` deltas,
     per-frame `tof_c0`/`tof_c1`; a flat point table of absolute bins under `--no-ims-chunked`), and
     0.13.0 rewrote its chunked facet into the grid in a second pass (`--ims-grid`, `--no-ims-grid`,

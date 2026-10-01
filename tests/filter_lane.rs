@@ -423,6 +423,53 @@ fn rt_window_truncates_chromatograms_and_refreshes_point_counts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--rt` cuts a chromatogram whose times are stored as 32-bit floats — the mzML lane keeps a PDA or
+/// DAD run's float32 time arrays as they are — and the column keeps its type. Only a 64-bit time
+/// axis used to be recognized: such chromatograms were copied whole, their point counts with them,
+/// with a warning that there was no time axis.
+#[test]
+fn rt_window_cuts_a_float32_time_axis() {
+    let dir = scratch("rt_float32");
+    let src = convert(PDA_UV, &dir);
+    let (lo, hi) = (0.003, 0.0055);
+    let src_point: StructArray = column(&table(&src, "chromatograms_data.parquet"), "point");
+    let time = src_point.column_by_name("time").unwrap();
+    assert_eq!(time.data_type(), &arrow::datatypes::DataType::Float32, "the fixture's chromatogram times are float32");
+    let time = arrow::compute::cast(time, &arrow::datatypes::DataType::Float64).unwrap();
+    let time = time.as_any().downcast_ref::<Float64Array>().unwrap();
+    let want = (0..time.len()).filter(|&r| (lo..=hi).contains(&time.value(r))).count() as u64;
+    assert!(want > 0 && (want as usize) < time.len(), "the window must cut the traces: {want} of {} points inside", time.len());
+
+    let out = dir.join("f.mzpeak");
+    let r = mzpc(&src, &out, &["--rt", &format!("{lo}-{hi}")]);
+    ok(&r);
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(!stderr.contains("no recognizable time axis"), "{stderr}");
+    let point: StructArray = column(&table(&out, "chromatograms_data.parquet"), "point");
+    let time = point.column_by_name("time").unwrap();
+    assert_eq!(time.data_type(), &arrow::datatypes::DataType::Float32, "the time column keeps its type");
+    let time = arrow::compute::cast(time, &arrow::datatypes::DataType::Float64).unwrap();
+    let time = time.as_any().downcast_ref::<Float64Array>().unwrap();
+    assert_eq!(time.len() as u64, want, "points left in the window");
+    assert!(time.iter().all(|t| t.is_some_and(|t| (lo..=hi).contains(&t))), "a point outside the window: {time:?}");
+
+    let idx = UInt64Array::from(point.column_by_name("chromatogram_index").unwrap().to_data());
+    let mut left: HashMap<u64, u64> = HashMap::new();
+    for r in 0..idx.len() {
+        *left.entry(idx.value(r)).or_default() += 1;
+    }
+    let meta = table(&out, "chromatograms_metadata.parquet");
+    let index = indices(&meta, "index");
+    let n = indices(&meta, "number_of_data_points");
+    for (c, n) in index.iter().zip(&n) {
+        let c = c.unwrap();
+        assert_eq!(n.unwrap(), left.get(&c).copied().unwrap_or(0), "chromatogram {c}: number_of_data_points");
+    }
+    let total = footer(&out, "chromatograms_metadata.parquet", "chromatogram_data_point_count");
+    assert_eq!(total, Some(want.to_string()), "the metadata footer total follows the truncation");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// (c) The same two filters through `-o f.mzML`.
 #[test]
 fn mzml_output_applies_the_same_filters() {
@@ -1057,5 +1104,74 @@ fn an_image_joins_the_marker_of_an_imaging_archive() {
     assert_eq!((&images[0]["archive_path"], &images[0]["source_name"]), (&serde_json::json!("images/image_0000.png"), &serde_json::json!("slide.png")));
     assert_eq!(member(&replaced, "images/image_0000.png"), png(16, 12));
     assert!(checksums_match(&replaced, "replaced") >= 6);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An archive of one MS1 spectrum (`scan=1`) and `ms2` MS2 spectra selected from it, written through
+/// the writer: every MS2's precursor and selected ion name the MS1 as their parent.
+fn write_parent_and_fragments(path: &Path, ms2: usize) {
+    use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray};
+    use mzdata::spectrum::{MultiLayerSpectrum, Precursor, SelectedIon, SignalContinuity, SpectrumDescription};
+    use mzpeak_prototyping::writer::MzPeakWriterType;
+
+    let spectrum = |index: usize| -> MultiLayerSpectrum {
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz.update_buffer(&[100.0f64, 200.0]).unwrap();
+        arrays.add(mz);
+        let mut intensity = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        intensity.update_buffer(&[1.0f32, 2.0]).unwrap();
+        arrays.add(intensity);
+        let mut descr = SpectrumDescription {
+            id: format!("scan={}", index + 1),
+            index,
+            ms_level: if index == 0 { 1 } else { 2 },
+            signal_continuity: SignalContinuity::Centroid,
+            ..Default::default()
+        };
+        if index > 0 {
+            descr.precursor = vec![Precursor {
+                ions: vec![SelectedIon { mz: 500.0, ..Default::default() }],
+                precursor_id: Some("scan=1".to_string()),
+                ..Default::default()
+            }];
+        }
+        MultiLayerSpectrum::new(descr, Some(arrays), None, None)
+    };
+    let probe = spectrum(1);
+    let mut writer = MzPeakWriterType::<File>::builder()
+        .chromatogram_chunked_encoding(None)
+        .sample_array_types_from_spectra(std::iter::once(probe.clone()))
+        .sample_array_types_for_peaks_from_spectra(std::iter::once(probe))
+        .build(File::create(path).unwrap(), false);
+    for index in 0..=ms2 {
+        writer.write_spectrum(&spectrum(index)).unwrap();
+    }
+    writer.finish_parquet().unwrap().finish().unwrap();
+}
+
+/// The references a filter nulls are reported once per facet, with the facet's name and its total.
+/// The rewrite reads a facet in batches of 1024 rows, and the warning came once per batch: a Thermo
+/// run filtered to `--ms-level 2` printed it 24 times. Here 1,100 fragments lose their parent, in the
+/// precursors and the selected-ions facet: two lines, not four.
+#[test]
+fn nulled_references_are_reported_once_per_facet() {
+    let dir = scratch("warn_once");
+    let src = dir.join("src.mzpeak");
+    write_parent_and_fragments(&src, 1100);
+    let precursors = table(&src, "spectra_metadata_precursors.parquet");
+    assert_eq!(indices(&precursors, "precursor_index"), vec![Some(0); 1100], "every fragment names the MS1 as its parent");
+
+    let out = dir.join("f.mzpeak");
+    let r = mzpc(&src, &out, &["--ms-level", "2"]);
+    ok(&r);
+    assert_eq!(indices(&table(&out, "spectra_metadata_precursors.parquet"), "precursor_index"), vec![None; 1100]);
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.contains("referenced a filtered-out spectrum")).collect();
+    assert_eq!(warnings.len(), 2, "one warning per facet:\n{stderr}");
+    for facet in ["spectra_metadata_precursors.parquet", "spectra_metadata_selected_ions.parquet"] {
+        let line = warnings.iter().find(|l| l.contains(facet)).unwrap_or_else(|| panic!("no warning names {facet}:\n{stderr}"));
+        assert!(line.contains("1100 rows"), "{line}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
