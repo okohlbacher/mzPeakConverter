@@ -167,9 +167,12 @@ impl<W: Write> Write for HeaderFixes<W> {
         Ok(buf.len())
     }
 
-    /// mzdata flushes once, after the document is closed, so nothing held here is mid-element.
+    /// Only what is complete goes out: a flush in mid-document must not let a header, an
+    /// `<indexList` or an offset through in two halves, unfixed. mzdata flushes once, after the
+    /// document is closed, and by then nothing is held: the index ends this sink's work. What a
+    /// truncated document leaves here goes out when the sink is dropped.
     fn flush(&mut self) -> io::Result<()> {
-        self.advance(true)?;
+        self.advance(false)?;
         self.inner.flush()
     }
 }
@@ -430,9 +433,23 @@ mod tests {
             let mut sink = HeaderFixes::new(out.clone(), Some(Cv::ims()));
             for chunk in raw.chunks(block) {
                 sink.write_all(chunk).unwrap();
+                sink.flush().unwrap(); // a flush anywhere holds back what is incomplete
             }
-            drop(sink); // no flush: what is still held goes out when the sink is dropped
+            assert!(*out.0.borrow() == whole, "blocks of {block}: complete once the index is through");
+            drop(sink);
             assert!(out.0.take() == whole, "blocks of {block}");
+        }
+        // A document cut off in its header, or in its index: what was held goes out on drop, as it is.
+        let in_index = rfind(&raw, b"<offset idRef").unwrap() + 20;
+        for cut in [raw.len() / 20, in_index] {
+            let out = Shared::default();
+            let mut sink = HeaderFixes::new(out.clone(), Some(Cv::ims()));
+            sink.write_all(&raw[..cut]).unwrap();
+            sink.flush().unwrap();
+            let before = out.0.borrow().len();
+            drop(sink);
+            let written = out.0.take();
+            assert!(written.len() > before && written.ends_with(&raw[cut - 10..cut]), "cut at {cut}");
         }
     }
 
