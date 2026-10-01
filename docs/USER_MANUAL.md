@@ -888,6 +888,8 @@ letter case, wherever it sits in the directory:
   lanes store as calibrated f64 m/z, in a format open readers decode (timsrust a TDF, this converter a
   TSF), and at 70 % of a TSF archive it is the price of that copy.
 - **baf2sql's `analysis.sqlite`**, the cache the BAF reader itself creates inside the `.d`.
+- **macOS AppleDouble companions `._*`**, the Finder metadata that copying a directory from a Mac to
+  NTFS, exFAT or SMB leaves beside every file (`--aux '._*=embed'` keeps them).
 
 Through 0.11.5 only TDF/TSF directories, `--agilent-grid` and ims-compact embedded anything, and
 `--agilent-grid` embedded `MSProfile.bin` and `MSPeak.bin` beside the grid it stores. For Thermo
@@ -1170,6 +1172,7 @@ release archive carries [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 | Agilent `.d`: `holds MRM/SIM dwell data only` | the native lane stores scan spectra; MRM/SIM dwells are transition chromatograms — use `--via-msconvert` (the box harness does this on its own) |
 | Agilent `.d`: `is an Agilent IM-QTOF run` | the native lane cannot carry the drift dimension (that needs Agilent's MIDAC SDK, which this converter does not read) — use `--via-msconvert` (the box harness does this on its own) |
 | Agilent `.d`: `output is the AGL1 format of an older AgilentGlueHost.exe` | rebuild `glue/agilent` (`dotnet build -c Release`) so the host and the converter agree |
+| timsTOF `.d`: `lists ._analysis.tdf … before analysis.tdf` | the `.d` was copied from a Mac to NTFS, exFAT or SMB, which leaves an AppleDouble `._*` file (Finder metadata) beside every file, and the volume lists the companion before the file it is named after. The timsTOF reader (timsrust) opens the first file whose name ends in `analysis.tdf` / `analysis.tdf_bin`, so it would read the companion in place of the run (it used to fail with "file is not a database"). Remove the `._*` files from the `.d`, or convert with `--bruker-sdk` (Windows/Linux). On a Mac, a `.d` on such a volume gets `._analysis.tdf` back from macOS as soon as timsrust opens the database for writing; copy the `.d` to an APFS disk instead. The default lane, `--no-ims-compact`, `--to mzml` and inspection refuse such a `.d` before opening it, and name a companion that appears while they open it. A companion listed AFTER its file (a fresh copy onto exFAT lists them so) is never reached: that `.d` converts as it always did, with the warning `holds ._analysis.tdf … beside analysis.tdf …, listed after them` |
 | Nothing was written | give `-o/--output`; without it the run only inspects |
 | Output exists error | pass `--force` to overwrite |
 | UV/PDA spectra missing after `--ms-level` | a wavelength spectrum has no MS level, so `--ms-level` leaves them out, of an archive and of an mzML export alike, and says so (§4.2) |

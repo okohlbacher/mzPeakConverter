@@ -25,6 +25,9 @@
 #
 # On every invocation the box converter is brought to the newest RELEASE TAG before any job runs
 # (BOX_AUTOUPDATE=1|check|0, BOX_CONVERTER_VERSION=vX.Y.Z, BOX_REQUIRE_VERSION=1 to abort if stale).
+# BOX_AUTOUPDATE=0 builds nothing, but a run that names BOX_CONVERTER_VERSION still asks the box's
+# exe for its version first (BOX_PROBE_TIMEOUT, default 120 s) and, with BOX_REQUIRE_VERSION=1,
+# dispatches no job to a different one.
 #
 # Each job's JSON goes to the box as a FILE (scp), and each job runs under a wall-clock cap,
 # BOX_JOB_TIMEOUT seconds (default 21600); the box's stderr for a job is kept in
@@ -34,9 +37,21 @@
 # relayed through S3 (box uploads via a presigned PUT; host downloads, verifies size+md5, deletes).
 # Config (env or a gitignored tools/box.env): BOX_SSH BOX_JUMP BOX_SSH_KEY [BOX_CONVERTER]
 # [S3_PREFIX] [PUT_EXPIRES] [ARCHIVE=true]  plus s3_relay's S3_BUCKET/S3_ENDPOINT/S3_REGION/AWS_PROFILE.
+# A git worktree has no tools/box.env (gitignored); it then uses the main checkout's, and says so.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-[ -f "$here/box.env" ] && . "$here/box.env"
+
+box_env(){  # -> the box.env to source: this checkout's, else the main checkout's; rc 1 if neither
+  # A worktree shares the main checkout's git dir (--git-common-dir) but not its untracked files,
+  # so `--box` from a worktree died on "set BOX_SSH" until someone copied the file across.
+  local common
+  [ -f "$here/box.env" ] && { printf '%s\n' "$here/box.env"; return 0; }
+  common="$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ -f "${common%/*}/tools/box.env" ] || return 1
+  echo "box_convert: no tools/box.env in this checkout; using the main checkout's ${common%/*}/tools/box.env" >&2
+  printf '%s\n' "${common%/*}/tools/box.env"
+}
+box_env_file="$(box_env)" && . "$box_env_file"
 
 usage(){ sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
@@ -138,8 +153,30 @@ ssh_watchdog(){  # secs cmd... -> run a box command under a hard wall-clock cap
   return $rc
 }
 
+assert_box_version(){  # BOX_AUTOUPDATE=0: ask the exe the jobs will run for its version, before any job
+  # Nothing updates the box then, and nothing used to ASK it either: the first word on its version
+  # came from the archives' own software_list after every job had run, when corpus_reconvert.py
+  # refused to stamp them one by one ("built by mzpeak-convert X, not Y"). Checked only when the run
+  # names a version (BOX_CONVERTER_VERSION; corpus_reconvert.py always does). A plain ssh command,
+  # no stdin, no update.
+  local want="${BOX_CONVERTER_VERSION:-latest}" have
+  local exe='C:\Users\User\src\mzPeakConverter\target\release\mzpeak-convert.exe'  # box_convert_remote.ps1's default
+  exe="${BOX_CONVERTER:-$exe}"
+  [ "$want" = latest ] && return 0
+  want="${want#v}"
+  have="$(ssh_watchdog "${BOX_PROBE_TIMEOUT:-120}" "powershell -NoProfile -Command \"& '$exe' --version\"" \
+            </dev/null 2>/dev/null | tr -d '\r' | awk '/^mzpeak-convert /{print $NF; exit}')"
+  if [ "$have" = "$want" ]; then
+    echo "box converter: BOX_AUTOUPDATE=0; $exe is $have, the version this run requires" >&2; return 0
+  fi
+  echo "box converter: BOX_AUTOUPDATE=0 and $exe reports ${have:-no version}, but this run requires $want" >&2
+  [ "${BOX_REQUIRE_VERSION:-0}" = 1 ] || return 0
+  echo "box converter: no job dispatched -- bring the box to v$want, or drop BOX_AUTOUPDATE=0 so the updater does" >&2
+  return 1
+}
+
 sync_box_converter(){  # once per invocation, before any job: make the box's converter current
-  [ "${BOX_AUTOUPDATE:-1}" = "0" ] && return 0
+  [ "${BOX_AUTOUPDATE:-1}" = "0" ] && { assert_box_version; return $?; }
   local want="${BOX_CONVERTER_VERSION:-latest}" build=true
   [ "${BOX_AUTOUPDATE:-1}" = "check" ] && build=false
   local job resp b64 fields ok action have wantv exe err

@@ -434,6 +434,128 @@ class SyncBox(Shell):
         self.assertEqual(self.sync(action="failed", have="0.11.4", error="cargo build failed")[0], 1)
         self.assertEqual(self.sync(action="refused-dirty", have="0.11.5", error="2 uncommitted change(s)")[0], 1)
 
+    def probe(self, reports: str, **env: str) -> tuple[int, str]:
+        """sync_box_converter under BOX_AUTOUPDATE=0, the box's exe answering `mzpeak-convert <reports>`."""
+        stub = r"""ssh_watchdog(){ shift; printf '%s\n' "$*" >> "$T/probe"; printf 'mzpeak-convert %s\r\n' "$REPORTS"; }"""
+        fns = shell_functions("assert_box_version", "sync_box_converter")
+        script = f"set -uo pipefail\n{stub}\n{fns}\nsync_box_converter; echo \"rc=$?\"\n"
+        return self.bash(script, **{"BOX_AUTOUPDATE": "0", "BOX_CONVERTER_VERSION": "v0.11.5",
+                                    "BOX_REQUIRE_VERSION": "1", "REPORTS": reports, **env})
+
+    def test_without_the_updater_the_box_version_is_still_asserted(self):
+        # BOX_AUTOUPDATE=0 used to skip every check: the first word on the box's version came from
+        # the archives' software_list, after the jobs.
+        rc, out = self.probe("0.11.4")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("reports 0.11.4, but this run requires 0.11.5", out)
+        self.assertIn("no job dispatched", out)
+        self.assertIn(r"& 'C:\Users\User\src\mzPeakConverter\target\release\mzpeak-convert.exe' --version",
+                      (self.tmp / "probe").read_text(), "the exe box_convert_remote.ps1 runs by default")
+        self.assertEqual(self.probe("0.11.5")[0], 0)
+        rc, out = self.probe("0.11.4", BOX_REQUIRE_VERSION="0")
+        self.assertEqual(rc, 0, "soft without BOX_REQUIRE_VERSION=1")
+        self.assertIn("requires 0.11.5", out)
+
+    def test_the_probe_asks_the_exe_the_jobs_run_and_only_when_a_version_is_named(self):
+        self.assertEqual(self.probe("0.11.5", BOX_CONVERTER=r"C:\Users\User\bin\mzpeak-convert-0.11.5.exe")[0], 0)
+        self.assertIn(r"& 'C:\Users\User\bin\mzpeak-convert-0.11.5.exe' --version", (self.tmp / "probe").read_text())
+        (self.tmp / "probe").unlink()
+        self.assertEqual(self.probe("0.0.1", BOX_CONVERTER_VERSION="")[0], 0)
+        self.assertFalse((self.tmp / "probe").exists(), "an ad-hoc run names no version: nothing to ask")
+
+
+class BoxEntry(Shell):
+    """The whole of box_convert.sh, from a checkout of its own, against stand-in ssh, scp and relay."""
+
+    SSH = r"""#!/bin/sh
+printf '%s\n' "$*" >> "$T/ssh"
+case "$*" in *--version*) printf 'mzpeak-convert %s\r\n' "$BOX_REPORTS" ;; esac
+"""
+    SCP = "#!/bin/sh\nexit 0\n"
+    RELAY = """#!/bin/sh
+[ "$1" = -c ] && exit 0            # resolve_relay_python's boto3 probe
+case "$2" in presign-put) echo https://relay.invalid/put ;; delete) ;; *) exit 1 ;; esac
+"""
+
+    def setUp(self):
+        super().setUp()
+        for name, body in (("ssh", self.SSH), ("scp", self.SCP), ("relay", self.RELAY)):
+            (self.tmp / "bin" / name).write_text(body)
+            (self.tmp / "bin" / name).chmod(0o755)
+        self.jobs = self.tmp / "jobs.tsv"
+        self.jobs.write_text(f"https://example.invalid/run.mzML\t{self.tmp / 'run.mzpeak'}\t--no-vendor\n")
+
+    def checkout(self, where: Path) -> Path:
+        """A copy of box_convert.sh in `where`/tools; -> that tools directory."""
+        tools = where / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "box_convert.sh").write_text((TOOLS / "box_convert.sh").read_text())
+        return tools
+
+    def run_script(self, tools: Path, **env: str) -> tuple[int, str]:
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("BOX_", "S3_", "MZPC_"))}
+        p = subprocess.run(["bash", str(tools / "box_convert.sh"), "--manifest", str(self.jobs)],
+                           capture_output=True, text=True, cwd=self.tmp, env={
+                               **clean, "PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "T": str(self.tmp),
+                               "TMPDIR": str(self.tmp), "MZPC_PYTHON": str(self.tmp / "bin" / "relay"), **env})
+        return p.returncode, p.stdout + p.stderr
+
+    def dispatched(self) -> bool:
+        return "-JobFile" in (self.tmp / "ssh").read_text()
+
+    BOX = {"BOX_SSH": "user@box", "BOX_JUMP": "user@jump", "BOX_SSH_KEY": "/dev/null",
+           "BOX_AUTOUPDATE": "0", "BOX_CONVERTER_VERSION": "v0.11.5", "BOX_REQUIRE_VERSION": "1"}
+
+    def test_a_box_on_another_version_gets_no_job(self):
+        tools = self.checkout(self.tmp / "plain")
+        rc, out = self.run_script(tools, **self.BOX, BOX_REPORTS="0.11.4")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("but this run requires 0.11.5", out)
+        self.assertFalse(self.dispatched(), out)
+
+        (self.tmp / "ssh").unlink()
+        rc, out = self.run_script(tools, **self.BOX, BOX_REPORTS="0.11.5")
+        self.assertTrue(self.dispatched(), out)
+
+    def worktree(self) -> tuple[Path, Path, Path]:
+        """A main checkout with a tools/box.env and a git worktree of it; -> (main, worktree, box.env)."""
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"]
+        main, wt = self.tmp / "main", self.tmp / "wt"
+        subprocess.run([*git, "init", "-q", str(main)], check=True)
+        subprocess.run([*git, "-C", str(main), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        subprocess.run([*git, "-C", str(main), "worktree", "add", "-q", "--detach", str(wt)], check=True)
+        env_file = self.checkout(main) / "box.env"
+        env_file.write_text("".join(f"{k}={v}\n" for k, v in self.BOX.items()))
+        return main, wt, env_file
+
+    def test_a_worktree_uses_the_main_checkouts_box_env_and_says_so(self):
+        main, wt, env_file = self.worktree()
+        rc, out = self.run_script(self.checkout(wt), BOX_REPORTS="0.11.5")
+        self.assertIn(f"using the main checkout's {env_file.resolve()}", out)
+        self.assertTrue(self.dispatched(), out)
+        self.assertIn("user@box", (self.tmp / "ssh").read_text())
+
+        (self.tmp / "ssh").unlink()
+        (wt / "tools" / "box.env").write_text(env_file.read_text())
+        rc, out = self.run_script(wt / "tools", BOX_REPORTS="0.11.5")
+        self.assertNotIn("main checkout", out, "a worktree's own box.env wins")
+        self.assertTrue(self.dispatched(), out)
+
+    def test_the_scp_tool_from_a_worktree_uses_the_main_checkouts_box_env_too(self):
+        # box_convert_scp.sh sourced only its own checkout's box.env and died on BOX_SSH:? in a worktree.
+        main, wt, env_file = self.worktree()
+        tools = wt / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "box_convert_scp.sh").write_text((TOOLS / "box_convert_scp.sh").read_text())
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("BOX_", "S3_", "MZPC_"))}
+        p = subprocess.run(["bash", str(tools / "box_convert_scp.sh")], input="", capture_output=True, text=True,
+                           cwd=self.tmp, env={**clean, "PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}",
+                                              "T": str(self.tmp)})
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn(f"using the main checkout's {env_file.resolve()}", out)
+        self.assertIn("SCP-CONVERT DONE", out)
+
 
 if __name__ == "__main__":
     unittest.main()
