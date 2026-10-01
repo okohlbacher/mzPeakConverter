@@ -5,8 +5,9 @@
 //! Why measure instead of a fixed rule: the best encoding depends on the data. On timsTOF grid
 //! indices byte-stream split beats dictionary by ~10 %; on Waters HDMSe frames (200 drift bins
 //! sharing one m/z axis, half the m/z deltas zero) dictionary wins, float mobility under
-//! byte-stream split is 3× larger, lossless delta m/z beats numpress, and integral intensities as
-//! int32 are a third smaller than as float32 (measured on PXD063409 CK1, 2026-09-29).
+//! byte-stream split is 3× larger, delta m/z (exact for these float32 values) beats numpress, and
+//! integral intensities as int32 are a third smaller than as float32 (measured on PXD063409 CK1,
+//! 2026-09-29).
 //!
 //! Parquet records its encoding per page, so readers need nothing to read any arm; int32 intensity
 //! is a declared array data type (MS:1000519). The `encoding_prescan` index block states what was
@@ -15,7 +16,7 @@
 use mzdata::spectrum::{ArrayType, BinaryDataArrayType, DataArray, MultiLayerSpectrum};
 use mzpeak_prototyping::writer::{ColumnEncoding, DataColumnEncodings};
 
-/// How the m/z axis is stored: lossless delta chunks under a Parquet encoding, or numpress-linear.
+/// How the m/z axis is stored: delta chunks under a Parquet encoding, or numpress-linear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MzArm {
     Delta(ColumnEncoding),

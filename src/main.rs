@@ -314,9 +314,10 @@ struct Cli {
     /// Delta m/z chunking instead of the default lossy numpress-linear. Each m/z is stored as its
     /// difference from the one before, which gives the value back exactly when m/z are 32-bit
     /// values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor. A 64-bit
-    /// m/z more than twice its predecessor — sparse spectra below about m/z 100 — can come back
-    /// one unit in the last place (about 1e-15 Da) off, and profile zero runs are still masked:
-    /// for an archive that is bit-exact, use `--lossless`.
+    /// m/z more than twice its predecessor in the same chunk, which happens at any mass in sparse
+    /// centroid spectra, can come back one unit in the last place off (1e-15 Da near m/z 10,
+    /// 5e-13 Da near m/z 4000), as can the values after it in that chunk; and profile zero runs
+    /// are still masked. For an archive that is bit-exact, use `--lossless`.
     #[arg(long)]
     no_numpress: bool,
 
@@ -336,9 +337,9 @@ struct Cli {
     /// result (no signal transformation declared, every point stored, no column narrower than the
     /// input declares); when the check fails the conversion fails and nothing is written. mzML and
     /// imzML inputs only: on every other lane it is refused. Conflicts with `--layout chunked`,
-    /// `--tof-grid auto|on`, `--agilent-grid` and an mzML output. Larger than the default where
-    /// m/z are 64-bit (2.3× on a 68-million-point profile imaging run), smaller where they are
-    /// 32-bit values.
+    /// `--tof-grid auto|on`, `--agilent-grid` and an mzML output, and is refused while
+    /// `MZPC_MAX_SPECTRA` caps the run. Larger than the default where m/z are 64-bit (2.4× on a
+    /// 68-million-point profile imaging run), smaller where they are 32-bit values.
     #[arg(long)]
     lossless: bool,
 
@@ -1329,7 +1330,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     }
 
     // Shimadzu `.lcd` stores m/z as scaled integers (fixed-point, 1e-4), so consecutive values are
-    // near-constant integer deltas. Lossless delta chunking is therefore strictly better than
+    // near-constant integer deltas. Delta chunking is therefore strictly better than
     // numpress-linear on this vendor -- SMALLER, FASTER *and* exact, measured on two QTOF DIA runs:
     //
     //     default (numpress)  1,125 MB   102 s   m/z off the vendor lattice by up to 3.8e-3
@@ -1665,6 +1666,21 @@ fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
     }
 }
 
+/// `--lossless` under `$MZPC_MAX_SPECTRA`: refused, whether or not the cap would bite. The cap
+/// stops the conversion after `n` spectra and disables `assert_source_complete`, and the post-write
+/// check only compares what was stored with what the lane was handed, so a capped archive would
+/// pass it while holding a part of the input.
+fn lossless_refuses_a_cap(cap: Option<usize>) -> Result<()> {
+    match cap {
+        Some(n) => bail!(
+            "--lossless conflicts with MZPC_MAX_SPECTRA={n}: a capped conversion stops after {n} \
+             spectra with the completeness check off, and --lossless promises every point of the \
+             input. Unset MZPC_MAX_SPECTRA, or convert without --lossless."
+        ),
+        None => Ok(()),
+    }
+}
+
 /// Refuse, in the style of the `--rt`/`--ms-level` refusal above, when the user supplied an option
 /// the selected lane would DROP; warn, once, for options that are merely inert there. Both are
 /// checked against `Settings::given` — what was passed on the command line — never against
@@ -1691,6 +1707,11 @@ fn refuse_unsupported_flags(lane: Lane, cfg: &Settings) -> Result<()> {
                 _ => "",
             }
         );
+    }
+    // A capped run stops early and switches the source-completeness check off: the archive would
+    // be exact in what it holds and silent about what it lacks.
+    if cfg.lossless {
+        lossless_refuses_a_cap(max_spectra())?;
     }
     // mzML lanes produce a document, not an archive; say the right noun in the message.
     let product = match lane {
@@ -12627,6 +12648,10 @@ mod tests {
             assert!(e.contains("--lossless conflicts with") && e.contains(what), "{args:?}: {e}");
         }
         assert!(resolve(&["--lossless", "--layout", "point", "--tof-grid", "off", "--no-numpress"]).is_ok());
+        // A cap on the spectra written, biting or not.
+        assert!(super::lossless_refuses_a_cap(None).is_ok());
+        let e = super::lossless_refuses_a_cap(Some(3)).unwrap_err().to_string();
+        assert!(e.contains("--lossless conflicts with MZPC_MAX_SPECTRA=3"), "{e}");
 
         let flag = "--keep-zero-runs";
         assert!(super::dropped_flags_for(Lane::AgilentGrid).contains(&flag));

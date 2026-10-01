@@ -4,8 +4,9 @@
 //! facet (`spectra_data`, `spectra_peaks`): the points the reader handed over against the points
 //! stored (the difference is what the zero-run mask left out), the numeric types the source
 //! declares for m/z and intensity where the lane knows them (mzML and imzML: the binary data
-//! types) against the stored column types, and, in `mz_error`, one entry per m/z encoding that can
-//! move a value, with its maximum absolute and relative error.
+//! types) against what the facet stores them as (the column's type, or `grid:<index type>` where
+//! the m/z are grid indices), and, in `mz_error`, one entry per m/z encoding that can move a value,
+//! with its maximum absolute and relative error.
 //!
 //! Where the numbers come from:
 //!
@@ -27,9 +28,19 @@
 //! * **delta** stores `fl(a − b)`, and `b + fl(a − b) == a` is guaranteed only for `a ≤ 2b`
 //!   (Sterbenz) or for m/z that are 32-bit values. A chunk whose last m/z is at most twice its
 //!   first is therefore exact by construction; the others are counted, with the largest m/z at
-//!   risk and the unit in the last place there (the errors seen are one such unit).
+//!   risk. Their error is a BOUND as well, one unit in the last place of the value ([`ulp`]): the
+//!   decoder adds the stored differences up from the chunk's first m/z, and a decoded value `y`
+//!   stays within `ulp(x)` of its source `x` through the chunk, by induction over its two kinds of
+//!   step. Where `x' ≤ 2x` the difference is exact and `y' = fl(x' + (y − x))`, which rounding
+//!   keeps inside `x' ± ulp(x')` because `ulp(x') ≥ ulp(x)`. Where `x' > 2x` the difference is off
+//!   by at most `ulp(x')/2` and `ulp(x) ≤ ulp(x')/2`, so the sum is again inside `x' ± ulp(x')`.
+//!   The absolute figure is the ulp of the largest m/z at risk, the relative one 2⁻⁵² (an ulp is
+//!   never a larger part of its value). The proof needs positive, ascending m/z: an at-risk chunk
+//!   that starts at or below zero leaves the entry without a figure.
 //! * **grid fits** (`grid-fit:<tol>Da`, `tof-grid:<ppm>ppm`) state the tolerance every fitted value
-//!   was accepted within, taken from the `transformations` entry.
+//!   was accepted within, taken from the `transformations` entry, and the other figure derived from
+//!   it over the m/z range of the grid rows stored: the absolute tolerance over the smallest m/z,
+//!   the relative one times the largest.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -282,15 +293,25 @@ struct ChunkStats {
     /// Delta chunks whose last m/z is more than twice their first.
     delta_at_risk: u64,
     delta_largest_at_risk: f64,
+    /// At-risk delta chunks that start at or below zero (or at no number), where the one-ulp bound
+    /// is not proven.
+    delta_unbounded: u64,
+    /// Rows whose m/z sit in the values or numpress column.
+    value_chunks: u64,
+    /// Rows whose m/z are grid indices (`MS:1003826`), and the m/z range they span.
+    grid_chunks: u64,
+    grid_min: f64,
+    grid_max: f64,
 }
 
 impl ChunkStats {
     fn new() -> Self {
-        Self { min_fixed_point: f64::INFINITY, numpress_rel: Some(0.0), ..Self::default() }
+        Self { min_fixed_point: f64::INFINITY, numpress_rel: Some(0.0), grid_min: f64::INFINITY, ..Self::default() }
     }
 
     /// One numpress-linear chunk: its bounds and its encoded bytes (the first eight are read).
     fn numpress(&mut self, start: f64, end: f64, encoded: &[u8]) {
+        self.value_chunks += 1;
         let Some(head) = encoded.first_chunk::<8>() else { return };
         // MS-Numpress writes the fixed point first, most significant byte first.
         let fixed_point = f64::from_be_bytes(*head);
@@ -305,11 +326,20 @@ impl ChunkStats {
     }
 
     fn delta(&mut self, start: f64, end: f64) {
+        self.value_chunks += 1;
         self.delta_chunks += 1;
         if !(start > 0.0 && end <= 2.0 * start) {
             self.delta_at_risk += 1;
             self.delta_largest_at_risk = self.delta_largest_at_risk.max(end);
+            self.delta_unbounded += u64::from(!(start > 0.0 && end.is_finite()));
         }
+    }
+
+    /// One grid row: the m/z are indices into the row's model, and the values column is empty.
+    fn grid(&mut self, start: f64, end: f64) {
+        self.grid_chunks += 1;
+        self.grid_min = self.grid_min.min(start);
+        self.grid_max = self.grid_max.max(end);
     }
 
     /// Fold another part of the same facet in.
@@ -324,6 +354,25 @@ impl ChunkStats {
         self.delta_chunks += other.delta_chunks;
         self.delta_at_risk += other.delta_at_risk;
         self.delta_largest_at_risk = self.delta_largest_at_risk.max(other.delta_largest_at_risk);
+        self.delta_unbounded += other.delta_unbounded;
+        self.value_chunks += other.value_chunks;
+        self.grid_chunks += other.grid_chunks;
+        self.grid_min = self.grid_min.min(other.grid_min);
+        self.grid_max = self.grid_max.max(other.grid_max);
+    }
+
+    /// What holds the facet's m/z: the values column's type, `grid:<index type>` when every row
+    /// is a grid row, both when the facet mixes them (a `--tof-grid` run keeps an off-grid
+    /// spectrum as 64-bit values beside the gridded ones).
+    fn mz_storage(&self, values: Option<String>, grid_index: Option<&str>) -> Option<String> {
+        if self.grid_chunks == 0 {
+            return values;
+        }
+        let grid = format!("grid:{}", grid_index.unwrap_or("unknown"));
+        match values {
+            Some(v) if self.value_chunks > 0 => Some(format!("{v}+{grid}")),
+            _ => Some(grid),
+        }
     }
 }
 
@@ -332,6 +381,7 @@ impl ChunkStats {
 struct StoredFacet {
     layout: String,
     points: Option<u64>,
+    /// What holds the m/z ([`ChunkStats::mz_storage`]), and the intensity column's type.
     mz_type: Option<String>,
     intensity_type: Option<String>,
     chunks: ChunkStats,
@@ -357,6 +407,7 @@ const MZ_ARRAY: &str = "MS:1000514";
 const INTENSITY_ARRAY: &str = "MS:1000515";
 const NUMPRESS_LINEAR: &str = "MS:1002312";
 const DELTA: &str = "MS:1003089";
+const GRID: &str = "MS:1003826";
 
 /// The first eight bytes of row `i` of a list-of-bytes column: a numpress chunk's fixed point.
 fn list_head(column: &ArrayRef, i: usize) -> Option<[u8; 8]> {
@@ -420,12 +471,13 @@ fn scan_row_group(tmp: &Path, member: &Member, metadata: &ArrowReaderMetadata, c
             }
             match encodings.value(i) {
                 NUMPRESS_LINEAR => {
-                    if let Some(head) = bytes.and_then(|c| list_head(c, i)) {
-                        chunks.numpress(starts.value(i), ends.value(i), &head);
-                    }
+                    let head = bytes.and_then(|c| list_head(c, i));
+                    chunks.numpress(starts.value(i), ends.value(i), head.as_ref().map_or(&[], |h| &h[..]));
                 }
                 DELTA => chunks.delta(starts.value(i), ends.value(i)),
-                _ => {}
+                GRID => chunks.grid(starts.value(i), ends.value(i)),
+                // Uncompressed values (`MS:1000576`), or an encoding this scan has no rule for.
+                _ => chunks.value_chunks += 1,
             }
         }
     }
@@ -457,10 +509,19 @@ fn stored_facet(tmp: &Path, member: &Member) -> Result<StoredFacet> {
             .map(|f| stored_type(f.data_type()))
     };
     let (mz_type, intensity_type) = (value_column(MZ_ARRAY), value_column(INTENSITY_ARRAY));
+    // The index type of the m/z grid column (`mz_grid { grid_type, parameters, indices }`).
+    let grid_index = children
+        .iter()
+        .find(|f| meta(f, "array_accession") == MZ_ARRAY && meta(f, "buffer_format") == "chunk_transform" && meta(f, "transform") == GRID)
+        .and_then(|f| match f.data_type() {
+            DataType::Struct(parts) => parts.iter().find(|p| p.name() == "indices").map(|p| stored_type(p.data_type())),
+            _ => None,
+        });
 
     // The chunk rows of an m/z main axis, one row group per worker: the numpress column is most of
     // a default archive, and reading it back on one core cost 6 % of a 68-million-point imzML
-    // conversion. A point facet, an empty one and an integer main axis (timsTOF) have nothing to scan.
+    // conversion. A point facet and an empty one have nothing to scan; a grid facet's rows are
+    // read for their bounds and encoding only.
     let mut chunks = ChunkStats::new();
     let named = |format: &str| children.iter().find(|f| meta(f, "array_accession") == MZ_ARRAY && meta(f, "buffer_format") == format).map(|f| f.name().clone());
     let numpress = children
@@ -477,6 +538,7 @@ fn stored_facet(tmp: &Path, member: &Member) -> Result<StoredFacet> {
             chunks.merge(&group?);
         }
     }
+    let mz_type = chunks.mz_storage(mz_type, grid_index.as_deref());
     Ok(StoredFacet { layout, points, mz_type, intensity_type, chunks })
 }
 
@@ -515,6 +577,8 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> R
     let mut block = serde_json::Map::new();
     let mut mz_error: Vec<Value> = Vec::new();
     let mut stored = stored(tmp)?;
+    // The m/z range of the grid rows of both facets, for the grid fits' second figure.
+    let (mut grid_min, mut grid_max) = (f64::INFINITY, 0.0f64);
     for (_, key) in FACETS {
         let source = lane.and_then(|l| l.get(key));
         let source_points = source.and_then(|s| s["source_points"].as_u64());
@@ -545,6 +609,9 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> R
         block.insert(key.to_string(), entry);
 
         let c = &facet.chunks;
+        if c.grid_chunks > 0 {
+            (grid_min, grid_max) = (grid_min.min(c.grid_min), grid_max.max(c.grid_max));
+        }
         if c.numpress_chunks > 0 {
             mz_error.push(json!({
                 "encoding": "numpress-linear",
@@ -559,23 +626,31 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> R
         // 32-bit m/z values survive delta exactly whatever their spacing.
         let f32_source = source_types.and_then(|t| t["mz"].as_array()).is_some_and(|t| !t.is_empty() && t.iter().all(|v| v == "float32"));
         if c.delta_chunks > 0 && c.delta_at_risk > 0 && !f32_source {
+            // One unit in the last place of the value (the module docs have the proof): of the
+            // largest m/z at risk in absolute terms, 2⁻⁵² of any value in relative ones.
+            let bounded = c.delta_unbounded == 0;
             mz_error.push(json!({
                 "encoding": "delta",
                 "facet": key,
                 "chunks": c.delta_chunks,
                 "chunks_not_exact_by_construction": c.delta_at_risk,
                 "largest_mz_at_risk": (c.delta_largest_at_risk * 1e6).ceil() / 1e6,
-                "ulp_there": round_up(ulp(c.delta_largest_at_risk)),
-                "max_abs_error": Value::Null,
-                "basis": "not measured",
+                "max_abs_error": bounded.then(|| round_up(ulp(c.delta_largest_at_risk))),
+                "max_rel_error_ppm": bounded.then(|| round_up(f64::EPSILON * 1e6)),
+                "basis": if bounded { "bound" } else { "not measured" },
             }));
         }
     }
+    // A tolerance is against the source value and the rows' bounds may be the fitted ones, a
+    // tolerance apart: the derived figure allows for that.
+    let grid_rows = grid_min <= grid_max;
     for t in transformations {
         if let Some(tol) = entry_bound(t, "grid-fit:", "Da") {
-            mz_error.push(json!({"encoding": t, "max_abs_error": tol, "basis": "tolerance"}));
+            let rel = (grid_rows && grid_min > tol).then(|| round_up(tol / (grid_min - tol) * 1e6));
+            mz_error.push(json!({"encoding": t, "max_abs_error": tol, "max_rel_error_ppm": rel, "basis": "tolerance"}));
         } else if let Some(ppm) = entry_bound(t, "tof-grid:", "ppm") {
-            mz_error.push(json!({"encoding": t, "max_rel_error_ppm": ppm, "basis": "tolerance"}));
+            let abs = (grid_rows && ppm < 1e6).then(|| round_up(ppm * 1e-6 * grid_max / (1.0 - ppm * 1e-6)));
+            mz_error.push(json!({"encoding": t, "max_abs_error": abs, "max_rel_error_ppm": ppm, "basis": "tolerance"}));
         } else if matches!(*t, "bruker:mz-calibration-chord" | "bruker:mz-calibrant-omitted" | "shimadzu:coarse-mz") {
             mz_error.push(json!({"encoding": t, "max_abs_error": Value::Null, "basis": "not measured"}));
         }
@@ -751,7 +826,79 @@ mod tests {
         let mut stats = ChunkStats::new();
         stats.delta(60.0, 110.0);
         stats.delta(1.0078, 38.96);
-        assert_eq!((stats.delta_chunks, stats.delta_at_risk, stats.delta_largest_at_risk), (2, 1, 38.96));
+        assert_eq!((stats.delta_chunks, stats.delta_at_risk, stats.delta_largest_at_risk, stats.delta_unbounded), (2, 1, 38.96, 0));
+        // A chunk from zero or below: at risk, and outside what the one-ulp bound is proven for.
+        stats.delta(0.0, 12.5);
+        assert_eq!((stats.delta_at_risk, stats.delta_unbounded, stats.value_chunks), (2, 1, 3));
+    }
+
+    /// The bound a delta entry records: through a whole chunk, every decoded m/z is within one
+    /// unit in the last place of its source value — so within the ulp of the chunk's last m/z and
+    /// within 2⁻⁵² of the value — and the bound is reached. Chunks of sparse ascending m/z at every
+    /// mass, encoded and decoded with the writer's own codec; an error made at one step is carried
+    /// into the next, which is what the induction in the module docs is about.
+    #[test]
+    fn a_delta_chunk_decodes_within_one_ulp_of_every_source_value() {
+        let strategy = ChunkingStrategy::Delta { chunk_size: 50.0 };
+        let mut rng = Lcg(0xde17a);
+        let (mut off, mut off_above_1000, mut carried, mut reached) = (0usize, 0usize, 0usize, false);
+        for chunk in 0..4000 {
+            // 2 to 60 values from somewhere in 0.5 … 500 Th, each step a factor of 1 to 4 (or,
+            // every third chunk, of 1 to 1.2: a dense stretch after an error, which carries it).
+            let mut x = 0.5 + 500.0 * rng.next().powi(4);
+            let n = 2 + (58.0 * rng.next()) as usize;
+            let dense_after = if chunk % 3 == 0 { 3 } else { usize::MAX };
+            let mz: Vec<f64> = (0..n)
+                .map(|i| {
+                    x *= if i >= dense_after { 1.0 + 0.2 * rng.next() } else { 1.0 + 3.0 * rng.next().powi(2) };
+                    x
+                })
+                .collect();
+            let (start, end, encoded) = strategy.encode_arrow(&Float64Array::from(mz.clone()));
+            let mut stats = ChunkStats::new();
+            stats.delta(start, end);
+            let mut decoded = DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+            strategy.decode_arrow(&encoded, start, end, &mut decoded, None);
+            let decoded = decoded.to_f64().unwrap();
+            assert_eq!(decoded.len(), mz.len(), "chunk {chunk}");
+            let mut previous_off = false;
+            for (a, b) in mz.iter().zip(decoded.iter()) {
+                let d = (a - b).abs();
+                assert!(d <= ulp(*a), "chunk {chunk}: {a} decoded as {b}, {d:e} off, more than its ulp {:e}", ulp(*a));
+                assert!(d <= ulp(end) && d / a <= f64::EPSILON, "chunk {chunk}: {a} decoded as {b}");
+                if d > 0.0 {
+                    assert!(stats.delta_at_risk == 1 && stats.delta_unbounded == 0, "chunk {chunk} [{start}, {end}] is not counted at risk");
+                    off += 1;
+                    off_above_1000 += usize::from(*a > 1000.0);
+                    carried += usize::from(previous_off);
+                    reached |= d == ulp(end);
+                }
+                previous_off = d > 0.0;
+            }
+        }
+        assert!(off > 1000, "only {off} values rounded: the chunks are not sparse enough to test the bound");
+        assert!(off_above_1000 > 100, "only {off_above_1000} values above m/z 1000 rounded: the error is not a low-mass one");
+        assert!(carried > 100, "only {carried} errors followed another: carrying is not exercised");
+        assert!(reached, "no value reached the ulp of its chunk's last m/z: the bound is loose");
+    }
+
+    /// What `stored_types.mz` says: the values column's type, the grid's index type where every
+    /// row is a grid row, both where the facet mixes them.
+    #[test]
+    fn grid_rows_are_named_as_the_mz_storage() {
+        let float64 = || Some("float64".to_string());
+        let mut stats = ChunkStats::new();
+        assert_eq!(stats.mz_storage(float64(), Some("uint32")), float64(), "no row scanned: the column type");
+        stats.grid(301.5, 1200.25);
+        stats.grid(99.75, 800.0);
+        assert_eq!((stats.grid_chunks, stats.grid_min, stats.grid_max), (2, 99.75, 1200.25));
+        assert_eq!(stats.mz_storage(float64(), Some("uint32")).as_deref(), Some("grid:uint32"));
+        assert_eq!(stats.mz_storage(None, None).as_deref(), Some("grid:unknown"));
+        let mut other = ChunkStats::new();
+        other.delta(100.0, 150.0);
+        stats.merge(&other);
+        assert_eq!(stats.mz_storage(float64(), Some("uint32")).as_deref(), Some("float64+grid:uint32"));
+        assert_eq!(other.mz_storage(float64(), Some("uint32")), float64());
     }
 
     /// A recorded bound is rounded up, to six digits, and survives a JSON round trip unchanged.

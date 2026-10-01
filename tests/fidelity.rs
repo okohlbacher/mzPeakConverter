@@ -8,7 +8,10 @@
 //!   `zero-run-mask`, and gives the pixels of a continuous-mode run one decoded m/z axis;
 //! * `--lossless` writes an archive whose stored arrays equal the source arrays bit for bit, at
 //!   the declared types, or fails and writes nothing;
-//! * `--no-numpress` (delta) is NOT bit-exact on sparse 64-bit m/z, and the block says where;
+//! * `--no-numpress` (delta) is NOT bit-exact on sparse 64-bit m/z, at any mass, and the block
+//!   bounds the error at one unit in the last place;
+//! * a facet whose m/z are grid indices says so in `stored_types`, and the grid fit's tolerance
+//!   holds for every decoded value;
 //! * the `.mzpeak` filter carries the block, or drops it when it removes spectra.
 
 use std::collections::BTreeMap;
@@ -28,14 +31,17 @@ fn scratch(tag: &str) -> PathBuf {
     d
 }
 
-/// `mzpeak-convert <input> -o <output> -q <args…>`, with `MZPC_KEEP_ZERO_RUNS` set when `env`.
-fn run(input: &Path, output: &Path, args: &[&str], env: bool) -> Output {
+/// `mzpeak-convert <input> -o <output> -q <args…>` under `envs`, with neither
+/// `MZPC_KEEP_ZERO_RUNS` nor `MZPC_MAX_SPECTRA` inherited.
+fn run_with(input: &Path, output: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"));
-    cmd.arg(input).arg("-o").arg(output).arg("-q").args(args).env_remove("MZPC_KEEP_ZERO_RUNS");
-    if env {
-        cmd.env("MZPC_KEEP_ZERO_RUNS", "1");
-    }
-    cmd.output().expect("failed to run mzpeak-convert")
+    cmd.arg(input).arg("-o").arg(output).arg("-q").args(args).env_remove("MZPC_KEEP_ZERO_RUNS").env_remove("MZPC_MAX_SPECTRA");
+    cmd.envs(envs.iter().copied()).output().expect("failed to run mzpeak-convert")
+}
+
+/// [`run_with`], with `MZPC_KEEP_ZERO_RUNS` set when `env`.
+fn run(input: &Path, output: &Path, args: &[&str], env: bool) -> Output {
+    run_with(input, output, args, if env { &[("MZPC_KEEP_ZERO_RUNS", "1")] } else { &[] })
 }
 
 fn convert(input: &Path, output: &Path, args: &[&str]) {
@@ -393,6 +399,20 @@ fn lossless_refuses_rather_than_pretends() {
     std::fs::write(&config, "lossless: true\n").unwrap();
     refused(&tdf, &dir.join("tdf.mzpeak"), &["--config", config.to_str().unwrap()], "--lossless is not available");
 
+    // A cap on the spectra written (`MZPC_MAX_SPECTRA`): the archive would hold a part of the
+    // input and pass the check on that part. Refused whether the cap bites (2 of 3) or not; the
+    // same capped run without `--lossless` is written, and marked partial.
+    let capped = dir.join("capped.mzpeak");
+    for cap in ["2", "300"] {
+        let r = run_with(&input, &capped, &["--lossless"], &[("MZPC_MAX_SPECTRA", cap)]);
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(!r.status.success() && err.contains(&format!("--lossless conflicts with MZPC_MAX_SPECTRA={cap}")), "cap {cap}: {err}");
+        assert!(!capped.exists() && !capped.with_extension("mzpeak.tmp").exists(), "cap {cap} left a file behind");
+    }
+    let r = run_with(&input, &capped, &["--layout", "point"], &[("MZPC_MAX_SPECTRA", "2")]);
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(metadata(&capped)["partial"]["spectra_written"], 2);
+
     // Out-of-order m/z: stored sorted, declared `sort-by-mz`, so not the source's arrays.
     let mut unsorted = mz;
     unsorted.swap(3, 9);
@@ -535,29 +555,37 @@ fn the_recorded_numpress_bound_holds_for_every_decoded_value() {
 }
 
 /// `--no-numpress` is delta, and delta is not bit-exact where a 64-bit m/z is more than twice its
-/// predecessor: the archive decodes at least one m/z a unit in the last place off, declares no
-/// transformation for it, and `fidelity.mz_error` names the chunks it can happen in. The same
-/// values as 32-bit floats are exact and get no entry.
+/// predecessor in the same chunk, at low mass and at high: the archive decodes such m/z a unit in
+/// the last place off (and carries the error into the values after it), declares no transformation
+/// for it, and `fidelity.mz_error` counts the chunks it can happen in and bounds the error — every
+/// decoded m/z is within `max_abs_error` and `max_rel_error_ppm` of its source. The same values as
+/// 32-bit floats are exact and get no entry.
 #[test]
-fn delta_on_sparse_64_bit_mz_is_off_by_an_ulp_and_the_block_says_so() {
+fn delta_on_sparse_64_bit_mz_is_off_by_an_ulp_and_the_block_bounds_it() {
     let dir = scratch("delta");
-    // Pairs (b, a) with a > 2b for which `b + (a - b) != a` in f64: the first two m/z of each spectrum.
+    // Pairs (b, a) with a > 2b for which `b + (a - b) != a` in f64, the first two m/z of each
+    // spectrum: six below m/z 50 (ToF-SIMS, GC-EI) and six between m/z 600 and 6,300 (a sparse
+    // centroid list), where the chunk goes on past `a` and the values after it inherit its error.
     let mut rng = Lcg(9);
-    let rounding: Vec<(f64, f64)> = (0..100_000)
-        .map(|_| {
-            let b = 1.0 + 9.0 * rng.next();
-            (b, b * (2.2 + 2.0 * rng.next()))
-        })
-        .filter(|(b, a)| b + (a - b) != *a)
-        .take(6)
-        .collect();
-    assert_eq!(rounding.len(), 6, "no pair rounds: the premise of this test is gone");
+    let mut pairs = |lo: f64, hi: f64| -> Vec<(f64, f64)> {
+        let found: Vec<(f64, f64)> = (0..100_000)
+            .map(|_| {
+                let b = lo + (hi - lo) * rng.next();
+                (b, b * (2.2 + 2.0 * rng.next()))
+            })
+            .filter(|(b, a)| b + (a - b) != *a)
+            .take(6)
+            .collect();
+        assert_eq!(found.len(), 6, "no pair rounds: the premise of this test is gone");
+        found
+    };
+    let rounding: Vec<(f64, f64)> = pairs(1.0, 10.0).into_iter().chain(pairs(300.0, 1500.0)).collect();
     let build = |as32: bool, rng: &mut Lcg| -> Vec<(Arr, Arr)> {
         rounding
             .iter()
             .map(|(b, a)| {
                 let mut mz = vec![*b, *a];
-                mz.extend((0..30).map(|i| 60.0 + 25.0 * f64::from(i) + rng.next()));
+                mz.extend((1..=30).map(|i| a.max(35.0) + 25.0 * f64::from(i) + rng.next()));
                 let it = f32s(&intensities(rng, mz.len(), false));
                 (if as32 { Arr::F32(f32s(&mz)) } else { Arr::F64(mz) }, Arr::F32(it))
             })
@@ -572,15 +600,33 @@ fn delta_on_sparse_64_bit_mz_is_off_by_an_ulp_and_the_block_says_so() {
     let input = write_imzml(&dir, "f64", &spectra, true, false);
     let out = dir.join("f64.mzpeak");
     convert(&input, &out, &["--no-numpress"]);
-    let off: usize = decoded(&out, spectra.len()).iter().zip(&spectra).map(|(d, (mz, _))| d.iter().zip(mz.as_f64()).filter(|(x, y)| x.to_bits() != y.to_bits()).count()).sum();
-    assert!(off >= 6, "delta decoded every 64-bit m/z exactly ({off} off)");
     assert!(transformations(&out).iter().all(|t| t == "mzml:dangling-reference-dropped"), "{:?}", transformations(&out));
     let errors = metadata(&out)["fidelity"]["mz_error"].clone();
     let e = &errors[0];
-    assert_eq!((errors.as_array().unwrap().len(), &e["encoding"], &e["basis"]), (1, &"delta".into(), &"not measured".into()), "{errors}");
-    assert!(e["chunks_not_exact_by_construction"].as_u64().unwrap() >= 6 && e["max_abs_error"].is_null(), "{e}");
-    let at_risk = e["largest_mz_at_risk"].as_f64().unwrap();
-    assert!(at_risk > 2.0 && at_risk < 60.0 && e["ulp_there"].as_f64().unwrap() < 1e-14, "{e}");
+    assert_eq!((errors.as_array().unwrap().len(), &e["encoding"], &e["facet"], &e["basis"]), (1, &"delta".into(), &"spectra_data".into(), &"bound".into()), "{errors}");
+    assert!(e["chunks_not_exact_by_construction"].as_u64().unwrap() >= 12, "{e}");
+    let (abs, rel_ppm, at_risk) = (e["max_abs_error"].as_f64().unwrap(), e["max_rel_error_ppm"].as_f64().unwrap(), e["largest_mz_at_risk"].as_f64().unwrap());
+    // One unit in the last place: of the largest m/z at risk, and at most 2^-52 of any value.
+    assert!(at_risk > 600.0 && at_risk < 8000.0 && abs >= at_risk * f64::EPSILON / 2.0 && abs <= at_risk * f64::EPSILON * 1.00001, "{e}");
+    assert!(rel_ppm >= f64::EPSILON * 1e6 && rel_ppm < f64::EPSILON * 1e6 * 1.00001, "{e}");
+
+    let (mut off_low, mut off_high, mut worst_abs, mut worst_rel) = (0usize, 0usize, 0.0f64, 0.0f64);
+    for (i, (d, (mz, _))) in decoded(&out, spectra.len()).iter().zip(&spectra).enumerate() {
+        let source = mz.as_f64();
+        assert_eq!(d.len(), source.len(), "spectrum {i}");
+        for (x, y) in d.iter().zip(&source) {
+            let err = (x - y).abs();
+            assert!(err <= abs, "spectrum {i}: {y} decoded as {x}, {err:e} off, above the recorded {abs:e}");
+            assert!(err / y * 1e6 <= rel_ppm, "spectrum {i}: {y} decoded as {x}, {:e} ppm off, above the recorded {rel_ppm:e}", err / y * 1e6);
+            off_low += usize::from(err > 0.0 && *y < 50.0);
+            off_high += usize::from(err > 0.0 && *y > 600.0);
+            worst_abs = worst_abs.max(err);
+            worst_rel = worst_rel.max(err / y * 1e6);
+        }
+    }
+    assert!(off_low >= 6, "delta decoded the low-mass 64-bit m/z exactly ({off_low} off)");
+    assert!(off_high > 6, "delta decoded the m/z above 600 exactly, or carried no error on ({off_high} off)");
+    assert!(worst_abs * 2.0 >= abs && worst_rel * 2.0 >= rel_ppm, "the bound is loose: worst {worst_abs:e} of {abs:e}, {worst_rel:e} of {rel_ppm:e} ppm");
 
     // `--lossless` on the same file: every one of them back.
     let exact = dir.join("f64-lossless.mzpeak");
@@ -599,6 +645,80 @@ fn delta_on_sparse_64_bit_mz_is_off_by_an_ulp_and_the_block_says_so() {
         assert_eq!(d, &mz.as_f64());
     }
     assert_eq!(metadata(&out)["fidelity"]["mz_error"], serde_json::json!([]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A facet whose m/z are grid indices says so: centroid m/z on a 1e-4 lattice take the fitted
+/// linear grid by default, every row of the peaks facet is a grid row with an empty values column,
+/// and `stored_types.mz` reads `grid:uint32`, not the type of the column that holds nothing. The
+/// `grid-fit` entry carries its tolerance and the relative figure that follows from it, and both
+/// hold for every decoded m/z. With `--no-mz-lattice` the same file is stored as 64-bit values.
+#[test]
+fn a_grid_facet_names_its_index_type_and_the_fit_tolerance_holds() {
+    let dir = scratch("grid");
+    let mut rng = Lcg(21);
+    let spectra: Vec<(Arr, Arr)> = (0..8)
+        .map(|_| {
+            let mut mz: Vec<f64> = (0..300).map(|_| ((100.0 + 1800.0 * rng.next()) * 1e4).round() / 1e4).collect();
+            mz.sort_by(f64::total_cmp);
+            mz.dedup();
+            let it = f32s(&intensities(&mut rng, mz.len(), false));
+            (Arr::F64(mz), Arr::F32(it))
+        })
+        .collect();
+    let input = write_imzml(&dir, "lattice", &spectra, false, false);
+    let out = dir.join("grid.mzpeak");
+    convert(&input, &out, &[]);
+    assert!(transformations(&out).contains(&"grid-fit:1e-6Da".to_string()), "{:?}", transformations(&out));
+
+    // Every row is a grid row, and the values column is empty.
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(member(&out, "spectra_peaks.parquet"))).unwrap().build().unwrap();
+    let mut rows = 0;
+    for batch in reader {
+        let batch = batch.unwrap();
+        let chunk = batch.column_by_name("chunk").expect("the peaks facet is chunked").as_struct();
+        let (values, grid) = (chunk.column_by_name("mz_chunk_values").unwrap(), chunk.column_by_name("mz_grid").unwrap());
+        assert_eq!((values.null_count(), grid.null_count()), (chunk.len(), 0), "a row holds m/z values, or no grid");
+        let DataType::Struct(parts) = grid.data_type() else { panic!("mz_grid is not a struct") };
+        let DataType::LargeList(item) = parts.iter().find(|p| p.name() == "indices").unwrap().data_type() else { panic!("no index list") };
+        assert_eq!(item.data_type(), &DataType::UInt32);
+        rows += chunk.len();
+    }
+    assert!(rows > 0);
+
+    let meta = metadata(&out);
+    let facet = &meta["fidelity"]["spectra_peaks"];
+    assert_eq!(facet["source_types"]["mz"], serde_json::json!(["float64"]));
+    assert_eq!(facet["stored_types"], serde_json::json!({"mz": "grid:uint32", "intensity": "float32"}), "{facet}");
+    let errors = meta["fidelity"]["mz_error"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let e = &errors[0];
+    assert_eq!((&e["encoding"], &e["basis"], e["max_abs_error"].as_f64()), (&"grid-fit:1e-6Da".into(), &"tolerance".into(), Some(1e-6)), "{e}");
+    let rel_ppm = e["max_rel_error_ppm"].as_f64().unwrap();
+    let smallest = spectra.iter().map(|(mz, _)| mz.as_f64()[0]).fold(f64::INFINITY, f64::min);
+    assert!(rel_ppm >= 1e-6 / smallest * 1e6 && rel_ppm < 1e-6 / smallest * 1e6 * 1.001, "{rel_ppm} against the tolerance over the smallest m/z {smallest}");
+
+    let mut reader = MzPeakReader::new(&out).unwrap();
+    let mut moved = 0usize;
+    for (i, (mz, _)) in spectra.iter().enumerate() {
+        let source = mz.as_f64();
+        let arrays = reader.get_spectrum_peak_arrays_for(i as u64).unwrap().expect("peak arrays");
+        let decoded = arrays.mzs().unwrap();
+        assert_eq!(decoded.len(), source.len(), "spectrum {i}");
+        for (x, y) in decoded.iter().zip(&source) {
+            let err = (x - y).abs();
+            assert!(err <= 1e-6 && err / y * 1e6 <= rel_ppm, "spectrum {i}: {y} decoded as {x}");
+            moved += usize::from(err > 0.0);
+        }
+    }
+    assert!(moved > 0, "the fitted grid gave every m/z back exactly: nothing to bound");
+
+    // The lattice off: 64-bit values in the values column, and no grid entry.
+    let plain = dir.join("plain.mzpeak");
+    convert(&input, &plain, &["--no-mz-lattice"]);
+    let meta = metadata(&plain);
+    assert_eq!(meta["fidelity"]["spectra_peaks"]["stored_types"]["mz"], "float64");
+    assert!(meta["fidelity"]["mz_error"].as_array().unwrap().iter().all(|e| !e["encoding"].as_str().unwrap().starts_with("grid-fit")));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
