@@ -13,8 +13,10 @@ binary members a test merely lists and digests are empty stand-ins.
 | `blank1.D/` | MetaboLights MTBLS11742, `blank1.D/AcqData` | `Devices.xml`, `Contents.xml`; empty `MSScan.bin`; plus an empty AppleDouble `._MSScan.bin`, added for the test (not in the source), that the member walk must skip | `agilent_meta::tests::blank1_gc_ms_states_model_serial_time_and_members` |
 | `mtbls243.d/` | MetaboLights MTBLS243, `03_D24062013T1259_1399CBU_01QC_A3.d/AcqData` | `Devices.xml` | `agilent_meta::tests::numeric_serial_stays_a_string` |
 | `tests/data/small.RAW` | [mzdata](https://github.com/mobiusklein/mzdata) test data `test/data/small.RAW` (Thermo LTQ FT, 48 spectra; upstream commit 47ddac2, 2024-03-21), copied from the pinned fork at [`1d539717`](https://github.com/okohlbacher/mzdata/blob/1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db/test/data/small.RAW); SHA-1 `b43e9286b40e8b5dbc0dfa2e428495769ca96a96`, the `MS:1000569` value in mzdata's `test/data/small.mzML` | the whole file (1.5 MB) | `tests/thermo_raw.rs` |
+| `imaging/thyra/` | [Thyra](https://github.com/M4i-Imaging-Mass-Spectrometry/thyra) `tests/data/fixtures`: Theodoros Visvikis's five synthetic pixel-size imzML files (one 3 × 2 acquisition of 50 µm pixels, the size stated five ways), with his `README.txt` and `pixel_size_expected.json`; HUPO-PSI/mzPeak-specification#23 | the eleven `pixel_size_*` files as upstream has them at commit `e652f90` (124 KB), the author's `README.txt`, Thyra's `LICENSE` | `tests/imaging_pixel_size_fixtures.rs` |
 
-Each fixture stays under its source's terms: ProteoWizard's repository and mzdata
+Each fixture stays under its source's terms: Thyra is MIT (Theodoros Visvikis, M4i, Maastricht
+University; its `LICENSE` is beside the files), ProteoWizard's repository and mzdata
 ([LICENSE](https://github.com/okohlbacher/mzdata/blob/1d539717ecc7e9cec7b7d81cb7cbcfdf363b45db/LICENSE))
 are Apache-2.0, and the MetaboLights slices come from public studies under EMBL-EBI's terms of use
 for MetaboLights.
