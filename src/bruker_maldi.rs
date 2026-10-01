@@ -21,6 +21,13 @@
 //!   the fallback, declared as such ([`PIXEL_FROM_BEAM`]), and only when every positioned frame
 //!   states the same finite size. Either way written as `IMS:1000046/47`, with `IMS:1000044/45` max
 //!   dimension = count × size.
+//! * The sequence's image: a used `.mis` names the photo its areas and teach points are drawn on
+//!   (`<ImageFile>`, beside the `.mis`). It is embedded as `images/image_NNNN.<ext>` with the
+//!   affine the teach points, the raster lattice and the frames' motor positions fix
+//!   ([`crate::mis_registration`], `registration_quality: teach_points`); the teach points go into
+//!   the archive with it. An image that is not beside the sequence, or a sequence that cannot be
+//!   registered, is warned about and recorded ([`SequenceImage`], `registration` /
+//!   `not_registered` in the block).
 //! * The acquisition region: each positioned frame's `RegionNumber` is a parameter of its scan
 //!   ([`REGION_PARAM`], no accession: the imaging profile names no region column yet), which the
 //!   block's `regions` list maps to the region's name. The bounding boxes there cannot tell the
@@ -98,6 +105,12 @@ pub struct MaldiInfo {
     pub mis: Option<Mis>,
     /// A `.mis` beside the `.d` that is not used, and why ([`Self::mis_mismatch`]).
     pub mis_rejected: Option<(String, String)>,
+    /// The image the used sequence names ([`SequenceImage`]), when it names one.
+    pub sequence_image: Option<SequenceImage>,
+    /// The teach-point registration of that image onto the pixel grid
+    /// ([`crate::mis_registration::register`]), or why there is none.
+    pub registration: Option<crate::mis_registration::Registration>,
+    pub registration_failed: Option<String>,
 }
 
 /// One `<Area>` of a FlexImaging `.mis`: its name, raster step (µm) and outline.
@@ -120,6 +133,25 @@ pub struct Mis {
     pub areas: Vec<MisArea>,
     /// The `<TeachPoint>`s, `imgx,imgy;stagex,stagey`: image px and stage µm of the same point.
     pub teach: Vec<((f64, f64), (f64, f64))>,
+    /// `<ReferencePoint>`, image px: the teach point the raster lattice is laid through.
+    pub reference: Option<(f64, f64)>,
+    /// `<ImageFile>`: the image the areas and teach points are drawn on, a name beside the `.mis`.
+    pub image_file: Option<String>,
+    /// `<OriginalImage>`: the file `<ImageFile>` was made from, its name alone (the element holds
+    /// the acquisition PC's path; MSV000088438's `IMG_0000.jpg` is the original at twice its size).
+    pub original_image: Option<String>,
+}
+
+/// The image a sequence names, resolved beside the `.mis`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SequenceImage {
+    /// `<ImageFile>` as named.
+    pub file: String,
+    /// Where it is, when it is beside the `.mis`.
+    pub path: Option<std::path::PathBuf>,
+    /// The sequence's other image names (`<OriginalImage>`), each with whether it is beside the
+    /// `.mis`: recorded, not embedded (the teach points are in `<ImageFile>`'s pixels).
+    pub others: Vec<(String, bool)>,
 }
 
 /// Read a `.mis`; `None` when it cannot be read or has no `<Area>`.
@@ -163,6 +195,12 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
                             mis.teach.extend(pair(image).zip(pair(stage)));
                         }
                     }
+                    (b"ReferencePoint", _) if !in_area => mis.reference = pair(&text),
+                    // Names only: `<OriginalImage>` holds a path on the acquisition PC
+                    // (`C:\Users\…\IMG_1357.jpg`), and a name with a separator would leave the
+                    // directory the `.mis` is in.
+                    (b"ImageFile", _) if !in_area => mis.image_file = file_name_of(&text),
+                    (b"OriginalImage", _) if !in_area => mis.original_image = file_name_of(&text),
                     _ => {}
                 }
             }
@@ -186,6 +224,13 @@ pub fn read_mis_from(file: &str, input: impl std::io::BufRead) -> Option<Mis> {
         buf.clear();
     }
     (!mis.areas.is_empty()).then_some(mis)
+}
+
+/// The last path component of a Windows or POSIX path in a `.mis` text element, trimmed; `None`
+/// when empty.
+fn file_name_of(text: &str) -> Option<String> {
+    let name = text.trim().rsplit(['\\', '/']).next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// `MaldiFrameInfo` of an open TSF/TDF database; `None` without the table or its position columns.
@@ -273,6 +318,7 @@ pub fn read_dot_d(dot_d: &Path) -> Option<MaldiInfo> {
     })?;
     info.mis = read_mis(&dot_d.with_extension("mis"));
     info.check_mis();
+    info.register_sequence_image(dot_d.parent().unwrap_or(Path::new("")));
     // Once per conversion: every lane reads the run's positions here, once.
     if info.unpositioned > 0 {
         log::warn!(
@@ -397,6 +443,50 @@ impl MaldiInfo {
         self.mis_rejected = Some((file, reason));
     }
 
+    /// Register the used sequence's image on the pixel grid
+    /// ([`crate::mis_registration::register`]) and find the image beside the `.mis` in `dir`.
+    /// Warned once here, like the positions: an image that is not beside the sequence, and a
+    /// sequence whose image cannot be registered (no image is embedded then: an unplaced photo
+    /// of the target says nothing a reader can use, and `--image` can still add it).
+    pub fn register_sequence_image(&mut self, dir: &Path) {
+        let Some(mis) = &self.mis else { return };
+        self.sequence_image = mis.image_file.as_ref().map(|file| {
+            let path = dir.join(file);
+            SequenceImage {
+                file: file.clone(),
+                path: path.is_file().then_some(path),
+                others: mis.original_image.iter().filter(|o| *o != file).map(|o| (o.clone(), dir.join(o).is_file())).collect(),
+            }
+        });
+        match crate::mis_registration::register(self, mis) {
+            Ok(reg) => {
+                log::info!(
+                    "Bruker MALDI: {} registers {} on the pixel grid through its {} teach points (reference point on raster node {:?}; {} spots checked)",
+                    mis.file,
+                    mis.image_file.as_deref().unwrap_or("no image"),
+                    mis.teach.len(),
+                    reg.reference_index,
+                    reg.spots_checked
+                );
+                self.registration = Some(reg);
+            }
+            Err(reason) => {
+                if let Some(img) = &self.sequence_image {
+                    log::warn!("Bruker MALDI: {} names the image {}, which is not embedded: it cannot be registered on the pixel grid ({reason})", mis.file, img.file);
+                }
+                self.registration_failed = Some(reason);
+            }
+        }
+        if let Some(img) = self.sequence_image.as_ref().filter(|i| i.path.is_none()) {
+            log::warn!(
+                "Bruker MALDI: {} names the image {}, which is not beside it: no image is embedded ({})",
+                mis.file,
+                img.file,
+                if self.registration.is_some() { "the registration is recorded; add the image later with --image" } else { "nor could it be registered" }
+            );
+        }
+    }
+
     pub fn pixel_size(&self) -> Option<(f64, f64)> {
         self.pixel_size_from().map(|(p, _)| p)
     }
@@ -498,6 +588,15 @@ impl MaldiInfo {
             "y_index": range(|s| s.y, &mut self.spots.values()),
             "mis": self.mis.as_ref().map(|m| &m.file),
             "mis_rejected": self.mis_rejected.as_ref().map(|(file, reason)| serde_json::json!({"file": file, "reason": reason})),
+            // The sequence's image and its teach-point registration (D8): the matrix lives here
+            // even when the image was not beside the sequence, so `--image` can place it later.
+            "sequence_image": self.sequence_image.as_ref().map(|i| serde_json::json!({
+                "file": i.file,
+                "found": i.path.is_some(),
+                "other_images": i.others.iter().map(|(name, found)| serde_json::json!({"file": name, "found": found})).collect::<Vec<_>>(),
+            })),
+            "registration": self.registration.as_ref().zip(self.mis.as_ref()).map(|(r, m)| r.json(&m.file)),
+            "not_registered": self.registration_failed,
             "region_parameter": self.spots.values().any(|s| s.region.is_some()).then(|| format!("each positioned frame's scan states its region_number as the parameter '{REGION_PARAM}'")),
             "regions": regions.iter().map(|(r, spots)| serde_json::json!({
                 "region_number": r,
@@ -777,8 +876,21 @@ mod tests {
         assert_eq!(info.pixel_size_from(), None);
         assert!(info.block()["pixel_size"].as_str().unwrap().contains("different raster steps"));
         // A .mis the regions do not map onto is ignored.
-        info.mis = Some(Mis { file: "other.mis".into(), areas: vec![mis.areas[0].clone()], teach: vec![] });
+        info.mis = Some(Mis { file: "other.mis".into(), areas: vec![mis.areas[0].clone()], ..Default::default() });
         assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)));
+    }
+
+    /// `<ImageFile>`, `<OriginalImage>` (a path on the acquisition PC: its name alone) and
+    /// `<ReferencePoint>` are read; a sequence without them has none.
+    #[test]
+    fn the_mis_names_its_image_and_reference_point() {
+        let mis = read_mis_from("run.mis", crate::mis_registration::tests::TSF.mis.as_bytes()).unwrap();
+        assert_eq!((mis.image_file.as_deref(), mis.original_image.as_deref(), mis.reference), (Some("IMG_0000.jpg"), Some("IMG_1357.jpg"), Some((1252.0, 776.0))));
+        assert_eq!((mis.teach.len(), mis.areas.len()), (3, 4));
+        let bare = read_mis_from("run.mis", MIS.as_bytes()).unwrap();
+        assert_eq!((bare.image_file, bare.original_image, bare.reference), (None, None, None));
+        assert_eq!(file_name_of(" ../up/x.png "), Some("x.png".into()), "a name, never a path");
+        assert_eq!(file_name_of("C:\\dir\\"), None);
     }
 
     /// A region number with no `<Area>`: the `.mis` is not used at all — no names, no raster step —
