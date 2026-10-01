@@ -1499,8 +1499,10 @@ fn apply_encodings(
 
 /// Carry the original index `metadata` blocks into `w`, add a `data_processing` entry, and add the
 /// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members, and
-/// `encoding_prescan` names its spectrum by the new index ([`renumber_prescan_block`]); `ims_calibration`
-/// and every other block are preserved verbatim. The provenance block's `renumbered` lists the entities
+/// `encoding_prescan` names its spectrum by the new index ([`renumber_prescan_block`]); `fidelity`
+/// is left out when spectra were filtered out, since its point counts and error bounds describe
+/// the source archive's facets (the provenance block's `dropped_index_blocks` says so), and is
+/// carried unchanged otherwise; `ims_calibration` and every other block are preserved verbatim. The provenance block's `renumbered` lists the entities
 /// (`spectrum`, `wavelength_spectrum`) whose kept indices were renumbered 0..n-1, every column holding
 /// such an index with them; their ids are the source's.
 #[allow(clippy::too_many_arguments)]
@@ -1514,10 +1516,15 @@ fn carry_index_metadata(
     spectra: Option<&Survivors>,
     renumbered: &[&str],
 ) -> Result<()> {
+    // Signal rows left the archive: a block that counts them no longer describes it.
+    let signal_rewritten = spectra.is_some_and(|s| s.kept.len() != s.total);
+    let mut dropped_blocks: Vec<&str> = Vec::new();
     if let Some(meta) = index.get("metadata").and_then(|m| m.as_object()) {
         for (k, v) in meta {
             // data_processing_method_list gets an appended entry; everything else verbatim.
-            if k == "data_processing_method_list" {
+            if k == crate::fidelity::BLOCK && signal_rewritten {
+                dropped_blocks.push(crate::fidelity::BLOCK);
+            } else if k == "data_processing_method_list" {
                 let mut list = v.clone();
                 if let Some(arr) = list.as_array_mut() {
                     arr.push(filter_processing_entry(opts));
@@ -1539,7 +1546,7 @@ fn carry_index_metadata(
             }
         }
     }
-    let provenance = serde_json::json!({
+    let mut provenance = serde_json::json!({
         "source": input.file_name().and_then(|n| n.to_str()).unwrap_or(""),
         "rt": opts.rt.map(|(a, b)| serde_json::json!([a, b])),
         "ms_level": opts.ms_levels,
@@ -1548,6 +1555,9 @@ fn carry_index_metadata(
         "renumbered": renumbered,
         "tool_version": env!("CARGO_PKG_VERSION"),
     });
+    if !dropped_blocks.is_empty() {
+        provenance["dropped_index_blocks"] = dropped_blocks.into();
+    }
     w.add_index_metadata("filter", &provenance)
         .map_err(|e| anyhow!("index metadata filter: {e}"))?;
     Ok(())

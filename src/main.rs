@@ -75,6 +75,7 @@ mod vendor;
 mod embed_aux;
 mod filter;
 mod encoding_prescan;
+mod fidelity;
 mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
@@ -221,6 +222,28 @@ fn mz_lattice_enabled() -> bool {
     env_flag("MZPC_NO_MZ_LATTICE") != Some(true)
 }
 
+/// `--keep-zero-runs`, published the same way and for the same reason as [`NO_MZ_LATTICE`]: six
+/// lanes build a writer, and the writer's second `build` argument is the only place the choice
+/// lands. Default (unset) = the zero-run mask is ON.
+static KEEP_ZERO_RUNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Is the writer's zero-run mask off on this run? `--keep-zero-runs` (config `keep_zero_runs`, and
+/// `--lossless`, which implies it) or `$MZPC_KEEP_ZERO_RUNS=1`. With it every profile point the
+/// reader hands over is stored, the all-zero stretches included, and `zero-run-mask` is never
+/// declared.
+fn keep_zero_runs() -> bool {
+    *KEEP_ZERO_RUNS.get().unwrap_or(&false) || env_flag("MZPC_KEEP_ZERO_RUNS") == Some(true)
+}
+
+/// `--lossless`, published like [`NO_MZ_LATTICE`]. [`Settings::resolve`] has already turned it into
+/// the point layout with zero runs kept and no m/z grid; what remains for the lanes is the check
+/// that the archive came out bit-exact ([`finish_archive`], [`fidelity::check_lossless`]).
+static LOSSLESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn lossless() -> bool {
+    *LOSSLESS.get().unwrap_or(&false)
+}
+
 /// CLI spelling of the signal representation to read. Mirrors `shimadzu::Representation`, and is
 /// also what the Bruker BAF lane consumes directly (that module builds on Linux too, where the
 /// `cfg(windows)` shimadzu enum does not exist).
@@ -288,9 +311,36 @@ struct Cli {
     #[arg(long, value_enum)]
     to: Option<OutputFormat>,
 
-    /// Lossless delta m/z chunking instead of the default lossy numpress-linear.
+    /// Delta m/z chunking instead of the default lossy numpress-linear. Each m/z is stored as its
+    /// difference from the one before, which gives the value back exactly when m/z are 32-bit
+    /// values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor. A 64-bit
+    /// m/z more than twice its predecessor — sparse spectra below about m/z 100 — can come back
+    /// one unit in the last place (about 1e-15 Da) off, and profile zero runs are still masked:
+    /// for an archive that is bit-exact, use `--lossless`.
     #[arg(long)]
     no_numpress: bool,
+
+    /// Keep zero-intensity runs: store every profile point the input holds. By default the writer
+    /// keeps the zeros that flank signal and drops the rest of each all-zero stretch (declared as
+    /// `zero-run-mask`), which leaves each spectrum a different subset of the m/z axis. With this
+    /// flag no profile point is dropped and `zero-run-mask` is not declared; continuous-mode
+    /// imaging data, whose pixels share one m/z axis, decodes to one shared axis only this way.
+    /// `MZPC_KEEP_ZERO_RUNS=1` does the same from the environment. Refused on `--agilent-grid`,
+    /// whose reader leaves the zero samples out itself.
+    #[arg(long)]
+    keep_zero_runs: bool,
+
+    /// A bit-exact archive, or no archive: every point of the input stored in the input's order,
+    /// each m/z and intensity with exactly the value the input holds. Selects the point layout
+    /// with zero runs kept and no numpress, m/z lattice or TOF grid, and after writing checks the
+    /// result (no signal transformation declared, every point stored, no column narrower than the
+    /// input declares); when the check fails the conversion fails and nothing is written. mzML and
+    /// imzML inputs only: on every other lane it is refused. Conflicts with `--layout chunked`,
+    /// `--tof-grid auto|on`, `--agilent-grid` and an mzML output. Larger than the default where
+    /// m/z are 64-bit (2.3× on a 68-million-point profile imaging run), smaller where they are
+    /// 32-bit values.
+    #[arg(long)]
+    lossless: bool,
 
     /// Disable the fixed-point m/z LATTICE for centroid peaks and store f64 `mz` instead.
     ///
@@ -589,6 +639,8 @@ struct FileConfig {
     to: Option<OutputFormat>,
     layout: Option<Layout>,
     no_numpress: Option<bool>,
+    keep_zero_runs: Option<bool>,
+    lossless: Option<bool>,
     no_mz_lattice: Option<bool>,
     chunk_size: Option<f64>,
     zstd_level: Option<i32>,
@@ -625,6 +677,11 @@ struct Settings {
     output_format: OutputFormat,
     layout: Layout,
     no_numpress: bool,
+    /// `--keep-zero-runs` (or `--lossless`): the writer's zero-run mask off.
+    keep_zero_runs: bool,
+    /// `--lossless`: a bit-exact archive or a failed conversion. Already folded into `layout`,
+    /// `no_numpress`, `keep_zero_runs`, `no_mz_lattice` and `tof_grid` by `resolve`.
+    lossless: bool,
     /// `--no-mz-lattice`: store f64 `mz` even when the centroids are on a fixed-point lattice.
     no_mz_lattice: bool,
     chunk_size: f64,
@@ -697,6 +754,8 @@ impl Settings {
         };
         note(cli.layout.is_some(), "--layout");
         note(cli.no_numpress, "--no-numpress");
+        note(cli.keep_zero_runs, "--keep-zero-runs");
+        note(cli.lossless, "--lossless");
         note(cli.no_mz_lattice, "--no-mz-lattice");
         note(cli.chunk_size.is_some(), "--chunk-size");
         note(cli.zstd_level.is_some(), "--zstd-level");
@@ -723,12 +782,40 @@ impl Settings {
         }
         note(cli.via_msconvert, "--via-msconvert");
         note(cli.msconvert_path.is_some(), "--msconvert-path");
+        // `--lossless` is an umbrella: it IS the point layout with zero runs kept and no m/z grid
+        // of any kind. A setting that asks for the opposite, on the command line or in the config
+        // file, is a contradiction to refuse, not a preference to override in silence.
+        let lossless = cli.lossless || fc.lossless.unwrap_or(false);
+        let layout = cli.layout.or(fc.layout);
+        let tof_grid = cli.tof_grid.or(fc.tof_grid);
+        let agilent_grid = cli.agilent_grid || fc.agilent_grid.unwrap_or(false);
+        if lossless {
+            let against: Vec<&str> = [
+                (layout == Some(Layout::Chunked), "--layout chunked"),
+                (matches!(tof_grid, Some(TofGridMode::Auto | TofGridMode::On)), "--tof-grid auto|on"),
+                (agilent_grid, "--agilent-grid"),
+                (output_format == OutputFormat::Mzml, "an mzML output (--to mzml or an .mzML name)"),
+            ]
+            .into_iter()
+            .filter_map(|(on, what)| on.then_some(what))
+            .collect();
+            if !against.is_empty() {
+                bail!(
+                    "--lossless conflicts with {} (command line or config file): it writes a \
+                     bit-exact mzPeak archive in the point layout, with zero runs kept and no m/z \
+                     grid. Drop one or the other.",
+                    against.join(", ")
+                );
+            }
+        }
         Ok(Settings {
             output,
             output_format,
-            layout: cli.layout.or(fc.layout).unwrap_or(Layout::Chunked),
-            no_numpress: cli.no_numpress || fc.no_numpress.unwrap_or(false),
-            no_mz_lattice: cli.no_mz_lattice || fc.no_mz_lattice.unwrap_or(false),
+            layout: if lossless { Layout::Point } else { layout.unwrap_or(Layout::Chunked) },
+            no_numpress: lossless || cli.no_numpress || fc.no_numpress.unwrap_or(false),
+            keep_zero_runs: lossless || cli.keep_zero_runs || fc.keep_zero_runs.unwrap_or(false),
+            lossless,
+            no_mz_lattice: lossless || cli.no_mz_lattice || fc.no_mz_lattice.unwrap_or(false),
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
             zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(3),
             // 22, not 5: the chunked timsTOF layout is written once and read many times, and the
@@ -749,8 +836,8 @@ impl Settings {
             aux: if cli.aux.is_empty() { fc.aux.unwrap_or_default() } else { cli.aux.clone() },
             image: if cli.image.is_empty() { fc.image.unwrap_or_default() } else { cli.image.clone() },
             sdrf: cli.sdrf.clone().or(fc.sdrf),
-            tof_grid: cli.tof_grid.or(fc.tof_grid),
-            agilent_grid: cli.agilent_grid || fc.agilent_grid.unwrap_or(false),
+            tof_grid: if lossless { Some(TofGridMode::Off) } else { tof_grid },
+            agilent_grid,
             via_msconvert: cli.via_msconvert || fc.via_msconvert.unwrap_or(false),
             msconvert_path: cli.msconvert_path.clone().or(fc.msconvert_path),
             representation: cli.representation.or(fc.representation).unwrap_or(RepresentationArg::Both),
@@ -802,6 +889,11 @@ impl TmpGuard {
     fn new(path: &Path) -> Self {
         track_tmp_in_flight(path);
         Self { path: path.to_path_buf() }
+    }
+
+    /// The tmp file, for a read of what has been written to it so far.
+    fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Put `path` in the panic hook's sweep; `dir` for a directory to remove with its contents,
@@ -1089,6 +1181,8 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     // Published out-of-band like `--representation` (see NO_MZ_LATTICE): from the RESOLVED setting,
     // so a config-file `no_mz_lattice: true` counts as much as the flag.
     let _ = NO_MZ_LATTICE.set(cfg.no_mz_lattice);
+    let _ = KEEP_ZERO_RUNS.set(cfg.keep_zero_runs);
+    let _ = LOSSLESS.set(cfg.lossless);
     let verbose = cfg.verbose > 0;
 
     // Inspection report: always when there is no output (the whole job is "inspect"), and also as a
@@ -1246,7 +1340,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     // but paid for with 27% more space). Its fidelity is data-dependent -- it IS exact on the
     // centroid mzML export of the same acquisition -- so this defaults per vendor, not globally.
     // The strategy requested here is provisional. `refine_chunking` swaps numpress-linear for
-    // lossless delta once real m/z has been sampled and found to sit on a fixed-point lattice --
+    // delta once real m/z has been sampled and found to sit on a fixed-point lattice --
     // superseding the `is_lcd()` guess this used to make, which was right about Shimadzu's NATIVE
     // lane and wrong about msconvert's mzML of the very same acquisition.
     let chunk = match cfg.layout {
@@ -1517,7 +1611,9 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
         // The mzML dispatch runs before SDK selection, so `--bruker-sdk` picks a backend the export
         // never consults — that is a choice silently overridden, not an inert flag.
         Lane::MzmlExport => &["--image", "--sdrf", "--aux", "--bruker-sdk"],
-        Lane::AgilentGrid => &["--image", "--sdrf", "--via-msconvert"],
+        // `--keep-zero-runs`: the file-direct reader leaves the zero samples out of its point lists
+        // itself (`agilent:drop-zero-samples`), so the archive would come out without them.
+        Lane::AgilentGrid => &["--image", "--sdrf", "--via-msconvert", "--keep-zero-runs"],
         // Lane selection puts msconvert before every native backend, so these four would be
         // silently overridden — the user chose a reader and gets a different one.
         Lane::ViaMsconvert => &["--aux", "--bruker-sdk", "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
@@ -1536,13 +1632,13 @@ fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
     const CODEC: &[&str] = &["--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level"];
     match lane {
         Lane::Filter => &[
-            "--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level",
+            "--layout", "--no-numpress", "--keep-zero-runs", "--no-mz-lattice", "--chunk-size", "--zstd-level",
             "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--aux", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
         ],
         Lane::FilterToMzml => &[
-            "--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level",
+            "--layout", "--no-numpress", "--keep-zero-runs", "--no-mz-lattice", "--chunk-size", "--zstd-level",
             "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
@@ -1553,12 +1649,13 @@ fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
         // timsrust's linear map would contradict its own arrays (9 % of the MS2 peaks of a
         // diaPASEF run outside their window), which a precursor-assigning reader cannot see.
         Lane::MzmlExport => &[
-            "--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level",
+            "--layout", "--no-numpress", "--keep-zero-runs", "--no-mz-lattice", "--chunk-size", "--zstd-level",
             "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration", "--no-chromatograms",
             "--tof-grid", "--agilent-grid",
         ],
         Lane::AgilentGrid => &["--layout", "--no-numpress", "--chunk-size"],
-        Lane::SdkImsCompact | Lane::ImsCompact => &["--layout", "--no-numpress"],
+        // `--keep-zero-runs`: a timsTOF frame holds the detector's hits, no zero-intensity point.
+        Lane::SdkImsCompact | Lane::ImsCompact => &["--layout", "--no-numpress", "--keep-zero-runs"],
         // No chunked TOF layout off the timsTOF ims-compact lane — which falls back to `Standard`
         // on a TDF timsrust cannot decompress, and checks this list again when it does.
         Lane::VendorReader | Lane::Standard => &["--ims-chunked", "--no-ims-chunked"],
@@ -1577,6 +1674,24 @@ fn refuse_unsupported_flags(lane: Lane, cfg: &Settings) -> Result<()> {
         list.iter().copied().filter(|f| cfg.given.contains(f)).collect()
     };
     let (name, remedy) = lane.describe();
+    // `--lossless` (config `lossless: true` included: it is a promise about the archive, not a
+    // codec preference) holds on the standard lane's mzML and imzML inputs, where the stored signal
+    // is checked against what the file declares. Everywhere else it is refused, not approximated.
+    if cfg.lossless && lane != Lane::Standard {
+        bail!(
+            "--lossless is not available on {name}: it is checked for mzML and imzML inputs only, \
+             and here the converter could not show that the stored signal equals the source bit \
+             for bit. Convert without it (`transformations` and `fidelity` in the archive index \
+             state what was changed and by how much){}.",
+            match lane {
+                Lane::ImsCompact | Lane::SdkImsCompact =>
+                    "; this lane stores the vendor's integer TOF and scan indices as they are",
+                Lane::ViaMsconvert => "; or run msconvert yourself and convert its mzML with --lossless",
+                Lane::Filter | Lane::FilterToMzml => "; an existing archive is re-packed, never re-encoded",
+                _ => "",
+            }
+        );
+    }
     // mzML lanes produce a document, not an archive; say the right noun in the message.
     let product = match lane {
         Lane::FilterToMzml | Lane::MzmlExport => "output",
@@ -1899,8 +2014,9 @@ fn is_agilent_ims_d(input: &Path) -> bool {
 }
 
 /// Refine a requested chunking strategy against real m/z values: numpress-linear's floating-point
-/// prediction fights a fixed-point lattice, so swap it for lossless delta when the data is on one.
-/// An explicitly requested delta (`--no-numpress`) is left alone.
+/// prediction fights a fixed-point lattice, so swap it for delta when the data is on one (exact
+/// wherever a value is at most twice its predecessor, see `Cli::no_numpress`). An explicitly
+/// requested delta (`--no-numpress`) is left alone.
 ///
 /// The detector itself moved to [`mz_lattice::fixed_point_lattice_scale`] (formerly the local
 /// `is_fixed_point_lattice`, returning a bool) because the lattice ROUTE needs the matched scale,
@@ -1914,8 +2030,8 @@ fn refine_chunking(
             if mz_lattice::fixed_point_lattice_scale(sample_mz).is_some() =>
         {
             log::info!(
-                "m/z is on a fixed-point lattice; using lossless delta chunking (numpress-linear \
-                 would be both larger and lossy on this data)"
+                "m/z is on a fixed-point lattice; using delta chunking (numpress-linear would be \
+                 both larger and lossier on this data)"
             );
             Some(ChunkingStrategy::Delta { chunk_size })
         }
@@ -3268,9 +3384,11 @@ fn convert_file_tof_grid(
     // facet matches what we write (the synthesized TIC/base-peak are f64 — sampling f64 source
     // chromatograms keeps the schema f64 and avoids an f32/f64 record-batch mismatch).
     builder = builder.sample_array_types_from_chromatograms(chromatograms_by_index(&mut reader).take(10).map(schema_sample_chromatogram));
-    let mut writer = builder.build(handle, true);
+    let mut writer = builder.build(handle, !keep_zero_runs());
     writer.copy_metadata_from(&reader);
     let mut source_refs = None;
+    // An mzML hands each array over at its declared binary type; the fidelity block states them.
+    let mut source_tally = fidelity::SourceTally::new(matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)));
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
         source_refs = Some(mzml_refs::DanglingRefs::check(read_path, &mut writer));
@@ -3294,6 +3412,8 @@ fn convert_file_tof_grid(
         if let Some(r) = source_refs.as_mut() {
             r.check_scans(entry.description_mut());
         }
+        // The source's points, before the grid route re-shapes the arrays.
+        source_tally.observe(&entry);
         let spec = match tof_grid_spectrum(&entry, &grid)? {
             TofRoute::Gridded(s) => {
                 n_gridded += 1;
@@ -3341,6 +3461,7 @@ fn convert_file_tof_grid(
         .chain(partial_marker(input, cap, n))
         .chain(acquisition_block)
         .chain(std::iter::once(transformations_block(&applied)))
+        .chain(std::iter::once(source_tally.block()))
         .collect();
     finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
 }
@@ -3898,6 +4019,15 @@ fn convert_agilent_grid(
         let ps = probe.next_spectrum()?.with_context(|| format!("no profile spectra in {}", input.display()))?;
         agilent_grid_spectrum(&probe, ps, &mut 0.0, &mut 0)?
     };
+    // `--keep-zero-runs` is refused on this lane (`dropped_flags_for`); the environment lever and a
+    // config file's `keep_zero_runs` get the same answer in words, since the reader has already
+    // left the zero samples out.
+    if keep_zero_runs() {
+        log::warn!(
+            "zero runs are not kept on the --agilent-grid lane (MZPC_KEEP_ZERO_RUNS or a config \
+             file's keep_zero_runs): its reader stores a sparse point list (agilent:drop-zero-samples)"
+        );
+    }
     let mut writer = agilent_grid_writer_builder(level, probe).build(handle, true);
     add_processing_metadata(&mut writer);
 
@@ -4223,6 +4353,19 @@ fn convert_file(
     // run). Until mzdata handles the model type, such a file is read on timsrust's two-point chord —
     // an approximation, declared below — rather than on a model that is wrong.
     let tdf_chord = mzdata_tdf_needs_chord(&mut reader, input, &format!("declared as {TDF_CHORD_TRANSFORMATION}"));
+    // `--lossless` compares what is stored with what the FILE declares, which only an mzML or
+    // imzML states (binary types, array lengths). A Thermo `.raw` or a TDF arrives through a
+    // library that has already computed its m/z; `run` cannot tell those from an mzML by lane.
+    if lossless() && !matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
+        bail!(
+            "--lossless is checked for mzML and imzML inputs only, and {} is read as {}: the \
+             converter could not show that the stored signal equals the source bit for bit. \
+             Convert without it (`transformations` and `fidelity` in the archive index state what \
+             was changed and by how much).",
+            input.display(),
+            reader_format(&reader)
+        );
+    }
 
     let is_imzml = matches!(reader, MZReaderType::IMzML(_));
 
@@ -4388,10 +4531,17 @@ fn convert_file(
         builder = builder.add_peak_grid_policies(lattice_fit_grid_policy());
     }
     builder = builder.sample_array_types_from_spectrum_source(&mut reader);
-    builder = builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader);
+    builder = if lossless() {
+        // `--lossless` writes a centroid spectrum's own arrays (see the write loop), so the peak
+        // facet's columns take the binary types the file declares, from the same arrays.
+        builder.sample_array_types_for_peaks_from_spectra(probes.iter().cloned().map(without_peak_sets))
+    } else {
+        builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader)
+    };
     builder = builder.sample_array_types_from_chromatograms(chromatograms_by_index(&mut reader).take(10).map(schema_sample_chromatogram));
 
-    let mut writer = builder.build(handle, true);
+    // The zero-run mask, unless `--keep-zero-runs` / `--lossless` keeps every profile point.
+    let mut writer = builder.build(handle, !keep_zero_runs());
 
     // Positions stated as scan cvParams (imzML, an mzML with positions) are promoted to the
     // `position_*` columns. Their column mappings name IMS terms, so the IMS vocabulary is declared
@@ -4499,6 +4649,9 @@ fn convert_file(
     let mut n = 0usize;
     let cap = max_spectra();
     let mut ms1 = Ms1Chroms::default();
+    // The fidelity block's source side: points and, for mzML and imzML (whose arrays arrive at
+    // their declared binary types), the numeric types.
+    let mut source_tally = fidelity::SourceTally::new(matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)));
     // Whether any spectrum was actually re-ordered below — declared in `transformations` so a
     // reader knows the stored point order is not the source's.
     let mut resorted = false;
@@ -4509,6 +4662,9 @@ fn convert_file(
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
+        }
+        if lossless() {
+            entry = without_peak_sets(entry);
         }
         // The mzPeak peaks facet requires non-decreasing m/z within a spectrum.
         if entry.has_ion_mobility_dimension() {
@@ -4572,6 +4728,7 @@ fn convert_file(
         if synth_chroms {
             ms1.observe(&entry);
         }
+        source_tally.observe(&entry);
         writer.write_spectrum(&entry)?;
         n += 1;
     }
@@ -4671,8 +4828,21 @@ fn convert_file(
             applied.extend(chromatogram_transforms);
             applied
         })))
+        .chain(std::iter::once(source_tally.block()))
         .collect();
     finish_archive(writer, tmp_guard, output, input, vendor, Some(AuxInputs { images, sdrf }), &index_blocks)
+}
+
+/// `--lossless`: a spectrum without the peak sets mzdata built from its arrays, so the writer stores
+/// the arrays themselves. mzdata's centroid peak set holds f64 m/z and f32 intensity in m/z order,
+/// whatever the file declares: a 64-bit intensity would be narrowed and an out-of-order list
+/// sorted, neither of them declared. A spectrum with no arrays keeps what it has.
+fn without_peak_sets(mut spectrum: MultiLayerSpectrum) -> MultiLayerSpectrum {
+    if spectrum.arrays.is_some() {
+        spectrum.peaks = None;
+        spectrum.deconvoluted_peaks = None;
+    }
+    spectrum
 }
 
 /// RAII cleanup for the sanitized copy [`sanitize_param_groups`] may write (an mzML with empty
@@ -6074,7 +6244,9 @@ fn convert_ims_compact_sdk(
 /// lists was dropped; [`mzml_refs`]). An entry names the transformation and never how often it was
 /// applied, which the run's warning says; `tof-grid:<ppm>ppm` is the one entry with a parameter, the
 /// bound its grid was accepted within. [`finish_archive`] mirrors the list into this conversion's
-/// processing method ([`mirror_transformations`]).
+/// processing method ([`mirror_transformations`]) and writes the `fidelity` block beside it, which
+/// says by how much ([`fidelity`]). An entry that changes spectrum signal also belongs in
+/// [`fidelity::SIGNAL_TRANSFORMATIONS`], the set `--lossless` fails on.
 fn transformations_block(applied: &[String]) -> (String, serde_json::Value) {
     ("transformations".to_string(), serde_json::json!(applied))
 }
@@ -6133,11 +6305,12 @@ struct AuxInputs<'a> {
     sdrf: Option<&'a Path>,
 }
 
-/// **The one archive epilogue.** Every lane that writes an `.mzpeak` ends here: flush Parquet, write
-/// the lane's index blocks IN ORDER, stream-embed vendor side-files + vendor metadata, then optical
-/// images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding the `metadata.imaging` /
-/// `metadata.study` / `metadata.sample_metadata` blocks — close the ZIP, and only then rename the
-/// temporary onto `output`.
+/// **The one archive epilogue.** Every lane that writes an `.mzpeak` ends here: flush Parquet, read
+/// the two signal facets back for the `fidelity` block (and, under `--lossless`, fail unless they
+/// are bit-exact), write the lane's index blocks IN ORDER, stream-embed vendor side-files + vendor
+/// metadata, then optical images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding
+/// the `metadata.imaging` / `metadata.study` / `metadata.sample_metadata` blocks — close the ZIP,
+/// and only then rename the temporary onto `output`.
 ///
 /// Through 0.11.5 there were six copies of this sequence (M17), and they had drifted: one lane dropped
 /// the `acquisition_time` block, another applied a different vendor-embed rule, and `--sdrf` on
@@ -6163,10 +6336,42 @@ fn finish_archive(
         let applied: Vec<&str> = block.as_array().into_iter().flatten().filter_map(serde_json::Value::as_str).collect();
         mirror_transformations(&mut writer, &applied);
     }
+    let applied: Vec<&str> = index_blocks
+        .iter()
+        .find(|(key, _)| key == "transformations")
+        .and_then(|(_, block)| block.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
     let mut zip: ZipArchiveWriter<fs::File> = writer.finish_parquet()?;
-    for (key, block) in index_blocks {
+    zip.flush().context("flushing the archive before its signal facets are read back")?;
+    // The fidelity block: the lane's count of what the reader handed over (when the lane counts),
+    // completed from the two signal facets as they now sit in the archive. A record, so a failure
+    // to read them back costs the block and a warning, not the conversion; under `--lossless` it
+    // is the evidence, and its absence fails the run.
+    let lane_fidelity = index_blocks.iter().find(|(key, _)| key == fidelity::BLOCK).map(|(_, block)| block);
+    let started = std::time::Instant::now();
+    let fidelity_block = match fidelity::complete(lane_fidelity, tmp_guard.path(), &applied) {
+        Ok(block) => {
+            log::debug!("fidelity block: signal facets read back in {:.3} s", started.elapsed().as_secs_f64());
+            Some(block)
+        }
+        Err(e) if lossless() => return Err(e.context("--lossless: reading the written signal back")),
+        Err(e) => {
+            log::warn!("fidelity index block not written: {e:#}");
+            None
+        }
+    };
+    if let (true, Some(block)) = (lossless(), &fidelity_block) {
+        fidelity::check_lossless(block, &applied)?;
+    }
+    for (key, block) in index_blocks.iter().filter(|(key, _)| key != fidelity::BLOCK) {
         zip.add_index_metadata(key, block)
             .with_context(|| format!("writing {key} index block"))?;
+    }
+    if let Some(block) = &fidelity_block {
+        zip.add_index_metadata(fidelity::BLOCK, block).context("writing fidelity index block")?;
     }
     embed_vendor_members(&mut zip, input, vendor)?;
     if let Some(aux) = aux {
@@ -6899,7 +7104,7 @@ fn convert_sciex_grid(
     if mode != TofGridMode::Off {
         builder = builder.add_grid_policies(exact_sqrt_grid_policy()).add_peak_grid_policies(exact_sqrt_grid_policy());
     }
-    let mut writer = builder.build(handle, true);
+    let mut writer = builder.build(handle, !keep_zero_runs());
     add_processing_metadata(&mut writer);
 
     let mut ms1 = Ms1Chroms::default();
@@ -7293,6 +7498,8 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         imaging: imaging_hints,
     } = hints;
     let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
+    // `--keep-zero-runs` (or its environment lever) on top of what the lane itself asks for.
+    let keep_zero_runs = keep_zero_runs || crate::keep_zero_runs();
     // MALDI imaging from a Bruker `.d` (the TSF lane): each frame's raster position.
     let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
     let mut index_blocks = index_blocks;
@@ -7374,7 +7581,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // Written once — or twice, when the pre-scan chose int32 intensities and a spectrum then carries
     // one int32 cannot hold exactly: that run is discarded and rewritten with the best float arm.
     let mut int32_fallback: Option<usize> = None;
-    let (mut writer, ms1, tally, counted_before) = 'attempt: loop {
+    let (mut writer, ms1, tally, counted_before, source_tally) = 'attempt: loop {
         let trial = prescan.as_ref().map(|(t, _, _)| *t);
         let int32 = trial.is_some_and(|t| t.intensity.int32);
         let mut schema_probes = probes.clone();
@@ -7408,6 +7615,9 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         // Count here, over the written spectra: the probe and sample fetches above went through
         // the same closure and must not show up in the run totals.
         let mut tally = FacetTally::default();
+        // The fidelity block's source side. A vendor reader's array types are its own choice, not
+        // the file's, so only the points are counted.
+        let mut source_tally = fidelity::SourceTally::new(false);
         let counted_before: Vec<usize> = counters.iter().map(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
         for i in 0..len {
             let VendorSpectrum { spectrum: mut spec, routes } = spectrum(i)?.into();
@@ -7431,9 +7641,10 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
             if synth_chroms {
                 ms1.observe(&spec);
             }
+            source_tally.observe(&spec);
             writer.write_spectrum(&spec)?;
         }
-        break (writer, ms1, tally, counted_before);
+        break (writer, ms1, tally, counted_before, source_tally);
     };
     if let Some((chosen, _, mut block)) = prescan {
         if let Some(i) = int32_fallback {
@@ -7511,10 +7722,21 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // The Shimadzu profile route's pad trim, from the routes of the written spectra.
     if tally.profile_span_trimmed > 0 {
         declare(&mut applied, "shimadzu:span-trim");
+        // The pad at the scan-window bounds is off the sqrt grid, so the grid route leaves it out
+        // whatever the writer's mask does: say so rather than let the flag look honoured.
+        if keep_zero_runs {
+            log::warn!(
+                "zero runs are kept, but the Shimadzu sqrt-grid route still left the zero pad at \
+                 the scan-window bounds out of {} spectra (shimadzu:span-trim); --layout point \
+                 stores every point",
+                tally.profile_span_trimmed
+            );
+        }
     }
     applied.extend(chromatogram_transforms);
     index_blocks.extend(partial_marker(input, max_spectra(), len));
     index_blocks.push(transformations_block(&applied));
+    index_blocks.push(source_tally.block());
     // No aux: `--image`/`--sdrf` are refused on the native vendor lanes (`run`).
     finish_archive(writer, tmp_guard, output, input, vendor, None, &index_blocks)?;
     Ok(tally)
@@ -12362,6 +12584,58 @@ mod tests {
         assert!(s.given.is_empty(), "config-file values must not be 'given': {:?}", s.given);
         assert_eq!(s.zstd_level, 5, "…while still taking effect as the default");
         assert!(refuse_unsupported_flags(Lane::ImsCompact, &s).is_ok(), "a profile's sdrf must not refuse a lane");
+    }
+
+    /// `--lossless` is the point layout with zero runs kept and no m/z grid, from the command line
+    /// or the config file; a setting that asks for the opposite is refused where it is resolved;
+    /// and the lane tables hold `--keep-zero-runs` where a lane cannot honour it (refused on
+    /// `--agilent-grid`, whose reader drops the zeros itself; inert where nothing is masked) and
+    /// nowhere else. `--lossless` passes the standard lane only, config value included.
+    #[test]
+    fn lossless_and_keep_zero_runs_resolve_and_meet_the_lane_tables() {
+        let resolve = |args: &[&str]| {
+            let argv: Vec<&str> = ["mzpeak-convert", TINY].into_iter().chain(args.iter().copied()).collect();
+            Settings::resolve(&Cli::try_parse_from(argv).unwrap())
+        };
+        let s = resolve(&[]).unwrap();
+        assert!(!s.lossless && !s.keep_zero_runs && s.layout == super::Layout::Chunked && !s.no_numpress && s.tof_grid.is_none());
+        let s = resolve(&["--keep-zero-runs"]).unwrap();
+        assert!(s.keep_zero_runs && !s.lossless && s.layout == super::Layout::Chunked && s.given.contains(&"--keep-zero-runs"));
+
+        let dir = scratch("lossless-cfg");
+        let cfg = dir.join("c.yaml");
+        fs::write(&cfg, "lossless: true\n").unwrap();
+        for s in [resolve(&["--lossless"]).unwrap(), resolve(&["--config", cfg.to_str().unwrap()]).unwrap()] {
+            assert!(s.lossless && s.keep_zero_runs && s.no_numpress && s.no_mz_lattice);
+            assert_eq!((s.layout, s.tof_grid), (super::Layout::Point, Some(super::TofGridMode::Off)));
+            assert!(refuse_unsupported_flags(Lane::Standard, &s).is_ok());
+            for lane in [Lane::Filter, Lane::FilterToMzml, Lane::AgilentGrid, Lane::ViaMsconvert, Lane::SdkImsCompact, Lane::BrukerSdk, Lane::ImsCompact, Lane::VendorReader] {
+                let e = refuse_unsupported_flags(lane, &s).unwrap_err().to_string();
+                assert!(e.contains("--lossless is not available on"), "{lane:?}: {e}");
+            }
+        }
+        fs::write(&cfg, "keep_zero_runs: true\ntof_grid: on\n").unwrap();
+        assert!(resolve(&["--config", cfg.to_str().unwrap()]).unwrap().keep_zero_runs);
+        for (args, what) in [
+            (&["--lossless", "--layout", "chunked"][..], "--layout chunked"),
+            (&["--lossless", "--tof-grid", "on"][..], "--tof-grid auto|on"),
+            (&["--lossless", "--agilent-grid"][..], "--agilent-grid"),
+            (&["--lossless", "--to", "mzml"][..], "an mzML output"),
+            (&["--lossless", "--config", cfg.to_str().unwrap()][..], "--tof-grid auto|on"),
+        ] {
+            let e = resolve(args).err().unwrap_or_else(|| panic!("{args:?} resolved")).to_string();
+            assert!(e.contains("--lossless conflicts with") && e.contains(what), "{args:?}: {e}");
+        }
+        assert!(resolve(&["--lossless", "--layout", "point", "--tof-grid", "off", "--no-numpress"]).is_ok());
+
+        let flag = "--keep-zero-runs";
+        assert!(super::dropped_flags_for(Lane::AgilentGrid).contains(&flag));
+        for lane in [Lane::Filter, Lane::FilterToMzml, Lane::MzmlExport, Lane::SdkImsCompact, Lane::ImsCompact] {
+            assert!(super::inert_flags_for(lane).contains(&flag) && !super::dropped_flags_for(lane).contains(&flag), "{lane:?}");
+        }
+        for lane in [Lane::Standard, Lane::ViaMsconvert, Lane::VendorReader, Lane::BrukerSdk] {
+            assert!(!super::inert_flags_for(lane).contains(&flag) && !super::dropped_flags_for(lane).contains(&flag), "{lane:?} honours it");
+        }
     }
 
     /// Every lane refusing `--image` names a remedy that works: the second run on the archive, which
