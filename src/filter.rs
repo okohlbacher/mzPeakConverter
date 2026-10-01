@@ -1550,6 +1550,15 @@ fn replace_struct_child(s: &StructArray, pos: usize, new_child: ArrayRef) -> Res
 /// larger than the converter wrote it in one 178 MiB group and 20.0 % larger in 11 byte-capped
 /// ones; following the source's encodings in parquet's default layout it was 1.5 % larger (laid
 /// out as the source, at this lane's zstd level, it is 4.2 %: see [`apply_layout`]).
+///
+/// The one column group not followed: a chunk's float bounds (`*_chunk_start` / `*_chunk_end`)
+/// where the source holds them dictionary-encoded, as archives written by 0.16.0 or earlier do.
+/// They are nearly all distinct, so the dictionary is the values over again, and every row group
+/// the byte cap makes pays its own: followed, the corpus Lumos peak facet (1 → 4 groups) grew by
+/// 1.19 %; re-encoded the converter's way (byte-stream split, dictionary off, as the vendored
+/// writer has written them since 0.17.0) it is 0.98 % smaller than the source (owner decision D16,
+/// 2026-10-01). Bounds already byte-stream split, or plain without a dictionary
+/// (`--grid-encoding plain`), are followed as before.
 fn apply_encodings(
     mut props: parquet::file::properties::WriterPropertiesBuilder,
     source: &ParquetMetaData,
@@ -1561,6 +1570,10 @@ fn apply_encodings(
         }
         let path = column.path().clone();
         let dictionary = used.iter().any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY));
+        if dictionary && is_float_chunk_bound(column) {
+            props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, Encoding::BYTE_STREAM_SPLIT);
+            continue;
+        }
         props = props.set_column_dictionary_enabled(path.clone(), dictionary);
         let value = [
             Encoding::BYTE_STREAM_SPLIT,
@@ -1575,6 +1588,14 @@ fn apply_encodings(
         }
     }
     props
+}
+
+/// A chunk facet's float bound column (`<axis>_chunk_start` / `<axis>_chunk_end` of a 32- or
+/// 64-bit float axis): the columns the converter byte-stream-splits with the dictionary off.
+fn is_float_chunk_bound(column: &parquet::schema::types::ColumnDescriptor) -> bool {
+    let name = column.path().string();
+    (name.ends_with("_chunk_start") || name.ends_with("_chunk_end"))
+        && matches!(column.physical_type(), parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT)
 }
 
 /// Lay the facet out as its source was. From the source's footer: its Parquet format version (the
@@ -1604,10 +1625,10 @@ fn apply_encodings(
 ///   with the first 1,024-row reader batch past parquet's 20,000 rows, so that facet is 3.7 %
 ///   (8 KB) larger even at the source's level. A point facet comes out 0.35-0.6 % smaller.
 /// * A chunk facet written by 0.16.0 or earlier has dictionary-encoded bounds, which this rewrite
-///   keeps (the converter now byte-stream-splits them), and once the byte cap splits the facet into
-///   row groups, each group pays its own dictionary: the corpus Lumos peak facet (1 → 4 groups)
-///   grows by 1.2 %, MFA381's (1 → 3) by 2.3 % and that archive by 1.2 %. Rebuilt from the raw
-///   file, both peak facets are 1.1 % smaller than in the corpus.
+///   re-encodes the converter's way ([`apply_encodings`]): followed, and once the byte cap split
+///   the facet into row groups, each group paid its own dictionary (the corpus Lumos peak facet,
+///   1 → 4 groups, +1.2 %; MFA381's, 1 → 3, +2.3 % and that archive +1.2 %); re-encoded, the Lumos
+///   facet is 0.98 % smaller than its source.
 fn apply_layout(
     mut props: parquet::file::properties::WriterPropertiesBuilder,
     source: &ParquetMetaData,

@@ -315,13 +315,16 @@ struct Cli {
     #[arg(long, value_enum)]
     to: Option<OutputFormat>,
 
-    /// Delta m/z chunking instead of the default lossy numpress-linear. Each m/z is stored as its
-    /// difference from the one before, which gives the value back exactly when m/z are 32-bit
-    /// values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor. A 64-bit
-    /// m/z more than twice its predecessor in the same chunk, which happens at any mass in sparse
-    /// centroid spectra, can come back one unit in the last place off (1e-15 Da near m/z 10,
-    /// 5e-13 Da near m/z 4000), as can the values after it in that chunk; and profile zero runs
-    /// are still masked. For an archive that is bit-exact, use `--lossless`.
+    /// Delta m/z chunking whatever a sample of the run says. By default the converter samples the
+    /// run: delta when every sampled m/z is a 32-bit value (exact and smaller there), else the
+    /// smaller of delta and the lossy numpress-linear on the sample (exact on a tie; the
+    /// `encoding_prescan` index block states the choice). Delta stores each m/z as its difference
+    /// from the one before, which gives the value back exactly when m/z are 32-bit values (most
+    /// imzML) and wherever a 64-bit m/z is at most twice its predecessor. A 64-bit m/z more than
+    /// twice its predecessor in the same chunk, which happens at any mass in sparse centroid
+    /// spectra, can come back one unit in the last place off (1e-15 Da near m/z 10, 5e-13 Da near
+    /// m/z 4000), as can the values after it in that chunk; and profile zero runs are still
+    /// masked. For an archive that is bit-exact, use `--lossless`.
     #[arg(long)]
     no_numpress: bool,
 
@@ -1430,9 +1433,12 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
 
     let vendor = if cfg.no_vendor {
         None
-    } else if use_ims_compact {
+    } else if use_ims_compact || (is_tsf_dir(&cli.input) && !use_bruker_sdk) {
         // The lossless ims-compact facet already encodes the exact signal, so drop the redundant raw
-        // `*_bin` bulk binary by default (was ~39% of the TDF archive, a verbatim copy).
+        // `*_bin` bulk binary by default (was ~39% of the TDF archive, a verbatim copy). The native
+        // TSF lane stores every frame's m/z exactly since 0.17.0 (owner decision D9), so its
+        // `analysis.tsf_bin` — 96 % of a TSF archive — is redundant there too; `--aux
+        // 'analysis.tsf_bin=embed'` keeps it, and the drop is recorded in `vendor_files`.
         Some(vendor::VendorPolicy::load_lossless(None, &cfg.aux)?)
     } else {
         Some(vendor::VendorPolicy::load(None, &cfg.aux)?)
@@ -2087,7 +2093,8 @@ fn is_agilent_ims_d(input: &Path) -> bool {
 /// Refine a requested chunking strategy against real m/z values: numpress-linear's floating-point
 /// prediction fights a fixed-point lattice, so swap it for delta when the data is on one (exact
 /// wherever a value is at most twice its predecessor, see `Cli::no_numpress`). An explicitly
-/// requested delta (`--no-numpress`) is left alone.
+/// requested delta (`--no-numpress`) is left alone. What is still numpress-linear afterwards goes
+/// to the default rule, [`choose_mz_encoding`], which decides from a larger sample.
 ///
 /// The detector itself moved to [`mz_lattice::fixed_point_lattice_scale`] (formerly the local
 /// `is_fixed_point_lattice`, returning a bool) because the lattice ROUTE needs the matched scale,
@@ -5194,6 +5201,17 @@ fn convert_file(
         .map_err(|e| anyhow::anyhow!("invalid zstd level {zstd_level}: {e}"))?;
 
     let chunk = refine_chunking(&sample_mz_from(&probes), chunk);
+    // The default m/z encoding, from a sample of the run: delta where every sampled m/z is a 32-bit
+    // value, else the smaller of delta and numpress-linear (`choose_mz_encoding`; the block states
+    // the choice). An explicit `--no-numpress` or `--layout point` is left alone.
+    let (chunk, mz_block) = {
+        let n = reader.len();
+        let sample_len = max_spectra().map_or(n, |m| m.min(n));
+        let mut by_index = |i: usize| reader.get_spectrum_by_index(i).ok_or_else(|| anyhow!("spectrum {i} could not be read"));
+        let decided = choose_mz_encoding(chunk, &probes, sample_len, &mut by_index, level, keep_zero_runs(), output, false)?;
+        reader.reset();
+        decided
+    };
 
     // FIXED-POINT m/z LATTICE (see `mz_lattice`). The same probes decide, from the CENTROID values
     // only, whether this run's peaks are vendor integers over a power of ten (Shimadzu `MassHigh`
@@ -5672,6 +5690,7 @@ fn convert_file(
         .chain(route)
         .chain(imaging_block.map(|b| ("imaging_pixel_size".to_string(), b)))
         .chain(imaging_blocks)
+        .chain(mz_block.map(|b| ("encoding_prescan".to_string(), b)))
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
             for t in &imaging_applied {
@@ -8425,6 +8444,10 @@ struct VendorHints {
     /// written under the encoding a sample of the run compressed best under. The Waters lane sets
     /// it; `MZPC_ENCODING_PRESCAN=0` turns it off.
     encoding_prescan: bool,
+    /// The lane stores m/z exactly (the Bruker TSF lane, owner decision D9): numpress-linear is
+    /// never written; the default rule weighs delta against the point layout on the sample and
+    /// keeps the smaller EXACT arm (`choose_mz_encoding`).
+    exact_mz: bool,
     /// An imaging run whose reader attaches each spectrum's pixel itself (Waters laser positions).
     imaging: Option<ImagingHints>,
 }
@@ -8547,6 +8570,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         chromatograms,
         source_file_params,
         encoding_prescan,
+        exact_mz,
         imaging: imaging_hints,
     } = hints;
     let (mut data_grid, mut peak_grid) = (data_grid, peak_grid);
@@ -8591,16 +8615,23 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         Some(ChunkingStrategy::NumpressLinear { chunk_size } | ChunkingStrategy::Delta { chunk_size }) => Some(chunk_size),
         _ => None,
     };
-    if let Some(width) = chunk_width.filter(|_| encoding_prescan && data_grid.is_none() && peak_grid.is_none()) {
+    // The lanes without a full pre-scan decide the m/z arm alone, by the default rule
+    // (`choose_mz_encoding`); the block goes under the same key.
+    let mut mz_block: Option<serde_json::Value> = None;
+    let no_grid = data_grid.is_none() && peak_grid.is_none();
+    if let Some(width) = chunk_width.filter(|_| encoding_prescan && no_grid) {
         let numpress = matches!(chunk, Some(ChunkingStrategy::NumpressLinear { .. }));
         let sample = prescan_sample(len, &mut spectrum);
         if !sample.is_empty() {
             let started = std::time::Instant::now();
             let int32 = sample.iter().chain(&probes).all(encoding_prescan::intensities_fit_int32);
-            let arms = encoding_prescan::Arms::new(numpress, int32);
+            // 32-bit m/z (every Waters value): delta returns them exactly, so the lossy arm is not
+            // offered — the first half of the default rule.
+            let all_32bit = encoding_prescan::all_32bit(sample_mz_values(sample.iter().chain(&probes)));
+            let arms = encoding_prescan::Arms::new(numpress && !all_32bit, int32);
             let mut results = Vec::new();
             for (k, trial) in arms.trials().into_iter().enumerate() {
-                let measured = prescan_trial(&sample, &probes, trial, width, level, keep_zero_runs, output, k)
+                let (measured, _) = prescan_trial(&sample, &probes, trial, width, level, keep_zero_runs, output, k)
                     .with_context(|| format!("encoding pre-scan trial {k}"))?;
                 results.push((trial, measured));
             }
@@ -8620,10 +8651,17 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
                     String::new()
                 },
             );
-            chunk = Some(prescan_chunk(chosen.mz, width));
-            let block = encoding_prescan::block(&results, chosen, sample.len(), points, has_mobility, int32);
+            chunk = prescan_chunk(chosen.mz, width);
+            let mut block = encoding_prescan::block(&results, chosen, sample.len(), points, has_mobility, int32);
+            if numpress && all_32bit {
+                block["numpress_linear_excluded"] = encoding_prescan::Basis::ThirtyTwoBit.label().into();
+            }
             prescan = Some((chosen, encoding_prescan::best_float_intensity(&results), block));
         }
+    } else if no_grid {
+        let (chosen, block) = choose_mz_encoding(chunk, &probes, len, &mut spectrum, level, keep_zero_runs, output, exact_mz)?;
+        chunk = chosen;
+        mz_block = block;
     }
     // A facet under a grid policy takes the reference implementation's chunk grid: one chunk per
     // spectrum for the profile facet (the model is per spectrum), its 50-Th default for the peaks.
@@ -8708,6 +8746,8 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
                 "intensity": label,
             });
         }
+        index_blocks.push(("encoding_prescan".to_string(), block));
+    } else if let Some(block) = mz_block {
         index_blocks.push(("encoding_prescan".to_string(), block));
     }
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, chromatograms.into_iter(), synth_chroms)?;
@@ -8843,9 +8883,23 @@ fn vendor_writer_builder(
         .data_column_encodings(encodings)
 }
 
-/// Points in a spectrum's raw arrays (0 without them).
+/// The m/z a spectrum hands the writer: its raw arrays' when they hold an m/z array, else its
+/// centroid peak set's (a Thermo `.raw` through mzdata), else none (a wavelength spectrum). The
+/// peak set is read as the field, not through `peaks()`, whose raw-array dispatch panics on arrays
+/// without an m/z array.
+fn spectrum_mzs(spec: &MultiLayerSpectrum) -> Vec<f64> {
+    match spec.raw_arrays().and_then(|a| a.mzs().ok()) {
+        Some(m) => m.to_vec(),
+        None => spec.peaks.as_ref().map(|p| p.iter().map(|p| p.mz).collect()).unwrap_or_default(),
+    }
+}
+
+/// Points in a spectrum's m/z array, or in its centroid peak set without one (0 with neither).
 fn point_count(spec: &MultiLayerSpectrum) -> usize {
-    spec.raw_arrays().and_then(|a| a.mzs().ok()).map_or(0, |m| m.len())
+    match spec.raw_arrays().and_then(|a| a.mzs().ok()) {
+        Some(m) => m.len(),
+        None => spec.peaks.as_ref().map_or(0, |p| p.len()),
+    }
 }
 
 /// The spectra the encoding pre-scan writes: four stretches of consecutive spectra spread over the
@@ -8876,16 +8930,18 @@ fn prescan_sample<S: Into<VendorSpectrum>>(
     sample
 }
 
-/// The chunking strategy an m/z arm writes with.
-fn prescan_chunk(arm: encoding_prescan::MzArm, chunk_size: f64) -> ChunkingStrategy {
+/// The chunking strategy an m/z arm writes with (`None`: the point layout).
+fn prescan_chunk(arm: encoding_prescan::MzArm, chunk_size: f64) -> Option<ChunkingStrategy> {
     match arm {
-        encoding_prescan::MzArm::Numpress => ChunkingStrategy::NumpressLinear { chunk_size },
-        encoding_prescan::MzArm::Delta(_) => ChunkingStrategy::Delta { chunk_size },
+        encoding_prescan::MzArm::Numpress => Some(ChunkingStrategy::NumpressLinear { chunk_size }),
+        encoding_prescan::MzArm::Delta(_) => Some(ChunkingStrategy::Delta { chunk_size }),
+        encoding_prescan::MzArm::Point => None,
     }
 }
 
 /// Write the pre-scan sample under one trial's arms to a scratch archive beside `output` and
-/// return each column group's compressed bytes. The scratch file is removed on return.
+/// return each column group's compressed bytes, with the writer's count of delta chunks at risk
+/// in the sample (over both facets). The scratch file is removed on return.
 fn prescan_trial(
     sample: &[MultiLayerSpectrum],
     probes: &[MultiLayerSpectrum],
@@ -8895,7 +8951,7 @@ fn prescan_trial(
     keep_zero_runs: bool,
     output: &Path,
     k: usize,
-) -> Result<encoding_prescan::Measured> {
+) -> Result<(encoding_prescan::Measured, u64)> {
     let convert = |spectra: &[MultiLayerSpectrum]| -> Vec<MultiLayerSpectrum> {
         let mut spectra = spectra.to_vec();
         if trial.intensity.int32 {
@@ -8908,16 +8964,94 @@ fn prescan_trial(
     let path = output.with_extension(format!("mzpeak.prescan{k}.tmp"));
     let guard = TmpGuard::new(&path);
     let handle = fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    let chunk = Some(prescan_chunk(trial.mz, chunk_size));
+    let chunk = prescan_chunk(trial.mz, chunk_size);
     let mut writer = vendor_writer_builder(chunk.clone(), chunk, level, &convert(probes), trial.encodings())
         .build(handle, !keep_zero_runs);
     for spec in convert(sample) {
         writer.write_spectrum(&spec)?;
     }
+    let at_risk = writer.spectrum_signal_tally_by_facet().iter().map(|t| t.delta_chunks_at_risk).sum();
     writer.finish_parquet()?.finish().map_err(|e| anyhow!("finalizing the pre-scan archive: {e}"))?;
-    let measured = facet_column_bytes(&path);
+    let measured = facet_column_bytes(&path)?;
     guard.discard();
-    measured
+    Ok((measured, at_risk))
+}
+
+/// Every m/z these spectra hand the writer ([`spectrum_mzs`]), flattened.
+fn sample_mz_values<'a>(spectra: impl IntoIterator<Item = &'a MultiLayerSpectrum>) -> impl Iterator<Item = f64> {
+    spectra.into_iter().flat_map(spectrum_mzs)
+}
+
+/// The default m/z encoding of a chunked facet, from a sample of the run (owner decision D1/D13,
+/// principle P2; the rule in [`encoding_prescan::pick_mz`]). `chunk` is the strategy requested so
+/// far: only numpress-linear, the default, is open to the rule — an explicit `--no-numpress` is the
+/// user's choice and `--layout point` has no chunk — except on a lane that stores m/z exactly
+/// (`exact`, the Bruker TSF lane), which weighs delta against the point layout whether numpress or
+/// delta was requested and never writes numpress. Returns the strategy to write with and the
+/// `encoding_prescan` block that says why, or `None` where nothing was decided. The sample is
+/// [`prescan_sample`]'s (up to four stretches of 64 spectra or 2 M points); the trials are
+/// [`prescan_trial`]'s, through the archive writer. `MZPC_ENCODING_PRESCAN=0` skips the rule:
+/// numpress as requested, or delta without a trial on an exact lane.
+#[allow(clippy::too_many_arguments)]
+fn choose_mz_encoding<S: Into<VendorSpectrum>>(
+    chunk: Option<ChunkingStrategy>,
+    probes: &[MultiLayerSpectrum],
+    len: usize,
+    spectrum: &mut impl FnMut(usize) -> Result<S>,
+    level: ZstdLevel,
+    keep_zero_runs: bool,
+    output: &Path,
+    exact: bool,
+) -> Result<(Option<ChunkingStrategy>, Option<serde_json::Value>)> {
+    use encoding_prescan::{Basis, MzArm, MzTrial};
+    use mzpeak_prototyping::writer::ColumnEncoding;
+    let width = match chunk {
+        Some(ChunkingStrategy::NumpressLinear { chunk_size }) => chunk_size,
+        Some(ChunkingStrategy::Delta { chunk_size }) if exact => chunk_size,
+        _ => return Ok((chunk, None)),
+    };
+    let delta = Some(ChunkingStrategy::Delta { chunk_size: width });
+    if !env_flag("MZPC_ENCODING_PRESCAN").unwrap_or(true) {
+        return Ok((if exact { delta } else { chunk }, None));
+    }
+    let sample = prescan_sample(len, spectrum);
+    if sample.is_empty() {
+        return Ok((if exact { delta } else { chunk }, None));
+    }
+    let points: usize = sample.iter().map(point_count).sum();
+    if encoding_prescan::all_32bit(sample_mz_values(sample.iter().chain(probes))) {
+        log::info!(
+            "m/z encoding: every sampled m/z ({} spectra, {points} points) is a 32-bit value; delta chunks, which return \
+             them exactly and are smaller than numpress-linear on such data",
+            sample.len()
+        );
+        return Ok((delta, Some(encoding_prescan::mz_block(sample.len(), points, &[], MzArm::Delta(ColumnEncoding::Writer), Basis::ThirtyTwoBit))));
+    }
+    let started = std::time::Instant::now();
+    let arms = if exact { [MzArm::Delta(ColumnEncoding::Writer), MzArm::Point] } else { [MzArm::Delta(ColumnEncoding::Writer), MzArm::Numpress] };
+    let mut trials = Vec::new();
+    for (k, arm) in arms.into_iter().enumerate() {
+        let trial = encoding_prescan::Trial {
+            mz: arm,
+            intensity: encoding_prescan::IntensityArm { int32: false, encoding: ColumnEncoding::Writer },
+            ion_mobility: ColumnEncoding::Writer,
+        };
+        let (measured, at_risk) = prescan_trial(&sample, probes, trial, width, level, keep_zero_runs, output, k)
+            .with_context(|| format!("m/z encoding trial {k} ({})", encoding_prescan::mz_label(arm)))?;
+        // Against numpress only the m/z columns move; against the point layout every column does.
+        let bytes = if exact { measured.mz + measured.intensity + measured.ion_mobility } else { measured.mz };
+        trials.push(MzTrial { arm, bytes, delta_chunks_at_risk: at_risk });
+    }
+    let (chosen, basis) = encoding_prescan::pick_mz(&trials, exact);
+    log::info!(
+        "m/z encoding ({} spectra, {points} points, {:.1} s): {}; {} — {}",
+        sample.len(),
+        started.elapsed().as_secs_f64(),
+        trials.iter().map(|t| format!("{} {} B{}", encoding_prescan::mz_label(t.arm), t.bytes, if t.delta_chunks_at_risk > 0 { format!(" ({} chunks at risk)", t.delta_chunks_at_risk) } else { String::new() })).collect::<Vec<_>>().join(", "),
+        encoding_prescan::mz_label(chosen),
+        basis.label()
+    );
+    Ok((prescan_chunk(chosen, width), Some(encoding_prescan::mz_block(sample.len(), points, &trials, chosen, basis))))
 }
 
 /// Compressed bytes of the spectrum data and peak facets of an archive, by column group.
@@ -8952,8 +9086,11 @@ fn convert_tsf(
     synth_chroms: bool,
 ) -> Result<()> {
     let reader = bruker_tsf::TsfReader::open(input)?;
+    // The frames' m/z are stored exactly (owner decision D9, 2026-10-01): the archive then holds
+    // the signal `analysis.tsf_bin` holds, and the policy drops that file by default (`run`).
+    let hints = VendorHints { exact_mz: true, ..VendorHints::default() };
     convert_vendor_reader(
-        input, output, chunk, zstd_level, vendor, synth_chroms, VendorHints::default(),
+        input, output, chunk, zstd_level, vendor, synth_chroms, hints,
         reader.len(), |i| reader.spectrum(i),
     )
 }
@@ -13466,18 +13603,22 @@ mod tests {
     }
 
     /// The `transformations` index block (invariant: every transformation declared) lists what was
-    /// applied, not what was configured. On the fixture the generic lane numpresses m/z and masks
-    /// nothing: its one profile spectrum (scan=20, 10 points) holds no run of zeros, so the mask the
-    /// writer was built with never shortened a spectrum. Its MS1 spectra arrive out of time order
-    /// (scan=19 at 5.89 min, scan=21 with no start time, cycle 22 at 42.05 s), so the synthesized TIC
-    /// and base-peak traces reach the writer unsorted and its backstop re-sorts them by time.
+    /// applied, not what was configured. On the fixture the generic lane masks nothing: its one
+    /// profile spectrum (scan=20, 10 points) holds no run of zeros, so the mask the writer was built
+    /// with never shortened a spectrum. Its MS1 spectra arrive out of time order (scan=19 at 5.89
+    /// min, scan=21 with no start time, cycle 22 at 42.05 s), so the synthesized TIC and base-peak
+    /// traces reach the writer unsorted and its backstop re-sorts them by time. The m/z encoding is
+    /// the sample's choice: numpress-linear where the rule is skipped (`MZPC_ENCODING_PRESCAN=0`),
+    /// delta otherwise — the fixture's 64-bit arrays hold integer m/z (0 to 20 in steps of 1 or 2),
+    /// 32-bit values, which delta returns exactly although its chunks span more than a factor of
+    /// two, so nothing is declared for it (through rc.2 `delta-ulp` was, from the declared type).
     #[test]
     fn transformations_block_declares_what_the_lane_applied() {
         let dir = scratch("transformations");
         let out = dir.join("tiny.mzpeak");
         let args: Vec<&std::ffi::OsStr> =
             vec![TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()];
-        let (ok, _, err) = run_bin(&args, &[]);
+        let (ok, _, err) = run_bin(&args, &[("MZPC_ENCODING_PRESCAN", "0")]);
         assert!(ok, "{err}");
         let meta = index_metadata(&out);
         let applied: Vec<&str> = meta["transformations"]
@@ -13490,23 +13631,34 @@ mod tests {
         // `sort-by-mz`: the fixture is already in m/z order. No `zero-run-mask`: no zero run. Its
         // `sic` is in seconds, stored in minutes.
         assert_eq!(applied, ["numpress-linear", "sort-by-time", "chromatogram-time-to-minutes"], "{applied:?}");
-        // `--no-numpress` drops the codec entry — the list follows the choice, not the lane — and
-        // delta brings its own: the fixture's spectra are sparse lists (m/z 0 to 20 in steps of 1
-        // or 2), so their delta chunks span more than a factor of two and are declared, in the
-        // list and, with the bound, in `fidelity.mz_error`. Through 0.17.0-rc.1 only the block
-        // said so.
-        let out2 = dir.join("tiny-delta.mzpeak");
-        let args: Vec<&std::ffi::OsStr> = vec![
-            TINY.as_ref(), "-o".as_ref(), out2.as_os_str(), "--force".as_ref(), "--no-numpress".as_ref(),
-        ];
-        let (ok, _, err) = run_bin(&args, &[]);
-        assert!(ok, "{err}");
-        let meta = index_metadata(&out2);
-        let applied: Vec<&str> =
-            meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(applied, ["sort-by-time", "chromatogram-time-to-minutes", "delta-ulp"], "{applied:?}");
-        let delta: Vec<&serde_json::Value> = meta["fidelity"]["mz_error"].as_array().unwrap().iter().filter(|e| e["encoding"] == "delta").collect();
-        assert!(!delta.is_empty() && delta.iter().all(|e| e["chunks_not_exact_by_construction"].as_u64() > Some(0)), "{}", meta["fidelity"]);
+        assert!(meta.get("encoding_prescan").is_none(), "the skipped rule leaves no block: {meta:#}");
+        // The default (the rule) and `--no-numpress` alike store the fixture's m/z as delta chunks:
+        // the codec entry goes — the list follows the choice, not the lane — and delta declares
+        // nothing, since every value is a 32-bit one (`mz_values_32bit`), though the chunks span
+        // more than a factor of two. The rule says why; the explicit flag writes no block.
+        for (tag, flag, env) in [("default", None, &[][..]), ("flag", Some("--no-numpress"), &[("MZPC_ENCODING_PRESCAN", "1")][..])] {
+            let out2 = dir.join(format!("tiny-delta-{tag}.mzpeak"));
+            let mut args: Vec<&std::ffi::OsStr> = vec![TINY.as_ref(), "-o".as_ref(), out2.as_os_str(), "--force".as_ref()];
+            args.extend(flag.map(std::ffi::OsStr::new));
+            let (ok, _, err) = run_bin(&args, env);
+            assert!(ok, "{tag}: {err}");
+            let meta = index_metadata(&out2);
+            let applied: Vec<&str> =
+                meta["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            assert_eq!(applied, ["sort-by-time", "chromatogram-time-to-minutes"], "{tag}: {applied:?}");
+            assert_eq!(meta["fidelity"]["mz_error"], serde_json::json!([]), "{tag}: {}", meta["fidelity"]);
+            for facet in ["spectra_data", "spectra_peaks"] {
+                assert_eq!((&meta["fidelity"][facet]["source_types"]["mz"], &meta["fidelity"][facet]["mz_values_32bit"]), (&serde_json::json!(["float64"]), &serde_json::json!(true)), "{tag} {facet}: {}", meta["fidelity"]);
+            }
+            let block = meta.get("encoding_prescan");
+            if flag.is_none() {
+                let block = block.expect("the rule states its choice");
+                assert_eq!((&block["chosen"]["mz"], &block["basis"]), (&serde_json::json!("delta"), &serde_json::json!(super::encoding_prescan::Basis::ThirtyTwoBit.label())), "{block:#}");
+                assert!(block.get("measured_bytes").is_none(), "no trial was needed: {block:#}");
+            } else {
+                assert!(block.is_none(), "{tag}: an explicit choice is not a measured one: {meta:#}");
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -14505,6 +14657,8 @@ mod tests {
     /// The pre-scan writes a sample once per arm and keeps each column's smallest arm; whatever it
     /// chooses, every m/z, intensity and drift time reads back as written. Its trial archives are
     /// removed without the "removed incomplete" warning a failed conversion gets (review 2026-09-30).
+    /// The frames' m/z are 32-bit values, as every Waters value is, so the lossy numpress arm is
+    /// not offered (the default rule's first half) and the block says why.
     #[test]
     fn encoding_prescan_keeps_each_columns_smallest_arm_and_the_values() {
         use super::{convert_vendor_reader_tallied, VendorHints};
@@ -14523,7 +14677,9 @@ mod tests {
         assert!(warned.is_empty(), "{warned:?}");
 
         let block = index_metadata(&out)["encoding_prescan"].clone();
-        assert_eq!(block["measured_bytes"]["mz"].as_object().unwrap().len(), 4, "{block:#}");
+        assert_eq!(block["measured_bytes"]["mz"].as_object().unwrap().len(), 3, "{block:#}");
+        assert!(!block["measured_bytes"]["mz"].as_object().unwrap().contains_key("numpress-linear"), "{block:#}");
+        assert_eq!(block["numpress_linear_excluded"], super::encoding_prescan::Basis::ThirtyTwoBit.label(), "{block:#}");
         assert_eq!(block["measured_bytes"]["intensity"].as_object().unwrap().len(), 4, "{block:#}");
         assert_eq!(block["measured_bytes"]["ion_mobility"].as_object().unwrap().len(), 3, "{block:#}");
         assert_eq!(block["int32_intensity_eligible"], true);

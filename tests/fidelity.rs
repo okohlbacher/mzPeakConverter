@@ -499,15 +499,17 @@ fn keep_zero_runs_stores_every_point_and_one_shared_axis() {
         let r = run(&input, &out, args, env);
         assert!(r.status.success(), "{tag}: {}", String::from_utf8_lossy(&r.stderr));
         let applied = transformations(&out);
-        assert!(!applied.contains(&"zero-run-mask".to_string()) && applied.contains(&"numpress-linear".to_string()), "{tag}: {applied:?}");
+        // The axis is 32-bit values, so the default encoding is delta (exact): no codec entry.
+        assert!(!applied.iter().any(|t| t == "zero-run-mask" || t == "numpress-linear" || t == "delta-ulp"), "{tag}: {applied:?}");
         let f = metadata(&out)["fidelity"]["spectra_data"].clone();
         assert_eq!((f["source_points"].as_u64(), f["stored_points"].as_u64()), (Some(source_points), Some(source_points)), "{tag}: {f}");
         let k = decoded(&out);
         assert_eq!(distinct_axes(&k), 1, "{tag}: the pixels decode to different axes");
         for (i, ((mz, it), (_, source))) in k.iter().zip(&spectra).enumerate() {
             assert_eq!(mz.len(), N, "{tag}: pixel {i}");
-            // numpress moves a 32-bit m/z by less than half a float32 step: rounding restores it.
-            assert_eq!(f32s(mz), axis, "{tag}: pixel {i} m/z, rounded to the source's 32 bits");
+            // Delta returns the 32-bit axis exactly (through rc.2 numpress moved each value by less
+            // than half a float32 step, and rounding restored it).
+            assert_eq!(mz, &axis.iter().map(|x| f64::from(*x)).collect::<Vec<_>>(), "{tag}: pixel {i} m/z");
             assert_eq!(&Arr::F32(it.clone()), source, "{tag}: pixel {i} intensities");
         }
     }
