@@ -235,16 +235,41 @@ that assigns precursors by mobility window (OpenSWATH's diaPASEF mode) needs the
 `--to mzml`, or a `--no-ims-compact` archive.
 
 An archive's export states what the direct export of its source states. Its chromatograms are the
-archive's, as stored (times in minutes), each with its type and polarity term; a TIC or base-peak
-chromatogram summed over the exported spectra is added only for a kind the archive lacks, in time
-order (so is the direct export's). Every precursor, a spectrum's or a chromatogram's, keeps its
+archive's, as stored (times in minutes), each with its type and polarity term. A TIC (`TIC`) or
+base-peak chromatogram (`BPC`) is added only for a kind the source or the archive lacks, on every
+route the one a conversion synthesizes into an archive: a point per MS1 spectrum written, summed
+from the signal written, in time order. (Through 0.17.0-rc.1 the direct export summed every
+spectrum, from its stated total ion current where it had one, and named the base-peak trace `BIC`:
+201 points where the archive of the same file holds 15.) A run without an MS1 spectrum gets no
+summed pair; when it has no other chromatogram either, the pair is written empty, since a
+`chromatogramList` must hold one. Every precursor, a spectrum's or a chromatogram's, keeps its
 isolation window, dissociation method and collision energy; 1/K0 is MS:1002815 `inverse reduced ion
 mobility`, once per element. Different by design: a spectrum's total ion current, base peak and
 observed m/z range are the archive's, computed from the stored peaks (a timsTOF `.d` states each
 window spectrum's frame totals); an ims-compact archive's whole frames state no per-window 1/K0,
 `window group` or limits, and it holds HyStar's TIC/base-peak traces but not mzdata's per-window
-pair (28 chromatograms where the `.d`'s export has 30). Not in any archive yet, so not in its
-export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` combination.
+pair (28 chromatograms where the `.d`'s export has 30); the direct export of an mzML or imzML
+writes each spectrum's arrays as the source holds them — every array, in the source's data types
+and order — where an archive's export writes what the archive stores (a plain centroid spectrum as
+64-bit m/z and 32-bit intensity in m/z order, whatever the source's types); and a `collision energy`, `peak intensity` or `ion injection time` of 0 that an mzML
+states in its own text is kept by its direct export and absent from its archive's, which stores a
+0 of these three as null. Not in any archive yet, so not in its export: an SRM trace's product (Q3)
+window and a spectrum's `sum of spectra` combination.
+
+An export states nothing that neither its source nor its archive states. A spectrum whose polarity
+is unknown gets no polarity term (the run says how many, in one warning); a scan gets an
+`ion injection time`, a selected ion a `peak intensity` and an activation a `collision energy` only
+where one is known — a vendor reader's or an archive's 0 means "not stated", and only an mzML that
+writes the 0 itself keeps it. Through 0.17.0-rc.1 every export stated `positive scan` and the three
+zeros regardless: a negative-mode imaging run was exported as positive, and a reader could not tell
+a 0 from a measurement. Still written whatever the source says: a `scan start time` of 0 for a scan
+that states no time (the archive stores that time as 0, not as null), and `base peak m/z` and
+`base peak intensity` 0 on a spectrum without a peak. A spectrum without a point is written with an
+m/z and an intensity array of length 0 and no observed m/z range; every array of length 0, a
+chromatogram's included, has an empty `<binary>` (`encodedLength="0"`, as ProteoWizard writes it),
+not the zlib stream of nothing that OpenMS 3.5 fails on in an integer array. No spectrum has an
+empty `<precursorList>`, no precursor an empty `<selectedIonList>`, and a chromatogram holds its
+`<precursor>` and `<product>` directly, as the mzML 1.1.0 schema has them.
 
 The header. An export carries the source's **scan settings** as a `scanSettingsList` (an imaging
 run's grid and pixel size, an inclusion list's targets), from an mzML/imzML as read and from an
