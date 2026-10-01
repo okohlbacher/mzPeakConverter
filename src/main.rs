@@ -2554,20 +2554,29 @@ fn convert_to_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
+    // An mzML or imzML source: everything this lane reads from the source's own text beside what
+    // mzdata hands over, in ONE streamed pass over its bytes ([`mzml_unstated::SourceText`]) —
+    // which spectra and chromatograms state a zero of the four terms mzdata's model holds as plain
+    // numbers (`stated`, below), each spectrum's `sourceFileRef` (`source_refs`, below) and whether
+    // an imaging term is mentioned (`ims`). Through 0.17.0-rc.2 these were three passes over the
+    // text, 0.04–0.21 s of every export of a 40–180 MB mzML (the audit of 2026-10-01).
+    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    let mut text = scan_lane.then(|| mzml_unstated::SourceText::read(&read_path, ["IMS:1"])).transpose().unwrap_or_else(|e| {
+        log::warn!(
+            "{}: its text was not read ({e}): the IMS vocabulary is not declared, no spectrum's sourceFileRef is kept, and \
+             every `scan start time`, `ion injection time`, `peak intensity` and `collision energy` of 0 is written, stated \
+             by the source or not",
+            input.display()
+        );
+        None
+    });
     // Imaging terms need their vocabulary in the cvList, which mzdata's writer fills with MS and UO
     // alone: an imzML always states some; an mzML is searched for one (pixel positions on its
-    // scans, a grid in its scan settings — one streamed byte search, as the archive lane makes for
-    // the positions). Through 0.16.0 every `cvRef="IMS"` of an export named a vocabulary the
-    // document did not declare.
+    // scans, a grid in its scan settings). Through 0.16.0 every `cvRef="IMS"` of an export named a
+    // vocabulary the document did not declare.
     let ims = match &reader {
         MZReaderType::IMzML(_) => true,
-        MZReaderType::MzML(_) => imaging::file_mentions(&read_path, ["IMS:1"]).map_or_else(
-            |e| {
-                log::warn!("{}: not searched for imaging terms ({e}); the IMS vocabulary is not declared", input.display());
-                false
-            },
-            |[found]| found,
-        ),
+        MZReaderType::MzML(_) => text.as_ref().is_some_and(|t| t.mentions[0]),
         _ => false,
     };
     let run = mzml_header::RunCell::default();
@@ -2581,14 +2590,14 @@ fn convert_to_mzml(
     // its own lists ([`mzml_refs`]) — the entries mzdata skips for being self-closing put back, a
     // reference that names nothing dropped, one warning — and with it what else that lane reads
     // back from the header: the source files' checksums as the text stated (mzdata reads a digest
-    // of digits as a number) and each spectrum's `sourceFileRef`. The ids are decoded for it as that
-    // lane decodes them and written escaped again ([`encode_xml_ids`]). Through 0.17.0-rc.1 this lane
-    // copied each reference as mzdata read it: a scan naming a configuration the source does not
-    // state was written naming one the export did not declare either.
-    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    // of digits as a number) and each spectrum's `sourceFileRef` (read above). The ids are decoded
+    // for it as that lane decodes them and written escaped again ([`encode_xml_ids`]). Through
+    // 0.17.0-rc.1 this lane copied each reference as mzdata read it: a scan naming a configuration
+    // the source does not state was written naming one the export did not declare either.
     let mut source_refs = scan_lane.then(|| {
         decode_pwiz_ids(&mut w);
-        let mut refs = mzml_refs::DanglingRefs::check(&read_path, &mut w);
+        let spectrum_files = text.as_mut().map(|t| std::mem::take(&mut t.spectrum_files)).unwrap_or_default();
+        let mut refs = mzml_refs::DanglingRefs::check_with_spectrum_files(&read_path, &mut w, spectrum_files);
         refs.number_scans_ahead(&mut w);
         refs
     });
@@ -2623,18 +2632,12 @@ fn convert_to_mzml(
     // The zeros the source states in its own text, which stay; every other 0 of those terms is
     // mzdata's default for "not stated" and is not written ([`mzml_unstated`]). Only an mzML or
     // imzML can state one, or leave a scan without a time: a vendor reader gives every scan its
-    // time and has no way to say "measured, and 0" of the others.
-    let stated = if scan_lane {
-        mzml_unstated::StatedZeros::read(&read_path).unwrap_or_else(|e| {
-            log::warn!(
-                "{}: not searched for the zeros it states ({e}); every `scan start time`, `ion injection time`, \
-                 `peak intensity` and `collision energy` of 0 is written, stated by the source or not",
-                input.display()
-            );
-            mzml_unstated::StatedZeros::everything()
-        })
-    } else {
-        Default::default()
+    // time and has no way to say "measured, and 0" of the others. A source whose text could not be
+    // read (warned about above) keeps every 0.
+    let stated = match (scan_lane, text.take()) {
+        (true, Some(text)) => text.zeros,
+        (true, None) => mzml_unstated::StatedZeros::everything(),
+        (false, _) => Default::default(),
     };
     if stated.count() > 0 {
         log::info!(
