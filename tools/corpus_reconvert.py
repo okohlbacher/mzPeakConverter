@@ -13,10 +13,14 @@ checkout or a copy:
     (or any other `convert.*` key) rebuilds the archive without waiting for a converter release.
 
 The `.built` stamp is read out of the archive it describes, never written from the request:
-    mzpeak-convert <version>     the archive's own software_list entry; another version is refused
+    mzpeak-convert <version>     the software_list entry of the archive's last conversion step;
+                                 another version is refused
     recipe <hash>                the descriptor recipe it was built under
     options <argv>               the archive's own `conversion options`, i.e. what actually ran
-The box strips lane flags and may fall back to msconvert, so only the archive knows what built it.
+The box strips lane flags and may fall back to msconvert, so only the archive knows what built it,
+and an archive whose recorded lane disagrees with the descriptor's `convert.flags` is refused too
+(LANE_FLAGS): a descriptor pinning `--via-msconvert` over a natively built archive, or an archive
+the msconvert fallback built under a descriptor pinning none, is reported, not stamped current.
 A stamp from before the recipe line counts as stale.
 
 `--clean` deletes every `.mzpeak` (and stamp) first. It reaches the same end state as the default
@@ -51,6 +55,8 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -233,7 +239,6 @@ def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[
     except ImportError:
         print("warn      : PyYAML unavailable — descriptors not read, falling back to every-unit walk")
         return {}, {}, set(), set()
-    import shlex  # noqa: PLC0415
     recipes: dict[Path, Recipe] = {}
     pinned: dict[Path, Path] = {}
     skipped: set[Path] = set()
@@ -407,7 +412,65 @@ def is_current(archive: Path, version: str, rid: str) -> bool:
     return bool(lines) and lines[0].strip() in compatible_versions(version) and f"recipe {rid}" in lines[1:]
 
 
-def write_stamp(archive: Path, version: str, rid: str) -> str | None:
+# Flags that choose the lane a conversion runs on (the reader and the encoder), with whether the
+# flag takes a value. The box strips these for its native-first attempt and adds its own on the
+# msconvert fallback (`--via-msconvert --tof-grid <mode>`), so an archive can record a lane its
+# descriptor never pinned, and a descriptor can pin one its archive never ran: on 2026-10-01 three
+# corpus descriptors did (agilent-qtof pinned `--via-msconvert --tof-grid auto` over a native
+# archive; agilent-6490-triplequad pinned `--via-msconvert` over the fallback's `--tof-grid auto`).
+# `write_stamp` refuses the stamp on either mismatch, printing both sides, so `is_current` cannot
+# call an archive current that its descriptor misdescribes (D17).
+LANE_FLAGS: dict[str, bool] = {
+    "--via-msconvert": False,
+    "--agilent-grid": False,
+    "--bruker-sdk": False,
+    "--no-ims-compact": False,
+    "--ims-chunked": False,
+    "--no-ims-chunked": False,
+    "--tof-grid": True,
+}
+
+
+def lane_pins(tokens: list[str]) -> list[str]:
+    """The lane flags among argv `tokens`, each with its value when it takes one, sorted:
+    `["--tof-grid auto", "--via-msconvert"]`. `--tof-grid=auto` and `--tof-grid auto` are one pin."""
+    pins: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        flag, eq, value = tokens[i].partition("=")
+        if flag in LANE_FLAGS:
+            if LANE_FLAGS[flag] and not eq:
+                value = tokens[i + 1] if i + 1 < len(tokens) else ""
+                i += 1
+            pins.add(f"{flag} {value}".strip() if LANE_FLAGS[flag] else flag)
+        i += 1
+    return sorted(pins)
+
+
+def recorded_conversion(md: dict) -> tuple[str | None, str]:
+    """(converter version, argv) of the conversion that wrote an archive, from its index metadata.
+
+    The LAST processing method carrying `conversion options` is that conversion: a source this tool
+    exported from an archive brings the earlier archive's method and software entry along, and the
+    new conversion is recorded after them under the next free ids (`mzpeak_convert_conversion_2`,
+    and the software `mzpeak-convert_2` when the versions differ). The method's `software_reference`
+    names the entry of the version that ran; without one, the last entry under `mzpeak-convert` or
+    a numbered `mzpeak-convert_N`. Looking up the plain id alone stamped such an archive with the
+    SOURCE's version and refused it as built by another converter.
+    """
+    methods = [m for dp in md.get("data_processing_method_list") or [] for m in dp.get("methods") or []]
+    conversions = [(m, p.get("value")) for m in methods for p in m.get("parameters") or []
+                   if p.get("name") == "conversion options"]
+    method, options = conversions[-1] if conversions else ({}, None)
+    softwares = md.get("software_list") or []
+    ref = method.get("software_reference")
+    ours = [s for s in softwares if s.get("id") == ref] if ref else []
+    if not ours:
+        ours = [s for s in softwares if re.fullmatch(r"mzpeak-convert(_\d+)?", s.get("id") or "")]
+    return (ours[-1].get("version") if ours else None), (options or "")
+
+
+def write_stamp(archive: Path, version: str, rid: str, flags: list[str] | None = None) -> str | None:
     """Stamp `archive` from its OWN index; -> None, or why it was left unstamped.
 
     What was requested says nothing reliable about what built an archive: the box strips lane flags
@@ -416,6 +479,8 @@ def write_stamp(archive: Path, version: str, rid: str) -> str | None:
     the host's version string used to be written beside whatever the box's exe produced. The archive
     records its converter (software_list) and its argv (`conversion options`), so the stamp copies
     those, and an archive another converter version built is refused rather than labelled current.
+    So is one whose recorded argv runs another lane than the descriptor's `flags` pin (LANE_FLAGS):
+    the refusal names both, and the unit stays failed until the descriptor or the archive changes.
     """
     try:
         with zipfile.ZipFile(archive) as z:
@@ -424,13 +489,13 @@ def write_stamp(archive: Path, version: str, rid: str) -> str | None:
             md = json.loads(z.read("mzpeak_index.json")).get("metadata") or {}
     except Exception as e:  # truncated zip, no index, unparsable index
         return f"unreadable archive index ({e})"
-    built = next((s.get("version") for s in md.get("software_list") or []
-                  if s.get("id") == "mzpeak-convert"), None)
-    options = next((p.get("value") for dp in md.get("data_processing_method_list") or []
-                    for m in dp.get("methods") or [] for p in m.get("parameters") or []
-                    if p.get("name") == "conversion options"), None) or ""
+    built, options = recorded_conversion(md)
     if built != version.split()[-1]:
         return f"built by mzpeak-convert {built or '<unrecorded>'}, not {version}"
+    pinned, ran = lane_pins(list(flags or [])), lane_pins(shlex.split(options))
+    if pinned != ran:
+        return (f"lane mismatch: the descriptor pins {' '.join(pinned) or 'no lane flag'}, "
+                f"the archive ran with {' '.join(ran) or 'no lane flag'} (options: {options})")
     stamp_for(archive).write_text(f"{version}\nrecipe {rid}\noptions {options}\n")
     return None
 
@@ -470,7 +535,7 @@ def convert(unit: Path, out: Path, binary: str, version: str, dry: bool,
             f"exit {proc.returncode}",
         )
         return unit, "failed", first.strip()[:200]
-    why = write_stamp(out, version, rid)
+    why = write_stamp(out, version, rid, extra)
     if why:
         return unit, "failed", f"not stamped: {why}"
     return unit, "converted", ""
@@ -565,7 +630,8 @@ def run_box(jobs: list[tuple[Path, Path, int | None]], root: Path, version: str,
         if before.get(out) == now:
             unchanged.append(out.name)
             continue
-        why = write_stamp(out, version, recipe_for(u, recipes or {}).rid)
+        r = recipe_for(u, recipes or {})
+        why = write_stamp(out, version, r.rid, r.flags)
         if why:
             print(f"box       : {out.name} arrived but is left unstamped: {why}")
             unchanged.append(out.name)
