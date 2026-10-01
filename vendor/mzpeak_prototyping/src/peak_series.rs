@@ -39,6 +39,18 @@ pub fn data_array_to_arrow_array(
         BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(data_array.to_f64()?.to_vec())),
         BinaryDataArrayType::Float32 => Arc::new(Float32Array::from(data_array.to_f32()?.to_vec())),
         BinaryDataArrayType::Int64 => Arc::new(Int64Array::from(data_array.to_i64()?.to_vec())),
+        // DELIBERATE DEVIATION (not upstream): a 64-bit integer array cast into an int32 column
+        // saturates, as a float cast into an integer column does (`to_i32` is an `as` cast, which
+        // wraps an integer out of range into another value). The writer's schema sampler keeps the
+        // case to an array of a type the sampled spectra did not show, and the converter counts the
+        // values the column does not hold.
+        BinaryDataArrayType::Int32 if data_array.dtype() == BinaryDataArrayType::Int64 => Arc::new(Int32Array::from(
+            data_array
+                .to_i64()?
+                .iter()
+                .map(|x| i32::try_from(*x).unwrap_or(if *x < 0 { i32::MIN } else { i32::MAX }))
+                .collect::<Vec<i32>>(),
+        )),
         BinaryDataArrayType::Int32 => Arc::new(Int32Array::from(data_array.to_i32()?.to_vec())),
         BinaryDataArrayType::ASCII => Arc::new(ascii_array(&data_array)),
     };
