@@ -1348,7 +1348,9 @@ mod tests {
             "chromatogram-time-to-minutes",
             "sort-by-time",
             "imzml:pixel-size-unit-assumed-um",
+            "imzml:pixel-size-unit-from-accession",
             "imaging:pixel-count-from-positions",
+            "imaging:pixel-size-user-supplied",
             "thermo:target-only-isolation-window",
             "bruker:trace-unit-rescale",
         ] {

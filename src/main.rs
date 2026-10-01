@@ -403,9 +403,23 @@ struct Cli {
     zstd_level: Option<i32>,
 
     /// Overwrite the output if it already exists; also converts an imzML whose .ibd begins with
-    /// another UUID than the header states (refused otherwise: the two files may not be a pair).
+    /// another UUID than the header states (refused otherwise: the two files may not be a pair);
+    /// with `--pixel-size`, also writes the supplied size over one the source states.
     #[arg(short, long)]
     force: bool,
+
+    /// Imaging runs only: the pixel size in micrometres, `X` for square pixels or `X,Y`, written
+    /// into the grid (`IMS:1000046/47`, with the max dimension from the pixel counts) when the
+    /// source settles none — an imzML or mzML whose header states no size or one the pixel-size
+    /// rule drops, a Bruker MALDI `.d` without a FlexImaging `.mis` raster step or a beam scan
+    /// size, a Waters single row's missing axis, or an existing `.mzpeak` archive (the rewrite lane:
+    /// the archive gains the size). A size the source does state is kept when it agrees and is an
+    /// ERROR naming both values when it differs; with `--force` the supplied size is written over
+    /// it. Declared `imaging:pixel-size-user-supplied`, recorded in `imaging_pixel_size` and as
+    /// `metadata.imaging.pixel_size_source: user_supplied`. Refused on an mzML output and on a run
+    /// that is not imaging. Config key `pixel_size`.
+    #[arg(long, value_name = "X[,Y]")]
+    pixel_size: Option<String>,
 
     /// Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and
     /// write standard f64 m/z instead.
@@ -830,6 +844,27 @@ struct FileConfig {
     quiet: Option<bool>,
     // Missing from 0.11.3, when `--sample` arrived, until this key: rejected as an unknown field.
     sample: Option<u32>,
+    pixel_size: Option<PixelSizeConfig>,
+}
+
+/// `pixel_size:` in the config file: `10`, `"10,20"` or `[10, 20]`, in micrometres — parsed as the
+/// command line's `X[,Y]` is.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum PixelSizeConfig {
+    Number(f64),
+    Text(String),
+    Pair([f64; 2]),
+}
+
+impl PixelSizeConfig {
+    fn text(&self) -> String {
+        match self {
+            PixelSizeConfig::Number(n) => n.to_string(),
+            PixelSizeConfig::Text(t) => t.clone(),
+            PixelSizeConfig::Pair([x, y]) => format!("{x},{y}"),
+        }
+    }
 }
 
 /// Effective settings after merging CLI over config-file over defaults.
@@ -878,6 +913,9 @@ struct Settings {
     quiet: bool,
     /// `--sample`: which sample of a multi-sample SciEX `.wiff` (1-based), published as `SCIEX_SAMPLE`.
     sample: Option<u32>,
+    /// `--pixel-size X[,Y]` (config `pixel_size`), with `--force` folded in: an imaging grid the
+    /// source leaves unsized gets this size (`imaging::apply_user_pixel_size`).
+    pixel_size: Option<imaging::UserPixelSize>,
     /// The options the user supplied ON THE COMMAND LINE (a config-file value is a standing default
     /// and is never counted here — see `resolve`), by
     /// their command-line spelling. [`refuse_unsupported_flags`] checks these, and only these,
@@ -948,6 +986,16 @@ impl Settings {
         }
         note(cli.via_msconvert, "--via-msconvert");
         note(cli.msconvert_path.is_some(), "--msconvert-path");
+        note(cli.pixel_size.is_some(), "--pixel-size");
+        let force = cli.force || fc.force.unwrap_or(false);
+        // Parsed here, so a malformed size is refused before any lane opens the input. Only the
+        // command line's --force writes the supplied size over one the source states: a config
+        // file's standing `force: true` overwrites outputs, and acknowledges no contradiction of
+        // this run (owner principle P3).
+        let pixel_size = match cli.pixel_size.clone().or_else(|| fc.pixel_size.as_ref().map(PixelSizeConfig::text)) {
+            Some(text) => Some(imaging::UserPixelSize::parse(&text, cli.force)?),
+            None => None,
+        };
         // `--lossless` is an umbrella: it IS the point layout with zero runs kept and no m/z grid
         // of any kind. A setting that asks for the opposite, on the command line or in the config
         // file, is a contradiction to refuse, not a preference to override in silence.
@@ -989,7 +1037,7 @@ impl Settings {
             // measured gain over level 5 (1.4% on 2485.d) is worth the encode time on a corpus that
             // is distributed. `--zstd-level` still overrides it for every lane.
             ims_zstd_level: cli.zstd_level.or(fc.zstd_level).unwrap_or(22),
-            force: cli.force || fc.force.unwrap_or(false),
+            force,
             no_ims_compact: cli.no_ims_compact || fc.no_ims_compact.unwrap_or(false),
             // Chunked is the default since 0.12.1. `--no-ims-chunked` (or `no_ims_chunked: true`,
             // or the older `ims_chunked: false`) goes to one chunk per frame.
@@ -1018,6 +1066,7 @@ impl Settings {
             verbose: if cli.verbose > 0 { cli.verbose } else { fc.verbose.unwrap_or(0) },
             quiet: cli.quiet || fc.quiet.unwrap_or(false),
             sample: cli.sample.or(fc.sample),
+            pixel_size,
             given,
         })
     }
@@ -1434,6 +1483,9 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
         );
     }
 
+    // `--pixel-size`, for every lane that writes an imaging grid (`imaging::user_pixel_size`).
+    imaging::set_user_pixel_size(cfg.pixel_size);
+
     // mzPeak input → filter path. A `.mzpeak` (or any ZIP with mzpeak_index.json) cannot be read by
     // mzdata; instead of the convert lanes below, route to the mzPeak→mzPeak filter (RT / MS-level /
     // aux drop+inject). This supersedes the old "mzdata can't read it" error.
@@ -1458,6 +1510,7 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
             drop_aux,
             images: cfg.image.clone(),
             sdrf: cfg.sdrf.clone(),
+            pixel_size: cfg.pixel_size,
         };
         // mzML output: read the `.mzpeak` with the sync reader (which decodes every buffer transform,
         // incl. the timsTOF tof→m/z) and write the RT / MS-level survivors to a real mzML — the "slice
@@ -1743,14 +1796,15 @@ impl Lane {
             ),
             Lane::SdkImsCompact => (
                 "the --bruker-sdk ims-compact lane",
-                "drop --bruker-sdk (the native timsTOF lane honours --ims-chunked and \
-                 --no-tims-recalibration), and add them with a second run on the archive: \
+                "drop --bruker-sdk (the native timsTOF lane honours --ims-chunked, \
+                 --no-tims-recalibration and --pixel-size), and add them with a second run on the archive: \
                  `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (--image only when \
                  the archive is imaging, a MALDI run)",
             ),
             Lane::BrukerSdk => (
                 "the --bruker-sdk f64 lane",
-                "drop --bruker-sdk, or drop the options; --image/--sdrf can be added with a second \
+                "drop --bruker-sdk (the native lanes honour them), or drop the options; --image/--sdrf, \
+                 and --pixel-size on an imaging archive, can be added with a second \
                  run on the archive: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` \
                  (--image only when the archive is imaging, a MALDI run)",
             ),
@@ -1781,19 +1835,23 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
     match lane {
         // Re-packs Parquet members verbatim: nothing the convert flags name is lost, only unused.
         Lane::Filter => &[],
-        // mzML cannot carry an embedded image/SDRF/aux member at all.
-        Lane::FilterToMzml => &["--image", "--sdrf", "--aux"],
+        // mzML cannot carry an embedded image/SDRF/aux member at all; `--pixel-size` writes an
+        // archive's grid and its declaration, which an mzML has no transformations list for.
+        Lane::FilterToMzml => &["--image", "--sdrf", "--aux", "--pixel-size"],
         // The mzML dispatch runs before SDK selection, so `--bruker-sdk` picks a backend the export
         // never consults — that is a choice silently overridden, not an inert flag.
-        Lane::MzmlExport => &["--image", "--sdrf", "--aux", "--bruker-sdk"],
+        Lane::MzmlExport => &["--image", "--sdrf", "--aux", "--bruker-sdk", "--pixel-size"],
         // `--keep-zero-runs`: the file-direct reader leaves the zero samples out of its point lists
-        // itself (`agilent:drop-zero-samples`), so the archive would come out without them.
-        Lane::AgilentGrid => &["--image", "--sdrf", "--via-msconvert", "--keep-zero-runs"],
+        // itself (`agilent:drop-zero-samples`), so the archive would come out without them. An
+        // Agilent profile `.d` is no imaging run: `--pixel-size` has no grid there.
+        Lane::AgilentGrid => &["--image", "--sdrf", "--via-msconvert", "--keep-zero-runs", "--pixel-size"],
         // Lane selection puts msconvert before every native backend, so these four would be
         // silently overridden — the user chose a reader and gets a different one.
         Lane::ViaMsconvert => &["--aux", "--bruker-sdk", "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
-        Lane::SdkImsCompact => &["--image", "--sdrf", "--no-tims-recalibration"],
-        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
+        // The SDK lanes mark no MALDI run imaging and write no pixel grid: `--pixel-size` would size
+        // nothing (the native lanes write the grid, and the archive can be sized afterwards).
+        Lane::SdkImsCompact => &["--image", "--sdrf", "--no-tims-recalibration", "--pixel-size"],
+        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration", "--pixel-size"],
         Lane::ImsCompact => &["--image", "--sdrf"],
         Lane::VendorReader => &["--image", "--sdrf"],
         Lane::Standard => &[],
@@ -2934,9 +2992,9 @@ fn imzml_scan_settings_for_mzml(input: &Path, read_path: &Path, list: &mut [mzda
         for m in f.unit_mismatches.iter().chain(&f.written_units).chain(&f.extent_mismatches) {
             log::warn!("imzML scan settings {}: {m}", f.settings_id);
         }
-        if let Some(t) = f.transformation {
+        if !f.transformations.is_empty() {
             log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
-            applied.push(t);
+            applied.extend(f.transformations.iter().copied());
         }
     }
     if !applied.is_empty() {
@@ -5392,6 +5450,11 @@ fn convert_file(
             imaging::Detected::ScanPositions
         })
     });
+    // `--pixel-size` sizes a pixel grid: a run that has none is refused before anything is written.
+    let user_pixel_size = imaging::user_pixel_size();
+    if let (Some(u), None) = (&user_pixel_size, &detected) {
+        bail!("--pixel-size {}: {} is not an imaging run (no pixel positions were found): there is no grid to size", u.text(), input.display());
+    }
     // A z the probes miss is searched for the same way (an imzML's text is its header and scans, the
     // arrays live in the `.ibd`); it used to stay a generic scan param with no `position_z` column.
     if scan_lane && detected.is_some() && !searched && !stated_z {
@@ -5595,6 +5658,8 @@ fn convert_file(
     // obsolete scan term "one way" as flyback — each change declared (`imaging`).
     let mut imaging_applied: Vec<&'static str> = Vec::new();
     let mut imaging_block: Option<serde_json::Value> = None;
+    // The imzML rule's word on each `<scanSettings>`: how the size it kept was settled, by id.
+    let mut fix_sources: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
     // Whether the pixel-size rule read this input's scan settings (imzML only): a lone `IMS:1000046`
     // still there afterwards is one the rule kept. On any other lane nothing tested it.
     let mut pixel_size_checked = false;
@@ -5674,14 +5739,21 @@ fn convert_file(
             for m in &f.extent_mismatches {
                 log::warn!("imzML scan settings {}: pixel size written as stated, but {m} (listed in imaging_pixel_size)", f.settings_id);
             }
-            if let Some(t) = f.transformation {
+            if !f.transformations.is_empty() {
                 log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
-                imaging_applied.push(t);
+                imaging_applied.extend(f.transformations.iter().copied());
             }
         }
         if !fixes.is_empty() {
             imaging_block = Some(fixes.iter().map(imaging::fix_json).collect());
         }
+        fix_sources = fixes.iter().map(|f| (f.settings_id.clone(), f.source())).collect();
+    }
+    // `--pixel-size` against what the source states (after the imzML rule): a contradiction is
+    // refused here, before any spectrum is written; the size itself is written once the pixel
+    // counts are known, below.
+    if let Some(u) = &user_pixel_size {
+        imaging::check_user_pixel_size(writer.scan_settings().and_then(|l| imaging::grid(l)), u, "the source's scan settings")?;
     }
     let mut source_refs = None;
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
@@ -5721,7 +5793,7 @@ fn convert_file(
     };
     // A MALDI timsTOF run through mzdata (`--no-ims-compact`): each frame's raster position.
     if let Some(m) = &maldi {
-        enable_bruker_imaging(&mut writer, m);
+        enable_bruker_imaging(&mut writer, m)?;
     }
     // Thermo precursor windows the reader library computed without a stated width are written
     // target-only (`thermo_isolation`); the count is declared in `transformations` below.
@@ -5930,6 +6002,9 @@ fn convert_file(
             imaging_applied.push(imaging::INVALID_Z_DROPPED);
         }
         if positioned == 0 {
+            if let Some(u) = &user_pixel_size {
+                bail!("--pixel-size {}: no scan of {} carries a pixel position, so no grid is written: there is nothing to size", u.text(), input.display());
+            }
             log::warn!("{}: no scan carries a pixel position; the archive is not marked imaging", input.display());
         } else {
             // mzdata's `FileMetadataConfig` behind the writer always holds a list, empty when the
@@ -5937,6 +6012,14 @@ fn convert_file(
             let list = writer.scan_settings_mut().expect("the writer holds a scan settings list");
             let counts = extent.bound(list);
             imaging_applied.extend(counts);
+            // `--pixel-size`, on the grid entry the counts are now in (the lanes' one rule).
+            let mut user_row = None;
+            if let (Some(u), Some(g)) = (&user_pixel_size, imaging::grid_mut(list)) {
+                user_row = imaging::apply_user_pixel_size(g, u, "the source's scan settings")?;
+            }
+            if user_row.is_some() {
+                imaging_applied.push(imaging::USER_SUPPLIED);
+            }
             let grid = imaging::grid(list).cloned();
             // mzdata gives a scan without `MS:1000016` the start time 0, and the writer stores it
             // (a null time is a question for the core spec): the marker says which it is, and for
@@ -5960,7 +6043,9 @@ fn convert_file(
                     Some(_) => "the input's scan settings, a count that did not bound the positions set to the largest",
                     None => "the input's scan settings",
                 },
-                "pixel_size": if imaging_block.is_some() {
+                "pixel_size": if user_row.is_some() {
+                    imaging::USER_SUPPLIED_PROVENANCE
+                } else if imaging_block.is_some() {
                     "checked, see imaging_pixel_size"
                 } else if imaging::states_pixel_size(grid.as_ref()) {
                     "as stated"
@@ -5987,7 +6072,22 @@ fn convert_file(
             // "pixel size" may be the area the term named until 2017 — 2500 µm² would be reported
             // as 2500 µm on both axes. The scan settings keep it as stated either way.
             let lone_x = if pixel_size_checked { imaging::LoneX::AlsoY } else { imaging::LoneX::XOnly };
-            let mut block = imaging::marker_block(grid.as_ref(), source, lone_x, provenance);
+            // How the size was settled: `--pixel-size`; the imzML rule's word on this entry; else a
+            // stated size is declared and none is unknown (an mzML's untested lone x gives the
+            // marker no size, and the marker says unknown of it).
+            let pixel_size_source = if user_row.is_some() {
+                imaging::SOURCE_USER_SUPPLIED
+            } else if let Some(s) = grid.as_ref().and_then(|g| fix_sources.get(&g.id)) {
+                s
+            } else if imaging::states_pixel_size(grid.as_ref()) {
+                imaging::SOURCE_DECLARED
+            } else {
+                imaging::SOURCE_UNKNOWN
+            };
+            if let Some(row) = user_row.take() {
+                imaging_block.get_or_insert_with(|| serde_json::json!([])).as_array_mut().expect("a list of rows").push(row);
+            }
+            let mut block = imaging::marker_block(grid.as_ref(), source, lone_x, pixel_size_source, provenance);
             // imzML: the binary mode the header states, and on a continuous-mode file whether every
             // spectrum did hold one m/z array (owner decision D2). Converter-first keys inside the
             // marker (P4), documented in the manual's §8.
@@ -6014,7 +6114,7 @@ fn convert_file(
         }
     }
     if let Some(m) = &maldi {
-        let (blocks, applied) = m.index_blocks();
+        let (blocks, applied) = m.index_blocks()?;
         imaging_blocks.extend(blocks);
         imaging_applied.extend(applied);
     }
@@ -7263,8 +7363,9 @@ where
     ensure_mzp_cv(&mut writer);
     // MALDI imaging (timsTOF fleX): each frame's raster position (`imaging::detect`, `bruker_maldi`).
     let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
+    refuse_user_pixel_size_without_grid(input, maldi.is_some())?;
     if let Some(m) = &maldi {
-        enable_bruker_imaging(&mut writer, m);
+        enable_bruker_imaging(&mut writer, m)?;
     }
 
     let mut ms1 = Ms1Chroms::default();
@@ -7431,7 +7532,7 @@ where
     if let Some(entry) = mz_summary.transformation {
         declare(&mut applied, entry);
     }
-    let (maldi_blocks, maldi_applied) = maldi.as_ref().map(|m| m.index_blocks()).unwrap_or_default();
+    let (maldi_blocks, maldi_applied) = maldi.as_ref().map(|m| m.index_blocks()).transpose()?.unwrap_or_default();
     for t in maldi_applied {
         declare(&mut applied, t);
     }
@@ -8690,7 +8791,7 @@ fn convert_waters(
     // Imaging (MALDI / DESI): the reader attaches each scan's pixel, fitted to its laser positions —
     // the Waters branch of imaging detection, which needs MassLynx open.
     if let Some(im) = reader.imaging() {
-        waters_imaging_hints(im, &mut hints);
+        waters_imaging_hints(im, &mut hints)?;
     }
     if let Some(block) = reader.drift_block() {
         hints.index_blocks.push(("waters_drift".to_string(), block));
@@ -8710,17 +8811,26 @@ fn convert_waters(
 /// `waters_imaging` block; laser positions that fit no grid get the block alone, saying why — no
 /// positions, no marker (review 2026-09-30 B14). Outside `convert_waters` so every host compiles it.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn waters_imaging_hints(im: &waters::WatersImaging, hints: &mut VendorHints) {
-    let Some(grid) = im.scan_settings() else {
+fn waters_imaging_hints(im: &waters::WatersImaging, hints: &mut VendorHints) -> Result<()> {
+    let Some(mut grid) = im.scan_settings() else {
         hints.index_blocks.push(("waters_imaging".to_string(), im.block()));
-        return;
+        return Ok(());
     };
-    let marker = im.marker(&grid);
-    hints.imaging = Some(ImagingHints {
-        grid,
-        blocks: vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())],
-        transformations: im.transformations(),
-    });
+    // `--pixel-size`, the lanes' one rule: a single row's lone x step gets its y, steps that agree
+    // are left alone, a differing size is refused unless --force.
+    let user_row = match imaging::user_pixel_size() {
+        Some(u) => imaging::apply_user_pixel_size(&mut grid, &u, "the grid fitted to the MassLynx laser positions")?,
+        None => None,
+    };
+    let marker = im.marker(&grid, user_row.as_ref());
+    let mut blocks = vec![("imaging".to_string(), marker), ("waters_imaging".to_string(), im.block())];
+    let mut transformations = im.transformations();
+    if let Some(row) = user_row {
+        blocks.push(("imaging_pixel_size".to_string(), serde_json::json!([row])));
+        transformations.push(imaging::USER_SUPPLIED);
+    }
+    hints.imaging = Some(ImagingHints { grid, blocks, transformations });
+    Ok(())
 }
 
 /// Convert a native Agilent MassHunter `.d` → mzPeak through the net48 MHDAC host (`agilent.rs`;
@@ -8924,6 +9034,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     let keep_zero_runs = keep_zero_runs || crate::keep_zero_runs();
     // MALDI imaging from a Bruker `.d` (the TSF lane): each frame's raster position.
     let maldi = imaging::detect(input, false, &[]).and_then(imaging::Detected::bruker);
+    refuse_user_pixel_size_without_grid(input, maldi.is_some() || imaging_hints.is_some())?;
     let mut index_blocks = index_blocks;
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
@@ -9024,7 +9135,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
         let mut writer = builder.build(handle, !keep_zero_runs);
         add_processing_metadata(&mut writer);
         if let Some(m) = &maldi {
-            enable_bruker_imaging(&mut writer, m);
+            enable_bruker_imaging(&mut writer, m)?;
         }
         if let Some(h) = &imaging_hints {
             enable_imaging(&mut writer, h.grid.clone());
@@ -9120,7 +9231,7 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
     // A lane that keeps zero runs built the writer with the mask off, so its tally has none to report.
     let mut applied = base_transformations(&writer);
     if let Some(m) = &maldi {
-        let (blocks, maldi_applied) = m.index_blocks();
+        let (blocks, maldi_applied) = m.index_blocks()?;
         for t in maldi_applied {
             declare(&mut applied, t);
         }
@@ -9167,9 +9278,25 @@ fn convert_vendor_reader_tallied<S: Into<VendorSpectrum>>(
 /// Turn a writer into an imaging one for a Bruker MALDI run: the position columns the imzML path
 /// writes, the IMS vocabulary, and the grid (pixel counts; pixel size from the beam scan size when
 /// there is one).
-fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) {
+fn enable_bruker_imaging(writer: &mut MzPeakWriterType<fs::File>, maldi: &bruker_maldi::MaldiInfo) -> Result<()> {
     log::info!("Bruker MALDI imaging: {} frames carry a raster position", maldi.spots.len());
-    enable_imaging(writer, maldi.scan_settings());
+    // `--pixel-size` is applied (or refused) here, before any spectrum is written.
+    let (grid, _) = maldi.grid()?;
+    enable_imaging(writer, grid);
+    Ok(())
+}
+
+/// `--pixel-size` on a lane whose run turned out not to be imaging: refused before anything is
+/// written, rather than accepted for a grid that is never written.
+fn refuse_user_pixel_size_without_grid(input: &Path, imaging: bool) -> Result<()> {
+    match imaging::user_pixel_size() {
+        Some(u) if !imaging => bail!(
+            "--pixel-size {}: {} is not an imaging run (no pixel grid is written for it): there is no grid to size",
+            u.text(),
+            input.display()
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Turn a writer into an imaging one: the position columns, the IMS vocabulary and the grid.
@@ -14727,6 +14854,17 @@ mod tests {
         for lane in [Lane::Standard, Lane::ViaMsconvert, Lane::VendorReader, Lane::BrukerSdk] {
             assert!(!super::inert_flags_for(lane).contains(&flag) && !super::dropped_flags_for(lane).contains(&flag), "{lane:?} honours it");
         }
+        // `--pixel-size` sizes an imaging grid: refused by every lane that writes none (the two SDK
+        // lanes mark no MALDI run imaging — through this unit's first cut they took the flag and
+        // exited 0 — the Agilent grid, the two mzML outputs); the rest honour it or refuse it at
+        // run time, on the run that turns out not to be imaging.
+        let flag = "--pixel-size";
+        for lane in [Lane::AgilentGrid, Lane::SdkImsCompact, Lane::BrukerSdk, Lane::FilterToMzml, Lane::MzmlExport] {
+            assert!(super::dropped_flags_for(lane).contains(&flag), "{lane:?}");
+        }
+        for lane in [Lane::Filter, Lane::Standard, Lane::ViaMsconvert, Lane::ImsCompact, Lane::VendorReader] {
+            assert!(!super::dropped_flags_for(lane).contains(&flag) && !super::inert_flags_for(lane).contains(&flag), "{lane:?} honours it");
+        }
     }
 
     /// Every lane refusing `--image` names a remedy that works: the second run on the archive, which
@@ -15141,15 +15279,31 @@ mod tests {
             let acc = row["accession"].as_str().unwrap();
             assert_eq!(row["unit"], param(&m["scan_settings_list"][0], acc).unwrap()["unit"], "{acc}: {:#}", m["imaging_pixel_size"]);
         }
-        // A single y in that unit pair is tested in the unit written (µm): 100 × 3 = 300 µm is kept,
-        // 0.01 is dropped — by accession it passed as 0.01 cm and was written as 0.01 µm.
-        for (name, value, kept) in [("cm_y", "100.0", true), ("cm_y_small", "0.01", false)] {
-            let m = convert(name, base.replace(px, "").replace(py, &cm(py).replace("100.0", value)));
-            let written = param(&m["scan_settings_list"][0], "IMS:1000047");
-            assert_eq!(written.is_some(), kept, "{name}: {:#}", m["imaging_pixel_size"]);
-            assert_eq!(declared(&m, super::imaging::DROPPED), !kept, "{name}: {:#}", m["transformations"]);
-            if let Some(w) = written {
-                assert_eq!((&w["value"], &w["unit"]), (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}");
+        // A single value in that unit pair is read both ways against the extent (owner decision D4):
+        // 100 "micrometer" × 3 = 300 µm passes by the name and is kept as it was; 0.01 passes only
+        // as 0.01 cm (the accession) and is written as 100 µm, declared (it was dropped through
+        // 0.17.0-rc.2; before review B17 it passed by accession and was written as 0.01 µm). A lone
+        // x gives y too (the vocabulary's default), so the marker reads both and says `declared`;
+        // a lone y says nothing about x: the marker has no `pixel_size_um` and says `unknown`, by
+        // its own rule (the first cut of this unit asserted `declared` of the lone y).
+        for (name, lone_x, value, by_accession) in [("cm_x", true, "100.0", false), ("cm_x_small", true, "0.01", true), ("cm_y", false, "100.0", false), ("cm_y_small", false, "0.01", true)] {
+            let header = if lone_x { base.replace(py, "").replace(px, &cm(px).replace("100.0", value)) } else { base.replace(px, "").replace(py, &cm(py).replace("100.0", value)) };
+            let m = convert(name, header);
+            let s = &m["scan_settings_list"][0];
+            assert!(!declared(&m, super::imaging::DROPPED), "{name}: {:#}", m["transformations"]);
+            assert_eq!(declared(&m, super::imaging::UNIT_FROM_ACCESSION), by_accession, "{name}: {:#}", m["transformations"]);
+            let written: Vec<&str> = if lone_x { vec!["IMS:1000046", "IMS:1000047"] } else { vec!["IMS:1000047"] };
+            for acc in ["IMS:1000046", "IMS:1000047"] {
+                match param(s, acc) {
+                    Some(w) => assert!(written.contains(&acc) && (&w["value"], &w["unit"]) == (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}: {acc} {w:#}"),
+                    None => assert!(!written.contains(&acc), "{name}: no {acc}: {s:#}"),
+                }
+            }
+            if lone_x {
+                assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"]), (&serde_json::json!({"x": 100.0, "y": 100.0}), &serde_json::json!("declared")), "{name}: {:#}", m["imaging"]);
+            } else {
+                assert!(m["imaging"].get("pixel_size_um").is_none(), "{name}: {:#}", m["imaging"]);
+                assert_eq!(m["imaging"]["pixel_size_source"], "unknown", "{name}: {:#}", m["imaging"]);
             }
         }
 
@@ -15186,6 +15340,140 @@ mod tests {
         assert_eq!(m["imaging"]["provenance"]["detected_from"], "IMS:1000050/51 on the input's scans");
         assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 3, "y": 3}), "{:#}", m["imaging"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--pixel-size` (owner decision D3, 2026-10-01): written where the source settles no size,
+    /// kept where it states the same, refused where it states another unless `--force`; declared
+    /// and recorded on the imzML lane and on the rewrite of an archive; refused where there is no
+    /// grid to size (a run that is not imaging, an mzML output) and when malformed; the config key
+    /// in its three spellings.
+    #[test]
+    fn a_user_pixel_size_is_written_where_the_source_settles_none() {
+        let dir = scratch("pixel-size-flag");
+        let thyra = |name: &str| std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/thyra")).join(format!("pixel_size_{name}.imzML"));
+        let convert = |input: &std::path::Path, out: &str, extra: &[&str]| -> (bool, serde_json::Value, String) {
+            let out = dir.join(out);
+            let mut args: Vec<&std::ffi::OsStr> = vec![input.as_os_str(), "-o".as_ref(), out.as_os_str()];
+            args.extend(extra.iter().map(std::ffi::OsStr::new));
+            let (ok, _, err) = run_bin(&args, &[]);
+            (ok, if ok { index_metadata(&out) } else { serde_json::Value::Null }, err)
+        };
+        let sizes = |m: &serde_json::Value| -> Vec<(String, f64, String)> {
+            let mut v: Vec<(String, f64, String)> = m["scan_settings_list"][0]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| ["IMS:1000046", "IMS:1000047", "IMS:1000044", "IMS:1000045"].contains(&p["accession"].as_str().unwrap_or("")))
+                .map(|p| (p["accession"].as_str().unwrap().into(), p["value"].as_f64().unwrap(), p["unit"].as_str().unwrap_or("").into()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let um = |acc: &str, v: f64| (acc.to_string(), v, "UO:0000017".to_string());
+        let user_supplied = serde_json::json!(super::imaging::USER_SUPPLIED);
+        // The unit contradiction without an extent: the rule drops the stated 50; --pixel-size 50
+        // fills it (declared, recorded, the max dimension from the 3 × 2 counts).
+        let (ok, m, err) = convert(&thyra("unit_contradiction"), "filled.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"]), (&serde_json::json!({"x": 50.0, "y": 50.0}), &serde_json::json!("user_supplied")), "{:#}", m["imaging"]);
+        assert_eq!(m["imaging"]["provenance"]["pixel_size"], "user supplied (--pixel-size)");
+        let declared = m["transformations"].as_array().unwrap();
+        assert!(declared.contains(&user_supplied) && declared.contains(&serde_json::json!(super::imaging::DROPPED)), "the rule's drop stays declared beside the fill: {declared:?}");
+        let rows = m["imaging_pixel_size"].as_array().unwrap();
+        assert_eq!((rows.len(), rows[0]["case"].as_str(), rows[1]["case"].as_str()), (2, Some("one value, untestable"), Some("user supplied (--pixel-size)")), "{rows:#?}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 150.0), um("IMS:1000045", 100.0), um("IMS:1000046", 50.0), um("IMS:1000047", 50.0)]);
+        // The declared 50 µm: 50 agrees (nothing declared), 20 is refused naming both, --force
+        // writes 20 × 25 over it and recomputes the stated max dimension.
+        let (ok, m, err) = convert(&thyra("unit_declared"), "agrees.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert!(m["imaging"]["pixel_size_source"] == "declared" && m.get("imaging_pixel_size").is_none() && !m["transformations"].as_array().unwrap().contains(&user_supplied), "{m:#}");
+        let (ok, _, err) = convert(&thyra("unit_declared"), "refused.mzpeak", &["--pixel-size", "20"]);
+        assert!(!ok && err.contains("--pixel-size 20 µm") && err.contains("(IMS:1000046) = 50 µm") && err.contains("--force"), "{err}");
+        assert!(!dir.join("refused.mzpeak").exists(), "nothing written");
+        let (ok, m, err) = convert(&thyra("unit_declared"), "forced.mzpeak", &["--pixel-size", "20,25", "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"]), (&serde_json::json!({"x": 20.0, "y": 25.0}), &serde_json::json!("user_supplied")));
+        let row = &m["imaging_pixel_size"][0];
+        assert_eq!((&row["overridden"], row["stated"].as_array().unwrap().len()), (&serde_json::json!(true), 2), "{row:#}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 60.0), um("IMS:1000045", 50.0), um("IMS:1000046", 20.0), um("IMS:1000047", 25.0)]);
+        // The rewrite lane: an archive without a size gains it, marker, declaration and row with it;
+        // its mzML export then states the size; an archive with another size refuses it.
+        let (ok, m, err) = convert(&thyra("unit_contradiction"), "unsized.mzpeak", &[]);
+        assert!(ok && m["imaging"].get("pixel_size_um").is_none() && m["imaging"]["pixel_size_source"] == "unknown", "{err} {:#}", m["imaging"]);
+        let (ok, m, err) = convert(&dir.join("unsized.mzpeak"), "rewritten.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert_eq!(
+            (&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"], &m["imaging"]["provenance"]["pixel_size"]),
+            (&serde_json::json!({"x": 50.0, "y": 50.0}), &serde_json::json!("user_supplied"), &serde_json::json!("user supplied (--pixel-size)")),
+            "{:#}",
+            m["imaging"]
+        );
+        assert!(m["transformations"].as_array().unwrap().contains(&user_supplied) && m["filter"].is_object(), "{m:#}");
+        assert_eq!(m["imaging_pixel_size"].as_array().unwrap().len(), 2, "{:#}", m["imaging_pixel_size"]);
+        assert_eq!(sizes(&m), [um("IMS:1000044", 150.0), um("IMS:1000045", 100.0), um("IMS:1000046", 50.0), um("IMS:1000047", 50.0)]);
+        let mzml = dir.join("rewritten.mzML");
+        let (ok, _, err) = run_bin(&[dir.join("rewritten.mzpeak").as_os_str(), "-o".as_ref(), mzml.as_os_str()], &[]);
+        assert!(ok, "{err}");
+        let text = std::fs::read_to_string(&mzml).unwrap();
+        assert!(text.contains(r#"accession="IMS:1000046""#) && text.contains(r#"accession="IMS:1000047""#), "the export states the size");
+        let (ok, _, err) = convert(&dir.join("forced.mzpeak"), "refused2.mzpeak", &["--pixel-size", "50"]);
+        assert!(!ok && err.contains("the archive's scan settings states a pixel size that differs"), "{err}");
+        // Refused where there is no grid: a run that is not imaging, an archive that is not, an mzML output.
+        let (ok, _, err) = convert(std::path::Path::new(TINY), "tiny.mzpeak", &["--pixel-size", "10"]);
+        assert!(!ok && err.contains("is not an imaging run"), "{err}");
+        let (ok, _, err) = convert(std::path::Path::new(TINY), "tiny-plain.mzpeak", &[]);
+        assert!(ok, "{err}");
+        let (ok, _, err) = convert(&dir.join("tiny-plain.mzpeak"), "tiny-rewritten.mzpeak", &["--pixel-size", "10"]);
+        assert!(!ok && err.contains("is not an imaging archive"), "{err}");
+        let (ok, _, err) = convert(&thyra("unit_contradiction"), "out.mzML", &["--pixel-size", "10"]);
+        assert!(!ok && err.contains("--pixel-size is not honoured"), "{err}");
+        // Malformed sizes are refused before any lane opens the input (`=`: clap takes a bare `-5`
+        // for a flag of its own and refuses it itself).
+        for bad in ["0", "abc", "1,2,3", "-5", "inf"] {
+            let flag = format!("--pixel-size={bad}");
+            let (ok, _, err) = convert(&thyra("unit_contradiction"), "bad.mzpeak", &[&flag]);
+            assert!(!ok && err.contains("--pixel-size") && !dir.join("bad.mzpeak").exists(), "{bad}: {err}");
+        }
+        // An axis stating no size but a count and a max dimension — the evidence D4 settles a size
+        // by — tests the supplied size the other way round (this unit's first cut wrote 20 µm beside
+        // a 150 µm × 3 px axis in silence): 50 fills and keeps the extents, 20 is refused naming the
+        // extent before anything is written, --force writes 20 with the extents recomputed.
+        let header = std::fs::read_to_string(thyra("unit_contradiction")).unwrap();
+        let size_line = r#"<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size" value="50" unitCvRef="UO" unitAccession="UO:0000015" unitName="micrometer"/>"#;
+        assert!(header.contains(size_line), "{header}");
+        let extents = r#"<cvParam cvRef="IMS" accession="IMS:1000044" name="max dimension x" value="150" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/><cvParam cvRef="IMS" accession="IMS:1000045" name="max dimension y" value="100" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#;
+        std::fs::write(dir.join("extent_only.imzML"), header.replace(size_line, extents)).unwrap();
+        std::fs::copy(thyra("unit_contradiction").with_extension("ibd"), dir.join("extent_only.ibd")).unwrap();
+        let (ok, _, err) = convert(&dir.join("extent_only.imzML"), "extent-refused.mzpeak", &["--pixel-size", "20"]);
+        assert!(!ok && err.contains("max dimension x (IMS:1000044) = 150 µm over 3 pixels, not 3 × 20 µm = 60 µm") && err.contains("--force"), "{err}");
+        assert!(!dir.join("extent-refused.mzpeak").exists(), "nothing written");
+        let (ok, m, err) = convert(&dir.join("extent_only.imzML"), "extent-filled.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 150.0), um("IMS:1000045", 100.0), um("IMS:1000046", 50.0), um("IMS:1000047", 50.0)]);
+        assert_eq!((&m["imaging"]["pixel_size_source"], &m["imaging_pixel_size"][0]["max_dimension"]), (&serde_json::json!("user_supplied"), &serde_json::json!([])), "{:#}", m["imaging_pixel_size"]);
+        let (ok, m, err) = convert(&dir.join("extent_only.imzML"), "extent-forced.mzpeak", &["--pixel-size", "20", "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 60.0), um("IMS:1000045", 40.0), um("IMS:1000046", 20.0), um("IMS:1000047", 20.0)]);
+        let row = &m["imaging_pixel_size"][0];
+        assert_eq!((&row["overridden"], row["stated"].as_array().unwrap().len(), row["max_dimension"].as_array().unwrap().len()), (&serde_json::json!(true), 0, 2), "{row:#}");
+        // The config key, in its three spellings; --force on the command line still folds in.
+        for (yaml, want) in [("pixel_size: 50", (50.0, 50.0)), ("pixel_size: \"50,60\"", (50.0, 60.0)), ("pixel_size: [50, 60]", (50.0, 60.0))] {
+            let cfg = dir.join("cfg.yaml");
+            std::fs::write(&cfg, yaml).unwrap();
+            let (ok, m, err) = convert(&thyra("unit_contradiction"), "cfg.mzpeak", &["-c", cfg.to_str().unwrap(), "--force"]);
+            assert!(ok, "{yaml}: {err}");
+            assert_eq!(m["imaging"]["pixel_size_um"], serde_json::json!({"x": want.0, "y": want.1}), "{yaml}");
+        }
+        // A config file's standing `force: true` overwrites outputs; it does not write over a stated
+        // size — that acknowledgement is the command line's --force alone (it did, in silence).
+        let cfg = dir.join("cfg-force.yaml");
+        std::fs::write(&cfg, "pixel_size: 20\nforce: true\n").unwrap();
+        let (ok, _, err) = convert(&thyra("unit_declared"), "cfg-force.mzpeak", &["-c", cfg.to_str().unwrap()]);
+        assert!(!ok && err.contains("(IMS:1000046) = 50 µm") && err.contains("--force"), "{err}");
+        let (ok, m, err) = convert(&thyra("unit_declared"), "cfg-force.mzpeak", &["-c", cfg.to_str().unwrap(), "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging_pixel_size"][0]["overridden"]), (&serde_json::json!({"x": 20.0, "y": 20.0}), &serde_json::json!(true)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The `.ibd` is hashed against the checksum the imzML states (HUPO-PSI/mzPeak-specification#23:

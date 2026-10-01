@@ -67,6 +67,9 @@ pub struct FilterOpts {
     pub images: Vec<PathBuf>,
     /// Inject an SDRF sample-metadata TSV (verbatim).
     pub sdrf: Option<PathBuf>,
+    /// `--pixel-size`: an imaging archive whose grid states no pixel size gains the supplied one
+    /// ([`apply_user_pixel_size`]).
+    pub pixel_size: Option<crate::imaging::UserPixelSize>,
 }
 
 /// Parse an `--rt MIN-MAX` argument. Either bound may be omitted for an open range (`10-`, `-30`).
@@ -169,9 +172,14 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
     // Parse the original index so we can carry its metadata blocks + per-member FileEntry classes.
     let index_json = read_member(&mut zip, "mzpeak_index.json")
         .context("reading mzpeak_index.json")?;
-    let index: serde_json::Value = serde_json::from_slice(&index_json)
+    let mut index: serde_json::Value = serde_json::from_slice(&index_json)
         .context("parsing mzpeak_index.json")?;
     crate::reject_legacy_tof_delta(input, index.pointer("/metadata/ims_calibration"))?;
+    // `--pixel-size` on the archive's own grid, before anything is re-encoded: a contradiction with
+    // a stated size is refused here.
+    if let Some(user) = &opts.pixel_size {
+        apply_user_pixel_size(&mut index, user, input)?;
+    }
     let orig_files = index_file_entries(&index);
 
     let member_names: Vec<String> = zip.file_names().map(str::to_string).collect();
@@ -1736,6 +1744,56 @@ fn carry_index_metadata(
     }
     w.add_index_metadata("filter", &provenance)
         .map_err(|e| anyhow!("index metadata filter: {e}"))?;
+    Ok(())
+}
+
+/// `--pixel-size` on the rewrite lane: the archive's grid entry (`metadata.scan_settings_list`, the
+/// one stating `IMS:1000042/43`) gains the size by the lanes' one rule
+/// ([`crate::imaging::apply_user_pixel_size`]: written where the archive states none, refused where
+/// it states a different one unless `--force`), and the `metadata.imaging` marker
+/// (`pixel_size_um`, `pixel_size_source`, `provenance.pixel_size`), the `transformations` list and
+/// the `imaging_pixel_size` rows are brought along, in the index the rewrite carries. An archive
+/// that is not imaging has no grid to size and is refused.
+fn apply_user_pixel_size(index: &mut serde_json::Value, user: &crate::imaging::UserPixelSize, input: &Path) -> Result<()> {
+    use crate::imaging::{SOURCE_USER_SUPPLIED, USER_SUPPLIED, USER_SUPPLIED_PROVENANCE};
+    let Some(meta) = index.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+        bail!("--pixel-size: {} has no index metadata", input.display());
+    };
+    if !meta.get("imaging").is_some_and(|m| m["is_imaging"] == true) {
+        bail!(
+            "--pixel-size: {} is not an imaging archive (no metadata.imaging marker): there is no pixel grid to size",
+            input.display()
+        );
+    }
+    let list: Vec<mzpeak_prototyping::param::ScanSettings> = match meta.get("scan_settings_list") {
+        Some(v) => serde_json::from_value(v.clone()).context("reading the archive's scan_settings_list")?,
+        None => Vec::new(),
+    };
+    let mut list: Vec<mzdata::meta::ScanSettings> = list.into_iter().map(Into::into).collect();
+    let Some(grid) = crate::imaging::grid_mut(&mut list) else {
+        bail!("--pixel-size: {} states no pixel grid (IMS:1000042/43) in its scan settings: there is no grid to size", input.display());
+    };
+    let Some(row) = crate::imaging::apply_user_pixel_size(grid, user, "the archive's scan settings")? else {
+        return Ok(());
+    };
+    let size = crate::imaging::pixel_size_um(grid);
+    let back: Vec<mzpeak_prototyping::param::ScanSettings> = list.iter().map(Into::into).collect();
+    meta.insert("scan_settings_list".into(), serde_json::to_value(back).context("writing the scan_settings_list")?);
+    if let Some(arr) = meta.entry("transformations").or_insert_with(|| serde_json::json!([])).as_array_mut() {
+        if !arr.iter().any(|e| e == USER_SUPPLIED) {
+            arr.push(USER_SUPPLIED.into());
+        }
+    }
+    if let Some(marker) = meta.get_mut("imaging") {
+        if let Some((x, y)) = size {
+            marker["pixel_size_um"] = serde_json::json!({"x": x, "y": y});
+        }
+        marker["pixel_size_source"] = SOURCE_USER_SUPPLIED.into();
+        marker["provenance"]["pixel_size"] = USER_SUPPLIED_PROVENANCE.into();
+    }
+    if let Some(arr) = meta.entry("imaging_pixel_size").or_insert_with(|| serde_json::json!([])).as_array_mut() {
+        arr.push(row);
+    }
     Ok(())
 }
 

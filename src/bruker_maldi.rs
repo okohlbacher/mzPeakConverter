@@ -98,6 +98,10 @@ pub struct MaldiInfo {
     pub mis: Option<Mis>,
     /// A `.mis` beside the `.d` that is not used, and why ([`Self::mis_mismatch`]).
     pub mis_rejected: Option<(String, String)>,
+    /// `--pixel-size`, read once by [`read_dot_d`]: written by [`Self::grid`] where neither the
+    /// `.mis` nor the beam scan size settles a size (refused, or written over under `--force`, where
+    /// one does — the lanes' one rule, [`crate::imaging::apply_user_pixel_size`]).
+    pub user: Option<crate::imaging::UserPixelSize>,
 }
 
 /// One `<Area>` of a FlexImaging `.mis`: its name, raster step (µm) and outline.
@@ -273,6 +277,7 @@ pub fn read_dot_d(dot_d: &Path) -> Option<MaldiInfo> {
     })?;
     info.mis = read_mis(&dot_d.with_extension("mis"));
     info.check_mis();
+    info.user = crate::imaging::user_pixel_size();
     // Once per conversion: every lane reads the run's positions here, once.
     if info.unpositioned > 0 {
         log::warn!(
@@ -401,6 +406,38 @@ impl MaldiInfo {
         self.pixel_size_from().map(|(p, _)| p)
     }
 
+    /// `metadata.imaging.pixel_size_source` of the grid: how [`Self::grid`] settled the size.
+    pub fn pixel_size_source(&self, user_row: Option<&serde_json::Value>) -> &'static str {
+        use crate::imaging::{SOURCE_DECLARED, SOURCE_FROM_BEAM, SOURCE_UNKNOWN, SOURCE_USER_SUPPLIED};
+        match (user_row, self.pixel_size_from()) {
+            (Some(_), _) => SOURCE_USER_SUPPLIED,
+            (None, Some((_, PixelSource::Mis))) => SOURCE_DECLARED,
+            (None, Some((_, PixelSource::Beam))) => SOURCE_FROM_BEAM,
+            (None, None) => SOURCE_UNKNOWN,
+        }
+    }
+
+    /// What settles the pixel size, for `--pixel-size`'s refusal.
+    fn settled_by(&self) -> String {
+        match (self.pixel_size_from(), &self.mis) {
+            (Some((_, PixelSource::Mis)), Some(m)) => format!("the FlexImaging sequence {}'s raster step", m.file),
+            (Some((_, PixelSource::Beam)), _) => "the frames' beam scan size (MaldiFrameInfo)".to_string(),
+            _ => "the Bruker MALDI run".to_string(),
+        }
+    }
+
+    /// The grid the lanes write: [`Self::scan_settings`] with `--pixel-size` applied by the lanes'
+    /// one rule — written where the `.d` settles no size, refused where it settles a different one
+    /// unless `--force` — and the `imaging_pixel_size` row that records it, if it did anything.
+    pub fn grid(&self) -> anyhow::Result<(ScanSettings, Option<serde_json::Value>)> {
+        let mut s = self.scan_settings();
+        let row = match &self.user {
+            Some(u) => crate::imaging::apply_user_pixel_size(&mut s, u, &self.settled_by())?,
+            None => None,
+        };
+        Ok((s, row))
+    }
+
     /// The distinct raster steps of the acquired regions; `None` when there is no `.mis` or a region
     /// does not map to an `<Area>` with a step.
     fn mis_rasters(&self) -> Option<Vec<(f64, f64)>> {
@@ -421,11 +458,20 @@ impl MaldiInfo {
             (Some(m), _) => format!("{} gives no raster step for every region", m.file),
             _ => "no FlexImaging .mis beside the .d".into(),
         };
-        match (self.pixel_size_from(), &self.mis) {
+        let settled = match (self.pixel_size_from(), &self.mis) {
             (Some((_, PixelSource::Mis)), Some(m)) => format!("the raster step in {}", m.file),
             (Some((_, PixelSource::Beam)), _) => format!("the beam scan size ({no_mis})"),
             (None, Some(m)) if self.mis_rasters().is_some() => format!("not written: the regions of {} have different raster steps", m.file),
             _ => format!("not written: {no_mis}, and the positioned frames do not all state one finite beam scan size"),
+        };
+        // `--pixel-size`: what the run settles, and what the user's size did about it (the lanes'
+        // one rule: fills where none is settled, agrees, or writes over under `--force`).
+        match (&self.user, self.pixel_size()) {
+            (None, _) => settled,
+            (Some(_), None) => format!("{}; the source: {}", crate::imaging::USER_SUPPLIED_PROVENANCE, settled.replacen("not written: ", "", 1)),
+            (Some(u), Some(_)) if crate::imaging::user_pixel_size_differences(Some(&self.scan_settings()), u).is_empty() => format!("{settled} (--pixel-size states the same)"),
+            (Some(u), Some((x, y))) if u.force => format!("{} (--force), written over {settled} = {x} × {y} µm", crate::imaging::USER_SUPPLIED_PROVENANCE),
+            (Some(_), Some(_)) => settled,
         }
     }
 
@@ -450,21 +496,29 @@ impl MaldiInfo {
         s
     }
 
-    /// The `metadata.imaging` marker block, the `bruker_maldi` block, and the transformations to
-    /// declare.
-    pub fn index_blocks(&self) -> (Vec<(String, serde_json::Value)>, Vec<&'static str>) {
+    /// The `metadata.imaging` marker block, the `bruker_maldi` block (and, under `--pixel-size`, the
+    /// `imaging_pixel_size` row), and the transformations to declare. `Err` is `--pixel-size`'s
+    /// refusal ([`Self::grid`]), which the lane's `enable_bruker_imaging` has raised before this.
+    pub fn index_blocks(&self) -> anyhow::Result<(Vec<(String, serde_json::Value)>, Vec<&'static str>)> {
         let mut applied = Vec::new();
         if self.min != (1, 1) {
             applied.push(SHIFTED_TO_BASE_1);
         }
-        if matches!(self.pixel_size_from(), Some((_, PixelSource::Beam))) {
+        let (grid, user_row) = self.grid()?;
+        // The beam fallback declares itself unless the user's size was written over it.
+        let overridden = user_row.as_ref().is_some_and(|r| r["overridden"] == true);
+        if matches!(self.pixel_size_from(), Some((_, PixelSource::Beam))) && !overridden {
             applied.push(PIXEL_FROM_BEAM);
         }
+        if user_row.is_some() {
+            applied.push(crate::imaging::USER_SUPPLIED);
+        }
         let mut marker = crate::imaging::marker_block(
-            Some(&self.scan_settings()),
+            Some(&grid),
             crate::imaging::COUNTS_OBSERVED_MAX,
             // Both sizes or none are written above: a lone x does not occur.
             crate::imaging::LoneX::XOnly,
+            self.pixel_size_source(user_row.as_ref()),
             serde_json::json!({
                 "detected_from": "MaldiFrameInfo in analysis.tsf/.tdf",
                 "positions": "XIndexPos/YIndexPos − position_offset",
@@ -476,7 +530,11 @@ impl MaldiInfo {
         if self.min != (1, 1) {
             marker["position_offset"] = serde_json::json!({"x": self.min.0 - 1, "y": self.min.1 - 1});
         }
-        (vec![("imaging".into(), marker), ("bruker_maldi".into(), self.block())], applied)
+        let mut blocks = vec![("imaging".to_string(), marker), ("bruker_maldi".to_string(), self.block())];
+        if let Some(row) = user_row {
+            blocks.push(("imaging_pixel_size".to_string(), serde_json::json!([row])));
+        }
+        Ok((blocks, applied))
     }
 
     /// The `bruker_maldi` index block.
@@ -552,8 +610,9 @@ mod tests {
         assert_eq!(get("IMS:1000046"), Some((20.0, Unit::Micrometer)));
         assert_eq!(get("IMS:1000044"), Some((3380.0, Unit::Micrometer)));
         assert_eq!(get("IMS:1000045"), Some((2260.0, Unit::Micrometer)));
-        let (blocks, applied) = info.index_blocks();
+        let (blocks, applied) = info.index_blocks().unwrap();
         assert_eq!(applied, vec![SHIFTED_TO_BASE_1, PIXEL_FROM_BEAM]);
+        assert_eq!(blocks[0].1["pixel_size_source"], "derived_from_beam_size");
         let marker = &blocks[0].1;
         assert_eq!((blocks[0].0.as_str(), &marker["is_imaging"], &marker["coordinate_base"]), ("imaging", &serde_json::json!(true), &serde_json::json!(1)));
         assert_eq!(marker["pixel_count"], serde_json::json!({"x": 169, "y": 113}));
@@ -569,7 +628,7 @@ mod tests {
              INSERT INTO MaldiFrameInfo VALUES (1, 1, 1), (2, 2, 1);",
         )
         .unwrap();
-        let (blocks, applied) = read(&c).unwrap().index_blocks();
+        let (blocks, applied) = read(&c).unwrap().index_blocks().unwrap();
         assert!(blocks[0].1.get("position_offset").is_none(), "absent when nothing was shifted");
         assert!(applied.is_empty());
     }
@@ -583,7 +642,58 @@ mod tests {
         assert!(info.pixel_size().is_none());
         let accs: Vec<String> = info.scan_settings().params.iter().map(|p| p.curie().unwrap().to_string()).collect();
         assert_eq!(accs, ["IMS:1000042", "IMS:1000043"]);
-        assert_eq!(info.index_blocks().1, vec![SHIFTED_TO_BASE_1]);
+        let (blocks, applied) = info.index_blocks().unwrap();
+        assert_eq!(applied, vec![SHIFTED_TO_BASE_1]);
+        assert_eq!(blocks[0].1["pixel_size_source"], "unknown");
+    }
+
+    /// `--pixel-size` on the Bruker lane goes through the lanes' one rule: it fills the grid where
+    /// neither the `.mis` nor the beam scan size settles a size (declared, recorded, max dimension
+    /// from the counts), agrees in silence with a size the run settles, is refused where that size
+    /// differs, and writes over it under `--force` with the beam fallback no longer declared.
+    #[test]
+    fn a_user_pixel_size_fills_what_the_run_does_not_settle() {
+        use crate::imaging::{UserPixelSize, USER_SUPPLIED};
+        let user = |x: f64, y: f64, force: bool| Some(UserPixelSize { x, y, force });
+        // No beam size settles it: filled.
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c);
+        c.execute_batch("UPDATE MaldiFrameInfo SET BeamScanSizeX = 10.0 WHERE Frame = 3;").unwrap();
+        let mut info = read(&c).unwrap();
+        info.user = user(25.0, 30.0, false);
+        let (grid, row) = info.grid().unwrap();
+        let get = |s: &ScanSettings, acc: &str| s.params.iter().find(|p| p.curie().unwrap().to_string() == acc).map(|p| (p.value.to_f64().unwrap(), p.unit));
+        assert_eq!((get(&grid, "IMS:1000046"), get(&grid, "IMS:1000047")), (Some((25.0, Unit::Micrometer)), Some((30.0, Unit::Micrometer))));
+        assert_eq!((get(&grid, "IMS:1000044"), get(&grid, "IMS:1000045")), (Some((169.0 * 25.0, Unit::Micrometer)), Some((113.0 * 30.0, Unit::Micrometer))), "max dimension from the counts");
+        let row = row.expect("a row");
+        assert_eq!((&row["transformation"], &row["overridden"]), (&serde_json::json!(USER_SUPPLIED), &serde_json::json!(false)));
+        let (blocks, applied) = info.index_blocks().unwrap();
+        assert_eq!(applied, vec![SHIFTED_TO_BASE_1, USER_SUPPLIED]);
+        assert_eq!((&blocks[0].1["pixel_size_um"], &blocks[0].1["pixel_size_source"]), (&serde_json::json!({"x": 25.0, "y": 30.0}), &serde_json::json!("user_supplied")));
+        assert!(blocks[0].1["provenance"]["pixel_size"].as_str().unwrap().starts_with("user supplied (--pixel-size); the source: "), "{}", blocks[0].1["provenance"]["pixel_size"]);
+        assert_eq!(blocks[2].0, "imaging_pixel_size");
+        assert_eq!(blocks[2].1[0]["written_um"].as_array().unwrap().len(), 2);
+        // The beam scan size settles 20 µm: the same size is nothing to write, a different one is
+        // refused naming both, and --force writes it over the beam size.
+        let c = Connection::open_in_memory().unwrap();
+        maldi_table(&c);
+        let mut info = read(&c).unwrap();
+        info.user = user(20.0, 20.0, false);
+        let (grid, row) = info.grid().unwrap();
+        assert!(row.is_none() && get(&grid, "IMS:1000046") == Some((20.0, Unit::Micrometer)));
+        assert_eq!(info.index_blocks().unwrap().1, vec![SHIFTED_TO_BASE_1, PIXEL_FROM_BEAM], "the beam fallback stays declared");
+        assert!(info.block()["pixel_size"].as_str().unwrap().ends_with("(--pixel-size states the same)"), "{}", info.block()["pixel_size"]);
+        info.user = user(50.0, 50.0, false);
+        let e = info.grid().unwrap_err().to_string();
+        assert!(e.contains("--pixel-size 50 µm") && e.contains("beam scan size") && e.contains("= 20 µm") && e.contains("--force"), "{e}");
+        assert!(info.index_blocks().is_err());
+        info.user = user(50.0, 50.0, true);
+        let (grid, row) = info.grid().unwrap();
+        assert_eq!((get(&grid, "IMS:1000046"), get(&grid, "IMS:1000044")), (Some((50.0, Unit::Micrometer)), Some((169.0 * 50.0, Unit::Micrometer))), "written over, the max dimension recomputed");
+        assert_eq!(row.unwrap()["overridden"], true);
+        let (blocks, applied) = info.index_blocks().unwrap();
+        assert_eq!(applied, vec![SHIFTED_TO_BASE_1, USER_SUPPLIED], "no beam fallback declared for a size that is not the beam's");
+        assert!(blocks[0].1["provenance"]["pixel_size"].as_str().unwrap().contains("(--force), written over the beam scan size"), "{}", blocks[0].1["provenance"]["pixel_size"]);
     }
 
     /// The beam fallback needs EVERY positioned frame to state the same finite size (review
@@ -603,7 +713,7 @@ mod tests {
             assert_eq!(info.pixel_size(), None, "{why}");
             assert!(info.beam.iter().all(|(x, y)| x.is_finite() && y.is_finite()), "{why}: {:?}", info.beam);
             assert!(info.beam_unstated > 0, "{why}");
-            assert!(!info.index_blocks().1.contains(&PIXEL_FROM_BEAM), "{why}");
+            assert!(!info.index_blocks().unwrap().1.contains(&PIXEL_FROM_BEAM), "{why}");
             assert!(info.block()["pixel_size"].as_str().unwrap().starts_with("not written"), "{why}");
         }
         // A frame without a position does not count.
@@ -646,7 +756,7 @@ mod tests {
         let info = read_with("(1, 'Custom', 1, 20.0, 20.0, 950.0), (2, 'Custom', 1, 20.0, 20.0, 950.0)");
         assert_eq!((info.beam.clone(), info.beam_unstated), (vec![(20.0, 20.0)], 0));
         assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)));
-        assert!(info.index_blocks().1.contains(&PIXEL_FROM_BEAM));
+        assert!(info.index_blocks().unwrap().1.contains(&PIXEL_FROM_BEAM));
         let b = info.block();
         assert_eq!(b["beam_scan_size_um"], serde_json::json!([{"x": 20.0, "y": 20.0}]));
         assert!(b["beam_scan_size_source"].as_str().unwrap().starts_with("MaldiFrameLaserInfo"), "{}", b["beam_scan_size_source"]);
@@ -665,7 +775,7 @@ mod tests {
             assert_eq!(info.pixel_size(), None, "{why}");
             assert!(info.beam_unstated > 0 || info.beam.len() > 1, "{why}");
             assert_eq!(info.spots.len(), 3, "{why}: every positioned frame is kept");
-            assert!(!info.index_blocks().1.contains(&PIXEL_FROM_BEAM), "{why}");
+            assert!(!info.index_blocks().unwrap().1.contains(&PIXEL_FROM_BEAM), "{why}");
         }
 
         // A laser table without the BeamScan flag: the sizes as they are.
@@ -762,7 +872,7 @@ mod tests {
         assert_eq!(info.pixel_size_from(), Some(((20.0, 20.0), PixelSource::Beam)), "no .mis: the beam scan size");
         info.mis = Some(mis.clone());
         assert_eq!(info.pixel_size_from(), Some(((1000.0, 1000.0), PixelSource::Mis)), "the raster step wins");
-        assert_eq!(info.index_blocks().1, vec![SHIFTED_TO_BASE_1], "a stated step is not declared as a fallback");
+        assert_eq!(info.index_blocks().unwrap().1, vec![SHIFTED_TO_BASE_1], "a stated step is not declared as a fallback");
         let b = info.block();
         assert_eq!(b["mis"], "run.mis");
         assert_eq!(b["regions"][0]["name"], "vc_rugose_1");

@@ -339,8 +339,10 @@ impl WatersImaging {
         self.grid.as_ref().ok()?.positions.get(i).copied().flatten()
     }
 
-    /// The grid: pixel counts always; pixel size (the step, µm) and max dimension on each axis with a
-    /// step — a single row keeps the column step (review 2026-09-30 B15). `None` without a grid.
+    /// The grid: pixel counts always; on each axis with a step, the pixel size (the step, µm), the
+    /// max dimension, and the absolute position offset (`IMS:1000053/54`, µm) — the position of the
+    /// image's top-left corner on the stage, [`Self::offset_um`], where it is not negative — a
+    /// single row keeps the column step (review 2026-09-30 B15). `None` without a grid.
     pub fn scan_settings(&self) -> Option<mzdata::meta::ScanSettings> {
         let g = self.grid.as_ref().ok()?;
         let mut s = mzdata::meta::ScanSettings { id: "scansettings1".into(), ..Default::default() };
@@ -350,22 +352,59 @@ impl WatersImaging {
         if let Some(ux) = g.x.pitch.map(|p| p * 1000.0) {
             s.params.push(p("pixel size (x)", mzdata::curie!(IMS:1000046), ux.into(), Unit::Micrometer));
             s.params.push(p("max dimension x", mzdata::curie!(IMS:1000044), (g.x.count as f64 * ux).into(), Unit::Micrometer));
+            if let Some(o) = Self::offset_um(&g.x) {
+                s.params.push(p("absolute position offset x", mzdata::curie!(IMS:1000053), o.into(), Unit::Micrometer));
+            }
         }
         if let Some(uy) = g.y.pitch.map(|p| p * 1000.0) {
             s.params.push(p("pixel size y", mzdata::curie!(IMS:1000047), uy.into(), Unit::Micrometer));
             s.params.push(p("max dimension y", mzdata::curie!(IMS:1000045), (g.y.count as f64 * uy).into(), Unit::Micrometer));
+            if let Some(o) = Self::offset_um(&g.y) {
+                s.params.push(p("absolute position offset y", mzdata::curie!(IMS:1000054), o.into(), Unit::Micrometer));
+            }
         }
         Some(s)
     }
 
-    /// The `metadata.imaging` marker for `grid` ([`Self::scan_settings`]). A single row's grid
-    /// states `IMS:1000046` alone — the column step the lane fitted; it knows no row step — so the
-    /// marker is told the x is that axis's only (`LoneX::XOnly`) and writes no `pixel_size_um`. On
-    /// the imzML lane a lone `IMS:1000046` gives both sizes, as the vocabulary defines it; whether
-    /// this lane should write its lone x at all is the owner's decision D5, and until then its
-    /// output stays as it was.
-    pub fn marker(&self, grid: &mzdata::meta::ScanSettings) -> serde_json::Value {
-        crate::imaging::marker_block(Some(grid), crate::imaging::COUNTS_OBSERVED_MAX, crate::imaging::LoneX::XOnly, self.provenance())
+    /// The absolute position offset of an axis (`IMS:1000053/54`: "the position … of the upper left
+    /// point of the image on the target", µm): the edge of pixel 1, half a step before its centre,
+    /// `(origin − pitch / 2) × 1000` — the origin is pixel 1's centre in mm. `None` without a step
+    /// (owner decision A6, 2026-10-01; a Bruker run's stage offset is unknown and written nowhere),
+    /// and `None` when that corner lies before the stage's zero: imagingMS.obo types both terms
+    /// `xsd:nonNegativeFloat`, so a negative corner is written nowhere and [`Self::block`] says so
+    /// (owner principle P4: spec-first for accessions).
+    pub fn offset_um(axis: &crate::imaging::GridAxis) -> Option<f64> {
+        // A corner within a picometre of the zero is the zero: the fit's float noise, not a stage
+        // position (an origin fitted to positions starting at 0 comes out as −3e-17 mm).
+        Self::corner_um(axis).filter(|um| *um >= -1e-6).map(|um| um.max(0.0))
+    }
+
+    /// The corner itself, negative or not; `None` without a step.
+    fn corner_um(axis: &crate::imaging::GridAxis) -> Option<f64> {
+        axis.pitch.map(|pitch| (axis.origin - pitch / 2.0) * 1000.0)
+    }
+
+    /// The `metadata.imaging` marker for `grid` ([`Self::scan_settings`], after `--pixel-size` where
+    /// given: `user_row` is its `imaging_pixel_size` row). A single row's grid states `IMS:1000046`
+    /// alone — the column step the lane fitted; it knows no row step — so the marker is told the x
+    /// is that axis's only (`LoneX::XOnly`) and writes no `pixel_size_um`; the vocabulary reads that
+    /// lone x as the y size too, which `waters_imaging` and the provenance record (owner decision
+    /// D5, 2026-10-01: accept and record).
+    pub fn marker(&self, grid: &mzdata::meta::ScanSettings, user_row: Option<&serde_json::Value>) -> serde_json::Value {
+        let source = if user_row.is_some() { crate::imaging::SOURCE_USER_SUPPLIED } else { self.pixel_size_source() };
+        crate::imaging::marker_block(Some(grid), crate::imaging::COUNTS_OBSERVED_MAX, crate::imaging::LoneX::XOnly, source, self.provenance(user_row))
+    }
+
+    /// `metadata.imaging.pixel_size_source` of the fitted grid: `declared` when both steps are the
+    /// method's, `derived_from_positions` when either was fitted, `unknown` for a single row or
+    /// column (no `pixel_size_um`).
+    pub fn pixel_size_source(&self) -> &'static str {
+        match &self.grid {
+            Ok(g) if g.x.pitch.is_some() && g.y.pitch.is_some() => {
+                if g.x.declared && g.y.declared { crate::imaging::SOURCE_DECLARED } else { crate::imaging::SOURCE_FROM_POSITIONS }
+            }
+            _ => crate::imaging::SOURCE_UNKNOWN,
+        }
     }
 
     /// The `transformations` entries of a run with a grid.
@@ -376,11 +415,15 @@ impl WatersImaging {
         }
     }
 
-    /// Where an axis's step came from.
+    /// Where an axis's step came from. A single row has no y step of its own: the grid states the x
+    /// step alone, which the IMS vocabulary reads as the y size too — recorded here as not measured
+    /// (owner decision D5).
     fn step_source(&self, a: usize, axis: &crate::imaging::GridAxis) -> String {
+        let x_step = self.grid.as_ref().is_ok_and(|g| g.x.pitch.is_some());
         match (&self.steps[a], axis.declared) {
             (Some((name, _)), true) => format!("declared: methodfile.xml {name}"),
             (Some((name, v)), false) => format!("fitted: the declared methodfile.xml {name} = {v} mm does not hold the positions"),
+            (None, _) if axis.pitch.is_none() && a == 1 && x_step => "vocabulary default of x: a single row, not measured; the lone IMS:1000046 (the x step) reads as the y size too".into(),
             (None, _) if axis.pitch.is_none() => "none: a single row or column".into(),
             (None, _) => "fitted".into(),
         }
@@ -397,10 +440,19 @@ impl WatersImaging {
         });
         match &self.grid {
             Ok(g) => {
-                let axis = |a: usize, x: &crate::imaging::GridAxis| serde_json::json!({
-                    "origin_mm": x.origin, "pitch_mm": x.pitch, "count": x.count, "max_residual_mm": x.max_residual,
-                    "step_source": self.step_source(a, x),
-                });
+                let axis = |a: usize, x: &crate::imaging::GridAxis| {
+                    let mut j = serde_json::json!({
+                        "origin_mm": x.origin, "pitch_mm": x.pitch, "count": x.count, "max_residual_mm": x.max_residual,
+                        "step_source": self.step_source(a, x),
+                    });
+                    // The top-left corner (`IMS:1000053/54`), or why the term is not written.
+                    match (Self::corner_um(x), Self::offset_um(x)) {
+                        (Some(_), Some(o)) => j["absolute_position_offset_um"] = o.into(),
+                        (Some(c), None) => j["absolute_position_offset_um"] = format!("not written: the top-left corner is at {c:.3} µm, before the stage's zero, and IMS:1000053/54 are non-negative floats (imagingMS.obo)").into(),
+                        (None, _) => {}
+                    }
+                    j
+                };
                 b["positions"] = "grid index = round((position − origin) / pitch) + 1".into();
                 b["scans_with_position"] = g.positions.iter().flatten().count().into();
                 b["off_grid_scans_dropped"] = g.off_grid.into();
@@ -412,15 +464,27 @@ impl WatersImaging {
         b
     }
 
-    /// The `provenance` of the `metadata.imaging` marker.
-    pub fn provenance(&self) -> serde_json::Value {
+    /// The `provenance` of the `metadata.imaging` marker (`user_row`: `--pixel-size`'s
+    /// `imaging_pixel_size` row, when it wrote anything).
+    pub fn provenance(&self, user_row: Option<&serde_json::Value>) -> serde_json::Value {
         let Ok(g) = &self.grid else { return serde_json::Value::Null };
-        let size = |a: &crate::imaging::GridAxis| if a.pitch.is_some() { "the step" } else { "not written: a single row or column" };
+        let overridden = user_row.is_some_and(|r| r["overridden"] == true);
+        let size = |a: &crate::imaging::GridAxis, lone_y: bool| {
+            if overridden || (a.pitch.is_none() && user_row.is_some()) {
+                crate::imaging::USER_SUPPLIED_PROVENANCE
+            } else if a.pitch.is_some() {
+                "the step"
+            } else if lone_y {
+                "not written: a single row; by the vocabulary the lone IMS:1000046 (the x step) states it too"
+            } else {
+                "not written: a single row or column"
+            }
+        };
         serde_json::json!({
             "detected_from": "laser aim positions in the MassLynx scan items",
             "positions": "grid indices fitted to the positions in mm (waters_imaging)",
             "origin_mm": {"x": g.x.origin, "y": g.y.origin},
-            "pixel_size": {"x": size(&g.x), "y": size(&g.y)},
+            "pixel_size": {"x": size(&g.x, false), "y": size(&g.y, g.x.pitch.is_some())},
         })
     }
 }
@@ -1912,20 +1976,65 @@ mod tests {
         let row: Vec<Option<(f64, f64)>> = (0..50).map(|c| Some((10.0 + c as f64 * 0.05, 20.0))).collect();
         let im = WatersImaging::from_positions(row.clone(), laser_names(), [None, None], 0).unwrap();
         let s = im.scan_settings().unwrap();
-        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044"]);
+        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044", "IMS:1000053"]);
         assert!((s.params[2].value.to_f64().unwrap() - 50.0).abs() < 1e-9);
-        assert_eq!(im.block()["y"]["step_source"], "none: a single row or column");
-        // The lone x is the column step only: the marker claims no y size from it (owner decision
-        // D5 pending; the imzML lane reads a lone IMS:1000046 as both, by the vocabulary).
-        let marker = im.marker(&s);
+        // The lone x is the column step only: the marker claims no y size from it, and the record
+        // says the vocabulary does (owner decision D5: accept and record).
+        assert_eq!(im.block()["x"]["step_source"], "fitted");
+        assert_eq!(im.block()["y"]["step_source"], "vocabulary default of x: a single row, not measured; the lone IMS:1000046 (the x step) reads as the y size too");
+        let marker = im.marker(&s, None);
         assert_eq!(marker["pixel_count"], serde_json::json!({"x": 50, "y": 1}));
         assert!(marker.get("pixel_size_um").is_none(), "{marker:#}");
+        assert_eq!(marker["pixel_size_source"], "unknown");
+        assert_eq!(marker["provenance"]["pixel_size"], serde_json::json!({"x": "the step", "y": "not written: a single row; by the vocabulary the lone IMS:1000046 (the x step) states it too"}));
+        // A single column says nothing of the kind: a lone y is a lone y.
+        let column: Vec<Option<(f64, f64)>> = (0..50).map(|r| Some((10.0, 20.0 + r as f64 * 0.05))).collect();
+        let im_col = WatersImaging::from_positions(column, laser_names(), [None, None], 0).unwrap();
+        assert_eq!(im_col.block()["x"]["step_source"], "none: a single row or column");
+        assert_eq!(im_col.marker(&im_col.scan_settings().unwrap(), None)["provenance"]["pixel_size"]["x"], "not written: a single row or column");
         // With the method's y step, both axes have a pixel size.
         let im = WatersImaging::from_positions(row, laser_names(), [None, step("DesiYStep", 0.05)], 0).unwrap();
         let s = im.scan_settings().unwrap();
-        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044", "IMS:1000047", "IMS:1000045"]);
-        let size = &im.marker(&s)["pixel_size_um"];
+        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044", "IMS:1000053", "IMS:1000047", "IMS:1000045", "IMS:1000054"]);
+        let marker = im.marker(&s, None);
+        let size = &marker["pixel_size_um"];
         assert!((size["x"].as_f64().unwrap() - 50.0).abs() < 1e-9 && (size["y"].as_f64().unwrap() - 50.0).abs() < 1e-9, "{size:#}");
+        assert_eq!(marker["pixel_size_source"], "derived_from_positions", "x was fitted");
+    }
+
+    /// Owner decision A6: `IMS:1000053/54` are the image's top-left corner on the stage in µm — the
+    /// edge of pixel 1, half a step before its centre — on each axis with a step, and absent
+    /// without one or when the corner is negative (the terms are `xsd:nonNegativeFloat`; the first
+    /// cut of this unit wrote −2525 µm). The arithmetic on the host; the lane that writes it needs
+    /// MassLynx.
+    #[test]
+    fn the_absolute_position_offset_is_the_top_left_corner() {
+        use crate::imaging::GridAxis;
+        let axis = |origin: f64, pitch: Option<f64>| GridAxis { origin, pitch, count: 10, max_residual: 0.0, declared: false };
+        assert_eq!(WatersImaging::offset_um(&axis(10.0, Some(0.1))), Some(9950.0));
+        assert_eq!(WatersImaging::offset_um(&axis(0.05, Some(0.1))), Some(0.0), "a corner on the zero is a non-negative float");
+        assert_eq!(WatersImaging::offset_um(&axis(0.05 - 1e-18, Some(0.1))), Some(0.0), "float noise below the zero is the zero");
+        assert_eq!(WatersImaging::offset_um(&axis(-2.5, Some(0.05))), None);
+        assert_eq!(WatersImaging::offset_um(&axis(0.0, Some(0.1))), None, "pixel 1 centred on the zero: its edge is before it");
+        assert_eq!(WatersImaging::offset_um(&axis(10.0, None)), None);
+        // A grid whose x starts on the stage's zero: no IMS:1000053, the block says why; y written.
+        let near_zero: Vec<Option<(f64, f64)>> = (0..3).flat_map(|r| (0..4).map(move |c| Some((c as f64 * 0.1, 10.0 + r as f64 * 0.1)))).collect();
+        let im = WatersImaging::from_positions(near_zero, laser_names(), [step("DesiXStep", 0.1), step("DesiYStep", 0.1)], 0).unwrap();
+        let s = im.scan_settings().unwrap();
+        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044", "IMS:1000047", "IMS:1000045", "IMS:1000054"]);
+        let b = im.block();
+        assert_eq!(b["x"]["absolute_position_offset_um"], "not written: the top-left corner is at -50.000 µm, before the stage's zero, and IMS:1000053/54 are non-negative floats (imagingMS.obo)", "{b:#}");
+        assert!((b["y"]["absolute_position_offset_um"].as_f64().unwrap() - 9950.0).abs() < 1e-6, "{b:#}");
+        // On a grid: pixel 1's centre at 80.3673 / 45.9005 mm, 0.1 mm steps.
+        let im = WatersImaging::from_positions(desi(3, 4), laser_names(), [step("DesiXStep", 0.1), step("DesiYStep", 0.1)], 0).unwrap();
+        let g = im.grid.as_ref().unwrap();
+        let s = im.scan_settings().unwrap();
+        let value = |acc: &str| s.params.iter().find(|p| p.curie().unwrap().to_string() == acc).map(|p| (p.value.to_f64().unwrap(), p.unit));
+        let (ox, oy) = (value("IMS:1000053").unwrap(), value("IMS:1000054").unwrap());
+        assert_eq!((ox.1, oy.1), (Unit::Micrometer, Unit::Micrometer));
+        assert!((ox.0 - (g.x.origin - 0.05) * 1000.0).abs() < 1e-6 && (oy.0 - (g.y.origin - 0.05) * 1000.0).abs() < 1e-6, "{ox:?} {oy:?} {g:?}");
+        assert!((ox.0 - 80317.3).abs() < 0.01 && (oy.0 - 45850.5).abs() < 0.01, "float32 positions: {ox:?} {oy:?}");
+        assert_eq!(im.marker(&s, None)["pixel_size_source"], "declared");
     }
 
     /// The real DESI run (MetaboLights MTBLS14771): `_func001.sts` holds each scan's laser aim
