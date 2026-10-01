@@ -79,14 +79,15 @@ impl VendorPolicy {
     ///   embedded them, and a signal file's twin survived its drop (`._FUNC001.DAT` does not match
     ///   `_FUNC*.DAT`).
     ///
-    /// The timsTOF `*_bin` is embedded here, as through 0.11.5: for the f64 paths (mzdata's TDF
-    /// reader, the TSF reader, the Bruker SDK) it is, beside the embedded `analysis.tdf` or
-    /// `analysis.tsf`, the exact copy of a signal they store as calibrated f64 m/z, in a format open
-    /// readers decode (timsrust a TDF, this converter a TSF). The LOSSLESS ims-compact path encodes that
-    /// exact integer-TOF + intensity signal into the Parquet peak facet, so the raw `*_bin` bulk file
-    /// is fully redundant there (it was ~39% of the archive, a verbatim copy); that path uses
-    /// [`load_lossless`](Self::load_lossless), which drops it too. SQLite rollback journals stay: they
-    /// can be needed to recover a database snapshot.
+    /// The timsTOF `*_bin` is embedded here, as through 0.11.5: for the f64 TDF paths (mzdata's TDF
+    /// reader, the Bruker SDK) it is, beside the embedded `analysis.tdf`, the exact copy of a signal
+    /// they store as numpress-encoded f64 m/z, in a format open readers decode (timsrust). The lanes
+    /// that store the exact signal themselves use [`load_lossless`](Self::load_lossless), which
+    /// drops it: the LOSSLESS ims-compact path encodes the exact integer-TOF + intensity signal into
+    /// the Parquet peak facet (the `*_bin` was ~39% of that archive, a verbatim copy), and since
+    /// 0.17.0 the native TSF lane stores every frame's m/z exactly (owner decision D9; the
+    /// `analysis.tsf_bin` was 96 % of a TSF archive). SQLite rollback journals stay: they can be
+    /// needed to recover a database snapshot.
     pub fn builtin() -> Self {
         const DROP: &[&str] = &[
             "analysis.sqlite",
@@ -141,12 +142,13 @@ impl VendorPolicy {
         Ok(policy)
     }
 
-    /// Like [`load`](Self::load), but for the **lossless** ims-compact facet: the exact integer-TOF
-    /// signal already lives in the Parquet peak facet, so the raw `*_bin` bulk binary
-    /// (`analysis.tdf_bin` / `analysis.tsf_bin`) is redundant and defaults to DROP. The drop rule is
-    /// inserted right after the user `--aux` overrides (which `load` prepends) and before the base
-    /// policy, so an explicit `--aux 'analysis.tdf_bin=embed'` still wins. The drop is recorded in
-    /// the `vendor_files` manifest, so it is visible, never silent.
+    /// Like [`load`](Self::load), but for a lane whose archive holds the exact signal: the
+    /// **lossless** ims-compact facet (the integer-TOF signal in the Parquet peak facet) and the
+    /// native TSF lane (every frame's m/z stored exactly, delta or point), where the raw `*_bin` bulk
+    /// binary (`analysis.tdf_bin` / `analysis.tsf_bin`) is redundant and defaults to DROP. The drop
+    /// rule is inserted right after the user `--aux` overrides (which `load` prepends) and before
+    /// the base policy, so an explicit `--aux 'analysis.tsf_bin=embed'` still wins. The drop is
+    /// recorded in the `vendor_files` manifest, so it is visible, never silent.
     pub fn load_lossless(path: Option<&Path>, overrides: &[String]) -> Result<Self> {
         let mut policy = Self::load(path, overrides)?;
         let drop_bin = Rule { pat: "*_bin".to_string(), action: Action::Drop, gzip: Gzip::Auto };
