@@ -5,8 +5,9 @@
 //! facet mutually consistent. Two orthogonal capabilities land here:
 //!
 //!   * **Phase 1 — aux remove/inject.** `--drop-aux <glob>` drops matching ZIP members; the existing
-//!     `--image`/`--sdrf` inject new members (reused verbatim from `embed_aux`). Pure ZIP-member
-//!     add/drop + index-manifest update.
+//!     `--image`/`--sdrf` inject new members (reused verbatim from `embed_aux`; `--image` only into
+//!     an imaging archive, onto its carried `metadata.imaging` grid). Pure ZIP-member add/drop +
+//!     index-manifest update.
 //!   * **Phase 2 — spectrum-level filters.** `--rt MIN-MAX` (keep spectra whose `spectrum.time` is in
 //!     the window) and `--ms-level N[,M…]` (keep spectra whose MS level is in the set). We compute the
 //!     surviving `spectrum.index` set from `spectra_metadata`, then row-filter EVERY per-spectrum
@@ -59,7 +60,7 @@ pub struct FilterOpts {
     pub ms_levels: Vec<u8>,
     /// Drop archive members matching any of these globs (`*`/`?` wildcards, `*` spans `/`).
     pub drop_aux: Vec<String>,
-    /// Inject optical images (verbatim), reusing the forward-path embed logic.
+    /// Inject optical images (verbatim) into an imaging archive, reusing the forward-path embed logic.
     pub images: Vec<PathBuf>,
     /// Inject an SDRF sample-metadata TSV (verbatim).
     pub sdrf: Option<PathBuf>,
@@ -311,24 +312,27 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
         }
     }
 
-    // ── injection (Phase 1) ─────────────────────────────────────────────────────────────────────
-    // Reuse the forward-path verbatim embed. `input` (the source mzpeak) drives sibling discovery /
-    // imzML-grid reads; for a non-imzML mzpeak the grid is unknown, so a strict --image without a
-    // grid will error there (documented). --sdrf needs no grid.
+    // ── index metadata: carry the originals, add filter provenance ──────────────────────────────
+    // Before the injection: an image is placed on the source's `metadata.imaging` grid and joins
+    // that marker, and an injected SDRF's back-references replace the source's. Carried after it,
+    // the marker was missing when the image needed its grid (every --image refused) and would have
+    // overwritten the embed's blocks.
     let mut injected: Vec<String> = Vec::new();
+    for img in &opts.images {
+        injected.push(img.file_name().and_then(|n| n.to_str()).unwrap_or("image").to_string());
+    }
+    if opts.sdrf.is_some() {
+        injected.push("sample_metadata/sdrf.tsv".to_string());
+    }
+    carry_index_metadata(&mut w, &index, opts, input, &dropped, &injected)?;
+
+    // ── injection (Phase 1) ─────────────────────────────────────────────────────────────────────
+    // Reuse the forward-path verbatim embed. --image needs the carried marker's pixel grid, so it
+    // is refused on an archive that is not imaging; --sdrf needs no grid.
     if !opts.images.is_empty() || opts.sdrf.is_some() {
         crate::embed_aux::embed_into_archive(&mut w, input, &opts.images, opts.sdrf.as_deref())
             .context("injecting aux members")?;
-        for img in &opts.images {
-            injected.push(img.file_name().and_then(|n| n.to_str()).unwrap_or("image").to_string());
-        }
-        if opts.sdrf.is_some() {
-            injected.push("sample_metadata/sdrf.tsv".to_string());
-        }
     }
-
-    // ── index metadata: carry the originals, add filter provenance ──────────────────────────────
-    carry_index_metadata(&mut w, &index, opts, input, &dropped, &injected)?;
 
     w.finish().map_err(|e| anyhow!("finalizing {}: {e}", output.display()))?;
     tmp_guard.finish(output)?;
@@ -1455,7 +1459,8 @@ fn is_primitive_numeric(dt: &DataType) -> bool {
 }
 
 /// Carry the original index `metadata` blocks into `w`, add a `data_processing` entry, and add the
-/// `filter` provenance block. `ims_calibration` and every other block are preserved verbatim.
+/// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members;
+/// `ims_calibration` and every other block are preserved verbatim.
 fn carry_index_metadata(
     w: &mut ZipArchiveWriter<File>,
     index: &serde_json::Value,
@@ -1473,6 +1478,14 @@ fn carry_index_metadata(
                     arr.push(filter_processing_entry(opts));
                 }
                 w.add_index_metadata(k, &list).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
+            } else if k == "imaging" {
+                // An image member `--drop-aux` removed leaves `images[]` with it: it used to stay
+                // listed, and a replacement `--image` was listed beside it under the same name.
+                let mut block = v.clone();
+                if let Some(images) = block.get_mut("images").and_then(|i| i.as_array_mut()) {
+                    images.retain(|i| !dropped.iter().any(|d| i["archive_path"] == d.as_str()));
+                }
+                w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
             } else {
                 w.add_index_metadata(k, v).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
             }

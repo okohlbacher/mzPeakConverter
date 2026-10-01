@@ -4,6 +4,140 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Fixes from the adversarial review of 2026-09-30.** Imaging input keeps its imaging on every lane,
+pixel positions are checked before they are written, the Waters grid fit refuses rather than
+guesses, Bruker MALDI trusts a FlexImaging `.mis` only when the regions map onto it, vendor SQLite
+reads roll a hot journal back in a copy, and an empty chunked facet is a chunked facet. Archives with
+imaging, empty chunked facets or a native Shimadzu model term change; rebuilding from the raw file
+applies the fixes (the `.mzpeak` → `.mzpeak` filter keeps member schemas as they are).
+
+### Added
+
+- `metadata.imaging.pixel_count_source` (imaging profile, review B18): `declared` when the source
+  stated the counts, `observed_max` when they were derived from or raised to the largest positions.
+  Always `observed_max` on the Bruker MALDI and Waters lanes.
+
+### Fixed
+
+- **Imaging input keeps its imaging on every lane** (review B9–B13).
+  - `--tof-grid auto|on` no longer sends an imaging run (imzML, an mzML with positions, a MALDI `.d`
+    under `--no-ims-compact`) down the TOF-grid lane, which wrote no position columns, no `IMS`
+    vocabulary and no marker. Such a run is converted on the standard lane with f64 m/z, with a
+    warning.
+  - An optical image never marks a run imaging. `--image` on a run with no pixel positions is an
+    error, and an auto-discovered `<stem>-opticalimage.*` beside such a run is skipped with a warning.
+    Before, both invented `is_imaging: true` from an imzML header's counts, or from nothing.
+  - Positions the six probe spectra miss are no longer lost. An mzML whose probes state no position
+    is searched in full for `IMS:1000050/51` (a byte search, 2.5 s on a 6.4 GB mzML); a
+    `position_z` stated only on spectra the probes skip gets its column. The marker is written only
+    once a position was; the `IMS` vocabulary whenever the position columns are.
+- **Pixel positions are checked before they are written.**
+  - A scan's x and y must both be pixel indices, integers from 1 to 2³² − 1; otherwise the position
+    is removed from its scan, z included, and declared `imaging:invalid-position-dropped`. Before,
+    an out-of-range or negative value became null on one axis only, and a 0 was written as 0.
+  - A stated z that is not a pixel index is removed alone, declared
+    `imaging:invalid-position-z-dropped`.
+  - Pixel counts derived from the positions go into the scan-settings entry that states the pixel
+    size, or into a new entry under an unused id (before, `scansettings1` was reused), and take every
+    positioned scan into account. An entry stating one axis's count is the grid entry.
+  - A stated count that does not bound the written positions is set to the largest position and
+    declared `imaging:pixel-count-raised-to-positions`.
+- **`--image` on an existing imaging archive** (`mzpeak-convert run.mzpeak -o with.mzpeak --image
+  slide.png`) places the image on the grid of the archive's `metadata.imaging` marker and adds it to
+  `images[]`; it was refused on every archive. An archive with no marker still refuses `--image`; an
+  image removed with `--drop-aux` leaves `images[]` too.
+- **An SDRF replaced on an existing archive** (`--drop-aux 'sample_metadata/*' --sdrf new.tsv`) is
+  described by its own `sample_metadata` / `study` blocks; the new member used to carry the old
+  file's SHA-256 and accession.
+- **The Waters imaging grid fit is fail-safe** (review B14/B15): the step the method declares, or an
+  exact lattice, or no grid at all.
+  - **Declared step:** `methodfile.xml` `DesiXStep` / `DesiYStep`, or any setting ending in `XStep` /
+    `YStep` (case-sensitive, in mm), when the laser positions lie within a quarter step of it.
+  - **Otherwise an exact lattice,** as the stage's float32 set points are: positions within 1 µm are
+    one; the step is the largest gap of 3 µm or more between neighbouring distinct positions whose
+    lattice, laid at that gap, holds all but 1 % of the scans in one 1 µm window; a position within
+    half a µm of its grid point is on it; the pitch is refined within float noise only.
+  - **Fixed by it:** exact sparse rasters no longer lose every position; spot arrays, tissue-microarray
+    cores and regions one or two columns wide keep their step; a stray a fraction of a step off no
+    longer seats that fraction; float32 noise is snapped off (3 µm steps included); a 33.33 µm step
+    is not rounded to 33.3 µm where the positions tell them apart.
+  - **Refused rather than guessed** without a declared step: jittered positions, a serpentine lag,
+    regions on lattices offset from one another, rotated rasters, a continuum of positions, and a
+    lattice that is a fraction of a coarser one needed only by stray scans. Such a run gets no
+    positions and no marker; `waters_imaging.no_grid` states why. `waters_imaging` records each
+    axis's `step_source` and the `declared_steps_mm`.
+- **Waters laser positions come from every written function**, not function 1 only; the lock-mass
+  function's scans get no position and stay out of the fit (`lockmass_scans_excluded`).
+- **A Waters single row or column keeps the other axis's pixel size**: pixel size and max dimension
+  are written per axis whose step is known; `metadata.imaging.pixel_size_um` still only when both
+  axes have one.
+- **Stray Waters scans no longer take imaging away from the run.** Up to 1 % of the positioned scans
+  may lie off the grid, or far outside the raster at one position (the stage parked at home): they
+  are written without a position, counted (`off_grid_scans_dropped`) and declared
+  `waters:off-grid-position-dropped`. A region far off the raster that spans columns (a QC spot)
+  keeps its pixels.
+- **Bruker MALDI, beam-size fallback** (B16): `BeamScanSizeX/Y` becomes the pixel size only when every
+  positioned frame states the same finite, positive size (before, a NULL on some frames was skipped
+  and +inf passed). A beam size that is not a number counts as unstated instead of dropping the
+  frame's position; `bruker_maldi.frames_without_beam_scan_size` counts them.
+- **Bruker MALDI, FlexImaging `.mis` plausibility** (B16): a `.mis` the regions do not map onto is not
+  used — neither its region names nor its raster step — with a warning and
+  `bruker_maldi.mis_rejected` (file, reason). It is rejected when a `RegionNumber` has no `<Area>`, or
+  when no single offset puts every region's `MotorPositionX/Y` inside its area's stage bounding box
+  (a rectangle's four corners or a polygon's vertices, placed by the teach points) within half a
+  raster step. Both MassIVE MSV000088438 runs pass; every other order of their four areas is rejected.
+- **timsTOF native lane, empty frames** (B16): an empty frame (`NumPeaks = 0`) takes its `Frames.Id` as
+  its spectrum id, not its position + 1, so gapped ids no longer collide and a MALDI frame's position
+  attaches.
+- **imzML pixel size** (B17): a single value is tested against its own axis's count and max dimension
+  (the other axis only when its own states none), both in one length unit, each in the unit it is
+  written in (the unit name's when mzdata knows it, else the accession's); a value without a length
+  unit is tested as micrometre; the square root of an area keeps the area's length unit (mm² → mm).
+  A stated unit is kept in the single- and two-value case alike. Each `imaging_pixel_size` row's
+  `written_um` gives the `unit` its value is written in.
+- **A hot rollback journal is rolled back, in a copy.** Vendor SQLite databases are opened
+  `immutable=1`, which skips SQLite's hot-journal check, so the `-journal` of a crashed or
+  still-writing acquisition was ignored. A `-journal` starting with the journal magic is now handled
+  like a non-empty `-wal`: database and journal are copied into a private scratch directory, rolled
+  back there, read into memory, and the scratch directory removed — also when the raw files are
+  read-only. A zero-byte or zeroed-header journal (the 32 HyStar journals in the corpus) is not hot.
+- **Unix file names holding a `\` or not in UTF-8 open the right file**: the SQLite URI is built from
+  the path's bytes, percent-encoded. Only Windows paths turn `\` into `/`; drive letters and UNC
+  paths are unchanged.
+- **WAL-mode HyStar databases** (`chromatography-data.sqlite`) are read for their device traces, which
+  were skipped with a warning.
+- **No spurious "removed incomplete …mzpeak.prescan{k}.tmp" warnings**: every Waters conversion logged
+  four for the encoding pre-scan's trial archives; they are now removed quietly.
+- **An empty chunked spectrum facet is a chunked facet.** A spectrum facet with nothing written to it
+  got point columns (`mz`, `intensity`) and `point` array-index entries under the `chunk` prefix —
+  every spectrum facet of an SRM/MRM run with empty spectra, and the profile facet of a
+  centroid-only Thermo run (66 facets in 35 corpus archives, all with zero rows). They now carry the
+  chunk columns a default-typed spectrum would have. Archives from earlier releases still read.
+- **`--layout point` stays point on lattice data**: a centroid list on a fixed-point lattice no longer
+  gets the fitted linear grid (a chunked peaks facet beside the point data facet); the native
+  Shimadzu lane applies neither of its grids under `--layout point`.
+- **`shimadzu:coarse-mz` is declared whenever the glue read the coarse field**
+  (`MZPC_SHIMADZU_COARSE_MZ=1`), also under `--no-mz-lattice` and on a profile-only run.
+- **Scan settings use the schema's key**: `scan_settings_list[].source_file_references` replaces
+  `source_file_refs`. Both spellings read, and so does an entry that states neither key or omits
+  `targets`.
+- **The native Shimadzu lane states the instrument's own model term**, resolved against the PSI-MS
+  vocabulary mzdata embeds (`LCMS-9030 wo PDA` → MS:1002998, `LCMS-9050` → MS:1003568); a model the
+  vocabulary lacks gets MS:1000124 with the stated name as its value. Every `.lcd` used to be
+  MS:1002998.
+- **Box harness** (`tools/box_convert.sh`): a job goes to the Windows box as a file (`-JobFile`), not
+  over ssh stdin, which stalled on slow links; every job is capped by a watchdog
+  (`BOX_JOB_TIMEOUT`, default 6 h) and every upload by `BOX_SCP_TIMEOUT` (default 300 s); a pool
+  slot frees when any job ends, not only the oldest.
+
+### Documentation
+
+- Bruker's baf2sql library creates its `analysis.sqlite` cache inside a BAF `.d` that has none; the
+  module docs and the user manual state this exception instead of claiming a conversion writes
+  nothing into the `.d`.
+
 ## [0.16.0] — 2026-09-30
 
 **Output change (imaging).** Imaging archives follow the imaging profile (HUPO-PSI/mzPeak-specification#24):

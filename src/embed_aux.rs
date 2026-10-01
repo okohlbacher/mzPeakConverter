@@ -49,13 +49,16 @@ const SDRF_DATA_KIND: &str = "sdrf";
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /// Embed any explicit `--image` paths plus a best-effort sibling optical image, and (if given) the
-/// `--sdrf` file, into the open `zip`. Adds the `metadata.imaging` / `metadata.study` /
-/// `metadata.sample_metadata` index blocks. Does NOT call `zip.finish()` — the caller owns that.
+/// `--sdrf` file, into the open `zip`. Adds the images to the lane's `metadata.imaging` marker and
+/// writes the `metadata.study` / `metadata.sample_metadata` index blocks. Does NOT call
+/// `zip.finish()` — the caller owns that.
 ///
-/// `input` is the source mzML/imzML path (used for sibling discovery + run-id/accession hints).
+/// `input` is the source mzML/imzML path (used for sibling discovery + run-id/accession hints), or
+/// on the filter lane the source `.mzpeak`, whose carried marker the images join (no sibling lookup).
 ///
-/// STRICTNESS: a missing/unreadable explicit `--image` or the `--sdrf` file ERRORS the conversion;
-/// a soft auto-discovered sibling image that is unreadable warns + is skipped.
+/// STRICTNESS: a missing/unreadable explicit `--image`, an explicit `--image` on a run the lane did
+/// not mark imaging, or the `--sdrf` file ERRORS the conversion; a soft auto-discovered sibling image
+/// that is unreadable, or found beside a run that is not imaging, warns + is skipped.
 pub fn embed_into_archive(
     zip: &mut ZipArchiveWriter<File>,
     input: &Path,
@@ -93,7 +96,9 @@ fn embed_optical_images(
     for path in images {
         embed_list.push((path.clone(), EmbedMode::Strict));
     }
-    if let Some(sibling) = discover_sibling_optical_image(input) {
+    // Not beside an existing archive (the filter lane): the run's sibling was looked for when it
+    // was converted, and an archive written next to its imzML would embed that image a second time.
+    if let Some(sibling) = discover_sibling_optical_image(input).filter(|_| !crate::filter::is_mzpeak_input(input)) {
         embed_list.push((sibling, EmbedMode::Soft));
     }
 
@@ -102,35 +107,39 @@ fn embed_optical_images(
     }
 
     // The full-extent affine maps image pixels onto the MS pixel grid Nx×Ny: the grid of the lane's
-    // own `metadata.imaging` block (a detected imaging run), else the imzML header's IMS:1000042/43.
-    // If unknown, a Strict --image hard-fails (we have no grid to map onto); a Soft-only run warns +
-    // embeds nothing.
+    // own `metadata.imaging` marker, written only for a run with pixel positions (on the filter
+    // lane, the source archive's marker, carried before this embed). Without one the run is not
+    // imaging, and an image must not make it one: the block used to be invented here, from an imzML
+    // header's counts or from nothing (review 2026-09-30 B10). An explicit --image is an error, an
+    // auto-discovered one is skipped.
     let marker = zip.index().metadata.get("imaging").cloned();
     let grid = marker
         .as_ref()
-        .and_then(|m| Some((m["pixel_count"]["x"].as_i64()?, m["pixel_count"]["y"].as_i64()?)))
-        .or_else(|| read_imzml_pixel_grid(input));
-    let (nx, ny) = match grid {
-        Some(g) => g,
-        None => {
-            if embed_list.iter().any(|(_, m)| *m == EmbedMode::Strict) {
-                bail!(
-                    "cannot build optical-image overlay affine: MS pixel grid (IMS:1000042/43) is \
-                     unknown for {} — an explicit --image needs a coordinate grid to map onto",
-                    input.display()
-                );
-            }
-            log::warn!(
-                "MS pixel_count unknown for {} — skipping auto-discovered optical image",
-                input.display()
-            );
-            return Ok(());
+        .and_then(|m| Some((m["pixel_count"]["x"].as_i64()?, m["pixel_count"]["y"].as_i64()?)));
+    let (Some(mut block), Some((nx, ny))) = (marker, grid) else {
+        let why = format!(
+            "{} carries no pixel positions (no imaging marker with a pixel grid was written), so \
+             there is no grid to overlay the image on",
+            input.display()
+        );
+        if let Some((path, _)) = embed_list.iter().find(|(_, m)| *m == EmbedMode::Strict) {
+            bail!("--image {}: {why}", path.display());
         }
+        log::warn!("skipping auto-discovered optical image: {why}");
+        return Ok(());
     };
 
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(embed_list.len());
-    // ordinal advances ONLY on a successful embed, so a skipped soft image leaves no gap.
-    let mut ordinal: usize = 0;
+    // ordinal advances ONLY on a successful embed, so a skipped soft image leaves no gap. It starts
+    // past the images the archive already holds (the filter lane copies them): a reused name would
+    // be a second member under it.
+    let mut ordinal = zip
+        .index()
+        .files
+        .iter()
+        .filter_map(|f| f.name.strip_prefix("images/image_")?.split('.').next()?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |k| k + 1);
     // Dedup canonicalized paths so --image X and a sibling that resolves to X embed once.
     let mut seen: Vec<PathBuf> = Vec::with_capacity(embed_list.len());
 
@@ -150,10 +159,11 @@ fn embed_optical_images(
         return Ok(());
     }
 
-    // metadata.imaging.images[] — match the prototype's block shape. Added to the lane's marker block
-    // when it wrote one (the run was detected as imaging), else the discovery flag + images[] alone.
-    let mut block = marker.unwrap_or_else(|| serde_json::json!({"is_imaging": true, "coordinate_base": 1}));
-    block["images"] = serde_json::json!(entries);
+    // metadata.imaging.images[] — match the prototype's block shape — added to the lane's marker,
+    // after any images it already lists.
+    let mut all = block["images"].as_array().cloned().unwrap_or_default();
+    all.extend(entries);
+    block["images"] = all.into();
     zip.add_index_metadata("imaging", &block)
         .context("writing metadata.imaging index")?;
     Ok(())
@@ -307,43 +317,6 @@ fn discover_sibling_optical_image(input: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Read the declared MS pixel grid `(Nx, Ny)` from an imzML header's `IMS:1000042` ("max count of
-/// pixel x") + `IMS:1000043` ("max count of pixel y") scanSettings cvParams. Returns None when the
-/// input is not a readable imzML or the grid is not declared. Bounded scan of the header bytes.
-fn read_imzml_pixel_grid(input: &Path) -> Option<(i64, i64)> {
-    // Only mzML/imzML inputs are files; a vendor .d directory has no grid here.
-    if !input.is_file() {
-        return None;
-    }
-    // Read a bounded prefix of the header (the scanSettingsList lives before <run>). 4 MiB is far
-    // more than any imzML header; we stop at the first <run> if seen.
-    let mut f = File::open(input).ok()?;
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
-    let n = read_prefix(&mut f, &mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf[..n]);
-    let head = match text.find("<run") {
-        Some(idx) => &text[..idx],
-        None => &text[..],
-    };
-    let nx = grid_value(head, "IMS:1000042")?;
-    let ny = grid_value(head, "IMS:1000043")?;
-    Some((nx, ny))
-}
-
-/// Extract the integer `value="N"` of the `<cvParam accession="<acc>" ... value="N"/>` in `head`.
-fn grid_value(head: &str, accession: &str) -> Option<i64> {
-    let needle = format!("accession=\"{accession}\"");
-    let start = head.find(&needle)?;
-    // Find the value="..." after the accession, bounded to the same tag (before the next '>').
-    let rest = &head[start..];
-    let tag_end = rest.find('>').unwrap_or(rest.len());
-    let tag = &rest[..tag_end];
-    let v_idx = tag.find("value=\"")? + "value=\"".len();
-    let v_rest = &tag[v_idx..];
-    let v_end = v_rest.find('"')?;
-    v_rest[..v_end].trim().parse::<i64>().ok()
 }
 
 /// Canonicalize a path for dedup; fall back to the lexical path when canonicalize fails (a
@@ -735,13 +708,6 @@ mod tests {
     fn accession_hint_strips_sdrf_suffix() {
         assert_eq!(accession_hint(Path::new("/x/MTBLS1129.sdrf.tsv")), "MTBLS1129");
         assert_eq!(accession_hint(Path::new("/x/PXD000001.tsv")), "PXD000001");
-    }
-
-    #[test]
-    fn grid_value_parses_cvparam() {
-        let head = r#"<cvParam accession="IMS:1000042" name="max count of pixel x" value="260"/>"#;
-        assert_eq!(grid_value(head, "IMS:1000042"), Some(260));
-        assert_eq!(grid_value(head, "IMS:9999999"), None);
     }
 
     /// End-to-end self-check: convert a tiny in-memory mzpeak archive, embed an SDRF + a PNG image,

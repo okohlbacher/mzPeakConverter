@@ -1,4 +1,5 @@
-# box_convert_remote.ps1 — runs ON the flash-workstation. Reads ONE job as JSON from stdin:
+# box_convert_remote.ps1 — runs ON the flash-workstation. Reads ONE job as JSON from -JobFile (the
+# host copies it by scp and this script deletes it once read), else from stdin:
 #   {"raw_url": "...", "put_url": "...", "opts": "--no-vendor", "archive": false, "converter": "..."}
 # Downloads the raw from its URL, converts in an isolated temp dir, uploads the .mzpeak via the
 # presigned PUT url, and prints base64(result-json) between <<<BOXRESULT / BOXRESULT>>> markers.
@@ -6,6 +7,7 @@
 # Secret URLs (presigned PUT, and a possibly-authenticated raw URL) are written to curl -K config
 # files inside the per-user temp dir, NEVER passed on curl's command line — so they don't appear in
 # the box process table. The temp dir (raw + mzpeak + configs) is always removed (isolation+hygiene).
+param([string]$JobFile = '')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # keep CLIXML progress out of stdout
 
@@ -115,7 +117,17 @@ if (Test-Path "$pwiz/msconvert.exe") { $env:MSCONVERT_PATH = (Join-Path $pwiz 'm
 if (Test-Path "$pwiz/timsdata.dll") { $env:TIMSDATA_LIB_DIR = $pwiz }   # --bruker-sdk loads timsdata.dll from pwiz-bin
 if (Test-Path 'C:\Users\User\box_convert_env.ps1') { . 'C:\Users\User\box_convert_env.ps1' }
 
-$job = [Console]::In.ReadToEnd() | ConvertFrom-Json
+# The job file carries presigned URLs: read it, then delete it at once. Job files a failed ssh left
+# behind (the copy landed, the run never started) are removed after a day.
+if ($JobFile) {
+    $jobText = [IO.File]::ReadAllText($JobFile)
+    Remove-Item -LiteralPath $JobFile -Force
+    Get-ChildItem -Path (Split-Path -Parent $JobFile) -Filter 'bxc-job-*.json' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } | Remove-Item -Force -ErrorAction SilentlyContinue
+} else {
+    $jobText = [Console]::In.ReadToEnd()
+}
+$job = $jobText | ConvertFrom-Json
 $work = Join-Path $env:TEMP ("bxc-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $res = [ordered]@{ stage='init'; exit=1; uploaded=$false; size=0; md5=''; log=''; error=''; note='';

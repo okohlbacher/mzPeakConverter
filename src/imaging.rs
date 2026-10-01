@@ -14,20 +14,22 @@
 //!   `ImzMLFileMetadata` and leaves them out of `file_description`; [`provenance_params`] puts them
 //!   back from the header ([`read_file_content`]), values as stated.
 //!
-//! mzdata keeps a unit by its accession only, so the unit NAME the file states — needed to see an
-//! accession/name disagreement — is read from the header here ([`read_scan_settings`]).
+//! mzdata keeps one unit per param (the name's when it knows the name, else the accession's), so
+//! the unit accession AND name the file states — needed to see a disagreement — are read from the
+//! header here ([`read_scan_settings`]).
 //!
 //! **Which runs are imaging** is decided by [`detect`], the one detector every lane calls: imzML
 //! input always; a Bruker `.d` with `MaldiFrameInfo` positions; any other input whose spectra state
-//! `IMS:1000050/51`. A detected run gets the imaging profile's `metadata.imaging` marker
-//! ([`marker_block`]) with its provenance; nothing else is marked imaging.
+//! `IMS:1000050/51` (an mzML the probes miss is searched in full, [`file_mentions`]). A detected run
+//! gets the imaging profile's `metadata.imaging` marker ([`marker_block`]) with its provenance once
+//! at least one position was written; nothing else is marked imaging.
 
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use mzdata::params::{Param, ParamDescribed, Unit};
+use mzdata::params::{CURIE, Param, ParamDescribed, Unit};
 use mzdata::meta::ScanSettings;
 use quick_xml::events::Event;
 
@@ -35,11 +37,28 @@ pub const UNIT_ASSUMED: &str = "imzml:pixel-size-unit-assumed-um";
 pub const AREA_TO_LENGTH: &str = "imzml:pixel-size-area-to-length";
 pub const DROPPED: &str = "imzml:pixel-size-dropped";
 pub const ONE_WAY_AS_FLYBACK: &str = "imzml:one-way-as-flyback";
-/// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes whichever of
-/// `unitAccession` / `unitName` comes last, so a disagreeing pair resolves by attribute order).
+/// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes the
+/// `unitName` when it names a unit mzdata knows, whatever the attribute order).
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
 /// The input states positions but no pixel counts: `IMS:1000042/43` are the largest positions.
 pub const COUNT_FROM_POSITIONS: &str = "imaging:pixel-count-from-positions";
+/// A declared pixel count did not bound the written positions — smaller than one, not a whole
+/// number, or stated for the other axis only: set to the largest position on its axis.
+pub const COUNT_RAISED: &str = "imaging:pixel-count-raised-to-positions";
+/// A scan's position was not a pixel index the `UInt32` columns can hold (x or y missing, not
+/// integral, below 1, above `u32::MAX`): all its position params were removed.
+pub const INVALID_POSITION_DROPPED: &str = "imaging:invalid-position-dropped";
+/// A scan's x and y were pixel indices but its z was not: only the z param was removed.
+pub const INVALID_Z_DROPPED: &str = "imaging:invalid-position-z-dropped";
+
+/// `metadata.imaging.pixel_count_source`: the source stated the counts…
+pub const COUNTS_DECLARED: &str = "declared";
+/// …or the writer took them from the largest positions.
+pub const COUNTS_OBSERVED_MAX: &str = "observed_max";
+
+const POSITIONS: [CURIE; 3] = [mzdata::curie!(IMS:1000050), mzdata::curie!(IMS:1000051), mzdata::curie!(IMS:1000052)];
+/// The pixel counts, x and y: an entry stating either is the grid entry.
+const COUNTS: [CURIE; 2] = [mzdata::curie!(IMS:1000042), mzdata::curie!(IMS:1000043)];
 
 /// What made a run an imaging run.
 pub enum Detected {
@@ -47,8 +66,9 @@ pub enum Detected {
     ImzML,
     /// A Bruker `.d` whose `analysis.tsf`/`.tdf` has `MaldiFrameInfo` positions.
     BrukerMaldi(crate::bruker_maldi::MaldiInfo),
-    /// Any other input whose sampled spectra state `IMS:1000050`/`51`: an mzML written from imaging
-    /// data, e.g. this converter's own `--to mzml` export of an imaging archive.
+    /// Any other input whose spectra state `IMS:1000050`/`51` (sampled, or an mzML's full text):
+    /// an mzML written from imaging data, e.g. this converter's own `--to mzml` export of an imaging
+    /// archive.
     ScanPositions,
 }
 
@@ -78,99 +98,470 @@ pub fn detect(input: &Path, is_imzml: bool, probes: &[mzdata::spectrum::MultiLay
 
 /// The `(x, y)` position a spectrum's scans state, if any.
 pub fn position_of(d: &mzdata::spectrum::SpectrumDescription) -> Option<(i64, i64)> {
-    d.acquisition.scans.iter().find_map(|sc| {
-        let v = |c| sc.get_param_by_curie(&c)?.value.to_i64().ok();
-        Some((v(mzdata::curie!(IMS:1000050))?, v(mzdata::curie!(IMS:1000051))?))
-    })
+    d.acquisition.scans.iter().find_map(scan_position)
 }
 
-/// The grid entry of a scan settings list: the one stating the pixel counts.
+fn scan_position(sc: &mzdata::spectrum::ScanEvent) -> Option<(i64, i64)> {
+    let v = |c| sc.get_param_by_curie(&c)?.value.to_i64().ok();
+    Some((v(mzdata::curie!(IMS:1000050))?, v(mzdata::curie!(IMS:1000051))?))
+}
+
+/// Which of `accessions` occur anywhere in a file's bytes. The detector's probes sample six spectra,
+/// so positions stated only on the others were lost with no trace (review 2026-09-30 B11); this
+/// finds them with one streamed byte search — no array is decoded; 2.5 s on a 6.4 GB mzML. Stops
+/// once all are found. The accessions share their first byte (`IMS:` terms): one pass finds that
+/// byte and tests each accession there.
+pub fn file_mentions<const N: usize>(path: &Path, accessions: [&str; N]) -> std::io::Result<[bool; N]> {
+    let first = accessions[0].as_bytes()[0];
+    assert!(accessions.iter().all(|a| a.as_bytes().first() == Some(&first)), "{accessions:?}");
+    let mut f = std::fs::File::open(path)?;
+    // An accession split across two blocks is found in the next: each block keeps the previous
+    // block's last `longest − 1` bytes in front.
+    let keep = accessions.iter().map(|a| a.len()).max().unwrap_or(1) - 1;
+    let mut buf = vec![0u8; keep + (1 << 20)];
+    let (mut carried, mut found) = (0, [false; N]);
+    loop {
+        let n = f.read(&mut buf[carried..])?;
+        if n == 0 {
+            return Ok(found);
+        }
+        let block = &buf[..carried + n];
+        let mut at = 0;
+        while let Some(i) = block[at..].iter().position(|&b| b == first) {
+            at += i;
+            for (hit, acc) in found.iter_mut().zip(accessions) {
+                *hit |= block[at..].starts_with(acc.as_bytes());
+            }
+            at += 1;
+        }
+        if found.iter().all(|h| *h) {
+            return Ok(found);
+        }
+        carried = keep.min(block.len());
+        let end = block.len();
+        buf.copy_within(end - carried..end, 0);
+    }
+}
+
+/// A position value the `UInt32` position columns can hold as a pixel index: integral, at least 1
+/// (the profile counts from 1), at most `u32::MAX`.
+fn pixel_index(p: &Param) -> bool {
+    p.value.to_f64().is_ok_and(|v| v.fract() == 0.0 && (1.0..=u32::MAX as f64).contains(&v))
+}
+
+/// Remove every position a scan cannot carry as the profile has it (review 2026-09-30 B12): x and y
+/// must both be pixel indices, else x, y and z are removed together; a z that is not one is removed
+/// alone, the scan keeping x and y (`position_z` is optional). The writer used to narrow each value
+/// on its own, so a negative or out-of-range one became null on ONE axis ("both set or both null")
+/// and a 0 was written as 0. Returns `(scans keeping a position, scans whose position was removed,
+/// scans whose z alone was removed)`.
+pub fn drop_invalid_positions(d: &mut mzdata::spectrum::SpectrumDescription) -> (usize, usize, usize) {
+    let (mut kept, mut dropped, mut z_dropped) = (0, 0, 0);
+    for sc in d.acquisition.scans.iter_mut() {
+        let [x, y, z] = POSITIONS.map(|c| sc.get_param_by_curie(&c).map(pixel_index));
+        if x.is_none() && y.is_none() && z.is_none() {
+            continue;
+        }
+        let removed: &[CURIE] = if x != Some(true) || y != Some(true) {
+            dropped += 1;
+            &POSITIONS
+        } else if z == Some(false) {
+            (kept, z_dropped) = (kept + 1, z_dropped + 1);
+            &POSITIONS[2..]
+        } else {
+            kept += 1;
+            continue;
+        };
+        sc.params_mut().retain(|p| !p.curie().is_some_and(|c| removed.contains(&c)));
+    }
+    (kept, dropped, z_dropped)
+}
+
+/// The grid entry of a scan settings list: the one stating the pixel counts (either axis: an entry
+/// with only a y count used to be passed over and a second grid entry added).
 pub fn grid(list: &[ScanSettings]) -> Option<&ScanSettings> {
-    list.iter().find(|s| s.params.iter().any(|p| p.curie() == Some(mzdata::curie!(IMS:1000042))))
+    list.iter().find(|s| states(s, &COUNTS))
 }
 
-/// The largest position written — the pixel counts of an input that states positions but no grid.
+fn states(s: &ScanSettings, accessions: &[CURIE]) -> bool {
+    s.params.iter().any(|p| p.curie().is_some_and(|c| accessions.contains(&c)))
+}
+
+/// The largest position written, per axis — what the pixel counts must at least be.
 #[derive(Debug, Default)]
 pub struct Extent(pub i64, pub i64);
 
 impl Extent {
+    /// Every positioned scan of the spectrum, not only the first (review 2026-09-30 B13).
     pub fn observe(&mut self, d: &mzdata::spectrum::SpectrumDescription) {
-        if let Some((x, y)) = position_of(d) {
+        for (x, y) in d.acquisition.scans.iter().filter_map(scan_position) {
             (self.0, self.1) = (self.0.max(x), self.1.max(y));
         }
     }
 
-    pub fn settings(&self) -> ScanSettings {
-        let mut s = ScanSettings { id: "scansettings1".into(), ..Default::default() };
-        s.params.push(Param::builder().name("max count of pixels x").curie(mzdata::curie!(IMS:1000042)).value(self.0).build());
-        s.params.push(Param::builder().name("max count of pixels y").curie(mzdata::curie!(IMS:1000043)).value(self.1).build());
-        s
+    /// Make the grid bound the written positions. Without a grid entry the counts are the largest
+    /// positions ([`COUNT_FROM_POSITIONS`]), added to the entry that states a pixel size (one grid
+    /// description), else to a new entry under an id not in use; a declared count that does not
+    /// bound the positions (below one, not a whole number, missing beside the other axis') is set
+    /// to the largest position ([`COUNT_RAISED`]). The transformation applied, if any.
+    pub fn bound(&self, list: &mut Vec<ScanSettings>) -> Option<&'static str> {
+        let grids = list.iter().filter(|s| states(s, &COUNTS)).count();
+        if grids > 1 {
+            // The profile wants exactly one grid entry; which one to keep is an owner decision.
+            log::warn!("{grids} scan settings state pixel counts (IMS:1000042/43); the imaging profile describes one grid — the first is the one checked");
+        }
+        let (i, counted) = match list.iter().position(|s| states(s, &COUNTS)) {
+            Some(i) => (i, false),
+            None => {
+                let sized = list.iter().position(|s| states(s, &[mzdata::curie!(IMS:1000046), mzdata::curie!(IMS:1000047)]));
+                let i = sized.unwrap_or_else(|| {
+                    let id = (1..).map(|k| format!("scansettings{k}")).find(|id| list.iter().all(|s| &s.id != id)).unwrap();
+                    list.push(ScanSettings { id, ..Default::default() });
+                    list.len() - 1
+                });
+                (i, true)
+            }
+        };
+        let s = &mut list[i];
+        let raised = raise_count(s, COUNTS[0], "max count of pixels x", self.0)
+            | raise_count(s, COUNTS[1], "max count of pixels y", self.1);
+        if counted { Some(COUNT_FROM_POSITIONS) } else { raised.then_some(COUNT_RAISED) }
+    }
+}
+
+/// Set a pixel count to `max` unless it already states an integer of at least that (a fractional
+/// count is replaced, even by a smaller `max`: it is no count of pixels). `true` when it changed.
+fn raise_count(s: &mut ScanSettings, curie: CURIE, name: &str, max: i64) -> bool {
+    match s.params.iter_mut().find(|p| p.curie() == Some(curie)) {
+        Some(p) if p.value.to_f64().is_ok_and(|v| v.fract() == 0.0 && v >= max as f64) => false,
+        Some(p) => {
+            p.value = max.into();
+            true
+        }
+        None => {
+            s.params.push(Param::builder().name(name).curie(curie).value(max).build());
+            true
+        }
     }
 }
 
 /// One axis of a pixel grid fitted to stage positions in mm (Waters states laser positions, not pixel
-/// indices): the position of pixel 1, the step (`None` for a single column), the pixel count, and
-/// the farthest any position lies from its grid point.
+/// indices): the position of pixel 1, the step (`None` for a single column without a declared
+/// step), the pixel count, the farthest any on-grid position lies from its grid point, and whether
+/// the step is the one the acquisition declared.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridAxis {
     pub origin: f64,
     pub pitch: Option<f64>,
     pub count: i64,
     pub max_residual: f64,
+    pub declared: bool,
 }
 
-impl GridAxis {
-    /// The 1-based pixel index of a position.
-    pub fn index(&self, v: f64) -> i64 {
-        self.pitch.map_or(1, |p| ((v - self.origin) / p).round() as i64 + 1)
-    }
-}
+/// A fitted axis and each position's 1-based pixel index (`None`: off the grid).
+type AxisFit = (GridAxis, Vec<Option<i64>>);
 
-/// Fit a grid axis to positions (mm). The step is the most common gap between neighbouring distinct
-/// positions, positions closer than 1 µm counting as one (float32 noise must not pose as a step);
-/// every position must then lie within a quarter step of its grid point. `None` when they do not —
-/// the positions are not a raster — or there are none.
-pub fn fit_axis(values: &[f64]) -> Option<GridAxis> {
-    let origin = values.iter().copied().fold(f64::INFINITY, f64::min);
-    if !origin.is_finite() {
+/// The share of positions a grid may leave off it: stray scans (a scan taken with the stage parked
+/// far off the raster) must not take the grid away from the whole run (review 2026-09-30 B15).
+pub const MAX_OFF_GRID: f64 = 0.01;
+
+/// Positions closer than this (mm) are one position: float32 noise must not pose as a step.
+const SAME_POSITION_MM: f64 = 1e-3;
+
+/// How far from its grid point a position may lie on a lattice fitted without a declared step: the
+/// positions a grid point holds are within [`SAME_POSITION_MM`] of each other.
+const ON_LATTICE_MM: f64 = SAME_POSITION_MM / 2.0;
+
+/// How far from its grid point a position may lie on a declared step, in steps.
+const QUARTER: f64 = 0.25;
+
+/// Fit a grid axis to positions (mm): the axis and each position's 1-based pixel index, `None` for
+/// the at most [`MAX_OFF_GRID`] positions that lie off it. `None` when no grid holds the rest — the
+/// positions are not a raster — or there are none.
+///
+/// The raster is the central 90 % of the positions and every position reached from it by gaps at
+/// most four times the largest gap inside it, and past a longer gap every group of positions that
+/// spans columns (a second section, a QC region). A group at one position is scans parked off the
+/// raster (at the stage's home): they get no pixel even when they lie on the grid by chance, where
+/// they would stretch it by hundreds of pixels (review 2026-09-30 B15) — unless they are more than
+/// [`MAX_OFF_GRID`] of the positions, and so a part of the raster.
+///
+/// A `declared` step (the acquisition's own, e.g. the DESI method's `DesiXStep`) is the pitch when
+/// it holds the positions within a quarter step. Otherwise the grid must hold them exactly, as the
+/// stage's set points (float32) lie (review 2026-09-30 B14: merging and folding heuristics kept
+/// writing wrong grids; this fit refuses rather than guesses). Positions within 1 µm are one; one
+/// holding all but [`MAX_OFF_GRID`] of the scans is a single column. Else the step is the largest
+/// gap between neighbouring distinct positions, of at least 3 µm, whose lattice holds all but
+/// [`MAX_OFF_GRID`] of the scans, decided at that gap: the 1 µm window of the residues modulo it
+/// holding the most scans must hold them. Least squares then refines pitch and origin by float
+/// noise only, and each position within half a µm of a grid point lies on it. A multiple of the
+/// true step leaves columns off its lattice; a stray half a step off makes half the step hold too,
+/// but the step is larger.
+///
+/// ponytail: jittered positions need a declared step — positions more than 1 µm off one lattice
+/// (jitter, a serpentine lag, regions rastered from origins off one lattice, a rotated raster) fit
+/// none; a step under 3 µm, or one no two neighbouring positions are apart, is not fitted, and a
+/// very sparse raster at large stage coordinates may be refused;
+/// positions recorded at 3 µm or coarser, or offset by a whole finer step (a lag, a region), fit
+/// that finer lattice, each at its own pixel; where the step fails (strays beyond 1 %, or no
+/// neighbouring gap), a stray's gap on a fraction of it may hold every column; a single column drops
+/// up to 1 % of the scans even on a neighbouring column; and a handful of positions a few µm apart
+/// may lie on a lattice by chance.
+pub fn fit_axis(values: &[f64], declared: Option<f64>) -> Option<AxisFit> {
+    if values.is_empty() || !values.iter().all(|v| v.is_finite()) {
         return None;
     }
-    // Distinct positions in 0.1 µm units, merged within 1 µm.
-    let mut keys: Vec<i64> = values.iter().map(|v| ((v - origin) * 1e4).round() as i64).collect();
-    keys.sort_unstable();
-    let mut distinct: Vec<i64> = Vec::new();
-    for k in keys {
-        if distinct.last().is_none_or(|&last| k - last >= 10) {
-            distinct.push(k);
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let trim = values.len() / 20;
+    let core = &sorted[trim..sorted.len() - trim];
+    // The raster: the core, and past it every position within four of its largest gaps of the last;
+    // beyond, the groups that span columns — a group at one position is parked.
+    let reach = 4.0 * core.windows(2).map(|w| w[1] - w[0]).fold(SAME_POSITION_MM, f64::max);
+    let (mut a, mut b) = (trim, sorted.len() - 1 - trim);
+    while a > 0 && sorted[a] - sorted[a - 1] <= reach {
+        a -= 1;
+    }
+    while b + 1 < sorted.len() && sorted[b + 1] - sorted[b] <= reach {
+        b += 1;
+    }
+    let near = |x: &f64, y: &f64| y - x <= reach;
+    let one = |g: &&[f64]| g[g.len() - 1] - g[0] < SAME_POSITION_MM;
+    let parked: usize = sorted[..a].chunk_by(near).chain(sorted[b + 1..].chunk_by(near)).filter(one).map(<[f64]>::len).sum();
+    let few = |off: usize| off as f64 <= MAX_OFF_GRID * values.len() as f64;
+    let raster = if few(parked) {
+        let regions = |s: &[f64]| -> Vec<f64> { s.chunk_by(near).filter(|g| !one(g)).flatten().copied().collect() };
+        [regions(&sorted[..a]), sorted[a..=b].to_vec(), regions(&sorted[b + 1..])].concat()
+    } else {
+        sorted.clone()
+    };
+    let raster = &raster[..];
+    if let Some(fit) = declared.and_then(|d| grid_at(values, raster, d, None, true, QUARTER * d)) {
+        return Some((GridAxis { declared: true, ..fit.0 }, fit.1));
+    }
+    let mean = |r: &[f64]| r.iter().sum::<f64>() / r.len() as f64;
+    let distinct: Vec<(f64, usize)> = runs(raster).into_iter().map(|r| (mean(r), r.len())).collect();
+    let (centre, _) = distinct.iter().copied().max_by_key(|d| d.1)?;
+    let column: Vec<Option<i64>> = values.iter().map(|v| ((v - centre).abs() < SAME_POSITION_MM).then_some(1)).collect();
+    let off = |index: &[Option<i64>]| index.iter().filter(|i| i.is_none()).count();
+    if few(off(&column)) {
+        let max_residual = values.iter().zip(&column).filter(|(_, i)| i.is_some()).map(|(v, _)| (v - centre).abs()).fold(0.0, f64::max);
+        return Some((GridAxis { origin: centre, pitch: None, count: 1, max_residual, declared: false }, column));
+    }
+    // The gaps of 3 µm or more, less a float32 step at the positions' magnitude: a 3 µm step's float32
+    // gaps lie on both sides of it.
+    let min_step = 3.0 * SAME_POSITION_MM;
+    let float32 = f32::EPSILON as f64 * sorted[0].abs().max(sorted[sorted.len() - 1].abs());
+    let mut gaps: Vec<f64> = distinct.windows(2).map(|w| w[1].0 - w[0].0).filter(|g| *g >= min_step - float32).collect();
+    gaps.sort_by(f64::total_cmp);
+    // The step is the first gap whose lattice holds, at that gap itself: a pitch refined before the
+    // decision slid from a stray's gap, or a lag's, to a fraction of the step that holds every
+    // column (review 2026-09-30, fourth pass). The residues modulo g sorted, and again one g on (a
+    // window may wrap around): the window of 1 µm holding the most scans must hold all but
+    // MAX_OFF_GRID of them; its mean residue is the phase.
+    let holds = |g: f64| -> Option<f64> {
+        let mut r: Vec<(f64, usize)> = distinct.iter().map(|&(v, n)| ((v - distinct[0].0).rem_euclid(g), n)).collect();
+        r.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let n = r.len();
+        r.extend_from_within(..);
+        r[n..].iter_mut().for_each(|x| x.0 += g);
+        let (mut best, mut j, mut held) = ((0, 0, 0), 0, 0);
+        for i in 0..n {
+            while j < i + n && r[j].0 - r[i].0 < SAME_POSITION_MM {
+                (held, j) = (held + r[j].1, j + 1);
+            }
+            if held > best.0 {
+                best = (held, i, j);
+            }
+            held -= r[i].1;
+        }
+        let phase = r[best.1..best.2].iter().map(|(x, k)| x * *k as f64).sum::<f64>() / best.0 as f64;
+        few(values.len() - best.0).then_some(distinct[0].0 + phase)
+    };
+    // Largest first, each run of gaps within 1 µm: first the mean of the gaps within four float32
+    // steps of its median (a float32 step's variants average to the step over the raster; a stray
+    // splitting a column's gap does not pull it off), then up to 16 other gaps of the run, largest
+    // first, each two float32 steps from those tried — a sparse raster's scans just off absent
+    // columns can outnumber its step's gaps and move the median off the step (review 2026-09-30,
+    // fifth pass). Each is tested at itself, then outward by quarter float32 steps to two, the
+    // first that holds: a sparse raster's one or two float32 gaps drift past 1 µm over the raster,
+    // and a shift that small is noise, never a fraction. A run with a gap that holds ends the
+    // search, fitted or not: a smaller run would be a fraction of the step.
+    let mut fit = None;
+    let mut from_other = false;
+    for run in runs(&gaps).into_iter().rev() {
+        let median = run[run.len() / 2];
+        let centre = mean(&run.iter().copied().filter(|g| (g - median).abs() <= 4.0 * float32).collect::<Vec<_>>());
+        let mut tried = vec![centre];
+        for &g in run.iter().rev() {
+            if tried.len() > 16 {
+                break;
+            }
+            if tried.iter().all(|t| (g - t).abs() > 2.0 * float32) {
+                tried.push(g);
+            }
+        }
+        let mut held = false;
+        fit = tried.into_iter().find_map(|g0| {
+            let (g, origin) = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7, -8, 8]
+                .into_iter()
+                .map(|i| g0 + i as f64 / 4.0 * float32)
+                .find_map(|g| holds(g).map(|o| (g, o)))?;
+            held = true;
+            from_other = g0 != centre;
+            // Least squares refines pitch and origin by float noise only — the grid points move by
+            // 1 µm at most over the raster, and it places no scan the grid at g leaves off (a stray
+            // half a µm off would slide the pitch to seat it) — else the grid is g's.
+            let tight = |f: &AxisFit| f.0.pitch.is_some_and(|p| (p - g).abs() * (f.0.count - 1) as f64 <= SAME_POSITION_MM);
+            let fixed = grid_at(values, raster, g, Some(origin), true, ON_LATTICE_MM);
+            grid_at(values, raster, g, Some(origin), false, ON_LATTICE_MM)
+                .filter(tight)
+                .filter(|r| fixed.as_ref().is_none_or(|f| r.1.iter().zip(&f.1).all(|(a, b)| a.is_none() || b.is_some())))
+                .or(fixed)
+        });
+        if held {
+            break;
         }
     }
-    let spread = |pitch: f64| values.iter().map(move |&v| {
-        let k = ((v - origin) / pitch).round();
-        (k as i64 + 1, (v - (origin + k * pitch)).abs())
+    let fit = fit?;
+    // A stage step is set in whole µm or 0.1 µm: snap the fitted pitch to the roundest such value
+    // within three standard errors of it (at least 1e-7 of it, a float32 step multiplied up) when
+    // that grid holds as many. Float32 noise would otherwise write 99.99995 µm; a 33.33 µm step
+    // stays.
+    let pitch = fit.0.pitch?;
+    let se = standard_error(&fit, values).max(1e-7 * pitch);
+    let snapped = [1e3, 1e4].into_iter().map(|u| (pitch * u).round() / u).find(|s| (s - pitch).abs() <= 3.0 * se);
+    let fit = match snapped.and_then(|s| grid_at(values, raster, s, Some(fit.0.origin), true, ON_LATTICE_MM)) {
+        Some(s) if off(&s.1) <= off(&fit.1) => s,
+        // A pitch from a gap other than the run's median must be a round step: sub-µm scatter on a
+        // few columns lets such a gap hold a pitch off the step.
+        _ if from_other => return None,
+        _ => fit,
+    };
+    (fit.0.pitch.is_some_and(|p| p >= min_step) && !seated_by_strays(&fit.1)).then_some(fit)
+}
+
+/// Whether a step-free lattice is a fraction 1/m of a coarser one seated by strays: the columns off
+/// the coarser lattice each hold at most half the scans of its median column, and at least two of
+/// its columns hold twice the scans of any of them (a raster column holds one scan per row; a
+/// stray, one — and a row acquired twice is not a coarser lattice). Such a grid places every scan
+/// right but states a pixel size the raster never had (review 2026-09-30, fifth pass).
+///
+/// ponytail: m up to 64; a single-row raster (one scan per column) cannot tell strays from columns,
+/// and tiny plus-shaped cores (1, 3, 1 scans per column) are refused.
+fn seated_by_strays(index: &[Option<i64>]) -> bool {
+    let mut per = std::collections::BTreeMap::<i64, usize>::new();
+    index.iter().flatten().for_each(|&i| *per.entry(i).or_default() += 1);
+    (2..=64i64).any(|m| {
+        let mut by = vec![0usize; m as usize];
+        per.iter().for_each(|(i, n)| by[i.rem_euclid(m) as usize] += n);
+        let r = (0..m).max_by_key(|&r| by[r as usize]).unwrap();
+        let (mut coarse, fine): (Vec<_>, Vec<_>) = per.iter().partition(|(i, _)| i.rem_euclid(m) == r);
+        coarse.sort_by_key(|(_, n)| **n);
+        let median = *coarse[coarse.len() / 2].1;
+        let most = fine.iter().map(|(_, n)| **n).max().unwrap_or(0);
+        2 * most <= median && coarse.iter().filter(|(_, n)| **n >= 2 * most).count() >= 2
+    })
+}
+
+/// Sorted values in runs within [`SAME_POSITION_MM`] of each run's first.
+fn runs(mut sorted: &[f64]) -> Vec<&[f64]> {
+    let mut runs = Vec::new();
+    while let Some(&first) = sorted.first() {
+        let (run, rest) = sorted.split_at(sorted.partition_point(|v| v - first < SAME_POSITION_MM));
+        runs.push(run);
+        sorted = rest;
+    }
+    runs
+}
+
+/// The least-squares line `v = origin + pitch · k` through `(k, v)`: `(pitch, origin)`, the pitch
+/// `fixed` when given. `None` without points or a positive pitch.
+fn line(points: &[(f64, f64)], fixed: Option<f64>) -> Option<(f64, f64)> {
+    if points.is_empty() {
+        return None;
+    }
+    let n = points.len() as f64;
+    let (mk, mv) = points.iter().fold((0.0, 0.0), |(a, b), (k, v)| (a + k / n, b + v / n));
+    let (cov, var) = points.iter().fold((0.0, 0.0), |(c, s), (k, v)| (c + (k - mk) * (v - mv), s + (k - mk) * (k - mk)));
+    let pitch = fixed.unwrap_or(cov / var);
+    (pitch > 0.0).then_some((pitch, mv - pitch * mk))
+}
+
+/// The standard error of a fitted pitch: the positions' scatter about the grid — at least a float32
+/// step at their magnitude, the precision MassLynx stores them in — over the spread of their
+/// indices. A position is one sample however many rows repeat it: the rows of a set point are one
+/// measurement of it, and counted each they left float32 pitches unsnapped (0.24999987 mm).
+fn standard_error((axis, index): &AxisFit, values: &[f64]) -> f64 {
+    let pitch = axis.pitch.unwrap_or(0.0);
+    let mut on: Vec<(f64, f64)> =
+        index.iter().zip(values).filter_map(|(i, v)| Some(((*i)? as f64, v - axis.origin - ((*i)? - 1) as f64 * pitch))).collect();
+    on.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    on.dedup();
+    let n = on.len() as f64;
+    let mk = on.iter().map(|(k, _)| k).sum::<f64>() / n;
+    let spread = on.iter().map(|(k, _)| (k - mk) * (k - mk)).sum::<f64>();
+    let float32 = f32::EPSILON as f64 * values.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let scatter = (on.iter().map(|(_, r)| r * r).sum::<f64>() / (n - 2.0).max(1.0)).max(float32 * float32);
+    (scatter / spread).sqrt()
+}
+
+/// The grid of step `c` (`fixed`: exactly `c`) through the `raster` positions, placing all the
+/// `values`. Its phase is `phase`, or else the circular mean of the raster positions modulo `c`,
+/// and the least-squares line through the positions it holds then refines pitch and origin (three
+/// rounds, the held positions growing as the pitch improves). A stray moves the circular mean by
+/// its share only — the walk over the gaps it replaced slipped a column wherever two strays split a
+/// gap, and lost the grid to 0.2 % of strays inside the raster (review 2026-09-30 B14/B15). `None`
+/// unless all but [`MAX_OFF_GRID`] of the `values` lie within `tol` (mm) of it; one outside the
+/// raster is off it.
+fn grid_at(values: &[f64], raster: &[f64], c: f64, phase: Option<f64>, fixed: bool, tol: f64) -> Option<AxisFit> {
+    use std::f64::consts::TAU;
+    if !(c > 0.0) {
+        return None;
+    }
+    let origin = phase.unwrap_or_else(|| {
+        let (sin, cos) = raster.iter().fold((0.0, 0.0), |(s, co), v| {
+            let a = TAU * (v / c).rem_euclid(1.0);
+            (s + a.sin(), co + a.cos())
+        });
+        c * sin.atan2(cos) / TAU
     });
-    if distinct.len() < 2 {
-        let max_residual = values.iter().map(|&v| v - origin).fold(0.0, f64::max);
-        return Some(GridAxis { origin, pitch: None, count: 1, max_residual });
+    let (mut pitch, mut origin) = (c, origin);
+    let place = |v: f64, pitch: f64, origin: f64| {
+        let k = ((v - origin) / pitch).round();
+        (k, (v - origin - k * pitch).abs())
+    };
+    for _ in 0..3 {
+        let held: Vec<(f64, f64)> =
+            raster.iter().map(|&v| (place(v, pitch, origin), v)).filter(|((_, r), _)| *r <= tol).map(|((k, _), v)| (k, v)).collect();
+        (pitch, origin) = line(&held, fixed.then_some(c))?;
     }
-    let mut gaps: HashMap<i64, usize> = HashMap::new();
-    for w in distinct.windows(2) {
-        *gaps.entry(w[1] - w[0]).or_default() += 1;
+    let inside = raster[0]..=raster[raster.len() - 1];
+    let placed: Vec<Option<i64>> = values
+        .iter()
+        .map(|&v| Some(place(v, pitch, origin)).filter(|(_, r)| *r <= tol && inside.contains(&v)).map(|(k, _)| k as i64))
+        .collect();
+    if placed.iter().filter(|k| k.is_none()).count() as f64 > MAX_OFF_GRID * values.len() as f64 {
+        return None;
     }
-    let (&step, _) = gaps.iter().max_by_key(|(g, n)| (**n, std::cmp::Reverse(**g)))?;
-    let pitch = step as f64 / 1e4;
-    let (count, max_residual) = spread(pitch).fold((1, 0.0f64), |(c, r), (k, d)| (c.max(k), r.max(d)));
-    (max_residual <= pitch / 4.0).then_some(GridAxis { origin, pitch: Some(pitch), count, max_residual })
+    let (lo, hi) = placed.iter().flatten().fold((i64::MAX, i64::MIN), |(lo, hi), k| (lo.min(*k), hi.max(*k)));
+    let max_residual = placed.iter().zip(values).filter_map(|(k, v)| Some((v - origin - (*k)? as f64 * pitch).abs())).fold(0.0, f64::max);
+    let axis = GridAxis { origin: origin + lo as f64 * pitch, pitch: Some(pitch), count: hi - lo + 1, max_residual, declared: false };
+    Some((axis, placed.iter().map(|k| k.map(|k| k - lo + 1)).collect()))
 }
 
 /// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
-/// marker, the coordinate base, the grid as the viewer reads it, and where it all came from.
-pub fn marker_block(grid: Option<&ScanSettings>, provenance: serde_json::Value) -> serde_json::Value {
+/// marker, the coordinate base, the grid as the viewer reads it and where its counts came from
+/// (`pixel_count_source`: [`COUNTS_DECLARED`] or [`COUNTS_OBSERVED_MAX`]; review 2026-09-30 B18),
+/// and where it all came from.
+pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, provenance: serde_json::Value) -> serde_json::Value {
     let mut b = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "provenance": provenance});
     let param = |acc| grid?.params.iter().find(|p| p.curie() == Some(acc));
     let int = |acc| param(acc)?.value.to_i64().ok();
     let um = |acc| param(acc).filter(|p| p.unit == Unit::Micrometer)?.value.to_f64().ok();
     if let (Some(x), Some(y)) = (int(mzdata::curie!(IMS:1000042)), int(mzdata::curie!(IMS:1000043))) {
         b["pixel_count"] = serde_json::json!({"x": x, "y": y});
+        b["pixel_count_source"] = pixel_count_source.into();
     }
     // ponytail: micrometre only; a pixel size in another length unit stays in the scan settings.
     if let (Some(x), Some(y)) = (um(mzdata::curie!(IMS:1000046)), um(mzdata::curie!(IMS:1000047))) {
@@ -274,20 +665,34 @@ pub fn read_scan_settings_from(input: impl BufRead) -> Result<Vec<RawSettings>> 
     Ok(settings)
 }
 
-/// The canonical name of a length unit accession, for the accession/name check.
-fn length_unit_name(accession: &str) -> Option<&'static str> {
+/// The canonical name of a length unit accession, for the accession/name check, and its size in µm,
+/// for the pixel-size test.
+fn length_unit(accession: &str) -> Option<(&'static str, f64)> {
     Some(match accession {
-        "UO:0000008" => "meter",
-        "UO:0000015" => "centimeter",
-        "UO:0000016" => "millimeter",
-        "UO:0000017" => "micrometer",
-        "UO:0000018" => "nanometer",
+        "UO:0000008" => ("meter", 1e6),
+        "UO:0000015" => ("centimeter", 1e4),
+        "UO:0000016" => ("millimeter", 1e3),
+        "UO:0000017" => ("micrometer", 1.0),
+        "UO:0000018" => ("nanometer", 1e-3),
         _ => return None,
     })
 }
 
 fn normalized_unit_name(name: &str) -> String {
     name.trim().to_lowercase().replace("metre", "meter").replace("µm", "micrometer").replace("μm", "micrometer")
+}
+
+/// The unit a param is written in: its unit NAME's when mzdata knows the name — mzdata lets a known
+/// name override the accession, whatever the attribute order — else its unit accession as stated.
+/// The pixel-size rule tests and keeps this unit, so a tested value is written in the unit it
+/// passed in (review 2026-09-30: tested by accession, a centimetre accession named "micrometer"
+/// passed as 0.01 cm and was written as 0.01 µm).
+///
+/// ponytail: an accession mzdata does not know (metre, UO:0000008) counts as stated, though mzdata
+/// writes that param without a unit; no corpus imzML states one.
+fn written_unit(q: &RawParam) -> Option<String> {
+    let by_name = q.unit_name.as_deref().and_then(|n| Unit::from_name(n).to_curie());
+    by_name.map(|c| c.to_string()).or_else(|| q.unit_accession.clone())
 }
 
 /// What the pixel-size rule did to one `<scanSettings>`.
@@ -301,6 +706,10 @@ pub struct PixelSizeFix {
     /// Pixel sizes to write: accession (`IMS:1000046`/`47`), value, and whether its unit is set to
     /// micrometre. An accession absent here is removed.
     pub write: Vec<(&'static str, f64, bool)>,
+    /// The unit accession each `write` value is in: micrometre where set, else [`written_unit`]'s
+    /// (an area's root keeps a stated length unit, so the values are not all µm) — until
+    /// [`check_written_units`] replaces it by the unit the writer's param actually carries.
+    pub write_units: Vec<Option<String>>,
     /// Unit accession/name disagreements seen on the pixel-size and extent params.
     pub unit_mismatches: Vec<String>,
     /// `(param accession, stated unit accession)` of those params, to compare with what was written.
@@ -325,7 +734,7 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
         .iter()
         .filter_map(|acc| get(acc))
         .filter_map(|p| {
-            let canonical = length_unit_name(p.unit_accession.as_deref()?)?;
+            let (canonical, _) = length_unit(p.unit_accession.as_deref()?)?;
             let stated = p.unit_name.as_deref()?;
             (normalized_unit_name(stated) != canonical).then(|| {
                 format!("{}: unit {} is {canonical} but named {stated:?}", p.accession, p.unit_accession.as_deref().unwrap_or(""))
@@ -337,15 +746,19 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
         .filter_map(|acc| get(acc))
         .filter_map(|p| {
             let ua = p.unit_accession.as_deref()?;
-            let canonical = length_unit_name(ua)?;
+            let (canonical, _) = length_unit(ua)?;
             (normalized_unit_name(p.unit_name.as_deref()?) != canonical).then(|| (p.accession.clone(), ua.to_string()))
         })
         .collect();
     let (x, y) = (get(PIXEL_X), get(PIXEL_Y));
-    let fix = |case, transformation, write, detail: String| PixelSizeFix {
+    let fix = |case, transformation, write: Vec<(&'static str, f64, bool)>, detail: String| PixelSizeFix {
         settings_id: s.id.clone(),
         case,
         transformation,
+        write_units: write
+            .iter()
+            .map(|&(a, _, um)| if um { Some("UO:0000017".into()) } else { get(a).and_then(written_unit) })
+            .collect(),
         write,
         unit_mismatches: unit_mismatches.clone(),
         mismatched: mismatched.clone(),
@@ -359,14 +772,15 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
             let (Some(vx), Some(vy)) = (num(PIXEL_X), num(PIXEL_Y)) else {
                 return Some(fix("x and y not numeric", Some(DROPPED), vec![], format!("x={:?} y={:?}", px.value, py.value)));
             };
-            if px.unit_accession.is_some() && py.unit_accession.is_some() {
+            let (ux, uy) = (written_unit(px), written_unit(py));
+            if ux.is_some() && uy.is_some() {
                 Some(fix("x and y with a unit", None, vec![(PIXEL_X, vx, false), (PIXEL_Y, vy, false)], String::new()))
                     .filter(|f| !f.unit_mismatches.is_empty())
             } else {
                 Some(fix(
                     "x and y without a unit: micrometre assumed",
                     Some(UNIT_ASSUMED),
-                    vec![(PIXEL_X, vx, px.unit_accession.is_none()), (PIXEL_Y, vy, py.unit_accession.is_none())],
+                    vec![(PIXEL_X, vx, ux.is_none()), (PIXEL_Y, vy, uy.is_none())],
                     format!("x={vx} y={vy}"),
                 ))
             }
@@ -376,33 +790,61 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
             let Some(v) = num(acc).filter(|v| *v > 0.0) else {
                 return Some(fix("one value, not numeric", Some(DROPPED), vec![], format!("{acc}={:?}", p.value)));
             };
-            // Test against the same axis first, then the other: pixels are square in every
-            // surveyed file that states both.
+            // Tested against its own axis's count and extent; the other axis's only when its own
+            // states none — pixels are square in every surveyed file that states both (review
+            // 2026-09-30 B17: x was tried first whatever the axis).
             let axes = [("IMS:1000042", "IMS:1000044"), ("IMS:1000043", "IMS:1000045")];
-            let tested: Vec<(f64, f64)> =
-                axes.iter().filter_map(|(c, e)| Some((num(c)?, num(e)?))).filter(|(c, e)| *c > 0.0 && *e > 0.0).collect();
-            if let Some((count, extent)) = tested.iter().find(|(c, e)| approx(v.sqrt() * c, *e)) {
+            let axes = if acc == PIXEL_X { axes } else { [axes[1], axes[0]] };
+            let tested = axes.iter().find_map(|&(c, e)| {
+                let (count, extent) = (num(c)?, num(e)?);
+                (count > 0.0 && extent > 0.0).then_some((count, extent, get(e)?))
+            });
+            let Some((count, extent, e)) = tested else {
+                return Some(fix(
+                    "one value that tests as neither area nor length",
+                    Some(DROPPED),
+                    vec![],
+                    format!("{acc}={v}; no pixel count and max dimension to test it against"),
+                ));
+            };
+            // Value and extent compared in µm, each in the unit it is written in (B17: the units were
+            // ignored); a param without a known length unit is tested as µm, and the detail says so.
+            let mut assumed = Vec::new();
+            let mut unit = |q: &RawParam| {
+                written_unit(q).as_deref().and_then(length_unit).unwrap_or_else(|| {
+                    assumed.push(q.accession.clone());
+                    ("micrometer", 1.0)
+                })
+            };
+            let ((vu, v_size), (eu, e_size)) = (unit(p), unit(e));
+            let extent_um = extent * e_size;
+            let note = if assumed.is_empty() { String::new() } else { format!(" ({} without a length unit: micrometre assumed)", assumed.join(", ")) };
+            if approx(v.sqrt() * v_size * count, extent_um) {
                 Some(fix(
                     "one value: an area (√value × count = extent)",
                     Some(AREA_TO_LENGTH),
-                    // The square root of an area is a length: micrometre, whatever unit the area had.
-                    vec![(acc, v.sqrt(), true)],
-                    format!("{acc}={v} as area; √{v} × {count} = {extent}"),
+                    // The square root of an area is a length in the unit the area is the square
+                    // of (µm² → µm, mm² → mm): a stated length unit stays, anything else was
+                    // tested as µm² and becomes µm.
+                    vec![(acc, v.sqrt(), assumed.contains(&p.accession))],
+                    format!("{acc}={v} as area; √({v} {vu}²) × {count} = {extent} {eu}{note}"),
                 ))
-            } else if let Some((count, extent)) = tested.iter().find(|(c, e)| approx(v * c, *e)) {
-                let unit_assumed = p.unit_accession.is_none();
+            } else if approx(v * v_size * count, extent_um) {
+                // A stated unit stays even when it is no length, as in the two-value case:
+                // micrometre is written only where none is stated.
+                let unit_assumed = written_unit(p).is_none();
                 Some(fix(
                     "one value: a length (value × count = extent)",
                     unit_assumed.then_some(UNIT_ASSUMED),
                     vec![(acc, v, unit_assumed)],
-                    format!("{acc}={v}; {v} × {count} = {extent}"),
+                    format!("{acc}={v}; {v} {vu} × {count} = {extent} {eu}{note}"),
                 ))
             } else {
                 Some(fix(
                     "one value that tests as neither area nor length",
                     Some(DROPPED),
                     vec![],
-                    format!("{acc}={v}; count/extent {tested:?}"),
+                    format!("{acc}={v} {vu}; count {count}, max dimension {extent} {eu}{note}"),
                 ))
             }
         }
@@ -439,15 +881,23 @@ pub fn apply(fix: &PixelSizeFix, settings: &mut ScanSettings) {
     }
 }
 
-/// After [`apply`]: the unit each mismatched param was actually written with. `true` when one of
-/// them differs from the accession the file states — mzdata resolved the pair by the name.
+/// After [`apply`]: the unit each mismatched param was actually written with, and each `write`
+/// value's unit as written (the index row must not contradict the archive). `true` when a
+/// mismatched param's differs from the accession the file states — mzdata resolved the pair by the
+/// name.
 pub fn check_written_units(fix: &mut PixelSizeFix, settings: &ScanSettings) -> bool {
+    let param = |acc: &str| settings.params.iter().find(|p| p.curie().is_some_and(|c| c.to_string() == acc));
     let mut replaced = false;
     for (acc, stated) in &fix.mismatched {
-        let Some(p) = settings.params.iter().find(|p| p.curie().is_some_and(|c| c.to_string() == *acc)) else { continue };
+        let Some(p) = param(acc) else { continue };
         let written = p.unit.to_curie().map(|c| c.to_string()).unwrap_or_else(|| "none".into());
         replaced |= written != *stated;
         fix.written_units.push(format!("{acc}: stated {stated}, written {written}"));
+    }
+    for ((acc, _, _), unit) in fix.write.iter().zip(fix.write_units.iter_mut()) {
+        if let Some(p) = param(acc) {
+            *unit = p.unit.to_curie().map(|c| c.to_string());
+        }
     }
     replaced
 }
@@ -471,7 +921,13 @@ pub fn fix_json(f: &PixelSizeFix) -> serde_json::Value {
         "scan_settings": f.settings_id,
         "case": f.case,
         "transformation": f.transformation,
-        "written_um": f.write.iter().map(|(a, v, assumed)| serde_json::json!({"accession": a, "value": v, "unit_assumed": assumed})).collect::<Vec<_>>(),
+        // The key predates `unit` (review 2026-09-30: an mm² area's root is written in mm).
+        "written_um": f
+            .write
+            .iter()
+            .zip(&f.write_units)
+            .map(|((a, v, assumed), unit)| serde_json::json!({"accession": a, "value": v, "unit": unit, "unit_assumed": assumed}))
+            .collect::<Vec<_>>(),
         "unit_mismatches": f.unit_mismatches,
         "written_units": f.written_units,
         "detail": f.detail,
@@ -586,23 +1042,487 @@ mod tests {
         ]);
     }
 
+    fn scan(params: &[(CURIE, &str)]) -> mzdata::spectrum::ScanEvent {
+        let mut sc = mzdata::spectrum::ScanEvent::default();
+        for (c, v) in params {
+            sc.add_param(Param::builder().name("p").curie(*c).value(v.parse::<mzdata::params::Value>().unwrap()).build());
+        }
+        sc
+    }
+    const X: CURIE = mzdata::curie!(IMS:1000050);
+    const Y: CURIE = mzdata::curie!(IMS:1000051);
+    const Z: CURIE = mzdata::curie!(IMS:1000052);
+
+    /// Review 2026-09-30 B12: a position the `UInt32` columns cannot hold as a pixel index leaves the
+    /// scan whole — x, y and z together — instead of becoming null on one axis. A z that is not one
+    /// leaves alone: the scan keeps its x and y.
+    #[test]
+    fn positions_that_are_not_pixel_indices_are_removed() {
+        let mut d = mzdata::spectrum::SpectrumDescription::default();
+        let other = (mzdata::curie!(MS:1000016), "1.5");
+        d.acquisition.scans = vec![
+            scan(&[(X, "1"), (Y, "4294967295"), other]),
+            scan(&[(X, "3.0"), (Y, "2"), (Z, "7")]),
+            scan(&[(X, "0"), (Y, "2")]),
+            scan(&[(X, "-3"), (Y, "2")]),
+            scan(&[(X, "2.5"), (Y, "2")]),
+            scan(&[(X, "4294967296"), (Y, "2")]),
+            scan(&[(X, "2"), other]),
+            scan(&[(X, "2"), (Y, "2"), (Z, "0")]),
+            scan(&[(X, "2"), (Y, "3"), (Z, "-1")]),
+            scan(&[(X, "0"), (Y, "2"), (Z, "0")]),
+            scan(&[(Z, "1")]),
+            scan(&[other]),
+        ];
+        assert_eq!(drop_invalid_positions(&mut d), (4, 7, 2));
+        let left: Vec<Vec<CURIE>> = d.acquisition.scans.iter().map(|s| s.params().iter().filter_map(|p| p.curie()).filter(|c| POSITIONS.contains(c)).collect()).collect();
+        assert_eq!(left, [vec![X, Y], vec![X, Y, Z], vec![], vec![], vec![], vec![], vec![], vec![X, Y], vec![X, Y], vec![], vec![], vec![]]);
+        assert!(d.acquisition.scans[6].get_param_by_curie(&mzdata::curie!(MS:1000016)).is_some(), "other params stay");
+    }
+
+    /// Review 2026-09-30 B13: every positioned scan counts toward the extent; the counts are
+    /// derived into the entry that states the pixel size, else a new entry under a free id, and
+    /// declared counts that do not bound the positions are raised.
+    #[test]
+    fn the_extent_sees_every_scan_and_bounds_the_grid() {
+        let mut d = mzdata::spectrum::SpectrumDescription::default();
+        d.acquisition.scans = vec![scan(&[(X, "1"), (Y, "2")]), scan(&[(X, "4"), (Y, "1")])];
+        let mut e = Extent::default();
+        e.observe(&d);
+        assert_eq!((e.0, e.1), (4, 2));
+        let count = |s: &ScanSettings, c: CURIE| s.params.iter().find(|p| p.curie() == Some(c)).map(|p| p.value.to_i64().unwrap());
+        let settings = |id: &str, params: &[(CURIE, &str)]| {
+            let mut s = ScanSettings { id: id.into(), ..Default::default() };
+            s.params = scan(params).params().to_vec();
+            s
+        };
+        let (cx, cy) = (mzdata::curie!(IMS:1000042), mzdata::curie!(IMS:1000043));
+
+        // No list at all: a new entry.
+        let mut list = Vec::new();
+        assert_eq!(e.bound(&mut list), Some(COUNT_FROM_POSITIONS));
+        assert_eq!((list[0].id.as_str(), count(&list[0], cx), count(&list[0], cy)), ("scansettings1", Some(4), Some(2)));
+        // An entry without a grid takes the next free id…
+        let mut list = vec![settings("scansettings1", &[(mzdata::curie!(IMS:1000044), "300")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_FROM_POSITIONS));
+        assert_eq!((list.len(), list[1].id.as_str(), count(&list[1], cx)), (2, "scansettings2", Some(4)));
+        // …unless it states the pixel size: the counts join it, one grid description.
+        let mut list = vec![settings("s", &[(mzdata::curie!(IMS:1000046), "100")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_FROM_POSITIONS));
+        assert_eq!((list.len(), count(&list[0], cx), count(&list[0], cy)), (1, Some(4), Some(2)));
+        // Declared counts: kept when they bound the positions, raised per axis when not.
+        let mut list = vec![settings("s", &[(cx, "5"), (cy, "5")])];
+        assert_eq!(e.bound(&mut list), None);
+        assert_eq!((count(&list[0], cx), count(&list[0], cy)), (Some(5), Some(5)));
+        let mut list = vec![settings("s", &[(cx, "3"), (cy, "2")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_RAISED));
+        assert_eq!((count(&list[0], cx), count(&list[0], cy)), (Some(4), Some(2)));
+        // A y count alone makes the grid entry: x joins it (no second entry), y is kept.
+        let mut list = vec![settings("s", &[(cy, "50")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_RAISED));
+        assert_eq!((list.len(), count(&list[0], cx), count(&list[0], cy)), (1, Some(4), Some(50)));
+        assert_eq!(grid(&list).map(|s| s.id.as_str()), Some("s"));
+        // A fractional count is no count of pixels: replaced by the largest position.
+        let mut list = vec![settings("s", &[(cx, "25.5"), (cy, "5")])];
+        assert_eq!(e.bound(&mut list), Some(COUNT_RAISED));
+        assert_eq!(count(&list[0], cx), Some(4));
+    }
+
+    /// Review 2026-09-30 B11: the full-input search finds an accession anywhere, including one
+    /// that straddles two read blocks, and only the ones present.
+    #[test]
+    fn file_mentions_finds_accessions_across_blocks() {
+        let p = std::env::temp_dir().join(format!("mzpc-imaging-mentions-{}", std::process::id()));
+        let keep = "IMS:1000050".len() - 1;
+        let mut bytes = vec![b'I'; keep + (1 << 20) - 5];
+        bytes.extend_from_slice(b"IMS:1000051 IMS:1000050");
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(file_mentions(&p, ["IMS:1000050", "IMS:1000051", "IMS:1000052"]).unwrap(), [true, true, false]);
+        std::fs::write(&p, "no positions here").unwrap();
+        assert_eq!(file_mentions(&p, ["IMS:1000050", "IMS:1000051"]).unwrap(), [false, false]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Deterministic noise in [-1, 1) (an LCG: the tests need no rand crate).
+    fn noise(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+    }
+
+    /// A raster of `rows` passes over `cols` columns 0.1 mm apart, each position mapped by `at(row, col)`.
+    fn raster(rows: usize, cols: usize, mut at: impl FnMut(usize, usize) -> f64) -> Vec<f64> {
+        (0..rows).flat_map(|r| (0..cols).map(move |c| (r, c))).map(|(r, c)| at(r, c)).collect()
+    }
+
+    fn columns(index: &[Option<i64>]) -> Vec<i64> {
+        index.iter().map(|i| i.expect("every position on the grid")).collect()
+    }
+
     #[test]
     fn a_raster_of_float32_stage_positions_fits_its_grid() {
-        // The shape of a Waters DESI run (MTBLS14771): 0.1 mm steps from 80.3673 mm, stored as f32.
-        let xs: Vec<f64> = (0..104).map(|k| (80.3673f32 + k as f32 * 0.1) as f64).collect();
-        let a = fit_axis(&xs).unwrap();
-        assert_eq!((a.pitch, a.count), (Some(0.1), 104));
-        assert!(a.max_residual < 1e-4, "{a:?}");
-        assert_eq!((a.index(xs[0]), a.index(xs[103])), (1, 104));
-        // Missing columns keep their place; the step is still the common gap.
-        let gappy: Vec<f64> = [0.0, 0.05, 0.10, 0.25, 0.30].to_vec();
-        let g = fit_axis(&gappy).unwrap();
-        assert_eq!((g.pitch, g.count, g.index(0.25)), (Some(0.05), 7, 6));
-        // One column: a single pixel, no step.
-        assert_eq!(fit_axis(&[5.0, 5.0000004]).unwrap().count, 1);
-        // Not a raster: positions far off any common step.
-        assert!(fit_axis(&[0.0, 0.1, 0.2, 0.37, 0.4]).is_none());
-        assert!(fit_axis(&[]).is_none());
+        // The shape of the Waters DESI run MTBLS14771: 104 columns 0.1 mm apart from 80.3673 mm,
+        // stored as f32, 103 rows.
+        let xs = raster(103, 104, |_, c| (80.3673f32 + c as f32 * 0.1) as f64);
+        let (a, index) = fit_axis(&xs, None).unwrap();
+        assert_eq!((a.pitch, a.count, a.declared), (Some(0.1), 104, false), "the float32 noise is snapped off");
+        assert!(a.max_residual < 1e-4 && (a.origin - 80.3673).abs() < 1e-4, "{a:?}");
+        assert_eq!(columns(&index), raster(103, 104, |_, c| c as f64 + 1.0).iter().map(|c| *c as i64).collect::<Vec<_>>());
+        // The step the method declares (DesiXStep) is taken as it is.
+        let (d, _) = fit_axis(&xs, Some(0.1)).unwrap();
+        assert_eq!((d.pitch, d.count, d.declared), (Some(0.1), 104, true));
+        // A declared step the positions do not lie on is not taken: the fit is.
+        let (f, _) = fit_axis(&xs, Some(0.07)).unwrap();
+        assert_eq!((f.pitch, f.count, f.declared), (Some(0.1), 104, false));
+        // Missing columns keep their place.
+        let (g, index) = fit_axis(&[0.0, 0.05, 0.10, 0.25, 0.30], None).unwrap();
+        assert_eq!((g.pitch, g.count, index[3]), (Some(0.05), 7, Some(6)));
+        // A regular raster is never folded into pixels of twice its step (nor a small one into one
+        // pixel): every column is a pixel.
+        for (cols, p) in [(2, 0.1), (3, 0.1), (4, 0.1), (7, 0.05), (40, 0.02)] {
+            let (a, _) = fit_axis(&raster(10, cols, |_, c| (3.0f32 + c as f32 * p as f32) as f64), None).unwrap();
+            assert_eq!((a.pitch, a.count), (Some(p), cols as i64), "{cols} columns at {p}");
+        }
+        // A step that is no whole 0.1 µm stays as fitted: 33.33 µm is not snapped to 33.3 µm.
+        let (s, _) = fit_axis(&raster(5, 100, |_, c| 1.0 + c as f64 * 0.03333), None).unwrap();
+        assert!((s.pitch.unwrap() - 0.03333).abs() < 1e-9 && s.count == 100, "{s:?}");
+        // A 3 µm step's float32 gaps lie on both sides of 3 µm (2.99835 and 3.00026 µm at 20 mm):
+        // the step is 3 µm, not refused as under it (review 2026-09-30, fourth pass).
+        for (from, cols) in [(20.397747f32, 6), (187.63855, 113)] {
+            let (a, _) = fit_axis(&raster(100, cols, |_, c| (from + c as f32 * 0.003) as f64), None).unwrap();
+            assert_eq!((a.pitch, a.count), (Some(0.003), cols as i64), "{from}");
+        }
+    }
+
+    /// Review 2026-09-30 B14: the most common gap of exact sparse positions is 0.2 mm, which fails
+    /// the quarter-step check — every position was lost. The largest lattice holding them is 0.1 mm;
+    /// a stray half a step off makes 0.05 mm hold too, but 0.1 mm is larger.
+    #[test]
+    fn exact_sparse_positions_fit_the_smallest_step_the_gaps_share() {
+        let (a, index) = fit_axis(&[0.0, 0.1, 0.3, 0.5, 0.7], None).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.1), 8));
+        assert_eq!(columns(&index), [1, 2, 4, 6, 8]);
+        let mut xs = raster(20, 5, |_, c| (6.0f32 + [0.0, 0.1, 0.3, 0.5, 0.7][c]) as f64);
+        xs.push(6.35);
+        let (a, index) = fit_axis(&xs, None).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.1), 8), "{a:?}");
+        assert_eq!((columns(&index[..5]), index[100]), (vec![1, 2, 4, 6, 8], None));
+    }
+
+    /// Review 2026-09-30 B14: jitter must not pose as the step — continuous, and recorded at 1 µm
+    /// or 2 µm (the 2 µm "step" of the first fix). Merging it into columns kept writing wrong grids:
+    /// jittered positions fit no lattice, and need the step the method declares.
+    #[test]
+    fn jittered_positions_fit_the_declared_step_or_none() {
+        let mut seed = 7;
+        let jittered = raster(20, 30, |_, c| 12.0 + c as f64 * 0.1 + 0.002 * noise(&mut seed));
+        let recorded = jittered.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>();
+        // ±10 µm recorded at 2 µm over 100 rows: 11 distinct positions per column.
+        let mut seed = 7;
+        let coarse: Vec<f64> = raster(100, 30, |_, c| 12.0 + c as f64 * 0.1 + 0.01 * noise(&mut seed)).iter().map(|v| (v * 500.0).round() / 500.0).collect();
+        for (rows, xs) in [(20, jittered), (20, recorded), (100, coarse)] {
+            assert_eq!(fit_axis(&xs, None), None);
+            let (a, index) = fit_axis(&xs, Some(0.1)).unwrap();
+            assert_eq!((a.pitch, a.count, a.declared), (Some(0.1), 30, true), "{a:?}");
+            assert!(a.max_residual <= 0.0101, "{a:?}");
+            assert_eq!(columns(&index), raster(rows, 30, |_, c| c as f64 + 1.0).iter().map(|c| *c as i64).collect::<Vec<_>>());
+        }
+    }
+
+    /// Review 2026-09-30 B14: a serpentine raster whose return passes lag behind has two positions
+    /// per column; the lag is not the step. Declared, the step holds both halves (a lag of 20, 30 or
+    /// 45 µm). Fitted, 30 and 45 µm lie on no lattice of 3 µm or more — no grid; a lag of a whole
+    /// finer step (20 µm of 100) puts every position on that finer lattice, each its own pixel.
+    #[test]
+    fn a_serpentine_lag_is_not_the_step() {
+        let want: Vec<i64> = raster(10, 30, |_, c| c as f64 + 1.0).iter().map(|c| *c as i64).collect();
+        for lag in [0.02, 0.03, 0.045] {
+            let xs = raster(10, 30, |r, c| 3.0 + c as f64 * 0.1 + if r % 2 == 1 { lag } else { 0.0 });
+            let (a, index) = fit_axis(&xs, Some(0.1)).unwrap();
+            assert_eq!((a.pitch, a.count, a.declared), (Some(0.1), 30, true), "lag {lag}: {a:?}");
+            assert!((a.max_residual - lag / 2.0).abs() < 1e-6, "lag {lag}: {a:?}");
+            assert_eq!(columns(&index), want, "lag {lag}");
+            let fitted = fit_axis(&xs, None).map(|(a, index)| (a.pitch, a.count, columns(&index)[..2].to_vec()));
+            assert_eq!(fitted, (lag == 0.02).then(|| (Some(0.02), 147, vec![1, 6])), "lag {lag}");
+        }
+        // Lags near a finer lattice's step, which a pitch refined before the decision slid onto
+        // (20, 25, 33.33, 50 µm: up to 147 columns; review 2026-09-30, fourth pass).
+        for lag in [0.0201, 0.0248, 0.0252, 0.033, 0.0336, 0.0495, 0.0505, 0.0665, 0.0752, 0.0801] {
+            let xs = raster(10, 30, |r, c| 3.0 + c as f64 * 0.1 + if r % 2 == 1 { lag } else { 0.0 });
+            assert_eq!(fit_axis(&xs, None), None, "lag {lag}");
+        }
+    }
+
+    /// Two regions each rastered on its own lattice, 30 µm apart (not a whole step), or 33 µm in the
+    /// same range (an oversampling pass: 89 columns of 33.33 µm, review 2026-09-30 fourth pass): no
+    /// lattice holds both, and there is no grid rather than a wrong one.
+    #[test]
+    fn regions_on_different_lattices_fit_none() {
+        for (from, apart) in [(23.03f32, "side by side"), (28.03, "5 mm apart"), (20.033, "interleaved")] {
+            let mut xs = raster(20, 30, |_, c| (20.0f32 + c as f32 * 0.1) as f64);
+            xs.extend(raster(20, 30, |_, c| (from + c as f32 * 0.1) as f64));
+            assert_eq!(fit_axis(&xs, None), None, "{apart}");
+        }
+    }
+
+    #[test]
+    fn a_single_column_is_one_pixel_with_the_declared_step_or_none() {
+        let (a, index) = fit_axis(&[5.0, 5.0000004, 5.0], None).unwrap();
+        assert_eq!((a.pitch, a.count, index), (None, 1, vec![Some(1); 3]));
+        let (d, _) = fit_axis(&[5.0, 5.0000004, 5.0], Some(0.05)).unwrap();
+        assert_eq!((d.pitch, d.count, d.declared), (Some(0.05), 1, true));
+    }
+
+    #[test]
+    fn positions_on_no_raster_fit_none() {
+        let sqrt: Vec<f64> = (0..30).map(|k| (k as f64).sqrt()).collect();
+        assert_eq!(fit_axis(&sqrt, None), None);
+        let mut seed = 11;
+        let scattered: Vec<f64> = (0..200).map(|_| 5.0 + 5.0 * noise(&mut seed)).collect();
+        assert_eq!(fit_axis(&scattered, None), None);
+        assert_eq!(fit_axis(&[], None), None);
+        assert_eq!(fit_axis(&[1.0, f64::NAN], None), None);
+        // A continuum whose gaps are all under 1 µm is no column: 20000 random positions over 1 mm
+        // chained into one pixel (review 2026-09-30, second pass).
+        let dense: Vec<f64> = (0..20_000).map(|_| 10.5 + 0.5 * noise(&mut seed)).collect();
+        assert_eq!(fit_axis(&dense, None), None);
+        // Positions a few µm apart on no lattice of 3 µm or more: least squares refined a gap of
+        // 3.11 µm to a pitch of 2.2 µm (review 2026-09-30, fourth pass).
+        let few = [50.027000906319515, 50.027000906319515, 50.027000906319515, 50.00696263927214, 50.00696263927214];
+        assert_eq!(fit_axis(&[&few[..], &[50.01007604845414, 50.024819139010326, 50.024819139010326]].concat(), None), None);
+    }
+
+    /// Review 2026-09-30 B15: a stray scan must not take the grid away from the run. Up to 1 % of
+    /// the positions may lie off it; they get no pixel and do not stretch the grid.
+    #[test]
+    fn a_few_strays_lose_their_pixel_and_keep_the_grid() {
+        let mut xs = raster(103, 104, |_, c| (80.3673f32 + c as f32 * 0.1) as f64);
+        // Parked far off the raster.
+        xs.push(0.0);
+        let (a, index) = fit_axis(&xs, None).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.1), 104), "{a:?}");
+        assert!((a.origin - 80.3673).abs() < 1e-4, "{a:?}");
+        assert_eq!(index.iter().filter(|i| i.is_none()).count(), 1);
+        assert_eq!(index.last(), Some(&None));
+        // Half a step off, inside the raster: the lattice of half the step holds it too, but the
+        // step's is larger and holds all but it.
+        xs.pop();
+        xs.push(80.3673 + 5.05);
+        let (a, index) = fit_axis(&xs, None).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.1), 104), "{a:?}");
+        assert_eq!(index.last(), Some(&None));
+        // Few columns, several parked scans, each at a position of its own: their gaps are a third
+        // of all gaps, and none of them is a column.
+        let mut xs = raster(100, 10, |_, c| 80.3673 + c as f64 * 0.1);
+        xs.extend([0.0, 1.0, 2.0, 3.0, 4.0]);
+        let (a, index) = fit_axis(&xs, None).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.1), 10), "{a:?}");
+        assert_eq!(index.iter().filter(|i| i.is_none()).count(), 5);
+        // Parked at the stage's home, which the grid of a raster from 10 mm holds by chance: it
+        // gets no pixel all the same and does not stretch the grid 200 pixels down.
+        let mut xs = raster(100, 100, |_, c| (10.0f32 + c as f32 * 0.05) as f64);
+        xs.push(0.0);
+        for declared in [None, Some(0.05)] {
+            let (a, index) = fit_axis(&xs, declared).unwrap();
+            assert_eq!((a.pitch, a.count, index[0], index.last()), (Some(0.05), 100, Some(1), Some(&None)), "{a:?}");
+        }
+        // More than 1 % off: no grid.
+        let mut few = raster(1, 20, |_, c| c as f64 * 0.1);
+        few.push(0.43);
+        assert_eq!(fit_axis(&few, None), None);
+    }
+
+    /// Review 2026-09-30, fourth pass: 4 strays in 304 scans (1.3 %) lose the 0.1 mm grid, and a
+    /// pitch refined before the decision slid from a stray's gap (81.8 µm) to 0.1/11 mm, on which
+    /// every column and stray lies: 320 columns of 9.09 µm. No grid; the declared step holds.
+    #[test]
+    fn strays_over_one_percent_seat_no_finer_lattice() {
+        let col = |c: usize| (20.0f32 + c as f32 * 0.1) as f64;
+        let mut xs = raster(10, 30, |_, c| col(c));
+        xs.extend([col(6) + 0.0091, col(6) + 0.0182, col(13) + 0.0091, col(13) + 0.0182]);
+        assert_eq!(fit_axis(&xs, None), None);
+        let (a, index) = fit_axis(&xs, Some(0.1)).unwrap();
+        assert_eq!((a.pitch, a.count, &index[..3]), (Some(0.1), 30, &[Some(1), Some(2), Some(3)][..]));
+    }
+
+    /// Review 2026-09-30, fourth pass: strays in the gaps of a sparse raster (every fourth column
+    /// missing, a stray 0.6 µm off the middle of each 30 µm gap, 0.62 % of the scans) make gaps of
+    /// 14.4 and 15.6 µm beside the 15 µm ones; their mean (14.8 µm) was no step. The step is 15 µm.
+    #[test]
+    fn a_stray_splitting_a_gap_does_not_pull_the_step_off() {
+        let cols: Vec<usize> = (0..60).filter(|c| c % 4 != 3).collect();
+        let at = |c: f32| (81.13209f32 + c * 0.015) as f64;
+        let mut xs = raster(50, cols.len(), |_, i| at(cols[i] as f32));
+        xs.extend((0..14).map(|k| at(4.0 * k as f32 + 3.0) + 0.0006));
+        let (a, index) = fit_axis(&xs, None).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.015), 59), "{a:?}");
+        assert_eq!(index.iter().filter(|i| i.is_none()).count(), 14);
+    }
+
+    /// Review 2026-09-30, fifth pass: in a sparse raster, scans a fraction of a µm off absent
+    /// columns outnumbered the step's own gaps and moved the run's median off the step, so the step
+    /// was never tried and one stray half a step off seated a half-step lattice.
+    #[test]
+    fn scans_just_off_absent_columns_do_not_hide_the_step() {
+        let cols: Vec<usize> = [0, 1].into_iter().chain((4..=88).step_by(3)).collect();
+        let at = |c: f32| (20.0f32 + c * 0.1) as f64;
+        let mut xs = raster(10, cols.len(), |_, i| at(cols[i] as f32));
+        xs.extend([at(5.0) + 0.0003, at(8.0) + 0.0003, at(10.0) + 0.05]);
+        let (a, index) = fit_axis(&xs, None).unwrap();
+        assert_eq!((a.pitch, a.count), (Some(0.1), 89), "{a:?}");
+        assert_eq!(index.iter().filter(|i| i.is_none()).count(), 1);
+    }
+
+    /// Review 2026-09-30, sixth pass: the stray-seated-fraction check took a row acquired twice, or
+    /// a one-row region, for the coarser lattice and every other row for strays.
+    #[test]
+    fn a_row_acquired_twice_is_no_coarser_lattice() {
+        let y = |r: f32| (40.0f32 + r * 0.1) as f64;
+        let mut ys = raster(20, 30, |r, _| y(r as f32));
+        ys.extend((0..30).map(|_| y(7.0)));
+        assert_eq!(fit_axis(&ys, None).map(|f| (f.0.pitch, f.0.count)), Some((Some(0.1), 20)));
+        let y5 = |r: f32| (40.0f32 + r * 0.05) as f64;
+        let mut ys = raster(20, 20, |r, _| y5(r as f32));
+        ys.extend((0..40).map(|_| y5(10.0)));
+        assert_eq!(fit_axis(&ys, None).map(|f| (f.0.pitch, f.0.count)), Some((Some(0.05), 20)));
+    }
+
+    /// Review 2026-09-30, sixth pass: trying every gap of a run at 17 offsets took 21 s to refuse
+    /// 100 rows of 10,000 columns with ±0.8 µm stage error per column (26 ms before).
+    #[test]
+    fn a_refusal_stays_fast() {
+        let mut seed = 5u64;
+        let off: Vec<f64> = (0..10_000).map(|_| 0.0008 * noise(&mut seed)).collect();
+        let xs = raster(100, 10_000, |_, c| 30.0 + c as f64 * 0.05 + off[c]);
+        let t = std::time::Instant::now();
+        assert!(fit_axis(&xs, None).is_none());
+        assert!(t.elapsed().as_secs_f64() < 3.0, "{:?}", t.elapsed());
+    }
+
+    /// Review 2026-09-30, sixth pass: sub-µm scatter on three 5 µm columns let a gap other than the
+    /// median hold 4.769 µm; and least squares slid the pitch to seat a stray 0.55 µm off (4.988 µm).
+    #[test]
+    fn neither_scatter_nor_a_stray_moves_the_step() {
+        let xs = [
+            141.86657616777987, 141.87166224238672, 141.87626637913908, 141.86631059022847, 141.8716289639936,
+            141.87603692814076, 141.86616945213697, 141.87154144273012, 141.87581197003428,
+        ];
+        assert!(fit_axis(&xs, None).is_none_or(|f| f.0.pitch == Some(0.005)));
+        let at = |c: f32| (138.66708f32 + c * 0.005) as f64;
+        let mut xs = raster(38, 6, |_, c| at(c as f32));
+        xs.extend([at(14.0) - 0.0003, at(18.0) - 0.00055]);
+        assert_eq!(fit_axis(&xs, None).unwrap().0.pitch, Some(0.005));
+    }
+
+    /// Review 2026-09-30, fifth pass: a very sparse raster at 195 mm whose step's only neighbouring
+    /// gaps are float32 values 0.009 µm off it (1.16 µm of drift over 127 steps) was refused — and
+    /// with one stray half a step off it got a 75 µm lattice.
+    #[test]
+    fn a_sparse_float32_raster_keeps_its_step() {
+        let cols = [0, 6, 13, 21, 23, 24, 32, 42, 51, 55, 70, 73, 78, 85, 93, 94, 96, 100, 107, 109, 112, 118, 121, 127];
+        let at = |c: f32| (195.51346f32 + c * 0.15) as f64;
+        let mut xs = raster(12, cols.len(), |_, i| at(cols[i] as f32));
+        for stray in [None, Some(at(106.5))] {
+            xs.extend(stray);
+            let (a, index) = fit_axis(&xs, None).unwrap();
+            assert_eq!((a.pitch, a.count), (Some(0.15), 128), "{stray:?}: {a:?}");
+            assert_eq!(index.iter().filter(|i| i.is_none()).count(), stray.iter().count());
+        }
+    }
+
+    /// Review 2026-09-30 B14/B15: strays inside the raster, far fewer than 1 %, took the grid away
+    /// (or wrote a wrong one: 0.0501 mm) — declared step or not. The grid's phase came from a walk
+    /// over the gaps that slipped a column wherever two strays split one.
+    #[test]
+    fn strays_inside_the_raster_keep_the_grid() {
+        for seed in 1000..1030u64 {
+            let mut seed = seed;
+            let mut xs = raster(100, 100, |_, c| (30.1234f32 + c as f32 * 0.05) as f64);
+            for _ in 0..50 {
+                xs.push(30.1234 + (noise(&mut seed) + 1.0) / 2.0 * 0.05 * 99.0);
+            }
+            for declared in [None, Some(0.05)] {
+                let (a, index) = fit_axis(&xs, declared).unwrap();
+                assert_eq!((a.pitch, a.count), (Some(0.05), 100), "seed {seed}: {a:?}");
+                assert_eq!(columns(&index[..10_000]), raster(100, 100, |_, c| c as f64 + 1.0).iter().map(|c| *c as i64).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// Review 2026-09-30 B15, second pass: only scans at one position far off the raster are
+    /// parked. A small region on the grid 1 mm off it (a QC spot, 0.25 % of the scans) lost every
+    /// position.
+    #[test]
+    fn a_far_region_on_the_grid_keeps_its_pixels() {
+        let mut xs = raster(100, 100, |_, c| (20.0f32 + c as f32 * 0.1) as f64);
+        xs.extend(raster(5, 5, |_, c| (20.0f32 + (110 + c) as f32 * 0.1) as f64));
+        for declared in [None, Some(0.1)] {
+            let (a, index) = fit_axis(&xs, declared).unwrap();
+            assert_eq!((a.pitch, a.count), (Some(0.1), 115), "{a:?}");
+            assert_eq!(columns(&index[10_000..]), [111, 112, 113, 114, 115].repeat(5));
+        }
+    }
+
+    /// v0.16.0's fit (2c5cb06): the most common gap between distinct positions (1 µm apart) is the
+    /// step when every position lies within a quarter of it from the smallest — `(pitch, count)`.
+    fn v0_16_fit(values: &[f64]) -> Option<(f64, i64)> {
+        let origin = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let mut keys: Vec<i64> = values.iter().map(|v| ((v - origin) * 1e4).round() as i64).collect();
+        keys.sort_unstable();
+        keys.dedup_by(|k, last| *k - *last < 10);
+        let mut gaps: HashMap<i64, usize> = HashMap::new();
+        for w in keys.windows(2) {
+            *gaps.entry(w[1] - w[0]).or_default() += 1;
+        }
+        let (&step, _) = gaps.iter().max_by_key(|(g, n)| (**n, std::cmp::Reverse(**g)))?;
+        let pitch = step as f64 / 1e4;
+        let place = |v: f64| ((v - origin) / pitch).round();
+        let holds = values.iter().all(|&v| (v - origin - place(v) * pitch).abs() <= pitch / 4.0);
+        holds.then(|| (pitch, values.iter().map(|&v| place(v) as i64 + 1).max().unwrap()))
+    }
+
+    /// Review 2026-09-30 B14, second pass: the fit must keep every exact layout v0.16.0 fitted.
+    /// Without a declared step, small regions with more than a tenth of the gaps between them
+    /// became a pixel each (4 × 4 spots of 5 pixels at a 12-pixel pitch: 4 pixels of 1.2 mm), and a
+    /// 5 µm raster with three columns missing lost its grid. Third pass: regions one and two columns
+    /// wide passed for a serpentine lag's halves (0.621 mm for a 0.1 mm raster), and pairs at
+    /// irregular gaps four columns into a pixel (10.231 mm for 0.2 mm).
+    #[test]
+    fn exact_layouts_v0_16_fitted_keep_their_step() {
+        let regions = |n: i64, width: i64, pitch: i64| -> Vec<i64> { (0..n).flat_map(|k| (0..width).map(move |c| k * pitch + c)).collect() };
+        let mut layouts: Vec<(f32, Vec<i64>)> = vec![
+            (0.1, regions(4, 5, 12)),
+            (0.1, regions(10, 6, 15)),
+            (0.1, regions(10, 5, 20)),
+            (0.1, regions(2, 6, 11)),
+            (0.1, regions(3, 4, 34)),
+            (0.05, regions(5, 6, 11)),
+            (0.005, regions(2, 100, 103)),
+            (0.005, regions(2, 50, 250)),
+            (0.008, regions(2, 100, 103)),
+            (0.1, vec![0, 6, 7, 12, 13]),
+            (0.1, vec![0, 13, 14]),
+            (0.2, vec![0, 14, 15, 25, 26, 42]),
+            (0.1, vec![0, 1, 11, 13, 33, 34]),
+            (0.03, vec![0, 2, 6, 9, 15, 20, 21]),
+            (0.2, vec![0, 1, 8, 9, 37, 38, 44, 45]),
+        ];
+        let mut seed = 5;
+        for _ in 0..40 {
+            layouts.push((0.1, (0..60).filter(|_| noise(&mut seed) > 0.0).collect()));
+        }
+        let mut compared = 0;
+        for (step, cols) in layouts {
+            let xs = raster(7, cols.len(), |_, i| (41.3f32 + cols[i] as f32 * step) as f64);
+            let (pitch, count) = ((step as f64 * 1e4).round() / 1e4, cols[cols.len() - 1] - cols[0] + 1);
+            if v0_16_fit(&xs).is_none_or(|(p, n)| (p - pitch).abs() > 1e-9 || n != count) {
+                continue;
+            }
+            compared += 1;
+            let (a, index) = fit_axis(&xs, None).unwrap_or_else(|| panic!("{step} {cols:?}"));
+            assert_eq!((a.pitch, a.count), (Some(pitch), count), "{cols:?}");
+            assert_eq!(columns(&index), raster(7, cols.len(), |_, i| (cols[i] - cols[0] + 1) as f64).iter().map(|c| *c as i64).collect::<Vec<_>>());
+        }
+        assert!(compared >= 47, "{compared}");
     }
 
     fn settings(params: &[(&str, &str, Option<(&str, &str)>)]) -> RawSettings {
@@ -650,14 +1570,93 @@ mod tests {
         assert_eq!(untestable.transformation, Some(DROPPED), "no count/extent: nothing to test against");
     }
 
+    /// Review 2026-09-30 B17: a single y is tested against y (x was tried first), and value and
+    /// extent are compared in one length unit, by accession.
+    #[test]
+    fn one_value_is_tested_on_its_own_axis_in_one_unit() {
+        const MM: Option<(&str, &str)> = Some(("UO:0000016", "millimeter"));
+        // y = 100 µm: an area on x (√100 × 10 = 100) but a length on its own axis (100 × 5 = 500).
+        let y = pixel_size_fix(&settings(&[
+            ("IMS:1000047", "100", UM),
+            ("IMS:1000042", "10", None), ("IMS:1000044", "100", UM),
+            ("IMS:1000043", "5", None), ("IMS:1000045", "500", UM),
+        ]))
+        .unwrap();
+        assert_eq!((y.case, y.transformation, y.write), ("one value: a length (value × count = extent)", None, vec![(PIXEL_Y, 100.0, false)]));
+        // 0.01 mm × 100 = 1000 µm: a length, once both are in µm.
+        let mm = pixel_size_fix(&settings(&[("IMS:1000046", "0.01", MM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
+        assert_eq!((mm.transformation, mm.write), (None, vec![(PIXEL_X, 0.01, false)]));
+        let nm = pixel_size_fix(&settings(&[("IMS:1000046", "10", UM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000000", Some(("UO:0000018", "nanometer")))])).unwrap();
+        assert_eq!(nm.transformation, None, "10 µm × 100 = 10⁶ nm");
+        // An area in mm²: its square root in mm (√0.0001 mm² = 0.01 mm; × 100 = 1 mm), the unit kept.
+        let area = pixel_size_fix(&settings(&[("IMS:1000046", "0.0001", MM), ("IMS:1000042", "100", None), ("IMS:1000044", "1", MM)])).unwrap();
+        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 0.01, false)]));
+        // The index row says which unit that is (its key, `written_um`, predates the mm case).
+        assert_eq!(fix_json(&area)["written_um"][0]["unit"], "UO:0000016");
+        // No unit anywhere: micrometre, and the detail says so.
+        let bare = pixel_size_fix(&settings(&[("IMS:1000046", "20", None), ("IMS:1000042", "100", None), ("IMS:1000044", "2000", None)])).unwrap();
+        assert_eq!((bare.transformation, bare.write.clone()), (Some(UNIT_ASSUMED), vec![(PIXEL_X, 20.0, true)]));
+        assert_eq!(fix_json(&bare)["written_um"][0]["unit"], "UO:0000017");
+        assert!(bare.detail.ends_with("(IMS:1000046, IMS:1000044 without a length unit: micrometre assumed)"), "{}", bare.detail);
+        assert!(!mm.detail.contains("assumed"), "{}", mm.detail);
+        // The detail's equation carries its units: the numbers are in different ones.
+        assert!(mm.detail.contains("0.01 millimeter × 100 = 1000 micrometer"), "{}", mm.detail);
+        assert!(area.detail.contains("√(0.0001 millimeter²) × 100 = 1 millimeter"), "{}", area.detail);
+        // A stated unit that is no length (UO:0000186, dimensionless) is tested as µm but kept, as
+        // the two-value case keeps it: nothing is declared.
+        let odd = pixel_size_fix(&settings(&[("IMS:1000046", "100", Some(("UO:0000186", "dimensionless unit"))), ("IMS:1000042", "3", None), ("IMS:1000044", "300", UM)])).unwrap();
+        assert_eq!((odd.transformation, odd.write.clone()), (None, vec![(PIXEL_X, 100.0, false)]));
+        assert_eq!(fix_json(&odd)["written_um"][0]["unit"], "UO:0000186");
+        assert!(odd.detail.ends_with("(IMS:1000046 without a length unit: micrometre assumed)"), "{}", odd.detail);
+    }
+
     #[test]
     fn a_unit_accession_that_disagrees_with_its_name_is_reported() {
         let cm = Some(("UO:0000015", "micrometer"));
         let f = pixel_size_fix(&settings(&[("IMS:1000046", "50", cm), ("IMS:1000047", "50", cm)])).unwrap();
         assert_eq!(f.transformation, None, "reported, not rewritten");
         assert_eq!(f.unit_mismatches.len(), 2, "{f:?}");
+        // Written as micrometre (mzdata took the name): the index row gives that unit, not the
+        // stated centimetre accession.
+        let mut ss = ScanSettings { id: "s1".into(), ..Default::default() };
+        for acc in [mzdata::curie!(IMS:1000046), mzdata::curie!(IMS:1000047)] {
+            ss.params.push(Param::builder().name("pixel size").curie(acc).value(50.0).unit(Unit::Micrometer).build());
+        }
+        let mut f = f;
+        apply(&f, &mut ss);
+        assert!(check_written_units(&mut f, &ss));
+        let units: Vec<serde_json::Value> = fix_json(&f)["written_um"].as_array().unwrap().iter().map(|e| e["unit"].clone()).collect();
+        assert_eq!(units, ["UO:0000017", "UO:0000017"]);
         let fine = Some(("UO:0000017", "micrometre"));
         assert_eq!(pixel_size_fix(&settings(&[("IMS:1000046", "50", fine), ("IMS:1000047", "50", fine)])), None);
+    }
+
+    /// Review 2026-09-30: a single value is tested in the unit mzdata writes it in — the unit
+    /// name's when mzdata knows the name — not by its accession, so what passes is written as it
+    /// passed. The extent is 3 px × 300 µm throughout.
+    #[test]
+    fn one_value_is_tested_in_the_unit_it_is_written_in() {
+        let one_y = |v: &str, unit: Option<(&str, &str)>| {
+            pixel_size_fix(&settings(&[("IMS:1000047", v, unit), ("IMS:1000043", "3", None), ("IMS:1000045", "300", UM)])).unwrap()
+        };
+        let cm_named_um = Some(("UO:0000015", "micrometer"));
+        // Written as 100 µm: a length. By accession (100 cm) it was dropped.
+        let kept = one_y("100", cm_named_um);
+        assert_eq!((kept.transformation, kept.write.clone(), kept.write_units.clone()), (None, vec![(PIXEL_Y, 100.0, false)], vec![Some("UO:0000017".into())]));
+        // Written as 0.01 µm: dropped. By accession (0.01 cm × 3 = 300 µm) it passed and was
+        // written as 0.01 µm.
+        assert_eq!(one_y("0.01", cm_named_um).transformation, Some(DROPPED));
+        // The micrometre accession named "millimeter" is written as mm: 100 mm is no 100 µm pixel.
+        assert_eq!(one_y("100", Some(("UO:0000017", "millimeter"))).transformation, Some(DROPPED));
+        // A unit stated by its name alone is a unit: 0.1 mm, kept in mm, nothing assumed.
+        let mut s = settings(&[("IMS:1000047", "0.1", Some(("", "millimeter"))), ("IMS:1000043", "3", None), ("IMS:1000045", "300", UM)]);
+        s.params[0].unit_accession = None;
+        let by_name = pixel_size_fix(&s).unwrap();
+        assert_eq!((by_name.transformation, by_name.write.clone(), by_name.write_units), (None, vec![(PIXEL_Y, 0.1, false)], vec![Some("UO:0000016".into())]));
+        // So is it for x and y: kept as stated, no micrometre over it.
+        let mut xy = settings(&[("IMS:1000046", "0.1", Some(("", "millimeter"))), ("IMS:1000047", "0.1", Some(("", "millimeter")))]);
+        xy.params.iter_mut().for_each(|p| p.unit_accession = None);
+        assert_eq!(pixel_size_fix(&xy), None);
     }
 
     #[test]
@@ -689,6 +1688,7 @@ mod tests {
             case: "area",
             transformation: Some(AREA_TO_LENGTH),
             write: vec![(PIXEL_X, 10.0, true)],
+            write_units: vec![],
             unit_mismatches: vec![],
             mismatched: vec![],
             written_units: vec![],
@@ -699,6 +1699,11 @@ mod tests {
         assert_eq!(ss.params[0].unit, Unit::Micrometer);
         assert!(one_way_to_flyback(&mut ss));
         assert_eq!(ss.params[1].curie().unwrap().to_string(), "IMS:1000413");
+        // An area whose unit is stated keeps it: √(mm²) is mm.
+        let mut in_mm = ScanSettings { id: "s1".into(), ..Default::default() };
+        in_mm.params.push(Param::builder().name("pixel size x").curie(mzdata::curie!(IMS:1000046)).value(0.0001).unit(Unit::Millimeter).build());
+        apply(&PixelSizeFix { write: vec![(PIXEL_X, 0.01, false)], ..fix.clone() }, &mut in_mm);
+        assert_eq!((in_mm.params[0].value.to_f64().unwrap(), in_mm.params[0].unit), (0.01, Unit::Millimeter));
         let drop = PixelSizeFix { write: vec![], transformation: Some(DROPPED), ..fix };
         apply(&drop, &mut ss);
         assert!(ss.params.iter().all(|p| p.curie().unwrap().to_string() != "IMS:1000046"));

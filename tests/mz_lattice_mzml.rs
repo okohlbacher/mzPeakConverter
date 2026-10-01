@@ -266,6 +266,45 @@ fn a_coarse_1e4_lattice_mzml_is_detected_at_its_own_scale() {
     lattice_fixture("mz_lattice_1e4.mzML", 1e4);
 }
 
+/// `--layout point` keeps the lattice centroids as exact f64 points. The grid is a chunk layout:
+/// armed beside the point data facet it put two layout families in one entity, behind a warning
+/// (review 2026-09-30 §E).
+#[test]
+fn layout_point_keeps_lattice_centroids_as_exact_points() {
+    let dir = scratch("point");
+    let input = fixture("mz_lattice_1e9.mzML");
+    let out = dir.join("point.mzpeak");
+    let st = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&input)
+        .arg("-o")
+        .arg(&out)
+        .args(["-q", "--layout", "point"])
+        .env_remove("MZPC_NO_MZ_LATTICE")
+        .status()
+        .expect("failed to run mzpeak-convert");
+    assert!(st.success(), "converting {} failed: {st}", input.display());
+
+    for name in ["spectra_data.parquet", "spectra_peaks.parquet"] {
+        let pq = SerializedFileReader::new(bytes::Bytes::from(member(&out, name))).unwrap();
+        let kv = pq.metadata().file_metadata().key_value_metadata().cloned().unwrap_or_default();
+        let index = kv.iter().find(|k| k.key == "spectrum_array_index").and_then(|k| k.value.clone()).unwrap();
+        let index: serde_json::Value = serde_json::from_str(&index).unwrap();
+        assert_eq!(index["prefix"], "point", "{name}: {index}");
+        assert!(index["entries"].as_array().unwrap().iter().all(|e| e["buffer_format"] == "point"), "{name}: {index}");
+    }
+    let index: serde_json::Value = serde_json::from_slice(&member(&out, "mzpeak_index.json")).unwrap();
+    let applied = index["metadata"]["transformations"].to_string();
+    assert!(!applied.contains("grid-fit"), "no grid, no grid fit: {applied}");
+
+    let src = source_mzs(&input);
+    let mut reader = MzPeakReader::new(&out).unwrap();
+    for (i, want) in src.iter().enumerate() {
+        let got = peak_mzs(reader.get_spectrum_peaks_for(i as u64).unwrap().expect("peaks"));
+        assert!(&got == want, "spectrum {i}: the point layout stores the source m/z bit for bit");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A non-lattice input must be untouched by all of this — the same converter decisions, the same
 /// bytes. The two runs differ only in `$MZPC_NO_MZ_LATTICE`, so argv (which the archive index
 /// records verbatim) is identical and the comparison is meaningful down to the byte.

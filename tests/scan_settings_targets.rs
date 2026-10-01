@@ -36,7 +36,25 @@ fn scan_settings_targets_are_objects() {
         let params = t["parameters"].as_array().unwrap_or_else(|| panic!("targets[{i}] lacks a 'parameters' list: {t}"));
         assert!(!params.is_empty(), "targets[{i}].parameters is empty");
     }
+    // The schema's key (review 2026-09-30): the fixture's `<sourceFileRef ref="sf_parameters"/>`
+    // lands under `source_file_references`, and the field name the struct used is gone.
+    let settings = &index["metadata"]["scan_settings_list"][0];
+    assert_eq!(settings["source_file_references"], serde_json::json!(["sf_parameters"]), "{settings}");
+    assert!(settings.get("source_file_refs").is_none(), "{settings}");
     let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn scan_settings_read_both_source_file_keys_and_neither() {
+    let read = |v: serde_json::Value| -> Vec<mzpeak_prototyping::param::ScanSettings> { serde_json::from_value(v).unwrap() };
+    // The schema's key, the one archives through 0.16.0 carry, and a spec archive that states only
+    // the required `id` and `parameters`.
+    let spec = read(serde_json::json!([{"id": "s1", "source_file_references": ["sf1"], "parameters": []}]));
+    let old = read(serde_json::json!([{"id": "s1", "source_file_refs": ["sf1"], "targets": [], "parameters": []}]));
+    let bare = read(serde_json::json!([{"id": "s1", "parameters": []}]));
+    assert_eq!(spec[0].source_file_refs, ["sf1"]);
+    assert_eq!(old[0].source_file_refs, ["sf1"]);
+    assert!(bare[0].source_file_refs.is_empty() && bare[0].targets.is_empty());
 }
 
 #[test]
