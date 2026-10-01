@@ -1125,8 +1125,6 @@ impl ArrayBuilder for ScanWindowBuilder {
     anyways!();
 }
 
-/// A builder for [`mzdata::spectrum::ScanEvent`], mapping to the `scan` table. It carries two indices, the source's index (usually a spectrum),
-/// and a unique scan index.
 /// A scan's `instrument_configuration_id` that names no configuration: [`ScanBuilder`] writes it as
 /// null. DELIBERATE DEVIATION (not upstream): mzdata's `ScanEvent` holds a plain `u32`, and its mzML
 /// reader gives a reference to an id the source's list lacks a fresh number, so a dangling source
@@ -1134,6 +1132,8 @@ impl ArrayBuilder for ScanWindowBuilder {
 /// such a scan (its `mzml_refs`); nothing else produces it — mzdata numbers configurations from 0.
 pub const NO_INSTRUMENT_CONFIGURATION: u32 = u32::MAX;
 
+/// A builder for [`mzdata::spectrum::ScanEvent`], mapping to the `scan` table. It carries two indices, the source's index (usually a spectrum),
+/// and a unique scan index.
 #[derive(Default, Debug)]
 pub struct ScanBuilder {
     source_index: UInt64Builder,

@@ -79,7 +79,7 @@ fn a_directory_at_the_tmp_path_is_left_alone() {
 }
 
 /// The other temp file a conversion can create: an mzML with an empty self-closing
-/// `<referenceableParamGroup/>` is converted from a sanitized copy (`mzpc-san-<pid>-<stem>.mzML`
+/// `<referenceableParamGroup/>` is converted from a sanitized copy (`mzpc-san-<pid>-<n>-<stem>.mzML`
 /// in the temp dir; mzdata panics on the original). It used to be removed only after a successful
 /// run — every failure, and every `-o x.mzML` export, left it behind. Same failure trigger as
 /// above (rename onto an occupied directory), so the copy exists right up to the failure.
