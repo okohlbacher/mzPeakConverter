@@ -984,9 +984,11 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
     comes first — on a dense run 8192 chunks were 270–460 MiB.
   - **Encodings.** Index lists and intensity are byte-stream-split with the dictionary off (measured
     −9.6 % against the reference implementation's dictionary default on 2485; its DELTA intent on
-    index lists would be +21 %), `spectrum_index` delta-packed, the bounds Parquet's default. Size on
-    2485.d against the vendor `analysis.tdf_bin`: about parity (the 0.13.0 corpus Bruker set measured
-    1.097× with this layout).
+    index lists would be +21 %), `spectrum_index` delta-packed, and the chunk bounds byte-stream-split
+    with the dictionary off, as on every chunk facet: nearly every bound is distinct, so a dictionary
+    only held the values again, once per row group (on 2485 the bounds are 30 % and the facet 0.6 %
+    smaller than with it). Size on 2485.d against the vendor `analysis.tdf_bin`: about parity (the
+    0.13.0 corpus Bruker set measured 1.097× with this layout).
   - **History.** 0.12.x wrote a TOF layout (integer TOF bounds, `tof_chunk_values` deltas,
     per-frame `tof_c0`/`tof_c1`; a flat point table of absolute bins under `--no-ims-chunked`), and
     0.13.0 rewrote its chunked facet into the grid in a second pass (`--ims-grid`, `--no-ims-grid`,

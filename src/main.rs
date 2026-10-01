@@ -5776,7 +5776,7 @@ where
             "verified": "1e-9 ppm vs Bruker timsdata SDK on a C2 != 0, C4 != 0 file (tests/fixtures/tdf_diapasef_sdk_golden.json)",
             "fallback": "a frame without a usable MzCalibration row carries the two-point chord below as an MS:1003825 sqrt model",
         },
-        "encoding": "byte-stream-split on the index lists and intensity; Parquet default (dictionary) on the bounds",
+        "encoding": "byte-stream-split, dictionary off, on the index lists, the intensity and the chunk bounds",
         // The two lanes derive the chord differently: the native lane from GlobalMetadata
         // (MzAcqRangeLower/Upper, DigitizerNumSamples), the SDK lane from the vendor library's
         // own `tims_index_to_mz(frame 1, [0, 1])`. Measured 4.28 ppm apart on 2485.d. It is NOT
