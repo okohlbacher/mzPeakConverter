@@ -1657,8 +1657,8 @@ fn is_tdf_dir(input: &Path) -> bool {
     input.is_dir() && has_nonempty(input, "analysis.tdf")
 }
 
-/// A failed mzdata open of `input`, with any file timsrust could have taken for `analysis.tdf`
-/// named when `input` is a TDF `.d` ([`bruker_native::name_timsrust_lookalikes`]).
+/// A failed mzdata open of `input`, with any file timsrust took for `analysis.tdf` /
+/// `analysis.tdf_bin` named when `input` is a TDF `.d` ([`bruker_native::name_timsrust_lookalikes`]).
 fn tdf_open_error(input: &Path, e: anyhow::Error) -> anyhow::Error {
     if is_tdf_dir(input) { bruker_native::name_timsrust_lookalikes(input, e) } else { e }
 }
