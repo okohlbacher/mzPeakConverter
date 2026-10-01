@@ -129,7 +129,8 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--layout <chunked\|point>` | `chunked` | Signal layout: `chunked` m/z layout (numpress-linear or delta); `point` — flat point layout, one row per m/z–intensity pair (§9) |
 | `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` / `.mzML.gz` → `mzml`, `.mzpeak` → `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1). Required when the output name has any other extension, or none; it wins over the extension |
 | `--no-numpress` | off | Delta m/z chunking instead of the default lossy numpress-linear: each m/z is stored as its difference from the one before. Exact for m/z that are 32-bit values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor; a 64-bit m/z more than twice its predecessor in the same chunk can come back one unit in the last place off (1e-15 Da near m/z 10, 5e-13 Da near m/z 4000), and so can the values after it in that chunk. This happens at any mass: a sparse centroid list is cut into chunks far wider than `--chunk-size`, since a chunk is never one point long (6 of 360 points of a ToF-SIMS-like test file; 7 of 6,281 in 200 generated centroid spectra over m/z 50–5000, 3 of them above m/z 1000). The archive declares it (`delta-ulp` in `transformations`), and the `fidelity` block counts the chunks this can happen in and bounds the error (§8). Profile zero runs are still masked. For a bit-exact archive use `--lossless` |
-| `--keep-zero-runs` | off | Store every profile point: the writer's zero-run mask (`zero-run-mask`, §8) is off, no profile point is dropped and the entry is not declared. **Continuous-mode imaging data** (imzML `IMS:1000030`), whose pixels share one m/z axis, decodes to one shared axis only with this flag: masked, every pixel keeps a different subset of the axis under its own numpress fixed points, so one source m/z decodes to several values across pixels (171.33333 to 8 values in the 9 pixels of `Example_Continuous`; one value with the flag). `MZPC_KEEP_ZERO_RUNS=1` does the same from the environment (§10). Refused on `--agilent-grid`, whose reader leaves the zero samples out itself; inert on the timsTOF ims-compact lanes, whose frames hold no zero-intensity point; on the native Shimadzu sqrt-grid route the zero pad at the scan-window bounds stays out (`shimadzu:span-trim`, with a warning) |
+| `--keep-zero-runs` | off | Store every profile point: the writer's zero-run mask (`zero-run-mask`, §8) is off, no profile point is dropped and the entry is not declared. **Continuous-mode imaging data** (imzML `IMS:1000030`), whose pixels share one m/z axis, keeps its zero runs **without this flag** since 0.17.0 (§8, imaging): masked, every pixel kept a different subset of the axis under its own numpress fixed points, so one source m/z decoded to several values across pixels (171.33333 to 8 values in the 9 pixels of `Example_Continuous`; one value now, and `metadata.imaging.shared_mz_axis` says the file's spectra did hold one array). The flag remains the override for processed-mode imzML and any other profile input. `MZPC_KEEP_ZERO_RUNS=1` does the same from the environment (§10). Refused on `--agilent-grid`, whose reader leaves the zero samples out itself; inert on the timsTOF ims-compact lanes, whose frames hold no zero-intensity point; on the native Shimadzu sqrt-grid route the zero pad at the scan-window bounds stays out (`shimadzu:span-trim`, with a warning) |
+| `--keep-contact` | off | **mzML/imzML input:** carry the header's `fileDescription/<contact>` — contact name `MS:1000586`, affiliation `MS:1000590`, address `MS:1000587`, URL `MS:1000588`, e-mail `MS:1000589`, every param as stated — into the archive's `file_description.contacts` (the spec's own slot: `contact_name`, `contact_affiliation`, `parameters`) and into the direct mzML export's `<fileDescription>`, after the source files. **By default it is dropped**, with one note naming the contact when a header states one: an archive is copied and published, and a name, an e-mail and a street address would travel with every copy (§4.1, §8). The export of an archive writes whatever its index holds, flag or not; inert on the `.mzpeak` input lanes and on every input without an mzML header. Config key `keep_contact` (§5) |
 | `--lossless` | off | A bit-exact archive, or none (§9): every point of the input stored in the input's order, each m/z and intensity with exactly the value the input holds. Selects the point layout with zero runs kept and no numpress, m/z lattice or TOF grid; after writing, the conversion fails (exit 1, nothing written) unless no signal transformation is declared, every point is stored and no column is narrower than the input declares. **mzML and imzML inputs only**; refused on every other lane, and for a Thermo `.raw` or a TDF on the standard lane. Conflicts with `--layout chunked`, `--tof-grid auto\|on`, `--agilent-grid` and an mzML output, and is refused while `MZPC_MAX_SPECTRA` is set (§10) |
 | `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
@@ -171,7 +172,7 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 
 | Lane (how it is selected) | Refused (exit 1) | Warned; the run goes on |
 |---|---|---|
-| `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --keep-zero-runs --no-mz-lattice --chunk-size --no-ims-compact --representation --ims-chunked --no-ims-grid --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output). `--ims-grid` is NOT a filter: it rewrites the timsTOF peaks facet into the grid layout (`--zstd-level` and `--grid-encoding` apply to that facet) and copies everything else |
+| `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --keep-zero-runs --keep-contact --no-mz-lattice --chunk-size --no-ims-compact --representation --ims-chunked --no-ims-grid --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output; an archive carries the contacts its index holds, or none). `--ims-grid` is NOT a filter: it rewrites the timsTOF peaks facet into the grid layout (`--zstd-level` and `--grid-encoding` apply to that facet) and copies everything else |
 | `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux` | the filter lane's list without `--aux` |
 | `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --keep-zero-runs --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --ims-grid --grid-encoding --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
 | `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert --keep-zero-runs` (the reader leaves the zero samples out itself, `agilent:drop-zero-samples`) | `--layout --no-numpress --chunk-size` |
@@ -537,6 +538,7 @@ to: mzpeak                 # or: mzml (default: inferred from the output extensi
 layout: chunked            # or: point
 no_numpress: false
 keep_zero_runs: false      # true: store every profile point (no zero-run mask)
+keep_contact: false        # true: carry an mzML/imzML header's <contact> (§4.1)
 lossless: false            # true: a bit-exact archive or a failed conversion (mzML/imzML only)
 no_mz_lattice: false
 chunk_size: 50
@@ -816,7 +818,38 @@ from 1. imzML input keeps its positions and scan settings as stated (imzML alrea
 with these checks since 0.16.0
 (HUPO-PSI/mzPeak-specification#23):
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
-checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
+checksum `IMS:1000090/91/92` — is written back into `file_description`, and the marker states the
+**storage mode** (`metadata.imaging.storage_mode`: `continuous` or `processed`, as the header
+states it). A **continuous-mode** imzML (`IMS:1000030`: every pixel holds the same m/z array) is
+written with its **zero runs kept**, without `--keep-zero-runs` (owner decision D2, 2026-10-01):
+masked, each pixel kept a different subset of the one axis under its own numpress fixed points, so
+one source m/z decoded to several values across pixels (`Example_Continuous`: 171.33333 to 8
+values in 9 pixels, 118 fixed points in 126 chunks; now one axis of 8,399 points for all nine, one
+value, within the numpress bound of 1.75e-7 Da — and 243 kB against 263 kB masked, since the nine
+spectra share one compression window; a sparse synthetic continuous file measured +12 %). No
+`zero-run-mask` is declared, since none was applied; numpress stays the m/z encoding. Whether the
+file's spectra did all hold one array is checked as they are written — each m/z array against the
+first, bit for bit — and stated as **`metadata.imaging.shared_mz_axis`** (`true`, or `false` with a
+warning counting the spectra that differ; absent for processed-mode input, whose pixels are masked
+as before, `--keep-zero-runs` the override). A spectrum typed `MS1 spectrum` (`MS:1000579`) that
+states **`ms level` 0** — the ms-imaging.org example files, the DESI and the GBM sets all do, in
+their shared `spectrum1` param group — is written with `ms_level` 1, declared
+`imzml:ms-level-0-as-1` and warned about once with the count (owner decision D6): the type proves
+the level, and readers' MS1 filters and the summed TIC/BPC pair (MS1 spectra that state a time)
+then apply to it; a spectrum that states no `ms level` at all reads the same way to mzdata and is
+treated alike. The marker's **`mz_range`** is `[min, max]` of the **stored** m/z arrays over the run
+(owner decision D10): of each spectrum the m/z the writer keeps — every point of a centroid
+spectrum, of a profile spectrum with the zero runs kept, and with the mask on the points the mask
+keeps, by the writer's own rule (an all-zero stretch at either end goes entirely, so the stored
+range is narrower than the source's `lowest`/`highest observed m/z` on such a spectrum: 34,775 of
+the 34,840 bladder spectra; the bladder archive's `mz_range` is `[400.00003, 999.99868]`). It is
+the range of the values handed to the writer; an m/z encoding with a bound (`fidelity.mz_error`)
+moves a stored value within that bound. Written on the imzML and mzML-with-positions lanes. A **TIC
+image** needs no structure of its own: it is a join of `spectra_metadata.total_ion_current` (and
+`base_peak_intensity`) with the pixel positions in `spectra_metadata_scans`, on `spectrum.index`
+— 0.16 s and 0.9 % of the archive's bytes for the bladder's 260 × 134 pixels; an ion image at one
+m/z is a range query over the signal facets (`mz_range` says what the archive holds). The
+header's **`<contact>`** is dropped unless `--keep-contact` (§4.1). The pixel size follows the
 issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; x and y of
 which one is zero or negative are no pixel size and are dropped; a single value
 is tested against its own axis's count and extent — the other axis's when its own states none — both
@@ -843,11 +876,16 @@ one warning names both hashes, `imzml:ibd-checksum-mismatch` is declared and
 `source_files` with the SHA-1 it hashes to. The **UUID** is checked the same way: an `.ibd` begins
 with its 16-byte UUID, which the imzML states as `IMS:1000080`, and the two are compared whatever
 the spelling (braces, dashes, case). `provenance.ibd_uuid` is `verified`, `mismatch` or `not stated`
-(`not checked` with the checksum); on a mismatch the conversion goes on, the stated value stays in
+(`not checked` with the checksum). A mismatch is the one imaging check that **refuses** rather than
+declares (owner decision D7, 2026-10-01): a wrong checksum is a damaged copy of the right data, a
+wrong UUID may be the wrong data — the two files are not the pair the imzML describes. The
+conversion stops before anything is written, on the archive lane and the direct mzML export alike,
+with a message naming both UUIDs; `--force` converts anyway, and then the stated value stays in
 `file_description`, a warning names both, `imzml:ibd-uuid-mismatch` is declared and
-`provenance.ibd_uuid_found` holds the 32 hex digits the `.ibd` begins with. Through 0.17.0-rc.1 a
-mismatch was one line of mzdata's log and nothing in the archive, which could read `ibd_checksum:
-verified` (or `not stated`) over an `.ibd` that is not the imzML's. A binary array typed with the imaging vocabulary's
+`provenance.ibd_uuid_found` holds the 32 hex digits the `.ibd` begins with (0.17.0-rc.2 warned and
+recorded without refusing; through 0.17.0-rc.1 a mismatch was one line of mzdata's log and nothing
+in the archive, which could read `ibd_checksum: verified` over an `.ibd` that is not the imzML's).
+A binary array typed with the imaging vocabulary's
 obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") is read as
 `MS:1000519` / `MS:1000522`, the terms that replaced them, declared
 `imzml:obsolete-integer-type-as-psi-ms` (the mzML export does the same, with a warning). An m/z or
@@ -995,11 +1033,20 @@ reads the rest back from the source text (`src/mzml_refs.rs`, `src/imaging.rs`):
 - A chromatogram **intensity array's unit** other than detector counts is kept: on the array where
   the value is no intensity (a device trace), as the chromatogram's `intensity array unit`
   parameter where it is one, or where mzdata does not know the unit (§7).
-- **Not carried:** `fileDescription/<contact>` — the contact's name, organization, address, URL and
-  e-mail (`MS:1000586`–`MS:1000590`). mzdata's model has no contact and the archive index no place
-  for one; nothing of it is stored, on purpose until it is decided whether an archive should carry
-  personal data that travels with every copy. Also not carried: a spectrum's `spotID`, and the
-  `sourceFileRef` / `externalSpectrumID` of a scan or precursor.
+- **`fileDescription/<contact>`** — the contact's name, organization, address, URL and e-mail
+  (`MS:1000586`–`MS:1000590`) — is **dropped by default**, with one note naming the contact
+  (owner decision D11, 2026-10-01): an archive is copied and published, and personal data would
+  travel with every copy. `--keep-contact` (config `keep_contact`) carries every `<contact>` of
+  the header, params as stated and in order, into the archive's `file_description.contacts` (the
+  spec's slot: `contact_name` from `MS:1000586`, `contact_affiliation` from `MS:1000590`,
+  `parameters` with every param) and into the direct export's `<fileDescription>`, as `<contact>`
+  elements after the source files, where the schema has them. The export of an archive writes the
+  contacts its index holds, flag or not — the decision was taken when the archive was written.
+  mzdata's model has no contact, so the header is read for them (`src/mzml_contact.rs`), as it
+  is for an imzML's provenance. Through 0.17.0-rc.2 nothing of a contact reached any output.
+  A spectrum's `ms level` of 0 on a spectrum typed `MS1 spectrum` is written as 1 by both
+  exports of an imzML (§8, imaging), with a warning on the direct lane. **Not carried:** a
+  spectrum's `spotID`, and the `sourceFileRef` / `externalSpectrumID` of a scan or precursor.
 
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
 the Agilent-MHDAC and BAF lanes (Bruker TDF/TSF, Shimadzu, Waters and SciEX have them), and the
@@ -1129,7 +1176,9 @@ archive; the lane-specific changes, each declared when it happens, are in the ta
    (7). The baseline extent of every peak is preserved, so the profile shape is unchanged, but
    `number_of_data_points` reflects the stored count rather than the source's. **Centroid spectra
    are never touched** — isolated and interior zero-intensity centroids round-trip exactly.
-   `--keep-zero-runs` turns the compaction off; how many points it dropped is in the `fidelity` block.
+   `--keep-zero-runs` turns the compaction off, and a continuous-mode imzML (`IMS:1000030`) has it
+   off without the flag, so its pixels decode to the one axis the file stores (imaging, below); how
+   many points it dropped is in the `fidelity` block.
 3. **`--tof-grid` sqrt grid** (`tof-grid:<ppm>ppm`) — a spectrum is stored on an integer sqrt-space grid (a
    chunk-grid row under its `MS:1003825` model) only when every point reconstructs within the ppm bound
    (`MZPC_TOF_GRID_PPM`, default 5). Spectra outside the bound keep f64 m/z as raw chunk rows.
@@ -1208,7 +1257,8 @@ The vocabulary:
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `imzml:obsolete-integer-type-as-psi-ms` | a binary array's data type was declared with the imaging vocabulary's obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") and was read as `MS:1000519` / `MS:1000522`, the PSI-MS terms that replaced them; the values are the ones the `.ibd` holds | imzML |
 | `imzml:ibd-checksum-mismatch` | the `.ibd` does not hash to a checksum the header states (`IMS:1000090/91/92`). The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_checksum_found` holds the hash found, and the `.ibd`'s `source_files` entry its SHA-1 (§8, imaging) | imzML |
-| `imzml:ibd-uuid-mismatch` | the `.ibd` does not begin with the UUID the header states (`IMS:1000080`): the two files are not the pair the imzML describes. The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_uuid` is `mismatch` and `ibd_uuid_found` holds the UUID the `.ibd` begins with (§8, imaging) | imzML |
+| `imzml:ibd-uuid-mismatch` | the `.ibd` does not begin with the UUID the header states (`IMS:1000080`): the two files are not the pair the imzML describes, and the conversion was forced past the refusal with `--force` (without it nothing is written, §8, imaging). The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_uuid` is `mismatch` and `ibd_uuid_found` holds the UUID the `.ibd` begins with | imzML (`--force`) |
+| `imzml:ms-level-0-as-1` | at least one spectrum typed `MS1 spectrum` (`MS:1000579`) stated `ms level` 0 (or none: mzdata reads both as 0) and was written with `ms_level` 1 — the type proves the level, and readers' MS1 filters and the summed TIC/BPC pair then apply to it. The run's warning gives the count (§8, imaging) | imzML (the direct mzML export writes level 1 too, with the warning as its declaration) |
 | `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y` (`MaldiFrameLaserInfo`, through `MaldiFrameInfo.LaserInfo`), not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
 | `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid, or far outside the raster at one position (a scan taken with the stage parked off it), and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
@@ -1395,7 +1445,8 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
 - **Zero runs and bit-exact archives** — three levels, from smallest to exact:
   the default masks profile zero runs and stores m/z with numpress-linear (bounded, the bound in
   `fidelity`, §8); `--keep-zero-runs` stores every point and keeps numpress, which is what gives
-  continuous-mode imaging data (one m/z axis for all pixels) one decoded axis; `--lossless` is
+  continuous-mode imaging data (one m/z axis for all pixels) one decoded axis — and what a
+  continuous-mode imzML gets without the flag since 0.17.0 (§8, imaging); `--lossless` is
   bit-exact or fails. It selects the point layout with zero runs kept and no numpress, lattice or
   TOF grid, writes a centroid spectrum's arrays at the binary types the file declares (the
   default lanes store its intensities as float32), and after writing checks the archive: no
@@ -1413,8 +1464,8 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   (+11 %), `--lossless` 409.8 MB (2.4×, every m/z and intensity equal to the `.ibd`); these are
   sizes without an optical image, and the 1.6 MB TIFF the corpus keeps beside this imzML is
   embedded on top when it is there. Where m/z are 32-bit values the exact archive is the smaller
-  one: `Example_Continuous` is 263 kB by default, 241 kB with `--keep-zero-runs` and 230 kB with
-  `--lossless`.
+  one: `Example_Continuous` was 263 kB masked (0.17.0-rc.2), is 243 kB by default since its zero
+  runs are kept (continuous mode, §8), 238 kB with `--no-numpress` and 230 kB with `--lossless`.
 - **zstd** — applied inside Parquet, `--zstd-level` 1–22 (default 3; the timsTOF **ims-compact**
   lanes default to **5**, the measured byte-plane plateau — an explicit `--zstd-level` applies to
   both).
