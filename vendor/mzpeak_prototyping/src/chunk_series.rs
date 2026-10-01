@@ -1754,7 +1754,12 @@ impl ArrowArrayChunk {
                         (_skip_zero_runs_gen(&intensity_array), intensity_array.len())
                     }
                     _ => {
-                        unimplemented!("{}", intensity_name)
+                        // DELIBERATE DEVIATION (not upstream, which panics here with
+                        // `unimplemented!`): an intensity array whose data type the source did not
+                        // state in a term the reader knows (an imzML typing it with the obsolete
+                        // `IMS:1000141`) is an input error, not a writer bug.
+                        log::error!("{intensity_name}: the intensity array has no data type the zero-run mask handles (float32/float64/int32/int64)");
+                        return Err(ArrayRetrievalError::DataTypeSizeMismatch);
                     }
                 };
                 let kept_indices: UInt64Array = kept_indices.into();
@@ -1788,7 +1793,9 @@ impl ArrowArrayChunk {
                             (is_zero_pair_mask(&intensity_array), intensity_array.len())
                         }
                         _ => {
-                            unimplemented!("{}", intensity_name)
+                            // DELIBERATE DEVIATION (not upstream): an error, as above.
+                            log::error!("{intensity_name}: the intensity array has no data type the zero-run mask handles (float32/float64/int32/int64)");
+                            return Err(ArrayRetrievalError::DataTypeSizeMismatch);
                         }
                     };
 

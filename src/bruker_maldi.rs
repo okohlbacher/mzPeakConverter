@@ -405,6 +405,8 @@ impl MaldiInfo {
         let mut marker = crate::imaging::marker_block(
             Some(&self.scan_settings()),
             crate::imaging::COUNTS_OBSERVED_MAX,
+            // Both sizes or none are written above: a lone x does not occur.
+            crate::imaging::LoneX::XOnly,
             serde_json::json!({
                 "detected_from": "MaldiFrameInfo in analysis.tsf/.tdf",
                 "positions": "XIndexPos/YIndexPos − position_offset",

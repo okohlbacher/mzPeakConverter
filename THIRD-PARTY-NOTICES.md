@@ -65,6 +65,17 @@ copyleft license (GPL/AGPL); the MPL-2.0 OpenMcdf above arrives inside a crate, 
 optional `LGPL-2.1-or-later` alternative, is also offered under `MIT OR Apache-2.0`, which
 this project takes. `mzpeak_prototyping` declares no license (above).
 
+## Test fixtures
+
+Not part of any release archive; they are in the repository for its tests.
+
+| Component | Location | License | Source |
+|---|---|---|---|
+| **Thyra** pixel-size imzML test files (five synthetic `.imzML`/`.ibd` pairs, `pixel_size_expected.json`, the author's `README.txt`) | `tests/fixtures/imaging/thyra/` | MIT, Copyright (c) 2025 Theodoros Visvikis (M4i, Maastricht University); the text is `LICENSE` in that directory | <https://github.com/M4i-Imaging-Mass-Spectrometry/thyra>, `tests/data/fixtures` at commit `e652f90`: the eleven `pixel_size_*` files byte for byte; `README.txt` as the author sent it (HUPO-PSI/mzPeak-specification#23) |
+
+The other fixtures are slices of public acquisitions under their sources' terms:
+[`tests/fixtures/README.md`](tests/fixtures/README.md).
+
 ## Vendor instrument SDKs (not bundled)
 
 The native readers for Bruker BAF and the timsdata SDK, Agilent (MHDAC), SciEX

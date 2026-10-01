@@ -358,6 +358,16 @@ impl WatersImaging {
         Some(s)
     }
 
+    /// The `metadata.imaging` marker for `grid` ([`Self::scan_settings`]). A single row's grid
+    /// states `IMS:1000046` alone — the column step the lane fitted; it knows no row step — so the
+    /// marker is told the x is that axis's only (`LoneX::XOnly`) and writes no `pixel_size_um`. On
+    /// the imzML lane a lone `IMS:1000046` gives both sizes, as the vocabulary defines it; whether
+    /// this lane should write its lone x at all is the owner's decision D5, and until then its
+    /// output stays as it was.
+    pub fn marker(&self, grid: &mzdata::meta::ScanSettings) -> serde_json::Value {
+        crate::imaging::marker_block(Some(grid), crate::imaging::COUNTS_OBSERVED_MAX, crate::imaging::LoneX::XOnly, self.provenance())
+    }
+
     /// The `transformations` entries of a run with a grid.
     pub fn transformations(&self) -> Vec<&'static str> {
         match &self.grid {
@@ -1905,10 +1915,17 @@ mod tests {
         assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044"]);
         assert!((s.params[2].value.to_f64().unwrap() - 50.0).abs() < 1e-9);
         assert_eq!(im.block()["y"]["step_source"], "none: a single row or column");
+        // The lone x is the column step only: the marker claims no y size from it (owner decision
+        // D5 pending; the imzML lane reads a lone IMS:1000046 as both, by the vocabulary).
+        let marker = im.marker(&s);
+        assert_eq!(marker["pixel_count"], serde_json::json!({"x": 50, "y": 1}));
+        assert!(marker.get("pixel_size_um").is_none(), "{marker:#}");
         // With the method's y step, both axes have a pixel size.
         let im = WatersImaging::from_positions(row, laser_names(), [None, step("DesiYStep", 0.05)], 0).unwrap();
         let s = im.scan_settings().unwrap();
         assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044", "IMS:1000047", "IMS:1000045"]);
+        let size = &im.marker(&s)["pixel_size_um"];
+        assert!((size["x"].as_f64().unwrap() - 50.0).abs() < 1e-9 && (size["y"].as_f64().unwrap() - 50.0).abs() < 1e-9, "{size:#}");
     }
 
     /// The real DESI run (MetaboLights MTBLS14771): `_func001.sts` holds each scan's laser aim

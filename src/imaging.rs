@@ -6,13 +6,21 @@
 //!   until 2017). [`pixel_size_fixes`] applies the issue author's rule: x and y with a unit are kept;
 //!   x and y without one are taken as micrometre; a single value is tested against pixel count and
 //!   extent — an area when `√value × count = extent` (written as its square root), a length when
-//!   `value × count = extent` — and anything else is dropped. Nothing changes silently: every
-//!   action becomes a `transformations` entry and a row of the `imaging_pixel_size` index block.
+//!   `value × count = extent` — and anything else is dropped. A lone `IMS:1000046` the rule keeps
+//!   is also written as `IMS:1000047`: the vocabulary defines it as the y size too when no
+//!   `IMS:1000047` is stated. Nothing changes silently: every change of a value or a unit becomes
+//!   a `transformations` entry and a row of the `imaging_pixel_size` index block. The vocabulary's
+//!   default made explicit — the y of a kept lone x, and the terms' current names — declares
+//!   nothing and is in the row only (its `written_um` and `detail`).
 //! * **"one way"** (`IMS:1000411`, obsolete) is written as its stated replacement, flyback
 //!   (`IMS:1000413`), and declared.
 //! * **File provenance.** mzdata consumes storage mode, UUID and `.ibd` checksum into its
 //!   `ImzMLFileMetadata` and leaves them out of `file_description`; [`provenance_params`] puts them
-//!   back from the header ([`read_file_content`]), values as stated.
+//!   back from the header ([`read_file_content`]), values as stated. The checksum is also CHECKED
+//!   ([`check_ibd`]): the stated value stays, a mismatch is declared with the hash found.
+//! * **Obsolete integer type terms.** `IMS:1000141`/`142` ("32-bit integer"/"64-bit integer") are
+//!   replaced by the PSI-MS terms they were obsoleted for in the reader's copy of the header
+//!   ([`replace_obsolete_integer_terms`]), declared; mzdata knows only the PSI-MS ones.
 //!
 //! mzdata keeps one unit per param (the name's when it knows the name, else the accession's), so
 //! the unit accession AND name the file states — needed to see a disagreement — are read from the
@@ -37,6 +45,12 @@ pub const UNIT_ASSUMED: &str = "imzml:pixel-size-unit-assumed-um";
 pub const AREA_TO_LENGTH: &str = "imzml:pixel-size-area-to-length";
 pub const DROPPED: &str = "imzml:pixel-size-dropped";
 pub const ONE_WAY_AS_FLYBACK: &str = "imzml:one-way-as-flyback";
+/// A binary array's data type was declared with the imaging vocabulary's obsolete `IMS:1000141`
+/// ("32-bit integer") or `IMS:1000142` ("64-bit integer"): read as `MS:1000519` / `MS:1000522`.
+pub const INTEGER_TYPE_AS_PSI_MS: &str = "imzml:obsolete-integer-type-as-psi-ms";
+/// The `.ibd` does not hash to the checksum the header states (`IMS:1000090/91/92`). The stated
+/// value is kept in `file_description`; the hash found is in `metadata.imaging.provenance`.
+pub const IBD_CHECKSUM_MISMATCH: &str = "imzml:ibd-checksum-mismatch";
 /// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes the
 /// `unitName` when it names a unit mzdata knows, whatever the attribute order).
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
@@ -550,11 +564,30 @@ fn grid_at(values: &[f64], raster: &[f64], c: f64, phase: Option<f64>, fixed: bo
     Some((axis, placed.iter().map(|k| k.map(|k| k - lo + 1)).collect()))
 }
 
+/// What a lone `IMS:1000046` in a grid entry says about y, for [`marker_block`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LoneX {
+    /// The source stated the term and the single-value rule read its scan settings (imzML): the
+    /// IMS vocabulary defines `IMS:1000046` as "the length of a pixel in the x dimension. If no
+    /// pixel size y (IMS:1000047) is explicitly specified, then this also describes the length of
+    /// a pixel in the y dimension". The rule writes that y itself ([`apply`]), so this default
+    /// only says the same of an entry the rule left as it was.
+    AlsoY,
+    /// x only, no `pixel_size_um`. The lane wrote the term itself for an axis whose step it
+    /// measured and knows no other axis's (a Waters single row: owner decision D5 keeps that
+    /// output as it is); or the source stated it and nothing tested it (an mzML with positions:
+    /// its lone "pixel size" may be the area the term named until 2017, and an untested value in
+    /// the marker would be read as a length on both axes).
+    XOnly,
+}
+
 /// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
 /// marker, the coordinate base, the grid as the viewer reads it and where its counts came from
 /// (`pixel_count_source`: [`COUNTS_DECLARED`] or [`COUNTS_OBSERVED_MAX`]; review 2026-09-30 B18),
-/// and where it all came from.
-pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, provenance: serde_json::Value) -> serde_json::Value {
+/// and where it all came from. `pixel_size_um` needs both axes in µm; `lone_x` says whether an
+/// `IMS:1000046` without an `IMS:1000047` gives both (HUPO-PSI/mzPeak-specification#23: a reader
+/// that does not know the vocabulary's default saw no pixel size at all).
+pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, lone_x: LoneX, provenance: serde_json::Value) -> serde_json::Value {
     let mut b = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "provenance": provenance});
     let param = |acc| grid?.params.iter().find(|p| p.curie() == Some(acc));
     let int = |acc| param(acc)?.value.to_i64().ok();
@@ -564,10 +597,21 @@ pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, prove
         b["pixel_count_source"] = pixel_count_source.into();
     }
     // ponytail: micrometre only; a pixel size in another length unit stays in the scan settings.
-    if let (Some(x), Some(y)) = (um(mzdata::curie!(IMS:1000046)), um(mzdata::curie!(IMS:1000047))) {
+    let x = um(mzdata::curie!(IMS:1000046));
+    let y = match param(mzdata::curie!(IMS:1000047)) {
+        Some(_) => um(mzdata::curie!(IMS:1000047)),
+        None => x.filter(|_| lone_x == LoneX::AlsoY),
+    };
+    if let (Some(x), Some(y)) = (x, y) {
         b["pixel_size_um"] = serde_json::json!({"x": x, "y": y});
     }
     b
+}
+
+/// Whether a grid entry states a pixel size on either axis (`provenance.pixel_size`: "as stated"
+/// only when there is one — it used to say so of a header that states none).
+pub fn states_pixel_size(grid: Option<&ScanSettings>) -> bool {
+    grid.is_some_and(|g| states(g, &[mzdata::curie!(IMS:1000046), mzdata::curie!(IMS:1000047)]))
 }
 
 /// One `cvParam` of a `<scanSettings>`, as the file states it.
@@ -704,8 +748,13 @@ pub struct PixelSizeFix {
     /// The `transformations` entry it declares, when the values changed.
     pub transformation: Option<&'static str>,
     /// Pixel sizes to write: accession (`IMS:1000046`/`47`), value, and whether its unit is set to
-    /// micrometre. An accession absent here is removed.
+    /// micrometre. An accession absent here is removed. A lone `IMS:1000046` the single-value rule
+    /// keeps is here twice, as itself and as `IMS:1000047` — the vocabulary's default made
+    /// explicit, which declares nothing.
     pub write: Vec<(&'static str, f64, bool)>,
+    /// The single-value rule kept the value: it is written under the vocabulary's names (the old
+    /// "pixel size" named the AREA term), and a lone x also as y ([`apply`]).
+    pub single: bool,
     /// The unit accession each `write` value is in: micrometre where set, else [`written_unit`]'s
     /// (an area's root keeps a stated length unit, so the values are not all µm) — until
     /// [`check_written_units`] replaces it by the unit the writer's param actually carries.
@@ -716,11 +765,19 @@ pub struct PixelSizeFix {
     pub mismatched: Vec<(String, String)>,
     /// What [`check_written_units`] found: the unit each mismatched param was written with.
     pub written_units: Vec<String>,
+    /// x and y both stated: the axes on which `value × count` is not the stated max dimension.
+    /// Reported only — which of the three the file has wrong is not decided, so nothing is changed.
+    pub extent_mismatches: Vec<String>,
     pub detail: String,
 }
 
 const PIXEL_X: &str = "IMS:1000046";
 const PIXEL_Y: &str = "IMS:1000047";
+/// The vocabulary's names of the two (imagingMS.obo 1.1.0). Until 2017 `IMS:1000046` was "pixel
+/// size", an area.
+const PIXEL_NAMES: [(&str, &str); 2] = [(PIXEL_X, "pixel size (x)"), (PIXEL_Y, "pixel size y")];
+/// `(pixel count, max dimension)` per axis, x then y.
+const AXES: [(&str, &str); 2] = [("IMS:1000042", "IMS:1000044"), ("IMS:1000043", "IMS:1000045")];
 
 fn approx(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
@@ -755,14 +812,17 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
         settings_id: s.id.clone(),
         case,
         transformation,
+        // A y written from a lone x (`get` finds none) carries the x param's unit.
         write_units: write
             .iter()
-            .map(|&(a, _, um)| if um { Some("UO:0000017".into()) } else { get(a).and_then(written_unit) })
+            .map(|&(a, _, um)| if um { Some("UO:0000017".into()) } else { get(a).or(x).and_then(written_unit) })
             .collect(),
         write,
+        single: false,
         unit_mismatches: unit_mismatches.clone(),
         mismatched: mismatched.clone(),
         written_units: Vec::new(),
+        extent_mismatches: Vec::new(),
         detail,
     };
     match (x, y) {
@@ -773,17 +833,36 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
                 return Some(fix("x and y not numeric", Some(DROPPED), vec![], format!("x={:?} y={:?}", px.value, py.value)));
             };
             let (ux, uy) = (written_unit(px), written_unit(py));
-            if ux.is_some() && uy.is_some() {
-                Some(fix("x and y with a unit", None, vec![(PIXEL_X, vx, false), (PIXEL_Y, vy, false)], String::new()))
-                    .filter(|f| !f.unit_mismatches.is_empty())
+            // Each axis against its own count and max dimension, where the file states both
+            // (HUPO-PSI/mzPeak-specification#23: 50 and 2500 over 150 × 100 µm were written as
+            // stated with no word). A unit that is no length is not compared.
+            let extent_mismatches: Vec<String> = [(px, vx), (py, vy)]
+                .into_iter()
+                .zip(AXES)
+                .filter_map(|((p, v), (c, e))| {
+                    let (count, extent, e) = (num(c)?, num(e)?, get(e)?);
+                    let size = |q: &RawParam| match written_unit(q) {
+                        Some(u) => length_unit(&u),
+                        None => Some(("micrometer", 1.0)),
+                    };
+                    let ((vu, v_size), (eu, e_size)) = (size(p)?, size(e)?);
+                    (count > 0.0 && extent > 0.0 && !approx(v * v_size * count, extent * e_size)).then(|| {
+                        format!("{}={v} {vu} × {count} pixels is not the max dimension {}={extent} {eu}", p.accession, e.accession)
+                    })
+                })
+                .collect();
+            let f = if ux.is_some() && uy.is_some() {
+                fix("x and y with a unit", None, vec![(PIXEL_X, vx, false), (PIXEL_Y, vy, false)], String::new())
             } else {
-                Some(fix(
+                fix(
                     "x and y without a unit: micrometre assumed",
                     Some(UNIT_ASSUMED),
                     vec![(PIXEL_X, vx, ux.is_none()), (PIXEL_Y, vy, uy.is_none())],
                     format!("x={vx} y={vy}"),
-                ))
-            }
+                )
+            };
+            let f = PixelSizeFix { extent_mismatches, ..f };
+            Some(f).filter(|f| f.transformation.is_some() || !f.unit_mismatches.is_empty() || !f.extent_mismatches.is_empty())
         }
         (Some(p), None) | (None, Some(p)) => {
             let acc: &'static str = if p.accession == PIXEL_X { PIXEL_X } else { PIXEL_Y };
@@ -793,19 +872,23 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
             // Tested against its own axis's count and extent; the other axis's only when its own
             // states none — pixels are square in every surveyed file that states both (review
             // 2026-09-30 B17: x was tried first whatever the axis).
-            let axes = [("IMS:1000042", "IMS:1000044"), ("IMS:1000043", "IMS:1000045")];
-            let axes = if acc == PIXEL_X { axes } else { [axes[1], axes[0]] };
+            let axes = if acc == PIXEL_X { AXES } else { [AXES[1], AXES[0]] };
             let tested = axes.iter().find_map(|&(c, e)| {
                 let (count, extent) = (num(c)?, num(e)?);
                 (count > 0.0 && extent > 0.0).then_some((count, extent, get(e)?))
             });
             let Some((count, extent, e)) = tested else {
-                return Some(fix(
-                    "one value that tests as neither area nor length",
-                    Some(DROPPED),
-                    vec![],
-                    format!("{acc}={v}; no pixel count and max dimension to test it against"),
-                ));
+                // Nothing was tested: its own case, and the detail names what the header lacks (it
+                // said "no pixel count and max dimension" of a header stating both counts).
+                let counted = AXES.iter().any(|a| num(a.0).is_some_and(|v| v > 0.0));
+                let sized = AXES.iter().any(|a| num(a.1).is_some_and(|v| v > 0.0));
+                let missing = match (counted, sized) {
+                    (true, false) => "no max dimension (IMS:1000044/45)",
+                    (false, true) => "no pixel count (IMS:1000042/43)",
+                    (false, false) => "no pixel count (IMS:1000042/43) and no max dimension (IMS:1000044/45)",
+                    (true, true) => "no axis with both a pixel count and a max dimension",
+                };
+                return Some(fix("one value, untestable", Some(DROPPED), vec![], format!("{acc}={v}; {missing} to test it against")));
             };
             // Value and extent compared in µm, each in the unit it is written in (B17: the units were
             // ignored); a param without a known length unit is tested as µm, and the detail says so.
@@ -819,34 +902,40 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
             let ((vu, v_size), (eu, e_size)) = (unit(p), unit(e));
             let extent_um = extent * e_size;
             let note = if assumed.is_empty() { String::new() } else { format!(" ({} without a length unit: micrometre assumed)", assumed.join(", ")) };
-            if approx(v.sqrt() * v_size * count, extent_um) {
-                Some(fix(
+            // What a kept value is written as: itself, and — a lone x — the same value as y. The
+            // vocabulary gives `IMS:1000046` that meaning when no `IMS:1000047` is stated, so the
+            // y states nothing new and declares nothing; a lone y says nothing about x.
+            let kept = |v: f64, um: bool| if acc == PIXEL_X { vec![(PIXEL_X, v, um), (PIXEL_Y, v, um)] } else { vec![(PIXEL_Y, v, um)] };
+            let also_y = if acc == PIXEL_X { "; also written as IMS:1000047, which the vocabulary's IMS:1000046 gives when none is stated" } else { "" };
+            let f = if approx(v.sqrt() * v_size * count, extent_um) {
+                fix(
                     "one value: an area (√value × count = extent)",
                     Some(AREA_TO_LENGTH),
                     // The square root of an area is a length in the unit the area is the square
                     // of (µm² → µm, mm² → mm): a stated length unit stays, anything else was
                     // tested as µm² and becomes µm.
-                    vec![(acc, v.sqrt(), assumed.contains(&p.accession))],
-                    format!("{acc}={v} as area; √({v} {vu}²) × {count} = {extent} {eu}{note}"),
-                ))
+                    kept(v.sqrt(), assumed.contains(&p.accession)),
+                    format!("{acc}={v} as area; √({v} {vu}²) × {count} = {extent} {eu}{note}{also_y}"),
+                )
             } else if approx(v * v_size * count, extent_um) {
                 // A stated unit stays even when it is no length, as in the two-value case:
                 // micrometre is written only where none is stated.
                 let unit_assumed = written_unit(p).is_none();
-                Some(fix(
+                fix(
                     "one value: a length (value × count = extent)",
                     unit_assumed.then_some(UNIT_ASSUMED),
-                    vec![(acc, v, unit_assumed)],
-                    format!("{acc}={v}; {v} {vu} × {count} = {extent} {eu}{note}"),
-                ))
+                    kept(v, unit_assumed),
+                    format!("{acc}={v}; {v} {vu} × {count} = {extent} {eu}{note}{also_y}"),
+                )
             } else {
-                Some(fix(
+                return Some(fix(
                     "one value that tests as neither area nor length",
                     Some(DROPPED),
                     vec![],
                     format!("{acc}={v} {vu}; count {count}, max dimension {extent} {eu}{note}"),
-                ))
-            }
+                ));
+            };
+            Some(PixelSizeFix { single: true, ..f })
         }
     }
 }
@@ -857,27 +946,41 @@ pub fn pixel_size_fixes(settings: &[RawSettings]) -> Vec<PixelSizeFix> {
 }
 
 /// Apply a fix to the writer's copy of the same `<scanSettings>`: the pixel-size params become
-/// exactly `fix.write` (micrometre where the unit was assumed).
+/// exactly `fix.write` (micrometre where the unit was assumed). A value the single-value rule kept
+/// gets the vocabulary's name, and a lone `IMS:1000046` is followed by an `IMS:1000047` of the same
+/// value and unit — also where the value itself is kept as stated (a length with its unit).
 pub fn apply(fix: &PixelSizeFix, settings: &mut ScanSettings) {
-    if fix.transformation.is_none() {
+    let at = |settings: &ScanSettings, acc: &str| settings.params.iter().position(|p| p.curie().is_some_and(|c| c.to_string() == acc));
+    if fix.transformation.is_some() {
+        for acc in [PIXEL_X, PIXEL_Y] {
+            let wanted = fix.write.iter().find(|(a, _, _)| *a == acc);
+            match (at(settings, acc), wanted) {
+                (Some(i), None) => {
+                    settings.params.remove(i);
+                }
+                (Some(i), Some((_, v, assume_um))) => {
+                    let p = &mut settings.params[i];
+                    p.value = (*v).into();
+                    if *assume_um {
+                        p.unit = Unit::Micrometer;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !fix.single {
         return;
     }
-    for acc in [PIXEL_X, PIXEL_Y] {
-        let wanted = fix.write.iter().find(|(a, _, _)| *a == acc);
-        let pos = settings.params.iter().position(|p| p.curie().is_some_and(|c| c.to_string() == acc));
-        match (pos, wanted) {
-            (Some(i), None) => {
-                settings.params.remove(i);
-            }
-            (Some(i), Some((_, v, assume_um))) => {
-                let p = &mut settings.params[i];
-                p.value = (*v).into();
-                if *assume_um {
-                    p.unit = Unit::Micrometer;
-                }
-            }
-            _ => {}
+    for (acc, name) in PIXEL_NAMES {
+        if let Some(i) = at(settings, acc) {
+            settings.params[i].name = name.into();
         }
+    }
+    let y_wanted = fix.write.iter().any(|(a, _, _)| *a == PIXEL_Y);
+    if let (Some(i), None, true) = (at(settings, PIXEL_X), at(settings, PIXEL_Y), y_wanted) {
+        let y = Param { name: PIXEL_NAMES[1].1.into(), accession: Some(1000047), ..settings.params[i].clone() };
+        settings.params.insert(i + 1, y);
     }
 }
 
@@ -930,6 +1033,7 @@ pub fn fix_json(f: &PixelSizeFix) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "unit_mismatches": f.unit_mismatches,
         "written_units": f.written_units,
+        "extent_mismatches": f.extent_mismatches,
         "detail": f.detail,
     })
 }
@@ -944,6 +1048,130 @@ const PROVENANCE: [(mzdata::params::CURIE, &str); 6] = [
     (mzdata::curie!(IMS:1000092), "ibd SHA-256"),
 ];
 
+/// The imaging vocabulary's obsolete binary data type terms and the PSI-MS terms they were
+/// obsoleted for (imagingMS.obo: "32-bit integer" / "64-bit integer", the same names in PSI-MS;
+/// the obo's comment on `IMS:1000142` names `MS:1000520`, which is PSI-MS's "16-bit float" —
+/// its "64-bit integer" is `MS:1000522`).
+const OBSOLETE_INTEGER_TERMS: [(&str, &str); 2] = [("IMS:1000141", "MS:1000519"), ("IMS:1000142", "MS:1000522")];
+
+/// The accessions [`replace_obsolete_integer_terms`] looks for, for [`file_mentions`].
+pub const OBSOLETE_INTEGER_ACCESSIONS: [&str; 2] = [OBSOLETE_INTEGER_TERMS[0].0, OBSOLETE_INTEGER_TERMS[1].0];
+
+/// An imzML's text with every cvParam naming an obsolete integer type term (`accession="IMS:1000141"`
+/// or `…142`) naming the PSI-MS term instead, `cvRef` included; `None` when there is none. mzdata
+/// maps only the PSI-MS terms to a data type, so such an array stayed untyped and the writer panicked
+/// on it ("not implemented: intensity_unknown_dc", through 0.16.0). Each tag keeps its byte length —
+/// the two characters saved become spaces between its attributes — so no offset into the text moves.
+pub fn replace_obsolete_integer_terms(text: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Option<Vec<u8>> = None;
+    let mut at = 0;
+    while let Some(i) = find(&text[at..], b"IMS:100014").map(|i| at + i) {
+        // The tag around the mention: from its `<` to its `>`.
+        let start = text[..i].iter().rposition(|&b| b == b'<').unwrap_or(i);
+        let end = text[i..].iter().position(|&b| b == b'>').map_or(text.len(), |e| i + e);
+        at = end;
+        let Ok(tag) = std::str::from_utf8(&text[start..end]) else { continue };
+        if !tag.starts_with("<cvParam") {
+            continue;
+        }
+        let mut new = tag.to_string();
+        for q in ['"', '\''] {
+            for (old, ms) in OBSOLETE_INTEGER_TERMS {
+                new = new.replace(&format!("accession={q}{old}{q}"), &format!("accession={q}{ms}{q} "));
+            }
+            if new != tag {
+                new = new.replace(&format!("cvRef={q}IMS{q}"), &format!("cvRef={q}MS{q} "));
+            }
+        }
+        if new != tag {
+            out.get_or_insert_with(|| text.to_vec()).splice(start..end, new.bytes());
+        }
+    }
+    out
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The `.ibd` beside an imzML, where mzdata looks for it: `<stem>.ibd`, else `<stem>.IBD`.
+pub fn ibd_beside(imzml: &Path) -> Option<std::path::PathBuf> {
+    ["ibd", "IBD"].iter().map(|ext| imzml.with_extension(ext)).find(|p| p.is_file())
+}
+
+/// What hashing the `.ibd` found ([`check_ibd`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IbdCheck {
+    /// SHA-1 of the `.ibd`, lower-case hex: its `MS:1000569` in `source_files`.
+    pub sha1: String,
+    /// Per checksum the header states with a value: the term, the value as stated, the hash found.
+    pub stated: Vec<(&'static str, String, String)>,
+}
+
+impl IbdCheck {
+    /// `metadata.imaging.provenance.ibd_checksum`.
+    pub fn status(&self) -> &'static str {
+        match (self.stated.is_empty(), self.mismatches().next().is_some()) {
+            (true, _) => "not stated",
+            (false, true) => "mismatch",
+            (false, false) => "verified",
+        }
+    }
+
+    /// The stated checksums the `.ibd` does not hash to: term, stated, found. Hex compares without
+    /// case (pyimzML writes upper case).
+    pub fn mismatches(&self) -> impl Iterator<Item = &(&'static str, String, String)> {
+        self.stated.iter().filter(|(_, stated, found)| !stated.trim().eq_ignore_ascii_case(found))
+    }
+
+    /// `metadata.imaging.provenance.ibd_checksum_found`: the hash found for each stated checksum
+    /// the `.ibd` does not match. `None` without a mismatch.
+    pub fn found_json(&self) -> Option<serde_json::Value> {
+        let rows: Vec<serde_json::Value> = self.mismatches().map(|(acc, _, found)| serde_json::json!({"accession": acc, "value": found})).collect();
+        (!rows.is_empty()).then(|| rows.into())
+    }
+}
+
+/// Hash the `.ibd` in one streamed pass: SHA-1 always (its source-file digest), and the algorithm
+/// of each checksum the header's file content states — `IMS:1000090` MD5, `IMS:1000091` SHA-1,
+/// `IMS:1000092` SHA-256. Nothing hashed the `.ibd` through 0.16.0: the stated checksum was copied
+/// into the archive whether or not the `.ibd` matched it (HUPO-PSI/mzPeak-specification#23; the
+/// public chilli set states a SHA-1 its `.ibd` does not have).
+pub fn check_ibd(ibd: &Path, content: &[RawParam]) -> Result<IbdCheck> {
+    use sha1::Digest;
+    let stated = |acc: &str| content.iter().find(|p| p.accession == acc).map(|p| p.value.clone()).filter(|v| !v.trim().is_empty());
+    let (md5_stated, sha1_stated, sha256_stated) = (stated("IMS:1000090"), stated("IMS:1000091"), stated("IMS:1000092"));
+    let mut sha1 = sha1::Sha1::new();
+    let mut md5 = md5_stated.is_some().then(md5::Md5::new);
+    let mut sha256 = sha256_stated.is_some().then(sha2::Sha256::new);
+    let mut file = std::fs::File::open(ibd).with_context(|| format!("opening {}", ibd.display()))?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).with_context(|| format!("reading {}", ibd.display()))?;
+        if n == 0 {
+            break;
+        }
+        sha1.update(&buf[..n]);
+        if let Some(h) = md5.as_mut() {
+            h.update(&buf[..n]);
+        }
+        if let Some(h) = sha256.as_mut() {
+            h.update(&buf[..n]);
+        }
+    }
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sha1 = hex(&sha1.finalize());
+    let stated = [
+        ("IMS:1000090", md5_stated, md5.map(|h| hex(&h.finalize()))),
+        ("IMS:1000091", sha1_stated, Some(sha1.clone())),
+        ("IMS:1000092", sha256_stated, sha256.map(|h| hex(&h.finalize()))),
+    ]
+    .into_iter()
+    .filter_map(|(acc, stated, found)| Some((acc, stated?, found?)))
+    .collect();
+    Ok(IbdCheck { sha1, stated })
+}
+
 /// `file_description.contents` params for the imzML provenance mzdata consumed, with the values
 /// exactly as the header states them (mzdata parses the UUID, and writing its parse back re-spelled
 /// `686ec248…` as `{686EC248-…}`: fidelity L0 keeps the identifier as stated).
@@ -953,7 +1181,9 @@ pub fn provenance_params(content: &[RawParam]) -> Vec<Param> {
         .filter_map(|(curie, name)| {
             let p = content.iter().find(|p| p.accession == curie.to_string())?;
             let b = Param::builder().name(*name).curie(*curie);
-            Some(if p.value.is_empty() { b.build() } else { b.value(p.value.clone()).build() })
+            // A string whatever it spells: `Value::from(String)` parses, and a checksum of decimal
+            // digits only (or one reading as a float, `12e4…`) was written as a number.
+            Some(if p.value.is_empty() { b.build() } else { b.value(mzdata::params::Value::String(p.value.clone())).build() })
         })
         .collect()
 }
@@ -1032,14 +1262,18 @@ mod tests {
             </fileContent></fileDescription>
             <referenceableParamGroupList><referenceableParamGroup id="sums">
             <cvParam cvRef="IMS" accession="IMS:1000091" name="ibd SHA-1" value="ABCDEF0123"/>
+            <cvParam cvRef="IMS" accession="IMS:1000090" name="ibd MD5" value="00000000000000000000000000000123"/>
             </referenceableParamGroup></referenceableParamGroupList><run/></mzML>"#;
         let p = provenance_params(&read_file_content_from(xml.as_bytes()).unwrap());
         let got: Vec<(String, String)> = p.iter().map(|p| (p.curie().unwrap().to_string(), p.value.to_string())).collect();
         assert_eq!(got, [
             ("IMS:1000031".to_string(), String::new()),
             ("IMS:1000080".to_string(), "686ec248523749d8a17590dde78ab130".to_string()),
+            ("IMS:1000090".to_string(), "00000000000000000000000000000123".to_string()),
             ("IMS:1000091".to_string(), "ABCDEF0123".to_string()),
         ]);
+        // A checksum of decimal digits only stays the string it is (it was written as the number 123).
+        assert!(p.iter().skip(1).all(|p| matches!(p.value, mzdata::params::Value::String(_))), "{p:?}");
     }
 
     fn scan(params: &[(CURIE, &str)]) -> mzdata::spectrum::ScanEvent {
@@ -1557,17 +1791,63 @@ mod tests {
     #[test]
     fn one_value_is_tested_as_area_then_length() {
         // 100 px × 10 µm = 1000 µm: 100 (µm²) is an area, 10 a length.
+        // A lone x that is kept is also the y size (the vocabulary's default): written as both.
         let area = pixel_size_fix(&settings(&[("IMS:1000046", "100", None), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 10.0, true)]));
+        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 10.0, true), (PIXEL_Y, 10.0, true)]));
         let length = pixel_size_fix(&settings(&[("IMS:1000046", "10", UM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((length.transformation, length.write.clone()), (None, vec![(PIXEL_X, 10.0, false)]));
+        assert_eq!((length.transformation, length.write.clone()), (None, vec![(PIXEL_X, 10.0, false), (PIXEL_Y, 10.0, false)]));
+        assert_eq!(length.write_units, vec![Some("UO:0000017".to_string()); 2], "the y carries the x's unit");
+        assert!(area.single && length.single && length.detail.contains("also written as IMS:1000047"), "{}", length.detail);
         // Only the y axis states count and extent: it is used.
         let y_axis = pixel_size_fix(&settings(&[("IMS:1000046", "400", UM), ("IMS:1000043", "50", None), ("IMS:1000045", "1000", UM)])).unwrap();
         assert_eq!(y_axis.transformation, Some(AREA_TO_LENGTH));
         let neither = pixel_size_fix(&settings(&[("IMS:1000046", "7", UM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((neither.transformation, neither.write.is_empty()), (Some(DROPPED), true));
-        let untestable = pixel_size_fix(&settings(&[("IMS:1000046", "7", UM)])).unwrap();
-        assert_eq!(untestable.transformation, Some(DROPPED), "no count/extent: nothing to test against");
+        assert_eq!((neither.case, neither.transformation, neither.write.is_empty()), ("one value that tests as neither area nor length", Some(DROPPED), true));
+        // Nothing to test against is its own case, and the detail names what the header lacks: it
+        // said "no pixel count and max dimension" of a header stating both counts
+        // (HUPO-PSI/mzPeak-specification#23, pixel_size_area_old_name_no_extent).
+        let untestable = |rest: &[(&str, &str, Option<(&str, &str)>)]| {
+            let f = pixel_size_fix(&settings(&[&[("IMS:1000046", "7", UM)], rest].concat())).unwrap();
+            assert_eq!((f.case, f.transformation, f.write.is_empty(), f.single), ("one value, untestable", Some(DROPPED), true, false));
+            f.detail
+        };
+        assert_eq!(untestable(&[]), "IMS:1000046=7; no pixel count (IMS:1000042/43) and no max dimension (IMS:1000044/45) to test it against");
+        assert_eq!(untestable(&[("IMS:1000042", "3", None), ("IMS:1000043", "2", None)]), "IMS:1000046=7; no max dimension (IMS:1000044/45) to test it against");
+        assert_eq!(untestable(&[("IMS:1000045", "100", UM)]), "IMS:1000046=7; no pixel count (IMS:1000042/43) to test it against");
+        assert_eq!(untestable(&[("IMS:1000042", "3", None), ("IMS:1000045", "100", UM)]), "IMS:1000046=7; no axis with both a pixel count and a max dimension to test it against");
+    }
+
+    /// HUPO-PSI/mzPeak-specification#23: x and y both stated were never held against the extent
+    /// (50 and 2500 over 150 × 100 µm passed in silence). Each axis that states count and max
+    /// dimension is compared and a disagreement reported; the values are written as stated.
+    #[test]
+    fn x_and_y_are_compared_with_the_extent() {
+        let grid = [("IMS:1000042", "3", None), ("IMS:1000043", "2", None), ("IMS:1000044", "150", UM), ("IMS:1000045", "100", UM)];
+        let with = |x: (&'static str, Option<(&'static str, &'static str)>), y: (&'static str, Option<(&'static str, &'static str)>)| {
+            pixel_size_fix(&settings(&[&[("IMS:1000046", x.0, x.1), ("IMS:1000047", y.0, y.1)], &grid[..]].concat()))
+        };
+        assert_eq!(with(("50", UM), ("50", UM)), None, "consistent: nothing to report");
+        let f = with(("50", UM), ("2500", UM)).unwrap();
+        assert_eq!((f.case, f.transformation, f.write.clone()), ("x and y with a unit", None, vec![(PIXEL_X, 50.0, false), (PIXEL_Y, 2500.0, false)]));
+        assert_eq!(f.extent_mismatches, ["IMS:1000047=2500 micrometer × 2 pixels is not the max dimension IMS:1000045=100 micrometer"]);
+        assert_eq!(fix_json(&f)["extent_mismatches"].as_array().unwrap().len(), 1);
+        // Without a unit: micrometre assumed, as before, and the same comparison.
+        let f = with(("50", None), ("2500", None)).unwrap();
+        assert_eq!((f.transformation, f.extent_mismatches.len()), (Some(UNIT_ASSUMED), 1));
+        assert!(with(("50", None), ("50", None)).unwrap().extent_mismatches.is_empty());
+        // Compared in one length unit: 0.05 mm × 3 = 150 µm.
+        const MM: Option<(&str, &str)> = Some(("UO:0000016", "millimeter"));
+        assert_eq!(with(("0.05", MM), ("0.05", MM)), None);
+        // A unit that is no length is not compared, and an axis without count or extent is not.
+        assert_eq!(with(("7", Some(("UO:0000186", "dimensionless unit"))), ("50", UM)), None);
+        assert_eq!(pixel_size_fix(&settings(&[("IMS:1000046", "7", UM), ("IMS:1000047", "7", UM), ("IMS:1000042", "3", None)])), None);
+        // Applying such a fix changes nothing.
+        let mut ss = ScanSettings { id: "s1".into(), ..Default::default() };
+        ss.params.push(Param::builder().name("pixel size").curie(mzdata::curie!(IMS:1000046)).value(50).unit(Unit::Micrometer).build());
+        ss.params.push(Param::builder().name("pixel size y").curie(mzdata::curie!(IMS:1000047)).value(2500).unit(Unit::Micrometer).build());
+        let before = ss.clone();
+        apply(&with(("50", UM), ("2500", UM)).unwrap(), &mut ss);
+        assert_eq!(ss.params, before.params);
     }
 
     /// Review 2026-09-30 B17: a single y is tested against y (x was tried first), and value and
@@ -1585,19 +1865,20 @@ mod tests {
         assert_eq!((y.case, y.transformation, y.write), ("one value: a length (value × count = extent)", None, vec![(PIXEL_Y, 100.0, false)]));
         // 0.01 mm × 100 = 1000 µm: a length, once both are in µm.
         let mm = pixel_size_fix(&settings(&[("IMS:1000046", "0.01", MM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((mm.transformation, mm.write), (None, vec![(PIXEL_X, 0.01, false)]));
+        assert_eq!((mm.transformation, mm.write), (None, vec![(PIXEL_X, 0.01, false), (PIXEL_Y, 0.01, false)]));
         let nm = pixel_size_fix(&settings(&[("IMS:1000046", "10", UM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000000", Some(("UO:0000018", "nanometer")))])).unwrap();
         assert_eq!(nm.transformation, None, "10 µm × 100 = 10⁶ nm");
         // An area in mm²: its square root in mm (√0.0001 mm² = 0.01 mm; × 100 = 1 mm), the unit kept.
         let area = pixel_size_fix(&settings(&[("IMS:1000046", "0.0001", MM), ("IMS:1000042", "100", None), ("IMS:1000044", "1", MM)])).unwrap();
-        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 0.01, false)]));
+        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 0.01, false), (PIXEL_Y, 0.01, false)]));
         // The index row says which unit that is (its key, `written_um`, predates the mm case).
         assert_eq!(fix_json(&area)["written_um"][0]["unit"], "UO:0000016");
+        assert_eq!(fix_json(&area)["written_um"][1], serde_json::json!({"accession": "IMS:1000047", "value": 0.01, "unit": "UO:0000016", "unit_assumed": false}));
         // No unit anywhere: micrometre, and the detail says so.
         let bare = pixel_size_fix(&settings(&[("IMS:1000046", "20", None), ("IMS:1000042", "100", None), ("IMS:1000044", "2000", None)])).unwrap();
-        assert_eq!((bare.transformation, bare.write.clone()), (Some(UNIT_ASSUMED), vec![(PIXEL_X, 20.0, true)]));
+        assert_eq!((bare.transformation, bare.write.clone()), (Some(UNIT_ASSUMED), vec![(PIXEL_X, 20.0, true), (PIXEL_Y, 20.0, true)]));
         assert_eq!(fix_json(&bare)["written_um"][0]["unit"], "UO:0000017");
-        assert!(bare.detail.ends_with("(IMS:1000046, IMS:1000044 without a length unit: micrometre assumed)"), "{}", bare.detail);
+        assert!(bare.detail.contains("(IMS:1000046, IMS:1000044 without a length unit: micrometre assumed)"), "{}", bare.detail);
         assert!(!mm.detail.contains("assumed"), "{}", mm.detail);
         // The detail's equation carries its units: the numbers are in different ones.
         assert!(mm.detail.contains("0.01 millimeter × 100 = 1000 micrometer"), "{}", mm.detail);
@@ -1605,9 +1886,9 @@ mod tests {
         // A stated unit that is no length (UO:0000186, dimensionless) is tested as µm but kept, as
         // the two-value case keeps it: nothing is declared.
         let odd = pixel_size_fix(&settings(&[("IMS:1000046", "100", Some(("UO:0000186", "dimensionless unit"))), ("IMS:1000042", "3", None), ("IMS:1000044", "300", UM)])).unwrap();
-        assert_eq!((odd.transformation, odd.write.clone()), (None, vec![(PIXEL_X, 100.0, false)]));
+        assert_eq!((odd.transformation, odd.write.clone()), (None, vec![(PIXEL_X, 100.0, false), (PIXEL_Y, 100.0, false)]));
         assert_eq!(fix_json(&odd)["written_um"][0]["unit"], "UO:0000186");
-        assert!(odd.detail.ends_with("(IMS:1000046 without a length unit: micrometre assumed)"), "{}", odd.detail);
+        assert!(odd.detail.contains("(IMS:1000046 without a length unit: micrometre assumed)"), "{}", odd.detail);
     }
 
     #[test]
@@ -1688,10 +1969,12 @@ mod tests {
             case: "area",
             transformation: Some(AREA_TO_LENGTH),
             write: vec![(PIXEL_X, 10.0, true)],
+            single: false,
             write_units: vec![],
             unit_mismatches: vec![],
             mismatched: vec![],
             written_units: vec![],
+            extent_mismatches: vec![],
             detail: String::new(),
         };
         apply(&fix, &mut ss);
@@ -1707,5 +1990,113 @@ mod tests {
         let drop = PixelSizeFix { write: vec![], transformation: Some(DROPPED), ..fix };
         apply(&drop, &mut ss);
         assert!(ss.params.iter().all(|p| p.curie().unwrap().to_string() != "IMS:1000046"));
+    }
+
+    /// HUPO-PSI/mzPeak-specification#23: a lone `IMS:1000046` the single-value rule keeps is
+    /// written as both sizes under the vocabulary's names — the area's root and a length kept as
+    /// stated alike — and the marker reads a lone x the same way, unless the lane says the x is a
+    /// measured axis only (the Waters single row).
+    #[test]
+    fn a_lone_x_that_is_kept_is_written_as_x_and_y() {
+        let named = |s: &ScanSettings| -> Vec<(String, String, f64, Unit)> {
+            s.params.iter().map(|p| (p.curie().unwrap().to_string(), p.name.clone(), p.value.to_f64().unwrap(), p.unit)).collect()
+        };
+        let grid = [("IMS:1000042", "3", None), ("IMS:1000044", "150", UM)];
+        let source = |value: &str, unit: Unit| {
+            let mut ss = ScanSettings { id: "s1".into(), ..Default::default() };
+            ss.params.push(Param::builder().name("max count of pixels x").curie(mzdata::curie!(IMS:1000042)).value(3).build());
+            ss.params.push(Param::builder().name("pixel size").curie(mzdata::curie!(IMS:1000046)).value(value.parse::<i64>().unwrap()).unit(unit).build());
+            ss.params.push(Param::builder().name("max dimension x").curie(mzdata::curie!(IMS:1000044)).value(150).unit(Unit::Micrometer).build());
+            ss
+        };
+        // 2500 with no unit: an area; 50 µm on both axes, the y right after the x.
+        let mut area = pixel_size_fix(&settings(&[&[("IMS:1000046", "2500", None)], &grid[..]].concat())).unwrap();
+        let mut ss = source("2500", Unit::Unknown);
+        apply(&area, &mut ss);
+        assert_eq!(
+            named(&ss)[1..3],
+            [("IMS:1000046".to_string(), "pixel size (x)".to_string(), 50.0, Unit::Micrometer), ("IMS:1000047".to_string(), "pixel size y".to_string(), 50.0, Unit::Micrometer)]
+        );
+        assert!(!check_written_units(&mut area, &ss));
+        assert_eq!(area.write_units, vec![Some("UO:0000017".to_string()); 2]);
+        // 50 µm, a length with its unit: nothing declared, the value untouched (still the integer
+        // the source wrote), renamed, and given as y too.
+        let length = pixel_size_fix(&settings(&[&[("IMS:1000046", "50", UM)], &grid[..]].concat())).unwrap();
+        assert_eq!(length.transformation, None);
+        let mut ss = source("50", Unit::Micrometer);
+        apply(&length, &mut ss);
+        assert_eq!(named(&ss)[1..3], named(&{ let mut a = source("2500", Unit::Unknown); apply(&area, &mut a); a })[1..3]);
+        assert_eq!((ss.params[1].value.clone(), ss.params[2].value.clone()), (50i64.into(), 50i64.into()));
+        let marker = |s: &ScanSettings, lone_x| marker_block(Some(s), COUNTS_DECLARED, lone_x, serde_json::json!({}));
+        assert_eq!(marker(&ss, LoneX::XOnly)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 50.0}), "both are written");
+        // A lone y says nothing about x: kept alone, renamed.
+        let lone_y = pixel_size_fix(&settings(&[("IMS:1000047", "50", UM), ("IMS:1000043", "2", None), ("IMS:1000045", "100", UM)])).unwrap();
+        assert_eq!((lone_y.single, lone_y.write.clone()), (true, vec![(PIXEL_Y, 50.0, false)]));
+        let mut ss = ScanSettings { id: "s1".into(), ..Default::default() };
+        ss.params.push(Param::builder().name("pixel size").curie(mzdata::curie!(IMS:1000047)).value(50).unit(Unit::Micrometer).build());
+        apply(&lone_y, &mut ss);
+        assert_eq!(named(&ss), [("IMS:1000047".to_string(), "pixel size y".to_string(), 50.0, Unit::Micrometer)]);
+        assert!(marker(&ss, LoneX::AlsoY).get("pixel_size_um").is_none());
+        // The marker: a lone x gives both by the vocabulary, or neither where the lane measured x
+        // alone; an x in another unit, or a y that is not µm, gives none.
+        let mut lone = ScanSettings { id: "s1".into(), ..Default::default() };
+        lone.params.push(Param::builder().name("pixel size (x)").curie(mzdata::curie!(IMS:1000046)).value(50.0).unit(Unit::Micrometer).build());
+        assert_eq!(marker(&lone, LoneX::AlsoY)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 50.0}));
+        assert!(marker(&lone, LoneX::XOnly).get("pixel_size_um").is_none());
+        assert!(states_pixel_size(Some(&lone)) && !states_pixel_size(Some(&ScanSettings::default())) && !states_pixel_size(None));
+        lone.params.push(Param::builder().name("pixel size y").curie(mzdata::curie!(IMS:1000047)).value(0.05).unit(Unit::Millimeter).build());
+        assert!(marker(&lone, LoneX::AlsoY).get("pixel_size_um").is_none(), "a stated y in mm is not replaced by the x");
+        lone.params.clear();
+        lone.params.push(Param::builder().name("pixel size (x)").curie(mzdata::curie!(IMS:1000046)).value(0.05).unit(Unit::Millimeter).build());
+        assert!(marker(&lone, LoneX::AlsoY).get("pixel_size_um").is_none());
+    }
+
+    /// The obsolete integer type terms become the PSI-MS ones, `cvRef` with them, in place: the
+    /// text keeps its length (an imzML may carry byte offsets), and nothing else is touched.
+    #[test]
+    fn obsolete_integer_type_terms_become_the_psi_ms_terms() {
+        let text = r#"<referenceableParamGroup id="intensities">
+  <cvParam cvRef="IMS" accession="IMS:1000141" name="32-bit integer" value=""/>
+  <cvParam accession='IMS:1000142' cvRef='IMS' name='64-bit integer'/>
+  <cvParam cvRef="IMS" accession="IMS:1000101" name="external data" value="true"/>
+  <userParam name="note" value="was IMS:1000141"/>
+</referenceableParamGroup>"#;
+        let out = String::from_utf8(replace_obsolete_integer_terms(text.as_bytes()).unwrap()).unwrap();
+        assert_eq!(out.len(), text.len());
+        assert!(out.contains(r#"<cvParam cvRef="MS"  accession="MS:1000519"  name="32-bit integer" value=""/>"#), "{out}");
+        assert!(out.contains("<cvParam accession='MS:1000522'  cvRef='MS'  name='64-bit integer'/>"), "{out}");
+        assert!(out.contains(r#"<cvParam cvRef="IMS" accession="IMS:1000101""#) && out.contains(r#"value="was IMS:1000141""#), "{out}");
+        assert_eq!(read_file_content_from(format!("<mzML><fileDescription><fileContent>{out}</fileContent></fileDescription></mzML>").as_bytes()).unwrap().len(), 3, "still well-formed");
+        assert_eq!(replace_obsolete_integer_terms(br#"<cvParam cvRef="MS" accession="MS:1000519" name="32-bit integer"/><userParam value="IMS:1000141"/>"#), None);
+    }
+
+    /// The `.ibd` is hashed with each algorithm the header states, in one pass, and always with
+    /// SHA-1 (its source-file digest); hex compares without case; a term stated without a value is
+    /// not a stated checksum.
+    #[test]
+    fn the_ibd_is_hashed_with_the_stated_algorithm() {
+        let dir = std::env::temp_dir().join(format!("mzpc-ibd-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ibd = dir.join("x.ibd");
+        std::fs::write(&ibd, b"abc").unwrap();
+        let content = |params: &[(&str, &str)]| -> Vec<RawParam> {
+            params.iter().map(|(a, v)| RawParam { accession: a.to_string(), value: v.to_string(), unit_accession: None, unit_name: None }).collect()
+        };
+        // The FIPS 180 / RFC 1321 test vectors of "abc".
+        const SHA1: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+        const MD5: &str = "900150983cd24fb0d6963f7d28e17f72";
+        const SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let all = check_ibd(&ibd, &content(&[("IMS:1000090", MD5), ("IMS:1000091", &SHA1.to_uppercase()), ("IMS:1000092", SHA256)])).unwrap();
+        assert_eq!((all.sha1.as_str(), all.stated.len(), all.status(), all.found_json()), (SHA1, 3, "verified", None));
+        let none = check_ibd(&ibd, &content(&[("IMS:1000031", ""), ("IMS:1000091", " ")])).unwrap();
+        assert_eq!((none.sha1.as_str(), none.status(), none.found_json()), (SHA1, "not stated", None));
+        for (acc, found) in [("IMS:1000090", MD5), ("IMS:1000091", SHA1), ("IMS:1000092", SHA256)] {
+            let wrong = check_ibd(&ibd, &content(&[(acc, "00ff")])).unwrap();
+            assert_eq!(wrong.status(), "mismatch", "{acc}");
+            assert_eq!(wrong.found_json(), Some(serde_json::json!([{"accession": acc, "value": found}])));
+        }
+        assert_eq!(ibd_beside(&dir.join("x.imzML")), Some(ibd));
+        assert_eq!(ibd_beside(&dir.join("y.imzML")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
