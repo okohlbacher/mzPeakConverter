@@ -247,9 +247,11 @@ export that writes imaging terms (pixel positions `IMS:1000050/51` on the scans,
 provenance: any imzML, an mzML that mentions an `IMS:` term, an imaging archive) declares the `IMS`
 vocabulary in its `cvList`, pinned to the commit the archive's `cv_list` names (§8). Through 0.16.0
 no export had a `scanSettingsList`, an archive's export had an empty `fileContent`, and the `cvList`
-declared MS and UO whatever the params named. The direct export writes scan settings as the source
-states them: the pixel-size rule of the archive lane (§8) is not applied, since an mzML has no
-`transformations` list to declare a changed value in.
+declared MS and UO whatever the params named. The direct export of an imzML applies the archive
+lane's rules to its scan settings (§8: the pixel-size rule, a unit accession its name contradicts,
+the obsolete "one way"), so both routes state the same grid; an mzML has no `transformations` list,
+so the run's warnings are the only declaration, the last of them naming each rule applied. A Waters
+imaging `.raw` exported directly states its fitted grid the same way, with the vocabulary declared.
 
 ```sh
 mzpeak-convert run.raw -o run.mzML            # Thermo → mzML

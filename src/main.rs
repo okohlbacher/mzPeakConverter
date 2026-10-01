@@ -2260,7 +2260,10 @@ fn convert_to_mzml(
     #[cfg(windows)]
     if is_waters_raw(input) {
         let r = waters::WatersReader::open(input)?;
-        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+        // An imaging run with a grid: the reader puts each scan's pixel on it (`IMS:1000050/51`),
+        // so the export states the grid those are indices of and declares the vocabulary.
+        let grid = r.imaging().and_then(|im| im.scan_settings());
+        return write_native_mzml_with(input, output, r.len(), grid, |i| r.spectrum(i));
     }
     #[cfg(windows)]
     if is_agilent_d(input) {
@@ -2412,17 +2415,17 @@ fn convert_to_mzml(
     w.copy_metadata_from(&reader);
     // The source's scan settings (an imaging run's grid and pixel size, an inclusion list): the
     // writer holds the list, but its metadata trait does not reach it, so `copy_metadata_from`
-    // left it empty and no export had a `<scanSettingsList>`. Written as the reader hands them
-    // over: the pixel-size rule of the archive lane changes values, and an mzML has no
-    // transformations list to declare that in.
+    // left it empty and no export had a `<scanSettingsList>`.
     w.scan_settings = reader.scan_settings().cloned().unwrap_or_default();
     // imzML: the file provenance mzdata consumes (storage mode, UUID, `.ibd` checksum), put back
-    // as the archive lane does, so the direct export and the export of the archive state the same.
+    // as the archive lane does, and that lane's rules for the scan settings, so the direct export
+    // and the export of the archive state the same.
     if let MZReaderType::IMzML(_) = &reader {
         match imaging::read_file_content(&read_path) {
             Ok(content) => w.file_description_mut().contents.extend(imaging::provenance_params(&content)),
             Err(e) => log::warn!("imzML file provenance not read: {e:#}"),
         }
+        imzml_scan_settings_for_mzml(input, &read_path, &mut w.scan_settings);
     }
     fixup_mzml_run_metadata(&mut w, input);
     let cap = max_spectra();
@@ -2468,6 +2471,48 @@ fn convert_to_mzml(
     write_source_chromatograms_mzml(&mut w, source_chroms.into_iter().chain(traces.into_iter().map(|t| t.chromatogram)))?;
 
     finish_mzml(w, tmp_guard, output)
+}
+
+/// The archive lane's rules for an imzML's scan settings ([`convert_file`]: the pixel-size rule,
+/// a unit accession its name contradicts, the obsolete "one way"), on the list the direct mzML
+/// export is about to write, so both exports of one imzML state the same grid. Handed over as
+/// mzdata reads them they did not: mzdata resolves a unit by its NAME, so a pixel size stated in
+/// `UO:0000015` (centimetre) named "micrometer" was exported as a clean 50 µm without a word, where
+/// the archive lane warns and, when the value cannot be tested, drops it. An mzML has no
+/// transformations list: the warnings are the declaration.
+fn imzml_scan_settings_for_mzml(input: &Path, read_path: &Path, list: &mut [mzdata::meta::ScanSettings]) {
+    let mut fixes = imaging::read_scan_settings(read_path).map(|s| imaging::pixel_size_fixes(&s)).unwrap_or_else(|e| {
+        log::warn!("imzML pixel-size check skipped: {e:#}");
+        Vec::new()
+    });
+    let mut applied: Vec<&'static str> = Vec::new();
+    for settings in list.iter_mut() {
+        if let Some(f) = fixes.iter_mut().find(|f| f.settings_id == settings.id) {
+            imaging::apply(f, settings);
+            if imaging::check_written_units(f, settings) {
+                applied.push(imaging::UNIT_FROM_NAME);
+            }
+        }
+        if imaging::one_way_to_flyback(settings) {
+            applied.push(imaging::ONE_WAY_AS_FLYBACK);
+        }
+    }
+    for f in &fixes {
+        for m in f.unit_mismatches.iter().chain(&f.written_units) {
+            log::warn!("imzML scan settings {}: {m}", f.settings_id);
+        }
+        if let Some(t) = f.transformation {
+            log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
+            applied.push(t);
+        }
+    }
+    if !applied.is_empty() {
+        log::warn!(
+            "{}: scan settings are written as the archive lane writes them ({}); mzML has no transformations list to declare that in",
+            input.display(),
+            applied.join(", ")
+        );
+    }
 }
 
 /// The mzPeak-INPUT filter path with an mzML output. Reads the `.mzpeak` with the sync `MzPeakReader`
@@ -2588,11 +2633,14 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // to the archive's own source files would name nothing here.
     scan_settings.iter_mut().for_each(|s| s.source_file_refs.clear());
     // The imaging vocabulary as the archive declares it; an archive that states imaging terms
-    // without declaring it gets the converter's pinned entry.
+    // without declaring it — in its file content, in its scan settings, or as the pixel positions
+    // of an archive marked as imaging (`metadata.imaging`), which the reader hands over as
+    // `IMS:1000050/51` on the scans — gets the converter's pinned entry.
     let cv_list = reader.file_index().metadata.get("cv_list");
     let is_ims = |p: &Param| p.curie().is_some_and(|c| c.controlled_vocabulary == mzdata::params::ControlledVocabulary::IMS);
+    let marked = reader.file_index().metadata.get("imaging").is_some_and(|m| m["is_imaging"] == true);
     let ims = mzml_header::Cv::from_cv_list(cv_list, "IMS").or_else(|| {
-        (contents.iter().any(is_ims) || scan_settings.iter().any(|s| s.iter_params().any(is_ims))).then(mzml_header::Cv::ims)
+        (marked || contents.iter().any(is_ims) || scan_settings.iter().any(|s| s.iter_params().any(is_ims))).then(mzml_header::Cv::ims)
     });
     let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims)?);
     w.copy_metadata_from(&reader);
@@ -2903,6 +2951,22 @@ fn write_native_mzml(
     input: &Path,
     output: &Path,
     len: usize,
+    spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
+) -> Result<()> {
+    write_native_mzml_with(input, output, len, None, spectrum)
+}
+
+/// [`write_native_mzml`] for a reader whose scans carry their pixel as imaging params (a Waters
+/// imaging `.raw`): `grid`, the scan settings those positions are indices of, becomes the export's
+/// `<scanSettingsList>`, and the `IMS` vocabulary is declared in its `<cvList>`. Without a grid the
+/// reader writes no position, and the header is the one every other native export has. Through
+/// 0.16.0, and in the first cut of the header sink, this lane wrote `cvRef="IMS"` positions under a
+/// `<cvList>` of MS and UO and no grid at all.
+fn write_native_mzml_with(
+    input: &Path,
+    output: &Path,
+    len: usize,
+    grid: Option<mzdata::meta::ScanSettings>,
     mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
 ) -> Result<()> {
     use mzdata::prelude::SpectrumWriter;
@@ -2918,7 +2982,8 @@ fn write_native_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()))?);
+    w.scan_settings.extend(grid);
     fixup_mzml_run_metadata(&mut w, input);
     let n = max_spectra().map_or(len, |m| m.min(len));
     w.set_spectrum_count(n as u64);
@@ -9069,6 +9134,56 @@ mod tests {
             assert!(xml.contains(&format!("<chromatogram id=\"{id}\"")), "no chromatogram {id}");
         }
         assert!(!xml.contains("<chromatogram id=\"TIC\""), "HyStar's MS trace is the TIC; the writer adds none");
+    }
+
+    /// `--to mzml` from a native reader whose scans carry their pixel — the Waters imaging lane,
+    /// whose reader runs on Windows only; what it hands the writer is built here. Such an export
+    /// wrote `cvRef="IMS"` positions under a `<cvList>` of MS and UO, and no grid: the header sink
+    /// was given no vocabulary on this lane. With the reader's grid the export declares `IMS`,
+    /// states the grid in a `<scanSettingsList>`, and its index follows the longer header; without
+    /// one (every other native export, and a Waters run whose laser positions fit no grid, which
+    /// gets no positions either) the header is what it was.
+    #[test]
+    fn a_native_mzml_export_of_an_imaging_run_declares_ims_and_states_its_grid() {
+        let (dir, _cleanup) = trace_scratch("native-imaging");
+        let input = dir.join("run.raw");
+        std::fs::create_dir_all(&input).unwrap();
+        let pixel = |i: usize| {
+            let mut spec = spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i);
+            let mut scan = mzdata::spectrum::ScanEvent::default();
+            scan.add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(i as i64 + 1).build());
+            scan.add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(1).build());
+            spec.description_mut().acquisition.scans.push(scan);
+            Ok(spec)
+        };
+        let mut grid = mzdata::meta::ScanSettings { id: "scansettings1".into(), ..Default::default() };
+        grid.add_param(Param::builder().name("max count of pixels x").curie(mzdata::curie!(IMS:1000042)).value(3).build());
+        grid.add_param(Param::builder().name("max count of pixels y").curie(mzdata::curie!(IMS:1000043)).value(1).build());
+
+        let out = dir.join("imaging.mzML");
+        super::write_native_mzml_with(&input, &out, 3, Some(grid), pixel).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let header = &xml[..xml.find("<run ").unwrap()];
+        assert!(header.contains("<cvList count=\"3\">") && header.contains("<cv id=\"IMS\" fullName=\"Imaging Mass Spectrometry Ontology\""), "{header}");
+        assert!(header.contains("/2c28b05ca297430303627d8c7d192cac1a2b1374/imagingMS.obo"), "pinned, as the archive's cv_list has it: {header}");
+        assert!(header.contains("<scanSettingsList count=\"1\">") && header.contains("accession=\"IMS:1000042\""), "{header}");
+        assert_eq!(xml.matches("accession=\"IMS:1000050\"").count(), 3);
+        // The index points at its elements, which the header's growth moved.
+        let mut offsets = 0;
+        for (at, open) in xml.match_indices("<offset idRef=\"") {
+            let (id, rest) = xml[at + open.len()..].split_once("\">").unwrap();
+            let offset: usize = rest[..rest.find('<').unwrap()].parse().unwrap();
+            let element = xml[offset..].trim_start();
+            assert!(element.starts_with("<spectrum ") || element.starts_with("<chromatogram "), "{id}: {:?}", &element[..30]);
+            assert!(element[..element.find('>').unwrap()].contains(&format!("id=\"{id}\"")), "{id}");
+            offsets += 1;
+        }
+        assert_eq!(offsets, 3 + 2, "three spectra, TIC and BPC");
+
+        let plain = dir.join("plain.mzML");
+        super::write_native_mzml(&input, &plain, 3, |i| Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))).unwrap();
+        let xml = std::fs::read_to_string(&plain).unwrap();
+        assert!(xml.contains("<cvList count=\"2\">") && !xml.contains("IMS") && !xml.contains("<scanSettingsList"), "{}", &xml[..xml.find("<run ").unwrap()]);
     }
 
     /// The mzML export of an archive holding device traces converts back, into an archive and into
