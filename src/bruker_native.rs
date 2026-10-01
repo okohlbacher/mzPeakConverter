@@ -735,7 +735,9 @@ impl Calibrant {
     }
 
     /// The largest correction over the calibrant range, in ppm of m/z — the bound an archive that
-    /// stores only the quadratic declares.
+    /// stores only the quadratic declares. Taken at 2,001 evenly spaced m/z: the maximum of the
+    /// sampled corrections, which for a polynomial of this degree over a range a few thousand Th
+    /// wide is the supremum to the digits stated, but is not proven to be.
     pub fn max_abs_ppm(&self) -> f64 {
         (0..=2000)
             .map(|i| self.lo + (self.hi - self.lo) * i as f64 / 2000.0)

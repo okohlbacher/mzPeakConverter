@@ -1203,6 +1203,18 @@ impl<
         ]
     }
 
+    /// DELIBERATE DEVIATION (mzPeakConverter, fidelity declarations): the Arrow schema of each
+    /// spectrum facet as it is being written, `[spectra_data, spectra_peaks]`; `None` for a peak
+    /// facet no spectrum has opened. A facet's column types are fixed here, from the spectra the
+    /// builder sampled, and an array of another type is cast into its column: the converter reads
+    /// the intensity column's type to say which casts changed a value, before `finish_parquet`.
+    pub fn spectrum_facet_schemas(&self) -> [Option<arrow::datatypes::SchemaRef>; 2] {
+        [
+            Some(self.spectrum_data_buffers.schema().clone()),
+            self.spectrum_peaks_writer.as_ref().map(|peaks| peaks.buffers().schema().clone()),
+        ]
+    }
+
     /// VENDORED PATCH (mzPeakConverter D15): what the writer has changed in the chromatogram signal
     /// so far: chromatograms its time re-sort backstop reordered. Read before `finish_parquet`.
     pub fn chromatogram_signal_tally(&self) -> crate::writer::array_buffer::SignalTally {

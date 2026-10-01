@@ -922,10 +922,13 @@ to do; so a list with none of the entries that touch spectrum signal (the set `-
 intensity value moved) says the signal is stored as the reader handed it over, and
 `fidelity.mz_error` is then empty as well. What a reader library leaves out before the lane sees
 it is in the list only where the lane counts it against the file, as it does for a timsTOF
-frame's points. Through 0.16.0 two value changes were in no entry: a 64-bit m/z a delta chunk
-returns one unit in the last place off (now `delta-ulp`) and a centroid intensity stored as the
-nearest float32 (now `intensity-f32-rounding`); an archive written by an earlier version may hold
-either under an empty list. Archives written by 0.11.5
+frame's points, and a vendor glue that narrows a value before the lane holds it declares what it
+counts under its own entry (the SciEX glue hands over float32 intensities and counts the clamped
+ones). Through 0.16.0 three value changes were in no entry: a 64-bit m/z a delta chunk
+returns one unit in the last place off (now `delta-ulp`), an intensity stored as the nearest
+float32 (now `intensity-f32-rounding`) and an intensity cast into an integer column that does
+not hold it (now `intensity-type-narrowing`); an archive written by an earlier version may hold
+any of them under an empty list. Archives written by 0.11.5
 and earlier listed `zero-run-mask` on every lane and `numpress-linear` whenever the codec was chosen,
 whether or not a spectrum was masked or a chunk encoded. An entry names the transformation, never
 how often it was applied: a count goes to the run's warning. `tof-grid:<ppm>ppm` and `grid-fit:<Da>Da` are
@@ -937,7 +940,8 @@ The vocabulary:
 | `zero-run-mask` | the writer's zero-intensity run compaction shortened at least one profile spectrum (item 2) | every lane whose writer masks (not native Waters frames) |
 | `numpress-linear` | at least one m/z chunk is stored with the lossy codec (item 1) | chunked layout without `--no-numpress` |
 | `delta-ulp` | a 64-bit m/z facet holds at least one delta chunk whose last m/z is more than twice its first (or that does not start above zero), where `b + (a − b)` can round: a decoded m/z can be one unit in the last place off its source value, and so can the values after it in the chunk. Declared from the writer's count of such chunks, the count `fidelity.mz_error` then reports with the bound; not for a facet whose source m/z are all 32-bit values, which delta returns exactly | chunked layout with `--no-numpress` (or a lane that chose delta: the m/z lattice fallback, a native lane's pre-scan), on sparse 64-bit m/z |
-| `intensity-f32-rounding` | at least one intensity was stored as the float32 nearest to a source value no float32 holds (a 64-bit float, or an integer above 2^24). A centroid spectrum reaches the peak facet through mzdata's peak set, whose intensity is a float32 whatever the file declares; a `--tof-grid` grid row carries float32 intensities. Counted against the source arrays as each spectrum is written; the facet's `intensity_values_rounded` in `fidelity` holds the count and the run's warning states it. 64-bit intensities that are all float32 values (every such file of the example corpus) declare nothing; `--lossless` stores the source's type | mzML/imzML lanes (centroid spectra), `--tof-grid` (gridded spectra) |
+| `intensity-f32-rounding` | at least one intensity was stored as the float32 nearest to a source value no float32 holds (a 64-bit float, or an integer above 2^24). Three ways there: a centroid spectrum reaches the peak facet through mzdata's peak set, whose intensity is a float32 whatever the file declares; a `--tof-grid` grid row carries float32 intensities; and a facet's intensity column has one type, taken from the spectra sampled before the first is written, so in a file whose intensity arrays change type a later 64-bit array (profile signal, or a centroid spectrum with a third per-peak array, which the writer stores from its arrays) is cast into a float32 column. Counted against the source arrays as each spectrum is written, for the type the facet's column has; the facet's `intensity_values_rounded` in `fidelity` holds the count and the run's warning states it. 64-bit intensities that are all float32 values (every such file of the example corpus) declare nothing; `--lossless` stores the source's type | mzML/imzML lanes, `--tof-grid`, native vendor readers (a spectrum whose intensities the reader hands over wider than the column) |
+| `intensity-type-narrowing` | at least one intensity was cast into a column of another type than float32 that does not hold its value. A facet has one intensity column, typed from the spectra the writer samples before the first is written. The case that occurs: a file that stores integer intensities in some spectra and floats in others gets an integer column (in the chunked layout when the first spectra hold integers), and the float values are cut to integers (clamped to the type's range). Also a 64-bit integer above 2^53 in a float64 column (point layout; the chunked layout keeps an integer array of another type than the column's as an auxiliary array of the spectrum, unchanged). The facet's `intensity_values_narrowed` holds the count and the run's warning states it; `--lossless` on such a file stores a type that holds every value or fails. A file with one intensity type throughout never declares it | mzML/imzML lanes, `--tof-grid` |
 | `sort-by-mz` | at least one spectrum was re-ordered into m/z order before it was stored: by the lane itself, or by the writer's backstop for a spectrum a reader handed over unsorted | generic mzdata lane, `--ims-chunked` (each frame by TOF across mobility scans; mobility is stored per point), `--bruker-sdk` TDF (the SDK hands over mobility-major frames), native Waters frames, and any lane whose reader hands over an unsorted spectrum |
 | `sort-by-time` | the writer's backstop re-ordered at least one chromatogram into time order before it was stored | any lane that hands the writer a chromatogram out of time order, a source chromatogram or the MS1 TIC/base-peak trace synthesized in spectrum order |
 | `sort-by-wavelength` | the writer's backstop re-ordered at least one wavelength (UV/PDA) spectrum into wavelength order before it was stored | any lane that writes wavelength spectra handed over out of order |
@@ -1026,10 +1030,18 @@ much. Every mzPeak lane writes it at close, from the two signal facets as they s
   own choice), as a list because a file may mix them. `intensity_values_rounded`, present when it
   is above zero, counts the intensities stored as the float32 nearest to a source value no float32
   holds (`intensity-f32-rounding`): a centroid spectrum's intensities reach the peak facet as
-  float32 on the default lanes whatever the file declares, which `--lossless` avoids. The stored
-  type alone does not show it: where the peak facet's column is a float64 (a file whose first
-  spectra are profile ones with 64-bit intensities), it holds the rounded values all the same. A
-  stored type narrower than a source type with no count beside it changed no value.
+  float32 on the default lanes whatever the file declares, and an array wider than a float32
+  column is cast into it; `--lossless` avoids both. The stored type alone does not show it: where
+  the peak facet's column is a float64 (a file whose first spectra are profile ones with 64-bit
+  intensities), it holds the rounded values of the centroid spectra all the same.
+  `intensity_values_narrowed` counts the intensities a column of another type does not hold
+  (`intensity-type-narrowing`: floats cut to integers in an integer column). Both are counted as
+  the spectra are written, by the way each reaches the column and for the type the column has, and
+  equal the number of stored intensities that differ from the file's (tested on files that mix
+  types, in both layouts). A stored type narrower than a source type with neither count beside
+  it changed no value: every value of the wider arrays is one the column holds, or, in the
+  chunked layout, an integer array of another type than the column's sits in the spectrum's
+  `auxiliary_arrays` at its own type.
 - `mz_error` lists every m/z encoding in the archive that can move a value; an empty list means
   none is present. `max_abs_error` is in m/z units, `max_rel_error_ppm` in ppm, and `basis` says
   what kind of number it is:
@@ -1052,7 +1064,9 @@ much. Every mzPeak lane writes it at close, from the two signal facets as they s
     `bruker:mz-calibrant-omitted` carries the bound the lane states in
     `ims_calibration.max_error_ppm` (the largest correction of the vendor's calibrant polynomial,
     in ppm of the stored m/z, rounded up to six digits) and, as `max_abs_error`, that share of the
-    largest m/z stored (SBA415: 0.655716 ppm).
+    largest m/z stored (SBA415: 0.655716 ppm). The lane takes that maximum over 2,001 evenly
+    spaced m/z across the calibrant range: the largest of the sampled corrections of a
+    low-degree polynomial, not a proven supremum.
   - `tolerance` (`grid-fit:<Da>Da`, `tof-grid:<ppm>ppm`): the bound every fitted value was
     accepted within, absolute for the fitted lattice and relative for the TOF grid, and the other
     figure derived from it over the m/z range of the grid rows stored (the absolute tolerance over
@@ -1223,7 +1237,9 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   exactly as `mzdata::io::tdf::MzCalibrationModel2::convert_f64` / `TimsCalibrationModel2::convert`
   evaluate them, which is how the bounds were computed, so a bound and its decoded point agree bit
   for bit. A diaPASEF or ddaPASEF window's 1/K0 band on its selected ion (`MZP:1000006/7`) and the
-  selected ion's own 1/K0 are evaluated the same way: a window's limits are the very values its
+  selected ion's own 1/K0 are evaluated the same way, by the native reader and by `--bruker-sdk`
+  (which asks the vendor library for a 1/K0 only where it stores the library's values: without a
+  ModelType-2 row, and on its f64 lane): a window's limits are the very values its
   boundary scans' points decode to, so cutting a frame by its stated bands assigns every point to
   its window, as the `--no-ims-compact` archive and the `.d` → mzML export state them. An archive
   written through 0.16.0 holds limits evaluated in the vendor library's order of operations, 1 to

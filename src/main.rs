@@ -2594,7 +2594,7 @@ fn convert_to_mzml(
             break;
         }
         if let Some(a) = tdf_points.as_mut() {
-            a.observe(spec.id(), points.observe(&spec));
+            a.observe(spec.id(), points.observe_points(&spec));
         }
         if scan_lane {
             require_typed_arrays(&spec)?;
@@ -3621,8 +3621,9 @@ fn convert_file_tof_grid(
         if let Some(r) = source_refs.as_mut() {
             r.check_scans(entry.description_mut());
         }
-        // The source's points, before the grid route re-shapes the arrays.
-        let counted = source_tally.observe(&entry);
+        // The source's points, before the grid route re-shapes the arrays. What the route hands
+        // the writer carries no peak set, so the intensities are counted below, by route.
+        let counted = source_tally.observe_points(&entry);
         if let Some(a) = tdf_points.as_mut() {
             source_tally.add_not_handed_over(a.observe(entry.id(), counted));
         }
@@ -3641,6 +3642,10 @@ fn convert_file_tof_grid(
             }
             TofRoute::F64(s) => {
                 n_f64 += 1;
+                // The source arrays as they are: the writer casts them to its columns' types.
+                if let Some(arrays) = s.arrays.as_ref() {
+                    source_tally.add_intensities_taken(arrays);
+                }
                 s
             }
         };
@@ -6769,12 +6774,20 @@ fn finish_archive(
     aux: Option<AuxInputs<'_>>,
     index_blocks: &[(String, serde_json::Value)],
 ) -> Result<()> {
-    let lane_fidelity = index_blocks.iter().find(|(key, _)| key == fidelity::BLOCK).map(|(_, block)| block);
-    // Two entries are declared here, for every lane, from the evidence the `fidelity` block is
+    // The lane's block, its intensity counts resolved against the type each facet's intensity
+    // column has in the writer's schema: a spectrum whose array is of another type was cast into it.
+    let schemas = writer.spectrum_facet_schemas();
+    let lane_fidelity = index_blocks
+        .iter()
+        .find(|(key, _)| key == fidelity::BLOCK)
+        .map(|(_, block)| fidelity::resolve_intensities(block, [schemas[0].as_deref(), schemas[1].as_deref()]));
+    let lane_fidelity = lane_fidelity.as_ref();
+    // Three entries are declared here, for every lane, from the evidence the `fidelity` block is
     // then written from, so `transformations` cannot stay silent where that block reports a
     // change: `delta-ulp` (the writer's count of delta chunks that are not exact by construction,
-    // per facet, against the lane's source types) and `intensity-f32-rounding` (the lane's count
-    // of intensities whose source value the float32 it handed over does not hold).
+    // per facet, against the lane's source types), `intensity-f32-rounding` and
+    // `intensity-type-narrowing` (the lane's counts of source intensities the stored column does
+    // not hold: stored as the nearest float32, or cast into a column of another type).
     let mut declared: Vec<String> = index_blocks
         .iter()
         .find(|(key, _)| key == "transformations")
@@ -6793,7 +6806,7 @@ fn finish_archive(
         );
         declare(&mut declared, fidelity::DELTA_ULP);
     }
-    let rounded = fidelity::intensity_values_rounded(lane_fidelity);
+    let (rounded, narrowed) = fidelity::intensities_changed(lane_fidelity);
     if rounded > 0 {
         log::warn!(
             "{rounded} intensities are stored as the nearest float32 of a source value no float32 holds \
@@ -6801,6 +6814,15 @@ fn finish_archive(
             fidelity::INTENSITY_F32_ROUNDING
         );
         declare(&mut declared, fidelity::INTENSITY_F32_ROUNDING);
+    }
+    if narrowed > 0 {
+        log::warn!(
+            "{narrowed} intensities are stored in a column whose type does not hold their source value: the input's \
+             intensity arrays change type, and a facet has one intensity column (declared as {}; --lossless stores \
+             a type that holds every value, or fails)",
+            fidelity::INTENSITY_TYPE_NARROWING
+        );
+        declare(&mut declared, fidelity::INTENSITY_TYPE_NARROWING);
     }
     // The (amended) `transformations` block, mirrored into the conversion's processing method
     // before the metadata is written: here, so no lane can declare one without the other. A lane

@@ -47,14 +47,23 @@
 //! * **`bruker:mz-calibrant-omitted`** takes the bound the lane states in
 //!   `ims_calibration.max_error_ppm` (the largest calibrant correction, in ppm of the stored m/z)
 //!   and that bound times the largest m/z of the grid rows; without the bound it is `not measured`.
+//!   The lane's figure is `Calibrant::max_abs_ppm`: the largest correction at 2,001 evenly spaced
+//!   m/z over the calibrant range, a sampled maximum of a low-degree polynomial and not a proven
+//!   supremum (the manual says so).
 //!
-//! Two `transformations` entries are decided from the same evidence as this block, in
+//! Three `transformations` entries are decided from the same evidence as this block, in
 //! [`finish_archive`](crate::finish_archive), so that neither key can say what the other does not:
 //! `delta-ulp` exactly when a `delta` entry is written here ([`delta_ulp_declared`], from the
-//! writer's count of the chunk rows this block then reads back, by the same rule), and
-//! `intensity-f32-rounding` when a facet's `intensity_values_rounded` is above zero
-//! ([`intensity_values_rounded`]): intensities the lane handed to the writer as a float32 (mzdata's
-//! centroid peak set, the `--tof-grid` grid rows) whose source value no float32 holds.
+//! writer's count of the chunk rows this block then reads back, by the same rule),
+//! `intensity-f32-rounding` when a facet's `intensity_values_rounded` is above zero and
+//! `intensity-type-narrowing` when its `intensity_values_narrowed` is ([`intensities_changed`]).
+//! The two counts are of source intensities the stored column does not hold: the lane counts,
+//! spectrum by spectrum, what each column type the facet could have would do to the values
+//! ([`IntensityTally`]), and the type the writer's schema has for the facet picks the count
+//! ([`resolve_intensities`]) before the facets are closed. A value is rounded where it passes
+//! through a float32 (mzdata's centroid peak set, a `--tof-grid` grid row) or lands in a float32
+//! column (the column's type is sampled from a few spectra; a later spectrum of a wider type is
+//! cast into it), and narrowed where the column is of another type that does not hold it.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -63,7 +72,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{Array, ArrayRef, AsArray, StructArray};
-use arrow::datatypes::{DataType, Field, Float64Type, UInt8Type};
+use arrow::datatypes::{DataType, Field, Fields, Float64Type, Schema, UInt8Type};
 use mzdata::prelude::*;
 use mzdata::spectrum::bindata::{ArrayType, BinaryArrayMap, BinaryDataArrayType};
 use mzdata::spectrum::{MultiLayerSpectrum, RefPeakDataLevel, SignalContinuity};
@@ -85,11 +94,12 @@ const FACETS: [(&str, &str); 2] = [("spectra_data.parquet", "spectra_data"), ("s
 /// other entry describes metadata (a dropped reference, a pixel size, a position), a chromatogram
 /// or device trace, or a precursor window, and does not count. A NEW entry that touches spectrum
 /// signal belongs here, or in [`SIGNAL_TRANSFORMATION_PREFIXES`] when it carries a parameter.
-pub const SIGNAL_TRANSFORMATIONS: [&str; 20] = [
+pub const SIGNAL_TRANSFORMATIONS: [&str; 21] = [
     "zero-run-mask",
     "numpress-linear",
     DELTA_ULP,
     INTENSITY_F32_ROUNDING,
+    INTENSITY_TYPE_NARROWING,
     "sort-by-mz",
     "sort-by-wavelength",
     "shimadzu:span-trim",
@@ -120,6 +130,14 @@ pub const DELTA_ULP: &str = "delta-ulp";
 /// [`finish_archive`](crate::finish_archive).
 pub const INTENSITY_F32_ROUNDING: &str = "intensity-f32-rounding";
 
+/// `transformations` entry: an intensity was cast into a column of another type than float32 that
+/// does not hold its value: a fractional or out-of-range value in an integer column (a facet has
+/// one intensity column, typed from the spectra the writer samples; a file that turns from
+/// integer to float intensities can have the floats cut to integers), a 64-bit integer above 2^53
+/// in a float64 column. The facet's `intensity_values_narrowed` counts them. Declared by
+/// [`finish_archive`](crate::finish_archive).
+pub const INTENSITY_TYPE_NARROWING: &str = "intensity-type-narrowing";
+
 /// Signal entries that carry their bound: `grid-fit:1e-6Da`, `tof-grid:5ppm`.
 pub const SIGNAL_TRANSFORMATION_PREFIXES: [&str; 2] = ["grid-fit:", "tof-grid:"];
 
@@ -142,14 +160,145 @@ fn type_name(dtype: BinaryDataArrayType) -> &'static str {
 /// How many values of an intensity array a float32 cannot hold: the count of `v` with
 /// `(v as f32) != v`. A NaN counts as kept (a float32 holds one), a 32-bit float array as exact.
 pub fn f32_cast_changes(arrays: &BinaryArrayMap) -> u64 {
-    let Some(a) = arrays.get(&ArrayType::IntensityArray) else { return 0 };
-    let n = match a.dtype() {
-        BinaryDataArrayType::Float64 => a.to_f64().map(|v| v.iter().filter(|x| !x.is_nan() && f64::from(**x as f32) != **x).count()),
-        BinaryDataArrayType::Int32 => a.to_i32().map(|v| v.iter().filter(|x| (**x as f32) as i64 != i64::from(**x)).count()),
-        BinaryDataArrayType::Int64 => a.to_i64().map(|v| v.iter().filter(|x| (**x as f32) as i128 != i128::from(**x)).count()),
-        _ => Ok(0),
-    };
-    n.unwrap_or(0) as u64
+    let mut tally = IntensityTally::default();
+    tally.add(arrays, true);
+    tally.rounded
+}
+
+/// What the intensities handed to the writer for one facet lose, counted for every type the
+/// facet's intensity column can have. The column's type is the writer's schema, sampled from a few
+/// spectra before the first is written, and a spectrum whose array is of another type is cast into
+/// it; which of these counts happened is known when the schema is ([`resolve_intensities`]).
+///
+/// Two ways in. A centroid spectrum stored from mzdata's peak set (`through_f32`): the peak set
+/// holds the float32 nearest each source value, whatever the column, and that float32 is what the
+/// column gets. Arrays the writer takes as they are: each value is cast to the column's type.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct IntensityTally {
+    /// Source values no float32 holds, of spectra stored from a float32 peak set or handed over
+    /// by the lane as float32: rounded whatever the column's type.
+    rounded: u64,
+    /// Float values of arrays the writer takes that no float32 holds: rounded in a float32 column.
+    float_not_f32: u64,
+    /// Float values handed to the column (a peak set's float32, a taken array's own value) that
+    /// are not an int32 / int64: cut to one, or clamped, in an integer column.
+    float_not_i32: u64,
+    float_not_i64: u64,
+    /// Integer values of arrays the writer takes that a float32 / float64 / int32 does not hold.
+    /// The point layout casts them into the column; the chunked layout files an integer array of
+    /// another type than the column's as an auxiliary array, at its own type, and changes nothing.
+    int_not_f32: u64,
+    int_not_f64: u64,
+    int_not_i32: u64,
+}
+
+impl IntensityTally {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// One float handed to the column: is it a value of the signed 32-bit and 64-bit integers?
+    /// (No NaN is, and no infinity.)
+    fn float(&mut self, x: f64) {
+        const I32: f64 = 2_147_483_648.0;
+        const I64: f64 = 9_223_372_036_854_775_808.0;
+        let integral = x.trunc() == x;
+        self.float_not_i32 += u64::from(!(integral && x >= -I32 && x < I32));
+        self.float_not_i64 += u64::from(!(integral && x >= -I64 && x < I64));
+    }
+
+    /// One source value `x` whose nearest float32 is `narrow`; `exact` when they are one value.
+    fn value(&mut self, x: f64, narrow: f32, exact: bool, through_f32: bool) {
+        if through_f32 {
+            self.rounded += u64::from(!exact);
+            self.float(f64::from(narrow));
+        } else {
+            self.float_not_f32 += u64::from(!exact);
+            self.float(x);
+        }
+    }
+
+    /// One source integer.
+    fn integer(&mut self, x: i64, through_f32: bool) {
+        let narrow = x as f32;
+        let exact = narrow as i128 == i128::from(x);
+        if through_f32 {
+            self.rounded += u64::from(!exact);
+            self.float(f64::from(narrow));
+        } else {
+            self.int_not_f32 += u64::from(!exact);
+            self.int_not_f64 += u64::from((x as f64) as i128 != i128::from(x));
+            self.int_not_i32 += u64::from(i32::try_from(x).is_err());
+        }
+    }
+
+    /// The intensity array of one spectrum, at the type the reader handed it over at.
+    fn add(&mut self, arrays: &BinaryArrayMap, through_f32: bool) {
+        let Some(a) = arrays.get(&ArrayType::IntensityArray) else { return };
+        match a.dtype() {
+            BinaryDataArrayType::Float64 => {
+                if let Ok(v) = a.to_f64() {
+                    v.iter().for_each(|x| self.value(*x, *x as f32, x.is_nan() || f64::from(*x as f32) == *x, through_f32));
+                }
+            }
+            BinaryDataArrayType::Float32 => {
+                if let Ok(v) = a.to_f32() {
+                    v.iter().for_each(|x| self.value(f64::from(*x), *x, true, through_f32));
+                }
+            }
+            BinaryDataArrayType::Int32 => {
+                if let Ok(v) = a.to_i32() {
+                    v.iter().for_each(|x| self.integer(i64::from(*x), through_f32));
+                }
+            }
+            BinaryDataArrayType::Int64 => {
+                if let Ok(v) = a.to_i64() {
+                    v.iter().for_each(|x| self.integer(*x, through_f32));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "rounded": self.rounded,
+            "float_not_f32": self.float_not_f32,
+            "float_not_i32": self.float_not_i32,
+            "float_not_i64": self.float_not_i64,
+            "int_not_f32": self.int_not_f32,
+            "int_not_f64": self.int_not_f64,
+            "int_not_i32": self.int_not_i32,
+        })
+    }
+
+    fn from_json(v: &Value) -> Self {
+        let n = |key: &str| v[key].as_u64().unwrap_or(0);
+        Self {
+            rounded: n("rounded"),
+            float_not_f32: n("float_not_f32"),
+            float_not_i32: n("float_not_i32"),
+            float_not_i64: n("float_not_i64"),
+            int_not_f32: n("int_not_f32"),
+            int_not_f64: n("int_not_f64"),
+            int_not_i32: n("int_not_i32"),
+        }
+    }
+
+    /// `(rounded, narrowed)` in a facet of `layout` whose intensity column is a `stored` (the names
+    /// [`stored_type`] gives): the values stored as the nearest float32, and those a column of
+    /// another type does not hold. Without a column of a known type, what the peak sets rounded.
+    fn resolve(&self, layout: &str, stored: Option<&str>) -> (u64, u64) {
+        // The chunk builder casts floats only; an integer array of another type is not cast.
+        let cast = |n: u64| if layout == "point" { n } else { 0 };
+        match stored {
+            Some("float32") => (self.rounded + self.float_not_f32 + cast(self.int_not_f32), 0),
+            Some("float64") => (self.rounded, cast(self.int_not_f64)),
+            Some("int32") => (self.rounded, self.float_not_i32 + cast(self.int_not_i32)),
+            Some("int64") => (self.rounded, self.float_not_i64),
+            _ => (self.rounded, 0),
+        }
+    }
 }
 
 /// The largest error a lane measured for one of its m/z statements, stored value against source
@@ -188,9 +337,15 @@ pub fn with_observed(mut block: (String, Value), encoding: &str, observed: Obser
 
 /// Lane-block key of the measured errors ([`with_observed`]); read by [`complete`], not written out.
 const OBSERVED: &str = "observed";
-/// Facet key, in the lane block and in the finished one: intensities whose source value the
-/// float32 handed to the writer does not hold ([`f32_cast_changes`]).
+/// Lane-block key of a facet's [`IntensityTally`]; [`resolve_intensities`] turns it into the two
+/// counts below, and it is not written out.
+const INTENSITY_TALLY: &str = "intensity_tally";
+/// Facet key: source intensities stored as the nearest float32, which is another value
+/// ([`INTENSITY_F32_ROUNDING`]).
 const INTENSITY_ROUNDED: &str = "intensity_values_rounded";
+/// Facet key: source intensities cast into a column of another type than float32 that does not
+/// hold them ([`INTENSITY_TYPE_NARROWING`]).
+const INTENSITY_NARROWED: &str = "intensity_values_narrowed";
 
 /// What the reader handed over for one facet.
 #[derive(Default)]
@@ -198,8 +353,8 @@ struct FacetSource {
     points: u64,
     mz: BTreeSet<&'static str>,
     intensity: BTreeSet<&'static str>,
-    /// Intensities the lane handed to the writer as a float32 that is not their source value.
-    intensity_rounded: u64,
+    /// What the facet's intensity column does to the values, for each type it can have.
+    intensities: IntensityTally,
 }
 
 impl FacetSource {
@@ -232,8 +387,8 @@ impl FacetSource {
         if types && !(self.mz.is_empty() && self.intensity.is_empty()) {
             out["source_types"] = json!({"mz": self.mz, "intensity": self.intensity});
         }
-        if self.intensity_rounded > 0 {
-            out[INTENSITY_ROUNDED] = self.intensity_rounded.into();
+        if !self.intensities.is_empty() {
+            out[INTENSITY_TALLY] = self.intensities.json();
         }
         out
     }
@@ -273,14 +428,27 @@ impl SourceTally {
     /// Count one spectrum, as the writer will route it (`AbstractMzPeakWriter::write_spectrum_data`).
     /// Call it on the spectrum as it is handed to `write_spectrum`. Returns the points counted.
     ///
+    /// Its intensities are counted with it ([`IntensityTally`]), by the way they reach the column.
     /// A centroid spectrum that carries a peak set copied from its arrays (mzdata's mzML reader
     /// builds one for every centroid spectrum) is stored from the peak set, whose intensity is a
-    /// float32 whatever the file declares: the source values that cast changes are counted
-    /// ([`f32_cast_changes`]) for `intensity-f32-rounding`. Not when the writer takes the arrays
-    /// instead, which it does when they hold more than the peak set (`centroid_arrays_beyond_peaks`:
-    /// a per-peak ion mobility array), and not for a peak set beside profile arrays or one of
-    /// another length, which is nobody's copy.
+    /// float32 whatever the file declares. The writer takes the arrays themselves when there is
+    /// no peak set (profile and unknown-continuity spectra, a centroid spectrum without one) and
+    /// when the arrays hold more than the peak set (`centroid_arrays_beyond_peaks`: a per-peak
+    /// ion mobility or charge array), and casts each to the type of its column. A peak set beside
+    /// profile arrays, or one of another length than the arrays, is nobody's copy and its own source.
     pub fn observe<C: CentroidLike, D: DeconvolutedCentroidLike>(&mut self, spec: &MultiLayerSpectrum<C, D>) -> u64 {
+        self.count(spec, true)
+    }
+
+    /// [`Self::observe`] without the intensities, for a lane that hands the writer another
+    /// spectrum than the one it read (`--tof-grid` re-shapes the arrays): the points and types are
+    /// the source's, and the lane says what becomes of the intensities
+    /// ([`Self::add_intensity_rounded`], [`Self::add_intensities_taken`]).
+    pub fn observe_points<C: CentroidLike, D: DeconvolutedCentroidLike>(&mut self, spec: &MultiLayerSpectrum<C, D>) -> u64 {
+        self.count(spec, false)
+    }
+
+    fn count<C: CentroidLike, D: DeconvolutedCentroidLike>(&mut self, spec: &MultiLayerSpectrum<C, D>, intensities: bool) -> u64 {
         // A wavelength spectrum goes to its own facet, which this block does not describe.
         if spec.spectrum_type().is_some_and(|t| !t.is_mass_spectrum()) {
             return 0;
@@ -291,6 +459,9 @@ impl SourceTally {
             RefPeakDataLevel::Missing => 0,
             RefPeakDataLevel::RawData(arrays) => {
                 self.last = if continuity == SignalContinuity::Centroid { Filed::Peaks } else { Filed::Data };
+                if intensities {
+                    self.facet(self.last).intensities.add(arrays, false);
+                }
                 self.facet(self.last).add_arrays(arrays, types)
             }
             peaks @ (RefPeakDataLevel::Centroid(_) | RefPeakDataLevel::Deconvoluted(_)) => {
@@ -303,6 +474,9 @@ impl SourceTally {
                     if continuity == SignalContinuity::Profile {
                         // Profile arrays beside a peak set: both facets are written.
                         counted += self.data.add_arrays(arrays, types);
+                        if intensities {
+                            self.data.intensities.add(arrays, false);
+                        }
                     } else {
                         // The peak set was built from these arrays; their types are the source's.
                         if types && n > 0 {
@@ -310,8 +484,8 @@ impl SourceTally {
                         }
                         let copy = arrays.get(&ArrayType::MZArray).and_then(|a| a.data_len().ok()) == Some(n);
                         let beyond = arrays.iter().any(|(t, _)| !matches!(t, ArrayType::MZArray | ArrayType::IntensityArray));
-                        if copy && !(centroid_set && beyond) {
-                            self.peaks.intensity_rounded += f32_cast_changes(arrays);
+                        if copy && intensities {
+                            self.peaks.intensities.add(arrays, !(centroid_set && beyond));
                         }
                     }
                 }
@@ -323,7 +497,14 @@ impl SourceTally {
     /// Intensities of the last counted spectrum that the lane itself narrowed to float32 before
     /// the writer saw them (the `--tof-grid` grid rows): `n` source values no float32 holds.
     pub fn add_intensity_rounded(&mut self, n: u64) {
-        self.facet(self.last).intensity_rounded += n;
+        self.facet(self.last).intensities.rounded += n;
+    }
+
+    /// The arrays the lane hands the writer for the last counted spectrum, with no peak set
+    /// beside them (a `--tof-grid` spectrum off the grid keeps its source arrays): the writer
+    /// casts the intensities to the type of the facet's column.
+    pub fn add_intensities_taken(&mut self, arrays: &BinaryArrayMap) {
+        self.facet(self.last).intensities.add(arrays, false);
     }
 
     /// Points the source holds that the reader did not hand over (`--no-ims-compact` on a TDF:
@@ -563,6 +744,53 @@ fn list_head(column: &ArrayRef, i: usize) -> Option<[u8; 8]> {
     bytes.get(start..end)?.first_chunk::<8>().copied()
 }
 
+/// The stored value type of the column of a facet (the fields of its one struct column) that
+/// holds the array `accession`.
+fn value_column(children: &Fields, accession: &str) -> Option<String> {
+    children
+        .iter()
+        .find(|f| meta(f, "array_accession") == accession && matches!(meta(f, "buffer_format"), "point" | "chunk_values" | "chunk_secondary"))
+        .map(|f| stored_type(f.data_type()))
+}
+
+/// The block's name for a facet's layout, from the name of its struct column.
+fn layout_name(top: &str) -> String {
+    match top {
+        "chunk" => "chunked".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `(layout, intensity column type)` of a signal facet, from the schema its writer was built
+/// with: what [`stored_facet`] reads back from the finished member, known before it is closed.
+fn intensity_column(schema: &Schema) -> Option<(String, Option<String>)> {
+    let top = schema.fields().first()?;
+    let DataType::Struct(children) = top.data_type() else { return None };
+    Some((layout_name(top.name()), value_column(children, INTENSITY_ARRAY)))
+}
+
+/// The lane's block with each facet's [`IntensityTally`] resolved against the facet's schema
+/// (`schemas`: `spectra_data`, `spectra_peaks`, as the writer holds them; `None` for a facet it
+/// never opened): `intensity_values_rounded` and `intensity_values_narrowed` where they are above
+/// zero, and the tally itself removed. Call it before the facets are closed: the two
+/// `transformations` entries are declared from the result ([`intensities_changed`]).
+pub fn resolve_intensities(lane: &Value, schemas: [Option<&Schema>; 2]) -> Value {
+    let mut lane = lane.clone();
+    for ((_, key), schema) in FACETS.iter().zip(schemas) {
+        let Some(facet) = lane.get_mut(*key).and_then(Value::as_object_mut) else { continue };
+        let Some(tally) = facet.remove(INTENSITY_TALLY) else { continue };
+        let (layout, stored) = schema.and_then(intensity_column).unwrap_or_default();
+        let (rounded, narrowed) = IntensityTally::from_json(&tally).resolve(&layout, stored.as_deref());
+        if rounded > 0 {
+            facet.insert(INTENSITY_ROUNDED.to_string(), rounded.into());
+        }
+        if narrowed > 0 {
+            facet.insert(INTENSITY_NARROWED.to_string(), narrowed.into());
+        }
+    }
+    lane
+}
+
 /// The columns of a chunk facet's m/z main axis that the scan reads, by name.
 struct ChunkColumns {
     top: String,
@@ -632,17 +860,8 @@ fn stored_facet(tmp: &Path, member: &Member) -> Result<StoredFacet> {
     let DataType::Struct(children) = top.data_type() else {
         bail!("{}: the facet's column is not a struct", member.name);
     };
-    let layout = match top.name().as_str() {
-        "chunk" => "chunked".to_string(),
-        other => other.to_string(),
-    };
-    let value_column = |accession: &str| {
-        children
-            .iter()
-            .find(|f| meta(f, "array_accession") == accession && matches!(meta(f, "buffer_format"), "point" | "chunk_values" | "chunk_secondary"))
-            .map(|f| stored_type(f.data_type()))
-    };
-    let (mz_type, intensity_type) = (value_column(MZ_ARRAY), value_column(INTENSITY_ARRAY));
+    let layout = layout_name(top.name());
+    let (mz_type, intensity_type) = (value_column(children, MZ_ARRAY), value_column(children, INTENSITY_ARRAY));
     // The index type of the m/z grid column (`mz_grid { grid_type, parameters, indices }`).
     let grid_index = children
         .iter()
@@ -724,11 +943,11 @@ pub fn delta_ulp_declared(lane: Option<&Value>, at_risk: [u64; 2]) -> bool {
     FACETS.iter().zip(at_risk).any(|((_, key), n)| n > 0 && !mz_source_is_f32(lane, key))
 }
 
-/// The intensities the lane's block counts as rounded to float32, over both facets
-/// ([`SourceTally::observe`], [`SourceTally::add_intensity_rounded`]); above zero,
-/// [`INTENSITY_F32_ROUNDING`] is declared.
-pub fn intensity_values_rounded(lane: Option<&Value>) -> u64 {
-    FACETS.iter().filter_map(|(_, key)| lane?.get(key)?.get(INTENSITY_ROUNDED)?.as_u64()).sum()
+/// `(rounded, narrowed)` over both facets of a lane block that [`resolve_intensities`] resolved:
+/// above zero, [`INTENSITY_F32_ROUNDING`] and [`INTENSITY_TYPE_NARROWING`] are declared.
+pub fn intensities_changed(lane: Option<&Value>) -> (u64, u64) {
+    let sum = |count: &str| FACETS.iter().filter_map(|(_, key)| lane?.get(key)?.get(count)?.as_u64()).sum();
+    (sum(INTENSITY_ROUNDED), sum(INTENSITY_NARROWED))
 }
 
 /// The `mz_error` entries of the declared `transformations` that state their own bound: the grid
@@ -804,8 +1023,10 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str], cali
             entry["source_types"] = t.clone();
         }
         entry["stored_types"] = json!({"mz": facet.mz_type, "intensity": facet.intensity_type});
-        if let Some(n) = source.and_then(|s| s.get(INTENSITY_ROUNDED)) {
-            entry[INTENSITY_ROUNDED] = n.clone();
+        for count in [INTENSITY_ROUNDED, INTENSITY_NARROWED] {
+            if let Some(n) = source.and_then(|s| s.get(count)) {
+                entry[count] = n.clone();
+            }
         }
         block.insert(key.to_string(), entry);
 
@@ -1220,51 +1441,110 @@ mod tests {
         assert_eq!(f32_cast_changes(&BinaryArrayMap::new()), 0);
     }
 
-    /// The lane's count behind `intensity-f32-rounding`: a centroid spectrum stored from the peak
-    /// set mzdata built from its arrays, and nothing else. The writer takes the arrays themselves
-    /// when they hold a per-peak mobility array, when the spectrum has no peak set (`--lossless`
-    /// removes it), and for profile signal, whose peak set is not a copy of the arrays.
-    #[test]
-    fn intensities_rounded_by_the_peak_set_are_counted_and_only_those() {
-        let mz = [100.0, 200.0, 300.0, 400.0];
-        let wide = || intensity_array!(Float64, [16777217.0f64, 2.0, 0.1, 4.0]);
-        let rounded = |tally: &SourceTally| intensity_values_rounded(Some(&tally.block().1));
+    /// A facet schema as the writer builds it: one struct column named for the layout, holding an
+    /// intensity column of `dtype` (a list of it in the chunked layout).
+    fn facet_schema(layout: &str, dtype: DataType) -> Schema {
+        let chunked = layout == "chunk";
+        let meta = [("array_accession", INTENSITY_ARRAY), ("buffer_format", if chunked { "chunk_secondary" } else { "point" })];
+        let dtype = if chunked { DataType::LargeList(std::sync::Arc::new(Field::new("item", dtype, true))) } else { dtype };
+        let intensity = Field::new("intensity", dtype, true).with_metadata(meta.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        Schema::new(vec![Field::new(layout, DataType::Struct(vec![intensity].into()), true)])
+    }
 
+    /// `(rounded, narrowed)` of the lane block of `tally`, per facet (`spectra_data`,
+    /// `spectra_peaks`), when both facets store their intensities as `dtype` in `layout`.
+    fn changed(tally: &SourceTally, layout: &str, dtype: DataType) -> [(u64, u64); 2] {
+        let schema = facet_schema(layout, dtype);
+        let lane = resolve_intensities(&tally.block().1, [Some(&schema), Some(&schema)]);
+        assert!(FACETS.iter().all(|(_, key)| lane[key].get(INTENSITY_TALLY).is_none()), "the tally is not written out: {lane}");
+        FACETS.map(|(_, key)| (lane[key][INTENSITY_ROUNDED].as_u64().unwrap_or(0), lane[key][INTENSITY_NARROWED].as_u64().unwrap_or(0)))
+    }
+
+    /// The counts behind `intensity-f32-rounding` and `intensity-type-narrowing` follow the way a
+    /// spectrum's intensities reach the column AND the column's type. A centroid spectrum stored
+    /// from the peak set mzdata built from its arrays is rounded whatever the column. Arrays the
+    /// writer takes (a per-peak mobility array beside the peak set, no peak set, profile signal)
+    /// are cast to the column's type: rounded in a float32 column, exact in a float64 one, cut in
+    /// an integer one. Through 0.17.0-rc.1 none of it was counted; the first version of this count
+    /// took arrays the writer takes for exact, which they are only in a column of their own type.
+    #[test]
+    fn intensities_are_counted_by_route_and_by_the_type_of_the_column() {
+        let mz = [100.0, 200.0, 300.0, 400.0];
+        // 16777217 and 0.1 are not float32 values; 0.1 alone is no integer.
+        let wide = || intensity_array!(Float64, [16777217.0f64, 2.0, 0.1, 4.0]);
+        let tally_of = |spec: &MultiLayerSpectrum<mzpeaks::CentroidPeak, mzpeaks::DeconvolutedPeak>| {
+            let mut tally = SourceTally::new(true);
+            tally.observe(spec);
+            tally
+        };
+
+        // Stored from the peak set: rounded in every column; the float32 handed on is 16777216
+        // and 0.1f32, of which an integer column holds the first.
         let mut tally = SourceTally::new(true);
         assert_eq!(tally.observe(&spectrum(SignalContinuity::Centroid, &mz, wide(), true, false)), 4, "the points counted are returned");
-        assert_eq!(rounded(&tally), 2);
-        let block = tally.block().1;
-        assert_eq!(block["spectra_peaks"], json!({"source_points": 4, "source_types": {"mz": ["float64"], "intensity": ["float64"]}, "intensity_values_rounded": 2}));
-        assert!(block["spectra_data"].get(INTENSITY_ROUNDED).is_none(), "{block}");
-
-        for (what, spec) in [
-            ("float32 intensities", spectrum(SignalContinuity::Centroid, &mz, intensity_array!(Float32, [1.0f32, 2.0, 3.0, 4.0]), true, false)),
-            ("the arrays hold a mobility array, and are what is stored", spectrum(SignalContinuity::Centroid, &mz, wide(), true, true)),
-            ("no peak set: the arrays are stored", spectrum(SignalContinuity::Centroid, &mz, wide(), false, false)),
-            ("profile arrays beside a peak set", spectrum(SignalContinuity::Profile, &mz, wide(), true, false)),
-        ] {
-            let mut tally = SourceTally::new(true);
-            tally.observe(&spec);
-            assert_eq!(rounded(&tally), 0, "{what}");
+        for layout in ["chunk", "point"] {
+            assert_eq!(changed(&tally, layout, DataType::Float32), [(0, 0), (2, 0)], "{layout}");
+            assert_eq!(changed(&tally, layout, DataType::Float64), [(0, 0), (2, 0)], "{layout}");
+            assert_eq!(changed(&tally, layout, DataType::Int32), [(0, 0), (2, 1)], "{layout}");
         }
+        let lane = resolve_intensities(&tally.block().1, [None, Some(&facet_schema("chunk", DataType::Float32))]);
+        assert_eq!(lane["spectra_peaks"], json!({"source_points": 4, "source_types": {"mz": ["float64"], "intensity": ["float64"]}, "intensity_values_rounded": 2}));
+        assert_eq!(intensities_changed(Some(&lane)), (2, 0));
+        assert_eq!(intensities_changed(None), (0, 0));
+
+        // Arrays the writer takes, into the peak facet (centroid) or the data facet (profile):
+        // the column's type decides.
+        for (what, spec, facet) in [
+            ("the arrays hold a mobility array, and are what is stored", spectrum(SignalContinuity::Centroid, &mz, wide(), true, true), 1),
+            ("no peak set: the arrays are stored", spectrum(SignalContinuity::Centroid, &mz, wide(), false, false), 1),
+            ("profile arrays", spectrum(SignalContinuity::Profile, &mz, wide(), false, false), 0),
+            ("profile arrays beside a peak set", spectrum(SignalContinuity::Profile, &mz, wide(), true, false), 0),
+            ("unknown continuity goes with profile", spectrum(SignalContinuity::Unknown, &mz, wide(), false, false), 0),
+        ] {
+            let tally = tally_of(&spec);
+            for layout in ["chunk", "point"] {
+                assert_eq!(changed(&tally, layout, DataType::Float32)[facet], (2, 0), "{what}, {layout}: a float32 column rounds");
+                assert_eq!(changed(&tally, layout, DataType::Float64)[facet], (0, 0), "{what}, {layout}: a float64 column holds every value");
+                assert_eq!(changed(&tally, layout, DataType::Int32)[facet], (0, 1), "{what}, {layout}: an int32 column cuts 0.1");
+                assert_eq!(changed(&tally, layout, DataType::Int64)[facet], (0, 1), "{what}, {layout}");
+                assert_eq!(changed(&tally, layout, DataType::Float32)[1 - facet], (0, 0), "{what}: the other facet");
+            }
+        }
+        // 32-bit float intensities: exact in either float column.
+        let tally = tally_of(&spectrum(SignalContinuity::Centroid, &mz, intensity_array!(Float32, [1.0f32, 2.0, 3.5, 4.0]), true, false));
+        assert_eq!((changed(&tally, "chunk", DataType::Float32)[1], changed(&tally, "point", DataType::Float64)[1]), ((0, 0), (0, 0)));
+        assert_eq!(changed(&tally, "chunk", DataType::Int32)[1], (0, 1), "3.5 in an integer column");
+
+        // Integer arrays the writer takes. The point layout casts them into the column; the chunk
+        // builder files an integer array of another type as an auxiliary array, unchanged.
+        let tally = tally_of(&spectrum(SignalContinuity::Profile, &mz, intensity_array!(Int64, [16777217i64, (1 << 53) + 1, 1 << 40, 7]), false, false));
+        assert_eq!(changed(&tally, "point", DataType::Float32)[0], (2, 0), "16777217 and 2^53 + 1");
+        assert_eq!(changed(&tally, "point", DataType::Float64)[0], (0, 1), "2^53 + 1");
+        assert_eq!(changed(&tally, "point", DataType::Int32)[0], (0, 2), "2^53 + 1 and 2^40");
+        assert_eq!(changed(&tally, "point", DataType::Int64)[0], (0, 0));
+        for dtype in [DataType::Float32, DataType::Float64, DataType::Int32, DataType::Int64] {
+            assert_eq!(changed(&tally, "chunk", dtype.clone())[0], (0, 0), "chunked, {dtype}");
+        }
+
         // A peak set of another length is not a copy of the arrays.
         let mut spec = spectrum(SignalContinuity::Centroid, &mz, wide(), true, false);
         spec.peaks = Some(mzpeaks::PeakSet::new(vec![mzpeaks::CentroidPeak::new(150.0, 1.0, 0)]));
-        let mut tally = SourceTally::new(true);
-        tally.observe(&spec);
-        assert_eq!(rounded(&tally), 0);
+        assert_eq!(changed(&tally_of(&spec), "chunk", DataType::Float32), [(0, 0), (0, 0)]);
 
-        // A lane's own narrowing (the `--tof-grid` grid rows) is added to the facet the spectrum
-        // went to; points the reader did not hand over, to that facet's source side.
+        // A lane that re-shapes the spectrum counts the points here and the intensities itself
+        // (`--tof-grid`): its own float32 rows, and the arrays it leaves for the writer to cast.
+        // Points the reader did not hand over go to the facet's source side.
         let mut tally = SourceTally::new(false);
-        tally.observe(&spectrum(SignalContinuity::Profile, &mz, wide(), false, false));
+        assert_eq!(tally.observe_points(&spectrum(SignalContinuity::Centroid, &mz, wide(), true, false)), 4);
+        assert_eq!(changed(&tally, "chunk", DataType::Float32), [(0, 0), (0, 0)], "observe_points counts no intensity");
         tally.add_intensity_rounded(3);
+        assert_eq!(tally.observe_points(&spectrum(SignalContinuity::Centroid, &mz, wide(), true, false)), 4);
+        tally.add_intensities_taken(spectrum(SignalContinuity::Centroid, &mz, wide(), false, false).raw_arrays().unwrap());
         tally.add_not_handed_over(10);
+        assert_eq!(changed(&tally, "chunk", DataType::Float32), [(0, 0), (5, 0)]);
+        assert_eq!(changed(&tally, "chunk", DataType::Float64), [(0, 0), (3, 0)]);
         let block = tally.block().1;
-        assert_eq!(block["spectra_data"], json!({"source_points": 14, "intensity_values_rounded": 3}));
-        assert_eq!(block["spectra_peaks"], json!({"source_points": 0}));
-        assert_eq!(intensity_values_rounded(Some(&block)), 3);
-        assert_eq!(intensity_values_rounded(None), 0);
+        assert_eq!((&block["spectra_peaks"]["source_points"], &block["spectra_data"]), (&json!(18), &json!({"source_points": 0})));
     }
 
     /// `delta-ulp` is declared for a facet with at-risk delta chunks unless its source m/z are all

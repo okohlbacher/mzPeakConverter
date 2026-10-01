@@ -160,13 +160,18 @@ fn transformations_block_pinned() {
             assert!(source.contains(entry), "{file} no longer declares {entry}");
         }
     }
-    // The two entries the archive epilogue declares for every lane, named in `fidelity` beside the
-    // evidence they are decided from; `finish_archive` declares them by those constants.
-    for entry in ["pub const DELTA_ULP: &str = \"delta-ulp\";", "pub const INTENSITY_F32_ROUNDING: &str = \"intensity-f32-rounding\";"] {
+    // The three entries the archive epilogue declares for every lane, named in `fidelity` beside
+    // the evidence they are decided from; `finish_archive` declares them by those constants.
+    for entry in [
+        "pub const DELTA_ULP: &str = \"delta-ulp\";",
+        "pub const INTENSITY_F32_ROUNDING: &str = \"intensity-f32-rounding\";",
+        "pub const INTENSITY_TYPE_NARROWING: &str = \"intensity-type-narrowing\";",
+    ] {
         assert!(include_str!("../src/fidelity.rs").contains(entry), "src/fidelity.rs no longer defines {entry}");
     }
     pinned("declare(&mut declared, fidelity::DELTA_ULP);");
     pinned("declare(&mut declared, fidelity::INTENSITY_F32_ROUNDING);");
+    pinned("declare(&mut declared, fidelity::INTENSITY_TYPE_NARROWING);");
     pinned("\"shimadzu:span-trim\"");
     pinned("\"shimadzu:coarse-mz\"");
     pinned("\"agilent:drop-zero-samples\"");
