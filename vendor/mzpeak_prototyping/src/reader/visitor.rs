@@ -2048,7 +2048,7 @@ impl<'a> MzPrecursorVisitor<'a> {
     /// with no dissociation method and an energy of 0 (a dia-PASEF MS2 frame's `CID, 48.46 eV`
     /// became `collision energy 0` in the mzML export). A column is found by its accession in the
     /// facet's column mapping, else by the writer's name for it. The column's method goes first, as
-    /// the writer ranks it: the list's are the supplemental ones. Proposed upstream.
+    /// the writer ranks it: the list's are the supplemental ones. To be proposed upstream.
     fn visit_activation_columns(&mut self, activation: &StructArray) {
         let mapping = self.metadata_map().member("activation");
         for (field, arr) in activation.fields().iter().zip(activation.columns()) {
