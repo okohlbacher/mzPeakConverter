@@ -22,11 +22,25 @@ carries each peak's mobility. **Output change (Bruker TDF, `--no-ims-compact`).*
 limits and the scan and precursor 1/K0 params move by at most 3 ulp, onto the exact values of the
 arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
 
+**Output change (mzML export of an archive).** An archive's export states each precursor's dissociation method and collision energy, each chromatogram precursor's isolation window, each chromatogram's polarity, and 1/K0 under its PSI-MS name once per element, as the direct export of the source does. Summed TIC and base-peak chromatograms are in time order on every mzML lane. These apply to existing archives. **Output change (Bruker TDF, ims-compact and `--bruker-sdk`).** Each frame's scan stores its ion injection time and the acquisition m/z range; rebuild an archive to gain them.
+
 ### Added
 
 - `metadata.imaging.pixel_count_source` (imaging profile, review B18): `declared` when the source
   stated the counts, `observed_max` when they were derived from or raised to the largest positions.
   Always `observed_max` on the Bruker MALDI and Waters lanes.
+
+### Changed
+
+- **The transformations a conversion applied are mirrored into its processing method.** The index `transformations` list (D15) had no counterpart in `data_processing_method_list`.
+  - Each entry is now a `transformation` userParam of `mzpeak_convert_conversion`'s method, in the index and in every metadata footer.
+  - MS:1003901 `zero intensity point trimming` is added first when a zero-trimming entry is present (`zero-run-mask`, `shimadzu:span-trim`, `agilent:drop-zero-samples`).
+  - The validator's processing-method cv_mapping rule still passes: 6/6 PASS on the real-data and fixture archives.
+- **The box harness checks the box converter's version before dispatching any job, with `BOX_AUTOUPDATE=0` too.**
+  - What was wrong: with the updater off, which is the documented workaround when it fails, box_convert.sh did not check the version at all. A stale exe converted the whole manifest, and only corpus_reconvert's stamp check noticed afterwards (`built by mzpeak-convert X, not Y`).
+  - What happens now: it asks the exe the jobs will run for `--version` (one ssh command, no update). If the box answers another version or none, it exits 3 with "no job dispatched" under `BOX_REQUIRE_VERSION=1` (corpus runs set this), and only warns otherwise.
+  - Measured: the live box's exe reports 0.15.0, so a run that requires v0.16.0 gets no job.
+- **The box tools work from a git worktree.** `tools/box.env` is gitignored, so `--box` (box_convert.sh) and box_convert_scp.sh died in a worktree on `BOX_SSH: parameter null or not set` until someone copied the file across. Both now use the main checkout's `tools/box.env`, found with `git rev-parse --git-common-dir`, and say which file they used. A worktree's own file still wins.
 
 ### Fixed
 
@@ -244,6 +258,32 @@ arrays (PXD059079 2485.d: 49,126 of 79,885 values move).
   through the mzML writer; the remap bit for bit against mzdata's model at every scan of two runs,
   and within 4 ulp of the SDK order; the recorded command line. The mzML reader they share is
   `tests/common/mzml_meta.rs`.
+- **Two conversions of same-named inputs in one process no longer share a temp copy.** The UTF-8 transcode, gunzip and sanitized copies were named `<prefix>-<pid>-<stem>`, so a second conversion of a file with the same stem in the same process wrote into the first one's copy ("writing transcoded …: Invalid argument"; an in-process test flaked once). Each copy is now `<prefix>-<pid>-<n>-<name>`, where n is a process-wide counter, and it is created exclusively. Cleanup is unchanged.
+- **Archives declare the PSI-MS version they actually resolve terms against.** `cv_list` stated MS 4.1.249, a string hard-coded in the vendored writer since 0.7.3, while mzdata 0.67.1 embeds 4.1.258. The validator reported "the archive declares MS 4.1.249". The version and the tag-pinned URI (`…/psi-ms-CV/v4.1.258/psi-ms.obo`) are now read from mzdata's embedded vocabulary, so archives and mzML exports agree on 4.1.258. UO and IMS have no copy inside mzdata and stay pinned; a test checks that each declared version names the release its URI pins.
+- **mzML/imzML cross-references that name nothing are dropped and declared.** A scan's `instrumentConfigurationRef`, a processing method's or instrument configuration's `softwareRef`, and the run's default configuration, processing and source file used to pass into the archive whether or not the source's lists held the id. GBM `Test_P15_r2` stored all 2826 scans as configuration 1 of a list holding only 0, and the synthetic imzML named processing `dp1`, which it does not have.
+  - Each such reference is now dropped: a scan's configuration becomes null, a softwareRef becomes empty, and a run default names the first entry of its list.
+  - The archive declares `mzml:dangling-reference-dropped`, and the run warns once, counting each kind and naming the ids as the source states them.
+  - Entries mzdata skips for being self-closing (`<software/>`, `<sourceFile/>`, `<instrumentConfiguration/>`) are read back from the header first, so a reference to one is kept. LA-ESI `Thaliana`'s MALDIquantForeign 0.12 is back in the software list.
+  - The 146 corpus mzML/imzML inputs under 40 MB convert unchanged; Test_P15_r2 is the only corpus source with a real dangling reference.
+- **An archive's mzML export keeps every precursor's activation.** The vendored reader read only an activation's `parameters`, but the writer keeps the dissociation method and the collision energy in columns of their own. So every precursor of every archive came back with no method and an energy of 0. The exports of PXD059079 2485's archives (ims-compact and `--no-ims-compact`) wrote `collision energy 0` and no CID on all 15,977 precursors, where the `.d`'s export states CID at 25.0–49.3 eV. Both columns are now read (a deliberate deviation from the reference reader). The 15,977 precursors match the `.d`'s export field for field, and OpenMS FileInfo counts 15,977 CID activations on each export (0 before).
+- **An exported chromatogram's precursor keeps its isolation window.** The reader looked the window's columns up in an empty column mapping. Every SRM/SIM trace was exported with a window of target 0 and no activation: all 201 traces of the Agilent 6490 corpus file `PC_Allan1`, all 4 of pwiz's `MRM Neg C5`, and `tiny.pwiz.1.1`'s selected ion current trace (456.7). An SRM trace's product (Q3) window is still not stored in the archive, so it is still not exported.
+- **Summed TIC and base-peak chromatograms are in time order.** The mzML writer sums them in spectrum order, so a run whose spectra are not in time order got an unsorted time array (`tiny.pwiz.1.1`'s base-peak trace: 5.8905, 5.9905, 0.0, 0.7008 min). This happened on every `--to mzml` lane, the Agilent profile lane included, and on the export of an archive that holds no chromatogram of that kind. An archive's stored chromatograms go across as stored, as they have since 0.12.4.
+- **A chromatogram's polarity reaches the mzML.** mzdata's writer writes none, so `negative scan` was dropped from every SRM trace of a negative-mode run on both routes (all 4 of `MRM Neg C5`). The reader also read a null chromatogram polarity from the value slot under it, which would have made a TIC beside a negative trace negative.
+- **1/K0 is MS:1002815 `inverse reduced ion mobility`, once.** An archive's export:
+  - named every selected ion's and scan's 1/K0 `inverse reduced ion mobility drift time`, a label PSI-MS does not have (15,977 selected ions of 2485);
+  - stated a `--no-ims-compact` archive's scan 1/K0 twice (15,977 of 16,377 scans);
+  - stated every spectrum's `scan start time` a second time at the spectrum level.
+
+  That copy is now dropped. On a scan without a time it becomes the scan's time, converted from its own unit.
+- **timsTOF frames store their ion injection time and scan window.** An ims-compact archive stored neither, on the native and the `--bruker-sdk` lane, and so did the SDK lane's `--no-ims-compact` frames. Their export stated `ion injection time 0` and no scan window on all 3,994 frames of 2485, where the `.d`'s export states 165.957 ms and 99.99–1700 m/z. `Frames.AccumulationTime` and the run's `MzAcqRangeLower`/`MzAcqRangeUpper` are stored now. For an otofControl acquisition the range is widened by 5 Th as timsrust widens it, which gives 94.99–1705 on MSV000092457's 13373.d on every lane. This adds 111 bytes to 2485's 118.7 MB archive, and the validator passes it as before. The `--bruker-sdk` half is not yet confirmed against `timsdata`.
+- **A timsTOF `.d` copied from a Mac to NTFS, exFAT or SMB now names its AppleDouble companion instead of failing with "file is not a database".**
+  - What was wrong: copying a `.d` that way leaves a 163-byte `._*` file of Finder metadata beside every file. timsrust 0.4.1 opens the first entry whose name *ends with* `analysis.tdf` / `analysis.tdf_bin`. NTFS and APFS list `._analysis.tdf` first, so the default lane, `--no-ims-compact`, `--to mzml` and inspection all read the companion and failed without naming the cause. `--bruker-sdk` converted the same copy (2485.d on the box).
+  - What happens now: each of these lanes reads the directory listing in the order timsrust walks it.
+    - A companion timsrust would take is refused before the open, with the file and the fix named: remove the `._*` files (on a Mac, copy the `.d` to APFS instead), or use `--bruker-sdk`.
+    - A companion listed after its file, as on a fresh copy onto exFAT, is never reached. That `.d` converts as before, with a warning. On PXD059079 2486.d every Parquet member equals the APFS conversion.
+    - On a Mac, macOS writes `._analysis.tdf` into a `.d` on exFAT as soon as timsrust opens the database read-write. A failed open now names a companion that appeared that way.
+  - The converter never deletes anything.
+- **Embedded vendor side-files now leave out AppleDouble `._*` companions.** The preserve-by-default catch-all embedded every `._*` file, and a signal file's companion (`._FUNC001.DAT`) survived even when that file itself was dropped. A fresh exFAT copy of 2486.d embedded 23 `vendor/._*` files; it now embeds none. They are recorded in `vendor_files`, and `--aux '._*=embed'` keeps them. No corpus unit holds a `._*` file outside `__MACOSX`, so no published archive changes.
 
 ### Documentation
 
