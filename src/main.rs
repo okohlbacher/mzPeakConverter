@@ -79,6 +79,7 @@ mod fidelity;
 mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
+mod mzml_contact;
 mod mzml_header;
 mod mzml_index;
 mod mzml_isolation;
@@ -247,6 +248,23 @@ fn lossless() -> bool {
     *LOSSLESS.get().unwrap_or(&false)
 }
 
+/// `--force`, published like [`LOSSLESS`]: beyond overwriting an existing output it lets a
+/// conversion go on where the lane would otherwise refuse the input as possibly the wrong data (an
+/// imzML whose `.ibd` begins with another UUID, owner decision D7).
+static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn force() -> bool {
+    *FORCE.get().unwrap_or(&false)
+}
+
+/// `--keep-contact` (config `keep_contact`), published like [`LOSSLESS`]: carry an mzML or imzML
+/// header's `<contact>` into the archive and the exports ([`mzml_contact`]). Default off: dropped.
+static KEEP_CONTACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn keep_contact() -> bool {
+    *KEEP_CONTACT.get().unwrap_or(&false)
+}
+
 /// CLI spelling of the signal representation to read. Mirrors `shimadzu::Representation`, and is
 /// also what the Bruker BAF lane consumes directly (that module builds on Linux too, where the
 /// `cfg(windows)` shimadzu enum does not exist).
@@ -331,9 +349,19 @@ struct Cli {
     /// flag no profile point is dropped and `zero-run-mask` is not declared; continuous-mode
     /// imaging data, whose pixels share one m/z axis, decodes to one shared axis only this way.
     /// `MZPC_KEEP_ZERO_RUNS=1` does the same from the environment. Refused on `--agilent-grid`,
-    /// whose reader leaves the zero samples out itself.
+    /// whose reader leaves the zero samples out itself. A continuous-mode imzML (`IMS:1000030`)
+    /// keeps its zero runs without this flag, so its pixels decode to the one m/z axis the file
+    /// stores; the flag remains the override for processed-mode input.
     #[arg(long)]
     keep_zero_runs: bool,
+
+    /// Carry the `<contact>` of an mzML or imzML header (contact name, affiliation, address, URL,
+    /// e-mail: `MS:1000586`–`MS:1000590`) into the archive's `file_description.contacts` and into
+    /// the mzML export. By default it is dropped, with a note when the header states one: an
+    /// archive is copied and published, and a name, an e-mail and a street address would travel
+    /// with every copy. The export of an archive writes whatever its index holds, flag or not.
+    #[arg(long)]
+    keep_contact: bool,
 
     /// A bit-exact archive, or no archive: every point of the input stored in the input's order,
     /// each m/z and intensity with exactly the value the input holds. Selects the point layout
@@ -374,7 +402,8 @@ struct Cli {
     #[arg(long)]
     zstd_level: Option<i32>,
 
-    /// Overwrite the output if it already exists.
+    /// Overwrite the output if it already exists; also converts an imzML whose .ibd begins with
+    /// another UUID than the header states (refused otherwise: the two files may not be a pair).
     #[arg(short, long)]
     force: bool,
 
@@ -641,7 +670,9 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// the bytes as they are stored — after every rewrite above it — [`mzml_index::IndexFixes`] points
 /// each offset of the index at its element, leaves out an index without an offset and writes the
 /// checksum of what the file holds.
-fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>, run: &mzml_header::RunCell) -> Result<Box<dyn Write>> {
+/// `contacts` are the `<contact>` elements the header gets ([`mzml_contact::Contact::xml`]; none
+/// unless `--keep-contact` found some, or an archive's index holds them).
+fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>, run: &mzml_header::RunCell, contacts: Vec<String>) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let sink: Box<dyn Write> = if has_gz_suffix(output) {
         log::info!("output name ends in .gz: gzip-compressing the mzML as it is written");
@@ -649,9 +680,95 @@ fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>, run: &mzml_header::RunC
     } else {
         Box::new(file)
     };
-    let sink = mzml_header::HeaderFixes::with_run(mzml_index::IndexFixes::new(sink), cv, run.clone());
+    let sink = mzml_header::HeaderFixes::with_run(mzml_index::IndexFixes::new(sink), cv, run.clone(), contacts);
     let sink = mzml_unstated::UnstatedTerms::new(mzml_wavelength::WavelengthSpectra::new(sink));
     Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(sink)))
+}
+
+/// The `<contact>` elements of an mzML or imzML header ([`mzml_contact`]) for the lanes that can
+/// carry them: read and handed over under `--keep-contact`; otherwise none, with one note when the
+/// header states some (the default drops them, owner decision D11). `scan_lane`: the input is an
+/// mzML or imzML — nothing else has a header to read.
+fn header_contacts(input: &Path, read_path: &Path, scan_lane: bool) -> Vec<mzml_contact::Contact> {
+    if !scan_lane {
+        if keep_contact() {
+            log::info!("--keep-contact: {} is not an mzML or imzML, and no other input states a contact", input.display());
+        }
+        return Vec::new();
+    }
+    let contacts = match mzml_contact::read(read_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("{}: the header's <contact> was not read ({e:#}); none carried", input.display());
+            return Vec::new();
+        }
+    };
+    if contacts.is_empty() {
+        return contacts;
+    }
+    let names: Vec<String> = contacts.iter().map(mzml_contact::Contact::summary).collect();
+    if keep_contact() {
+        log::info!("--keep-contact: {} contact(s) of the header carried ({})", contacts.len(), names.join(", "));
+        contacts
+    } else {
+        log::info!(
+            "the header's <contact> ({}) is not carried: a name, an e-mail or an address would travel with every copy of the \
+             output; --keep-contact carries it",
+            names.join(", ")
+        );
+        Vec::new()
+    }
+}
+
+/// The refusal of an imzML whose `.ibd` begins with another UUID than its header states
+/// (`IMS:1000080`): the two files are not the pair the imzML describes, and the signal could be
+/// another run's — the one case the imaging checks refuse rather than declare (owner decision D7).
+/// `--force` converts anyway, warned and recorded. An `.ibd` shorter than a UUID (empty, truncated)
+/// begins with none: the message says so, with the file's length ([`imaging::found_uuid_text`]).
+fn ibd_uuid_mismatch_error(ibd: &Path, stated: &str, found: &str) -> anyhow::Error {
+    anyhow!(
+        "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the imzML describes, and \
+         the signal could be another run's. Not converted. Pass --force to convert anyway: the mismatch is then warned \
+         about, the stated UUID kept, and (in an archive) declared as {} with the UUID found in metadata.imaging.provenance",
+        ibd.display(),
+        imaging::found_uuid_text(found),
+        imaging::IBD_UUID_MISMATCH
+    )
+}
+
+/// The index key of the writer's `file_description` block, which [`finish_archive`] completes with
+/// a lane's additions under the same key ([`contacts_block`]).
+const FILE_DESCRIPTION_BLOCK: &str = mzpeak_prototyping::constants::FILE_DESCRIPTION_KEY;
+
+/// The lane's addition to `file_description`: the header's contacts, as the spec's `contacts`
+/// array ([`mzml_contact::Contact::index_json`]); nothing when there are none.
+fn contacts_block(contacts: &[mzml_contact::Contact]) -> Option<(String, serde_json::Value)> {
+    (!contacts.is_empty())
+        .then(|| (FILE_DESCRIPTION_BLOCK.to_string(), serde_json::json!({"contacts": contacts.iter().map(mzml_contact::Contact::index_json).collect::<Vec<_>>()})))
+}
+
+/// The signal a spectrum hands the writer, for the imaging marker: its m/z array against the run's
+/// one axis (`shared`, a continuous-mode imzML) and the range the writer stores (`range`; `masked`:
+/// the zero-run mask is on, which applies to a profile spectrum). The writer takes a centroid
+/// spectrum's peak set, which mzdata built from the same arrays, so the arrays are the values
+/// either way; a spectrum without arrays gives the peak set's m/z, and without either an empty one.
+fn observe_stored_signal(entry: &MultiLayerSpectrum, shared: Option<&mut imaging::SharedAxis>, range: &mut imaging::StoredRange, masked: bool) {
+    let profile = entry.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile;
+    if let Some(arrays) = entry.arrays.as_ref() {
+        let mzs = arrays.mzs().ok();
+        let mzs: &[f64] = mzs.as_deref().unwrap_or(&[]);
+        if let Some(s) = shared {
+            s.observe(mzs);
+        }
+        let intensities = arrays.get(&ArrayType::IntensityArray).and_then(|a| a.to_f64().ok());
+        range.observe(mzs, intensities.as_deref(), masked && profile);
+    } else {
+        let mzs: Vec<f64> = entry.peaks.as_ref().map(|p| p.iter().map(|peak| peak.mz).collect()).unwrap_or_default();
+        if let Some(s) = shared {
+            s.observe(&mzs);
+        }
+        range.observe(&mzs, None, false);
+    }
 }
 
 /// When to apply the statistically-DETECTED TOF-grid m/z encoding (strategy A). This
@@ -683,6 +800,7 @@ struct FileConfig {
     layout: Option<Layout>,
     no_numpress: Option<bool>,
     keep_zero_runs: Option<bool>,
+    keep_contact: Option<bool>,
     lossless: Option<bool>,
     no_mz_lattice: Option<bool>,
     chunk_size: Option<f64>,
@@ -722,6 +840,8 @@ struct Settings {
     no_numpress: bool,
     /// `--keep-zero-runs` (or `--lossless`): the writer's zero-run mask off.
     keep_zero_runs: bool,
+    /// `--keep-contact`: an mzML/imzML header's `<contact>` carried ([`KEEP_CONTACT`]).
+    keep_contact: bool,
     /// `--lossless`: a bit-exact archive or a failed conversion. Already folded into `layout`,
     /// `no_numpress`, `keep_zero_runs`, `no_mz_lattice` and `tof_grid` by `resolve`.
     lossless: bool,
@@ -800,6 +920,7 @@ impl Settings {
         note(cli.layout.is_some(), "--layout");
         note(cli.no_numpress, "--no-numpress");
         note(cli.keep_zero_runs, "--keep-zero-runs");
+        note(cli.keep_contact, "--keep-contact");
         note(cli.lossless, "--lossless");
         note(cli.no_mz_lattice, "--no-mz-lattice");
         note(cli.chunk_size.is_some(), "--chunk-size");
@@ -859,6 +980,7 @@ impl Settings {
             layout: if lossless { Layout::Point } else { layout.unwrap_or(Layout::Chunked) },
             no_numpress: lossless || cli.no_numpress || fc.no_numpress.unwrap_or(false),
             keep_zero_runs: lossless || cli.keep_zero_runs || fc.keep_zero_runs.unwrap_or(false),
+            keep_contact: cli.keep_contact || fc.keep_contact.unwrap_or(false),
             lossless,
             no_mz_lattice: lossless || cli.no_mz_lattice || fc.no_mz_lattice.unwrap_or(false),
             chunk_size: cli.chunk_size.or(fc.chunk_size).unwrap_or(50.0),
@@ -1234,6 +1356,8 @@ fn run(cli: &Cli, cfg: &Settings) -> Result<i32> {
     let _ = NO_MZ_LATTICE.set(cfg.no_mz_lattice);
     let _ = KEEP_ZERO_RUNS.set(cfg.keep_zero_runs);
     let _ = LOSSLESS.set(cfg.lossless);
+    let _ = FORCE.set(cfg.force);
+    let _ = KEEP_CONTACT.set(cfg.keep_contact);
     let verbose = cfg.verbose > 0;
 
     // Inspection report: always when there is no output (the whole job is "inspect"), and also as a
@@ -1682,14 +1806,16 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
 fn inert_flags_for(lane: Lane) -> &'static [&'static str] {
     const CODEC: &[&str] = &["--layout", "--no-numpress", "--no-mz-lattice", "--chunk-size", "--zstd-level"];
     match lane {
+        // `--keep-contact`: an archive carries the contacts its index holds, or none; the flag
+        // decided that when the archive was written.
         Lane::Filter => &[
-            "--layout", "--no-numpress", "--keep-zero-runs", "--no-mz-lattice", "--chunk-size", "--zstd-level",
+            "--layout", "--no-numpress", "--keep-zero-runs", "--keep-contact", "--no-mz-lattice", "--chunk-size", "--zstd-level",
             "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--aux", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
         ],
         Lane::FilterToMzml => &[
-            "--layout", "--no-numpress", "--keep-zero-runs", "--no-mz-lattice", "--chunk-size", "--zstd-level",
+            "--layout", "--no-numpress", "--keep-zero-runs", "--keep-contact", "--no-mz-lattice", "--chunk-size", "--zstd-level",
             "--no-ims-compact", "--representation", "--ims-chunked", "--no-ims-chunked", "--bruker-sdk",
             "--no-tims-recalibration", "--no-chromatograms", "--tof-grid", "--agilent-grid",
             "--via-msconvert", "--msconvert-path",
@@ -2579,8 +2705,40 @@ fn convert_to_mzml(
         MZReaderType::MzML(_) => text.as_ref().is_some_and(|t| t.mentions[0]),
         _ => false,
     };
+    // imzML: the header's file content (storage mode, UUID, checksum), read once for the UUID check
+    // here and the provenance params below. An `.ibd` that begins with another UUID than the
+    // header states is not this imzML's: refused before the output exists unless `--force`, as the
+    // archive lane refuses it (owner decision D7); forced, the warning is the declaration — mzML
+    // has no transformations list.
+    let imzml_content: Option<Vec<imaging::RawParam>> = matches!(reader, MZReaderType::IMzML(_)).then(|| {
+        imaging::read_file_content(&read_path).unwrap_or_else(|e| {
+            log::warn!("imzML file provenance not read: {e:#}");
+            Vec::new()
+        })
+    });
+    if let Some(content) = &imzml_content {
+        if let Some(ibd) = imaging::ibd_beside(input).or_else(|| imaging::ibd_beside(&read_path)) {
+            match imaging::ibd_uuid(&ibd) {
+                Ok(found) => {
+                    if let Some((stated, found)) = imaging::uuid_mismatch(content, &found) {
+                        if !force() {
+                            return Err(ibd_uuid_mismatch_error(&ibd, stated, found));
+                        }
+                        log::warn!(
+                            "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the imzML \
+                             describes; exported under --force, the stated value kept (mzML has no transformations list to declare it in)",
+                            ibd.display(),
+                            imaging::found_uuid_text(found)
+                        );
+                    }
+                }
+                Err(e) => log::warn!("the .ibd UUID was not checked: {e:#}"),
+            }
+        }
+    }
+    let contacts: Vec<String> = header_contacts(input, &read_path, scan_lane).iter().map(mzml_contact::Contact::xml).collect();
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims), &run)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims), &run, contacts)?);
     w.copy_metadata_from(&reader);
     // The source's scan settings (an imaging run's grid and pixel size, an inclusion list): the
     // writer holds the list, but its metadata trait does not reach it, so `copy_metadata_from`
@@ -2607,11 +2765,8 @@ fn convert_to_mzml(
     // imzML: the file provenance mzdata consumes (storage mode, UUID, `.ibd` checksum), put back
     // as the archive lane does, and that lane's rules for the scan settings, so the direct export
     // and the export of the archive state the same.
-    if let MZReaderType::IMzML(_) = &reader {
-        match imaging::read_file_content(&read_path) {
-            Ok(content) => w.file_description_mut().contents.extend(imaging::provenance_params(&content)),
-            Err(e) => log::warn!("imzML file provenance not read: {e:#}"),
-        }
+    if let Some(content) = &imzml_content {
+        w.file_description_mut().contents.extend(imaging::provenance_params(content));
         imzml_scan_settings_for_mzml(input, &read_path, &mut w.scan_settings);
     }
     prepare_mzml_header(&mut w, input, wall_clock, &run);
@@ -2648,6 +2803,10 @@ fn convert_to_mzml(
     }
     let stated_by = |id: &str| if scan_lane { stated.spectrum(id) } else { mzml_unstated::Zeros::TIME };
     let mut written = 0usize;
+    // imzML spectra typed MS1 at `ms level` 0, written at level 1 as the archive lane writes them
+    // (owner decision D6, `imaging::ms_level_zero_as_one`); mzML has no transformations list, so
+    // the warning after the loop is the declaration.
+    let mut ms_level_raised = 0usize;
     for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             if let Some(a) = tdf_points.as_mut() {
@@ -2658,6 +2817,9 @@ fn convert_to_mzml(
         }
         if let Some(a) = tdf_points.as_mut() {
             a.observe(spec.id(), points.observe_points(&spec));
+        }
+        if imzml_content.is_some() && imaging::ms_level_zero_as_one(spec.description_mut()) {
+            ms_level_raised += 1;
         }
         // mzdata's mzML writer panics on an array without a data type (`require_typed_arrays`).
         if scan_lane {
@@ -2707,6 +2869,13 @@ fn convert_to_mzml(
     }
     if let Some(g) = &thermo_windows {
         g.report();
+    }
+    if ms_level_raised > 0 {
+        log::warn!(
+            "{ms_level_raised} spectra typed MS1 spectrum (MS:1000579) state ms level 0; written with ms level 1 (mzML has \
+             no transformations list to declare {} in)",
+            imaging::MS_LEVEL_0_AS_1
+        );
     }
     configurations.report();
     // Same truncated-source cross-check the mzPeak lanes make; the `?` drops the writer and then
@@ -2908,7 +3077,13 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
         (marked || contents.iter().any(is_ims) || scan_settings.iter().any(|s| s.iter_params().any(is_ims))).then(mzml_header::Cv::ims)
     });
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims, &run)?);
+    // The contacts the archive holds (`file_description.contacts`, written under `--keep-contact`):
+    // the export states them as the archive does, flag or not.
+    let contacts: Vec<String> = mzml_contact::from_index(reader.file_index().metadata.get("file_description")).iter().map(mzml_contact::Contact::xml).collect();
+    if !contacts.is_empty() {
+        log::info!("{} contact(s) of the archive's file_description are written into the export's <fileDescription>", contacts.len());
+    }
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims, &run, contacts)?);
     w.copy_metadata_from(&archived);
     w.scan_settings = scan_settings;
     // The archive itself is a source of this file too: listed after the files it lists, with its
@@ -3508,7 +3683,7 @@ fn write_native_mzml_with(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()), &run)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()), &run, Vec::new())?);
     w.scan_settings.extend(grid);
     prepare_mzml_header(&mut w, input, None, &run);
     let n = max_spectra().map_or(len, |m| m.min(len));
@@ -3550,7 +3725,7 @@ fn write_agilent_profile_mzml(
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
     let run = mzml_header::RunCell::default();
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None, &run)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None, &run, Vec::new())?);
     prepare_mzml_header(&mut w, input, None, &run);
     // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
     // (matches write_native_mzml, which also uses the reader's record count).
@@ -5276,6 +5451,48 @@ fn convert_file(
         }
     }
 
+    // imzML: the header's file content (storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the
+    // `.ibd` checksum), read once here for two decisions taken before the output exists and reused
+    // below for the provenance. The `.ibd` is where mzdata looks for it.
+    let imzml_content: Option<Vec<imaging::RawParam>> = is_imzml.then(|| {
+        imaging::read_file_content(read_path).unwrap_or_else(|e| {
+            log::warn!("imzML file provenance not read: {e:#}");
+            Vec::new()
+        })
+    });
+    let ibd_path = is_imzml.then(|| imaging::ibd_beside(input).or_else(|| imaging::ibd_beside(read_path))).flatten();
+    // An `.ibd` that begins with another UUID than the header states is not this imzML's, and its
+    // signal could be another run's: refused, before anything is written, unless `--force` (owner
+    // decision D7; the full hash check below then warns and declares it). The one imaging check
+    // that refuses: a wrong checksum means a damaged copy of the right data, a wrong UUID may mean
+    // the wrong data.
+    if let (Some(content), Some(ibd), false) = (&imzml_content, &ibd_path, force()) {
+        match imaging::ibd_uuid(ibd) {
+            Ok(found) => {
+                if let Some((stated, found)) = imaging::uuid_mismatch(content, &found) {
+                    return Err(ibd_uuid_mismatch_error(ibd, stated, found));
+                }
+            }
+            Err(e) => log::warn!("the .ibd UUID was not checked before writing: {e:#}"),
+        }
+    }
+    // A continuous-mode imzML stores one m/z array for every pixel. Masked, each pixel kept a
+    // different subset of it, under its own numpress fixed points, and one source m/z decoded to
+    // several values across pixels (171.33333 → 8 values in the 9 pixels of `Example_Continuous`,
+    // HUPO-PSI/mzPeak-specification#23); the zero runs are kept on such a file without being asked
+    // (owner decision D2), and whether every spectrum did hold the same array is checked in the
+    // write loop (`metadata.imaging.shared_mz_axis`). `--keep-zero-runs` stays the override for
+    // processed-mode input.
+    let storage_mode = imzml_content.as_deref().and_then(imaging::storage_mode);
+    let continuous = storage_mode == Some("continuous");
+    let mask_off = keep_zero_runs() || continuous;
+    if continuous && !keep_zero_runs() {
+        log::info!(
+            "continuous-mode imzML (IMS:1000030): zero runs kept, so every pixel decodes to the one m/z axis the file \
+             stores; no zero-run-mask (as under --keep-zero-runs)"
+        );
+    }
+
     let tmp = output.with_extension("mzpeak.tmp");
     let tmp_guard = TmpGuard::new(&tmp);
     let handle = fs::File::create(&tmp)
@@ -5350,8 +5567,9 @@ fn convert_file(
     };
     builder = builder.sample_array_types_from_chromatograms(chromatogram_schema_samples(&mut reader, read_path));
 
-    // The zero-run mask, unless `--keep-zero-runs` / `--lossless` keeps every profile point.
-    let mut writer = builder.build(handle, !keep_zero_runs());
+    // The zero-run mask, unless `--keep-zero-runs` / `--lossless` keeps every profile point, or
+    // the input is a continuous-mode imzML (`mask_off`, above).
+    let mut writer = builder.build(handle, !mask_off);
 
     // Positions stated as scan cvParams (imzML, an mzML with positions) are promoted to the
     // `position_*` columns. Their column mappings name IMS terms, so the IMS vocabulary is declared
@@ -5386,16 +5604,14 @@ fn convert_file(
         if typed.is_some() {
             imaging_applied.push(imaging::INTEGER_TYPE_AS_PSI_MS);
         }
-        let content = imaging::read_file_content(read_path).unwrap_or_else(|e| {
-            log::warn!("imzML file provenance not read: {e:#}");
-            Vec::new()
-        });
-        writer.file_description_mut().contents.extend(imaging::provenance_params(&content));
+        let content: &[imaging::RawParam] = imzml_content.as_deref().unwrap_or(&[]);
+        writer.file_description_mut().contents.extend(imaging::provenance_params(content));
         // The `.ibd` against the checksum the header states. The stated value stays as written
         // (fidelity L0, above); a mismatch is declared, with the hash found in the marker — the
-        // conversion goes on (owner decision D7), as it does on mzdata's UUID warning.
-        if let Some(path) = imaging::ibd_beside(input).or_else(|| imaging::ibd_beside(read_path)) {
-            match imaging::check_ibd(&path, &content) {
+        // conversion goes on (owner decision D7: a wrong checksum is a damaged copy of the right
+        // data). A UUID mismatch got here only under `--force` (refused above without it).
+        if let Some(path) = ibd_path.clone() {
+            match imaging::check_ibd(&path, content) {
                 Ok(check) => {
                     let mismatches: Vec<String> = check
                         .mismatches()
@@ -5410,12 +5626,15 @@ fn convert_file(
                         );
                         imaging_applied.push(imaging::IBD_CHECKSUM_MISMATCH);
                     }
-                    // The UUID pairs the two files; handled as the checksum is (owner decision D7).
+                    // The UUID pairs the two files: a mismatch was refused above unless `--force`,
+                    // and forced it is warned about, declared and recorded (owner decision D7).
                     if let Some((stated, found)) = check.uuid_mismatch() {
                         log::warn!(
-                            "{}: the .ibd begins with UUID {found}, the imzML states {stated}: they are not the pair the \
-                             imzML describes; the stated value is kept, declared as {}",
+                            "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the \
+                             imzML describes; converted under --force, the stated value kept, declared as {} (the UUID found \
+                             is in metadata.imaging.provenance.ibd_uuid_found)",
                             path.display(),
+                            imaging::found_uuid_text(found),
                             imaging::IBD_UUID_MISMATCH
                         );
                         imaging_applied.push(imaging::IBD_UUID_MISMATCH);
@@ -5469,6 +5688,9 @@ fn convert_file(
         decode_pwiz_ids(&mut writer);
         source_refs = Some(mzml_refs::DanglingRefs::check(read_path, &mut writer));
     }
+    // The header's `<contact>`, which mzdata's model drops: carried into `file_description.contacts`
+    // under `--keep-contact` ([`finish_archive`] merges the block), else noted and left out.
+    let contacts = header_contacts(input, read_path, scan_lane);
     add_processing_metadata(&mut writer);
 
     // Keep the ion-mobility dimension for TDF (do not flatten 3D frames).
@@ -5526,6 +5748,12 @@ fn convert_file(
     // How many spectra carry a scan start time other than 0, which mzdata also gives a scan that
     // states none.
     let mut timed = 0usize;
+    // imzML spectra typed MS1 at `ms level` 0, written at level 1 (owner decision D6).
+    let mut ms_level_raised = 0usize;
+    // The imaging marker's account of the stored signal: whether a continuous-mode imzML's spectra
+    // all hold one m/z array (`shared_mz_axis`), and the range the writer stores (`mz_range`).
+    let mut shared_axis = continuous.then(imaging::SharedAxis::default);
+    let mut stored_range = imaging::StoredRange::default();
     let mut ran_out = true;
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
@@ -5594,6 +5822,12 @@ fn convert_file(
             }
             (positioned, unpositioned, z_removed) = (positioned + kept, unpositioned + dropped, z_removed + z);
             extent.observe(entry.description());
+            // After the sort above: the arrays as the writer gets them.
+            observe_stored_signal(&entry, shared_axis.as_mut(), &mut stored_range, !mask_off);
+        }
+        // Before the TIC/BPC collector and the source tally see the spectrum.
+        if is_imzml && imaging::ms_level_zero_as_one(entry.description_mut()) {
+            ms_level_raised += 1;
         }
         timed += usize::from(entry.description().acquisition.scans.iter().any(|sc| sc.start_time != 0.0));
         if let Some(g) = thermo_windows.as_mut() {
@@ -5615,6 +5849,14 @@ fn convert_file(
         n += 1;
     }
     log::debug!("wrote {n} spectra");
+    if ms_level_raised > 0 {
+        log::warn!(
+            "{ms_level_raised} spectra typed MS1 spectrum (MS:1000579) state ms level 0; written with ms_level 1, declared \
+             as {}",
+            imaging::MS_LEVEL_0_AS_1
+        );
+        imaging_applied.push(imaging::MS_LEVEL_0_AS_1);
+    }
     if let (true, Some(a)) = (ran_out, tdf_points.as_mut()) {
         source_tally.add_not_handed_over(a.finish(None));
     }
@@ -5745,7 +5987,30 @@ fn convert_file(
             // "pixel size" may be the area the term named until 2017 — 2500 µm² would be reported
             // as 2500 µm on both axes. The scan settings keep it as stated either way.
             let lone_x = if pixel_size_checked { imaging::LoneX::AlsoY } else { imaging::LoneX::XOnly };
-            imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), source, lone_x, provenance)));
+            let mut block = imaging::marker_block(grid.as_ref(), source, lone_x, provenance);
+            // imzML: the binary mode the header states, and on a continuous-mode file whether every
+            // spectrum did hold one m/z array (owner decision D2). Converter-first keys inside the
+            // marker (P4), documented in the manual's §8.
+            if let Some(mode) = storage_mode {
+                block["storage_mode"] = mode.into();
+            }
+            if let Some(axis) = &shared_axis {
+                block["shared_mz_axis"] = axis.shared().into();
+                if !axis.shared() {
+                    log::warn!(
+                        "continuous-mode imzML (IMS:1000030) whose spectra do not all hold one m/z array: {} of {} differ \
+                         from the first; metadata.imaging.shared_mz_axis is false",
+                        axis.differing(),
+                        axis.spectra()
+                    );
+                }
+            }
+            // The stored arrays' range (owner decision D10): what a reader can ask for, not the
+            // source's observed-m/z terms (the mask leaves edge zero runs out).
+            if let Some(range) = stored_range.json() {
+                block["mz_range"] = range;
+            }
+            imaging_blocks.push(("imaging".into(), block));
         }
     }
     if let Some(m) = &maldi {
@@ -5763,6 +6028,7 @@ fn convert_file(
         .chain(route)
         .chain(imaging_block.map(|b| ("imaging_pixel_size".to_string(), b)))
         .chain(imaging_blocks)
+        .chain(contacts_block(&contacts))
         .chain(std::iter::once(transformations_block(&{
             let mut applied = base_transformations(&writer);
             for t in &imaging_applied {
@@ -7502,7 +7768,20 @@ fn finish_archive(
     if let (true, Some(block)) = (lossless(), &fidelity_block) {
         fidelity::check_lossless(block, &applied)?;
     }
-    for (key, block) in index_blocks.iter().filter(|(key, _)| key != fidelity::BLOCK) {
+    // A lane's additions to `file_description` (the contacts, `--keep-contact`): merged into the
+    // block the writer copied to the index at close — its own model has no slot for them, so the
+    // block is completed here rather than in vendored code — key by key, nothing of the writer's
+    // replaced.
+    if let Some((_, extra)) = index_blocks.iter().find(|(key, _)| key == FILE_DESCRIPTION_BLOCK) {
+        let mut description = zip.index().metadata.get(FILE_DESCRIPTION_BLOCK).cloned().unwrap_or_else(|| serde_json::json!({}));
+        if let (Some(description), Some(extra)) = (description.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                description.insert(key.clone(), value.clone());
+            }
+        }
+        zip.add_index_metadata(FILE_DESCRIPTION_BLOCK, &description).context("writing the file_description index block")?;
+    }
+    for (key, block) in index_blocks.iter().filter(|(key, _)| key != fidelity::BLOCK && key != FILE_DESCRIPTION_BLOCK) {
         zip.add_index_metadata(key, block)
             .with_context(|| format!("writing {key} index block"))?;
     }
@@ -11248,7 +11527,7 @@ mod tests {
         let output = dir.join("out.mzML");
         let tmp = super::mzml_tmp_path(&output);
         let guard = super::TmpGuard::new(&tmp);
-        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None, &Default::default()).unwrap());
+        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None, &Default::default(), Vec::new()).unwrap());
         w.set_spectrum_count(3);
         for (i, (time, intensity)) in [(5.8905, 30.0f32), (0.0, 10.0), (0.7008, 20.0)].into_iter().enumerate() {
             let mut descr = SpectrumDescription { id: format!("scan={}", i + 1), index: i, ms_level: 1, ..Default::default() };
@@ -14981,6 +15260,368 @@ mod tests {
         let (m, _) = convert("sha256", &format!(r#"<cvParam cvRef="IMS" accession="IMS:1000092" name="ibd SHA-256" value="{sha256}"/>"#));
         assert_eq!(m["imaging"]["provenance"]["ibd_checksum"], "verified");
         ibd_source(&m, "sha256");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 2 × 2 profile imzML written for the test in the binary mode `mode` (`continuous` or
+    /// `processed`): one 12-point m/z axis (64-bit float, `100 + i`) and per spectrum 12 float32
+    /// intensities with an all-zero stretch at each end and one inside (`[0,0,0, 5+k, 7, 0,0,0, 3,
+    /// 0,0,0]`), so the writer's mask keeps indices 2..=9. In continuous mode every spectrum's m/z
+    /// array is the one at offset 16, as the mode defines it; with `odd_axis` the last spectrum
+    /// points at an array of its own (`axis + 0.5`), which the mode forbids. The `.ibd`'s SHA-1 and
+    /// UUID are stated. Returns the path and the axis.
+    fn profile_imzml(dir: &std::path::Path, name: &str, mode: &str, odd_axis: bool) -> (std::path::PathBuf, Vec<f64>) {
+        use sha1::{Digest, Sha1};
+        let template = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let head = &template[..template.find("<spectrumList").unwrap()];
+        let centroid = r#"accession="MS:1000127" name="centroid spectrum""#;
+        let processed = r#"<cvParam cvRef="IMS" accession="IMS:1000031" name="processed"/>"#;
+        assert!(head.matches(centroid).count() == 2 && head.contains(processed) && head.contains("fd5c5dae18095ba7ab55a6ad1bd1175180b292a8"));
+        let axis: Vec<f64> = (0..12).map(|i| 100.0 + i as f64).collect();
+        let mut ibd: Vec<u8> = vec![0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0x03, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9];
+        let shared_at = ibd.len();
+        axis.iter().for_each(|v| ibd.extend(v.to_le_bytes()));
+        let array = |group: &str, offset: usize, bytes: usize| {
+            format!(
+                r#"<binaryDataArray encodedLength="0"><referenceableParamGroupRef ref="{group}"/>
+            <cvParam cvRef="IMS" accession="IMS:1000103" name="external array length" value="12"/>
+            <cvParam cvRef="IMS" accession="IMS:1000102" name="external offset" value="{offset}"/>
+            <cvParam cvRef="IMS" accession="IMS:1000104" name="external encoded length" value="{bytes}"/>
+            <binary/></binaryDataArray>"#
+            )
+        };
+        let mut spectra = String::new();
+        for k in 0..4usize {
+            let mz_at = if odd_axis && k == 3 {
+                let at = ibd.len();
+                axis.iter().for_each(|v| ibd.extend((v + 0.5).to_le_bytes()));
+                at
+            } else if mode == "continuous" {
+                shared_at
+            } else {
+                let at = ibd.len();
+                axis.iter().for_each(|v| ibd.extend(v.to_le_bytes()));
+                at
+            };
+            let intensity_at = ibd.len();
+            for v in [0.0f32, 0.0, 0.0, 5.0 + k as f32, 7.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0] {
+                ibd.extend(v.to_le_bytes());
+            }
+            spectra.push_str(&format!(
+                r#"<spectrum id="Scan={}" defaultArrayLength="0" index="{k}">
+        <referenceableParamGroupRef ref="spectrum1"/>
+        <scanList count="1"><cvParam cvRef="MS" accession="MS:1000795" name="no combination"/>
+          <scan>{}</scan></scanList>
+        <binaryDataArrayList count="2">{}{}</binaryDataArrayList></spectrum>
+"#,
+                k + 1,
+                position(k % 2 + 1, k / 2 + 1),
+                array("mzArray", mz_at, 96),
+                array("intensityArray", intensity_at, 48),
+            ));
+        }
+        let sha1: String = Sha1::digest(&ibd).iter().map(|b| format!("{b:02x}")).collect();
+        let text = format!(
+            "{}<spectrumList count=\"4\" defaultDataProcessingRef=\"dp1\">\n{spectra}</spectrumList></run></mzML>\n",
+            head.replace(centroid, r#"accession="MS:1000128" name="profile spectrum""#)
+                .replace(processed, &format!(r#"<cvParam cvRef="IMS" accession="IMS:10000{}" name="{mode}"/>"#, if mode == "continuous" { "30" } else { "31" }))
+                .replace("fd5c5dae18095ba7ab55a6ad1bd1175180b292a8", &sha1)
+        );
+        std::fs::write(dir.join(format!("{name}.ibd")), ibd).unwrap();
+        let path = dir.join(format!("{name}.imzML"));
+        std::fs::write(&path, text).unwrap();
+        (path, axis)
+    }
+
+    /// The m/z arrays of the first `n` spectra of an archive, as the reader decodes them.
+    fn stored_mz(archive: &std::path::Path, n: usize) -> Vec<Vec<f64>> {
+        use mzpeak_prototyping::MzPeakReader;
+        let mut r = MzPeakReader::new(archive).unwrap();
+        (0..n).map(|i| r.get_spectrum(i).unwrap().arrays.as_ref().unwrap().mzs().unwrap().to_vec()).collect()
+    }
+
+    /// Owner decision D2 (2026-10-01): a continuous-mode imzML (`IMS:1000030`) is written with the
+    /// zero runs kept without being asked, so every pixel decodes to the one m/z axis the file
+    /// stores — masked, each pixel kept a different subset of it and one source m/z decoded to
+    /// several values across pixels (171.33333 → 8 values in the 9 pixels of `Example_Continuous`,
+    /// HUPO-PSI/mzPeak-specification#23) — nothing lossy is declared that did not happen, and the
+    /// marker states the mode and whether every spectrum did hold the same array. A processed-mode
+    /// file is masked as before, `--keep-zero-runs` its override. Decision D10 beside it: the
+    /// marker's `mz_range` is the STORED arrays' range, which the mask narrows on such a file.
+    #[test]
+    fn imzml_continuous_mode_keeps_zero_runs_and_states_the_shared_axis() {
+        let dir = scratch("imzml-continuous");
+        let convert = |name: &str, src: &std::path::Path, flags: &[&str]| -> (std::path::PathBuf, serde_json::Value, String) {
+            let out = dir.join(format!("{name}.mzpeak"));
+            let mut args: Vec<&std::ffi::OsStr> = vec![src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()];
+            args.extend(flags.iter().map(|f| std::ffi::OsStr::new(f)));
+            let (ok, _, err) = run_bin(&args, &[]);
+            assert!(ok, "{name}: {err}");
+            let m = index_metadata(&out);
+            (out, m, err)
+        };
+        let masked = |m: &serde_json::Value| m["transformations"].to_string().contains("zero-run-mask");
+        let points = |m: &serde_json::Value| (m["fidelity"]["spectra_data"]["source_points"].as_u64(), m["fidelity"]["spectra_data"]["stored_points"].as_u64());
+
+        // Continuous: kept, said so, the mode and the verified shared axis in the marker, and the
+        // four pixels decode to one axis — the source's, within the numpress bound that stays.
+        let (src, axis) = profile_imzml(&dir, "cont", "continuous", false);
+        let (out, m, log) = convert("cont", &src, &[]);
+        assert!(!masked(&m), "{:#}", m["transformations"]);
+        assert!(log.contains("continuous-mode imzML (IMS:1000030): zero runs kept"), "{log}");
+        assert_eq!((m["imaging"]["storage_mode"].as_str(), m["imaging"]["shared_mz_axis"].as_bool()), (Some("continuous"), Some(true)), "{:#}", m["imaging"]);
+        assert_eq!(points(&m), (Some(48), Some(48)), "{:#}", m["fidelity"]);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.0]));
+        let decoded = stored_mz(&out, 4);
+        assert!(decoded.iter().all(|d| d == &decoded[0]), "one axis for every pixel: {decoded:?}");
+        assert_eq!(decoded[0].len(), 12);
+        assert!(decoded[0].iter().zip(&axis).all(|(d, a)| (d - a).abs() < 1e-6), "{:?}", decoded[0]);
+        assert!(m["transformations"].to_string().contains("numpress-linear"), "numpress stays the encoding: {:#}", m["transformations"]);
+
+        // Continuous by its header, but one spectrum holds another array: kept all the same (the
+        // header's claim decided the mask), `shared_mz_axis` false, one warning with the count.
+        let (src, _) = profile_imzml(&dir, "odd", "continuous", true);
+        let (_, m, log) = convert("odd", &src, &[]);
+        assert!(!masked(&m));
+        assert_eq!(m["imaging"]["shared_mz_axis"], false, "{:#}", m["imaging"]);
+        assert!(log.contains("1 of 4 differ from the first; metadata.imaging.shared_mz_axis is false"), "{log}");
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.5]));
+
+        // Processed: masked as before, the mode stated, no shared-axis claim; the stored range is
+        // what the mask left (the edge runs go, index 2 to 9); `--keep-zero-runs` is the override.
+        let (src, _) = profile_imzml(&dir, "proc", "processed", false);
+        let (_, m, log) = convert("proc", &src, &[]);
+        assert!(masked(&m), "{:#}", m["transformations"]);
+        assert!(!log.contains("zero runs kept"), "{log}");
+        assert_eq!(m["imaging"]["storage_mode"], "processed");
+        assert!(m["imaging"].get("shared_mz_axis").is_none(), "{:#}", m["imaging"]);
+        assert_eq!(points(&m), (Some(48), Some(28)), "7 of 12 points per spectrum: {:#}", m["fidelity"]);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([102.0, 109.0]), "{:#}", m["imaging"]);
+        let (_, m, _) = convert("proc_keep", &src, &["--keep-zero-runs"]);
+        assert!(!masked(&m));
+        assert_eq!(points(&m), (Some(48), Some(48)));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.0]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owner decision D6 (2026-10-01): a spectrum typed `MS1 spectrum` (MS:1000579) that states
+    /// `ms level` 0 — the ms-imaging.org example files, the DESI set and the GBM set all do, in
+    /// their shared `spectrum1` group — is written with `ms_level` 1, declared, warned once with the
+    /// count; the direct mzML export writes level 1 too, with the warning as its declaration. A
+    /// file stating level 1 declares nothing.
+    #[test]
+    fn imzml_ms_level_zero_on_ms1_spectra_is_written_as_one() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        let one = r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>"#;
+        assert!(base.contains(one));
+        let dir = scratch("imzml-ms-level-0");
+        let levels = |archive: &std::path::Path| -> Vec<i64> {
+            let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+            let meta = extract_zip_entry(&mut zip, "spectra_metadata.parquet", &dir);
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&meta).unwrap()).unwrap().build().unwrap();
+            let mut levels = Vec::new();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let level = arrow::compute::cast(batch.column_by_name("ms_level").unwrap(), &arrow::datatypes::DataType::Int64).unwrap();
+                levels.extend(level.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().iter().map(|v| v.unwrap()));
+            }
+            levels
+        };
+        for (name, level, raised) in [("zero", r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="0"/>"#, true), ("one", one, false)] {
+            std::fs::write(dir.join(format!("{name}.imzML")), base.replace(one, level)).unwrap();
+            std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
+            let src = dir.join(format!("{name}.imzML"));
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            let m = index_metadata(&out);
+            assert_eq!(m["transformations"].to_string().contains(super::imaging::MS_LEVEL_0_AS_1), raised, "{name}: {:#}", m["transformations"]);
+            assert_eq!(err.matches("state ms level 0; written with ms_level 1").count(), usize::from(raised), "{name}: {err}");
+            if raised {
+                assert!(err.contains("9 spectra typed MS1 spectrum (MS:1000579) state ms level 0"), "{err}");
+            }
+            assert_eq!(levels(&out), vec![1; 9], "{name}");
+            // The direct export: level 1 in the text, the warning its declaration.
+            let mzml = dir.join(format!("{name}.mzML"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            let text = std::fs::read_to_string(&mzml).unwrap();
+            assert_eq!(text.matches(r#"name="ms level" value="1""#).count(), 9, "{name}");
+            assert!(!text.contains(r#"name="ms level" value="0""#), "{name}");
+            assert_eq!(err.contains("state ms level 0; written with ms level 1"), raised, "{name}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owner decision D7 (2026-10-01): an `.ibd` that begins with another UUID than the imzML states
+    /// is not the pair the imzML describes — the signal could be another run's — and is refused,
+    /// before anything is written, with both UUIDs in the message; `--force` converts it anyway,
+    /// warned, declared and recorded as rc.2 did. A checksum mismatch alone goes on converting
+    /// (a damaged copy of the right data). Both lanes: the archive and the direct mzML export. An
+    /// `.ibd` shorter than a UUID is refused the same way, the message giving its length.
+    #[test]
+    fn imzml_ibd_uuid_mismatch_refuses_unless_forced() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        const STATED: &str = "{1a2b3c4d-5e6f-7081-9203-b4c5d6e7f8a9}";
+        const OTHER: &str = "{2487DB05-6594-49DA-8B16-D4C1FA24CA57}";
+        const SHA1: &str = "fd5c5dae18095ba7ab55a6ad1bd1175180b292a8";
+        assert!(base.contains(STATED) && base.contains(SHA1));
+        let dir = scratch("imzml-ibd-uuid");
+        std::fs::write(dir.join("bad.imzML"), base.replace(STATED, OTHER)).unwrap();
+        std::fs::copy(ibd, dir.join("bad.ibd")).unwrap();
+        std::fs::write(dir.join("sum.imzML"), base.replace(SHA1, "173bdf1701ab791b462fdfcbfd2f4ad6c5b26168")).unwrap();
+        std::fs::copy(ibd, dir.join("sum.ibd")).unwrap();
+        let src = dir.join("bad.imzML");
+        for ext in ["mzpeak", "mzML"] {
+            let out = dir.join(format!("bad.{ext}"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str()], &[]);
+            assert!(!ok, "{ext}: refused: {err}");
+            assert!(err.contains("the .ibd begins with UUID 1a2b3c4d5e6f70819203b4c5d6e7f8a9, the imzML states {2487DB05-6594-49DA-8B16-D4C1FA24CA57}"), "{ext}: {err}");
+            assert!(err.contains("Not converted. Pass --force"), "{ext}: {err}");
+            assert!(!out.exists(), "{ext}: nothing written");
+            assert!(fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp")), "{ext}: no temp left");
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{ext}: forced: {err}");
+            assert!(err.contains("they are not the pair the imzML describes") && err.contains("--force"), "{ext}: {err}");
+            assert!(out.exists());
+        }
+        let m = index_metadata(&dir.join("bad.mzpeak"));
+        let p = &m["imaging"]["provenance"];
+        assert_eq!((p["ibd_uuid"].as_str(), p["ibd_uuid_found"].as_str()), (Some("mismatch"), Some("1a2b3c4d5e6f70819203b4c5d6e7f8a9")), "{p:#}");
+        assert!(m["transformations"].to_string().contains(super::imaging::IBD_UUID_MISMATCH), "{:#}", m["transformations"]);
+        let uuid = m["file_description"]["contents"].as_array().unwrap().iter().find(|p| p["accession"] == "IMS:1000080").unwrap();
+        assert_eq!(uuid["value"], OTHER, "the stated value stays");
+        // A checksum mismatch alone: converted, declared, no --force needed.
+        let out = dir.join("sum.mzpeak");
+        let (ok, _, err) = run_bin(&[dir.join("sum.imzML").as_os_str(), "-o".as_ref(), out.as_os_str()], &[]);
+        assert!(ok, "{err}");
+        let m = index_metadata(&out);
+        assert_eq!((m["imaging"]["provenance"]["ibd_checksum"].as_str(), m["imaging"]["provenance"]["ibd_uuid"].as_str()), (Some("mismatch"), Some("verified")));
+        // An `.ibd` shorter than a UUID (empty, truncated) begins with no UUID: refused, the message
+        // giving the length instead of an empty UUID.
+        for (name, bytes) in [("empty", 0usize), ("short", 5)] {
+            let src = dir.join(format!("{name}.imzML"));
+            std::fs::write(&src, &base).unwrap();
+            std::fs::write(dir.join(format!("{name}.ibd")), vec![0u8; bytes]).unwrap();
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str()], &[]);
+            assert!(!ok, "{name}: refused: {err}");
+            assert!(err.contains(&format!("the .ibd begins with no UUID (the .ibd is {bytes} bytes long), the imzML states {STATED}")), "{name}: {err}");
+            assert!(!out.exists(), "{name}: nothing written");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owner decision D11 (2026-10-01): the header's `<contact>` is dropped by default, with a note,
+    /// and carried under `--keep-contact` (config `keep_contact` too) into the archive's
+    /// `file_description.contacts` — the spec's slot: `contact_name`, `contact_affiliation`, every
+    /// param — and into both mzML exports, as `<contact>` after the source files. The export of an
+    /// archive writes what the archive holds, flag or not. The test header is Latin-1, as the
+    /// ms-imaging.org example files are (Thorsten Schramm's affiliation has an umlaut).
+    #[test]
+    fn keep_contact_carries_the_contact_into_the_archive_and_both_exports() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        const AFFILIATION: &str = "Institut f\u{fc}r Anorganische und Analytische Chemie";
+        let contact = format!(
+            r#"    <contact>
+      <cvParam cvRef="MS" accession="MS:1000586" name="contact name" value="Thorsten Schramm"/>
+      <cvParam cvRef="MS" accession="MS:1000590" name="contact organization" value="{AFFILIATION}"/>
+      <cvParam cvRef="MS" accession="MS:1000587" name="contact address" value="Schubertstraße 60, Gießen, Germany"/>
+      <cvParam cvRef="MS" accession="MS:1000588" name="contact URL" value="https://example.org/~schramm"/>
+      <cvParam cvRef="MS" accession="MS:1000589" name="contact email" value="thorsten.schramm@example.org"/>
+    </contact>
+  </fileDescription>"#
+        );
+        assert!(base.contains("  </fileDescription>") && base.contains(r#"encoding="ISO-8859-1""#));
+        let dir = scratch("keep-contact");
+        // Written as the Latin-1 bytes the declaration promises.
+        let latin1: Vec<u8> = base.replace("  </fileDescription>", &contact).chars().map(|c| u8::try_from(u32::from(c)).expect("Latin-1")).collect();
+        std::fs::write(dir.join("c.imzML"), latin1).unwrap();
+        std::fs::copy(ibd, dir.join("c.ibd")).unwrap();
+        let src = dir.join("c.imzML");
+        let run = |out: &std::path::Path, flags: &[&str], envs: &[(&str, &str)]| -> String {
+            let mut args: Vec<&std::ffi::OsStr> = vec![src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()];
+            args.extend(flags.iter().map(|f| std::ffi::OsStr::new(f)));
+            let (ok, _, err) = run_bin(&args, envs);
+            assert!(ok, "{}: {err}", out.display());
+            err
+        };
+        let accessions = |c: &serde_json::Value| -> Vec<String> { c["parameters"].as_array().unwrap().iter().map(|p| p["accession"].as_str().unwrap().to_string()).collect() };
+
+        // Default: dropped, one note naming the contact.
+        let plain = dir.join("plain.mzpeak");
+        let log = run(&plain, &[], &[]);
+        let m = index_metadata(&plain);
+        assert!(m["file_description"].get("contacts").is_none(), "{:#}", m["file_description"]);
+        assert!(log.contains("the header's <contact> (Thorsten Schramm) is not carried") && log.contains("--keep-contact carries it"), "{log}");
+
+        // --keep-contact: the spec's contact object, every param, the umlaut decoded.
+        let kept = dir.join("kept.mzpeak");
+        let log = run(&kept, &["--keep-contact"], &[]);
+        assert!(log.contains("--keep-contact: 1 contact(s) of the header carried (Thorsten Schramm)"), "{log}");
+        let m = index_metadata(&kept);
+        let contacts = m["file_description"]["contacts"].as_array().unwrap_or_else(|| panic!("{:#}", m["file_description"]));
+        assert_eq!(contacts.len(), 1);
+        let c = &contacts[0];
+        assert_eq!((c["contact_name"].as_str(), c["contact_affiliation"].as_str()), (Some("Thorsten Schramm"), Some(AFFILIATION)), "{c:#}");
+        assert_eq!(accessions(c), ["MS:1000586", "MS:1000590", "MS:1000587", "MS:1000588", "MS:1000589"]);
+        assert_eq!(c["parameters"][4]["value"], "thorsten.schramm@example.org");
+        // The rest of the block is the writer's, untouched.
+        assert!(m["file_description"]["contents"].as_array().is_some_and(|c| !c.is_empty()) && m["file_description"]["source_files"].as_array().is_some_and(|s| s.len() == 2), "{:#}", m["file_description"]);
+        // The config key.
+        std::fs::write(dir.join("keep.yaml"), "keep_contact: true\n").unwrap();
+        let by_config = dir.join("config.mzpeak");
+        run(&by_config, &["--config", dir.join("keep.yaml").to_str().unwrap()], &[]);
+        assert_eq!(index_metadata(&by_config)["file_description"]["contacts"].as_array().map(Vec::len), Some(1));
+
+        // The exports: the direct one under the flag, the archive's from what it holds.
+        let contact_in = |mzml: &std::path::Path, expected: bool| {
+            let text = std::fs::read_to_string(mzml).unwrap();
+            let header = &text[..text.find("<run ").unwrap()];
+            assert_eq!(header.contains("<contact>"), expected, "{}: {header}", mzml.display());
+            if expected {
+                let fd = &header[header.find("<fileDescription>").unwrap()..header.find("</fileDescription>").unwrap()];
+                let at = fd.find("<contact>").unwrap();
+                assert!(fd.contains(&format!(r#"<cvParam cvRef="MS" accession="MS:1000590" name="contact organization" value="{AFFILIATION}"/>"#)), "{fd}");
+                for acc in ["MS:1000586", "MS:1000590", "MS:1000587", "MS:1000588", "MS:1000589"] {
+                    assert_eq!(fd[at..].matches(&format!("accession=\"{acc}\"")).count(), 1, "{acc}: {fd}");
+                }
+                assert!(fd.find("</fileContent>").is_some_and(|c| c < at) && fd.find("</sourceFileList>").is_none_or(|s| s < at), "after the content and the source files: {fd}");
+                assert_eq!(header.matches("<contact>").count(), 1, "one contact");
+            }
+            // The index still points at its elements.
+            for (at, _) in text.match_indices("<offset idRef=\"") {
+                let rest = &text[at..];
+                let n: usize = rest.split_once("\">").unwrap().1.split_once('<').unwrap().0.parse().unwrap();
+                let element = text[n..].trim_start();
+                assert!(element.starts_with("<spectrum ") || element.starts_with("<chromatogram "), "{}: offset {n}", mzml.display());
+            }
+            let n: usize = text.split_once("<indexListOffset>").unwrap().1.split_once('<').unwrap().0.parse().unwrap();
+            assert!(text[n..].trim_start().starts_with("<indexList "));
+        };
+        let direct = dir.join("direct.mzML");
+        run(&direct, &["--keep-contact"], &[]);
+        contact_in(&direct, true);
+        let direct_plain = dir.join("direct_plain.mzML");
+        let log = run(&direct_plain, &[], &[]);
+        contact_in(&direct_plain, false);
+        assert!(log.contains("is not carried"), "{log}");
+        for (archive, expected) in [(&kept, true), (&plain, false)] {
+            let mzml = dir.join(format!("{}.mzML", archive.file_stem().unwrap().to_str().unwrap()));
+            let (ok, _, err) = run_bin(&[archive.as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{err}");
+            contact_in(&mzml, expected);
+        }
+        // An mzML export with the contact reads as mzML, and the round trip keeps it under the flag.
+        let reader = super::MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&direct).unwrap();
+        assert_eq!(reader.len(), 9);
+        let back = dir.join("back.mzpeak");
+        let (ok, _, err) = run_bin(&[direct.as_os_str(), "-o".as_ref(), back.as_os_str(), "--force".as_ref(), "--keep-contact".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert_eq!(index_metadata(&back)["file_description"]["contacts"][0]["contact_name"], "Thorsten Schramm");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

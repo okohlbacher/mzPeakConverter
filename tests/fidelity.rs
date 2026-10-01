@@ -444,9 +444,12 @@ fn lossless_refuses_rather_than_pretends() {
 }
 
 /// Continuous-mode imaging data: nine pixels on one 32-bit m/z axis, each with its own zero runs.
-/// By default the mask leaves every pixel a different subset of the axis and the pixels decode to
-/// different axes; `--keep-zero-runs` (flag or environment) stores all points, declares no
-/// `zero-run-mask`, and every pixel decodes to the same axis. Intensities are untouched either way.
+/// Since 0.17.0 the header's `IMS:1000030` is enough (owner decision D2): the default stores all
+/// points, declares no `zero-run-mask`, states `storage_mode: continuous` and a verified
+/// `shared_mz_axis`, and every pixel decodes to the same axis — what `--keep-zero-runs` (flag or
+/// environment) did before and still does. The same spectra written in processed mode are masked by
+/// default (every pixel a different subset of the axis, different decoded axes), `--keep-zero-runs`
+/// the override. Intensities are untouched either way.
 #[test]
 fn keep_zero_runs_stores_every_point_and_one_shared_axis() {
     let dir = scratch("keep");
@@ -461,7 +464,8 @@ fn keep_zero_runs_stores_every_point_and_one_shared_axis() {
             (Arr::F32(axis.clone()), Arr::F32(it))
         })
         .collect();
-    let input = write_imzml(&dir, "continuous", &spectra, true, true);
+    let continuous = write_imzml(&dir, "continuous", &spectra, true, true);
+    let processed = write_imzml(&dir, "processed", &spectra, true, false);
     let source_points = (9 * N) as u64;
 
     let decoded = |archive: &Path| -> Vec<(Vec<f64>, Vec<f32>)> {
@@ -480,7 +484,7 @@ fn keep_zero_runs_stores_every_point_and_one_shared_axis() {
     };
 
     let masked = dir.join("masked.mzpeak");
-    convert(&input, &masked, &[]);
+    convert(&processed, &masked, &[]);
     let f = metadata(&masked)["fidelity"]["spectra_data"].clone();
     let m = decoded(&masked);
     let stored: u64 = m.iter().map(|(mz, _)| mz.len() as u64).sum();
@@ -493,15 +497,29 @@ fn keep_zero_runs_stores_every_point_and_one_shared_axis() {
         let nonzero = |v: &[f32]| v.iter().filter(|x| **x != 0.0).map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(nonzero(kept), nonzero(source));
     }
+    let marker = metadata(&masked)["imaging"].clone();
+    assert_eq!(marker["storage_mode"], "processed", "{marker}");
+    assert!(marker.get("shared_mz_axis").is_none(), "no shared-axis claim for processed mode: {marker}");
 
-    for (tag, args, env) in [("flag", &["--keep-zero-runs"][..], false), ("env", &[][..], true)] {
+    for (tag, input, args, env) in [
+        ("continuous-default", &continuous, &[][..], false),
+        ("continuous-flag", &continuous, &["--keep-zero-runs"][..], false),
+        ("continuous-env", &continuous, &[][..], true),
+        ("processed-flag", &processed, &["--keep-zero-runs"][..], false),
+    ] {
         let out = dir.join(format!("keep-{tag}.mzpeak"));
-        let r = run(&input, &out, args, env);
+        let r = run(input, &out, args, env);
         assert!(r.status.success(), "{tag}: {}", String::from_utf8_lossy(&r.stderr));
         let applied = transformations(&out);
         assert!(!applied.contains(&"zero-run-mask".to_string()) && applied.contains(&"numpress-linear".to_string()), "{tag}: {applied:?}");
         let f = metadata(&out)["fidelity"]["spectra_data"].clone();
         assert_eq!((f["source_points"].as_u64(), f["stored_points"].as_u64()), (Some(source_points), Some(source_points)), "{tag}: {f}");
+        let marker = metadata(&out)["imaging"].clone();
+        if std::ptr::eq(input, &continuous) {
+            assert_eq!((marker["storage_mode"].as_str(), marker["shared_mz_axis"].as_bool()), (Some("continuous"), Some(true)), "{tag}: {marker}");
+        } else {
+            assert_eq!(marker["storage_mode"], "processed", "{tag}: {marker}");
+        }
         let k = decoded(&out);
         assert_eq!(distinct_axes(&k), 1, "{tag}: the pixels decode to different axes");
         for (i, ((mz, it), (_, source))) in k.iter().zip(&spectra).enumerate() {

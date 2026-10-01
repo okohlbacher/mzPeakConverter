@@ -52,9 +52,16 @@ pub const INTEGER_TYPE_AS_PSI_MS: &str = "imzml:obsolete-integer-type-as-psi-ms"
 /// value is kept in `file_description`; the hash found is in `metadata.imaging.provenance`.
 pub const IBD_CHECKSUM_MISMATCH: &str = "imzml:ibd-checksum-mismatch";
 /// The `.ibd` does not begin with the UUID the header states (`IMS:1000080`): the two files are not
-/// the pair the imzML describes. The stated value is kept in `file_description`; the UUID found is
-/// in `metadata.imaging.provenance`.
+/// the pair the imzML describes, so the signal could be another run's. Such a pair is refused
+/// unless `--force` (owner decision D7, 2026-10-01); forced, the stated value is kept in
+/// `file_description` and the UUID found is in `metadata.imaging.provenance`.
 pub const IBD_UUID_MISMATCH: &str = "imzml:ibd-uuid-mismatch";
+/// A spectrum typed `MS1 spectrum` (`MS:1000579`) whose `ms level` is 0 — stated as 0, as the
+/// imzML writers from the ms-imaging.org example files on state it in their `spectrum1` group, or
+/// not stated at all, which mzdata reads alike — was written with `ms_level` 1 (owner decision D6,
+/// 2026-10-01): the type proves the level, and readers' MS1 filters and the summed TIC/BPC rule
+/// then apply to it.
+pub const MS_LEVEL_0_AS_1: &str = "imzml:ms-level-0-as-1";
 /// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes the
 /// `unitName` when it names a unit mzdata knows, whatever the attribute order).
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
@@ -1205,7 +1212,7 @@ pub struct IbdCheck {
 
 /// A UUID as 32 lower-case hex digits: braces, dashes and whitespace removed (`{554A27FA-79D2-…}`
 /// and `554a27fa79d2…` are the same identifier).
-fn uuid_hex(stated: &str) -> String {
+pub(crate) fn uuid_hex(stated: &str) -> String {
     stated.chars().filter(|c| !matches!(c, '{' | '}' | '-') && !c.is_whitespace()).flat_map(char::to_lowercase).collect()
 }
 
@@ -1297,6 +1304,153 @@ pub fn check_ibd(ibd: &Path, content: &[RawParam]) -> Result<IbdCheck> {
     .collect();
     let uuid = content.iter().find(|p| p.accession == "IMS:1000080").map(|p| p.value.clone()).filter(|v| !v.trim().is_empty()).map(|v| (v, hex(&head)));
     Ok(IbdCheck { sha1, stated, uuid })
+}
+
+/// The UUID an `.ibd` begins with (its first 16 bytes, 32 lower-case hex digits; fewer for a
+/// shorter file), for a lane that does not hash the whole file (the direct mzML export).
+pub fn ibd_uuid(ibd: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(ibd).with_context(|| format!("opening {}", ibd.display()))?;
+    let mut head = [0u8; 16];
+    let mut n = 0;
+    while n < 16 {
+        let read = file.read(&mut head[n..]).with_context(|| format!("reading {}", ibd.display()))?;
+        if read == 0 {
+            break;
+        }
+        n += read;
+    }
+    Ok(head[..n].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The UUID an `.ibd` begins with, for a message: `UUID <32 hex digits>`; for a file shorter than
+/// the 16 bytes a UUID takes (an empty or truncated `.ibd`, which begins with no UUID at all)
+/// `no UUID (the .ibd is N bytes long)` — [`ibd_uuid`] and [`check_ibd`] give the hex of what is there.
+pub fn found_uuid_text(found: &str) -> String {
+    if found.len() == 32 {
+        format!("UUID {found}")
+    } else {
+        format!("no UUID (the .ibd is {} bytes long)", found.len() / 2)
+    }
+}
+
+/// `(stated, found)` when the header states a UUID (`IMS:1000080`) the `.ibd` does not begin with,
+/// compared as [`IbdCheck::uuid_mismatch`] compares them; `None` when it states none or they agree.
+pub fn uuid_mismatch<'a>(content: &'a [RawParam], found: &'a str) -> Option<(&'a str, &'a str)> {
+    let stated = content.iter().find(|p| p.accession == "IMS:1000080").map(|p| p.value.as_str()).filter(|v| !v.trim().is_empty())?;
+    (uuid_hex(stated) != found).then_some((stated, found))
+}
+
+/// `metadata.imaging.storage_mode`: the binary mode the imzML header states — `continuous`
+/// (`IMS:1000030`: every pixel holds the same m/z array) or `processed` (`IMS:1000031`: each pixel
+/// its own); `None` when it states neither (mzdata refuses such a file).
+pub fn storage_mode(content: &[RawParam]) -> Option<&'static str> {
+    let states = |acc: &str| content.iter().any(|p| p.accession == acc);
+    if states("IMS:1000030") {
+        Some("continuous")
+    } else if states("IMS:1000031") {
+        Some("processed")
+    } else {
+        None
+    }
+}
+
+/// A spectrum typed `MS1 spectrum` (`MS:1000579`) whose `ms level` is 0 gets `ms_level` 1
+/// ([`MS_LEVEL_0_AS_1`]); `true` when it did. mzdata consumes the `ms level` param into
+/// `ms_level` and leaves a stated 0 and an unstated level alike at 0; the type param stays.
+pub fn ms_level_zero_as_one(d: &mut mzdata::spectrum::SpectrumDescription) -> bool {
+    if d.ms_level == 0 && d.get_param_by_curie(&mzdata::curie!(MS:1000579)).is_some() {
+        d.ms_level = 1;
+        return true;
+    }
+    false
+}
+
+/// Whether every spectrum of a continuous-mode imzML holds one and the same m/z array — the
+/// header's `IMS:1000030` claims it, and a reader that places pixels on one axis depends on it
+/// (HUPO-PSI/mzPeak-specification#23: the archive is written with the zero runs kept for exactly
+/// that, and `metadata.imaging.shared_mz_axis` says whether the claim held). Each array is compared
+/// bit for bit with the first; a spectrum without an m/z array counts as an empty one.
+#[derive(Default)]
+pub struct SharedAxis {
+    first: Option<Vec<u64>>,
+    spectra: usize,
+    differing: usize,
+}
+
+impl SharedAxis {
+    pub fn observe(&mut self, mzs: &[f64]) {
+        self.spectra += 1;
+        match &self.first {
+            None => self.first = Some(mzs.iter().map(|v| v.to_bits()).collect()),
+            Some(first) => {
+                if first.len() != mzs.len() || first.iter().zip(mzs).any(|(a, b)| *a != b.to_bits()) {
+                    self.differing += 1;
+                }
+            }
+        }
+    }
+
+    /// `metadata.imaging.shared_mz_axis`: no spectrum differs from the first.
+    pub fn shared(&self) -> bool {
+        self.differing == 0
+    }
+
+    pub fn spectra(&self) -> usize {
+        self.spectra
+    }
+
+    pub fn differing(&self) -> usize {
+        self.differing
+    }
+}
+
+/// The smallest and largest m/z the archive stores for a run (`metadata.imaging.mz_range`, owner
+/// decision D10): of each spectrum, the m/z of the points the writer keeps — every point of a
+/// centroid spectrum, and of a profile spectrum with the zero-run mask off; with the mask on, the
+/// points the mask keeps, by the writer's own rule ([`mzpeak_prototyping::filter::find_where_not_zeros`]:
+/// an all-zero stretch at either end goes entirely, so the stored range is narrower than the
+/// source's `lowest`/`highest observed m/z` on such a spectrum — 34,775 of the 34,840 bladder
+/// spectra). The range of the values handed to the writer; an m/z encoding with a bound
+/// (`fidelity.mz_error`) moves a stored value within that bound.
+#[derive(Debug)]
+pub struct StoredRange {
+    min: f64,
+    max: f64,
+}
+
+impl Default for StoredRange {
+    fn default() -> Self {
+        Self { min: f64::INFINITY, max: f64::NEG_INFINITY }
+    }
+}
+
+impl StoredRange {
+    /// `masked`: the writer's zero-run mask applies to this spectrum (a profile spectrum, the mask
+    /// on); `intensities` are then needed to tell which points it keeps (without them, every point
+    /// counts).
+    pub fn observe(&mut self, mzs: &[f64], intensities: Option<&[f64]>, masked: bool) {
+        let mut take = |v: f64| {
+            if v.is_finite() {
+                self.min = self.min.min(v);
+                self.max = self.max.max(v);
+            }
+        };
+        match intensities.filter(|i| masked && i.len() == mzs.len()) {
+            Some(intensities) => {
+                let array = arrow::array::Float64Array::from(intensities.to_vec());
+                let kept = mzpeak_prototyping::filter::find_where_not_zeros(&array).unwrap_or_default();
+                for i in kept {
+                    take(mzs[i as usize]);
+                }
+            }
+            None => mzs.iter().copied().for_each(take),
+        }
+    }
+
+    /// `[min, max]`, or `None` when no point was stored.
+    pub fn json(&self) -> Option<serde_json::Value> {
+        (self.min <= self.max).then(|| serde_json::json!([self.min, self.max]))
+    }
 }
 
 /// `file_description.contents` params for the imzML provenance mzdata consumed, with the values
@@ -2319,5 +2473,106 @@ mod tests {
             let f = pixel_size_fix(&settings(&[("IMS:1000046", x, UM), ("IMS:1000047", y, UM)])).unwrap();
             assert_eq!((f.case, f.transformation, f.write.len()), ("x and y not both positive", Some(DROPPED), 0), "{x} {y}");
         }
+    }
+
+    fn content(params: &[(&str, &str)]) -> Vec<RawParam> {
+        params.iter().map(|(a, v)| RawParam { accession: a.to_string(), value: v.to_string(), unit_accession: None, unit_name: None }).collect()
+    }
+
+    /// The storage mode as the header states it; a header stating both (nonsense) reads as
+    /// continuous, one stating neither as none.
+    #[test]
+    fn storage_mode_is_the_header_s_term() {
+        assert_eq!(storage_mode(&content(&[("IMS:1000030", ""), ("IMS:1000080", "x")])), Some("continuous"));
+        assert_eq!(storage_mode(&content(&[("IMS:1000031", "")])), Some("processed"));
+        assert_eq!(storage_mode(&content(&[("IMS:1000080", "x")])), None);
+    }
+
+    /// A spectrum typed MS1 at level 0 becomes level 1, once; a spectrum at level 0 without the
+    /// type, or typed MSn, or already at a level, is left alone.
+    #[test]
+    fn ms_level_zero_on_an_ms1_spectrum_becomes_one() {
+        let typed = |acc: Option<CURIE>, level: u8| {
+            let mut d = mzdata::spectrum::SpectrumDescription { ms_level: level, ..Default::default() };
+            if let Some(acc) = acc {
+                d.add_param(Param::builder().name("spectrum type").curie(acc).build());
+            }
+            d
+        };
+        let mut d = typed(Some(mzdata::curie!(MS:1000579)), 0);
+        assert!(ms_level_zero_as_one(&mut d) && d.ms_level == 1);
+        assert!(!ms_level_zero_as_one(&mut d) && d.ms_level == 1, "once");
+        assert!(d.get_param_by_curie(&mzdata::curie!(MS:1000579)).is_some(), "the type stays");
+        for (acc, level) in [(None, 0), (Some(mzdata::curie!(MS:1000580)), 0), (Some(mzdata::curie!(MS:1000579)), 2)] {
+            let mut d = typed(acc, level);
+            assert!(!ms_level_zero_as_one(&mut d) && d.ms_level == level, "{acc:?} {level}");
+        }
+    }
+
+    /// The shared axis holds while every array equals the first bit for bit; one that differs in
+    /// a value, in length, or is missing (empty) breaks it, and the count says how many did.
+    #[test]
+    fn the_shared_axis_is_every_array_against_the_first() {
+        let mut s = SharedAxis::default();
+        assert!(s.shared() && s.spectra() == 0);
+        s.observe(&[100.0, 100.5, 101.0]);
+        s.observe(&[100.0, 100.5, 101.0]);
+        assert!(s.shared() && s.spectra() == 2 && s.differing() == 0);
+        s.observe(&[100.0, 100.5, 101.0 + 1e-12]);
+        s.observe(&[100.0, 100.5]);
+        s.observe(&[]);
+        assert!(!s.shared() && (s.spectra(), s.differing()) == (5, 3));
+        // -0.0 and 0.0 are different bits: a continuous file's axis is the same bytes everywhere.
+        let mut z = SharedAxis::default();
+        z.observe(&[0.0]);
+        z.observe(&[-0.0]);
+        assert!(!z.shared());
+    }
+
+    /// The stored range follows the writer's mask: edge zero runs go entirely (the first kept m/z
+    /// is the boundary zero before the first signal), interior runs keep their boundary zeros;
+    /// with the mask off, or on a centroid spectrum, every point counts; an all-zero profile keeps
+    /// its two ends. Non-finite m/z are skipped; an empty run gives no range.
+    #[test]
+    fn the_stored_range_is_what_the_mask_keeps() {
+        let mz: Vec<f64> = (0..12).map(|i| 100.0 + i as f64).collect();
+        let intensity = [0.0, 0.0, 0.0, 5.0, 7.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0];
+        let json = |r: &StoredRange| r.json().map(|v| (v[0].as_f64().unwrap(), v[1].as_f64().unwrap()));
+        let mut masked = StoredRange::default();
+        masked.observe(&mz, Some(&intensity), true);
+        assert_eq!(json(&masked), Some((102.0, 109.0)), "{masked:?}");
+        let mut kept = StoredRange::default();
+        kept.observe(&mz, Some(&intensity), false);
+        assert_eq!(json(&kept), Some((100.0, 111.0)));
+        let mut centroid = StoredRange::default();
+        centroid.observe(&mz, None, true);
+        assert_eq!(json(&centroid), Some((100.0, 111.0)), "no intensities to mask by: every point");
+        let mut blank = StoredRange::default();
+        blank.observe(&mz[..4], Some(&[0.0; 4]), true);
+        assert_eq!(json(&blank), Some((100.0, 103.0)), "an all-zero profile keeps both ends");
+        let mut run = StoredRange::default();
+        run.observe(&[200.0, f64::NAN, 50.0], None, false);
+        run.observe(&mz, Some(&intensity), true);
+        assert_eq!(json(&run), Some((50.0, 200.0)));
+        assert_eq!(StoredRange::default().json(), None);
+    }
+
+    /// The UUID read from the first 16 bytes, compared with the header's spelling of it.
+    #[test]
+    fn the_ibd_uuid_is_read_and_compared_whatever_the_spelling() {
+        let dir = std::env::temp_dir().join(format!("mzpc-imaging-uuid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ibd = dir.join("a.ibd");
+        std::fs::write(&ibd, [0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81, 0x92, 0x03, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 1, 2, 3]).unwrap();
+        let found = ibd_uuid(&ibd).unwrap();
+        assert_eq!(found, "1a2b3c4d5e6f7081920 3b4c5d6e7f8a9".replace(' ', ""));
+        assert_eq!(uuid_mismatch(&content(&[("IMS:1000080", "{1A2B3C4D-5E6F-7081-9203-B4C5D6E7F8A9}")]), &found), None);
+        assert_eq!(uuid_mismatch(&content(&[("IMS:1000080", "1a2b3c4d5e6f70819203b4c5d6e7f8a9")]), &found), None);
+        assert_eq!(uuid_mismatch(&content(&[("IMS:1000080", "{2487DB05-6594-49DA-8B16-D4C1FA24CA57}")]), &found), Some(("{2487DB05-6594-49DA-8B16-D4C1FA24CA57}", found.as_str())));
+        assert_eq!(uuid_mismatch(&content(&[("IMS:1000080", " ")]), &found), None, "no UUID stated");
+        std::fs::write(&ibd, [0xab, 0xcd]).unwrap();
+        assert_eq!(ibd_uuid(&ibd).unwrap(), "abcd", "a file shorter than a UUID");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
