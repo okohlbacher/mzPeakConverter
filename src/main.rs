@@ -402,7 +402,8 @@ struct Cli {
     #[arg(long)]
     zstd_level: Option<i32>,
 
-    /// Overwrite the output if it already exists.
+    /// Overwrite the output if it already exists; also converts an imzML whose .ibd begins with
+    /// another UUID than the header states (refused otherwise: the two files may not be a pair).
     #[arg(short, long)]
     force: bool,
 
@@ -722,13 +723,15 @@ fn header_contacts(input: &Path, read_path: &Path, scan_lane: bool) -> Vec<mzml_
 /// The refusal of an imzML whose `.ibd` begins with another UUID than its header states
 /// (`IMS:1000080`): the two files are not the pair the imzML describes, and the signal could be
 /// another run's — the one case the imaging checks refuse rather than declare (owner decision D7).
-/// `--force` converts anyway, warned and recorded.
+/// `--force` converts anyway, warned and recorded. An `.ibd` shorter than a UUID (empty, truncated)
+/// begins with none: the message says so, with the file's length ([`imaging::found_uuid_text`]).
 fn ibd_uuid_mismatch_error(ibd: &Path, stated: &str, found: &str) -> anyhow::Error {
     anyhow!(
-        "{}: the .ibd begins with UUID {found}, the imzML states {stated}: they are not the pair the imzML describes, and \
+        "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the imzML describes, and \
          the signal could be another run's. Not converted. Pass --force to convert anyway: the mismatch is then warned \
          about, the stated UUID kept, and (in an archive) declared as {} with the UUID found in metadata.imaging.provenance",
         ibd.display(),
+        imaging::found_uuid_text(found),
         imaging::IBD_UUID_MISMATCH
     )
 }
@@ -2714,9 +2717,10 @@ fn convert_to_mzml(
                             return Err(ibd_uuid_mismatch_error(&ibd, stated, found));
                         }
                         log::warn!(
-                            "{}: the .ibd begins with UUID {found}, the imzML states {stated}: they are not the pair the imzML \
+                            "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the imzML \
                              describes; exported under --force, the stated value kept (mzML has no transformations list to declare it in)",
-                            ibd.display()
+                            ibd.display(),
+                            imaging::found_uuid_text(found)
                         );
                     }
                 }
@@ -5535,10 +5539,11 @@ fn convert_file(
                     // and forced it is warned about, declared and recorded (owner decision D7).
                     if let Some((stated, found)) = check.uuid_mismatch() {
                         log::warn!(
-                            "{}: the .ibd begins with UUID {found}, the imzML states {stated}: they are not the pair the \
+                            "{}: the .ibd begins with {}, the imzML states {stated}: they are not the pair the \
                              imzML describes; converted under --force, the stated value kept, declared as {} (the UUID found \
                              is in metadata.imaging.provenance.ibd_uuid_found)",
                             path.display(),
+                            imaging::found_uuid_text(found),
                             imaging::IBD_UUID_MISMATCH
                         );
                         imaging_applied.push(imaging::IBD_UUID_MISMATCH);
@@ -15341,7 +15346,8 @@ mod tests {
     /// is not the pair the imzML describes — the signal could be another run's — and is refused,
     /// before anything is written, with both UUIDs in the message; `--force` converts it anyway,
     /// warned, declared and recorded as rc.2 did. A checksum mismatch alone goes on converting
-    /// (a damaged copy of the right data). Both lanes: the archive and the direct mzML export.
+    /// (a damaged copy of the right data). Both lanes: the archive and the direct mzML export. An
+    /// `.ibd` shorter than a UUID is refused the same way, the message giving its length.
     #[test]
     fn imzml_ibd_uuid_mismatch_refuses_unless_forced() {
         let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
@@ -15381,6 +15387,18 @@ mod tests {
         assert!(ok, "{err}");
         let m = index_metadata(&out);
         assert_eq!((m["imaging"]["provenance"]["ibd_checksum"].as_str(), m["imaging"]["provenance"]["ibd_uuid"].as_str()), (Some("mismatch"), Some("verified")));
+        // An `.ibd` shorter than a UUID (empty, truncated) begins with no UUID: refused, the message
+        // giving the length instead of an empty UUID.
+        for (name, bytes) in [("empty", 0usize), ("short", 5)] {
+            let src = dir.join(format!("{name}.imzML"));
+            std::fs::write(&src, &base).unwrap();
+            std::fs::write(dir.join(format!("{name}.ibd")), vec![0u8; bytes]).unwrap();
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str()], &[]);
+            assert!(!ok, "{name}: refused: {err}");
+            assert!(err.contains(&format!("the .ibd begins with no UUID (the .ibd is {bytes} bytes long), the imzML states {STATED}")), "{name}: {err}");
+            assert!(!out.exists(), "{name}: nothing written");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

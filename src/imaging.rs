@@ -1322,6 +1322,17 @@ pub fn ibd_uuid(ibd: &Path) -> Result<String> {
     Ok(head[..n].iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// The UUID an `.ibd` begins with, for a message: `UUID <32 hex digits>`; for a file shorter than
+/// the 16 bytes a UUID takes (an empty or truncated `.ibd`, which begins with no UUID at all)
+/// `no UUID (the .ibd is N bytes long)` — [`ibd_uuid`] and [`check_ibd`] give the hex of what is there.
+pub fn found_uuid_text(found: &str) -> String {
+    if found.len() == 32 {
+        format!("UUID {found}")
+    } else {
+        format!("no UUID (the .ibd is {} bytes long)", found.len() / 2)
+    }
+}
+
 /// `(stated, found)` when the header states a UUID (`IMS:1000080`) the `.ibd` does not begin with,
 /// compared as [`IbdCheck::uuid_mismatch`] compares them; `None` when it states none or they agree.
 pub fn uuid_mismatch<'a>(content: &'a [RawParam], found: &'a str) -> Option<(&'a str, &'a str)> {

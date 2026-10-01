@@ -553,8 +553,10 @@ fn a_run_that_states_no_scan_time_gets_no_synthesized_chromatogram() {
 }
 
 /// The `.ibd` begins with its UUID, and the imzML states the same one: the pairing check the imzML
-/// specification gives. A mismatch was mzdata's log line only; it is recorded and declared, and the
-/// conversion goes on (as for a checksum mismatch).
+/// specification gives. A mismatch was mzdata's log line only; since 0.17.0 it is refused unless
+/// `--force` (owner decision D7; `imzml_ibd_uuid_mismatch_refuses_unless_forced` in the crate), and
+/// forced — this file's `convert` helper passes the flag — it is recorded and declared, the
+/// conversion going on (as a checksum mismatch alone always does).
 #[test]
 fn an_ibd_that_does_not_begin_with_the_stated_uuid_is_recorded_and_declared() {
     let dir = scratch("uuid");

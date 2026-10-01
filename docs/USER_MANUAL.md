@@ -135,7 +135,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
 | `--zstd-level <ZSTD_LEVEL>` | `3` (timsTOF ims-compact lanes: `22`) | Zstd compression level (1–22). The ims-compact lanes default to 22: their archives are written once and read many times, and 22 is 1.4 % smaller than 5 on PXD059079's 2485.d. An explicit value applies to every lane (§9) |
-| `-f, --force` | off | Overwrite the output if it already exists |
+| `-f, --force` | off | Overwrite the output if it already exists; also converts an imzML whose `.ibd` begins with another UUID than the header states — refused otherwise, since the two files may not be the pair the imzML describes (§8, imaging; forced, the mismatch is warned about, declared as `imzml:ibd-uuid-mismatch` and recorded) |
 | `--no-ims-compact` | off | Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and write standard f64 m/z instead |
 | `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum (Shimadzu `.lcd` does). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written. Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) |
 | `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: 50-Th chunks (`--chunk-size` overrides the width) on the reference implementation's chunk grid — every chunk row keeps its real m/z bounds (page-prunable: m/z window queries read only the chunks they need) and its points as integer TOF bins and TIMS scan numbers under the frame's own vendor calibration models (§9). Passing the flag explicitly is inert and says so |
@@ -841,8 +841,9 @@ treated alike. The marker's **`mz_range`** is `[min, max]` of the **stored** m/z
 (owner decision D10): of each spectrum the m/z the writer keeps — every point of a centroid
 spectrum, of a profile spectrum with the zero runs kept, and with the mask on the points the mask
 keeps, by the writer's own rule (an all-zero stretch at either end goes entirely, so the stored
-range is narrower than the source's `lowest`/`highest observed m/z` on such a spectrum: 34,775 of
-the 34,840 bladder spectra; the bladder archive's `mz_range` is `[400.00003, 999.99868]`). It is
+range is narrower than the source array's on such a spectrum: on 34,839 of the 34,840 bladder
+spectra the mask moves the first or the last stored point inward from the array's ends; the bladder
+archive's `mz_range` is `[400.00003, 999.99868]`). It is
 the range of the values handed to the writer; an m/z encoding with a bound (`fidelity.mz_error`)
 moves a stored value within that bound. Written on the imzML and mzML-with-positions lanes. A **TIC
 image** needs no structure of its own: it is a join of `spectra_metadata.total_ion_current` (and
@@ -880,7 +881,8 @@ the spelling (braces, dashes, case). `provenance.ibd_uuid` is `verified`, `misma
 declares (owner decision D7, 2026-10-01): a wrong checksum is a damaged copy of the right data, a
 wrong UUID may be the wrong data — the two files are not the pair the imzML describes. The
 conversion stops before anything is written, on the archive lane and the direct mzML export alike,
-with a message naming both UUIDs; `--force` converts anyway, and then the stated value stays in
+with a message naming both UUIDs (an `.ibd` shorter than the 16 bytes a UUID takes begins with
+none, and the message gives its length instead); `--force` converts anyway, and then the stated value stays in
 `file_description`, a warning names both, `imzml:ibd-uuid-mismatch` is declared and
 `provenance.ibd_uuid_found` holds the 32 hex digits the `.ibd` begins with (0.17.0-rc.2 warned and
 recorded without refusing; through 0.17.0-rc.1 a mismatch was one line of mzdata's log and nothing
