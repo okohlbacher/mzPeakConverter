@@ -301,7 +301,22 @@ auto-discovered; none beside an existing archive). Both are
 strict: a missing or unreadable path fails the conversion. An image maps onto the pixel grid of
 an **imaging run** (§8: the lane wrote pixel positions and its `metadata.imaging` marker) and never
 makes a run imaging: on any other run an explicit `--image` fails the conversion and an
-auto-discovered sibling is skipped with a warning; `--sdrf` needs nothing. Which lanes embed them:
+auto-discovered sibling is skipped with a warning; `--sdrf` needs nothing.
+
+The affine is the imaging profile's, `[a, b, c, d, e, f]` from 0-based image pixel centres to
+1-based MS pixel centres (`x_ms = a·col + b·row + c`, `y_ms = d·col + e·row + f`), and its
+`registration_quality` is `assumed_full_extent`: nothing registered the image, the converter lays
+its extent on the extent of the Nx × Ny pixel grid. For a W × H image that is `a = Nx/W`,
+`c = 0.5 + 0.5·Nx/W`, `e = Ny/H`, `f = 0.5 + 0.5·Ny/H`, `b = d = 0`: the image's left edge
+(col −0.5) falls on the left edge of MS pixel 1 (x_ms 0.5), its right edge (col W − 0.5) on the
+right edge of MS pixel Nx (x_ms Nx + 0.5). (Through 0.16.0 the matrix mapped the corner pixel
+centres onto each other, `a = (Nx − 1)/(W − 1)`, `c = 1`, which is off by up to half an MS pixel at
+the edges; archives written before keep that matrix.) One kind of archive gets **no affine**: a
+Bruker MALDI run whose `bruker_maldi` block names a FlexImaging sequence (`.mis`). Its grid is the
+bounding box of the acquired regions, while the sequence's image is a photo of the whole target, so
+the full-extent matrix would misplace it (by up to 11 MS pixels on MassIVE MSV000088438). The image
+is embedded and listed in `images[]` without `affine`, with a warning; the registration from the
+sequence's teach points is planned. Which lanes embed them:
 
 | Lane | `--sdrf` / `--image` |
 |---|---|
