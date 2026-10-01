@@ -103,7 +103,9 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   removed the live defect from. Landed with the fixes, their Windows or box half still unconfirmed:
   SciEX precursors and that `OnceLock`, the MIDAC scaffold's deletion, the BAF lane's member
   digests, the M35 route label (`conversion_route`), and the box harness stamping the *effective*
-  recipe.
+  recipe. Since wave 2 (2026-10-01): the `--bruker-sdk` timsTOF lane's ion injection time and scan
+  window on every frame (type-checked and unit-tested on macOS with the SDK module built, never run
+  against `timsdata`).
 - **Measured 2026-09-11, corpus-wide (report in `~/Claude/mzPeak/data/open-issues-fixes-2026-09-10/`):**
   156 mzML round trips over 227,979 spectra carry the **total intensity exactly** — every m/z
   difference is inside the `numpress-linear` bound the archive declares, ids/order/MS level/

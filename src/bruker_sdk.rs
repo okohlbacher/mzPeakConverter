@@ -465,6 +465,12 @@ pub struct TdfSdkReader {
     /// Frames whose points [`Self::ims_grid_spectrum`] re-sorted into TOF order (the SDK hands them
     /// over mobility-major); the converter declares `sort-by-mz` from it.
     grid_resorted: std::sync::atomic::AtomicUsize,
+    /// Each frame's `Frames.AccumulationTime` (ms), in `frames` order, and the run's acquisition m/z
+    /// range: the ion injection time and scan window every frame's scan states, as on the native lane
+    /// and the `.d → mzML` lane (`bruker_native::state_frame_acquisition`). Through 0.16.0 this lane
+    /// stated neither, and an archive's export wrote `ion injection time 0` and no scan window.
+    accumulation_time: Vec<Option<f64>>,
+    scan_window: Option<mzdata::spectrum::ScanWindow>,
     /// Frames whose points the SDK handed over out of m/z order, re-sorted by [`Self::spectrum`].
     /// Shared with the converter, which counts it over the written frames only
     /// (`VendorHints::counters`) and declares `sort-by-mz` when it moved.
@@ -481,6 +487,8 @@ impl TdfSdkReader {
         })?;
         let conn = open_sqlite(&dir, "analysis.tdf")?;
         let (frames, has_cal) = read_frames(&conn, true)?;
+        let accumulation_time = crate::bruker_native::read_accumulation_times(&conn, frames.len());
+        let scan_window = crate::bruker_native::read_acquisition_scan_window(&conn);
         let tdf = dir.join("analysis.tdf");
         let windows = crate::bruker_native::read_frame_windows(&tdf).unwrap_or_else(|e| {
             log::warn!("TDF MS2 isolation windows unavailable ({e}); precursors will be absent");
@@ -503,7 +511,20 @@ impl TdfSdkReader {
         let tims_grid = crate::tims_mobility::TimsMobilityCalibration::from_tdf_path(&tdf)
             .unwrap_or(None)
             .and_then(|c| mzpeak_prototyping::grid::GridEncoding::from_parameters(mzpeak_prototyping::grid::TimsTofTimsLinearGrid2::ACCESSION, &c.grid_parameters()));
-        Ok(Self { api, handle, frames, windows, dir, mz_rows, tims_grid, resorted: Default::default(), grid_resorted: Default::default(), _not_thread_safe: PhantomData })
+        Ok(Self {
+            api,
+            handle,
+            frames,
+            windows,
+            dir,
+            mz_rows,
+            tims_grid,
+            accumulation_time,
+            scan_window,
+            resorted: Default::default(),
+            grid_resorted: Default::default(),
+            _not_thread_safe: PhantomData,
+        })
     }
 
     /// What the grid rows' m/z amount to against the vendor's model.
@@ -582,6 +603,17 @@ impl TdfSdkReader {
         let bytes = serde_json::to_vec_pretty(&doc)?;
         std::fs::write(out, bytes).with_context(|| format!("writing {}", out.display()))?;
         Ok(points.len())
+    }
+
+    /// Frame `i`'s accumulation time and the run's acquisition m/z range on its scan (see the fields).
+    fn state_frame_acquisition(&self, descr: &mut SpectrumDescription, i: usize) {
+        if let Some(scan) = descr.acquisition.first_scan_mut() {
+            crate::bruker_native::state_frame_acquisition(
+                scan,
+                self.accumulation_time.get(i).copied().flatten(),
+                self.scan_window.as_ref(),
+            );
+        }
     }
 
     /// Attach this frame's MS2 precursors, using the VENDOR's own scan→1/K0 conversion
@@ -691,6 +723,7 @@ impl TdfSdkReader {
 
         let arrays = mz_intensity_arrays(&mz, &intensity, Some(&mob))?;
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
+        self.state_frame_acquisition(&mut descr, i);
         self.attach_precursors(&mut descr, frame);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
@@ -766,6 +799,7 @@ impl TdfSdkReader {
         )?;
 
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
+        self.state_frame_acquisition(&mut descr, i);
         if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
             crate::bruker_native::add_frame_calibration_params(&mut descr, t1, t2, id);
         }
