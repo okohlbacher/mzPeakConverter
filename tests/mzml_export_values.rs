@@ -15,7 +15,9 @@
 //!   * a spectrum without a precursor got `<precursorList count="0">`, and a chromatogram's precursor
 //!     and product the lists the schema has for spectra only;
 //!   * the base-peak chromatogram summed for a source that has none was `BIC` over every spectrum on
-//!     the direct route and `BPC` over the MS1 spectra in the archive.
+//!     the direct route and `BPC` over the MS1 spectra in the archive;
+//!   * every `<offset>` of the index pointed at the line break before its element, and the
+//!     `<fileChecksum>` was not the SHA-1 of the file.
 //!
 //! The fixtures stand in for the corpus units the corpus-gated tests run on.
 
@@ -104,7 +106,8 @@ fn chromatograms(mzml: &str) -> Vec<Chromatogram> {
 }
 
 /// What no part of an export may hold, whatever its source: the marks of [`mzml_unstated`], the
-/// lists the schema does not have, an empty array written as a compressed nothing.
+/// lists the schema does not have, an empty array written as a compressed nothing; and what its
+/// last lines must: an index of the elements' own positions and the file's checksum.
 fn assert_well_formed(route: &str, mzml: &str, log: &str) {
     for gone in [
         "value=\"NaN\"",
@@ -122,14 +125,23 @@ fn assert_well_formed(route: &str, mzml: &str, log: &str) {
         assert!(!chromatogram.contains("<precursorList") && !chromatogram.contains("<productList"), "{route}: {}", &chromatogram[..200]);
     }
     assert_eq!(count(log, "Could not determine scan polarity"), 0, "{route}: a warning per spectrum\n{log}");
-    // The index still points at its elements.
+    // The index points at its elements, and the checksum is the file's.
+    let mut indexed = 0;
     for (at, open) in mzml.match_indices("<offset idRef=\"") {
         let rest = &mzml[at + open.len()..];
         let (id, rest) = rest.split_once("\">").unwrap();
         let offset: usize = rest[..rest.find('<').unwrap()].parse().unwrap();
-        let element = mzml[offset..].trim_start();
-        assert!(element.starts_with("<spectrum ") || element.starts_with("<chromatogram "), "{route}: {id} at {offset}");
+        let element = &mzml[offset..];
+        assert!(element.starts_with("<spectrum ") || element.starts_with("<chromatogram "), "{route}: {id} at {offset}: {:?}", &element[..20]);
+        assert!(element[..element.find('>').unwrap()].contains(&format!("id=\"{id}\"")), "{route}: {id} at {offset}");
+        indexed += 1;
     }
+    assert_eq!(indexed, count(mzml, "<spectrum ") + count(mzml, "<chromatogram "), "{route}: an offset per element");
+    let list: usize = mzml.split_once("<indexListOffset>").unwrap().1.split_once('<').unwrap().0.parse().unwrap();
+    assert!(mzml[list..].starts_with("<indexList "), "{route}: {:?}", &mzml[list..list + 20]);
+    let checked = mzml.find("<fileChecksum>").unwrap() + "<fileChecksum>".len();
+    let sha1: String = <sha1::Sha1 as sha1::Digest>::digest(&mzml.as_bytes()[..checked]).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(&mzml[checked..checked + 40], sha1, "{route}: the SHA-1 of the file up to and including <fileChecksum>");
 }
 
 /// ProteoWizard's SCIEX file states no `ion injection time` and no `peak intensity`, and a
@@ -337,6 +349,26 @@ fn the_summed_base_peak_chromatogram_is_the_same_on_both_routes() {
     for (d, a) in summed[0].1.iter().zip(&summed[1].1) {
         assert!((d - a).abs() <= d.abs() * 1e-6, "intensity: direct {d} vs archive {a}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The index and the checksum are those of the document, compressed or not: a `.mzML.gz` holds the
+/// same bytes as the `.mzML`, offsets counted in the uncompressed text. mzdata's writer records each
+/// offset at the line break before the element and takes the checksum before its last bytes are out.
+#[test]
+fn a_gzipped_export_has_the_same_index_and_checksum() {
+    let dir = scratch("gz-index");
+    let (plain, gz) = (dir.join("out.mzML"), dir.join("out.mzML.gz"));
+    let log = convert(Path::new(TINY), &plain, &[], &[]);
+    convert(Path::new(TINY), &gz, &[], &[]);
+    let text = std::fs::read_to_string(&plain).unwrap();
+    assert_eq!(count(&text, "<offset idRef="), 4 + 3, "four spectra; tic, sic and BPC");
+    assert_well_formed("direct", &text, &log);
+    // The two differ in the command line the export records, and so in the checksum.
+    let unzipped = gunzip(&gz);
+    assert_well_formed("direct .gz", &unzipped, &log);
+    let index = |doc: &str| doc[doc.find("<indexList ").unwrap()..doc.find("<fileChecksum>").unwrap()].to_string();
+    assert_eq!(index(&text).lines().count(), index(&unzipped).lines().count());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

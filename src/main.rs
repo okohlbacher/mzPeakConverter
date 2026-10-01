@@ -80,6 +80,7 @@ mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
 mod mzml_header;
+mod mzml_index;
 mod mzml_isolation;
 mod mzml_refs;
 mod mzml_unstated;
@@ -625,7 +626,7 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// name ends in `.gz`. The XML is compressed AS it is written — one pass, no re-read. Both the mzML
 /// writer and the encoder finish on drop (the writer closes the document, the encoder writes the
 /// gzip trailer), which is why the four export sites can let `w` fall out of scope as before. Above
-/// both sit four sinks that change what mzdata's writer states wrongly:
+/// both sit five sinks that change what mzdata's writer states wrongly:
 /// [`mzml_isolation::TargetOnlyWindows`] leaves an isolation window of unknown width target-only (the
 /// writer prints offsets of ±target), [`mzml_unstated::UnstatedTerms`] removes what the lanes marked
 /// as stated by nobody (a polarity, an injection time, a selected-ion intensity or a collision
@@ -634,6 +635,8 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// [`mzml_header::HeaderFixes`] writes the
 /// header's `<scanSettingsList>` as the schema has it and declares `cv` — a vocabulary the document
 /// uses beside MS and UO, the only two the writer lists — moving the index's offsets by what that adds.
+/// Last, on the bytes as they are stored, [`mzml_index::IndexFixes`] points each offset of the index
+/// at its element and writes the checksum of what the file holds.
 fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let sink: Box<dyn Write> = if has_gz_suffix(output) {
@@ -642,7 +645,7 @@ fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>) -> Result<Box<dyn Write
     } else {
         Box::new(file)
     };
-    let sink = mzml_header::HeaderFixes::new(sink, cv);
+    let sink = mzml_header::HeaderFixes::new(mzml_index::IndexFixes::new(sink), cv);
     let sink = mzml_unstated::UnstatedTerms::new(mzml_wavelength::WavelengthSpectra::new(sink));
     Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(sink)))
 }

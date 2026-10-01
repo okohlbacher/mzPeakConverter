@@ -269,7 +269,11 @@ m/z and an intensity array of length 0 and no observed m/z range; every array of
 chromatogram's included, has an empty `<binary>` (`encodedLength="0"`, as ProteoWizard writes it),
 not the zlib stream of nothing that OpenMS 3.5 fails on in an integer array. No spectrum has an
 empty `<precursorList>`, no precursor an empty `<selectedIonList>`, and a chromatogram holds its
-`<precursor>` and `<product>` directly, as the mzML 1.1.0 schema has them.
+`<precursor>` and `<product>` directly, as the mzML 1.1.0 schema has them. Each `<offset>` of the
+index is the byte position of its `<spectrum>` or `<chromatogram>` start tag, `<indexListOffset>`
+that of `<indexList>`, and `<fileChecksum>` the SHA-1 of the file up to and including the
+`<fileChecksum>` start tag (of the uncompressed document for a `.mzML.gz`); through 0.17.0-rc.1
+the offsets pointed at the line break before each element and the checksum matched no export.
 
 The header. An export carries the source's **scan settings** as a `scanSettingsList` (an imaging
 run's grid and pixel size, an inclusion list's targets), from an mzML/imzML as read and from an
