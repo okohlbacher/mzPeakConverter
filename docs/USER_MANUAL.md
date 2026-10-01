@@ -548,8 +548,12 @@ declared `imaging:pixel-count-from-positions` when the input states none, raised
 `imaging:pixel-count-raised-to-positions` when a stated count does not bound them); and the
 `metadata.imaging` index block — `is_imaging`, `coordinate_base: 1`, `pixel_count`,
 `pixel_count_source` (`declared`, or `observed_max` when the counts are the largest positions: always
-on the Bruker and Waters lanes), `pixel_size_um` (when both axes have one in µm) and a `provenance` record of what was detected and
-where each value came from. A position stated as a scan cvParam (imzML, mzML) is written only as a
+on the Bruker and Waters lanes), `pixel_size_um` (when both axes have one in µm; a lone `IMS:1000046` the source
+states gives both, as the vocabulary defines it) and a `provenance` record of what was detected and
+where each value came from: `pixel_size` (`as stated`, `none stated`, or `checked, see
+imaging_pixel_size`), and on the imzML and mzML lanes `time` — `as stated`, or `not stated by the
+source; index is the source list order` when no spectrum states `MS:1000016` (every time is then
+stored as 0). A position stated as a scan cvParam (imzML, mzML) is written only as a
 pixel index: x and y both present, integers from 1 to 2³² − 1; any other is removed from its scan,
 all axes together, and declared `imaging:invalid-position-dropped`. A stated z that is not such an
 integer is removed alone, the scan keeping x and y, and declared `imaging:invalid-position-z-dropped`.
@@ -559,7 +563,7 @@ z, for `IMS:1000052`); the `IMS` vocabulary is declared with the position column
 once a position was written. `--tof-grid` does not apply to an imaging run: it is converted on the standard
 lane with f64 m/z, with a warning. `--image` adds its `images[]` to that block. Positions count
 from 1. imzML input keeps its positions and scan settings as stated (imzML already counts from 1),
-with three checks since 0.16.0
+with these checks since 0.16.0
 (HUPO-PSI/mzPeak-specification#23):
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
 checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
@@ -568,9 +572,27 @@ is tested against its own axis's count and extent — the other axis's when its 
 converted to one length unit, each by the unit it is written in (its unit name's when mzdata knows the
 name, which then overrides the accession, else its unit accession), micrometre where that is no length
 unit: it is an area when `√value × count = extent` and written as its square root, in the unit the
-area is the square of, a length when `value × count = extent`, and otherwise dropped), each action
+area is the square of, a length when `value × count = extent`, and otherwise dropped — `one value,
+untestable` when the header lacks the count or the max dimension to test it against, which the row's
+detail names), each action
 declared and listed in the `imaging_pixel_size` index block together with any unit accession that
-disagrees with its unit name; and the obsolete "one way" is written as flyback. A **Bruker MALDI**
+disagrees with its unit name; and the obsolete "one way" is written as flyback. A single
+`IMS:1000046` the rule keeps is written under the vocabulary's names as both `IMS:1000046` ("pixel
+size (x)") and `IMS:1000047` ("pixel size y"), same value and unit: the vocabulary defines
+`IMS:1000046` as the y size too when no `IMS:1000047` is stated, so this declares nothing; a single
+`IMS:1000047` stays alone. Where x and y are both stated and an axis states its count and max
+dimension, `value × count` is compared with the max dimension: a disagreement is warned about and
+listed in the row's `extent_mismatches`, the values written as stated. The **`.ibd` is hashed** in
+one pass with the algorithm of each checksum the header states (`IMS:1000090` MD5, `IMS:1000091`
+SHA-1, `IMS:1000092` SHA-256): `metadata.imaging.provenance.ibd_checksum` is `verified`, `mismatch`
+or `not stated`. On a mismatch the conversion goes on — the stated value stays in `file_description`,
+one warning names both hashes, `imzml:ibd-checksum-mismatch` is declared and
+`provenance.ibd_checksum_found` holds the hash found (`accession`, `value`). The `.ibd` is listed in
+`source_files` with the SHA-1 it hashes to. A binary array typed with the imaging vocabulary's
+obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") is read as
+`MS:1000519` / `MS:1000522`, the terms that replaced them, declared
+`imzml:obsolete-integer-type-as-psi-ms` (the mzML export does the same, with a warning); an intensity
+array of a type nothing maps is an error naming the array. A **Bruker MALDI**
 `.d` (TSF or TDF, every timsTOF lane) carries the same position columns from
 `MaldiFrameInfo.XIndexPos/YIndexPos` per frame. Those are absolute raster indices on the target, so
 they are **shifted so the smallest is 1** — one shift for the whole run,
@@ -852,6 +874,8 @@ The vocabulary:
 | `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
 | `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata takes the unit name when it names a unit mzdata knows, whatever the attribute order) | imzML |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
+| `imzml:obsolete-integer-type-as-psi-ms` | a binary array's data type was declared with the imaging vocabulary's obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") and was read as `MS:1000519` / `MS:1000522`, the PSI-MS terms that replaced them; the values are the ones the `.ibd` holds | imzML |
+| `imzml:ibd-checksum-mismatch` | the `.ibd` does not hash to a checksum the header states (`IMS:1000090/91/92`). The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_checksum_found` holds the hash found, and the `.ibd`'s `source_files` entry its SHA-1 (§8, imaging) | imzML |
 | `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
 | `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid, or far outside the raster at one position (a scan taken with the stage parked off it), and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
