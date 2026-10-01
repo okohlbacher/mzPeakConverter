@@ -455,9 +455,38 @@ const EMPTY_LIST_END: &[u8] = b"</chromatogramList>";
 /// Everything the writer states about a spectrum or a chromatogram comes before its arrays.
 const HEAD_END: &[u8] = b"<binaryDataArrayList";
 
+/// The spectrum-type terms: the children of MS:1000559 `spectrum type` in PSI-MS 4.1.155, the two
+/// obsolete ones (`product ion spectrum`, `PDA spectrum`) included, since a source may still state
+/// them. An export states a spectrum's type once: the first copy of a term stays, a repeat of the
+/// same term at spectrum level is blanked. mzdata's writer prints the model's term and then every
+/// param, filtering out only `MS1 spectrum` and `MSn spectrum` on a spectrum whose ms level is above
+/// 0, so every other type — and MS1 on a spectrum of ms level 0 — came out twice (module docs).
+const SPECTRUM_TYPES: [&str; 19] = [
+    "MS:1000294",
+    "MS:1000322",
+    "MS:1000325",
+    "MS:1000326",
+    "MS:1000328",
+    "MS:1000341",
+    "MS:1000343",
+    "MS:1000579",
+    "MS:1000580",
+    "MS:1000581",
+    "MS:1000582",
+    "MS:1000583",
+    "MS:1000620",
+    "MS:1000789",
+    "MS:1000790",
+    "MS:1000804",
+    "MS:1000805",
+    "MS:1000806",
+    "MS:1000928",
+];
+
 /// A byte sink for `MzMLWriter` that blanks what [`mark_spectrum`] and [`mark_precursors`] marked,
-/// an empty `<precursorList>` or `<selectedIonList>`, the lists around a chromatogram's precursor
-/// and product, and a `<chromatogramList>` without a chromatogram.
+/// a repeated spectrum-type term, an empty `<precursorList>` or `<selectedIonList>`, the lists
+/// around a chromatogram's precursor and product, and a `<chromatogramList>` without a
+/// chromatogram.
 pub struct UnstatedTerms<W: Write> {
     inner: W,
     /// Bytes not passed on yet: a `<spectrum>` or `<chromatogram>` element whose head is still
@@ -465,12 +494,24 @@ pub struct UnstatedTerms<W: Write> {
     held: Vec<u8>,
     spectra: usize,
     no_polarity: usize,
+    /// Spectrum-type terms blanked as repeats.
+    repeated_types: usize,
 }
 
 impl<W: Write> UnstatedTerms<W> {
     pub fn new(inner: W) -> Self {
-        Self { inner, held: Vec::new(), spectra: 0, no_polarity: 0 }
+        Self { inner, held: Vec::new(), spectra: 0, no_polarity: 0, repeated_types: 0 }
     }
+}
+
+/// What [`unstated`] found in one element's head.
+#[derive(Debug, Default)]
+struct Blanks {
+    spans: Vec<Range<usize>>,
+    /// A spectrum without a polarity.
+    no_polarity: bool,
+    /// Spectrum-type terms repeated at spectrum level.
+    repeated_types: usize,
 }
 
 impl<W: Write> Write for UnstatedTerms<W> {
@@ -498,12 +539,13 @@ impl<W: Write> Write for UnstatedTerms<W> {
                 break;
             };
             if let Ok(head) = std::str::from_utf8(&self.held[open..head_end]) {
-                let (spans, no_polarity) = unstated(head, chromatogram);
-                for span in spans {
+                let blanks = unstated(head, chromatogram);
+                for span in blanks.spans {
                     self.held[open + span.start..open + span.end].fill(b' ');
                 }
                 self.spectra += usize::from(!chromatogram);
-                self.no_polarity += usize::from(no_polarity);
+                self.no_polarity += usize::from(blanks.no_polarity);
+                self.repeated_types += blanks.repeated_types;
             }
             done = head_end;
         }
@@ -533,6 +575,9 @@ impl<W: Write> Drop for UnstatedTerms<W> {
                 self.no_polarity,
                 self.spectra
             );
+        }
+        if self.repeated_types > 0 {
+            log::info!("{} repeated spectrum-type terms are written once (mzdata's writer states a spectrum's type beside the param)", self.repeated_types);
         }
     }
 }
@@ -567,21 +612,32 @@ fn elements<'a>(head: &'a str, open: &'a str) -> impl Iterator<Item = Range<usiz
 /// * each `scan start time`, `ion injection time`, `peak intensity` and `collision energy` whose
 ///   value is NaN;
 /// * the polarity marker and, with it, the spectrum's `positive scan`;
+/// * a repeat of a spectrum-type term ([`SPECTRUM_TYPES`]) at spectrum level: the first copy stays;
 /// * a `<precursorList count="0">` and a `<selectedIonList count="0">` up to their end tags (the
 ///   schema wants a member in each; a precursor may go without its selected ions);
 /// * in a chromatogram, the start and end tags of the lists around its precursor and product,
 ///   whatever they count.
-fn unstated(head: &str, chromatogram: bool) -> (Vec<Range<usize>>, bool) {
-    let mut spans = Vec::new();
+fn unstated(head: &str, chromatogram: bool) -> Blanks {
+    let mut blanks = Blanks::default();
+    let spans = &mut blanks.spans;
     let scan_list = head.find("<scanList").unwrap_or(head.len());
     let marker = elements(head, "<userParam ")
         .find(|span| span.start < scan_list && attribute(&head[span.clone()], "name") == Some(POLARITY_NOT_STATED));
+    let mut types: Vec<&str> = Vec::new();
     for span in elements(head, "<cvParam ") {
         let param = &head[span.clone()];
         let Some(accession) = attribute(param, "accession") else { continue };
         let nan = attribute(param, "value") == Some("NaN") && TERMS[..WRITTEN].iter().any(|(a, _, _)| *a == accession);
         let polarity = marker.is_some() && accession == "MS:1000130" && span.start < scan_list;
-        if nan || polarity {
+        let repeated = !chromatogram && span.start < scan_list && SPECTRUM_TYPES.contains(&accession) && {
+            let seen = types.contains(&accession);
+            if !seen {
+                types.push(accession);
+            }
+            seen
+        };
+        blanks.repeated_types += usize::from(repeated);
+        if nan || polarity || repeated {
             spans.push(span);
         }
     }
@@ -598,9 +654,9 @@ fn unstated(head: &str, chromatogram: bool) -> (Vec<Range<usize>>, bool) {
             spans.extend(head.match_indices(tag).filter_map(|(at, _)| Some(at..at + head[at..].find('>')? + 1)));
         }
     }
-    let no_polarity = marker.is_some();
+    blanks.no_polarity = marker.is_some();
     spans.extend(marker);
-    (spans, no_polarity)
+    blanks
 }
 
 #[cfg(test)]
@@ -785,7 +841,7 @@ mod tests {
         let head = "<chromatogram id=\"x\" index=\"0\">\n<precursorList count=\"2\">\n<precursor><selectedIonList count=\"1\"><selectedIon/></selectedIonList></precursor>\n<precursor/>\n</precursorList>\n<productList count=\"12\"><product/></productList>\n";
         let blanked = |head: &str, chromatogram: bool| {
             let mut out = head.as_bytes().to_vec();
-            for span in unstated(head, chromatogram).0 {
+            for span in unstated(head, chromatogram).spans {
                 out[span].fill(b' ');
             }
             String::from_utf8(out).unwrap()

@@ -448,6 +448,49 @@ fn a_lossless_archive_exports_its_integer_intensities() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A spectrum's type term is written once per spectrum on both routes. mzdata's writer states the
+/// model's term and then the source's param, filtering out only `MS1 spectrum` / `MSn spectrum` on a
+/// spectrum of ms level 1 or more: through 0.17.0-rc.2 an SRM spectrum came out as `SRM spectrum`
+/// twice from its mzML and three times from its archive (ProteoWizard's Enolase `srmSpectra`: 202
+/// and 303 for 101 spectra), and every pixel of an imzML that states `ms level` 0 as `MS1 spectrum`
+/// twice (`Example_Continuous`).
+#[test]
+fn a_spectrum_type_term_is_written_once_on_both_routes() {
+    let dir = scratch("spectrum-type");
+    let tiny = std::fs::read_to_string(TINY).unwrap();
+    let msn = r#"accession="MS:1000580" name="MSn spectrum""#;
+    let group = r#"<referenceableParamGroup id="CommonMS2SpectrumParams">"#;
+    let (head, tail) = tiny.split_once(group).expect("the fixture changed");
+    assert_eq!(count(tail, msn), 1, "the fixture changed");
+    let srm = dir.join("srm.mzML");
+    std::fs::write(&srm, format!("{head}{group}{}", tail.replacen(msn, r#"accession="MS:1000583" name="SRM spectrum""#, 1))).unwrap();
+    for (route, mzml, log) in both_routes(&srm, &dir, &[]) {
+        let spectra = elements(&mzml, "spectrum");
+        let srm: Vec<usize> = spectra.iter().map(|s| count(s, "MS:1000583")).collect();
+        assert_eq!(srm, [0, 1, 0, 0], "{route}: SRM spectrum once, on the spectrum that states it");
+        let ms1: Vec<usize> = spectra.iter().map(|s| count(s, "MS:1000579")).collect();
+        assert_eq!(ms1, [1, 0, 1, 1], "{route}: MS1 spectrum once on each MS1 spectrum");
+        assert_eq!(spectra.iter().map(|s| count(s, "MS:1000580")).sum::<usize>(), 0, "{route}: the MS2 spectrum is an SRM spectrum, not an MSn one");
+        assert_well_formed(route, &mzml, &log);
+    }
+    // Nine pixels that state `ms level` 0 and `MS1 spectrum` through their param group.
+    let imaging = std::fs::read_to_string(IMAGING).unwrap();
+    let level = r#"name="ms level" value="1""#;
+    assert_eq!(count(&imaging, level), 1, "the fixture changed");
+    let zero = dir.join("level0.imzML");
+    std::fs::write(&zero, imaging.replacen(level, r#"name="ms level" value="0""#, 1)).unwrap();
+    std::fs::copy(Path::new(IMAGING).with_extension("ibd"), dir.join("level0.ibd")).unwrap();
+    for (route, mzml, log) in both_routes(&zero, &dir, &[]) {
+        let spectra = elements(&mzml, "spectrum");
+        assert_eq!(spectra.len(), 9, "{route}");
+        let ms1: Vec<usize> = spectra.iter().map(|s| count(s, "MS:1000579")).collect();
+        assert_eq!(ms1, [1; 9], "{route}: MS1 spectrum once per pixel");
+        assert_eq!(zeros(&mzml, "MS:1000511"), 9, "{route}: ms level 0 stays");
+        assert_well_formed(route, &mzml, &log);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A scan that states no start time is exported without one. mzdata's model holds 0 for it and its
 /// writer prints that 0: through rc.1 the fixture's `scan=21`, which states no time, was exported
 /// with `scan start time` 0, and so was every pixel of an imaging run. The direct export reads which
