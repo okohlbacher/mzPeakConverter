@@ -478,12 +478,17 @@ impl MaldiInfo {
             }
         }
         if let Some(img) = self.sequence_image.as_ref().filter(|i| i.path.is_none()) {
-            log::warn!(
-                "Bruker MALDI: {} names the image {}, which is not beside it: no image is embedded ({})",
-                mis.file,
-                img.file,
-                if self.registration.is_some() { "the registration is recorded; add the image later with --image" } else { "nor could it be registered" }
-            );
+            // The timsTOF lanes refuse --image (all but --no-ims-compact): the way in is the
+            // .mzpeak → .mzpeak lane, which places an image of the sequence's name by the record.
+            let then = if self.registration.is_some() {
+                format!(
+                    "the registration is recorded; add the image later on the .mzpeak → .mzpeak lane, which places an image of that name by it: mzpeak-convert <out>.mzpeak -o <with-image>.mzpeak --image {}",
+                    img.file
+                )
+            } else {
+                "nor could it be registered".to_string()
+            };
+            log::warn!("Bruker MALDI: {} names the image {}, which is not beside it: no image is embedded ({then})", mis.file, img.file);
         }
     }
 

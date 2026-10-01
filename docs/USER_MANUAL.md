@@ -144,7 +144,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
-| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`), imaging runs only:** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine (image extent on grid extent; on a Bruker MALDI run acquired from a FlexImaging sequence, whose own image every timsTOF lane embeds with its teach-point registration, the same registration for an image in that image's pixel frame and no affine for any other, §4.3). Repeatable. A bad/missing path, or a run with no pixel positions, ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable or the run is not imaging) (§4.3) |
+| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`), imaging runs only:** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine (image extent on grid extent; on a Bruker MALDI run acquired from a FlexImaging sequence, whose own image every timsTOF lane embeds with its teach-point registration, that registration only for the sequence's image itself — the `<ImageFile>` name, supplied later because it was not beside the `.mis` — and no affine for any other, §4.3). Repeatable. A bad/missing path, or a run with no pixel positions, ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable or the run is not imaging) (§4.3) |
 | `--sdrf <SDRF>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an SDRF (sample-metadata) TSV VERBATIM as `sample_metadata/sdrf.tsv` with `metadata.study` + `metadata.sample_metadata` back-refs. A missing/unreadable path ERRORS the conversion (§4.3) |
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
@@ -529,19 +529,22 @@ when the image is not beside the `.mis` (the registration is still recorded) or 
 cannot be registered (`not_registered` says why: fewer than three or collinear teach points, frames
 without motor positions, areas without an outline, no or several lattice placements). The photo is
 large next to the signal: 8.9 MB, 26 % of MSV000088438's TSF archive (34 MB, `analysis.tsf_bin`
-embedded) and 62 % of the native TDF one (14.2 MB; 5.5 MB without it); `--drop-aux 'images/*'` on
-the `.mzpeak` → `.mzpeak` lane removes it. A later `--image` on such an archive is placed by the
-same registration when it is in the sequence image's pixel frame — the same width and height, or,
-when that image was not embedded, the same file name — and otherwise embedded **without an affine**,
-with a warning naming both sizes; an image the archive already holds (same SHA-256) is not embedded
-twice. Which lanes embed them:
+embedded) and 62 % of the native TDF one (14.2 MB; 5.4 MB without it); `--drop-aux 'images/*'` on
+the `.mzpeak` → `.mzpeak` lane removes it. A later `--image` on such an archive gets the same
+registration only when it is the sequence's image itself: the file the `.mis` names
+(`<ImageFile>`), supplied on the `.mzpeak` → `.mzpeak` lane because it was not beside the sequence.
+Every other image is embedded **without an affine**, with a warning — one of the same width and
+height included: the teach points were set on the sequence's image and no other, and a photo of
+another target proves nothing by its size (both MSV000088438 runs' photos are 8064 × 6048
+`IMG_0000.jpg` files), so exactly one image in the archive carries the registration. An image the
+archive already holds (same SHA-256) is not embedded twice. Which lanes embed them:
 
 | Lane | `--sdrf` / `--image` |
 |---|---|
 | mzML / imzML on the standard lane, **including the `--tof-grid` sub-path** (the same command used to keep or lose the SDRF depending on whether the grid fit passed — fixed in 0.9.13) | embedded (`--sdrf`; `--image` on an imaging run only, which skips the `--tof-grid` sub-path) |
 | Thermo `.raw`, Bruker TDF with `--no-ims-compact` (mzdata path) | embedded (`--sdrf`; `--image` on an imaging run only) |
 | `--via-msconvert` | embedded (since 0.9.13; it used to hard-code "none") |
-| `.mzpeak` → `.mzpeak` (§4.2) | injected into the existing archive (`--sdrf`; `--image` into an imaging archive only, placed on the grid of the source's `metadata.imaging` marker, which is carried and gains the image in `images[]` after any it lists; on a Bruker MALDI archive acquired from a FlexImaging sequence by the archive's teach-point registration, or without an affine, see above) |
+| `.mzpeak` → `.mzpeak` (§4.2) | injected into the existing archive (`--sdrf`; `--image` into an imaging archive only, placed on the grid of the source's `metadata.imaging` marker, which is carried and gains the image in `images[]` after any it lists; on a Bruker MALDI archive acquired from a FlexImaging sequence by the archive's teach-point registration when it is the sequence's own image, not yet embedded, else without an affine, see above) |
 | default timsTOF ims-compact, both `--bruker-sdk` lanes, `--agilent-grid`, native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | **refused** (exit 1) — convert first, then inject: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (`--image` only when the archive is imaging: a Bruker MALDI or Waters imaging run, see the row above). A FlexImaging sequence's own image is embedded on the timsTOF lanes regardless (above) |
 | `--to mzml`, `.mzpeak` → mzML | **refused** — mzML has no place for them |
 

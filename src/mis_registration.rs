@@ -60,15 +60,19 @@ pub fn compose(outer: &Affine, inner: &Affine) -> Affine {
     ]
 }
 
+/// A source point and the point it maps to: (image px, stage µm) for a teach point, (raster
+/// index, motor µm) for a frame.
+pub type Pair = ((f64, f64), (f64, f64));
+
 /// The least-squares affine taking each pair's first point to its second, and the largest
 /// residual (Euclidean). `None` with fewer than three pairs or collinear sources. Centred normal
 /// equations: image pixels run to 8000 and stage µm to 60000, so the uncentred sums lose digits.
-pub fn fit(pairs: &[((f64, f64), (f64, f64))]) -> Option<(Affine, f64)> {
+pub fn fit(pairs: &[Pair]) -> Option<(Affine, f64)> {
     let n = pairs.len();
     if n < 3 {
         return None;
     }
-    let mean = |f: &dyn Fn(&((f64, f64), (f64, f64))) -> f64| pairs.iter().map(f).sum::<f64>() / n as f64;
+    let mean = |f: &dyn Fn(&Pair) -> f64| pairs.iter().map(f).sum::<f64>() / n as f64;
     let (mx, my) = (mean(&|p| p.0 .0), mean(&|p| p.0 .1));
     let (mu, mv) = (mean(&|p| p.1 .0), mean(&|p| p.1 .1));
     let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
@@ -84,8 +88,8 @@ pub fn fit(pairs: &[((f64, f64), (f64, f64))]) -> Option<(Affine, f64)> {
         syv += dy * dv;
     }
     let det = sxx * syy - sxy * sxy;
-    if !(det > 1e-9 * sxx * syy) || !det.is_finite() {
-        return None; // collinear (or coincident) sources: no plane to fit
+    if !det.is_finite() || det <= 1e-9 * sxx * syy {
+        return None; // collinear (or coincident) sources, or NaN: no plane to fit
     }
     let a = (syy * sxu - sxy * syu) / det;
     let b = (sxx * syu - sxy * sxu) / det;
@@ -164,13 +168,12 @@ pub fn register(info: &MaldiInfo, mis: &Mis) -> Result<Registration, String> {
     let (image_to_stage, teach_residual_um) =
         fit(&mis.teach).ok_or_else(|| format!("the teach points of {} are collinear: no map from the image to the stage", mis.file))?;
     // Raster index → motor µm from every frame that states both.
-    let lattice: Vec<((f64, f64), (f64, f64))> =
-        info.spots.values().filter_map(|s| Some(((s.x as f64, s.y as f64), s.motor?))).collect();
+    let lattice: Vec<Pair> = info.spots.values().filter_map(|s| Some(((s.x as f64, s.y as f64), s.motor?))).collect();
     let (index_to_motor, lattice_residual_um) = fit(&lattice).ok_or_else(|| {
         format!("{} frames state a motor position; three on more than one line are needed to fit the raster lattice", lattice.len())
     })?;
     let step_um = (index_to_motor[0].hypot(index_to_motor[3])).min(index_to_motor[1].hypot(index_to_motor[4]));
-    if !(step_um > 0.0) || lattice_residual_um > 0.05 * step_um {
+    if step_um.is_nan() || step_um <= 0.0 || lattice_residual_um > 0.05 * step_um {
         return Err(format!(
             "the frames' XIndexPos/YIndexPos and MotorPositionX/Y do not fit one lattice (largest residual {lattice_residual_um:.1} µm at a {step_um:.1} µm step)"
         ));
@@ -195,10 +198,10 @@ pub fn register(info: &MaldiInfo, mis: &Mis) -> Result<Registration, String> {
     let outlines: Vec<Vec<(f64, f64)>> = mis.areas.iter().map(|a| a.points.iter().map(|&p| apply(&image_to_stage, p)).collect()).collect();
     let mut regions: BTreeMap<usize, Vec<(f64, f64)>> = BTreeMap::new();
     for s in info.spots.values() {
-        if let (Some(r), Some(m)) = (s.region.and_then(|r| usize::try_from(r).ok()), s.motor) {
-            if outlines.get(r).is_some_and(|o| o.len() >= 3) {
-                regions.entry(r).or_default().push(m);
-            }
+        if let (Some(r), Some(m)) = (s.region.and_then(|r| usize::try_from(r).ok()), s.motor)
+            && outlines.get(r).is_some_and(|o| o.len() >= 3)
+        {
+            regions.entry(r).or_default().push(m);
         }
     }
     let spots_checked: usize = regions.values().map(Vec::len).sum();
