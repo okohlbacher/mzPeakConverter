@@ -51,6 +51,10 @@ pub const INTEGER_TYPE_AS_PSI_MS: &str = "imzml:obsolete-integer-type-as-psi-ms"
 /// The `.ibd` does not hash to the checksum the header states (`IMS:1000090/91/92`). The stated
 /// value is kept in `file_description`; the hash found is in `metadata.imaging.provenance`.
 pub const IBD_CHECKSUM_MISMATCH: &str = "imzml:ibd-checksum-mismatch";
+/// The `.ibd` does not begin with the UUID the header states (`IMS:1000080`): the two files are not
+/// the pair the imzML describes. The stated value is kept in `file_description`; the UUID found is
+/// in `metadata.imaging.provenance`.
+pub const IBD_UUID_MISMATCH: &str = "imzml:ibd-uuid-mismatch";
 /// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes the
 /// `unitName` when it names a unit mzdata knows, whatever the attribute order).
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
@@ -155,6 +159,64 @@ pub fn file_mentions<const N: usize>(path: &Path, accessions: [&str; N]) -> std:
         let end = block.len();
         buf.copy_within(end - carried..end, 0);
     }
+}
+
+/// How many of the first `limit` spectra of an mzML or imzML state a scan start time
+/// (`MS:1000016`), on the spectrum or through a param group it references: `(stating, spectra)`.
+/// mzdata gives a scan without the term the time 0, so a stated 0 and no time at all read alike;
+/// the marker's `provenance.time` said "as stated" of a run where one spectrum of nine states one.
+/// One pass over the text (an imzML's is its header and scans); no array is decoded.
+pub fn spectra_stating_time(path: &Path, limit: usize) -> Result<(usize, usize)> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    spectra_stating_time_from(std::io::BufReader::new(file), limit)
+}
+
+pub fn spectra_stating_time_from(input: impl BufRead, limit: usize) -> Result<(usize, usize)> {
+    const TIME: &str = "MS:1000016";
+    let mut reader = quick_xml::Reader::from_reader(input);
+    let mut buf = Vec::new();
+    // The param groups that hold the term, the group being read, and whether the spectrum being
+    // read has stated it.
+    let mut timed_groups: std::collections::HashSet<String> = Default::default();
+    let mut group: Option<String> = None;
+    let mut spectrum: Option<bool> = None;
+    let (mut stating, mut spectra) = (0, 0);
+    while spectra < limit {
+        let ev = reader.read_event_into(&mut buf).context("parsing the source's scan times")?;
+        match &ev {
+            Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
+                b"referenceableParamGroup" if matches!(ev, Event::Start(_)) => group = attr(e, b"id"),
+                b"spectrum" if matches!(ev, Event::Start(_)) => spectrum = Some(false),
+                b"spectrum" => spectra += 1,
+                b"cvParam" if attr(e, b"accession").as_deref() == Some(TIME) => {
+                    if let Some(stated) = spectrum.as_mut() {
+                        *stated = true;
+                    } else if let Some(id) = &group {
+                        timed_groups.insert(id.clone());
+                    }
+                }
+                b"referenceableParamGroupRef" => {
+                    if let (Some(stated), Some(id)) = (spectrum.as_mut(), attr(e, b"ref")) {
+                        *stated |= timed_groups.contains(&id);
+                    }
+                }
+                _ => {}
+            },
+            Event::End(e) => match e.local_name().as_ref() {
+                b"referenceableParamGroup" => group = None,
+                b"spectrum" => {
+                    spectra += 1;
+                    stating += usize::from(spectrum.take() == Some(true));
+                }
+                b"spectrumList" => break,
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok((stating, spectra))
 }
 
 /// A position value the `UInt32` position columns can hold as a pixel index: integral, at least 1
@@ -584,19 +646,33 @@ pub enum LoneX {
 /// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
 /// marker, the coordinate base, the grid as the viewer reads it and where its counts came from
 /// (`pixel_count_source`: [`COUNTS_DECLARED`] or [`COUNTS_OBSERVED_MAX`]; review 2026-09-30 B18),
-/// and where it all came from. `pixel_size_um` needs both axes in µm; `lone_x` says whether an
-/// `IMS:1000046` without an `IMS:1000047` gives both (HUPO-PSI/mzPeak-specification#23: a reader
-/// that does not know the vocabulary's default saw no pixel size at all).
+/// and where it all came from. `pixel_size_um` needs both axes as a positive length — in
+/// micrometres, converted from nanometres, millimetres or centimetres where the entry states one of
+/// those (a size in mm used to give the marker none; the scan settings keep the unit as stated);
+/// `lone_x` says whether an `IMS:1000046` without an `IMS:1000047` gives both
+/// (HUPO-PSI/mzPeak-specification#23: a reader that does not know the vocabulary's default saw no
+/// pixel size at all).
 pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, lone_x: LoneX, provenance: serde_json::Value) -> serde_json::Value {
     let mut b = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "provenance": provenance});
     let param = |acc| grid?.params.iter().find(|p| p.curie() == Some(acc));
     let int = |acc| param(acc)?.value.to_i64().ok();
-    let um = |acc| param(acc).filter(|p| p.unit == Unit::Micrometer)?.value.to_f64().ok();
+    // In micrometres, from any length unit mzdata can state; a size that is not positive is no size.
+    let um = |acc| {
+        let p = param(acc)?;
+        let v = p.value.to_f64().ok()?;
+        let um = match p.unit {
+            Unit::Micrometer => v,
+            Unit::Nanometer => v / 1e3,
+            Unit::Millimeter => v * 1e3,
+            Unit::Centimeter => v * 1e4,
+            _ => return None,
+        };
+        (um.is_finite() && um > 0.0).then_some(um)
+    };
     if let (Some(x), Some(y)) = (int(mzdata::curie!(IMS:1000042)), int(mzdata::curie!(IMS:1000043))) {
         b["pixel_count"] = serde_json::json!({"x": x, "y": y});
         b["pixel_count_source"] = pixel_count_source.into();
     }
-    // ponytail: micrometre only; a pixel size in another length unit stays in the scan settings.
     let x = um(mzdata::curie!(IMS:1000046));
     let y = match param(mzdata::curie!(IMS:1000047)) {
         Some(_) => um(mzdata::curie!(IMS:1000047)),
@@ -606,6 +682,16 @@ pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, lone_
         b["pixel_size_um"] = serde_json::json!({"x": x, "y": y});
     }
     b
+}
+
+/// `provenance.time` of an imaging marker whose source states no `scan start time` on any spectrum:
+/// the archive stores time 0 for each (a null time is a question for the core spec).
+pub const TIME_NOT_STATED: &str = "not stated by the source; index is the source list order";
+
+/// Whether an archive's imaging marker (`metadata.imaging`) says its source stated no scan start
+/// time: every stored time is then the 0 the reader fills in, and an mzML export states none.
+pub fn states_no_time(marker: &serde_json::Value) -> bool {
+    marker["provenance"]["time"] == TIME_NOT_STATED
 }
 
 /// Whether a grid entry states a pixel size on either axis (`provenance.pixel_size`: "as stated"
@@ -832,6 +918,11 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
             let (Some(vx), Some(vy)) = (num(PIXEL_X), num(PIXEL_Y)) else {
                 return Some(fix("x and y not numeric", Some(DROPPED), vec![], format!("x={:?} y={:?}", px.value, py.value)));
             };
+            // A pixel has a size: zero or a negative number is none (a lone value was always held to
+            // this; x = 0, y = −100 µm were written as stated, into the marker too).
+            if vx <= 0.0 || vy <= 0.0 {
+                return Some(fix("x and y not both positive", Some(DROPPED), vec![], format!("x={vx} y={vy}")));
+            }
             let (ux, uy) = (written_unit(px), written_unit(py));
             // Each axis against its own count and max dimension, where the file states both
             // (HUPO-PSI/mzPeak-specification#23: 50 and 2500 over 150 × 100 µm were written as
@@ -1106,6 +1197,16 @@ pub struct IbdCheck {
     pub sha1: String,
     /// Per checksum the header states with a value: the term, the value as stated, the hash found.
     pub stated: Vec<(&'static str, String, String)>,
+    /// The UUID the header states (`IMS:1000080`, as stated) and the one the `.ibd` begins with
+    /// (its first 16 bytes, 32 lower-case hex digits; fewer for a shorter file). `None` when the
+    /// header states none.
+    pub uuid: Option<(String, String)>,
+}
+
+/// A UUID as 32 lower-case hex digits: braces, dashes and whitespace removed (`{554A27FA-79D2-…}`
+/// and `554a27fa79d2…` are the same identifier).
+fn uuid_hex(stated: &str) -> String {
+    stated.chars().filter(|c| !matches!(c, '{' | '}' | '-') && !c.is_whitespace()).flat_map(char::to_lowercase).collect()
 }
 
 impl IbdCheck {
@@ -1124,6 +1225,23 @@ impl IbdCheck {
         self.stated.iter().filter(|(_, stated, found)| !stated.trim().eq_ignore_ascii_case(found))
     }
 
+    /// `metadata.imaging.provenance.ibd_uuid`: whether the `.ibd` begins with the UUID the header
+    /// states. The imzML specification pairs the two files by it, and where the header states no
+    /// checksum it is the one pairing check there is.
+    pub fn uuid_status(&self) -> &'static str {
+        match &self.uuid {
+            None => "not stated",
+            Some(_) if self.uuid_mismatch().is_some() => "mismatch",
+            Some(_) => "verified",
+        }
+    }
+
+    /// `(stated, found)` when the header states a UUID the `.ibd` does not begin with.
+    pub fn uuid_mismatch(&self) -> Option<(&str, &str)> {
+        let (stated, found) = self.uuid.as_ref()?;
+        (uuid_hex(stated) != *found).then_some((stated.as_str(), found.as_str()))
+    }
+
     /// `metadata.imaging.provenance.ibd_checksum_found`: the hash found for each stated checksum
     /// the `.ibd` does not match. `None` without a mismatch.
     pub fn found_json(&self) -> Option<serde_json::Value> {
@@ -1134,7 +1252,10 @@ impl IbdCheck {
 
 /// Hash the `.ibd` in one streamed pass: SHA-1 always (its source-file digest), and the algorithm
 /// of each checksum the header's file content states — `IMS:1000090` MD5, `IMS:1000091` SHA-1,
-/// `IMS:1000092` SHA-256. Nothing hashed the `.ibd` through 0.16.0: the stated checksum was copied
+/// `IMS:1000092` SHA-256 — and compare its first 16 bytes with the UUID the header states
+/// (`IMS:1000080`; through 0.17.0-rc.1 only mzdata's log line said when they differ, and the archive
+/// could read `ibd_checksum: verified` over a `.ibd` that is not the imzML's).
+/// Nothing hashed the `.ibd` through 0.16.0: the stated checksum was copied
 /// into the archive whether or not the `.ibd` matched it (HUPO-PSI/mzPeak-specification#23; the
 /// public chilli set states a SHA-1 its `.ibd` does not have).
 pub fn check_ibd(ibd: &Path, content: &[RawParam]) -> Result<IbdCheck> {
@@ -1146,10 +1267,15 @@ pub fn check_ibd(ibd: &Path, content: &[RawParam]) -> Result<IbdCheck> {
     let mut sha256 = sha256_stated.is_some().then(sha2::Sha256::new);
     let mut file = std::fs::File::open(ibd).with_context(|| format!("opening {}", ibd.display()))?;
     let mut buf = vec![0u8; 1 << 20];
+    // The `.ibd` begins with its UUID, 16 bytes.
+    let mut head: Vec<u8> = Vec::with_capacity(16);
     loop {
         let n = file.read(&mut buf).with_context(|| format!("reading {}", ibd.display()))?;
         if n == 0 {
             break;
+        }
+        if head.len() < 16 {
+            head.extend_from_slice(&buf[..n.min(16 - head.len())]);
         }
         sha1.update(&buf[..n]);
         if let Some(h) = md5.as_mut() {
@@ -1169,7 +1295,8 @@ pub fn check_ibd(ibd: &Path, content: &[RawParam]) -> Result<IbdCheck> {
     .into_iter()
     .filter_map(|(acc, stated, found)| Some((acc, stated?, found?)))
     .collect();
-    Ok(IbdCheck { sha1, stated })
+    let uuid = content.iter().find(|p| p.accession == "IMS:1000080").map(|p| p.value.clone()).filter(|v| !v.trim().is_empty()).map(|v| (v, hex(&head)));
+    Ok(IbdCheck { sha1, stated, uuid })
 }
 
 /// `file_description.contents` params for the imzML provenance mzdata consumed, with the values
@@ -2038,17 +2165,24 @@ mod tests {
         assert_eq!(named(&ss), [("IMS:1000047".to_string(), "pixel size y".to_string(), 50.0, Unit::Micrometer)]);
         assert!(marker(&ss, LoneX::AlsoY).get("pixel_size_um").is_none());
         // The marker: a lone x gives both by the vocabulary, or neither where the lane measured x
-        // alone; an x in another unit, or a y that is not µm, gives none.
+        // alone; a stated y is the y, in micrometres whatever length unit it is in, and a size in
+        // a unit that is no length gives none.
         let mut lone = ScanSettings { id: "s1".into(), ..Default::default() };
         lone.params.push(Param::builder().name("pixel size (x)").curie(mzdata::curie!(IMS:1000046)).value(50.0).unit(Unit::Micrometer).build());
         assert_eq!(marker(&lone, LoneX::AlsoY)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 50.0}));
         assert!(marker(&lone, LoneX::XOnly).get("pixel_size_um").is_none());
         assert!(states_pixel_size(Some(&lone)) && !states_pixel_size(Some(&ScanSettings::default())) && !states_pixel_size(None));
         lone.params.push(Param::builder().name("pixel size y").curie(mzdata::curie!(IMS:1000047)).value(0.05).unit(Unit::Millimeter).build());
-        assert!(marker(&lone, LoneX::AlsoY).get("pixel_size_um").is_none(), "a stated y in mm is not replaced by the x");
+        assert_eq!(marker(&lone, LoneX::AlsoY)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 50.0}), "a stated y in mm, in µm");
+        lone.params[1].value = 0.02.into();
+        assert_eq!(marker(&lone, LoneX::AlsoY)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 20.0}), "a stated y is not replaced by the x");
+        lone.params[1].unit = Unit::Second;
+        assert!(marker(&lone, LoneX::AlsoY).get("pixel_size_um").is_none(), "a stated y that is no length is not replaced by the x");
         lone.params.clear();
         lone.params.push(Param::builder().name("pixel size (x)").curie(mzdata::curie!(IMS:1000046)).value(0.05).unit(Unit::Millimeter).build());
-        assert!(marker(&lone, LoneX::AlsoY).get("pixel_size_um").is_none());
+        assert_eq!(marker(&lone, LoneX::AlsoY)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 50.0}));
+        lone.params[0].unit = Unit::Unknown;
+        assert!(marker(&lone, LoneX::AlsoY).get("pixel_size_um").is_none(), "no unit, no micrometres");
     }
 
     /// The obsolete integer type terms become the PSI-MS ones, `cvRef` with them, in place: the
@@ -2098,5 +2232,92 @@ mod tests {
         assert_eq!(ibd_beside(&dir.join("x.imzML")), Some(ibd));
         assert_eq!(ibd_beside(&dir.join("y.imzML")), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `.ibd`'s first 16 bytes against the UUID the header states, however it is spelt (braces,
+    /// dashes, case); a header that states none, and a file shorter than a UUID.
+    #[test]
+    fn the_ibd_s_first_bytes_are_compared_with_the_stated_uuid() {
+        let dir = std::env::temp_dir().join(format!("mzpc-ibd-uuid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ibd = dir.join("x.ibd");
+        let uuid: Vec<u8> = (0x10..0x20).collect();
+        std::fs::write(&ibd, [&uuid[..], b"signal"].concat()).unwrap();
+        let stating = |v: &str| vec![RawParam { accession: "IMS:1000080".into(), value: v.into(), unit_accession: None, unit_name: None }];
+        const HEX: &str = "101112131415161718191a1b1c1d1e1f";
+        for spelling in ["{10111213-1415-1617-1819-1A1B1C1D1E1F}", "10111213-1415-1617-1819-1a1b1c1d1e1f", HEX, " 101112131415161718191A1B1C1D1E1F "] {
+            let c = check_ibd(&ibd, &stating(spelling)).unwrap();
+            assert_eq!((c.uuid_status(), c.uuid_mismatch()), ("verified", None), "{spelling}");
+        }
+        let other = "{00111213-1415-1617-1819-1A1B1C1D1E1F}";
+        let c = check_ibd(&ibd, &stating(other)).unwrap();
+        assert_eq!((c.uuid_status(), c.uuid_mismatch()), ("mismatch", Some((other, HEX))));
+        // The checksum's status is its own: nothing stated, whatever the UUID says.
+        assert_eq!(c.status(), "not stated");
+        for unstated in [Vec::new(), stating(""), stating("  ")] {
+            let c = check_ibd(&ibd, &unstated).unwrap();
+            assert_eq!((c.uuid_status(), c.uuid_mismatch()), ("not stated", None));
+        }
+        std::fs::write(&ibd, &uuid[..5]).unwrap();
+        let c = check_ibd(&ibd, &stating(HEX)).unwrap();
+        assert_eq!(c.uuid_mismatch(), Some((HEX, "1011121314")), "a file shorter than a UUID does not begin with it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spectra are counted as stating a scan start time when the term is on the spectrum or in a
+    /// param group it references — not when it only sits in a group nothing references, and not
+    /// beyond the spectra that were read.
+    #[test]
+    fn spectra_stating_a_scan_time_are_counted() {
+        let time = r#"<cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="0"/>"#;
+        let doc = format!(
+            r#"<mzML><referenceableParamGroupList>
+              <referenceableParamGroup id="timed">{time}</referenceableParamGroup>
+              <referenceableParamGroup id="plain"><cvParam accession="MS:1000511" value="1"/></referenceableParamGroup>
+            </referenceableParamGroupList><run><spectrumList>
+              <spectrum id="a"><scanList><scan>{time}</scan></scanList></spectrum>
+              <spectrum id="b"><scanList><scan><referenceableParamGroupRef ref="timed"/></scan></scanList></spectrum>
+              <spectrum id="c"><referenceableParamGroupRef ref="plain"/><scanList><scan/></scanList></spectrum>
+              <spectrum id="d"/>
+              <spectrum id="e"><scanList><scan>{time}</scan></scanList></spectrum>
+            </spectrumList><chromatogramList><chromatogram>{time}</chromatogram></chromatogramList></run></mzML>"#
+        );
+        assert_eq!(spectra_stating_time_from(doc.as_bytes(), usize::MAX).unwrap(), (3, 5));
+        assert_eq!(spectra_stating_time_from(doc.as_bytes(), 4).unwrap(), (2, 4), "the first four only");
+        let none = doc.replace("MS:1000016", "MS:1000017");
+        assert_eq!(spectra_stating_time_from(none.as_bytes(), usize::MAX).unwrap(), (0, 5));
+    }
+
+    /// `pixel_size_um` is micrometres whatever length unit the grid states, and only a positive
+    /// size: 0.1 mm and 100000 nm are 100 µm; a zero or negative size gives the marker none.
+    #[test]
+    fn the_marker_s_pixel_size_is_micrometres_from_any_length_unit() {
+        let grid = |x: f64, y: f64, unit: Unit| {
+            let mut s = ScanSettings { id: "grid".into(), ..Default::default() };
+            let size = |name: &str, acc, v: f64| Param::builder().name(name).curie(acc).value(v).unit(unit).build();
+            s.add_param(Param::builder().name("max count of pixels x").curie(mzdata::curie!(IMS:1000042)).value(3).build());
+            s.add_param(Param::builder().name("max count of pixels y").curie(mzdata::curie!(IMS:1000043)).value(3).build());
+            s.add_param(size("pixel size (x)", mzdata::curie!(IMS:1000046), x));
+            s.add_param(size("pixel size y", mzdata::curie!(IMS:1000047), y));
+            s
+        };
+        let marker = |s: &ScanSettings| marker_block(Some(s), COUNTS_DECLARED, LoneX::AlsoY, serde_json::json!({}));
+        let um = serde_json::json!({"x": 100.0, "y": 50.0});
+        for (x, y, unit) in [(100.0, 50.0, Unit::Micrometer), (0.1, 0.05, Unit::Millimeter), (100000.0, 50000.0, Unit::Nanometer), (0.01, 0.005, Unit::Centimeter)] {
+            assert_eq!(marker(&grid(x, y, unit))["pixel_size_um"], um, "{x} {unit:?}");
+        }
+        for (x, y, unit) in [(0.0, 100.0, Unit::Micrometer), (100.0, -100.0, Unit::Micrometer), (f64::NAN, 100.0, Unit::Micrometer), (100.0, 100.0, Unit::Second), (100.0, 100.0, Unit::Unknown)] {
+            assert!(marker(&grid(x, y, unit)).get("pixel_size_um").is_none(), "{x} {y} {unit:?}");
+        }
+    }
+
+    /// x and y both stated, one of them zero or negative: no pixel size, dropped and declared, as a
+    /// lone value that is not positive always was.
+    #[test]
+    fn x_and_y_that_are_not_both_positive_are_dropped() {
+        for (x, y) in [("0", "-100"), ("100", "0"), ("-5", "5")] {
+            let f = pixel_size_fix(&settings(&[("IMS:1000046", x, UM), ("IMS:1000047", y, UM)])).unwrap();
+            assert_eq!((f.case, f.transformation, f.write.len()), ("x and y not both positive", Some(DROPPED), 0), "{x} {y}");
+        }
     }
 }

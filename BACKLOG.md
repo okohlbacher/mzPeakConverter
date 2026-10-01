@@ -373,6 +373,39 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
   - Harmonization (2026-09-11): every chromatogram time is stored in minutes, on every lane; a time recorded in seconds or milliseconds (ProteoWizard's mzML chromatograms, HyStar's device traces) is divided into minutes before the schema is sampled and declared as `chromatogram-time-to-minutes`. `--rt` keeps reading a column's declared unit, for the seconds columns of mzML-lane archives built by 0.11.5 and earlier (none published).
   - Harmonization (2026-09-11): a default archive embeds no raw signal file of a BAF, Agilent MassHunter or Waters MassLynx directory (`analysis.baf*`, `*.ami`, `ser`/`fid`; `MSProfile.bin`, `MSPeak.bin`, `IMSFrame.bin`; `_FUNC*.DAT/.IDX`, `_func*.cdt/.ind`), matched by file name in any case; kept by decision: `MSScan.bin`, `MSMassCal.bin`, `*.mcf`, `_FUNC*.STS`, `_CHRO*`, `_mob/`, and the timsTOF `*_bin` on the f64 TDF/TSF lanes.
 
+## Corpus rebuild with the 0.17.0 release candidates (2026-10-01)
+
+The corpus (200 units) was rebuilt in place with `0.17.0-rc.1` (waves 1–3) and `0.17.0-rc.2`
+(wave 4), each time audited beyond the validator (fidelity records, mzML exports, imaging, readers,
+sizes; every finding reproduced independently). rc.2: 200/200 validator PASS, sizes and row counts
+equal to rc.1, no row group over 64 MiB. The archives are stamped with the rc version and are
+rebuilt once more by the release. Decisions the audit raised are D11–D18 in
+`~/Claude/mzPeak/output/imaging-plan-2026-10-01.md` §9.
+
+- **Left open by the audit, converter side:** a spectrum that states no scan time is stored as time 0
+  and exported so on the archive route (D14); the direct mzML lane makes up to four passes over the
+  source text and is ~45 % slower than rc.1 on a 182 MB file (copy the source's encoded payloads
+  through instead of re-encoding); integer peak-intensity columns still go through the reader's
+  float32 peak list on export (a5e5b0e covers float64 only); the SciEX glue narrows Clearcore2's
+  doubles to float32 before the lane counts them (count `(float)x != x` in the glue); `--lossless`
+  refuses whenever `MZPC_MAX_SPECTRA` is set, even a cap that would not bite; the native SciEX lane
+  logs one vendored "Failed to construct satisfactory model" WARN per spectrum kept as f64 (771 on
+  `08_SWATH_1E_1H`) — noise, since tolerance `Da(0.0)` only passes an exact fit; the box's canonical
+  checkout holds a CRLF copy of `tests/fixtures/tiny.pwiz.1.1.mzML` (checked out before the `-text`
+  rule), which fails one unit test there — refresh the working copy, no commit.
+- **Upstream reports to file (no converter change):** arrow-rs writes a page index that marks pages of
+  list-of-struct `parameters` columns as all-null (parquet-rs 59.1.0); the HUPO Python reference
+  reader fails on multi-precursor spectra without a parent (whole-frame diaPASEF, MSX) and on the
+  time column lookup through the column mapping; mzdata's mzML writer orders a shared
+  `referenceableParamGroup` by hash (four runs, four orders) and sets every array's
+  `dataProcessingRef` from the list default; mzdata assigns `scan=1` as the precursor of every Thermo
+  SRM spectrum unconditionally; SRM product (Q3) windows have no facet in the archive
+  (`chromatograms_metadata_products` is unwritten by every writer and `todo!()` in the reference
+  reader); the `one_over_k0` SDK/model 1–4 ulp difference.
+- **Corpus descriptors:** three pinned descriptors state lane flags their archives were not built
+  with (D17); `example1-continuous.yaml` should add `--keep-zero-runs` so the continuous example
+  decodes to one axis (D2); bladder units `--pixel-size 10` once D3 is decided.
+
 ## Vendoring exit — `vendor/mzpeak_prototyping` (opened 2026-09-23)
 
 Owner decision: *"we will move away from vendored libraries asap."* **Guiding principle (owner, 2026-09-23):

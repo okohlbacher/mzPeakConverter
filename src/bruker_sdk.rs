@@ -462,6 +462,9 @@ pub struct TdfSdkReader {
     /// The TIMS ModelType-2 model as the reference implementation's grid; `None` without such a row
     /// (1/K0 is then stored as the SDK's plain values).
     tims_grid: Option<mzpeak_prototyping::grid::GridEncoding>,
+    /// The calibration row `tims_grid` was built from, for the 1/K0 of a window's limits on the
+    /// grid lane ([`Self::attach_precursors`]); `None` exactly when `tims_grid` is.
+    tims_model: Option<crate::tims_mobility::TimsMobilityCalibration>,
     /// Frames whose points [`Self::ims_grid_spectrum`] re-sorted into TOF order (the SDK hands them
     /// over mobility-major); the converter declares `sort-by-mz` from it.
     grid_resorted: std::sync::atomic::AtomicUsize,
@@ -508,9 +511,11 @@ impl TdfSdkReader {
                 HashMap::new()
             }
         };
-        let tims_grid = crate::tims_mobility::TimsMobilityCalibration::from_tdf_path(&tdf)
-            .unwrap_or(None)
+        let tims_model = crate::tims_mobility::TimsMobilityCalibration::from_tdf_path(&tdf).unwrap_or(None);
+        let tims_grid = tims_model
             .and_then(|c| mzpeak_prototyping::grid::GridEncoding::from_parameters(mzpeak_prototyping::grid::TimsTofTimsLinearGrid2::ACCESSION, &c.grid_parameters()));
+        // Kept only with the grid it is evaluated for.
+        let tims_model = tims_model.filter(|_| tims_grid.is_some());
         Ok(Self {
             api,
             handle,
@@ -519,6 +524,7 @@ impl TdfSdkReader {
             dir,
             mz_rows,
             tims_grid,
+            tims_model,
             accumulation_time,
             scan_window,
             resorted: Default::default(),
@@ -616,21 +622,33 @@ impl TdfSdkReader {
         }
     }
 
-    /// Attach this frame's MS2 precursors, using the VENDOR's own scan→1/K0 conversion
-    /// (`tims_scannum_to_oneoverk0`) for the mobility — the SDK is the authority the native lane's
-    /// recalibration is measured against, so on this lane we can use it directly.
-    fn attach_precursors(&self, descr: &mut SpectrumDescription, frame: &FrameMeta) {
+    /// Attach this frame's MS2 precursors. The 1/K0 of a window's limits and of its selected ion
+    /// is evaluated the way the frame's own mobility values are, so the limits are bit for bit
+    /// values of the mobility array stored beside them:
+    ///
+    /// * `grid` (the ims-compact lane, [`Self::ims_grid_spectrum`]) with a ModelType-2 row: the
+    ///   mobility is stored as scan numbers under that model, which a reader evaluates as mzdata's
+    ///   `TimsCalibrationModel2` does, so the limits are evaluated the same way
+    ///   ([`one_over_k0_as_mzdata`](crate::tims_mobility::TimsMobilityCalibration::one_over_k0_as_mzdata)),
+    ///   as on the native lane (`bruker_native::lane_mobility`). Through 0.17.0-rc.1 they were the
+    ///   SDK's values here, 1 to 4 ulp off the grid's at most scans.
+    /// * otherwise (the f64 lane, [`Self::spectrum`], or no such row): the mobility array holds the
+    ///   VENDOR's own scan→1/K0 conversion (`tims_scannum_to_oneoverk0`), and so do the limits.
+    fn attach_precursors(&self, descr: &mut SpectrumDescription, frame: &FrameMeta, grid: bool) {
         let Some(windows) = self.windows.get(&frame.id) else { return };
-        let precursors = crate::bruker_native::build_precursors(windows, |scan| {
-            self.convert(
-                self.api.tims_scannum_to_oneoverk0,
-                frame.id,
-                &[scan],
-                "tims_scannum_to_oneoverk0",
-            )
-            .ok()
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0.0)
+        let model = if grid { self.tims_model } else { None };
+        let precursors = crate::bruker_native::build_precursors(windows, |scan| match model {
+            Some(model) => model.one_over_k0_as_mzdata(scan),
+            None => self
+                .convert(
+                    self.api.tims_scannum_to_oneoverk0,
+                    frame.id,
+                    &[scan],
+                    "tims_scannum_to_oneoverk0",
+                )
+                .ok()
+                .and_then(|v| v.first().copied())
+                .unwrap_or(0.0),
         });
         // ALL of them: a timsTOF MS2 frame carries one precursor per isolation window (~1.6 for
         // DDA-PASEF, 5.0 for dia-PASEF), and the native lane keeps every one.
@@ -724,7 +742,7 @@ impl TdfSdkReader {
         let arrays = mz_intensity_arrays(&mz, &intensity, Some(&mob))?;
         let mut descr = make_description(i, frame, SignalContinuity::Centroid);
         self.state_frame_acquisition(&mut descr, i);
-        self.attach_precursors(&mut descr, frame);
+        self.attach_precursors(&mut descr, frame, false);
         Ok(MultiLayerSpectrum::new(descr, Some(arrays), None, None))
     }
 
@@ -803,7 +821,7 @@ impl TdfSdkReader {
         if let (Some(t1), Some(t2), Some(id)) = (frame.t1, frame.t2, frame.mz_cal_id) {
             crate::bruker_native::add_frame_calibration_params(&mut descr, t1, t2, id);
         }
-        self.attach_precursors(&mut descr, frame);
+        self.attach_precursors(&mut descr, frame, true);
         // Summary terms from the STORED points — the grid values — stated explicitly, as on every
         // grid lane.
         if let (Some(&lo), Some(&hi)) = (mz.first(), mz.last()) {

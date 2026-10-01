@@ -156,10 +156,22 @@ fn transformations_block_pinned() {
     pinned("\"grid-fit:1e-6Da\"");
     pinned("\"grid-encode:mz,ion_mobility\"");
     for (file, source) in [("src/bruker_native.rs", include_str!("../src/bruker_native.rs"))] {
-        for entry in ["\"bruker:mz-calibrant-omitted\"", "\"bruker:mz-calibration-chord\""] {
+        for entry in ["\"bruker:mz-calibrant-omitted\"", "\"bruker:mz-calibration-chord\"", "\"bruker:out-of-window-points-dropped\""] {
             assert!(source.contains(entry), "{file} no longer declares {entry}");
         }
     }
+    // The three entries the archive epilogue declares for every lane, named in `fidelity` beside
+    // the evidence they are decided from; `finish_archive` declares them by those constants.
+    for entry in [
+        "pub const DELTA_ULP: &str = \"delta-ulp\";",
+        "pub const INTENSITY_F32_ROUNDING: &str = \"intensity-f32-rounding\";",
+        "pub const INTENSITY_TYPE_NARROWING: &str = \"intensity-type-narrowing\";",
+    ] {
+        assert!(include_str!("../src/fidelity.rs").contains(entry), "src/fidelity.rs no longer defines {entry}");
+    }
+    pinned("declare(&mut declared, fidelity::DELTA_ULP);");
+    pinned("declare(&mut declared, fidelity::INTENSITY_F32_ROUNDING);");
+    pinned("declare(&mut declared, fidelity::INTENSITY_TYPE_NARROWING);");
     pinned("\"shimadzu:span-trim\"");
     pinned("\"shimadzu:coarse-mz\"");
     pinned("\"agilent:drop-zero-samples\"");

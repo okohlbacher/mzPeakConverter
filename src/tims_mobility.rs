@@ -52,6 +52,7 @@ impl TimsMobilityCalibration {
 
     /// TIMS ramp voltage at a (possibly fractional) 0-based mobility scan index.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // with `one_over_k0`
     pub fn voltage(&self, scan: f64) -> f64 {
         if self.c1 == 0.0 {
             return self.c2;
@@ -61,7 +62,13 @@ impl TimsMobilityCalibration {
 
     /// Inverse reduced ion mobility 1/K0 (Vs·s/cm²) for a 0-based mobility scan index (fractional
     /// indices interpolate on the ramp, as the SDK does).
+    ///
+    /// The SDK's order of operations: the reference the SDK goldens below pin, and what
+    /// [`Self::one_over_k0_as_mzdata`] is held within 4 ulp of. No lane writes these values any
+    /// more: every 1/K0 that must agree with a mobility array or grid — which is every one the
+    /// timsTOF lanes write — is evaluated in the array's arithmetic instead.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn one_over_k0(&self, scan: f64) -> f64 {
         let w = self.voltage(scan);
         w / (self.c7 + self.c6 * w)

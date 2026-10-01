@@ -10,8 +10,8 @@
 //! [`TargetOnlyWindows`] sits under that writer and blanks exactly that pair with spaces of the same
 //! length. The element is left target-only, which is what ProteoWizard writes when it knows no
 //! width, and every byte offset the writer records in `<indexList>` stays true. The
-//! `<fileChecksum>` is left as mzdata wrote it: mzdata takes that digest before flushing its own
-//! buffer, so it did not match the file's bytes before this sink existed either.
+//! `<fileChecksum>` mzdata wrote no longer matches (it never did: mzdata takes that digest before
+//! flushing its own buffer); [`crate::mzml_index`] writes the file's own, after every sink.
 
 use std::io::{self, Write};
 use std::ops::Range;

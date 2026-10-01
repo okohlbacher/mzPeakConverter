@@ -196,6 +196,110 @@ impl MobilityCal {
     }
 }
 
+/// `transformations` entry: points of an MS2 frame that lie in a TIMS scan outside every
+/// isolation window of the frame, and are therefore in no spectrum. mzdata's TDF reader (the
+/// `--no-ims-compact` archive lane and the direct `.d` → mzML export) hands a PASEF frame over as
+/// one spectrum per window (diaPASEF: per `DiaFrameMsMsWindows` row of the frame's group;
+/// ddaPASEF: per `PasefFrameMsMsInfo` row) and nothing for the scans between and around them, as
+/// ProteoWizard does. The default ims-compact lane stores the frame whole.
+pub(crate) const OUT_OF_WINDOW_DROPPED: &str = "bruker:out-of-window-points-dropped";
+
+/// The points mzdata's TDF reader hands over for each frame against the frame's own count,
+/// `Frames.NumPeaks`: the file-side evidence for [`OUT_OF_WINDOW_DROPPED`], which the lane cannot
+/// get from the reader (it yields nothing for what it leaves out, so a count of what it handed
+/// over always balances).
+///
+/// Spectra arrive frame by frame, a frame's windows together; a frame is settled when a spectrum
+/// of another frame follows or the reader ends ([`Self::finish`]). A frame the `MZPC_MAX_SPECTRA`
+/// cap cut through is not settled: its unread windows are the cap's doing.
+pub(crate) struct FramePointAccount {
+    num_peaks: HashMap<i64, u64>,
+    /// The frame being read, and the points handed over for it so far.
+    open: Option<(i64, u64)>,
+    /// Frames settled, their `NumPeaks` in sum, how many of them had points in no spectrum, and
+    /// how many such points.
+    pub frames: u64,
+    pub frame_points: u64,
+    pub short_frames: u64,
+    pub missing: u64,
+}
+
+impl FramePointAccount {
+    /// Read `Frames.Id` / `Frames.NumPeaks` of the `.d`.
+    pub fn open(dot_d: &Path) -> Result<Self> {
+        let tdf = dot_d.join("analysis.tdf");
+        let conn = crate::vendor_sqlite::open(&tdf).with_context(|| format!("opening {}", tdf.display()))?;
+        let mut stmt = conn.prepare("SELECT Id, NumPeaks FROM Frames").context("querying Frames.NumPeaks")?;
+        let num_peaks = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?.max(0) as u64)))
+            .and_then(Iterator::collect::<rusqlite::Result<HashMap<i64, u64>>>)
+            .context("reading Frames.NumPeaks")?;
+        Ok(Self::new(num_peaks))
+    }
+
+    /// Over explicit counts (`Frames.Id` → `NumPeaks`).
+    pub(crate) fn new(num_peaks: HashMap<i64, u64>) -> Self {
+        Self { num_peaks, open: None, frames: 0, frame_points: 0, short_frames: 0, missing: 0 }
+    }
+
+    /// The `Frames.Id` in a spectrum id of mzdata's TDF reader (`merged=7 frame=3 startScan=…`).
+    fn frame_of(id: &str) -> Option<i64> {
+        id.split_whitespace().find_map(|t| t.strip_prefix("frame=")).and_then(|n| n.parse().ok())
+    }
+
+    /// One spectrum the reader handed over, with its point count. Returns the points of the frame
+    /// this spectrum ENDED (the previous one, when `id` names another) that were in no spectrum.
+    pub fn observe(&mut self, id: &str, points: u64) -> u64 {
+        let Some(frame) = Self::frame_of(id) else { return 0 };
+        match &mut self.open {
+            Some((open, n)) if *open == frame => {
+                *n += points;
+                0
+            }
+            _ => {
+                let missing = self.settle();
+                self.open = Some((frame, points));
+                missing
+            }
+        }
+    }
+
+    /// The read is over. `unread` is the id of the first spectrum the cap left unread, `None`
+    /// when the reader ran out: the open frame is settled unless that spectrum is one of its own.
+    /// Returns its points that were in no spectrum.
+    pub fn finish(&mut self, unread: Option<&str>) -> u64 {
+        if unread.is_some() && unread.and_then(Self::frame_of) == self.open.map(|(frame, _)| frame) {
+            self.open = None;
+            return 0;
+        }
+        self.settle()
+    }
+
+    fn settle(&mut self) -> u64 {
+        let Some((frame, handed_over)) = self.open.take() else { return 0 };
+        // A frame the table does not list has no count to hold the reader to.
+        let Some(&total) = self.num_peaks.get(&frame) else { return 0 };
+        let missing = total.saturating_sub(handed_over);
+        self.frames += 1;
+        self.frame_points += total;
+        self.short_frames += u64::from(missing > 0);
+        self.missing += missing;
+        missing
+    }
+
+    /// The run's warning when points were left out, `None` when every settled frame is whole.
+    pub fn warning(&self) -> Option<String> {
+        (self.missing > 0).then(|| {
+            format!(
+                "{} of the {} points of the {} frames read lie outside every isolation window of their frame \
+                 ({} frames) and are in no spectrum: mzdata's TDF reader hands a PASEF frame over as one spectrum \
+                 per window. The default ims-compact lane stores every point",
+                self.missing, self.frame_points, self.frames, self.short_frames
+            )
+        })
+    }
+}
+
 /// Re-expresses the 1/K0 values mzdata's TDF reader puts in spectrum METADATA on the vendor model.
 ///
 /// mzdata 0.66.6 converts its signal arrays through the frame's ModelType-2 `TimsCalibration`
@@ -631,7 +735,9 @@ impl Calibrant {
     }
 
     /// The largest correction over the calibrant range, in ppm of m/z — the bound an archive that
-    /// stores only the quadratic declares.
+    /// stores only the quadratic declares. Taken at 2,001 evenly spaced m/z: the maximum of the
+    /// sampled corrections, which for a polynomial of this degree over a range a few thousand Th
+    /// wide is the supremum to the digits stated, but is not proven to be.
     pub fn max_abs_ppm(&self) -> f64 {
         (0..=2000)
             .map(|i| self.lo + (self.hi - self.lo) * i as f64 / 2000.0)
@@ -1187,6 +1293,40 @@ impl NativeTofReader {
     }
 }
 
+/// The ims-compact lane's 1/K0 at a FRACTIONAL scan position: `recal`, the vendor's ModelType-2
+/// model, when the run has one (and `--no-tims-recalibration` is not given), else timsrust's
+/// linear converter `im`.
+///
+/// `Precursors.ScanNumber` is fractional (the mobility peak apex, not a scan boundary), so
+/// rounding it to an integer throws away up to a full scan of precision. The vendor model is
+/// continuous and takes the value directly; timsrust's linear converter is integer-only, so
+/// interpolate between the neighbouring scans — exact for a linear model, which is what that
+/// path is.
+///
+/// The vendor model is evaluated as the reader decodes the archive's mobility grid
+/// ([`one_over_k0_as_mzdata`](crate::tims_mobility::TimsMobilityCalibration::one_over_k0_as_mzdata),
+/// mzdata's `TimsCalibrationModel2` on the grid's own four parameters), not in the SDK's order of
+/// operations: a window's stored limits are then bit for bit the 1/K0 its boundary scans' points
+/// decode to. Through 0.17.0-rc.1 they were the SDK-order values, 1 to 4 ulp off at most scans, and
+/// a frame cut by its own stated bands put the points of a boundary scan outside their window
+/// (2485.d: 5,327 points in 2,945 windows above their upper limit) — the `--no-ims-compact` lane's
+/// 0.17.0 fix ([`TdfMobilityRemap::remap`]), which this lane lacked.
+fn lane_mobility(recal: Option<&crate::tims_mobility::TimsMobilityCalibration>, im: &Scan2ImConverter, scan: f64) -> f64 {
+    match recal {
+        Some(c) => c.one_over_k0_as_mzdata(scan), // vendor ModelType-2 rational, in the grid's arithmetic
+        None => {
+            let lo = scan.floor().max(0.0);
+            let frac = scan - lo;
+            let a = im.convert(lo as u32);
+            if frac == 0.0 {
+                a
+            } else {
+                a + frac * (im.convert(lo as u32 + 1) - a)
+            }
+        }
+    }
+}
+
 /// Build the mzdata precursors for one frame's isolation windows.
 ///
 /// Free-standing so BOTH timsTOF lanes share it: the native (timsrust) reader and the `--bruker-sdk`
@@ -1284,25 +1424,9 @@ impl NativeTofReader {
         self.mobility_for_scan_f(scan as f64)
     }
 
-    /// 1/K0 at a FRACTIONAL scan position. `Precursors.ScanNumber` is fractional (the mobility peak
-    /// apex, not a scan boundary), so rounding it to an integer throws away up to a full scan of
-    /// precision. The vendor model is continuous and takes the value directly; timsrust's linear
-    /// converter is integer-only, so interpolate between the neighbouring scans — exact for a linear
-    /// model, which is what that path is.
+    /// 1/K0 at a (possibly fractional) scan position ([`lane_mobility`]).
     pub fn mobility_for_scan_f(&self, scan: f64) -> f64 {
-        match &self.recal {
-            Some(c) => c.one_over_k0(scan), // vendor ModelType-2 rational
-            None => {
-                let lo = scan.floor().max(0.0);
-                let frac = scan - lo;
-                let a = self.im.convert(lo as u32);
-                if frac == 0.0 {
-                    a
-                } else {
-                    a + frac * (self.im.convert(lo as u32 + 1) - a)
-                }
-            }
-        }
+        lane_mobility(self.recal.as_ref(), &self.im, scan)
     }
 
     /// Build the IN-ARCHIVE ims-compact spectrum for frame `i` on the reference implementation's
@@ -1744,6 +1868,106 @@ mod isolation_mobility_band_tests {
 
     fn im(p: &Param) -> f64 {
         p.value.to_f64().unwrap()
+    }
+
+    /// The ims-compact lane's window limits are the very values its mobility grid decodes to.
+    ///
+    /// Frame 2 of PXD059079 2485.d: its six diaPASEF windows (`DiaFrameMsMsWindows`) and the
+    /// run's `TimsCalibration` row. The archive stores each point's TIMS scan and the reader
+    /// decodes it with mzdata's `TimsCalibrationModel2` on the grid's four parameters, so that is
+    /// what a window's limits are held to here, bit for bit, with every scan of the window inside
+    /// them. Through 0.17.0-rc.1 the limits were evaluated in the SDK's order of operations and 9
+    /// of these 12 were one to four ulp off the scan they name: cutting the frame by its stated
+    /// bands put a boundary scan's points outside their window.
+    #[test]
+    fn the_ims_compact_band_limits_are_the_grid_s_decoded_values() {
+        let recal = crate::tims_mobility::TimsMobilityCalibration::new(
+            1.0, 1551.0, 254.40951107260733, 118.71749047939912, 33.64485981308411, 0.012463618472198826, 172.2839721407802,
+        );
+        let linear = Scan2ImConverter::from_boundaries(0.70, 1.45, 1552);
+        let [c6, c7, offset, slope] = recal.grid_parameters();
+        let decode = |scan: u32| mzdata::io::tdf::TimsCalibrationModel2::new(c6, c7, offset, slope).convert(scan);
+        let scans = [(220u32, 329u32), (329, 533), (559, 801), (816, 1125), (1147, 1438), (1450, 1532)];
+        let windows: Vec<FrameWindow> = scans
+            .iter()
+            .map(|&(scan_begin, scan_end)| FrameWindow {
+                scan_begin,
+                scan_end,
+                isolation_mz: 800.0,
+                isolation_width: 25.0,
+                collision_energy: 30.0,
+                mono_mz: None,
+                average_mz: None,
+                charge: None,
+                intensity: None,
+                parent: None,
+                scan_number: None,
+            })
+            .collect();
+        let precursors = build_precursors(&windows, |scan| lane_mobility(Some(&recal), &linear, scan));
+        assert_eq!(precursors.len(), scans.len());
+        let mut off_in_sdk_order = 0;
+        for (p, &(begin, end)) in precursors.iter().zip(&scans) {
+            let ps = p.ions[0].params.as_ref().unwrap();
+            let at = |c: CURIE| im(ps.iter().find(|p| p.curie() == Some(c)).unwrap());
+            let (lower, upper) = (at(MZP_IM_WINDOW_LOWER), at(MZP_IM_WINDOW_UPPER));
+            assert_eq!(lower.to_bits(), decode(end).to_bits(), "window [{begin}, {end}): lower limit {lower} is not scan {end}'s {}", decode(end));
+            assert_eq!(upper.to_bits(), decode(begin).to_bits(), "window [{begin}, {end}): upper limit {upper} is not scan {begin}'s {}", decode(begin));
+            // 1/K0 falls with the scan: every scan of the window decodes inside its limits.
+            assert!((begin..end).all(|scan| lower <= decode(scan) && decode(scan) <= upper), "window [{begin}, {end})");
+            // The selected ion's own 1/K0 (the window's midpoint here), on the same arithmetic.
+            let mid = (f64::from(begin) + f64::from(end)) / 2.0;
+            assert_eq!(at(curie!(MS:1002815)).to_bits(), recal.one_over_k0_as_mzdata(mid).to_bits());
+            off_in_sdk_order += usize::from(recal.one_over_k0(f64::from(begin)) != upper) + usize::from(recal.one_over_k0(f64::from(end)) != lower);
+        }
+        // The first window, as the direct `.d` → mzML export states it.
+        let ps = precursors[0].ions[0].params.as_ref().unwrap();
+        let at = |c: CURIE| im(ps.iter().find(|p| p.curie() == Some(c)).unwrap());
+        assert_eq!((at(MZP_IM_WINDOW_LOWER), at(MZP_IM_WINDOW_UPPER), at(curie!(MS:1002815))), (1.305614518000337, 1.3591422652116412, 1.3323874701174356));
+        // The premise: the SDK's order of operations really does give other values here.
+        assert!(off_in_sdk_order > 0, "the SDK-order evaluation equals the grid's at every limit: nothing is tested");
+        // No ModelType-2 row: timsrust's linear map, which a plain-values archive stores as well.
+        assert_eq!(lane_mobility(None, &linear, 220.0), linear.convert(220u32));
+        let half = lane_mobility(None, &linear, 220.5);
+        assert!(linear.convert(221u32) < half && half < linear.convert(220u32));
+    }
+
+    /// The per-frame point account behind `bruker:out-of-window-points-dropped`: a frame is held
+    /// to `Frames.NumPeaks` once a spectrum of another frame follows it or the reader ends, and a
+    /// frame the spectrum cap cut through is not.
+    #[test]
+    fn frame_points_outside_every_window_are_counted_per_frame() {
+        let counts = || [(1i64, 1000u64), (2, 3328), (3, 2500), (4, 900)].into_iter().collect::<HashMap<i64, u64>>();
+        let mut a = FramePointAccount::new(counts());
+        // An MS1 frame, whole; then frame 2 of 2485.d: six windows holding 2,536 of 3,328 points.
+        assert_eq!(a.observe("merged=0 frame=1 startScan=1 endScan=1552", 1000), 0);
+        let mut ended = Vec::new();
+        for (i, n) in [106u64, 220, 342, 669, 1015, 184].into_iter().enumerate() {
+            ended.push(a.observe(&format!("merged={} frame=2 startScan=221 endScan=329", i + 1), n));
+        }
+        assert_eq!(ended, [0, 0, 0, 0, 0, 0], "frame 1 was whole, and frame 2 is still open");
+        assert_eq!(a.observe("merged=7 frame=3 startScan=1 endScan=1552", 2500), 792, "frame 2 ended 792 points short");
+        assert_eq!(a.finish(None), 0, "frame 3 was whole");
+        assert_eq!((a.frames, a.frame_points, a.short_frames, a.missing), (3, 6828, 1, 792));
+        let warning = a.warning().expect("points were left out");
+        assert!(warning.contains("792 of the 6828 points of the 3 frames read") && warning.contains("(1 frames)"), "{warning}");
+
+        // The cap stops inside frame 2: its unread windows are not the reader's omission.
+        let mut a = FramePointAccount::new(counts());
+        a.observe("merged=0 frame=1 startScan=1 endScan=1552", 1000);
+        a.observe("merged=1 frame=2 startScan=221 endScan=329", 106);
+        assert_eq!(a.finish(Some("merged=2 frame=2 startScan=330 endScan=533")), 0);
+        assert_eq!((a.frames, a.missing, a.warning()), (1, 0, None));
+        // The cap stops between frames: the frame before it is settled.
+        let mut a = FramePointAccount::new(counts());
+        a.observe("merged=1 frame=2 startScan=221 endScan=329", 106);
+        assert_eq!(a.finish(Some("merged=7 frame=3 startScan=1 endScan=1552")), 3222);
+        // More points than the frame holds (overlapping windows) is not a negative omission, an id
+        // without a frame and a frame the table does not list are passed over.
+        let mut a = FramePointAccount::new(counts());
+        assert_eq!(a.observe("merged=1 frame=4 startScan=1 endScan=10", 950) + a.observe("scan=5", 10) + a.observe("merged=2 frame=9 startScan=1 endScan=10", 5), 0);
+        assert_eq!(a.finish(None), 0);
+        assert_eq!((a.frames, a.missing), (1, 0));
     }
 
     /// The window band is carried as MZP:1000006/7 (Unknown-CV CURIEs rendered `MZP:` by the

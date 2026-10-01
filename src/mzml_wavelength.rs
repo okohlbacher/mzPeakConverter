@@ -9,8 +9,7 @@
 //! length, as [`crate::mzml_isolation`] does for unknown isolation windows, so every byte offset the
 //! writer records in `<indexList>` stays true. `defaultArrayLength="0"` stays: a longer number does
 //! not fit in its place, and each array's own `arrayLength` is right. A mass spectrum passes through.
-//! The `<fileChecksum>` is left as mzdata wrote it: mzdata takes that digest before flushing its own
-//! buffer, so it did not match the file's bytes before this sink existed either.
+//! The `<fileChecksum>` is written after every sink, by [`crate::mzml_index`].
 //!
 //! The sink cannot tell a term mzdata invented from one a source stated, so a wavelength spectrum
 //! also loses a stated `positive scan` or `ion injection time` of 0. No source in the corpus states

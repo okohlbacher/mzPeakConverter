@@ -226,11 +226,12 @@ fn scan_settings_and_file_content_of_a_plain_run_are_exported() {
         assert_eq!(targets, [("MS:1000744", Some("1000")), ("MS:1000744", Some("1200"))], "{what}");
         assert!(!cv_params(inside(&header, "fileContent").unwrap()).is_empty(), "{what}: an empty fileContent");
     }
-    // The direct export lists the source's files, so the reference stays, as an attribute; the
-    // archive's export lists the archive alone, so it states none.
-    let header = text(&direct);
-    assert!(header.contains("<sourceFileRefList count=\"1\">") && header.contains("<sourceFileRef ref=\"sf_parameters\"/>"), "{}", inside(&header, "scanSettingsList").unwrap());
-    assert!(!text(&exported).contains("<sourceFileRef"));
+    // Both exports list the source's files, so the reference stays, as an attribute. Through
+    // 0.17.0-rc.1 the archive's export listed the archive alone and stated none.
+    for path in [&direct, &exported] {
+        let header = text(path);
+        assert!(header.contains("<sourceFileRefList count=\"1\">") && header.contains("<sourceFileRef ref=\"sf_parameters\"/>"), "{}", inside(&header, "scanSettingsList").unwrap());
+    }
     // mzdata reads the list back as the source states it.
     let source = mzdata::io::mzml::MzMLReader::open_path(TINY).unwrap().scan_settings().unwrap().clone();
     let back = mzdata::io::mzml::MzMLReader::open_path(&direct).unwrap().scan_settings().unwrap().clone();

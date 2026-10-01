@@ -235,6 +235,195 @@ fn facet_follows_the_declared_representation_and_the_export_is_clean() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two things a grid archive got wrong through 0.17.0-rc.1, on the run above (six gridded profile
+/// spectra, one gridded and three off-lattice centroid spectra).
+///
+/// * `fidelity.mz_error` stated only the 5 ppm a fit is ACCEPTED within. It now also states the
+///   largest error the accepted grid left, measured over every gridded point while the archive
+///   was written (`observed_max_rel_error_ppm`, `observed_max_abs_error`): what decoding the
+///   archive against the source measures, here four orders of magnitude inside the tolerance.
+/// * The off-lattice m/z of a grid facet (`mz_chunk_values` of its raw `MS:1000576` rows: whole
+///   spectra of exact 64-bit values, nearly all distinct) were left to Parquet's global
+///   dictionary, which held every value over again in each row group. They are written
+///   byte-stream-split without it, like the chunk bounds. A chunk facet WITHOUT a grid column
+///   keeps the dictionary on that column: its values are delta differences, another default.
+#[test]
+fn a_grid_archive_states_the_error_its_grid_left_and_keeps_off_lattice_mz_out_of_the_dictionary() {
+    use parquet::basic::Encoding;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let dir = std::env::temp_dir().join(format!("mzpc-tofgrid-observed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("synthetic.mzML");
+    let archive = dir.join("synthetic.mzpeak");
+    write_mzml(&src);
+    run(&[&src, Path::new("-o"), &archive, Path::new("--tof-grid"), Path::new("on")], &[("MZPC_TOF_GRID_C1", "1e-4")]);
+
+    // --- the error the grid left, against the same figure measured by decoding the archive ---
+    let index: serde_json::Value = {
+        let mut z = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        serde_json::from_reader(z.by_name("mzpeak_index.json").unwrap()).unwrap()
+    };
+    let errors = index["metadata"]["fidelity"]["mz_error"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let e = &errors[0];
+    assert_eq!((&e["encoding"], &e["basis"], e["max_rel_error_ppm"].as_f64()), (&"tof-grid:5ppm".into(), &"tolerance".into(), Some(5.0)), "{e}");
+    let (observed_abs, observed_ppm) = (
+        e["observed_max_abs_error"].as_f64().unwrap_or_else(|| panic!("no observed_max_abs_error in {e}")),
+        e["observed_max_rel_error_ppm"].as_f64().unwrap_or_else(|| panic!("no observed_max_rel_error_ppm in {e}")),
+    );
+    let truth = synthetic();
+    let mut reader = mzpeak_prototyping::MzPeakReader::new(&archive).unwrap();
+    let (mut measured_abs, mut measured_ppm) = (0.0f64, 0.0f64);
+    for (ix, (mz, _, continuity)) in truth.iter().enumerate() {
+        if !(ix < N_PROFILE || ix == CENTROID_ON) {
+            continue;
+        }
+        let arrays = if *continuity == SignalContinuity::Profile {
+            reader.get_spectrum_arrays(ix as u64).unwrap().expect("signal arrays")
+        } else {
+            reader.get_spectrum_peak_arrays_for(ix as u64).unwrap().expect("peak arrays")
+        };
+        let decoded = arrays.mzs().unwrap();
+        assert_eq!(decoded.len(), mz.len(), "spectrum {ix}");
+        for (stored, source) in decoded.iter().zip(mz) {
+            measured_abs = measured_abs.max((stored - source).abs());
+            measured_ppm = measured_ppm.max((stored - source).abs() / source * 1e6);
+        }
+    }
+    assert!(measured_ppm > 0.0, "the grid gave every m/z back exactly: nothing to measure");
+    // Recorded rounded up to six digits: at least what decoding measures, and no more than that.
+    assert!(observed_ppm >= measured_ppm && observed_ppm <= measured_ppm * 1.001, "recorded {observed_ppm:e} ppm, decoding measures {measured_ppm:e}");
+    assert!(observed_abs >= measured_abs && observed_abs <= measured_abs * 1.001, "recorded {observed_abs:e}, decoding measures {measured_abs:e}");
+    assert!(observed_ppm < 5.0 / 1000.0 && observed_abs < e["max_abs_error"].as_f64().unwrap() / 1000.0, "{e}");
+
+    // --- the encodings of the m/z values column, per facet of an archive ---
+    let values_column = |archive: &Path, name: &str| -> (bool, Vec<Encoding>, i64) {
+        let mut z = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+        let p = dir.join(format!("footer-{name}"));
+        std::io::copy(&mut z.by_name(name).unwrap(), &mut File::create(&p).unwrap()).unwrap();
+        let md = SerializedFileReader::new(File::open(&p).unwrap()).unwrap().metadata().clone();
+        let (mut dictionary, mut encodings, mut values) = (false, Vec::new(), 0);
+        for rg in md.row_groups() {
+            let col = rg.columns().iter().find(|c| c.column_path().string() == "chunk.mz_chunk_values.list.item").unwrap_or_else(|| panic!("{name}: no m/z values column"));
+            dictionary |= col.dictionary_page_offset().is_some();
+            encodings.extend(col.encodings());
+            values += col.num_values();
+        }
+        (dictionary, encodings, values)
+    };
+    // The peaks facet: one grid row and three raw rows of 29 values each (+ the nulls of the grid row).
+    let (dictionary, encodings, values) = values_column(&archive, "spectra_peaks.parquet");
+    assert!(values >= 3 * 29, "{values} values");
+    assert!(!dictionary && encodings.contains(&Encoding::BYTE_STREAM_SPLIT), "off-lattice m/z of a grid facet: dictionary {dictionary}, {encodings:?}");
+    assert!(!encodings.iter().any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)), "{encodings:?}");
+    // The data facet holds grid rows only: the same rule, on a column of nulls.
+    let (dictionary, _, _) = values_column(&archive, "spectra_data.parquet");
+    assert!(!dictionary);
+    // The values are the source's, bit for bit (the first test reads them through the export).
+    for ix in CENTROID_ON + 1..N_TOTAL {
+        let arrays = reader.get_spectrum_peak_arrays_for(ix as u64).unwrap().expect("peak arrays");
+        assert_eq!(arrays.mzs().unwrap().iter().map(|x| x.to_bits()).collect::<Vec<_>>(), truth[ix].0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "spectrum {ix}");
+    }
+
+    // The same file without a grid, delta-encoded: no grid column, and the default is untouched.
+    let plain = dir.join("plain.mzpeak");
+    run(&[&src, Path::new("-o"), &plain, Path::new("--no-numpress")], &[]);
+    let (dictionary, encodings, _) = values_column(&plain, "spectra_peaks.parquet");
+    assert!(dictionary && !encodings.contains(&Encoding::BYTE_STREAM_SPLIT), "a delta facet's values column changed: dictionary {dictionary}, {encodings:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `intensity_values_rounded` of a `--tof-grid` archive is the number of stored intensities that
+/// differ from the source's, per facet. A grid row carries float32 intensities and an off-lattice
+/// spectrum keeps its source arrays, which the writer casts into the facet's column; neither
+/// goes through mzdata's peak set. The first version of the count took the route of the spectrum
+/// READ (a centroid spectrum: stored from its peak set, rounded) and then added the grid row's
+/// narrowing on top, so a gridded centroid spectrum was counted twice: 441,372 rounded
+/// intensities stated for a facet of 264,726 points.
+#[test]
+fn a_grid_archive_counts_each_rounded_intensity_once() {
+    let dir = std::env::temp_dir().join(format!("mzpc-tofgrid-rounding-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 64-bit intensities: three per spectrum that a float32 holds, the rest that none does.
+    let intensity = |n: usize, s: usize| -> Vec<f64> { (0..n).map(|i| if i < 3 { 2.0 + i as f64 } else { 1000.0 + 0.1234567 * (i + 7 * s) as f64 }).collect() };
+    let mut spectra: Vec<(Vec<f64>, Vec<f64>, SignalContinuity)> = Vec::new();
+    for s in 0..3 {
+        spectra.push(((0..200).map(|i| mz_of(40_000 + 1_200 * s as i64 + 5 * i)).collect(), intensity(200, s), SignalContinuity::Profile));
+    }
+    for s in 0..4 {
+        spectra.push(((0..50).map(|i| mz_of(42_000 + 11 * i + s as i64)).collect(), intensity(50, s), SignalContinuity::Centroid));
+    }
+    for s in 0..2 {
+        let mz = (0..30).map(|i| 137.0 + 0.131 * i as f64 + 0.017 * (i as f64 + s as f64).sin()).collect();
+        spectra.push((mz, intensity(30, s), SignalContinuity::Centroid));
+    }
+    let src = dir.join("wide.mzML");
+    let mut w = MzMLWriter::new(File::create(&src).unwrap());
+    w.set_spectrum_count(spectra.len() as u64);
+    for (i, (mz, it, continuity)) in spectra.iter().enumerate() {
+        let mut arrays = BinaryArrayMap::new();
+        for (kind, values) in [(ArrayType::MZArray, mz), (ArrayType::IntensityArray, it)] {
+            let mut a = DataArray::wrap(&kind, BinaryDataArrayType::Float64, Vec::new());
+            a.update_buffer(values).unwrap();
+            arrays.add(a);
+        }
+        let d = SpectrumDescription { index: i, id: format!("scan={}", i + 1), ms_level: 1, signal_continuity: *continuity, ..Default::default() };
+        let spec: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(d, Some(arrays), None, None);
+        w.write(&spec).unwrap();
+    }
+    w.close().unwrap();
+    let archive = dir.join("wide.mzpeak");
+    run(&[&src, Path::new("-o"), &archive, Path::new("--tof-grid"), Path::new("on")], &[("MZPC_TOF_GRID_C1", "1e-4")]);
+
+    // Both kinds of row are there: four gridded centroid spectra, two kept as 64-bit m/z.
+    let peaks = facet_rows(&archive, "spectra_peaks.parquet", &dir);
+    assert_eq!(peaks.values().filter(|(_, grid, _)| *grid > 0).count(), 4, "{peaks:?}");
+    assert_eq!(peaks.values().filter(|(_, _, raw)| *raw > 0).count(), 2, "{peaks:?}");
+
+    let index: serde_json::Value = {
+        let mut z = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        serde_json::from_reader(z.by_name("mzpeak_index.json").unwrap()).unwrap()
+    };
+    let fidelity = &index["metadata"]["fidelity"];
+
+    // What the archive hands back against what the file holds, per facet (`spectra_data`,
+    // `spectra_peaks`), and what should have changed: a grid row's intensities are float32
+    // whatever the column, an off-lattice spectrum's are cast into the column, which is exact
+    // unless the column is a float32.
+    let mut reader = mzpeak_prototyping::MzPeakReader::new(&archive).unwrap();
+    let (mut changed, mut points, mut expected) = ([0u64; 2], [0u64; 2], [0u64; 2]);
+    for (ix, (_, it, continuity)) in spectra.iter().enumerate() {
+        let (facet, key, arrays) = if *continuity == SignalContinuity::Profile {
+            (0, "spectra_data", reader.get_spectrum_arrays(ix as u64).unwrap().expect("signal arrays"))
+        } else {
+            (1, "spectra_peaks", reader.get_spectrum_peak_arrays_for(ix as u64).unwrap().expect("peak arrays"))
+        };
+        let stored = arrays.get(&ArrayType::IntensityArray).expect("intensities").to_f64().unwrap().to_vec();
+        assert_eq!(stored.len(), it.len(), "spectrum {ix}");
+        changed[facet] += stored.iter().zip(it).filter(|(a, b)| a != b).count() as u64;
+        points[facet] += it.len() as u64;
+        let not_f32 = it.iter().filter(|x| f64::from(**x as f32) != **x).count() as u64;
+        assert_eq!(not_f32, it.len() as u64 - 3, "the premise: all but three intensities of a spectrum are no float32 values");
+        let gridded = ix < 7;
+        if gridded || fidelity[key]["stored_types"]["intensity"] == "float32" {
+            expected[facet] += not_f32;
+        }
+    }
+    assert_eq!(changed, expected, "stored types: {} and {}", fidelity["spectra_data"]["stored_types"], fidelity["spectra_peaks"]["stored_types"]);
+    assert!(changed[0] == 3 * 197 && changed[1] >= 4 * 47, "{changed:?}");
+
+    for (facet, key) in ["spectra_data", "spectra_peaks"].iter().enumerate() {
+        assert_eq!(fidelity[key]["intensity_values_rounded"].as_u64(), Some(changed[facet]), "{key}: {}", fidelity[key]);
+        assert_eq!(fidelity[key]["stored_points"].as_u64(), Some(points[facet]), "{key}");
+        assert!(fidelity[key].get("intensity_values_narrowed").is_none(), "{key}: {}", fidelity[key]);
+    }
+    let declared: Vec<&str> = index["metadata"]["transformations"].as_array().unwrap().iter().filter_map(|t| t.as_str()).collect();
+    assert!(declared.contains(&"intensity-f32-rounding") && !declared.contains(&"intensity-type-narrowing"), "{declared:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An m/z range query over a grid facet hands back exactly the points of a full read filtered in
 /// memory. Until 0.12.5 it handed back NOTHING for every gridded spectrum: the facet's `mz` column is
 /// NULL on those rows, the m/z predicate pushed into Parquet dropped every NULL, and `tof_index` was
