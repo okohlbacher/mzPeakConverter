@@ -308,6 +308,146 @@ fn a_lossless_archive_exports_its_64_bit_intensities() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every array of a source spectrum, by name: its type and its decoded bytes.
+fn raw_arrays_of(mzml: &Path) -> Vec<BTreeMap<String, (BinaryDataArrayType, Vec<u8>)>> {
+    let mut reader = mzdata::io::mzml::MzMLReader::open_path(mzml).unwrap();
+    reader
+        .iter()
+        .map(|s| {
+            let arrays = s.arrays.as_ref().expect("the reader keeps a spectrum's arrays");
+            arrays.iter().map(|(name, a)| (format!("{name:?}"), (a.dtype, a.decode().unwrap().to_vec()))).collect()
+        })
+        .collect()
+}
+
+/// An mzML of centroid spectra written by mzdata's writer: 64-bit m/z, and each spectrum's intensity
+/// array as given (the writer keeps an array's own type). A spectrum may have no point.
+fn write_typed_mzml(path: &Path, spectra: &[(Vec<f64>, mzdata::spectrum::DataArray)]) {
+    use mzdata::io::mzml::MzMLWriter;
+    use mzdata::mzpeaks::{CentroidPeak, DeconvolutedPeak};
+    use mzdata::spectrum::bindata::{ArrayType, DataArray};
+    use mzdata::spectrum::{BinaryArrayMap, MultiLayerSpectrum, ScanEvent, SignalContinuity, SpectrumDescription};
+    let mut w = MzMLWriter::new(std::fs::File::create(path).unwrap());
+    w.set_spectrum_count(spectra.len() as u64);
+    for (i, (mz, intensity)) in spectra.iter().enumerate() {
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz_array = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz_array.update_buffer(mz).unwrap();
+        arrays.add(mz_array);
+        arrays.add(intensity.clone());
+        let mut description = SpectrumDescription {
+            index: i,
+            id: format!("scan={}", i + 1),
+            ms_level: 1,
+            signal_continuity: SignalContinuity::Centroid,
+            polarity: ScanPolarity::Positive,
+            ..Default::default()
+        };
+        let mut scan = ScanEvent::default();
+        scan.start_time = 0.5 + i as f64;
+        description.acquisition.scans.push(scan);
+        let spectrum: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(description, Some(arrays), None, None);
+        w.write(&spectrum).unwrap();
+    }
+    w.close().unwrap();
+}
+
+/// A `--lossless` archive of a source whose intensities are 32- or 64-bit integers (or 64-bit floats)
+/// stores them as they are, and its export writes them as stored, in their type — bit for bit, with
+/// the array's own type term, and a spectrum without a point with arrays of length 0 in that type.
+/// Through 0.17.0-rc.2 the export took a facet's arrays only when its intensity column was a 64-bit
+/// float: an integer column went through the reader's peak list, whose intensity is a 32-bit float,
+/// so every value above 2^24 came back changed (80,299,922 → 80,299,920) and the array was declared
+/// `32-bit float`, with no warning (the audit of 2026-10-01, finding 6).
+#[test]
+fn a_lossless_archive_exports_its_integer_intensities() {
+    use mzdata::spectrum::bindata::{ArrayType, DataArray};
+    let dir = scratch("integer-intensity");
+    let mz = |n: usize| -> Vec<f64> { (0..n).map(|k| 100.0 + 1.5 * k as f64).collect() };
+    let cases: [(&str, BinaryDataArrayType, &str, Box<dyn Fn(&[f64]) -> DataArray>); 3] = [
+        (
+            "int32",
+            BinaryDataArrayType::Int32,
+            "MS:1000519",
+            Box::new(|v: &[f64]| {
+                let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int32, Vec::new());
+                a.update_buffer(&v.iter().map(|x| *x as i32).collect::<Vec<_>>()).unwrap();
+                a
+            }),
+        ),
+        (
+            "int64",
+            BinaryDataArrayType::Int64,
+            "MS:1000522",
+            Box::new(|v: &[f64]| {
+                let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int64, Vec::new());
+                // Beyond 2^53 as well, which no float holds.
+                a.update_buffer(&v.iter().map(|x| *x as i64 * 1_000_003 + 1).collect::<Vec<_>>()).unwrap();
+                a
+            }),
+        ),
+        (
+            "float64",
+            BinaryDataArrayType::Float64,
+            "MS:1000523",
+            Box::new(|v: &[f64]| {
+                let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new());
+                a.update_buffer(&v.iter().map(|x| x + 0.1).collect::<Vec<_>>()).unwrap();
+                a
+            }),
+        ),
+    ];
+    // Above 2^24 (16,777,216), where a 32-bit float no longer holds every integer, and below.
+    let big = [16_777_217.0, 80_299_922.0, 33_554_433.0, 2_147_483_647.0, 7.0, 0.0, 100_000_001.0, 16_777_216.0];
+    let small = [1.0, 2.0, 3.0];
+    for (tag, dtype, source_term, array) in &cases {
+        let source = dir.join(format!("{tag}.mzML"));
+        write_typed_mzml(&source, &[(mz(8), array(&big)), (mz(0), array(&[])), (mz(3), array(&small))]);
+        let want = raw_arrays_of(&source);
+        assert_eq!(want[0]["IntensityArray"].0, *dtype, "{tag}: the writer kept the type");
+        assert_eq!(want[1]["IntensityArray"].1.len(), 0, "{tag}: an empty spectrum");
+        let source_text = std::fs::read_to_string(&source).unwrap();
+        let stated: usize = elements(&source_text, "spectrum").iter().map(|s| count(s, source_term)).sum();
+        assert_eq!(stated, if *dtype == BinaryDataArrayType::Float64 { 6 } else { 3 }, "{tag}: the source's type terms on its spectra");
+        let (archive, export) = (dir.join(format!("{tag}.mzpeak")), dir.join(format!("{tag}-export.mzML")));
+        convert(&source, &archive, &["--lossless"], &[]);
+        let log = convert(&archive, &export, &[], &[]);
+        let got = raw_arrays_of(&export);
+        assert_eq!(got.len(), 3, "{tag}");
+        let (want_values, got_values) = (arrays_of(&source), arrays_of(&export));
+        for at in 0..3 {
+            // An integer column is written as 64-bit floats, which hold every 32-bit integer and
+            // every 64-bit one below 2^53: OpenMS 3.5 refuses an integer-encoded intensity array
+            // (`Encoding intensity array as integer is not allowed`), the source's included.
+            assert_eq!(got[at]["IntensityArray"].0, BinaryDataArrayType::Float64, "{tag}: spectrum {at}: the intensity array's type");
+            assert!(got_values[at]["IntensityArray"].1 == want_values[at]["IntensityArray"].1, "{tag}: spectrum {at}: intensities, value for value");
+            if *dtype == BinaryDataArrayType::Float64 {
+                assert!(got[at]["IntensityArray"] == want[at]["IntensityArray"], "{tag}: spectrum {at}: intensities, bit for bit");
+            }
+            assert!(got[at]["MZArray"] == want[at]["MZArray"], "{tag}: spectrum {at}: m/z");
+        }
+        let text = std::fs::read_to_string(&export).unwrap();
+        let spectra = elements(&text, "spectrum");
+        assert_eq!(spectra.len(), 3, "{tag}");
+        for (at, spectrum) in spectra.iter().enumerate() {
+            assert_eq!(
+                count(spectrum, "MS:1000521") + count(spectrum, "MS:1000519") + count(spectrum, "MS:1000522"),
+                0,
+                "{tag}: spectrum {at}: no 32-bit float or integer array"
+            );
+            // The `<binaryDataArray>` that holds the intensity array: its type term comes first.
+            let term_at = spectrum.find("MS:1000515").unwrap();
+            let open = spectrum[..term_at].rfind("<binaryDataArray ").unwrap();
+            let intensity = &spectrum[open..open + spectrum[open..].find("</binaryDataArray>").unwrap()];
+            assert_eq!(count(intensity, "MS:1000523"), 1, "{tag}: spectrum {at}: the intensity array's type term\n{intensity}");
+        }
+        assert_eq!(count(spectra[1], "encodedLength=\"0\""), 2, "{tag}: the empty spectrum's two arrays\n{}", spectra[1]);
+        assert_well_formed(tag, &text, &log);
+        assert!(!log.contains("2^53"), "{tag}: {log}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A scan that states no start time is exported without one. mzdata's model holds 0 for it and its
 /// writer prints that 0: through rc.1 the fixture's `scan=21`, which states no time, was exported
 /// with `scan start time` 0, and so was every pixel of an imaging run. The direct export reads which
