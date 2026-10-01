@@ -14871,13 +14871,17 @@ mod tests {
             let acc = row["accession"].as_str().unwrap();
             assert_eq!(row["unit"], param(&m["scan_settings_list"][0], acc).unwrap()["unit"], "{acc}: {:#}", m["imaging_pixel_size"]);
         }
-        // A single y in that unit pair is tested in the unit written (µm): 100 × 3 = 300 µm is kept,
-        // 0.01 is dropped — by accession it passed as 0.01 cm and was written as 0.01 µm.
-        for (name, value, kept) in [("cm_y", "100.0", true), ("cm_y_small", "0.01", false)] {
+        // A single y in that unit pair is read both ways against the extent (owner decision D4):
+        // 100 "micrometer" × 3 = 300 µm passes by the name and is kept as it was; 0.01 passes only
+        // as 0.01 cm (the accession) and is written as 100 µm, declared (it was dropped through
+        // 0.17.0-rc.2; before review B17 it passed by accession and was written as 0.01 µm).
+        for (name, value, by_accession) in [("cm_y", "100.0", false), ("cm_y_small", "0.01", true)] {
             let m = convert(name, base.replace(px, "").replace(py, &cm(py).replace("100.0", value)));
             let written = param(&m["scan_settings_list"][0], "IMS:1000047");
-            assert_eq!(written.is_some(), kept, "{name}: {:#}", m["imaging_pixel_size"]);
-            assert_eq!(declared(&m, super::imaging::DROPPED), !kept, "{name}: {:#}", m["transformations"]);
+            assert!(written.is_some(), "{name}: {:#}", m["imaging_pixel_size"]);
+            assert!(!declared(&m, super::imaging::DROPPED), "{name}: {:#}", m["transformations"]);
+            assert_eq!(declared(&m, super::imaging::UNIT_FROM_ACCESSION), by_accession, "{name}: {:#}", m["transformations"]);
+            assert_eq!(m["imaging"]["pixel_size_source"], "declared", "{name}: {:#}", m["imaging"]);
             if let Some(w) = written {
                 assert_eq!((&w["value"], &w["unit"]), (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}");
             }
