@@ -3834,8 +3834,8 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
         .map(readable_chromatogram_arrays)
         // A device trace's unit, which the writer states for no `intensity array`.
         .map(unit_keeping_chromatogram_arrays)
-        // The empty, id-less chromatogram an archive holds when it had none (`write_empty_chromatogram`).
-        .filter(|c| !(c.id().is_empty() && c.arrays.get(&ArrayType::TimeArray).is_none_or(|t| t.data_len().unwrap_or(0) == 0)))
+        // The placeholder row an archive holds when it had no chromatogram (`write_empty_chromatogram`).
+        .filter(|c| !is_placeholder_chromatogram(c))
         .filter(|c| {
             // mzdata's writer `unwrap`s a chromatogram's time array, and this binary aborts on panic.
             let timed = c.arrays.has_array(&ArrayType::TimeArray);
@@ -9029,17 +9029,38 @@ fn convert_tsf(
     )
 }
 
+/// The name of the parameter that marks the placeholder row of a run without a chromatogram
+/// ([`write_empty_chromatogram`]): a reader that finds it on a `chromatograms_metadata` row skips
+/// the row. Its value says why the row is there.
+const CHROMATOGRAM_PLACEHOLDER: &str = "placeholder chromatogram";
+
 /// Write one empty chromatogram (zero data points, no fabricated TIC). Mirrors mzML2mzPeak's
 /// `ensure_chromatogram_facet`: keeps the archive openable by the reference reader AND triggers
-/// the writer's index-metadata finalization. The (zero-length) TimeArray + IntensityArray are
-/// required because the writer unwraps the TimeArray on the chromatogram path.
+/// the writer's index-metadata finalization — the vendored writer emits `chromatograms_metadata`
+/// only when it holds a row, and the vendored reader counts 2 chromatograms where the member is
+/// absent. The (zero-length) TimeArray + IntensityArray are required because the writer unwraps
+/// the TimeArray on the chromatogram path.
+///
+/// The row is an id-less entry with no points and the [`CHROMATOGRAM_PLACEHOLDER`] parameter, so a
+/// reader can tell it from a chromatogram. The footers count it as the facets count: the metadata
+/// facet's `chromatogram_count` is its rows (1), the data facet's one past the largest index with a
+/// row in that file (0, decision D1): the same pair an empty spectrum leaves on the spectrum facets.
 fn write_empty_chromatogram(writer: &mut MzPeakWriterType<fs::File>) -> Result<()> {
     let mut arrays = BinaryArrayMap::new();
     arrays.add(DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new()));
     arrays.add(DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float64, Vec::new()));
-    let empty = Chromatogram::new(ChromatogramDescription::default(), arrays);
+    let mut description = ChromatogramDescription::default();
+    description.add_param(Param::new_key_value(CHROMATOGRAM_PLACEHOLDER, "the run has no chromatogram: this row holds the facet open and is not one"));
+    let empty = Chromatogram::new(description, arrays);
     writer.write_chromatogram(&empty)?;
     Ok(())
+}
+
+/// Whether a chromatogram read from an archive is the placeholder row of a run without one
+/// ([`write_empty_chromatogram`]): marked since 0.17.0, before that an id-less row without a point.
+fn is_placeholder_chromatogram(chrom: &Chromatogram) -> bool {
+    chrom.params().iter().any(|p| !p.is_controlled() && p.name == CHROMATOGRAM_PLACEHOLDER)
+        || (chrom.id().is_empty() && chrom.arrays.get(&ArrayType::TimeArray).is_none_or(|t| t.data_len().unwrap_or(0) == 0))
 }
 
 /// The `(total_ion_current, base_peak_intensity)` pair behind the synthesized TIC/BPC chromatograms.

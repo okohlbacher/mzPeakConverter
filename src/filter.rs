@@ -130,9 +130,34 @@ pub fn report_inspect(input: &Path) -> Result<()> {
     }
     if names.iter().any(|n| n == "chromatograms_metadata.parquet") {
         let bytes = read_member(&mut zip, "chromatograms_metadata.parquet")?;
-        println!("chromatograms: {}", parquet_row_count(&bytes)?);
+        let rows = parquet_row_count(&bytes)?;
+        // The one row of a run without a chromatogram is the writer's placeholder (`write_empty_chromatogram`), not one.
+        if rows == 1 && single_row_is_placeholder(&bytes).unwrap_or(false) {
+            println!("chromatograms: 0 (one placeholder row: the run has no chromatogram)");
+        } else {
+            println!("chromatograms: {rows}");
+        }
     }
     Ok(())
+}
+
+/// Whether the one row of a `chromatograms_metadata` facet is the placeholder of a run without a
+/// chromatogram: an empty id (the row carries the `placeholder chromatogram` parameter too, since
+/// 0.17.0; the empty id is what the manual tells a reader to skip on, and what older archives have).
+fn single_row_is_placeholder(bytes: &[u8]) -> Result<bool> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes_of(bytes))?.build()?;
+    for batch in reader {
+        let batch = batch?;
+        let Some(view) = facet_view(&batch, "chromatogram") else { return Ok(false) };
+        let Some(ids) = view.column_by_name("id") else { return Ok(false) };
+        let empty = ids
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .map(|a| a.len() == 1 && a.is_valid(0) && a.value(0).is_empty())
+            .or_else(|| ids.as_any().downcast_ref::<arrow::array::StringArray>().map(|a| a.len() == 1 && a.is_valid(0) && a.value(0).is_empty()));
+        return Ok(empty.unwrap_or(false));
+    }
+    Ok(false)
 }
 
 /// Filter `input` (a `.mzpeak`) into `output` (a new `.mzpeak`) per `opts`.
