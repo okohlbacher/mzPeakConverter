@@ -523,8 +523,16 @@ fn has_gz_suffix(p: &Path) -> bool {
 /// drops, so the sink must be closed before the rename or the renamed file is a truncated gzip. That
 /// order used to be carried by a comment beside a hand-written `drop(w)` in four places; here it is
 /// structural — the writer cannot outlive the call, and no caller can forget the drop.
+///
+/// A lane that wrote no chromatogram of its own (`write_agilent_profile_mzml`, and
+/// `write_native_mzml` for a source that is not a directory) gets the writer's TIC and base-peak pair
+/// here through [`write_source_chromatograms_mzml`], in time order, where the writer's close would
+/// have written them in spectrum order; every lane's summaries are sorted the same way.
 fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: TmpGuard, output: &Path) -> Result<()> {
     use mzdata::prelude::SpectrumWriter;
+    if !w.wrote_summaries {
+        write_source_chromatograms_mzml(&mut w, std::iter::empty())?;
+    }
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
     drop(w);
@@ -8263,9 +8271,16 @@ fn strip_grid_axis(arrays: &mut BinaryArrayMap) {
 ///   scan keeps one of each accession with a given value and unit.
 /// * The reader hands `spectra_metadata.time` back as a SPECTRUM-level `scan start time`, beside the
 ///   scan's own: mzML states the time on the scan. It is dropped, or becomes the scan's time where the
-///   scan has none (an archive without its scans facet).
+///   scan has none (an archive without its scans facet), in minutes, the scan's unit: the param's
+///   own unit says what its value is in (minutes when it states none, as this writer maps the column).
 fn correct_reader_terms(descr: &mut mzdata::spectrum::SpectrumDescription) {
-    let time = descr.params.iter().find(|p| p.curie() == Some(curie!(MS:1000016))).map(|p| p.value.to_f64());
+    let time = descr.params.iter().find(|p| p.curie() == Some(curie!(MS:1000016))).map(|p| {
+        p.value.to_f64().map(|t| match p.unit {
+            Unit::Second => t / 60.0,
+            Unit::Millisecond => t / 60_000.0,
+            _ => t,
+        })
+    });
     if let Some(time) = time {
         descr.params.retain(|p| p.curie() != Some(curie!(MS:1000016)));
         // Without a scans facet the reader hands over one default scan, at time 0.
@@ -9128,6 +9143,66 @@ mod tests {
                 ("inverse reduced ion mobility", "1.1".to_string()),
             ]
         );
+    }
+
+    /// A spectrum-level `scan start time` that becomes the scan's time is converted by its own unit:
+    /// a scan's time is in minutes, and one stated in seconds (or milliseconds) used to land on the
+    /// scan as that many minutes, 60× (60,000×) too late. A time without a unit is minutes.
+    #[test]
+    fn a_spectrum_level_time_reaches_the_scan_in_minutes() {
+        use mzdata::curie;
+        use mzdata::params::Unit;
+        let moved = |value: f64, unit: Unit| {
+            let mut descr = SpectrumDescription::default();
+            descr.acquisition.scans.clear();
+            descr.add_param(Param::builder().name("scan start time").curie(curie!(MS:1000016)).value(value).unit(unit).build());
+            super::correct_reader_terms(&mut descr);
+            assert!(descr.params.iter().all(|p| p.curie() != Some(curie!(MS:1000016))));
+            descr.acquisition.first_scan().unwrap().start_time
+        };
+        assert_eq!(moved(353.43, Unit::Second), 353.43 / 60.0);
+        assert_eq!(moved(353_430.0, Unit::Millisecond), 353_430.0 / 60_000.0);
+        assert_eq!(moved(5.8905, Unit::Minute), 5.8905);
+        assert_eq!(moved(5.8905, Unit::Unknown), 5.8905);
+    }
+
+    /// A lane that writes no chromatogram of its own (the Agilent profile lane; the native lane on a
+    /// source that is not a directory) ends in `finish_mzml`, where mzdata's close used to write the
+    /// TIC and base-peak pair in spectrum order: three spectra at 5.8905, 0.0, 0.7008 min gave that
+    /// time array. Now both are in time order, each point keeping its intensity.
+    #[test]
+    fn the_mzml_epilogue_writes_the_summed_chromatograms_in_time_order() {
+        use mzdata::spectrum::SignalContinuity;
+        let (dir, _cleanup) = trace_scratch("epilogue-order");
+        let output = dir.join("out.mzML");
+        let tmp = super::mzml_tmp_path(&output);
+        let guard = super::TmpGuard::new(&tmp);
+        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp).unwrap());
+        w.set_spectrum_count(3);
+        for (i, (time, intensity)) in [(5.8905, 30.0f32), (0.0, 10.0), (0.7008, 20.0)].into_iter().enumerate() {
+            let mut descr = SpectrumDescription { id: format!("scan={}", i + 1), index: i, ms_level: 1, ..Default::default() };
+            descr.signal_continuity = SignalContinuity::Centroid;
+            descr.acquisition.first_scan_mut().unwrap().start_time = time;
+            let mut arrays = BinaryArrayMap::new();
+            let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+            mz.extend(&[100.0f64, 200.0]).unwrap();
+            arrays.add(mz);
+            let mut int = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+            int.extend(&[intensity, 1.0]).unwrap();
+            arrays.add(int);
+            mzdata::prelude::SpectrumWriter::write(&mut w, &MultiLayerSpectrum::new(descr, Some(arrays), None, None)).unwrap();
+        }
+        super::finish_mzml(w, guard, &output).unwrap();
+        let mut r = mzdata::io::mzml::MzMLReader::open_path(&output).unwrap();
+        let chroms: Vec<super::Chromatogram> = (0..r.count_chromatograms()).map(|i| r.get_chromatogram_by_index(i).unwrap()).collect();
+        assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["TIC", "BIC"]);
+        let points = |c: &super::Chromatogram| {
+            let t = c.arrays.get(&ArrayType::TimeArray).unwrap().to_f64().unwrap().to_vec();
+            let v = c.arrays.get(&ArrayType::IntensityArray).unwrap().to_f32().unwrap().to_vec();
+            (t, v)
+        };
+        assert_eq!(points(&chroms[0]), (vec![0.0, 0.7008, 5.8905], vec![11.0, 21.0, 31.0]));
+        assert_eq!(points(&chroms[1]), (vec![0.0, 0.7008, 5.8905], vec![10.0, 20.0, 30.0]));
     }
 
     /// mzML → mzML keeps each chromatogram's type term. mzdata's reader moves it into the typed
