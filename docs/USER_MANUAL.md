@@ -221,7 +221,12 @@ method is software `mzpeak-convert` doing MS:1000544 `Conversion to mzML`, with 
 (paths reduced to their file names) as a `conversion options` userParam. For a source that states
 processing of its own (an mzML), the entry first repeats the methods of the processing the source's
 spectra point at by default, as msconvert does, and the source's entries follow it unchanged; a
-source that states none (every raw vendor format, an archive) gets the step alone. A timsTOF `.d` is
+source that states none (every raw vendor format) gets the step alone. An archive's export
+continues the archive's history: after the methods of the archive's default processing come those
+of the steps this tool's archive lanes recorded on the way — the conversion that wrote the archive
+(`mzpeak_convert_conversion`, with its `transformation` params, §8) and each filter
+(`mzpeak_convert_filter`, §4.2) — then the export, each one `order` later; those entries stay in the
+list as well. A timsTOF `.d` is
 exported with its mobility params as the archive lanes write them: each diaPASEF spectrum's
 `ion mobility lower limit` / `upper limit` pair in order (mzdata's reader emits it inverted) and,
 with the precursor and scan 1/K0, on the vendor's ModelType-2 model that its mobility array uses,
@@ -234,7 +239,54 @@ with every window's precursor and no mobility limits of its own, and the export 
 that assigns precursors by mobility window (OpenSWATH's diaPASEF mode) needs the `.d` exported with
 `--to mzml`, or a `--no-ims-compact` archive.
 
-An archive's export states what the direct export of its source states. Its chromatograms are the
+The run. Every export states the run as its source does: its **id** (`<run id>`), its
+**`startTimeStamp`** when the source states one, its **`defaultSourceFileRef`** (the source's
+default: an Agilent `.d`'s `MSScan.bin`, not the first file listed) and its default instrument
+configuration. A start time with a UTC offset is written in RFC 3339; a clock the source states
+without a zone (an mzML's own zone-less `startTimeStamp`, a Waters or SciEX wall clock, an archive's
+`acquisition_time` block, §8) is written as stated, without one — `xs:dateTime` has that form.
+Through 0.17.0-rc.1 every export was `<run id="1">` of the first listed source file, undated.
+Every id of the header is an `xs:ID`, an XML name, and an archive's ids and a vendor run's name
+are plain strings (`MRM Neg C5`, `20181203_Capan2_1`, sample `1`): the run's id and each source
+file's, sample's, software's and scan settings' id is written escaped as ProteoWizard
+escapes it — each byte a name may not start with (anything but an ASCII letter or `_`) or hold
+(anything but those, a digit, `.`, `-`) as `_x00hh_`: `MRM_x0020_Neg_x0020_C5`,
+`_x0032_0181203_Capan2_1`, `_x0031_` — with the references that name it; an id that is a name
+already is left as it is, and the mzML lanes decode the escapes again on import. Instrument
+configurations are `IC1`, `IC2`, … in the order of their numbers, and a processing's id is written
+as stated (no lane holds one that is not a name). Ids are not made unique across
+the lists (ProteoWizard's own UNIFI files name a source file and a software `UNIFI`).
+
+References. Every reference of an export resolves. The direct export of an mzML or imzML runs the
+archive lane's check (§8, `mzml:dangling-reference-dropped`), and an archive's export runs it on the
+index's lists: an entry mzdata skips for being self-closing is put back, and a reference that names
+nothing is dropped — a scan is written under the run's default configuration (what an mzML scan
+without the attribute means), a run default names the first entry of its list, an instrument
+configuration's `softwareRef` is left out, and a processing method, whose `softwareRef` mzML
+requires, names `software_not_stated`, an entry with no version and no term. One warning counts
+each kind; an mzML has no `transformations` list to declare it in. An instrument configuration
+without components or software has no `<componentList>` or `<softwareRef>` (the writer's empty ones
+are not schema-valid). Against the mzML 1.1.0 schema the header of an export validates; what remains
+is in the body, from mzdata's writer: an empty `<precursorList>` on every MS1 spectrum, a
+`<precursorList>` on a chromatogram, an empty `<binaryDataArrayList>` on a spectrum without points;
+and a `<componentList>` that lacks a source, an analyzer or a detector the source does not state.
+
+An archive's export states what the direct export of its source states: the source files, the
+samples, the software, the instrument configurations (each scan under the one it was acquired on),
+the processing history and the run are the archive's (`file_description`, `sample_list`,
+`software_list`, `instrument_configuration_list`, `data_processing_method_list`, `run`). Through
+0.17.0-rc.1 it stated none of them: one empty instrument configuration, the archive as the only
+source file, this tool as the only software — and a run of two analyzers named an `IC2` it did not
+declare. Different by design, in the header: the archive itself is listed as a source file
+(`mzpeak_archive`, with its SHA-1) after the files the archive lists (an imzML's `.ibd` among them),
+never as the default; the processing chain and list hold the archive's conversion (above); every
+processing method carries MS:1000530 `file format conversion`, a software without a term
+MS:1000799, a detector without one MS:1000026 and a configuration without a model MS:1000031, which
+the archive's writer adds to meet the spec's CvMapping; a term is named as the embedded vocabulary
+names it (`Thermo RAW format` where an old source writes `Thermo RAW file`); the run's `sampleRef`
+is not written by either export (mzdata's run model has none); and an mzML or imzML whose
+`startTimeStamp` has no zone is exported with it directly, but not from its archive, which does
+not hold such a clock for those two formats. Its chromatograms are the
 archive's, as stored (times in minutes), each with its type and polarity term; a TIC or base-peak
 chromatogram summed over the exported spectra is added only for a kind the archive lacks, in time
 order (so is the direct export's). Every precursor, a spectrum's or a chromatogram's, keeps its
@@ -249,7 +301,7 @@ export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` com
 The header. An export carries the source's **scan settings** as a `scanSettingsList` (an imaging
 run's grid and pixel size, an inclusion list's targets), from an mzML/imzML as read and from an
 archive's `scan_settings_list`; an entry's source file references are kept where the export lists
-those files (the direct export) and left out where it lists the archive alone. An archive's export
+the file, which both exports do. An archive's export
 states the archive's `file_description.contents` as its `fileContent`, and the direct export of an
 imzML adds the provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the
 `.ibd` checksum `IMS:1000090/91/92` — as the archive lane does, so both routes state the same. An
@@ -299,6 +351,19 @@ lane injects `--sdrf` into an existing archive — the documented way to add it 
 lane that cannot embed it (§4.3; `--image` too, into an imaging archive) — and writes to `<out>.mzpeak.tmp` first, renaming
 into place on success. The three filters on a **raw or exchange** input are a hard error with the
 two-step remedy printed (convert first, then filter the archive); they used to be silently ignored.
+
+The rewrite records itself in the index: a `filter` block (source name, options, what was dropped,
+injected and renumbered, `tool_version`) and an entry of `data_processing_method_list`
+(`mzpeak_convert_filter`; a second rewrite's is `mzpeak_convert_filter_2`) whose method — MS:1001486
+`data filtering`, the options as a `filter options` param — names the `software_list` entry of the
+version that ran: the source's `mzpeak-convert` when this version converted the source, else a new
+entry (`mzpeak-convert_2`) beside it. Through 0.17.0-rc.1 the entry's id was fixed and its method
+named `mzpeak-convert` whatever that entry's version, so filtering a 0.16.0 archive credited the
+step to 0.16.0, and a second filter repeated the id. **The index is where the step is recorded.**
+The Parquet footers of the metadata facets (`spectra_metadata*.parquet`,
+`chromatograms_data.parquet`) repeat the software and processing lists as the conversion wrote
+them, and a rewrite leaves those copies as they are, in a facet it rewrites and in one it copies
+byte for byte alike: read an archive's history from `mzpeak_index.json`.
 
 ```sh
 mzpeak-convert run.mzpeak -o ms2_5to6.mzpeak --ms-level 2 --rt 5-6
@@ -559,7 +624,8 @@ zone unstated. Show or compare it as a local wall clock and never attach an offs
 reader's own nor UTC. An archive with neither states no acquisition time. Bruker and Agilent
 directories follow the same rule: their clocks carry offsets in every file seen so far, and one
 that does not becomes the block too (archives written by 0.11.5 and earlier dropped it on the
-lanes that read those directories).
+lanes that read those directories). An mzML export writes either as the run's `startTimeStamp`
+(§4.1): the instant in RFC 3339, the wall clock as stated, without an offset.
 
 ProteoWizard resolves the same ambiguity by asserting: it labels an unzoned Waters clock `Z`, and
 its `adjustUnknownTimeZonesToHostTimeZone` default shifts other readers' values by the converting
@@ -959,7 +1025,7 @@ The vocabulary:
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
-| `mzml:dangling-reference-dropped` | a reference the source states between its own lists names no entry of them, and was dropped: a scan's `instrumentConfigurationRef` (its `instrument_configuration_id` is null), a processing method's or an instrument configuration's `softwareRef` (empty), the run's `defaultInstrumentConfigurationRef` or `defaultSourceFileRef` or the spectrum list's `defaultDataProcessingRef` (each then names the first entry of its list, as for a source that states none — the spec requires all three). A self-closing `<software/>`, `<sourceFile/>` or `<instrumentConfiguration/>`, which mzdata skips, is read back from the header first and put back where the source states it, so a reference to it resolves and is kept. The run's warning counts each kind and names the ids as the source states them | mzML, imzML |
+| `mzml:dangling-reference-dropped` | a reference the source states between its own lists names no entry of them, and was dropped: a scan's `instrumentConfigurationRef` (its `instrument_configuration_id` is null), a processing method's or an instrument configuration's `softwareRef` (empty), the run's `defaultInstrumentConfigurationRef` or `defaultSourceFileRef` or the spectrum list's `defaultDataProcessingRef` (each then names the first entry of its list, as for a source that states none — the spec requires all three). A self-closing `<software/>`, `<sourceFile/>` or `<instrumentConfiguration/>`, which mzdata skips, is read back from the header first and put back where the source states it, so a reference to it resolves and is kept. The run's warning counts each kind and names the ids as the source states them | mzML, imzML (the mzML exports apply the same rule, §4.1, with no list to declare it in) |
 
 **The list in `data_processing_method_list`.** The same entries are mirrored into the conversion's
 own processing method (`mzpeak_convert_conversion`, software `mzpeak-convert`), so a reader of the
@@ -967,7 +1033,11 @@ processing list alone learns what the conversion applied: each entry as a `trans
 userParam carrying it verbatim, and, when `zero-run-mask`, `shimadzu:span-trim` or
 `agilent:drop-zero-samples` is among them, PSI-MS `MS:1003901` `zero intensity point trimming` first
 — the one kind PSI-MS has a term for. A conversion with no entry leaves the method as before.
-Archives written through 0.16.0 hold the list only in `transformations`.
+Archives written through 0.16.0 hold the list only in `transformations`. Ids are unique in the two
+lists: a source this tool wrote brings `mzpeak-convert` and, when it was exported from an archive,
+that archive's `mzpeak_convert_conversion` with it, so the same version's software entry is reused
+(another version's keeps its id; this one's is `mzpeak-convert_2`) and the new conversion is
+`mzpeak_convert_conversion_2`. Through 0.17.0-rc.1 both were written a second time under the same id.
 
 **The `fidelity` index key.** `transformations` names what changed; `metadata.fidelity` says by how
 much. Every mzPeak lane writes it at close, from the two signal facets as they sit in the archive

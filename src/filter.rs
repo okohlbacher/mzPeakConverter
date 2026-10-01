@@ -1597,31 +1597,40 @@ fn carry_index_metadata(
     // Signal rows left the archive: a block that counts them no longer describes it.
     let signal_rewritten = spectra.is_some_and(|s| s.kept.len() != s.total);
     let mut dropped_blocks: Vec<&str> = Vec::new();
-    if let Some(meta) = index.get("metadata").and_then(|m| m.as_object()) {
-        for (k, v) in meta {
-            // data_processing_method_list gets an appended entry; everything else verbatim.
-            if k == crate::fidelity::BLOCK && signal_rewritten {
-                dropped_blocks.push(crate::fidelity::BLOCK);
-            } else if k == "data_processing_method_list" {
-                let mut list = v.clone();
-                if let Some(arr) = list.as_array_mut() {
-                    arr.push(filter_processing_entry(opts));
-                }
-                w.add_index_metadata(k, &list).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
-            } else if k == "imaging" {
-                // An image member `--drop-aux` removed leaves `images[]` with it: it used to stay
-                // listed, and a replacement `--image` was listed beside it under the same name.
-                let mut block = v.clone();
-                if let Some(images) = block.get_mut("images").and_then(|i| i.as_array_mut()) {
-                    images.retain(|i| !dropped.iter().any(|d| i["archive_path"] == d.as_str()));
-                }
-                w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
-            } else if k == "encoding_prescan" {
-                let block = renumber_prescan_block(v, spectra);
-                w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
-            } else {
-                w.add_index_metadata(k, v).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
+    let empty = serde_json::Map::new();
+    let meta = index.get("metadata").and_then(|m| m.as_object()).unwrap_or(&empty);
+    let step = FilterStep::plan(meta, opts);
+    // The step's two lists: the source's, with the step's entries appended (written where the source
+    // index holds none, too).
+    for (k, entry) in [("data_processing_method_list", Some(&step.processing)), ("software_list", step.software.as_ref())] {
+        let mut list = meta.get(k).cloned().unwrap_or_else(|| serde_json::json!([]));
+        if let (Some(arr), Some(entry)) = (list.as_array_mut(), entry) {
+            arr.push(entry.clone());
+        }
+        if meta.contains_key(k) || entry.is_some() {
+            w.add_index_metadata(k, &list).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
+        }
+    }
+    for (k, v) in meta {
+        // Everything else verbatim.
+        if k == "data_processing_method_list" || k == "software_list" {
+            continue;
+        }
+        if k == crate::fidelity::BLOCK && signal_rewritten {
+            dropped_blocks.push(crate::fidelity::BLOCK);
+        } else if k == "imaging" {
+            // An image member `--drop-aux` removed leaves `images[]` with it: it used to stay
+            // listed, and a replacement `--image` was listed beside it under the same name.
+            let mut block = v.clone();
+            if let Some(images) = block.get_mut("images").and_then(|i| i.as_array_mut()) {
+                images.retain(|i| !dropped.iter().any(|d| i["archive_path"] == d.as_str()));
             }
+            w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
+        } else if k == "encoding_prescan" {
+            let block = renumber_prescan_block(v, spectra);
+            w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
+        } else {
+            w.add_index_metadata(k, v).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
         }
     }
     let mut provenance = serde_json::json!({
@@ -1654,8 +1663,61 @@ fn renumber_prescan_block(block: &serde_json::Value, spectra: Option<&Survivors>
     block
 }
 
+/// The id of the `data_processing_method_list` entry a rewrite records itself under; a second
+/// rewrite's is `mzpeak_convert_filter_2`.
+pub(crate) const PROCESSING_ID: &str = "mzpeak_convert_filter";
+
+/// How a rewrite records itself in the index: a `data_processing_method_list` entry under a free
+/// id, whose method names the software entry of the VERSION THAT RAN — the source's own, when this
+/// version wrote the source, else a new one under a free id (`mzpeak-convert_2` beside the
+/// `mzpeak-convert` of the version that converted). The ids follow the converter's rule
+/// (`crate::own_software`, `crate::free_id`). Through 0.17.0-rc.1 the entry's id was fixed and its
+/// method named `mzpeak-convert` whatever that entry's version: filtering a 0.16.0 archive credited
+/// the step to 0.16.0, and filtering the result again wrote `mzpeak_convert_filter` twice.
+///
+/// The step is recorded in the INDEX, like the `filter` block. The Parquet footers of the metadata
+/// facets (`spectra_metadata*.parquet`, `chromatograms_data.parquet`) keep the two lists as the
+/// conversion wrote them, in a rewritten facet and in one copied verbatim alike: a `--drop-aux` or
+/// `--ms-level` rewrite copies some of those members byte for byte, so footers updated where a
+/// facet happens to be rewritten would disagree with each other; the index is the one place that
+/// states the archive's history.
+struct FilterStep {
+    /// The entry to append to `data_processing_method_list`.
+    processing: serde_json::Value,
+    /// The entry to append to `software_list`, unless the source holds this version's.
+    software: Option<serde_json::Value>,
+}
+
+impl FilterStep {
+    fn plan(meta: &serde_json::Map<String, serde_json::Value>, opts: &FilterOpts) -> Self {
+        let version = env!("CARGO_PKG_VERSION");
+        let entries = |key: &str| meta.get(key).and_then(|l| l.as_array()).map(Vec::as_slice).unwrap_or_default();
+        let id_of = |e: &serde_json::Value| e["id"].as_str().map(str::to_string);
+        let mut taken: HashSet<String> =
+            entries("software_list").iter().chain(entries("data_processing_method_list")).filter_map(id_of).collect();
+        let own = entries("software_list")
+            .iter()
+            .find(|e| e["version"] == version && e["id"].as_str().is_some_and(|id| crate::is_numbered_id(id, crate::OWN_SOFTWARE_ID)))
+            .and_then(id_of);
+        let (software_id, software) = match own {
+            Some(id) => (id, None),
+            None => {
+                let id = crate::free_id(crate::OWN_SOFTWARE_ID, &mut taken);
+                let entry = serde_json::json!({
+                    "id": id,
+                    "version": version,
+                    "parameters": [{"accession": "MS:1000799", "name": "custom unreleased software tool", "unit": null, "value": crate::OWN_SOFTWARE_ID}]
+                });
+                (id, Some(entry))
+            }
+        };
+        let id = crate::free_id(PROCESSING_ID, &mut taken);
+        Self { processing: filter_processing_entry(opts, &id, &software_id), software }
+    }
+}
+
 /// An mzML-style data_processing method entry describing this filter operation.
-fn filter_processing_entry(opts: &FilterOpts) -> serde_json::Value {
+fn filter_processing_entry(opts: &FilterOpts, id: &str, software: &str) -> serde_json::Value {
     let mut desc = String::from("mzpeak-convert filter");
     if let Some((a, b)) = opts.rt {
         desc.push_str(&format!(" rt={a}-{b}"));
@@ -1667,10 +1729,10 @@ fn filter_processing_entry(opts: &FilterOpts) -> serde_json::Value {
         desc.push_str(&format!(" drop_aux={:?}", opts.drop_aux));
     }
     serde_json::json!({
-        "id": "mzpeak_convert_filter",
+        "id": id,
         "methods": [{
             "order": 1,
-            "software_reference": "mzpeak-convert",
+            "software_reference": software,
             "parameters": [
                 {"accession": null, "name": "filter options", "unit": null, "value": desc},
                 {"accession": "MS:1001486", "name": "data filtering", "unit": null, "value": null}
@@ -1841,6 +1903,54 @@ mod tests {
         assert!(survivors(&too_wide).is_err(), "an ms_level of 300 does not fit UInt8");
         let float_level = meta(Arc::new(Float64Array::from(vec![1.0, 2.0])), Arc::new(Float64Array::from(vec![0.5, 0.5])));
         assert!(survivors(&float_level).is_err(), "a float ms_level is not cast");
+    }
+
+    /// The step a rewrite records: under a free processing id, naming software of the version that
+    /// ran. An archive another version converted (its `mzpeak-convert` is 0.16.0) gets this version's
+    /// entry beside it and the step names that one — through 0.17.0-rc.1 the step named
+    /// `mzpeak-convert`, crediting the filter to 0.16.0; an archive this version wrote, or already
+    /// filtered, reuses the entry it holds and numbers the step.
+    #[test]
+    fn a_rewrite_names_the_version_that_ran_under_free_ids() {
+        let version = env!("CARGO_PKG_VERSION");
+        let opts = FilterOpts { rt: Some((1.0, 2.0)), ..Default::default() };
+        let index = |software: serde_json::Value, processing: serde_json::Value| {
+            serde_json::json!({"software_list": software, "data_processing_method_list": processing})
+        };
+        let plan = |index: &serde_json::Value| FilterStep::plan(index.as_object().unwrap(), &opts);
+        let step = |s: &FilterStep| (s.processing["id"].as_str().unwrap().to_string(), s.processing["methods"][0]["software_reference"].as_str().unwrap().to_string());
+
+        let older = index(
+            serde_json::json!([{"id": "Xcalibur", "version": ""}, {"id": "mzpeak-convert", "version": "0.16.0"}]),
+            serde_json::json!([{"id": "mzpeak_convert_conversion"}]),
+        );
+        let s = plan(&older);
+        assert_eq!(step(&s), ("mzpeak_convert_filter".to_string(), "mzpeak-convert_2".to_string()));
+        let added = s.software.expect("this version's software entry");
+        assert_eq!((added["id"].as_str(), added["version"].as_str()), (Some("mzpeak-convert_2"), Some(version)));
+        assert_eq!(added["parameters"][0]["accession"], "MS:1000799");
+        assert_eq!(s.processing["methods"][0]["parameters"][0]["value"], "mzpeak-convert filter rt=1-2");
+
+        // That result, filtered again by this version: its own entry, the next step id.
+        let again = index(
+            serde_json::json!([{"id": "mzpeak-convert", "version": "0.16.0"}, {"id": "mzpeak-convert_2", "version": version}]),
+            serde_json::json!([{"id": "mzpeak_convert_conversion"}, {"id": "mzpeak_convert_filter"}]),
+        );
+        let s = plan(&again);
+        assert_eq!(step(&s), ("mzpeak_convert_filter_2".to_string(), "mzpeak-convert_2".to_string()));
+        assert!(s.software.is_none(), "the entry is there");
+
+        // An archive of this version; and an index without either list.
+        let own = index(serde_json::json!([{"id": "mzpeak-convert", "version": version}]), serde_json::json!([]));
+        let s = plan(&own);
+        assert_eq!(step(&s), ("mzpeak_convert_filter".to_string(), "mzpeak-convert".to_string()));
+        assert!(s.software.is_none());
+        let s = FilterStep::plan(&serde_json::Map::new(), &opts);
+        assert_eq!(step(&s), ("mzpeak_convert_filter".to_string(), "mzpeak-convert".to_string()));
+        assert!(s.software.is_some());
+        // A software named like a step id, or a step named like the software, is in the way too.
+        let crossed = index(serde_json::json!([{"id": "mzpeak_convert_filter", "version": "1"}]), serde_json::json!([{"id": "mzpeak-convert"}]));
+        assert_eq!(step(&plan(&crossed)), ("mzpeak_convert_filter_2".to_string(), "mzpeak-convert_2".to_string()));
     }
 
     /// The kept indices, renumbered: a kept entity's new index is its rank, nothing else maps, and

@@ -105,8 +105,11 @@ fn an_mzml_source_s_default_processing_is_extended_by_the_step() {
 
 /// The archive export (`filter_mzpeak_to_mzml`). The vendored archive reader restores none of the
 /// lists the archive's index holds (software, processing, instruments), so 0.16.0 wrote
-/// `<softwareList count="0">` and `<dataProcessingList count="0">` here too; the export's own step
-/// fills both, as the only entry.
+/// `<softwareList count="0">` and `<dataProcessingList count="0">` here, and 0.17.0-rc.1 the
+/// export's own step as the only entry of both. The export now takes the lists from the index: its
+/// step extends the archive's default processing (the source's `pwiz_processing`) through the
+/// conversion that wrote the archive, and the archive's entries follow it
+/// (`tests/mzml_export_header.rs` has the rest of the header).
 #[test]
 fn an_archive_export_records_the_mzml_conversion() {
     let dir = scratch("archive");
@@ -116,7 +119,11 @@ fn an_archive_export_records_the_mzml_conversion() {
     convert(&archive, &mzml, &[], &[]);
     let m = mzml_meta::read(&mzml);
     let ours = mzml_meta::assert_processing_contract(&m, "tiny → mzPeak → mzML");
-    assert_eq!(dp_ids(&m), [ours.as_str()]);
+    assert_eq!(dp_ids(&m), [ours.as_str(), "CompassXtract_x0020_processing", "pwiz_processing", "mzpeak_convert_conversion"]);
+    assert_eq!(
+        methods(&m, &ours),
+        [("pwiz".to_string(), Some(2)), ("mzpeak-convert".to_string(), Some(3)), ("mzpeak-convert".to_string(), Some(4))]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

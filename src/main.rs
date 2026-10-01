@@ -628,9 +628,11 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// [`mzml_isolation::TargetOnlyWindows`] leaves an isolation window of unknown width target-only (the
 /// writer prints offsets of ±target), [`mzml_wavelength::WavelengthSpectra`] removes the terms the
 /// writer invents for a wavelength spectrum, both in place, and [`mzml_header::HeaderFixes`] writes the
-/// header's `<scanSettingsList>` as the schema has it and declares `cv` — a vocabulary the document
-/// uses beside MS and UO, the only two the writer lists — moving the index's offsets by what that adds.
-fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>) -> Result<Box<dyn Write>> {
+/// header's `<scanSettingsList>` as the schema has it, declares `cv` — a vocabulary the document
+/// uses beside MS and UO, the only two the writer lists — leaves out the empty elements the schema
+/// does not take and states the run as `run` holds it once the lane has filled it
+/// ([`prepare_mzml_header`]), moving the index's offsets by what all that adds.
+fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>, run: &mzml_header::RunCell) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let sink: Box<dyn Write> = if has_gz_suffix(output) {
         log::info!("output name ends in .gz: gzip-compressing the mzML as it is written");
@@ -638,7 +640,7 @@ fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>) -> Result<Box<dyn Write
     } else {
         Box::new(file)
     };
-    let sink = mzml_header::HeaderFixes::new(sink, cv);
+    let sink = mzml_header::HeaderFixes::with_run(sink, cv, run.clone());
     Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(mzml_wavelength::WavelengthSpectra::new(sink))))
 }
 
@@ -2552,12 +2554,28 @@ fn convert_to_mzml(
         ),
         _ => false,
     };
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims))?);
+    let run = mzml_header::RunCell::default();
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims), &run)?);
     w.copy_metadata_from(&reader);
     // The source's scan settings (an imaging run's grid and pixel size, an inclusion list): the
     // writer holds the list, but its metadata trait does not reach it, so `copy_metadata_from`
     // left it empty and no export had a `<scanSettingsList>`.
     w.scan_settings = reader.scan_settings().cloned().unwrap_or_default();
+    // An mzML or imzML source: the archive lane's check of the references the source states between
+    // its own lists ([`mzml_refs`]) — the entries mzdata skips for being self-closing put back, a
+    // reference that names nothing dropped, one warning. The ids are decoded for it as that lane
+    // decodes them and written escaped again ([`encode_xml_ids`]). Through 0.17.0-rc.1 this lane
+    // copied each reference as mzdata read it: a scan naming a configuration the source does not
+    // state was written naming one the export did not declare either.
+    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    let mut source_refs = scan_lane.then(|| {
+        decode_pwiz_ids(&mut w);
+        let mut refs = mzml_refs::DanglingRefs::check(&read_path, &mut w);
+        refs.number_scans_ahead(&mut w);
+        refs
+    });
+    // mzdata keeps a `startTimeStamp` only when it carries a UTC offset; the header has it as written.
+    let wall_clock = source_refs.as_ref().and_then(|r| r.start_time_stamp()).map(str::to_string);
     // imzML: the file provenance mzdata consumes (storage mode, UUID, `.ibd` checksum), put back
     // as the archive lane does, and that lane's rules for the scan settings, so the direct export
     // and the export of the archive state the same.
@@ -2568,7 +2586,8 @@ fn convert_to_mzml(
         }
         imzml_scan_settings_for_mzml(input, &read_path, &mut w.scan_settings);
     }
-    fixup_mzml_run_metadata(&mut w, input);
+    prepare_mzml_header(&mut w, input, wall_clock, &run);
+    let mut configurations = MzmlScanConfigurations::of(&w);
     let cap = max_spectra();
     let n_spec = cap.map_or_else(|| reader.len(), |m| m.min(reader.len()));
     w.set_spectrum_count(n_spec as u64);
@@ -2577,16 +2596,19 @@ fn convert_to_mzml(
     // fails to transition into the chromatogramList.
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
 
-    // mzdata's mzML writer panics on an array without a data type (`require_typed_arrays`).
-    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
     let mut written = 0usize;
     for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             break;
         }
+        // mzdata's mzML writer panics on an array without a data type (`require_typed_arrays`).
         if scan_lane {
             require_typed_arrays(&spec)?;
         }
+        if let Some(r) = source_refs.as_mut() {
+            r.check_scans(spec.description_mut());
+        }
+        configurations.apply(spec.description_mut());
         if let Some(g) = thermo_windows.as_mut() {
             g.apply(spec.description_mut());
         }
@@ -2606,6 +2628,10 @@ fn convert_to_mzml(
     if let Some(g) = &thermo_windows {
         g.report();
     }
+    if let Some(r) = &source_refs {
+        r.warn_mzml(input, "source");
+    }
+    configurations.report();
     // Same truncated-source cross-check the mzPeak lanes make; the `?` drops the writer and then
     // the guard, so a truncated source leaves no half mzML that looks like a successful conversion.
     assert_source_complete(input, written, cap)?;
@@ -2766,18 +2792,19 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    // What the index states about the file's content and its scan settings (an imaging run's grid
-    // and pixel size). The vendored reader restores none of the index's lists, so through 0.16.0
-    // every archive was exported with an empty `<fileContent>` and no `<scanSettingsList>`.
+    // What the index states about the run: the file's content and source files, the instrument
+    // configurations, the software and processing history, the samples, the scan settings (an
+    // imaging run's grid and pixel size) and the run itself. The vendored reader restores none of
+    // these lists, and through 0.17.0-rc.1 the export took the file content and the scan settings
+    // alone: an LTQ-FT run's 976 FTMS scans named an `IC2` the export did not declare, and no
+    // archive's export named its instrument, its acquisition software, its sample or the file it
+    // was converted from.
     let archived = reader.file_index().as_file_metadata().unwrap_or_else(|e| {
-        log::warn!("{}: file description and scan settings not read from the index ({e}); exported without", input.display());
+        log::warn!("{}: run metadata not read from the index ({e}); exported without", input.display());
         Default::default()
     });
     let contents = archived.file_description().contents.clone();
-    let mut scan_settings = archived.scan_settings().cloned().unwrap_or_default();
-    // The export lists the archive as its one source file, so a scan settings entry's references
-    // to the archive's own source files would name nothing here.
-    scan_settings.iter_mut().for_each(|s| s.source_file_refs.clear());
+    let scan_settings = archived.scan_settings().cloned().unwrap_or_default();
     // The imaging vocabulary as the archive declares it; an archive that states imaging terms
     // without declaring it — in its file content, in its scan settings, or as the pixel positions
     // of an archive marked as imaging (`metadata.imaging`), which the reader hands over as
@@ -2788,11 +2815,25 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let ims = mzml_header::Cv::from_cv_list(cv_list, "IMS").or_else(|| {
         (marked || contents.iter().any(is_ims) || scan_settings.iter().any(|s| s.iter_params().any(is_ims))).then(mzml_header::Cv::ims)
     });
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims)?);
-    w.copy_metadata_from(&reader);
-    w.file_description_mut().contents = contents;
+    let run = mzml_header::RunCell::default();
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims, &run)?);
+    w.copy_metadata_from(&archived);
     w.scan_settings = scan_settings;
-    fixup_mzml_run_metadata(&mut w, input);
+    // The archive itself is a source of this file too: listed after the files it lists, with its
+    // SHA-1, and never the default — that stays the archive's own (the raw file it was made from).
+    {
+        let sources = &mut w.file_description_mut().source_files;
+        let mut taken: std::collections::HashSet<String> = sources.iter().map(|sf| sf.id.clone()).collect();
+        let archive = input_source_file(input, free_id("mzpeak_archive", &mut taken));
+        sources.push(archive);
+    }
+    // The references of the index's own lists, checked as an mzML source's are: an archive of this
+    // version holds none that dangles, one written before 0.17.0 from such a source does.
+    let mut index_refs = mzml_refs::DanglingRefs::check_metadata(&mut w, None);
+    // A clock the vendor states without a zone is kept in the `acquisition_time` block.
+    let wall_clock = reader.file_index().metadata.get("acquisition_time").and_then(|b| b["wall_clock"].as_str()).map(str::to_string);
+    prepare_mzml_header(&mut w, input, wall_clock, &run);
+    let mut configurations = MzmlScanConfigurations::of(&w);
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
     // A timsTOF archive keeps each peak's 1/K0 in its peak facet (`mean_inverse_reduced_ion_mobility`),
@@ -2821,6 +2862,8 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 }
                 correct_reader_terms(spec.description_mut());
                 demote_mzp_params(spec.description_mut());
+                index_refs.check_scans(spec.description_mut());
+                configurations.apply(spec.description_mut());
                 unreferenced += drop_references_to(spec.description_mut(), &left_out);
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
@@ -2837,6 +2880,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 }
                 let descr = spec.description_mut();
                 demote_mzp_params(descr);
+                configurations.apply(descr);
                 // The archive's summary columns are computed from the arrays when it is written, and its
                 // reader hands each back as a parameter. Import drops what a source stated for the total
                 // ion current, base peak and lambda max (the archive of ProteoWizard's Waters PDA file no
@@ -2855,6 +2899,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                     if let Some(t) = wavelength_time[&k] {
                         let mut scan = mzdata::spectrum::ScanEvent::default();
                         scan.start_time = t;
+                        scan.instrument_configuration_id = configurations.default;
                         descr.acquisition.scans.push(scan);
                     }
                 }
@@ -2862,6 +2907,8 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
             }
         }
     }
+    index_refs.warn_mzml(input, "archive");
+    configurations.report();
     if whole_frames > 0 {
         log::warn!(
             "{whole_frames} MS2 spectra are whole timsTOF frames (an ims-compact archive): each is \
@@ -3128,9 +3175,10 @@ fn write_native_mzml_with(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()))?);
+    let run = mzml_header::RunCell::default();
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()), &run)?);
     w.scan_settings.extend(grid);
-    fixup_mzml_run_metadata(&mut w, input);
+    prepare_mzml_header(&mut w, input, None, &run);
     let n = max_spectra().map_or(len, |m| m.min(len));
     w.set_spectrum_count(n as u64);
     for i in 0..n {
@@ -3170,8 +3218,9 @@ fn write_agilent_profile_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None)?);
-    fixup_mzml_run_metadata(&mut w, input);
+    let run = mzml_header::RunCell::default();
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None, &run)?);
+    prepare_mzml_header(&mut w, input, None, &run);
     // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
     // (matches write_native_mzml, which also uses the reader's record count).
     let cap = max_spectra();
@@ -8635,6 +8684,26 @@ fn decode_pwiz_ids(target: &mut impl MSDataFileMetadata) {
     }
 }
 
+/// The input itself as a source file, under `id`: its name and, for a single file, its SHA-1.
+fn input_source_file(input: &Path, id: String) -> SourceFile {
+    // `name` identifies the source; the directory it happened to sit in on the converting
+    // machine is not provenance, it is the operator's filesystem — and it would travel with
+    // every distributed archive. Record the bare `file://` authority instead of an absolute path.
+    let location = "file://".to_string();
+    let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mut sf = SourceFile { name, location, id, ..Default::default() };
+    // MS:1000569 SHA-1 of the source, as msconvert records it: the digest, not the path, is the
+    // provenance that survives distribution. Single files only — a `.d` directory has no
+    // single byte stream to digest, and hashing one arbitrary member would be a false claim.
+    if input.is_file() {
+        match embed_aux::sha1_hex(input) {
+            Ok(hex) => sf.add_param(run_metadata::sha1_param(hex)),
+            Err(e) => log::warn!("could not digest {}: {e}", input.display()),
+        }
+    }
+    sf
+}
+
 /// Normalise the run metadata every lane writes and merge in what a vendor directory states.
 /// Returns the `acquisition_time` index block when that directory states only a wall clock without
 /// a zone (`run_metadata::apply`): an archive lane writes it into the index, and an mzML output,
@@ -8669,27 +8738,7 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) -> Opt
     // 1b. Ensure at least one source_file (the input itself) so default_source_file_id can resolve
     //     — only when no member was stated above.
     if target.file_description().source_files.is_empty() {
-        // `name` identifies the source; the directory it happened to sit in on the converting
-        // machine is not provenance, it is the operator's filesystem — and it would travel with
-        // every distributed archive. Record the bare `file://` authority instead of an absolute path.
-        let location = "file://".to_string();
-        let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let mut sf = SourceFile {
-            name,
-            location,
-            id: "sourceFile".to_string(),
-            ..Default::default()
-        };
-        // MS:1000569 SHA-1 of the source, as msconvert records it: the digest, not the path, is the
-        // provenance that survives distribution. Single files only — a `.d` directory has no
-        // single byte stream to digest, and hashing one arbitrary member would be a false claim.
-        if input.is_file() {
-            match embed_aux::sha1_hex(input) {
-                Ok(hex) => sf.add_param(run_metadata::sha1_param(hex)),
-                Err(e) => log::warn!("could not digest {}: {e}", input.display()),
-            }
-        }
-        target.file_description_mut().source_files.push(sf);
+        target.file_description_mut().source_files.push(input_source_file(input, "sourceFile".to_string()));
     }
 
     // 2. default_source_file_id / default_data_processing_id ← first list entry, when unset.
@@ -8732,20 +8781,251 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) -> Opt
 }
 
 /// [`fixup_run_metadata`] for an mzML output, after recording this conversion
-/// ([`add_mzml_conversion_step`]) — first, so the default processing it resolves exists. The run
-/// model the mzML writer serialises holds only a zoned `start_time` (`DateTime<FixedOffset>`), so
-/// an unzoned vendor clock cannot be carried: name the clock that was left out instead of dropping
-/// it without a word. All four mzML lanes call this before the spectrumList opens.
-fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
+/// ([`add_mzml_conversion_step`]) — first, so the default processing it resolves exists — and then
+/// what an mzML asks of the model beyond an archive: a processing method that names no software
+/// names [`mzml_refs::UNSTATED_SOFTWARE`] ([`state_unstated_software`]), and every id is an XML name
+/// ([`encode_xml_ids`]). Returns the run as the header is to state it ([`mzml_run`]): mzdata's writer
+/// states none of it, so the lane hands it to the header sink ([`prepare_mzml_header`]).
+///
+/// `wall_clock` is a start time the lane's source states WITHOUT a zone (an mzML's own
+/// `startTimeStamp`, an archive's `acquisition_time` block); a vendor directory's unzoned clock
+/// ([`fixup_run_metadata`]'s block) comes first. The run model holds only a zoned `start_time`
+/// (`DateTime<FixedOffset>`), but `startTimeStamp` is an `xs:dateTime`, which has the zone-less
+/// form: the clock is written as stated. Through 0.17.0-rc.1 no export wrote a `startTimeStamp` at
+/// all, and an unzoned vendor clock was named in a warning and left out.
+#[must_use]
+fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path, wall_clock: Option<String>) -> mzml_header::Run {
     add_mzml_conversion_step(w);
-    if let Some((_, block)) = fixup_run_metadata(w, input) {
-        log::warn!(
-            "{}: acquisition time {} states no time zone, and the mzML run model holds only zoned \
-             times; it is not written",
-            block["source"].as_str().unwrap_or("vendor file"),
-            block["wall_clock"].as_str().unwrap_or("?")
-        );
+    let vendor_clock = fixup_run_metadata(w, input).and_then(|(_, block)| block["wall_clock"].as_str().map(str::to_string));
+    state_unstated_software(w);
+    encode_xml_ids(w);
+    cv_params_first(w);
+    drop_untyped_components(w);
+    mzml_run(w, vendor_clock.or(wall_clock))
+}
+
+/// An mzML component is a `<source>`, an `<analyzer>` or a `<detector>`: one of unknown type has no
+/// element, and mzdata's writer panics on it. No lane of this tool writes one; an archive from
+/// elsewhere may hold one, and its export leaves it out and says so.
+fn drop_untyped_components(target: &mut impl MSDataFileMetadata) {
+    let mut dropped = 0usize;
+    for ic in target.instrument_configurations_mut().values_mut() {
+        let held = ic.components.len();
+        ic.components.retain(|c| c.component_type != mzdata::meta::ComponentType::Unknown);
+        dropped += held - ic.components.len();
     }
+    if dropped > 0 {
+        log::warn!("{dropped} instrument component(s) of unknown type have no mzML element; not written");
+    }
+}
+
+/// The schema's order inside every header element: `cvParam`s, then `userParam`s. mzdata's writer
+/// prints a list as it stands, and an archive's lists stand as its lanes built them — this
+/// conversion's own method holds its `conversion options` userParam before the terms added after it.
+fn cv_params_first(target: &mut impl MSDataFileMetadata) {
+    fn order(params: &mut [Param]) {
+        params.sort_by_key(|p| !p.is_controlled());
+    }
+    target.softwares_mut().iter_mut().for_each(|sw| order(&mut sw.params));
+    target.data_processings_mut().iter_mut().flat_map(|dp| dp.methods.iter_mut()).for_each(|m| order(&mut m.params));
+    for ic in target.instrument_configurations_mut().values_mut() {
+        order(&mut ic.params);
+        ic.components.iter_mut().for_each(|c| order(&mut c.params));
+    }
+    target.samples_mut().iter_mut().for_each(|sample| order(&mut sample.params));
+    let description = target.file_description_mut();
+    order(&mut description.contents);
+    description.source_files.iter_mut().for_each(|sf| order(&mut sf.params));
+}
+
+/// The header step of all four mzML lanes, on the writer itself: [`fixup_mzml_run_metadata`], the
+/// same id rule for the writer's scan settings (its metadata trait does not reach them) — an entry's
+/// source file references are kept where the export lists the file — and the run handed to the
+/// header sink through `run` ([`mzml_sink`]). Call it once the writer holds the source's metadata
+/// and before its first spectrum.
+fn prepare_mzml_header(w: &mut mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, input: &Path, wall_clock: Option<String>, run: &mzml_header::RunCell) {
+    let stated = fixup_mzml_run_metadata(w, input, wall_clock);
+    let listed: std::collections::HashSet<String> = w.file_description().source_files.iter().map(|sf| sf.id.clone()).collect();
+    let mut unlisted = 0usize;
+    for settings in w.scan_settings.iter_mut() {
+        settings.id = pwiz_id::encode(&settings.id);
+        let stated = settings.source_file_refs.len();
+        settings.source_file_refs = settings.source_file_refs.iter().map(|r| pwiz_id::encode(r)).filter(|r| listed.contains(r)).collect();
+        unlisted += stated - settings.source_file_refs.len();
+    }
+    if unlisted > 0 {
+        log::warn!("{unlisted} source file reference(s) of the scan settings name a file the export does not list; not written");
+    }
+    *run.borrow_mut() = Some(stated);
+}
+
+/// The run of an mzML export as its `<run>` start tag states it, from the run description
+/// [`fixup_run_metadata`] completed: its id, its default instrument configuration under the name
+/// mzdata's writer gives it, its default source file — the SOURCE's default, where mzdata's writer
+/// names the first file listed — and its start time: the zoned `start_time` in RFC 3339 (`Z` for
+/// UTC, fractional seconds as stated), else `wall_clock` when it is an `xs:dateTime` without a zone.
+fn mzml_run(w: &impl MSDataFileMetadata, wall_clock: Option<String>) -> mzml_header::Run {
+    let run = w.run_description().cloned().unwrap_or_default();
+    let start_time_stamp = match (run.start_time, wall_clock) {
+        (Some(t), _) => Some(t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        (None, Some(clock)) if chrono::NaiveDateTime::parse_from_str(&clock, "%Y-%m-%dT%H:%M:%S%.f").is_ok() => {
+            log::info!("acquisition time {clock} states no time zone; written as the run's startTimeStamp without one, as stated");
+            Some(clock)
+        }
+        (None, Some(clock)) => {
+            log::warn!("acquisition time {clock:?} is not an xs:dateTime; the run's startTimeStamp is not written");
+            None
+        }
+        (None, None) => None,
+    };
+    mzml_header::Run {
+        id: run.id.unwrap_or_default(),
+        default_instrument_configuration: run.default_instrument_id.map(mzml_instrument_id),
+        start_time_stamp,
+        default_source_file: run.default_source_file_id,
+    }
+}
+
+/// The id mzdata's mzML writer gives instrument configuration `n` (its private `instrument_id`).
+fn mzml_instrument_id(n: u32) -> String {
+    format!("IC{}", u64::from(n) + 1)
+}
+
+/// mzML requires a `processingMethod` to name a `software` (`softwareRef`, an `xs:IDREF`), where an
+/// archive's `software_reference` may be empty — a reference the source could not resolve is
+/// stored that way ([`mzml_refs`]). Such a method names [`mzml_refs::UNSTATED_SOFTWARE`], declared
+/// once, with no version and no term: the list then says that the software is not stated rather
+/// than crediting the step to one that is. An instrument configuration's empty reference needs no
+/// entry: the element is optional and the header sink leaves it out.
+fn state_unstated_software(target: &mut impl MSDataFileMetadata) {
+    const ID: &str = mzml_refs::UNSTATED_SOFTWARE;
+    if !target.data_processings().iter().flat_map(|dp| &dp.methods).any(|m| m.software_reference.is_empty()) {
+        return;
+    }
+    if !target.softwares().iter().any(|s| s.id == ID) {
+        target.softwares_mut().push(Software::new(ID.into(), String::new(), Vec::new()));
+    }
+    for method in target.data_processings_mut().iter_mut().flat_map(|dp| dp.methods.iter_mut()) {
+        if method.software_reference.is_empty() {
+            method.software_reference = ID.to_string();
+        }
+    }
+}
+
+/// Every id of an mzML header is an `xs:ID`, an XML name: the run's, and each source file's,
+/// sample's and software's, with the references that name them. An archive holds plain strings
+/// (`MRM Neg C5`, sample `1`, software `Bruker otofControl`; the mzML lanes decode ProteoWizard's
+/// escapes on import, [`decode_pwiz_ids`]) and the vendor readers name the run after the file
+/// (`20181203_Capan2_1`), so each is escaped the way ProteoWizard escapes it
+/// ([`pwiz_id::encode`]); an id that is a name already — every id of a well-formed mzML source —
+/// stays as it is. Through 0.17.0-rc.1 the run id was mzdata's constant `1`, which is not a name
+/// either. Instrument configurations are numbered, and written `IC<n+1>` by mzdata. A data
+/// processing's id is written as stated: no lane makes one up that is not a name (a source's are
+/// its own XML ids, this tool's are `mzpeak_convert_…`), and arrays name it too
+/// (`dataProcessingRef`), so changing it here alone would leave those naming nothing. Ids are not
+/// made unique ACROSS the lists, which the schema's `xs:ID` also asks: ProteoWizard's own UNIFI
+/// files name a source file and a software `UNIFI`, and the export states both as the source does.
+fn encode_xml_ids(target: &mut impl MSDataFileMetadata) {
+    use pwiz_id::encode;
+    for sw in target.softwares_mut() {
+        sw.id = encode(&sw.id);
+    }
+    for m in target.data_processings_mut().iter_mut().flat_map(|dp| dp.methods.iter_mut()) {
+        m.software_reference = encode(&m.software_reference);
+    }
+    for ic in target.instrument_configurations_mut().values_mut() {
+        ic.software_reference = encode(&ic.software_reference);
+    }
+    for sf in target.file_description_mut().source_files.iter_mut() {
+        sf.id = encode(&sf.id);
+    }
+    for sample in target.samples_mut() {
+        sample.id = encode(&sample.id);
+    }
+    if let Some(run) = target.run_description_mut() {
+        for id in [&mut run.id, &mut run.default_source_file_id].into_iter().flatten() {
+            *id = encode(id);
+        }
+    }
+}
+
+/// What an mzML scan may name as its instrument configuration: one of the list the header
+/// declared. Any other — the null an archive lane stores for a reference it dropped
+/// ([`mzml_refs::DanglingRefs::check_scans`]), which mzdata's writer would print as `IC0`, or a
+/// number the list does not hold — is written as the run's default, which is what an mzML scan
+/// without the attribute means (mzdata's writer always writes the attribute).
+struct MzmlScanConfigurations {
+    declared: std::collections::HashSet<u32>,
+    default: u32,
+    /// Scans naming a number outside the list that no check dropped.
+    undeclared: usize,
+}
+
+impl MzmlScanConfigurations {
+    /// From the metadata the header is written from: after [`prepare_mzml_header`].
+    fn of(w: &impl MSDataFileMetadata) -> Self {
+        let declared: std::collections::HashSet<u32> = w.instrument_configurations().keys().copied().collect();
+        let default = w.run_description().and_then(|r| r.default_instrument_id).or_else(|| declared.iter().copied().min()).unwrap_or(0);
+        Self { declared, default, undeclared: 0 }
+    }
+
+    fn apply(&mut self, descr: &mut mzdata::spectrum::SpectrumDescription) {
+        for scan in descr.acquisition.scans.iter_mut() {
+            let n = scan.instrument_configuration_id;
+            if !self.declared.contains(&n) {
+                self.undeclared += usize::from(n != mzpeak_prototyping::writer::NO_INSTRUMENT_CONFIGURATION);
+                scan.instrument_configuration_id = self.default;
+            }
+        }
+    }
+
+    fn report(&self) {
+        if self.undeclared > 0 {
+            log::warn!(
+                "{} scan(s) name an instrument configuration the header does not declare; written under the run's default",
+                self.undeclared
+            );
+        }
+    }
+}
+
+/// The software id this tool records itself under.
+const OWN_SOFTWARE_ID: &str = "mzpeak-convert";
+
+/// Is `id` `base` itself, or `base` under the numeric suffix [`free_id`] gives a second entry
+/// (`base_2`)?
+fn is_numbered_id(id: &str, base: &str) -> bool {
+    id == base
+        || id.strip_prefix(base).and_then(|rest| rest.strip_prefix('_')).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `base`, or the first of `base_2`, `base_3`, … that `taken` does not hold; `taken` then holds it.
+fn free_id(base: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let id = std::iter::once(base.to_string())
+        .chain((2u32..).map(|n| format!("{base}_{n}")))
+        .find(|id| !taken.contains(id))
+        .expect("an unbounded sequence holds a free id");
+    taken.insert(id.clone());
+    id
+}
+
+/// The ids in use among a model's software and processing entries: one namespace, as in an mzML.
+fn software_and_processing_ids(target: &impl MSDataFileMetadata) -> std::collections::HashSet<String> {
+    target.softwares().iter().map(|s| s.id.clone()).chain(target.data_processings().iter().map(|dp| dp.id.clone())).collect()
+}
+
+/// The software entry for THIS version of the tool, as every lane that records a step references
+/// it: the entry a source written by this very version already holds (`mzpeak-convert`, or
+/// `mzpeak-convert_2` where an older version took the plain id), else a new one under a free id.
+/// So a file passed through the tool any number of times lists each version once, and no id twice.
+fn own_software(target: &mut impl MSDataFileMetadata, taken: &mut std::collections::HashSet<String>) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    if let Some(s) = target.softwares().iter().find(|s| is_numbered_id(&s.id, OWN_SOFTWARE_ID) && s.version == version) {
+        return s.id.clone();
+    }
+    let id = free_id(OWN_SOFTWARE_ID, taken);
+    target.softwares_mut().push(Software::new(id.clone(), version.into(), vec![custom_software_name(OWN_SOFTWARE_ID)]));
+    id
 }
 
 /// Record the step that wrote this mzML as the default processing of both lists: a
@@ -8756,11 +9036,10 @@ fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
 /// mzML 1.1 requires one: `dataProcessingList` holds at least one `dataProcessing`, and
 /// `spectrumList` and `chromatogramList` must name one in `defaultDataProcessingRef`. mzdata's
 /// writer names the list's FIRST entry there, and writes the attribute only when the list is not
-/// empty — and only an mzML source brings entries (the vendored archive reader restores none of
-/// the lists an archive's index holds). Through 0.16.0 every export of a raw file (Bruker
-/// TDF/TSF/BAF, Thermo, the Windows vendor readers, Agilent profile) and of an archive came out
-/// with `<dataProcessingList count="0">` and no default, which OpenMS 3.5 refuses ("Required
-/// attribute 'defaultDataProcessingRef' not present!").
+/// empty. Through 0.16.0 every export of a raw file (Bruker TDF/TSF/BAF, Thermo, the Windows vendor
+/// readers, Agilent profile) and of an archive came out with `<dataProcessingList count="0">` and
+/// no default, which OpenMS 3.5 refuses ("Required attribute 'defaultDataProcessingRef' not
+/// present!").
 ///
 /// Recorded on every export, not only to an empty list: this tool did write the file, and an mzML
 /// source's list states how THAT file was made (msconvert's own `Conversion to mzML`, a peak
@@ -8775,43 +9054,24 @@ fn fixup_mzml_run_metadata(w: &mut impl MSDataFileMetadata, input: &Path) {
 /// `run.default_data_processing_id` goes on naming the source's default, because the writer uses
 /// it only to leave out a `binaryDataArray`'s `dataProcessingRef` equal to it, and such an array
 /// then inherits the new default, which extends that very entry. Where the source states no
-/// processing, the step is the only entry. Ids must be unique in an mzML, and a source written by
-/// this tool already holds `mzpeak-convert` (another version, maybe) and this very step, so an id
-/// in use gets a numeric suffix; the same version's software entry is reused.
+/// processing, the step is the only entry.
+///
+/// An ARCHIVE's list holds more than its default: its default processing is its source's (an mzML
+/// source's `pwiz_Reader_…_conversion`), and the steps this tool's archive lanes recorded on the
+/// way — the conversion that wrote the archive (`mzpeak_convert_conversion`, with its
+/// `transformation` params), a filter (`mzpeak_convert_filter`) — stand beside it, named by
+/// nothing. The data the export writes went through them, so the step holds their methods too,
+/// between the default's and its own, each one `order` after the last: every entry of those two
+/// ids (and their numbered repeats) in list order, minus a method the chain already holds (an
+/// archive made from this tool's own mzML has it in its default). A source without such entries —
+/// every raw file, an mzML some other tool wrote — is extended as before.
+///
+/// Ids must be unique in an mzML, and a source written by this tool already holds
+/// `mzpeak-convert` (another version, maybe) and this very step, so an id in use gets a numeric
+/// suffix ([`free_id`]); the same version's software entry is reused ([`own_software`]).
 fn add_mzml_conversion_step(target: &mut impl MSDataFileMetadata) {
-    const SOFTWARE_ID: &str = "mzpeak-convert";
-    let version = env!("CARGO_PKG_VERSION");
-    let mut taken: std::collections::HashSet<String> = target
-        .softwares()
-        .iter()
-        .map(|s| s.id.clone())
-        .chain(target.data_processings().iter().map(|dp| dp.id.clone()))
-        .collect();
-    let mut fresh = |base: &str| -> String {
-        let id = std::iter::once(base.to_string())
-            .chain((2u32..).map(|n| format!("{base}_{n}")))
-            .find(|id| !taken.contains(id))
-            .expect("an unbounded sequence holds a free id");
-        taken.insert(id.clone());
-        id
-    };
-    let reusable = target
-        .softwares()
-        .iter()
-        .find(|s| s.id == SOFTWARE_ID && s.version == version)
-        .map(|s| s.id.clone());
-    let software = match reusable {
-        Some(id) => id,
-        None => {
-            let id = fresh(SOFTWARE_ID);
-            target.softwares_mut().push(Software::new(
-                id.clone(),
-                version.into(),
-                vec![custom_software_name(SOFTWARE_ID)],
-            ));
-            id
-        }
-    };
+    let mut taken = software_and_processing_ids(target);
+    let software = own_software(target, &mut taken);
     // The source's default: the entry its run names (an mzML source's `defaultDataProcessingRef`,
     // as mzdata's reader hands it over), else, when it names none or one not in the list, the first.
     let named = target.run_description().and_then(|r| r.default_data_processing_id.clone());
@@ -8821,7 +9081,19 @@ fn add_mzml_conversion_step(target: &mut impl MSDataFileMetadata) {
         .or_else(|| target.data_processings().first())
         .cloned();
     let mut methods = source_default.as_ref().map(|dp| dp.methods.clone()).unwrap_or_default();
-    let order = methods.iter().map(|m| m.order).max().map_or(1, |o| o.saturating_add(1));
+    let next_order = |methods: &[ProcessingMethod]| methods.iter().map(|m| m.order).max().map_or(1, |o| o.saturating_add(1));
+    let archive_steps = target
+        .data_processings()
+        .iter()
+        .filter(|dp| is_numbered_id(&dp.id, CONVERSION_PROCESSING_ID) || is_numbered_id(&dp.id, filter::PROCESSING_ID))
+        .filter(|dp| source_default.as_ref().is_none_or(|default| default.id != dp.id));
+    for method in archive_steps.flat_map(|dp| &dp.methods) {
+        if !methods.iter().any(|m| m.software_reference == method.software_reference && m.params == method.params) {
+            let order = next_order(&methods);
+            methods.push(ProcessingMethod { order, ..method.clone() });
+        }
+    }
+    let order = next_order(&methods);
     methods.push(ProcessingMethod {
         order,
         software_reference: software,
@@ -8831,7 +9103,7 @@ fn add_mzml_conversion_step(target: &mut impl MSDataFileMetadata) {
             conversion_options_param(),
         ],
     });
-    let id = fresh("mzpeak_convert_to_mzml");
+    let id = free_id("mzpeak_convert_to_mzml", &mut taken);
     target.data_processings_mut().insert(0, DataProcessing { id, methods });
     if let (Some(dp), Some(run)) = (source_default, target.run_description_mut()) {
         run.default_data_processing_id = Some(dp.id);
@@ -9007,17 +9279,21 @@ fn demote_mzp_in(params: &mut [Param]) {
 /// ([`add_processing_metadata`]); its method is the one [`mirror_transformations`] extends.
 const CONVERSION_PROCESSING_ID: &str = "mzpeak_convert_conversion";
 
+/// Record this conversion in an archive: software `mzpeak-convert` of this version and a
+/// processing entry [`CONVERSION_PROCESSING_ID`] whose one method names it. A source this tool wrote
+/// brings both ids with it — an mzML export holds the software entry, an export of an archive that
+/// archive's conversion — and through 0.17.0-rc.1 they were pushed a second time under the same ids
+/// (`BSA-FT-HCD.mzML` exported and converted back: two `mzpeak-convert` 0.17.0-rc.1 entries). The
+/// same version's software entry is reused, another version's keeps its id and this one gets the
+/// next ([`own_software`]), and the entry's id is the first free one (`mzpeak_convert_conversion_2`).
 fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
-    writer.softwares_mut().push(Software::new(
-        "mzpeak-convert".into(),
-        env!("CARGO_PKG_VERSION").into(),
-        vec![custom_software_name("mzpeak-convert")],
-    ));
+    let mut taken = software_and_processing_ids(writer);
+    let software = own_software(writer, &mut taken);
     writer.data_processings_mut().push(DataProcessing {
-        id: CONVERSION_PROCESSING_ID.to_string(),
+        id: free_id(CONVERSION_PROCESSING_ID, &mut taken),
         methods: vec![ProcessingMethod {
             order: 1,
-            software_reference: "mzpeak-convert".to_string(),
+            software_reference: software,
             params: vec![conversion_options_param()],
         }],
     });
@@ -9040,12 +9316,14 @@ const ZERO_INTENSITY_TRIMMING: [&str; 3] = ["zero-run-mask", "shimadzu:span-trim
 /// with no entry keeps the method as it was. Run on the writer before `finish_parquet`, which copies
 /// the list into the index and every metadata footer.
 fn mirror_transformations(target: &mut impl MSDataFileMetadata, applied: &[&str]) {
+    // This conversion's entry is the last of its id ([`add_processing_metadata`] pushes it, under
+    // the next free number when the source brought one), and its one method is this tool's.
     let Some(method) = target
         .data_processings_mut()
         .iter_mut()
         .rev()
-        .find(|dp| dp.id == CONVERSION_PROCESSING_ID)
-        .and_then(|dp| dp.methods.iter_mut().find(|m| m.software_reference == "mzpeak-convert"))
+        .find(|dp| is_numbered_id(&dp.id, CONVERSION_PROCESSING_ID))
+        .and_then(|dp| dp.methods.iter_mut().find(|m| is_numbered_id(&m.software_reference, OWN_SOFTWARE_ID)))
     else {
         return;
     };
@@ -9905,7 +10183,7 @@ mod tests {
         let output = dir.join("out.mzML");
         let tmp = super::mzml_tmp_path(&output);
         let guard = super::TmpGuard::new(&tmp);
-        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None).unwrap());
+        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None, &Default::default()).unwrap());
         w.set_spectrum_count(3);
         for (i, (time, intensity)) in [(5.8905, 30.0f32), (0.0, 10.0), (0.7008, 20.0)].into_iter().enumerate() {
             let mut descr = SpectrumDescription { id: format!("scan={}", i + 1), index: i, ms_level: 1, ..Default::default() };
@@ -10465,7 +10743,7 @@ mod tests {
             *w.softwares_mut() = softwares;
             *w.data_processings_mut() = processings;
             w.run_description_mut().unwrap().default_data_processing_id = default.map(str::to_string);
-            super::fixup_mzml_run_metadata(&mut w, std::path::Path::new("run.d"));
+            let _ = super::fixup_mzml_run_metadata(&mut w, std::path::Path::new("run.d"), None);
             w.set_spectrum_count(1);
             SpectrumWriter::write(&mut w, spec).unwrap();
             SpectrumWriter::close(&mut w).unwrap();
@@ -12987,11 +13265,13 @@ mod tests {
         let (ok, _, err) = run_bin(&args, &[]);
         assert!(ok, "{err}");
         let xml = fs::read_to_string(&mzml).unwrap();
-        // mzdata's mzML writer numbers the run itself (`<run id="1"`); the software ids it carries.
+        // Decoded for the reference check and escaped again on the way out: the run's id and the
+        // software ids are the source's.
         assert!(
             xml.contains(r#"<software id="Compass_x0020_Xtract""#) && xml.contains(r#"softwareRef="Compass_x0020_Xtract""#),
             "mzML software ids must stay escaped"
         );
+        assert!(xml.contains(r#"<run id="Experiment_x0020_1" "#), "the run's own id, escaped");
         assert!(!xml.contains("Compass Xtract") && !xml.contains("Experiment 1"), "nothing decoded reaches the mzML");
     }
 
