@@ -146,7 +146,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
-| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`), imaging runs only:** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine (image extent on grid extent; none on a Bruker MALDI run acquired from a FlexImaging sequence, §4.3). Repeatable. A bad/missing path, or a run with no pixel positions, ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable or the run is not imaging) (§4.3) |
+| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`), imaging runs only:** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine (image extent on grid extent; on a Bruker MALDI run acquired from a FlexImaging sequence, whose own image every timsTOF lane embeds with its teach-point registration, that registration only for the sequence's image itself — the `<ImageFile>` name, supplied later because it was not beside the `.mis` — and no affine for any other, §4.3). Repeatable. A bad/missing path, or a run with no pixel positions, ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable or the run is not imaging) (§4.3) |
 | `--sdrf <SDRF>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an SDRF (sample-metadata) TSV VERBATIM as `sample_metadata/sdrf.tsv` with `metadata.study` + `metadata.sample_metadata` back-refs. A missing/unreadable path ERRORS the conversion (§4.3) |
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
@@ -544,20 +544,52 @@ its extent on the extent of the Nx × Ny pixel grid. For a W × H image that is 
 (col −0.5) falls on the left edge of MS pixel 1 (x_ms 0.5), its right edge (col W − 0.5) on the
 right edge of MS pixel Nx (x_ms Nx + 0.5). (Through 0.16.0 the matrix mapped the corner pixel
 centres onto each other, `a = (Nx − 1)/(W − 1)`, `c = 1`, which is off by up to half an MS pixel at
-the edges; archives written before keep that matrix.) One kind of archive gets **no affine**: a
-Bruker MALDI run whose `bruker_maldi` block names a FlexImaging sequence (`.mis`). Its grid is the
-bounding box of the acquired regions, while the sequence's image is a photo of the whole target, so
-the full-extent matrix would misplace it (by up to 11 MS pixels on MassIVE MSV000088438). The image
-is embedded and listed in `images[]` without `affine`, with a warning; the registration from the
-sequence's teach points is planned. Which lanes embed them:
+the edges; archives written before keep that matrix.)
+
+**A Bruker MALDI run acquired from a FlexImaging sequence** (`<stem>.mis` beside the `.d`, §8) is
+placed differently. Its grid is the bounding box of the acquired regions, while the sequence's image
+is a photo of the whole target, so the full-extent matrix would misplace it (by up to 11.5 MS pixels
+on MassIVE MSV000088438). Instead, every timsTOF lane — `--image` or not, including the lanes that
+refuse `--image` — embeds the sequence's own image, the `<ImageFile>` its areas and teach points were
+drawn on, found beside the `.mis`, as `images/image_0000.<ext>` with the affine its **teach points**
+fix, `registration_quality: teach_points`. The `<TeachPoint>`s pair image pixels with stage µm (an
+affine, exact with three); the frames' `MaldiFrameInfo` raster indices and `MotorPositionX/Y` fit
+the raster lattice by least squares (±1000 µm per step on MSV000088438, the y axis flipped,
+residual 0.03 µm — a rotated or mirrored stage is just another fit); and because flexImaging's
+stage frame and timsControl's motor frame differ by a translation stated in neither file, the
+lattice is laid through the sequence's `<ReferencePoint>` at the one raster node that keeps every
+acquired spot inside its own `<Area>` outline (on both MSV000088438 runs the reference point lies
+within 1 µm of a lattice node, and a placement one step off leaves a whole row of spots outside: 245
+of 276 inside against 276). The matrix maps the sequence's 0-based image pixel coordinates, taken
+as pixel centres, to 1-based MS pixel centres (`position_x/y`); against flexImaging's own spot list,
+every spot of both runs lands within 0.001 MS px. The `images[]` entry carries, under
+`registration`, what a reader needs to redo it: the teach points (image px, stage µm), the reference
+point and its raster index, the image → stage and raster index → stage affines, the stage − motor
+translation, the fitted step, the residuals and the number of spots checked; the `bruker_maldi`
+block holds the same record (`registration`) and the image names (`sequence_image`: the
+`<ImageFile>`, whether it was beside the sequence, and `<OriginalImage>`'s name — recorded, not
+embedded; MSV000088438's is the same photo at half the size). Nothing is embedded, with a warning,
+when the image is not beside the `.mis` (the registration is still recorded) or when the sequence
+cannot be registered (`not_registered` says why: fewer than three or collinear teach points, frames
+without motor positions, areas without an outline, no or several lattice placements). The photo is
+large next to the signal: 8.9 MB, 26 % of MSV000088438's TSF archive (34 MB, `analysis.tsf_bin`
+embedded) and 62 % of the native TDF one (14.2 MB; 5.4 MB without it); `--drop-aux 'images/*'` on
+the `.mzpeak` → `.mzpeak` lane removes it. A later `--image` on such an archive gets the same
+registration only when it is the sequence's image itself: the file the `.mis` names
+(`<ImageFile>`), supplied on the `.mzpeak` → `.mzpeak` lane because it was not beside the sequence.
+Every other image is embedded **without an affine**, with a warning — one of the same width and
+height included: the teach points were set on the sequence's image and no other, and a photo of
+another target proves nothing by its size (both MSV000088438 runs' photos are 8064 × 6048
+`IMG_0000.jpg` files), so exactly one image in the archive carries the registration. An image the
+archive already holds (same SHA-256) is not embedded twice. Which lanes embed them:
 
 | Lane | `--sdrf` / `--image` |
 |---|---|
 | mzML / imzML on the standard lane, **including the `--tof-grid` sub-path** (the same command used to keep or lose the SDRF depending on whether the grid fit passed — fixed in 0.9.13) | embedded (`--sdrf`; `--image` on an imaging run only, which skips the `--tof-grid` sub-path) |
 | Thermo `.raw`, Bruker TDF with `--no-ims-compact` (mzdata path) | embedded (`--sdrf`; `--image` on an imaging run only) |
 | `--via-msconvert` | embedded (since 0.9.13; it used to hard-code "none") |
-| `.mzpeak` → `.mzpeak` (§4.2) | injected into the existing archive (`--sdrf`; `--image` into an imaging archive only, placed on the grid of the source's `metadata.imaging` marker, which is carried and gains the image in `images[]` after any it lists; without an affine on a Bruker MALDI archive acquired from a FlexImaging sequence, see above) |
-| default timsTOF ims-compact, both `--bruker-sdk` lanes, `--agilent-grid`, native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | **refused** (exit 1) — convert first, then inject: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (`--image` only when the archive is imaging: a Bruker MALDI or Waters imaging run, see the row above) |
+| `.mzpeak` → `.mzpeak` (§4.2) | injected into the existing archive (`--sdrf`; `--image` into an imaging archive only, placed on the grid of the source's `metadata.imaging` marker, which is carried and gains the image in `images[]` after any it lists; on a Bruker MALDI archive acquired from a FlexImaging sequence by the archive's teach-point registration when it is the sequence's own image, not yet embedded, else without an affine, see above) |
+| default timsTOF ims-compact, both `--bruker-sdk` lanes, `--agilent-grid`, native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | **refused** (exit 1) — convert first, then inject: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (`--image` only when the archive is imaging: a Bruker MALDI or Waters imaging run, see the row above). A FlexImaging sequence's own image is embedded on the timsTOF lanes regardless (above) |
 | `--to mzml`, `.mzpeak` → mzML | **refused** — mzML has no place for them |
 
 ## 5. Configuration file
@@ -989,7 +1021,11 @@ imaging profile names no region column yet), on every timsTOF lane. A frame with
 `position_x` / `position_y`, the block counts such frames (`frames_without_position`) and the
 conversion warns once. An empty frame that has a row keeps its pixel. The `bruker_maldi` index block
 holds the regions (number, name, raster step, frames, raw index ranges), the `.mis` it read (or
-rejected, and why), the beam scan size and where it was read (`beam_scan_size_source`).
+rejected, and why), the beam scan size and where it was read (`beam_scan_size_source`). A used
+`.mis` also names the image its areas were drawn on (`<ImageFile>`, beside it): that image is
+embedded with the registration its teach points, the raster lattice and the frames' motor positions
+fix (§4.3, `registration_quality: teach_points`), and the block records the image names
+(`sequence_image`) and the registration or why there is none (`registration`, `not_registered`).
 A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
 in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them
 and writes the grid index, declared (`waters:laser-position-fitted-to-grid`), with the fit (origin,

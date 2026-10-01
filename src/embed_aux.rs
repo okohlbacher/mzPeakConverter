@@ -12,9 +12,13 @@
 //!     `size_bytes`, `affine` (`{type:"affine", matrix:[6], maps:"image_px -> ms_px",
 //!     registration_quality:"assumed_full_extent"}`), and `role:"optical"`. The affine is the
 //!     imaging profile's: 0-based image pixel centres to 1-based MS pixel centres, here with the
-//!     image's extent laid on the grid's ([`full_extent_affine`]). An image added to a Bruker MALDI
-//!     archive acquired from a FlexImaging sequence gets NO affine ([`unregistered_reason`]): that
-//!     grid is the bounding box of the acquired regions and the photo is of the whole target.
+//!     image's extent laid on the grid's ([`full_extent_affine`]). A Bruker MALDI archive acquired
+//!     from a FlexImaging sequence embeds the sequence's own image with the registration its
+//!     teach points fix ([`embed_sequence_image`], `registration_quality:"teach_points"`, the
+//!     registration record beside the affine); a later `--image` gets that registration only when
+//!     it IS that image (the `<ImageFile>` name, supplied because the image was not beside the
+//!     `.mis`), and any other image NO affine ([`unregistered_reason`], [`place`]): that grid is
+//!     the bounding box of the acquired regions and the photo is of the whole target.
 //!   * SDRF → ZIP member `sample_metadata/sdrf.tsv` (fixed name), entity_type `"sample-metadata"`,
 //!     data_kind `"sdrf"`. Back-refs: `metadata.study` (`{dataset_accession, title,
 //!     sample_metadata_ref}`) + `metadata.sample_metadata` (`{member, sha256, size_bytes,
@@ -133,36 +137,47 @@ fn embed_optical_images(
         return Ok(());
     };
 
-    // A grid the full-extent assumption does not hold for: such an image is embedded without an
-    // affine, said once.
-    let grid = match unregistered_reason(&zip.index().metadata) {
-        Some(why) => {
+    // How these images are placed: on a Bruker MALDI run acquired from a FlexImaging sequence, by
+    // the sequence's teach-point registration when the archive carries one and the image is the
+    // sequence's own (the name the `.mis` gives, not yet in the archive), and otherwise not at all,
+    // said once; on any other grid, the full-extent assumption.
+    let mut placement = match (sequence_registration(&zip.index().metadata, &block), unregistered_reason(&zip.index().metadata)) {
+        (Some(p), _) => p,
+        (None, Some(why)) => {
             log::warn!("optical image embedded WITHOUT an affine (no registration is written): {why}");
-            None
+            Placement::Unplaced
         }
-        None => Some((nx, ny)),
+        (None, None) => Placement::FullExtent(nx, ny),
     };
 
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(embed_list.len());
     // ordinal advances ONLY on a successful embed, so a skipped soft image leaves no gap. It starts
-    // past the images the archive already holds (the filter lane copies them): a reused name would
-    // be a second member under it.
-    let mut ordinal = zip
-        .index()
-        .files
-        .iter()
-        .filter_map(|f| f.name.strip_prefix("images/image_")?.split('.').next()?.parse::<usize>().ok())
-        .max()
-        .map_or(0, |k| k + 1);
-    // Dedup canonicalized paths so --image X and a sibling that resolves to X embed once.
+    // past the images the archive already holds (the filter lane copies them, a sequence's image
+    // went in before): a reused name would be a second member under it.
+    let mut ordinal = next_image_ordinal(zip);
+    // Dedup canonicalized paths so --image X and a sibling that resolves to X embed once, and by
+    // digest against the images the archive already lists: the sequence's own image given again
+    // as `--image`, or an image injected into an archive that holds it.
     let mut seen: Vec<PathBuf> = Vec::with_capacity(embed_list.len());
+    let mut digests: Vec<String> = block["images"].as_array().into_iter().flatten().filter_map(|e| e["sha256"].as_str().map(str::to_string)).collect();
 
     for (path, mode) in &embed_list {
         let key = canonical_key(path);
         if seen.contains(&key) {
             continue;
         }
-        if let Some(entry) = embed_one_image(zip, path, ordinal, grid, *mode)? {
+        if let Ok((sha, _)) = sha256_and_size(path) {
+            if digests.contains(&sha) {
+                log::info!("{} is already in the archive (same SHA-256): not embedded again", path.display());
+                seen.push(key);
+                continue;
+            }
+            digests.push(sha);
+        }
+        if let Some(mut entry) = embed_one_image(zip, path, ordinal, *mode)? {
+            if let Some(why) = place(&mut entry, &mut placement) {
+                log::warn!("{}: embedded WITHOUT an affine: {why}", path.display());
+            }
             entries.push(entry);
             seen.push(key);
             ordinal += 1;
@@ -183,36 +198,154 @@ fn embed_optical_images(
     Ok(())
 }
 
+/// The first free ordinal of `images/image_NNNN.<ext>`: past every image the archive holds.
+fn next_image_ordinal(zip: &ZipArchiveWriter<File>) -> usize {
+    zip.index()
+        .files
+        .iter()
+        .filter_map(|f| f.name.strip_prefix("images/image_")?.split('.').next()?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |k| k + 1)
+}
+
+/// **The FlexImaging sequence's own image** (owner decision D8): on a Bruker MALDI run whose
+/// `bruker_maldi` block holds a teach-point registration and names an `<ImageFile>` found beside
+/// the `.mis`, embed that image as the next `images/image_NNNN.<ext>` with the registration's
+/// affine (`registration_quality: teach_points`) and the registration itself in its `images[]`
+/// entry, so a reader can redo the transform. Called for every lane from the archive epilogue:
+/// no `--image` is involved, and the lanes that refuse `--image` embed it too. A sequence whose
+/// image is not beside it, or could not be registered, was warned about when the `.d` was read
+/// and leaves its record in the block; nothing is embedded. Soft on the file itself (unreadable
+/// → warn and skip): the image is auto-discovered.
+pub fn embed_sequence_image(zip: &mut ZipArchiveWriter<File>, input: &Path) -> Result<()> {
+    let Some(bruker) = zip.index().metadata.get("bruker_maldi").cloned() else { return Ok(()) };
+    let Some(file) = bruker["sequence_image"]["file"].as_str().map(str::to_string) else { return Ok(()) };
+    if bruker["sequence_image"]["found"] != serde_json::json!(true) || bruker["registration"].is_null() {
+        return Ok(());
+    }
+    let Some(mut marker) = zip.index().metadata.get("imaging").cloned() else { return Ok(()) };
+    let registration = bruker["registration"].clone();
+    let path = input.parent().unwrap_or(Path::new("")).join(&file);
+    let ordinal = next_image_ordinal(zip);
+    let Some(mut entry) = embed_one_image(zip, &path, ordinal, EmbedMode::Soft)? else { return Ok(()) };
+    entry["source"] = format!("the <ImageFile> of the FlexImaging sequence {}", bruker["mis"].as_str().unwrap_or("?")).into();
+    entry["affine"] = affine_of(&registration);
+    entry["registration"] = registration;
+    let mut all = marker["images"].as_array().cloned().unwrap_or_default();
+    log::info!(
+        "FlexImaging sequence image {file} embedded as {} with the teach-point registration ({} bytes)",
+        entry["archive_path"].as_str().unwrap_or("?"),
+        entry["size_bytes"]
+    );
+    all.push(entry);
+    marker["images"] = all.into();
+    zip.add_index_metadata("imaging", &marker).context("writing metadata.imaging index")?;
+    Ok(())
+}
+
+/// The `affine` object of an `images[]` entry from a recorded registration.
+fn affine_of(registration: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "affine",
+        "matrix": registration["matrix"],
+        "maps": "image_px -> ms_px",
+        "registration_quality": crate::mis_registration::QUALITY,
+    })
+}
+
+/// How an added image is placed on the pixel grid.
+enum Placement {
+    /// Its extent laid on the grid's Nx × Ny: `assumed_full_extent`.
+    FullExtent(i64, i64),
+    /// The sequence's teach-point registration, which exactly one image carries: the sequence's
+    /// own, `embedded` as this archive member when it is in, else the image named `name` (the
+    /// `.mis`'s `<ImageFile>`, supplied later because it was not beside the sequence). The teach
+    /// points were set on that image and no other; an image that merely has its size could be a
+    /// photo of another target (both MSV000088438 runs' photos are 8064 × 6048 `IMG_0000.jpg`).
+    TeachPoints { registration: serde_json::Value, name: String, embedded: Option<String> },
+    /// No affine (a FlexImaging run without a registration), said once by the caller.
+    Unplaced,
+}
+
+/// The teach-point placement an archive's `bruker_maldi` block offers, if any: its `registration`
+/// (written even when the sequence's image was not beside it), the image file it names, and the
+/// archive member already carrying the registration, if one does (the `images[]` entry the
+/// sequence embed, or an earlier by-name placement, wrote).
+fn sequence_registration(metadata: &std::collections::HashMap<String, serde_json::Value>, marker: &serde_json::Value) -> Option<Placement> {
+    let block = metadata.get("bruker_maldi")?;
+    let registration = block.get("registration").filter(|r| r.is_object())?.clone();
+    let name = block["sequence_image"]["file"].as_str()?.to_string();
+    let embedded = marker["images"].as_array().into_iter().flatten().find_map(|e| {
+        (e["affine"]["registration_quality"] == crate::mis_registration::QUALITY).then(|| e["archive_path"].as_str().unwrap_or("?").to_string())
+    });
+    Some(Placement::TeachPoints { registration, name, embedded })
+}
+
+/// Give `entry` its `affine` under `placement`; `Some(why)` when it gets none. A teach-point
+/// placement is used up by the image that takes it (`embedded`), so no second image gets it.
+fn place(entry: &mut serde_json::Value, placement: &mut Placement) -> Option<String> {
+    let (w, h) = (entry["width"].as_i64().unwrap_or(0), entry["height"].as_i64().unwrap_or(0));
+    match placement {
+        Placement::FullExtent(nx, ny) => {
+            // Full-extent affine: the image's real (w,h); a dimensionless (0,0) embed counts as ONE
+            // image pixel over the whole grid (0 would divide by zero), whose centre is the grid's.
+            let (aw, ah) = if w <= 0 || h <= 0 { (1, 1) } else { (w as u32, h as u32) };
+            entry["affine"] = serde_json::json!({
+                "type": "affine",
+                "matrix": full_extent_affine(*nx, *ny, aw, ah),
+                "maps": "image_px -> ms_px",
+                "registration_quality": "assumed_full_extent",
+            });
+            None
+        }
+        Placement::TeachPoints { registration, name, embedded } => {
+            if embedded.is_none() && entry["source_name"] == name.as_str() {
+                entry["affine"] = affine_of(registration);
+                entry["registration"] = registration.clone();
+                *embedded = Some(entry["archive_path"].as_str().unwrap_or("?").to_string());
+                return None;
+            }
+            Some(match embedded {
+                Some(member) => format!(
+                    "the archive's teach-point registration is for the FlexImaging sequence image {name}, embedded as {member}; nothing proves this {w} × {h} px image is in its pixel frame (a byte-identical copy would not have been embedded twice)"
+                ),
+                None => format!(
+                    "the archive's teach-point registration is for the FlexImaging sequence image {name}, which was not embedded; only an image of that name is taken to be in its pixel frame, and this one ({w} × {h} px) is not"
+                ),
+            })
+        }
+        Placement::Unplaced => Some("see above".into()),
+    }
+}
+
 /// Why an image added to this archive must not get the full-extent affine, if it must not: the
-/// archive's `bruker_maldi` block names a FlexImaging sequence (`.mis`, used or rejected). Such a
-/// run's pixel grid is the bounding box of the acquired regions, shifted to start at 1, while the
-/// sequence's own image is a photo of the whole target, registered through its teach points: laying
-/// the photo's extent on the grid's misplaces it by up to 11 MS pixels on MassIVE MSV000088438
-/// (the photo spans MS pixels −11…54 of a 28-pixel grid). `assumed_full_extent` would state a
-/// registration nobody made. The teach-point registration is not written yet (planned: embedding
-/// the sequence's image with it), so the image goes in without an affine, which the profile allows
-/// (`affine` is optional in `schema/mzpeak_index.json`).
+/// archive's `bruker_maldi` block names a FlexImaging sequence (`.mis`, used or rejected) and holds
+/// no teach-point registration. Such a run's pixel grid is the bounding box of the acquired
+/// regions, shifted to start at 1, while the sequence's own image is a photo of the whole target,
+/// registered through its teach points: laying the photo's extent on the grid's misplaces it by up
+/// to 11 MS pixels on MassIVE MSV000088438 (the photo spans MS pixels −11…54 of a 28-pixel grid).
+/// `assumed_full_extent` would state a registration nobody made, so the image goes in without an
+/// affine, which the profile allows (`affine` is optional in `schema/mzpeak_index.json`).
 fn unregistered_reason(metadata: &std::collections::HashMap<String, serde_json::Value>) -> Option<String> {
     let block = metadata.get("bruker_maldi")?;
     let mis = block["mis"].as_str().or_else(|| block["mis_rejected"]["file"].as_str())?;
+    let not_registered = block["not_registered"].as_str().map_or(String::new(), |why| format!(" ({why})"));
     Some(format!(
         "this is a Bruker MALDI run acquired from the FlexImaging sequence {mis}, so its pixel grid \
          is the bounding box of the acquired regions and not the extent of a photo of the target; \
-         laying the image's extent on the grid would misplace it. The registration from the \
-         sequence's teach points is planned; until then readers get this image with no placement"
+         laying the image's extent on the grid would misplace it, and the archive holds no \
+         teach-point registration{not_registered}; readers get this image with no placement"
     ))
 }
 
 /// Embed ONE optical image (any format) as `images/image_{ordinal:04}.<ext>`, returning its
-/// `metadata.imaging.images[]` entry as a JSON value. The ordinal is the ONLY part of the archive
-/// name that varies — the attacker-influenced source basename never reaches the archive path.
-/// `grid` is the MS pixel grid Nx×Ny the image's extent is laid on; `None` writes no affine
-/// ([`unregistered_reason`]).
+/// `metadata.imaging.images[]` entry as a JSON value, without an `affine` (the caller places it,
+/// [`place`]). The ordinal is the ONLY part of the archive name that varies — the
+/// attacker-influenced source basename never reaches the archive path.
 fn embed_one_image(
     zip: &mut ZipArchiveWriter<File>,
     path: &Path,
     ordinal: usize,
-    grid: Option<(i64, i64)>,
     mode: EmbedMode,
 ) -> Result<Option<serde_json::Value>> {
     // On a defect: Strict → Err (abort the conversion); Soft → warn + Ok(None) (skip this image).
@@ -299,7 +432,7 @@ fn embed_one_image(
         Err(_) => fail!("failed to digest image bytes"),
     };
 
-    let mut entry = serde_json::json!({
+    Ok(Some(serde_json::json!({
         "archive_path": member,
         "source_name": source_name,
         "media_type": media_type,
@@ -308,19 +441,7 @@ fn embed_one_image(
         "sha256": sha256,
         "size_bytes": size as i64,
         "role": "optical",
-    });
-    if let Some((nx, ny)) = grid {
-        // Full-extent affine: the image's real (w,h); a dimensionless (0,0) embed counts as ONE
-        // image pixel over the whole grid (0 would divide by zero), whose centre is the grid's.
-        let (aw, ah) = if w == 0 || h == 0 { (1, 1) } else { (w, h) };
-        entry["affine"] = serde_json::json!({
-            "type": "affine",
-            "matrix": full_extent_affine(nx, ny, aw, ah),
-            "maps": "image_px -> ms_px",
-            "registration_quality": "assumed_full_extent",
-        });
-    }
-    Ok(Some(entry))
+    })))
 }
 
 /// Build the full-extent affine `[a,b,c,d,e,f]`: `(x_ms, y_ms) = (a·col + c, e·row + f)`, `b=d=0`.
@@ -777,6 +898,100 @@ mod tests {
         std::fs::remove_file(&img).ok();
     }
 
+    /// The sequence's image and later images on an archive that carries the teach-point
+    /// registration (owner decision D8). `embed_sequence_image` embeds the `<ImageFile>` found
+    /// beside the `.d` with the `teach_points` affine and the registration record. A later
+    /// `--image` gets NO affine once that image is in — a same-size image of another name included
+    /// (the review's case: another target's 8064 × 6048 `IMG_0000.jpg` must not inherit a
+    /// registration nobody made) — and the sequence's image given again is not embedded twice.
+    /// When the sequence's image was not beside it, only the image of its name is placed, and
+    /// only the first one: a second file of that name, in the same pass or a later one, gets none.
+    #[test]
+    fn the_sequence_image_and_later_images_are_placed_by_the_registration() {
+        use mzpeak_prototyping::writer::MzPeakWriterType;
+        use mzpeaks::{CentroidPeak, DeconvolutedPeak};
+        use std::io::Read as _;
+
+        let png = |w: u32, h: u32, tail: u8| {
+            let mut png = Vec::new();
+            png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+            png.extend_from_slice(&13u32.to_be_bytes());
+            png.extend_from_slice(b"IHDR");
+            png.extend_from_slice(&w.to_be_bytes());
+            png.extend_from_slice(&h.to_be_bytes());
+            png.extend_from_slice(&[8, 2, 0, 0, 0, tail]);
+            png
+        };
+        let dir = std::env::temp_dir().join(format!("mzpc_embed_aux_seq_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("run.d")).unwrap();
+        std::fs::create_dir_all(dir.join("second")).unwrap();
+        std::fs::create_dir_all(dir.join("third")).unwrap();
+        let dot_d = dir.join("run.d");
+        std::fs::write(dir.join("IMG.png"), png(56, 48, 0)).unwrap();
+        std::fs::write(dir.join("copy.png"), png(56, 48, 1)).unwrap();
+        std::fs::write(dir.join("other.png"), png(57, 48, 0)).unwrap();
+        std::fs::write(dir.join("second/IMG.png"), png(56, 48, 2)).unwrap();
+        std::fs::write(dir.join("third/IMG.png"), png(56, 48, 3)).unwrap();
+        let registration = serde_json::json!({"matrix": [0.25, 0.0, -3.0, 0.0, 0.25, -2.0], "sequence": "run.mis",
+            "teach_points": [{"image_px": [1.0, 2.0], "stage_um": [10.0, 20.0]}], "reference_point": {"image_px": [1.0, 2.0], "raster_index": [3, 4]}});
+        let marker = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "pixel_count": {"x": 28, "y": 24}});
+        let bruker = |found: bool| {
+            serde_json::json!({"mis": "run.mis", "mis_rejected": null, "sequence_image": {"file": "IMG.png", "found": found, "other_images": []}, "registration": registration})
+        };
+        let run = |name: &str, found: bool, batches: &[&[&str]]| -> (Vec<String>, Vec<serde_json::Value>) {
+            let out = dir.join(format!("{name}.mzpeak"));
+            let writer = MzPeakWriterType::<File, CentroidPeak, DeconvolutedPeak>::builder().build(File::create(&out).unwrap(), true);
+            let mut zip = writer.finish_parquet().unwrap();
+            zip.add_index_metadata("imaging", &marker).unwrap();
+            zip.add_index_metadata("bruker_maldi", &bruker(found)).unwrap();
+            embed_sequence_image(&mut zip, &dot_d).unwrap();
+            for later in batches {
+                let later: Vec<PathBuf> = later.iter().map(|n| dir.join(n)).collect();
+                embed_optical_images(&mut zip, Path::new("/x/run.mzpeak"), &later).unwrap();
+            }
+            zip.finish().unwrap();
+            let mut archive = zip::ZipArchive::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+            let members: Vec<String> = archive.file_names().filter(|n| n.starts_with("images/")).map(str::to_string).collect();
+            let mut idx = String::new();
+            archive.by_name("mzpeak_index.json").unwrap().read_to_string(&mut idx).unwrap();
+            let images = serde_json::from_str::<serde_json::Value>(&idx).unwrap()["metadata"]["imaging"]["images"].as_array().cloned().unwrap_or_default();
+            (members, images)
+        };
+        let quality = |e: &serde_json::Value| e.get("affine").map(|a| a["registration_quality"].as_str().unwrap().to_string());
+
+        // The sequence's image first, then a same-size image of another name, a differently sized
+        // one, the sequence's image again, and a same-size, same-name file with other bytes.
+        let (members, images) = run("found", true, &[&["copy.png", "other.png", "IMG.png", "second/IMG.png"]]);
+        assert_eq!(members, ["images/image_0000.png", "images/image_0001.png", "images/image_0002.png", "images/image_0003.png"]);
+        assert_eq!(images.len(), 4, "{images:#?}");
+        assert_eq!((images[0]["source_name"].as_str(), quality(&images[0])), (Some("IMG.png"), Some(QUALITY_STR.into())));
+        assert_eq!(images[0]["affine"]["matrix"], registration["matrix"]);
+        assert_eq!(images[0]["registration"], registration);
+        assert!(images[0]["source"].as_str().unwrap().contains("run.mis"));
+        assert_eq!((images[1]["source_name"].as_str(), quality(&images[1])), (Some("copy.png"), None), "56 × 48 proves nothing: it could be another target's photo");
+        assert!(images[1].get("registration").is_none(), "{:#}", images[1]);
+        assert_eq!((images[2]["source_name"].as_str(), quality(&images[2])), (Some("other.png"), None));
+        assert!(images[2].get("registration").is_none());
+        assert_eq!((images[3]["source_name"].as_str(), quality(&images[3])), (Some("IMG.png"), None), "the registration is carried by image_0000 already");
+        assert!(images.iter().filter(|e| quality(e).is_some()).count() == 1, "exactly one image carries the registration: {images:#?}");
+
+        // The sequence's image was not beside it: nothing embedded by the sequence; a later image
+        // of its name is placed — the first one only, in this pass or a later one — and an image of
+        // another name (even the same size) is not.
+        let (members, images) = run("missing", false, &[&["copy.png", "IMG.png", "second/IMG.png"], &["third/IMG.png"]]);
+        assert_eq!(members, ["images/image_0000.png", "images/image_0001.png", "images/image_0002.png", "images/image_0003.png"]);
+        assert_eq!((images[0]["source_name"].as_str(), quality(&images[0])), (Some("copy.png"), None));
+        assert_eq!((images[1]["source_name"].as_str(), quality(&images[1])), (Some("IMG.png"), Some(QUALITY_STR.into())));
+        assert_eq!(images[1]["registration"], registration);
+        assert_eq!((images[2]["source_name"].as_str(), quality(&images[2])), (Some("IMG.png"), None), "same pass, the name is used up");
+        assert_eq!((images[3]["source_name"].as_str(), quality(&images[3])), (Some("IMG.png"), None), "later pass, image_0001 carries it");
+        assert!(images.iter().filter(|e| quality(e).is_some()).count() == 1, "{images:#?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const QUALITY_STR: &str = crate::mis_registration::QUALITY;
+
     #[test]
     fn detect_format_by_magic() {
         let p = write_tmp("tiff", b"II\x2A\x00rest");
@@ -847,9 +1062,10 @@ mod tests {
         let mut zip = writer.finish_parquet().expect("finish_parquet");
 
         // Strict image embed needs a grid; pass it directly via embed_one_image to avoid an imzML.
-        let entry = embed_one_image(&mut zip, &img, 0, Some((8, 4)), EmbedMode::Strict)
+        let mut entry = embed_one_image(&mut zip, &img, 0, EmbedMode::Strict)
             .expect("embed image")
             .expect("image entry");
+        assert_eq!(place(&mut entry, &mut Placement::FullExtent(8, 4)), None);
         let block = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "images": [entry]});
         zip.add_index_metadata("imaging", &block).unwrap();
 

@@ -80,6 +80,7 @@ mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
 mod mzml_contact;
+mod mis_registration;
 mod mzml_header;
 mod mzml_index;
 mod mzml_isolation;
@@ -7781,7 +7782,8 @@ struct AuxInputs<'a> {
 /// **The one archive epilogue.** Every lane that writes an `.mzpeak` ends here: flush Parquet, read
 /// the two signal facets back for the `fidelity` block (and, under `--lossless`, fail unless they
 /// are bit-exact), write the lane's index blocks IN ORDER, stream-embed vendor side-files + vendor
-/// metadata, then optical images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding
+/// metadata, then a FlexImaging sequence's registered image (every lane; `embed_sequence_image`),
+/// then optical images (`--image` + sibling discovery) and an SDRF (`--sdrf`) — adding
 /// the `metadata.imaging` / `metadata.study` / `metadata.sample_metadata` blocks — close the ZIP,
 /// and only then rename the temporary onto `output`.
 ///
@@ -7911,6 +7913,9 @@ fn finish_archive(
         zip.add_index_metadata(fidelity::BLOCK, block).context("writing fidelity index block")?;
     }
     embed_vendor_members(&mut zip, input, vendor)?;
+    // The FlexImaging sequence's image with its teach-point registration, on every lane that read
+    // a `.mis` (the `bruker_maldi` block says), before any `--image`: it is `images/image_0000`.
+    embed_aux::embed_sequence_image(&mut zip, input).context("embedding the FlexImaging sequence's image")?;
     if let Some(aux) = aux {
         embed_aux::embed_into_archive(&mut zip, input, aux.images, aux.sdrf)
             .context("embedding optical images / SDRF")?;
@@ -16412,6 +16417,130 @@ mod tests {
             .collect();
         assert_eq!(regions, [Some(0), Some(0), Some(1), Some(1), None]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The FlexImaging sequence's image (owner decision D8): a `.d` whose `.mis` names an
+    /// `<ImageFile>` beside it — MSV000088438's TDF sequence, its 13 extreme spots as the frames —
+    /// embeds the image as `images/image_0000.png` with the teach-point affine (the auditors'
+    /// all-spot matrix within 1e-4 MS px over the whole image), `registration_quality:
+    /// teach_points`, and the registration record (teach points, reference point and its raster
+    /// node) in the entry and in the `bruker_maldi` block. Without the image file: one warning, no
+    /// member, the registration kept for a later `--image`. Without teach points: no image, the
+    /// reason recorded. Through 0.16.0 no lane embedded the sequence's image.
+    #[test]
+    fn a_fleximaging_sequence_image_is_embedded_with_its_teach_point_registration() {
+        use crate::mis_registration::{apply, tests::TDF};
+        use serde_json::json;
+        let dir = scratch("maldi-mis-image");
+        let build = |tag: &str, mis: &str, with_image: bool| -> (std::path::PathBuf, String) {
+            let d = dir.join(tag);
+            let dot_d = d.join("run.d");
+            fs::create_dir_all(&dot_d).unwrap();
+            // tsf_bin: per frame an 8-byte [padded][compressed] header, then zstd([tof f64 × n][intensity f32 × n]).
+            let (mut bin, mut frames, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+            for (i, (region, x, y, mx, my, name)) in TDF.rows.iter().enumerate() {
+                let id = i as i64 + 1;
+                let mut raw = Vec::new();
+                for k in 0..2 {
+                    raw.extend_from_slice(&(1000.0 * (k + 1) as f64 + id as f64).to_le_bytes());
+                }
+                for k in 0..2 {
+                    raw.extend_from_slice(&(10.0 * (k + 1) as f32).to_le_bytes());
+                }
+                let z = zstd::encode_all(&raw[..], 3).unwrap();
+                let offset = bin.len();
+                bin.extend_from_slice(&((z.len() + 8) as u32).to_le_bytes());
+                bin.extend_from_slice(&(z.len() as u32).to_le_bytes());
+                bin.extend_from_slice(&z);
+                frames.push(format!("({id}, {}, 0, '+', 2, {offset})", id as f64 * 0.5));
+                rows.push(format!("({id}, 0, '{name}', {region}, {x}, {y}, {mx}, {my})"));
+            }
+            fs::write(dot_d.join("analysis.tsf_bin"), &bin).unwrap();
+            let db = rusqlite::Connection::open(dot_d.join("analysis.tsf")).unwrap();
+            db.execute_batch(&format!(
+                "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+                 INSERT INTO GlobalMetadata VALUES ('MzAcqRangeLower', '100'), ('MzAcqRangeUpper', '1000'),
+                                                   ('DigitizerNumSamples', '100000'), ('AcquisitionSoftware', 'timsControl');
+                 CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, MsMsType INTEGER, Polarity TEXT, NumPeaks INTEGER, TimsId INTEGER);
+                 INSERT INTO Frames VALUES {};
+                 CREATE TABLE MaldiFrameInfo (Frame INTEGER PRIMARY KEY, Chip INTEGER, SpotName TEXT, RegionNumber INTEGER,
+                                              XIndexPos INTEGER, YIndexPos INTEGER, MotorPositionX REAL, MotorPositionY REAL);
+                 INSERT INTO MaldiFrameInfo VALUES {};",
+                frames.join(", "),
+                rows.join(", ")
+            ))
+            .unwrap();
+            drop(db);
+            fs::write(d.join("run.mis"), mis).unwrap();
+            if with_image {
+                // A PNG header stating the real photo's size; the bytes are copied, never decoded.
+                let mut png = Vec::new();
+                png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+                png.extend_from_slice(&13u32.to_be_bytes());
+                png.extend_from_slice(b"IHDR");
+                png.extend_from_slice(&8064u32.to_be_bytes());
+                png.extend_from_slice(&6048u32.to_be_bytes());
+                png.extend_from_slice(&[8, 2, 0, 0, 0]);
+                png.extend_from_slice(&[7u8; 1000]);
+                fs::write(d.join("IMG_0000.png"), &png).unwrap();
+            }
+            let out = d.join("run.mzpeak");
+            let (ok, _, err) = run_bin(&[dot_d.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{tag}: {err}");
+            (out, err)
+        };
+        let mis = TDF.mis.replace("IMG_0000.jpg", "IMG_0000.png");
+
+        // The image beside the sequence: embedded first, registered, recorded twice.
+        let (out, err) = build("image", &mis, true);
+        assert!(!err.contains("not beside") && !err.contains("cannot be registered"), "{err}");
+        assert!(zip_members(&out).contains(&"images/image_0000.png".to_string()), "{:?}", zip_members(&out));
+        let m = index_metadata(&out);
+        let images = m["imaging"]["images"].as_array().cloned().unwrap_or_default();
+        assert_eq!(images.len(), 1, "{:#}", m["imaging"]);
+        let e = &images[0];
+        assert_eq!((&e["source_name"], &e["width"], &e["height"], &e["media_type"], &e["size_bytes"]), (&json!("IMG_0000.png"), &json!(8064), &json!(6048), &json!("image/png"), &json!(1029)));
+        assert_eq!((&e["affine"]["registration_quality"], &e["affine"]["maps"], &e["affine"]["type"]), (&json!("teach_points"), &json!("image_px -> ms_px"), &json!("affine")));
+        assert!(e["source"].as_str().unwrap().contains("run.mis"), "{e:#}");
+        let matrix: Vec<f64> = e["affine"]["matrix"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        let matrix: [f64; 6] = matrix.try_into().unwrap();
+        for corner in [(0.0, 0.0), (8063.0, 0.0), (0.0, 6047.0), (8063.0, 6047.0)] {
+            let (ax, ay) = apply(&matrix, corner);
+            let (ex, ey) = apply(&TDF.expect, corner);
+            assert!((ax - ex).abs() < 1e-4 && (ay - ey).abs() < 1e-4, "{corner:?}: {:?} vs the auditors' {:?}", (ax, ay), (ex, ey));
+        }
+        let reg = &e["registration"];
+        assert_eq!(reg["teach_points"].as_array().map(Vec::len), Some(3));
+        assert_eq!(reg["teach_points"][0], json!({"image_px": [1204.0, 778.0], "stage_um": [-22965.0, 15855.0]}));
+        assert_eq!(reg["reference_point"], json!({"image_px": [1204.0, 778.0], "raster_index": [9, 6]}));
+        assert_eq!((&reg["matrix"], &reg["sequence"], &reg["spots_checked"]), (&e["affine"]["matrix"], &json!("run.mis"), &json!(13)));
+        assert_eq!(m["bruker_maldi"]["registration"], *reg, "the block keeps the same record");
+        assert_eq!(m["bruker_maldi"]["sequence_image"], json!({"file": "IMG_0000.png", "found": true, "other_images": [{"file": "IMG_1390.jpg", "found": false}]}));
+        assert!(m["bruker_maldi"]["not_registered"].is_null());
+        assert_eq!(m["imaging"]["pixel_size_um"], json!({"x": 1000.0, "y": 1000.0}), "the raster step, as before");
+        let listed = zip_members(&out).iter().filter(|n| n.starts_with("images/")).count();
+        assert_eq!(listed, 1);
+
+        // The image not beside the sequence: a warning, no member, the registration kept.
+        let (out, err) = build("missing", &mis, false);
+        assert!(!zip_members(&out).iter().any(|n| n.starts_with("images/")), "{:?}", zip_members(&out));
+        assert_eq!(err.matches("names the image IMG_0000.png, which is not beside it").count(), 1, "{err}");
+        let m = index_metadata(&out);
+        assert!(m["imaging"]["images"].as_array().is_none_or(Vec::is_empty), "{:#}", m["imaging"]);
+        assert_eq!(m["bruker_maldi"]["sequence_image"]["found"], false);
+        assert_eq!(m["bruker_maldi"]["registration"]["reference_point"]["raster_index"], json!([9, 6]), "kept for a later --image");
+
+        // A sequence without teach points: the image is beside it, but no image goes in.
+        let bare: String = mis.lines().filter(|l| !l.contains("TeachPoint") && !l.contains("ReferencePoint")).collect::<Vec<_>>().join("\r\n");
+        let (out, err) = build("noteach", &bare, true);
+        assert!(!zip_members(&out).iter().any(|n| n.starts_with("images/")), "{:?}", zip_members(&out));
+        assert_eq!(err.matches("which is not embedded: it cannot be registered on the pixel grid").count(), 1, "{err}");
+        let m = index_metadata(&out);
+        assert!(m["bruker_maldi"]["registration"].is_null(), "{:#}", m["bruker_maldi"]);
+        assert!(m["bruker_maldi"]["not_registered"].as_str().unwrap().contains("0 teach point(s)"), "{}", m["bruker_maldi"]["not_registered"]);
+        assert_eq!(m["bruker_maldi"]["sequence_image"]["found"], true);
+        assert_eq!(m["imaging"]["pixel_size_um"], json!({"x": 1000.0, "y": 1000.0}), "the sequence is still used for the step and the names");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Each scan row's `(position_x, position_y)`, `None` for a null; `None` for the whole when the
