@@ -182,7 +182,7 @@ pub(crate) fn apply(
                         "wall_clock": wall_clock.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
                         "zone": "unstated",
                         "source": source,
-                        "note": "the vendor file records a local wall-clock time without a UTC offset; \
+                        "note": "the source records a local wall-clock time without a UTC offset; \
                                  run.start_time is null because RFC 3339 cannot say 'zone unknown'"
                     }),
                 ));

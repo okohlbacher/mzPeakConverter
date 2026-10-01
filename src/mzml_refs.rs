@@ -27,6 +27,22 @@
 //! replayed), one only scans name the first time a scan does — the scan's own id is then read from
 //! the source ([`DanglingRefs::check_scans`]), and the configuration is put back once the scans are
 //! written ([`DanglingRefs::restore_scan_configurations`]).
+//!
+//! Three more things the header (or a `<spectrum>` start tag) states and mzdata does not hand over as
+//! stated are read back here, with the same parser:
+//!
+//! * a source file's **`MS:1000569` SHA-1**. mzdata types a param's value by trial parse, so a digest
+//!   of decimal digits only became an integer (`…0123` → 123) and one reading as a float a float
+//!   (`…e9` → 1.2e46). [`Header::restore_checksums`] writes the text back as a string, as the imzML
+//!   lane does for the `.ibd` checksums;
+//! * the run's **`startTimeStamp`** ([`Header::start_time_stamp`]). mzdata keeps one only when it is
+//!   RFC 3339 with an offset and drops any other with an ERROR line; `crate::mzml_start_time` stores a
+//!   stamp without a zone as the vendor lanes store an unzoned clock;
+//! * a spectrum's **`sourceFileRef`** attribute, which mzdata does not read at all: the DESI ColAd
+//!   imzML names one of 135 raw line files on each of 17,820 spectra. A file that mentions the
+//!   attribute is read once more for it ([`spectrum_source_files`]) and each spectrum gets it as the
+//!   parameter [`SOURCE_FILE_REF`] ([`DanglingRefs::check_spectrum`]); one naming no source file is
+//!   dropped and declared like the other references.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::BufRead;
@@ -43,6 +59,11 @@ use crate::pwiz_id;
 /// The `transformations` entry of an archive from which a dangling reference was dropped.
 pub const DROPPED: &str = "mzml:dangling-reference-dropped";
 
+/// The name of the spectrum parameter that carries an mzML `<spectrum sourceFileRef="…">`: the
+/// attribute's own name, its value the id of an entry of `file_description.source_files`. A
+/// parameter without an accession — PSI-MS has no term for the attribute, and the spec no column.
+pub const SOURCE_FILE_REF: &str = "sourceFileRef";
+
 /// One entry of a header list, as the source states it.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Entry {
@@ -54,17 +75,20 @@ struct Entry {
     /// A source file's `name` and `location`; empty for the other lists, and when unstated.
     name: String,
     location: String,
+    /// A source file's `MS:1000569` SHA-1, the value's text as the element states it.
+    sha1: Option<String>,
 }
 
 /// What an mzML or imzML header states before `<run>`, read with quick_xml rather than mzdata: every
-/// `<software>`, `<sourceFile>` and `<instrumentConfiguration>` in document order, self-closing or
-/// not, and the run's `defaultInstrumentConfigurationRef`.
+/// `<software>`, `<sourceFile>` (with its SHA-1) and `<instrumentConfiguration>` in document order,
+/// self-closing or not, and the run's `defaultInstrumentConfigurationRef` and `startTimeStamp`.
 #[derive(Debug, Default)]
 pub struct Header {
     software: Vec<Entry>,
     source_files: Vec<Entry>,
     configurations: Vec<Entry>,
     default_configuration: Option<String>,
+    start_time_stamp: Option<String>,
 }
 
 impl Header {
@@ -77,21 +101,65 @@ impl Header {
         let mut reader = quick_xml::Reader::from_reader(input);
         let mut buf = Vec::new();
         let mut this = Self::default();
+        // Inside a `<sourceFile>…</sourceFile>`: its cvParams are that entry's.
+        let mut in_source_file = false;
         loop {
             match reader.read_event_into(&mut buf).context("parsing the mzML header")? {
                 // mzdata reads the run's attributes from its start tag, then the spectra.
-                Event::Start(e) if e.name().as_ref() == b"run" => {
+                Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"run" => {
                     this.default_configuration = value(&e, b"defaultInstrumentConfigurationRef");
+                    this.start_time_stamp = value(&e, b"startTimeStamp").filter(|t| !t.trim().is_empty());
                     break;
                 }
-                Event::Start(e) => this.entry(&e, false),
-                Event::Empty(e) => this.entry(&e, true),
+                Event::Start(e) => {
+                    in_source_file |= e.name().as_ref() == b"sourceFile";
+                    this.entry(&e, false);
+                    this.checksum(&e, in_source_file);
+                }
+                Event::Empty(e) => {
+                    this.entry(&e, true);
+                    this.checksum(&e, in_source_file);
+                }
+                Event::End(e) if e.name().as_ref() == b"sourceFile" => in_source_file = false,
                 Event::Eof => break,
                 _ => {}
             }
             buf.clear();
         }
         Ok(this)
+    }
+
+    /// A `<cvParam accession="MS:1000569" value="…"/>` inside a `<sourceFile>`: that entry's SHA-1.
+    fn checksum(&mut self, e: &BytesStart, in_source_file: bool) {
+        if in_source_file && e.name().as_ref() == b"cvParam" && value(e, b"accession").as_deref() == Some("MS:1000569") {
+            if let Some(sf) = self.source_files.last_mut() {
+                sf.sha1 = value(e, b"value");
+            }
+        }
+    }
+
+    /// The run's `startTimeStamp`, as stated; `None` when the run states none (or an empty one).
+    pub fn start_time_stamp(&self) -> Option<&str> {
+        self.start_time_stamp.as_deref()
+    }
+
+    /// Write each source file's `MS:1000569` SHA-1 as the string the header states. mzdata types a
+    /// value by trial parse: 40 decimal digits become an integer or a float, and a digest was stored
+    /// as `123` or `1.2345678901234568e46`. Returns how many values were put back.
+    pub fn restore_checksums(&self, target: &mut impl MSDataFileMetadata) -> usize {
+        let mut restored = 0;
+        for e in self.source_files.iter() {
+            // An empty value states no digest (the DESI ColAd parameter file's): nothing to restore.
+            let Some(stated) = e.sha1.as_deref().filter(|v| !v.is_empty()) else { continue };
+            let Some(sf) = target.file_description_mut().source_files.iter_mut().find(|sf| sf.id == e.id) else { continue };
+            for p in sf.params.iter_mut().filter(|p| p.curie() == Some(mzdata::curie!(MS:1000569))) {
+                if !matches!(&p.value, mzdata::params::Value::String(v) if v == stated) {
+                    p.value = mzdata::params::Value::String(stated.to_string());
+                    restored += 1;
+                }
+            }
+        }
+        restored
     }
 
     fn entry(&mut self, e: &BytesStart, self_closing: bool) {
@@ -190,6 +258,13 @@ pub struct DanglingRefs {
     dangling: HashMap<u32, String>,
     /// Per mzML attribute: how many references were dropped, and the ids they named.
     dropped: BTreeMap<&'static str, (usize, BTreeSet<String>)>,
+    /// The ids of the source's source files, once the skipped entries are back.
+    files: HashSet<String>,
+    /// The `sourceFileRef` each `<spectrum>` states, by spectrum id; empty for a source that states
+    /// none ([`spectrum_source_files`]).
+    spectrum_files: HashMap<String, String>,
+    /// The run's `startTimeStamp` as the header states it.
+    start_time_stamp: Option<String>,
 }
 
 impl DanglingRefs {
@@ -203,7 +278,19 @@ impl DanglingRefs {
             .ok();
         let mut this = Self::check_metadata(target, header.as_ref());
         this.source = Some(path.to_path_buf());
+        this.spectrum_files = spectrum_source_files(path).unwrap_or_else(|e| {
+            log::warn!("{}: the spectra's sourceFileRef attributes were not read: {e:#}", path.display());
+            HashMap::new()
+        });
+        if !this.spectrum_files.is_empty() {
+            log::info!("{} spectra name a source file (sourceFileRef); stored as the spectrum parameter {SOURCE_FILE_REF:?}", this.spectrum_files.len());
+        }
         this
+    }
+
+    /// The run's `startTimeStamp`, as the header states it.
+    pub fn start_time_stamp(&self) -> Option<&str> {
+        self.start_time_stamp.as_deref()
     }
 
     /// Put back what `header` states and mzdata skipped, then drop the run-level references of the
@@ -222,6 +309,11 @@ impl DanglingRefs {
                      {files} <sourceFile/>, {configurations} <instrumentConfiguration/>"
                 );
             }
+            let checksums = header.restore_checksums(target);
+            if checksums > 0 {
+                log::info!("{checksums} source file SHA-1 (MS:1000569) written as the text the header states (mzdata read a number)");
+            }
+            this.start_time_stamp = header.start_time_stamp().map(str::to_string);
         }
         this.configurations = target.instrument_configurations().keys().copied().collect();
         if this.configurations.is_empty() {
@@ -243,6 +335,7 @@ impl DanglingRefs {
         }
         let processing: HashSet<String> = target.data_processings().iter().map(|dp| dp.id.clone()).collect();
         let files: HashSet<String> = target.file_description().source_files.iter().map(|sf| sf.id.clone()).collect();
+        this.files = files.clone();
         if let Some(run) = target.run_description_mut() {
             if let Some(id) = run.default_instrument_id.filter(|id| !this.configurations.contains(id)) {
                 run.default_instrument_id = None;
@@ -287,6 +380,24 @@ impl DanglingRefs {
         }
         self.names = numbers.into_iter().map(|(id, n)| (n, id)).collect();
         restored
+    }
+
+    /// One spectrum on its way into the archive: its scans' configurations ([`Self::check_scans`]) and
+    /// the source file its `<spectrum>` names. mzdata does not read `spectrum@sourceFileRef`; the id
+    /// read back from the source becomes the parameter [`SOURCE_FILE_REF`] when the source lists that
+    /// file, and is dropped and counted like any other reference when it does not.
+    pub fn check_spectrum(&mut self, descr: &mut SpectrumDescription) {
+        self.check_scans(descr);
+        if self.spectrum_files.is_empty() {
+            return;
+        }
+        let Some(file) = self.spectrum_files.get(&descr.id).cloned() else { return };
+        if self.files.contains(&file) {
+            // A string whatever it spells: an id of digits must not become a number.
+            descr.params.push(source_file_ref_param(file));
+        } else {
+            self.note("sourceFileRef", file);
+        }
     }
 
     /// Null the configuration of each scan of `descr` that names none of the source's. A number
@@ -408,6 +519,79 @@ impl DanglingRefs {
     }
 }
 
+/// The spectrum parameter for a `sourceFileRef`.
+fn source_file_ref_param(file: String) -> mzdata::params::Param {
+    mzdata::params::Param::builder().name(SOURCE_FILE_REF).value(mzdata::params::Value::String(file)).build()
+}
+
+/// What the direct mzML export of an mzML or imzML takes from this module: the source files' SHA-1
+/// as the header states it, and each spectrum's `sourceFileRef` as the parameter the archive lane
+/// stores (an mzML `userParam`: mzdata's writer has no such attribute), so both routes state the
+/// same. Dangling references are not dropped on this lane.
+#[derive(Debug, Default)]
+pub struct StatedForExport {
+    files: HashSet<String>,
+    spectrum_files: HashMap<String, String>,
+}
+
+impl StatedForExport {
+    /// Read `path`'s header and spectrum tags; restore the checksums in `target`. After the source's
+    /// metadata was copied.
+    pub fn read(path: &Path, target: &mut impl MSDataFileMetadata) -> Self {
+        match Header::read(path) {
+            Ok(header) => {
+                header.restore_checksums(target);
+            }
+            Err(e) => log::warn!("{}: header not read back, source file checksums are written as mzdata read them: {e:#}", path.display()),
+        }
+        let spectrum_files = spectrum_source_files(path).unwrap_or_else(|e| {
+            log::warn!("{}: the spectra's sourceFileRef attributes were not read: {e:#}", path.display());
+            HashMap::new()
+        });
+        Self { files: target.file_description().source_files.iter().map(|sf| sf.id.clone()).collect(), spectrum_files }
+    }
+
+    /// Give `descr` its `sourceFileRef` parameter, when its `<spectrum>` names a file the source lists.
+    pub fn apply(&self, descr: &mut SpectrumDescription) {
+        if let Some(file) = self.spectrum_files.get(&descr.id).filter(|f| self.files.contains(*f)) {
+            descr.params.push(source_file_ref_param(file.clone()));
+        }
+    }
+}
+
+/// The `sourceFileRef` each `<spectrum>` of an mzML or imzML states, by spectrum id. The file is
+/// first searched for the attribute as bytes (`sourceFileRef=`: the run's `defaultSourceFileRef`
+/// has a capital S, a scan settings' `<sourceFileRef ref=…>` no `=` after the name), and only one
+/// that mentions it is parsed — a `<scan>` or `<precursor>` naming an external spectrum's file is
+/// such a mention too, and then the result is empty.
+pub fn spectrum_source_files(path: &Path) -> Result<HashMap<String, String>> {
+    let [mentioned] = crate::imaging::file_mentions(path, ["sourceFileRef="]).with_context(|| format!("reading {}", path.display()))?;
+    if !mentioned {
+        return Ok(HashMap::new());
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    spectrum_source_files_from(std::io::BufReader::new(file))
+}
+
+fn spectrum_source_files_from(input: impl BufRead) -> Result<HashMap<String, String>> {
+    let mut reader = quick_xml::Reader::from_reader(input);
+    let mut buf = Vec::new();
+    let mut found = HashMap::new();
+    loop {
+        match reader.read_event_into(&mut buf).context("parsing the source's spectra")? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"spectrum" => {
+                if let (Some(id), Some(file)) = (value(&e, b"id"), value(&e, b"sourceFileRef")) {
+                    found.insert(id, file);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(found)
+}
+
 /// The first scan naming each configuration id that `numbered` lacks, by (spectrum id, position among
 /// the spectrum's `<scan>` start tags — mzdata skips a self-closing one): the source's own id for a
 /// number mzdata gave on first sight.
@@ -476,6 +660,79 @@ mod tests {
         assert_eq!(h.default_configuration.as_deref(), Some("IC2"));
         // IC1's start tag first, then the run's default IC2, which mzdata never read as an entry.
         assert_eq!(h.numbering(), HashMap::from([("IC1".to_string(), 0), ("IC2".to_string(), 1)]));
+    }
+
+    /// The header's source-file digests and the run's start time stamp, as stated; a digest mzdata
+    /// read as a number is written back as the text, an empty one and a matching string are left.
+    #[test]
+    fn checksums_and_the_start_time_stamp_are_read_as_stated() {
+        let h = header(
+            r#"<mzML><fileDescription><sourceFileList count="4">
+              <sourceFile id="digits" name="a.raw" location="file:///d"><cvParam accession="MS:1000563" name="Thermo RAW format"/>
+                <cvParam cvRef="MS" accession="MS:1000569" name="SHA-1" value="0000000000000000000000000000000000000123"/></sourceFile>
+              <sourceFile id="hex" name="b.raw" location="file:///d"><cvParam accession="MS:1000569" value="71be39fb2700ab2f3c8b2234b91274968b6899b1"/></sourceFile>
+              <sourceFile id="empty" name="p" location=""><cvParam accession="MS:1000569" value=""/></sourceFile>
+              <sourceFile id="none" name="c.raw" location="file:///d"/>
+            </sourceFileList></fileDescription>
+            <softwareList><software id="pwiz" version="3"><cvParam accession="MS:1000569" value="not a source file's"/></software></softwareList>
+            <run id="r" startTimeStamp="2009-08-11T15:59:44"><spectrumList/></run></mzML>"#,
+        );
+        let stated: Vec<(&str, Option<&str>)> = h.source_files.iter().map(|e| (e.id.as_str(), e.sha1.as_deref())).collect();
+        assert_eq!(
+            stated,
+            [("digits", Some("0000000000000000000000000000000000000123")), ("hex", Some("71be39fb2700ab2f3c8b2234b91274968b6899b1")), ("empty", Some("")), ("none", None)]
+        );
+        assert_eq!(h.start_time_stamp(), Some("2009-08-11T15:59:44"));
+        assert_eq!(header(r#"<mzML><run id="r" startTimeStamp=" "/></mzML>"#).start_time_stamp(), None);
+        assert_eq!(header(r#"<mzML><run id="r"><spectrumList/></run></mzML>"#).start_time_stamp(), None);
+
+        // What mzdata read: the digits as an integer, the hex as a string, the empty one as empty.
+        use mzdata::params::{Param, Value};
+        let sha1 = |v: Value| Param::builder().name("SHA-1").curie(mzdata::curie!(MS:1000569)).value(v).build();
+        let mut meta = FileMetadataConfig::default();
+        for (id, v) in [("digits", Value::Int(123)), ("hex", Value::String("71be39fb2700ab2f3c8b2234b91274968b6899b1".into())), ("empty", Value::Empty)] {
+            meta.file_description_mut().source_files.push(SourceFile { id: id.into(), params: vec![sha1(v)], ..Default::default() });
+        }
+        assert_eq!(h.restore_checksums(&mut meta), 1);
+        let values: Vec<&Value> = meta.file_description().source_files.iter().map(|sf| &sf.params[0].value).collect();
+        assert_eq!(
+            values,
+            [&Value::String("0000000000000000000000000000000000000123".into()), &Value::String("71be39fb2700ab2f3c8b2234b91274968b6899b1".into()), &Value::Empty]
+        );
+        assert_eq!(h.restore_checksums(&mut meta), 0, "nothing left to restore");
+    }
+
+    /// Each `<spectrum>`'s `sourceFileRef`, by spectrum id; a scan's or a precursor's attribute of
+    /// the same name (an external spectrum's file) is not the spectrum's. One the source lists
+    /// becomes the spectrum's parameter, a string whatever it spells; one it does not is dropped.
+    #[test]
+    fn a_spectrum_s_source_file_reference_becomes_its_parameter() {
+        let doc = br#"<mzML><run><spectrumList>
+            <spectrum index="0" id="File=0Scan=1" defaultArrayLength="0" sourceFileRef="sf1"><scanList><scan sourceFileRef="sfX" externalSpectrumID="scan=3"/></scanList></spectrum>
+            <spectrum index="1" id="File=1Scan=1" defaultArrayLength="0"><precursorList><precursor sourceFileRef="sfY" externalSpectrumID="scan=4"/></precursorList></spectrum>
+            <spectrum index="2" id="a&amp;b" sourceFileRef="007"/>
+            <spectrum index="3" id="lost" sourceFileRef="ghost"></spectrum>
+        </spectrumList></run></mzML>"#;
+        let found = spectrum_source_files_from(&doc[..]).unwrap();
+        assert_eq!(
+            found,
+            HashMap::from([("File=0Scan=1".to_string(), "sf1".to_string()), ("a&b".to_string(), "007".to_string()), ("lost".to_string(), "ghost".to_string())])
+        );
+
+        let mut refs = DanglingRefs { files: HashSet::from(["sf1".to_string(), "007".to_string()]), spectrum_files: found, ..Default::default() };
+        let stored = |refs: &mut DanglingRefs, id: &str| {
+            let mut d = SpectrumDescription { id: id.into(), ..Default::default() };
+            refs.check_spectrum(&mut d);
+            d.params.iter().find(|p| p.name == SOURCE_FILE_REF).map(|p| p.value.clone())
+        };
+        use mzdata::params::Value;
+        assert_eq!(stored(&mut refs, "File=0Scan=1"), Some(Value::String("sf1".into())));
+        assert_eq!(stored(&mut refs, "a&b"), Some(Value::String("007".into())), "an id of digits stays a string");
+        assert_eq!(stored(&mut refs, "File=1Scan=1"), None);
+        assert_eq!(refs.summary(), None);
+        assert_eq!(stored(&mut refs, "lost"), None);
+        assert_eq!(refs.summary().unwrap(), "1 sourceFileRef (ghost)");
+        assert_eq!(refs.transformation(), Some(DROPPED));
     }
 
     /// Every run-level kind is dropped exactly when it names nothing, and a scan's configuration
