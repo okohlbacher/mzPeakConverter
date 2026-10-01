@@ -514,9 +514,19 @@ fn entry_bound(entry: &str, prefix: &str, suffix: &str) -> Option<f64> {
 pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> Result<Value> {
     let mut block = serde_json::Map::new();
     let mut mz_error: Vec<Value> = Vec::new();
-    for (key, facet) in stored(tmp)? {
+    let mut stored = stored(tmp)?;
+    for (_, key) in FACETS {
         let source = lane.and_then(|l| l.get(key));
         let source_points = source.and_then(|s| s["source_points"].as_u64());
+        let Some(at) = stored.iter().position(|(k, _)| *k == key) else {
+            // Points were handed over for a facet the archive does not hold: say so, with no
+            // stored side, rather than leave the facet out as if it had been empty.
+            if let Some(n) = source_points.filter(|n| *n > 0) {
+                block.insert(key.to_string(), json!({"source_points": n}));
+            }
+            continue;
+        };
+        let (_, facet) = stored.swap_remove(at);
         if facet.points.unwrap_or(0) == 0 && source_points.unwrap_or(0) == 0 {
             continue;
         }
@@ -861,5 +871,9 @@ mod tests {
         let mut b = exact_block();
         b["spectra_data"].as_object_mut().unwrap().remove("source_types");
         fails(&b, &[], "type is unknown");
+        // Points handed over for a facet the archive does not hold.
+        let mut b = exact_block();
+        b["spectra_peaks"] = json!({"source_points": 5});
+        fails(&b, &[], "spectra_peaks: the source or stored point count is unknown");
     }
 }
