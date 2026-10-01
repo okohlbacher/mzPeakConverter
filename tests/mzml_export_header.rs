@@ -282,6 +282,78 @@ fn a_direct_mzml_export_declares_a_configuration_only_scans_name() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A scan whose reference names nothing is written under the run's default configuration by BOTH
+/// exports, also where that default is not the first of the list: the archive stores such a scan
+/// without a configuration, its reader hands a null over as configuration 0, and the archive's
+/// export wrote it under `IC1` whatever the run's default was. Here the default is `IC2`; scan=1's
+/// spectrum has two scans, the second dangling, and scan=2's only scan dangles.
+#[test]
+fn a_dropped_scan_reference_is_written_under_the_runs_default_by_both_exports() {
+    let dir = scratch("default-configuration");
+    let mut source = std::fs::read_to_string(DANGLING).unwrap();
+    let scan = |ic: &str, minutes: &str| {
+        format!(
+            r#"<scan instrumentConfigurationRef="{ic}"><cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="{minutes}" unitCvRef="UO" unitAccession="UO:0000031" unitName="minute"/></scan>"#
+        )
+    };
+    for (from, to) in [
+        (r#"<instrumentConfigurationList count="1">"#.to_string(), r#"<instrumentConfigurationList count="2">"#.to_string()),
+        (
+            "    </instrumentConfiguration>\n  </instrumentConfigurationList>".to_string(),
+            "    </instrumentConfiguration>\n    <instrumentConfiguration id=\"IC2\"><cvParam cvRef=\"MS\" accession=\"MS:1000031\" name=\"instrument model\" value=\"\"/></instrumentConfiguration>\n  </instrumentConfigurationList>".to_string(),
+        ),
+        (r#"defaultInstrumentConfigurationRef="IC7""#.to_string(), r#"defaultInstrumentConfigurationRef="IC2""#.to_string()),
+        (r#"<scanList count="1">"#.to_string(), r#"<scanList count="2">"#.to_string()),
+        (scan("IC1", "1.0"), format!("{}\n          {}", scan("IC1", "1.0"), scan("IC9", "1.0"))),
+    ] {
+        assert!(source.contains(&from), "{from}");
+        source = source.replacen(&from, &to, 1);
+    }
+    let (src, direct, archive, exported) = (dir.join("default_ic2.mzML"), dir.join("direct.mzML"), dir.join("a.mzpeak"), dir.join("archive.mzML"));
+    std::fs::write(&src, source).unwrap();
+    convert(&src, &direct, &["--to", "mzml"]);
+    convert(&src, &archive, &[]);
+    convert(&archive, &exported, &[]);
+    let expected = [Some("IC1".to_string()), Some("IC2".to_string()), Some("IC2".to_string())];
+    for (mzml, what) in [(&direct, "direct"), (&exported, "archive")] {
+        let m = read(mzml, what);
+        let names: Vec<&str> = m.configurations.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(names, ["IC1", "IC2"], "{what}");
+        assert_eq!(m.run["defaultInstrumentConfigurationRef"], "IC2", "{what}");
+        assert_eq!(m.scan_configurations, expected, "{what}: IC1 as stated, then the two dropped references under the default");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A step run twice with the same options is in the export's chain twice: two filters over the same
+/// window are two methods equal in software and parameters, and the chain, which leaves out a step
+/// its default already holds, listed them once.
+#[test]
+fn a_step_repeated_with_the_same_options_is_in_the_chain_each_time() {
+    let dir = scratch("same-filter-twice");
+    let p = |name: &str| dir.join(name);
+    convert(Path::new(TINY), &p("a.mzpeak"), &[]);
+    convert(&p("a.mzpeak"), &p("f1.mzpeak"), &["--rt", "0-100000"]);
+    convert(&p("f1.mzpeak"), &p("f2.mzpeak"), &["--rt", "0-100000"]);
+    convert(&p("f2.mzpeak"), &p("f2.mzML"), &[]);
+    let filters = |m: &mzml_meta::Mzml| -> Vec<Option<i64>> {
+        let default = m.spectrum_list_default.clone().flatten().unwrap();
+        let chain = &m.data_processings.iter().find(|(id, _)| *id == default).unwrap().1;
+        assert_eq!(chain.len(), 5, "pwiz, conversion, filter, filter, export: {chain:?}");
+        chain.iter().filter(|meth| meth.accessions.contains(&"MS:1001486".to_string())).map(|meth| meth.order).collect()
+    };
+    assert_eq!(filters(&read(&p("f2.mzML"), "filtered twice alike → mzML")), [Some(4), Some(5)]);
+    // Converted back and exported again, the chain's steps are not added a second time: the default
+    // holds conversion, filter, filter and export, and each answers for one of the list's steps.
+    convert(&p("f2.mzML"), &p("b.mzpeak"), &[]);
+    convert(&p("b.mzpeak"), &p("b.mzML"), &[]);
+    let m = read(&p("b.mzML"), "filtered twice alike → mzML → mzPeak → mzML");
+    let default = m.spectrum_list_default.clone().flatten().unwrap();
+    let chain = &m.data_processings.iter().find(|(id, _)| *id == default).unwrap().1;
+    assert_eq!(chain.len(), 7, "pwiz, conversion, filter, filter, export, conversion, export: {chain:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Round trips keep the software and processing ids unique: an export converted back records its
 /// conversion beside the export's (one `mzpeak-convert` entry for the one version), exporting that
 /// again and filtering a filtered archive number their steps, and each step names software of the

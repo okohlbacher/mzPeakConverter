@@ -2834,6 +2834,19 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let wall_clock = reader.file_index().metadata.get("acquisition_time").and_then(|b| b["wall_clock"].as_str()).map(str::to_string);
     prepare_mzml_header(&mut w, input, wall_clock, &run);
     let mut configurations = MzmlScanConfigurations::of(&w);
+    // The scans stored without a configuration — a reference the import dropped — which the reader
+    // hands over as configuration 0: marked again, so each is written under the run's default, as
+    // the direct export of the source writes it, not under `IC1` whatever the default is.
+    let unconfigured = filter::scans_without_configuration(&reader, false)?;
+    let unconfigured_wavelength =
+        if wavelength.is_empty() { Default::default() } else { filter::scans_without_configuration(&reader, true)? };
+    let unconfigure = |descr: &mut mzdata::spectrum::SpectrumDescription, positions: Option<&Vec<usize>>| {
+        for &at in positions.into_iter().flatten() {
+            if let Some(scan) = descr.acquisition.scans.get_mut(at) {
+                scan.instrument_configuration_id = mzpeak_prototyping::writer::NO_INSTRUMENT_CONFIGURATION;
+            }
+        }
+    };
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
     // A timsTOF archive keeps each peak's 1/K0 in its peak facet (`mean_inverse_reduced_ion_mobility`),
@@ -2862,6 +2875,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 }
                 correct_reader_terms(spec.description_mut());
                 demote_mzp_params(spec.description_mut());
+                unconfigure(spec.description_mut(), unconfigured.get(&(i as u64)));
                 index_refs.check_scans(spec.description_mut());
                 configurations.apply(spec.description_mut());
                 unreferenced += drop_references_to(spec.description_mut(), &left_out);
@@ -2880,6 +2894,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 }
                 let descr = spec.description_mut();
                 demote_mzp_params(descr);
+                unconfigure(descr, unconfigured_wavelength.get(&k));
                 configurations.apply(descr);
                 // The archive's summary columns are computed from the arrays when it is written, and its
                 // reader hands each back as a parameter. Import drops what a source stated for the total
@@ -8706,9 +8721,10 @@ fn input_source_file(input: &Path, id: String) -> SourceFile {
 
 /// Normalise the run metadata every lane writes and merge in what a vendor directory states.
 /// Returns the `acquisition_time` index block when that directory states only a wall clock without
-/// a zone (`run_metadata::apply`): an archive lane writes it into the index, and an mzML output,
-/// which cannot carry it, says so (`fixup_mzml_run_metadata`). Through 0.11.5 the block was dropped
-/// here, so an unzoned Bruker or Agilent clock left no trace on the lanes that rely on this fixup.
+/// a zone (`run_metadata::apply`): an archive lane writes it into the index, and an mzML output
+/// writes the clock as the run's `startTimeStamp`, zone-less as stated ([`mzml_run`]; through
+/// 0.17.0-rc.1 it was left out with a warning). Through 0.11.5 the block was dropped here, so an
+/// unzoned Bruker or Agilent clock left no trace on the lanes that rely on this fixup.
 #[must_use]
 fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) -> Option<(String, serde_json::Value)> {
     // 0. Provenance hygiene on what the reader ALREADY copied. Step 1 below sanitises only the
@@ -8953,7 +8969,9 @@ fn encode_xml_ids(target: &mut impl MSDataFileMetadata) {
 /// declared. Any other — the null an archive lane stores for a reference it dropped
 /// ([`mzml_refs::DanglingRefs::check_scans`]), which mzdata's writer would print as `IC0`, or a
 /// number the list does not hold — is written as the run's default, which is what an mzML scan
-/// without the attribute means (mzdata's writer always writes the attribute).
+/// without the attribute means (mzdata's writer always writes the attribute). An archive's reader
+/// hands a stored null over as 0, so its export marks those scans first
+/// ([`filter::scans_without_configuration`]).
 struct MzmlScanConfigurations {
     declared: std::collections::HashSet<u32>,
     default: u32,
@@ -9062,9 +9080,11 @@ fn own_software(target: &mut impl MSDataFileMetadata, taken: &mut std::collectio
 /// `transformation` params), a filter (`mzpeak_convert_filter`) — stand beside it, named by
 /// nothing. The data the export writes went through them, so the step holds their methods too,
 /// between the default's and its own, each one `order` after the last: every entry of those two
-/// ids (and their numbered repeats) in list order, minus a method the chain already holds (an
-/// archive made from this tool's own mzML has it in its default). A source without such entries —
-/// every raw file, an mzML some other tool wrote — is extended as before.
+/// ids (and their numbered repeats) in list order, minus a method the default's chain already holds
+/// (an archive made from this tool's own mzML has it in its default) — one step per method of that
+/// chain, so two steps with the same options (a filter run twice over the same window) are both
+/// there. A source without such entries — every raw file, an mzML some other tool wrote — is
+/// extended as before.
 ///
 /// Ids must be unique in an mzML, and a source written by this tool already holds
 /// `mzpeak-convert` (another version, maybe) and this very step, so an id in use gets a numeric
@@ -9087,10 +9107,19 @@ fn add_mzml_conversion_step(target: &mut impl MSDataFileMetadata) {
         .iter()
         .filter(|dp| is_numbered_id(&dp.id, CONVERSION_PROCESSING_ID) || is_numbered_id(&dp.id, filter::PROCESSING_ID))
         .filter(|dp| source_default.as_ref().is_none_or(|default| default.id != dp.id));
+    // A step the default's chain already holds is that very method, once: each method of the
+    // default answers for ONE step, so a step repeated with the same options (a second filter over
+    // the same window) is in the chain as often as it ran.
+    let mut unclaimed: Vec<bool> = vec![true; methods.len()];
     for method in archive_steps.flat_map(|dp| &dp.methods) {
-        if !methods.iter().any(|m| m.software_reference == method.software_reference && m.params == method.params) {
-            let order = next_order(&methods);
-            methods.push(ProcessingMethod { order, ..method.clone() });
+        let held = (0..unclaimed.len())
+            .find(|&at| unclaimed[at] && methods[at].software_reference == method.software_reference && methods[at].params == method.params);
+        match held {
+            Some(at) => unclaimed[at] = false,
+            None => {
+                let order = next_order(&methods);
+                methods.push(ProcessingMethod { order, ..method.clone() });
+            }
         }
     }
     let order = next_order(&methods);

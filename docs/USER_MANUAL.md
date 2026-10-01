@@ -225,8 +225,8 @@ source that states none (every raw vendor format) gets the step alone. An archiv
 continues the archive's history: after the methods of the archive's default processing come those
 of the steps this tool's archive lanes recorded on the way — the conversion that wrote the archive
 (`mzpeak_convert_conversion`, with its `transformation` params, §8) and each filter
-(`mzpeak_convert_filter`, §4.2) — then the export, each one `order` later; those entries stay in the
-list as well. A timsTOF `.d` is
+(`mzpeak_convert_filter`, §4.2), as often as it ran — then the export, each one `order` later; those
+entries stay in the list as well. A timsTOF `.d` is
 exported with its mobility params as the archive lanes write them: each diaPASEF spectrum's
 `ion mobility lower limit` / `upper limit` pair in order (mzdata's reader emits it inverted) and,
 with the precursor and scan 1/K0, on the vendor's ModelType-2 model that its mobility array uses,
@@ -271,22 +271,32 @@ is in the body, from mzdata's writer: an empty `<precursorList>` on every MS1 sp
 `<precursorList>` on a chromatogram, an empty `<binaryDataArrayList>` on a spectrum without points;
 and a `<componentList>` that lacks a source, an analyzer or a detector the source does not state.
 
-An archive's export states what the direct export of its source states: the source files, the
-samples, the software, the instrument configurations (each scan under the one it was acquired on),
-the processing history and the run are the archive's (`file_description`, `sample_list`,
-`software_list`, `instrument_configuration_list`, `data_processing_method_list`, `run`). Through
+An archive's export states what the archive holds: the source files, the samples, the software,
+the instrument configurations (each scan under the one it was acquired on, one stored without a
+configuration under the run's default), the processing history and the run are the archive's
+(`file_description`, `sample_list`, `software_list`, `instrument_configuration_list`,
+`data_processing_method_list`, `run`) — which is what the direct export of its source states
+wherever both lanes read the source through the same reader. Through
 0.17.0-rc.1 it stated none of them: one empty instrument configuration, the archive as the only
 source file, this tool as the only software — and a run of two analyzers named an `IC2` it did not
 declare. Different by design, in the header: the archive itself is listed as a source file
 (`mzpeak_archive`, with its SHA-1) after the files the archive lists (an imzML's `.ibd` among them),
-never as the default; the processing chain and list hold the archive's conversion (above); every
+never as the default; the processing chain and list hold the archive's conversion (above); a
+timsTOF `.d` is read by mzdata's TDF reader for `--to mzml` and natively for an archive, so its
+direct export lists mzdata's entries beside the vendor directory's (software `TIMS_SDK` and
+`ACQ_SW` after `timsTOF`, sample `SAMPLE_1` with a `TDF:AnalysisId`, a configuration of five
+components naming `ACQ_SW`) and its archive's export the native lane's (software `timsTOF`, sample
+`sample_1`, the analyzer alone); every
 processing method carries MS:1000530 `file format conversion`, a software without a term
 MS:1000799, a detector without one MS:1000026 and a configuration without a model MS:1000031, which
 the archive's writer adds to meet the spec's CvMapping; a term is named as the embedded vocabulary
 names it (`Thermo RAW format` where an old source writes `Thermo RAW file`); the run's `sampleRef`
 is not written by either export (mzdata's run model has none); and an mzML or imzML whose
 `startTimeStamp` has no zone is exported with it directly, but not from its archive, which does
-not hold such a clock for those two formats. Its chromatograms are the
+not hold such a clock for those two formats. Not a difference between the two exports, but one a
+header diff shows: the parameters two or more instrument configurations share are written once,
+as a `referenceableParamGroup`, in an order mzdata's writer does not keep from one run to the next
+(an LTQ-FT's serial number, model and four `customization` blocks). Its chromatograms are the
 archive's, as stored (times in minutes), each with its type and polarity term; a TIC or base-peak
 chromatogram summed over the exported spectra is added only for a kind the archive lacks, in time
 order (so is the direct export's). Every precursor, a spectrum's or a chromatogram's, keeps its

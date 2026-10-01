@@ -413,6 +413,70 @@ fn index_times<T: ChunkReader + 'static>(facet: ParquetRecordBatchReaderBuilder<
     Ok(rows)
 }
 
+/// The scans an archive stores WITHOUT an instrument configuration, for its mass spectra
+/// (`wavelength` false) or its wavelength spectra: spectrum index → the positions of such scans
+/// among that spectrum's scan rows, in stored order, which is the order the reader hands a
+/// spectrum's scans over in. Empty for nearly every archive: the lanes store a null only for a
+/// reference they dropped (`mzml:dangling-reference-dropped`).
+///
+/// The reader cannot tell: it skips a null and leaves the scan the number 0, the FIRST
+/// configuration, so the export of such an archive wrote the scan under `IC1` where the direct
+/// export of its source writes it under the run's default. Read from the scans facet itself (the
+/// split layout's; the reader refuses the packed one of pre-0.7.0 archives): two columns, and a
+/// second time only when one is null. A facet without the column states nothing, and stays as read.
+pub(crate) fn scans_without_configuration(reader: &MzPeakReader, wavelength: bool) -> Result<HashMap<u64, Vec<usize>>> {
+    let member = if wavelength {
+        Some("wavelength_spectra_metadata_scans.parquet".to_string())
+    } else {
+        reader.file_index().find_entry(&EntityType::Spectrum, &DataKind::Scans).map(|fe| fe.name.clone())
+    };
+    let Some(member) = member.filter(|m| archive_has_member(reader, m)) else { return Ok(HashMap::new()) };
+    // Each scan row as (spectrum index, whether its configuration is null), in stored order; a
+    // batch without a null is not walked unless `all` asks for every row.
+    let rows = |all: bool, visit: &mut dyn FnMut(u64, bool)| -> Result<()> {
+        let facet = reader.open_parquet(&member).with_context(|| format!("opening {member}"))?;
+        let schema = facet.schema().clone();
+        let column = ["instrument_configuration_id", "instrument_configuration_ref"].into_iter().find(|c| schema.column_with_name(c).is_some());
+        let (Ok(source), Some(column)) = (schema.index_of("source_index"), column) else { return Ok(()) };
+        let mask = ProjectionMask::roots(facet.parquet_schema(), [source, schema.index_of(column)?]);
+        for batch in facet.with_projection(mask).build().with_context(|| format!("reading {member}"))? {
+            let batch = batch?;
+            let (Some(source), Some(configuration)) = (batch.column_by_name("source_index").and_then(to_u64), batch.column_by_name(column)) else {
+                bail!("{member}: `source_index` is not an integer column");
+            };
+            if !all && configuration.null_count() == 0 {
+                continue;
+            }
+            for row in (0..batch.num_rows()).filter(|&r| source.is_valid(r)) {
+                visit(source.value(row), configuration.is_null(row));
+            }
+        }
+        Ok(())
+    };
+    let mut without: HashMap<u64, Vec<usize>> = HashMap::new();
+    rows(false, &mut |spectrum, null| {
+        if null {
+            without.entry(spectrum).or_default();
+        }
+    })?;
+    if without.is_empty() {
+        return Ok(without);
+    }
+    // The position of each such scan among its spectrum's rows: counted over every row of the
+    // spectra that have one.
+    let mut seen: HashMap<u64, usize> = HashMap::new();
+    rows(true, &mut |spectrum, null| {
+        if let Some(positions) = without.get_mut(&spectrum) {
+            let at = seen.entry(spectrum).or_default();
+            if null {
+                positions.push(*at);
+            }
+            *at += 1;
+        }
+    })?;
+    Ok(without)
+}
+
 /// Whether the archive `reader` opened holds a member called `name`.
 pub(crate) fn archive_has_member(reader: &MzPeakReader, name: &str) -> bool {
     reader.list_all_files_in_archive().iter().any(|n| n == name)
