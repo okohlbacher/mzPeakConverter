@@ -916,10 +916,11 @@ written with its **zero runs kept**, without `--keep-zero-runs` (owner decision 
 masked, each pixel kept a different subset of the one axis under its own numpress fixed points, so
 one source m/z decoded to several values across pixels (`Example_Continuous`: 171.33333 to 8
 values in 9 pixels, 118 fixed points in 126 chunks; now one axis of 8,399 points for all nine, one
-value, within the numpress bound of 1.75e-7 Da — and 243 kB against 263 kB masked, since the nine
-spectra share one compression window; a sparse synthetic continuous file measured +12 %). No
-`zero-run-mask` is declared, since none was applied; numpress stays the m/z encoding. Whether the
-file's spectra did all hold one array is checked as they are written — each m/z array against the
+value, and exactly, since the axis is 32-bit values and the m/z encoding is then delta (*The
+default m/z encoding*, below) — and 238 kB against 263 kB masked, since the nine spectra share one
+compression window; a sparse synthetic continuous file measured +12 %). No `zero-run-mask` is
+declared, since none was applied; the m/z encoding is the sample's choice, as on any input. Whether
+the file's spectra did all hold one array is checked as they are written — each m/z array against the
 first, bit for bit — and stated as **`metadata.imaging.shared_mz_axis`** (`true`, or `false` with a
 warning counting the spectra that differ; absent for processed-mode input, whose pixels are masked
 as before, `--keep-zero-runs` the override). A spectrum typed `MS1 spectrum` (`MS:1000579`) that
@@ -1640,8 +1641,9 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   (+11 %), `--lossless` 409.8 MB (2.4×, every m/z and intensity equal to the `.ibd`); these are
   sizes without an optical image, and the 1.6 MB TIFF the corpus keeps beside this imzML is
   embedded on top when it is there. Where m/z are 32-bit values the exact archive is the smaller
-  one: `Example_Continuous` was 263 kB masked (0.17.0-rc.2), is 243 kB by default since its zero
-  runs are kept (continuous mode, §8), 238 kB with `--no-numpress` and 230 kB with `--lossless`.
+  one: `Example_Continuous` was 263 kB masked under numpress (0.17.0-rc.2), is 238 kB by default
+  since its zero runs are kept and its 32-bit axis takes exact delta (continuous mode and *The
+  default m/z encoding*, §8; `--no-numpress` changes nothing there) and 233 kB with `--lossless`.
 - **zstd** — applied inside Parquet, `--zstd-level` 1–22 (default 3; the timsTOF **ims-compact**
   lanes default to **5**, the measured byte-plane plateau — an explicit `--zstd-level` applies to
   both).
