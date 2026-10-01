@@ -48,6 +48,19 @@ Bruker's beam-size fallback reads the table that holds it, and the `--image` aff
 gains a `fidelity` index block** stating source and stored point counts, numeric types, and the
 measured m/z error of each lossy transform. Default signal output is unchanged.
 
+**Found by rebuilding and auditing the corpus with a release candidate** (200 units, every finding
+reproduced independently). **Output change (mzML export).** An export states the run — its id,
+start time, default source file — and an archive's export the instrument, software, processing,
+sample and source-file lists the archive holds (it wrote an empty configuration and its own software
+only). No export states a polarity, start time, injection time, collision energy or peak intensity
+that nobody stated, zero-length arrays load in OpenMS, and an mzML → mzML conversion keeps every
+array of a spectrum. **Output change (archives).** A start time without a zone is kept as an
+`acquisition_time` block, a device trace keeps its unit, a Thermo SRM spectrum no longer names
+itself as its precursor spectrum, and every value change is declared where the `fidelity` block
+reports it (`delta-ulp`, `intensity-f32-rounding`, `intensity-type-narrowing`,
+`bruker:out-of-window-points-dropped`). timsTOF window limits equal the mobility grid's values.
+**Native SciEX runs with empty spectra convert again** (they aborted since 0.14.0).
+
 ### Added
 
 - `metadata.imaging.pixel_count_source` (imaging profile, review B18): `declared` when the source
@@ -127,6 +140,40 @@ measured m/z error of each lossy transform. Default signal output is unchanged.
     `filter.dropped_index_blocks`) when `--rt` or `--ms-level` removes spectra.
   - Cost: 0.03 s of a 4.4 s conversion on the bladder imzML. Default archives are otherwise
     unchanged.
+- **`delta-ulp` in `transformations`.** A 64-bit m/z in a delta chunk whose last value is more
+  than twice its first can come back one unit in the last place off, and `fidelity.mz_error` said
+  so (`delta`) while `transformations` stayed empty. The entry is now declared, mirrored into the
+  processing method and counted by `--lossless`, from the writer's own count of such chunk rows,
+  by the rule the block applies when it reads them back, so the two cannot disagree (QC01
+  `--no-numpress`: 4 of 43,332 chunks, bound 1.42e-14 Da). Not for a facet whose source m/z are
+  all 32-bit values, which delta returns exactly.
+- **`intensity-f32-rounding` and `intensity-type-narrowing` in `transformations`**, with the facet
+  counts `intensity_values_rounded` and `intensity_values_narrowed` in `fidelity` and a warning
+  that states them. A centroid spectrum reaches the peak facet through mzdata's float32 peak set,
+  a `--tof-grid` grid row carries float32 intensities, and a facet has ONE intensity column,
+  typed from the spectra the writer samples, into which an array of another type is cast. None
+  of it was declared. The counts are taken as each spectrum is written, by the way it reaches the
+  column and for the type the column has, and equal the number of stored intensities that differ
+  from the file's (generated mzML, both layouts: 15,000 of 15,000 on 64-bit centroid intensities;
+  6,000 of 12,000 where 32-bit spectra come first and 64-bit ones with a charge array follow;
+  40,000 of 80,000 on profile spectra that turn from 32-bit to 64-bit). `intensity-type-narrowing`
+  is the case of a file that mixes integer and float intensities: the column can come out as an
+  integer one, and the floats are cut to integers (40,000 of 80,000 on a generated file, stored
+  clamped at 2,147,483,647). What is stored is unchanged; it was silent and is now declared.
+  64-bit intensities that are all float32 values (every such file of the example corpus) declare
+  nothing. `agilent:intensity-f32-rounding` keeps its name.
+- **`bruker:out-of-window-points-dropped`.** `--no-ims-compact` on a diaPASEF run stores what
+  mzdata's TDF reader hands over, one spectrum per isolation window, and the points of the TIMS
+  scans outside every window were in no spectrum, undeclared, while `fidelity` read
+  `source_points == stored_points`. The lane now counts each frame against `Frames.NumPeaks`,
+  declares the entry, warns with the count and states the file's own count as `source_points`
+  (2485.d, first 120 spectra: 667,268 of 677,882 points stored, 10,614 left out in 25 of 28
+  frames). The `.d` → mzML export drops the same points and warns. A ddaPASEF run checked
+  (PXD078573 9629.d) holds none and declares nothing.
+- **`fidelity.mz_error` states what a TOF grid left**, not only the tolerance a fit is accepted
+  within: `observed_max_rel_error_ppm` and `observed_max_abs_error`, measured over every gridded
+  point while the archive is written (a SCIEX slice of 16.5 million points: 0.865 ppm of the
+  5 ppm allowed).
 
 ### Changed
 
@@ -224,6 +271,30 @@ measured m/z error of each lossy transform. Default signal output is unchanged.
     centroid spectra over m/z 50–5000, 3 of them above m/z 1000 (2.3e-13 Da).
   - Now: the wording says so, the `fidelity` block counts the chunks and bounds the error, and
     `--lossless` is the flag for a bit-exact archive. 32-bit m/z values stay exact under delta.
+- **The summed TIC and base-peak chromatograms are the same on both export routes.** The direct
+  export summed every spectrum, from its stated total ion current where it had one, and named the
+  base-peak trace `BIC`; an archive holds `BPC` over the MS1 spectra (201 points against 15 for
+  `swath.api-sample-centroid`). Every route now writes `TIC` and `BPC` with a point per MS1
+  spectrum, summed from the signal written, and only for a kind the source or archive lacks.
+  Nothing is summed over a run without an `ms level` 1 spectrum: an MS2-only file, or an imaging
+  run whose pixels state `ms level` 0, is exported without a summed pair, where it used to get one
+  over whatever spectra it held (2,826 points at time 0 for `Test_P15_r2`).
+- **Off-grid m/z of a grid facet are byte-stream-split, without the dictionary.** In a facet with
+  an `mz_grid` column the values column holds only the spectra that are on no grid: whole spectra
+  of 64-bit m/z, nearly all distinct, which the dictionary held over again in every byte-capped
+  row group (the native SCIEX facet of PXD011326 grew 0.8 %, +9.3 MB, in 0.17.0-rc.1). Measured
+  through `--tof-grid` on an mzML slice of a SCIEX run with 160 of 1,079 spectra off the grid:
+  the column 18,151,745 → 12,870,470 bytes (−29.1 %), the facet 34,539,254 → 29,258,089
+  (−15.3 %), every value identical. The native SCIEX lane itself is not measured yet. A chunk
+  facet without a grid column (delta, numpress) is untouched.
+- **ims-compact window limits are values of the mobility grid.** A diaPASEF or ddaPASEF window's
+  1/K0 band and its selected ion's 1/K0 were evaluated in the vendor library's order of
+  operations, 1 to 4 units in the last place off the values the archive's own mobility grid
+  decodes to, so a frame cut by its stated bands put boundary points outside their window
+  (2485.d: 5,327 points in 2,945 of 15,977 windows; on its first 40 frames 86 limits off and 72
+  boundary points outside, now 0 and 0). They are evaluated as the grid is, as the
+  `--no-ims-compact` lane's already are. Measured on the native reader; the `--bruker-sdk`
+  reader carries the same change. ims-compact archives need a rebuild to carry it.
 
 ### Fixed
 
@@ -377,10 +448,8 @@ measured m/z error of each lossy transform. Default signal output is unchanged.
   step a fresh id (`mzpeak_convert_to_mzml_2`). OpenMS 3.5 `FileInfo` refuses the 0.16.0 exports of
   PXD059079 2485.d, of both its archive kinds and of a Thermo `.raw`, and reads all of this
   version's (the `.d`: 16,377 spectra); on a timsTOF diaPASEF run capped at 20,000 spectra,
-  OpenSWATH assigns the precursors of the export. This is the processing requirement, not full XSD
-  validity: mzdata's writer still gives the run the id `1` (not an NCName), writes an empty
-  `precursorList` on every MS1 spectrum and an empty `softwareRef` where a source states nothing,
-  as 0.16.0 does.
+  OpenSWATH assigns the precursors of the export. The run's id, the empty `softwareRef` and the
+  empty `precursorList` of 0.16.0's exports are fixed too (below).
 - **A timsTOF `.d` → mzML writes each diaPASEF window's 1/K0 limits in order, on the vendor
   model, bracketing the window's own peaks.** `--to mzml` wrote mzdata's TDF params as they come:
   the spectrum-level `ion mobility lower limit` from the window's first scan, the larger 1/K0
@@ -624,12 +693,184 @@ measured m/z error of each lossy transform. Default signal output is unchanged.
 - **mzML export of a Waters imaging `.raw` declares `IMS` and states its fitted grid.** The native
   lane wrote the positions under a `cvList` of MS and UO and no grid (Windows lane; box check
   pending).
+- **An archive's mzML export states the run the archive holds.** Through 0.17.0-rc.1 the export
+  took the file content and the scan settings from the index and nothing else: one empty
+  instrument configuration (`<componentList count="0">`, `<softwareRef ref=""/>`, neither
+  schema-valid), the archive as the only source file, this tool as the only software, no sample —
+  and the 976 FTMS scans of an LTQ-FT run named an `IC2` the export did not declare. It now carries
+  the index's source files, samples, software, instrument configurations, processing history and
+  run; the archive itself is still listed as a source file (`mzpeak_archive`, with its SHA-1), after
+  the archive's own and never as the default, and a scan settings' `sourceFileRef` is kept where
+  the file is listed. The processing chain runs through the steps the archive lanes recorded: the
+  archive's default, its conversion, each filter as often as it ran, then the export. LTQ-FT
+  (`mtab_BIOS_CRAM1620_1_072617_34`): `IC1` and `IC2` declared, 3,904 and 976 scans. Over 181
+  corpus archives (exports capped at 3 spectra) every reference resolves and the header validates
+  against the mzML 1.1 schema but for two cases the sources state themselves: an id shared by a
+  source file and a software (UNIFI / waters_connect, 19 archives) and a component list without a
+  source (3). The spectrum and chromatogram bodies are byte-identical to rc.1's on all 181.
+- **Every mzML export states the run's id, start time and default source file.** mzdata's writer
+  wrote `<run id="1">`, undated, with the first listed file as `defaultSourceFileRef` and the
+  lowest configuration as the default, on every lane (pwiz's Agilent `MRM Neg C5`, acquired
+  2006-09-10T02:11:56Z from `MSScan.bin`, came out as run `1` of `acqmethod.xml`). The header
+  post-pass (`src/mzml_header.rs`) now rewrites the `<run>` start tag: the run's own id, its
+  `startTimeStamp` (RFC 3339 for a zoned time; a clock the source states without a zone is written
+  as stated, zone-less, where it was left out with a warning), the source's default source file and
+  the run's default configuration. An id that is not an XML name is escaped as ProteoWizard escapes
+  it (`_x00hh_` per byte: `MRM_x0020_Neg_x0020_C5`, `_x0032_0181203_Capan2_1`), for the run, source
+  files, samples, software and scan settings and every reference to them; the mzML import lanes
+  decode it again. Empty `<softwareRef ref=""/>` and `<componentList count="0">` are no longer
+  written. Of 165 mzML/imzML corpus sources exported directly, 144 run tags equal the source's and
+  21 gain a `defaultSourceFileRef` the source does not state.
+- **The direct mzML/imzML → mzML export drops the references that name nothing.** It copied each
+  reference as mzdata read it, where the archive lane repairs them (`src/mzml_refs.rs`): the 2,826
+  scans of GBM `Test_P15_r2.imzML` named `IC2` under a list declaring `IC1` alone. The lane now
+  runs the same check, with one warning: an entry mzdata skips for being self-closing is put back
+  (a configuration only scans name is numbered ahead of them), a scan whose reference was dropped
+  is written under the run's default configuration, a run default names its list's first entry,
+  and a processing method whose software is unknown names a declared `software_not_stated`. An
+  archive's export does the same for a scan the archive stores without a configuration: its reader
+  hands the null over as configuration 0, so such a scan was `IC1` whatever the run's default.
+- **Software and processing ids stay unique across round trips.** Converting this tool's own mzML
+  back wrote two `software_list` entries with the id `mzpeak-convert`, a second filter a second
+  `mzpeak_convert_filter`, and the filter step named a software entry of the version that wrote
+  the archive, not the one that ran. Each version of the tool is now listed once (`mzpeak-convert`,
+  `mzpeak-convert_2`), a repeated step is numbered (`mzpeak_convert_conversion_2`,
+  `mzpeak_convert_filter_2`, `mzpeak_convert_to_mzml_2`), and the filter step references the
+  software entry of the running version. The filter step is recorded in `mzpeak_index.json` only:
+  the Parquet footers keep the conversion's lists in rewritten and copied facets alike (manual
+  §4.2).
+- **An mzML export states nothing that neither its source nor its archive states.** mzdata's writer
+  prints a polarity, a `scan start time`, an `ion injection time`, a `peak intensity` and a
+  `collision energy` for every spectrum: `positive scan` and 0 where its model holds none. On both
+  routes (`raw -o x.mzML` and `x.mzpeak -o x.mzML`) the negative-mode imaging run
+  `180817_NEG_Thaliana_Leaf_bottom_1_0841` was exported as 1,196 positive scans acquired at 0 min,
+  ProteoWizard's `swath.api-sample-centroid` gained 201 injection times and 186 peak intensities of
+  0 it does not state, and the SRM run `LD401_001fmol_r1` 9,600 zeros of each of the three terms
+  where its archive holds nulls. Now a spectrum of unknown polarity gets no polarity term (one
+  warning for the run instead of one per spectrum), and a 0 of the four other terms is written only
+  where it is a stated value: a vendor reader's or an archive's start time, and whatever an mzML or
+  imzML writes itself, in a `cvParam` or through a param group. 138 ProteoWizard mzML files,
+  direct export: the counts of all five terms equal the source's in 138 of 138. 153 archives: no 0
+  of the three terms in 69,448 spectra. An imaging archive whose marker says its source stated no
+  time is exported without `scan start time`. Left: the export of any other archive still writes
+  the 0 it stores for a scan whose source stated no time (8 scans in 4 of those 138 files).
+- **The direct mzML/imzML → mzML export writes the source's arrays.** It wrote mzdata's peak list
+  for a centroid spectrum, m/z and a 32-bit intensity, and dropped every other array: all 15
+  `mean inverse reduced ion mobility array`s of ProteoWizard's
+  `Hela_QC_PASEF_Slot1-first-6-frames-combineIMS-centroid.mzML`, and 64-bit intensities were
+  narrowed to 32 bits. Every array is now written in the source's data type and order, bit-equal
+  to the source in 138 of 138 files. A source with 64-bit or 32-bit arrays that pack worse exports
+  larger and slower than before: a 182 MB ion-trap mzML 171.7 → 179.9 MB and 7.6 → 11.1 s, an
+  imzML with 32-bit m/z 294.0 → 314.6 MB.
+- **Arrays of length 0 are written empty and uncompressed.** The writer compressed them, and the
+  zlib stream of nothing (`eNoDAAAAAAE=`) fails to inflate to an integer array in OpenMS 3.5: the
+  exports of five corpus archives that hold an empty chromatogram did not load. Each such array is
+  now `no compression`, `encodedLength="0"`, `<binary></binary>`, on every export path. All five
+  load, and so do the exports of 153 of 153 small corpus archives.
+- **An empty spectrum is schema-valid on both routes.** The direct Thermo export stated
+  `lowest observed m/z` inf and `highest observed m/z` -inf (570 values on the 285 empty scans of
+  `SZB8102938.RAW`) and the archive's export wrote `<binaryDataArrayList count="0">`. Both now
+  write an m/z and an intensity array of length 0 and no observed range.
+- **No list the mzML 1.1.0 schema does not have.** No spectrum gets `<precursorList count="0">`,
+  no precursor `<selectedIonList count="0">`; a chromatogram holds its `<precursor>` and
+  `<product>` directly; a run without a chromatogram has no `<chromatogramList>` and no
+  chromatogram index.
+- **The index and the checksum of an mzML export are true.** Every `<offset>` pointed at the line
+  break 9 bytes before its element and `<fileChecksum>` matched no export. Each offset is now the
+  position of its `<spectrum>` or `<chromatogram>` start tag, `<indexListOffset>` that of
+  `<indexList>`, and the checksum the SHA-1 of the file up to and including the `<fileChecksum>`
+  start tag: 70,989 of 70,989 offsets and 153 of 153 checksums across the small corpus archives.
+- **A header value that reads as NaN or infinity no longer aborts the conversion.** The vendored
+  writer unwrapped the JSON conversion of every float, and JSON has neither: a cvParam or userParam
+  whose text is `NaN` or `Inf`, or a digest of digits with an exponent beyond a 64-bit float
+  (`…e99999`), ended the run with exit 134 and no archive, on 0.16.0 and 0.17.0-rc.1 alike. Such a
+  value is stored as the string Rust prints for it (`NaN`, `inf`, `-inf`).
+- **A source file's checksum stays the text the header states.** mzdata types a value by trial
+  parse, so a SHA-1 (`MS:1000569`), MD5 (`MS:1000568`) or SHA-256 (`MS:1003151`) of decimal digits
+  became a number (`…0123` as 123; ProteoWizard's `tiny.pwiz` example as 1.2345678901234568e39). The
+  lane reads the text back from the header, on the archive lanes and in the direct mzML export.
+- **An mzML or imzML run `startTimeStamp` without a UTC offset is kept.** mzdata dropped it with an
+  ERROR line, and the archive stated no acquisition time (five corpus imzML units:
+  Example_Continuous, Example_Processed, both copies of the PXD001283 bladder, DESI 120TopL). It is
+  now the `acquisition_time` block the Waters and SciEX lanes write for an unzoned clock (`source`:
+  `mzML run startTimeStamp` / `imzML run startTimeStamp`). An offset without its colon (`+0200`) is
+  read as the offset it is; text that is not read as a date-time is kept as `stated`.
+- **A device trace keeps its unit, and an ion current keeps its intensity.** ProteoWizard writes a
+  pump pressure, flow rate, temperature or solvent percentage as an `intensity array` in that unit;
+  it went into the `intensity` column, declared in detector counts, and both mzML exports stated
+  counts (49 chromatograms of 12 corpus mzML files). A value that is no intensity is now stored as
+  the native Bruker lanes store the same traces — the chromatogram's pressure, flow-rate or
+  temperature array, otherwise a non-standard array named after the chromatogram, in its unit — and
+  exported so. An intensity in counts per second or percent of base peak, and the array of a TIC,
+  base-peak, SIC, SIM or SRM chromatogram in any unit, stays the intensity; the stated unit's
+  accession is the chromatogram parameter `intensity array unit`, declared as
+  `mzml:chromatogram-intensity-unit-as-parameter`. A unit mzdata has no name for, which read as no
+  unit at all, is read back from the source and kept the same way. The facet keeps its `intensity`
+  column when the source's first chromatograms are all device traces.
+- **A Thermo run without MS1 names no precursor spectrum.** mzdata named scan 1 as the precursor
+  spectrum of every scan, scan 1 included (PXD057269 LD401: 9,600 of 9,600 rows). A reference to the
+  spectrum itself, or to one whose MS level is not below the child's, is cleared and declared
+  (`thermo:invalid-precursor-reference-dropped`); `--to mzml` writes no `spectrumRef` and warns.
+- **A spectrum's `sourceFileRef` is stored.** mzdata does not read the attribute; the DESI ColAd
+  imzML's 17,820 spectra lost their link to its 135 raw line files. It is the spectrum parameter
+  `sourceFileRef` and a userParam in both mzML exports; one that names no listed source file is
+  dropped under `mzml:dangling-reference-dropped`.
+- **A source's processing method gains no term it does not state.** Every source method was given
+  `file format conversion` (`MS:1000530`). The term is now added only to a method that states no
+  child of `MS:1000452` data transformation, which the spec's `processingmethod_must` rule requires;
+  the conversion's own method states it itself.
+- **An mzML or imzML that states no scan start time gets no synthesized TIC or base-peak
+  chromatogram.** Every point sat at time 0 (LA-ESI `Thaliana`: 1,196 points; the PXD001283 bladder:
+  34,840). `provenance.time` of an imaging run says `stated on N of M spectra; the others are stored
+  as 0` when only some spectra state one.
+- **An `.ibd` that does not begin with the imzML's UUID is recorded.** The mismatch was one line of
+  mzdata's log. `provenance.ibd_uuid` is `verified`, `mismatch` or `not stated`, a mismatch adds
+  `ibd_uuid_found` and declares `imzml:ibd-uuid-mismatch`; the conversion goes on.
+- **`metadata.imaging.pixel_size_um` is in micrometres whatever length unit the imzML states**,
+  converted from nanometres, millimetres or centimetres (the scan settings keep the stated unit); x
+  and y of which one is zero or negative are dropped and declared (`imzml:pixel-size-dropped`).
+- **An input path that does not exist is reported as missing** (`error: input <path>: No such file
+  or directory`, exit 1); a missing `.raw` used to reach the Thermo reader and was reported as a
+  missing .NET framework.
+- **`fidelity` read "not measured" for `bruker:mz-calibrant-omitted`** although
+  `ims_calibration.max_error_ppm` of the same index states the bound. The entry now carries it,
+  with its share of the largest stored m/z (SBA415: 0.655716 ppm). The bound is the largest
+  calibrant correction at 2,001 evenly spaced m/z over the calibrant range, and the manual says so.
+- **Manual**: the sentence that an empty `transformations` list means the signal is stored as
+  handed over now names the entries it depends on; `grid-encode:mz` and
+  `grid-encode:mz,ion_mobility` are in the vocabulary table.
+- **The cost of chunk bounds without the dictionary, where bounds repeat, re-measured** against
+  0.16.0 (values identical): QC01's centroid facet +0.06 % (50,603,257 → 50,633,270 bytes, the
+  bounds +25 % and +27 %), ltpmsi-chilli +0.16 % (168,621,970 → 168,886,758, bounds +55–57 %),
+  and most on a small facet: pwiz's ImsSynth_Chrom, 291 KB in 7,341 chunk rows, +1.67 %. The
+  0.17.0-rc.1 notes gave +0.05 % and +0.10 %.
+
+(Note for the owner, not changelog text: the `--bruker-sdk` clause in "ims-compact window limits" is
+true only once commit dfba0fc has been built and run on Windows or Linux; drop the clause if that
+commit is reverted.)
+- **Native SciEX runs with an empty spectrum convert again.** The vendored grid code unwrapped the
+  m/z range of an empty array (`grid.rs`), so since 0.14.0 the native lane panicked on any `.wiff`
+  holding an empty spectrum and the box harness shipped the msconvert fallback, which is larger and
+  drops those spectra. Four corpus units: PXD071869 `08_SWATH_1E_1H` (native 1.93 GB, fallback
+  2.57 GB), PXD053710 Exposome zSWATH, PXD065872 Ozaki SWATH and MSV000095995 `MRM_03` (fallback:
+  6,856 of 23,646 spectra). An empty array now gets no grid model, as an empty peak list does.
+- **An archive's 64-bit peak intensities are exported as stored.** The export of a `--lossless`
+  archive narrowed them to 32 bits (15.1 came out as 15.100000381) with nothing declared; a peak
+  facet with a float64 intensity column is now exported from the facet's arrays.
+- **The mzML exports agree on a run that states no times.** No summed TIC/BPC is written over
+  spectra without a time on either route; a spectrum `sourceFileRef` resolves in an archive's export
+  and is dropped and counted on the direct lane when it names no listed file; a dangling
+  `dataProcessingRef` on an array is cleared on the direct lane.
 
 ### Documentation
 
 - Bruker's baf2sql library creates its `analysis.sqlite` cache inside a BAF `.d` that has none; the
   module docs and the user manual state this exception instead of claiming a conversion writes
   nothing into the `.d`.
+- The manual lists what an mzML or imzML conversion keeps as stated and what it does not carry (§8):
+  `fileDescription/<contact>`, a spectrum's `spotID`, and a scan's or precursor's `sourceFileRef` /
+  `externalSpectrumID` are not carried. It describes the chromatogram facet's placeholder row (§7)
+  and where an archive export's `sourceFileRef` ids resolve (§4.1).
 
 ## [0.16.0] — 2026-09-30
 
