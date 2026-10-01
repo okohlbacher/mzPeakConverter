@@ -348,7 +348,8 @@ an mzML or imzML writes each spectrum's arrays as the source holds them — ever
 source's data types and order — where an archive's export writes what the archive stores (a plain
 centroid spectrum as 64-bit m/z and 32-bit intensity in m/z order, whatever the source's types;
 what storing changed of the intensities the archive declares, §8 `intensity-f32-rounding` and
-`intensity-type-narrowing`); a
+`intensity-type-narrowing`; a peak facet that holds 64-bit intensities — a `--lossless` archive's —
+is exported with them, as stored); a
 `collision energy`, `peak intensity` or `ion injection time` of 0 that an mzML states in its own
 text is kept by its direct export and absent from its archive's, which stores a 0 of these three as
 null; and a scan of an mzML that states no start time has none in the direct export and

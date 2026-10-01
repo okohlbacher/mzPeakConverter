@@ -2942,6 +2942,13 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // and the reader's peak list has no room for it: through 0.16.0 every such spectrum was exported
     // with m/z and intensity only. Such a spectrum is exported from the facet's arrays instead.
     let peak_mobility = reader.metadata.peak_array_indices().is_some_and(|a| a.has_ion_mobility());
+    // So is a spectrum of a peak facet whose intensity column is 64-bit — a `--lossless` archive,
+    // which stores a centroid spectrum's own arrays, or one whose first spectra were profile: the
+    // peak list's intensity is a 32-bit float, and the export of an archive that holds 15.1 wrote
+    // 15.100000381, of a `--lossless` archive included, without a word.
+    let peak_wide = reader.metadata.peak_array_indices().is_some_and(|a| {
+        a.iter().any(|e| e.array_type == ArrayType::IntensityArray && e.data_type == DataType::Float64)
+    });
     // MS2 spectra that are whole frames (an ims-compact archive): precursors, but no window limits
     // of their own. Counted, and named once the export is done. Only such an archive is counted —
     // the ims-compact lanes are the one writer of the `ims_calibration` block: an MS2 spectrum of
@@ -2962,7 +2969,8 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 let mut spec = reader
                     .get_spectrum_by_index(i)
                     .ok_or_else(|| anyhow!("spectrum {i} vanished between metadata and data passes"))?;
-                if peak_mobility && with_peak_facet_arrays(&mut reader, i, &mut spec)? && ims_compact {
+                let from_arrays = (peak_mobility || peak_wide) && with_peak_facet_arrays(&mut reader, i, &mut spec, peak_wide)?;
+                if from_arrays && peak_mobility && ims_compact {
                     let d = spec.description();
                     if !d.precursor.is_empty() && !d.params.iter().any(|p| p.name == "ion mobility lower limit") {
                         whole_frames += 1;
@@ -3088,7 +3096,8 @@ fn drop_precursor_references(precursors: &mut [mzdata::spectrum::Precursor], lef
 
 /// Give a spectrum read from an archive's peak facet that facet's ARRAYS in place of the reader's
 /// peak list when they hold each peak's ion mobility, which the list (`CentroidPeak`: m/z,
-/// intensity) has no room for. Returns whether the spectrum's signal was replaced. The arrays come
+/// intensity) has no room for, or — `wide` — a 64-bit intensity, which the list's 32-bit float
+/// would round. Returns whether the spectrum's signal was replaced. The arrays come
 /// back in the facet's own order and types: they are put in m/z order, as the peak list was, and a
 /// TOF lane's integer intensities become the 32-bit floats the peak list held; the m/z and 1/K0
 /// arrays are the ones the reader decodes for the peak list too (on a timsTOF archive, from the
@@ -3097,6 +3106,7 @@ fn with_peak_facet_arrays(
     reader: &mut mzpeak_prototyping::MzPeakReader,
     index: usize,
     spec: &mut MultiLayerSpectrum,
+    wide: bool,
 ) -> Result<bool> {
     if spec.peaks.is_none() || spec.arrays.as_ref().is_some_and(|a| !a.is_empty()) {
         return Ok(false);
@@ -3107,7 +3117,7 @@ fn with_peak_facet_arrays(
     else {
         return Ok(false);
     };
-    if !arrays.has_ion_mobility() || !arrays.has_array(&ArrayType::MZArray) {
+    if !(arrays.has_ion_mobility() || wide) || !arrays.has_array(&ArrayType::MZArray) {
         return Ok(false);
     }
     strip_grid_axis(&mut arrays);

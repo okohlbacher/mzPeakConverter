@@ -270,6 +270,44 @@ fn the_direct_mzml_lane_writes_the_sources_arrays() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An archive that stores 64-bit intensities in its peak facet — a `--lossless` one, which keeps a
+/// centroid spectrum's own arrays — exports them as stored. The reader's peak list holds a 32-bit
+/// float, so the export of an archive holding 15.1 wrote 15.100000381 (0.17.0-rc.1, and each wave-4
+/// unit on its own). A default archive stores such a spectrum as 32-bit floats and says so when it
+/// is converted (`intensity-f32-rounding`); its export writes what it stores.
+#[test]
+fn a_lossless_archive_exports_its_64_bit_intensities() {
+    // The fixture's first intensity array (15.0, 14.0, … as 64-bit floats), and the same plus 0.1.
+    const STATED: &str = "AAAAAAAALkAAAAAAAAAsQAAAAAAAACpAAAAAAAAAKEAAAAAAAAAmQAAAAAAAACRAAAAAAAAAIkAAAAAAAAAgQAAAAAAAABxAAAAAAAAAGEAAAAAAAAAUQAAAAAAAABBAAAAAAAAACEAAAAAAAAAAQAAAAAAAAPA/";
+    const TENTHS: &str = "MzMzMzMzLkAzMzMzMzMsQDMzMzMzMypAMzMzMzMzKEAzMzMzMzMmQDMzMzMzMyRAMzMzMzMzIkAzMzMzMzMgQGZmZmZmZhxAZmZmZmZmGEBmZmZmZmYUQGZmZmZmZhBAzczMzMzMCEDNzMzMzMwAQJqZmZmZmfE/";
+    let dir = scratch("wide-intensity");
+    let tiny = std::fs::read_to_string(TINY).unwrap();
+    assert!(tiny.contains(STATED), "the fixture changed");
+    let source = dir.join("tenths.mzML");
+    std::fs::write(&source, tiny.replacen(STATED, TENTHS, 1)).unwrap();
+    let want = arrays_of(&source);
+    assert_eq!(want[0]["IntensityArray"].0, BinaryDataArrayType::Float64);
+    assert_eq!(want[0]["IntensityArray"].1[0], 15.1);
+
+    let (lossless, export) = (dir.join("lossless.mzpeak"), dir.join("lossless.mzML"));
+    convert(&source, &lossless, &["--lossless"], &[]);
+    let log = convert(&lossless, &export, &[], &[]);
+    let got = arrays_of(&export);
+    for at in [0, 3] {
+        assert!(want[at]["IntensityArray"] == got[at]["IntensityArray"], "spectrum {at}: {:?}", got[at]["IntensityArray"]);
+        assert!(want[at]["MZArray"] == got[at]["MZArray"], "spectrum {at}: m/z");
+    }
+    assert_well_formed("lossless archive", &std::fs::read_to_string(&export).unwrap(), &log);
+
+    let (archive, export) = (dir.join("default.mzpeak"), dir.join("default.mzML"));
+    let log = convert(&source, &archive, &[], &[]);
+    assert!(log.contains("15 intensities are stored as the nearest float32") && log.contains("intensity-f32-rounding"), "{log}");
+    convert(&archive, &export, &[], &[]);
+    let got = arrays_of(&export);
+    assert_eq!(got[0]["IntensityArray"], (BinaryDataArrayType::Float32, want[0]["IntensityArray"].1.iter().map(|v| *v as f32 as f64).collect()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A scan that states no start time is exported without one. mzdata's model holds 0 for it and its
 /// writer prints that 0: through rc.1 the fixture's `scan=21`, which states no time, was exported
 /// with `scan start time` 0, and so was every pixel of an imaging run. The direct export reads which
