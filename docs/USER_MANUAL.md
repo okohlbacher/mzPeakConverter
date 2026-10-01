@@ -124,10 +124,10 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | Option | Default | Description |
 |---|---|---|
 | `<INPUT>` | — | Input file or vendor directory (mzML / `.mzML.gz` / imzML, Bruker `.d`, Thermo `.raw`, …; positional, required) |
-| `-o, --output <OUTPUT>` | *(none → inspect only)* | Output path. `.mzpeak` (default) or `.mzML` — the format is inferred from the extension (or forced with `--to`); `.mzML.gz` writes gzip-compressed mzML (§4.1). If omitted, **nothing is written** — the input is only inspected and a report (format, spectra, chromatograms) is printed |
+| `-o, --output <OUTPUT>` | *(none → inspect only)* | Output path. `.mzpeak` or `.mzML` — the format is inferred from the extension, any case; `.mzML.gz` writes gzip-compressed mzML (§4.1). **Any other name is refused** (exit 1) unless `--to` states the format: through 0.16.0 `-o run.imzML`, any unknown extension, or none wrote an mzPeak archive under that name. If omitted, **nothing is written** — the input is only inspected and a report (format, spectra, chromatograms) is printed |
 | `-c, --config <CONFIG>` | — | Config file (YAML) setting defaults for any option below; explicit command-line flags win (§5) |
 | `--layout <chunked\|point>` | `chunked` | Signal layout: `chunked` m/z layout (numpress-linear or delta); `point` — flat point layout, one row per m/z–intensity pair (§9) |
-| `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` → `mzml`, else `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1) |
+| `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` / `.mzML.gz` → `mzml`, `.mzpeak` → `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1). Required when the output name has any other extension, or none; it wins over the extension |
 | `--no-numpress` | off | Lossless delta m/z chunking instead of the default lossy numpress-linear |
 | `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
@@ -192,7 +192,7 @@ want the refusal to protect you.
 
 ### 4.1 mzML output (`--to mzml`, `-o x.mzML`, `-o x.mzML.gz`)
 
-An output name ending in `.mzML` (or `--to mzml` with any name) writes a **plain mzML** through
+An output name ending in `.mzML`, in any case (or `--to mzml` with any name), writes a **plain mzML** through
 the mzdata writer, streaming the read spectra straight through — no mzPeak encoder runs (no
 ims-compact, TOF grid, chunking, byte-plane or side-file embedding). It covers every format the
 tool reads: everything mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF) plus the
@@ -344,7 +344,7 @@ struct in `src/main.rs` and lists every accepted key; the six marked *(0.9.13)* 
 ```yaml
 # mzpeak-convert.yaml — every overridable option, all optional
 output: out.mzpeak
-to: mzpeak                 # or: mzml (default: inferred from the output extension)
+to: mzpeak                 # or: mzml (default: inferred from the output extension, .mzpeak or .mzML)
 layout: chunked            # or: point
 no_numpress: false
 no_mz_lattice: false

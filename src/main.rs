@@ -269,9 +269,9 @@ struct Cli {
     /// Input file or vendor directory (mzML/.mzML.gz/imzML, Bruker .d, Thermo .raw).
     input: PathBuf,
 
-    /// Output path. `.mzpeak` (default) or `.mzML` — the format is inferred from the extension (or
-    /// forced with `--to`). If omitted, NOTHING is written — the input is only inspected and a
-    /// report (format, spectra, chromatograms) is printed.
+    /// Output path. `.mzpeak` or `.mzML` (`.mzML.gz`) — the format is inferred from the extension;
+    /// any other name is refused unless `--to` states the format. If omitted, NOTHING is written —
+    /// the input is only inspected and a report (format, spectra, chromatograms) is printed.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -283,7 +283,8 @@ struct Cli {
     #[arg(long, value_enum)]
     layout: Option<Layout>,
 
-    /// Output format [default: inferred from the -o extension — `.mzML`→mzml, else mzpeak]. `mzml`
+    /// Output format [default: inferred from the -o extension — `.mzML`→mzml, `.mzpeak`→mzpeak;
+    /// required for any other output name]. `mzml`
     /// writes a plain mzML (vendor→mzML) instead of mzPeak, bypassing the mzPeak-specific encoders.
     #[arg(long, value_enum)]
     to: Option<OutputFormat>,
@@ -498,17 +499,42 @@ enum OutputFormat {
     Mzml,
 }
 
-/// Infer the output format from the `-o` file extension: `.mzML`/`.mzml` → mzML, everything else
-/// (`.mzpeak`, no/unknown extension) → mzPeak.
-fn infer_output_format(output: &Path) -> OutputFormat {
+/// Infer the output format from the `-o` file extension, any case: `.mzML` (or `.mzML.gz`) → mzML,
+/// `.mzpeak` → mzPeak. Any other name is refused: only `--to` can say what to write under it.
+///
+/// Through 0.16.0 "everything else" was mzPeak, so `-o run.imzML` (or `.mzXML`, `.mgf`, a typo, no
+/// extension at all) exited 0 having written a ZIP archive under that name — nothing reads it as
+/// what its name says, and nothing told the user. This is the ONE place a format is derived from a
+/// name: the lanes take `Settings::output_format`, and their own temporaries (`x.mzpeak.tmp`,
+/// `x.mzML.tmp.gz`, the pre-scan trials) are built from an output already accepted here.
+fn infer_output_format(output: &Path) -> Result<OutputFormat> {
     // `x.mzML.gz` is an mzML request too: look through a trailing `.gz` before deciding. Without
-    // this the last extension is `gz`, the request falls to "everything else", and the user gets an
-    // mzPeak ARCHIVE written under a `.mzML.gz` name.
-    let inner = if has_gz_suffix(output) { output.with_extension("") } else { output.to_path_buf() };
-    match inner.extension().and_then(|e| e.to_str()) {
-        Some(e) if e.eq_ignore_ascii_case("mzml") => OutputFormat::Mzml,
-        _ => OutputFormat::Mzpeak,
+    // this the last extension is `gz`, and the request is no format at all. `x.mzpeak.gz` is not a
+    // name for either: an archive is a ZIP, and nothing here gzips one.
+    let gz = has_gz_suffix(output);
+    let inner = if gz { output.with_extension("") } else { output.to_path_buf() };
+    let ext = inner.extension().and_then(|e| e.to_str());
+    match ext {
+        Some(e) if e.eq_ignore_ascii_case("mzml") => return Ok(OutputFormat::Mzml),
+        Some(e) if e.eq_ignore_ascii_case("mzpeak") && !gz => return Ok(OutputFormat::Mzpeak),
+        _ => {}
     }
+    let named = match output.extension().and_then(|e| e.to_str()) {
+        Some(_) if gz && ext.is_some_and(|e| e.eq_ignore_ascii_case("mzpeak")) => "`.mzpeak.gz` names".to_string(),
+        Some(e) => format!("its extension `.{e}` names"),
+        None => "a name without an extension states".to_string(),
+    };
+    let hint = match ext {
+        Some(e) if !gz && (e.eq_ignore_ascii_case("imzml") || e.eq_ignore_ascii_case("ibd")) => " (imzML is read, not written)",
+        _ => "",
+    };
+    bail!(
+        "-o {}: the output format is taken from the extension, and {named} neither format this tool \
+         writes{hint}: `.mzpeak` (an mzPeak archive) or `.mzML` (mzML; `.mzML.gz` gzip-compressed). \
+         Name the output accordingly, or state the format with --to mzpeak|mzml to write it under \
+         this name",
+        output.display()
+    )
 }
 
 /// Does the path end in `.gz` (any case)?
@@ -681,10 +707,12 @@ impl Settings {
         // given, else the config value, else the built-in default.
         let output = cli.output.clone().or(fc.output);
         // Output format: explicit --to wins, else config, else infer from the -o extension
-        // (`.mzML`→mzml, else mzpeak).
-        let output_format = cli.to.or(fc.to).unwrap_or_else(|| {
-            output.as_deref().map(infer_output_format).unwrap_or(OutputFormat::Mzpeak)
-        });
+        // (`.mzML`→mzml, `.mzpeak`→mzpeak, anything else refused). Without -o nothing is written.
+        let output_format = match (cli.to.or(fc.to), output.as_deref()) {
+            (Some(format), _) => format,
+            (None, Some(output)) => infer_output_format(output)?,
+            (None, None) => OutputFormat::Mzpeak,
+        };
         // "Given" = set on the COMMAND LINE. A config file is a standing profile applied to every
         // invocation, so a value there is a default, not this run's intent — counting it would make
         // a profile that carries `zstd_level: 12` refuse the `.mzpeak` filter lane outright. Kept
@@ -12230,6 +12258,63 @@ mod tests {
         fs::write(&cfg, "quiet: true\n").unwrap();
         let cli = Cli::try_parse_from(["mzpeak-convert", TINY, "--config", cfg.to_str().unwrap()]).unwrap();
         assert!(Settings::resolve(&cli).unwrap().quiet);
+    }
+
+    /// The output format comes from the `-o` extension, and a name that states neither format is
+    /// refused unless `--to` (or the config's `to`) says what to write. Through 0.16.0 every such
+    /// name — `run.imzML`, `run.mzXML`, a typo, none at all — got a ZIP archive, exit 0.
+    #[test]
+    fn an_output_extension_that_names_no_format_is_refused() {
+        use super::{OutputFormat, infer_output_format};
+        let infer = |name: &str| infer_output_format(std::path::Path::new(name)).map_err(|e| format!("{e:#}"));
+        for name in ["a.mzpeak", "a.MZPEAK", "dir.d/a.b.mzPeak", "a.mzML.mzpeak"] {
+            assert_eq!(infer(name), Ok(OutputFormat::Mzpeak), "{name}");
+        }
+        for name in ["a.mzML", "a.mzml", "a.MZML", "a.mzML.gz", "a.mzml.GZ", "a.mzpeak.mzML"] {
+            assert_eq!(infer(name), Ok(OutputFormat::Mzml), "{name}");
+        }
+        for name in ["a.imzML", "a.ibd", "a.mzXML", "a.mgf", "a.foo", "a", "a.gz", "a.mzpeak.gz", "a.mzpeak.tmp", "a.mzML.tmp", "a.zip", ".mzpeak"] {
+            let err = infer(name).expect_err(name);
+            assert!(err.contains("`.mzpeak`") && err.contains("`.mzML`") && err.contains("--to mzpeak|mzml"), "{name}: {err}");
+            assert!(err.starts_with(&format!("-o {name}: ")), "{name}: {err}");
+        }
+        assert!(infer("a.imzML").unwrap_err().contains("`.imzML` names neither format this tool writes (imzML is read, not written)"));
+        assert!(infer("a").unwrap_err().contains("a name without an extension states neither format"));
+        assert!(infer("a.mzpeak.gz").unwrap_err().contains("`.mzpeak.gz` names neither format"));
+
+        // Settings: refused without a format, accepted with `--to` or the config's `to`; nothing is
+        // inferred, and so nothing refused, when no output is asked for.
+        let resolve = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["mzpeak-convert", TINY].iter().chain(args)).unwrap();
+            Settings::resolve(&cli).map(|s| s.output_format).map_err(|e| format!("{e:#}"))
+        };
+        assert!(resolve(&["-o", "x.imzML"]).unwrap_err().contains("names neither format"));
+        assert!(resolve(&["-o", "x"]).is_err());
+        assert_eq!(resolve(&["-o", "x.imzML", "--to", "mzpeak"]), Ok(OutputFormat::Mzpeak));
+        assert_eq!(resolve(&["-o", "x.dat", "--to", "mzml"]), Ok(OutputFormat::Mzml));
+        assert_eq!(resolve(&["-o", "x.mzML", "--to", "mzpeak"]), Ok(OutputFormat::Mzpeak), "--to wins over the extension, as before");
+        assert_eq!(resolve(&[]), Ok(OutputFormat::Mzpeak));
+        let dir = scratch("out-ext");
+        let cfg = dir.join("c.yaml");
+        fs::write(&cfg, "to: mzml\n").unwrap();
+        assert_eq!(resolve(&["-o", "x.foo", "--config", cfg.to_str().unwrap()]), Ok(OutputFormat::Mzml));
+        fs::write(&cfg, "output: x.foo\n").unwrap();
+        assert!(resolve(&["--config", cfg.to_str().unwrap()]).is_err(), "a config-file output is held to the same rule");
+
+        // The binary: exit 1, the message, and no file under the refused name or its temporaries.
+        for name in ["x.imzML", "x.foo", "x"] {
+            let out = dir.join(name);
+            let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str()], &[]);
+            assert!(!ok && (err.contains("names neither format") || err.contains("states neither format")), "{name}: {err}");
+            let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n != "c.yaml").collect();
+            assert!(left.is_empty(), "{name}: {left:?}");
+        }
+        // `--to` writes what it says under the name given.
+        let out = dir.join("x.imzML");
+        let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--to".as_ref(), "mzpeak".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert_eq!(&fs::read(&out).unwrap()[..4], b"PK\x03\x04");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// ProteoWizard's `_xHHHH_` escapes come off on copy: `run.id`, and the software ids with every
