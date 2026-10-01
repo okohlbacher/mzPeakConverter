@@ -780,7 +780,10 @@ impl GridPolicy {
                 return Some(model)
             }
             let v = v.to_f64().ok()?;
-            let (low, high) = Self::minmax(&v).unwrap();
+            // DELIBERATE DEVIATION: an empty array has no range and gets no model, as
+            // `model_from_peaks` gives an empty peak list none. Upstream unwraps here, so one empty
+            // spectrum on a grid lane (a native SciEX run keeps them) aborted the conversion.
+            let (low, high) = Self::minmax(&v)?;
             let pad = Self::padding(low, high);
             self.model_from(&v, (low - pad).max(0.0), high + pad, scale)
         })
