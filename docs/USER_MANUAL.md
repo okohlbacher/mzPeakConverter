@@ -233,7 +233,8 @@ with the precursor and scan 1/K0, on the vendor's ModelType-2 model that its mob
 evaluated as mzdata evaluates the array, so each window's limits bracket its own peaks exactly;
 and the window's band as `userParam`s on the selected ion. `--no-tims-recalibration` is inert here.
 An archive's export (`a.mzpeak -o a.mzML`) carries each peak's ion mobility where the archive holds
-it (every timsTOF archive). A `--no-ims-compact` archive holds one spectrum per diaPASEF window, and
+it (every timsTOF archive), and its 32-bit integer intensities as 64-bit floats, exactly (below:
+no export writes an integer-encoded intensity array). A `--no-ims-compact` archive holds one spectrum per diaPASEF window, and
 exports like the `.d`. Neither holds the points of an MS2 frame that lie in a TIMS scan outside
 every isolation window of the frame: mzdata's TDF reader, which both go through, hands a PASEF frame
 over as one spectrum per window and nothing for the scans between and around them, as ProteoWizard
@@ -304,7 +305,10 @@ names it (`Thermo RAW format` where an old source writes `Thermo RAW file`); the
 is not written by either export (mzdata's run model has none); and an mzML or imzML whose
 `startTimeStamp` has no zone is exported with it by both routes, directly as the source spells it
 and from its archive as the `acquisition_time` block holds it (§8: a fraction of a second with 3,
-6 or 9 digits, so `…45.00035` comes back as `…45.000350`). Not a difference between the two exports, but one a
+6 or 9 digits, so `…45.00035` comes back as `…45.000350`) — mzdata still logs an
+`ERROR … Expected a dateTime value conforming to ISO 8601 standard` line when it reads such a
+stamp (once per read of an imzML, so twice on a round trip); the line is the reader's, and the
+clock is kept. Not a difference between the two exports, but one a
 header diff shows: the parameters two or more instrument configurations share are written once,
 as a `referenceableParamGroup`, in an order mzdata's writer does not keep from one run to the next
 (an LTQ-FT's serial number, model and four `customization` blocks).
@@ -329,7 +333,10 @@ MS:1002815 `inverse reduced ion mobility`, once per element. Different by design
 observed m/z range are the archive's, computed from the stored peaks (a timsTOF `.d` states each
 window spectrum's frame totals); an ims-compact archive's whole frames state no per-window 1/K0,
 `window group` or limits, and it holds HyStar's TIC/base-peak traces but not mzdata's per-window
-pair (28 chromatograms where the `.d`'s export has 30); a device trace that ProteoWizard writes as
+pair (28 chromatograms where the `.d`'s export has 30), and its diaPASEF frames carry no precursor
+`spectrumRef`, because the archive stores no parent frame for a scheduled window
+(`precursor_index` null, the decision of 2026-09-03) where mzdata's TDF reader, which the `.d`'s
+direct export goes through, names the preceding MS1 frame; a device trace that ProteoWizard writes as
 an `intensity array` in pascal, psi, µL/min, °C, percent or absorbance units is written — by the
 archive's export and the direct export alike — as a `pressure array`, `flow rate array`,
 `temperature array` or a `non-standard data array` named after the chromatogram, in that unit
@@ -348,8 +355,25 @@ an mzML or imzML writes each spectrum's arrays as the source holds them — ever
 source's data types and order — where an archive's export writes what the archive stores (a plain
 centroid spectrum as 64-bit m/z and 32-bit intensity in m/z order, whatever the source's types;
 what storing changed of the intensities the archive declares, §8 `intensity-f32-rounding` and
-`intensity-type-narrowing`; a peak facet that holds 64-bit intensities — a `--lossless` archive's —
-is exported with them, as stored); a
+`intensity-type-narrowing`; a peak facet whose intensities are 64-bit floats — a `--lossless`
+archive's — is exported with them, as stored, and one whose intensities are 32- or 64-bit integers
+— a `--lossless` archive of an integer source's, a timsTOF archive's — with every value, as 64-bit
+floats: mzML allows an integer-encoded array, but OpenMS 3.5 refuses a file whose intensity array
+is one (`Encoding intensity array as integer is not allowed`, an integer-intensity source mzML and
+its direct export, which writes the source's arrays as held, included), and 64-bit floats hold
+every 32-bit integer and every 64-bit one below 2^53 (the run warns and counts any beyond); a
+spectrum without a point gets arrays of length 0 in its facet's types; through 0.17.0-rc.2 an
+integer peak column went through the reader's 32-bit float peak list, which changes every value
+above 2^24, and an integer profile column was written as the integers it holds); a scan window's
+limits, an isolation window's target and offsets, a collision
+energy and a selected ion's intensity are held by mzdata's model as 32-bit floats, so both routes
+write them within about 1e-7 relative of the source's text (a lower limit of `102.966518275071`
+comes back as `102.96651458740234`); the direct export of an mzML or imzML leaves out what that
+model has no slot for — a `userParam` under `isolationWindow` or `scanWindow` (an isolation
+window's `ms level`, a scan window's `centroided min/max`), the unit `UO:0000324` (square angstrom)
+of a collision cross section, and a unit the source spells by a name mzdata does not know
+(`number of counts` for MS:1000131; an archive's export keeps the unit its column declares) — all
+four filed upstream with mzdata; a
 `collision energy`, `peak intensity` or `ion injection time` of 0 that an mzML states in its own
 text is kept by its direct export and absent from its archive's, which stores a 0 of these three as
 null; and a scan of an mzML that states no start time has none in the direct export and
@@ -368,7 +392,16 @@ and an archive's time is the scan's, 0 included; a scan of an mzML or imzML that
 none in the direct export; and an imaging archive whose marker says that its source stated no time
 (`imaging.provenance.time`, §8) is exported without any. The direct export of an mzML or imzML reads
 which spectra and chromatograms state which of these four, in a `cvParam` of their own or of a
-`referenceableParamGroup` they refer to, in one extra pass over the source's text. Through
+`referenceableParamGroup` they refer to, in one extra pass over the source's text (the same pass
+reads each spectrum's `sourceFileRef` and looks for an imaging term; through 0.17.0-rc.2 these were
+three passes). Performance: the direct export of an mzML takes 35–45 % longer than 0.16.0 did on
+the same file (a 38 MB Shimadzu export 0.95 s where 0.16.0 took 0.65 s, a 182 MB LTQ-XL one 5.3 s
+for 3.7 s; min of 3 runs each, 2026-10-01), almost all of it per spectrum: the lane writes the
+source's arrays as held (decoded and encoded again, a 64-bit intensity array deflated as such where
+0.16.0 wrote a 32-bit one from the peak list), runs the byte sinks that put the writer's output
+right, and digests the file for `<fileChecksum>` (a profile of the LTQ-XL export: zlib's deflate
+55 % of the samples, the sinks 7 %, the SHA-1 4 %); the one text pass is 0.13–0.32 s of it on those
+files, where 0.16.0 read the text once for 0.08–0.19 s. Through
 0.17.0-rc.1 every export stated `positive scan`, the three zeros and a start time regardless: a
 negative-mode imaging run was exported as positive, every pixel of an imaging run without times as
 acquired at 0 min, and a reader could not tell a 0 from a measurement. Still written whatever the
@@ -636,9 +669,16 @@ Contents:
   unstated time as 0, and every point of the trace would sit at time 0 (two corpus imaging runs held
   1,196 and 34,840 such points). A facet with nothing else to hold — that case, or a run with no MS1
   spectrum and no source chromatogram — carries one **placeholder row**: `id` empty,
-  `chromatogram_type` null, `number_of_data_points` 0, no row in `chromatograms_data`. The reference
-  reader needs the facet to open the archive; a reader should skip a row with an empty id and no
-  points, as this converter's mzML export does. A value that is not an
+  `chromatogram_type` null, `number_of_data_points` 0, no row in `chromatograms_data`, and (since
+  0.17.0) the parameter `placeholder chromatogram`, whose value says why the row is there. The
+  reference reader needs the facet to open the archive; a reader should skip a row that carries the
+  parameter, or has an empty id and no points, as this converter's mzML export does, and
+  `mzpeak-convert <archive>` reports it as `chromatograms: 0 (one placeholder row: …)`. The two
+  footers count it as every facet counts: `chromatograms_metadata` declares `chromatogram_count` 1,
+  its rows (the validator's `chromatogram_count_agreement` holds a metadata facet to its row count),
+  and `chromatograms_data` declares 0, one past the largest index with a row in that file (decision
+  D1, below) — the same pair a centroid-only run leaves on `spectra_metadata` (3) and
+  `spectra_data` (0). A value that is not an
   intensity, such as a device trace's pressure, flow rate, temperature or solvent percentage,
   has no column of its own: it is stored in that chromatogram's `auxiliary_arrays` in
   `chromatograms_metadata`, under its name and in its unit, and the trace's `intensity` values in
@@ -1076,7 +1116,12 @@ selected-ion counts agree, pairs them **positionally in row order** — the only
 the archive supports. Where the counts differ (one precursor with several ions, SPS-MS3;
 or ions missing) nothing is assumed and every ion is attached to the first precursor as
 before. Other readers should apply the same rule; a per-spectrum precursor ordinal in the
-spec is the long-term fix.
+spec is the long-term fix. The HUPO Python reference reader (`hupo-mzpeak/python`, as of
+2026-09-30) does not yet: it raises on a spectrum with several precursors and no parent
+(`Length of values (1) does not match length of index (4)` on every diaPASEF frame of an
+ims-compact archive) and on its retention-time lookups (`KeyError: 'time'` from `.time[…]` and
+`extract_tic()`); both are reader-side defects, filed upstream, and the archives read in the Rust
+reader and this converter.
 
 **Shimadzu `.lcd` (native, Windows).** Each vendor point carries a coarse `Mass` (Int32,
 a 1e-4 Da lattice — what ProteoWizard reads) and `MassHigh` (Int64, 1e-9 Da), and
