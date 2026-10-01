@@ -1,6 +1,6 @@
-//! What an mzML this tool writes states about its processing and, per spectrum, about its
-//! ion-mobility window, read back from the file with quick-xml — and the processing contract every
-//! such file must meet ([`assert_processing_contract`]).
+//! What an mzML this tool writes states about its processing, its header's ids and references and,
+//! per spectrum, about its ion-mobility window, read back from the file with quick-xml — and the
+//! contracts every such file must meet ([`assert_processing_contract`], [`assert_header_contract`]).
 //!
 //! One implementation for the unit tests in `src/` and the integration tests in `tests/`, pulled in
 //! with `#[path]` as `corpus.rs` is (the crate has no library target to share it through).
@@ -42,8 +42,29 @@ pub struct Spectrum {
     pub band_upper: Option<f64>,
 }
 
+/// One `instrumentConfiguration` of the header.
+#[derive(Debug, Default, Clone)]
+pub struct Configuration {
+    pub id: String,
+    /// Its `<componentList count>` and the components the list holds; `None` without the element.
+    pub components: Option<(usize, usize)>,
+    /// Its `<softwareRef ref>`; `None` without the element.
+    pub software_ref: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Mzml {
+    /// The attributes of the `<run>` start tag.
+    pub run: BTreeMap<String, String>,
+    /// Every `sourceFile` id, `sample` id and `scanSettings` id, in document order.
+    pub source_files: Vec<String>,
+    pub samples: Vec<String>,
+    pub scan_settings: Vec<String>,
+    /// Every `<sourceFileRef ref>` of the scan settings.
+    pub source_file_refs: Vec<String>,
+    pub configurations: Vec<Configuration>,
+    /// Each `<scan>`'s `instrumentConfigurationRef`, in document order; `None` where it states none.
+    pub scan_configurations: Vec<Option<String>>,
     /// Every `software` id with its version, in document order.
     pub softwares: Vec<(String, String)>,
     /// The `count` attribute of `dataProcessingList`.
@@ -106,6 +127,28 @@ pub fn read(path: &Path) -> Mzml {
         let parent = stack.last().map(Vec::as_slice);
         let in_ion = stack.iter().any(|n| n == b"selectedIon");
         match name.as_slice() {
+            b"run" => {
+                out.run = tag
+                    .attributes()
+                    .flatten()
+                    .map(|a| (String::from_utf8_lossy(a.key.as_ref()).into_owned(), attr(&tag, a.key.as_ref()).unwrap_or_default()))
+                    .collect()
+            }
+            b"sourceFile" => out.source_files.push(attr(&tag, b"id").unwrap_or_default()),
+            b"sample" => out.samples.push(attr(&tag, b"id").unwrap_or_default()),
+            b"scanSettings" => out.scan_settings.push(attr(&tag, b"id").unwrap_or_default()),
+            b"sourceFileRef" => out.source_file_refs.push(attr(&tag, b"ref").unwrap_or_default()),
+            b"instrumentConfiguration" => out.configurations.push(Configuration { id: attr(&tag, b"id").unwrap_or_default(), ..Default::default() }),
+            b"componentList" => {
+                let count = attr(&tag, b"count").and_then(|c| c.parse().ok()).unwrap_or(usize::MAX);
+                out.configurations.last_mut().expect("componentList outside instrumentConfiguration").components = Some((count, 0));
+            }
+            b"source" | b"analyzer" | b"detector" if matches!(parent, Some(b"componentList")) => {
+                let held = out.configurations.last_mut().and_then(|c| c.components.as_mut()).expect("an open componentList");
+                held.1 += 1;
+            }
+            b"softwareRef" => out.configurations.last_mut().expect("softwareRef outside instrumentConfiguration").software_ref = attr(&tag, b"ref"),
+            b"scan" => out.scan_configurations.push(attr(&tag, b"instrumentConfigurationRef")),
             b"software" => out.softwares.push((attr(&tag, b"id").unwrap_or_default(), attr(&tag, b"version").unwrap_or_default())),
             b"dataProcessingList" => out.data_processing_count = attr(&tag, b"count").and_then(|c| c.parse().ok()),
             b"dataProcessing" => out.data_processings.push((attr(&tag, b"id").unwrap_or_default(), Vec::new())),
@@ -195,4 +238,66 @@ pub fn assert_processing_contract(m: &Mzml, what: &str) -> String {
         assert!(seen.insert(id.as_str()), "{what}: id {id:?} used twice");
     }
     ours.clone()
+}
+
+/// Is `id` an `xs:ID` as ProteoWizard writes one: an ASCII letter or `_`, then those, digits, `.`, `-`?
+pub fn is_xml_id(id: &str) -> bool {
+    let mut bytes = id.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_') && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
+/// What mzML 1.1's schema asks of the header's ids and references. Panics, naming `what`, unless:
+/// * the run has an id, and it, each source file's, sample's, software's, data processing's, scan
+///   settings' and instrument configuration's id is an XML name ([`is_xml_id`]), none twice in its
+///   list;
+/// * the run's `defaultInstrumentConfigurationRef` and every scan's `instrumentConfigurationRef`
+///   name a declared configuration, its `defaultSourceFileRef` and every scan settings'
+///   `sourceFileRef` a listed source file;
+/// * no configuration holds an empty `softwareRef` (it names a listed software or is absent) or an
+///   empty `componentList` (it counts the components it holds, at least one, or is absent);
+/// * a `startTimeStamp`, when there, is an `xs:dateTime`.
+pub fn assert_header_contract(m: &Mzml, what: &str) {
+    let run_id = m.run.get("id").unwrap_or_else(|| panic!("{what}: the run has no id"));
+    let software: Vec<String> = m.softwares.iter().map(|(id, _)| id.clone()).collect();
+    let processing: Vec<String> = m.data_processings.iter().map(|(id, _)| id.clone()).collect();
+    let configurations: Vec<String> = m.configurations.iter().map(|c| c.id.clone()).collect();
+    for (list, ids) in [
+        ("run", std::slice::from_ref(run_id)),
+        ("sourceFile", &m.source_files[..]),
+        ("sample", &m.samples[..]),
+        ("software", &software[..]),
+        ("dataProcessing", &processing[..]),
+        ("scanSettings", &m.scan_settings[..]),
+        ("instrumentConfiguration", &configurations[..]),
+    ] {
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            assert!(is_xml_id(id), "{what}: {list} id {id:?} is not an XML name");
+            assert!(seen.insert(id.as_str()), "{what}: {list} id {id:?} used twice");
+        }
+    }
+    let default = m.run.get("defaultInstrumentConfigurationRef").unwrap_or_else(|| panic!("{what}: no defaultInstrumentConfigurationRef"));
+    assert!(configurations.contains(default), "{what}: the run's default configuration {default:?} is not one of {configurations:?}");
+    for named in m.scan_configurations.iter().flatten() {
+        assert!(configurations.contains(named), "{what}: a scan names configuration {named:?}, not one of {configurations:?}");
+    }
+    if let Some(file) = m.run.get("defaultSourceFileRef") {
+        assert!(m.source_files.contains(file), "{what}: the run's default source file {file:?} is not one of {:?}", m.source_files);
+    }
+    for file in &m.source_file_refs {
+        assert!(m.source_files.contains(file), "{what}: a scan settings names source file {file:?}, not one of {:?}", m.source_files);
+    }
+    for c in &m.configurations {
+        if let Some(r) = &c.software_ref {
+            assert!(software.contains(r), "{what}: configuration {} names software {r:?}, not one of {software:?}", c.id);
+        }
+        if let Some((count, held)) = c.components {
+            assert!(held > 0 && count == held, "{what}: configuration {} has a componentList of count {count} holding {held}", c.id);
+        }
+    }
+    if let Some(t) = m.run.get("startTimeStamp") {
+        let zoned = chrono::DateTime::parse_from_rfc3339(t).is_ok();
+        let plain = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S%.f").is_ok();
+        assert!(zoned || plain, "{what}: startTimeStamp {t:?} is not an xs:dateTime");
+    }
 }

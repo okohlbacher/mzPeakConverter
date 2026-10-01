@@ -27,6 +27,15 @@
 //! replayed), one only scans name the first time a scan does — the scan's own id is then read from
 //! the source ([`DanglingRefs::check_scans`]), and the configuration is put back once the scans are
 //! written ([`DanglingRefs::restore_scan_configurations`]).
+//!
+//! The mzML exports run the same check (`convert_to_mzml` on an mzML or imzML source,
+//! `filter_mzpeak_to_mzml` on an archive's index). An mzML states its header before its scans and
+//! has no null for a scan's configuration, so there a configuration only scans name is numbered
+//! AHEAD of them ([`DanglingRefs::number_scans_ahead`]), a scan whose reference was dropped is
+//! written under the run's default — what an mzML scan without the attribute means — and the warning
+//! is the only declaration ([`DanglingRefs::warn_mzml`]). Through 0.17.0-rc.1 the direct export
+//! copied every reference as mzdata read it: `Test_P15_r2.imzML` came out with 2,826 scans naming
+//! `IC2` under a list declaring `IC1` alone.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::BufRead;
@@ -43,6 +52,11 @@ use crate::pwiz_id;
 /// The `transformations` entry of an archive from which a dangling reference was dropped.
 pub const DROPPED: &str = "mzml:dangling-reference-dropped";
 
+/// The `software` id an mzML export declares, without version or term, for a `processingMethod`
+/// whose software the source does not state: mzML requires the method's `softwareRef` to name an
+/// entry, where an archive's `software_reference` may be empty.
+pub const UNSTATED_SOFTWARE: &str = "software_not_stated";
+
 /// One entry of a header list, as the source states it.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Entry {
@@ -58,13 +72,16 @@ struct Entry {
 
 /// What an mzML or imzML header states before `<run>`, read with quick_xml rather than mzdata: every
 /// `<software>`, `<sourceFile>` and `<instrumentConfiguration>` in document order, self-closing or
-/// not, and the run's `defaultInstrumentConfigurationRef`.
+/// not, and the run's `defaultInstrumentConfigurationRef` and `startTimeStamp`.
 #[derive(Debug, Default)]
 pub struct Header {
     software: Vec<Entry>,
     source_files: Vec<Entry>,
     configurations: Vec<Entry>,
     default_configuration: Option<String>,
+    /// The run's `startTimeStamp` as written. mzdata keeps one only when it carries a UTC offset
+    /// (RFC 3339) and discards an `xs:dateTime` without one.
+    start_time_stamp: Option<String>,
 }
 
 impl Header {
@@ -82,6 +99,7 @@ impl Header {
                 // mzdata reads the run's attributes from its start tag, then the spectra.
                 Event::Start(e) if e.name().as_ref() == b"run" => {
                     this.default_configuration = value(&e, b"defaultInstrumentConfigurationRef");
+                    this.start_time_stamp = value(&e, b"startTimeStamp");
                     break;
                 }
                 Event::Start(e) => this.entry(&e, false),
@@ -184,6 +202,8 @@ pub struct DanglingRefs {
     /// The first scan naming each configuration id the header does not number, by (spectrum id, scan
     /// position): read from `source` on first need.
     first_references: Option<HashMap<(String, usize), String>>,
+    /// The run's `startTimeStamp` as the source's header writes it ([`Header`]).
+    start_time_stamp: Option<String>,
     /// The configurations a scan names that the source states and mzdata skipped, to put back.
     restored: BTreeSet<u32>,
     /// The numbers outside the list found to name nothing, with the id the source states.
@@ -203,7 +223,51 @@ impl DanglingRefs {
             .ok();
         let mut this = Self::check_metadata(target, header.as_ref());
         this.source = Some(path.to_path_buf());
+        this.start_time_stamp = header.and_then(|h| h.start_time_stamp);
         this
+    }
+
+    /// The run's `startTimeStamp` as the source writes it, for a lane that can state a clock without
+    /// a zone (an mzML output: `xs:dateTime` has that form, mzdata's run model does not).
+    pub fn start_time_stamp(&self) -> Option<&str> {
+        self.start_time_stamp.as_deref()
+    }
+
+    /// For a lane that writes its configuration list BEFORE its scans (an mzML output): give each
+    /// configuration the header states, mzdata skipped and only scans name ([`Self::pending`]) the
+    /// number mzdata will give it, and put it back now. mzdata numbers an id on first sight, so the
+    /// ids the header does not number get the next numbers in the order their first scans stand in
+    /// the source, which is read once here; an id that names nothing is noted under its number, to
+    /// be dropped by name when its scans arrive. Nothing to do — and the source is not read — when
+    /// no such configuration is pending. Scans must then be read in document order; one whose
+    /// number still falls outside the list is classified as [`Self::check_scans`] always does, too
+    /// late for the header (the caller writes it under the run's default).
+    pub fn number_scans_ahead(&mut self, target: &mut impl MSDataFileMetadata) {
+        // `pending` holds an id only when the replay of the header's numbering matched mzdata's.
+        if self.pending.is_empty() {
+            return;
+        }
+        let Some(path) = self.source.clone() else { return };
+        let numbered: HashSet<&str> = self.names.values().map(String::as_str).collect();
+        let found = match first_scan_references(&path, &numbered) {
+            Ok(found) => found,
+            Err(e) => {
+                log::warn!("{}: scan configuration ids not read back: {e:#}", path.display());
+                return;
+            }
+        };
+        let next = self.names.len() as u32;
+        for (k, (_, id)) in found.iter().enumerate() {
+            let n = next + k as u32;
+            if self.pending.contains(id) {
+                self.configurations.insert(n);
+                self.restored.insert(n);
+            } else {
+                self.dangling.insert(n, id.clone());
+            }
+        }
+        self.first_references = Some(found.into_iter().collect());
+        self.restore_scan_configurations(target);
     }
 
     /// Put back what `header` states and mzdata skipped, then drop the run-level references of the
@@ -346,11 +410,11 @@ impl DanglingRefs {
             let found = match &self.source {
                 Some(path) => first_scan_references(path, &numbered).unwrap_or_else(|e| {
                     log::warn!("{}: scan configuration ids not read back: {e:#}", path.display());
-                    HashMap::new()
+                    Vec::new()
                 }),
-                None => HashMap::new(),
+                None => Vec::new(),
             };
-            self.first_references = Some(found);
+            self.first_references = Some(found.into_iter().collect());
         }
         self.first_references.as_ref()?.get(&(spectrum.to_string(), at)).cloned()
     }
@@ -393,6 +457,21 @@ impl DanglingRefs {
         }
     }
 
+    /// [`Self::warn`] for an mzML output, which has no `transformations` list: the warning is the
+    /// declaration, and says what the export writes in a dropped reference's place. `lists` names
+    /// whose lists the references were checked against (`source`, `archive`).
+    pub fn warn_mzml(&self, input: &Path, lists: &str) {
+        if let Some(what) = self.summary() {
+            log::warn!(
+                "{}: dropped references that name no entry of the {lists}'s lists: {what}; such a scan is \
+                 written under the run's default configuration, a run default names the list's first \
+                 entry, and a software reference is left out (a processing method names `{UNSTATED_SOFTWARE}`). \
+                 mzML has no transformations list to declare this in",
+                input.display()
+            );
+        }
+    }
+
     fn summary(&self) -> Option<String> {
         (!self.dropped.is_empty()).then(|| {
             self.dropped
@@ -410,16 +489,19 @@ impl DanglingRefs {
 
 /// The first scan naming each configuration id that `numbered` lacks, by (spectrum id, position among
 /// the spectrum's `<scan>` start tags — mzdata skips a self-closing one): the source's own id for a
-/// number mzdata gave on first sight.
-fn first_scan_references(path: &Path, numbered: &HashSet<&str>) -> Result<HashMap<(String, usize), String>> {
+/// number mzdata gave on first sight. In document order, the order mzdata numbers them in when it
+/// reads the spectra from the first on.
+type FirstReferences = Vec<((String, usize), String)>;
+
+fn first_scan_references(path: &Path, numbered: &HashSet<&str>) -> Result<FirstReferences> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     scan_references(std::io::BufReader::new(file), numbered)
 }
 
-fn scan_references(input: impl BufRead, numbered: &HashSet<&str>) -> Result<HashMap<(String, usize), String>> {
+fn scan_references(input: impl BufRead, numbered: &HashSet<&str>) -> Result<FirstReferences> {
     let mut reader = quick_xml::Reader::from_reader(input);
     let mut buf = Vec::new();
-    let mut found = HashMap::new();
+    let mut found = Vec::new();
     let mut seen = HashSet::new();
     let (mut spectrum, mut at) = (String::new(), 0usize);
     loop {
@@ -429,7 +511,7 @@ fn scan_references(input: impl BufRead, numbered: &HashSet<&str>) -> Result<Hash
                 b"scan" => {
                     if let Some(id) = value(&e, b"instrumentConfigurationRef") {
                         if !numbered.contains(id.as_str()) && seen.insert(id.clone()) {
-                            found.insert((spectrum.clone(), at), id);
+                            found.push(((spectrum.clone(), at), id));
                         }
                     }
                     at += 1;
@@ -465,7 +547,7 @@ mod tests {
             <software id="noversion"/>
           </softwareList><instrumentConfigurationList count="2"><instrumentConfiguration id="IC1"><cvParam accession="MS:1000031"/></instrumentConfiguration>
             <instrumentConfiguration id="IC2"/></instrumentConfigurationList>
-          <run id="r" defaultInstrumentConfigurationRef="IC2"><spectrumList><spectrum><software id="late"/></spectrum></spectrumList></run></mzML>"#,
+          <run id="r" defaultInstrumentConfigurationRef="IC2" startTimeStamp="2009-08-11T15:59:44"><spectrumList><spectrum><software id="late"/></spectrum></spectrumList></run></mzML>"#,
         );
         let ids = |l: &[Entry]| l.iter().map(|e| (e.id.clone(), e.self_closing)).collect::<Vec<_>>();
         assert_eq!(ids(&h.software), [("MALDIquantForeign".into(), true), ("pwiz".into(), false), ("noversion".into(), true)]);
@@ -474,6 +556,7 @@ mod tests {
         assert_eq!((h.source_files[1].name.as_str(), h.source_files[1].location.as_str()), ("b.raw", "file:///e"));
         assert_eq!(ids(&h.configurations), [("IC1".into(), false), ("IC2".into(), true)]);
         assert_eq!(h.default_configuration.as_deref(), Some("IC2"));
+        assert_eq!(h.start_time_stamp.as_deref(), Some("2009-08-11T15:59:44"), "as written, zone or not");
         // IC1's start tag first, then the run's default IC2, which mzdata never read as an entry.
         assert_eq!(h.numbering(), HashMap::from([("IC1".to_string(), 0), ("IC2".to_string(), 1)]));
     }
@@ -592,12 +675,13 @@ mod tests {
             <spectrum id="s2"><scanList><scan instrumentConfigurationRef="IC2"></scan></scanList></spectrum>
             <spectrum id="s3"><scanList><scan instrumentConfigurationRef="IC9"></scan></scanList></spectrum></spectrumList></run>"#;
         let numbered = HashSet::from(["IC1"]);
-        refs.first_references = Some(scan_references(&scans[..], &numbered).unwrap());
+        let found = scan_references(&scans[..], &numbered).unwrap();
         assert_eq!(
-            refs.first_references.as_ref().unwrap(),
-            &HashMap::from([(("s1".to_string(), 0), "IC9".to_string()), (("s2".to_string(), 0), "IC2".to_string())]),
-            "a self-closing <scan/> is not counted, as mzdata skips it"
+            found,
+            [(("s1".to_string(), 0), "IC9".to_string()), (("s2".to_string(), 0), "IC2".to_string())],
+            "in document order; a self-closing <scan/> is not counted, as mzdata skips it"
         );
+        refs.first_references = Some(found.into_iter().collect());
 
         let spectrum = |id: &str, ns: &[u32]| {
             let mut d = SpectrumDescription { id: id.into(), ..Default::default() };
@@ -616,5 +700,53 @@ mod tests {
         let mut listed: Vec<u32> = meta.instrument_configurations().keys().copied().collect();
         listed.sort();
         assert_eq!(listed, [0, 2], "IC2 is back as configuration 2");
+    }
+
+    /// A lane that writes its header before its scans numbers the configurations only scans name
+    /// ahead of them: the source's scans name `IC9` (nothing) first, then `IC2` (stated, self-closing),
+    /// so mzdata will number them 1 and 2 — IC2 is in the list before a scan is read, IC9 is known by
+    /// name, and the scans then check as they do on the archive lane.
+    #[test]
+    fn configurations_only_scans_name_are_numbered_ahead_of_the_scans() {
+        let source = r#"<mzML><instrumentConfigurationList><instrumentConfiguration id="IC1"><cvParam/></instrumentConfiguration>
+            <instrumentConfiguration id="IC2"/></instrumentConfigurationList><run id="r" defaultInstrumentConfigurationRef="IC1" startTimeStamp="2009-08-11T15:59:44"><spectrumList>
+            <spectrum id="s1"><scanList><scan instrumentConfigurationRef="IC1"></scan><scan instrumentConfigurationRef="IC9"></scan></scanList></spectrum>
+            <spectrum id="s2"><scanList><scan instrumentConfigurationRef="IC2"></scan></scanList></spectrum></spectrumList></run></mzML>"#;
+        let path = std::env::temp_dir().join(format!("mzpc-refs-ahead-{}.mzML", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        // What mzdata read from the header: IC1 as configuration 0, the run's default.
+        let mut meta = FileMetadataConfig::default();
+        meta.instrument_configurations_mut().insert(0, InstrumentConfiguration { id: 0, ..Default::default() });
+        meta.run_description_mut().unwrap().default_instrument_id = Some(0);
+        let mut refs = DanglingRefs::check(&path, &mut meta);
+        assert_eq!(refs.start_time_stamp(), Some("2009-08-11T15:59:44"));
+        let listed = |meta: &FileMetadataConfig| {
+            let mut n: Vec<u32> = meta.instrument_configurations().keys().copied().collect();
+            n.sort();
+            n
+        };
+        assert_eq!(listed(&meta), [0], "IC2 has no number yet");
+
+        refs.number_scans_ahead(&mut meta);
+        assert_eq!(listed(&meta), [0, 2], "IC9 will be 1, IC2 2");
+        let _ = std::fs::remove_file(&path);
+
+        let spectrum = |id: &str, ns: &[u32]| {
+            let mut d = SpectrumDescription { id: id.into(), ..Default::default() };
+            d.acquisition.scans = ns.iter().map(|&n| mzdata::spectrum::ScanEvent { instrument_configuration_id: n, ..Default::default() }).collect();
+            d
+        };
+        let (mut s1, mut s2) = (spectrum("s1", &[0, 1]), spectrum("s2", &[2]));
+        refs.check_scans(&mut s1);
+        refs.check_scans(&mut s2);
+        let ns = |d: &SpectrumDescription| d.acquisition.scans.iter().map(|s| s.instrument_configuration_id).collect::<Vec<_>>();
+        assert_eq!((ns(&s1), ns(&s2)), (vec![0, NO_INSTRUMENT_CONFIGURATION], vec![2]));
+        assert_eq!(refs.summary().unwrap(), "1 instrumentConfigurationRef (IC9)");
+
+        // Nothing pending: the source is not read (it is gone), and nothing changes.
+        let mut plain = DanglingRefs::check_metadata(&mut meta, None);
+        plain.source = Some(path);
+        plain.number_scans_ahead(&mut meta);
+        assert_eq!(listed(&meta), [0, 2]);
     }
 }
