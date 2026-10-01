@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.17.0] — 2026-10-02
 
 **Fixes from the adversarial review of 2026-09-30.** Imaging input keeps its imaging on every lane,
 pixel positions are checked before they are written, the Waters grid fit refuses rather than
