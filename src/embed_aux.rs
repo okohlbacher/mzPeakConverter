@@ -10,7 +10,11 @@
 //!     Per-image descriptive metadata → the `metadata.imaging` index block's `images[]` array, with
 //!     fields `archive_path`, `source_name`, `media_type`, `width`, `height`, `sha256`,
 //!     `size_bytes`, `affine` (`{type:"affine", matrix:[6], maps:"image_px -> ms_px",
-//!     registration_quality:"assumed_full_extent"}`), and `role:"optical"`.
+//!     registration_quality:"assumed_full_extent"}`), and `role:"optical"`. The affine is the
+//!     imaging profile's: 0-based image pixel centres to 1-based MS pixel centres, here with the
+//!     image's extent laid on the grid's ([`full_extent_affine`]). An image added to a Bruker MALDI
+//!     archive acquired from a FlexImaging sequence gets NO affine ([`unregistered_reason`]): that
+//!     grid is the bounding box of the acquired regions and the photo is of the whole target.
 //!   * SDRF → ZIP member `sample_metadata/sdrf.tsv` (fixed name), entity_type `"sample-metadata"`,
 //!     data_kind `"sdrf"`. Back-refs: `metadata.study` (`{dataset_accession, title,
 //!     sample_metadata_ref}`) + `metadata.sample_metadata` (`{member, sha256, size_bytes,
@@ -129,6 +133,16 @@ fn embed_optical_images(
         return Ok(());
     };
 
+    // A grid the full-extent assumption does not hold for: such an image is embedded without an
+    // affine, said once.
+    let grid = match unregistered_reason(&zip.index().metadata) {
+        Some(why) => {
+            log::warn!("optical image embedded WITHOUT an affine (no registration is written): {why}");
+            None
+        }
+        None => Some((nx, ny)),
+    };
+
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(embed_list.len());
     // ordinal advances ONLY on a successful embed, so a skipped soft image leaves no gap. It starts
     // past the images the archive already holds (the filter lane copies them): a reused name would
@@ -148,7 +162,7 @@ fn embed_optical_images(
         if seen.contains(&key) {
             continue;
         }
-        if let Some(entry) = embed_one_image(zip, path, ordinal, nx, ny, *mode)? {
+        if let Some(entry) = embed_one_image(zip, path, ordinal, grid, *mode)? {
             entries.push(entry);
             seen.push(key);
             ordinal += 1;
@@ -169,15 +183,36 @@ fn embed_optical_images(
     Ok(())
 }
 
+/// Why an image added to this archive must not get the full-extent affine, if it must not: the
+/// archive's `bruker_maldi` block names a FlexImaging sequence (`.mis`, used or rejected). Such a
+/// run's pixel grid is the bounding box of the acquired regions, shifted to start at 1, while the
+/// sequence's own image is a photo of the whole target, registered through its teach points: laying
+/// the photo's extent on the grid's misplaces it by up to 11 MS pixels on MassIVE MSV000088438
+/// (the photo spans MS pixels −11…54 of a 28-pixel grid). `assumed_full_extent` would state a
+/// registration nobody made. The teach-point registration is not written yet (planned: embedding
+/// the sequence's image with it), so the image goes in without an affine, which the profile allows
+/// (`affine` is optional in `schema/mzpeak_index.json`).
+fn unregistered_reason(metadata: &std::collections::HashMap<String, serde_json::Value>) -> Option<String> {
+    let block = metadata.get("bruker_maldi")?;
+    let mis = block["mis"].as_str().or_else(|| block["mis_rejected"]["file"].as_str())?;
+    Some(format!(
+        "this is a Bruker MALDI run acquired from the FlexImaging sequence {mis}, so its pixel grid \
+         is the bounding box of the acquired regions and not the extent of a photo of the target; \
+         laying the image's extent on the grid would misplace it. The registration from the \
+         sequence's teach points is planned; until then readers get this image with no placement"
+    ))
+}
+
 /// Embed ONE optical image (any format) as `images/image_{ordinal:04}.<ext>`, returning its
 /// `metadata.imaging.images[]` entry as a JSON value. The ordinal is the ONLY part of the archive
 /// name that varies — the attacker-influenced source basename never reaches the archive path.
+/// `grid` is the MS pixel grid Nx×Ny the image's extent is laid on; `None` writes no affine
+/// ([`unregistered_reason`]).
 fn embed_one_image(
     zip: &mut ZipArchiveWriter<File>,
     path: &Path,
     ordinal: usize,
-    nx: i64,
-    ny: i64,
+    grid: Option<(i64, i64)>,
     mode: EmbedMode,
 ) -> Result<Option<serde_json::Value>> {
     // On a defect: Strict → Err (abort the conversion); Soft → warn + Ok(None) (skip this image).
@@ -264,12 +299,7 @@ fn embed_one_image(
         Err(_) => fail!("failed to digest image bytes"),
     };
 
-    // Full-extent affine: TIFF uses real (w,h); a dimensionless (0,0) embed passes (1,1) so the
-    // helper yields the constant-axis identity (0 would divide-by-zero; W==1/H==1 is guarded).
-    let (aw, ah) = if w == 0 || h == 0 { (1, 1) } else { (w, h) };
-    let matrix = full_extent_affine(nx, ny, aw, ah);
-
-    Ok(Some(serde_json::json!({
+    let mut entry = serde_json::json!({
         "archive_path": member,
         "source_name": source_name,
         "media_type": media_type,
@@ -277,31 +307,35 @@ fn embed_one_image(
         "height": h as i64,
         "sha256": sha256,
         "size_bytes": size as i64,
-        "affine": {
+        "role": "optical",
+    });
+    if let Some((nx, ny)) = grid {
+        // Full-extent affine: the image's real (w,h); a dimensionless (0,0) embed counts as ONE
+        // image pixel over the whole grid (0 would divide by zero), whose centre is the grid's.
+        let (aw, ah) = if w == 0 || h == 0 { (1, 1) } else { (w, h) };
+        entry["affine"] = serde_json::json!({
             "type": "affine",
-            "matrix": matrix,
+            "matrix": full_extent_affine(nx, ny, aw, ah),
             "maps": "image_px -> ms_px",
             "registration_quality": "assumed_full_extent",
-        },
-        "role": "optical",
-    })))
+        });
+    }
+    Ok(Some(entry))
 }
 
-/// Build the full-extent affine `[a,b,c,d,e,f]` mapping 0-based image pixels into the 1-based MS
-/// pixel grid Nx×Ny: `(x_ms, y_ms) = (a·col + c, e·row + f)`. `a = (nx-1)/(w-1)` (0 when w==1);
-/// `e = (ny-1)/(h-1)` (0 when h==1); `b=d=0`, `c=f=1`. Corner check: (0,0)→(1,1), (W-1,H-1)→(Nx,Ny).
+/// Build the full-extent affine `[a,b,c,d,e,f]`: `(x_ms, y_ms) = (a·col + c, e·row + f)`, `b=d=0`.
+/// The imaging profile defines the affine from 0-based image pixel CENTRES to 1-based MS pixel
+/// CENTRES, and `assumed_full_extent` says the image's extent is the grid's: the image's left edge
+/// (col −0.5) lies on the grid's (x_ms 0.5, the left edge of MS pixel 1), its right edge (col W−0.5)
+/// on the grid's (x_ms Nx+0.5). So `a = Nx/W`, `c = 0.5 + 0.5·Nx/W`; the same on y with Ny/H.
+///
+/// Through 0.16.0 this mapped the corner pixel centres onto each other (`a = (Nx−1)/(W−1)`, `c = 1`:
+/// image pixel 0 → MS 1, pixel W−1 → MS Nx), which stretches the image by half an image pixel past
+/// each edge: off by up to half an MS pixel at the edges, nothing at the centre, and equal only when
+/// W = Nx.
 fn full_extent_affine(nx: i64, ny: i64, w: u32, h: u32) -> [f64; 6] {
-    let a = if w > 1 {
-        (nx - 1) as f64 / (w - 1) as f64
-    } else {
-        0.0
-    };
-    let e = if h > 1 {
-        (ny - 1) as f64 / (h - 1) as f64
-    } else {
-        0.0
-    };
-    [a, 0.0, 1.0, 0.0, e, 1.0]
+    let (a, e) = (nx as f64 / w as f64, ny as f64 / h as f64);
+    [a, 0.0, 0.5 + 0.5 * a, 0.0, e, 0.5 + 0.5 * e]
 }
 
 /// Best-effort sibling optical-image discovery: `<dir>/<stem>-opticalimage.{tif,tiff,png,jpg,jpeg}`.
@@ -661,15 +695,86 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// The full-extent affine lays the image's EXTENT on the grid's, in the profile's coordinates
+    /// (0-based image pixel centres → 1-based MS pixel centres). It mapped the corner pixel centres
+    /// onto each other: image pixel 0 of a 5-pixel image over 10 MS pixels covers MS pixels 1 and 2
+    /// (centre 1.5) and was placed at 1.0.
     #[test]
-    fn affine_corner_maps() {
-        // Nx=10, Ny=20, W=5, H=8 → a=2.25, e=19/7; (0,0)→(1,1), (4,7)→(10,20).
+    fn affine_maps_the_image_extent_onto_the_grid_extent() {
+        // Nx=10, Ny=20, W=5, H=8 → a=2, c=1.5; e=2.5, f=1.75.
         let m = full_extent_affine(10, 20, 5, 8);
-        let apply = |col: f64, row: f64| (m[0] * col + m[2], m[4] * row + m[5]);
-        let (x0, y0) = apply(0.0, 0.0);
-        assert!((x0 - 1.0).abs() < 1e-9 && (y0 - 1.0).abs() < 1e-9);
-        let (x1, y1) = apply(4.0, 7.0);
-        assert!((x1 - 10.0).abs() < 1e-9 && (y1 - 20.0).abs() < 1e-9);
+        assert_eq!(m, [2.0, 0.0, 1.5, 0.0, 2.5, 1.75]);
+        let apply = |col: f64, row: f64| (m[0] * col + m[1] * row + m[2], m[3] * col + m[4] * row + m[5]);
+        let close = |(x, y): (f64, f64), (ex, ey): (f64, f64)| (x - ex).abs() < 1e-12 && (y - ey).abs() < 1e-12;
+        // Edges on edges: the image's top-left corner is the top-left corner of MS pixel (1, 1), its
+        // bottom-right corner the bottom-right corner of MS pixel (Nx, Ny).
+        assert!(close(apply(-0.5, -0.5), (0.5, 0.5)), "{:?}", apply(-0.5, -0.5));
+        assert!(close(apply(4.5, 7.5), (10.5, 20.5)), "{:?}", apply(4.5, 7.5));
+        // Pixel centres: the first image pixel is centred between MS pixels 1 and 2 on x.
+        assert!(close(apply(0.0, 0.0), (1.5, 1.75)));
+        assert!(close(apply(4.0, 7.0), (9.5, 19.25)));
+        // An image with the grid's own size: pixel k is MS pixel k + 1.
+        assert_eq!(full_extent_affine(10, 20, 10, 20), [1.0, 0.0, 1.0, 0.0, 1.0, 1.0]);
+        // A high-resolution image: its centre stays on the grid's centre.
+        let m = full_extent_affine(28, 24, 8064, 6048);
+        assert!((m[0] * 4031.5 + m[2] - 14.5).abs() < 1e-9 && (m[4] * 3023.5 + m[5] - 12.5).abs() < 1e-9);
+        // An image of unknown size counts as one pixel over the grid: its centre is the grid's.
+        assert_eq!(full_extent_affine(28, 24, 1, 1), [28.0, 0.0, 14.5, 0.0, 24.0, 12.5]);
+    }
+
+    /// `--image` on an imaging archive (the filter lane's call): the image is laid on the grid of
+    /// the marker with the full-extent affine — unless the archive is a Bruker MALDI run acquired
+    /// from a FlexImaging sequence, whose grid is a bounding box of regions: then no affine at all,
+    /// where it wrote `assumed_full_extent` (off by up to 11 MS pixels on MSV000088438).
+    #[test]
+    fn an_image_on_a_fleximaging_run_gets_no_affine() {
+        use mzpeak_prototyping::writer::MzPeakWriterType;
+        use mzpeaks::{CentroidPeak, DeconvolutedPeak};
+        use std::io::Read as _;
+
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&56u32.to_be_bytes());
+        png.extend_from_slice(&48u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let img = write_tmp("fleximaging.png", &png);
+        let marker = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "pixel_count": {"x": 28, "y": 24}});
+        let images = |name: &str, bruker: Option<serde_json::Value>| {
+            let out = std::env::temp_dir().join(format!("mzpc_embed_aux_{name}_{}.mzpeak", std::process::id()));
+            let writer = MzPeakWriterType::<File, CentroidPeak, DeconvolutedPeak>::builder().build(File::create(&out).unwrap(), true);
+            let mut zip = writer.finish_parquet().unwrap();
+            zip.add_index_metadata("imaging", &marker).unwrap();
+            if let Some(b) = &bruker {
+                zip.add_index_metadata("bruker_maldi", b).unwrap();
+            }
+            embed_optical_images(&mut zip, Path::new("/x/run.mzpeak"), std::slice::from_ref(&img)).unwrap();
+            zip.finish().unwrap();
+            let mut archive = zip::ZipArchive::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+            assert!(archive.by_name("images/image_0000.png").is_ok(), "{name}: the image is embedded either way");
+            let mut idx = String::new();
+            archive.by_name("mzpeak_index.json").unwrap().read_to_string(&mut idx).unwrap();
+            std::fs::remove_file(&out).ok();
+            serde_json::from_str::<serde_json::Value>(&idx).unwrap()["metadata"]["imaging"]["images"].clone()
+        };
+        // Any other imaging archive, and a Bruker MALDI run with no sequence beside it.
+        for (name, bruker) in [("plain", None), ("nomis", Some(serde_json::json!({"mis": null, "mis_rejected": null})))] {
+            let entry = images(name, bruker)[0].clone();
+            assert_eq!(entry["affine"]["registration_quality"], "assumed_full_extent", "{name}");
+            assert_eq!(entry["affine"]["matrix"], serde_json::json!([0.5, 0.0, 0.75, 0.0, 0.5, 0.75]), "{name}");
+        }
+        // A sequence was read (used, or rejected): the image, its size and digest, and no affine.
+        for (name, bruker) in [
+            ("mis", serde_json::json!({"mis": "run.mis", "mis_rejected": null})),
+            ("rejected", serde_json::json!({"mis": null, "mis_rejected": {"file": "run.mis", "reason": "RegionNumber 1 has no <Area> (the file has 1)"}})),
+        ] {
+            let entry = images(name, Some(bruker))[0].clone();
+            assert!(entry.get("affine").is_none(), "{name}: {entry:#}");
+            assert_eq!((&entry["archive_path"], &entry["width"], &entry["height"], &entry["role"]), (&serde_json::json!("images/image_0000.png"), &serde_json::json!(56), &serde_json::json!(48), &serde_json::json!("optical")), "{name}");
+            assert_eq!(entry["sha256"].as_str().map(str::len), Some(64), "{name}");
+        }
+        std::fs::remove_file(&img).ok();
     }
 
     #[test]
@@ -742,7 +847,7 @@ mod tests {
         let mut zip = writer.finish_parquet().expect("finish_parquet");
 
         // Strict image embed needs a grid; pass it directly via embed_one_image to avoid an imzML.
-        let entry = embed_one_image(&mut zip, &img, 0, 8, 4, EmbedMode::Strict)
+        let entry = embed_one_image(&mut zip, &img, 0, Some((8, 4)), EmbedMode::Strict)
             .expect("embed image")
             .expect("image entry");
         let block = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "images": [entry]});

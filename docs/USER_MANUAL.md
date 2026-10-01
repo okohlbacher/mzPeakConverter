@@ -124,10 +124,10 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | Option | Default | Description |
 |---|---|---|
 | `<INPUT>` | — | Input file or vendor directory (mzML / `.mzML.gz` / imzML, Bruker `.d`, Thermo `.raw`, …; positional, required) |
-| `-o, --output <OUTPUT>` | *(none → inspect only)* | Output path. `.mzpeak` (default) or `.mzML` — the format is inferred from the extension (or forced with `--to`); `.mzML.gz` writes gzip-compressed mzML (§4.1). If omitted, **nothing is written** — the input is only inspected and a report (format, spectra, chromatograms) is printed |
+| `-o, --output <OUTPUT>` | *(none → inspect only)* | Output path. `.mzpeak` or `.mzML` — the format is inferred from the extension, any case; `.mzML.gz` writes gzip-compressed mzML (§4.1). **Any other name is refused** (exit 1) unless `--to` states the format: through 0.16.0 `-o run.imzML`, any unknown extension, or none wrote an mzPeak archive under that name. If omitted, **nothing is written** — the input is only inspected and a report (format, spectra, chromatograms) is printed |
 | `-c, --config <CONFIG>` | — | Config file (YAML) setting defaults for any option below; explicit command-line flags win (§5) |
 | `--layout <chunked\|point>` | `chunked` | Signal layout: `chunked` m/z layout (numpress-linear or delta); `point` — flat point layout, one row per m/z–intensity pair (§9) |
-| `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` → `mzml`, else `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1) |
+| `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` / `.mzML.gz` → `mzml`, `.mzpeak` → `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1). Required when the output name has any other extension, or none; it wins over the extension |
 | `--no-numpress` | off | Lossless delta m/z chunking instead of the default lossy numpress-linear |
 | `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
@@ -142,7 +142,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
-| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`), imaging runs only:** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine. Repeatable. A bad/missing path, or a run with no pixel positions, ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable or the run is not imaging) (§4.3) |
+| `--image <IMAGE>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`), imaging runs only:** embed an optical image VERBATIM into the archive as `images/image_NNNN.<ext>` with a `metadata.imaging` overlay affine (image extent on grid extent; none on a Bruker MALDI run acquired from a FlexImaging sequence, §4.3). Repeatable. A bad/missing path, or a run with no pixel positions, ERRORS the conversion (strict). An `<input-stem>-opticalimage.{tif,tiff,png,jpg}` sibling is additionally auto-discovered (best-effort: warn + skip if unreadable or the run is not imaging) (§4.3) |
 | `--sdrf <SDRF>` | — | **standard-lane inputs (mzML/imzML, Thermo `.raw`, TDF with `--no-ims-compact`, `--via-msconvert`):** embed an SDRF (sample-metadata) TSV VERBATIM as `sample_metadata/sdrf.tsv` with `metadata.study` + `metadata.sample_metadata` back-refs. A missing/unreadable path ERRORS the conversion (§4.3) |
 | `--rt <MIN-MAX>` | — | mzPeak input only: keep spectra whose time is within MIN-MAX (unit matches the stored `spectrum.time`) (§4.2) |
 | `--ms-level <MS_LEVEL>` | — | mzPeak input only: keep spectra with these MS levels (repeatable or comma-list) (§4.2) |
@@ -192,7 +192,7 @@ want the refusal to protect you.
 
 ### 4.1 mzML output (`--to mzml`, `-o x.mzML`, `-o x.mzML.gz`)
 
-An output name ending in `.mzML` (or `--to mzml` with any name) writes a **plain mzML** through
+An output name ending in `.mzML`, in any case (or `--to mzml` with any name), writes a **plain mzML** through
 the mzdata writer, streaming the read spectra straight through — no mzPeak encoder runs (no
 ims-compact, TOF grid, chunking, byte-plane or side-file embedding). It covers every format the
 tool reads: everything mzdata reads directly (mzML/imzML, Thermo `.raw`, Bruker TDF) plus the
@@ -235,6 +235,23 @@ window spectrum's frame totals); an ims-compact archive's whole frames state no 
 `window group` or limits, and it holds HyStar's TIC/base-peak traces but not mzdata's per-window
 pair (28 chromatograms where the `.d`'s export has 30). Not in any archive yet, so not in its
 export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` combination.
+
+The header. An export carries the source's **scan settings** as a `scanSettingsList` (an imaging
+run's grid and pixel size, an inclusion list's targets), from an mzML/imzML as read and from an
+archive's `scan_settings_list`; an entry's source file references are kept where the export lists
+those files (the direct export) and left out where it lists the archive alone. An archive's export
+states the archive's `file_description.contents` as its `fileContent`, and the direct export of an
+imzML adds the provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the
+`.ibd` checksum `IMS:1000090/91/92` — as the archive lane does, so both routes state the same. An
+export that writes imaging terms (pixel positions `IMS:1000050/51` on the scans, the grid, that
+provenance: any imzML, an mzML that mentions an `IMS:` term, an imaging archive) declares the `IMS`
+vocabulary in its `cvList`, pinned to the commit the archive's `cv_list` names (§8). Through 0.16.0
+no export had a `scanSettingsList`, an archive's export had an empty `fileContent`, and the `cvList`
+declared MS and UO whatever the params named. The direct export of an imzML applies the archive
+lane's rules to its scan settings (§8: the pixel-size rule, a unit accession its name contradicts,
+the obsolete "one way"), so both routes state the same grid; an mzML has no `transformations` list,
+so the run's warnings are the only declaration, the last of them naming each rule applied. A Waters
+imaging `.raw` exported directly states its fitted grid the same way, with the vocabulary declared.
 
 ```sh
 mzpeak-convert run.raw -o run.mzML            # Thermo → mzML
@@ -310,14 +327,29 @@ auto-discovered; none beside an existing archive). Both are
 strict: a missing or unreadable path fails the conversion. An image maps onto the pixel grid of
 an **imaging run** (§8: the lane wrote pixel positions and its `metadata.imaging` marker) and never
 makes a run imaging: on any other run an explicit `--image` fails the conversion and an
-auto-discovered sibling is skipped with a warning; `--sdrf` needs nothing. Which lanes embed them:
+auto-discovered sibling is skipped with a warning; `--sdrf` needs nothing.
+
+The affine is the imaging profile's, `[a, b, c, d, e, f]` from 0-based image pixel centres to
+1-based MS pixel centres (`x_ms = a·col + b·row + c`, `y_ms = d·col + e·row + f`), and its
+`registration_quality` is `assumed_full_extent`: nothing registered the image, the converter lays
+its extent on the extent of the Nx × Ny pixel grid. For a W × H image that is `a = Nx/W`,
+`c = 0.5 + 0.5·Nx/W`, `e = Ny/H`, `f = 0.5 + 0.5·Ny/H`, `b = d = 0`: the image's left edge
+(col −0.5) falls on the left edge of MS pixel 1 (x_ms 0.5), its right edge (col W − 0.5) on the
+right edge of MS pixel Nx (x_ms Nx + 0.5). (Through 0.16.0 the matrix mapped the corner pixel
+centres onto each other, `a = (Nx − 1)/(W − 1)`, `c = 1`, which is off by up to half an MS pixel at
+the edges; archives written before keep that matrix.) One kind of archive gets **no affine**: a
+Bruker MALDI run whose `bruker_maldi` block names a FlexImaging sequence (`.mis`). Its grid is the
+bounding box of the acquired regions, while the sequence's image is a photo of the whole target, so
+the full-extent matrix would misplace it (by up to 11 MS pixels on MassIVE MSV000088438). The image
+is embedded and listed in `images[]` without `affine`, with a warning; the registration from the
+sequence's teach points is planned. Which lanes embed them:
 
 | Lane | `--sdrf` / `--image` |
 |---|---|
 | mzML / imzML on the standard lane, **including the `--tof-grid` sub-path** (the same command used to keep or lose the SDRF depending on whether the grid fit passed — fixed in 0.9.13) | embedded (`--sdrf`; `--image` on an imaging run only, which skips the `--tof-grid` sub-path) |
 | Thermo `.raw`, Bruker TDF with `--no-ims-compact` (mzdata path) | embedded (`--sdrf`; `--image` on an imaging run only) |
 | `--via-msconvert` | embedded (since 0.9.13; it used to hard-code "none") |
-| `.mzpeak` → `.mzpeak` (§4.2) | injected into the existing archive (`--sdrf`; `--image` into an imaging archive only, placed on the grid of the source's `metadata.imaging` marker, which is carried and gains the image in `images[]` after any it lists) |
+| `.mzpeak` → `.mzpeak` (§4.2) | injected into the existing archive (`--sdrf`; `--image` into an imaging archive only, placed on the grid of the source's `metadata.imaging` marker, which is carried and gains the image in `images[]` after any it lists; without an affine on a Bruker MALDI archive acquired from a FlexImaging sequence, see above) |
 | default timsTOF ims-compact, both `--bruker-sdk` lanes, `--agilent-grid`, native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | **refused** (exit 1) — convert first, then inject: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (`--image` only when the archive is imaging: a Bruker MALDI or Waters imaging run, see the row above) |
 | `--to mzml`, `.mzpeak` → mzML | **refused** — mzML has no place for them |
 
@@ -338,7 +370,7 @@ struct in `src/main.rs` and lists every accepted key; the six marked *(0.9.13)* 
 ```yaml
 # mzpeak-convert.yaml — every overridable option, all optional
 output: out.mzpeak
-to: mzpeak                 # or: mzml (default: inferred from the output extension)
+to: mzpeak                 # or: mzml (default: inferred from the output extension, .mzpeak or .mzML)
 layout: chunked            # or: point
 no_numpress: false
 no_mz_lattice: false
@@ -623,9 +655,18 @@ describes one grid). A `.mis` the regions do not map onto — a region number wi
 regions whose `MotorPositionX/Y` no single offset places inside their areas' bounding boxes (within
 half a raster step) as the `.mis` teach points locate them — is not used, with a warning and the
 reason in the block. Without a usable `.mis` the frames' beam scan size is the fallback, declared as
-such, when every positioned frame states the same finite one. The max dimension `IMS:1000044/45` is
-count × size. The `bruker_maldi` index block holds the regions (number, name, raster step, frames,
-raw index ranges), the `.mis` it read (or rejected, and why) and the beam scan size.
+such, when every positioned frame states the same finite one: `BeamScanSizeX/Y` of the
+`MaldiFrameLaserInfo` row the frame's `MaldiFrameInfo.LaserInfo` names (of `MaldiFrameInfo` itself in
+a schema that has the columns there), unstated where that row's `BeamScan` is 0 — the beam was not
+scanned, as on both MSV000088438 runs. The max dimension `IMS:1000044/45` is
+count × size. Each positioned frame's scan states its acquisition region, `MaldiFrameInfo.RegionNumber`,
+as the parameter `acquisition region` in its `parameters` list (a parameter without an accession: the
+imaging profile names no region column yet), on every timsTOF lane. A frame without a
+`MaldiFrameInfo` row, or with a NULL index, has no position: its scan is written with null
+`position_x` / `position_y`, the block counts such frames (`frames_without_position`) and the
+conversion warns once. An empty frame that has a row keeps its pixel. The `bruker_maldi` index block
+holds the regions (number, name, raster step, frames, raw index ranges), the `.mis` it read (or
+rejected, and why), the beam scan size and where it was read (`beam_scan_size_source`).
 A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan's laser aim position
 in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them
 and writes the grid index, declared (`waters:laser-position-fitted-to-grid`), with the fit (origin,
@@ -891,7 +932,7 @@ The vocabulary:
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `imzml:obsolete-integer-type-as-psi-ms` | a binary array's data type was declared with the imaging vocabulary's obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") and was read as `MS:1000519` / `MS:1000522`, the PSI-MS terms that replaced them; the values are the ones the `.ibd` holds | imzML |
 | `imzml:ibd-checksum-mismatch` | the `.ibd` does not hash to a checksum the header states (`IMS:1000090/91/92`). The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_checksum_found` holds the hash found, and the `.ibd`'s `source_files` entry its SHA-1 (§8, imaging) | imzML |
-| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y`, not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
+| `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y` (`MaldiFrameLaserInfo`, through `MaldiFrameInfo.LaserInfo`), not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
 | `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid, or far outside the raster at one position (a scan taken with the stage parked off it), and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
 | `bruker:raster-index-shifted-to-base-1` | a Bruker MALDI run's positions are `XIndexPos/YIndexPos − origin + 1`, the run's smallest index becoming 1; `origin` is in the `bruker_maldi` block | Bruker TSF / TDF with `MaldiFrameInfo` |

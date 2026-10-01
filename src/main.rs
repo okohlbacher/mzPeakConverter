@@ -78,6 +78,7 @@ mod encoding_prescan;
 mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
+mod mzml_header;
 mod mzml_isolation;
 mod mzml_refs;
 mod mzml_wavelength;
@@ -269,9 +270,9 @@ struct Cli {
     /// Input file or vendor directory (mzML/.mzML.gz/imzML, Bruker .d, Thermo .raw).
     input: PathBuf,
 
-    /// Output path. `.mzpeak` (default) or `.mzML` — the format is inferred from the extension (or
-    /// forced with `--to`). If omitted, NOTHING is written — the input is only inspected and a
-    /// report (format, spectra, chromatograms) is printed.
+    /// Output path. `.mzpeak` or `.mzML` (`.mzML.gz`) — the format is inferred from the extension;
+    /// any other name is refused unless `--to` states the format. If omitted, NOTHING is written —
+    /// the input is only inspected and a report (format, spectra, chromatograms) is printed.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -283,7 +284,8 @@ struct Cli {
     #[arg(long, value_enum)]
     layout: Option<Layout>,
 
-    /// Output format [default: inferred from the -o extension — `.mzML`→mzml, else mzpeak]. `mzml`
+    /// Output format [default: inferred from the -o extension — `.mzML`→mzml, `.mzpeak`→mzpeak;
+    /// required for any other output name]. `mzml`
     /// writes a plain mzML (vendor→mzML) instead of mzPeak, bypassing the mzPeak-specific encoders.
     #[arg(long, value_enum)]
     to: Option<OutputFormat>,
@@ -498,17 +500,42 @@ enum OutputFormat {
     Mzml,
 }
 
-/// Infer the output format from the `-o` file extension: `.mzML`/`.mzml` → mzML, everything else
-/// (`.mzpeak`, no/unknown extension) → mzPeak.
-fn infer_output_format(output: &Path) -> OutputFormat {
+/// Infer the output format from the `-o` file extension, any case: `.mzML` (or `.mzML.gz`) → mzML,
+/// `.mzpeak` → mzPeak. Any other name is refused: only `--to` can say what to write under it.
+///
+/// Through 0.16.0 "everything else" was mzPeak, so `-o run.imzML` (or `.mzXML`, `.mgf`, a typo, no
+/// extension at all) exited 0 having written a ZIP archive under that name — nothing reads it as
+/// what its name says, and nothing told the user. This is the ONE place a format is derived from a
+/// name: the lanes take `Settings::output_format`, and their own temporaries (`x.mzpeak.tmp`,
+/// `x.mzML.tmp.gz`, the pre-scan trials) are built from an output already accepted here.
+fn infer_output_format(output: &Path) -> Result<OutputFormat> {
     // `x.mzML.gz` is an mzML request too: look through a trailing `.gz` before deciding. Without
-    // this the last extension is `gz`, the request falls to "everything else", and the user gets an
-    // mzPeak ARCHIVE written under a `.mzML.gz` name.
-    let inner = if has_gz_suffix(output) { output.with_extension("") } else { output.to_path_buf() };
-    match inner.extension().and_then(|e| e.to_str()) {
-        Some(e) if e.eq_ignore_ascii_case("mzml") => OutputFormat::Mzml,
-        _ => OutputFormat::Mzpeak,
+    // this the last extension is `gz`, and the request is no format at all. `x.mzpeak.gz` is not a
+    // name for either: an archive is a ZIP, and nothing here gzips one.
+    let gz = has_gz_suffix(output);
+    let inner = if gz { output.with_extension("") } else { output.to_path_buf() };
+    let ext = inner.extension().and_then(|e| e.to_str());
+    match ext {
+        Some(e) if e.eq_ignore_ascii_case("mzml") => return Ok(OutputFormat::Mzml),
+        Some(e) if e.eq_ignore_ascii_case("mzpeak") && !gz => return Ok(OutputFormat::Mzpeak),
+        _ => {}
     }
+    let named = match output.extension().and_then(|e| e.to_str()) {
+        Some(_) if gz && ext.is_some_and(|e| e.eq_ignore_ascii_case("mzpeak")) => "`.mzpeak.gz` names".to_string(),
+        Some(e) => format!("its extension `.{e}` names"),
+        None => "a name without an extension states".to_string(),
+    };
+    let hint = match ext {
+        Some(e) if !gz && (e.eq_ignore_ascii_case("imzml") || e.eq_ignore_ascii_case("ibd")) => " (imzML is read, not written)",
+        _ => "",
+    };
+    bail!(
+        "-o {}: the output format is taken from the extension, and {named} neither format this tool \
+         writes{hint}: `.mzpeak` (an mzPeak archive) or `.mzML` (mzML; `.mzML.gz` gzip-compressed). \
+         Name the output accordingly, or state the format with --to mzpeak|mzml to write it under \
+         this name",
+        output.display()
+    )
 }
 
 /// Does the path end in `.gz` (any case)?
@@ -546,11 +573,13 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// name ends in `.gz`. The XML is compressed AS it is written — one pass, no re-read. Both the mzML
 /// writer and the encoder finish on drop (the writer closes the document, the encoder writes the
 /// gzip trailer), which is why the four export sites can let `w` fall out of scope as before. Above
-/// both sit two sinks that blank, in place, what mzdata's writer states wrongly:
+/// both sit three sinks that change what mzdata's writer states wrongly:
 /// [`mzml_isolation::TargetOnlyWindows`] leaves an isolation window of unknown width target-only (the
-/// writer prints offsets of ±target), and [`mzml_wavelength::WavelengthSpectra`] removes the terms the
-/// writer invents for a wavelength spectrum.
-fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
+/// writer prints offsets of ±target), [`mzml_wavelength::WavelengthSpectra`] removes the terms the
+/// writer invents for a wavelength spectrum, both in place, and [`mzml_header::HeaderFixes`] writes the
+/// header's `<scanSettingsList>` as the schema has it and declares `cv` — a vocabulary the document
+/// uses beside MS and UO, the only two the writer lists — moving the index's offsets by what that adds.
+fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let sink: Box<dyn Write> = if has_gz_suffix(output) {
         log::info!("output name ends in .gz: gzip-compressing the mzML as it is written");
@@ -558,6 +587,7 @@ fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
     } else {
         Box::new(file)
     };
+    let sink = mzml_header::HeaderFixes::new(sink, cv);
     Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(mzml_wavelength::WavelengthSpectra::new(sink))))
 }
 
@@ -681,10 +711,12 @@ impl Settings {
         // given, else the config value, else the built-in default.
         let output = cli.output.clone().or(fc.output);
         // Output format: explicit --to wins, else config, else infer from the -o extension
-        // (`.mzML`→mzml, else mzpeak).
-        let output_format = cli.to.or(fc.to).unwrap_or_else(|| {
-            output.as_deref().map(infer_output_format).unwrap_or(OutputFormat::Mzpeak)
-        });
+        // (`.mzML`→mzml, `.mzpeak`→mzpeak, anything else refused). Without -o nothing is written.
+        let output_format = match (cli.to.or(fc.to), output.as_deref()) {
+            (Some(format), _) => format,
+            (None, Some(output)) => infer_output_format(output)?,
+            (None, None) => OutputFormat::Mzpeak,
+        };
         // "Given" = set on the COMMAND LINE. A config file is a standing profile applied to every
         // invocation, so a value there is a default, not this run's intent — counting it would make
         // a profile that carries `zstd_level: 12` refuse the `.mzpeak` filter lane outright. Kept
@@ -2228,7 +2260,10 @@ fn convert_to_mzml(
     #[cfg(windows)]
     if is_waters_raw(input) {
         let r = waters::WatersReader::open(input)?;
-        return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
+        // An imaging run with a grid: the reader puts each scan's pixel on it (`IMS:1000050/51`),
+        // so the export states the grid those are indices of and declares the vocabulary.
+        let grid = r.imaging().and_then(|im| im.scan_settings());
+        return write_native_mzml_with(input, output, r.len(), grid, |i| r.spectrum(i));
     }
     #[cfg(windows)]
     if is_agilent_d(input) {
@@ -2364,8 +2399,38 @@ fn convert_to_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    // Imaging terms need their vocabulary in the cvList, which mzdata's writer fills with MS and UO
+    // alone: an imzML always states some; an mzML is searched for one (pixel positions on its
+    // scans, a grid in its scan settings — one streamed byte search, as the archive lane makes for
+    // the positions). Through 0.16.0 every `cvRef="IMS"` of an export named a vocabulary the
+    // document did not declare.
+    let ims = match &reader {
+        MZReaderType::IMzML(_) => true,
+        MZReaderType::MzML(_) => imaging::file_mentions(&read_path, ["IMS:1"]).map_or_else(
+            |e| {
+                log::warn!("{}: not searched for imaging terms ({e}); the IMS vocabulary is not declared", input.display());
+                false
+            },
+            |[found]| found,
+        ),
+        _ => false,
+    };
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims))?);
     w.copy_metadata_from(&reader);
+    // The source's scan settings (an imaging run's grid and pixel size, an inclusion list): the
+    // writer holds the list, but its metadata trait does not reach it, so `copy_metadata_from`
+    // left it empty and no export had a `<scanSettingsList>`.
+    w.scan_settings = reader.scan_settings().cloned().unwrap_or_default();
+    // imzML: the file provenance mzdata consumes (storage mode, UUID, `.ibd` checksum), put back
+    // as the archive lane does, and that lane's rules for the scan settings, so the direct export
+    // and the export of the archive state the same.
+    if let MZReaderType::IMzML(_) = &reader {
+        match imaging::read_file_content(&read_path) {
+            Ok(content) => w.file_description_mut().contents.extend(imaging::provenance_params(&content)),
+            Err(e) => log::warn!("imzML file provenance not read: {e:#}"),
+        }
+        imzml_scan_settings_for_mzml(input, &read_path, &mut w.scan_settings);
+    }
     fixup_mzml_run_metadata(&mut w, input);
     let cap = max_spectra();
     let n_spec = cap.map_or_else(|| reader.len(), |m| m.min(reader.len()));
@@ -2415,6 +2480,48 @@ fn convert_to_mzml(
     write_source_chromatograms_mzml(&mut w, source_chroms.into_iter().chain(traces.into_iter().map(|t| t.chromatogram)))?;
 
     finish_mzml(w, tmp_guard, output)
+}
+
+/// The archive lane's rules for an imzML's scan settings ([`convert_file`]: the pixel-size rule,
+/// a unit accession its name contradicts, the obsolete "one way"), on the list the direct mzML
+/// export is about to write, so both exports of one imzML state the same grid. Handed over as
+/// mzdata reads them they did not: mzdata resolves a unit by its NAME, so a pixel size stated in
+/// `UO:0000015` (centimetre) named "micrometer" was exported as a clean 50 µm without a word, where
+/// the archive lane warns and, when the value cannot be tested, drops it. An mzML has no
+/// transformations list: the warnings are the declaration.
+fn imzml_scan_settings_for_mzml(input: &Path, read_path: &Path, list: &mut [mzdata::meta::ScanSettings]) {
+    let mut fixes = imaging::read_scan_settings(read_path).map(|s| imaging::pixel_size_fixes(&s)).unwrap_or_else(|e| {
+        log::warn!("imzML pixel-size check skipped: {e:#}");
+        Vec::new()
+    });
+    let mut applied: Vec<&'static str> = Vec::new();
+    for settings in list.iter_mut() {
+        if let Some(f) = fixes.iter_mut().find(|f| f.settings_id == settings.id) {
+            imaging::apply(f, settings);
+            if imaging::check_written_units(f, settings) {
+                applied.push(imaging::UNIT_FROM_NAME);
+            }
+        }
+        if imaging::one_way_to_flyback(settings) {
+            applied.push(imaging::ONE_WAY_AS_FLYBACK);
+        }
+    }
+    for f in &fixes {
+        for m in f.unit_mismatches.iter().chain(&f.written_units) {
+            log::warn!("imzML scan settings {}: {m}", f.settings_id);
+        }
+        if let Some(t) = f.transformation {
+            log::warn!("imzML scan settings {}: pixel size — {} ({})", f.settings_id, f.case, f.detail);
+            applied.push(t);
+        }
+    }
+    if !applied.is_empty() {
+        log::warn!(
+            "{}: scan settings are written as the archive lane writes them ({}); mzML has no transformations list to declare that in",
+            input.display(),
+            applied.join(", ")
+        );
+    }
 }
 
 /// The mzPeak-INPUT filter path with an mzML output. Reads the `.mzpeak` with the sync `MzPeakReader`
@@ -2522,8 +2629,32 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    // What the index states about the file's content and its scan settings (an imaging run's grid
+    // and pixel size). The vendored reader restores none of the index's lists, so through 0.16.0
+    // every archive was exported with an empty `<fileContent>` and no `<scanSettingsList>`.
+    let archived = reader.file_index().as_file_metadata().unwrap_or_else(|e| {
+        log::warn!("{}: file description and scan settings not read from the index ({e}); exported without", input.display());
+        Default::default()
+    });
+    let contents = archived.file_description().contents.clone();
+    let mut scan_settings = archived.scan_settings().cloned().unwrap_or_default();
+    // The export lists the archive as its one source file, so a scan settings entry's references
+    // to the archive's own source files would name nothing here.
+    scan_settings.iter_mut().for_each(|s| s.source_file_refs.clear());
+    // The imaging vocabulary as the archive declares it; an archive that states imaging terms
+    // without declaring it — in its file content, in its scan settings, or as the pixel positions
+    // of an archive marked as imaging (`metadata.imaging`), which the reader hands over as
+    // `IMS:1000050/51` on the scans — gets the converter's pinned entry.
+    let cv_list = reader.file_index().metadata.get("cv_list");
+    let is_ims = |p: &Param| p.curie().is_some_and(|c| c.controlled_vocabulary == mzdata::params::ControlledVocabulary::IMS);
+    let marked = reader.file_index().metadata.get("imaging").is_some_and(|m| m["is_imaging"] == true);
+    let ims = mzml_header::Cv::from_cv_list(cv_list, "IMS").or_else(|| {
+        (marked || contents.iter().any(is_ims) || scan_settings.iter().any(|s| s.iter_params().any(is_ims))).then(mzml_header::Cv::ims)
+    });
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims)?);
     w.copy_metadata_from(&reader);
+    w.file_description_mut().contents = contents;
+    w.scan_settings = scan_settings;
     fixup_mzml_run_metadata(&mut w, input);
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
@@ -2829,6 +2960,22 @@ fn write_native_mzml(
     input: &Path,
     output: &Path,
     len: usize,
+    spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
+) -> Result<()> {
+    write_native_mzml_with(input, output, len, None, spectrum)
+}
+
+/// [`write_native_mzml`] for a reader whose scans carry their pixel as imaging params (a Waters
+/// imaging `.raw`): `grid`, the scan settings those positions are indices of, becomes the export's
+/// `<scanSettingsList>`, and the `IMS` vocabulary is declared in its `<cvList>`. Without a grid the
+/// reader writes no position, and the header is the one every other native export has. Through
+/// 0.16.0, and in the first cut of the header sink, this lane wrote `cvRef="IMS"` positions under a
+/// `<cvList>` of MS and UO and no grid at all.
+fn write_native_mzml_with(
+    input: &Path,
+    output: &Path,
+    len: usize,
+    grid: Option<mzdata::meta::ScanSettings>,
     mut spectrum: impl FnMut(usize) -> Result<mzdata::spectrum::MultiLayerSpectrum>,
 ) -> Result<()> {
     use mzdata::prelude::SpectrumWriter;
@@ -2844,7 +2991,8 @@ fn write_native_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, grid.as_ref().map(|_| mzml_header::Cv::ims()))?);
+    w.scan_settings.extend(grid);
     fixup_mzml_run_metadata(&mut w, input);
     let n = max_spectra().map_or(len, |m| m.min(len));
     w.set_spectrum_count(n as u64);
@@ -2885,7 +3033,7 @@ fn write_agilent_profile_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None)?);
     fixup_mzml_run_metadata(&mut w, input);
     // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
     // (matches write_native_mzml, which also uses the reader's record count).
@@ -9162,6 +9310,57 @@ mod tests {
         assert!(!xml.contains("<chromatogram id=\"TIC\""), "HyStar's MS trace is the TIC; the writer adds none");
     }
 
+    /// `--to mzml` from a native reader whose scans carry their pixel — the Waters imaging lane,
+    /// whose reader runs on Windows only; what it hands the writer is built here. Such an export
+    /// wrote `cvRef="IMS"` positions under a `<cvList>` of MS and UO, and no grid: the header sink
+    /// was given no vocabulary on this lane. With the reader's grid the export declares `IMS`,
+    /// states the grid in a `<scanSettingsList>`, and its index follows the longer header; without
+    /// one (every other native export, and a Waters run whose laser positions fit no grid, which
+    /// gets no positions either) the header is what it was.
+    #[test]
+    fn a_native_mzml_export_of_an_imaging_run_declares_ims_and_states_its_grid() {
+        let (dir, _cleanup) = trace_scratch("native-imaging");
+        let input = dir.join("run.raw");
+        std::fs::create_dir_all(&input).unwrap();
+        let pixel = |i: usize| {
+            let mut spec = spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i);
+            spec.description_mut().id = format!("scan={}", i + 1); // the index is keyed by id
+            let mut scan = mzdata::spectrum::ScanEvent::default();
+            scan.add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(i as i64 + 1).build());
+            scan.add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(1).build());
+            spec.description_mut().acquisition.scans.push(scan);
+            Ok(spec)
+        };
+        let mut grid = mzdata::meta::ScanSettings { id: "scansettings1".into(), ..Default::default() };
+        grid.add_param(Param::builder().name("max count of pixels x").curie(mzdata::curie!(IMS:1000042)).value(3).build());
+        grid.add_param(Param::builder().name("max count of pixels y").curie(mzdata::curie!(IMS:1000043)).value(1).build());
+
+        let out = dir.join("imaging.mzML");
+        super::write_native_mzml_with(&input, &out, 3, Some(grid), pixel).unwrap();
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let header = &xml[..xml.find("<run ").unwrap()];
+        assert!(header.contains("<cvList count=\"3\">") && header.contains("<cv id=\"IMS\" fullName=\"Imaging Mass Spectrometry Ontology\""), "{header}");
+        assert!(header.contains("/2c28b05ca297430303627d8c7d192cac1a2b1374/imagingMS.obo"), "pinned, as the archive's cv_list has it: {header}");
+        assert!(header.contains("<scanSettingsList count=\"1\">") && header.contains("accession=\"IMS:1000042\""), "{header}");
+        assert_eq!(xml.matches("accession=\"IMS:1000050\"").count(), 3);
+        // The index points at its elements, which the header's growth moved.
+        let mut offsets = 0;
+        for (at, open) in xml.match_indices("<offset idRef=\"") {
+            let (id, rest) = xml[at + open.len()..].split_once("\">").unwrap();
+            let offset: usize = rest[..rest.find('<').unwrap()].parse().unwrap();
+            let element = xml[offset..].trim_start();
+            assert!(element.starts_with("<spectrum ") || element.starts_with("<chromatogram "), "{id}: {:?}", &element[..30]);
+            assert!(element[..element.find('>').unwrap()].contains(&format!("id=\"{id}\"")), "{id}");
+            offsets += 1;
+        }
+        assert_eq!(offsets, 3 + 2, "three spectra, TIC and BPC");
+
+        let plain = dir.join("plain.mzML");
+        super::write_native_mzml(&input, &plain, 3, |i| Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))).unwrap();
+        let xml = std::fs::read_to_string(&plain).unwrap();
+        assert!(xml.contains("<cvList count=\"2\">") && !xml.contains("IMS") && !xml.contains("<scanSettingsList"), "{}", &xml[..xml.find("<run ").unwrap()]);
+    }
+
     /// The mzML export of an archive holding device traces converts back, into an archive and into
     /// an mzML. mzdata's mzML reader has no case for the `pressure array` (MS:1000821), `flow rate
     /// array` (MS:1000820) and `temperature array` (MS:1000822) the export writes: each came back
@@ -9463,7 +9662,7 @@ mod tests {
         let output = dir.join("out.mzML");
         let tmp = super::mzml_tmp_path(&output);
         let guard = super::TmpGuard::new(&tmp);
-        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp).unwrap());
+        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None).unwrap());
         w.set_spectrum_count(3);
         for (i, (time, intensity)) in [(5.8905, 30.0f32), (0.0, 10.0), (0.7008, 20.0)].into_iter().enumerate() {
             let mut descr = SpectrumDescription { id: format!("scan={}", i + 1), index: i, ms_level: 1, ..Default::default() };
@@ -12406,6 +12605,63 @@ mod tests {
         assert!(Settings::resolve(&cli).unwrap().quiet);
     }
 
+    /// The output format comes from the `-o` extension, and a name that states neither format is
+    /// refused unless `--to` (or the config's `to`) says what to write. Through 0.16.0 every such
+    /// name — `run.imzML`, `run.mzXML`, a typo, none at all — got a ZIP archive, exit 0.
+    #[test]
+    fn an_output_extension_that_names_no_format_is_refused() {
+        use super::{OutputFormat, infer_output_format};
+        let infer = |name: &str| infer_output_format(std::path::Path::new(name)).map_err(|e| format!("{e:#}"));
+        for name in ["a.mzpeak", "a.MZPEAK", "dir.d/a.b.mzPeak", "a.mzML.mzpeak"] {
+            assert_eq!(infer(name), Ok(OutputFormat::Mzpeak), "{name}");
+        }
+        for name in ["a.mzML", "a.mzml", "a.MZML", "a.mzML.gz", "a.mzml.GZ", "a.mzpeak.mzML"] {
+            assert_eq!(infer(name), Ok(OutputFormat::Mzml), "{name}");
+        }
+        for name in ["a.imzML", "a.ibd", "a.mzXML", "a.mgf", "a.foo", "a", "a.gz", "a.mzpeak.gz", "a.mzpeak.tmp", "a.mzML.tmp", "a.zip", ".mzpeak"] {
+            let err = infer(name).expect_err(name);
+            assert!(err.contains("`.mzpeak`") && err.contains("`.mzML`") && err.contains("--to mzpeak|mzml"), "{name}: {err}");
+            assert!(err.starts_with(&format!("-o {name}: ")), "{name}: {err}");
+        }
+        assert!(infer("a.imzML").unwrap_err().contains("`.imzML` names neither format this tool writes (imzML is read, not written)"));
+        assert!(infer("a").unwrap_err().contains("a name without an extension states neither format"));
+        assert!(infer("a.mzpeak.gz").unwrap_err().contains("`.mzpeak.gz` names neither format"));
+
+        // Settings: refused without a format, accepted with `--to` or the config's `to`; nothing is
+        // inferred, and so nothing refused, when no output is asked for.
+        let resolve = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["mzpeak-convert", TINY].iter().chain(args)).unwrap();
+            Settings::resolve(&cli).map(|s| s.output_format).map_err(|e| format!("{e:#}"))
+        };
+        assert!(resolve(&["-o", "x.imzML"]).unwrap_err().contains("names neither format"));
+        assert!(resolve(&["-o", "x"]).is_err());
+        assert_eq!(resolve(&["-o", "x.imzML", "--to", "mzpeak"]), Ok(OutputFormat::Mzpeak));
+        assert_eq!(resolve(&["-o", "x.dat", "--to", "mzml"]), Ok(OutputFormat::Mzml));
+        assert_eq!(resolve(&["-o", "x.mzML", "--to", "mzpeak"]), Ok(OutputFormat::Mzpeak), "--to wins over the extension, as before");
+        assert_eq!(resolve(&[]), Ok(OutputFormat::Mzpeak));
+        let dir = scratch("out-ext");
+        let cfg = dir.join("c.yaml");
+        fs::write(&cfg, "to: mzml\n").unwrap();
+        assert_eq!(resolve(&["-o", "x.foo", "--config", cfg.to_str().unwrap()]), Ok(OutputFormat::Mzml));
+        fs::write(&cfg, "output: x.foo\n").unwrap();
+        assert!(resolve(&["--config", cfg.to_str().unwrap()]).is_err(), "a config-file output is held to the same rule");
+
+        // The binary: exit 1, the message, and no file under the refused name or its temporaries.
+        for name in ["x.imzML", "x.foo", "x"] {
+            let out = dir.join(name);
+            let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str()], &[]);
+            assert!(!ok && (err.contains("names neither format") || err.contains("states neither format")), "{name}: {err}");
+            let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).filter(|n| n != "c.yaml").collect();
+            assert!(left.is_empty(), "{name}: {left:?}");
+        }
+        // `--to` writes what it says under the name given.
+        let out = dir.join("x.imzML");
+        let (ok, _, err) = run_bin(&[TINY.as_ref(), "-o".as_ref(), out.as_os_str(), "--to".as_ref(), "mzpeak".as_ref()], &[]);
+        assert!(ok, "{err}");
+        assert_eq!(&fs::read(&out).unwrap()[..4], b"PK\x03\x04");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// ProteoWizard's `_xHHHH_` escapes come off on copy: `run.id`, and the software ids with every
     /// reference to them still resolving. pwiz escapes each byte of a non-ASCII name's UTF-8, so a
     /// run of byte escapes decodes as UTF-8, and stays as written when it is not UTF-8. What only
@@ -13282,6 +13538,10 @@ mod tests {
     /// smallest is 1 (declared, origin recorded); the archive is marked imaging, names the IMS
     /// vocabulary, states the grid and says where its pixel size came from; and the conversion leaves
     /// the `.d` exactly as it found it (no `-shm` / `-wal`).
+    ///
+    /// Frame 4 is empty (`NumPeaks = 0`) and keeps its pixel; frame 5 has no `MaldiFrameInfo` row
+    /// and gets a null position, counted and warned about once — through 0.16.0 with no trace. Each
+    /// positioned frame's scan states its `RegionNumber`.
     #[test]
     fn bruker_maldi_tsf_carries_its_pixel_positions() {
         use arrow::array::{Array, UInt32Array};
@@ -13291,7 +13551,7 @@ mod tests {
         // tsf_bin: per frame an 8-byte [padded][compressed] header, then zstd([tof f64 × n][intensity f32 × n]).
         let mut bin = Vec::new();
         let mut frames = Vec::new();
-        for (id, n) in [(1i64, 3usize), (2, 2), (3, 4)] {
+        for (id, n) in [(1i64, 3usize), (2, 2), (3, 4), (4, 0), (5, 2)] {
             let mut raw = Vec::new();
             for k in 0..n {
                 raw.extend_from_slice(&(1000.0 * (k + 1) as f64 + id as f64).to_le_bytes());
@@ -13319,7 +13579,8 @@ mod tests {
                                           XIndexPos INTEGER, YIndexPos INTEGER, BeamScanSizeX REAL, BeamScanSizeY REAL);
              INSERT INTO MaldiFrameInfo VALUES (1, 0, 'R00X669Y700', 0, 669, 700, 20.0, 20.0),
                                                (2, 0, 'R00X670Y700', 0, 670, 700, 20.0, 20.0),
-                                               (3, 0, 'R01X837Y812', 1, 837, 812, 20.0, 20.0);",
+                                               (3, 0, 'R01X837Y812', 1, 837, 812, 20.0, 20.0),
+                                               (4, 0, 'R01X836Y812', 1, 836, 812, 20.0, 20.0);",
             frames.join(", ")
         ))
         .unwrap();
@@ -13331,11 +13592,13 @@ mod tests {
         assert!(ok, "{err}");
         let after: std::collections::BTreeSet<_> = std::fs::read_dir(&dot_d).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(before, after, "the conversion wrote into the .d");
+        assert_eq!(err.matches("1 of 5 frames have no raster position").count(), 1, "warned, once: {err}");
 
         let m = index_metadata(&out);
         assert!(m["cv_list"].to_string().contains("\"IMS\""), "{:#}", m["cv_list"]);
         assert_eq!(m["bruker_maldi"]["x_index"], serde_json::json!([669, 837]), "{:#}", m["bruker_maldi"]);
         assert_eq!(m["bruker_maldi"]["regions"].as_array().unwrap().len(), 2);
+        assert_eq!((&m["bruker_maldi"]["frames_with_position"], &m["bruker_maldi"]["frames_without_position"]), (&serde_json::json!(4), &serde_json::json!(1)));
         assert!(m["transformations"].to_string().contains(super::bruker_maldi::PIXEL_FROM_BEAM));
         assert!(m["transformations"].to_string().contains(super::bruker_maldi::SHIFTED_TO_BASE_1));
         let grid = |acc: &str| m["scan_settings_list"][0]["parameters"].as_array().unwrap().iter().find(|p| p["accession"] == acc).unwrap().clone();
@@ -13366,8 +13629,33 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(col("position_x"), vec![1, 2, 169]);
-        assert_eq!(col("position_y"), vec![1, 1, 113]);
+        assert_eq!(col("position_x"), vec![1, 2, 169, 168]);
+        assert_eq!(col("position_y"), vec![1, 1, 113, 113]);
+        let rows = scan_positions(&out).unwrap();
+        assert_eq!(rows[3], (Some(168), Some(113)), "the empty frame keeps its pixel");
+        assert_eq!(rows[4], (None, None), "the frame without a MaldiFrameInfo row has none");
+        // Each positioned frame's region, in the scan's parameter list; none on the row-less frame.
+        let regions: Vec<Option<i64>> = batches
+            .iter()
+            .flat_map(|b| {
+                use arrow::array::{Int64Array, LargeListArray, LargeStringArray, StructArray};
+                let params = b.column_by_name("parameters").unwrap().as_any().downcast_ref::<LargeListArray>().unwrap().clone();
+                (0..params.len())
+                    .map(|i| {
+                        let row = params.value(i);
+                        let row = row.as_any().downcast_ref::<StructArray>().unwrap();
+                        let name = row.column_by_name("name").unwrap().as_any().downcast_ref::<LargeStringArray>().unwrap();
+                        let value = row.column_by_name("value").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
+                        let int = value.column_by_name("integer").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+                        let hit: Vec<i64> = (0..row.len()).filter(|&k| name.value(k) == super::bruker_maldi::REGION_PARAM).map(|k| int.value(k)).collect();
+                        assert!(hit.len() <= 1, "one region per scan");
+                        assert!((0..row.len()).all(|k| name.value(k) != super::bruker_maldi::REGION_PARAM || row.column_by_name("accession").unwrap().is_null(k)), "no accession");
+                        hit.first().copied()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(regions, [Some(0), Some(0), Some(1), Some(1), None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
