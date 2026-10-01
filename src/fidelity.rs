@@ -40,7 +40,21 @@
 //! * **grid fits** (`grid-fit:<tol>Da`, `tof-grid:<ppm>ppm`) state the tolerance every fitted value
 //!   was accepted within, taken from the `transformations` entry, and the other figure derived from
 //!   it over the m/z range of the grid rows stored: the absolute tolerance over the smallest m/z,
-//!   the relative one times the largest.
+//!   the relative one times the largest. A `tof-grid` lane also hands over the largest error its
+//!   accepted fits left ([`ObservedMzError`], [`SourceTally::set_observed`]): the entry states it
+//!   beside the tolerance, as `observed_max_abs_error` / `observed_max_rel_error_ppm` (MEASURED,
+//!   stored value against source value, over every gridded point).
+//! * **`bruker:mz-calibrant-omitted`** takes the bound the lane states in
+//!   `ims_calibration.max_error_ppm` (the largest calibrant correction, in ppm of the stored m/z)
+//!   and that bound times the largest m/z of the grid rows; without the bound it is `not measured`.
+//!
+//! Two `transformations` entries are decided from the same evidence as this block, in
+//! [`finish_archive`](crate::finish_archive), so that neither key can say what the other does not:
+//! `delta-ulp` exactly when a `delta` entry is written here ([`delta_ulp_declared`], from the
+//! writer's count of the chunk rows this block then reads back, by the same rule), and
+//! `intensity-f32-rounding` when a facet's `intensity_values_rounded` is above zero
+//! ([`intensity_values_rounded`]): intensities the lane handed to the writer as a float32 (mzdata's
+//! centroid peak set, the `--tof-grid` grid rows) whose source value no float32 holds.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -71,9 +85,11 @@ const FACETS: [(&str, &str); 2] = [("spectra_data.parquet", "spectra_data"), ("s
 /// other entry describes metadata (a dropped reference, a pixel size, a position), a chromatogram
 /// or device trace, or a precursor window, and does not count. A NEW entry that touches spectrum
 /// signal belongs here, or in [`SIGNAL_TRANSFORMATION_PREFIXES`] when it carries a parameter.
-pub const SIGNAL_TRANSFORMATIONS: [&str; 17] = [
+pub const SIGNAL_TRANSFORMATIONS: [&str; 20] = [
     "zero-run-mask",
     "numpress-linear",
+    DELTA_ULP,
+    INTENSITY_F32_ROUNDING,
     "sort-by-mz",
     "sort-by-wavelength",
     "shimadzu:span-trim",
@@ -89,7 +105,20 @@ pub const SIGNAL_TRANSFORMATIONS: [&str; 17] = [
     "waters:sonar-summed",
     "bruker:mz-calibration-chord",
     "bruker:mz-calibrant-omitted",
+    "bruker:out-of-window-points-dropped",
 ];
+
+/// `transformations` entry: a 64-bit m/z facet holds delta chunks that are not exact by
+/// construction, so a decoded m/z can be one unit in the last place off its source (the block's
+/// `delta` entry bounds it). Declared by [`finish_archive`](crate::finish_archive).
+pub const DELTA_ULP: &str = "delta-ulp";
+
+/// `transformations` entry: an intensity was stored as the float32 nearest to a source value no
+/// float32 holds (a 64-bit float, or an integer above 2^24). The facet's `intensity_values_rounded`
+/// counts them. The lane-neutral sibling of `agilent:intensity-f32-rounding`, which the
+/// `--agilent-grid` reader declares for its own counts. Declared by
+/// [`finish_archive`](crate::finish_archive).
+pub const INTENSITY_F32_ROUNDING: &str = "intensity-f32-rounding";
 
 /// Signal entries that carry their bound: `grid-fit:1e-6Da`, `tof-grid:5ppm`.
 pub const SIGNAL_TRANSFORMATION_PREFIXES: [&str; 2] = ["grid-fit:", "tof-grid:"];
@@ -110,18 +139,74 @@ fn type_name(dtype: BinaryDataArrayType) -> &'static str {
     }
 }
 
+/// How many values of an intensity array a float32 cannot hold: the count of `v` with
+/// `(v as f32) != v`. A NaN counts as kept (a float32 holds one), a 32-bit float array as exact.
+pub fn f32_cast_changes(arrays: &BinaryArrayMap) -> u64 {
+    let Some(a) = arrays.get(&ArrayType::IntensityArray) else { return 0 };
+    let n = match a.dtype() {
+        BinaryDataArrayType::Float64 => a.to_f64().map(|v| v.iter().filter(|x| !x.is_nan() && f64::from(**x as f32) != **x).count()),
+        BinaryDataArrayType::Int32 => a.to_i32().map(|v| v.iter().filter(|x| (**x as f32) as i64 != i64::from(**x)).count()),
+        BinaryDataArrayType::Int64 => a.to_i64().map(|v| v.iter().filter(|x| (**x as f32) as i128 != i128::from(**x)).count()),
+        _ => Ok(0),
+    };
+    n.unwrap_or(0) as u64
+}
+
+/// The largest error a lane measured for one of its m/z statements, stored value against source
+/// value over every point the statement covers (the `--tof-grid` fits: each gridded point's
+/// reconstructed m/z against the m/z the reader handed over).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ObservedMzError {
+    /// In m/z; `None` when the lane measures the relative error only.
+    pub max_abs: Option<f64>,
+    pub max_rel_ppm: f64,
+}
+
+impl ObservedMzError {
+    /// Fold in one spectrum: its source m/z and the m/z stored for the same points, in order.
+    pub fn observe(&mut self, source: &[f64], stored: &[f64]) {
+        for (x, y) in source.iter().zip(stored) {
+            let err = (x - y).abs();
+            self.max_abs = Some(self.max_abs.unwrap_or(0.0).max(err));
+            if *x > 0.0 {
+                self.max_rel_ppm = self.max_rel_ppm.max(err / x * 1e6);
+            }
+        }
+    }
+}
+
+/// A lane's fidelity block ([`SourceTally::block`], or an empty `(BLOCK, {})` for a lane that does
+/// not count its source) with the error it measured for the `transformations` entry `encoding`
+/// added; [`complete`] writes the figures into that entry of `mz_error`.
+pub fn with_observed(mut block: (String, Value), encoding: &str, observed: ObservedMzError) -> (String, Value) {
+    block.1[OBSERVED][encoding] = json!({
+        "max_abs_error": observed.max_abs.map(round_up),
+        "max_rel_error_ppm": round_up(observed.max_rel_ppm),
+    });
+    block
+}
+
+/// Lane-block key of the measured errors ([`with_observed`]); read by [`complete`], not written out.
+const OBSERVED: &str = "observed";
+/// Facet key, in the lane block and in the finished one: intensities whose source value the
+/// float32 handed to the writer does not hold ([`f32_cast_changes`]).
+const INTENSITY_ROUNDED: &str = "intensity_values_rounded";
+
 /// What the reader handed over for one facet.
 #[derive(Default)]
 struct FacetSource {
     points: u64,
     mz: BTreeSet<&'static str>,
     intensity: BTreeSet<&'static str>,
+    /// Intensities the lane handed to the writer as a float32 that is not their source value.
+    intensity_rounded: u64,
 }
 
 impl FacetSource {
     /// A raw array map: its points (the m/z array's length, else the widest array's, as the
     /// writer counts a grid spectrum that carries an index axis and no m/z) and its array types.
-    fn add_arrays(&mut self, arrays: &BinaryArrayMap, types: bool) {
+    /// Returns the points.
+    fn add_arrays(&mut self, arrays: &BinaryArrayMap, types: bool) -> u64 {
         let n = match arrays.get(&ArrayType::MZArray) {
             Some(mz) => mz.data_len().unwrap_or(0),
             None => arrays.iter().filter_map(|(_, a)| a.data_len().ok()).max().unwrap_or(0),
@@ -130,6 +215,7 @@ impl FacetSource {
         if types && n > 0 {
             self.add_types(arrays);
         }
+        n as u64
     }
 
     fn add_types(&mut self, arrays: &BinaryArrayMap) {
@@ -146,8 +232,18 @@ impl FacetSource {
         if types && !(self.mz.is_empty() && self.intensity.is_empty()) {
             out["source_types"] = json!({"mz": self.mz, "intensity": self.intensity});
         }
+        if self.intensity_rounded > 0 {
+            out[INTENSITY_ROUNDED] = self.intensity_rounded.into();
+        }
         out
     }
+}
+
+/// Which signal facet the writer files a spectrum under.
+#[derive(Clone, Copy, PartialEq)]
+enum Filed {
+    Data,
+    Peaks,
 }
 
 /// The lane's half of the block: the points and array types of every spectrum it handed to the
@@ -158,45 +254,83 @@ pub struct SourceTally {
     /// The reader hands each array over at the binary type its source declares (mzML, imzML), so
     /// the types seen are the source's. A vendor reader's array types are its own choice.
     declared_types: bool,
+    /// Where the last counted spectrum's points went ([`Self::add_not_handed_over`]).
+    last: Filed,
 }
 
 impl SourceTally {
     pub fn new(declared_types: bool) -> Self {
-        Self { data: FacetSource::default(), peaks: FacetSource::default(), declared_types }
+        Self { data: FacetSource::default(), peaks: FacetSource::default(), declared_types, last: Filed::Peaks }
+    }
+
+    fn facet(&mut self, filed: Filed) -> &mut FacetSource {
+        match filed {
+            Filed::Data => &mut self.data,
+            Filed::Peaks => &mut self.peaks,
+        }
     }
 
     /// Count one spectrum, as the writer will route it (`AbstractMzPeakWriter::write_spectrum_data`).
-    /// Call it on the spectrum as it is handed to `write_spectrum`.
-    pub fn observe<C: CentroidLike, D: DeconvolutedCentroidLike>(&mut self, spec: &MultiLayerSpectrum<C, D>) {
+    /// Call it on the spectrum as it is handed to `write_spectrum`. Returns the points counted.
+    ///
+    /// A centroid spectrum that carries a peak set copied from its arrays (mzdata's mzML reader
+    /// builds one for every centroid spectrum) is stored from the peak set, whose intensity is a
+    /// float32 whatever the file declares: the source values that cast changes are counted
+    /// ([`f32_cast_changes`]) for `intensity-f32-rounding`. Not when the writer takes the arrays
+    /// instead, which it does when they hold more than the peak set (`centroid_arrays_beyond_peaks`:
+    /// a per-peak ion mobility array), and not for a peak set beside profile arrays or one of
+    /// another length, which is nobody's copy.
+    pub fn observe<C: CentroidLike, D: DeconvolutedCentroidLike>(&mut self, spec: &MultiLayerSpectrum<C, D>) -> u64 {
         // A wavelength spectrum goes to its own facet, which this block does not describe.
         if spec.spectrum_type().is_some_and(|t| !t.is_mass_spectrum()) {
-            return;
+            return 0;
         }
         let types = self.declared_types;
         let continuity = spec.signal_continuity();
         match spec.peaks() {
-            RefPeakDataLevel::Missing => {}
+            RefPeakDataLevel::Missing => 0,
             RefPeakDataLevel::RawData(arrays) => {
-                if continuity == SignalContinuity::Centroid {
-                    self.peaks.add_arrays(arrays, types);
-                } else {
-                    self.data.add_arrays(arrays, types);
-                }
+                self.last = if continuity == SignalContinuity::Centroid { Filed::Peaks } else { Filed::Data };
+                self.facet(self.last).add_arrays(arrays, types)
             }
             peaks @ (RefPeakDataLevel::Centroid(_) | RefPeakDataLevel::Deconvoluted(_)) => {
                 let n = peaks.len();
+                let centroid_set = matches!(peaks, RefPeakDataLevel::Centroid(_)) && continuity == SignalContinuity::Centroid;
                 self.peaks.points += n as u64;
+                self.last = Filed::Peaks;
+                let mut counted = n as u64;
                 if let Some(arrays) = spec.raw_arrays() {
                     if continuity == SignalContinuity::Profile {
                         // Profile arrays beside a peak set: both facets are written.
-                        self.data.add_arrays(arrays, types);
-                    } else if types && n > 0 {
+                        counted += self.data.add_arrays(arrays, types);
+                    } else {
                         // The peak set was built from these arrays; their types are the source's.
-                        self.peaks.add_types(arrays);
+                        if types && n > 0 {
+                            self.peaks.add_types(arrays);
+                        }
+                        let copy = arrays.get(&ArrayType::MZArray).and_then(|a| a.data_len().ok()) == Some(n);
+                        let beyond = arrays.iter().any(|(t, _)| !matches!(t, ArrayType::MZArray | ArrayType::IntensityArray));
+                        if copy && !(centroid_set && beyond) {
+                            self.peaks.intensity_rounded += f32_cast_changes(arrays);
+                        }
                     }
                 }
+                counted
             }
         }
+    }
+
+    /// Intensities of the last counted spectrum that the lane itself narrowed to float32 before
+    /// the writer saw them (the `--tof-grid` grid rows): `n` source values no float32 holds.
+    pub fn add_intensity_rounded(&mut self, n: u64) {
+        self.facet(self.last).intensity_rounded += n;
+    }
+
+    /// Points the source holds that the reader did not hand over (`--no-ims-compact` on a TDF:
+    /// the points of an MS2 frame outside every isolation window), added to the source side of
+    /// the facet the last counted spectrum went to, so `source_points` is the file's count.
+    pub fn add_not_handed_over(&mut self, points: u64) {
+        self.facet(self.last).points += points;
     }
 
     /// The `(key, value)` pair a lane puts among its index blocks; [`complete`] merges the stored
@@ -570,10 +704,74 @@ fn entry_bound(entry: &str, prefix: &str, suffix: &str) -> Option<f64> {
     entry.strip_prefix(prefix)?.strip_suffix(suffix)?.parse().ok()
 }
 
+/// Does the lane's source declare nothing but 32-bit m/z for the facet `key`? Such values survive
+/// delta exactly whatever their spacing (the differences are taken in 64-bit arithmetic).
+fn mz_source_is_f32(lane: Option<&Value>, key: &str) -> bool {
+    lane.and_then(|l| l.get(key))
+        .and_then(|s| s.get("source_types"))
+        .and_then(|t| t["mz"].as_array())
+        .is_some_and(|t| !t.is_empty() && t.iter().all(|v| v == "float32"))
+}
+
+/// Whether the archive about to be finished gets a `delta` entry in `mz_error`, and with it
+/// [`DELTA_ULP`] in `transformations`: a facet holds delta chunks that are not exact by
+/// construction and its source m/z are not all 32-bit. `at_risk` is the writer's count of such
+/// chunk rows per facet, in [`FACETS`] order (`spectra_data`, `spectra_peaks`), taken as the rows
+/// were buffered with the rule [`ChunkStats::delta`] applies to them when [`complete`] reads them
+/// back; `lane` is the lane's block. The entry is decided before the facets are closed because
+/// the processing method that mirrors it is written with them.
+pub fn delta_ulp_declared(lane: Option<&Value>, at_risk: [u64; 2]) -> bool {
+    FACETS.iter().zip(at_risk).any(|((_, key), n)| n > 0 && !mz_source_is_f32(lane, key))
+}
+
+/// The intensities the lane's block counts as rounded to float32, over both facets
+/// ([`SourceTally::observe`], [`SourceTally::add_intensity_rounded`]); above zero,
+/// [`INTENSITY_F32_ROUNDING`] is declared.
+pub fn intensity_values_rounded(lane: Option<&Value>) -> u64 {
+    FACETS.iter().filter_map(|(_, key)| lane?.get(key)?.get(INTENSITY_ROUNDED)?.as_u64()).sum()
+}
+
+/// The `mz_error` entries of the declared `transformations` that state their own bound: the grid
+/// fits' tolerances (with what the lane measured, where it did), and the timsTOF statements.
+/// `grid` is the m/z range of the grid rows stored, over both facets, when there are any.
+fn declared_mz_errors(transformations: &[&str], lane: Option<&Value>, calibrant_ppm: Option<f64>, grid: Option<(f64, f64)>) -> Vec<Value> {
+    let mut mz_error = Vec::new();
+    // A tolerance is against the source value and the rows' bounds may be the fitted ones, a
+    // tolerance apart: the derived figure allows for that.
+    for t in transformations {
+        if let Some(tol) = entry_bound(t, "grid-fit:", "Da") {
+            let rel = grid.filter(|(min, _)| *min > tol).map(|(min, _)| round_up(tol / (min - tol) * 1e6));
+            mz_error.push(json!({"encoding": t, "max_abs_error": tol, "max_rel_error_ppm": rel, "basis": "tolerance"}));
+        } else if let Some(ppm) = entry_bound(t, "tof-grid:", "ppm") {
+            let abs = grid.filter(|_| ppm < 1e6).map(|(_, max)| round_up(ppm * 1e-6 * max / (1.0 - ppm * 1e-6)));
+            let mut entry = json!({"encoding": t, "max_abs_error": abs, "max_rel_error_ppm": ppm, "basis": "tolerance"});
+            // What the accepted fits left, where the lane measured it: the tolerance is what a fit
+            // had to stay within, and on a real flight-time lattice it stays far inside.
+            if let Some(observed) = lane.and_then(|l| l.get(OBSERVED)).and_then(|o| o.get(*t)) {
+                entry["observed_max_rel_error_ppm"] = observed["max_rel_error_ppm"].clone();
+                if !observed["max_abs_error"].is_null() {
+                    entry["observed_max_abs_error"] = observed["max_abs_error"].clone();
+                }
+            }
+            mz_error.push(entry);
+        } else if let ("bruker:mz-calibrant-omitted", Some(ppm)) = (*t, calibrant_ppm) {
+            // The lane's own bound (`ims_calibration.max_error_ppm`): the largest correction the
+            // vendor's calibrant polynomial makes, in ppm of the stored m/z; in m/z, that share of
+            // the largest m/z stored.
+            let abs = grid.map(|(_, max)| round_up(ppm * 1e-6 * max));
+            mz_error.push(json!({"encoding": t, "max_abs_error": abs, "max_rel_error_ppm": round_up(ppm), "basis": "bound"}));
+        } else if matches!(*t, "bruker:mz-calibration-chord" | "bruker:mz-calibrant-omitted" | "shimadzu:coarse-mz") {
+            mz_error.push(json!({"encoding": t, "max_abs_error": Value::Null, "basis": "not measured"}));
+        }
+    }
+    mz_error
+}
+
 /// The finished block: the lane's source side (`lane`, from [`SourceTally::block`], when the lane
 /// counts) merged with what is stored at `tmp`, and the m/z error of every encoding present.
-/// `transformations` is the lane's declared list, for the grid fits' tolerances.
-pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> Result<Value> {
+/// `transformations` is the lane's declared list, for the grid fits' tolerances; `calibrant_ppm`
+/// the bound the lane states for `bruker:mz-calibrant-omitted` (`ims_calibration.max_error_ppm`).
+pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str], calibrant_ppm: Option<f64>) -> Result<Value> {
     let mut block = serde_json::Map::new();
     let mut mz_error: Vec<Value> = Vec::new();
     let mut stored = stored(tmp)?;
@@ -606,6 +804,9 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> R
             entry["source_types"] = t.clone();
         }
         entry["stored_types"] = json!({"mz": facet.mz_type, "intensity": facet.intensity_type});
+        if let Some(n) = source.and_then(|s| s.get(INTENSITY_ROUNDED)) {
+            entry[INTENSITY_ROUNDED] = n.clone();
+        }
         block.insert(key.to_string(), entry);
 
         let c = &facet.chunks;
@@ -623,9 +824,9 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> R
                 "basis": "bound",
             }));
         }
-        // 32-bit m/z values survive delta exactly whatever their spacing.
-        let f32_source = source_types.and_then(|t| t["mz"].as_array()).is_some_and(|t| !t.is_empty() && t.iter().all(|v| v == "float32"));
-        if c.delta_chunks > 0 && c.delta_at_risk > 0 && !f32_source {
+        // 32-bit m/z values survive delta exactly whatever their spacing. The same test, on the
+        // writer's count of the same rows, declares `delta-ulp` ([`delta_ulp_declared`]).
+        if c.delta_chunks > 0 && c.delta_at_risk > 0 && !mz_source_is_f32(lane, key) {
             // One unit in the last place of the value (the module docs have the proof): of the
             // largest m/z at risk in absolute terms, 2⁻⁵² of any value in relative ones.
             let bounded = c.delta_unbounded == 0;
@@ -641,20 +842,7 @@ pub fn complete(lane: Option<&Value>, tmp: &Path, transformations: &[&str]) -> R
             }));
         }
     }
-    // A tolerance is against the source value and the rows' bounds may be the fitted ones, a
-    // tolerance apart: the derived figure allows for that.
-    let grid_rows = grid_min <= grid_max;
-    for t in transformations {
-        if let Some(tol) = entry_bound(t, "grid-fit:", "Da") {
-            let rel = (grid_rows && grid_min > tol).then(|| round_up(tol / (grid_min - tol) * 1e6));
-            mz_error.push(json!({"encoding": t, "max_abs_error": tol, "max_rel_error_ppm": rel, "basis": "tolerance"}));
-        } else if let Some(ppm) = entry_bound(t, "tof-grid:", "ppm") {
-            let abs = (grid_rows && ppm < 1e6).then(|| round_up(ppm * 1e-6 * grid_max / (1.0 - ppm * 1e-6)));
-            mz_error.push(json!({"encoding": t, "max_abs_error": abs, "max_rel_error_ppm": ppm, "basis": "tolerance"}));
-        } else if matches!(*t, "bruker:mz-calibration-chord" | "bruker:mz-calibrant-omitted" | "shimadzu:coarse-mz") {
-            mz_error.push(json!({"encoding": t, "max_abs_error": Value::Null, "basis": "not measured"}));
-        }
-    }
+    mz_error.extend(declared_mz_errors(transformations, lane, calibrant_ppm, (grid_min <= grid_max).then_some((grid_min, grid_max))));
     block.insert("mz_error".to_string(), mz_error.into());
     Ok(block.into())
 }
@@ -917,7 +1105,18 @@ mod tests {
     /// The signal set: what `--lossless` fails on, and what it lets through.
     #[test]
     fn signal_transformations_are_told_from_the_rest() {
-        for t in ["zero-run-mask", "numpress-linear", "sort-by-mz", "grid-fit:1e-6Da", "tof-grid:5ppm", "agilent:drop-zero-samples", "waters:sonar-summed"] {
+        for t in [
+            "zero-run-mask",
+            "numpress-linear",
+            "delta-ulp",
+            "intensity-f32-rounding",
+            "sort-by-mz",
+            "grid-fit:1e-6Da",
+            "tof-grid:5ppm",
+            "agilent:drop-zero-samples",
+            "waters:sonar-summed",
+            "bruker:out-of-window-points-dropped",
+        ] {
             assert!(is_signal_transformation(t), "{t}");
         }
         for t in [
@@ -975,6 +1174,153 @@ mod tests {
         );
         for e in NOT_SIGNAL {
             assert!(!is_signal_transformation(e) && seen.contains(e), "{e} is listed here but gone from the sources, or is signal");
+        }
+    }
+
+    /// A spectrum as a lane hands it to the writer: m/z and `intensity` arrays, a per-peak ion
+    /// mobility array when `mobility`, and, when `peak_set`, the centroid peak set mzdata's mzML
+    /// reader builds from the two (64-bit m/z, 32-bit intensity).
+    fn spectrum(continuity: SignalContinuity, mz: &[f64], intensity: DataArray, peak_set: bool, mobility: bool) -> MultiLayerSpectrum<mzpeaks::CentroidPeak, mzpeaks::DeconvolutedPeak> {
+        let mut arrays = BinaryArrayMap::new();
+        let mut mz_array = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+        mz_array.update_buffer(mz).unwrap();
+        arrays.add(mz_array);
+        arrays.add(intensity);
+        if mobility {
+            let mut im = DataArray::wrap(&ArrayType::MeanInverseReducedIonMobilityArray, BinaryDataArrayType::Float64, Vec::new());
+            im.update_buffer(&vec![1.0f64; mz.len()]).unwrap();
+            arrays.add(im);
+        }
+        let description = mzdata::spectrum::SpectrumDescription { signal_continuity: continuity, ..Default::default() };
+        let peaks = peak_set.then(|| mzpeaks::PeakSet::new(mz.iter().enumerate().map(|(i, m)| mzpeaks::CentroidPeak::new(*m, 1.0, i as u32)).collect()));
+        MultiLayerSpectrum::new(description, Some(arrays), peaks, None)
+    }
+
+    /// An intensity array of `dtype` over `values`' little-endian bytes.
+    macro_rules! intensity_array {
+        ($dtype:ident, $values:expr) => {
+            DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::$dtype, $values.iter().flat_map(|x| x.to_le_bytes()).collect())
+        };
+    }
+
+    /// What a float32 cannot hold is counted per source type: a 64-bit float that is not a
+    /// float32, an integer above 2^24 that is not a multiple of its float32 spacing. NaN and a
+    /// 32-bit array count nothing.
+    #[test]
+    fn values_a_float32_cannot_hold_are_counted_by_source_type() {
+        let count = |a: DataArray| {
+            let mut arrays = BinaryArrayMap::new();
+            arrays.add(a);
+            f32_cast_changes(&arrays)
+        };
+        assert_eq!(count(intensity_array!(Float64, [1.5f64, 16777217.0, 0.1, f64::NAN, 1e300, -2.0])), 3, "16777217, 0.1 and 1e300");
+        assert_eq!(count(intensity_array!(Int32, [0i32, 16777216, 16777217, 16777218, i32::MAX, -16777217])), 3);
+        assert_eq!(count(intensity_array!(Int64, [1i64 << 40, (1 << 40) + 1, i64::MAX, 7])), 2);
+        assert_eq!(count(intensity_array!(Float32, [0.1f32, 3.0e38])), 0);
+        assert_eq!(f32_cast_changes(&BinaryArrayMap::new()), 0);
+    }
+
+    /// The lane's count behind `intensity-f32-rounding`: a centroid spectrum stored from the peak
+    /// set mzdata built from its arrays, and nothing else. The writer takes the arrays themselves
+    /// when they hold a per-peak mobility array, when the spectrum has no peak set (`--lossless`
+    /// removes it), and for profile signal, whose peak set is not a copy of the arrays.
+    #[test]
+    fn intensities_rounded_by_the_peak_set_are_counted_and_only_those() {
+        let mz = [100.0, 200.0, 300.0, 400.0];
+        let wide = || intensity_array!(Float64, [16777217.0f64, 2.0, 0.1, 4.0]);
+        let rounded = |tally: &SourceTally| intensity_values_rounded(Some(&tally.block().1));
+
+        let mut tally = SourceTally::new(true);
+        assert_eq!(tally.observe(&spectrum(SignalContinuity::Centroid, &mz, wide(), true, false)), 4, "the points counted are returned");
+        assert_eq!(rounded(&tally), 2);
+        let block = tally.block().1;
+        assert_eq!(block["spectra_peaks"], json!({"source_points": 4, "source_types": {"mz": ["float64"], "intensity": ["float64"]}, "intensity_values_rounded": 2}));
+        assert!(block["spectra_data"].get(INTENSITY_ROUNDED).is_none(), "{block}");
+
+        for (what, spec) in [
+            ("float32 intensities", spectrum(SignalContinuity::Centroid, &mz, intensity_array!(Float32, [1.0f32, 2.0, 3.0, 4.0]), true, false)),
+            ("the arrays hold a mobility array, and are what is stored", spectrum(SignalContinuity::Centroid, &mz, wide(), true, true)),
+            ("no peak set: the arrays are stored", spectrum(SignalContinuity::Centroid, &mz, wide(), false, false)),
+            ("profile arrays beside a peak set", spectrum(SignalContinuity::Profile, &mz, wide(), true, false)),
+        ] {
+            let mut tally = SourceTally::new(true);
+            tally.observe(&spec);
+            assert_eq!(rounded(&tally), 0, "{what}");
+        }
+        // A peak set of another length is not a copy of the arrays.
+        let mut spec = spectrum(SignalContinuity::Centroid, &mz, wide(), true, false);
+        spec.peaks = Some(mzpeaks::PeakSet::new(vec![mzpeaks::CentroidPeak::new(150.0, 1.0, 0)]));
+        let mut tally = SourceTally::new(true);
+        tally.observe(&spec);
+        assert_eq!(rounded(&tally), 0);
+
+        // A lane's own narrowing (the `--tof-grid` grid rows) is added to the facet the spectrum
+        // went to; points the reader did not hand over, to that facet's source side.
+        let mut tally = SourceTally::new(false);
+        tally.observe(&spectrum(SignalContinuity::Profile, &mz, wide(), false, false));
+        tally.add_intensity_rounded(3);
+        tally.add_not_handed_over(10);
+        let block = tally.block().1;
+        assert_eq!(block["spectra_data"], json!({"source_points": 14, "intensity_values_rounded": 3}));
+        assert_eq!(block["spectra_peaks"], json!({"source_points": 0}));
+        assert_eq!(intensity_values_rounded(Some(&block)), 3);
+        assert_eq!(intensity_values_rounded(None), 0);
+    }
+
+    /// `delta-ulp` is declared for a facet with at-risk delta chunks unless its source m/z are all
+    /// 32-bit — the test [`complete`] puts to the same rows for the `delta` entry.
+    #[test]
+    fn delta_ulp_follows_the_at_risk_chunks_of_a_64_bit_facet() {
+        let lane = |data: &[&str], peaks: &[&str]| json!({"spectra_data": {"source_types": {"mz": data}}, "spectra_peaks": {"source_types": {"mz": peaks}}});
+        assert!(!delta_ulp_declared(None, [0, 0]));
+        assert!(delta_ulp_declared(None, [0, 3]), "a lane that states no source types");
+        assert!(delta_ulp_declared(Some(&lane(&["float64"], &["float64"])), [2, 0]));
+        assert!(!delta_ulp_declared(Some(&lane(&["float32"], &["float64"])), [2, 0]), "32-bit m/z are exact under delta");
+        assert!(delta_ulp_declared(Some(&lane(&["float32"], &["float64"])), [2, 1]));
+        assert!(delta_ulp_declared(Some(&lane(&["float32", "float64"], &[])), [2, 0]), "a facet that mixes the two");
+        assert!(delta_ulp_declared(Some(&lane(&[], &[])), [0, 1]), "no type seen is not 32-bit");
+    }
+
+    /// The entries that state their own bound: a `tof-grid` entry carries what the lane measured
+    /// beside its tolerance, and `bruker:mz-calibrant-omitted` the bound `ims_calibration` states,
+    /// with its share of the largest m/z stored; without a bound it stays `not measured`.
+    #[test]
+    fn declared_entries_state_the_measured_error_and_the_lane_s_bound() {
+        // Errors that are exact in binary: 2^-30 at m/z 100 (the largest relative one), 2^-29 at
+        // m/z 400 (the largest absolute one), and a point at m/z 0, which has no relative error.
+        let (small, large) = (2f64.powi(-30), 2f64.powi(-29));
+        let mut observed = ObservedMzError::default();
+        observed.observe(&[100.0, 400.0, 0.0], &[100.0 + small, 400.0 - large, small]);
+        assert_eq!(observed, ObservedMzError { max_abs: Some(large), max_rel_ppm: small / 100.0 * 1e6 });
+        let lane = with_observed(SourceTally::new(true).block(), "tof-grid:5ppm", observed).1;
+        let grid = Some((99.5, 1500.0));
+        let entries = declared_mz_errors(&["zero-run-mask", "tof-grid:5ppm"], Some(&lane), None, grid);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let e = &entries[0];
+        assert_eq!((&e["encoding"], &e["basis"], e["max_rel_error_ppm"].as_f64()), (&json!("tof-grid:5ppm"), &json!("tolerance"), Some(5.0)));
+        let (abs, rel) = (e["observed_max_abs_error"].as_f64().unwrap(), e["observed_max_rel_error_ppm"].as_f64().unwrap());
+        // Recorded rounded up to six digits.
+        assert!((large..large * 1.00001).contains(&abs) && (observed.max_rel_ppm..observed.max_rel_ppm * 1.00001).contains(&rel), "{e}");
+        assert!(abs < e["max_abs_error"].as_f64().unwrap() && rel < 5.0);
+        // A lane that measured the relative error only (the native SciEX fits), and one that
+        // measured nothing: the tolerance alone.
+        let relative = with_observed((BLOCK.to_string(), json!({})), "tof-grid:5ppm", ObservedMzError { max_abs: None, max_rel_ppm: 1.7534567 }).1;
+        let e = &declared_mz_errors(&["tof-grid:5ppm"], Some(&relative), None, grid)[0];
+        assert_eq!((e["observed_max_rel_error_ppm"].as_f64(), e.get("observed_max_abs_error")), (Some(1.75346), None), "{e}");
+        let e = &declared_mz_errors(&["tof-grid:5ppm"], None, None, grid)[0];
+        assert!(e.get("observed_max_rel_error_ppm").is_none(), "{e}");
+
+        // SBA415: `ims_calibration.max_error_ppm`, and grid rows up to m/z 1700.
+        let ppm = 0.6557159657616491;
+        let e = &declared_mz_errors(&["bruker:mz-calibrant-omitted"], None, Some(ppm), Some((100.0, 1700.0)))[0];
+        assert_eq!((&e["basis"], e["max_rel_error_ppm"].as_f64(), e["max_abs_error"].as_f64()), (&json!("bound"), Some(0.655716), Some(0.00111472)), "{e}");
+        assert!(e["max_rel_error_ppm"].as_f64().unwrap() >= ppm && e["max_abs_error"].as_f64().unwrap() >= ppm * 1e-6 * 1700.0);
+        let e = &declared_mz_errors(&["bruker:mz-calibrant-omitted"], None, Some(ppm), None)[0];
+        assert_eq!((&e["basis"], &e["max_abs_error"]), (&json!("bound"), &Value::Null), "no grid row stored: {e}");
+        // A row without the calibrant has no bound to state, and the chord never has.
+        for t in ["bruker:mz-calibrant-omitted", "bruker:mz-calibration-chord", "shimadzu:coarse-mz"] {
+            let e = &declared_mz_errors(&[t], None, if t.ends_with("chord") { Some(ppm) } else { None }, grid)[0];
+            assert_eq!((&e["basis"], &e["max_abs_error"]), (&json!("not measured"), &Value::Null), "{t}: {e}");
         }
     }
 

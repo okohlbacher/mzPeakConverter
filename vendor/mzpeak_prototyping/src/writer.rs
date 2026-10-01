@@ -1193,6 +1193,16 @@ impl<
         tally
     }
 
+    /// DELIBERATE DEVIATION (mzPeakConverter, fidelity declarations): [`Self::spectrum_signal_tally`]
+    /// per facet, `[spectra_data, spectra_peaks]`. The converter decides its `delta-ulp` declaration
+    /// facet by facet (a facet whose source m/z are 32-bit is exact). Read before `finish_parquet`.
+    pub fn spectrum_signal_tally_by_facet(&self) -> [crate::writer::array_buffer::SignalTally; 2] {
+        [
+            self.spectrum_data_buffers.tally(),
+            self.spectrum_peaks_writer.as_ref().map(|peaks| peaks.buffers().tally()).unwrap_or_default(),
+        ]
+    }
+
     /// VENDORED PATCH (mzPeakConverter D15): what the writer has changed in the chromatogram signal
     /// so far: chromatograms its time re-sort backstop reordered. Read before `finish_parquet`.
     pub fn chromatogram_signal_tally(&self) -> crate::writer::array_buffer::SignalTally {

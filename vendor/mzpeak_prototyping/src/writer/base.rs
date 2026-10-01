@@ -1551,6 +1551,13 @@ pub trait AbstractMzPeakWriter {
                 .set_data_page_row_count_limit(data_page_size);
         }
 
+        // DELIBERATE DEVIATION (mzPeakConverter, wave 4): whether this is a GRID chunk facet, one
+        // with an `mz_grid` column beside `mz_chunk_values` (see the rule for that column below).
+        let mz_grid_facet = parquet_schema
+            .columns()
+            .iter()
+            .any(|c| c.path().parts().iter().any(|part| part == "mz_grid"));
+
         for c in parquet_schema.columns().iter() {
             let colpath = c.path().to_string();
             if (colpath.contains("_mz_") || colpath.contains(".mz"))
@@ -1629,6 +1636,30 @@ pub trait AbstractMzPeakWriter {
                 // of what this saves. A centroid facet with few distinct bounds grows slightly:
                 // QC01 +0.05 %, the ltpmsi-chilli imaging run +0.10 % (169 MB in 7 groups, its
                 // bounds +39-43 %).
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
+            if mz_grid_facet
+                && colpath.ends_with("mz_chunk_values.list.item")
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
+                log::debug!("{}: byte-stream-split (grid facet)", c.path());
+                // DELIBERATE DEVIATION from upstream, which leaves the values column to the global
+                // dictionary. In a GRID facet a grid row's values are null, so the column holds
+                // only the rows that are not on a grid: raw (`MS:1000576`) f64 m/z, a whole
+                // off-lattice spectrum each on the one-chunk-per-spectrum lanes, and nearly all
+                // distinct. The dictionary then holds the values over again until it overflows,
+                // and every byte-capped row group pays its own: on the native SciEX facet of
+                // PXD011326 (27.5 million off-lattice f64 m/z, 99.94 % distinct) the column was
+                // 233.8 MB, about 101 MB of it dictionary pages, and the facet grew 0.8 % when the
+                // byte cap doubled its row groups (corpus audit of 0.17.0-rc.1). Byte-stream-split
+                // without the dictionary, as the chunk bounds above. A chunk facet WITHOUT a grid
+                // column (delta or numpress m/z) keeps the dictionary: its values are differences,
+                // and that default is not this rule's to change.
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
