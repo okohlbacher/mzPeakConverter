@@ -1633,9 +1633,11 @@ pub trait AbstractMzPeakWriter {
                 // 1.2 %. Byte-stream-split without the dictionary, the bounds are 23-38 % smaller
                 // than with it, that Lumos facet 2.3 % (MFA381's peak facet 3.2 %, PXD059079 2485's
                 // grid facet 0.6 %, values identical); plain without the dictionary saves 57-83 %
-                // of what this saves. A centroid facet with few distinct bounds grows slightly:
-                // QC01 +0.05 %, the ltpmsi-chilli imaging run +0.10 % (169 MB in 7 groups, its
-                // bounds +39-43 %).
+                // of what this saves. A facet whose bounds repeat grows (re-measured against
+                // 0.16.0 after the corpus audit of 0.17.0-rc.1, values identical): QC01's centroid
+                // facet +0.06 % (bounds +25-27 %), the ltpmsi-chilli imaging run +0.16 % (169 MB
+                // in 7 groups, bounds +55-57 %), and most on a small one: pwiz's ImsSynth_Chrom
+                // profile facet, 291 KB in 7,341 chunk rows, +1.67 % (bounds +25 % and +103 %).
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
