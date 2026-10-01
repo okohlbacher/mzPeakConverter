@@ -517,7 +517,8 @@ case "$2" in presign-put) echo https://relay.invalid/put ;; delete) ;; *) exit 1
         rc, out = self.run_script(tools, **self.BOX, BOX_REPORTS="0.11.5")
         self.assertTrue(self.dispatched(), out)
 
-    def test_a_worktree_uses_the_main_checkouts_box_env_and_says_so(self):
+    def worktree(self) -> tuple[Path, Path, Path]:
+        """A main checkout with a tools/box.env and a git worktree of it; -> (main, worktree, box.env)."""
         git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"]
         main, wt = self.tmp / "main", self.tmp / "wt"
         subprocess.run([*git, "init", "-q", str(main)], check=True)
@@ -525,6 +526,10 @@ case "$2" in presign-put) echo https://relay.invalid/put ;; delete) ;; *) exit 1
         subprocess.run([*git, "-C", str(main), "worktree", "add", "-q", "--detach", str(wt)], check=True)
         env_file = self.checkout(main) / "box.env"
         env_file.write_text("".join(f"{k}={v}\n" for k, v in self.BOX.items()))
+        return main, wt, env_file
+
+    def test_a_worktree_uses_the_main_checkouts_box_env_and_says_so(self):
+        main, wt, env_file = self.worktree()
         rc, out = self.run_script(self.checkout(wt), BOX_REPORTS="0.11.5")
         self.assertIn(f"using the main checkout's {env_file.resolve()}", out)
         self.assertTrue(self.dispatched(), out)
@@ -535,6 +540,21 @@ case "$2" in presign-put) echo https://relay.invalid/put ;; delete) ;; *) exit 1
         rc, out = self.run_script(wt / "tools", BOX_REPORTS="0.11.5")
         self.assertNotIn("main checkout", out, "a worktree's own box.env wins")
         self.assertTrue(self.dispatched(), out)
+
+    def test_the_scp_tool_from_a_worktree_uses_the_main_checkouts_box_env_too(self):
+        # box_convert_scp.sh sourced only its own checkout's box.env and died on BOX_SSH:? in a worktree.
+        main, wt, env_file = self.worktree()
+        tools = wt / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "box_convert_scp.sh").write_text((TOOLS / "box_convert_scp.sh").read_text())
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("BOX_", "S3_", "MZPC_"))}
+        p = subprocess.run(["bash", str(tools / "box_convert_scp.sh")], input="", capture_output=True, text=True,
+                           cwd=self.tmp, env={**clean, "PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}",
+                                              "T": str(self.tmp)})
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn(f"using the main checkout's {env_file.resolve()}", out)
+        self.assertIn("SCP-CONVERT DONE", out)
 
 
 if __name__ == "__main__":

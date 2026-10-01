@@ -4,7 +4,14 @@
 # <out>, clean the box temp. Converted mzPeak NEVER touches S3 (per user rule). Parallel via -P.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-set -a; . "$here/box.env" 2>/dev/null; set +a
+# A git worktree has no tools/box.env (gitignored): use the main checkout's, as box_convert.sh does.
+env_file="$here/box.env"
+if [ ! -f "$env_file" ] && common="$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+   && [ -f "${common%/*}/tools/box.env" ]; then
+  env_file="${common%/*}/tools/box.env"
+  echo "box_convert_scp: no tools/box.env in this checkout; using the main checkout's $env_file" >&2
+fi
+set -a; . "$env_file" 2>/dev/null; set +a
 : "${BOX_SSH:?}" "${BOX_JUMP:?}" "${BOX_SSH_KEY:?}"
 JOBS="${JOBS:-2}"
 SSHOPT=(-i "$BOX_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -o ServerAliveCountMax=8 -o TCPKeepAlive=yes)
