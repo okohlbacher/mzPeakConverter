@@ -2503,7 +2503,7 @@ fn convert_to_mzml(
     use mzdata::prelude::{MSDataFileMetadata, SpectrumSource, SpectrumWriter};
     // mzdata reaches chromatograms only by offset, through the index `recover_chromatogram_index`
     // checked, so where the spectrum pass leaves the reader does not matter.
-    let source_chroms: Vec<Chromatogram> = chromatograms_by_index(&mut reader).collect();
+    let source_chroms: Vec<Chromatogram> = chromatograms_by_index(&mut reader, &read_path).collect();
     warn_unread_chromatograms(input, &read_path, source_chroms.len());
     let _ = reader.reset();
     // The mzPeak lane's rule for Thermo windows without a stated width (`thermo_isolation`). mzML
@@ -3326,23 +3326,57 @@ fn readable_chromatogram_arrays(mut chrom: Chromatogram) -> Chromatogram {
     chrom
 }
 
-/// Keep the unit of a chromatogram whose `intensity array` is not an intensity. ProteoWizard writes
-/// a device trace — a pump pressure in pascal or psi, a flow rate in µL/min, a column temperature in
-/// °C, a solvent percentage, a UV absorbance — as an `intensity array` (MS:1000515) carrying that
-/// unit. The chromatogram facet has ONE `intensity` column, declared in detector counts, and mzdata's
-/// mzML writer states MS:1000131 for every intensity array whatever its unit: the unit was gone from
-/// the archive and from both mzML exports (49 chromatograms of 12 corpus mzML files; `Column
-/// Pressure (channel 1)` of ProteoWizard's ABI PressureTrace run read back as counts).
+/// The chromatogram parameter (no accession) that states the unit of the source's `intensity array`
+/// where the stored array cannot: its value is the unit's accession as the source states it
+/// (`MS:1000814`). See [`unit_keeping_chromatogram_arrays`].
+const INTENSITY_ARRAY_UNIT: &str = "intensity array unit";
+
+/// The `transformations` entry of an archive in which a chromatogram's intensity is in the unit its
+/// [`INTENSITY_ARRAY_UNIT`] parameter names, not in the `intensity` column's detector counts.
+const INTENSITY_UNIT_AS_PARAMETER: &str = "mzml:chromatogram-intensity-unit-as-parameter";
+
+/// Whether a chromatogram's intensity is in the unit its [`INTENSITY_ARRAY_UNIT`] parameter names.
+fn intensity_unit_is_a_parameter(chrom: &Chromatogram) -> bool {
+    chrom.arrays.has_array(&ArrayType::IntensityArray) && chrom.params().iter().any(|p| !p.is_controlled() && p.name == INTENSITY_ARRAY_UNIT)
+}
+
+/// Keep the unit of a chromatogram whose `intensity array` is not in detector counts. ProteoWizard
+/// writes a device trace — a pump pressure in pascal or psi, a flow rate in µL/min, a column
+/// temperature in °C, a solvent percentage, a UV absorbance — as an `intensity array` (MS:1000515)
+/// carrying that unit. The chromatogram facet has ONE `intensity` column, declared in detector
+/// counts, and mzdata's mzML writer states MS:1000131 for every intensity array whatever its unit:
+/// the unit was gone from the archive and from both mzML exports (49 chromatograms of 12 corpus mzML
+/// files; `Column Pressure (channel 1)` of ProteoWizard's ABI PressureTrace run read back as counts).
 ///
-/// Such an array is given the type the native Bruker lanes give the same traces
+/// A value that is NOT an intensity is given the type the native Bruker lanes give the same traces
 /// ([`bruker_traces`]): the pressure, flow rate or temperature array of a chromatogram of that type,
 /// otherwise a non-standard data array named after the chromatogram — an array the writer stores as
 /// that chromatogram's auxiliary array, in its own unit and data type, and that an mzML export states
-/// with its unit. The values are untouched. An intensity array in detector counts, or stating no
-/// unit, stays the intensity; so does one whose replacement type the chromatogram already holds.
+/// with its unit. The values are untouched.
+///
+/// An intensity stays the `intensity array`: one in detector counts or stating no unit, as it is;
+/// one in another intensity unit PSI-MS allows on the array (MS:1000814 counts per second,
+/// MS:1000132 percent of base peak, MS:1000905 the same times 100), the array of an ion-current
+/// chromatogram (TIC, base peak, SIC, SIM, SRM) whatever unit it states, and one whose replacement
+/// type the chromatogram already holds, with the stated unit's accession as the chromatogram
+/// parameter [`INTENSITY_ARRAY_UNIT`], which the archive and both exports carry. Moved like a
+/// device trace, a TIC in counts per second had no intensity left in the archive or in either
+/// export, and still counted as the source's TIC, so none was synthesized.
+///
+/// A unit mzdata has no `Unit` for reads as `Unit::Unknown`, like no unit at all;
+/// [`chromatograms_by_index`] reads its accession back from the source and notes it as that same
+/// parameter, which is taken here for the array's unit: such a trace is moved (its array then
+/// states no unit, the parameter does), such an ion current stays.
 fn unit_keeping_chromatogram_arrays(mut chrom: Chromatogram) -> Chromatogram {
-    let stated = chrom.arrays.get(&ArrayType::IntensityArray).map(|a| a.unit);
-    if stated.is_none_or(|u| matches!(u, Unit::DetectorCounts | Unit::Unknown)) {
+    let Some(array_unit) = chrom.arrays.get(&ArrayType::IntensityArray).map(|a| a.unit) else {
+        return chrom;
+    };
+    let noted = chrom.params().iter().find(|p| !p.is_controlled() && p.name == INTENSITY_ARRAY_UNIT).map(|p| p.value.to_string());
+    let (unit, stated) = match (array_unit, &noted) {
+        (Unit::Unknown, Some(accession)) => (Unit::from_accession(accession), true),
+        (unit, _) => (unit, unit != Unit::Unknown),
+    };
+    if !stated || unit == Unit::DetectorCounts {
         return chrom;
     }
     let kind = match chrom.chromatogram_type() {
@@ -3351,7 +3385,20 @@ fn unit_keeping_chromatogram_arrays(mut chrom: Chromatogram) -> Chromatogram {
         ChromatogramType::TemperatureChromatogram => ArrayType::TemperatureArray,
         _ => ArrayType::nonstandard(if chrom.id().is_empty() { "trace" } else { chrom.id() }),
     };
-    if chrom.arrays.has_array(&kind) {
+    let an_intensity = matches!(unit, Unit::CountsPerSecond | Unit::PercentBasePeak | Unit::PercentBasePeakTimes100)
+        || matches!(
+            chrom.chromatogram_type(),
+            ChromatogramType::TotalIonCurrentChromatogram
+                | ChromatogramType::BasePeakChromatogram
+                | ChromatogramType::SelectedIonCurrentChromatogram
+                | ChromatogramType::SelectedIonMonitoringChromatogram
+                | ChromatogramType::SelectedReactionMonitoringChromatogram
+        );
+    if an_intensity || chrom.arrays.has_array(&kind) {
+        if noted.is_none() {
+            let accession = unit.for_param().0.to_string();
+            chrom.description_mut().add_param(Param::new_key_value(INTENSITY_ARRAY_UNIT, mzdata::params::Value::String(accession)));
+        }
         return chrom;
     }
     if let Some(mut array) = chrom.arrays.byte_buffer_map.remove(&ArrayType::IntensityArray) {
@@ -3376,9 +3423,41 @@ fn schema_sample_chromatogram(chrom: Chromatogram) -> Chromatogram {
     // First, so a device trace's `intensity array` in pascal does not become the `intensity` column.
     let mut chrom = unit_keeping_chromatogram_arrays(chrom);
     chrom.arrays.byte_buffer_map.retain(|t, _| matches!(t, ArrayType::TimeArray | ArrayType::IntensityArray));
+    // The column is declared in detector counts whichever chromatogram is sampled first: an
+    // intensity in another unit names it in its own parameter (`INTENSITY_ARRAY_UNIT`), and the
+    // TIC and base-peak chromatogram synthesized into the same column are in counts.
+    if intensity_unit_is_a_parameter(&chrom) {
+        if let Some(i) = chrom.arrays.get_mut(&ArrayType::IntensityArray) {
+            i.unit = Unit::DetectorCounts;
+        }
+    }
     // A time array that cannot be read is sampled as it is; writing that chromatogram fails on it.
     let _ = chromatogram_time_to_minutes(&mut chrom.arrays);
     chrom
+}
+
+/// The chromatograms an mzML lane samples the chromatogram facet's schema from: the source's first
+/// ten ([`schema_sample_chromatogram`]) and, when they are all device traces — none keeps an
+/// `intensity array` — one more with a time and a 64-bit intensity in detector counts. Sampled from
+/// traces alone the facet had no `intensity` column, and the TIC and base-peak chromatogram
+/// synthesized after them (and every ion current past the tenth) were stored as a per-row auxiliary
+/// `intensity array` with no unit. A source with no chromatogram samples nothing, and the writer's
+/// default time and intensity columns stand, as before.
+fn chromatogram_schema_samples(
+    reader: &mut MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>,
+    read_path: &Path,
+) -> impl Iterator<Item = Chromatogram> {
+    let mut samples: Vec<Chromatogram> = chromatograms_by_index_noting(reader, read_path, false).take(10).map(schema_sample_chromatogram).collect();
+    if !samples.is_empty() && !samples.iter().any(|c| c.arrays.has_array(&ArrayType::IntensityArray)) {
+        let mut arrays = BinaryArrayMap::new();
+        for (kind, unit) in [(ArrayType::TimeArray, Unit::Minute), (ArrayType::IntensityArray, Unit::DetectorCounts)] {
+            let mut a = DataArray::wrap(&kind, BinaryDataArrayType::Float64, Vec::new());
+            a.unit = unit;
+            arrays.add(a);
+        }
+        samples.push(Chromatogram::new(ChromatogramDescription::default(), arrays));
+    }
+    samples.into_iter()
 }
 
 /// Pass a source's chromatograms through to an mzML — every one of them, its TIC and base-peak
@@ -3443,6 +3522,14 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
     // kinds the source lacks. One summed over no mass spectrum is empty, and is written only when
     // nothing else is (a chromatogramList must hold a chromatogram): a chromatogram-only file with
     // its own TIC gains no empty base-peak trace.
+    let other_unit: Vec<&str> = kept.iter().filter(|c| intensity_unit_is_a_parameter(c)).map(|c| c.id()).collect();
+    if let Some(first) = other_unit.first() {
+        log::warn!(
+            "{} chromatogram(s) ({first:?} first) state an intensity in another unit than detector counts, which the \
+             mzML writer states for every intensity array; the unit is each one's userParam `{INTENSITY_ARRAY_UNIT}`",
+            other_unit.len()
+        );
+    }
     let carried = |kind: ChromatogramType| kept.iter().any(|c| c.chromatogram_type() == kind);
     let mut summaries: Vec<Chromatogram> = [
         (ChromatogramType::TotalIonCurrentChromatogram, &w.tic_collector),
@@ -3612,7 +3699,7 @@ fn convert_file_tof_grid(
     // Derive the chromatogram schema (intensity/time dtypes) from the source chromatograms so the
     // facet matches what we write (the synthesized TIC/base-peak are f64 — sampling f64 source
     // chromatograms keeps the schema f64 and avoids an f32/f64 record-batch mismatch).
-    builder = builder.sample_array_types_from_chromatograms(chromatograms_by_index(&mut reader).take(10).map(schema_sample_chromatogram));
+    builder = builder.sample_array_types_from_chromatograms(chromatogram_schema_samples(&mut reader, read_path));
     let mut writer = builder.build(handle, !keep_zero_runs());
     writer.copy_metadata_from(&reader);
     let mut source_refs = None;
@@ -3671,7 +3758,7 @@ fn convert_file_tof_grid(
     // standard lane.
     let time_stated = states_scan_times(input, read_path, source_refs.is_some(), timed);
     let read = std::cell::Cell::new(0usize);
-    let source = chromatograms_by_index(&mut reader).inspect(|_| read.set(read.get() + 1));
+    let source = chromatograms_by_index(&mut reader, read_path).inspect(|_| read.set(read.get() + 1));
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, source, synth_chroms && time_stated)?;
     warn_unread_chromatograms(input, read_path, read.get());
     if let Some(r) = &source_refs {
@@ -4811,7 +4898,7 @@ fn convert_file(
     } else {
         builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader)
     };
-    builder = builder.sample_array_types_from_chromatograms(chromatograms_by_index(&mut reader).take(10).map(schema_sample_chromatogram));
+    builder = builder.sample_array_types_from_chromatograms(chromatogram_schema_samples(&mut reader, read_path));
 
     // The zero-run mask, unless `--keep-zero-runs` / `--lossless` keeps every profile point.
     let mut writer = builder.build(handle, !keep_zero_runs());
@@ -5090,7 +5177,7 @@ fn convert_file(
     }
 
     let read = std::cell::Cell::new(0usize);
-    let source = chromatograms_by_index(&mut reader).inspect(|_| read.set(read.get() + 1));
+    let source = chromatograms_by_index(&mut reader, read_path).inspect(|_| read.set(read.get() + 1));
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, source, synth_chroms && time_stated)?;
     warn_unread_chromatograms(input, read_path, read.get());
     if let Some(r) = &source_refs {
@@ -5966,12 +6053,82 @@ fn same_elements(path: &Path, read: &mzdata::io::OffsetIndex, scanned: &mzdata::
 
 /// A reader's chromatograms, each read by its position in the index. `iter_chromatograms` ends at
 /// the first chromatogram that does not parse, and every readable one after it went with it.
-fn chromatograms_by_index(
-    reader: &mut MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>,
-) -> impl Iterator<Item = Chromatogram> + '_ {
+///
+/// An mzML chromatogram whose `intensity array` comes back with no unit is looked up in the source
+/// (`read_path`, the file mzdata opened): mzdata reads a unit it has no `Unit` for as
+/// `Unit::Unknown`, and an array in bar or in millilitres per minute was then stored and exported
+/// as detector counts, with nothing said. The accession the element states is noted as the
+/// chromatogram parameter [`INTENSITY_ARRAY_UNIT`], which [`unit_keeping_chromatogram_arrays`]
+/// acts on. An array that states no unit, and any other format's, is left as read.
+fn chromatograms_by_index<'a>(
+    reader: &'a mut MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>,
+    read_path: &'a Path,
+) -> impl Iterator<Item = Chromatogram> + 'a {
+    chromatograms_by_index_noting(reader, read_path, true)
+}
+
+/// [`chromatograms_by_index`]; `warn` is whether a unit read back from the source is reported (the
+/// schema sampling reads the first chromatograms a second time, and says nothing).
+fn chromatograms_by_index_noting<'a>(
+    reader: &'a mut MZReaderType<fs::File, CentroidPeak, DeconvolutedPeak>,
+    read_path: &'a Path,
+    warn: bool,
+) -> impl Iterator<Item = Chromatogram> + 'a {
     use mzdata::prelude::ChromatogramSource;
     let n = reader.count_chromatograms();
-    (0..n).filter_map(move |i| reader.get_chromatogram_by_index(i))
+    let mut source: Option<BufReader<fs::File>> = None;
+    let mut warn = warn;
+    (0..n).filter_map(move |i| {
+        let mut chrom = reader.get_chromatogram_by_index(i)?;
+        let unread = chrom.arrays.get(&ArrayType::IntensityArray).is_some_and(|a| a.unit == Unit::Unknown)
+            && !chrom.params().iter().any(|p| !p.is_controlled() && p.name == INTENSITY_ARRAY_UNIT);
+        if let (true, MZReaderType::MzML(mzml)) = (unread, &*reader) {
+            let at = mzml.chromatogram_index.get_index(i).map(|(_, offset)| offset);
+            if source.is_none() {
+                source = fs::File::open(read_path).ok().map(BufReader::new);
+            }
+            if let Some(accession) = at.zip(source.as_mut()).and_then(|(at, f)| stated_intensity_unit(f, at)) {
+                if std::mem::take(&mut warn) {
+                    log::warn!(
+                        "chromatogram {:?}: its intensity array is in a unit mzdata does not know ({accession}); \
+                         kept as the chromatogram parameter `{INTENSITY_ARRAY_UNIT}` (said once, for the first)",
+                        chrom.id()
+                    );
+                }
+                chrom.description_mut().add_param(Param::new_key_value(INTENSITY_ARRAY_UNIT, mzdata::params::Value::String(accession)));
+            }
+        }
+        Some(chrom)
+    })
+}
+
+/// The `unitAccession` the `intensity array` (MS:1000515) of the `<chromatogram>` at byte `at`
+/// states, when mzdata has no `Unit` for it; `None` when the array states none, or one mzdata reads.
+/// One element is read, with the tokenizer mzdata reads it with.
+fn stated_intensity_unit(source: &mut BufReader<fs::File>, at: u64) -> Option<String> {
+    use quick_xml::events::Event;
+    source.seek(SeekFrom::Start(at)).ok()?;
+    let mut xml = quick_xml::Reader::from_reader(source);
+    let config = xml.config_mut();
+    config.check_end_names = false;
+    config.allow_unmatched_ends = true;
+    let mut buf = Vec::new();
+    loop {
+        match xml.read_event_into(&mut buf).ok()? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"cvParam" => {
+                let attr = |key: &[u8]| {
+                    e.attributes().flatten().find(|a| a.key.as_ref() == key).map(|a| String::from_utf8_lossy(&a.value).trim().to_string())
+                };
+                if attr(b"accession").as_deref() == Some("MS:1000515") {
+                    return attr(b"unitAccession").filter(|u| !u.is_empty() && Unit::from_accession(u) == Unit::Unknown);
+                }
+            }
+            Event::End(e) if matches!(e.name().as_ref(), b"chromatogram" | b"chromatogramList" | b"run") => return None,
+            Event::Eof => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
 }
 
 /// Warn when fewer chromatograms were read than the source's `<chromatogramList count>` declares,
@@ -8612,7 +8769,8 @@ fn source_chromatogram(id: &str, kind: ChromatogramType, time_seconds: &[f64], i
 /// too). Falls back to one empty chromatogram if nothing else was written (the reference reader
 /// requires the facet to open, and the writer finalizes index metadata here). Returns the
 /// `transformations` entries the written chromatograms add, for the lane's index block:
-/// `chromatogram-time-to-minutes`, and the device traces' ([`bruker_traces::Trace`]).
+/// `chromatogram-time-to-minutes`, the device traces' ([`bruker_traces::Trace`]), and
+/// [`INTENSITY_UNIT_AS_PARAMETER`] when a stored intensity is in the unit its parameter names.
 fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
     writer: &mut MzPeakWriterType<fs::File>,
     input: &Path,
@@ -8639,6 +8797,7 @@ fn finish_chromatograms<I: Iterator<Item = Chromatogram>>(
             (to_minutes, "chromatogram-time-to-minutes"),
             (rescaled, "bruker:trace-unit-rescale"),
             (merged, "bruker:trace-sort-dedup"),
+            (intensity_unit_is_a_parameter(&chrom), INTENSITY_UNIT_AS_PARAMETER),
         ] {
             if done {
                 declare(&mut applied, entry);
@@ -8856,8 +9015,10 @@ fn fixup_run_metadata(target: &mut impl MSDataFileMetadata, input: &Path) -> Opt
 /// ([`mzml_refs::Header::start_time_stamp`]); nothing happens when the run already has a time. A
 /// stamp with an offset becomes `run.start_time`; one without becomes the `acquisition_time` index
 /// block the Waters and SciEX lanes write for an unzoned clock ([`run_metadata::apply`]), which is
-/// returned for the caller to add; one that is no date-time at all is kept verbatim in that block
-/// as `stated`, with no `wall_clock`.
+/// returned for the caller to add; one that is not read as a date-time (a date alone, free text) is
+/// kept verbatim in that block as `stated`, with no `wall_clock` and no `zone`. An offset without
+/// its colon (`+0200`, ISO 8601's basic form, which xsd:dateTime does not allow) is read as the
+/// offset it is ([`run_metadata::parse_vendor_time`]).
 #[must_use]
 fn mzml_start_time(target: &mut impl MSDataFileMetadata, stamp: Option<&str>, format: &'static str) -> Option<(String, serde_json::Value)> {
     let stamp = stamp?;
@@ -8872,13 +9033,13 @@ fn mzml_start_time(target: &mut impl MSDataFileMetadata, stamp: Option<&str>, fo
                 "{source} {stamp:?} is not a date-time this converter reads; run.start_time stays null and \
                  the text is kept as `stated` in the `acquisition_time` index block"
             );
+            // No `zone`: text that was not read states neither a zone nor the lack of one.
             Some((
                 "acquisition_time".to_string(),
                 serde_json::json!({
                     "stated": stamp,
-                    "zone": "unstated",
                     "source": source,
-                    "note": "not an ISO 8601 date-time; kept as the source states it"
+                    "note": "not an xsd:dateTime this converter reads; kept as the source states it"
                 }),
             ))
         }
@@ -9161,6 +9322,12 @@ fn demote_mzp_in(params: &mut [Param]) {
 /// ([`add_processing_metadata`]); its method is the one [`mirror_transformations`] extends.
 const CONVERSION_PROCESSING_ID: &str = "mzpeak_convert_conversion";
 
+/// Record this conversion: the software `mzpeak-convert` and the processing
+/// [`CONVERSION_PROCESSING_ID`], whose one method states the command line and MS:1000530 `file
+/// format conversion`. The term is stated here, last: the vendored writer adds it only to a method
+/// that states no data transformation, and this method gains one (MS:1003901) whenever the
+/// conversion trims zeros ([`mirror_transformations`]) — an archive that declared a zero trim no
+/// longer said its own step is a format conversion, while one without a trim did.
 fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
     writer.softwares_mut().push(Software::new(
         "mzpeak-convert".into(),
@@ -9172,10 +9339,13 @@ fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
         methods: vec![ProcessingMethod {
             order: 1,
             software_reference: "mzpeak-convert".to_string(),
-            params: vec![conversion_options_param()],
+            params: vec![conversion_options_param(), Param::builder().name("file format conversion").curie(FILE_FORMAT_CONVERSION).build()],
         }],
     });
 }
+
+/// MS:1000530 `file format conversion`, the term of this conversion's own processing method.
+const FILE_FORMAT_CONVERSION: mzdata::params::CURIE = curie!(MS:1000530);
 
 /// The `transformations` entries that are PSI-MS's MS:1003901 `zero intensity point trimming`
 /// ("remove excess zero intensity value data points from a spectrum"): the writer's zero-run mask,
@@ -9206,7 +9376,10 @@ fn mirror_transformations(target: &mut impl MSDataFileMetadata, applied: &[&str]
     if applied.iter().any(|t| ZERO_INTENSITY_TRIMMING.contains(t)) {
         method.params.insert(0, Param::builder().name("zero intensity point trimming").curie(curie!(MS:1003901)).build());
     }
-    method.params.extend(
+    // Before the method's `file format conversion`, which stays last (the order every release wrote).
+    let at = method.params.iter().position(|p| p.curie() == Some(FILE_FORMAT_CONVERSION)).unwrap_or(method.params.len());
+    method.params.splice(
+        at..at,
         applied.iter().map(|t| Param::new_key_value("transformation", mzdata::params::Value::String(t.to_string()))),
     );
 }
@@ -10017,6 +10190,43 @@ mod tests {
         // Sampled for the schema, a pascal trace leaves no `intensity` column in pascal behind.
         let sampled = super::schema_sample_chromatogram(chromatogram("p", C::PressureChromatogram, Unit::Pascal));
         assert!(sampled.arrays.iter().all(|(t, _)| *t == ArrayType::TimeArray));
+
+        // An intensity in another intensity unit, and an ion current whatever unit it states, stay
+        // the `intensity array`: moved like a trace, a TIC in counts per second had no intensity
+        // left. The unit's accession is the chromatogram's parameter; the column samples as counts.
+        let noted = |c: &super::Chromatogram| -> Vec<String> {
+            c.params().iter().filter(|p| p.name == super::INTENSITY_ARRAY_UNIT).map(|p| p.value.to_string()).collect()
+        };
+        for (chrom, accession) in [
+            (chromatogram("tic", C::TotalIonCurrentChromatogram, Unit::CountsPerSecond), "MS:1000814"),
+            (chromatogram("relative", C::Unknown, Unit::PercentBasePeak), "MS:1000132"),
+            (chromatogram("relative x100", C::Unknown, Unit::PercentBasePeakTimes100), "MS:1000905"),
+            (chromatogram("srm", C::SelectedReactionMonitoringChromatogram, Unit::Volt), "UO:0000218"),
+        ] {
+            let kept = super::unit_keeping_chromatogram_arrays(chrom);
+            assert!(kept.arrays.has_array(&ArrayType::IntensityArray) && kept.arrays.len() == 2, "{}", kept.id());
+            assert_eq!(noted(&kept), [accession], "{}", kept.id());
+            assert!(super::intensity_unit_is_a_parameter(&kept));
+            let sampled = super::schema_sample_chromatogram(kept.clone());
+            assert_eq!(sampled.arrays.get(&ArrayType::IntensityArray).unwrap().unit, Unit::DetectorCounts, "{}", kept.id());
+            // Read back from the archive (the column's counts) or from the export: nothing is added.
+            let again = super::unit_keeping_chromatogram_arrays(kept);
+            assert!(again.arrays.has_array(&ArrayType::IntensityArray) && noted(&again) == [accession], "{}", again.id());
+        }
+        // A unit mzdata has no `Unit` for comes noted by `chromatograms_by_index`, on an array that
+        // reads as stating none: a trace is moved (the parameter states its unit), an ion current
+        // stays; and a noted intensity unit on such an array (an archive column without a unit)
+        // stays the intensity too.
+        let with_note = |id: &str, kind: C, accession: &str| {
+            let mut c = chromatogram(id, kind, Unit::Unknown);
+            c.description_mut().add_param(Param::new_key_value(super::INTENSITY_ARRAY_UNIT, mzdata::params::Value::String(accession.to_string())));
+            super::unit_keeping_chromatogram_arrays(c)
+        };
+        let moved = with_note("ELSD", C::Unknown, "UO:0000095");
+        assert!(moved.arrays.has_array(&ArrayType::nonstandard("ELSD")) && !moved.arrays.has_array(&ArrayType::IntensityArray));
+        assert_eq!(noted(&moved), ["UO:0000095"]);
+        assert!(with_note("sic", C::SelectedIonCurrentChromatogram, "UO:0000095").arrays.has_array(&ArrayType::IntensityArray));
+        assert!(with_note("rate", C::Unknown, "MS:1000814").arrays.has_array(&ArrayType::IntensityArray));
 
         let source = || cases().into_iter().take(7).map(|(c, _)| c);
         let (dir, _cleanup) = trace_scratch("trace-units");
@@ -12337,6 +12547,12 @@ mod tests {
         let masked = method(&convert("zero-run", &[100.0, 100.5, 101.0, 101.5, 102.0, 102.5], &[5.0, 0.0, 0.0, 0.0, 0.0, 9.0]));
         assert_eq!(masked["parameters"][0]["accession"], "MS:1003901", "{masked:#}");
         assert_eq!(masked["parameters"][0]["name"], "zero intensity point trimming");
+        // …and the step is still a file format conversion: the term is this method's own, last,
+        // and not the vendored writer's fallback for a method that states no data transformation
+        // (with MS:1003901 stated the fallback left it out).
+        let accessions: Vec<&str> = masked["parameters"].as_array().unwrap().iter().filter_map(|p| p["accession"].as_str()).collect();
+        assert_eq!(accessions, ["MS:1003901", "MS:1000530"], "{masked:#}");
+        assert_eq!(masked["parameters"].as_array().unwrap().last().unwrap()["accession"], "MS:1000530");
         assert_eq!(user_params(&masked), ["zero-run-mask"]);
         let unsorted = method(&convert("unsorted", &[101.0, 100.0, 102.0, 103.0], &[5.0, 6.0, 7.0, 9.0]));
         assert_eq!(user_params(&unsorted), ["sort-by-mz"]);

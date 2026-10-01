@@ -249,7 +249,13 @@ archive's export and the direct export alike — as a `pressure array`, `flow ra
 `temperature array` or a `non-standard data array` named after the chromatogram, in that unit
 (mzdata's writer states detector counts for every `intensity array`, which is how the unit was lost
 through 0.17.0-rc.1; a reader that takes a chromatogram's values from `intensity array` alone finds
-none on such a trace); a spectrum's `sourceFileRef` attribute is a `userParam` of that name; and a
+none on such a trace); a chromatogram intensity in counts per second or percent of base peak, an
+ion current in any other unit, and an intensity in a unit mzdata does not know are still written
+as an `intensity array` in detector counts, with the stated unit's accession in the chromatogram's
+`intensity array unit` userParam (§7; the run warns); a spectrum's `sourceFileRef` attribute is a
+`userParam` of that name, whose source-file id an archive's export does not list (its
+`sourceFileList` names the archive; the ids are in the archive's `file_description`, and in the
+direct export's list); and a
 Thermo precursor that named the spectrum itself, or one of no lower MS level, has no `spectrumRef`
 (a run without MS1 named scan 1 on every scan). Not in any archive yet, so not in its
 export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` combination.
@@ -501,12 +507,24 @@ Contents:
   or as zeros (mzPeakViewer does, so far); its values are in the auxiliary array. This holds for a
   Bruker `.d`'s HyStar traces and, since 0.17.0, for the same traces on the mzML lane: ProteoWizard
   writes each as an `intensity array` in the trace's unit (pascal, psi, µL/min, °C, percent,
-  absorbance unit), and an intensity array in any unit but `MS:1000131` detector counts is stored as
+  absorbance unit), and an intensity array in a unit that is not an intensity's is stored as
   the pressure, flow rate or temperature array of a chromatogram of that type, otherwise as a
   non-standard array named after the chromatogram — values and data type untouched. Through
   0.17.0-rc.1 it went into the shared `intensity` column, which is declared in detector counts, and
   the unit was gone from the archive and from both mzML exports (49 chromatograms of 12 corpus mzML
-  files). An intensity array that states no unit stays the intensity.
+  files). An intensity stays in the `intensity` column: an array in detector counts or stating no
+  unit, as it is; one in another unit PSI-MS allows on an intensity array (`MS:1000814` counts per
+  second, `MS:1000132` percent of base peak, `MS:1000905` the same times 100), and the array of an
+  ion-current chromatogram (TIC, base peak, SIC, SIM, SRM) in whatever unit it states, with the
+  stated unit's accession as that chromatogram's parameter **`intensity array unit`** (no accession;
+  value e.g. `MS:1000814`), which both mzML exports write as a userParam, and
+  `mzml:chromatogram-intensity-unit-as-parameter` declared: the column goes on declaring detector
+  counts, which the synthesized TIC and base-peak chromatogram beside it are in. A unit mzdata has
+  no name for (it knows 29 units) reads as no unit; the lane reads the accession back
+  from the source's `<chromatogram>` and stores the array by the same rule, with the same
+  parameter stating the unit (the stored array cannot name a unit mzdata does not know). The
+  facet keeps its `intensity` column when the first chromatograms of the source are all device
+  traces.
 - `vendor/…` — embedded original side-files (optional, see §8).
 
 **Footer count keys.** The spectrum, chromatogram and wavelength facets carry `<entity>_count`
@@ -587,8 +605,10 @@ offset (`2009-08-11T15:59:44`: five corpus imzML units): the block's `source` is
 startTimeStamp` / `imzML run startTimeStamp`, and `wall_clock` is the stamp as an ISO 8601 local
 time (a fraction of a second is written with 3, 6 or 9 digits). Through 0.17.0-rc.1 such a stamp
 was dropped — mzdata reads the attribute as RFC 3339 and discards anything else, with an ERROR
-line that still appears in the log — and the archive stated no acquisition time at all. A stamp
-that is no date-time is kept verbatim as `stated`, with no `wall_clock`.
+line that still appears in the log — and the archive stated no acquisition time at all. An offset
+without its colon (`+0200`, ISO 8601's basic form) is read as the offset it states and gives
+`run.start_time`. A stamp that is not read as a date-time (a date alone, free text) is kept
+verbatim as `stated`, with no `wall_clock` and no `zone`.
 
 ProteoWizard resolves the same ambiguity by asserting: it labels an unzoned Waters clock `Z`, and
 its `adjustUnknownTimeZonesToHostTimeZone` default shifts other readers' values by the converting
@@ -803,9 +823,10 @@ WIFF.
 reads both, types every param value by trial parse and reads only part of the header; the lane
 reads the rest back from the source text (`src/mzml_refs.rs`, `src/imaging.rs`):
 
-- A source file's **SHA-1** (`MS:1000569`) is the text the header states. A digest of decimal digits
-  only, or of digits with one `e`, used to be stored as a number (`…0123` as 123; ProteoWizard's
-  own `tiny.pwiz` example as 1.2345678901234568e39), as the `.ibd` checksums were through 0.16.0.
+- A source file's **checksum** — SHA-1 (`MS:1000569`), MD5 (`MS:1000568`), SHA-256 (`MS:1003151`) —
+  is the text the header states. A digest of decimal digits only, or of digits with one `e`, used
+  to be stored as a number (`…0123` as 123; ProteoWizard's own `tiny.pwiz` example as
+  1.2345678901234568e39), as the `.ibd` checksums were through 0.16.0.
 - A header value that reads as **NaN or infinity** (a userParam whose text is `NaN` or `Inf`, a
   digest with an exponent beyond a 64-bit float) is stored as the string Rust prints for it —
   `NaN`, `inf`, `-inf` — since JSON has no such number; through 0.17.0-rc.1 it aborted the
@@ -815,16 +836,22 @@ reads the rest back from the source text (`src/mzml_refs.rs`, `src/imaging.rs`):
 - A spectrum's **`sourceFileRef`** attribute (the DESI ColAd imzML names one of 135 raw line files
   on each of 17,820 spectra) is the spectrum parameter `sourceFileRef` — no accession; its value is
   the id of an entry of `file_description.source_files` — and a `userParam` of that name in both
-  mzML exports. One that names no listed source file is dropped and declared
-  (`mzml:dangling-reference-dropped`). The same attribute on a `<scan>` or a `<precursor>` (with
-  `externalSpectrumID`: a spectrum of another file) is not carried.
+  mzML exports. In the mzML written from an archive the id resolves against the archive's
+  `file_description`, not against that mzML: its `sourceFileList` holds the archive alone (§4.1),
+  where the direct export lists the source's files. One that names no listed source file is dropped
+  and declared (`mzml:dangling-reference-dropped`). The same attribute on a `<scan>` or a
+  `<precursor>` (with `externalSpectrumID`: a spectrum of another file) is not carried.
 - A source's **processing methods** keep the terms they state. `file format conversion`
   (`MS:1000530`) is added only to a method none of whose terms is a child of `MS:1000452` data
   transformation in the PSI-MS vocabulary the binary embeds (a method with no CV term at all among
   them), because the spec's `processingmethod_must` rule requires one; through 0.17.0-rc.1 every
   source method gained it, so a `low intensity data point removal` step also claimed a format
-  conversion.
+  conversion. The conversion's own method (`mzpeak_convert_conversion`) states the term itself, on
+  every lane, beside `MS:1003901` when it trimmed zeros.
 - The run's **`startTimeStamp`** without an offset is the `acquisition_time` block (above).
+- A chromatogram **intensity array's unit** other than detector counts is kept: on the array where
+  the value is no intensity (a device trace), as the chromatogram's `intensity array unit`
+  parameter where it is one, or where mzdata does not know the unit (§7).
 - **Not carried:** `fileDescription/<contact>` — the contact's name, organization, address, URL and
   e-mail (`MS:1000586`–`MS:1000590`). mzdata's model has no contact and the archive index no place
   for one; nothing of it is stored, on purpose until it is decided whether an archive should carry
@@ -999,6 +1026,7 @@ The vocabulary:
 | `sort-by-time` | the writer's backstop re-ordered at least one chromatogram into time order before it was stored | any lane that hands the writer a chromatogram out of time order, a source chromatogram or the MS1 TIC/base-peak trace synthesized in spectrum order |
 | `sort-by-wavelength` | the writer's backstop re-ordered at least one wavelength (UV/PDA) spectrum into wavelength order before it was stored | any lane that writes wavelength spectra handed over out of order |
 | `chromatogram-time-to-minutes` | at least one chromatogram time recorded in seconds or milliseconds was divided into minutes, the unit `chromatograms_data` declares on every lane, as a 64-bit float (not bit-exact). A time array that states no unit is stored as given | mzML/imzML with source chromatograms (ProteoWizard writes seconds), Bruker `.d` with `chromatography-data.sqlite` (HyStar records seconds) |
+| `mzml:chromatogram-intensity-unit-as-parameter` | at least one chromatogram's values in the `intensity` column are in another unit than the detector counts the column declares: an intensity the source states in counts per second (`MS:1000814`), percent of base peak (`MS:1000132`, `MS:1000905`), an ion-current chromatogram's in any other unit, or one in a unit mzdata has no name for. The values are stored as stated; the unit's accession is that chromatogram's parameter `intensity array unit` (§7) | mzML with source chromatograms |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer sqrt grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `grid-fit:1e-6Da` | a centroid list on a fixed-point lattice was stored under the reference implementation's fitted linear grid, every value within 1e-6 Da (item 4) | generic mzML lane (lattice detected), native Shimadzu `.lcd` centroids |
 | `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 5) | native Shimadzu `.lcd` profile |

@@ -6,7 +6,9 @@
 //! * a run `startTimeStamp` without a UTC offset was dropped with an ERROR line and no trace;
 //! * a spectrum's `sourceFileRef` was not stored;
 //! * every source processing method gained an invented `file format conversion` term;
-//! * a device trace written as an `intensity array` in pascal was stored and exported as counts;
+//! * a device trace written as an `intensity array` in pascal was stored and exported as counts
+//!   (and, moved out of the way, must not take an ion current in counts per second with it, nor
+//!   leave the facet without an `intensity` column; a unit mzdata does not know is read back);
 //! * an imaging run that states no scan start time got a TIC and a base-peak chromatogram with
 //!   every point at time 0, and `provenance.time` said "as stated" when one spectrum of nine states
 //!   one;
@@ -78,6 +80,22 @@ fn variant(source: &str, dir: &Path, name: &str, edits: &[(&str, &str)]) -> Path
     path
 }
 
+/// The mzML fixture with each `(from, to)` replaced exactly once within its `<chromatogramList>`
+/// (the spectra hold the same arrays as its TIC), written as `dir/name`.
+fn chromatogram_variant(dir: &Path, name: &str, edits: &[(&str, &str)]) -> PathBuf {
+    let text = std::fs::read_to_string(TINY).unwrap();
+    let (head, mut list) = text.split_at(text.find("<chromatogramList").unwrap());
+    let mut edited;
+    for (from, to) in edits {
+        assert_eq!(list.matches(from).count(), 1, "{from:?} must occur exactly once in the chromatogram list");
+        edited = list.replace(from, to);
+        list = &edited;
+    }
+    let path = dir.join(name);
+    std::fs::write(&path, format!("{head}{list}")).unwrap();
+    path
+}
+
 /// The synthetic imzML with `edits`, and its `.ibd` beside it.
 fn imzml_variant(dir: &Path, name: &str, edits: &[(&str, &str)]) -> PathBuf {
     let path = variant(IMZML, dir, &format!("{name}.imzML"), edits);
@@ -131,8 +149,13 @@ fn strings(archive: &Path, facet: &str, column: &str) -> Vec<Option<String>> {
 
 /// Per spectrum of `spectra_metadata`: its id and the string value of its parameter `name`.
 fn spectrum_parameter(archive: &Path, name: &str) -> Vec<(String, Option<String>)> {
+    parameter(archive, "spectra_metadata.parquet", name)
+}
+
+/// Per row of a metadata facet: its id and the string value of its parameter `name`.
+fn parameter(archive: &Path, facet: &str, name: &str) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
-    for b in batches(archive, "spectra_metadata.parquet") {
+    for b in batches(archive, facet) {
         let (ids, params) = (b.column_by_name("id").unwrap(), b.column_by_name("parameters").unwrap());
         for i in 0..b.num_rows() {
             let item = list_item(params, i);
@@ -234,6 +257,13 @@ fn a_start_time_stamp_without_an_offset_is_kept_as_acquisition_time() {
     let m = metadata(&convert(&odd, &dir, "odd.mzpeak").0);
     assert_eq!(m["acquisition_time"]["stated"], "June 27th");
     assert!(m["acquisition_time"].get("wall_clock").is_none() && m["run"]["start_time"].is_null());
+    assert!(m["acquisition_time"].get("zone").is_none(), "text that was not read states no zone, nor the lack of one: {}", m["acquisition_time"]);
+
+    // An offset without its colon (ISO 8601's basic form) is the offset it states.
+    let basic = variant(TINY, &dir, "basic.mzML", &[("startTimeStamp=\"2007-06-27T15:23:45.00035\"", "startTimeStamp=\"2007-06-27T15:23:45.00035+0200\"")]);
+    let m = metadata(&convert(&basic, &dir, "basic.mzpeak").0);
+    assert_eq!(m["run"]["start_time"], "2007-06-27T15:23:45.000350+02:00");
+    assert!(m.get("acquisition_time").is_none(), "{}", m["acquisition_time"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -299,11 +329,7 @@ fn a_source_processing_method_gains_no_term_it_does_not_state() {
 #[test]
 fn a_device_trace_keeps_its_unit_in_the_archive_and_in_both_exports() {
     let dir = scratch("traces");
-    const SIC_TYPE: &str = "<cvParam cvRef=\"MS\" accession=\"MS:1000627\" name=\"selected ion current chromatogram\" value=\"\"/>";
-    const COUNTS: &str = "<cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\" value=\"\" unitCvRef=\"MS\" unitAccession=\"MS:1000131\" unitName=\"number of counts\"/>\n              <binary>AAAAAAAAJEAAAAAAAAAiQ";
-    let trace = |name: &str, kind: &str, unit: &str| {
-        variant(TINY, &dir, name, &[(SIC_TYPE, kind), (COUNTS, &COUNTS.replace("unitCvRef=\"MS\" unitAccession=\"MS:1000131\" unitName=\"number of counts\"", unit))])
-    };
+    let trace = |name: &str, kind: &str, unit: &str| variant(TINY, &dir, name, &[(SIC_TYPE, kind), (SIC_COUNTS, &SIC_COUNTS.replace(COUNTS_UNIT, unit))]);
     let pressure = trace(
         "pressure.mzML",
         "<cvParam cvRef=\"MS\" accession=\"MS:1003019\" name=\"pressure chromatogram\" value=\"\"/>",
@@ -357,6 +383,141 @@ fn a_device_trace_keeps_its_unit_in_the_archive_and_in_both_exports() {
         let c = arrow::compute::cast(b.column_by_name("number_of_auxiliary_arrays").unwrap(), &arrow::datatypes::DataType::Int64).unwrap();
         c.as_primitive::<arrow::datatypes::Int64Type>().iter().all(|v| v.unwrap_or(0) == 0)
     }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The fixture's two chromatogram intensity arrays, each with the start of its `<binary>`: the TIC's
+/// and the SIC's.
+const TIC_COUNTS: &str = "<cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\" value=\"\" unitCvRef=\"MS\" unitAccession=\"MS:1000131\" unitName=\"number of counts\"/>\n              <binary>AAAAAAAALkAAAAAAAAAsQ";
+const SIC_COUNTS: &str = "<cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\" value=\"\" unitCvRef=\"MS\" unitAccession=\"MS:1000131\" unitName=\"number of counts\"/>\n              <binary>AAAAAAAAJEAAAAAAAAAiQ";
+const COUNTS_UNIT: &str = "unitCvRef=\"MS\" unitAccession=\"MS:1000131\" unitName=\"number of counts\"";
+const TIC_TYPE: &str = "<cvParam cvRef=\"MS\" accession=\"MS:1000235\" name=\"total ion current chromatogram\" value=\"\"/>\n          <binaryDataArrayList";
+const SIC_TYPE: &str = "<cvParam cvRef=\"MS\" accession=\"MS:1000627\" name=\"selected ion current chromatogram\" value=\"\"/>";
+
+/// Per chromatogram: id, how many of its points have a value in the facet's `intensity` column,
+/// and its number of auxiliary arrays.
+fn chromatogram_values(archive: &Path) -> Vec<(String, usize, i64)> {
+    let int64 = |c: &ArrayRef| -> Vec<i64> {
+        let c = arrow::compute::cast(c, &arrow::datatypes::DataType::Int64).unwrap();
+        c.as_primitive::<arrow::datatypes::Int64Type>().iter().map(|v| v.unwrap_or(0)).collect()
+    };
+    let mut rows: Vec<(String, usize, i64)> = Vec::new();
+    for b in batches(archive, "chromatograms_metadata.parquet") {
+        let (ids, aux) = (b.column_by_name("id").unwrap(), int64(b.column_by_name("number_of_auxiliary_arrays").unwrap()));
+        rows.extend((0..b.num_rows()).map(|i| (text(ids, i).unwrap_or_default(), 0, aux[i])));
+    }
+    for b in batches(archive, "chromatograms_data.parquet") {
+        let point = b.column_by_name("point").unwrap().as_struct();
+        let index = int64(point.column_by_name("chromatogram_index").unwrap());
+        let Some(intensity) = point.column_by_name("intensity") else { continue };
+        for (k, &i) in index.iter().enumerate() {
+            rows[i as usize].1 += usize::from(!intensity.is_null(k));
+        }
+    }
+    rows
+}
+
+/// What a chromatogram list of an mzML export states: how many `intensity array`s, how many
+/// non-standard arrays, and the values of the `intensity array unit` userParams.
+fn exported_chromatogram_units(mzml: &Path) -> (usize, usize, Vec<String>) {
+    let text = std::fs::read_to_string(mzml).unwrap();
+    let chromatograms = &text[text.find("<chromatogramList").unwrap()..];
+    let units = chromatograms
+        .split("name=\"intensity array unit\" value=\"")
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        .collect();
+    (chromatograms.matches("accession=\"MS:1000515\"").count(), chromatograms.matches("accession=\"MS:1000786\"").count(), units)
+}
+
+/// PSI-MS allows an `intensity array` in counts per second (MS:1000814) or percent of base peak.
+/// Moved out of the `intensity` column like a device trace, such a TIC had no intensity left — in
+/// the archive (15 points, none with a value) or in either export — and none was synthesized in
+/// its place. An intensity stays the intensity, in every unit an ion current states; the unit is
+/// the chromatogram's `intensity array unit` parameter, and the archive declares it.
+#[test]
+fn an_ion_current_in_another_intensity_unit_stays_the_intensity() {
+    let dir = scratch("ion-current-units");
+    const CPS: &str = "unitCvRef=\"MS\" unitAccession=\"MS:1000814\" unitName=\"counts per second\"";
+    let cps = chromatogram_variant(&dir, "cps.mzML", &[(TIC_COUNTS, &TIC_COUNTS.replace(COUNTS_UNIT, CPS)), (SIC_COUNTS, &SIC_COUNTS.replace(COUNTS_UNIT, CPS))]);
+    let (archive, _) = convert(&cps, &dir, "cps.mzpeak");
+    assert_eq!(chromatogram_values(&archive), [("BPC".to_string(), 3, 0), ("tic".to_string(), 15, 0), ("sic".to_string(), 10, 0)]);
+    let unit = |archive: &Path| -> Vec<Option<String>> { parameter(archive, "chromatograms_metadata.parquet", "intensity array unit").into_iter().map(|(_, v)| v).collect() };
+    assert_eq!(unit(&archive), [None, Some("MS:1000814".to_string()), Some("MS:1000814".to_string())]);
+    assert!(declared(&metadata(&archive), "mzml:chromatogram-intensity-unit-as-parameter"));
+    let stated = vec!["MS:1000814".to_string(); 2];
+    assert_eq!(exported_chromatogram_units(&convert(&archive, &dir, "cps.archive.mzML").0), (3, 0, stated.clone()), "archive export");
+    let (direct, log) = convert(&cps, &dir, "cps.direct.mzML");
+    assert_eq!(exported_chromatogram_units(&direct), (3, 0, stated), "direct export");
+    assert!(log.contains("2 chromatogram(s) (\"tic\" first) state an intensity in another unit"), "{log}");
+
+    // A pressure in pascal on a selected ion current chromatogram: an ion current keeps its
+    // intensity whatever unit the array states.
+    const PASCAL: &str = "unitCvRef=\"UO\" unitAccession=\"UO:0000110\" unitName=\"pascal\"";
+    let odd = variant(TINY, &dir, "odd.mzML", &[(SIC_COUNTS, &SIC_COUNTS.replace(COUNTS_UNIT, PASCAL))]);
+    let (archive, _) = convert(&odd, &dir, "odd.mzpeak");
+    assert_eq!(chromatogram_values(&archive)[2], ("sic".to_string(), 10, 0));
+    assert_eq!(unit(&archive), [None, None, Some("UO:0000110".to_string())]);
+
+    // Counts are counts: no parameter, nothing declared.
+    let (archive, _) = convert(Path::new(TINY), &dir, "counts.mzpeak");
+    assert_eq!(unit(&archive), [None, None, None]);
+    assert!(!declared(&metadata(&archive), "mzml:chromatogram-intensity-unit-as-parameter"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// mzdata reads a unit it has no `Unit` for as no unit at all: an `intensity array` in
+/// `UO:0000095` was stored in the counts column and exported as detector counts, with nothing said.
+/// The accession is read back from the source: a trace is stored as a device trace is, with the
+/// unit as the chromatogram's parameter (the array cannot state it); an ion current stays the
+/// intensity, with the same parameter.
+#[test]
+fn a_chromatogram_unit_mzdata_does_not_know_is_read_back_from_the_source() {
+    let dir = scratch("unknown-unit");
+    const VOLUME: &str = "unitCvRef=\"UO\" unitAccession=\"UO:0000095\" unitName=\"volume unit\"";
+    let unit = |archive: &Path| -> Vec<Option<String>> { parameter(archive, "chromatograms_metadata.parquet", "intensity array unit").into_iter().map(|(_, v)| v).collect() };
+    let sic = variant(TINY, &dir, "sic.mzML", &[(SIC_COUNTS, &SIC_COUNTS.replace(COUNTS_UNIT, VOLUME))]);
+    let (archive, log) = convert(&sic, &dir, "sic.mzpeak");
+    assert_eq!(chromatogram_values(&archive)[2], ("sic".to_string(), 10, 0));
+    assert_eq!(unit(&archive), [None, None, Some("UO:0000095".to_string())]);
+    assert_eq!(log.matches("a unit mzdata does not know (UO:0000095)").count(), 1, "{log}");
+    assert!(declared(&metadata(&archive), "mzml:chromatogram-intensity-unit-as-parameter"));
+
+    const UV: &str = "<cvParam cvRef=\"MS\" accession=\"MS:1000811\" name=\"electromagnetic radiation chromatogram\" value=\"\"/>";
+    let trace = variant(TINY, &dir, "trace.mzML", &[(SIC_TYPE, UV), (SIC_COUNTS, &SIC_COUNTS.replace(COUNTS_UNIT, VOLUME))]);
+    let (archive, _) = convert(&trace, &dir, "trace.mzpeak");
+    assert_eq!(chromatogram_values(&archive)[2], ("sic".to_string(), 0, 1), "its values are its auxiliary array");
+    assert_eq!(unit(&archive), [None, None, Some("UO:0000095".to_string())]);
+    assert!(!declared(&metadata(&archive), "mzml:chromatogram-intensity-unit-as-parameter"), "no stored intensity is in another unit");
+    for (route, mzml) in [("archive", convert(&archive, &dir, "trace.archive.mzML").0), ("direct", convert(&trace, &dir, "trace.direct.mzML").0)] {
+        assert_eq!(exported_chromatogram_units(&mzml), (2, 1, vec!["UO:0000095".to_string()]), "{route}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The chromatogram facet's schema is sampled from the source's first chromatograms. When they are
+/// all device traces, none keeps an `intensity array`, and the facet had no `intensity` column:
+/// the TIC and base-peak chromatogram synthesized after them stored their intensity as a per-row
+/// auxiliary array with no unit.
+#[test]
+fn a_source_of_device_traces_alone_leaves_the_intensity_column_in_place() {
+    let dir = scratch("traces-alone");
+    let traces = chromatogram_variant(
+        &dir,
+        "traces.mzML",
+        &[
+            (TIC_TYPE, &TIC_TYPE.replace("accession=\"MS:1000235\" name=\"total ion current chromatogram\"", "accession=\"MS:1003019\" name=\"pressure chromatogram\"")),
+            (SIC_TYPE, "<cvParam cvRef=\"MS\" accession=\"MS:1003020\" name=\"flow rate chromatogram\" value=\"\"/>"),
+            (TIC_COUNTS, &TIC_COUNTS.replace(COUNTS_UNIT, "unitCvRef=\"UO\" unitAccession=\"UO:0000110\" unitName=\"pascal\"")),
+            (SIC_COUNTS, &SIC_COUNTS.replace(COUNTS_UNIT, "unitCvRef=\"UO\" unitAccession=\"UO:0000271\" unitName=\"microliters per minute\"")),
+        ],
+    );
+    let (archive, _) = convert(&traces, &dir, "traces.mzpeak");
+    assert_eq!(
+        chromatogram_values(&archive),
+        [("TIC".to_string(), 3, 0), ("BPC".to_string(), 3, 0), ("tic".to_string(), 0, 1), ("sic".to_string(), 0, 1)],
+        "the synthesized pair in the intensity column, each trace in its auxiliary array"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

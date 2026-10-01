@@ -31,10 +31,11 @@
 //! Three more things the header (or a `<spectrum>` start tag) states and mzdata does not hand over as
 //! stated are read back here, with the same parser:
 //!
-//! * a source file's **`MS:1000569` SHA-1**. mzdata types a param's value by trial parse, so a digest
-//!   of decimal digits only became an integer (`…0123` → 123) and one reading as a float a float
-//!   (`…e9` → 1.2e46). [`Header::restore_checksums`] writes the text back as a string, as the imzML
-//!   lane does for the `.ibd` checksums;
+//! * a source file's **checksums** (`MS:1000569` SHA-1, `MS:1000568` MD5, `MS:1003151` SHA-256).
+//!   mzdata types a param's value by trial parse, so a digest of decimal digits only became an
+//!   integer (`…0123` → 123) and one reading as a float a float (`…e9` → 1.2e46).
+//!   [`Header::restore_checksums`] writes the text back as a string, as the imzML lane does for the
+//!   `.ibd` checksums;
 //! * the run's **`startTimeStamp`** ([`Header::start_time_stamp`]). mzdata keeps one only when it is
 //!   RFC 3339 with an offset and drops any other with an ERROR line; `crate::mzml_start_time` stores a
 //!   stamp without a zone as the vendor lanes store an unzoned clock;
@@ -75,12 +76,17 @@ struct Entry {
     /// A source file's `name` and `location`; empty for the other lists, and when unstated.
     name: String,
     location: String,
-    /// A source file's `MS:1000569` SHA-1, the value's text as the element states it.
-    sha1: Option<String>,
+    /// A source file's checksums ([`CHECKSUMS`]): accession and the value's text as the element
+    /// states it, in document order.
+    checksums: Vec<(String, String)>,
 }
 
+/// The PSI-MS terms that state a source file's checksum (the children of MS:1000561 `data file
+/// checksum type`): MD5, SHA-1, SHA-256. Each is a digest of hex digits, so a text.
+const CHECKSUMS: [&str; 3] = ["MS:1000568", "MS:1000569", "MS:1003151"];
+
 /// What an mzML or imzML header states before `<run>`, read with quick_xml rather than mzdata: every
-/// `<software>`, `<sourceFile>` (with its SHA-1) and `<instrumentConfiguration>` in document order,
+/// `<software>`, `<sourceFile>` (with its checksums) and `<instrumentConfiguration>` in document order,
 /// self-closing or not, and the run's `defaultInstrumentConfigurationRef` and `startTimeStamp`.
 #[derive(Debug, Default)]
 pub struct Header {
@@ -129,12 +135,15 @@ impl Header {
         Ok(this)
     }
 
-    /// A `<cvParam accession="MS:1000569" value="…"/>` inside a `<sourceFile>`: that entry's SHA-1.
+    /// A `<cvParam accession="MS:1000569" value="…"/>` inside a `<sourceFile>`: that entry's SHA-1;
+    /// its MD5 (`MS:1000568`) and SHA-256 (`MS:1003151`) likewise.
     fn checksum(&mut self, e: &BytesStart, in_source_file: bool) {
-        if in_source_file && e.name().as_ref() == b"cvParam" && value(e, b"accession").as_deref() == Some("MS:1000569") {
-            if let Some(sf) = self.source_files.last_mut() {
-                sf.sha1 = value(e, b"value");
-            }
+        if !in_source_file || e.name().as_ref() != b"cvParam" {
+            return;
+        }
+        let Some(accession) = value(e, b"accession").filter(|a| CHECKSUMS.contains(&a.as_str())) else { return };
+        if let Some(sf) = self.source_files.last_mut() {
+            sf.checksums.push((accession, value(e, b"value").unwrap_or_default()));
         }
     }
 
@@ -143,19 +152,24 @@ impl Header {
         self.start_time_stamp.as_deref()
     }
 
-    /// Write each source file's `MS:1000569` SHA-1 as the string the header states. mzdata types a
-    /// value by trial parse: 40 decimal digits become an integer or a float, and a digest was stored
-    /// as `123` or `1.2345678901234568e46`. Returns how many values were put back.
+    /// Write each source file's checksums ([`CHECKSUMS`]: SHA-1, MD5, SHA-256) as the strings the
+    /// header states. mzdata types a value by trial parse: 40 decimal digits become an integer or a
+    /// float, and a digest was stored as `123` or `1.2345678901234568e46`. A term stated more than
+    /// once on a file is matched in document order. Returns how many values were put back.
     pub fn restore_checksums(&self, target: &mut impl MSDataFileMetadata) -> usize {
         let mut restored = 0;
         for e in self.source_files.iter() {
-            // An empty value states no digest (the DESI ColAd parameter file's): nothing to restore.
-            let Some(stated) = e.sha1.as_deref().filter(|v| !v.is_empty()) else { continue };
             let Some(sf) = target.file_description_mut().source_files.iter_mut().find(|sf| sf.id == e.id) else { continue };
-            for p in sf.params.iter_mut().filter(|p| p.curie() == Some(mzdata::curie!(MS:1000569))) {
-                if !matches!(&p.value, mzdata::params::Value::String(v) if v == stated) {
-                    p.value = mzdata::params::Value::String(stated.to_string());
-                    restored += 1;
+            for accession in CHECKSUMS {
+                let stated = e.checksums.iter().filter(|(a, _)| a == accession).map(|(_, v)| v.as_str());
+                let term: Option<mzdata::params::CURIE> = accession.parse().ok();
+                let read = sf.params.iter_mut().filter(|p| term.is_some() && p.curie() == term);
+                for (p, stated) in read.zip(stated) {
+                    // An empty value states no digest (the DESI ColAd parameter file's): nothing to restore.
+                    if !stated.is_empty() && !matches!(&p.value, mzdata::params::Value::String(v) if v == stated) {
+                        p.value = mzdata::params::Value::String(stated.to_string());
+                        restored += 1;
+                    }
                 }
             }
         }
@@ -670,17 +684,28 @@ mod tests {
             r#"<mzML><fileDescription><sourceFileList count="4">
               <sourceFile id="digits" name="a.raw" location="file:///d"><cvParam accession="MS:1000563" name="Thermo RAW format"/>
                 <cvParam cvRef="MS" accession="MS:1000569" name="SHA-1" value="0000000000000000000000000000000000000123"/></sourceFile>
-              <sourceFile id="hex" name="b.raw" location="file:///d"><cvParam accession="MS:1000569" value="71be39fb2700ab2f3c8b2234b91274968b6899b1"/></sourceFile>
+              <sourceFile id="hex" name="b.raw" location="file:///d"><cvParam accession="MS:1000569" value="71be39fb2700ab2f3c8b2234b91274968b6899b1"/>
+                <cvParam accession="MS:1000568" name="MD5" value="00000000000000000000000000000456"/>
+                <cvParam accession="MS:1003151" name="SHA-256" value="1e63"/></sourceFile>
               <sourceFile id="empty" name="p" location=""><cvParam accession="MS:1000569" value=""/></sourceFile>
               <sourceFile id="none" name="c.raw" location="file:///d"/>
             </sourceFileList></fileDescription>
             <softwareList><software id="pwiz" version="3"><cvParam accession="MS:1000569" value="not a source file's"/></software></softwareList>
             <run id="r" startTimeStamp="2009-08-11T15:59:44"><spectrumList/></run></mzML>"#,
         );
-        let stated: Vec<(&str, Option<&str>)> = h.source_files.iter().map(|e| (e.id.as_str(), e.sha1.as_deref())).collect();
+        let stated: Vec<(&str, Vec<(&str, &str)>)> =
+            h.source_files.iter().map(|e| (e.id.as_str(), e.checksums.iter().map(|(a, v)| (a.as_str(), v.as_str())).collect())).collect();
         assert_eq!(
             stated,
-            [("digits", Some("0000000000000000000000000000000000000123")), ("hex", Some("71be39fb2700ab2f3c8b2234b91274968b6899b1")), ("empty", Some("")), ("none", None)]
+            [
+                ("digits", vec![("MS:1000569", "0000000000000000000000000000000000000123")]),
+                (
+                    "hex",
+                    vec![("MS:1000569", "71be39fb2700ab2f3c8b2234b91274968b6899b1"), ("MS:1000568", "00000000000000000000000000000456"), ("MS:1003151", "1e63")]
+                ),
+                ("empty", vec![("MS:1000569", "")]),
+                ("none", vec![]),
+            ]
         );
         assert_eq!(h.start_time_stamp(), Some("2009-08-11T15:59:44"));
         assert_eq!(header(r#"<mzML><run id="r" startTimeStamp=" "/></mzML>"#).start_time_stamp(), None);
@@ -693,12 +718,18 @@ mod tests {
         for (id, v) in [("digits", Value::Int(123)), ("hex", Value::String("71be39fb2700ab2f3c8b2234b91274968b6899b1".into())), ("empty", Value::Empty)] {
             meta.file_description_mut().source_files.push(SourceFile { id: id.into(), params: vec![sha1(v)], ..Default::default() });
         }
-        assert_eq!(h.restore_checksums(&mut meta), 1);
+        // …and the MD5 as an integer, the SHA-256 as a float: digests too, restored like the SHA-1.
+        let hex = &mut meta.file_description_mut().source_files[1];
+        hex.params.push(Param::builder().name("MD5").curie(mzdata::curie!(MS:1000568)).value(Value::Int(456)).build());
+        hex.params.push(Param::builder().name("SHA-256").curie(mzdata::curie!(MS:1003151)).value(Value::Float(1e63)).build());
+        assert_eq!(h.restore_checksums(&mut meta), 3);
         let values: Vec<&Value> = meta.file_description().source_files.iter().map(|sf| &sf.params[0].value).collect();
         assert_eq!(
             values,
             [&Value::String("0000000000000000000000000000000000000123".into()), &Value::String("71be39fb2700ab2f3c8b2234b91274968b6899b1".into()), &Value::Empty]
         );
+        let others: Vec<&Value> = meta.file_description().source_files[1].params[1..].iter().map(|p| &p.value).collect();
+        assert_eq!(others, [&Value::String("00000000000000000000000000000456".into()), &Value::String("1e63".into())]);
         assert_eq!(h.restore_checksums(&mut meta), 0, "nothing left to restore");
     }
 
