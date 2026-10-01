@@ -5,7 +5,8 @@
 //!     spectrum (all 1,196 spectra of a negative-mode imaging run);
 //!   * every scan stated an `ion injection time`, every selected ion a `peak intensity` and every
 //!     activation a `collision energy`, 0 where the source or the archive holds none (201 and 186
-//!     such zeros on ProteoWizard's `swath.api-sample-centroid.mzML`, which states neither term);
+//!     such zeros on ProteoWizard's `swath.api-sample-centroid.mzML`, which states neither term),
+//!     and a scan that states no time a `scan start time` of 0 (every pixel of an imaging run);
 //!   * the direct mzML → mzML lane wrote mzdata's peak list for a centroid spectrum: m/z and a 32-bit
 //!     intensity, and none of the spectrum's other arrays (the per-peak 1/K0 of a combineIMS file);
 //!   * an array of length 0 was written as the zlib stream of nothing, which OpenMS 3.5 cannot
@@ -15,7 +16,8 @@
 //!   * a spectrum without a precursor got `<precursorList count="0">`, and a chromatogram's precursor
 //!     and product the lists the schema has for spectra only;
 //!   * the base-peak chromatogram summed for a source that has none was `BIC` over every spectrum on
-//!     the direct route and `BPC` over the MS1 spectra in the archive;
+//!     the direct route and `BPC` over the MS1 spectra in the archive, and a run without an MS1
+//!     spectrum got a pair summed over whatever it held;
 //!   * every `<offset>` of the index pointed at the line break before its element, and the
 //!     `<fileChecksum>` was not the SHA-1 of the file.
 //!
@@ -35,6 +37,10 @@ const TINY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.pwi
 const SWATH_GZ: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
 const SMALL_RAW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/small.RAW");
 const PASEF: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/pasef_combineims_centroid.pwiz.mzML");
+/// Nine pixels that state `ms level` 1 and no `scan start time`.
+const IMAGING: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML");
+/// Two MS2 spectra and no chromatogram.
+const MS2_ONLY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dangling_refs.mzML");
 /// The zlib stream of zero bytes, base64-encoded: what mzdata's writer prints for an empty array.
 const ZLIB_OF_NOTHING: &str = "eNoDAAAAAAE=";
 
@@ -264,9 +270,81 @@ fn the_direct_mzml_lane_writes_the_sources_arrays() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A scan that states no start time is exported without one. mzdata's model holds 0 for it and its
+/// writer prints that 0: through rc.1 the fixture's `scan=21`, which states no time, was exported
+/// with `scan start time` 0, and so was every pixel of an imaging run. The direct export reads which
+/// spectra state a time; an archive stores 0 for such a scan and only an imaging archive says that
+/// no time was stated (`imaging.provenance.time`), so its export states none, while the export of
+/// any other archive still writes the stored 0 (the manual's "Different by design").
+#[test]
+fn a_scan_without_a_start_time_is_exported_without_one() {
+    let dir = scratch("start-time");
+    let tiny = std::fs::read_to_string(TINY).unwrap();
+    assert_eq!((count(&tiny, "<spectrum "), count(&tiny, "MS:1000016")), (4, 3), "the fixture changed");
+    let times = |mzml: &str| -> Vec<(usize, usize)> {
+        elements(mzml, "spectrum").iter().map(|s| (count(s, "MS:1000016"), zeros(s, "MS:1000016"))).collect()
+    };
+    let routes = both_routes(Path::new(TINY), &dir, &[]);
+    assert_eq!(times(&routes[0].1), [(1, 0), (1, 0), (0, 0), (1, 0)], "direct: scan=21 states no time");
+    assert_eq!(times(&routes[1].1), [(1, 0), (1, 0), (1, 1), (1, 0)], "archive: the 0 it stores for scan=21");
+    let mut reader = mzdata::io::mzml::MzMLReader::new_indexed(std::io::Cursor::new(routes[0].1.clone().into_bytes()));
+    let read: Vec<f64> = reader.iter().map(|s| s.start_time()).collect();
+    assert_eq!(read[2], 0.0, "no time reads as mzdata's default");
+    assert!(read[0] > 5.0 && read[3] > 0.7, "{read:?}");
+    // A 0 the source writes itself is a statement, and stays.
+    let stated = r#"name="scan start time" value="5.8905000000000003""#;
+    assert_eq!(count(&tiny, stated), 1, "the fixture changed");
+    let source = dir.join("zero-time.mzML");
+    std::fs::write(&source, tiny.replace(stated, r#"name="scan start time" value="0""#)).unwrap();
+    let routes = both_routes(&source, &dir, &[]);
+    assert_eq!(times(&routes[0].1), [(1, 1), (1, 0), (0, 0), (1, 0)], "direct: the stated 0, and no other");
+    for (route, mzml, log) in &routes {
+        assert_well_formed(route, mzml, log);
+    }
+    // An imaging run that states no time at all: none on either route.
+    let imzml = std::fs::read_to_string(IMAGING).unwrap();
+    assert_eq!((count(&imzml, "<spectrum "), count(&imzml, "MS:1000016")), (9, 0), "the fixture changed");
+    for (route, mzml, log) in both_routes(Path::new(IMAGING), &dir, &[]) {
+        assert_eq!((count(&mzml, "<spectrum "), count(&mzml, "MS:1000016")), (9, 0), "{route}: a time nobody stated");
+        assert_eq!(count(&mzml, "accession=\"IMS:1000050\""), 9, "{route}: the scans keep what they state");
+        assert_well_formed(route, &mzml, &log);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Nothing is summed over a run without an MS1 spectrum, and a run left without a chromatogram has
+/// no `<chromatogramList>` and no chromatogram index: the schema lets a run go without the list,
+/// not the list without a member. Through rc.1 the two MS2 spectra of this fixture got a `TIC` and
+/// a `BIC` summed over them on the direct route, a `TIC` on the archive's.
+#[test]
+fn nothing_is_summed_over_a_run_without_an_ms1_spectrum() {
+    let dir = scratch("no-ms1");
+    let source = std::fs::read_to_string(MS2_ONLY).unwrap();
+    assert_eq!((count(&source, "<spectrum "), count(&source, "name=\"ms level\" value=\"2\""), count(&source, "<chromatogram")), (2, 2, 0), "the fixture changed");
+    for (route, mzml, log) in both_routes(Path::new(MS2_ONLY), &dir, &[]) {
+        assert_eq!((count(&mzml, "<spectrum "), count(&mzml, "<chromatogram")), (2, 0), "{route}: {}", &mzml[mzml.find("</spectrumList>").unwrap()..]);
+        assert_eq!((count(&mzml, "<indexList count=\"1\">"), count(&mzml, "<index name=")), (1, 1), "{route}");
+        assert_well_formed(route, &mzml, &log);
+        assert!(chromatograms(&mzml).is_empty(), "{route}");
+        let mut reader = mzdata::io::mzml::MzMLReader::new_indexed(std::io::Cursor::new(mzml.into_bytes()));
+        assert_eq!(reader.iter().count(), 2, "{route}");
+        if let Some(loads) = openms_loads(&dir.join(if route == "direct" { "direct.mzML" } else { "export.mzML" })) {
+            assert!(loads, "{route}: OpenMS FileInfo does not load the export");
+        }
+    }
+    // The export converts back, to an archive with the two spectra and no chromatogram of its own.
+    let back = dir.join("back.mzML");
+    convert(&dir.join("direct.mzML"), &dir.join("back.mzpeak"), &[], &[]);
+    convert(&dir.join("back.mzpeak"), &back, &[], &[]);
+    let back = std::fs::read_to_string(&back).unwrap();
+    assert_eq!((count(&back, "<spectrum "), count(&back, "<chromatogram")), (2, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The fixture's third spectrum (`scan=21`) has no point. Both routes write it with an m/z and an
-/// intensity array of length 0, each an empty `<binary>`; through rc.1 the archive's export had
-/// `<binaryDataArrayList count="0">`, which the schema does not allow.
+/// intensity array of length 0, each an empty `<binary>` declared `no compression` (an empty string
+/// is no zlib stream); through rc.1 the archive's export had `<binaryDataArrayList count="0">`,
+/// which the schema does not allow. The arrays of every other spectrum keep their compression.
 #[test]
 fn an_empty_spectrum_is_written_with_two_empty_arrays() {
     let dir = scratch("empty-spectrum");
@@ -276,6 +354,10 @@ fn an_empty_spectrum_is_written_with_two_empty_arrays() {
         assert!(empty.contains("defaultArrayLength=\"0\"") && empty.contains("<binaryDataArrayList count=\"2\">"), "{route}: {empty}");
         assert_eq!((count(empty, "encodedLength=\"0\""), count(empty, "<binary></binary>")), (2, 2), "{route}: {empty}");
         assert!(empty.contains("MS:1000514") && empty.contains("MS:1000515"), "{route}: an m/z and an intensity array");
+        assert_eq!((count(empty, "MS:1000576"), count(empty, "MS:1000574")), (2, 0), "{route}: declared uncompressed: {empty}");
+        for full in spectra.iter().filter(|s| !s.contains("id=\"scan=21\"")) {
+            assert_eq!((count(full, "MS:1000576"), count(full, "MS:1000574")), (0, 2), "{route}: {}", &full[..120]);
+        }
         assert_well_formed(route, &mzml, &log);
         let mut reader = mzdata::io::mzml::MzMLReader::new_indexed(std::io::Cursor::new(mzml.into_bytes()));
         let points: Vec<usize> = reader.iter().map(|s| s.peaks().len()).collect();
@@ -312,6 +394,7 @@ fn a_chromatogram_without_a_point_has_empty_payloads() {
     for c in &chroms {
         assert!(c.contains("defaultArrayLength=\"0\""), "{c}");
         assert_eq!(count(c, "encodedLength=\"0\""), count(c, "<binaryDataArray "), "{c}");
+        assert_eq!((count(c, "MS:1000576"), count(c, "MS:1000574")), (count(c, "<binaryDataArray "), 0), "declared uncompressed: {c}");
     }
     assert_well_formed("archive --rt", &mzml, &log);
     assert!(chromatograms(&mzml).iter().all(|c| c.time().unwrap().is_empty()));
@@ -393,22 +476,32 @@ fn corpus_hela_combine_ims_keeps_its_mobility_arrays() {
 }
 
 /// Three imaging runs whose imzML states no polarity and no injection time (one of them negative
-/// mode by its name): neither does an export, on either route. The first 25 pixels of each.
+/// mode by its name): neither does an export, on either route. Two of them state no scan start
+/// time either, and one of those `ms level` 0 on every pixel, through a param group: the exports
+/// state no time for the two, and sum no TIC or base-peak chromatogram over the one (through rc.1:
+/// a `scan start time` of 0 on every pixel, and a pair of 25 points at time 0). The first 25 pixels
+/// of each.
 #[test]
 fn corpus_imaging_exports_invent_no_polarity() {
-    for unit in [
-        "imzml-examples/zenodo-LA-ESI/imzML_LA-ESI/180817_NEG_Thaliana_Leaf_bottom_1_0841.imzML",
-        "imzml-examples/zenodo-LTP/imzML_LTP/ltpmsi-chilli.imzML",
-        "imzml-examples/zenodo-18187395-GBM-multimodal/imzml/Test_P15_r2.imzML",
+    for (unit, timed, ms1) in [
+        ("imzml-examples/zenodo-LA-ESI/imzML_LA-ESI/180817_NEG_Thaliana_Leaf_bottom_1_0841.imzML", false, true),
+        ("imzml-examples/zenodo-LTP/imzML_LTP/ltpmsi-chilli.imzML", true, true),
+        ("imzml-examples/zenodo-18187395-GBM-multimodal/imzml/Test_P15_r2.imzML", false, false),
     ] {
         let Some(source) = corpus::corpus_path(unit) else { continue };
         let text = std::fs::read_to_string(&source).unwrap();
         assert_eq!(count(&text, "MS:1000130") + count(&text, "MS:1000129") + count(&text, "MS:1000927"), 0, "{unit} changed");
+        assert_eq!(count(&text, "MS:1000016") > 0, timed, "{unit} changed");
+        assert_eq!(count(&text, "name=\"ms level\" value=\"0\"") == 0, ms1, "{unit} changed");
         let dir = scratch("imaging");
         for (route, mzml, log) in both_routes(&source, &dir, &[("MZPC_MAX_SPECTRA", "25")]) {
             assert_eq!(count(&mzml, "<spectrum "), 25, "{unit} {route}");
             assert_eq!(count(&mzml, "MS:1000130") + count(&mzml, "MS:1000129"), 0, "{unit} {route}: a polarity nobody stated");
             assert_eq!(count(&mzml, "MS:1000927"), 0, "{unit} {route}: ion injection time");
+            assert_eq!(count(&mzml, "MS:1000016"), if timed { 25 } else { 0 }, "{unit} {route}: scan start time");
+            let summed: Vec<String> = chromatograms(&mzml).iter().map(|c| format!("{}:{}", c.id(), c.time().unwrap().len())).collect();
+            assert_eq!(summed, if ms1 { vec!["TIC:25", "BPC:25"] } else { Vec::new() }, "{unit} {route}");
+            assert_eq!(count(&mzml, "<chromatogramList"), usize::from(ms1), "{unit} {route}");
             assert_eq!(count(&log, "25 of 25 spectra state no polarity"), 1, "{unit} {route}\n{log}");
             assert_well_formed(route, &mzml, &log);
         }

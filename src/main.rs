@@ -629,14 +629,17 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// both sit five sinks that change what mzdata's writer states wrongly:
 /// [`mzml_isolation::TargetOnlyWindows`] leaves an isolation window of unknown width target-only (the
 /// writer prints offsets of ±target), [`mzml_unstated::UnstatedTerms`] removes what the lanes marked
-/// as stated by nobody (a polarity, an injection time, a selected-ion intensity or a collision
-/// energy of 0) and the precursor lists the schema does not have, [`mzml_wavelength::WavelengthSpectra`]
+/// as stated by nobody (a polarity, a start time, an injection time, a selected-ion intensity or a
+/// collision energy of 0) and the lists the schema does not have (a precursor list without a
+/// member or in a chromatogram, a chromatogram list without a chromatogram),
+/// [`mzml_wavelength::WavelengthSpectra`]
 /// removes the terms the writer invents for a wavelength spectrum, all three in place, and
 /// [`mzml_header::HeaderFixes`] writes the
 /// header's `<scanSettingsList>` as the schema has it and declares `cv` — a vocabulary the document
 /// uses beside MS and UO, the only two the writer lists — moving the index's offsets by what that adds.
 /// Last, on the bytes as they are stored, [`mzml_index::IndexFixes`] points each offset of the index
-/// at its element and writes the checksum of what the file holds.
+/// at its element, leaves out an index without an offset and writes the checksum of what the file
+/// holds.
 fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let sink: Box<dyn Write> = if has_gz_suffix(output) {
@@ -2589,12 +2592,13 @@ fn convert_to_mzml(
     let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
     // The zeros the source states in its own text, which stay; every other 0 of those terms is
     // mzdata's default for "not stated" and is not written ([`mzml_unstated`]). Only an mzML or
-    // imzML can state one: a vendor reader has no way to say "measured, and 0".
+    // imzML can state one, or leave a scan without a time: a vendor reader gives every scan its
+    // time and has no way to say "measured, and 0" of the others.
     let stated = if scan_lane {
         mzml_unstated::StatedZeros::read(&read_path).unwrap_or_else(|e| {
             log::warn!(
-                "{}: not searched for the zeros it states ({e}); every `ion injection time`, `peak intensity` \
-                 and `collision energy` of 0 is written, stated by the source or not",
+                "{}: not searched for the zeros it states ({e}); every `scan start time`, `ion injection time`, \
+                 `peak intensity` and `collision energy` of 0 is written, stated by the source or not",
                 input.display()
             );
             mzml_unstated::StatedZeros::everything()
@@ -2604,10 +2608,12 @@ fn convert_to_mzml(
     };
     if stated.count() > 0 {
         log::info!(
-            "{} spectra and chromatograms state a zero injection time, selected-ion intensity or collision energy themselves: kept",
+            "{} spectra and chromatograms state a zero start time, injection time, selected-ion intensity or collision \
+             energy themselves: kept",
             stated.count()
         );
     }
+    let stated_by = |id: &str| if scan_lane { stated.spectrum(id) } else { mzml_unstated::Zeros::TIME };
     let mut written = 0usize;
     for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
@@ -2632,10 +2638,11 @@ fn convert_to_mzml(
         }
         // By the type's axis, not `!is_mass_spectrum()`: mzdata tests a type's direct parents only,
         // so MS:1000789 and MS:1000790, which ARE mass spectra, would count as something else.
+        let zeros = stated_by(spec.id());
         if spec.spectrum_type().is_some_and(|t| t.default_main_axis() == ArrayType::WavelengthArray) {
+            mzml_unstated::mark_start_times(spec.description_mut(), zeros);
             write_wavelength_spectrum(&mut w, &mut spec)?;
         } else {
-            let zeros = stated.spectrum(spec.id());
             write_mzml_spectrum(&mut w, &mut spec, zeros).map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
         }
         written += 1;
@@ -2849,6 +2856,12 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // `--no-ims-compact` archive) does not apply to it.
     let ims_compact = reader.file_index().metadata.contains_key("ims_calibration");
     let mut whole_frames = 0usize;
+    // An archive holds a 0 injection time, selected-ion intensity or collision energy as null: none
+    // is stated. It stores a time for every spectrum, 0 where the source stated none, and only an
+    // imaging archive's marker says which it is (`imaging.provenance.time`, for the run as a whole):
+    // there no spectrum gets a `scan start time` nobody stated (all 1,196 of the Thaliana run's).
+    let untimed = reader.file_index().metadata.get("imaging").is_some_and(imaging::states_no_time);
+    let stated = if untimed { mzml_unstated::Zeros::NONE } else { mzml_unstated::Zeros::TIME };
     for item in &items {
         match *item {
             ExportItem::Mass(i) => {
@@ -2867,9 +2880,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                 if let Some(arrays) = spec.arrays.as_mut() {
                     strip_grid_axis(arrays);
                 }
-                // An archive holds a 0 of these terms as null: none is stated.
-                write_mzml_spectrum(&mut w, &mut spec, mzml_unstated::Zeros::NONE)
-                    .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
+                write_mzml_spectrum(&mut w, &mut spec, stated).map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
             }
             ExportItem::Wavelength(k) => {
                 let mut spec = reader
@@ -3086,8 +3097,8 @@ fn interleave_by_time(mass: &[(usize, Option<f64>)], wavelength: &[(u64, Option<
 /// `write_agilent_profile_mzml`), so the four state the same things the same way:
 ///
 /// * nothing nobody stated ([`mzml_unstated`]): no polarity for a spectrum whose polarity is unknown,
-///   and no `ion injection time`, `peak intensity` or `collision energy` of 0 unless `stated` says the
-///   source wrote that 0 itself;
+///   and no `scan start time`, `ion injection time`, `peak intensity` or `collision energy` of 0
+///   unless `stated` says that 0 is a stated value;
 /// * no observed m/z range that is not a number: mzdata's Thermo reader states `lowest observed m/z`
 ///   inf and `highest observed m/z` -inf for a scan without a peak (570 such values on the 285 empty
 ///   MS2 spectra of `SZB8102938.RAW`);
@@ -3104,15 +3115,18 @@ fn write_mzml_spectrum<W: Write>(
     stated: mzml_unstated::Zeros,
 ) -> io::Result<()> {
     use mzdata::prelude::SpectrumWriter;
+    // Before the marks: a time nobody stated is not a number after them, and the summed
+    // chromatograms take the 0 a conversion to an archive takes.
+    let time = spec.start_time();
     let descr = spec.description_mut();
     mzml_unstated::mark_spectrum(descr, stated);
     descr.params.retain(|p| {
         !(matches!(p.curie(), Some(curie!(MS:1000527)) | Some(curie!(MS:1000528))) && p.to_f64().is_ok_and(|v| !v.is_finite()))
     });
-    mzml_signal(w, spec);
-    let point = (spec.ms_level() == 1).then(|| (spec.start_time(), chromatogram_summary(spec)));
+    let empty = mzml_signal(spec);
+    let point = (spec.ms_level() == 1).then(|| (time, chromatogram_summary(spec)));
     let (tic, bic) = (std::mem::take(&mut w.tic_collector), std::mem::take(&mut w.bic_collector));
-    let written = SpectrumWriter::write(w, &*spec);
+    let written = with_empty_arrays_uncompressed(w, empty, |w| SpectrumWriter::write(w, &*spec));
     (w.tic_collector, w.bic_collector) = (tic, bic);
     if let Some((time, (tic, base_peak))) = point {
         w.tic_collector.add(time, tic as f32);
@@ -3123,17 +3137,18 @@ fn write_mzml_spectrum<W: Write>(
 
 /// Hand a mass spectrum's signal to mzdata's mzML writer so that a spectrum without a point is
 /// written as the schema has it and as other readers take it: with an m/z and an intensity array of
-/// length 0, each with an empty `<binary>`.
+/// length 0, each with an empty `<binary>`. Returns the arrays of length 0, for
+/// [`with_empty_arrays_uncompressed`].
 ///
 /// The writer prints `<binaryDataArrayList count="0">` for a spectrum that holds no arrays (the
 /// archive reader's empty spectrum: 285 of them in the export of `SZB8102938.mzpeak`), which the mzML
 /// schema does not allow, and for an empty peak list two arrays whose payload is the zlib stream of
 /// nothing. A spectrum without a peak gets its arrays here, in the types the writer gives a peak
 /// list; arrays a source stated stay, in their own types ([`empty_arrays_for_mzml`]).
-fn mzml_signal<W: Write>(w: &mzdata::io::mzml::MzMLWriter<W>, spec: &mut MultiLayerSpectrum) {
+fn mzml_signal(spec: &mut MultiLayerSpectrum) -> Vec<(ArrayType, BinaryDataArrayType)> {
     let no_peaks = spec.peaks.as_ref().is_none_or(|p| p.is_empty()) && spec.deconvoluted_peaks.as_ref().is_none_or(|p| p.is_empty());
     if !no_peaks {
-        return;
+        return Vec::new();
     }
     spec.peaks = None;
     spec.deconvoluted_peaks = None;
@@ -3146,27 +3161,53 @@ fn mzml_signal<W: Write>(w: &mzdata::io::mzml::MzMLWriter<W>, spec: &mut MultiLa
         intensity.unit = Unit::DetectorCounts;
         arrays.add(intensity);
     }
-    empty_arrays_for_mzml(w, arrays);
+    empty_arrays_for_mzml(arrays)
 }
 
-/// Give every array of length 0 an empty payload: `encodedLength="0"` and `<binary></binary>`, what
-/// ProteoWizard writes for one. mzdata's writer compresses a decoded array whatever its length, and
-/// the zlib stream of nothing is 8 bytes (`eNoDAAAAAAE=`): valid, but OpenMS 3.5 fails to inflate it
-/// to an integer array (`Parsing error: 'Decompression error?'`) and refused the whole file — the
-/// exports of the five corpus archives that hold an empty chromatogram with a 64-bit integer
-/// `ms level` array. An array already in the compression the writer is about to apply is copied as
-/// it is, so an empty one marked that way is written empty; one that came in as that stream of
-/// nothing (an export of this tool's, converted again) is emptied too.
-fn empty_arrays_for_mzml<W: Write>(w: &mzdata::io::mzml::MzMLWriter<W>, arrays: &mut BinaryArrayMap) {
+/// Give every array of length 0 an empty payload, and say which they are: written through
+/// [`with_empty_arrays_uncompressed`], each is `encodedLength="0"`, `no compression` and
+/// `<binary></binary>`. mzdata's writer compresses a decoded array whatever its length, and the zlib
+/// stream of nothing is 8 bytes (`eNoDAAAAAAE=`): valid, but OpenMS 3.5 fails to inflate it to an
+/// integer array (`Parsing error: 'Decompression error?'`) and refused the whole file — the exports
+/// of the five corpus archives that hold an empty chromatogram with a 64-bit integer `ms level`
+/// array. An array that came in as that stream of nothing (an export of this tool's, converted
+/// again) is emptied too.
+fn empty_arrays_for_mzml(arrays: &mut BinaryArrayMap) -> Vec<(ArrayType, BinaryDataArrayType)> {
     use mzdata::spectrum::bindata::BinaryCompressionType;
+    let mut empty = Vec::new();
     for (_, array) in arrays.iter_mut() {
         let nothing = array.data.is_empty()
             || (array.compression == BinaryCompressionType::Zlib && array.data.len() <= 16 && array.decode().is_ok_and(|d| d.is_empty()));
         if nothing {
             array.data.clear();
-            array.compression = w.get_compression_method_for(array);
+            array.compression = BinaryCompressionType::NoCompression;
+            empty.push((array.name.clone(), array.dtype));
         }
     }
+    empty
+}
+
+/// Write one spectrum or chromatogram with its arrays of length 0 (`empty`, from
+/// [`empty_arrays_for_mzml`]) declared and written as `no compression`. The writer names an array's
+/// compression by its type and data type, not per array, and copies the payload of an array already
+/// in that compression as it is: for this one element those arrays are uncompressed, so the empty
+/// payload is what the element states it is (an empty string is no zlib stream). Every other array
+/// keeps the writer's compression, and so does the next element.
+fn with_empty_arrays_uncompressed<W: Write, T>(
+    w: &mut mzdata::io::mzml::MzMLWriter<W>,
+    empty: Vec<(ArrayType, BinaryDataArrayType)>,
+    write: impl FnOnce(&mut mzdata::io::mzml::MzMLWriter<W>) -> T,
+) -> T {
+    if empty.is_empty() {
+        return write(w);
+    }
+    let compression = w.data_array_compression.clone();
+    for (name, dtype) in empty {
+        w.set_compression_method(name, dtype, mzdata::spectrum::bindata::BinaryCompressionType::NoCompression);
+    }
+    let written = write(w);
+    w.data_array_compression = compression;
+    written
 }
 
 /// Write a wavelength (UV/PDA) spectrum through mzdata's mzML writer, keeping it out of the TIC and
@@ -3182,11 +3223,9 @@ fn write_wavelength_spectrum<W: Write>(
     if spec.description().polarity == mzdata::spectrum::ScanPolarity::Unknown {
         spec.description_mut().polarity = mzdata::spectrum::ScanPolarity::Positive;
     }
-    if let Some(arrays) = spec.arrays.as_mut() {
-        empty_arrays_for_mzml(w, arrays);
-    }
+    let empty = spec.arrays.as_mut().map(empty_arrays_for_mzml).unwrap_or_default();
     let (tic, bic) = (std::mem::take(&mut w.tic_collector), std::mem::take(&mut w.bic_collector));
-    let written = SpectrumWriter::write(w, &*spec);
+    let written = with_empty_arrays_uncompressed(w, empty, |w| SpectrumWriter::write(w, &*spec));
     (w.tic_collector, w.bic_collector) = (tic, bic);
     written.map(|_| ()).map_err(|e| anyhow!("writing wavelength spectrum {} to mzML: {e}", spec.id()))
 }
@@ -3271,7 +3310,7 @@ fn write_native_mzml_with(
         let mut spec = spectrum(i)?;
         // Native timsTOF readers attach MZP:1000006/7 to selected ions; mzML gets them as userParam.
         demote_mzp_params(spec.description_mut());
-        write_mzml_spectrum(&mut w, &mut spec, mzml_unstated::Zeros::NONE)
+        write_mzml_spectrum(&mut w, &mut spec, mzml_unstated::Zeros::TIME)
             .map_err(|e| anyhow!("writing spectrum {i} to mzML: {e}"))?;
     }
     // A Bruker `.d`'s HyStar device traces, which its archive carries too ([`bruker_traces`]); no
@@ -3363,7 +3402,7 @@ fn write_agilent_profile_mzml(
         descr.acquisition.scans.push(scan);
 
         let mut spec = MultiLayerSpectrum::new(descr, Some(arrays), None, None);
-        write_mzml_spectrum(&mut w, &mut spec, mzml_unstated::Zeros::NONE)
+        write_mzml_spectrum(&mut w, &mut spec, mzml_unstated::Zeros::TIME)
             .map_err(|e| anyhow!("writing spectrum {out_index} to mzML: {e}"))?;
         out_index += 1;
     }
@@ -3471,15 +3510,17 @@ fn schema_sample_chromatogram(mut chrom: Chromatogram) -> Chromatogram {
 /// ([`time_sorted_summary`]), each only when the source carries no chromatogram of that kind:
 /// a LabSolutions export's pair per acquisition event and an archive's own pair reach the mzML, and
 /// neither is doubled. The writer used to add its pair whenever a mass spectrum had been written and
-/// the source's pair was dropped for it. A chromatogramList must hold a chromatogram, so with nothing
-/// kept the writer's pair is written even when no spectrum was (empty, `defaultArrayLength` 0). Must
-/// be called after all spectra (the summaries are what has been written; writer state too).
+/// the source's pair was dropped for it. A trace summed over no MS1 spectrum has no point and is not
+/// written: nobody stated it, and through 0.17.0-rc.1 such a run got one summed over whatever it
+/// held instead. A run left without any chromatogram has no `<chromatogramList>` (the writer prints
+/// an empty one at close, which [`mzml_unstated::UnstatedTerms`] blanks, and
+/// [`mzml_index::IndexFixes`] drops its index). Must be called after all spectra (the summaries are
+/// what has been written; writer state too).
 /// The writer puts `<chromatogramList count>` out with the first chromatogram, from a count it
 /// starts at 2 (its own summary pair), so the count is set here first. Every array is given a type
 /// the writer can name ([`readable_chromatogram_arrays`]), every typed chromatogram its type term, and
 /// every array of length 0 an empty payload ([`empty_arrays_for_mzml`]): a chromatogram without a
-/// point — an archive's empty TIC, one an `--rt` window empties, the pair summed over no MS1
-/// spectrum — is one OpenMS reads.
+/// point — an archive's empty TIC, one an `--rt` window empties — is one OpenMS reads.
 fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromatogram>>(
     w: &mut mzdata::io::mzml::MzMLWriter<W>,
     source: I,
@@ -3525,9 +3566,9 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
         })
         .collect();
     // The writer's own summaries, the ones `write_summary_chromatograms` would add at close, for the
-    // kinds the source lacks. One summed over no mass spectrum is empty, and is written only when
-    // nothing else is (a chromatogramList must hold a chromatogram): a chromatogram-only file with
-    // its own TIC gains no empty base-peak trace.
+    // kinds the source lacks. One summed over no MS1 spectrum has no point and is not written: a
+    // chromatogram-only file with its own TIC gains no empty base-peak trace, and a run of MS2
+    // spectra alone, or of spectra that state `ms level` 0, no empty pair.
     let carried = |kind: ChromatogramType| kept.iter().any(|c| c.chromatogram_type() == kind);
     let mut summaries: Vec<Chromatogram> = [
         (ChromatogramType::TotalIonCurrentChromatogram, &w.tic_collector),
@@ -3536,14 +3577,13 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
     .into_iter()
     .filter(|(kind, _)| !carried(*kind))
     .map(|(_, collector)| time_sorted_summary(collector.to_chromatogram()))
+    .filter(|c| c.arrays.get(&ArrayType::TimeArray).and_then(|t| t.data_len().ok()).unwrap_or(0) > 0)
     .collect();
-    if !kept.is_empty() {
-        summaries.retain(|c| c.arrays.get(&ArrayType::TimeArray).and_then(|t| t.data_len().ok()).unwrap_or(0) > 0);
-    }
     w.chromatogram_count = (kept.len() + summaries.len()) as u64;
     for chrom in kept.iter_mut().chain(&mut summaries) {
-        empty_arrays_for_mzml(w, &mut chrom.arrays);
-        w.write_chromatogram(chrom).map_err(|e| anyhow!("writing chromatogram {:?} to mzML: {e}", chrom.id()))?;
+        let empty = empty_arrays_for_mzml(&mut chrom.arrays);
+        with_empty_arrays_uncompressed(w, empty, |w| w.write_chromatogram(chrom))
+            .map_err(|e| anyhow!("writing chromatogram {:?} to mzML: {e}", chrom.id()))?;
     }
     w.wrote_summaries = true;
     if !kept.is_empty() {
@@ -5221,7 +5261,7 @@ fn convert_file(
                 } else {
                     "none stated"
                 },
-                "time": if time_stated { "as stated" } else { "not stated by the source; index is the source list order" },
+                "time": if time_stated { "as stated" } else { imaging::TIME_NOT_STATED },
             });
             // imzML: what hashing the `.ibd` against the stated checksum found, and on a mismatch
             // the hash it has (`file_description` keeps the stated one).
@@ -9715,6 +9755,7 @@ mod tests {
         let pixel = |i: usize| {
             let mut spec = spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i);
             spec.description_mut().id = format!("scan={}", i + 1); // the index is keyed by id
+            spec.description_mut().ms_level = 1;
             let mut scan = mzdata::spectrum::ScanEvent::default();
             scan.add_param(Param::builder().name("position x").curie(mzdata::curie!(IMS:1000050)).value(i as i64 + 1).build());
             scan.add_param(Param::builder().name("position y").curie(mzdata::curie!(IMS:1000051)).value(1).build());
@@ -9749,6 +9790,9 @@ mod tests {
         super::write_native_mzml(&input, &plain, 3, |i| Ok(spec_from(&[100.0 + i as f64, 200.0], &[1.0, 2.0], i))).unwrap();
         let xml = std::fs::read_to_string(&plain).unwrap();
         assert!(xml.contains("<cvList count=\"2\">") && !xml.contains("IMS") && !xml.contains("<scanSettingsList"), "{}", &xml[..xml.find("<run ").unwrap()]);
+        // These three state no MS level: nothing is summed over them, and a run without a
+        // chromatogram has no list of them and no index of them.
+        assert!(!xml.contains("<chromatogram") && xml.contains("<indexList count=\"1\">"), "{}", &xml[xml.find("</spectrumList>").unwrap()..]);
     }
 
     /// The mzML export of an archive holding device traces converts back, into an archive and into

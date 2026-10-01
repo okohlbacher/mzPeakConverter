@@ -240,40 +240,55 @@ base-peak chromatogram (`BPC`) is added only for a kind the source or the archiv
 route the one a conversion synthesizes into an archive: a point per MS1 spectrum written, summed
 from the signal written, in time order. (Through 0.17.0-rc.1 the direct export summed every
 spectrum, from its stated total ion current where it had one, and named the base-peak trace `BIC`:
-201 points where the archive of the same file holds 15.) A run without an MS1 spectrum gets no
-summed pair; when it has no other chromatogram either, the pair is written empty, since a
-`chromatogramList` must hold one. Every precursor, a spectrum's or a chromatogram's, keeps its
-isolation window, dissociation method and collision energy; 1/K0 is MS:1002815 `inverse reduced ion
-mobility`, once per element. Different by design: a spectrum's total ion current, base peak and
-observed m/z range are the archive's, computed from the stored peaks (a timsTOF `.d` states each
-window spectrum's frame totals); an ims-compact archive's whole frames state no per-window 1/K0,
-`window group` or limits, and it holds HyStar's TIC/base-peak traces but not mzdata's per-window
-pair (28 chromatograms where the `.d`'s export has 30); the direct export of an mzML or imzML
-writes each spectrum's arrays as the source holds them — every array, in the source's data types
-and order — where an archive's export writes what the archive stores (a plain centroid spectrum as
-64-bit m/z and 32-bit intensity in m/z order, whatever the source's types); and a `collision energy`, `peak intensity` or `ion injection time` of 0 that an mzML
-states in its own text is kept by its direct export and absent from its archive's, which stores a
-0 of these three as null. Not in any archive yet, so not in its export: an SRM trace's product (Q3)
-window and a spectrum's `sum of spectra` combination.
+201 points where the archive of the same file holds 15.) A run without an MS1 spectrum — MS2 spectra
+alone, or an imaging run whose pixels state `ms level` 0 — gets no summed pair: nothing is summed
+over it, and a conversion synthesizes none into its archive either. When it has no other
+chromatogram, the export has no `chromatogramList` and no chromatogram index (the schema lets a run
+go without the list, not the list without a member); through 0.17.0-rc.1 such a run got a pair
+summed over whatever spectra it held. A summed point takes its spectrum's start time, 0 for a
+spectrum that states none, as in the archive. Every precursor, a spectrum's or a chromatogram's,
+keeps its isolation window, dissociation method and collision energy; 1/K0 is MS:1002815
+`inverse reduced ion mobility`, once per element. Different by design: a spectrum's total ion
+current, base peak and observed m/z range are the archive's, computed from the stored peaks (a
+timsTOF `.d` states each window spectrum's frame totals); an ims-compact archive's whole frames
+state no per-window 1/K0, `window group` or limits, and it holds HyStar's TIC/base-peak traces but
+not mzdata's per-window pair (28 chromatograms where the `.d`'s export has 30); the direct export of
+an mzML or imzML writes each spectrum's arrays as the source holds them — every array, in the
+source's data types and order — where an archive's export writes what the archive stores (a plain
+centroid spectrum as 64-bit m/z and 32-bit intensity in m/z order, whatever the source's types); a
+`collision energy`, `peak intensity` or `ion injection time` of 0 that an mzML states in its own
+text is kept by its direct export and absent from its archive's, which stores a 0 of these three as
+null; and a scan of an mzML that states no start time has none in the direct export and
+`scan start time` 0 in the archive's, which stores a time for every spectrum (an imaging archive
+excepted, below). Not in any archive yet, so not in its export: an SRM trace's product (Q3) window
+and a spectrum's `sum of spectra` combination.
 
 An export states nothing that neither its source nor its archive states. A spectrum whose polarity
 is unknown gets no polarity term (the run says how many, in one warning); a scan gets an
 `ion injection time`, a selected ion a `peak intensity` and an activation a `collision energy` only
 where one is known — a vendor reader's or an archive's 0 means "not stated", and only an mzML that
-writes the 0 itself keeps it. Through 0.17.0-rc.1 every export stated `positive scan` and the three
-zeros regardless: a negative-mode imaging run was exported as positive, and a reader could not tell
-a 0 from a measurement. Still written whatever the source says: a `scan start time` of 0 for a scan
-that states no time (the archive stores that time as 0, not as null), and `base peak m/z` and
-`base peak intensity` 0 on a spectrum without a peak. A spectrum without a point is written with an
-m/z and an intensity array of length 0 and no observed m/z range; every array of length 0, a
-chromatogram's included, has an empty `<binary>` (`encodedLength="0"`, as ProteoWizard writes it),
-not the zlib stream of nothing that OpenMS 3.5 fails on in an integer array. No spectrum has an
-empty `<precursorList>`, no precursor an empty `<selectedIonList>`, and a chromatogram holds its
-`<precursor>` and `<product>` directly, as the mzML 1.1.0 schema has them. Each `<offset>` of the
-index is the byte position of its `<spectrum>` or `<chromatogram>` start tag, `<indexListOffset>`
-that of `<indexList>`, and `<fileChecksum>` the SHA-1 of the file up to and including the
-`<fileChecksum>` start tag (of the uncompressed document for a `.mzML.gz`); through 0.17.0-rc.1
-the offsets pointed at the line break before each element and the checksum matched no export.
+writes the 0 itself keeps it. A scan gets a `scan start time` where one is stated: a vendor reader's
+and an archive's time is the scan's, 0 included; a scan of an mzML or imzML that states no time gets
+none in the direct export; and an imaging archive whose marker says that its source stated no time
+(`imaging.provenance.time`, §8) is exported without any. The direct export of an mzML or imzML reads
+which spectra and chromatograms state which of these four, in a `cvParam` of their own or of a
+`referenceableParamGroup` they refer to, in one extra pass over the source's text. Through
+0.17.0-rc.1 every export stated `positive scan`, the three zeros and a start time regardless: a
+negative-mode imaging run was exported as positive, every pixel of an imaging run without times as
+acquired at 0 min, and a reader could not tell a 0 from a measurement. Still written whatever the
+source says: `scan start time` 0 by the export of an archive that is not an imaging one, for a scan
+whose source stated no time (the archive stores 0, and nothing in it says which scans stated one),
+and `base peak m/z` and `base peak intensity` 0 on a spectrum without a peak. A spectrum without a
+point is written with an m/z and an intensity array of length 0 and no observed m/z range; every
+array of length 0, a chromatogram's included, is declared `no compression` and has an empty
+`<binary>` (`encodedLength="0"`), not the zlib stream of nothing that OpenMS 3.5 fails on in an
+integer array. No spectrum has an empty `<precursorList>`, no precursor an empty
+`<selectedIonList>`, and a chromatogram holds its `<precursor>` and `<product>` directly, as the
+mzML 1.1.0 schema has them. Each `<offset>` of the index is the byte position of its `<spectrum>` or
+`<chromatogram>` start tag, `<indexListOffset>` that of `<indexList>`, and `<fileChecksum>` the
+SHA-1 of the file up to and including the `<fileChecksum>` start tag (of the uncompressed document
+for a `.mzML.gz`); through 0.17.0-rc.1 the offsets pointed at the line break before each element and
+the checksum matched no export.
 
 The header. An export carries the source's **scan settings** as a `scanSettingsList` (an imaging
 run's grid and pixel size, an inclusion list's targets), from an mzML/imzML as read and from an
@@ -636,7 +651,8 @@ states gives both, as the vocabulary defines it) and a `provenance` record of wh
 where each value came from: `pixel_size` (`as stated`, `none stated`, or `checked, see
 imaging_pixel_size`), and on the imzML and mzML lanes `time` — `as stated`, or `not stated by the
 source; index is the source list order` when no spectrum states `MS:1000016` (every time is then
-stored as 0). A position stated as a scan cvParam (imzML, mzML) is written only as a
+stored as 0, and an mzML export of the archive states no `scan start time`, §4.1). A position
+stated as a scan cvParam (imzML, mzML) is written only as a
 pixel index: x and y both present, integers from 1 to 2³² − 1; any other is removed from its scan,
 all axes together, and declared `imaging:invalid-position-dropped`. A stated z that is not such an
 integer is removed alone, the scan keeping x and y, and declared `imaging:invalid-position-z-dropped`.

@@ -14,7 +14,9 @@
 //! are stored. It notes where every `<spectrum `, `<chromatogram ` and the `<indexList ` starts,
 //! hashes what passes, and holds the index — the tail of the document — to write each offset as the
 //! position of the element that follows it and the checksum as mzML defines it: the SHA-1 of the
-//! file up to and including the `<fileChecksum>` start tag.
+//! file up to and including the `<fileChecksum>` start tag. An `<index>` without an offset — the
+//! chromatogram index of a run without a chromatogram, which mzdata writes all the same and the
+//! indexed-mzML schema does not allow — is left out, and the list counts the rest.
 
 use std::io::{self, Write};
 
@@ -118,9 +120,10 @@ impl<W: Write> Drop for IndexFixes<W> {
 }
 
 /// The text from `<indexList ` to the end of the document with each `<offset>` moved to the
-/// element start that follows it within [`REACH`], `<indexListOffset>` set to `index_list`, and
-/// the `<fileChecksum>` the SHA-1 of everything before the index (`sha` so far) and of this text
-/// up to and including the `<fileChecksum>` start tag.
+/// element start that follows it within [`REACH`], `<indexListOffset>` set to `index_list`, no
+/// `<index>` without an offset ([`drop_empty_indexes`]), and the `<fileChecksum>` the SHA-1 of
+/// everything before the index (`sha` so far) and of this text up to and including the
+/// `<fileChecksum>` start tag.
 fn fix_index(index: &str, index_list: u64, elements: &[u64], mut sha: Sha1) -> String {
     let mut out = String::with_capacity(index.len() + 64);
     let mut rest = index;
@@ -147,6 +150,7 @@ fn fix_index(index: &str, index_list: u64, elements: &[u64], mut sha: Sha1) -> S
         rest = &tail[2..];
     }
     out.push_str(rest);
+    drop_empty_indexes(&mut out);
     if let Some(open) = out.find(CHECKSUM).map(|at| at + CHECKSUM.len()) {
         if let Some(close) = out[open..].find("</fileChecksum>").map(|i| open + i) {
             sha.update(&out.as_bytes()[..open]);
@@ -154,6 +158,36 @@ fn fix_index(index: &str, index_list: u64, elements: &[u64], mut sha: Sha1) -> S
         }
     }
     out
+}
+
+/// Take out each `<index>` that holds no `<offset>`, with the line break and indentation before it,
+/// and make the `<indexList>`'s count that of the indexes left. Nothing changes when none is empty,
+/// or when all are (a document without a spectrum or a chromatogram).
+fn drop_empty_indexes(index: &mut String) {
+    const CLOSE: &str = "</index>";
+    const COUNT: &str = "<indexList count=\"";
+    let (mut empty, mut kept, mut from) = (Vec::new(), 0usize, 0);
+    while let Some(open) = index[from..].find("<index ").map(|i| from + i) {
+        let Some(close) = index[open..].find(CLOSE).map(|i| open + i) else { break };
+        let body = index[open..close].split_once('>').map_or("", |(_, body)| body);
+        if body.trim().is_empty() {
+            empty.push(index[..open].trim_end().len()..close + CLOSE.len());
+        } else {
+            kept += 1;
+        }
+        from = close;
+    }
+    if empty.is_empty() || kept == 0 {
+        return;
+    }
+    for span in empty.into_iter().rev() {
+        index.replace_range(span, "");
+    }
+    if let Some(open) = index.find(COUNT).map(|at| at + COUNT.len()) {
+        if let Some(end) = index[open..].find('"') {
+            index.replace_range(open..open + end, &kept.to_string());
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -284,6 +318,23 @@ mod tests {
             assert_eq!(written.len(), cut, "cut at {cut}");
             assert!(written.ends_with(&raw[cut - 10..cut]), "cut at {cut}");
         }
+    }
+
+    /// A run without a chromatogram: mzdata writes an empty chromatogram index, which goes, and the
+    /// list counts the one index left. An index with offsets stays, and so do two empty ones.
+    #[test]
+    fn an_index_without_an_offset_is_left_out() {
+        let index = "<indexList count=\"2\">\n    <index name=\"spectrum\">\n      <offset idRef=\"a\">100</offset>\n    </index>\n    <index name=\"chromatogram\">\n    </index>\n  </indexList>\n  <indexListOffset>7</indexListOffset>\n  <fileChecksum>0</fileChecksum>\n</indexedmzML>";
+        let fixed = fix_index(index, 900, &[109], Sha1::new());
+        assert_eq!(
+            fixed.split_once("<indexListOffset>").unwrap().0,
+            "<indexList count=\"1\">\n    <index name=\"spectrum\">\n      <offset idRef=\"a\">109</offset>\n    </index>\n  </indexList>\n  "
+        );
+        assert_eq!(checksum(&fixed).0, checksum(&fixed).1, "the checksum is of the text as it is written");
+        let both = fixed.replace("count=\"1\"", "count=\"2\"").replace("</index>", "</index><index name=\"chromatogram\"><offset idRef=\"TIC\">300</offset></index>");
+        assert!(fix_index(&both, 900, &[109], Sha1::new()).contains("<indexList count=\"2\">"), "{both}");
+        let none = "<indexList count=\"2\"><index name=\"spectrum\"></index><index name=\"chromatogram\"> </index></indexList><fileChecksum>0</fileChecksum>";
+        assert_eq!(fix_index(none, 0, &[], Sha1::new()).split_once("<fileChecksum>").unwrap().0, none.split_once("<fileChecksum>").unwrap().0);
     }
 
     #[test]
