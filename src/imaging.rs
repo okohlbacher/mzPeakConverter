@@ -777,39 +777,90 @@ pub fn user_pixel_size() -> Option<UserPixelSize> {
 const PIXEL_SIZE_TERMS: [(CURIE, &str); 2] = [(mzdata::curie!(IMS:1000046), "pixel size (x)"), (mzdata::curie!(IMS:1000047), "pixel size y")];
 const MAX_DIMENSION_TERMS: [(CURIE, &str); 2] = [(mzdata::curie!(IMS:1000044), "max dimension x"), (mzdata::curie!(IMS:1000045), "max dimension y")];
 
-/// Where a grid entry's stated pixel size (`None`: not stated on either axis) differs from the
-/// supplied one: one line per axis, naming the stated value. A stated axis whose value is no length
-/// in micrometres (zero, a unit that is no length) differs too: the source settled something the
-/// supplied size would overwrite.
-pub fn user_pixel_size_differences(grid: Option<&ScanSettings>, user: &UserPixelSize) -> Vec<String> {
-    let Some(grid) = grid else { return Vec::new() };
-    PIXEL_SIZE_TERMS
-        .iter()
-        .zip([user.x, user.y])
-        .filter_map(|((curie, name), want)| {
-            let p = grid.params.iter().find(|p| p.curie() == Some(*curie))?;
-            match um_of(p) {
-                Some(v) if approx(v, want) => None,
-                Some(v) => Some(format!("{name} ({curie}) = {v} µm")),
-                None => Some(format!("{name} ({curie}) = {} {}", p.value, p.unit.to_curie().map(|c| c.to_string()).unwrap_or_else(|| "(no unit)".into()))),
-            }
-        })
-        .collect()
+/// Where a grid entry contradicts the supplied size. `sizes`: one line per axis whose stated pixel
+/// size differs, naming the stated value — a stated axis whose value is no length in micrometres
+/// (zero, a unit that is no length) differs too: the source settled something the supplied size
+/// would overwrite. `extents`: one line per axis that states no pixel size but a pixel count and a
+/// max dimension the supplied size does not give (count × supplied ≠ max dimension, the test the
+/// imzML rule settles a size by, D4): the evidence that would have proved a size says the supplied
+/// one is not it (review 2026-10-01 of this unit: 20 µm over a 150 µm × 3 px axis was written
+/// beside the 150 µm in silence). An axis stating a size is tested against that size alone: a
+/// stated size the source's own extent contradicts is the source's inconsistency, which the imzML
+/// rule records, not the supplied value's.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct UserPixelSizeDifferences {
+    pub sizes: Vec<String>,
+    pub extents: Vec<String>,
 }
 
-/// Refuse a `--pixel-size` that contradicts a size `grid` states, unless `--force` (owner principle
-/// P3: the supplied size could be the wrong data). `what` names the source for the message.
+impl UserPixelSizeDifferences {
+    pub fn is_empty(&self) -> bool {
+        self.sizes.is_empty() && self.extents.is_empty()
+    }
+
+    /// What the source states: "a pixel size that differs (…)", "a max dimension the supplied size
+    /// does not give (…)", or both.
+    pub fn text(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.sizes.is_empty() {
+            parts.push(format!("a pixel size that differs ({})", self.sizes.join(", ")));
+        }
+        if !self.extents.is_empty() {
+            parts.push(format!("a max dimension the supplied size does not give ({})", self.extents.join(", ")));
+        }
+        parts.join(" and ")
+    }
+}
+
+/// A max dimension in micrometres: as [`um_of`] reads it, or — stated without a unit — the value
+/// as micrometres, the imzML rule's reading of such a param (`true`: assumed).
+fn extent_um(p: &Param) -> Option<(f64, bool)> {
+    match um_of(p) {
+        Some(v) => Some((v, false)),
+        None if p.unit == Unit::Unknown => p.value.to_f64().ok().filter(|v| v.is_finite() && *v > 0.0).map(|v| (v, true)),
+        None => None,
+    }
+}
+
+pub fn user_pixel_size_differences(grid: Option<&ScanSettings>, user: &UserPixelSize) -> UserPixelSizeDifferences {
+    let mut d = UserPixelSizeDifferences::default();
+    let Some(grid) = grid else { return d };
+    let find = |curie: CURIE| grid.params.iter().find(|p| p.curie() == Some(curie));
+    for ((((curie, name), want), count), (ext, ext_name)) in PIXEL_SIZE_TERMS.iter().zip([user.x, user.y]).zip(COUNTS).zip(MAX_DIMENSION_TERMS) {
+        match find(*curie) {
+            Some(p) => match um_of(p) {
+                Some(v) if approx(v, want) => {}
+                Some(v) => d.sizes.push(format!("{name} ({curie}) = {v} µm")),
+                None => d.sizes.push(format!("{name} ({curie}) = {} {}", p.value, p.unit.to_curie().map(|c| c.to_string()).unwrap_or_else(|| "(no unit)".into()))),
+            },
+            None => {
+                let Some(n) = find(count).and_then(|p| p.value.to_f64().ok()).filter(|n| *n > 0.0) else { continue };
+                let Some((e, assumed)) = find(ext).and_then(extent_um) else { continue };
+                if !approx(n * want, e) {
+                    let note = if assumed { " (no unit: micrometre assumed)" } else { "" };
+                    d.extents.push(format!("{ext_name} ({ext}) = {e} µm{note} over {n} pixels, not {n} × {want} µm = {} µm", n * want));
+                }
+            }
+        }
+    }
+    d
+}
+
+/// Refuse a `--pixel-size` that contradicts what `grid` states — a pixel size, or the max dimension
+/// of an axis without one — unless `--force` (owner principle P3: the supplied size could be the
+/// wrong data). `what` names the source for the message.
 pub fn check_user_pixel_size(grid: Option<&ScanSettings>, user: &UserPixelSize, what: &str) -> Result<()> {
     let differing = user_pixel_size_differences(grid, user);
     if differing.is_empty() || user.force {
         return Ok(());
     }
     bail!(
-        "--pixel-size {}: {what} states a pixel size that differs ({}); the supplied size is written \
-         only where the source settles none. Check which is right; --force writes the supplied size \
-         over the stated one, declared as {USER_SUPPLIED} and recorded in imaging_pixel_size",
+        "--pixel-size {}: {what} states {}; the supplied size is written only where the source \
+         settles none. Check which is right; --force writes the supplied size over what is stated \
+         (a stated max dimension is recomputed from the pixel counts), declared as {USER_SUPPLIED} \
+         and recorded in imaging_pixel_size",
         user.text(),
-        differing.join(", ")
+        differing.text()
     );
 }
 
@@ -818,11 +869,13 @@ pub fn check_user_pixel_size(grid: Option<&ScanSettings>, user: &UserPixelSize, 
 /// rewrite on the archive's list). `IMS:1000046/47` are written in µm where the entry states
 /// neither — a stated axis that agrees with the supplied value stays as it is and the other is
 /// filled (a Waters single row states the x step alone) — and `IMS:1000044/45` from the pixel counts
-/// where the entry states those and no max dimension. A stated size that differs is refused
+/// where the entry states those and no max dimension. A stated size that differs, or a stated max
+/// dimension the supplied size does not give on an axis without a size, is refused
 /// ([`check_user_pixel_size`]) unless `--force`: then the supplied size is written over it, the
-/// stated values are recorded, and a stated max dimension is recomputed from the counts. `None`
-/// when the entry already states the supplied size on both axes; else the `imaging_pixel_size` row
-/// to list, whose transformation is [`USER_SUPPLIED`].
+/// stated values are recorded, and a stated max dimension is recomputed from the counts (its stated
+/// value kept in the row's `max_dimension`). `None` when the entry already states the supplied size
+/// on both axes; else the `imaging_pixel_size` row to list, whose transformation is
+/// [`USER_SUPPLIED`].
 pub fn apply_user_pixel_size(grid: &mut ScanSettings, user: &UserPixelSize, what: &str) -> Result<Option<serde_json::Value>> {
     check_user_pixel_size(Some(grid), user, what)?;
     let at = |grid: &ScanSettings, curie: CURIE| grid.params.iter().position(|p| p.curie() == Some(curie));
@@ -833,7 +886,8 @@ pub fn apply_user_pixel_size(grid: &mut ScanSettings, user: &UserPixelSize, what
             Some(serde_json::json!({"accession": curie.to_string(), "value": p.value.to_string(), "unit": p.unit.to_curie().map(|c| c.to_string())}))
         })
         .collect();
-    let overridden = !user_pixel_size_differences(Some(grid), user).is_empty();
+    let differing = user_pixel_size_differences(Some(grid), user);
+    let overridden = !differing.is_empty();
     if stated.len() == 2 && !overridden {
         log::info!("--pixel-size {}: {what} states the same size; nothing to write", user.text());
         return Ok(None);
@@ -860,9 +914,11 @@ pub fn apply_user_pixel_size(grid: &mut ScanSettings, user: &UserPixelSize, what
         let Some(n) = at(grid, *count).and_then(|i| grid.params[i].value.to_f64().ok()).filter(|n| *n > 0.0) else { continue };
         match at(grid, curie) {
             Some(i) if overridden => {
-                grid.params[i].value = (n * v).into();
-                grid.params[i].unit = Unit::Micrometer;
-                max_dimension.push(format!("{curie} recomputed as {n} × {v} µm"));
+                let p = &mut grid.params[i];
+                let was = format!("{} {}", p.value, p.unit.to_curie().map(|c| c.to_string()).unwrap_or_else(|| "(no unit)".into()));
+                p.value = (n * v).into();
+                p.unit = Unit::Micrometer;
+                max_dimension.push(format!("{curie} (stated {was}) recomputed as {n} × {v} µm"));
             }
             Some(_) => {}
             None => {
@@ -872,9 +928,9 @@ pub fn apply_user_pixel_size(grid: &mut ScanSettings, user: &UserPixelSize, what
         }
     }
     let detail = match (stated.is_empty(), overridden) {
-        (true, _) => format!("{what} states no pixel size; {} written as supplied", user.text()),
-        (false, true) => format!("{what} states a different pixel size; {} written over it (--force)", user.text()),
+        (true, false) => format!("{what} states no pixel size; {} written as supplied", user.text()),
         (false, false) => format!("{what} states one axis, which agrees; the other written as supplied ({})", user.text()),
+        (_, true) => format!("{what} states {}; {} written over it (--force)", differing.text(), user.text()),
     };
     log::warn!("--pixel-size: {detail}{}", if max_dimension.is_empty() { String::new() } else { format!("; {}", max_dimension.join(", ")) });
     Ok(Some(serde_json::json!({
@@ -2648,6 +2704,46 @@ mod tests {
         zero.params.push(size(mzdata::curie!(IMS:1000046), "pixel size (x)", 0.0, Unit::Micrometer));
         let e = apply_user_pixel_size(&mut zero, &user(20.0, 20.0, false), "the test").unwrap_err().to_string();
         assert!(e.contains("= 0 UO:0000017"), "{e}");
+        // An axis without a size but with a count and a max dimension (the evidence the imzML rule
+        // settles a size by, D4) tests the supplied size the other way round: 3 × 50 = 150 µm
+        // fills, 20 is refused naming the stated extent, and --force writes 20 over it with the max
+        // dimension recomputed and its stated value kept in the row (through this unit's first
+        // cut, 20 µm was written beside the 150 µm in silence).
+        let mut extent = ScanSettings { id: "g".into(), ..Default::default() };
+        extent.params.push(count(mzdata::curie!(IMS:1000042), "max count of pixels x", 3));
+        extent.params.push(count(mzdata::curie!(IMS:1000043), "max count of pixels y", 2));
+        extent.params.push(size(mzdata::curie!(IMS:1000044), "max dimension x", 150.0, Unit::Micrometer));
+        extent.params.push(size(mzdata::curie!(IMS:1000045), "max dimension y", 0.1, Unit::Millimeter));
+        let before = extent.clone();
+        let mut agreed = extent.clone();
+        let row = apply_user_pixel_size(&mut agreed, &user(50.0, 50.0, false), "the test").unwrap().unwrap();
+        assert_eq!(agreed.params[..4], before.params[..4], "the stated extents stay");
+        assert_eq!(values(&agreed)[4..], [("IMS:1000046".into(), 50.0, Unit::Micrometer), ("IMS:1000047".into(), 50.0, Unit::Micrometer)]);
+        assert_eq!((&row["overridden"], row["max_dimension"].as_array().unwrap().len()), (&serde_json::json!(false), 0), "{row:#}");
+        let d = user_pixel_size_differences(Some(&extent), &user(20.0, 20.0, false));
+        assert!(d.sizes.is_empty(), "{d:?}");
+        assert_eq!(d.extents, ["max dimension x (IMS:1000044) = 150 µm over 3 pixels, not 3 × 20 µm = 60 µm", "max dimension y (IMS:1000045) = 100 µm over 2 pixels, not 2 × 20 µm = 40 µm"]);
+        let e = apply_user_pixel_size(&mut extent, &user(20.0, 20.0, false), "the test").unwrap_err().to_string();
+        assert!(e.contains("the test states a max dimension the supplied size does not give (max dimension x (IMS:1000044) = 150 µm over 3 pixels, not 3 × 20 µm = 60 µm, ") && e.contains("--force"), "{e}");
+        assert_eq!(extent.params, before.params, "refused: untouched");
+        let row = apply_user_pixel_size(&mut extent, &user(20.0, 20.0, true), "the test").unwrap().unwrap();
+        assert_eq!(values(&extent)[2..], [("IMS:1000044".into(), 60.0, Unit::Micrometer), ("IMS:1000045".into(), 40.0, Unit::Micrometer), ("IMS:1000046".into(), 20.0, Unit::Micrometer), ("IMS:1000047".into(), 20.0, Unit::Micrometer)]);
+        assert_eq!((&row["overridden"], row["stated"].as_array().unwrap().len()), (&serde_json::json!(true), 0), "{row:#}");
+        assert_eq!(row["max_dimension"], serde_json::json!(["IMS:1000044 (stated 150 UO:0000017) recomputed as 3 × 20 µm", "IMS:1000045 (stated 0.1 UO:0000016) recomputed as 2 × 20 µm"]));
+        assert!(row["detail"].as_str().unwrap().contains("states a max dimension the supplied size does not give"), "{}", row["detail"]);
+        // A max dimension stated without a unit is read as micrometres, as the imzML rule reads it.
+        let mut unitless = ScanSettings { id: "g".into(), ..Default::default() };
+        unitless.params.push(count(mzdata::curie!(IMS:1000042), "max count of pixels x", 3));
+        unitless.params.push(count(mzdata::curie!(IMS:1000044), "max dimension x", 150));
+        assert!(user_pixel_size_differences(Some(&unitless), &user(50.0, 50.0, false)).is_empty());
+        assert_eq!(user_pixel_size_differences(Some(&unitless), &user(20.0, 20.0, false)).extents, ["max dimension x (IMS:1000044) = 150 µm (no unit: micrometre assumed) over 3 pixels, not 3 × 20 µm = 60 µm"]);
+        // An axis that states a size is tested against that size alone: 100 × 3 ≠ 150 is the
+        // source's own inconsistency (the imzML rule records it), not the supplied value's.
+        let mut off = before.clone();
+        off.params.push(size(mzdata::curie!(IMS:1000046), "pixel size (x)", 100.0, Unit::Micrometer));
+        off.params.push(size(mzdata::curie!(IMS:1000047), "pixel size y", 50.0, Unit::Micrometer));
+        assert!(user_pixel_size_differences(Some(&off), &user(100.0, 50.0, false)).is_empty());
+        assert_eq!(user_pixel_size_differences(Some(&off), &user(50.0, 50.0, false)).text(), "a pixel size that differs (pixel size (x) (IMS:1000046) = 100 µm)");
         // Parsing.
         assert_eq!(UserPixelSize::parse("10", false).unwrap(), user(10.0, 10.0, false));
         assert_eq!(UserPixelSize::parse(" 10 , 20.5 ", true).unwrap(), user(10.0, 20.5, true));

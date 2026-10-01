@@ -867,9 +867,12 @@ impl Settings {
         note(cli.msconvert_path.is_some(), "--msconvert-path");
         note(cli.pixel_size.is_some(), "--pixel-size");
         let force = cli.force || fc.force.unwrap_or(false);
-        // Parsed here, so a malformed size is refused before any lane opens the input.
+        // Parsed here, so a malformed size is refused before any lane opens the input. Only the
+        // command line's --force writes the supplied size over one the source states: a config
+        // file's standing `force: true` overwrites outputs, and acknowledges no contradiction of
+        // this run (owner principle P3).
         let pixel_size = match cli.pixel_size.clone().or_else(|| fc.pixel_size.as_ref().map(PixelSizeConfig::text)) {
-            Some(text) => Some(imaging::UserPixelSize::parse(&text, force)?),
+            Some(text) => Some(imaging::UserPixelSize::parse(&text, cli.force)?),
             None => None,
         };
         // `--lossless` is an umbrella: it IS the point layout with zero runs kept and no m/z grid
@@ -1669,14 +1672,15 @@ impl Lane {
             ),
             Lane::SdkImsCompact => (
                 "the --bruker-sdk ims-compact lane",
-                "drop --bruker-sdk (the native timsTOF lane honours --ims-chunked and \
-                 --no-tims-recalibration), and add them with a second run on the archive: \
+                "drop --bruker-sdk (the native timsTOF lane honours --ims-chunked, \
+                 --no-tims-recalibration and --pixel-size), and add them with a second run on the archive: \
                  `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` (--image only when \
                  the archive is imaging, a MALDI run)",
             ),
             Lane::BrukerSdk => (
                 "the --bruker-sdk f64 lane",
-                "drop --bruker-sdk, or drop the options; --image/--sdrf can be added with a second \
+                "drop --bruker-sdk (the native lanes honour them), or drop the options; --image/--sdrf, \
+                 and --pixel-size on an imaging archive, can be added with a second \
                  run on the archive: `mzpeak-convert out.mzpeak -o with.mzpeak --image … --sdrf …` \
                  (--image only when the archive is imaging, a MALDI run)",
             ),
@@ -1720,8 +1724,10 @@ fn dropped_flags_for(lane: Lane) -> &'static [&'static str] {
         // Lane selection puts msconvert before every native backend, so these four would be
         // silently overridden — the user chose a reader and gets a different one.
         Lane::ViaMsconvert => &["--aux", "--bruker-sdk", "--no-ims-compact", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
-        Lane::SdkImsCompact => &["--image", "--sdrf", "--no-tims-recalibration"],
-        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration"],
+        // The SDK lanes mark no MALDI run imaging and write no pixel grid: `--pixel-size` would size
+        // nothing (the native lanes write the grid, and the archive can be sized afterwards).
+        Lane::SdkImsCompact => &["--image", "--sdrf", "--no-tims-recalibration", "--pixel-size"],
+        Lane::BrukerSdk => &["--image", "--sdrf", "--ims-chunked", "--no-ims-chunked", "--no-tims-recalibration", "--pixel-size"],
         Lane::ImsCompact => &["--image", "--sdrf"],
         Lane::VendorReader => &["--image", "--sdrf"],
         Lane::Standard => &[],
@@ -14457,6 +14463,17 @@ mod tests {
         for lane in [Lane::Standard, Lane::ViaMsconvert, Lane::VendorReader, Lane::BrukerSdk] {
             assert!(!super::inert_flags_for(lane).contains(&flag) && !super::dropped_flags_for(lane).contains(&flag), "{lane:?} honours it");
         }
+        // `--pixel-size` sizes an imaging grid: refused by every lane that writes none (the two SDK
+        // lanes mark no MALDI run imaging — through this unit's first cut they took the flag and
+        // exited 0 — the Agilent grid, the two mzML outputs); the rest honour it or refuse it at
+        // run time, on the run that turns out not to be imaging.
+        let flag = "--pixel-size";
+        for lane in [Lane::AgilentGrid, Lane::SdkImsCompact, Lane::BrukerSdk, Lane::FilterToMzml, Lane::MzmlExport] {
+            assert!(super::dropped_flags_for(lane).contains(&flag), "{lane:?}");
+        }
+        for lane in [Lane::Filter, Lane::Standard, Lane::ViaMsconvert, Lane::ImsCompact, Lane::VendorReader] {
+            assert!(!super::dropped_flags_for(lane).contains(&flag) && !super::inert_flags_for(lane).contains(&flag), "{lane:?} honours it");
+        }
     }
 
     /// Every lane refusing `--image` names a remedy that works: the second run on the archive, which
@@ -14871,19 +14888,31 @@ mod tests {
             let acc = row["accession"].as_str().unwrap();
             assert_eq!(row["unit"], param(&m["scan_settings_list"][0], acc).unwrap()["unit"], "{acc}: {:#}", m["imaging_pixel_size"]);
         }
-        // A single y in that unit pair is read both ways against the extent (owner decision D4):
+        // A single value in that unit pair is read both ways against the extent (owner decision D4):
         // 100 "micrometer" × 3 = 300 µm passes by the name and is kept as it was; 0.01 passes only
         // as 0.01 cm (the accession) and is written as 100 µm, declared (it was dropped through
-        // 0.17.0-rc.2; before review B17 it passed by accession and was written as 0.01 µm).
-        for (name, value, by_accession) in [("cm_y", "100.0", false), ("cm_y_small", "0.01", true)] {
-            let m = convert(name, base.replace(px, "").replace(py, &cm(py).replace("100.0", value)));
-            let written = param(&m["scan_settings_list"][0], "IMS:1000047");
-            assert!(written.is_some(), "{name}: {:#}", m["imaging_pixel_size"]);
+        // 0.17.0-rc.2; before review B17 it passed by accession and was written as 0.01 µm). A lone
+        // x gives y too (the vocabulary's default), so the marker reads both and says `declared`;
+        // a lone y says nothing about x: the marker has no `pixel_size_um` and says `unknown`, by
+        // its own rule (the first cut of this unit asserted `declared` of the lone y).
+        for (name, lone_x, value, by_accession) in [("cm_x", true, "100.0", false), ("cm_x_small", true, "0.01", true), ("cm_y", false, "100.0", false), ("cm_y_small", false, "0.01", true)] {
+            let header = if lone_x { base.replace(py, "").replace(px, &cm(px).replace("100.0", value)) } else { base.replace(px, "").replace(py, &cm(py).replace("100.0", value)) };
+            let m = convert(name, header);
+            let s = &m["scan_settings_list"][0];
             assert!(!declared(&m, super::imaging::DROPPED), "{name}: {:#}", m["transformations"]);
             assert_eq!(declared(&m, super::imaging::UNIT_FROM_ACCESSION), by_accession, "{name}: {:#}", m["transformations"]);
-            assert_eq!(m["imaging"]["pixel_size_source"], "declared", "{name}: {:#}", m["imaging"]);
-            if let Some(w) = written {
-                assert_eq!((&w["value"], &w["unit"]), (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}");
+            let written: Vec<&str> = if lone_x { vec!["IMS:1000046", "IMS:1000047"] } else { vec!["IMS:1000047"] };
+            for acc in ["IMS:1000046", "IMS:1000047"] {
+                match param(s, acc) {
+                    Some(w) => assert!(written.contains(&acc) && (&w["value"], &w["unit"]) == (&serde_json::json!(100.0), &serde_json::json!("UO:0000017")), "{name}: {acc} {w:#}"),
+                    None => assert!(!written.contains(&acc), "{name}: no {acc}: {s:#}"),
+                }
+            }
+            if lone_x {
+                assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging"]["pixel_size_source"]), (&serde_json::json!({"x": 100.0, "y": 100.0}), &serde_json::json!("declared")), "{name}: {:#}", m["imaging"]);
+            } else {
+                assert!(m["imaging"].get("pixel_size_um").is_none(), "{name}: {:#}", m["imaging"]);
+                assert_eq!(m["imaging"]["pixel_size_source"], "unknown", "{name}: {:#}", m["imaging"]);
             }
         }
 
@@ -15014,6 +15043,28 @@ mod tests {
             let (ok, _, err) = convert(&thyra("unit_contradiction"), "bad.mzpeak", &[&flag]);
             assert!(!ok && err.contains("--pixel-size") && !dir.join("bad.mzpeak").exists(), "{bad}: {err}");
         }
+        // An axis stating no size but a count and a max dimension — the evidence D4 settles a size
+        // by — tests the supplied size the other way round (this unit's first cut wrote 20 µm beside
+        // a 150 µm × 3 px axis in silence): 50 fills and keeps the extents, 20 is refused naming the
+        // extent before anything is written, --force writes 20 with the extents recomputed.
+        let header = std::fs::read_to_string(thyra("unit_contradiction")).unwrap();
+        let size_line = r#"<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size" value="50" unitCvRef="UO" unitAccession="UO:0000015" unitName="micrometer"/>"#;
+        assert!(header.contains(size_line), "{header}");
+        let extents = r#"<cvParam cvRef="IMS" accession="IMS:1000044" name="max dimension x" value="150" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/><cvParam cvRef="IMS" accession="IMS:1000045" name="max dimension y" value="100" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#;
+        std::fs::write(dir.join("extent_only.imzML"), header.replace(size_line, extents)).unwrap();
+        std::fs::copy(thyra("unit_contradiction").with_extension("ibd"), dir.join("extent_only.ibd")).unwrap();
+        let (ok, _, err) = convert(&dir.join("extent_only.imzML"), "extent-refused.mzpeak", &["--pixel-size", "20"]);
+        assert!(!ok && err.contains("max dimension x (IMS:1000044) = 150 µm over 3 pixels, not 3 × 20 µm = 60 µm") && err.contains("--force"), "{err}");
+        assert!(!dir.join("extent-refused.mzpeak").exists(), "nothing written");
+        let (ok, m, err) = convert(&dir.join("extent_only.imzML"), "extent-filled.mzpeak", &["--pixel-size", "50"]);
+        assert!(ok, "{err}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 150.0), um("IMS:1000045", 100.0), um("IMS:1000046", 50.0), um("IMS:1000047", 50.0)]);
+        assert_eq!((&m["imaging"]["pixel_size_source"], &m["imaging_pixel_size"][0]["max_dimension"]), (&serde_json::json!("user_supplied"), &serde_json::json!([])), "{:#}", m["imaging_pixel_size"]);
+        let (ok, m, err) = convert(&dir.join("extent_only.imzML"), "extent-forced.mzpeak", &["--pixel-size", "20", "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!(sizes(&m), [um("IMS:1000044", 60.0), um("IMS:1000045", 40.0), um("IMS:1000046", 20.0), um("IMS:1000047", 20.0)]);
+        let row = &m["imaging_pixel_size"][0];
+        assert_eq!((&row["overridden"], row["stated"].as_array().unwrap().len(), row["max_dimension"].as_array().unwrap().len()), (&serde_json::json!(true), 0, 2), "{row:#}");
         // The config key, in its three spellings; --force on the command line still folds in.
         for (yaml, want) in [("pixel_size: 50", (50.0, 50.0)), ("pixel_size: \"50,60\"", (50.0, 60.0)), ("pixel_size: [50, 60]", (50.0, 60.0))] {
             let cfg = dir.join("cfg.yaml");
@@ -15022,6 +15073,15 @@ mod tests {
             assert!(ok, "{yaml}: {err}");
             assert_eq!(m["imaging"]["pixel_size_um"], serde_json::json!({"x": want.0, "y": want.1}), "{yaml}");
         }
+        // A config file's standing `force: true` overwrites outputs; it does not write over a stated
+        // size — that acknowledgement is the command line's --force alone (it did, in silence).
+        let cfg = dir.join("cfg-force.yaml");
+        std::fs::write(&cfg, "pixel_size: 20\nforce: true\n").unwrap();
+        let (ok, _, err) = convert(&thyra("unit_declared"), "cfg-force.mzpeak", &["-c", cfg.to_str().unwrap()]);
+        assert!(!ok && err.contains("(IMS:1000046) = 50 µm") && err.contains("--force"), "{err}");
+        let (ok, m, err) = convert(&thyra("unit_declared"), "cfg-force.mzpeak", &["-c", cfg.to_str().unwrap(), "--force"]);
+        assert!(ok, "{err}");
+        assert_eq!((&m["imaging"]["pixel_size_um"], &m["imaging_pixel_size"][0]["overridden"]), (&serde_json::json!({"x": 20.0, "y": 20.0}), &serde_json::json!(true)));
         let _ = fs::remove_dir_all(&dir);
     }
 

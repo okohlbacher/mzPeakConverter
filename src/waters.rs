@@ -341,8 +341,8 @@ impl WatersImaging {
 
     /// The grid: pixel counts always; on each axis with a step, the pixel size (the step, µm), the
     /// max dimension, and the absolute position offset (`IMS:1000053/54`, µm) — the position of the
-    /// image's top-left corner on the stage, [`Self::offset_um`] — a single row keeps the column
-    /// step (review 2026-09-30 B15). `None` without a grid.
+    /// image's top-left corner on the stage, [`Self::offset_um`], where it is not negative — a
+    /// single row keeps the column step (review 2026-09-30 B15). `None` without a grid.
     pub fn scan_settings(&self) -> Option<mzdata::meta::ScanSettings> {
         let g = self.grid.as_ref().ok()?;
         let mut s = mzdata::meta::ScanSettings { id: "scansettings1".into(), ..Default::default() };
@@ -352,12 +352,16 @@ impl WatersImaging {
         if let Some(ux) = g.x.pitch.map(|p| p * 1000.0) {
             s.params.push(p("pixel size (x)", mzdata::curie!(IMS:1000046), ux.into(), Unit::Micrometer));
             s.params.push(p("max dimension x", mzdata::curie!(IMS:1000044), (g.x.count as f64 * ux).into(), Unit::Micrometer));
-            s.params.push(p("absolute position offset x", mzdata::curie!(IMS:1000053), Self::offset_um(&g.x).unwrap().into(), Unit::Micrometer));
+            if let Some(o) = Self::offset_um(&g.x) {
+                s.params.push(p("absolute position offset x", mzdata::curie!(IMS:1000053), o.into(), Unit::Micrometer));
+            }
         }
         if let Some(uy) = g.y.pitch.map(|p| p * 1000.0) {
             s.params.push(p("pixel size y", mzdata::curie!(IMS:1000047), uy.into(), Unit::Micrometer));
             s.params.push(p("max dimension y", mzdata::curie!(IMS:1000045), (g.y.count as f64 * uy).into(), Unit::Micrometer));
-            s.params.push(p("absolute position offset y", mzdata::curie!(IMS:1000054), Self::offset_um(&g.y).unwrap().into(), Unit::Micrometer));
+            if let Some(o) = Self::offset_um(&g.y) {
+                s.params.push(p("absolute position offset y", mzdata::curie!(IMS:1000054), o.into(), Unit::Micrometer));
+            }
         }
         Some(s)
     }
@@ -365,8 +369,18 @@ impl WatersImaging {
     /// The absolute position offset of an axis (`IMS:1000053/54`: "the position … of the upper left
     /// point of the image on the target", µm): the edge of pixel 1, half a step before its centre,
     /// `(origin − pitch / 2) × 1000` — the origin is pixel 1's centre in mm. `None` without a step
-    /// (owner decision A6, 2026-10-01; a Bruker run's stage offset is unknown and written nowhere).
+    /// (owner decision A6, 2026-10-01; a Bruker run's stage offset is unknown and written nowhere),
+    /// and `None` when that corner lies before the stage's zero: imagingMS.obo types both terms
+    /// `xsd:nonNegativeFloat`, so a negative corner is written nowhere and [`Self::block`] says so
+    /// (owner principle P4: spec-first for accessions).
     pub fn offset_um(axis: &crate::imaging::GridAxis) -> Option<f64> {
+        // A corner within a picometre of the zero is the zero: the fit's float noise, not a stage
+        // position (an origin fitted to positions starting at 0 comes out as −3e-17 mm).
+        Self::corner_um(axis).filter(|um| *um >= -1e-6).map(|um| um.max(0.0))
+    }
+
+    /// The corner itself, negative or not; `None` without a step.
+    fn corner_um(axis: &crate::imaging::GridAxis) -> Option<f64> {
         axis.pitch.map(|pitch| (axis.origin - pitch / 2.0) * 1000.0)
     }
 
@@ -426,10 +440,19 @@ impl WatersImaging {
         });
         match &self.grid {
             Ok(g) => {
-                let axis = |a: usize, x: &crate::imaging::GridAxis| serde_json::json!({
-                    "origin_mm": x.origin, "pitch_mm": x.pitch, "count": x.count, "max_residual_mm": x.max_residual,
-                    "step_source": self.step_source(a, x),
-                });
+                let axis = |a: usize, x: &crate::imaging::GridAxis| {
+                    let mut j = serde_json::json!({
+                        "origin_mm": x.origin, "pitch_mm": x.pitch, "count": x.count, "max_residual_mm": x.max_residual,
+                        "step_source": self.step_source(a, x),
+                    });
+                    // The top-left corner (`IMS:1000053/54`), or why the term is not written.
+                    match (Self::corner_um(x), Self::offset_um(x)) {
+                        (Some(_), Some(o)) => j["absolute_position_offset_um"] = o.into(),
+                        (Some(c), None) => j["absolute_position_offset_um"] = format!("not written: the top-left corner is at {c:.3} µm, before the stage's zero, and IMS:1000053/54 are non-negative floats (imagingMS.obo)").into(),
+                        (None, _) => {}
+                    }
+                    j
+                };
                 b["positions"] = "grid index = round((position − origin) / pitch) + 1".into();
                 b["scans_with_position"] = g.positions.iter().flatten().count().into();
                 b["off_grid_scans_dropped"] = g.off_grid.into();
@@ -1981,14 +2004,27 @@ mod tests {
 
     /// Owner decision A6: `IMS:1000053/54` are the image's top-left corner on the stage in µm — the
     /// edge of pixel 1, half a step before its centre — on each axis with a step, and absent
-    /// without one. The arithmetic on the host; the lane that writes it needs MassLynx.
+    /// without one or when the corner is negative (the terms are `xsd:nonNegativeFloat`; the first
+    /// cut of this unit wrote −2525 µm). The arithmetic on the host; the lane that writes it needs
+    /// MassLynx.
     #[test]
     fn the_absolute_position_offset_is_the_top_left_corner() {
         use crate::imaging::GridAxis;
         let axis = |origin: f64, pitch: Option<f64>| GridAxis { origin, pitch, count: 10, max_residual: 0.0, declared: false };
         assert_eq!(WatersImaging::offset_um(&axis(10.0, Some(0.1))), Some(9950.0));
-        assert_eq!(WatersImaging::offset_um(&axis(-2.5, Some(0.05))), Some(-2525.0));
+        assert_eq!(WatersImaging::offset_um(&axis(0.05, Some(0.1))), Some(0.0), "a corner on the zero is a non-negative float");
+        assert_eq!(WatersImaging::offset_um(&axis(0.05 - 1e-18, Some(0.1))), Some(0.0), "float noise below the zero is the zero");
+        assert_eq!(WatersImaging::offset_um(&axis(-2.5, Some(0.05))), None);
+        assert_eq!(WatersImaging::offset_um(&axis(0.0, Some(0.1))), None, "pixel 1 centred on the zero: its edge is before it");
         assert_eq!(WatersImaging::offset_um(&axis(10.0, None)), None);
+        // A grid whose x starts on the stage's zero: no IMS:1000053, the block says why; y written.
+        let near_zero: Vec<Option<(f64, f64)>> = (0..3).flat_map(|r| (0..4).map(move |c| Some((c as f64 * 0.1, 10.0 + r as f64 * 0.1)))).collect();
+        let im = WatersImaging::from_positions(near_zero, laser_names(), [step("DesiXStep", 0.1), step("DesiYStep", 0.1)], 0).unwrap();
+        let s = im.scan_settings().unwrap();
+        assert_eq!(accessions(&s), ["IMS:1000042", "IMS:1000043", "IMS:1000046", "IMS:1000044", "IMS:1000047", "IMS:1000045", "IMS:1000054"]);
+        let b = im.block();
+        assert_eq!(b["x"]["absolute_position_offset_um"], "not written: the top-left corner is at -50.000 µm, before the stage's zero, and IMS:1000053/54 are non-negative floats (imagingMS.obo)", "{b:#}");
+        assert!((b["y"]["absolute_position_offset_um"].as_f64().unwrap() - 9950.0).abs() < 1e-6, "{b:#}");
         // On a grid: pixel 1's centre at 80.3673 / 45.9005 mm, 0.1 mm steps.
         let im = WatersImaging::from_positions(desi(3, 4), laser_names(), [step("DesiXStep", 0.1), step("DesiYStep", 0.1)], 0).unwrap();
         let g = im.grid.as_ref().unwrap();
