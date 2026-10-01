@@ -292,8 +292,9 @@ MS:1000799, a detector without one MS:1000026 and a configuration without a mode
 the archive's writer adds to meet the spec's CvMapping; a term is named as the embedded vocabulary
 names it (`Thermo RAW format` where an old source writes `Thermo RAW file`); the run's `sampleRef`
 is not written by either export (mzdata's run model has none); and an mzML or imzML whose
-`startTimeStamp` has no zone is exported with it directly, but not from its archive, which does
-not hold such a clock for those two formats. Not a difference between the two exports, but one a
+`startTimeStamp` has no zone is exported with it by both routes, directly as the source spells it
+and from its archive as the `acquisition_time` block holds it (§8: a fraction of a second with 3,
+6 or 9 digits, so `…45.00035` comes back as `…45.000350`). Not a difference between the two exports, but one a
 header diff shows: the parameters two or more instrument configurations share are written once,
 as a `referenceableParamGroup`, in an order mzdata's writer does not keep from one run to the next
 (an LTQ-FT's serial number, model and four `customization` blocks). Its chromatograms are the
@@ -305,7 +306,21 @@ mobility`, once per element. Different by design: a spectrum's total ion current
 observed m/z range are the archive's, computed from the stored peaks (a timsTOF `.d` states each
 window spectrum's frame totals); an ims-compact archive's whole frames state no per-window 1/K0,
 `window group` or limits, and it holds HyStar's TIC/base-peak traces but not mzdata's per-window
-pair (28 chromatograms where the `.d`'s export has 30). Not in any archive yet, so not in its
+pair (28 chromatograms where the `.d`'s export has 30); a device trace that ProteoWizard writes as
+an `intensity array` in pascal, psi, µL/min, °C, percent or absorbance units is written — by the
+archive's export and the direct export alike — as a `pressure array`, `flow rate array`,
+`temperature array` or a `non-standard data array` named after the chromatogram, in that unit
+(mzdata's writer states detector counts for every `intensity array`, which is how the unit was lost
+through 0.17.0-rc.1; a reader that takes a chromatogram's values from `intensity array` alone finds
+none on such a trace); a chromatogram intensity in counts per second or percent of base peak, an
+ion current in any other unit, and an intensity in a unit mzdata does not know are still written
+as an `intensity array` in detector counts, with the stated unit's accession in the chromatogram's
+`intensity array unit` userParam (§7; the run warns); a spectrum's `sourceFileRef` attribute is a
+`userParam` of that name on both routes, its value the id of an entry of the export's own
+`sourceFileList` (the direct export lists the source's files, an archive's export the files of the
+archive's `file_description`; the id is escaped as that entry's is); and a
+Thermo precursor that named the spectrum itself, or one of no lower MS level, has no `spectrumRef`
+(a run without MS1 named scan 1 on every scan). Not in any archive yet, so not in its
 export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` combination.
 
 The header. An export carries the source's **scan settings** as a `scanSettingsList` (an imaging
@@ -553,12 +568,39 @@ Contents:
   chromatograms: one metadata row each, and their points, times in minutes. Every chromatogram the
   source carries is stored (a LabSolutions export's TIC/BPC pair per acquisition event, a Bruker `.d`'s
   HyStar traces); a TIC and a base-peak chromatogram are summed over the MS1 spectra only for the kind
-  the source lacks, and lead the facet (`--no-chromatograms` synthesizes none). A value that is not an
-  intensity, such as a Bruker device trace's pressure, flow rate, temperature or solvent percentage,
+  the source lacks, and lead the facet (`--no-chromatograms` synthesizes none). An mzML or imzML
+  whose spectra state no scan start time (`MS:1000016`) gets no synthesized pair: mzdata reads an
+  unstated time as 0, and every point of the trace would sit at time 0 (two corpus imaging runs held
+  1,196 and 34,840 such points). A facet with nothing else to hold — that case, or a run with no MS1
+  spectrum and no source chromatogram — carries one **placeholder row**: `id` empty,
+  `chromatogram_type` null, `number_of_data_points` 0, no row in `chromatograms_data`. The reference
+  reader needs the facet to open the archive; a reader should skip a row with an empty id and no
+  points, as this converter's mzML export does. A value that is not an
+  intensity, such as a device trace's pressure, flow rate, temperature or solvent percentage,
   has no column of its own: it is stored in that chromatogram's `auxiliary_arrays` in
   `chromatograms_metadata`, under its name and in its unit, and the trace's `intensity` values in
   `chromatograms_data` are null. A reader that plots `intensity` alone shows such a trace as empty
-  or as zeros (mzPeakViewer does, so far); its values are in the auxiliary array.
+  or as zeros (mzPeakViewer does, so far); its values are in the auxiliary array. This holds for a
+  Bruker `.d`'s HyStar traces and, since 0.17.0, for the same traces on the mzML lane: ProteoWizard
+  writes each as an `intensity array` in the trace's unit (pascal, psi, µL/min, °C, percent,
+  absorbance unit), and an intensity array in a unit that is not an intensity's is stored as
+  the pressure, flow rate or temperature array of a chromatogram of that type, otherwise as a
+  non-standard array named after the chromatogram — values and data type untouched. Through
+  0.17.0-rc.1 it went into the shared `intensity` column, which is declared in detector counts, and
+  the unit was gone from the archive and from both mzML exports (49 chromatograms of 12 corpus mzML
+  files). An intensity stays in the `intensity` column: an array in detector counts or stating no
+  unit, as it is; one in another unit PSI-MS allows on an intensity array (`MS:1000814` counts per
+  second, `MS:1000132` percent of base peak, `MS:1000905` the same times 100), and the array of an
+  ion-current chromatogram (TIC, base peak, SIC, SIM, SRM) in whatever unit it states, with the
+  stated unit's accession as that chromatogram's parameter **`intensity array unit`** (no accession;
+  value e.g. `MS:1000814`), which both mzML exports write as a userParam, and
+  `mzml:chromatogram-intensity-unit-as-parameter` declared: the column goes on declaring detector
+  counts, which the synthesized TIC and base-peak chromatogram beside it are in. A unit mzdata has
+  no name for (it knows 29 units) reads as no unit; the lane reads the accession back
+  from the source's `<chromatogram>` and stores the array by the same rule, with the same
+  parameter stating the unit (the stored array cannot name a unit mzdata does not know). The
+  facet keeps its `intensity` column when the first chromatograms of the source are all device
+  traces.
 - `vendor/…` — embedded original side-files (optional, see §8).
 
 **Footer count keys.** The spectrum, chromatogram and wavelength facets carry `<entity>_count`
@@ -634,8 +676,18 @@ zone unstated. Show or compare it as a local wall clock and never attach an offs
 reader's own nor UTC. An archive with neither states no acquisition time. Bruker and Agilent
 directories follow the same rule: their clocks carry offsets in every file seen so far, and one
 that does not becomes the block too (archives written by 0.11.5 and earlier dropped it on the
-lanes that read those directories). An mzML export writes either as the run's `startTimeStamp`
-(§4.1): the instant in RFC 3339, the wall clock as stated, without an offset.
+lanes that read those directories). So does an **mzML or imzML** whose run `startTimeStamp` has no
+offset (`2009-08-11T15:59:44`: five corpus imzML units): the block's `source` is `mzML run
+startTimeStamp` / `imzML run startTimeStamp`, and `wall_clock` is the stamp as an ISO 8601 local
+time (a fraction of a second is written with 3, 6 or 9 digits). Through 0.17.0-rc.1 such a stamp
+was dropped — mzdata reads the attribute as RFC 3339 and discards anything else, with an ERROR
+line that still appears in the log — and the archive stated no acquisition time at all. An offset
+without its colon (`+0200`, ISO 8601's basic form) is read as the offset it states and gives
+`run.start_time`. A stamp that is not read as a date-time (a date alone, free text) is kept
+verbatim as `stated`, with no `wall_clock` and no `zone`. An mzML export writes either as the run's
+`startTimeStamp` (§4.1): the instant in RFC 3339, the wall clock as stated, without an offset — the
+direct export of an mzML or imzML reads the source's stamp the same way and writes a clock without
+an offset as the source spells it; a stamp that is not a date-time is not written.
 
 ProteoWizard resolves the same ambiguity by asserting: it labels an unzoned Waters clock `Z`, and
 its `adjustUnknownTimeZonesToHostTimeZone` default shifts other readers' values by the converting
@@ -678,12 +730,16 @@ declared `imaging:pixel-count-from-positions` when the input states none, raised
 `imaging:pixel-count-raised-to-positions` when a stated count does not bound them); and the
 `metadata.imaging` index block — `is_imaging`, `coordinate_base: 1`, `pixel_count`,
 `pixel_count_source` (`declared`, or `observed_max` when the counts are the largest positions: always
-on the Bruker and Waters lanes), `pixel_size_um` (when both axes have one in µm; a lone `IMS:1000046` the source
+on the Bruker and Waters lanes), `pixel_size_um` (when both axes have a positive size in a length
+unit: always in micrometres, converted where the grid states nanometres, millimetres or centimetres,
+which stay as stated in `scan_settings_list`; a lone `IMS:1000046` the source
 states gives both, as the vocabulary defines it) and a `provenance` record of what was detected and
 where each value came from: `pixel_size` (`as stated`, `none stated`, or `checked, see
-imaging_pixel_size`), and on the imzML and mzML lanes `time` — `as stated`, or `not stated by the
-source; index is the source list order` when no spectrum states `MS:1000016` (every time is then
-stored as 0). A position stated as a scan cvParam (imzML, mzML) is written only as a
+imaging_pixel_size`), and on the imzML and mzML lanes `time` — `as stated` when every spectrum
+states `MS:1000016`, `stated on N of M spectra; the others are stored as 0` when only some do
+(counted in the source: a stated 0 and no time read alike once stored), or `not stated by the
+source; index is the source list order` when none does (every time is then stored as 0, and no
+TIC or base-peak chromatogram is synthesized, §7). A position stated as a scan cvParam (imzML, mzML) is written only as a
 pixel index: x and y both present, integers from 1 to 2³² − 1; any other is removed from its scan,
 all axes together, and declared `imaging:invalid-position-dropped`. A stated z that is not such an
 integer is removed alone, the scan keeping x and y, and declared `imaging:invalid-position-z-dropped`.
@@ -697,7 +753,8 @@ with these checks since 0.16.0
 (HUPO-PSI/mzPeak-specification#23):
 the file provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the `.ibd`
 checksum `IMS:1000090/91/92` — is written back into `file_description`; the pixel size follows the
-issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; a single value
+issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; x and y of
+which one is zero or negative are no pixel size and are dropped; a single value
 is tested against its own axis's count and extent — the other axis's when its own states none — both
 converted to one length unit, each by the unit it is written in (its unit name's when mzdata knows the
 name, which then overrides the accession, else its unit accession), micrometre where that is no length
@@ -719,7 +776,14 @@ or `not stated` (`not checked` when the `.ibd` could not be found or read for ha
 warning). On a mismatch the conversion goes on — the stated value stays in `file_description`,
 one warning names both hashes, `imzml:ibd-checksum-mismatch` is declared and
 `provenance.ibd_checksum_found` holds the hash found (`accession`, `value`). The `.ibd` is listed in
-`source_files` with the SHA-1 it hashes to. A binary array typed with the imaging vocabulary's
+`source_files` with the SHA-1 it hashes to. The **UUID** is checked the same way: an `.ibd` begins
+with its 16-byte UUID, which the imzML states as `IMS:1000080`, and the two are compared whatever
+the spelling (braces, dashes, case). `provenance.ibd_uuid` is `verified`, `mismatch` or `not stated`
+(`not checked` with the checksum); on a mismatch the conversion goes on, the stated value stays in
+`file_description`, a warning names both, `imzml:ibd-uuid-mismatch` is declared and
+`provenance.ibd_uuid_found` holds the 32 hex digits the `.ibd` begins with. Through 0.17.0-rc.1 a
+mismatch was one line of mzdata's log and nothing in the archive, which could read `ibd_checksum:
+verified` (or `not stated`) over an `.ibd` that is not the imzML's. A binary array typed with the imaging vocabulary's
 obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") is read as
 `MS:1000519` / `MS:1000522`, the terms that replaced them, declared
 `imzml:obsolete-integer-type-as-psi-ms` (the mzML export does the same, with a warning). An m/z or
@@ -833,6 +897,45 @@ per experiment (ProteoWizard reads the mode only through the `.wiff2` API), so i
 no method; neither does a file that names no instrument. A precursor-ion scan states no precursor:
 its fixed mass is a product, which the archive has no place for. This has not yet been run on a
 WIFF.
+
+**What an mzML or imzML conversion keeps as stated, and what it does not carry.** mzdata, which
+reads both, types every param value by trial parse and reads only part of the header; the lane
+reads the rest back from the source text (`src/mzml_refs.rs`, `src/imaging.rs`):
+
+- A source file's **checksum** — SHA-1 (`MS:1000569`), MD5 (`MS:1000568`), SHA-256 (`MS:1003151`) —
+  is the text the header states. A digest of decimal digits only, or of digits with one `e`, used
+  to be stored as a number (`…0123` as 123; ProteoWizard's own `tiny.pwiz` example as
+  1.2345678901234568e39), as the `.ibd` checksums were through 0.16.0.
+- A header value that reads as **NaN or infinity** (a userParam whose text is `NaN` or `Inf`, a
+  digest with an exponent beyond a 64-bit float) is stored as the string Rust prints for it —
+  `NaN`, `inf`, `-inf` — since JSON has no such number; through 0.17.0-rc.1 it aborted the
+  conversion (exit 134, no archive). The spelling is mzdata's reading, not the source's (`Inf`
+  becomes `inf`): any other text value that happens to parse as a number is still stored as that
+  number.
+- A spectrum's **`sourceFileRef`** attribute (the DESI ColAd imzML names one of 135 raw line files
+  on each of 17,820 spectra) is the spectrum parameter `sourceFileRef` — no accession; its value is
+  the id of an entry of `file_description.source_files` — and a `userParam` of that name in both
+  mzML exports, where it names an entry of the export's `sourceFileList`: the direct export lists
+  the source's files and an archive's export the archive's own (§4.1). One that names no listed
+  source file is dropped and declared (`mzml:dangling-reference-dropped`; the direct mzML export
+  leaves it out and counts it in its one warning). The same attribute on a `<scan>` or a
+  `<precursor>` (with `externalSpectrumID`: a spectrum of another file) is not carried.
+- A source's **processing methods** keep the terms they state. `file format conversion`
+  (`MS:1000530`) is added only to a method none of whose terms is a child of `MS:1000452` data
+  transformation in the PSI-MS vocabulary the binary embeds (a method with no CV term at all among
+  them), because the spec's `processingmethod_must` rule requires one; through 0.17.0-rc.1 every
+  source method gained it, so a `low intensity data point removal` step also claimed a format
+  conversion. The conversion's own method (`mzpeak_convert_conversion`) states the term itself, on
+  every lane, beside `MS:1003901` when it trimmed zeros.
+- The run's **`startTimeStamp`** without an offset is the `acquisition_time` block (above).
+- A chromatogram **intensity array's unit** other than detector counts is kept: on the array where
+  the value is no intensity (a device trace), as the chromatogram's `intensity array unit`
+  parameter where it is one, or where mzdata does not know the unit (§7).
+- **Not carried:** `fileDescription/<contact>` — the contact's name, organization, address, URL and
+  e-mail (`MS:1000586`–`MS:1000590`). mzdata's model has no contact and the archive index no place
+  for one; nothing of it is stored, on purpose until it is decided whether an archive should carry
+  personal data that travels with every copy. Also not carried: a spectrum's `spotID`, and the
+  `sourceFileRef` / `externalSpectrumID` of a scan or precursor.
 
 **What the native lanes still do not carry** (tracked in BACKLOG.md): per-scan precursors on
 the Agilent-MHDAC and BAF lanes (Bruker TDF/TSF, Shimadzu, Waters and SciEX have them), and the
@@ -1002,6 +1105,7 @@ The vocabulary:
 | `sort-by-time` | the writer's backstop re-ordered at least one chromatogram into time order before it was stored | any lane that hands the writer a chromatogram out of time order, a source chromatogram or the MS1 TIC/base-peak trace synthesized in spectrum order |
 | `sort-by-wavelength` | the writer's backstop re-ordered at least one wavelength (UV/PDA) spectrum into wavelength order before it was stored | any lane that writes wavelength spectra handed over out of order |
 | `chromatogram-time-to-minutes` | at least one chromatogram time recorded in seconds or milliseconds was divided into minutes, the unit `chromatograms_data` declares on every lane, as a 64-bit float (not bit-exact). A time array that states no unit is stored as given | mzML/imzML with source chromatograms (ProteoWizard writes seconds), Bruker `.d` with `chromatography-data.sqlite` (HyStar records seconds) |
+| `mzml:chromatogram-intensity-unit-as-parameter` | at least one chromatogram's values in the `intensity` column are in another unit than the detector counts the column declares: an intensity the source states in counts per second (`MS:1000814`), percent of base peak (`MS:1000132`, `MS:1000905`), an ion-current chromatogram's in any other unit, or one in a unit mzdata has no name for. The values are stored as stated; the unit's accession is that chromatogram's parameter `intensity array unit` (§7) | mzML with source chromatograms |
 | `tof-grid:<ppm>ppm` | a statistically fitted integer sqrt grid replaced f64 m/z within that bound (item 3) | mzML `--tof-grid`, native SCIEX per-spectrum grid |
 | `grid-fit:1e-6Da` | a centroid list on a fixed-point lattice was stored under the reference implementation's fitted linear grid, every value within 1e-6 Da (item 4) | generic mzML lane (lattice detected), native Shimadzu `.lcd` centroids |
 | `shimadzu:span-trim` | the profile sqrt-grid route left the zero-intensity pad at the scan-window bounds out of at least one gridded spectrum (item 5) | native Shimadzu `.lcd` profile |
@@ -1019,11 +1123,12 @@ The vocabulary:
 | `sciex:truncate-unequal-arrays` | Clearcore2 returned m/z and intensity arrays of different lengths for at least one spectrum, and the longer was cut to the shorter | native SciEX `.wiff` |
 | `imzml:pixel-size-unit-assumed-um` | an imzML pixel size stated without a unit was taken as micrometre (§8, imaging) | imzML |
 | `imzml:pixel-size-area-to-length` | a single imzML pixel size tested as an area (`√value × count = extent`) and was written as its square root, in the unit the area is the square of (micrometre when no length unit is stated) | imzML |
-| `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, or was not numeric, and was not written | imzML |
+| `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, was not numeric, or (x and y both stated) was zero or negative on an axis, and was not written | imzML |
 | `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata takes the unit name when it names a unit mzdata knows, whatever the attribute order) | imzML |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `imzml:obsolete-integer-type-as-psi-ms` | a binary array's data type was declared with the imaging vocabulary's obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") and was read as `MS:1000519` / `MS:1000522`, the PSI-MS terms that replaced them; the values are the ones the `.ibd` holds | imzML |
 | `imzml:ibd-checksum-mismatch` | the `.ibd` does not hash to a checksum the header states (`IMS:1000090/91/92`). The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_checksum_found` holds the hash found, and the `.ibd`'s `source_files` entry its SHA-1 (§8, imaging) | imzML |
+| `imzml:ibd-uuid-mismatch` | the `.ibd` does not begin with the UUID the header states (`IMS:1000080`): the two files are not the pair the imzML describes. The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_uuid` is `mismatch` and `ibd_uuid_found` holds the UUID the `.ibd` begins with (§8, imaging) | imzML |
 | `bruker:pixel-size-from-beam-scan-size` | a Bruker MALDI run's pixel size (and the max dimension derived from it) is the frames' `BeamScanSizeX/Y` (`MaldiFrameLaserInfo`, through `MaldiFrameInfo.LaserInfo`), not the FlexImaging raster step: no `<stem>.mis` beside the `.d`, or one its regions do not map onto | Bruker TSF / TDF with `MaldiFrameInfo` |
 | `waters:laser-position-fitted-to-grid` | a Waters imaging run's pixel positions are grid indices fitted to the laser aim positions (mm) MassLynx states per scan; the fit is in the `waters_imaging` block | native Waters `.raw` with laser positions |
 | `waters:off-grid-position-dropped` | at most 1 % of a Waters imaging run's positioned scans lie off the fitted grid, or far outside the raster at one position (a scan taken with the stage parked off it), and were written without a position; the count is `off_grid_scans_dropped` in `waters_imaging` | native Waters `.raw` with laser positions |
@@ -1033,9 +1138,10 @@ The vocabulary:
 | `imaging:invalid-position-dropped` | at least one scan stated a position that is not a pixel index (x or y missing, not an integer, below 1 or above 2³² − 1); its position params (z included) were removed and every position column is null for it. The run's warning gives the count | imzML, mzML with `IMS:1000050/51` |
 | `imaging:invalid-position-z-dropped` | at least one scan stated pixel-index x and y but a z that is not one (not an integer, below 1 or above 2³² − 1); only its z param was removed, so `position_z` is null for it and x and y are kept. The run's warning gives the count | imzML, mzML with `IMS:1000052` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
+| `thermo:invalid-precursor-reference-dropped` | at least one precursor named, as the spectrum it was selected from, the spectrum itself or a spectrum whose MS level is not below its own, and the reference was cleared (`precursor_id` and `precursor_index` null). mzdata names the reader library's parent index on every scan, and the library reports index 0 where a scan has no parent: on a run without MS1 (SRM) every spectrum named scan 1, scan 1 included. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
-| `mzml:dangling-reference-dropped` | a reference the source states between its own lists names no entry of them, and was dropped: a scan's `instrumentConfigurationRef` (its `instrument_configuration_id` is null), a processing method's or an instrument configuration's `softwareRef` (empty), the run's `defaultInstrumentConfigurationRef` or `defaultSourceFileRef` or the spectrum list's `defaultDataProcessingRef` (each then names the first entry of its list, as for a source that states none — the spec requires all three). A self-closing `<software/>`, `<sourceFile/>` or `<instrumentConfiguration/>`, which mzdata skips, is read back from the header first and put back where the source states it, so a reference to it resolves and is kept. The run's warning counts each kind and names the ids as the source states them | mzML, imzML (the mzML exports apply the same rule, §4.1, with no list to declare it in) |
+| `mzml:dangling-reference-dropped` | a reference the source states between its own lists names no entry of them, and was dropped: a scan's `instrumentConfigurationRef` (its `instrument_configuration_id` is null), a processing method's or an instrument configuration's `softwareRef` (empty), the run's `defaultInstrumentConfigurationRef` or `defaultSourceFileRef` or the spectrum list's `defaultDataProcessingRef` (each then names the first entry of its list, as for a source that states none — the spec requires all three), a spectrum's `sourceFileRef` (no `sourceFileRef` parameter is written). A self-closing `<software/>`, `<sourceFile/>` or `<instrumentConfiguration/>`, which mzdata skips, is read back from the header first and put back where the source states it, so a reference to it resolves and is kept. The run's warning counts each kind and names the ids as the source states them | mzML, imzML (the mzML exports apply the same rule, §4.1, with no list to declare it in) |
 
 **The list in `data_processing_method_list`.** The same entries are mirrored into the conversion's
 own processing method (`mzpeak_convert_conversion`, software `mzpeak-convert`), so a reader of the

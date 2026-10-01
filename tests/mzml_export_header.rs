@@ -191,6 +191,30 @@ fn a_start_time_is_written_zoned_or_as_the_clock_the_source_states() {
     let direct = dir.join("tiny.mzML");
     convert(Path::new(TINY), &direct, &["--to", "mzml"]);
     assert_eq!(read(&direct, "tiny → mzML").run["startTimeStamp"], "2007-06-27T15:23:45.00035");
+    // The archive keeps that clock in its `acquisition_time` block (a fraction of a second in 3, 6
+    // or 9 digits), and its export writes the block's clock: both routes date the run.
+    let (kept, back) = (dir.join("tiny.mzpeak"), dir.join("tiny.archive.mzML"));
+    convert(Path::new(TINY), &kept, &[]);
+    assert_eq!(index_metadata(&kept)["acquisition_time"]["wall_clock"], "2007-06-27T15:23:45.000350");
+    convert(&kept, &back, &[]);
+    assert_eq!(read(&back, "tiny → mzPeak → mzML").run["startTimeStamp"], "2007-06-27T15:23:45.000350");
+    // One reader of the stamp for both lanes: an offset without its colon (ISO 8601's basic form,
+    // which mzdata drops) is the offset it states, in the direct export as in the archive; text
+    // that is no date-time is not written, and the run says so.
+    let variant = |name: &str, stamp: &str| {
+        let path = dir.join(name);
+        let text = String::from_utf8_lossy(&std::fs::read(TINY).unwrap())
+            .replace(r#"startTimeStamp="2007-06-27T15:23:45.00035""#, &format!(r#"startTimeStamp="{stamp}""#));
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+    let basic = dir.join("basic.mzML");
+    convert(&variant("basic.src.mzML", "2007-06-27T15:23:45.00035+0200"), &basic, &["--to", "mzml"]);
+    assert_eq!(read(&basic, "basic offset → mzML").run["startTimeStamp"], "2007-06-27T15:23:45.000350+02:00");
+    let odd = dir.join("odd.mzML");
+    let log = convert(&variant("odd.src.mzML", "June 27th"), &odd, &["--to", "mzml"]);
+    assert!(!read(&odd, "no date-time → mzML").run.contains_key("startTimeStamp"));
+    assert!(log.contains("\"June 27th\" is not a date-time this converter reads; the export's startTimeStamp is not written"), "{log}");
 
     let zoned = dir.join("zoned.src.mzML");
     let text = String::from_utf8_lossy(&std::fs::read(TINY).unwrap()).replace(r#"startTimeStamp="2007-06-27T15:23:45.00035""#, r#"startTimeStamp="2007-06-27T15:23:45.5+02:00""#);

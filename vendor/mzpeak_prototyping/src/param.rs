@@ -431,9 +431,13 @@ impl From<mzdata::params::ControlledVocabulary> for ControlledVocabularyEntry {
 fn value_ref_to_serde_json_value(value: mzdata::params::ValueRef<'_>) -> serde_json::Value {
     match value {
         mzdata::params::ValueRef::String(x) => serde_json::Value::String(x.to_string()),
-        mzdata::params::ValueRef::Float(x) => {
-            serde_json::Value::Number(serde_json::Number::from_f64(x).unwrap())
-        }
+        // DELIBERATE DEVIATION: JSON has no NaN or infinity, and `from_f64(..).unwrap()` aborted the
+        // conversion on any header value mzdata's trial parse reads as one — a userParam whose text
+        // is `NaN` or `Inf`, a digest of digits with an exponent beyond f64 (`…e99999`). Such a
+        // value is written as the string Rust prints for it (`NaN`, `inf`, `-inf`).
+        mzdata::params::ValueRef::Float(x) => serde_json::Number::from_f64(x)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(x.to_string())),
         mzdata::params::ValueRef::Int(x) => {
             serde_json::Value::Number(serde_json::Number::from_i128(x as i128).unwrap())
         }
@@ -494,6 +498,22 @@ fn ensure_cv_term(params: &mut Vec<MetaParam>, accession: CURIE, name: &str) {
         value: serde_json::Value::Null,
         unit: None,
     });
+}
+
+/// `processingmethod_must`: give a processing method MS:1000530 "file format conversion" unless one
+/// of its params already is a child of MS:1000452 "data transformation" in the PSI-MS vocabulary
+/// mzdata embeds. DELIBERATE DEVIATION (see the call site).
+fn ensure_data_transformation_term(params: &mut Vec<MetaParam>) {
+    use mzdata::params::MSVocabulary;
+    // The copy embedded in the binary, as the converter's `main` pins it; a no-op once initialised.
+    MSVocabulary::init_static();
+    let states_one = params
+        .iter()
+        .filter_map(|p| p.accession)
+        .any(|c| MSVocabulary::is_child_of(c, mzdata::curie!(MS:1000452)));
+    if !states_one {
+        ensure_cv_term(params, mzdata::curie!(MS:1000530), "file format conversion");
+    }
 }
 
 /// Like [`ensure_cv_term`] but only injects when the list carries NO CV-accession param at all.
@@ -787,7 +807,11 @@ impl From<&mzdata::meta::ProcessingMethod> for ProcessingMethod {
         // CvMapping `processingmethod_must` requires a CHILD of MS:1000452 "data transformation"
         // (use_term:false → not the abstract parent itself). MS:1000530 "file format conversion"
         // is the honest child for a format converter.
-        ensure_cv_term(&mut parameters, mzdata::curie!(MS:1000530), "file format conversion");
+        // DELIBERATE DEVIATION: added only to a method that states no such child itself (a method
+        // with no CV term at all among them). It used to be added to EVERY method, so a source's
+        // `low intensity data point removal` or `Conversion to mzML` step also claimed a file
+        // format conversion it does not state.
+        ensure_data_transformation_term(&mut parameters);
         Self {
             order: value.order,
             software_reference: value.software_reference.clone(),

@@ -182,7 +182,7 @@ pub(crate) fn apply(
                         "wall_clock": wall_clock.format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
                         "zone": "unstated",
                         "source": source,
-                        "note": "the vendor file records a local wall-clock time without a UTC offset; \
+                        "note": "the source records a local wall-clock time without a UTC offset; \
                                  run.start_time is null because RFC 3339 cannot say 'zone unknown'"
                     }),
                 ));
@@ -322,6 +322,12 @@ pub(crate) fn parse_vendor_time(text: &str, source: &'static str) -> Result<Acqu
     if let Ok(dt) = DateTime::parse_from_rfc3339(t) {
         return Ok(AcquisitionTime::Stated(dt));
     }
+    // ISO 8601's basic offset, `+0200`: a stated zone RFC 3339 has no form for. It read as no
+    // date-time at all, and an mzML stamp `2007-06-27T15:23:45+0200` was kept as text with
+    // `zone: unstated`.
+    if let Ok(dt) = DateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S%.f%z") {
+        return Ok(AcquisitionTime::Stated(dt));
+    }
     for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(n) = NaiveDateTime::parse_from_str(t, fmt) {
             return Ok(AcquisitionTime::Naive { wall_clock: n, source });
@@ -396,7 +402,14 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(parse_vendor_time("2018-12-03T22:39:33", "t").unwrap(), AcquisitionTime::Naive { .. }));
+        // ISO 8601's basic offset is a stated zone too.
+        match parse_vendor_time("2007-06-27T15:23:45+0200", "t").unwrap() {
+            AcquisitionTime::Stated(dt) => assert_eq!(dt.to_rfc3339(), "2007-06-27T15:23:45+02:00"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse_vendor_time("2007-06-27T15:23:45.5-0430", "t").unwrap(), AcquisitionTime::Stated(_)));
         assert!(parse_vendor_time("yesterday", "t").is_err());
+        assert!(parse_vendor_time("2007-06-27", "t").is_err(), "a date alone is no date-time");
     }
 
     #[test]

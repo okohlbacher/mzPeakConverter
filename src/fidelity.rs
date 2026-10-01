@@ -939,8 +939,9 @@ mod tests {
     /// `imaging:` and `mzml:` namespaces describe metadata and are not signal by their kind.)
     #[test]
     fn every_vendor_entry_in_the_sources_is_classified() {
-        const NOT_SIGNAL: [&str; 7] = [
+        const NOT_SIGNAL: [&str; 8] = [
             "thermo:target-only-isolation-window",
+            "thermo:invalid-precursor-reference-dropped",
             "bruker:trace-unit-rescale",
             "bruker:trace-sort-dedup",
             "bruker:raster-index-shifted-to-base-1",
