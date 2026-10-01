@@ -237,16 +237,18 @@ keeping spectra whose retention time is within `--rt MIN-MAX` (same unit as the 
 `spectrum.time`, minutes for every lane this tool writes) and/or whose MS level is in `--ms-level`
 (`--ms-level 1 --ms-level 2` or `--ms-level 1,2`), and dropping archive members that match
 `--drop-aux <glob>` (`--no-vendor` on this lane is shorthand for `--drop-aux 'vendor*'`). `--rt`
-also truncates the chromatograms, in the same minutes. This converter stores every chromatogram
-time in minutes (§8, `chromatogram-time-to-minutes`), and the window is converted into whatever unit
-a chromatogram time axis declares, so an mzML-lane archive converted by 0.11.5 or earlier, whose
-column declares ProteoWizard's seconds, is cut where the window says too. Such an archive holds its
+also truncates the chromatograms, in the same minutes, whether their time axis is stored as 64- or
+32-bit floats (a PDA or DAD run's mzML; through 0.16 such a trace was copied whole). This converter
+stores every chromatogram time in minutes (§8, `chromatogram-time-to-minutes`), and the window is
+converted into whatever unit a chromatogram time axis declares, so an mzML-lane archive converted
+by 0.11.5 or earlier, whose column declares ProteoWizard's seconds, is cut where the window says too. Such an archive holds its
 synthesized TIC/BPC in minutes under that seconds label, so `--rt` cuts those two traces at 60 times
 the times it names: rebuild it first. No published corpus archive has a seconds column. Parquet
 facets are not re-encoded from the signal: the per-spectrum and chromatogram facets a filter can
-change are read and written back (zstd level 5, every column in the encodings the source used, row
-groups bounded as a conversion's, §10 `MZPC_ROW_GROUP_MB`) and run-global facets are copied
-verbatim, so encoder options are inert here — warned about, not refused (see the table above). The same
+change are read and written back (zstd level 5, every column in the encodings the source used, the
+source's Parquet format version, sort order and bloom filters, the page limits a conversion gives
+the facet, row groups bounded as a conversion's, §10 `MZPC_ROW_GROUP_MB`) and run-global facets
+are copied verbatim, so encoder options are inert here — warned about, not refused (see the table above). The same
 lane injects `--sdrf` into an existing archive — the documented way to add it to an archive from a
 lane that cannot embed it (§4.3; `--image` too, into an imaging archive) — and writes to `<out>.mzpeak.tmp` first, renaming
 into place on success. The three filters on a **raw or exchange** input are a hard error with the

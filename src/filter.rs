@@ -26,6 +26,7 @@
 //! per-spectrum-shaped (a top-level `point`/`chunk`/`peak` struct) but carries no key we can map to
 //! survivors is a hard ERROR — we never silently ship a facet that references dropped spectra.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -288,7 +289,7 @@ pub fn run(input: &Path, output: &Path, opts: &FilterOpts) -> Result<()> {
             let bytes = read_member(&mut zip, name)?;
             let class = classify_facet(&bytes, &fe)
                 .with_context(|| format!("classifying facet {name}"))?;
-            let out_bytes = process_parquet(&bytes, class, spectra, opts, chrom_kept.as_ref(), wavelength_survivors.as_ref())
+            let out_bytes = process_parquet(name, &bytes, class, spectra, opts, chrom_kept.as_ref(), wavelength_survivors.as_ref())
                 .with_context(|| format!("filtering facet {name}"))?;
             // Through the hashing path: the bytes changed, so the SHA-512 must be recomputed. The
             // entry is the source's, and `start_for_entry` + `write_all` shipped its old checksum on
@@ -766,8 +767,10 @@ type BatchMap<'a> = Box<dyn Fn(&RecordBatch) -> Result<Option<RecordBatch>> + 'a
 
 /// Filter/copy one Parquet facet and return the re-encoded bytes. `spectra` `None` copies the spectrum
 /// facets' rows as they are, `wavelength` `None` the wavelength facets; otherwise the rows of the kept
-/// entities stay, renumbered.
+/// entities stay, renumbered. The references to filtered-out spectra it nulls are reported once, under
+/// the facet's `name`.
 fn process_parquet(
+    name: &str,
     bytes: &[u8],
     class: Facet,
     spectra: Option<&Survivors>,
@@ -776,13 +779,16 @@ fn process_parquet(
     wavelength: Option<&Renumber>,
 ) -> Result<Vec<u8>> {
     let copy = || -> BatchMap { Box::new(|b: &RecordBatch| Ok(Some(b.clone()))) };
+    // The rows whose reference to a filtered-out spectrum was nulled, over the whole facet: counted
+    // per batch, it was reported once per 1024 rows (24 times on a Thermo run under --ms-level 2).
+    let nulled = &Cell::new(0usize);
     let (map, mode): (BatchMap, CountMode) = match (class, spectra, wavelength) {
         (Facet::RunGlobal, _, _) => return Ok(bytes.to_vec()), // verbatim
         (Facet::WavelengthMeta | Facet::WavelengthSecondary | Facet::WavelengthData(_), _, None) => return Ok(bytes.to_vec()),
         (Facet::WavelengthMeta, _, Some(kept)) => (Box::new(move |b| filter_by_top_key(b, "index", kept)), CountMode::WavelengthMeta),
         (Facet::WavelengthSecondary, _, Some(kept)) => {
             let own = own_index(bytes, kept)?;
-            (Box::new(move |b| filter_secondary(b, kept, None, own.as_ref())), CountMode::Vendor)
+            (Box::new(move |b| filter_secondary(b, kept, None, own.as_ref(), nulled)), CountMode::Vendor)
         }
         (Facet::WavelengthData(field), _, Some(kept)) => {
             let f = field.clone();
@@ -792,7 +798,7 @@ fn process_parquet(
         // A chromatogram's precursor has the spectrum precursor's schema: its `precursor_index` and
         // `precursor_id` name the spectrum it was selected from. Copied as they were, one naming a
         // filtered-out spectrum survived the rewrite, and the mzML export wrote it as a spectrumRef.
-        (Facet::ChromatogramSecondary, Some(s), _) => (Box::new(move |b| Ok(Some(remap_references(b, s)?))), CountMode::Vendor),
+        (Facet::ChromatogramSecondary, Some(s), _) => (Box::new(move |b| Ok(Some(remap_references(b, s, nulled)?))), CountMode::Vendor),
         (Facet::SpectrumMeta | Facet::SpectrumMetaFlat, None, _) => (copy(), CountMode::SpectrumMeta),
         (Facet::SpectrumData(field), None, _) => (copy(), CountMode::SpectrumData(field)),
         (Facet::SpectrumSecondary | Facet::VendorOrdinal, None, _) => (copy(), CountMode::Vendor),
@@ -806,7 +812,7 @@ fn process_parquet(
         }
         (Facet::SpectrumSecondary, Some(s), _) => {
             let own = own_index(bytes, &s.kept)?;
-            (Box::new(move |b| filter_secondary(b, &s.kept, Some(s), own.as_ref())), CountMode::Vendor)
+            (Box::new(move |b| filter_secondary(b, &s.kept, Some(s), own.as_ref(), nulled)), CountMode::Vendor)
         }
         // The Thermo trailer facets' `ordinal` is the spectrum index.
         (Facet::VendorOrdinal, Some(s), _) => (Box::new(move |b| filter_by_top_key(b, "ordinal", &s.kept)), CountMode::Vendor),
@@ -827,7 +833,15 @@ fn process_parquet(
             (Box::new(move |b| Ok(Some(refresh_chrom_point_counts(b, kept)?))), CountMode::ChromatogramMeta(total))
         }
     };
-    reencode(bytes, map, mode)
+    let out = reencode(bytes, map, mode, || nulled.set(0))?;
+    if nulled.get() > 0 {
+        log::warn!(
+            "{name}: {} rows referenced a filtered-out spectrum (a precursor's parent, or a scan's \
+             spectrum_reference); the reference is nulled",
+            nulled.get()
+        );
+    }
+    Ok(out)
 }
 
 /// How to recompute the per-facet count KVs after filtering.
@@ -849,15 +863,19 @@ enum CountMode {
 /// Stream a Parquet facet through `map` (batch → optional filtered batch), re-encoding to zstd with
 /// the original key-value metadata preserved (minus ARROW:schema and the recomputed counts) and the
 /// counts refreshed via `append_key_value_metadata`. Every column keeps the source facet's encodings
-/// (`apply_encodings`); on any encoding incompatibility we retry the whole facet with plain zstd
-/// (correctness first).
-fn reencode<F>(bytes: &[u8], map: F, mode: CountMode) -> Result<Vec<u8>>
+/// (`apply_encodings`) and the facet its layout (`apply_layout`); on any encoding incompatibility we
+/// retry the whole facet with plain zstd (correctness first), calling `restart` first, as `map` sees
+/// every batch again.
+fn reencode<F>(bytes: &[u8], map: F, mode: CountMode, restart: impl Fn()) -> Result<Vec<u8>>
 where
     F: Fn(&RecordBatch) -> Result<Option<RecordBatch>>,
 {
     match reencode_inner(bytes, &map, &mode, true) {
         Ok(v) => Ok(v),
-        Err(_) => reencode_inner(bytes, &map, &mode, false),
+        Err(_) => {
+            restart();
+            reencode_inner(bytes, &map, &mode, false)
+        }
     }
 }
 
@@ -898,7 +916,7 @@ where
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
         .set_key_value_metadata(Some(preserved));
     if fancy {
-        props = apply_encodings(props, &source);
+        props = apply_layout(apply_encodings(props, &source), &source, mode);
     }
     let props = props.build();
     // The writer's row groups end at the byte cap as well as parquet's row cap, as every convert
@@ -1115,17 +1133,18 @@ fn filter_by_top_key(batch: &RecordBatch, key: &str, kept: &Renumber) -> Result<
 
 /// One batch of a spectrum or wavelength-spectrum secondary (scans, precursors, selected ions,
 /// products): the rows of kept entities, `source_index` renumbered, their references to other spectra
-/// remapped (`spectra`, [`remap_references`]), and the facet's own row index (`own`, [`own_index`])
-/// renumbered.
+/// remapped (`spectra`, [`remap_references`], counting the rows that lose one in `nulled`), and the
+/// facet's own row index (`own`, [`own_index`]) renumbered.
 fn filter_secondary(
     batch: &RecordBatch,
     kept: &Renumber,
     spectra: Option<&Survivors>,
     own: Option<&(&'static str, Renumber)>,
+    nulled: &Cell<usize>,
 ) -> Result<Option<RecordBatch>> {
     let Some(mut out) = filter_by_top_key(batch, "source_index", kept)? else { return Ok(None) };
     if let Some(spectra) = spectra {
-        out = remap_references(&out, spectra)?;
+        out = remap_references(&out, spectra, nulled)?;
     }
     if let Some((column, renumber)) = own {
         out = renumber_column(&out, column, renumber)?;
@@ -1163,8 +1182,9 @@ fn own_index(bytes: &[u8], kept: &Renumber) -> Result<Option<(&'static str, Renu
 /// goes with it. A `precursor_id` or a scan's `spectrum_reference` naming a filtered-out spectrum by
 /// id is nulled as well. A reference the archive cannot resolve (another run's spectrum, a USI) is
 /// kept, as is a `precursor_id` whose `precursor_index` the source left null. A facet without these
-/// columns passes through untouched.
-fn remap_references(batch: &RecordBatch, spectra: &Survivors) -> Result<RecordBatch> {
+/// columns passes through untouched. The rows that lose a reference are added to `nulled`, which
+/// [`process_parquet`] reports once for the facet.
+fn remap_references(batch: &RecordBatch, spectra: &Survivors, nulled: &Cell<usize>) -> Result<RecordBatch> {
     let parent = batch
         .column_by_name("precursor_index")
         .map(|c| to_u64(c).ok_or_else(|| anyhow!("precursor_index is {}, not an integer column", c.data_type())))
@@ -1190,13 +1210,7 @@ fn remap_references(batch: &RecordBatch, spectra: &Survivors) -> Result<RecordBa
             cols[at] = arrow::compute::nullif(&cols[at], &gone)?;
         }
     }
-    let nulled = touched.iter().filter(|t| **t).count();
-    if nulled > 0 {
-        log::warn!(
-            "{nulled} rows referenced a filtered-out spectrum (a precursor's parent, or a scan's \
-             spectrum_reference); the reference is nulled"
-        );
-    }
+    nulled.set(nulled.get() + touched.iter().filter(|t| **t).count());
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
 }
 
@@ -1231,8 +1245,9 @@ fn minutes_in_axis(s: &StructArray, child: &str) -> f64 {
     }
 }
 
-/// Truncate chromatogram data to the RT window [lo, hi] (minutes, see [`minutes_in_axis`]). Two layouts:
-///   * **point** (`<field>.time` double): keep rows whose time is in the window.
+/// Truncate chromatogram data to the RT window [lo, hi] (minutes, see [`minutes_in_axis`]). Two layouts,
+/// with times of any float width ([`float_child`]):
+///   * **point** (`<field>.time`): keep rows whose time is in the window.
 ///   * **chunk** (`<field>.time_chunk_start`/`_end`): keep whole chunk rows that OVERLAP the window
 ///     (chunk-granularity truncation — we never edit chunk list contents, mirroring the whole-spectrum
 ///     peak policy). A layout with neither is copied unchanged (cannot locate a time axis).
@@ -1244,7 +1259,7 @@ fn filter_chromatogram_time(
 ) -> Result<Option<RecordBatch>> {
     let s = struct_col(batch, field)
         .ok_or_else(|| anyhow!("expected `{field}` struct column"))?;
-    if let Some(time) = f64_child(s, "time") {
+    if let Some(time) = float_child(s, "time") {
         let k = minutes_in_axis(s, "time");
         let (lo, hi) = (lo * k, hi * k);
         let mask: BooleanArray = (0..time.len())
@@ -1252,7 +1267,7 @@ fn filter_chromatogram_time(
             .collect();
         return Ok(Some(filter_record_batch(batch, &mask)?));
     }
-    if let (Some(start), Some(end)) = (f64_child(s, "time_chunk_start"), f64_child(s, "time_chunk_end")) {
+    if let (Some(start), Some(end)) = (float_child(s, "time_chunk_start"), float_child(s, "time_chunk_end")) {
         let k = minutes_in_axis(s, "time_chunk_start");
         let (lo, hi) = (lo * k, hi * k);
         let mask: BooleanArray = (0..start.len())
@@ -1288,7 +1303,7 @@ fn chromatogram_kept_points(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<Option
         let batch = batch?;
         let s = struct_col(&batch, &field).unwrap();
         let idx = u64_child(s, "chromatogram_index").unwrap();
-        if let Some(time) = f64_child(s, "time") {
+        if let Some(time) = float_child(s, "time") {
             // Point layout: one point per row.
             let k = minutes_in_axis(s, "time");
             let (lo, hi) = (lo * k, hi * k);
@@ -1297,7 +1312,7 @@ fn chromatogram_kept_points(bytes: &[u8], (lo, hi): (f64, f64)) -> Result<Option
                 kept.entry(idx.value(r)).or_default().push(keep);
             }
         } else if let (Some(start), Some(end)) =
-            (f64_child(s, "time_chunk_start"), f64_child(s, "time_chunk_end"))
+            (float_child(s, "time_chunk_start"), float_child(s, "time_chunk_end"))
         {
             // Chunk layout: a kept (overlapping) chunk keeps its whole intensity list.
             let k = minutes_in_axis(s, "time_chunk_start");
@@ -1497,6 +1512,56 @@ fn apply_encodings(
     props
 }
 
+/// Lay the facet out as its source was. From the source's footer: its Parquet format version (the
+/// writer version: data page v2, and v2's fallback encodings, on every facet the converter writes),
+/// its sorting columns, and a bloom filter on each column that had one (no converter facet has one:
+/// the vendored writer names the index column by a dotted string, which parquet takes as a single
+/// path segment). A footer does not record page limits, so those are the converter's (vendor
+/// `writer/base.rs`): a spectrum signal facet's pages end at 1,048,576 rows in the point layout and
+/// at a quarter of parquet's 1 MiB page in the chunk layout (`spectrum_data_writer_props`), a signal
+/// facet with an ion-mobility column has twice parquet's dictionary page, and every other facet
+/// parquet's limits.
+///
+/// With parquet's defaults instead — format 1.0, pages of at most 20,000 rows, no sort order — a
+/// filter keeping every spectrum grew QC01's point peak facet by 16.2 % and a Thermo point profile
+/// facet by 5.6 %; laid out as the source, both are 1.9 % smaller than the source. What is left
+/// between a rewrite and its source is the zstd level, which no footer records either: at the
+/// source's own level a keep-everything rewrite of a chunked Thermo, Lumos or timsTOF archive is its
+/// source's size to 0.03 %. At this lane's level 5, chunk facets written at level 3 come out 1.2 %
+/// smaller to 0.1 % larger, and the timsTOF grid facet, written at level 22, 4.2 % larger
+/// (PXD059079 2485; 1.5 % with parquet's defaults, whose 1 MiB pages compress better than the
+/// source's quarter pages).
+fn apply_layout(
+    mut props: parquet::file::properties::WriterPropertiesBuilder,
+    source: &ParquetMetaData,
+    mode: &CountMode,
+) -> parquet::file::properties::WriterPropertiesBuilder {
+    use parquet::file::properties::{DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT, DEFAULT_PAGE_SIZE, WriterVersion};
+    let version = if source.file_metadata().version() >= 2 { WriterVersion::PARQUET_2_0 } else { WriterVersion::PARQUET_1_0 };
+    props = props.set_writer_version(version);
+    // Every row group of a converter facet declares the same order. A filter keeps the rows in order
+    // and renumbers an index in its own order, so the declaration still holds.
+    if let Some(sorted) = source.row_groups().first().and_then(|rg| rg.sorting_columns()) {
+        props = props.set_sorting_columns(Some(sorted.clone()));
+    }
+    let columns = source.file_metadata().schema_descr().columns();
+    for (i, column) in columns.iter().enumerate() {
+        if source.row_groups().iter().any(|rg| rg.column(i).bloom_filter_offset().is_some()) {
+            props = props.set_column_bloom_filter_enabled(column.path().clone(), true);
+        }
+    }
+    let signal = matches!(mode, CountMode::SpectrumData(_) | CountMode::ChromatogramData(_) | CountMode::WavelengthData(_));
+    if signal && columns.iter().any(|c| c.path().string().contains("ion_mobility")) {
+        props = props.set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
+    }
+    match mode {
+        CountMode::SpectrumData(field) if field == "chunk" => props.set_data_page_size_limit(DEFAULT_PAGE_SIZE / 4),
+        // The converter passes parquet's page size, 1,048,576, as the row count.
+        CountMode::SpectrumData(_) => props.set_data_page_row_count_limit(DEFAULT_PAGE_SIZE),
+        _ => props,
+    }
+}
+
 /// Carry the original index `metadata` blocks into `w`, add a `data_processing` entry, and add the
 /// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members, and
 /// `encoding_prescan` names its spectrum by the new index ([`renumber_prescan_block`]); `ims_calibration`
@@ -1689,8 +1754,12 @@ fn u64_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a UInt64Array> {
     s.column_by_name(name)?.as_any().downcast_ref::<UInt64Array>()
 }
 
-fn f64_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a Float64Array> {
-    s.column_by_name(name)?.as_any().downcast_ref::<Float64Array>()
+/// A float child of `s` as f64, whatever width it is stored in: the time axis of a chromatogram the
+/// mzML lane carried from a PDA or DAD run is float32, and was taken for no time axis at all. Only
+/// read to decide which rows a window keeps; the column itself is written back in its own type.
+fn float_child(s: &StructArray, name: &str) -> Option<Float64Array> {
+    let values = lossless(s.column_by_name(name), DataType::is_floating, &DataType::Float64)?;
+    values.as_any().downcast_ref::<Float64Array>().cloned()
 }
 
 fn lstr_child<'a>(s: &'a StructArray, name: &str) -> Option<&'a arrow::array::LargeStringArray> {
@@ -1787,7 +1856,7 @@ mod tests {
             dropped_ids: ["s2", "s6"].map(String::from).into(),
         };
         let fe = FileEntry::new("spectra_metadata_precursors.parquet".to_string(), EntityType::Spectrum, DataKind::Precursors);
-        let out = process_parquet(&bytes, classify_facet(&bytes, &fe).unwrap(), Some(&spectra), &FilterOpts::default(), None, None).unwrap();
+        let out = process_parquet(&fe.name, &bytes, classify_facet(&bytes, &fe).unwrap(), Some(&spectra), &FilterOpts::default(), None, None).unwrap();
         let t = ParquetRecordBatchReaderBuilder::try_new(bytes_of(&out)).unwrap().build().unwrap().next().unwrap().unwrap();
         let u64s = |name: &str| to_u64(t.column_by_name(name).unwrap()).unwrap().iter().collect::<Vec<_>>();
         let strs = |name: &str| {
@@ -1816,7 +1885,7 @@ mod tests {
         );
         let spectra = Survivors { kept: Renumber::new([3u64, 5]), total: 7, dangling: 0, dropped_ids: ["s2", "s6"].map(String::from).into() };
         let fe = FileEntry::new("chromatograms_metadata_precursors.parquet".to_string(), EntityType::Chromatogram, DataKind::Precursors);
-        let out = process_parquet(&bytes, classify_facet(&bytes, &fe).unwrap(), Some(&spectra), &FilterOpts::default(), None, None).unwrap();
+        let out = process_parquet(&fe.name, &bytes, classify_facet(&bytes, &fe).unwrap(), Some(&spectra), &FilterOpts::default(), None, None).unwrap();
         let t = ParquetRecordBatchReaderBuilder::try_new(bytes_of(&out)).unwrap().build().unwrap().next().unwrap().unwrap();
         let u64s = |name: &str| to_u64(t.column_by_name(name).unwrap()).unwrap().iter().collect::<Vec<_>>();
         let ids = t.column_by_name("precursor_id").unwrap().as_any().downcast_ref::<arrow::array::LargeStringArray>().unwrap().clone();
@@ -1878,7 +1947,7 @@ mod tests {
             let bytes = parquet(vec![("source_index", source_index.clone())], &[(key, "4")]);
             let fe = FileEntry::new(name.to_string(), entity, kind);
             let class = classify_facet(&bytes, &fe).unwrap();
-            let out = process_parquet(&bytes, class, Some(&survivors), &FilterOpts::default(), None, None).unwrap();
+            let out = process_parquet(name, &bytes, class, Some(&survivors), &FilterOpts::default(), None, None).unwrap();
             assert!(!footer_keys(&out).iter().any(|k| k.ends_with("_count")), "{name}: {:?}", footer_keys(&out));
         }
     }
