@@ -78,6 +78,7 @@ mod encoding_prescan;
 mod vendor_sqlite;
 mod imaging;
 mod bruker_maldi;
+mod mzml_header;
 mod mzml_isolation;
 mod mzml_refs;
 mod mzml_wavelength;
@@ -572,11 +573,13 @@ fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: T
 /// name ends in `.gz`. The XML is compressed AS it is written — one pass, no re-read. Both the mzML
 /// writer and the encoder finish on drop (the writer closes the document, the encoder writes the
 /// gzip trailer), which is why the four export sites can let `w` fall out of scope as before. Above
-/// both sit two sinks that blank, in place, what mzdata's writer states wrongly:
+/// both sit three sinks that change what mzdata's writer states wrongly:
 /// [`mzml_isolation::TargetOnlyWindows`] leaves an isolation window of unknown width target-only (the
-/// writer prints offsets of ±target), and [`mzml_wavelength::WavelengthSpectra`] removes the terms the
-/// writer invents for a wavelength spectrum.
-fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
+/// writer prints offsets of ±target), [`mzml_wavelength::WavelengthSpectra`] removes the terms the
+/// writer invents for a wavelength spectrum, both in place, and [`mzml_header::HeaderFixes`] writes the
+/// header's `<scanSettingsList>` as the schema has it and declares `cv` — a vocabulary the document
+/// uses beside MS and UO, the only two the writer lists — moving the index's offsets by what that adds.
+fn mzml_sink(output: &Path, cv: Option<mzml_header::Cv>) -> Result<Box<dyn Write>> {
     let file = fs::File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let sink: Box<dyn Write> = if has_gz_suffix(output) {
         log::info!("output name ends in .gz: gzip-compressing the mzML as it is written");
@@ -584,6 +587,7 @@ fn mzml_sink(output: &Path) -> Result<Box<dyn Write>> {
     } else {
         Box::new(file)
     };
+    let sink = mzml_header::HeaderFixes::new(sink, cv);
     Ok(Box::new(mzml_isolation::TargetOnlyWindows::new(mzml_wavelength::WavelengthSpectra::new(sink))))
 }
 
@@ -2388,8 +2392,38 @@ fn convert_to_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    // Imaging terms need their vocabulary in the cvList, which mzdata's writer fills with MS and UO
+    // alone: an imzML always states some; an mzML is searched for one (pixel positions on its
+    // scans, a grid in its scan settings — one streamed byte search, as the archive lane makes for
+    // the positions). Through 0.16.0 every `cvRef="IMS"` of an export named a vocabulary the
+    // document did not declare.
+    let ims = match &reader {
+        MZReaderType::IMzML(_) => true,
+        MZReaderType::MzML(_) => imaging::file_mentions(&read_path, ["IMS:1"]).map_or_else(
+            |e| {
+                log::warn!("{}: not searched for imaging terms ({e}); the IMS vocabulary is not declared", input.display());
+                false
+            },
+            |[found]| found,
+        ),
+        _ => false,
+    };
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims.then(mzml_header::Cv::ims))?);
     w.copy_metadata_from(&reader);
+    // The source's scan settings (an imaging run's grid and pixel size, an inclusion list): the
+    // writer holds the list, but its metadata trait does not reach it, so `copy_metadata_from`
+    // left it empty and no export had a `<scanSettingsList>`. Written as the reader hands them
+    // over: the pixel-size rule of the archive lane changes values, and an mzML has no
+    // transformations list to declare that in.
+    w.scan_settings = reader.scan_settings().cloned().unwrap_or_default();
+    // imzML: the file provenance mzdata consumes (storage mode, UUID, `.ibd` checksum), put back
+    // as the archive lane does, so the direct export and the export of the archive state the same.
+    if let MZReaderType::IMzML(_) = &reader {
+        match imaging::read_file_content(&read_path) {
+            Ok(content) => w.file_description_mut().contents.extend(imaging::provenance_params(&content)),
+            Err(e) => log::warn!("imzML file provenance not read: {e:#}"),
+        }
+    }
     fixup_mzml_run_metadata(&mut w, input);
     let cap = max_spectra();
     let n_spec = cap.map_or_else(|| reader.len(), |m| m.min(reader.len()));
@@ -2541,8 +2575,29 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    // What the index states about the file's content and its scan settings (an imaging run's grid
+    // and pixel size). The vendored reader restores none of the index's lists, so through 0.16.0
+    // every archive was exported with an empty `<fileContent>` and no `<scanSettingsList>`.
+    let archived = reader.file_index().as_file_metadata().unwrap_or_else(|e| {
+        log::warn!("{}: file description and scan settings not read from the index ({e}); exported without", input.display());
+        Default::default()
+    });
+    let contents = archived.file_description().contents.clone();
+    let mut scan_settings = archived.scan_settings().cloned().unwrap_or_default();
+    // The export lists the archive as its one source file, so a scan settings entry's references
+    // to the archive's own source files would name nothing here.
+    scan_settings.iter_mut().for_each(|s| s.source_file_refs.clear());
+    // The imaging vocabulary as the archive declares it; an archive that states imaging terms
+    // without declaring it gets the converter's pinned entry.
+    let cv_list = reader.file_index().metadata.get("cv_list");
+    let is_ims = |p: &Param| p.curie().is_some_and(|c| c.controlled_vocabulary == mzdata::params::ControlledVocabulary::IMS);
+    let ims = mzml_header::Cv::from_cv_list(cv_list, "IMS").or_else(|| {
+        (contents.iter().any(is_ims) || scan_settings.iter().any(|s| s.iter_params().any(is_ims))).then(mzml_header::Cv::ims)
+    });
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, ims)?);
     w.copy_metadata_from(&reader);
+    w.file_description_mut().contents = contents;
+    w.scan_settings = scan_settings;
     fixup_mzml_run_metadata(&mut w, input);
     w.set_spectrum_count(items.len() as u64);
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
@@ -2863,7 +2918,7 @@ fn write_native_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None)?);
     fixup_mzml_run_metadata(&mut w, input);
     let n = max_spectra().map_or(len, |m| m.min(len));
     w.set_spectrum_count(n as u64);
@@ -2904,7 +2959,7 @@ fn write_agilent_profile_mzml(
     // ([`finish_mzml`]), because there the four were identical.
     let tmp = mzml_tmp_path(output);
     let tmp_guard = TmpGuard::new(&tmp);
-    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp)?);
+    let mut w = mzdata::io::mzml::MzMLWriter::new(mzml_sink(&tmp, None)?);
     fixup_mzml_run_metadata(&mut w, input);
     // Upper bound on the count attribute — empty/truncated segments are skipped while streaming
     // (matches write_native_mzml, which also uses the reader's record count).
@@ -9317,7 +9372,7 @@ mod tests {
         let output = dir.join("out.mzML");
         let tmp = super::mzml_tmp_path(&output);
         let guard = super::TmpGuard::new(&tmp);
-        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp).unwrap());
+        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp, None).unwrap());
         w.set_spectrum_count(3);
         for (i, (time, intensity)) in [(5.8905, 30.0f32), (0.0, 10.0), (0.7008, 20.0)].into_iter().enumerate() {
             let mut descr = SpectrumDescription { id: format!("scan={}", i + 1), index: i, ms_level: 1, ..Default::default() };

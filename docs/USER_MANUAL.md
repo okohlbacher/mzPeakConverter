@@ -236,6 +236,21 @@ window spectrum's frame totals); an ims-compact archive's whole frames state no 
 pair (28 chromatograms where the `.d`'s export has 30). Not in any archive yet, so not in its
 export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` combination.
 
+The header. An export carries the source's **scan settings** as a `scanSettingsList` (an imaging
+run's grid and pixel size, an inclusion list's targets), from an mzML/imzML as read and from an
+archive's `scan_settings_list`; an entry's source file references are kept where the export lists
+those files (the direct export) and left out where it lists the archive alone. An archive's export
+states the archive's `file_description.contents` as its `fileContent`, and the direct export of an
+imzML adds the provenance mzdata consumes — storage mode `IMS:1000030/31`, UUID `IMS:1000080`, the
+`.ibd` checksum `IMS:1000090/91/92` — as the archive lane does, so both routes state the same. An
+export that writes imaging terms (pixel positions `IMS:1000050/51` on the scans, the grid, that
+provenance: any imzML, an mzML that mentions an `IMS:` term, an imaging archive) declares the `IMS`
+vocabulary in its `cvList`, pinned to the commit the archive's `cv_list` names (§8). Through 0.16.0
+no export had a `scanSettingsList`, an archive's export had an empty `fileContent`, and the `cvList`
+declared MS and UO whatever the params named. The direct export writes scan settings as the source
+states them: the pixel-size rule of the archive lane (§8) is not applied, since an mzML has no
+`transformations` list to declare a changed value in.
+
 ```sh
 mzpeak-convert run.raw -o run.mzML            # Thermo → mzML
 mzpeak-convert run.d --to mzml -o run.xml     # format forced, any name
