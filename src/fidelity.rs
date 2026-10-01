@@ -184,9 +184,11 @@ struct IntensityTally {
     /// are not an int32 / int64: cut to one, or clamped, in an integer column.
     float_not_i32: u64,
     float_not_i64: u64,
-    /// Integer values of arrays the writer takes that a float32 / float64 / int32 does not hold.
-    /// The point layout casts them into the column; the chunked layout files an integer array of
-    /// another type than the column's as an auxiliary array, at its own type, and changes nothing.
+    /// Integer values of arrays the writer takes that a float32 / float64 / int32 does not hold:
+    /// rounded, or clamped to the int32 range, in such a column. Both layouts cast an integer
+    /// array of another type into the column and clamp what is out of range; through 0.17.0-rc.2
+    /// the chunked layout filed such an array as an auxiliary array, and the point layout stored
+    /// a null for each out-of-range value (arrow's safe cast), which the reader takes as absent.
     int_not_f32: u64,
     int_not_f64: u64,
     int_not_i32: u64,
@@ -285,16 +287,17 @@ impl IntensityTally {
         }
     }
 
-    /// `(rounded, narrowed)` in a facet of `layout` whose intensity column is a `stored` (the names
+    /// `(rounded, narrowed)` in a facet whose intensity column is a `stored` (the names
     /// [`stored_type`] gives): the values stored as the nearest float32, and those a column of
     /// another type does not hold. Without a column of a known type, what the peak sets rounded.
-    fn resolve(&self, layout: &str, stored: Option<&str>) -> (u64, u64) {
-        // The chunk builder casts floats only; an integer array of another type is not cast.
-        let cast = |n: u64| if layout == "point" { n } else { 0 };
+    /// Both layouts cast an array of another type into the column, integers included: through
+    /// 0.17.0-rc.2 the chunk builder cast floats only and filed an integer array of another type
+    /// in `auxiliary_arrays`, so the integer counts applied to the point layout alone.
+    fn resolve(&self, stored: Option<&str>) -> (u64, u64) {
         match stored {
-            Some("float32") => (self.rounded + self.float_not_f32 + cast(self.int_not_f32), 0),
-            Some("float64") => (self.rounded, cast(self.int_not_f64)),
-            Some("int32") => (self.rounded, self.float_not_i32 + cast(self.int_not_i32)),
+            Some("float32") => (self.rounded + self.float_not_f32 + self.int_not_f32, 0),
+            Some("float64") => (self.rounded, self.int_not_f64),
+            Some("int32") => (self.rounded, self.float_not_i32 + self.int_not_i32),
             Some("int64") => (self.rounded, self.float_not_i64),
             _ => (self.rounded, 0),
         }
@@ -779,8 +782,8 @@ pub fn resolve_intensities(lane: &Value, schemas: [Option<&Schema>; 2]) -> Value
     for ((_, key), schema) in FACETS.iter().zip(schemas) {
         let Some(facet) = lane.get_mut(*key).and_then(Value::as_object_mut) else { continue };
         let Some(tally) = facet.remove(INTENSITY_TALLY) else { continue };
-        let (layout, stored) = schema.and_then(intensity_column).unwrap_or_default();
-        let (rounded, narrowed) = IntensityTally::from_json(&tally).resolve(&layout, stored.as_deref());
+        let (_, stored) = schema.and_then(intensity_column).unwrap_or_default();
+        let (rounded, narrowed) = IntensityTally::from_json(&tally).resolve(stored.as_deref());
         if rounded > 0 {
             facet.insert(INTENSITY_ROUNDED.to_string(), rounded.into());
         }
@@ -1516,15 +1519,15 @@ mod tests {
         assert_eq!((changed(&tally, "chunk", DataType::Float32)[1], changed(&tally, "point", DataType::Float64)[1]), ((0, 0), (0, 0)));
         assert_eq!(changed(&tally, "chunk", DataType::Int32)[1], (0, 1), "3.5 in an integer column");
 
-        // Integer arrays the writer takes. The point layout casts them into the column; the chunk
-        // builder files an integer array of another type as an auxiliary array, unchanged.
+        // Integer arrays the writer takes: cast into the column in both layouts (the chunk builder
+        // filed an integer array of another type as an auxiliary array, unchanged, through rc.2, and
+        // the counts applied to the point layout alone).
         let tally = tally_of(&spectrum(SignalContinuity::Profile, &mz, intensity_array!(Int64, [16777217i64, (1 << 53) + 1, 1 << 40, 7]), false, false));
-        assert_eq!(changed(&tally, "point", DataType::Float32)[0], (2, 0), "16777217 and 2^53 + 1");
-        assert_eq!(changed(&tally, "point", DataType::Float64)[0], (0, 1), "2^53 + 1");
-        assert_eq!(changed(&tally, "point", DataType::Int32)[0], (0, 2), "2^53 + 1 and 2^40");
-        assert_eq!(changed(&tally, "point", DataType::Int64)[0], (0, 0));
-        for dtype in [DataType::Float32, DataType::Float64, DataType::Int32, DataType::Int64] {
-            assert_eq!(changed(&tally, "chunk", dtype.clone())[0], (0, 0), "chunked, {dtype}");
+        for layout in ["chunk", "point"] {
+            assert_eq!(changed(&tally, layout, DataType::Float32)[0], (2, 0), "{layout}: 16777217 and 2^53 + 1");
+            assert_eq!(changed(&tally, layout, DataType::Float64)[0], (0, 1), "{layout}: 2^53 + 1");
+            assert_eq!(changed(&tally, layout, DataType::Int32)[0], (0, 2), "{layout}: 2^53 + 1 and 2^40");
+            assert_eq!(changed(&tally, layout, DataType::Int64)[0], (0, 0), "{layout}");
         }
 
         // A peak set of another length is not a copy of the arrays.

@@ -13,10 +13,15 @@ checkout or a copy:
     (or any other `convert.*` key) rebuilds the archive without waiting for a converter release.
 
 The `.built` stamp is read out of the archive it describes, never written from the request:
-    mzpeak-convert <version>     the archive's own software_list entry; another version is refused
+    mzpeak-convert <version>     the software_list entry of the archive's last conversion step;
+                                 another version is refused
     recipe <hash>                the descriptor recipe it was built under
     options <argv>               the archive's own `conversion options`, i.e. what actually ran
-The box strips lane flags and may fall back to msconvert, so only the archive knows what built it.
+The box strips lane flags and may fall back to msconvert, so only the archive knows what built it,
+and an archive whose recorded lane disagrees with the descriptor's `convert.flags` is refused too
+(LANE_FLAGS): a descriptor pinning `--via-msconvert` over a natively built archive, or an archive
+the msconvert fallback built under a descriptor pinning none, is reported, not stamped current;
+a stamp already written whose `options` line runs another lane than the descriptor pins is stale.
 A stamp from before the recipe line counts as stale.
 
 `--clean` deletes every `.mzpeak` (and stamp) first. It reaches the same end state as the default
@@ -51,6 +56,8 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -233,7 +240,6 @@ def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[
     except ImportError:
         print("warn      : PyYAML unavailable — descriptors not read, falling back to every-unit walk")
         return {}, {}, set(), set()
-    import shlex  # noqa: PLC0415
     recipes: dict[Path, Recipe] = {}
     pinned: dict[Path, Path] = {}
     skipped: set[Path] = set()
@@ -391,9 +397,13 @@ def compatible_versions(version: str) -> set[str]:
     return out
 
 
-def is_current(archive: Path, version: str, rid: str) -> bool:
+def is_current(archive: Path, version: str, rid: str, flags: list[str] | None = None) -> bool:
     """True when `archive` was produced by `version` (or an output-identical release) under recipe
-    `rid` AND uses the split-facet layout. A stamp with no recipe line predates recipes: stale."""
+    `rid`, on the lane the descriptor's `flags` pin, AND uses the split-facet layout. A stamp with no
+    recipe line predates recipes: stale. The stamp's `options` line is the argv the archive records,
+    and a lane it names that the descriptor does not (or the reverse) makes the archive stale, once
+    printed: three corpus archives stamped before this check record the box's msconvert fallback
+    under descriptors pinning no lane (SWATH and MRM SciEX units), and counted as current."""
     if not archive.exists():
         return False
     try:
@@ -404,10 +414,102 @@ def is_current(archive: Path, version: str, rid: str) -> bool:
         return False  # unreadable/truncated -> rebuild
     stamp = stamp_for(archive)
     lines = stamp.read_text().splitlines() if stamp.exists() else []
-    return bool(lines) and lines[0].strip() in compatible_versions(version) and f"recipe {rid}" in lines[1:]
+    if not (lines and lines[0].strip() in compatible_versions(version) and f"recipe {rid}" in lines[1:]):
+        return False
+    options = next((ln[len("options "):] for ln in lines[1:] if ln.startswith("options ")), "")
+    why = lane_mismatch(flags, options)
+    if why:
+        if archive not in _lane_stale_reported:   # once per run: the report asks again
+            _lane_stale_reported.add(archive)
+            print(f"stale     : {archive.name}: {why}")
+        return False
+    return True
 
 
-def write_stamp(archive: Path, version: str, rid: str) -> str | None:
+_lane_stale_reported: set[Path] = set()
+
+
+# Flags that choose the lane a conversion runs on (the reader and the encoder), with whether the
+# flag takes a value. The box strips these for its native-first attempt and adds its own on the
+# msconvert fallback (`--via-msconvert --tof-grid <mode>`), so an archive can record a lane its
+# descriptor never pinned, and a descriptor can pin one its archive never ran: on 2026-10-01 three
+# corpus descriptors did (agilent-qtof pinned `--via-msconvert --tof-grid auto` over a native
+# archive; agilent-6490-triplequad pinned `--via-msconvert` over the fallback's `--tof-grid auto`),
+# and three SciEX archives recorded the fallback under descriptors pinning nothing. `write_stamp`
+# refuses the stamp on either mismatch and `is_current` calls a stamped archive stale on it, each
+# printing both sides, so no archive its descriptor misdescribes counts as current (D17).
+LANE_FLAGS: dict[str, bool] = {
+    "--via-msconvert": False,
+    "--agilent-grid": False,
+    "--bruker-sdk": False,
+    "--no-ims-compact": False,
+    "--ims-chunked": False,
+    "--no-ims-chunked": False,
+    "--tof-grid": True,
+}
+
+
+def lane_pins(tokens: list[str]) -> list[str]:
+    """The lane flags among argv `tokens`, each with its value when it takes one, sorted:
+    `["--tof-grid auto", "--via-msconvert"]`. `--tof-grid=auto` and `--tof-grid auto` are one pin."""
+    pins: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        flag, eq, value = tokens[i].partition("=")
+        if flag in LANE_FLAGS:
+            if LANE_FLAGS[flag] and not eq:
+                value = tokens[i + 1] if i + 1 < len(tokens) else ""
+                i += 1
+            pins.add(f"{flag} {value}".strip() if LANE_FLAGS[flag] else flag)
+        i += 1
+    return sorted(pins)
+
+
+def argv_of(options: str) -> list[str]:
+    """The recorded `conversion options` line as argv. Shell-split, so a quoted input name holds
+    together; a line the splitter rejects (an apostrophe in a vendor folder's name, `O'Neil.d`) is
+    split on whitespace instead of failing the stamp -- no lane flag contains a space."""
+    try:
+        return shlex.split(options)
+    except ValueError:
+        return options.split()
+
+
+def lane_mismatch(flags: list[str] | None, options: str) -> str | None:
+    """Why the lane the descriptor's `flags` pin is not the one the recorded argv `options` ran, or
+    None when they agree: `"lane mismatch: the descriptor pins --via-msconvert, the archive ran with
+    no lane flag (options: ...)"`."""
+    pinned, ran = lane_pins(list(flags or [])), lane_pins(argv_of(options))
+    if pinned == ran:
+        return None
+    return (f"lane mismatch: the descriptor pins {' '.join(pinned) or 'no lane flag'}, "
+            f"the archive ran with {' '.join(ran) or 'no lane flag'} (options: {options})")
+
+
+def recorded_conversion(md: dict) -> tuple[str | None, str]:
+    """(converter version, argv) of the conversion that wrote an archive, from its index metadata.
+
+    The LAST processing method carrying `conversion options` is that conversion: a source this tool
+    exported from an archive brings the earlier archive's method and software entry along, and the
+    new conversion is recorded after them under the next free ids (`mzpeak_convert_conversion_2`,
+    and the software `mzpeak-convert_2` when the versions differ). The method's `software_reference`
+    names the entry of the version that ran; without one, the last entry under `mzpeak-convert` or
+    a numbered `mzpeak-convert_N`. Looking up the plain id alone stamped such an archive with the
+    SOURCE's version and refused it as built by another converter.
+    """
+    methods = [m for dp in md.get("data_processing_method_list") or [] for m in dp.get("methods") or []]
+    conversions = [(m, p.get("value")) for m in methods for p in m.get("parameters") or []
+                   if p.get("name") == "conversion options"]
+    method, options = conversions[-1] if conversions else ({}, None)
+    softwares = md.get("software_list") or []
+    ref = method.get("software_reference")
+    ours = [s for s in softwares if s.get("id") == ref] if ref else []
+    if not ours:
+        ours = [s for s in softwares if re.fullmatch(r"mzpeak-convert(_\d+)?", s.get("id") or "")]
+    return (ours[-1].get("version") if ours else None), (options or "")
+
+
+def write_stamp(archive: Path, version: str, rid: str, flags: list[str] | None = None) -> str | None:
     """Stamp `archive` from its OWN index; -> None, or why it was left unstamped.
 
     What was requested says nothing reliable about what built an archive: the box strips lane flags
@@ -416,6 +518,8 @@ def write_stamp(archive: Path, version: str, rid: str) -> str | None:
     the host's version string used to be written beside whatever the box's exe produced. The archive
     records its converter (software_list) and its argv (`conversion options`), so the stamp copies
     those, and an archive another converter version built is refused rather than labelled current.
+    So is one whose recorded argv runs another lane than the descriptor's `flags` pin (LANE_FLAGS):
+    the refusal names both, and the unit stays failed until the descriptor or the archive changes.
     """
     try:
         with zipfile.ZipFile(archive) as z:
@@ -424,13 +528,12 @@ def write_stamp(archive: Path, version: str, rid: str) -> str | None:
             md = json.loads(z.read("mzpeak_index.json")).get("metadata") or {}
     except Exception as e:  # truncated zip, no index, unparsable index
         return f"unreadable archive index ({e})"
-    built = next((s.get("version") for s in md.get("software_list") or []
-                  if s.get("id") == "mzpeak-convert"), None)
-    options = next((p.get("value") for dp in md.get("data_processing_method_list") or []
-                    for m in dp.get("methods") or [] for p in m.get("parameters") or []
-                    if p.get("name") == "conversion options"), None) or ""
+    built, options = recorded_conversion(md)
     if built != version.split()[-1]:
         return f"built by mzpeak-convert {built or '<unrecorded>'}, not {version}"
+    why = lane_mismatch(flags, options)
+    if why:
+        return why
     stamp_for(archive).write_text(f"{version}\nrecipe {rid}\noptions {options}\n")
     return None
 
@@ -470,7 +573,7 @@ def convert(unit: Path, out: Path, binary: str, version: str, dry: bool,
             f"exit {proc.returncode}",
         )
         return unit, "failed", first.strip()[:200]
-    why = write_stamp(out, version, rid)
+    why = write_stamp(out, version, rid, extra)
     if why:
         return unit, "failed", f"not stamped: {why}"
     return unit, "converted", ""
@@ -565,7 +668,8 @@ def run_box(jobs: list[tuple[Path, Path, int | None]], root: Path, version: str,
         if before.get(out) == now:
             unchanged.append(out.name)
             continue
-        why = write_stamp(out, version, recipe_for(u, recipes or {}).rid)
+        r = recipe_for(u, recipes or {})
+        why = write_stamp(out, version, r.rid, r.flags)
         if why:
             print(f"box       : {out.name} arrived but is left unstamped: {why}")
             unchanged.append(out.name)
@@ -598,6 +702,7 @@ def convert_target(target: Path, cands: list[tuple[Path, int | None]], binary: s
 
 
 def main(argv: list[str] | None = None) -> int:
+    _lane_stale_reported.clear()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", nargs="?", default=os.path.expanduser("~/Claude/mzpeak-example-data/data"))
     ap.add_argument("--clean", action="store_true", help="delete every .mzpeak first, then convert all")
@@ -655,8 +760,8 @@ def main(argv: list[str] | None = None) -> int:
               f"native one and skipping the duplicate(s)")
         for t, c in dup.items():
             print(f"            {t.name}  <- {', '.join(x.name for x, _ in c)}")
-    rid = {t: recipe_for(c[0][0], recipes).rid for t, c in groups.items()}
-    todo = [t for t in groups if not is_current(t, version, rid[t])]
+    recipe = {t: recipe_for(c[0][0], recipes) for t, c in groups.items()}
+    todo = [t for t in groups if not is_current(t, version, recipe[t].rid, recipe[t].flags)]
     fresh = len(groups) - len(todo)
     print(f"archives  : {len(groups)} (from {len(units)} units)\nalready ok: {fresh}\nto convert: {len(todo)}\n")
 
@@ -693,7 +798,7 @@ def main(argv: list[str] | None = None) -> int:
                                       publish_s3=args.publish_s3)
 
     # ---- report -------------------------------------------------------------
-    have = [t for t in groups if is_current(t, version, rid[t])]
+    have = [t for t in groups if is_current(t, version, recipe[t].rid, recipe[t].flags)]
     print("\n" + "=" * 72)
     print(f"COMPLETENESS  {len(have)}/{len(groups)} archives current"
           f"  ({100.0 * len(have) / max(1, len(groups)):.1f}%)   [from {len(units)} raw units]")

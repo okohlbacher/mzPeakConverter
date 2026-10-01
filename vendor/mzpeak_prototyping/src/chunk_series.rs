@@ -1654,8 +1654,18 @@ impl ArrowArrayChunk {
                     // intensity list — a parallel-length violation with the mobility only reachable as
                     // an opaque blob. Measured: 4,136 such chunk rows across 18 corpus archives.
                     // Alias the other float widths onto the schema's field so the array lands in its
-                    // own column; the builder casts to the declared width.
-                    for alt in [BinaryDataArrayType::Float32, BinaryDataArrayType::Float64] {
+                    // own column; the builder casts to the declared width. The integer widths too
+                    // (DELIBERATE DEVIATION, extended for 0.17.0): an integer intensity array of
+                    // another type than the column's missed the lookup the same way and was spilled
+                    // with its facet row left empty ("BUG: signal array ... spilled"); it is cast
+                    // into the column like a float now, and the converter counts and declares what
+                    // the cast changes (`intensity-type-narrowing`, `intensity-f32-rounding`).
+                    for alt in [
+                        BinaryDataArrayType::Float32,
+                        BinaryDataArrayType::Float64,
+                        BinaryDataArrayType::Int32,
+                        BinaryDataArrayType::Int64,
+                    ] {
                         if alt != f.dtype {
                             let mut a = f.clone();
                             a.dtype = alt;
