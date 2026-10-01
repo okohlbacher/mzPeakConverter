@@ -216,6 +216,36 @@ class Stamps(Harness):
         self.run_main(root)   # ... and the stamp without an options line is current
         self.assertEqual(self.runs(), 6)
 
+    def test_restamp_keeps_an_archive_whose_recorded_options_equal_its_edited_recipe(self):
+        cv = {"input": "auto", "flags": "--zstd-level 12"}
+        root = make_corpus(self.tmp, {"general-ms/ds/ds.yaml": {"convert": cv}}, {"general-ms/ds/a.mzML": b"x"})
+        desc, stamp = root / "general-ms/ds/ds.yaml", root / "general-ms/ds/a.mzpeak.built"
+        self.run_main(root)
+        # a convert.* edit that leaves the flags alone (a re-pin to what the archive records, a note):
+        # the recipe id changes, the archive does not -> re-stamped, not rebuilt
+        same = {**cv, "note": "re-pinned 2026-10-01 to what the archive records"}
+        desc.write_text(json.dumps({"convert": same}))
+        rc, out = self.run_main(root, "--restamp", "--report-only")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("restamped : 1 archive(s)", out)
+        self.assertEqual(stamp.read_text().splitlines()[1], f"recipe {cr.recipe_id(same)}")
+        self.run_main(root)
+        self.assertEqual(self.runs(), 1, "a re-stamped archive was rebuilt")
+        # a flags edit is a different archive: nothing to re-stamp, the next pass rebuilds
+        desc.write_text(json.dumps({"convert": {**cv, "flags": "--zstd-level 9"}}))
+        rc, out = self.run_main(root, "--restamp", "--report-only")
+        self.assertIn("restamped : 0 archive(s)", out)
+        self.run_main(root)
+        self.assertEqual(self.runs(), 2, "an archive recording other flags was re-stamped as current")
+        # the recorded-options reading: box and host argv orders, -o/-f/--force and the input dropped,
+        # a path-valued flag compared by its last component
+        self.assertEqual(cr.recorded_flags("run.wiff --zstd-level 12 --via-msconvert --tof-grid auto -o out.mzpeak --force"),
+                         ["--zstd-level 12", "--via-msconvert", "--tof-grid auto"])
+        self.assertEqual(cr.recorded_flags("/x/My Run 1.raw -o /x/My Run 1.mzpeak -f --image /x/img/CHJ 2.png"),
+                         ["--image CHJ 2.png"])
+        self.assertEqual(cr.recorded_flags("FM_1-1_01_20254.d -o out.mzpeak --force"), [])
+        self.assertEqual(cr.flag_chunks("--image /abs/dir/CHJ2.png --sample 2"), ["--image CHJ2.png", "--sample 2"])
+
     def test_box_archives_are_stamped_from_their_own_index(self):
         lane = {"input": "auto", "flags": "--via-msconvert --tof-grid auto"}
         root = make_corpus(self.tmp, {
@@ -374,6 +404,27 @@ class BoxPhase(Harness):
             self.run_main(root, "--box", "--publish-s3")
         self.assertEqual(self.manifest()["run.mzpeak"][0], "s3://v09/general-ms/ds/run.mzpeak")
 
+    def test_the_box_no_vendor_default_reaches_only_undescribed_units(self):
+        # A described dataset without flags converts with the converter's defaults (HOW-TO-ADD-DATA:
+        # "omit to convert with defaults"), as the host path always did. The old `flags or
+        # ['--no-vendor']` gave ten box archives a flag no descriptor asked for, and left no way to
+        # pin a unit the box built bare (D17, the BAF unit).
+        root = make_corpus(self.tmp, {
+            "general-ms/bare/bare.yaml": {"convert": {"input": "auto"}},
+            "general-ms/plain/plain.yaml": {"title": "no convert block at all"},
+            "pwiz-examples/px/px.yaml": {"convert": {"input": "auto"}},   # multi-unit tile: no recipe
+        }, {
+            "general-ms/bare/run.wiff": b"x",
+            "general-ms/plain/other.wiff": b"x",
+            "pwiz-examples/px/px.wiff": b"x",
+        })
+        rc, out = self.run_main(root, "--box")
+        self.assertEqual(rc, 0, out)
+        jobs = self.manifest()
+        self.assertEqual(jobs["run.mzpeak"][1], "", "a described, flag-less dataset got the box default")
+        self.assertEqual(jobs["other.mzpeak"][1], "", "a descriptor without a convert block got the box default")
+        self.assertEqual(jobs["px.mzpeak"][1], "--no-vendor", "an undescribed unit lost the box default")
+
     def test_convert_samples_builds_one_archive_per_sample(self):
         sciex = self.tmp / "data/general-ms/sciex"
         root = make_corpus(self.tmp, {"general-ms/sciex/sciex.yaml": {"convert": {"input": "En_PPY.wiff",
@@ -384,8 +435,8 @@ class BoxPhase(Harness):
         rc, out = self.run_main(root, "--box")
         jobs = self.manifest()
         self.assertEqual(sorted(jobs), ["En_PPY.sample117.mzpeak", "En_PPY.sample2.mzpeak"])
-        self.assertEqual(jobs["En_PPY.sample2.mzpeak"], (str(sciex / "En_PPY.sample2.mzpeak"), "--no-vendor --sample 2"))
-        self.assertEqual(jobs["En_PPY.sample117.mzpeak"][1], "--no-vendor --sample 117")
+        self.assertEqual(jobs["En_PPY.sample2.mzpeak"], (str(sciex / "En_PPY.sample2.mzpeak"), "--sample 2"))
+        self.assertEqual(jobs["En_PPY.sample117.mzpeak"][1], "--sample 117")
         for n in (2, 117):
             self.assertTrue((sciex / f"En_PPY.sample{n}.mzpeak.built").exists(), out)
         # the single archive the samples replace must not stay beside them, publishable, in silence

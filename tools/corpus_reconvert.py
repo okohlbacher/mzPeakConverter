@@ -27,6 +27,11 @@ A stamp from before the recipe line counts as stale.
 `--clean` deletes every `.mzpeak` (and stamp) first. It reaches the same end state as the default
 idempotent pass, only slower, so prefer the default unless you specifically want a from-scratch run.
 
+`--restamp` first re-stamps every archive whose recorded `conversion options` are exactly what its
+edited recipe asks for (same converter version, same flags in whichever order the host or the box
+passed them). A descriptor re-pinned to what the box actually built (D17) then stays current
+instead of forcing a no-op rebuild; any other difference leaves the archive stale.
+
 Units that cannot convert on this host (vendor SDKs that are Windows-only, or a missing msconvert)
 are reported as SKIPPED, never counted as complete — completeness has to mean something. With
 `--box` they convert on the flash workstation and come back to the host beside their raw, through a
@@ -40,7 +45,7 @@ each as `<stem>.sample<N>.mzpeak`, converted with `--sample N`. The unit's forme
 reported as SUPERSEDED ON DISK, failing the run, until it is removed.
 
 Usage:
-    tools/corpus_reconvert.py [ROOT] [--clean] [--jobs N] [--dry-run] [--report-only]
+    tools/corpus_reconvert.py [ROOT] [--clean] [--jobs N] [--dry-run] [--report-only] [--restamp]
                               [--box [--box-jobs N] [--publish-s3]]
 
 Release day, once the tag is pushed and `mzpeak-convert --version` names it:
@@ -217,6 +222,7 @@ class Recipe(NamedTuple):
     flags: list[str]  # convert.flags, path-valued arguments absolutised
     rid: str          # recipe_id of the descriptor's `convert` block: what a .built stamp must name
     samples: tuple[int, ...] = ()   # convert.samples: one archive per listed sample of a multi-sample WIFF
+    described: bool = True          # False only for UNDESCRIBED: no descriptor governs the unit at all
 
 
 def recipe_id(cv: dict) -> str:
@@ -226,7 +232,7 @@ def recipe_id(cv: dict) -> str:
     return hashlib.sha256(json.dumps(cv, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-UNDESCRIBED = Recipe([], recipe_id({}))
+UNDESCRIBED = Recipe([], recipe_id({}), described=False)
 
 
 def load_recipes(root: Path) -> tuple[dict[Path, Recipe], dict[Path, Path], set[Path], set[Path]]:
@@ -509,6 +515,21 @@ def recorded_conversion(md: dict) -> tuple[str | None, str]:
     return (ours[-1].get("version") if ours else None), (options or "")
 
 
+def archive_record(archive: Path) -> tuple[str | None, str, str | None]:
+    """What `archive` says built it: (converter version, `conversion options`, problem) of its LAST
+    conversion ([`recorded_conversion`]). `problem` is set, and the rest empty, when the archive
+    cannot answer (no split-facet layout, an unreadable index)."""
+    try:
+        with zipfile.ZipFile(archive) as z:
+            if not any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
+                return None, "", "no split-facet layout"
+            md = json.loads(z.read("mzpeak_index.json")).get("metadata") or {}
+    except Exception as e:  # truncated zip, no index, unparsable index
+        return None, "", f"unreadable archive index ({e})"
+    built, options = recorded_conversion(md)
+    return built, options, None
+
+
 def write_stamp(archive: Path, version: str, rid: str, flags: list[str] | None = None) -> str | None:
     """Stamp `archive` from its OWN index; -> None, or why it was left unstamped.
 
@@ -521,14 +542,9 @@ def write_stamp(archive: Path, version: str, rid: str, flags: list[str] | None =
     So is one whose recorded argv runs another lane than the descriptor's `flags` pin (LANE_FLAGS):
     the refusal names both, and the unit stays failed until the descriptor or the archive changes.
     """
-    try:
-        with zipfile.ZipFile(archive) as z:
-            if not any(n.endswith(FORMAT_MARKER) for n in z.namelist()):
-                return "no split-facet layout"
-            md = json.loads(z.read("mzpeak_index.json")).get("metadata") or {}
-    except Exception as e:  # truncated zip, no index, unparsable index
-        return f"unreadable archive index ({e})"
-    built, options = recorded_conversion(md)
+    built, options, problem = archive_record(archive)
+    if problem:
+        return problem
     if built != version.split()[-1]:
         return f"built by mzpeak-convert {built or '<unrecorded>'}, not {version}"
     why = lane_mismatch(flags, options)
@@ -536,6 +552,58 @@ def write_stamp(archive: Path, version: str, rid: str, flags: list[str] | None =
         return why
     stamp_for(archive).write_text(f"{version}\nrecipe {rid}\noptions {options}\n")
     return None
+
+
+def flag_chunks(argv_text: str) -> list[str]:
+    """`argv_text` as one chunk per flag with its value ("--zstd-level 12", "--image CHJ2.png"),
+    path-shaped tokens reduced to their last component the way `conversion options` records them.
+    Split at flag boundaries, not on whitespace: a value may hold spaces, and so may the input."""
+    chunks = re.split(r"\s+(?=--?[A-Za-z])", argv_text.strip())
+    out = []
+    for c in chunks:
+        if not c:
+            continue
+        toks = [t.rsplit("/", 1)[-1].rstrip("/") if "/" in t else t for t in c.split()]
+        out.append(" ".join(toks))
+    return out
+
+
+def recorded_flags(options: str) -> list[str]:
+    """The flags inside an archive's `conversion options`: the input positional (first chunk), the
+    output (`-o`/`--output <path>`) and the overwrite switch (`-f`/`--force`) dropped. The box writes
+    `<unit> <flags> -o out.mzpeak --force`, the host `<unit> -o <out> -f <flags>`; both reduce to the
+    same chunks, which is what a recipe's flags are compared with."""
+    chunks = flag_chunks(options)[1:]
+    return [c for c in chunks if c not in ("-f", "--force")
+            and not c.startswith("-o ") and not c.startswith("--output ") and c not in ("-o", "--output")]
+
+
+def restamp(groups: dict, recipes: dict[Path, Recipe], version: str, root: Path) -> int:
+    """Re-stamp every archive whose recorded `conversion options` are exactly its recipe's flags, so
+    an edited recipe that names what the box actually built (a D17 re-pin, an added comment, a key
+    other than `flags`) does not force a no-op rebuild. -> how many were re-stamped.
+
+    Only the stamp's recipe line changes, and only for an archive that is current in every other
+    respect: built by this converter version (`write_stamp` refuses another) and recording the
+    recipe's flags, in whichever order the host or the box passed them. A flag the recipe asks for
+    that the archive does not record, or the reverse, leaves the archive stale: that archive IS
+    different from what the recipe builds, and only a rebuild can say so honestly.
+    """
+    done = 0
+    for t, cands in groups.items():
+        u, n = cands[0]
+        r = recipe_for(u, recipes)
+        if not r.described or not t.exists() or is_current(t, version, r.rid, r.flags):
+            continue
+        built, options, problem = archive_record(t)
+        if problem or built != version.split()[-1]:
+            continue
+        if sorted(recorded_flags(options)) != sorted(flag_chunks(" ".join([*r.flags, *sample_flags(n)]))):
+            continue
+        if write_stamp(t, version, r.rid, r.flags) is None:
+            print(f"restamped : {t.relative_to(root)}  recipe {r.rid}  ({options})")
+            done += 1
+    return done
 
 
 def convert(unit: Path, out: Path, binary: str, version: str, dry: bool,
@@ -617,9 +685,15 @@ def run_box(jobs: list[tuple[Path, Path, int | None]], root: Path, version: str,
     manifest.parent.mkdir(parents=True, exist_ok=True)
     with manifest.open("w") as fh:
         for u, t, n in jobs:
-            # The descriptor's own flags, so a box-built archive matches its host-built recipe
-            # (an SDRF demonstrator keeps `--sdrf`); `--no-vendor` only where none are described.
-            flags = (recipe_for(u, recipes or {}).flags or ['--no-vendor']) + sample_flags(n)
+            # The descriptor's own flags, so a box-built archive matches its host-built recipe (an SDRF
+            # demonstrator keeps `--sdrf`). `--no-vendor` only where NO descriptor governs the unit
+            # (pwiz-examples, an ungoverned tile): a described dataset without flags converts with the
+            # converter's defaults, as HOW-TO-ADD-DATA.txt says and as the host path has always done.
+            # Until 2026-10-01 the default applied to any flag-less recipe, so ten box archives carry
+            # `--no-vendor` their descriptors never asked for, and a pin that names what the box built
+            # bare (D17, the BAF unit) could not be written at all.
+            r = recipe_for(u, recipes or {})
+            flags = (r.flags if r.described else ['--no-vendor']) + sample_flags(n)
             # The archive comes back to the host by default: box_convert.sh relays it through a
             # staging key that it verifies and deletes. --publish-s3 names the DURABLE corpus key
             # instead, and box_convert.sh then copies the verified object onto s3://v09/..., the
@@ -709,6 +783,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--report-only", action="store_true", help="audit completeness, convert nothing")
+    ap.add_argument("--restamp", action="store_true",
+                    help="first re-stamp archives whose recorded conversion options already equal their "
+                         "(edited) recipe, so a re-pin to what the box built does not rebuild; then continue")
     ap.add_argument("--box", action="store_true",
                     help="also convert host-unsupported vendor units on the flash workstation")
     # Was 1, because every box job re-downloaded its own raw and N of those at once thrashed the box
@@ -761,6 +838,9 @@ def main(argv: list[str] | None = None) -> int:
         for t, c in dup.items():
             print(f"            {t.name}  <- {', '.join(x.name for x, _ in c)}")
     recipe = {t: recipe_for(c[0][0], recipes) for t, c in groups.items()}
+    if args.restamp:
+        print(f"restamped : {restamp(groups, recipes, version, root)} archive(s) whose recorded options "
+              f"already equal their recipe")
     todo = [t for t in groups if not is_current(t, version, recipe[t].rid, recipe[t].flags)]
     fresh = len(groups) - len(todo)
     print(f"archives  : {len(groups)} (from {len(units)} units)\nalready ok: {fresh}\nto convert: {len(todo)}\n")
