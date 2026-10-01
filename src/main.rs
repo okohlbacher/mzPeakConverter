@@ -524,8 +524,16 @@ fn has_gz_suffix(p: &Path) -> bool {
 /// drops, so the sink must be closed before the rename or the renamed file is a truncated gzip. That
 /// order used to be carried by a comment beside a hand-written `drop(w)` in four places; here it is
 /// structural — the writer cannot outlive the call, and no caller can forget the drop.
+///
+/// A lane that wrote no chromatogram of its own (`write_agilent_profile_mzml`, and
+/// `write_native_mzml` for a source that is not a directory) gets the writer's TIC and base-peak pair
+/// here through [`write_source_chromatograms_mzml`], in time order, where the writer's close would
+/// have written them in spectrum order; every lane's summaries are sorted the same way.
 fn finish_mzml(mut w: mzdata::io::mzml::MzMLWriter<Box<dyn Write>>, tmp_guard: TmpGuard, output: &Path) -> Result<()> {
     use mzdata::prelude::SpectrumWriter;
+    if !w.wrote_summaries {
+        write_source_chromatograms_mzml(&mut w, std::iter::empty())?;
+    }
     SpectrumWriter::close(&mut w)
         .map_err(|e| anyhow!("finalizing mzML {}: {e}", output.display()))?;
     drop(w);
@@ -2534,6 +2542,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
                         whole_frames += 1;
                     }
                 }
+                correct_reader_terms(spec.description_mut());
                 demote_mzp_params(spec.description_mut());
                 unreferenced += drop_references_to(spec.description_mut(), &left_out);
                 if let Some(arrays) = spec.arrays.as_mut() {
@@ -2596,6 +2605,7 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let chroms: Vec<Chromatogram> = (0..n_chrom)
         .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
         .map(|mut c| {
+            c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
             demote_mzp_params_chrom(c.description_mut());
             unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
             if let Some(window) = opts.rt {
@@ -3029,8 +3039,9 @@ fn schema_sample_chromatogram(mut chrom: Chromatogram) -> Chromatogram {
 }
 
 /// Pass a source's chromatograms through to an mzML — every one of them, its TIC and base-peak
-/// chromatograms included — then the TIC and the base-peak chromatogram the mzML writer sums over
-/// the mass spectra written so far, each only when the source carries no chromatogram of that kind:
+/// chromatograms included, as they are — then the TIC and the base-peak chromatogram the mzML writer
+/// sums over the mass spectra written so far, in time order ([`time_sorted_summary`]), each only when
+/// the source carries no chromatogram of that kind:
 /// a LabSolutions export's pair per acquisition event and an archive's own pair reach the mzML, and
 /// neither is doubled. The writer used to add its pair whenever a mass spectrum had been written and
 /// the source's pair was dropped for it. A chromatogramList must hold a chromatogram, so with nothing
@@ -3065,6 +3076,21 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
                     c.description_mut().params.insert(0, p);
                 }
             }
+            // The polarity likewise: mzdata's reader takes `negative scan` / `positive scan` into the
+            // typed field (an archive's `scan_polarity` column comes back there too) and its writer
+            // writes no chromatogram's, so every SRM trace of `MRM Neg C5` (pwiz's Agilent test
+            // file) lost its `negative scan` on both routes. Put it back after the type term.
+            let polarity = match c.description().polarity {
+                mzdata::spectrum::ScanPolarity::Positive => Some(("positive scan", curie!(MS:1000130))),
+                mzdata::spectrum::ScanPolarity::Negative => Some(("negative scan", curie!(MS:1000129))),
+                _ => None,
+            };
+            if let Some((name, accession)) = polarity {
+                if !c.params().iter().any(|p| matches!(p.curie(), Some(curie!(MS:1000129)) | Some(curie!(MS:1000130)))) {
+                    let at = usize::from(c.params().first().is_some_and(|p| p.curie().and_then(ChromatogramType::from_curie).is_some()));
+                    c.description_mut().params.insert(at, Param::builder().name(name).curie(accession).build());
+                }
+            }
             c
         })
         .collect();
@@ -3079,7 +3105,7 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
     ]
     .into_iter()
     .filter(|(kind, _)| !carried(*kind))
-    .map(|(_, collector)| collector.to_chromatogram())
+    .map(|(_, collector)| time_sorted_summary(collector.to_chromatogram()))
     .collect();
     if !kept.is_empty() {
         summaries.retain(|c| c.arrays.get(&ArrayType::TimeArray).and_then(|t| t.data_len().ok()).unwrap_or(0) > 0);
@@ -3099,6 +3125,17 @@ fn write_source_chromatograms_mzml<W: std::io::Write, I: Iterator<Item = Chromat
         );
     }
     Ok(())
+}
+
+/// A summary chromatogram of the mzML writer, in time order. The writer appends a point per spectrum
+/// in the order the spectra are written, so a run whose spectra are not in time order came out with
+/// an unsorted time array (`tiny.pwiz.1.1`'s base-peak trace: 5.8905, 5.9905, 0.0, 0.7008 min), which
+/// a chromatogram cannot have. The points are sorted by time, stably, each keeping its intensity.
+fn time_sorted_summary(mut chrom: Chromatogram) -> Chromatogram {
+    if let Err(e) = chrom.arrays.sort_by_array(&ArrayType::TimeArray) {
+        log::warn!("summary chromatogram {:?}: not sorted by time: {e}", chrom.id());
+    }
+    chrom
 }
 
 /// Run ProteoWizard `msconvert` for the output mzML (`--via-msconvert --to mzml`). It writes into a
@@ -8296,6 +8333,79 @@ fn strip_grid_axis(arrays: &mut BinaryArrayMap) {
     });
 }
 
+/// What the vendored reader states wrongly for an archive's spectrum, put right on the way into an
+/// mzML (`filter_mzpeak_to_mzml`); the `.d → mzML` lane states each of them right. Through 0.16.0:
+///
+/// * PSI-MS names MS:1002815 `inverse reduced ion mobility`; the reader names every 1/K0 it rebuilds
+///   from a scan's or a selected ion's `ion_mobility_value` column `inverse reduced ion mobility
+///   drift time`, a label no PSI-MS release has (every selected ion of a timsTOF archive's export).
+/// * The writer keeps a scan's 1/K0 in the scan's `ion_mobility_value` column AND in its
+///   `parameters`, and the reader adds the column's copy after the list's: every MS2 `<scan>` of a
+///   `--no-ims-compact` archive's export stated MS:1002815 twice (15,977 of PXD059079 2485's). A
+///   scan keeps one of each accession with a given value and unit.
+/// * The reader hands `spectra_metadata.time` back as a SPECTRUM-level `scan start time`, beside the
+///   scan's own: mzML states the time on the scan. It is dropped, or becomes the scan's time where the
+///   scan has none (an archive without its scans facet), in minutes, the scan's unit: the param's
+///   own unit says what its value is in (minutes when it states none, as this writer maps the column).
+fn correct_reader_terms(descr: &mut mzdata::spectrum::SpectrumDescription) {
+    let time = descr.params.iter().find(|p| p.curie() == Some(curie!(MS:1000016))).map(|p| {
+        p.value.to_f64().map(|t| match p.unit {
+            Unit::Second => t / 60.0,
+            Unit::Millisecond => t / 60_000.0,
+            _ => t,
+        })
+    });
+    if let Some(time) = time {
+        descr.params.retain(|p| p.curie() != Some(curie!(MS:1000016)));
+        // Without a scans facet the reader hands over one default scan, at time 0.
+        match (descr.acquisition.scans.first_mut(), time) {
+            (None, Ok(t)) => {
+                let mut scan = mzdata::spectrum::ScanEvent::default();
+                scan.start_time = t;
+                descr.acquisition.scans.push(scan);
+            }
+            (Some(scan), Ok(t)) if scan.start_time == 0.0 => scan.start_time = t,
+            _ => {}
+        }
+    }
+    for scan in descr.acquisition.scans.iter_mut() {
+        if let Some(ps) = scan.params.as_mut() {
+            correct_reader_params(ps);
+        }
+    }
+    for prec in descr.precursor.iter_mut() {
+        correct_reader_ion_terms(prec);
+    }
+}
+
+/// [`correct_reader_terms`] for a precursor's selected ions (a spectrum's or a chromatogram's).
+fn correct_reader_ion_terms(prec: &mut mzdata::spectrum::Precursor) {
+    for ion in prec.ions.iter_mut() {
+        if let Some(ps) = ion.params.as_mut() {
+            correct_reader_params(ps);
+        }
+    }
+}
+
+/// One parameter list of [`correct_reader_terms`]: MS:1002815 under its PSI-MS name, and one of each
+/// controlled term with a given value and unit.
+fn correct_reader_params(params: &mut Vec<Param>) {
+    for p in params.iter_mut() {
+        if p.curie() == Some(curie!(MS:1002815)) {
+            p.name = "inverse reduced ion mobility".to_string();
+        }
+    }
+    let mut seen: Vec<(mzdata::params::CURIE, mzdata::params::Value, Unit)> = Vec::new();
+    params.retain(|p| match p.curie() {
+        Some(c) if seen.iter().any(|(sc, sv, su)| *sc == c && *sv == p.value && *su == p.unit) => false,
+        Some(c) => {
+            seen.push((c, p.value.clone(), p.unit));
+            true
+        }
+        None => true,
+    });
+}
+
 /// [`demote_mzp_params`] for a chromatogram.
 fn demote_mzp_params_chrom(descr: &mut ChromatogramDescription) {
     demote_mzp_in(&mut descr.params);
@@ -9111,6 +9221,100 @@ mod tests {
             assert_eq!(p.curie().and_then(C::from_curie), Some(kind), "{accession} reads back as {kind:?}");
         }
         assert!(super::chromatogram_type_param(C::Unknown).is_none());
+    }
+
+    /// An archive spectrum as the vendored reader hands it over, without its scans facet: one default
+    /// scan at time 0, the time a spectrum-level `scan start time`, and a scan 1/K0 twice, the second
+    /// under the reader's label. The export states the time on the scan alone and the 1/K0 once, under
+    /// PSI-MS's name; a second `window group`-like uncontrolled param and a different value stay.
+    #[test]
+    fn reader_terms_are_put_right_for_the_mzml_export() {
+        use mzdata::curie;
+        use mzdata::params::Unit;
+        let k0 = |name: &str, v: f64| {
+            Param::builder().name(name).curie(curie!(MS:1002815)).value(v).unit(Unit::VoltSecondPerSquareCentimeter).build()
+        };
+        let mut descr = SpectrumDescription::default();
+        descr.add_param(Param::builder().name("scan start time").curie(curie!(MS:1000016)).value(5.8905).unit(Unit::Minute).build());
+        let scan = descr.acquisition.first_scan_mut().unwrap();
+        assert_eq!(scan.start_time, 0.0);
+        scan.add_param(k0("inverse reduced ion mobility", 1.3323874701174356));
+        scan.add_param(Param::new_key_value("window group", 1i64));
+        scan.add_param(k0("inverse reduced ion mobility drift time", 1.3323874701174356));
+        scan.add_param(k0("inverse reduced ion mobility drift time", 1.1));
+        super::correct_reader_terms(&mut descr);
+        assert!(descr.params.iter().all(|p| p.curie() != Some(curie!(MS:1000016))));
+        let scan = descr.acquisition.first_scan().unwrap();
+        assert_eq!(scan.start_time, 5.8905);
+        let names: Vec<(&str, String)> = scan.params().iter().map(|p| (p.name.as_str(), p.value.to_string())).collect();
+        assert_eq!(
+            names,
+            [
+                ("inverse reduced ion mobility", "1.3323874701174356".to_string()),
+                ("window group", "1".to_string()),
+                ("inverse reduced ion mobility", "1.1".to_string()),
+            ]
+        );
+    }
+
+    /// A spectrum-level `scan start time` that becomes the scan's time is converted by its own unit:
+    /// a scan's time is in minutes, and one stated in seconds (or milliseconds) used to land on the
+    /// scan as that many minutes, 60× (60,000×) too late. A time without a unit is minutes.
+    #[test]
+    fn a_spectrum_level_time_reaches_the_scan_in_minutes() {
+        use mzdata::curie;
+        use mzdata::params::Unit;
+        let moved = |value: f64, unit: Unit| {
+            let mut descr = SpectrumDescription::default();
+            descr.acquisition.scans.clear();
+            descr.add_param(Param::builder().name("scan start time").curie(curie!(MS:1000016)).value(value).unit(unit).build());
+            super::correct_reader_terms(&mut descr);
+            assert!(descr.params.iter().all(|p| p.curie() != Some(curie!(MS:1000016))));
+            descr.acquisition.first_scan().unwrap().start_time
+        };
+        assert_eq!(moved(353.43, Unit::Second), 353.43 / 60.0);
+        assert_eq!(moved(353_430.0, Unit::Millisecond), 353_430.0 / 60_000.0);
+        assert_eq!(moved(5.8905, Unit::Minute), 5.8905);
+        assert_eq!(moved(5.8905, Unit::Unknown), 5.8905);
+    }
+
+    /// A lane that writes no chromatogram of its own (the Agilent profile lane; the native lane on a
+    /// source that is not a directory) ends in `finish_mzml`, where mzdata's close used to write the
+    /// TIC and base-peak pair in spectrum order: three spectra at 5.8905, 0.0, 0.7008 min gave that
+    /// time array. Now both are in time order, each point keeping its intensity.
+    #[test]
+    fn the_mzml_epilogue_writes_the_summed_chromatograms_in_time_order() {
+        use mzdata::spectrum::SignalContinuity;
+        let (dir, _cleanup) = trace_scratch("epilogue-order");
+        let output = dir.join("out.mzML");
+        let tmp = super::mzml_tmp_path(&output);
+        let guard = super::TmpGuard::new(&tmp);
+        let mut w = mzdata::io::mzml::MzMLWriter::new(super::mzml_sink(&tmp).unwrap());
+        w.set_spectrum_count(3);
+        for (i, (time, intensity)) in [(5.8905, 30.0f32), (0.0, 10.0), (0.7008, 20.0)].into_iter().enumerate() {
+            let mut descr = SpectrumDescription { id: format!("scan={}", i + 1), index: i, ms_level: 1, ..Default::default() };
+            descr.signal_continuity = SignalContinuity::Centroid;
+            descr.acquisition.first_scan_mut().unwrap().start_time = time;
+            let mut arrays = BinaryArrayMap::new();
+            let mut mz = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
+            mz.extend(&[100.0f64, 200.0]).unwrap();
+            arrays.add(mz);
+            let mut int = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+            int.extend(&[intensity, 1.0]).unwrap();
+            arrays.add(int);
+            mzdata::prelude::SpectrumWriter::write(&mut w, &MultiLayerSpectrum::new(descr, Some(arrays), None, None)).unwrap();
+        }
+        super::finish_mzml(w, guard, &output).unwrap();
+        let mut r = mzdata::io::mzml::MzMLReader::open_path(&output).unwrap();
+        let chroms: Vec<super::Chromatogram> = (0..r.count_chromatograms()).map(|i| r.get_chromatogram_by_index(i).unwrap()).collect();
+        assert_eq!(chroms.iter().map(|c| c.id()).collect::<Vec<_>>(), ["TIC", "BIC"]);
+        let points = |c: &super::Chromatogram| {
+            let t = c.arrays.get(&ArrayType::TimeArray).unwrap().to_f64().unwrap().to_vec();
+            let v = c.arrays.get(&ArrayType::IntensityArray).unwrap().to_f32().unwrap().to_vec();
+            (t, v)
+        };
+        assert_eq!(points(&chroms[0]), (vec![0.0, 0.7008, 5.8905], vec![11.0, 21.0, 31.0]));
+        assert_eq!(points(&chroms[1]), (vec![0.0, 0.7008, 5.8905], vec![10.0, 20.0, 30.0]));
     }
 
     /// mzML → mzML keeps each chromatogram's type term. mzdata's reader moves it into the typed

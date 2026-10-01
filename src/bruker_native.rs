@@ -27,7 +27,7 @@ use mzdata::curie;
 use mzdata::meta::DissociationMethodTerm;
 use mzdata::spectrum::{
     Activation, IsolationWindow, IsolationWindowState, MultiLayerSpectrum,
-    Precursor, ScanPolarity, SelectedIon, SignalContinuity, SpectrumDescription,
+    Precursor, ScanPolarity, ScanWindow, SelectedIon, SignalContinuity, SpectrumDescription,
 };
 
 use mzpeak_prototyping::grid::{GridEncoding, GridModelLike, SquareRootLinearGrid, TimsTofMzGrid2, TimsTofTimsLinearGrid2};
@@ -459,6 +459,9 @@ pub struct NativeTofReader {
     /// order when [`Self::ims_grid_spectrum`] sorted them. The finisher declares `sort-by-mz` from it
     /// (the schema probe counts too; it is one frame of the run).
     frames_reordered: std::sync::atomic::AtomicUsize,
+    /// The run's acquisition m/z range (`GlobalMetadata` `MzAcqRangeLower` / `MzAcqRangeUpper`), every
+    /// frame's scan window, as the `.d → mzML` lane states it; `None` when it is not a range.
+    scan_window: Option<ScanWindow>,
 }
 
 /// Per-frame `Frames` columns, ordered by `Id` so position `i` matches timsrust's frame index.
@@ -490,6 +493,10 @@ struct FrameTable {
     t1: Vec<Option<f64>>,
     t2: Vec<Option<f64>>,
     mz_cal_id: Vec<Option<i64>>,
+    /// `AccumulationTime` (ms) — how long the TIMS tunnel accumulated the frame's ions, which the
+    /// `.d → mzML` lane (mzdata's TDF reader) states as the frame's `ion injection time`. Read on its
+    /// own ([`read_accumulation_times`]): empty when unreadable, which only leaves the time unstated.
+    accumulation_time: Vec<Option<f64>>,
 }
 
 /// Converter-owned CURIEs for the per-frame calibration inputs (`Frames.T1`, `Frames.T2`,
@@ -1098,7 +1105,8 @@ impl NativeTofReader {
             }
         };
         let tims_grid = recal.as_ref().and_then(|c| GridEncoding::from_parameters(TimsTofTimsLinearGrid2::ACCESSION, &c.grid_parameters()));
-        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows, mz_rows, tims_grid, frames_reordered: Default::default() })
+        let scan_window = acquisition_scan_window(meta.lower_mz, meta.upper_mz);
+        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows, mz_rows, tims_grid, frames_reordered: Default::default(), scan_window })
     }
 
     /// What the grid rows' m/z amount to against the vendor's model ([`mz_model_summary`]).
@@ -1365,6 +1373,11 @@ impl NativeTofReader {
         if let Some(&rt) = self.table.rt.get(i) {
             descr.acquisition.first_scan_mut().unwrap().start_time = rt / 60.0;
         }
+        state_frame_acquisition(
+            descr.acquisition.first_scan_mut().unwrap(),
+            self.table.accumulation_time.get(i).copied().flatten(),
+            self.scan_window.as_ref(),
+        );
         // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
         descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
         descr.precursor = self.precursors_at(i);
@@ -1503,13 +1516,84 @@ fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
         .map_err(|e| anyhow::anyhow!("opening {} for Frames: {e}", tdf.display()))?;
     // T1/T2/MzCalibration are in every TDF schema seen; should one lack them, keep the core four
     // rather than failing the conversion.
-    match read_frame_rows(&conn, true) {
-        Ok(t) => Ok(t),
+    let mut table = match read_frame_rows(&conn, true) {
+        Ok(t) => t,
         Err(e) => {
             log::warn!("TDF Frames T1/T2/MzCalibration unavailable ({e}); per-frame calibration columns omitted");
-            read_frame_rows(&conn, false)
+            read_frame_rows(&conn, false)?
+        }
+    };
+    table.accumulation_time = read_accumulation_times(&conn, table.id.len());
+    Ok(table)
+}
+
+/// `Frames.AccumulationTime` in `Id` order, one per frame row; empty, with a warning, when the column
+/// cannot be read or its count is not the frames' (a frame's position must name its own row). Both
+/// ims-compact lanes read it, this one and `--bruker-sdk`'s (`bruker_sdk::TdfSdkReader`).
+pub(crate) fn read_accumulation_times(conn: &rusqlite::Connection, frames: usize) -> Vec<Option<f64>> {
+    let read = || -> rusqlite::Result<Vec<Option<f64>>> {
+        let mut stmt = conn.prepare("SELECT AccumulationTime FROM Frames ORDER BY Id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, Option<f64>>(0))?;
+        rows.collect()
+    };
+    match read() {
+        Ok(times) if times.len() == frames => times,
+        Ok(times) => {
+            log::warn!("TDF Frames.AccumulationTime: {} rows for {frames} frames; no frame states an ion injection time", times.len());
+            Vec::new()
+        }
+        Err(e) => {
+            log::warn!("TDF Frames.AccumulationTime unavailable ({e}); no frame states an ion injection time");
+            Vec::new()
         }
     }
+}
+
+/// The run's acquisition m/z range (`GlobalMetadata` `MzAcqRangeLower` / `MzAcqRangeUpper`) as the
+/// scan window of every frame, as the `.d → mzML` lane (mzdata's TDF reader) states it; `None` when
+/// the two do not make a range.
+pub(crate) fn acquisition_scan_window(lower: f64, upper: f64) -> Option<ScanWindow> {
+    (lower.is_finite() && upper.is_finite() && lower < upper)
+        .then(|| ScanWindow { lower_bound: lower as f32, upper_bound: upper as f32 })
+}
+
+/// [`acquisition_scan_window`] from `analysis.tdf`'s own `GlobalMetadata`, for the `--bruker-sdk`
+/// lane, which has no timsrust metadata to take it from. This lane's `meta.lower_mz` / `upper_mz`
+/// are the same two keys as timsrust reads them, widened by 5 Th on each side when
+/// `AcquisitionSoftware` is `Bruker otofControl`; that is done here too, so both lanes state what the
+/// `.d → mzML` lane does. `None`, with a warning, when either key is missing or not a number. Live on
+/// Windows/Linux (the SDK reader path); dead on macOS, where that path is cfg'd out.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub(crate) fn read_acquisition_scan_window(conn: &rusqlite::Connection) -> Option<ScanWindow> {
+    use rusqlite::types::Value;
+    let get = |key: &str| conn.query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [key], |r| r.get::<_, Value>(0)).ok();
+    let value = |key: &str| -> Option<f64> {
+        match get(key)? {
+            Value::Real(x) => Some(x),
+            Value::Integer(n) => Some(n as f64),
+            Value::Text(t) => t.trim().parse().ok(),
+            _ => None,
+        }
+    };
+    let widen = if matches!(get("AcquisitionSoftware"), Some(Value::Text(s)) if s == "Bruker otofControl") { 5.0 } else { 0.0 };
+    let window = value("MzAcqRangeLower")
+        .zip(value("MzAcqRangeUpper"))
+        .and_then(|(lo, hi)| acquisition_scan_window(lo - widen, hi + widen));
+    if window.is_none() {
+        log::warn!("TDF GlobalMetadata MzAcqRangeLower/MzAcqRangeUpper unavailable; no frame states a scan window");
+    }
+    window
+}
+
+/// What the `.d → mzML` lane states on every frame's scan, on both ims-compact lanes: the frame's
+/// `AccumulationTime` (ms) as its ion injection time and the run's acquisition m/z range as its scan
+/// window (165.957 ms and 99.99–1700 on PXD059079 2485). Through 0.16.0 an ims-compact archive held
+/// neither, and its export wrote `ion injection time 0` and no window.
+pub(crate) fn state_frame_acquisition(scan: &mut mzdata::spectrum::ScanEvent, accumulation_ms: Option<f64>, window: Option<&ScanWindow>) {
+    if let Some(ms) = accumulation_ms {
+        scan.injection_time = ms as f32;
+    }
+    scan.scan_windows.extend(window.cloned());
 }
 
 fn read_frame_rows(conn: &rusqlite::Connection, with_cal: bool) -> Result<FrameTable> {
@@ -2030,6 +2114,74 @@ mod empty_frame_read_tests {
         assert_eq!(spec.description.id, "frame=5");
         assert!(maldi.attach(&mut spec), "the position of frame 5 attaches");
         assert_eq!(crate::imaging::position_of(&spec.description), Some((3, 1)));
+    }
+
+    /// Each frame's scan states the frame's `AccumulationTime` as its ion injection time and the run's
+    /// `MzAcqRangeLower`–`MzAcqRangeUpper` as its scan window, as the `.d → mzML` lane does; through
+    /// 0.16.0 an ims-compact archive stored neither, and its export wrote `ion injection time 0`.
+    /// Frame ids 1, 2, 5 with three different times: a frame's position names its own row. The
+    /// `--bruker-sdk` lane, which has no timsrust metadata, reads the same window from the same file
+    /// (`read_acquisition_scan_window`), otofControl's widening included.
+    #[test]
+    fn a_frame_states_its_accumulation_time_and_the_acquisition_range() {
+        for (software, expected) in [("timsTOF", (99.993933, 1700.0)), ("Bruker otofControl", (94.993933, 1705.0))] {
+            let dot_d = std::env::temp_dir().join(format!("mzpc-accumulation-{}.d", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dot_d);
+            std::fs::create_dir_all(&dot_d).unwrap();
+            std::fs::write(dot_d.join("analysis.tdf_bin"), [0u8; 8]).unwrap();
+            let conn = rusqlite::Connection::open(dot_d.join("analysis.tdf")).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+                 INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', '2'), ('AcquisitionSoftware', '{software}'),
+                     ('MzAcqRangeLower', '99.993933'), ('MzAcqRangeUpper', '1700'), ('DigitizerNumSamples', '439442'),
+                     ('OneOverK0AcqRangeLower', '0.78'), ('OneOverK0AcqRangeUpper', '1.6');
+                 CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, Polarity TEXT, ScanMode INTEGER, MsMsType INTEGER,
+                     TimsId INTEGER, NumScans INTEGER, NumPeaks INTEGER, AccumulationTime REAL);
+                 INSERT INTO Frames VALUES (1, 0.5, '+', 20, 0, 0, 900, 0, 165.957), (2, 0.6, '+', 20, 0, 0, 900, 0, 50.0),
+                                           (5, 0.9, '+', 20, 0, 0, 900, 0, 25.5);"
+            ))
+            .unwrap();
+            let sdk_window = super::read_acquisition_scan_window(&conn).map(|w| (w.lower_bound, w.upper_bound));
+            drop(conn);
+            let reader = super::NativeTofReader::open(&dot_d).unwrap();
+            let scans: Vec<mzdata::spectrum::ScanEvent> =
+                (0..3).map(|i| reader.ims_grid_spectrum(i, true).unwrap().description.acquisition.scans[0].clone()).collect();
+            let _ = std::fs::remove_dir_all(&dot_d);
+            assert_eq!(scans.iter().map(|s| s.injection_time).collect::<Vec<_>>(), [165.957, 50.0, 25.5]);
+            for scan in &scans {
+                assert_eq!(scan.scan_windows.len(), 1);
+                assert_eq!((scan.scan_windows[0].lower_bound, scan.scan_windows[0].upper_bound), expected, "{software}");
+            }
+            assert_eq!(sdk_window, Some(expected), "the SDK lane's window is the native lane's ({software})");
+        }
+    }
+
+    /// The `--bruker-sdk` ims-compact lane reads the two from `analysis.tdf` itself: the acquisition
+    /// range from `GlobalMetadata`, whose `Value` holds text in every TDF seen but is an untyped column
+    /// (a number stored as one reads the same), and `Frames.AccumulationTime` in `Id` order. A missing
+    /// key or an inverted range states no window; a frame count that is not the table's states no time.
+    #[test]
+    fn the_sdk_lane_reads_the_accumulation_time_and_the_acquisition_range() {
+        use super::{read_accumulation_times, read_acquisition_scan_window};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value);
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, AccumulationTime REAL);
+             INSERT INTO Frames VALUES (5, 25.5), (1, 165.957), (2, NULL);",
+        )
+        .unwrap();
+        let window = |conn: &rusqlite::Connection| read_acquisition_scan_window(conn).map(|w| (w.lower_bound, w.upper_bound));
+        assert_eq!(window(&conn), None);
+        conn.execute_batch("INSERT INTO GlobalMetadata VALUES ('MzAcqRangeLower', '99.993933'), ('MzAcqRangeUpper', '1700');").unwrap();
+        assert_eq!(window(&conn), Some((99.993933, 1700.0)));
+        conn.execute_batch("UPDATE GlobalMetadata SET Value = 1700.0 WHERE Key = 'MzAcqRangeUpper';").unwrap();
+        assert_eq!(window(&conn), Some((99.993933, 1700.0)));
+        conn.execute_batch("INSERT INTO GlobalMetadata VALUES ('AcquisitionSoftware', 'Bruker otofControl');").unwrap();
+        assert_eq!(window(&conn), Some((94.993933, 1705.0)), "widened as timsrust widens an otofControl range");
+        conn.execute_batch("UPDATE GlobalMetadata SET Value = 50 WHERE Key = 'MzAcqRangeUpper';").unwrap();
+        assert_eq!(window(&conn), None);
+        assert_eq!(read_accumulation_times(&conn, 3), [Some(165.957), None, Some(25.5)]);
+        assert!(read_accumulation_times(&conn, 4).is_empty());
     }
 
     /// Random access to an EMPTY spectrum must not abort the process.
