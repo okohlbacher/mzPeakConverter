@@ -185,8 +185,10 @@ struct IntensityTally {
     float_not_i32: u64,
     float_not_i64: u64,
     /// Integer values of arrays the writer takes that a float32 / float64 / int32 does not hold:
-    /// rounded, or clamped, in such a column (both layouts cast an integer array of another type
-    /// into the column; through 0.17.0-rc.2 the chunked layout filed it as an auxiliary array).
+    /// rounded, or clamped to the int32 range, in such a column. Both layouts cast an integer
+    /// array of another type into the column and clamp what is out of range; through 0.17.0-rc.2
+    /// the chunked layout filed such an array as an auxiliary array, and the point layout stored
+    /// a null for each out-of-range value (arrow's safe cast), which the reader takes as absent.
     int_not_f32: u64,
     int_not_f64: u64,
     int_not_i32: u64,

@@ -495,7 +495,7 @@ impl PointBuffers {
                 let arr = if arr.data_type() == &dt {
                     arr
                 } else {
-                    arrow::compute::cast(&arr, &dt).unwrap_or(arr)
+                    crate::peak_series::cast_saturating(&arr, &dt).unwrap_or(arr)
                 };
                 log::debug!("Routing variant field {label} to canonical column {key}");
                 (key, arr)

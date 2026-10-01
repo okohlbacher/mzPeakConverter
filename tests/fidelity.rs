@@ -1134,13 +1134,17 @@ fn intensity_types_mixed_among_the_sampled_spectra_take_a_column_that_holds_them
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An integer intensity array of another type than the column's that reaches the chunked layout
-/// after the sampled spectra was filed in the spectrum's `auxiliary_arrays` with the facet row
-/// left empty ("BUG: signal array ... spilled" in the log): the archive held fewer intensities
-/// than the file, and nothing was declared. It is cast into the column now, as a float of another
-/// type always was, and the cast is counted and declared: an int32 column clamps a 64-bit integer
-/// out of its range to the range (`intensity-type-narrowing`; mzdata's cast alone would wrap it), a
-/// float32 column rounds an integer above 2^24 (`intensity-f32-rounding`).
+/// An intensity array of another type than the column's that reaches the writer after the sampled
+/// spectra is cast into the column, in both layouts, and the cast is counted and declared: an int32
+/// column clamps an integer or a float out of its range to the range (`intensity-type-narrowing`),
+/// a float32 column rounds an integer above 2^24 (`intensity-f32-rounding`). Through 0.17.0-rc.2
+/// neither layout did that for every such array: the chunked layout filed an integer array of
+/// another type in the spectrum's `auxiliary_arrays` with the facet row left empty ("BUG: signal
+/// array ... spilled" in the log), so the archive held fewer intensities than the file and nothing
+/// was declared; and the point layout cast with arrow's safe cast, which stores a NULL for every
+/// value the column does not hold — counted and declared, but an intensity list of nulls is one
+/// the reader takes as absent, and the mzML export of such an archive wrote the spectrum with an
+/// m/z array and no intensity array. (mzdata's own cast would wrap an integer out of range.)
 #[test]
 fn an_integer_array_of_another_type_after_the_sampled_spectra_is_cast_and_declared_not_spilled() {
     let dir = scratch("late-integer");
@@ -1149,6 +1153,8 @@ fn an_integer_array_of_another_type_after_the_sampled_spectra_is_cast_and_declar
     let mz: Vec<f64> = (0..points).map(|i| 200.0 + 0.01 * i as f64).collect();
     let counts = |rng: &mut Lcg| Intensity::I32((0..points).map(|_| 1 + (1000.0 * rng.next()) as i32).collect());
     let wide_counts = |rng: &mut Lcg| Intensity::I64((0..points).map(|_| (1i64 << 31) + (1e12 * rng.next()) as i64).collect());
+    let negative_counts = |rng: &mut Lcg| Intensity::I64((0..points).map(|_| -(1i64 << 31) - 1 - (1e9 * rng.next()) as i64).collect());
+    let big_floats = |rng: &mut Lcg| Intensity::F64((0..points).map(|_| 3.0e9 + 1.0e9 * rng.next() + 0.25).collect());
     let narrow = |rng: &mut Lcg| Intensity::F32((0..points).map(|_| (1e5 * rng.next()) as f32 + 0.5).collect());
     // Odd integers between 2^24 and 2^25: no float32 holds one.
     let large_counts = |rng: &mut Lcg| Intensity::I32((0..points).map(|_| (1 << 24) + 1 + 2 * (1e6 * rng.next()) as i32).collect());
@@ -1156,25 +1162,25 @@ fn an_integer_array_of_another_type_after_the_sampled_spectra_is_cast_and_declar
     let mut spectra = |a: Gen, b: Gen| -> Vec<MzmlSpectrum> {
         (0..first + later).map(|i| MzmlSpectrum { profile: true, mz: mz.clone(), intensity: if i < first { a(&mut rng) } else { b(&mut rng) }, charge: false }).collect()
     };
-    // (name, spectra, the column type, the layouts, the count key, what the later values become)
-    let cases: [(&str, Vec<MzmlSpectrum>, DataType, &[&str], &str, &str); 2] = [
-        // The point layout's cast of an integer out of range is arrow's, which stores a null: not
-        // this change's, so the chunked layout alone here.
-        ("counts-then-wide-counts", spectra(&counts, &wide_counts), DataType::Int32, &["chunked"], "intensity_values_narrowed", "intensity-type-narrowing"),
-        ("narrow-then-large-counts", spectra(&narrow, &large_counts), DataType::Float32, &["chunked", "point"], "intensity_values_rounded", "intensity-f32-rounding"),
+    // (name, spectra, the column type, the count key, what the later values become)
+    let cases: [(&str, Vec<MzmlSpectrum>, DataType, &str, &str); 4] = [
+        ("counts-then-wide-counts", spectra(&counts, &wide_counts), DataType::Int32, "intensity_values_narrowed", "intensity-type-narrowing"),
+        ("counts-then-negative-counts", spectra(&counts, &negative_counts), DataType::Int32, "intensity_values_narrowed", "intensity-type-narrowing"),
+        ("counts-then-big-floats", spectra(&counts, &big_floats), DataType::Int32, "intensity_values_narrowed", "intensity-type-narrowing"),
+        ("narrow-then-large-counts", spectra(&narrow, &large_counts), DataType::Float32, "intensity_values_rounded", "intensity-f32-rounding"),
     ];
-    for (name, spectra, column, layouts, key, entry) in &cases {
+    for (name, spectra, column, key, entry) in &cases {
         let input = dir.join(format!("{name}.mzML"));
         write_mzml(&input, spectra);
         let source: Vec<f64> = spectra.iter().flat_map(|s| s.intensity.as_f64()).collect();
         let expected: Vec<f64> = source
             .iter()
             .map(|x| match column {
-                DataType::Int32 => x.clamp(f64::from(i32::MIN), f64::from(i32::MAX)),
+                DataType::Int32 => x.clamp(f64::from(i32::MIN), f64::from(i32::MAX)).trunc(),
                 _ => f64::from(*x as f32),
             })
             .collect();
-        for layout in *layouts {
+        for layout in ["chunked", "point"] {
             let out = dir.join(format!("{name}-{layout}.mzpeak"));
             let err = loud(&input, &out, &["--layout", layout]);
             assert!(!err.contains("spilled"), "{name}, {layout}: {err}");
