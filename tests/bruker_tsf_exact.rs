@@ -6,7 +6,10 @@
 //!   the point layout where that is smaller — never numpress-linear; the decoded m/z are the
 //!   calibration's values `(a + b·tof)²` bit for bit, `fidelity.mz_error` is empty and
 //!   `transformations` names no m/z change;
-//! * sparse frames whose delta chunks would be at risk: the point layout, exact;
+//! * sparse frames whose delta chunks would be at risk: the point layout, exact — under
+//!   `--no-numpress` too (inert on this lane: there is no numpress to switch off) and under
+//!   `MZPC_ENCODING_PRESCAN=0`, which writes the point layout without the trial, so no path leaves
+//!   the archive inexact while the bin is gone;
 //! * `analysis.tsf_bin` is dropped and the drop recorded in `vendor_files`; `--aux
 //!   'analysis.tsf_bin=embed'` keeps it.
 //!
@@ -191,7 +194,10 @@ fn tsf_mz_are_stored_exactly_as_delta_or_point_never_numpress() {
     let chosen = block["chosen"]["mz"].as_str().unwrap();
     assert!(chosen == "delta" || chosen == "point", "{block:#}");
     assert_eq!(block["delta_chunks_at_risk"], 0, "{block:#}");
-    assert!(block["measured_bytes"]["mz"].get("numpress-linear").is_none(), "an exact lane offers no lossy arm: {block:#}");
+    // The trial counts whole facets (the point layout moves every column), filed as such.
+    assert!(block["measured_bytes"].get("mz").is_none(), "whole-facet bytes are not the m/z column's: {block:#}");
+    assert!(block["measured_bytes"]["facets"].get("numpress-linear").is_none(), "an exact lane offers no lossy arm: {block:#}");
+    assert!(block["measured_bytes"]["facets"]["delta"].is_u64() && block["measured_bytes"]["facets"]["point"].is_u64(), "{block:#}");
     assert_eq!(m["fidelity"]["spectra_peaks"]["layout"], if chosen == "point" { "point" } else { "chunked" }, "{block:#}");
 
     // Sparse frames: delta has a chunk at risk in every frame, so the exact arm is the point layout.
@@ -205,13 +211,24 @@ fn tsf_mz_are_stored_exactly_as_delta_or_point_never_numpress() {
     assert!(block["delta_chunks_at_risk"].as_u64() > Some(0), "{block:#}");
     assert_eq!(m["fidelity"]["spectra_peaks"]["layout"], "point");
 
-    // `--no-numpress` on this lane asks for delta: still exact, so still the point layout here.
+    // `--no-numpress` is inert on this lane (nothing to switch off) and says so: the trial runs as
+    // by default and the point layout, the exact arm, is written with its block.
     let out = dir.join("sparse-flag.mzpeak");
-    convert(&sparse, &out, &["--no-numpress"]);
+    let r = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
+        .arg(&sparse).arg("-o").arg(&out).arg("--force").arg("--no-numpress")
+        .env_remove("MZPC_ENCODING_PRESCAN")
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(err.contains("--no-numpress is inert on this lane"), "{err}");
     assert_exact(&out, &expected, "sparse --no-numpress");
-    assert_eq!(index(&out)["metadata"]["fidelity"]["spectra_peaks"]["layout"], "point");
+    let m = index(&out)["metadata"].clone();
+    assert_eq!((&m["fidelity"]["spectra_peaks"]["layout"], &m["encoding_prescan"]["chosen"]["mz"]), (&Value::from("point"), &Value::from("point")), "{m:#}");
 
-    // The lever skips the trial: delta without a check, declared where it is at risk.
+    // The lever skips the trial: the point layout, exact without a check — never untested delta,
+    // which on these frames would be one ulp off while the bin, the vendor's exact copy, is dropped.
     let out = dir.join("sparse-env.mzpeak");
     let r = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
         .arg(&sparse).arg("-o").arg(&out).arg("-q").arg("--force")
@@ -219,11 +236,19 @@ fn tsf_mz_are_stored_exactly_as_delta_or_point_never_numpress() {
         .output()
         .unwrap();
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    assert_exact(&out, &expected, "sparse MZPC_ENCODING_PRESCAN=0");
     let m = index(&out)["metadata"].clone();
     assert!(m.get("encoding_prescan").is_none(), "{m:#}");
-    assert_eq!(m["fidelity"]["spectra_peaks"]["layout"], "chunked");
-    let applied: Vec<&str> = m["transformations"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(applied.contains(&"delta-ulp") && !applied.contains(&"numpress-linear"), "{applied:?}");
+    assert_eq!(m["fidelity"]["spectra_peaks"]["layout"], "point", "{m:#}");
+    assert!(!members(&out).iter().any(|n| n.contains("tsf_bin")), "the bin stays dropped on an exact archive");
+
+    // `--layout point` is the user's own choice of the exact layout: no trial, no block.
+    let out = dir.join("sparse-point.mzpeak");
+    convert(&sparse, &out, &["--layout", "point"]);
+    assert_exact(&out, &expected, "sparse --layout point");
+    let m = index(&out)["metadata"].clone();
+    assert!(m.get("encoding_prescan").is_none(), "{m:#}");
+    assert_eq!(m["fidelity"]["spectra_peaks"]["layout"], "point");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

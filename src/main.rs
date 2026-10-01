@@ -8446,7 +8446,8 @@ struct VendorHints {
     encoding_prescan: bool,
     /// The lane stores m/z exactly (the Bruker TSF lane, owner decision D9): numpress-linear is
     /// never written; the default rule weighs delta against the point layout on the sample and
-    /// keeps the smaller EXACT arm (`choose_mz_encoding`).
+    /// keeps the smaller EXACT arm, and without the trial (`MZPC_ENCODING_PRESCAN=0`) the point
+    /// layout is written (`choose_mz_encoding`), so the archive is exact on every path.
     exact_mz: bool,
     /// An imaging run whose reader attaches each spectrum's pixel itself (Waters laser positions).
     imaging: Option<ImagingHints>,
@@ -8986,12 +8987,14 @@ fn sample_mz_values<'a>(spectra: impl IntoIterator<Item = &'a MultiLayerSpectrum
 /// principle P2; the rule in [`encoding_prescan::pick_mz`]). `chunk` is the strategy requested so
 /// far: only numpress-linear, the default, is open to the rule — an explicit `--no-numpress` is the
 /// user's choice and `--layout point` has no chunk — except on a lane that stores m/z exactly
-/// (`exact`, the Bruker TSF lane), which weighs delta against the point layout whether numpress or
-/// delta was requested and never writes numpress. Returns the strategy to write with and the
-/// `encoding_prescan` block that says why, or `None` where nothing was decided. The sample is
-/// [`prescan_sample`]'s (up to four stretches of 64 spectra or 2 M points); the trials are
-/// [`prescan_trial`]'s, through the archive writer. `MZPC_ENCODING_PRESCAN=0` skips the rule:
-/// numpress as requested, or delta without a trial on an exact lane.
+/// (`exact`, the Bruker TSF lane), which never writes numpress and weighs delta against the point
+/// layout whether numpress or delta was requested (`--no-numpress` is inert there, and says so).
+/// Returns the strategy to write with and the `encoding_prescan` block that says why, or `None`
+/// where nothing was decided. The sample is [`prescan_sample`]'s (up to four stretches of 64
+/// spectra or 2 M points); the trials are [`prescan_trial`]'s, through the archive writer.
+/// `MZPC_ENCODING_PRESCAN=0` skips the rule: numpress as requested, or on an exact lane the point
+/// layout without a trial — the one layout exact on any data, so the lane's archive is exact on
+/// every path and dropping the vendor's binary copy of the signal (`run`) stays sound.
 #[allow(clippy::too_many_arguments)]
 fn choose_mz_encoding<S: Into<VendorSpectrum>>(
     chunk: Option<ChunkingStrategy>,
@@ -9011,12 +9014,21 @@ fn choose_mz_encoding<S: Into<VendorSpectrum>>(
         _ => return Ok((chunk, None)),
     };
     let delta = Some(ChunkingStrategy::Delta { chunk_size: width });
+    if exact && matches!(chunk, Some(ChunkingStrategy::Delta { .. })) {
+        log::info!(
+            "--no-numpress is inert on this lane: it never writes numpress-linear; delta chunks are weighed against \
+             the point layout as by default, and the smaller exact one is written (--layout point selects the point \
+             layout outright)"
+        );
+    }
+    // No trial: numpress as requested, or on an exact lane the point layout (exact on any data).
+    let untested = if exact { None } else { chunk };
     if !env_flag("MZPC_ENCODING_PRESCAN").unwrap_or(true) {
-        return Ok((if exact { delta } else { chunk }, None));
+        return Ok((untested, None));
     }
     let sample = prescan_sample(len, spectrum);
     if sample.is_empty() {
-        return Ok((if exact { delta } else { chunk }, None));
+        return Ok((untested, None));
     }
     let points: usize = sample.iter().map(point_count).sum();
     if encoding_prescan::all_32bit(sample_mz_values(sample.iter().chain(probes))) {
@@ -9025,7 +9037,7 @@ fn choose_mz_encoding<S: Into<VendorSpectrum>>(
              them exactly and are smaller than numpress-linear on such data",
             sample.len()
         );
-        return Ok((delta, Some(encoding_prescan::mz_block(sample.len(), points, &[], MzArm::Delta(ColumnEncoding::Writer), Basis::ThirtyTwoBit))));
+        return Ok((delta, Some(encoding_prescan::mz_block(sample.len(), points, &[], MzArm::Delta(ColumnEncoding::Writer), Basis::ThirtyTwoBit, exact))));
     }
     let started = std::time::Instant::now();
     let arms = if exact { [MzArm::Delta(ColumnEncoding::Writer), MzArm::Point] } else { [MzArm::Delta(ColumnEncoding::Writer), MzArm::Numpress] };
@@ -9051,7 +9063,7 @@ fn choose_mz_encoding<S: Into<VendorSpectrum>>(
         encoding_prescan::mz_label(chosen),
         basis.label()
     );
-    Ok((prescan_chunk(chosen, width), Some(encoding_prescan::mz_block(sample.len(), points, &trials, chosen, basis))))
+    Ok((prescan_chunk(chosen, width), Some(encoding_prescan::mz_block(sample.len(), points, &trials, chosen, basis, exact))))
 }
 
 /// Compressed bytes of the spectrum data and peak facets of an archive, by column group.

@@ -128,7 +128,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `-c, --config <CONFIG>` | — | Config file (YAML) setting defaults for any option below; explicit command-line flags win (§5) |
 | `--layout <chunked\|point>` | `chunked` | Signal layout: `chunked` m/z layout (numpress-linear or delta); `point` — flat point layout, one row per m/z–intensity pair (§9) |
 | `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` / `.mzML.gz` → `mzml`, `.mzpeak` → `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1). Required when the output name has any other extension, or none; it wins over the extension |
-| `--no-numpress` | off | Delta m/z chunking whatever a sample of the run says. Without it the converter decides from a sample (§8, *The default m/z encoding*): delta when every sampled m/z is a 32-bit value, else the smaller of delta and the lossy numpress-linear, exact on a tie; the `encoding_prescan` index block states the choice. Delta stores each m/z as its difference from the one before. Exact for m/z that are 32-bit values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor; a 64-bit m/z more than twice its predecessor in the same chunk can come back one unit in the last place off (1e-15 Da near m/z 10, 5e-13 Da near m/z 4000), and so can the values after it in that chunk. This happens at any mass: a sparse centroid list is cut into chunks far wider than `--chunk-size`, since a chunk is never one point long (6 of 360 points of a ToF-SIMS-like test file; 7 of 6,281 in 200 generated centroid spectra over m/z 50–5000, 3 of them above m/z 1000). The archive declares it (`delta-ulp` in `transformations`), and the `fidelity` block counts the chunks this can happen in and bounds the error (§8). Profile zero runs are still masked. For a bit-exact archive use `--lossless` |
+| `--no-numpress` | off | Delta m/z chunking whatever a sample of the run says. Without it the converter decides from a sample (§8, *The default m/z encoding*): delta when every sampled m/z is a 32-bit value, else the smaller of delta and the lossy numpress-linear, exact on a tie; the `encoding_prescan` index block states the choice. **Inert on the native Bruker TSF lane**, which never writes numpress-linear: there the flag changes nothing (a log line says so), the lane weighs delta chunks against the point layout as by default and writes the smaller exact one — the point layout where a sampled delta chunk is at risk; `--layout point` selects that layout outright (§8). Delta stores each m/z as its difference from the one before. Exact for m/z that are 32-bit values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor; a 64-bit m/z more than twice its predecessor in the same chunk can come back one unit in the last place off (1e-15 Da near m/z 10, 5e-13 Da near m/z 4000), and so can the values after it in that chunk. This happens at any mass: a sparse centroid list is cut into chunks far wider than `--chunk-size`, since a chunk is never one point long (6 of 360 points of a ToF-SIMS-like test file; 7 of 6,281 in 200 generated centroid spectra over m/z 50–5000, 3 of them above m/z 1000). The archive declares it (`delta-ulp` in `transformations`), and the `fidelity` block counts the chunks this can happen in and bounds the error (§8). Profile zero runs are still masked. For a bit-exact archive use `--lossless` |
 | `--keep-zero-runs` | off | Store every profile point: the writer's zero-run mask (`zero-run-mask`, §8) is off, no profile point is dropped and the entry is not declared. **Continuous-mode imaging data** (imzML `IMS:1000030`), whose pixels share one m/z axis, decodes to one shared axis only with this flag: masked, every pixel keeps a different subset of the axis under its own numpress fixed points, so one source m/z decodes to several values across pixels (171.33333 to 8 values in the 9 pixels of `Example_Continuous`; one value with the flag). `MZPC_KEEP_ZERO_RUNS=1` does the same from the environment (§10). Refused on `--agilent-grid`, whose reader leaves the zero samples out itself; inert on the timsTOF ims-compact lanes, whose frames hold no zero-intensity point; on the native Shimadzu sqrt-grid route the zero pad at the scan-window bounds stays out (`shimadzu:span-trim`, with a warning) |
 | `--lossless` | off | A bit-exact archive, or none (§9): every point of the input stored in the input's order, each m/z and intensity with exactly the value the input holds. Selects the point layout with zero runs kept and no numpress, m/z lattice or TOF grid; after writing, the conversion fails (exit 1, nothing written) unless no signal transformation is declared, every point is stored and no column is narrower than the input declares. **mzML and imzML inputs only**; refused on every other lane, and for a Thermo `.raw` or a TDF on the standard lane. Conflicts with `--layout chunked`, `--tof-grid auto\|on`, `--agilent-grid` and an mzML output, and is refused while `MZPC_MAX_SPECTRA` is set (§10) |
 | `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
@@ -435,8 +435,11 @@ written by 0.16.0 or earlier holds its chunk bounds dictionary-encoded: those tw
 one exception to following the source — the rewrite stores them byte-stream split with the
 dictionary off, as a conversion writes them (§9), because followed, every row group the byte cap
 makes paid for that dictionary again (the corpus Lumos peak facet +1.19 %, MFA381's +2.3 %), and
-re-encoded the Lumos facet is 0.98 % smaller than its source; the values are unchanged, and every
-other column keeps the source's encoding. The same
+re-encoded the Lumos facet is 0.98 % smaller than its source. Not on every archive the smaller
+choice: a 0.16.0 QC01 archive, whose chunk bounds repeat across its 2,281 spectra, comes out
+0.07 % larger re-encoded than followed (50,333,986 against 50,297,493 B, both below the
+source's 50,603,257 B) — the rule buys the common case, not every case. The values are unchanged,
+and every other column keeps the source's encoding. The same
 lane injects `--sdrf` into an existing archive — the documented way to add it to an archive from a
 lane that cannot embed it (§4.3; `--image` too, into an imaging archive) — and writes to `<out>.mzpeak.tmp` first, renaming
 into place on success. The three filters on a **raw or exchange** input are a hard error with the
@@ -950,17 +953,26 @@ than a factor of two (the one-ulp case of §4). Measured on the corpus: numpress
 Bruker microTOF neg_01_Fistax run (delta would be 2.1× its size) and on the PXD001283 bladder imzML
 (3.6×), both unchanged; every file on which delta came out smaller held 32-bit values. The
 `encoding_prescan` block of such an archive holds `sample`, `measured_bytes.mz` per arm (absent when
-no trial was needed), `delta_chunks_at_risk` in the sample, `chosen.mz` and `basis` (`every sampled
-m/z is a 32-bit value …`, `the smaller arm`, `a tie on bytes: the exact arm`, …). `transformations`
-and `fidelity` then name only what was written: `numpress-linear` with its bound where the codec was
-kept, `delta-ulp` with the ulp bound where delta chunks are at risk, nothing where delta is exact.
-`--no-numpress` and `--layout point` are the user's choice and skip the sample (no block);
-`MZPC_ENCODING_PRESCAN=0` skips it too and writes numpress-linear as every version before 0.17.0
-did. The native **Bruker TSF** lane stores its frames' m/z exactly (owner decision D9): it never
-offers the lossy arm and weighs delta against the point layout instead, keeping the smaller exact
-one (the point layout where a sampled delta chunk is at risk, `basis: the exact arm …`); on the
-MSV000088438 MALDI run the point layout won and the archive went from 25.1 MB to 0.89 MB, 24.2 MB of
-it the `analysis.tsf_bin` the lane no longer embeds (below). Retention time,
+no trial was needed; `measured_bytes.facets` on the TSF lane below, whose trial counts every column
+of the facets, since the point layout moves them all — never read as the m/z column's size),
+`delta_chunks_at_risk` in the sample, `chosen.mz` and `basis` (`every sampled m/z is a 32-bit value
+…`, `the smaller arm`, `a tie on bytes: the exact arm`, …). `transformations` and `fidelity` then
+name only what was written: `numpress-linear` with its bound where the codec was kept, `delta-ulp`
+with the ulp bound where delta chunks are at risk, nothing where delta is exact. `--no-numpress`
+and `--layout point` are the user's choice and skip the sample (no block) — on every lane but the
+TSF lane below, where `--no-numpress` is inert; `MZPC_ENCODING_PRESCAN=0` skips it too and writes
+numpress-linear as every version before 0.17.0 did. The native **Bruker TSF** lane stores its
+frames' m/z exactly (owner decision D9) on every path: it never offers the lossy arm and weighs
+delta against the point layout instead, keeping the smaller exact one (the point layout where a
+sampled delta chunk is at risk, `basis: the exact arm …`); `--no-numpress` changes nothing there
+(there is no numpress to switch off; a log line says so, and the trial runs as by default, so the
+flag can still end in the point layout), `--layout point` selects the point layout outright, and
+`MZPC_ENCODING_PRESCAN=0` writes the point layout without the trial — the one layout exact on any
+data — rather than untested delta chunks, which on sparse frames would be one ulp off while the
+lane drops the vendor's exact copy of the signal. On the MSV000088438 MALDI run the point layout
+won and the archive went from 25.1 MB to 0.89 MB, 24.2 MB of it the `analysis.tsf_bin` the lane
+no longer embeds (below); under the lever the same run is the same point layout, 0.89 MB, its m/z
+bit-equal to the default archive's. Retention time,
 polarity, scan window, the MS level (from the function-type code: product-ion types are MS2, the
 second function of an MSe pair is MS2, every other MS function — lock mass, auxiliary — is MS1) and
 the precursors come from the SDK: a set mass > 0 (DDA) gives a selected ion with a target-only
@@ -1149,7 +1161,8 @@ archive; the lane-specific changes, each declared when it happens, are in the ta
 
 1. **numpress-linear** (`numpress-linear`) — the chunk encoding of m/z where a sample of the run
    showed it smaller than exact delta (*The default m/z encoding*, above; through 0.16.0 the default
-   on every chunked facet) is lossy (§9); `--no-numpress` selects the delta encoding always, exact
+   on every chunked facet) is lossy (§9); `--no-numpress` selects the delta encoding always (the
+   native TSF lane excepted, where it is inert: *The default m/z encoding*, above), exact
    for 32-bit m/z values and wherever a 64-bit m/z is at most twice its predecessor (§4). The bound
    of every numpress archive is in its `fidelity` block.
 2. **Profile zero-run compaction** (`zero-run-mask`) — in **profile** spectra, a run of two or more *consecutive*
@@ -1428,8 +1441,10 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
 - **Layout** — `chunked` (default) groups m/z into chunks (`--chunk-size`, Th) and
   encodes each with delta (exact except as §4 states) or numpress-linear (lossy, compact),
   whichever a sample of the run shows smaller, delta whenever every sampled m/z is a 32-bit value
-  and always with `--no-numpress` (§8, *The default m/z encoding*). `point` writes one row per
-  (m/z, intensity), each at the numeric type of its column, with no encoding that can move a value.
+  and always with `--no-numpress` (§8, *The default m/z encoding*; the native TSF lane never
+  writes numpress-linear and may answer `chunked` with the point layout, the smaller exact one).
+  `point` writes one row per (m/z, intensity), each at the numeric type of its column, with no
+  encoding that can move a value.
 - **Zero runs and bit-exact archives** — three levels, from smallest to exact:
   the default masks profile zero runs and stores m/z as the sample's choice (exact delta, or
   numpress-linear bounded, the bound in `fidelity`, §8); `--keep-zero-runs` stores every point and
@@ -1639,7 +1654,7 @@ instead.
 | `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | yes — `transformations` lists `shimadzu:coarse-mz` |
 | `MZPC_WATERS_KEEP_COLLAPSED` | Native Waters lane: write MassLynx's collapsed retention-time functions (run-summed mobilograms) as spectra instead of leaving them out. On/off lever read through the common rule (empty, `0`, `false`, `no` are off) | yes — `collapsed_functions[].written` in `waters_functions` (and `waters_drift`), and `waters:drop-functions` when they were left out |
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
-| `MZPC_ENCODING_PRESCAN=0` | Every chunked lane: skip the sample-based m/z choice (§8, *The default m/z encoding*) and write numpress-linear as versions before 0.17.0 did (delta under `--no-numpress`; the TSF lane delta without its trial). Native Waters lane: skip the whole encoding pre-scan and write the fixed encodings — numpress m/z (or delta under `--no-numpress`), float32 byte-stream-split intensity, dictionary ion mobility (`env_flag` spellings) | yes — the archive then has no `encoding_prescan` block |
+| `MZPC_ENCODING_PRESCAN=0` | Every chunked lane: skip the sample-based m/z choice (§8, *The default m/z encoding*) and write numpress-linear as versions before 0.17.0 did (delta under `--no-numpress`; the native TSF lane the point layout without its trial — exact on any data, so its `analysis.tsf_bin` stays dropped on this path too). Native Waters lane: skip the whole encoding pre-scan and write the fixed encodings — numpress m/z (or delta under `--no-numpress`), float32 byte-stream-split intensity, dictionary ion mobility (`env_flag` spellings) | yes — the archive then has no `encoding_prescan` block |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |
 | `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`) | the fitted `{c0,c1}` is stored; the fact that `c1` was forced is not |
 | `MZPC_MAX_SPECTRA=<n>` | Stop after `n` spectra. **Deliberately truncating**: it also disables the "all source spectra written" completeness check, so the archive is a partial one that exits 0. Diagnostics only; the WARN stays. `--lossless` is refused while it is set | yes — every mzPeak lane that honours the cap writes `metadata.partial` = `{partial: true, max_spectra, source_declared, spectra_written, cause: "MZPC_MAX_SPECTRA"}` when the cap bit (0.9.13); a cap larger than the file writes no marker |

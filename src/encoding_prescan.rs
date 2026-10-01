@@ -288,15 +288,24 @@ pub fn pick_mz(trials: &[MzTrial], exact_only: bool) -> (MzArm, Basis) {
 
 /// The `encoding_prescan` index block of a lane that decided the m/z arm alone: the sample, each
 /// arm's bytes where arms were written, the delta chunks at risk in the sample, the choice and why.
-pub fn mz_block(sample_spectra: usize, sample_points: usize, trials: &[MzTrial], chosen: MzArm, basis: Basis) -> serde_json::Value {
+/// The bytes go under `measured_bytes.mz` when the trial counted the m/z columns alone (delta
+/// against numpress-linear: nothing else moves) and under `measured_bytes.facets` when it counted
+/// every column of the facets (`whole_facets`: delta against the point layout, which moves them all),
+/// so a reader never takes a whole-facet figure for the m/z column's.
+pub fn mz_block(sample_spectra: usize, sample_points: usize, trials: &[MzTrial], chosen: MzArm, basis: Basis, whole_facets: bool) -> serde_json::Value {
     let mut block = serde_json::json!({
         "method": if trials.is_empty() {
             "every sampled m/z tested for being a 32-bit float value; delta chosen without a trial \
              when all are (exact whatever their spacing, and smaller than numpress-linear on such data)"
+        } else if whole_facets {
+            "the sample written once per m/z arm through the archive writer; every column's compressed \
+             bytes summed over the spectrum data and peak facets (the point layout moves them all); \
+             the smaller EXACT arm kept (delta is exact when no sampled chunk spans more than a \
+             factor of two)"
         } else {
-            "the sample written once per m/z arm through the archive writer; compressed bytes summed \
-             over the spectrum data and peak facets; the smaller arm kept, on a tie the exact one \
-             (delta is exact when no sampled chunk spans more than a factor of two)"
+            "the sample written once per m/z arm through the archive writer; the m/z columns' \
+             compressed bytes summed over the spectrum data and peak facets; the smaller arm kept, on \
+             a tie the exact one (delta is exact when no sampled chunk spans more than a factor of two)"
         },
         "sample": { "spectra": sample_spectra, "points": sample_points },
         "chosen": { "mz": mz_label(chosen) },
@@ -307,7 +316,8 @@ pub fn mz_block(sample_spectra: usize, sample_points: usize, trials: &[MzTrial],
         for t in trials {
             mz.insert(mz_label(t.arm), t.bytes.into());
         }
-        block["measured_bytes"] = serde_json::json!({ "mz": mz });
+        let counted = if whole_facets { "facets" } else { "mz" };
+        block["measured_bytes"] = serde_json::json!({ counted: mz });
         if let Some(d) = trials.iter().find(|t| matches!(t.arm, MzArm::Delta(_))) {
             block["delta_chunks_at_risk"] = d.delta_chunks_at_risk.into();
         }
@@ -484,10 +494,14 @@ mod tests {
         assert_eq!(pick_mz(&[delta(100, 0), point(100)], true), (MzArm::Delta(Writer), Basis::TieExact));
         assert_eq!(pick_mz(&[delta(90, 2)], true), (MzArm::Delta(Writer), Basis::OnlyExact), "no exact arm offered: the first stays");
 
-        let block = mz_block(12, 3456, &[delta(80, 3), numpress(100)], MzArm::Delta(Writer), Basis::Smaller);
-        assert_eq!(block["measured_bytes"]["mz"], serde_json::json!({"delta": 80, "numpress-linear": 100}));
+        let block = mz_block(12, 3456, &[delta(80, 3), numpress(100)], MzArm::Delta(Writer), Basis::Smaller, false);
+        assert_eq!(block["measured_bytes"], serde_json::json!({"mz": {"delta": 80, "numpress-linear": 100}}));
         assert_eq!((&block["delta_chunks_at_risk"], &block["chosen"]["mz"], &block["basis"]), (&serde_json::json!(3), &serde_json::json!("delta"), &serde_json::json!(Basis::Smaller.label())));
-        let block = mz_block(12, 3456, &[], MzArm::Delta(Writer), Basis::ThirtyTwoBit);
+        let block = mz_block(12, 3456, &[], MzArm::Delta(Writer), Basis::ThirtyTwoBit, false);
         assert!(block.get("measured_bytes").is_none() && block["chosen"]["mz"] == "delta" && block["sample"]["points"] == 3456, "{block}");
+        // The exact lane's trial counts whole facets: the figures are filed as such, not as the m/z column's.
+        let block = mz_block(12, 3456, &[delta(779, 2), point(512)], MzArm::Point, Basis::OnlyExact, true);
+        assert_eq!(block["measured_bytes"], serde_json::json!({"facets": {"delta": 779, "point": 512}}), "{block}");
+        assert!(block["method"].as_str().unwrap().contains("every column"), "{block}");
     }
 }
