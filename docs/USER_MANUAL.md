@@ -248,7 +248,14 @@ facets are not re-encoded from the signal: the per-spectrum and chromatogram fac
 change are read and written back (zstd level 5, every column in the encodings the source used, the
 source's Parquet format version, sort order and bloom filters, the page limits a conversion gives
 the facet, row groups bounded as a conversion's, §10 `MZPC_ROW_GROUP_MB`) and run-global facets
-are copied verbatim, so encoder options are inert here — warned about, not refused (see the table above). The same
+are copied verbatim, so encoder options are inert here — warned about, not refused (see the table above).
+Keeping every spectrum of an archive this version wrote, a rewritten spectrum signal facet comes out
+between 1.9 % smaller and 0.3 % larger than its source, and a chunked timsTOF grid facet 4.2 %
+larger: the lane writes at zstd level 5, the converter at 3 (22 on that facet). A chunked archive
+written by 0.16.0 or earlier keeps its
+dictionary-encoded chunk bounds through the rewrite, and once the byte cap splits its peak facet,
+each row group pays for that dictionary again (MFA381's peak facet +2.3 %); rebuilt from the raw
+file, the bounds are byte-stream-split (§9). The same
 lane injects `--sdrf` into an existing archive — the documented way to add it to an archive from a
 lane that cannot embed it (§4.3; `--image` too, into an imaging archive) — and writes to `<out>.mzpeak.tmp` first, renaming
 into place on success. The three filters on a **raw or exchange** input are a hard error with the

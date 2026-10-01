@@ -1484,7 +1484,8 @@ fn replace_struct_child(s: &StructArray, pos: usize, new_child: ArrayRef) -> Res
 /// column shipped dictionary-encoded, and once the byte cap split a facet into row groups each
 /// group paid for its own dictionary. The 2485 peak facet, all spectra kept, came out 16.8 %
 /// larger than the converter wrote it in one 178 MiB group and 20.0 % larger in 11 byte-capped
-/// ones; following the source it is 1.5 % larger.
+/// ones; following the source's encodings in parquet's default layout it was 1.5 % larger (laid
+/// out as the source, at this lane's zstd level, it is 4.2 %: see [`apply_layout`]).
 fn apply_encodings(
     mut props: parquet::file::properties::WriterPropertiesBuilder,
     source: &ParquetMetaData,
@@ -1517,20 +1518,32 @@ fn apply_encodings(
 /// its sorting columns, and a bloom filter on each column that had one (no converter facet has one:
 /// the vendored writer names the index column by a dotted string, which parquet takes as a single
 /// path segment). A footer does not record page limits, so those are the converter's (vendor
-/// `writer/base.rs`): a spectrum signal facet's pages end at 1,048,576 rows in the point layout and
-/// at a quarter of parquet's 1 MiB page in the chunk layout (`spectrum_data_writer_props`), a signal
-/// facet with an ion-mobility column has twice parquet's dictionary page, and every other facet
-/// parquet's limits.
+/// `writer/base.rs`): a spectrum signal facet's pages end at 1,048,576 rows in the point layout
+/// and at a quarter of parquet's 1 MiB page in the chunk layout (`spectrum_data_writer_props`), a
+/// signal facet with an ion-mobility column has twice parquet's dictionary page, and every other
+/// facet parquet's limits.
 ///
 /// With parquet's defaults instead — format 1.0, pages of at most 20,000 rows, no sort order — a
 /// filter keeping every spectrum grew QC01's point peak facet by 16.2 % and a Thermo point profile
-/// facet by 5.6 %; laid out as the source, both are 1.9 % smaller than the source. What is left
-/// between a rewrite and its source is the zstd level, which no footer records either: at the
-/// source's own level a keep-everything rewrite of a chunked Thermo, Lumos or timsTOF archive is its
-/// source's size to 0.03 %. At this lane's level 5, chunk facets written at level 3 come out 1.2 %
-/// smaller to 0.1 % larger, and the timsTOF grid facet, written at level 22, 4.2 % larger
-/// (PXD059079 2485; 1.5 % with parquet's defaults, whose 1 MiB pages compress better than the
-/// source's quarter pages).
+/// facet by 5.6 %; laid out as the source, both are 1.9 % smaller than the source.
+///
+/// Three differences remain, measured keeping every spectrum (`--rt 0-100000`):
+/// * The zstd level, which no footer records: the converter writes at 3 (22 on the chunked timsTOF
+///   facet), this lane at 5. At the source's own level a chunked spectrum facet comes out at its
+///   source's size to 0.08 % (Thermo, Lumos, MFA381, QC01, PXD059079 2485). At level 5, on archives
+///   this version converts, a chunk profile facet is 1.1-1.2 % smaller, a chunk centroid facet
+///   0.6 % smaller to 0.25 % larger, and the 2485 grid facet 4.2 % larger (1.4-1.5 % with
+///   parquet's defaults, whose 1 MiB pages compress better at level 5 than the source's quarter
+///   pages).
+/// * Page boundaries, which no footer records either: the converter ends a chromatogram facet's
+///   page with the chromatogram it is writing (one 25,280-row page on the Thermo run), this lane
+///   with the first 1,024-row reader batch past parquet's 20,000 rows, so that facet is 3.7 %
+///   (8 KB) larger even at the source's level. A point facet comes out 0.35-0.6 % smaller.
+/// * A chunk facet written by 0.16.0 or earlier has dictionary-encoded bounds, which this rewrite
+///   keeps (the converter now byte-stream-splits them), and once the byte cap splits the facet into
+///   row groups, each group pays its own dictionary: the corpus Lumos peak facet (1 → 4 groups)
+///   grows by 1.2 %, MFA381's (1 → 3) by 2.3 % and that archive by 1.2 %. Rebuilt from the raw
+///   file, both peak facets are 1.1 % smaller than in the corpus.
 fn apply_layout(
     mut props: parquet::file::properties::WriterPropertiesBuilder,
     source: &ParquetMetaData,

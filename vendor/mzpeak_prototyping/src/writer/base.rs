@@ -1619,14 +1619,16 @@ pub trait AbstractMzPeakWriter {
             {
                 log::debug!("{}: byte-stream-split", c.path());
                 // DELIBERATE DEVIATION from upstream, which leaves a chunk's bounds to the global
-                // dictionary. A chunk's first and last m/z are nearly all distinct, so the dictionary
-                // holds the values over again, and every row group pays its own: once row groups
-                // were bounded by bytes as well as rows, a Lumos peak facet went from 1 to 4 groups,
-                // its two bound columns grew by 21 % each and the facet by 1.2 %. Byte-stream-split
-                // without the dictionary, the bounds are 23-38 % smaller than with it, that Lumos
-                // facet 2.3 % (MFA381's peak facet 3.2 %, PXD059079 2485's grid facet 0.6 %, values
-                // identical); plain without the dictionary saves 57-83 % of what this saves. Only a
-                // small centroid facet with few distinct bounds grows (QC01, +0.05 %).
+                // dictionary. On an LC-MS run a chunk's first and last m/z are nearly all distinct,
+                // so the dictionary holds the values over again, and every row group pays its own:
+                // once row groups were bounded by bytes as well as rows, a Lumos peak facet went
+                // from 1 to 4 groups, its two bound columns grew by 21 % each and the facet by
+                // 1.2 %. Byte-stream-split without the dictionary, the bounds are 23-38 % smaller
+                // than with it, that Lumos facet 2.3 % (MFA381's peak facet 3.2 %, PXD059079 2485's
+                // grid facet 0.6 %, values identical); plain without the dictionary saves 57-83 %
+                // of what this saves. A centroid facet with few distinct bounds grows slightly:
+                // QC01 +0.05 %, the ltpmsi-chilli imaging run +0.10 % (169 MB in 7 groups, its
+                // bounds +39-43 %).
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
