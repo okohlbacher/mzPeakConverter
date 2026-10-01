@@ -2375,10 +2375,15 @@ fn convert_to_mzml(
     // fails to transition into the chromatogramList.
     w.start_spectrum_list().map_err(|e| anyhow!("opening mzML spectrumList: {e}"))?;
 
+    // mzdata's mzML writer panics on an array without a data type (`require_typed_arrays`).
+    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
     let mut written = 0usize;
     for (i, mut spec) in reader.iter().enumerate() {
         if cap.is_some_and(|m| i >= m) {
             break;
+        }
+        if scan_lane {
+            require_typed_arrays(&spec)?;
         }
         if let Some(g) = thermo_windows.as_mut() {
             g.apply(spec.description_mut());
@@ -3732,6 +3737,32 @@ fn require_aligned_arrays(what: &str, index: usize, n_mz: usize, n_intensity: us
     Ok(())
 }
 
+/// Refuse an mzML/imzML spectrum whose m/z or intensity array holds bytes but states no data type
+/// the reader knows: mzdata leaves `Unknown` on a `<binaryDataArray>` naming none of `MS:1000519`,
+/// `521`, `522`, `523` (an imzML typing it with an imaging-vocabulary term other than the obsolete
+/// `IMS:1000141/142`, which [`replace_obsolete_integer_terms`] reads as the PSI-MS ones). Nothing
+/// can decode such an array, and the writer has no column for it: a profile spectrum failed in the
+/// zero-run mask and a centroid one PANICKED ("A column was not visited: intensity_unknown_dc",
+/// exit 134, the reader's temp copies left behind), as did mzdata's mzML writer on the export lane.
+/// An array without bytes passes — an empty spectrum that states no type converted before and
+/// still does.
+fn require_typed_arrays(entry: &MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak>) -> Result<()> {
+    let Some(arrays) = entry.arrays.as_ref() else { return Ok(()) };
+    for (array, name) in [(ArrayType::MZArray, "m/z"), (ArrayType::IntensityArray, "intensity")] {
+        if arrays.get(&array).is_some_and(|a| a.dtype == BinaryDataArrayType::Unknown && !a.data.is_empty()) {
+            bail!(
+                "spectrum {} ({}): the {name} array states no data type the reader knows (MS:1000519 \
+                 32-bit integer, MS:1000521 32-bit float, MS:1000522 64-bit integer, MS:1000523 64-bit \
+                 float; of the imaging vocabulary's own type terms only the obsolete IMS:1000141/142 \
+                 are read, as the integer ones), so its bytes cannot be decoded. Refusing to convert.",
+                entry.description().index,
+                entry.description().id
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Decide and build the representation for one spectrum (PER-SPECTRUM, not all-or-nothing).
 ///
 /// Try to map every f64 m/z to a grid `tof_index` that reconstructs within `PPM_TOL`. If ALL points
@@ -4250,6 +4281,13 @@ fn convert_file(
         v
     };
 
+    // An m/z or intensity array the source types with no term the reader knows cannot be written:
+    // refused here for the sampled spectra, before the output exists, and per spectrum below.
+    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
+    if scan_lane {
+        probes.iter().try_for_each(require_typed_arrays)?;
+    }
+
     // Imaging (`imaging::detect`): imzML always, a Bruker MALDI `.d` (mzdata's TDF lane,
     // `--no-ims-compact`), or any input whose spectra state positions. The probes see six spectra,
     // so an mzML whose probes state none is searched in full for the position accessions — bytes,
@@ -4274,7 +4312,6 @@ fn convert_file(
     });
     // A z the probes miss is searched for the same way (an imzML's text is its header and scans, the
     // arrays live in the `.ibd`); it used to stay a generic scan param with no `position_z` column.
-    let scan_lane = matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_));
     if scan_lane && detected.is_some() && !searched && !stated_z {
         stated_z = imaging::file_mentions(read_path, ["IMS:1000052"]).map_or_else(
             |e| {
@@ -4426,6 +4463,9 @@ fn convert_file(
     // obsolete scan term "one way" as flyback — each change declared (`imaging`).
     let mut imaging_applied: Vec<&'static str> = Vec::new();
     let mut imaging_block: Option<serde_json::Value> = None;
+    // Whether the pixel-size rule read this input's scan settings (imzML only): a lone `IMS:1000046`
+    // still there afterwards is one the rule kept. On any other lane nothing tested it.
+    let mut pixel_size_checked = false;
     // The imzML's `.ibd`, hashed: `(file name, what the hashes say)`.
     let mut ibd: Option<(String, imaging::IbdCheck)> = None;
     if let MZReaderType::IMzML(_) = &reader {
@@ -4461,11 +4501,16 @@ fn convert_file(
                 Err(e) => log::warn!("the .ibd checksum was not checked: {e:#}"),
             }
         }
-        let fixes = imaging::read_scan_settings(read_path).map(|s| imaging::pixel_size_fixes(&s)).unwrap_or_else(|e| {
-            log::warn!("imzML pixel-size check skipped: {e:#}");
-            Vec::new()
-        });
-        let mut fixes = fixes;
+        let mut fixes = match imaging::read_scan_settings(read_path) {
+            Ok(s) => {
+                pixel_size_checked = true;
+                imaging::pixel_size_fixes(&s)
+            }
+            Err(e) => {
+                log::warn!("imzML pixel-size check skipped: {e:#}");
+                Vec::new()
+            }
+        };
         if let Some(list) = writer.scan_settings_mut() {
             for settings in list.iter_mut() {
                 if let Some(f) = fixes.iter_mut().find(|f| f.settings_id == settings.id) {
@@ -4553,6 +4598,9 @@ fn convert_file(
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
             break;
+        }
+        if scan_lane {
+            require_typed_arrays(&entry)?;
         }
         // The mzPeak peaks facet requires non-decreasing m/z within a spectrum.
         if entry.has_ion_mobility_dimension() {
@@ -4716,7 +4764,12 @@ fn convert_file(
                 }
             }
             let source = if counts.is_some() { imaging::COUNTS_OBSERVED_MAX } else { imaging::COUNTS_DECLARED };
-            imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), source, imaging::LoneX::AlsoY, provenance)));
+            // A lone `IMS:1000046` gives the marker both axes only where the single-value rule
+            // ran: an mzML with positions is not tested (the rule is the imzML lane's), and its lone
+            // "pixel size" may be the area the term named until 2017 — 2500 µm² would be reported
+            // as 2500 µm on both axes. The scan settings keep it as stated either way.
+            let lone_x = if pixel_size_checked { imaging::LoneX::AlsoY } else { imaging::LoneX::XOnly };
+            imaging_blocks.push(("imaging".into(), imaging::marker_block(grid.as_ref(), source, lone_x, provenance)));
         }
     }
     if let Some(m) = &maldi {
@@ -12997,13 +13050,17 @@ mod tests {
         ibd_source(&m, "mismatch");
 
         // The other two algorithms the vocabulary has, hashed as stated.
-        let md5 = r#"<cvParam cvRef="IMS" accession="IMS:1000090" name="ibd MD5" value="2b7a4d9a6d0c5e9f3a1d0b8a7c6e5f40"/>"#;
-        let (m, _) = convert("md5", md5);
+        // The stated MD5 is decimal digits only: it stays the string the header states (it was
+        // written as the number 123, through 0.16.0 too).
+        const DIGITS: &str = "00000000000000000000000000000123";
+        let md5 = format!(r#"<cvParam cvRef="IMS" accession="IMS:1000090" name="ibd MD5" value="{DIGITS}"/>"#);
+        let (m, _) = convert("md5", &md5);
+        assert_eq!(content(&m, "IMS:1000090"), Some(serde_json::json!(DIGITS)), "the stated value stays, a string");
         let p = &m["imaging"]["provenance"];
         assert_eq!(p["ibd_checksum"], "mismatch");
         let found = p["ibd_checksum_found"][0]["value"].as_str().unwrap().to_string();
         assert_eq!((p["ibd_checksum_found"][0]["accession"].as_str(), found.len()), (Some("IMS:1000090"), 32), "an MD5: {p:#}");
-        let (m, _) = convert("md5_right", &md5.replace("2b7a4d9a6d0c5e9f3a1d0b8a7c6e5f40", &found));
+        let (m, _) = convert("md5_right", &md5.replace(DIGITS, &found));
         assert_eq!(m["imaging"]["provenance"]["ibd_checksum"], "verified");
         let sha256 = {
             use sha2::{Digest, Sha256};
@@ -13079,12 +13136,25 @@ mod tests {
     /// ("not implemented: intensity_unknown_dc", no archive): mzdata maps only the PSI-MS terms to a
     /// data type. They are read as `MS:1000519` / `MS:1000522`, declared, and give the archive the
     /// PSI-MS terms give; the mzML export reads them the same way. A type no rule maps is an error
-    /// naming the array, not a panic.
+    /// naming the spectrum and the array, not a panic — profile or centroid, archive or mzML export
+    /// (the centroid archive and both exports still panicked after the profile case was an error).
     #[test]
     fn imzml_obsolete_integer_type_terms_are_read_as_psi_ms() {
         use mzpeak_prototyping::MzPeakReader;
         let dir = scratch("imzml-integer-types");
         const DECLARED: &str = super::imaging::INTEGER_TYPE_AS_PSI_MS;
+        // The converter's private copies of an input's header in the temp dir (`fresh_temp`:
+        // `.mzpc-utf8-…` for the template's Latin-1, `.mzpc-ims-<the converter's pid>-<n>-<stem>`
+        // for the obsolete terms), by the input's stem — the pid is the spawned binary's, not this
+        // process's.
+        let copies = |stem: &str| -> std::collections::BTreeSet<std::ffi::OsString> {
+            fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .filter(|n| n.to_str().is_some_and(|n| n.starts_with(".mzpc-") && n.ends_with(&format!("-{stem}"))))
+                .collect()
+        };
         let stored = |archive: &std::path::Path| -> Vec<(BinaryDataArrayType, Vec<i64>)> {
             let mut r = MzPeakReader::new(archive).unwrap();
             (0..4)
@@ -13103,6 +13173,7 @@ mod tests {
             for (name, term, obsolete) in [(format!("ims{width}"), ims, true), (format!("ms{width}"), ms, false)] {
                 let (src, intensities) = integer_imzml(&dir, &name, term, width);
                 let out = dir.join(format!("{name}.mzpeak"));
+                let before = copies(&name);
                 let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
                 assert!(ok && !err.contains("panicked"), "{name}: {err}");
                 let m = index_metadata(&out);
@@ -13113,8 +13184,7 @@ mod tests {
                 assert_eq!(got.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(), intensities, "{name}");
                 archives.push(got);
                 // The reader's copy of the header is removed with the run.
-                let left: Vec<_> = fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!(".mzpc-ims-{}-", std::process::id()))).collect();
-                assert!(left.is_empty(), "{left:?}");
+                assert_eq!(copies(&name), before, "{name}: a copy of the header was left behind");
                 if obsolete {
                     let mzml = dir.join(format!("{name}.mzML"));
                     let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
@@ -13127,12 +13197,37 @@ mod tests {
             assert!(archives[0].iter().all(|(d, _)| *d == dtype), "{:?}", archives[0]);
         }
 
-        // A type term nothing maps: an error that names the array, and no archive.
-        let (src, _) = integer_imzml(&dir, "untyped", r#"<cvParam cvRef="IMS" accession="IMS:1000143" name="16-bit integer"/>"#, 4);
-        let out = dir.join("untyped.mzpeak");
+        // The same spectra declared centroid take the writer's other path, the peaks facet.
+        let centroid = |src: &std::path::Path| {
+            let text = fs::read_to_string(src).unwrap();
+            assert!(text.contains(r#"accession="MS:1000128" name="profile spectrum""#));
+            fs::write(src, text.replace(r#"accession="MS:1000128" name="profile spectrum""#, r#"accession="MS:1000127" name="centroid spectrum""#)).unwrap();
+        };
+        let (src, _) = integer_imzml(&dir, "ims4_centroid", r#"<cvParam cvRef="IMS" accession="IMS:1000141" name="32-bit integer" value=""/>"#, 4);
+        centroid(&src);
+        let out = dir.join("ims4_centroid.mzpeak");
         let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
-        assert!(!ok && !err.contains("panicked") && !out.exists(), "{err}");
-        assert!(err.contains("the intensity array has no data type") && err.contains("error: converting"), "{err}");
+        assert!(ok && !err.contains("panicked"), "{err}");
+        assert!(index_metadata(&out)["transformations"].to_string().contains(DECLARED));
+
+        // A type term nothing maps: an error that names the spectrum and the array, no output and
+        // no copy left behind (the panic left the UTF-8 one) — profile and centroid, to an archive
+        // and to mzML.
+        for kind in ["profile", "centroid"] {
+            let name = format!("untyped_{kind}");
+            let (src, _) = integer_imzml(&dir, &name, r#"<cvParam cvRef="IMS" accession="IMS:1000143" name="16-bit integer"/>"#, 4);
+            if kind == "centroid" {
+                centroid(&src);
+            }
+            for ext in ["mzpeak", "mzML"] {
+                let out = dir.join(format!("{name}.{ext}"));
+                let before = copies(&name);
+                let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+                assert!(!ok && !err.contains("panicked") && !out.exists(), "{name} to {ext}: {err}");
+                assert_eq!(copies(&name), before, "{name} to {ext}: a copy of the header was left behind");
+                assert!(err.contains("error: converting") && err.contains("spectrum 0 (Scan=1): the intensity array states no data type the reader knows"), "{name} to {ext}: {err}");
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -13337,6 +13432,38 @@ mod tests {
             let rows = scan_positions(&out).expect("position columns");
             assert_eq!((rows.len(), rows[0], rows[200]), (201, (Some(1), Some(1)), (Some(1), Some(11))), "{mode}");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An mzML with positions is not run through the pixel-size rule (the imzML lane's), so a lone
+    /// `IMS:1000046` in its scan settings is untested — the "pixel size" of an old header is an
+    /// area. The marker's default for a lone x must not reach it: it reported `pixel_size_um`
+    /// {2500, 2500} for the header the imzML lane drops as `one value, untestable`. The scan
+    /// settings stay as stated and the marker states no size; x and y both stated still give one.
+    #[test]
+    fn an_mzml_lone_pixel_size_is_not_given_to_y() {
+        let dir = scratch("mzml-lone-pixel-size");
+        let counts = r#"<cvParam cvRef="IMS" accession="IMS:1000042" name="max count of pixels x" value="20"/><cvParam cvRef="IMS" accession="IMS:1000043" name="max count of pixels y" value="20"/>"#;
+        let size = |acc: &str, name: &str, value: &str| format!(r#"<cvParam cvRef="IMS" accession="{acc}" name="{name}" value="{value}" unitCvRef="UO" unitAccession="UO:0000017" unitName="micrometer"/>"#);
+        let convert = |name: &str, sizes: String| -> serde_json::Value {
+            let header = format!(r#"<scanSettingsList count="1"><scanSettings id="ss1">{counts}{sizes}</scanSettings></scanSettingsList>"#);
+            let src = swath_variant(&dir, name, &header, |k| position(k % 20 + 1, k / 20 + 1));
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            index_metadata(&out)
+        };
+        let m = convert("lone", size("IMS:1000046", "pixel size", "2500"));
+        assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 20, "y": 20}), "{:#}", m["imaging"]);
+        assert!(m["imaging"].get("pixel_size_um").is_none(), "an untested lone x: {:#}", m["imaging"]);
+        assert_eq!(m["imaging"]["provenance"]["pixel_size"], "as stated");
+        let params = m["scan_settings_list"][0]["parameters"].as_array().unwrap();
+        let x = params.iter().find(|p| p["accession"] == "IMS:1000046").expect("the stated size stays");
+        assert_eq!((&x["name"], &x["value"]), (&serde_json::json!("pixel size"), &serde_json::json!(2500)), "as stated: {x:#}");
+        assert!(!params.iter().any(|p| p["accession"] == "IMS:1000047") && m.get("imaging_pixel_size").is_none(), "{params:#?}");
+
+        let m = convert("both", size("IMS:1000046", "pixel size (x)", "50") + &size("IMS:1000047", "pixel size y", "40"));
+        assert_eq!(m["imaging"]["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 40.0}), "{:#}", m["imaging"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

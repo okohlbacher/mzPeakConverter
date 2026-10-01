@@ -585,14 +585,20 @@ dimension, `value × count` is compared with the max dimension: a disagreement i
 listed in the row's `extent_mismatches`, the values written as stated. The **`.ibd` is hashed** in
 one pass with the algorithm of each checksum the header states (`IMS:1000090` MD5, `IMS:1000091`
 SHA-1, `IMS:1000092` SHA-256): `metadata.imaging.provenance.ibd_checksum` is `verified`, `mismatch`
-or `not stated`. On a mismatch the conversion goes on — the stated value stays in `file_description`,
+or `not stated` (`not checked` when the `.ibd` could not be found or read for hashing, with a
+warning). On a mismatch the conversion goes on — the stated value stays in `file_description`,
 one warning names both hashes, `imzml:ibd-checksum-mismatch` is declared and
 `provenance.ibd_checksum_found` holds the hash found (`accession`, `value`). The `.ibd` is listed in
 `source_files` with the SHA-1 it hashes to. A binary array typed with the imaging vocabulary's
 obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") is read as
 `MS:1000519` / `MS:1000522`, the terms that replaced them, declared
-`imzml:obsolete-integer-type-as-psi-ms` (the mzML export does the same, with a warning); an intensity
-array of a type nothing maps is an error naming the array. A **Bruker MALDI**
+`imzml:obsolete-integer-type-as-psi-ms` (the mzML export does the same, with a warning). An m/z or
+intensity array of an imzML or mzML that holds data but states no data type the reader knows
+(`MS:1000519/521/522/523`) is an error naming the spectrum and the array, on the archive and the
+mzML export lane alike; an empty array may leave its type out. An **mzML with positions** is not
+run through the pixel-size rule: its scan settings stay as stated, and a single `IMS:1000046` there
+gives the marker no `pixel_size_um` (it may be the area the term named until 2017, and nothing
+tested it); x and y both stated in micrometre do. A **Bruker MALDI**
 `.d` (TSF or TDF, every timsTOF lane) carries the same position columns from
 `MaldiFrameInfo.XIndexPos/YIndexPos` per frame. Those are absolute raster indices on the target, so
 they are **shifted so the smallest is 1** — one shift for the whole run,

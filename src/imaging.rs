@@ -8,8 +8,10 @@
 //!   extent — an area when `√value × count = extent` (written as its square root), a length when
 //!   `value × count = extent` — and anything else is dropped. A lone `IMS:1000046` the rule keeps
 //!   is also written as `IMS:1000047`: the vocabulary defines it as the y size too when no
-//!   `IMS:1000047` is stated. Nothing changes silently: every action becomes a `transformations`
-//!   entry and a row of the `imaging_pixel_size` index block.
+//!   `IMS:1000047` is stated. Nothing changes silently: every change of a value or a unit becomes
+//!   a `transformations` entry and a row of the `imaging_pixel_size` index block. The vocabulary's
+//!   default made explicit — the y of a kept lone x, and the terms' current names — declares
+//!   nothing and is in the row only (its `written_um` and `detail`).
 //! * **"one way"** (`IMS:1000411`, obsolete) is written as its stated replacement, flyback
 //!   (`IMS:1000413`), and declared.
 //! * **File provenance.** mzdata consumes storage mode, UUID and `.ibd` checksum into its
@@ -565,13 +567,17 @@ fn grid_at(values: &[f64], raster: &[f64], c: f64, phase: Option<f64>, fixed: bo
 /// What a lone `IMS:1000046` in a grid entry says about y, for [`marker_block`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LoneX {
-    /// The source stated the term (imzML, an mzML with positions): the IMS vocabulary defines
-    /// `IMS:1000046` as "the length of a pixel in the x dimension. If no pixel size y (IMS:1000047)
-    /// is explicitly specified, then this also describes the length of a pixel in the y dimension".
+    /// The source stated the term and the single-value rule read its scan settings (imzML): the
+    /// IMS vocabulary defines `IMS:1000046` as "the length of a pixel in the x dimension. If no
+    /// pixel size y (IMS:1000047) is explicitly specified, then this also describes the length of
+    /// a pixel in the y dimension". The rule writes that y itself ([`apply`]), so this default
+    /// only says the same of an entry the rule left as it was.
     AlsoY,
-    /// The lane wrote the term itself for an axis whose step it measured and knows no other axis's
-    /// (a Waters single row: owner decision D5 keeps that output as it is): x only, no
-    /// `pixel_size_um`.
+    /// x only, no `pixel_size_um`. The lane wrote the term itself for an axis whose step it
+    /// measured and knows no other axis's (a Waters single row: owner decision D5 keeps that
+    /// output as it is); or the source stated it and nothing tested it (an mzML with positions:
+    /// its lone "pixel size" may be the area the term named until 2017, and an untested value in
+    /// the marker would be read as a length on both axes).
     XOnly,
 }
 
@@ -1175,7 +1181,9 @@ pub fn provenance_params(content: &[RawParam]) -> Vec<Param> {
         .filter_map(|(curie, name)| {
             let p = content.iter().find(|p| p.accession == curie.to_string())?;
             let b = Param::builder().name(*name).curie(*curie);
-            Some(if p.value.is_empty() { b.build() } else { b.value(p.value.clone()).build() })
+            // A string whatever it spells: `Value::from(String)` parses, and a checksum of decimal
+            // digits only (or one reading as a float, `12e4…`) was written as a number.
+            Some(if p.value.is_empty() { b.build() } else { b.value(mzdata::params::Value::String(p.value.clone())).build() })
         })
         .collect()
 }
@@ -1254,14 +1262,18 @@ mod tests {
             </fileContent></fileDescription>
             <referenceableParamGroupList><referenceableParamGroup id="sums">
             <cvParam cvRef="IMS" accession="IMS:1000091" name="ibd SHA-1" value="ABCDEF0123"/>
+            <cvParam cvRef="IMS" accession="IMS:1000090" name="ibd MD5" value="00000000000000000000000000000123"/>
             </referenceableParamGroup></referenceableParamGroupList><run/></mzML>"#;
         let p = provenance_params(&read_file_content_from(xml.as_bytes()).unwrap());
         let got: Vec<(String, String)> = p.iter().map(|p| (p.curie().unwrap().to_string(), p.value.to_string())).collect();
         assert_eq!(got, [
             ("IMS:1000031".to_string(), String::new()),
             ("IMS:1000080".to_string(), "686ec248523749d8a17590dde78ab130".to_string()),
+            ("IMS:1000090".to_string(), "00000000000000000000000000000123".to_string()),
             ("IMS:1000091".to_string(), "ABCDEF0123".to_string()),
         ]);
+        // A checksum of decimal digits only stays the string it is (it was written as the number 123).
+        assert!(p.iter().skip(1).all(|p| matches!(p.value, mzdata::params::Value::String(_))), "{p:?}");
     }
 
     fn scan(params: &[(CURIE, &str)]) -> mzdata::spectrum::ScanEvent {
