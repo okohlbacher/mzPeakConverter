@@ -106,7 +106,7 @@ fn data_facet_intensity_is_zstd_for_both_chunk_encodings() {
     assert_intensity_is_compressed(&numpress, "numpress-linear");
     let _ = std::fs::remove_file(&numpress);
 
-    // Lossless delta m/z: no twin, no rewrite. The control that stayed correct throughout.
+    // Delta m/z (`--no-numpress`): no twin, no rewrite. The control that stayed correct throughout.
     let delta = convert_fixture("delta", &["--no-numpress"]);
     assert_intensity_is_compressed(&delta, "delta");
     let _ = std::fs::remove_file(&delta);

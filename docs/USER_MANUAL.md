@@ -128,7 +128,9 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `-c, --config <CONFIG>` | — | Config file (YAML) setting defaults for any option below; explicit command-line flags win (§5) |
 | `--layout <chunked\|point>` | `chunked` | Signal layout: `chunked` m/z layout (numpress-linear or delta); `point` — flat point layout, one row per m/z–intensity pair (§9) |
 | `--to <mzpeak\|mzml>` | inferred from the `-o` extension (`.mzML` / `.mzML.gz` → `mzml`, `.mzpeak` → `mzpeak`) | `mzml` writes a plain mzML (vendor → mzML) instead of mzPeak, bypassing the mzPeak-specific encoders (§4.1). Required when the output name has any other extension, or none; it wins over the extension |
-| `--no-numpress` | off | Lossless delta m/z chunking instead of the default lossy numpress-linear |
+| `--no-numpress` | off | Delta m/z chunking instead of the default lossy numpress-linear: each m/z is stored as its difference from the one before. Exact for m/z that are 32-bit values (most imzML) and wherever a 64-bit m/z is at most twice its predecessor; a 64-bit m/z more than twice its predecessor in the same chunk can come back one unit in the last place off (1e-15 Da near m/z 10, 5e-13 Da near m/z 4000), and so can the values after it in that chunk. This happens at any mass: a sparse centroid list is cut into chunks far wider than `--chunk-size`, since a chunk is never one point long (6 of 360 points of a ToF-SIMS-like test file; 7 of 6,281 in 200 generated centroid spectra over m/z 50–5000, 3 of them above m/z 1000). The `fidelity` block counts the chunks this can happen in and bounds the error (§8). Profile zero runs are still masked. For a bit-exact archive use `--lossless` |
+| `--keep-zero-runs` | off | Store every profile point: the writer's zero-run mask (`zero-run-mask`, §8) is off, no profile point is dropped and the entry is not declared. **Continuous-mode imaging data** (imzML `IMS:1000030`), whose pixels share one m/z axis, decodes to one shared axis only with this flag: masked, every pixel keeps a different subset of the axis under its own numpress fixed points, so one source m/z decodes to several values across pixels (171.33333 to 8 values in the 9 pixels of `Example_Continuous`; one value with the flag). `MZPC_KEEP_ZERO_RUNS=1` does the same from the environment (§10). Refused on `--agilent-grid`, whose reader leaves the zero samples out itself; inert on the timsTOF ims-compact lanes, whose frames hold no zero-intensity point; on the native Shimadzu sqrt-grid route the zero pad at the scan-window bounds stays out (`shimadzu:span-trim`, with a warning) |
+| `--lossless` | off | A bit-exact archive, or none (§9): every point of the input stored in the input's order, each m/z and intensity with exactly the value the input holds. Selects the point layout with zero runs kept and no numpress, m/z lattice or TOF grid; after writing, the conversion fails (exit 1, nothing written) unless no signal transformation is declared, every point is stored and no column is narrower than the input declares. **mzML and imzML inputs only**; refused on every other lane, and for a Thermo `.raw` or a TDF on the standard lane. Conflicts with `--layout chunked`, `--tof-grid auto\|on`, `--agilent-grid` and an mzML output, and is refused while `MZPC_MAX_SPECTRA` is set (§10) |
 | `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
 | `--zstd-level <ZSTD_LEVEL>` | `3` (timsTOF ims-compact lanes: `22`) | Zstd compression level (1–22). The ims-compact lanes default to 22: their archives are written once and read many times, and 22 is 1.4 % smaller than 5 on PXD059079's 2485.d. An explicit value applies to every lane (§9) |
@@ -169,16 +171,24 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 
 | Lane (how it is selected) | Refused (exit 1) | Warned; the run goes on |
 |---|---|---|
-| `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --no-mz-lattice --chunk-size --no-ims-compact --representation --ims-chunked --no-ims-grid --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output). `--ims-grid` is NOT a filter: it rewrites the timsTOF peaks facet into the grid layout (`--zstd-level` and `--grid-encoding` apply to that facet) and copies everything else |
+| `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --keep-zero-runs --no-mz-lattice --chunk-size --no-ims-compact --representation --ims-chunked --no-ims-grid --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output). `--ims-grid` is NOT a filter: it rewrites the timsTOF peaks facet into the grid layout (`--zstd-level` and `--grid-encoding` apply to that facet) and copies everything else |
 | `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux` | the filter lane's list without `--aux` |
-| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --ims-grid --grid-encoding --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
-| `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert` | `--layout --no-numpress --chunk-size` |
+| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --keep-zero-runs --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --ims-grid --grid-encoding --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
+| `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert --keep-zero-runs` (the reader leaves the zero samples out itself, `agilent:drop-zero-samples`) | `--layout --no-numpress --chunk-size` |
 | `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --grid-encoding --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
-| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --no-tims-recalibration` (the SDK lane's 1/K0 comes from the vendor's own scan→1/K0 model) | `--layout --no-numpress` |
+| `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --no-tims-recalibration` (the SDK lane's 1/K0 comes from the vendor's own scan→1/K0 model) | `--layout --no-numpress --keep-zero-runs` |
 | `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | — |
-| default timsTOF (TDF) ims-compact | `--image --sdrf` | `--layout --no-numpress` |
+| default timsTOF (TDF) ims-compact | `--image --sdrf` | `--layout --no-numpress --keep-zero-runs` |
 | native vendor readers (TSF / BAF / Agilent / `.wiff` / Waters / `.lcd`) | `--image --sdrf` | `--ims-chunked --no-ims-chunked` |
 | standard mzdata lane (mzML / imzML / Thermo `.raw` / TDF f64) | — | `--ims-chunked --no-ims-chunked` (also when a timsTOF run falls back to this lane because timsrust cannot decompress it) |
+
+`--lossless` is refused (exit 1) on every lane but the standard one, and there for an input that
+is not an mzML or imzML (a Thermo `.raw`, a TDF read as f64): its check compares the stored signal
+with what the file declares, which only those two formats state. Unlike the options above it is
+refused when it comes from the config file too: it is a promise about the archive, not a codec
+preference. For the same reason it is refused while `MZPC_MAX_SPECTRA` is set, whether or not the
+cap would bite: a capped run stops early with the completeness check off, and its archive would be
+exact in what it holds and silent about what it lacks.
 
 Options a lane has no use for that appear in neither column (`--no-vendor` on an mzML export,
 `--tof-grid` on the native Bruker/Agilent lanes, `--bruker-sdk` on a non-Bruker input converted to
@@ -373,6 +383,8 @@ output: out.mzpeak
 to: mzpeak                 # or: mzml (default: inferred from the output extension, .mzpeak or .mzML)
 layout: chunked            # or: point
 no_numpress: false
+keep_zero_runs: false      # true: store every profile point (no zero-run mask)
+lossless: false            # true: a bit-exact archive or a failed conversion (mzML/imzML only)
 no_mz_lattice: false
 chunk_size: 50
 zstd_level: 9
@@ -447,6 +459,7 @@ Contents:
 
 - `mzpeak_index.json` — manifest: facets, schema versions, run metadata,
   `ims_calibration` (for ims-compact), `transformations` (what was done to the signal, §8),
+  `fidelity` (by how much: points stored against points read, numeric types, m/z error, §8),
   `partial` (only when `MZPC_MAX_SPECTRA` truncated the run, §10), declared file entries.
   Since 0.9.13 `source_files[].location` never carries the converting machine's path (it is
   reduced to the bare `file://` authority; non-`file` URL schemes are kept), `run.id` is never a
@@ -703,7 +716,7 @@ each column keeps the arm whose compressed bytes came out smallest (a tie keeps 
 
 | column | arms |
 |---|---|
-| m/z | lossless delta chunks under dictionary, byte-stream split or plain encoding; numpress-linear unless `--no-numpress` |
+| m/z | delta chunks (exact for these float32 m/z) under dictionary, byte-stream split or plain encoding; numpress-linear unless `--no-numpress` |
 | intensity | float32 under byte-stream split or dictionary; the same values as int32 (MS:1000519) under either, when every sampled intensity is an integer in int32 range |
 | ion mobility | dictionary, byte-stream split or plain |
 
@@ -712,7 +725,7 @@ records its encoding per page, so any reader reads every arm; int32 intensities 
 values unchanged. If a spectrum the sample did not see carries an intensity int32 cannot hold, the
 run is written again with the smallest float32 arm and the block says so (`int32_fallback`).
 Measured on PXD063409 `20181112_HDMSE_CK1` (2.1 G points) before this lane had it: numpress m/z
-2.02 GB against 1.45 GB lossless delta, float32 byte-stream-split intensity 1.60 GB against 1.08 GB as
+2.02 GB against 1.45 GB delta, float32 byte-stream-split intensity 1.60 GB against 1.08 GB as
 int32, and float ion mobility under byte-stream split 3.3× its dictionary size. `MZPC_ENCODING_PRESCAN=0`
 (§10) keeps the fixed encodings. The scan
 row's `ion_mobility_value` stays NULL on purpose: a frame has no single drift time. Retention time,
@@ -864,13 +877,16 @@ archive; the lane-specific changes, each declared when it happens, are in the ta
 **The `transformations` index key** below:
 
 1. **numpress-linear** (`numpress-linear`) — the *default* chunk encoding of profile m/z on the `chunked` layout is
-   lossy (§9); `--no-numpress` selects the lossless delta encoding.
+   lossy (§9); `--no-numpress` selects the delta encoding, exact for 32-bit m/z values and wherever a
+   64-bit m/z is at most twice its predecessor (§4). The bound of every numpress archive is in its
+   `fidelity` block.
 2. **Profile zero-run compaction** (`zero-run-mask`) — in **profile** spectra, a run of two or more *consecutive*
    zero-intensity points is collapsed to a single zero at each peak boundary —
    `[0,0,0,0,0, 900, 500, 0,0,0, 300, 0]` (12 points) is stored as `[0, 900, 500, 0, 0, 300, 0]`
    (7). The baseline extent of every peak is preserved, so the profile shape is unchanged, but
    `number_of_data_points` reflects the stored count rather than the source's. **Centroid spectra
    are never touched** — isolated and interior zero-intensity centroids round-trip exactly.
+   `--keep-zero-runs` turns the compaction off; how many points it dropped is in the `fidelity` block.
 3. **`--tof-grid` sqrt grid** (`tof-grid:<ppm>ppm`) — a spectrum is stored on an integer sqrt-space grid (a
    chunk-grid row under its `MS:1003825` model) only when every point reconstructs within the ppm bound
    (`MZPC_TOF_GRID_PPM`, default 5). Spectra outside the bound keep f64 m/z as raw chunk rows.
@@ -953,6 +969,69 @@ userParam carrying it verbatim, and, when `zero-run-mask`, `shimadzu:span-trim` 
 — the one kind PSI-MS has a term for. A conversion with no entry leaves the method as before.
 Archives written through 0.16.0 hold the list only in `transformations`.
 
+**The `fidelity` index key.** `transformations` names what changed; `metadata.fidelity` says by how
+much. Every mzPeak lane writes it at close, from the two signal facets as they sit in the archive
+(`src/fidelity.rs`):
+
+```json
+"fidelity": {
+  "spectra_data": {
+    "layout": "chunked",
+    "source_points": 75591, "stored_points": 36856,
+    "source_types": {"mz": ["float32"], "intensity": ["float32"]},
+    "stored_types": {"mz": "float64", "intensity": "float32"}
+  },
+  "mz_error": [
+    {"encoding": "numpress-linear", "facet": "spectra_data", "chunks": 126, "min_fixed_point": 2783817.0,
+     "max_abs_error": 1.7961e-07, "max_rel_error_ppm": 0.000233, "basis": "bound"}
+  ]
+}
+```
+
+- One entry per signal facet that holds or was handed points (`spectra_data`, `spectra_peaks`).
+  `stored_points` is the facet's footer count. `stored_types` says what holds the values: the
+  numeric type of the intensity column and of the m/z column (numpress chunks decode to that type,
+  with the error `mz_error` states), or `grid:<index type>` for m/z on a chunked facet whose rows
+  are grid rows (`MS:1003826`: the values column is empty, and each m/z is computed as a 64-bit
+  value from an integer index and the row's model). Every default timsTOF archive reads
+  `"mz": "grid:uint32"`, as do the fitted-lattice and `--tof-grid` facets; a facet that mixes the
+  two kinds of row (a `--tof-grid` run keeps an off-grid spectrum as 64-bit values) reads
+  `float64+grid:uint32`. `source_points`
+  is what the reader handed the writer, counted by the lane (the mzML/imzML, `--tof-grid` and native
+  vendor-reader lanes; the ims-compact, `--agilent-grid` and SCIEX grid lanes state the stored side
+  only): the difference is what the zero-run mask left out. `source_types` are the binary data
+  types the file declares, on the mzML and imzML lanes only (a vendor library's array types are its
+  own choice), as a list because a file may mix them. A stored type narrower than a source type is
+  a value change `transformations` does not name: a centroid spectrum's 64-bit intensities are
+  stored as float32 on the default lanes, which `--lossless` avoids.
+- `mz_error` lists every m/z encoding in the archive that can move a value; an empty list means
+  none is present. `max_abs_error` is in m/z units, `max_rel_error_ppm` in ppm, and `basis` says
+  what kind of number it is:
+  - `bound` (`numpress-linear`, `delta`): not a measurement but a bound computed from the stored
+    chunks. For numpress it is, per chunk, `0.5 / fixed point` plus four units in the last place of
+    the chunk's largest m/z, the fixed point read from the encoded chunk's first eight bytes; the
+    relative figure divides each chunk's bound by its smallest m/z. `0.5 / fixed point` alone is exceeded by about 1e-14 Da
+    through f64 rounding, so a strict check against it fails; the recorded bound holds for every
+    value (tested by decoding, `fidelity::tests`) and is reached to within 1 % on real data.
+    A `delta` entry is a bound as well. It appears only when 64-bit m/z are stored in delta
+    chunks whose last m/z is more than twice the first, where `b + (a − b)` can round; it counts
+    those chunks (`chunks_not_exact_by_construction`) and gives the largest m/z among them
+    (`largest_mz_at_risk`). A decoded value stays within one unit in the last place of its source
+    value through the whole chunk, although an error is carried from one value into the next (the
+    proof is in `src/fidelity.rs`, and the tests decode against it): `max_abs_error` is that unit
+    at the largest m/z at risk (4.5e-13 Da below m/z 4096), `max_rel_error_ppm` is 2.22e-10, the
+    most one such unit is of its value. A delta chunk within a factor of two, and any delta chunk
+    of 32-bit m/z values, is exact.
+  - `tolerance` (`grid-fit:<Da>Da`, `tof-grid:<ppm>ppm`): the bound every fitted value was
+    accepted within, absolute for the fitted lattice and relative for the TOF grid, and the other
+    figure derived from it over the m/z range of the grid rows stored (the absolute tolerance over
+    their smallest m/z, the relative one times their largest).
+  - `not measured` (the Bruker chord and Shimadzu coarse-m/z entries, and a `delta` entry whose
+    chunks start at or below m/z 0): no figure.
+- The `.mzpeak` → `.mzpeak` filter (§4.2) carries the block unchanged while every spectrum is
+  kept, and leaves it out when `--rt` or `--ms-level` removed spectra (its counts would describe
+  the source archive); the `filter` block then lists it under `dropped_index_blocks`.
+
 Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
 decompress a frame; the recorded command line is the same on both routes). Only those lanes write
@@ -1016,7 +1095,31 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
 
 - **Layout** — `chunked` (default) groups m/z into chunks (`--chunk-size`, Th) and
   encodes each with numpress-linear (lossy, compact) or, with `--no-numpress`,
-  lossless delta. `point` writes one row per (m/z, intensity).
+  delta (exact except as §4 states). `point` writes one row per (m/z, intensity), each
+  at the numeric type of its column, with no encoding that can move a value.
+- **Zero runs and bit-exact archives** — three levels, from smallest to exact:
+  the default masks profile zero runs and stores m/z with numpress-linear (bounded, the bound in
+  `fidelity`, §8); `--keep-zero-runs` stores every point and keeps numpress, which is what gives
+  continuous-mode imaging data (one m/z axis for all pixels) one decoded axis; `--lossless` is
+  bit-exact or fails. It selects the point layout with zero runs kept and no numpress, lattice or
+  TOF grid, writes a centroid spectrum's arrays at the binary types the file declares (the
+  default lanes store its intensities as float32), and after writing checks the archive: no
+  signal transformation declared (the set is `SIGNAL_TRANSFORMATIONS` in `src/fidelity.rs`;
+  entries about metadata, chromatograms or precursor windows, such as
+  `mzml:dangling-reference-dropped` or `chromatogram-time-to-minutes`, do not count), both signal
+  facets in the point layout with as many points as were read, no m/z encoding with an error, and
+  no column narrower than its source type (a 32-bit value in a 64-bit column passes and shows in
+  `fidelity`). When the check fails, so does the conversion, and nothing is written; a spectrum
+  whose m/z are out of order fails it, since storing it means sorting it. mzML and imzML only.
+  The check covers the mass spectra's m/z and intensity; chromatograms (whose times are still
+  written in minutes) and wavelength spectra are stored as on the default lanes. Measured on the
+  HR2MSI mouse urinary bladder imzML (34,840 profile spectra, 67,916,471 points, 64-bit m/z;
+  815 MB `.ibd`): default 173.8 MB with 40,559,444 points stored, `--keep-zero-runs` 193.6 MB
+  (+11 %), `--lossless` 409.8 MB (2.4×, every m/z and intensity equal to the `.ibd`); these are
+  sizes without an optical image, and the 1.6 MB TIFF the corpus keeps beside this imzML is
+  embedded on top when it is there. Where m/z are 32-bit values the exact archive is the smaller
+  one: `Example_Continuous` is 263 kB by default, 241 kB with `--keep-zero-runs` and 230 kB with
+  `--lossless`.
 - **zstd** — applied inside Parquet, `--zstd-level` 1–22 (default 3; the timsTOF **ims-compact**
   lanes default to **5**, the measured byte-plane plateau — an explicit `--zstd-level` applies to
   both).
@@ -1030,7 +1133,7 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   range and accepted only when every value rebuilds within 1e-6 Da (≤ 3e-7 Da on a 1,900-Th
   spectrum) — declared as `grid-fit:1e-6Da`. That is upstream's own `--peak-encoding grid`, and on
   such data it is far smaller than delta chunking: on the 4.5 GB LabSolutions `DIA_Hela_20ng` mzML
-  (279.7 M centroids) the m/z bytes go 1,897 MB (lossless delta) → ~0.93 GB. Only the **peaks** facet
+  (279.7 M centroids) the m/z bytes go 1,897 MB (delta) → ~0.93 GB. Only the **peaks** facet
   is affected — profile arrays keep the chunked layout and the `--no-numpress` / `--chunk-size` /
   `--layout` choices exactly as before, so a profile-only input converts unchanged. Under
   `--layout point` the grid is not applied (nor, on the native Shimadzu lane, the profile sqrt grid):
@@ -1183,13 +1286,14 @@ instead.
 | Variable | Effect | Recorded in the archive? |
 |---|---|---|
 | `MZPC_NO_MZ_LATTICE=1` | Same as `--no-mz-lattice` (§9): keep exact f64 m/z for lattice centroid lists instead of the fitted linear grid, on every lane (`env_flag` spellings) | implicitly — `transformations` has no `grid-fit` entry and the peaks facet has no grid rows |
+| `MZPC_KEEP_ZERO_RUNS=1` | Same as `--keep-zero-runs` (§4): the writer's zero-run mask off, every profile point stored (`env_flag` spellings). Not honoured by `--agilent-grid`, which warns | implicitly — `transformations` has no `zero-run-mask` entry and `fidelity` shows `stored_points` equal to `source_points` |
 | `MZPC_SHIMADZU_COARSE_MZ=1` | Shimadzu glue: read the coarse 1e-4 `Mass` instead of `MassHigh` (§8). Read by the C# glue and compared to the literal `1` — only `=1` switches it | yes — `transformations` lists `shimadzu:coarse-mz` |
 | `MZPC_WATERS_KEEP_COLLAPSED` | Native Waters lane: write MassLynx's collapsed retention-time functions (run-summed mobilograms) as spectra instead of leaving them out. On/off lever read through the common rule (empty, `0`, `false`, `no` are off) | yes — `collapsed_functions[].written` in `waters_functions` (and `waters_drift`), and `waters:drop-functions` when they were left out |
 | `MZPC_BYTE_PLANE_INTENSITY=0` | Opt out of Int32 byte-plane intensity (on by default for timsTOF ims-compact) back to Float32 (`env_flag` spellings: empty, `0`, `false`, `no` all opt out) | yes — `ims_calibration.intensity_dtype` = `int32` \| `float32` (0.9.13) |
 | `MZPC_ENCODING_PRESCAN=0` | Native Waters lane: skip the encoding pre-scan (§8) and write the fixed encodings — numpress m/z (or delta under `--no-numpress`), float32 byte-stream-split intensity, dictionary ion mobility (`env_flag` spellings) | yes — the archive then has no `encoding_prescan` block |
 | `MZPC_TOF_GRID_PPM=<ppm>` | `--tof-grid` reconstruction tolerance (default 5.0). The lane is bounded-lossy and this number **is** the bound — raising it above the instrument's mass accuracy is not defensible. Logged as a warning when set | yes — `transformations` carries `tof-grid:<ppm>ppm`, and the `tof_calibration` block its `roundtrip_tolerance_ppm` |
 | `MZPC_TOF_GRID_C1=<step>` | `--tof-grid`: force the sqrt-space step instead of inferring it (`c1 = quantum / (2·√mz_max)`) | the fitted `{c0,c1}` is stored; the fact that `c1` was forced is not |
-| `MZPC_MAX_SPECTRA=<n>` | Stop after `n` spectra. **Deliberately truncating**: it also disables the "all source spectra written" completeness check, so the archive is a partial one that exits 0. Diagnostics only; the WARN stays | yes — every mzPeak lane that honours the cap writes `metadata.partial` = `{partial: true, max_spectra, source_declared, spectra_written, cause: "MZPC_MAX_SPECTRA"}` when the cap bit (0.9.13); a cap larger than the file writes no marker |
+| `MZPC_MAX_SPECTRA=<n>` | Stop after `n` spectra. **Deliberately truncating**: it also disables the "all source spectra written" completeness check, so the archive is a partial one that exits 0. Diagnostics only; the WARN stays. `--lossless` is refused while it is set | yes — every mzPeak lane that honours the cap writes `metadata.partial` = `{partial: true, max_spectra, source_declared, spectra_written, cause: "MZPC_MAX_SPECTRA"}` when the cap bit (0.9.13); a cap larger than the file writes no marker |
 
 **Performance / diagnostic.** No effect on the values written (bytes only where noted); zero cost
 when unset.

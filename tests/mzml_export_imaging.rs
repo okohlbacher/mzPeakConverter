@@ -286,7 +286,7 @@ fn the_direct_export_of_an_imzml_applies_the_archive_lanes_scan_settings_rules()
     type Sizes<'a> = &'a [(&'a str, Option<&'a str>, Option<&'a str>)];
     let cases: [(&str, Vec<&str>, bool, Sizes, &[&str]); 6] = [
         ("stated", vec![&x, &y], true, &[("IMS:1000046", Some("100"), UM), ("IMS:1000047", Some("100"), UM)], &[]),
-        ("area", vec!["<cvParam cvRef=\"IMS\" accession=\"IMS:1000046\" name=\"pixel size\" value=\"10000\"/>"], true, &[("IMS:1000046", Some("100"), UM)], &["imzml:pixel-size-area-to-length"]),
+        ("area", vec!["<cvParam cvRef=\"IMS\" accession=\"IMS:1000046\" name=\"pixel size\" value=\"10000\"/>"], true, &[("IMS:1000046", Some("100"), UM), ("IMS:1000047", Some("100"), UM)], &["imzml:pixel-size-area-to-length"]),
         (
             "unitless",
             vec!["<cvParam cvRef=\"IMS\" accession=\"IMS:1000046\" name=\"pixel size x\" value=\"100\"/>", "<cvParam cvRef=\"IMS\" accession=\"IMS:1000047\" name=\"pixel size y\" value=\"100\"/>"],

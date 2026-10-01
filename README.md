@@ -30,7 +30,9 @@ preserves vendor metadata and ion-mobility structure.
 declares every transformation it applied** in the index (`transformations`). Most lanes
 are bit-exact (integer TOF, the vendors' own integer grids, centroid m/z). Five general
 signal transforms are not, and each is named in the archive with its bound: the default
-**numpress-linear** chunk encoding of profile m/z (`--no-numpress` for lossless delta),
+**numpress-linear** chunk encoding of profile m/z (`--no-numpress` for delta, exact but for
+one unit in the last place where a 64-bit m/z is more than twice its predecessor, which sparse
+spectra have at any mass; `--lossless` for a bit-exact archive of an mzML or imzML),
 **zero-run compaction** of profile baselines (consecutive zeros collapse to one at each
 peak boundary), the **`--tof-grid` sqrt grid**, accepted only within a ppm bound
 (`MZPC_TOF_GRID_PPM`, default 5), the **fitted linear grid** on fixed-point-lattice
