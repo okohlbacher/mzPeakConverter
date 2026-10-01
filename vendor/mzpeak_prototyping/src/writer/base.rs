@@ -39,6 +39,7 @@ use crate::{
     writer::{
         ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChromatogramBuilder,
         MiniPeakWriterType, SpectrumBuilder, WavelengthSpectrumBuilder, WriteBatchConfig, ColumnEncoding,
+        row_group::{RowGroupCutter, row_group_max_bytes, write_row_groups},
     },
 };
 
@@ -383,20 +384,16 @@ impl GenericDataArrayWriter {
         &self.data_buffers
     }
 
+    /// `row_groups` cuts the facet's row groups at its row and byte caps (DELIBERATE DEVIATION, see
+    /// `row_group`).
     pub fn drain_into<W: io::Write + Send>(
         &mut self,
         writer: &mut ArrowWriter<W>,
+        row_groups: &mut RowGroupCutter,
     ) -> io::Result<()> {
         for batch in self.data_buffers.drain() {
-            writer.write(&batch)?;
             // Bound the in-progress row group by size for EVERY layout (not just chunked).
-            if writer.in_progress_size() > 16_000_000 {
-                log::debug!(
-                    "Flushing row group buffer with approximately {} bytes",
-                    writer.in_progress_size()
-                );
-                writer.flush()?;
-            }
+            write_row_groups(writer, row_groups, batch, Some(16_000_000))?;
         }
         Ok(())
     }
@@ -1271,24 +1268,21 @@ pub trait AbstractMzPeakWriter {
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(true);
 
+        // DELIBERATE DEVIATION (see `row_group`): row groups end at the byte cap as well as the row cap.
+        let max_row_group_bytes = row_group_max_bytes(write_batch_config.row_group_bytes);
         if parallel {
             let schema = peak_buffer.schema().clone();
             let (file_writer, factory) = peak_writer.into_serialized_writer()?;
-            // parquet 59 made this `Option<usize>` (None = the default). The parallel peak
-            // encoder cuts row groups at exactly this count, so it must resolve to the same
-            // 1,048,576 the old `max_row_group_size()` returned or byte-identity breaks.
-            let max_rows = file_writer
-                .properties()
-                .max_row_group_row_count()
-                .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
+            // Both backends cut row groups from `peak_data_props` (the properties `file_writer` was
+            // built with), so their boundaries — and bytes — are the same.
             Ok(MiniPeakWriterType::new_parallel(
                 file_writer,
                 factory,
                 schema,
-                max_rows,
                 peak_buffer,
                 buffer_size,
                 peak_data_props,
+                max_row_group_bytes,
             ))
         } else {
             Ok(MiniPeakWriterType::new(
@@ -1296,6 +1290,7 @@ pub trait AbstractMzPeakWriter {
                 peak_buffer,
                 buffer_size,
                 peak_data_props,
+                max_row_group_bytes,
             ))
         }
     }
@@ -1573,8 +1568,8 @@ pub trait AbstractMzPeakWriter {
                 // disabling it BYTE_STREAM_SPLIT was only the fallback and the column shipped
                 // dictionary-encoded. Measured with zstd, values bit-identical: −22 % / −25 % on the
                 // m/z of the densest native SciEX row groups, −25 % to −48 % on point-layout
-                // mzML/Thermo m/z. Chunk facets are left as they are, so chunked archives keep their
-                // bytes; their `mz_chunk_*` boundary columns would gain about 1 % of the facet.
+                // mzML/Thermo m/z. Chunk facets are outside this rule; their bounds have their own
+                // below.
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
@@ -1608,11 +1603,32 @@ pub trait AbstractMzPeakWriter {
                 // the TOF column, and a grid's `[first, deltas…]` index list — have the same
                 // byte-plane redundancy, so BSS beats delta-packing there too (grid indices: BSS
                 // −9.6 % vs dictionary, DELTA_BINARY_PACKED +21 %, measured on PXD059079 2485).
-                // Chunk BOUNDS stay dictionary-encoded here on purpose: `tests/data_facet_compression.rs`
-                // pins that chunked archives keep their bytes. Dictionary encoding is enabled globally and takes
-                // precedence over a column encoding, so it is disabled for these columns explicitly.
+                // Dictionary encoding is enabled globally and takes precedence over a column
+                // encoding, so it is disabled for these columns explicitly.
                 // DELIBERATE DEVIATION from upstream, which requests DELTA for grid indices but leaves
                 // the dictionary on (so its files are RLE_DICTIONARY throughout).
+                data_props = data_props
+                    .set_column_dictionary_enabled(c.path().clone(), false)
+                    .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
+            if (colpath.ends_with("_chunk_start") || colpath.ends_with("_chunk_end"))
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
+                log::debug!("{}: byte-stream-split", c.path());
+                // DELIBERATE DEVIATION from upstream, which leaves a chunk's bounds to the global
+                // dictionary. On an LC-MS run a chunk's first and last m/z are nearly all distinct,
+                // so the dictionary holds the values over again, and every row group pays its own:
+                // once row groups were bounded by bytes as well as rows, a Lumos peak facet went
+                // from 1 to 4 groups, its two bound columns grew by 21 % each and the facet by
+                // 1.2 %. Byte-stream-split without the dictionary, the bounds are 23-38 % smaller
+                // than with it, that Lumos facet 2.3 % (MFA381's peak facet 3.2 %, PXD059079 2485's
+                // grid facet 0.6 %, values identical); plain without the dictionary saves 57-83 %
+                // of what this saves. A centroid facet with few distinct bounds grows slightly:
+                // QC01 +0.05 %, the ltpmsi-chilli imaging run +0.10 % (169 MB in 7 groups, its
+                // bounds +39-43 %).
                 data_props = data_props
                     .set_column_dictionary_enabled(c.path().clone(), false)
                     .set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);

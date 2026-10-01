@@ -27,7 +27,7 @@ use mzdata::curie;
 use mzdata::meta::DissociationMethodTerm;
 use mzdata::spectrum::{
     Activation, IsolationWindow, IsolationWindowState, MultiLayerSpectrum,
-    Precursor, ScanPolarity, SelectedIon, SignalContinuity, SpectrumDescription,
+    Precursor, ScanPolarity, ScanWindow, SelectedIon, SignalContinuity, SpectrumDescription,
 };
 
 use mzpeak_prototyping::grid::{GridEncoding, GridModelLike, SquareRootLinearGrid, TimsTofMzGrid2, TimsTofTimsLinearGrid2};
@@ -205,9 +205,10 @@ impl MobilityCal {
 /// goes through timsrust's LINEAR nominal-range interpolation (`metadata.im_converter`). On
 /// PXD059079 2485.d that put the `--no-ims-compact` selected ion at 1.317349 against the ims-compact
 /// lane's 1.332429 for the same window (0.015 Vs/cm², up to ~0.03 at the high-mobility edge). The
-/// linear map is exactly invertible, so this recovers the scan position and re-evaluates the same
-/// ModelType-2 model the native lane uses ([`crate::tims_mobility`]); with no ModelType-2 row the
-/// values are left as they are (the native lane falls back to the same linear map then).
+/// linear map is invertible, so this recovers the scan position and re-evaluates the same
+/// ModelType-2 model the native lane uses ([`crate::tims_mobility`]), in the arithmetic of mzdata's
+/// arrays ([`TdfMobilityRemap::remap`]); with no ModelType-2 row the values are left as they are
+/// (the native lane falls back to the same linear map then).
 ///
 /// It also attaches the window's 1/K0 band to each selected ion as MZP:1000006/7, from mzdata's
 /// spectrum-level `ion mobility lower/upper limit` (that spelling is kept), so both lanes spell the
@@ -247,15 +248,23 @@ impl TdfMobilityRemap {
 
     /// For tests: a remap over explicit models.
     #[cfg(test)]
-    fn new(linear: Scan2ImConverter, recal: Option<crate::tims_mobility::TimsMobilityCalibration>) -> Self {
+    pub(crate) fn new(linear: Scan2ImConverter, recal: Option<crate::tims_mobility::TimsMobilityCalibration>) -> Self {
         Self { linear, recal }
     }
 
-    /// A 1/K0 produced by timsrust's linear converter → the same scan position on the vendor model.
+    /// A 1/K0 produced by timsrust's linear converter → the same scan position on the vendor model,
+    /// evaluated as mzdata evaluates its mobility arrays
+    /// ([`one_over_k0_as_mzdata`](crate::tims_mobility::TimsMobilityCalibration::one_over_k0_as_mzdata)).
+    /// The linear round trip does not give the scan back exactly (a few 1e-13 off), so a position
+    /// that close to the half-scan grid every param here comes from — window bounds are whole
+    /// scans, midpoints half ones — is put back on it first. Together these make a window's limits
+    /// the very values its first and last scan's peaks carry: through 0.16.0 (SDK-order arithmetic
+    /// on the unsnapped position) the upper limit often came out a bit or two below the array value
+    /// of its own first scan, and those peaks lay outside their window.
     #[inline]
     pub fn remap(&self, im: f64) -> f64 {
         match &self.recal {
-            Some(c) => c.one_over_k0(self.linear.invert(im)),
+            Some(c) => c.one_over_k0_as_mzdata(snap_to_half_scan(self.linear.invert(im))),
             None => im,
         }
     }
@@ -322,6 +331,110 @@ impl TdfMobilityRemap {
     }
 }
 
+/// A scan position recovered through timsrust's linear map, put back on the half-scan grid when it
+/// lies within 1e-6 scans of it (the round trip is off by ~1e-13); any other position — a DDA
+/// precursor's fractional `ScanNumber` — as it is.
+fn snap_to_half_scan(scan: f64) -> f64 {
+    let grid = (scan * 2.0).round() / 2.0;
+    if (scan - grid).abs() < 1e-6 { grid } else { scan }
+}
+
+/// The two files timsrust 0.4.1 looks up by name suffix inside a `.d` (`FrameReader::new`).
+const TIMSRUST_SUFFIX_LOOKUPS: [&str; 2] = ["analysis.tdf", "analysis.tdf_bin"];
+
+/// The files in a `.d` that timsrust's suffix lookup can take for `analysis.tdf` or
+/// `analysis.tdf_bin` without being either (letter case aside), each list sorted.
+#[derive(Debug, Default, PartialEq)]
+struct Lookalikes {
+    /// Listed before the file they stand in for: timsrust opens these in place of the run.
+    taken: Vec<String>,
+    /// Listed after it: timsrust opens the run's own file and never reaches these.
+    passed: Vec<String>,
+}
+
+/// [`Lookalikes`] of a `.d` whose entry names are `listing`, IN LISTING ORDER, by timsrust 0.4.1's
+/// own rule (`utils::find_extension`): for each lookup, the first entry whose lower-cased name ends
+/// with the wanted one is the file it opens. The order is the verdict: NTFS and APFS list
+/// `._analysis.tdf` before `analysis.tdf`, a fresh copy onto exFAT lists it after.
+fn timsrust_lookalikes<'a>(listing: impl IntoIterator<Item = &'a str>) -> Lookalikes {
+    let listing: Vec<(&str, String)> = listing.into_iter().map(|n| (n, n.to_lowercase())).collect();
+    let mut found = Lookalikes::default();
+    for want in TIMSRUST_SUFFIX_LOOKUPS {
+        let mut matches = listing.iter().filter(|(_, lower)| lower.ends_with(want));
+        let lookalike = |(name, lower): &(&str, String)| (lower != want).then(|| name.to_string());
+        found.taken.extend(matches.next().and_then(lookalike));
+        found.passed.extend(matches.filter_map(lookalike));
+    }
+    found.taken.sort();
+    found.passed.sort();
+    found
+}
+
+/// [`timsrust_lookalikes`] of `dot_d` as `read_dir` lists it, which is the listing timsrust walks
+/// (a name that is not UTF-8 it skips, and so does this); none when it cannot be listed (the open
+/// itself then reports the directory).
+fn lookalikes_in(dot_d: &Path) -> Lookalikes {
+    match std::fs::read_dir(dot_d) {
+        Ok(entries) => {
+            let names: Vec<_> = entries.flatten().filter_map(|e| e.file_name().to_str().map(str::to_owned)).collect();
+            timsrust_lookalikes(names.iter().map(String::as_str))
+        }
+        Err(_) => Lookalikes::default(),
+    }
+}
+
+fn lookalikes_message(dot_d: &Path, taken: &[String]) -> String {
+    format!(
+        "{} lists {} before analysis.tdf / analysis.tdf_bin. The timsTOF reader (timsrust) opens the \
+         first file whose name ends in `analysis.tdf` / `analysis.tdf_bin`, so it reads these in place \
+         of the run (\"file is not a database\"). `._*` files are macOS AppleDouble companions: Finder \
+         metadata that copying a .d from a Mac to NTFS, exFAT or SMB leaves beside every file, and that \
+         macOS writes on such a volume whenever a file there is opened for writing, as timsrust opens \
+         analysis.tdf. Remove them from the .d (on a Mac, copy the .d to an APFS disk instead: macOS \
+         writes them back), or convert with --bruker-sdk (Windows/Linux), which opens the exact files",
+        dot_d.display(),
+        taken.join(", ")
+    )
+}
+
+/// Refuse a TDF `.d` in which timsrust would open another file in place of `analysis.tdf` or
+/// `analysis.tdf_bin`. timsrust 0.4.1 (`utils::find_extension`) takes the FIRST directory entry
+/// whose name ends with the one it wants, and a macOS AppleDouble companion does: copying a `.d`
+/// from a Mac to NTFS, exFAT or SMB leaves `._analysis.tdf` (163 bytes of Finder metadata) beside
+/// every file. NTFS lists it first, so the default lane and `--no-ims-compact` failed with "file is
+/// not a database" while `--bruker-sdk`, which opens the exact names, converted the same copy
+/// (2485.d on the box, 2026-09-30). A companion listed AFTER the run's file (a fresh copy onto exFAT
+/// lists entries in the order they were written) is never reached, and that `.d` converts as it
+/// always did, with a warning naming it. Called before every timsrust open of a `.d`.
+pub fn refuse_timsrust_lookalikes(dot_d: &Path) -> Result<()> {
+    let found = lookalikes_in(dot_d);
+    if !found.taken.is_empty() {
+        bail!(lookalikes_message(dot_d, &found.taken))
+    }
+    if !found.passed.is_empty() {
+        log::warn!(
+            "{} holds {} beside analysis.tdf / analysis.tdf_bin, listed after them, so the timsTOF reader \
+             (timsrust), which opens the first file whose name ends in `analysis.tdf` / `analysis.tdf_bin`, \
+             reads the run's own files. On a volume that lists them first the same .d is refused; `._*` \
+             files are macOS AppleDouble companions, safe to remove",
+            dot_d.display(),
+            found.passed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// `err`, a failed timsrust open of `dot_d`, with any lookalike timsrust took named in front of it.
+/// The open can write one itself: on a Mac, a `.d` on an exFAT or SMB volume gets `._analysis.tdf`
+/// the moment timsrust opens `analysis.tdf` read-write (its metadata read, before it looks the file
+/// up), because macOS keeps the file's `com.apple.provenance` attribute there (measured on an exFAT
+/// disk image, macOS 26), so [`refuse_timsrust_lookalikes`] found nothing a moment earlier. One
+/// listed after the run's file did not cause the failure and is not named.
+pub fn name_timsrust_lookalikes(dot_d: &Path, err: anyhow::Error) -> anyhow::Error {
+    let found = lookalikes_in(dot_d);
+    if found.taken.is_empty() { err } else { err.context(lookalikes_message(dot_d, &found.taken)) }
+}
+
 /// Native integer-TOF reader over a Bruker `.d` (TDF). The mzdata-integration seam: a future
 /// upstream native-TOF API would back this same surface.
 pub struct NativeTofReader {
@@ -346,6 +459,9 @@ pub struct NativeTofReader {
     /// order when [`Self::ims_grid_spectrum`] sorted them. The finisher declares `sort-by-mz` from it
     /// (the schema probe counts too; it is one frame of the run).
     frames_reordered: std::sync::atomic::AtomicUsize,
+    /// The run's acquisition m/z range (`GlobalMetadata` `MzAcqRangeLower` / `MzAcqRangeUpper`), every
+    /// frame's scan window, as the `.d → mzML` lane states it; `None` when it is not a range.
+    scan_window: Option<ScanWindow>,
 }
 
 /// Per-frame `Frames` columns, ordered by `Id` so position `i` matches timsrust's frame index.
@@ -377,6 +493,10 @@ struct FrameTable {
     t1: Vec<Option<f64>>,
     t2: Vec<Option<f64>>,
     mz_cal_id: Vec<Option<i64>>,
+    /// `AccumulationTime` (ms) — how long the TIMS tunnel accumulated the frame's ions, which the
+    /// `.d → mzML` lane (mzdata's TDF reader) states as the frame's `ion injection time`. Read on its
+    /// own ([`read_accumulation_times`]): empty when unreadable, which only leaves the time unstated.
+    accumulation_time: Vec<Option<f64>>,
 }
 
 /// Converter-owned CURIEs for the per-frame calibration inputs (`Frames.T1`, `Frames.T2`,
@@ -942,10 +1062,11 @@ impl NativeTofReader {
         if !tdf.exists() {
             bail!("{} is not a TDF .d (no analysis.tdf)", dot_d.display());
         }
+        refuse_timsrust_lookalikes(dot_d)?;
         let meta = MetadataReader::new(&tdf)
             .map_err(|e| anyhow::anyhow!("reading TDF metadata: {e}"))?;
         let frames = FrameReader::new(dot_d)
-            .map_err(|e| anyhow::anyhow!("opening TDF frames: {e}"))?;
+            .map_err(|e| name_timsrust_lookalikes(dot_d, anyhow::anyhow!("opening TDF frames: {e}")))?;
         let model = TofMzModel::from_converter(&meta.mz_converter);
         // Best-effort: a missing/other-ModelType calibration just leaves us on the linear path.
         let recal = if recalibrate {
@@ -984,7 +1105,8 @@ impl NativeTofReader {
             }
         };
         let tims_grid = recal.as_ref().and_then(|c| GridEncoding::from_parameters(TimsTofTimsLinearGrid2::ACCESSION, &c.grid_parameters()));
-        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows, mz_rows, tims_grid, frames_reordered: Default::default() })
+        let scan_window = acquisition_scan_window(meta.lower_mz, meta.upper_mz);
+        Ok(Self { frames, im: meta.im_converter, recal, model, table, windows, mz_rows, tims_grid, frames_reordered: Default::default(), scan_window })
     }
 
     /// What the grid rows' m/z amount to against the vendor's model ([`mz_model_summary`]).
@@ -1251,6 +1373,11 @@ impl NativeTofReader {
         if let Some(&rt) = self.table.rt.get(i) {
             descr.acquisition.first_scan_mut().unwrap().start_time = rt / 60.0;
         }
+        state_frame_acquisition(
+            descr.acquisition.first_scan_mut().unwrap(),
+            self.table.accumulation_time.get(i).copied().flatten(),
+            self.scan_window.as_ref(),
+        );
         // Polarity: timsrust does not surface it, so it comes from TDF `Frames.Polarity`.
         descr.polarity = self.table.polarity.get(i).copied().unwrap_or_default();
         descr.precursor = self.precursors_at(i);
@@ -1389,13 +1516,84 @@ fn read_frame_table(tdf: &Path) -> Result<FrameTable> {
         .map_err(|e| anyhow::anyhow!("opening {} for Frames: {e}", tdf.display()))?;
     // T1/T2/MzCalibration are in every TDF schema seen; should one lack them, keep the core four
     // rather than failing the conversion.
-    match read_frame_rows(&conn, true) {
-        Ok(t) => Ok(t),
+    let mut table = match read_frame_rows(&conn, true) {
+        Ok(t) => t,
         Err(e) => {
             log::warn!("TDF Frames T1/T2/MzCalibration unavailable ({e}); per-frame calibration columns omitted");
-            read_frame_rows(&conn, false)
+            read_frame_rows(&conn, false)?
+        }
+    };
+    table.accumulation_time = read_accumulation_times(&conn, table.id.len());
+    Ok(table)
+}
+
+/// `Frames.AccumulationTime` in `Id` order, one per frame row; empty, with a warning, when the column
+/// cannot be read or its count is not the frames' (a frame's position must name its own row). Both
+/// ims-compact lanes read it, this one and `--bruker-sdk`'s (`bruker_sdk::TdfSdkReader`).
+pub(crate) fn read_accumulation_times(conn: &rusqlite::Connection, frames: usize) -> Vec<Option<f64>> {
+    let read = || -> rusqlite::Result<Vec<Option<f64>>> {
+        let mut stmt = conn.prepare("SELECT AccumulationTime FROM Frames ORDER BY Id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, Option<f64>>(0))?;
+        rows.collect()
+    };
+    match read() {
+        Ok(times) if times.len() == frames => times,
+        Ok(times) => {
+            log::warn!("TDF Frames.AccumulationTime: {} rows for {frames} frames; no frame states an ion injection time", times.len());
+            Vec::new()
+        }
+        Err(e) => {
+            log::warn!("TDF Frames.AccumulationTime unavailable ({e}); no frame states an ion injection time");
+            Vec::new()
         }
     }
+}
+
+/// The run's acquisition m/z range (`GlobalMetadata` `MzAcqRangeLower` / `MzAcqRangeUpper`) as the
+/// scan window of every frame, as the `.d → mzML` lane (mzdata's TDF reader) states it; `None` when
+/// the two do not make a range.
+pub(crate) fn acquisition_scan_window(lower: f64, upper: f64) -> Option<ScanWindow> {
+    (lower.is_finite() && upper.is_finite() && lower < upper)
+        .then(|| ScanWindow { lower_bound: lower as f32, upper_bound: upper as f32 })
+}
+
+/// [`acquisition_scan_window`] from `analysis.tdf`'s own `GlobalMetadata`, for the `--bruker-sdk`
+/// lane, which has no timsrust metadata to take it from. This lane's `meta.lower_mz` / `upper_mz`
+/// are the same two keys as timsrust reads them, widened by 5 Th on each side when
+/// `AcquisitionSoftware` is `Bruker otofControl`; that is done here too, so both lanes state what the
+/// `.d → mzML` lane does. `None`, with a warning, when either key is missing or not a number. Live on
+/// Windows/Linux (the SDK reader path); dead on macOS, where that path is cfg'd out.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub(crate) fn read_acquisition_scan_window(conn: &rusqlite::Connection) -> Option<ScanWindow> {
+    use rusqlite::types::Value;
+    let get = |key: &str| conn.query_row("SELECT Value FROM GlobalMetadata WHERE Key = ?1", [key], |r| r.get::<_, Value>(0)).ok();
+    let value = |key: &str| -> Option<f64> {
+        match get(key)? {
+            Value::Real(x) => Some(x),
+            Value::Integer(n) => Some(n as f64),
+            Value::Text(t) => t.trim().parse().ok(),
+            _ => None,
+        }
+    };
+    let widen = if matches!(get("AcquisitionSoftware"), Some(Value::Text(s)) if s == "Bruker otofControl") { 5.0 } else { 0.0 };
+    let window = value("MzAcqRangeLower")
+        .zip(value("MzAcqRangeUpper"))
+        .and_then(|(lo, hi)| acquisition_scan_window(lo - widen, hi + widen));
+    if window.is_none() {
+        log::warn!("TDF GlobalMetadata MzAcqRangeLower/MzAcqRangeUpper unavailable; no frame states a scan window");
+    }
+    window
+}
+
+/// What the `.d → mzML` lane states on every frame's scan, on both ims-compact lanes: the frame's
+/// `AccumulationTime` (ms) as its ion injection time and the run's acquisition m/z range as its scan
+/// window (165.957 ms and 99.99–1700 on PXD059079 2485). Through 0.16.0 an ims-compact archive held
+/// neither, and its export wrote `ion injection time 0` and no window.
+pub(crate) fn state_frame_acquisition(scan: &mut mzdata::spectrum::ScanEvent, accumulation_ms: Option<f64>, window: Option<&ScanWindow>) {
+    if let Some(ms) = accumulation_ms {
+        scan.injection_time = ms as f32;
+    }
+    scan.scan_windows.extend(window.cloned());
 }
 
 fn read_frame_rows(conn: &rusqlite::Connection, with_cal: bool) -> Result<FrameTable> {
@@ -1691,6 +1889,43 @@ mod isolation_mobility_band_tests {
         assert_eq!(im(d.get_param_by_name("ion mobility lower limit").unwrap()), 0.9);
         assert_eq!(im(d.get_param_by_name("ion mobility upper limit").unwrap()), 1.1);
     }
+
+    /// The remapped value of a whole scan is BIT FOR BIT the 1/K0 mzdata's TDF reader writes into
+    /// the mobility array for a peak of that scan, and a half scan (a window's midpoint) is mzdata's
+    /// model there too. Through 0.16.0 the remap used the SDK-order arithmetic on the unsnapped
+    /// round-trip position, and a window's upper limit came out a bit or two below the array value
+    /// of its own first scan at about half of all scans: 1.5 million peaks of a diaPASEF run lay
+    /// just outside their window. A DDA precursor's fractional position is not moved.
+    #[test]
+    fn remap_is_mzdatas_array_value_at_every_scan() {
+        use timsrust::converters::ConvertableDomain;
+        // (nominal range, scans, ModelType-2 row): SBA415 and PXD059079 2485.d.
+        for (lo, hi, n, c) in [
+            (0.600, 1.600, 909u32, [1.0, 909.0, 211.45198604901222, 73.95258004355563, 32.72727272727273, 0.00492817555366883, 131.11541877221117]),
+            (0.700, 1.450, 1551, [1.0, 1551.0, 254.40951107260733, 118.71749047939912, 33.64485981308411, 0.012463618472198826, 172.2839721407802]),
+        ] {
+            let linear = Scan2ImConverter::from_boundaries(lo, hi, n);
+            let recal = crate::tims_mobility::TimsMobilityCalibration::new(c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+            let row = mzdata::io::tdf::TimsCalibration::new(
+                1, 2, Some(c[0]), Some(c[1]), Some(c[2]), Some(c[3]), Some(c[4]), Some(c[5]), Some(c[6]),
+            );
+            let array = mzdata::io::tdf::TimsCalibrationModel2::try_from(&row).unwrap();
+            let remap = TdfMobilityRemap::new(linear, Some(recal));
+            let mut inexact = 0;
+            for s in 0..=n {
+                inexact += usize::from(linear.invert(linear.convert(s)) != s as f64);
+                let got = remap.remap(linear.convert(s));
+                assert_eq!(got.to_bits(), array.convert(s).to_bits(), "scan {s}: {got} vs mzdata's array {}", array.convert(s));
+                let mid = s as f64 + 0.5;
+                assert_eq!(remap.remap(linear.convert(mid)).to_bits(), array.convert(mid).to_bits(), "scan {mid}");
+            }
+            // The premise: the linear round trip alone does not give every scan back.
+            assert!(inexact > 0, "{n} scans: the linear round trip was exact everywhere");
+            // A fractional DDA position stays where it is.
+            let frac = 747.5194174757281;
+            assert!((remap.remap(linear.convert(frac)) - recal.one_over_k0(frac)).abs() < 1e-12);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1740,6 +1975,111 @@ mod single_point_chunk_tests {
 }
 
 #[cfg(test)]
+mod appledouble_tests {
+    /// A readable synthetic TDF of three empty frames (timsrust never decodes them, so the
+    /// `.tdf_bin` only has to exist), as `empty_frame_read_tests` builds it.
+    fn synthetic_tdf(dot_d: &std::path::Path) {
+        std::fs::write(dot_d.join("analysis.tdf_bin"), [0u8; 8]).unwrap();
+        let conn = rusqlite::Connection::open(dot_d.join("analysis.tdf")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+             INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', '2'), ('AcquisitionSoftware', 'timsTOF'),
+                 ('MzAcqRangeLower', '100'), ('MzAcqRangeUpper', '2000'), ('DigitizerNumSamples', '439442'),
+                 ('OneOverK0AcqRangeLower', '0.78'), ('OneOverK0AcqRangeUpper', '1.6');
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, Polarity TEXT, ScanMode INTEGER, MsMsType INTEGER,
+                 TimsId INTEGER, NumScans INTEGER, NumPeaks INTEGER, AccumulationTime REAL);
+             INSERT INTO Frames VALUES (1, 0.5, '+', 20, 0, 0, 900, 0, 100.0), (2, 0.6, '+', 20, 0, 0, 900, 0, 100.0),
+                                       (3, 0.9, '+', 20, 0, 0, 900, 0, 100.0);",
+        )
+        .unwrap();
+    }
+
+    /// A 163-byte AppleDouble header (magic 0x00051607, version 2, "Mac OS X" filler), the size
+    /// macOS leaves beside each file of a `.d` copied to NTFS, exFAT or SMB.
+    fn appledouble() -> Vec<u8> {
+        let mut b = vec![0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00];
+        b.extend_from_slice(b"Mac OS X        ");
+        b.resize(163, 0);
+        b
+    }
+
+    fn lookalikes(listing: &[&str]) -> (Vec<String>, Vec<String>) {
+        let found = super::timsrust_lookalikes(listing.iter().copied());
+        (found.taken, found.passed)
+    }
+
+    /// The verdict follows the listing order, as timsrust's lookup does: a companion listed before
+    /// the run's file is taken (refused), one listed after it is passed over (warned about only).
+    /// An order-blind rule refused the second listing, which converts (a fresh exFAT copy of
+    /// PXD059079 2486.d lists `analysis.tdf_bin, ._analysis.tdf_bin, analysis.tdf, ._analysis.tdf`).
+    #[test]
+    fn the_listing_order_decides_which_lookalike_timsrust_takes() {
+        let none: Vec<String> = Vec::new();
+        // NTFS and APFS: the companions first.
+        assert_eq!(
+            lookalikes(&["._analysis.tdf", "._analysis.tdf_bin", "analysis.tdf_bin", "analysis.tdf"]),
+            (vec!["._analysis.tdf".into(), "._analysis.tdf_bin".into()], none.clone())
+        );
+        // A fresh copy onto exFAT: each companion after its file.
+        assert_eq!(
+            lookalikes(&["analysis.tdf_bin", "._analysis.tdf_bin", "analysis.tdf", "._analysis.tdf"]),
+            (none.clone(), vec!["._analysis.tdf".into(), "._analysis.tdf_bin".into()])
+        );
+        // macOS rewrites `._analysis.tdf` into a freed slot ahead of the database: one of each.
+        assert_eq!(
+            lookalikes(&["._analysis.tdf", "analysis.tdf_bin", "._analysis.tdf_bin", "analysis.tdf"]),
+            (vec!["._analysis.tdf".into()], vec!["._analysis.tdf_bin".into()])
+        );
+        // The real files under another letter case, or names that only look alike, are no lookalikes.
+        assert_eq!(
+            lookalikes(&["Analysis.TDF", "analysis.tdf-journal", "._chromatography-data.sqlite", "ANALYSIS.tdf_bin"]),
+            (none.clone(), none.clone())
+        );
+        // Without the run's own file the lookalike is all timsrust finds.
+        assert_eq!(lookalikes(&["analysis.tdf", "._analysis.tdf_bin"]), (vec!["._analysis.tdf_bin".into()], none));
+    }
+
+    /// The `.d`-level verdict agrees with timsrust's own lookup on whatever order this volume lists
+    /// the entries in: the run opens exactly when timsrust reads the run's `analysis.tdf`, and when
+    /// it would not, the lookalike and the fix are named and the file is left in place. APFS lists
+    /// `._analysis.tdf` before `analysis.tdf` and `old_analysis.tdf` after it, so on a Mac both
+    /// branches run; on another volume the pure test above pins them.
+    #[test]
+    fn a_lookalike_is_refused_exactly_when_timsrust_would_read_it() {
+        for (i, lookalike) in ["._analysis.tdf", "old_analysis.tdf"].into_iter().enumerate() {
+            let dot_d = std::env::temp_dir().join(format!("mzpc-appledouble-{}-{i}.d", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dot_d);
+            std::fs::create_dir_all(&dot_d).unwrap();
+            synthetic_tdf(&dot_d);
+            assert!(super::NativeTofReader::open(&dot_d).is_ok(), "the synthetic run opens without {lookalike}");
+            let failed = || anyhow::anyhow!("opening TDF frames: file is not a database");
+            let plain = format!("{:#}", super::name_timsrust_lookalikes(&dot_d, failed()));
+            assert_eq!(plain, "opening TDF frames: file is not a database", "nothing to name, nothing added");
+            std::fs::write(dot_d.join(lookalike), appledouble()).unwrap();
+            // timsrust's own lookup, unguarded: the 163-byte stub is no database.
+            let timsrust_reads_the_run = super::FrameReader::new(&dot_d).is_ok();
+            let opened = super::NativeTofReader::open(&dot_d);
+            let named = format!("{:#}", super::name_timsrust_lookalikes(&dot_d, failed()));
+            let kept = dot_d.join(lookalike).is_file();
+            let _ = std::fs::remove_dir_all(&dot_d);
+            eprintln!("{lookalike}: timsrust reads the run: {timsrust_reads_the_run}");
+            if timsrust_reads_the_run {
+                assert!(opened.is_ok(), "{lookalike} listed after the run: refused {:#}", opened.err().unwrap());
+                assert_eq!(named, plain, "{lookalike} did not cause it");
+            } else {
+                let msg = format!("{:#}", opened.err().expect("timsrust would read the stub, and the run opened"));
+                assert!(msg.contains(&format!("lists {lookalike} before analysis.tdf")), "{msg}");
+                assert!(msg.contains("--bruker-sdk") && msg.contains("AppleDouble"), "the fix is named: {msg}");
+                // A companion macOS writes during the open is named in front of the open's own error.
+                assert!(named.contains(&format!("lists {lookalike} before")) && named.contains("APFS"), "{named}");
+                assert!(named.ends_with(": opening TDF frames: file is not a database"), "{named}");
+            }
+            assert!(kept, "the converter never removes {lookalike} itself");
+        }
+    }
+}
+
+#[cfg(test)]
 mod empty_frame_read_tests {
     /// An empty frame's spectrum id is its `Frames.Id`, not `position + 1`, when the ids have a gap
     /// (review 2026-09-30 B16), so a MALDI frame's position attaches. A synthetic TDF of empty frames
@@ -1774,6 +2114,74 @@ mod empty_frame_read_tests {
         assert_eq!(spec.description.id, "frame=5");
         assert!(maldi.attach(&mut spec), "the position of frame 5 attaches");
         assert_eq!(crate::imaging::position_of(&spec.description), Some((3, 1)));
+    }
+
+    /// Each frame's scan states the frame's `AccumulationTime` as its ion injection time and the run's
+    /// `MzAcqRangeLower`–`MzAcqRangeUpper` as its scan window, as the `.d → mzML` lane does; through
+    /// 0.16.0 an ims-compact archive stored neither, and its export wrote `ion injection time 0`.
+    /// Frame ids 1, 2, 5 with three different times: a frame's position names its own row. The
+    /// `--bruker-sdk` lane, which has no timsrust metadata, reads the same window from the same file
+    /// (`read_acquisition_scan_window`), otofControl's widening included.
+    #[test]
+    fn a_frame_states_its_accumulation_time_and_the_acquisition_range() {
+        for (software, expected) in [("timsTOF", (99.993933, 1700.0)), ("Bruker otofControl", (94.993933, 1705.0))] {
+            let dot_d = std::env::temp_dir().join(format!("mzpc-accumulation-{}.d", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dot_d);
+            std::fs::create_dir_all(&dot_d).unwrap();
+            std::fs::write(dot_d.join("analysis.tdf_bin"), [0u8; 8]).unwrap();
+            let conn = rusqlite::Connection::open(dot_d.join("analysis.tdf")).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE GlobalMetadata (Key TEXT, Value TEXT);
+                 INSERT INTO GlobalMetadata VALUES ('TimsCompressionType', '2'), ('AcquisitionSoftware', '{software}'),
+                     ('MzAcqRangeLower', '99.993933'), ('MzAcqRangeUpper', '1700'), ('DigitizerNumSamples', '439442'),
+                     ('OneOverK0AcqRangeLower', '0.78'), ('OneOverK0AcqRangeUpper', '1.6');
+                 CREATE TABLE Frames (Id INTEGER PRIMARY KEY, Time REAL, Polarity TEXT, ScanMode INTEGER, MsMsType INTEGER,
+                     TimsId INTEGER, NumScans INTEGER, NumPeaks INTEGER, AccumulationTime REAL);
+                 INSERT INTO Frames VALUES (1, 0.5, '+', 20, 0, 0, 900, 0, 165.957), (2, 0.6, '+', 20, 0, 0, 900, 0, 50.0),
+                                           (5, 0.9, '+', 20, 0, 0, 900, 0, 25.5);"
+            ))
+            .unwrap();
+            let sdk_window = super::read_acquisition_scan_window(&conn).map(|w| (w.lower_bound, w.upper_bound));
+            drop(conn);
+            let reader = super::NativeTofReader::open(&dot_d).unwrap();
+            let scans: Vec<mzdata::spectrum::ScanEvent> =
+                (0..3).map(|i| reader.ims_grid_spectrum(i, true).unwrap().description.acquisition.scans[0].clone()).collect();
+            let _ = std::fs::remove_dir_all(&dot_d);
+            assert_eq!(scans.iter().map(|s| s.injection_time).collect::<Vec<_>>(), [165.957, 50.0, 25.5]);
+            for scan in &scans {
+                assert_eq!(scan.scan_windows.len(), 1);
+                assert_eq!((scan.scan_windows[0].lower_bound, scan.scan_windows[0].upper_bound), expected, "{software}");
+            }
+            assert_eq!(sdk_window, Some(expected), "the SDK lane's window is the native lane's ({software})");
+        }
+    }
+
+    /// The `--bruker-sdk` ims-compact lane reads the two from `analysis.tdf` itself: the acquisition
+    /// range from `GlobalMetadata`, whose `Value` holds text in every TDF seen but is an untyped column
+    /// (a number stored as one reads the same), and `Frames.AccumulationTime` in `Id` order. A missing
+    /// key or an inverted range states no window; a frame count that is not the table's states no time.
+    #[test]
+    fn the_sdk_lane_reads_the_accumulation_time_and_the_acquisition_range() {
+        use super::{read_accumulation_times, read_acquisition_scan_window};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE GlobalMetadata (Key TEXT, Value);
+             CREATE TABLE Frames (Id INTEGER PRIMARY KEY, AccumulationTime REAL);
+             INSERT INTO Frames VALUES (5, 25.5), (1, 165.957), (2, NULL);",
+        )
+        .unwrap();
+        let window = |conn: &rusqlite::Connection| read_acquisition_scan_window(conn).map(|w| (w.lower_bound, w.upper_bound));
+        assert_eq!(window(&conn), None);
+        conn.execute_batch("INSERT INTO GlobalMetadata VALUES ('MzAcqRangeLower', '99.993933'), ('MzAcqRangeUpper', '1700');").unwrap();
+        assert_eq!(window(&conn), Some((99.993933, 1700.0)));
+        conn.execute_batch("UPDATE GlobalMetadata SET Value = 1700.0 WHERE Key = 'MzAcqRangeUpper';").unwrap();
+        assert_eq!(window(&conn), Some((99.993933, 1700.0)));
+        conn.execute_batch("INSERT INTO GlobalMetadata VALUES ('AcquisitionSoftware', 'Bruker otofControl');").unwrap();
+        assert_eq!(window(&conn), Some((94.993933, 1705.0)), "widened as timsrust widens an otofControl range");
+        conn.execute_batch("UPDATE GlobalMetadata SET Value = 50 WHERE Key = 'MzAcqRangeUpper';").unwrap();
+        assert_eq!(window(&conn), None);
+        assert_eq!(read_accumulation_times(&conn, 3), [Some(165.957), None, Some(25.5)]);
+        assert!(read_accumulation_times(&conn, 4).is_empty());
     }
 
     /// Random access to an EMPTY spectrum must not abort the process.

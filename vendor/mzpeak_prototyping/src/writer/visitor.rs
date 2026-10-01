@@ -1125,6 +1125,13 @@ impl ArrayBuilder for ScanWindowBuilder {
     anyways!();
 }
 
+/// A scan's `instrument_configuration_id` that names no configuration: [`ScanBuilder`] writes it as
+/// null. DELIBERATE DEVIATION (not upstream): mzdata's `ScanEvent` holds a plain `u32`, and its mzML
+/// reader gives a reference to an id the source's list lacks a fresh number, so a dangling source
+/// reference would otherwise be stored as a valid-looking integer. The converter sets this value on
+/// such a scan (its `mzml_refs`); nothing else produces it — mzdata numbers configurations from 0.
+pub const NO_INSTRUMENT_CONFIGURATION: u32 = u32::MAX;
+
 /// A builder for [`mzdata::spectrum::ScanEvent`], mapping to the `scan` table. It carries two indices, the source's index (usually a spectrum),
 /// and a unique scan index.
 #[derive(Default, Debug)]
@@ -1270,8 +1277,10 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
                 .and_then(|v| v.curie())
                 .as_ref(),
         );
-        self.instrument_configuration_ref
-            .append_value(item.instrument_configuration_id);
+        self.instrument_configuration_ref.append_option(
+            (item.instrument_configuration_id != NO_INSTRUMENT_CONFIGURATION)
+                .then_some(item.instrument_configuration_id),
+        );
         self.spectrum_reference
             .append_option(item.spectrum_reference.as_ref());
 

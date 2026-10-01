@@ -70,14 +70,35 @@ impl TimsMobilityCalibration {
     /// The reference implementation's 4 parameters of this model (`TimsTofTimsLinearGrid2`, mzdata
     /// `TimsCalibrationModel2`): `[C6, C7, offset, slope]` with `slope = (C3 − C2)/C1` and
     /// `offset = C2 − slope·(C4 + C0)`, so that `1/K0 = 1/(C6 + C7/(offset + slope·scan))` — the
-    /// same rational as [`Self::one_over_k0`] in the other form (equal to within 1 ulp).
+    /// same rational as [`Self::one_over_k0`] in the other form (equal to within 4 ulp,
+    /// [`Self::one_over_k0_as_mzdata`]).
     pub fn grid_parameters(&self) -> [f64; 4] {
         let slope = if self.c1 == 0.0 { 0.0 } else { (self.c3 - self.c2) / self.c1 };
         [self.c6, self.c7, self.c2 - slope * (self.c4 + self.c0), slope]
     }
 
+    /// [`Self::one_over_k0`] evaluated the way mzdata's `TimsCalibrationModel2` evaluates the
+    /// per-peak mobility arrays of its TDF reader, with mzdata's own code on
+    /// [`Self::grid_parameters`]: `1/(C6 + C7/(offset + slope·scan))`. The same model; the
+    /// operations run in another order, so at half to two thirds of all scans the two differ, by
+    /// 1 to 4 ulp (2485.d, SBA415). A param that must bracket mzdata's array values — a diaPASEF
+    /// window's limits on the `--no-ims-compact` and `--to mzml` lanes — needs this one: with
+    /// [`Self::one_over_k0`], 1.5 million of the 2.2 billion MS2 peaks of a diaPASEF run sat up to
+    /// 2.2e-16 above their window's upper limit.
+    #[inline]
+    pub fn one_over_k0_as_mzdata(&self, scan: f64) -> f64 {
+        use timsrust::converters::ConvertableDomain;
+        let [c6, c7, offset, slope] = self.grid_parameters();
+        mzdata::io::tdf::TimsCalibrationModel2::new(c6, c7, offset, slope).convert(scan)
+    }
+
     /// Load from an open `analysis.tdf` connection. `Ok(None)` when there is no `ModelType = 2` row
     /// (caller must fall back to the linear approximation — this model is type-2-specific).
+    ///
+    /// The first `ModelType = 2` row serves every frame, where the SDK and mzdata's reader evaluate
+    /// each frame on the row its `Frames.TimsCalibration` names. Every run seen references exactly
+    /// one row; a run whose frames reference more would get 1/K0 values off the vendor's on the
+    /// frames of the others, so that is said, once per open.
     pub fn from_tdf(conn: &Connection) -> Result<Option<Self>> {
         let row = conn
             .query_row(
@@ -88,6 +109,15 @@ impl TimsMobilityCalibration {
             )
             .optional()
             .context("reading TimsCalibration")?;
+        if row.is_some()
+            && let Some(n) = referenced_calibrations(conn).filter(|&n| n > 1)
+        {
+            log::warn!(
+                "the frames of this run reference {n} TimsCalibration rows; every 1/K0 this \
+                 converter computes uses the first ModelType-2 row, so frames calibrated by \
+                 another are off the vendor's values"
+            );
+        }
         Ok(row.map(|(c0, c1, c2, c3, c4, c6, c7)| Self::new(c0, c1, c2, c3, c4, c6, c7)))
     }
 
@@ -97,6 +127,12 @@ impl TimsMobilityCalibration {
         .with_context(|| format!("opening {}", tdf.display()))?;
         Self::from_tdf(&conn)
     }
+}
+
+/// How many distinct `TimsCalibration` rows the run's frames reference; `None` when the `Frames`
+/// table cannot say.
+fn referenced_calibrations(conn: &Connection) -> Option<i64> {
+    conn.query_row("SELECT COUNT(DISTINCT TimsCalibration) FROM Frames", [], |r| r.get::<_, i64>(0)).ok()
 }
 
 #[cfg(test)]
@@ -183,5 +219,51 @@ mod scan_number_precision_tests {
         )
         .unwrap();
         assert!(TimsMobilityCalibration::from_tdf(&conn).unwrap().is_none());
+    }
+
+    /// `one_over_k0_as_mzdata` is bit for bit what mzdata's `TimsCalibrationModel2`, built by
+    /// mzdata from the same row, gives at every scan — the value its TDF reader puts in a
+    /// spectrum's mobility array — and the SDK-order `one_over_k0` to within 4 ulp.
+    #[test]
+    fn mzdata_order_matches_mzdata_bit_for_bit() {
+        use timsrust::converters::ConvertableDomain;
+        // PXD059079 2485.d (1552 scans) and bruker-timstof-pro SBA415 (910 scans).
+        for (c, scans) in [
+            ([1.0, 1551.0, 254.40951107260733, 118.71749047939912, 33.64485981308411, 0.012463618472198826, 172.2839721407802], 1552u32),
+            ([1.0, 909.0, 211.45198604901222, 73.95258004355563, 32.72727272727273, 0.00492817555366883, 131.11541877221117], 910),
+        ] {
+            let ours = TimsMobilityCalibration::new(c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+            let row = mzdata::io::tdf::TimsCalibration::new(
+                1, 2, Some(c[0]), Some(c[1]), Some(c[2]), Some(c[3]), Some(c[4]), Some(c[5]), Some(c[6]),
+            );
+            let theirs = mzdata::io::tdf::TimsCalibrationModel2::try_from(&row).unwrap();
+            let mut differ = 0;
+            for s in 0..=scans {
+                let (a, b) = (ours.one_over_k0_as_mzdata(s as f64), theirs.convert(s));
+                assert_eq!(a.to_bits(), b.to_bits(), "scan {s}: {a} vs mzdata {b}");
+                let sdk = ours.one_over_k0(s as f64);
+                // In ulps, not in EPSILON: below 1/K0 = 1 (SBA415 reaches 0.60) an ulp is EPSILON/2.
+                // Both are positive and finite, so their bit patterns count ulps.
+                assert!(a.to_bits().abs_diff(sdk.to_bits()) <= 4, "scan {s}: {a} vs {sdk}");
+                differ += usize::from(a != sdk);
+            }
+            // The premise: the two orders really do disagree somewhere.
+            assert!(differ > 0, "{scans} scans: the SDK order never differed");
+        }
+    }
+
+    /// A run whose frames reference several calibration rows is counted (and `from_tdf` warns).
+    #[test]
+    fn frames_on_several_calibration_rows_are_counted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE Frames (Id INTEGER, TimsCalibration INTEGER);
+             INSERT INTO Frames VALUES (1, 1), (2, 1), (3, 2);",
+        )
+        .unwrap();
+        assert_eq!(referenced_calibrations(&conn), Some(2));
+        conn.execute_batch("DELETE FROM Frames WHERE Id = 3;").unwrap();
+        assert_eq!(referenced_calibrations(&conn), Some(1));
+        assert_eq!(referenced_calibrations(&Connection::open_in_memory().unwrap()), None);
     }
 }

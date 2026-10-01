@@ -74,6 +74,10 @@ impl VendorPolicy {
     /// * **baf2sql's `analysis.sqlite`**: the BAF reader has the library materialize that cache next
     ///   to `analysis.baf`, inside the `.d`, when it opens the run (`bruker_baf.rs`), so it is this
     ///   converter's by-product, not a file the vendor wrote.
+    /// * **macOS AppleDouble companions `._*`**: Finder metadata that copying a directory from a Mac
+    ///   to NTFS, exFAT or SMB leaves beside every file, not a file the vendor wrote. The catch-all
+    ///   embedded them, and a signal file's twin survived its drop (`._FUNC001.DAT` does not match
+    ///   `_FUNC*.DAT`).
     ///
     /// The timsTOF `*_bin` is embedded here, as through 0.11.5: for the f64 paths (mzdata's TDF
     /// reader, the TSF reader, the Bruker SDK) it is, beside the embedded `analysis.tdf` or
@@ -86,6 +90,7 @@ impl VendorPolicy {
     pub fn builtin() -> Self {
         const DROP: &[&str] = &[
             "analysis.sqlite",
+            "._*",
             // Bruker BAF: the signal and its two indexes, DataAnalysis's cached views, FTMS transients.
             "analysis.baf",
             "analysis.baf_idx",
@@ -583,6 +588,21 @@ mod tests {
         assert_eq!(asked.resolve("AcqData/MSPeak.bin").0, Action::Embed, "a path rule");
         assert_eq!(asked.resolve("AcqData/MSScan.bin").0, Action::Drop);
         assert_eq!(asked.resolve("Other/MSScan.bin").0, Action::Embed, "a path rule matches that path only");
+    }
+
+    /// AppleDouble `._*` companions (a `.d` copied from a Mac to NTFS, exFAT or SMB) are dropped and
+    /// recorded like any default drop, the twin of a kept file and of a dropped one alike; `--aux`
+    /// can still keep them.
+    #[test]
+    fn appledouble_companions_are_dropped_unless_asked_for() {
+        for pol in [VendorPolicy::load(None, &[]).unwrap(), VendorPolicy::load_lossless(None, &[]).unwrap()] {
+            for name in ["._analysis.tdf", "._analysis.tdf_bin", "AcqData/._MSScan.bin", "._FUNC001.DAT", "._Hystar.Method"] {
+                assert_eq!(pol.resolve(name).0, Action::Drop, "{name}");
+            }
+            assert_eq!(pol.resolve("analysis.tdf").0, Action::Embed);
+        }
+        let asked = VendorPolicy::load(None, &["._*=embed".to_string()]).unwrap();
+        assert_eq!(asked.resolve("._analysis.tdf").0, Action::Embed);
     }
 
     #[test]

@@ -14,7 +14,8 @@
 //! are compressed, and `pruned_peak_facet_keeps_its_writer_properties` builds, through the writer, the
 //! one input that still triggers the rewrite.
 //!
-//! `point_layout_float_mz_is_byte_stream_split` pins the m/z encoding of point facets.
+//! `point_layout_float_mz_is_byte_stream_split` pins the m/z encoding of point facets,
+//! `chunk_bounds_are_byte_stream_split` that of a chunk's bounds.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -223,7 +224,7 @@ fn is_dictionary(e: &Encoding) -> bool {
 /// (`shuffle_mz`), but no lane set it, and the global dictionary takes precedence over a column
 /// encoding anyway, so every point `mz` column shipped dictionary-encoded: on the native SciEX
 /// Sample002 archive that column is 409 MB, 42 % of the archive. The values must read back
-/// bit-identical, and chunk facets, which the rule leaves alone, keep their dictionary.
+/// bit-identical.
 #[test]
 fn point_layout_float_mz_is_byte_stream_split() {
     let assert_bss = |archive: &Path, member: &str| {
@@ -267,26 +268,40 @@ fn point_layout_float_mz_is_byte_stream_split() {
     let _ = std::fs::remove_file(&point);
 
     // The mzML `--tof-grid` lane builds its writer separately: its gridded centroids are chunk-grid
-    // rows whose index lists are byte-stream-split without a dictionary.
+    // rows whose index lists and bounds are byte-stream-split without a dictionary.
     let swath = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
     let gridded = convert(swath, "tof-grid-mz", &["--tof-grid", "on"]);
-    // (The bounds keep the writer's dictionary encoding, as on every chunk facet — see below.)
-    for column in ["chunk.mz_grid.indices.list.item"] {
-        let row_groups = column_encodings(&gridded, "spectra_peaks.parquet", column);
-        assert!(!row_groups.is_empty(), "no row group");
+    assert_bss_columns(&gridded, "spectra_peaks.parquet", &["chunk.mz_grid.indices.list.item", "chunk.mz_chunk_start", "chunk.mz_chunk_end"]);
+    let _ = std::fs::remove_file(&gridded);
+
+    // Chunk bounds: see `chunk_bounds_are_byte_stream_split`.
+}
+
+/// Every row group of `column` in `member` is BYTE_STREAM_SPLIT without a dictionary.
+fn assert_bss_columns(archive: &Path, member: &str, columns: &[&str]) {
+    for column in columns {
+        let row_groups = column_encodings(archive, member, column);
+        assert!(!row_groups.is_empty(), "{member} has no row group");
         for encodings in row_groups {
             assert!(
                 encodings.contains(&Encoding::BYTE_STREAM_SPLIT) && !encodings.iter().any(is_dictionary),
-                "spectra_peaks {column} must be BYTE_STREAM_SPLIT without a dictionary (encodings: {encodings:?})"
+                "{member} {column} must be BYTE_STREAM_SPLIT without a dictionary (encodings: {encodings:?})"
             );
         }
     }
-    let _ = std::fs::remove_file(&gridded);
+}
 
-    // Chunk facets are outside the rule, so a chunked archive keeps its bytes.
-    let chunked = convert_fixture("chunk-mz", &[]);
-    for encodings in column_encodings(&chunked, "spectra_data.parquet", "chunk.mz_chunk_start") {
-        assert!(encodings.iter().any(is_dictionary), "chunk.mz_chunk_start changed encoding: {encodings:?}");
+/// A chunk's m/z bounds are byte-stream-split with the dictionary off, in the profile and the peak
+/// facet alike. They are nearly all distinct, so a dictionary is the values over again plus the
+/// indices, and every row group pays its own: once row groups were bounded by bytes (a Lumos peak
+/// facet went from 1 to 4 groups), the two bound columns grew by 21 % each and the facet by 1.2 %.
+/// Byte-stream-split, the same four-group facet is 2.3 % smaller than with its dictionaries (MFA381's
+/// peak facet 3.2 %, PXD059079 2485's timsTOF grid facet 0.6 %), the values identical.
+#[test]
+fn chunk_bounds_are_byte_stream_split() {
+    let chunked = convert_fixture("chunk-bounds", &[]);
+    for member in ["spectra_data.parquet", "spectra_peaks.parquet"] {
+        assert_bss_columns(&chunked, member, &["chunk.mz_chunk_start", "chunk.mz_chunk_end"]);
     }
     let _ = std::fs::remove_file(&chunked);
 }

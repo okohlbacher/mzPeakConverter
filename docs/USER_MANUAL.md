@@ -138,7 +138,7 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: 50-Th chunks (`--chunk-size` overrides the width) on the reference implementation's chunk grid — every chunk row keeps its real m/z bounds (page-prunable: m/z window queries read only the chunks they need) and its points as integer TOF bins and TIMS scan numbers under the frame's own vendor calibration models (§9). Passing the flag explicitly is inert and says so |
 | `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: one chunk per frame instead of 50-Th chunks — the same grid rows, whole-frame access in one row, no m/z pruning within a frame. (Through 0.13 this selected a flat point table of absolute TOF bins; that layout is gone) |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
-| `--no-tims-recalibration` | off | Bruker timsTOF (TDF), ims-compact path only: disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. With the grid layout (default since 0.13.0, §9) this flag also keeps the 0.12.x TOF layout, with a warning: the grid stores 1/K0 as TIMS scan numbers under the exact model, which the linear approximation is not on. INERT with `--no-ims-compact`: that path takes its mobility from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally |
+| `--no-tims-recalibration` | off | Bruker timsTOF (TDF): disable this converter's scan→1/K0 calibration (the `TimsCalibration` ModelType-2 model, `W = C2 + (C3−C2)(scan−C4−C0)/C1`, `1/K0 = W/(C7 + C6·W)` — identical to the Bruker SDK's `tims_scannum_to_oneoverk0` to 6e-16 on every corpus run) and use timsrust's linear approximation of the nominal acquisition range (up to 0.03 Vs·s/cm² off). The model and the vendor's rows are declared in the `vendor_tims_calibration` index block. Recalibration is ON by default. On the ims-compact grid (§9) the flag stores 1/K0 as plain values (`ion_mobility_grid.column: null`), with a warning: the grid stores 1/K0 as TIMS scan numbers under the exact model, which the linear approximation is not on. The ims-compact path applies the choice to arrays and params alike; `--no-ims-compact` takes its mobility ARRAYS from mzdata's TDF reader, which applies the same ModelType-2 calibration itself, unconditionally, so there the flag switches only the precursor/scan/window-limit 1/K0 params (and warns that the arrays stay on the model). INERT with `--to mzml`, and says so: that export keeps every 1/K0 on the model its mobility arrays use, so each diaPASEF window's limits bracket its own peaks (on timsrust's linear map they would miss 9 % of them) |
 | `--no-vendor` | off | Do not embed vendor side-files into the archive (§8) |
 | `--no-chromatograms` | off | Do not synthesize TIC + base-peak chromatograms from the MS1 spectra. By default a TIC and a base-peak chromatogram are summed over the MS1 spectra, each only when the source carries no chromatogram of that kind; every chromatogram the source carries is stored in any case |
 | `--aux <AUX>` | — | Vendor side-file rule (repeatable): `glob=embed` or `glob=drop`, the glob matched in any letter case against a file's name or its `/`-separated path inside the vendor directory. Highest precedence (§8) |
@@ -204,6 +204,38 @@ also be exported to mzML (`mzpeak-convert a.mzpeak -o a.mzML`), optionally throu
 renamed into place only on success, so a failed run never leaves a partial `.mzML` and never
 destroys a previous output under `--force`.
 
+Every mzML the tool writes itself records the conversion as the default processing of its
+`spectrumList` and `chromatogramList` (`defaultDataProcessingRef`), which mzML 1.1 requires and
+stock OpenMS 3.5 needs to read the file: a `dataProcessing` (`mzpeak_convert_to_mzml`) whose last
+method is software `mzpeak-convert` doing MS:1000544 `Conversion to mzML`, with the command line
+(paths reduced to their file names) as a `conversion options` userParam. For a source that states
+processing of its own (an mzML), the entry first repeats the methods of the processing the source's
+spectra point at by default, as msconvert does, and the source's entries follow it unchanged; a
+source that states none (every raw vendor format, an archive) gets the step alone. A timsTOF `.d` is
+exported with its mobility params as the archive lanes write them: each diaPASEF spectrum's
+`ion mobility lower limit` / `upper limit` pair in order (mzdata's reader emits it inverted) and,
+with the precursor and scan 1/K0, on the vendor's ModelType-2 model that its mobility array uses,
+evaluated as mzdata evaluates the array, so each window's limits bracket its own peaks exactly;
+and the window's band as `userParam`s on the selected ion. `--no-tims-recalibration` is inert here.
+An archive's export (`a.mzpeak -o a.mzML`) carries each peak's ion mobility where the archive holds
+it (every timsTOF archive). A `--no-ims-compact` archive holds one spectrum per diaPASEF window, and
+exports like the `.d`. An ims-compact archive holds whole frames: each is exported as one spectrum,
+with every window's precursor and no mobility limits of its own, and the export says so. A reader
+that assigns precursors by mobility window (OpenSWATH's diaPASEF mode) needs the `.d` exported with
+`--to mzml`, or a `--no-ims-compact` archive.
+
+An archive's export states what the direct export of its source states. Its chromatograms are the
+archive's, as stored (times in minutes), each with its type and polarity term; a TIC or base-peak
+chromatogram summed over the exported spectra is added only for a kind the archive lacks, in time
+order (so is the direct export's). Every precursor, a spectrum's or a chromatogram's, keeps its
+isolation window, dissociation method and collision energy; 1/K0 is MS:1002815 `inverse reduced ion
+mobility`, once per element. Different by design: a spectrum's total ion current, base peak and
+observed m/z range are the archive's, computed from the stored peaks (a timsTOF `.d` states each
+window spectrum's frame totals); an ims-compact archive's whole frames state no per-window 1/K0,
+`window group` or limits, and it holds HyStar's TIC/base-peak traces but not mzdata's per-window
+pair (28 chromatograms where the `.d`'s export has 30). Not in any archive yet, so not in its
+export: an SRM trace's product (Q3) window and a spectrum's `sum of spectra` combination.
+
 ```sh
 mzpeak-convert run.raw -o run.mzML            # Thermo → mzML
 mzpeak-convert run.d --to mzml -o run.xml     # format forced, any name
@@ -217,14 +249,25 @@ keeping spectra whose retention time is within `--rt MIN-MAX` (same unit as the 
 `spectrum.time`, minutes for every lane this tool writes) and/or whose MS level is in `--ms-level`
 (`--ms-level 1 --ms-level 2` or `--ms-level 1,2`), and dropping archive members that match
 `--drop-aux <glob>` (`--no-vendor` on this lane is shorthand for `--drop-aux 'vendor*'`). `--rt`
-also truncates the chromatograms, in the same minutes. This converter stores every chromatogram
-time in minutes (§8, `chromatogram-time-to-minutes`), and the window is converted into whatever unit
-a chromatogram time axis declares, so an mzML-lane archive converted by 0.11.5 or earlier, whose
-column declares ProteoWizard's seconds, is cut where the window says too. Such an archive holds its
+also truncates the chromatograms, in the same minutes, whether their time axis is stored as 64- or
+32-bit floats (a PDA or DAD run's mzML; through 0.16 such a trace was copied whole). This converter
+stores every chromatogram time in minutes (§8, `chromatogram-time-to-minutes`), and the window is
+converted into whatever unit a chromatogram time axis declares, so an mzML-lane archive converted
+by 0.11.5 or earlier, whose column declares ProteoWizard's seconds, is cut where the window says too. Such an archive holds its
 synthesized TIC/BPC in minutes under that seconds label, so `--rt` cuts those two traces at 60 times
 the times it names: rebuild it first. No published corpus archive has a seconds column. Parquet
-facets are copied verbatim, so encoder options are inert here — warned about, not refused (see the
-table above). The same
+facets are not re-encoded from the signal: the per-spectrum and chromatogram facets a filter can
+change are read and written back (zstd level 5, every column in the encodings the source used, the
+source's Parquet format version, sort order and bloom filters, the page limits a conversion gives
+the facet, row groups bounded as a conversion's, §10 `MZPC_ROW_GROUP_MB`) and run-global facets
+are copied verbatim, so encoder options are inert here — warned about, not refused (see the table above).
+Keeping every spectrum of an archive this version wrote, a rewritten spectrum signal facet comes out
+between 1.9 % smaller and 0.3 % larger than its source, and a chunked timsTOF grid facet 4.2 %
+larger: the lane writes at zstd level 5, the converter at 3 (22 on that facet). A chunked archive
+written by 0.16.0 or earlier keeps its
+dictionary-encoded chunk bounds through the rewrite, and once the byte cap splits its peak facet,
+each row group pays for that dictionary again (MFA381's peak facet +2.3 %); rebuilt from the raw
+file, the bounds are byte-stream-split (§9). The same
 lane injects `--sdrf` into an existing archive — the documented way to add it to an archive from a
 lane that cannot embed it (§4.3; `--image` too, into an imaging archive) — and writes to `<out>.mzpeak.tmp` first, renaming
 into place on success. The three filters on a **raw or exchange** input are a hard error with the
@@ -240,6 +283,22 @@ Wavelength (UV/PDA) spectra have no MS level, so `--ms-level` leaves them out, t
 them, and `--rt` keeps those whose time lies in the window. The archive → mzML export (§4.1) takes the
 same two rules, so filtering into an archive and exporting that writes the spectra a filtered export
 does. The export places them among the mass spectra by retention time.
+
+The spectra a filtered archive keeps are numbered 0..n-1 in the order of their old indices, as the
+spec's `index` requires, and every column that holds a spectrum index follows: each metadata facet's
+`source_index`, the data facets' `spectrum_index`, the Thermo trailer facets' `ordinal`, a
+precursor's or selected ion's `precursor_index` (its parent spectrum, for a chromatogram's precursor
+too), and the `encoding_prescan` block's `int32_fallback.spectrum_index`. A scans facet's own
+`scan_index` and a products facet's `product_index` restart at 0 as well, and the wavelength spectra
+are numbered the same way. The ids are the source's, so a spectrum is found in the source by its
+`id`. A precursor whose parent spectrum was filtered out loses its `precursor_index` and
+`precursor_id`, and a reference by id to a spectrum that is gone (`precursor_id`, a scan's
+`spectrum_reference`) is nulled, in the spectrum and the chromatogram facets alike; the mzML export
+writes no `spectrumRef` to a spectrum it leaves out either. The index's `filter` block lists what was
+renumbered under `renumbered` (`spectrum`, `wavelength_spectrum`; empty when a window starts at the
+first spectrum and nothing moved). An archive filtered by 0.16 or earlier keeps sparse indices;
+filtering it again numbers what it keeps 0..n-1, while `--drop-aux`, `--sdrf` and `--image` alone
+copy the spectra as they are.
 
 ### 4.3 Embedding sample metadata and images (`--sdrf`, `--image`)
 
@@ -361,7 +420,10 @@ Contents:
   reduced to the bare `file://` authority; non-`file` URL schemes are kept), `run.id` is never a
   path, and `default_instrument_id` always resolves: a run without an instrument record gets one
   empty configuration `0` to point at (the spec requires the integer; 0.10.0 briefly wrote `null`,
-  which the validator's schema check refuses — fixed in 0.10.2).
+  which the validator's schema check refuses — fixed in 0.10.2). `cv_list` declares for `MS` the
+  `data-version` of the PSI-MS vocabulary mzdata embeds, which every CURIE resolves against, read from
+  that copy (4.1.258 with mzdata 0.67.1; archives through 0.16.0 declared 4.1.249); `UO` and `IMS`,
+  which mzdata holds no copy of, stay pinned to one release or commit each.
 - `spectra_metadata.parquet` — per-spectrum descriptors (id, index, MS level,
   polarity, scan time, precursor info, …).
 - `spectra_data.parquet` / `spectra_peaks.parquet` — signal arrays (chunked/point): profile
@@ -664,7 +726,9 @@ on SBA415) and `bruker:mz-calibrant-omitted` in `transformations`; the row itsel
 included, is in `vendor_mz_calibration`. **Archives written by 0.13.0 read ModelType-2 rows as
 ModelType 1 and are wrong by an order of magnitude (m/z 270 stored as 21): reconvert them.** mzdata
 0.67.1 has the same defect, so the `--no-ims-compact` and fallback lanes read such files on
-timsrust's chord instead (`bruker:mz-calibration-chord`).
+timsrust's chord instead (`bruker:mz-calibration-chord`), and so does `--to mzml`, with a warning
+in place of the declaration an mzML has no list for (through 0.16.0 that export was an order of
+magnitude low).
 
 **History.** Through 0.13 the archive stored integer `tof` columns with the chord in
 `ims_calibration` (`"exact": false`), and — when every row was ModelType 1 with `C2 = 0` — per-frame
@@ -808,6 +872,15 @@ The vocabulary:
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
 | `bruker:trace-sort-dedup` | a HyStar device trace was stored out of time order or with repeated samples (overlapping chunks), and was written in time order with each exact (time, value) repeat once | Bruker `.d` with `chromatography-data.sqlite` |
+| `mzml:dangling-reference-dropped` | a reference the source states between its own lists names no entry of them, and was dropped: a scan's `instrumentConfigurationRef` (its `instrument_configuration_id` is null), a processing method's or an instrument configuration's `softwareRef` (empty), the run's `defaultInstrumentConfigurationRef` or `defaultSourceFileRef` or the spectrum list's `defaultDataProcessingRef` (each then names the first entry of its list, as for a source that states none — the spec requires all three). A self-closing `<software/>`, `<sourceFile/>` or `<instrumentConfiguration/>`, which mzdata skips, is read back from the header first and put back where the source states it, so a reference to it resolves and is kept. The run's warning counts each kind and names the ids as the source states them | mzML, imzML |
+
+**The list in `data_processing_method_list`.** The same entries are mirrored into the conversion's
+own processing method (`mzpeak_convert_conversion`, software `mzpeak-convert`), so a reader of the
+processing list alone learns what the conversion applied: each entry as a `transformation`
+userParam carrying it verbatim, and, when `zero-run-mask`, `shimadzu:span-trim` or
+`agilent:drop-zero-samples` is among them, PSI-MS `MS:1003901` `zero intensity point trimming` first
+— the one kind PSI-MS has a term for. A conversion with no entry leaves the method as before.
+Archives written through 0.16.0 hold the list only in `transformations`.
 
 Beside `transformations`, other index keys let a reader audit an archive offline: `metadata.conversion_route` says which timsTOF route built an ims-compact archive (`ims-compact` read by
 `timsrust` or `timsdata`, or `mzdata-fallback` with the `reason` — the native reader could not
@@ -848,6 +921,8 @@ letter case, wherever it sits in the directory:
   lanes store as calibrated f64 m/z, in a format open readers decode (timsrust a TDF, this converter a
   TSF), and at 70 % of a TSF archive it is the price of that copy.
 - **baf2sql's `analysis.sqlite`**, the cache the BAF reader itself creates inside the `.d`.
+- **macOS AppleDouble companions `._*`**, the Finder metadata that copying a directory from a Mac to
+  NTFS, exFAT or SMB leaves beside every file (`--aux '._*=embed'` keeps them).
 
 Through 0.11.5 only TDF/TSF directories, `--agilent-grid` and ims-compact embedded anything, and
 `--agilent-grid` embedded `MSProfile.bin` and `MSPeak.bin` beside the grid it stores. For Thermo
@@ -939,13 +1014,16 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   `ims_calibration.ion_mobility_grid.column` is null.
   - **Chunk width.** `--ims-chunked` *(default)*: 50-Th chunks (`--chunk-size`), the m/z-prunable
     form. `--no-ims-chunked`: one chunk per frame — whole-frame access in one row, no pruning within
-    a frame. Row groups are 8192 chunks (`MZPC_ROW_GROUP_ROWS`), the measured random-access sweet
-    spot (7.5 vs 13.4 ms/frame at +1 % size).
+    a frame. Row groups end at 8192 chunks (`MZPC_ROW_GROUP_ROWS`), the measured random-access
+    sweet spot (7.5 vs 13.4 ms/frame at +1 % size), or at 48 MiB (`MZPC_ROW_GROUP_MB`), whichever
+    comes first — on a dense run 8192 chunks were 270–460 MiB.
   - **Encodings.** Index lists and intensity are byte-stream-split with the dictionary off (measured
     −9.6 % against the reference implementation's dictionary default on 2485; its DELTA intent on
-    index lists would be +21 %), `spectrum_index` delta-packed, the bounds Parquet's default. Size on
-    2485.d against the vendor `analysis.tdf_bin`: about parity (the 0.13.0 corpus Bruker set measured
-    1.097× with this layout).
+    index lists would be +21 %), `spectrum_index` delta-packed, and the chunk bounds byte-stream-split
+    with the dictionary off, as on every chunk facet: nearly every bound is distinct, so a dictionary
+    only held the values again, once per row group (on 2485 the bounds are 30 % and the facet 0.6 %
+    smaller than with it). Size on 2485.d against the vendor `analysis.tdf_bin`: about parity (the
+    0.13.0 corpus Bruker set measured 1.097× with this layout).
   - **History.** 0.12.x wrote a TOF layout (integer TOF bounds, `tof_chunk_values` deltas,
     per-frame `tof_c0`/`tof_c1`; a flat point table of absolute bins under `--no-ims-chunked`), and
     0.13.0 rewrote its chunked facet into the grid in a second pass (`--ims-grid`, `--no-ims-grid`,
@@ -1049,12 +1127,13 @@ when unset.
 |---|---|
 | `MZPC_BUFFER_SPECTRA=<n>` | Spectra buffered in RAM before the writer flushes a row group (default 256) on the standard f64 paths |
 | `MZPC_DECODE_WINDOW=<n>` | Bounded reorder window for the parallel timsTOF decoder (default 8× rayon threads, capped at 128). Output order — and therefore the bytes — is unchanged |
-| `MZPC_ROW_GROUP_ROWS=<n>` | Peak-facet parquet row-group size in rows (default 8192 chunks/group on chunked facets, parquet's 2^20 otherwise). Trades size against per-frame random access |
+| `MZPC_ROW_GROUP_ROWS=<n>` | Peak-facet parquet row-group size in rows (default 8192 chunks/group on chunked facets, parquet's 2^20 otherwise). Trades size against per-frame random access; a group also ends at `MZPC_ROW_GROUP_MB` |
+| `MZPC_ROW_GROUP_MB=<MiB>` | Vendored writer (and the filter lane's rewrites): byte cap of a signal-facet row group — `spectra_data`, `spectra_peaks`, `chromatograms_data`, wavelength data — in MiB of Arrow buffers, fractions allowed (default 48, three quarters of the validator's 64 MiB `data_row_group_not_monolithic` threshold). A group ends at this or at its row cap, whichever comes first. A conversion writes a spectrum's rows as one batch, and the byte rule starts a new group rather than split a spectrum that fits one; the filter lane and the point-column prune rewrite pass on reader batches of 1024 rows, so their byte cuts can fall inside a spectrum, as the row cap's always could. Changes row-group boundaries, so the bytes — not the values — differ |
 | `MZPC_ENCODE_THREADS=<n>` | Vendored writer: worker threads for the parallel peak-facet encode (default `available_parallelism()`; `RAYON_NUM_THREADS` is honoured as a fallback; `0` or a non-number is ignored). Output is byte-identical at any thread count |
-| `MZPC_ENCODE_INFLIGHT_BYTES=<bytes>` | Vendored writer: byte budget for row groups in flight in that parallel encode (default `max(256 MB, threads × 48 MB)`); bounds memory, never the bytes written |
+| `MZPC_ENCODE_INFLIGHT_BYTES=<bytes>` | Vendored writer: byte budget for row groups in flight in that parallel encode (default `max(256 MB, threads × 48 MB)`); never changes the bytes written. A group is charged at most the budget's per-thread share, so groups larger than that share still encode one per worker instead of one at a time. Memory in flight is therefore at most `max(budget, threads × largest row group)` plus Arrow's spare capacity, and the largest group is bounded by `MZPC_ROW_GROUP_MB` (a single chunk larger than that is a group of its own): a budget below `threads × MZPC_ROW_GROUP_MB` no longer lowers memory (2485 at 8 MB: 1.76 GB peak RSS, as at the default budget; through 0.16, which encoded such groups one at a time, 784 MB in seven times the wall time). To bound memory on a small host, lower `MZPC_ENCODE_THREADS` or `MZPC_ROW_GROUP_MB` |
 | `MZPC_PARALLEL_ENCODE=0` | Vendored writer: serial peak-facet encode instead of the parallel default (on for every unencrypted archive; encrypted facets are always serial). Output is byte-identical either way. Its own rule: empty or `0` = off, any other value (including `false`) = on |
 | `MZPC_FLUSH_MEM_MB=<MB>` | Vendored writer: flush the in-RAM array buffers once they exceed this many MB (default 128), independent of spectrum or point counts. Changes row-group boundaries on the standard f64 facets, so the bytes — not the values — can differ |
-| `MZPC_TIMING=1` | Log decode-vs-write busy times for the pipelined timsTOF path (`env_flag` in `src/`; the vendored encoder's own timing line uses empty-or-`0` = off) |
+| `MZPC_TIMING=1` | Log decode-vs-write busy times for the pipelined timsTOF path (`env_flag` in `src/`; the vendored encoder's own timing lines — its settings, and at the end its row groups and how many encode jobs ran at once on average and at most — use empty-or-`0` = off. That average is wall-clock occupancy: a job the OS has descheduled still counts, so on an oversubscribed host it overstates the parallelism, which process CPU time / wall time measures) |
 | `MZPC_SHIMADZU_DEBUG=1` | Shimadzu glue: trace scan-count discovery on stderr (read by the C# glue: empty or `0` = off, anything else on) |
 | `MZPC_SHIMADZU_PROBE=<n>` | Shimadzu `.lcd`: print the first `n` spectra as JSON lines and exit **without writing an archive**. Since 0.9.13 it is handled before lane selection (in `run`, `src/main.rs`), so it works without `-o` — it used to live inside the Shimadzu lane, which only runs with `-o`, and therefore always swallowed the requested archive; a value that is not a count (including empty) is an error rather than 10; with `-o` it refuses; on macOS/Linux, where the reader does not exist, it is an error rather than silently ignored |
 | `MZPC_DUMP_IM_TABLE=1` | Bruker TDF: dump the scan→1/K0 table (timsrust, and the SDK where available) and exit without converting. Refuses with `-o` |
@@ -1128,6 +1207,7 @@ release archive carries [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 | Agilent `.d`: `holds MRM/SIM dwell data only` | the native lane stores scan spectra; MRM/SIM dwells are transition chromatograms — use `--via-msconvert` (the box harness does this on its own) |
 | Agilent `.d`: `is an Agilent IM-QTOF run` | the native lane cannot carry the drift dimension (that needs Agilent's MIDAC SDK, which this converter does not read) — use `--via-msconvert` (the box harness does this on its own) |
 | Agilent `.d`: `output is the AGL1 format of an older AgilentGlueHost.exe` | rebuild `glue/agilent` (`dotnet build -c Release`) so the host and the converter agree |
+| timsTOF `.d`: `lists ._analysis.tdf … before analysis.tdf` | the `.d` was copied from a Mac to NTFS, exFAT or SMB, which leaves an AppleDouble `._*` file (Finder metadata) beside every file, and the volume lists the companion before the file it is named after. The timsTOF reader (timsrust) opens the first file whose name ends in `analysis.tdf` / `analysis.tdf_bin`, so it would read the companion in place of the run (it used to fail with "file is not a database"). Remove the `._*` files from the `.d`, or convert with `--bruker-sdk` (Windows/Linux). On a Mac, a `.d` on such a volume gets `._analysis.tdf` back from macOS as soon as timsrust opens the database for writing; copy the `.d` to an APFS disk instead. The default lane, `--no-ims-compact`, `--to mzml` and inspection refuse such a `.d` before opening it, and name a companion that appears while they open it. A companion listed AFTER its file (a fresh copy onto exFAT lists them so) is never reached: that `.d` converts as it always did, with the warning `holds ._analysis.tdf … beside analysis.tdf …, listed after them` |
 | Nothing was written | give `-o/--output`; without it the run only inspects |
 | Output exists error | pass `--force` to overwrite |
 | UV/PDA spectra missing after `--ms-level` | a wavelength spectrum has no MS level, so `--ms-level` leaves them out, of an archive and of an mzML export alike, and says so (§4.2) |

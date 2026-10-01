@@ -411,8 +411,9 @@ def write_stamp(archive: Path, version: str, rid: str) -> str | None:
     """Stamp `archive` from its OWN index; -> None, or why it was left unstamped.
 
     What was requested says nothing reliable about what built an archive: the box strips lane flags
-    and may fall back to msconvert, and `BOX_AUTOUPDATE=0` skips its version check, after which the
-    host's version string used to be written beside whatever the box's exe produced. The archive
+    and may fall back to msconvert, and `BOX_AUTOUPDATE=0` used to skip its version check (box_convert.sh
+    now asks the exe before dispatching, but an exe swapped mid-run still answers only here), after which
+    the host's version string used to be written beside whatever the box's exe produced. The archive
     records its converter (software_list) and its argv (`conversion options`), so the stamp copies
     those, and an archive another converter version built is refused rather than labelled current.
     """
