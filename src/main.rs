@@ -3222,7 +3222,7 @@ fn convert_file_tof_grid(
     let mut source_refs = None;
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
-        source_refs = Some(check_source_refs(read_path, &mut writer));
+        source_refs = Some(mzml_refs::DanglingRefs::check(read_path, &mut writer));
     }
     add_processing_metadata(&mut writer);
 
@@ -3268,6 +3268,9 @@ fn convert_file_tof_grid(
     let source = chromatograms_by_index(&mut reader).inspect(|_| read.set(read.get() + 1));
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, source, synth_chroms)?;
     warn_unread_chromatograms(input, read_path, read.get());
+    if let Some(r) = &source_refs {
+        r.restore_scan_configurations(&mut writer);
+    }
     let acquisition_block = fixup_run_metadata(&mut writer, input);
     let mut applied = base_transformations(&writer);
     applied.extend(chromatogram_transforms);
@@ -4399,7 +4402,7 @@ fn convert_file(
     let mut source_refs = None;
     if matches!(reader, MZReaderType::MzML(_) | MZReaderType::IMzML(_)) {
         decode_pwiz_ids(&mut writer);
-        source_refs = Some(check_source_refs(read_path, &mut writer));
+        source_refs = Some(mzml_refs::DanglingRefs::check(read_path, &mut writer));
     }
     add_processing_metadata(&mut writer);
 
@@ -4531,6 +4534,9 @@ fn convert_file(
     let source = chromatograms_by_index(&mut reader).inspect(|_| read.set(read.get() + 1));
     let chromatogram_transforms = finish_chromatograms(&mut writer, input, &ms1, source, synth_chroms)?;
     warn_unread_chromatograms(input, read_path, read.get());
+    if let Some(r) = &source_refs {
+        r.restore_scan_configurations(&mut writer);
+    }
 
     // Fill required ms_run fields the source may have left implicit, so the index schema validates.
     let acquisition_block = fixup_run_metadata(&mut writer, input);
@@ -8356,18 +8362,6 @@ fn mirror_transformations(target: &mut impl MSDataFileMetadata, applied: &[&str]
     method.params.extend(
         applied.iter().map(|t| Param::new_key_value("transformation", mzdata::params::Value::String(t.to_string()))),
     );
-}
-
-/// The mzML and imzML lanes' reference check ([`mzml_refs`]): the self-closing `<software/>` entries
-/// mzdata skips are put back from the header, then every reference that still names no entry of the
-/// source's lists is dropped. After `decode_pwiz_ids`, before [`add_processing_metadata`].
-fn check_source_refs(read_path: &Path, target: &mut impl MSDataFileMetadata) -> mzml_refs::DanglingRefs {
-    match mzml_refs::restore_self_closing_software(read_path, target) {
-        Ok(0) => {}
-        Ok(n) => log::info!("{n} self-closing <software/> entries read back from the header (mzdata skips them)"),
-        Err(e) => log::warn!("self-closing <software/> entries not read back: {e:#}"),
-    }
-    mzml_refs::DanglingRefs::check_metadata(target)
 }
 
 /// The `conversion options` param every conversion records (the archive lanes'

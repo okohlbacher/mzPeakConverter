@@ -5,7 +5,9 @@
 //! export's scans (GBM `Test_P15_r2`) were stored naming configuration 1 of a list holding only 0, a
 //! MALDIquantForeign export's processing (LA-ESI `Thaliana`) named software the archive did not list
 //! — mzdata skips the self-closing `<software/>` the source does state — and the synthetic imzML
-//! fixture's spectrum list names processing `dp1`, which it does not have.
+//! fixture's spectrum list names processing `dp1`, which it does not have. mzdata skips a
+//! self-closing `<sourceFile/>` and `<instrumentConfiguration/>` the same way; a reference to one is
+//! whole and is kept.
 
 use arrow::array::{Array, RecordBatch, UInt32Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -27,13 +29,18 @@ fn scratch(test: &str) -> PathBuf {
 }
 
 /// Convert `input` into `dir/out.mzpeak`; the archive and the run's log.
-fn convert(input: &str, dir: &Path) -> (PathBuf, String) {
+fn convert(input: impl AsRef<Path>, dir: &Path) -> (PathBuf, String) {
+    convert_with(input, dir, &[])
+}
+
+fn convert_with(input: impl AsRef<Path>, dir: &Path, args: &[&str]) -> (PathBuf, String) {
     let out = dir.join("out.mzpeak");
     let r = Command::new(env!("CARGO_BIN_EXE_mzpeak-convert"))
-        .arg(input)
+        .arg(input.as_ref())
         .arg("-o")
         .arg(&out)
         .arg("--force")
+        .args(args)
         .env_remove("RUST_LOG")
         .output()
         .expect("failed to run mzpeak-convert");
@@ -72,7 +79,8 @@ fn strings<'a>(v: &'a serde_json::Value, key: &str) -> Vec<&'a str> {
 }
 
 /// Each kind is dropped where it names nothing and kept where it resolves; the run's defaults then
-/// name the first entry of their lists, as for a source that states none; one warning counts them.
+/// name the first entry of their lists, as for a source that states none; one warning counts them,
+/// naming each id as the source states it.
 #[test]
 fn dangling_references_are_dropped_declared_and_warned_once() {
     let dir = scratch("fixture");
@@ -110,8 +118,8 @@ fn dangling_references_are_dropped_declared_and_warned_once() {
     assert_eq!(warnings.len(), 1, "{log}");
     assert!(
         warnings[0].contains(
-            "1 defaultDataProcessingRef (dp1), 1 defaultInstrumentConfigurationRef (configuration 1), \
-             1 defaultSourceFileRef (sf9), 1 instrumentConfigurationRef (configuration 2), 2 softwareRef (acquisition, ghost)"
+            "1 defaultDataProcessingRef (dp1), 1 defaultInstrumentConfigurationRef (IC7), \
+             1 defaultSourceFileRef (sf9), 1 instrumentConfigurationRef (IC9), 2 softwareRef (acquisition, ghost)"
         ),
         "{}",
         warnings[0]
@@ -145,5 +153,94 @@ fn an_imzml_default_processing_that_names_nothing_is_dropped() {
     let m = metadata(&archive);
     assert_eq!(m["run"]["default_data_processing_id"], "mzpeak_convert_conversion");
     assert!(m["transformations"].as_array().unwrap().iter().any(|t| t == DROPPED), "{:#}", m["transformations"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The fixture made whole: every reference resolves, and two of them name entries mzdata skips for
+/// being self-closing — the run's default source file `sf9` and scan=2's configuration `IC2`. Both
+/// are put back and kept; nothing is dropped. Through the first cut of the check, both were dropped
+/// and declared, and the default re-pointed at `sf1`, a different file.
+#[test]
+fn references_to_self_closing_entries_are_kept() {
+    let dir = scratch("selfclosing");
+    let fixture = std::fs::read_to_string(DANGLING).unwrap();
+    let mut whole = fixture.clone();
+    for (from, to) in [
+        (r#"<softwareRef ref="acquisition"/>"#, r#"<softwareRef ref="pwiz"/>"#),
+        (r#"softwareRef="ghost""#, r#"softwareRef="pwiz""#),
+        (r#"defaultInstrumentConfigurationRef="IC7""#, r#"defaultInstrumentConfigurationRef="IC1""#),
+        (r#"defaultDataProcessingRef="dp1""#, r#"defaultDataProcessingRef="pwiz_conversion""#),
+        (r#"instrumentConfigurationRef="IC9""#, r#"instrumentConfigurationRef="IC2""#),
+        (
+            "    </instrumentConfiguration>\n  </instrumentConfigurationList>",
+            "    </instrumentConfiguration>\n    <instrumentConfiguration id=\"IC2\"/>\n  </instrumentConfigurationList>",
+        ),
+        (
+            "      </sourceFile>\n    </sourceFileList>",
+            "      </sourceFile>\n      <sourceFile id=\"sf9\" name=\"other.raw\" location=\"file:///data\"/>\n    </sourceFileList>",
+        ),
+    ] {
+        assert!(whole.contains(from), "{from}");
+        whole = whole.replacen(from, to, 1);
+    }
+    let src = dir.join("self_closing.mzML");
+    std::fs::write(&src, whole).unwrap();
+    let (archive, log) = convert(&src, &dir);
+    let m = metadata(&archive);
+
+    assert_eq!(scan_configurations(&archive), [Some(0), Some(1)], "scan=2 names IC2, put back as configuration 1");
+    let mut ics: Vec<u64> = m["instrument_configuration_list"].as_array().unwrap().iter().map(|ic| ic["id"].as_u64().unwrap()).collect();
+    ics.sort();
+    assert_eq!(ics, [0, 1], "{:#}", m["instrument_configuration_list"]);
+    let files = m["file_description"]["source_files"].as_array().unwrap();
+    let files: Vec<(&str, &str)> = files.iter().map(|f| (f["id"].as_str().unwrap(), f["name"].as_str().unwrap())).collect();
+    assert_eq!(files, [("sf1", "dangling_refs.raw"), ("sf9", "other.raw")]);
+    assert_eq!(m["run"]["default_source_file_id"], "sf9", "the default names the file the source names");
+    assert_eq!(m["run"]["default_instrument_id"], 0);
+    assert!(!m["transformations"].as_array().unwrap().iter().any(|t| t == DROPPED), "{:#}", m["transformations"]);
+    assert!(!log.contains("dropped references"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `--tof-grid` lane runs the same check on its own copy of the metadata and the scans: the
+/// SWATH fixture (whose fit is accepted) with spectrum 0's scan naming `IC_gone`, which nothing
+/// states, and spectrum 1's naming `IC2`, a self-closing entry of its list. The first is null and
+/// declared next to the lane's own entry, the second kept and put back. Through the first cut of the
+/// check, no test ran this lane.
+#[test]
+fn the_tof_grid_lane_checks_the_scans_too() {
+    use std::io::Read as _;
+    let dir = scratch("tofgrid");
+    let mut text = String::new();
+    let gz = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swath.api-sample-centroid.mzML.gz");
+    flate2::read::GzDecoder::new(File::open(gz).unwrap()).read_to_string(&mut text).unwrap();
+    assert!(!text.contains("<indexList"), "the edit shifts offsets: the fixture must be unindexed");
+    let list_end = "    </instrumentConfiguration>\n  </instrumentConfigurationList>";
+    assert!(text.contains(list_end));
+    let text = text
+        .replacen(list_end, "    </instrumentConfiguration>\n    <instrumentConfiguration id=\"IC2\"/>\n  </instrumentConfigurationList>", 1)
+        .replacen("<scan>", r#"<scan instrumentConfigurationRef="IC_gone">"#, 1)
+        .replacen("<scan>", r#"<scan instrumentConfigurationRef="IC2">"#, 1);
+    let src = dir.join("swath_refs.mzML");
+    std::fs::write(&src, text).unwrap();
+    let (archive, log) = convert_with(&src, &dir, &["--tof-grid", "on"]);
+    let m = metadata(&archive);
+
+    let applied: Vec<&str> = m["transformations"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    assert!(applied.iter().any(|t| t.starts_with("tof-grid:")), "the TOF-grid lane wrote this archive: {applied:?}");
+    assert!(applied.contains(&DROPPED), "{applied:?}");
+    let scans = scan_configurations(&archive);
+    assert_eq!(scans.len(), 201);
+    assert_eq!(scans[0], None, "IC_gone names nothing");
+    assert!(scans[2..].iter().all(|c| *c == Some(0)), "a scan naming none is the run's IC1");
+    // IC2's number is the one mzdata gave it on first sight, which depends on the order it read the
+    // spectra in (the lane samples some first): not 0, and listed.
+    let ics: Vec<u64> = m["instrument_configuration_list"].as_array().unwrap().iter().map(|ic| ic["id"].as_u64().unwrap()).collect();
+    assert_eq!(ics.len(), 2, "{:#}", m["instrument_configuration_list"]);
+    let ic2 = scans[1].expect("IC2 is kept") as u64;
+    assert!(ic2 != 0 && ics.contains(&ic2), "{ic2} in {ics:?}");
+    let warnings: Vec<&str> = log.lines().filter(|l| l.contains("dropped references")).collect();
+    assert_eq!(warnings.len(), 1, "{log}");
+    assert!(warnings[0].contains("1 instrumentConfigurationRef (IC_gone)"), "{}", warnings[0]);
     let _ = std::fs::remove_dir_all(&dir);
 }
