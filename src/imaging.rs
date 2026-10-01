@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Read};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use mzdata::params::{CURIE, Param, ParamDescribed, Unit};
 use mzdata::meta::ScanSettings;
 use quick_xml::events::Event;
@@ -58,6 +58,15 @@ pub const IBD_UUID_MISMATCH: &str = "imzml:ibd-uuid-mismatch";
 /// The unit mzdata wrote differs from the unit ACCESSION the file states (mzdata takes the
 /// `unitName` when it names a unit mzdata knows, whatever the attribute order).
 pub const UNIT_FROM_NAME: &str = "imzml:unit-accession-replaced-by-name";
+/// A pixel-size param's unit accession and unit name disagree, and only the accession's reading
+/// passes the extent test (`value × count = extent`, or `√value × count` for an area): the value is
+/// written in micrometres from the accession's unit. Owner decision D4 (2026-10-01): through
+/// 0.17.0-rc.2 only the name's reading was tested, and 0.005 `UO:0000015` named "micrometer" over
+/// 3 pixels × 150 µm was dropped.
+pub const UNIT_FROM_ACCESSION: &str = "imzml:pixel-size-unit-from-accession";
+/// `--pixel-size`: the pixel size written is the one the user supplied, the source settling none —
+/// or, under `--force`, a different one, which the `imaging_pixel_size` row records.
+pub const USER_SUPPLIED: &str = "imaging:pixel-size-user-supplied";
 /// The input states positions but no pixel counts: `IMS:1000042/43` are the largest positions.
 pub const COUNT_FROM_POSITIONS: &str = "imaging:pixel-count-from-positions";
 /// A declared pixel count did not bound the written positions — smaller than one, not a whole
@@ -73,6 +82,19 @@ pub const INVALID_Z_DROPPED: &str = "imaging:invalid-position-z-dropped";
 pub const COUNTS_DECLARED: &str = "declared";
 /// …or the writer took them from the largest positions.
 pub const COUNTS_OBSERVED_MAX: &str = "observed_max";
+
+/// `metadata.imaging.pixel_size_source`: how `pixel_size_um` was settled (converter-defined, owner
+/// principle P4; proposed for HUPO-PSI/mzPeak-specification#25 with the issue author's four values
+/// verbatim). `unknown` whenever the marker states no `pixel_size_um`.
+pub const SOURCE_DECLARED: &str = "declared";
+pub const SOURCE_UNIT_ASSUMED: &str = "unit_assumed";
+pub const SOURCE_FROM_AREA: &str = "derived_from_area";
+pub const SOURCE_USER_SUPPLIED: &str = "user_supplied";
+pub const SOURCE_FROM_POSITIONS: &str = "derived_from_positions";
+pub const SOURCE_FROM_BEAM: &str = "derived_from_beam_size";
+pub const SOURCE_UNKNOWN: &str = "unknown";
+/// `provenance.pixel_size` of a marker whose size `--pixel-size` wrote.
+pub const USER_SUPPLIED_PROVENANCE: &str = "user supplied (--pixel-size)";
 
 const POSITIONS: [CURIE; 3] = [mzdata::curie!(IMS:1000050), mzdata::curie!(IMS:1000051), mzdata::curie!(IMS:1000052)];
 /// The pixel counts, x and y: an entry stating either is the grid entry.
@@ -257,6 +279,17 @@ pub fn drop_invalid_positions(d: &mut mzdata::spectrum::SpectrumDescription) -> 
 /// with only a y count used to be passed over and a second grid entry added).
 pub fn grid(list: &[ScanSettings]) -> Option<&ScanSettings> {
     list.iter().find(|s| states(s, &COUNTS))
+}
+
+pub fn grid_mut(list: &mut [ScanSettings]) -> Option<&mut ScanSettings> {
+    list.iter_mut().find(|s| states(s, &COUNTS))
+}
+
+/// The pixel size a grid entry states, both axes in µm (`None` when either is missing, not
+/// positive or in a unit that is no length).
+pub fn pixel_size_um(grid: &ScanSettings) -> Option<(f64, f64)> {
+    let um = |curie| grid.params.iter().find(|p| p.curie() == Some(curie)).and_then(um_of);
+    Some((um(mzdata::curie!(IMS:1000046))?, um(mzdata::curie!(IMS:1000047))?))
 }
 
 fn states(s: &ScanSettings, accessions: &[CURIE]) -> bool {
@@ -643,6 +676,20 @@ pub enum LoneX {
     XOnly,
 }
 
+/// A length param in micrometres, from any length unit mzdata can state; a size that is not
+/// positive, or in a unit that is no length, is no size.
+fn um_of(p: &Param) -> Option<f64> {
+    let v = p.value.to_f64().ok()?;
+    let um = match p.unit {
+        Unit::Micrometer => v,
+        Unit::Nanometer => v / 1e3,
+        Unit::Millimeter => v * 1e3,
+        Unit::Centimeter => v * 1e4,
+        _ => return None,
+    };
+    (um.is_finite() && um > 0.0).then_some(um)
+}
+
 /// The imaging profile's `metadata.imaging` index block (HUPO-PSI/mzPeak-specification#24): the
 /// marker, the coordinate base, the grid as the viewer reads it and where its counts came from
 /// (`pixel_count_source`: [`COUNTS_DECLARED`] or [`COUNTS_OBSERVED_MAX`]; review 2026-09-30 B18),
@@ -651,24 +698,14 @@ pub enum LoneX {
 /// those (a size in mm used to give the marker none; the scan settings keep the unit as stated);
 /// `lone_x` says whether an `IMS:1000046` without an `IMS:1000047` gives both
 /// (HUPO-PSI/mzPeak-specification#23: a reader that does not know the vocabulary's default saw no
-/// pixel size at all).
-pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, lone_x: LoneX, provenance: serde_json::Value) -> serde_json::Value {
+/// pixel size at all). `pixel_size_source` is the lane's word on how that size was settled (the
+/// [`SOURCE_DECLARED`] family); the block states it as [`SOURCE_UNKNOWN`] whenever it writes no
+/// `pixel_size_um`, whatever the lane says.
+pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, lone_x: LoneX, pixel_size_source: &str, provenance: serde_json::Value) -> serde_json::Value {
     let mut b = serde_json::json!({"is_imaging": true, "coordinate_base": 1, "provenance": provenance});
     let param = |acc| grid?.params.iter().find(|p| p.curie() == Some(acc));
     let int = |acc| param(acc)?.value.to_i64().ok();
-    // In micrometres, from any length unit mzdata can state; a size that is not positive is no size.
-    let um = |acc| {
-        let p = param(acc)?;
-        let v = p.value.to_f64().ok()?;
-        let um = match p.unit {
-            Unit::Micrometer => v,
-            Unit::Nanometer => v / 1e3,
-            Unit::Millimeter => v * 1e3,
-            Unit::Centimeter => v * 1e4,
-            _ => return None,
-        };
-        (um.is_finite() && um > 0.0).then_some(um)
-    };
+    let um = |acc| um_of(param(acc)?);
     if let (Some(x), Some(y)) = (int(mzdata::curie!(IMS:1000042)), int(mzdata::curie!(IMS:1000043))) {
         b["pixel_count"] = serde_json::json!({"x": x, "y": y});
         b["pixel_count_source"] = pixel_count_source.into();
@@ -680,8 +717,177 @@ pub fn marker_block(grid: Option<&ScanSettings>, pixel_count_source: &str, lone_
     };
     if let (Some(x), Some(y)) = (x, y) {
         b["pixel_size_um"] = serde_json::json!({"x": x, "y": y});
+        b["pixel_size_source"] = pixel_size_source.into();
+    } else {
+        b["pixel_size_source"] = SOURCE_UNKNOWN.into();
     }
     b
+}
+
+/// `--pixel-size X[,Y]`: the pixel size the user supplies, in µm, for a source that settles none.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UserPixelSize {
+    pub x: f64,
+    pub y: f64,
+    /// `--force`: a stated size that differs is written over instead of refused.
+    pub force: bool,
+}
+
+impl UserPixelSize {
+    /// `X` or `X,Y` in µm, each a positive finite number.
+    pub fn parse(text: &str, force: bool) -> Result<Self> {
+        let num = |s: &str| -> Result<f64> {
+            let v: f64 = s.trim().parse().map_err(|_| anyhow::anyhow!("--pixel-size {text:?}: {:?} is not a number", s.trim()))?;
+            if !(v.is_finite() && v > 0.0) {
+                bail!("--pixel-size {text:?}: a pixel size is a positive length in micrometres, not {}", s.trim());
+            }
+            Ok(v)
+        };
+        let (x, y) = match text.split(',').collect::<Vec<_>>().as_slice() {
+            [x] => (num(x)?, num(x)?),
+            [x, y] => (num(x)?, num(y)?),
+            _ => bail!("--pixel-size expects X or X,Y in micrometres (10, or 10,20); got {text:?}"),
+        };
+        Ok(Self { x, y, force })
+    }
+
+    /// `10 µm` or `10 × 20 µm`.
+    pub fn text(&self) -> String {
+        if self.x == self.y { format!("{} µm", self.x) } else { format!("{} × {} µm", self.x, self.y) }
+    }
+}
+
+/// The `--pixel-size` of this run, for the lanes. Set once by `run` before any lane opens its
+/// input; the lanes read it where they build their grid entry (the imzML/mzML lane after its own
+/// rule and the pixel counts, the Bruker MALDI reader, the Waters grid fit). A process-wide value,
+/// as `MZPC_KEEP_ZERO_RUNS` and the writer's other environment levers are: threading one option
+/// through the eleven lane signatures and their callers would touch every lane for a value only the
+/// imaging grid reads. Unit tests pass a [`UserPixelSize`] to the functions below instead of setting
+/// this: the test binary's threads share it.
+static USER_PIXEL_SIZE: std::sync::RwLock<Option<UserPixelSize>> = std::sync::RwLock::new(None);
+
+pub fn set_user_pixel_size(user: Option<UserPixelSize>) {
+    *USER_PIXEL_SIZE.write().unwrap_or_else(|e| e.into_inner()) = user;
+}
+
+pub fn user_pixel_size() -> Option<UserPixelSize> {
+    *USER_PIXEL_SIZE.read().unwrap_or_else(|e| e.into_inner())
+}
+
+const PIXEL_SIZE_TERMS: [(CURIE, &str); 2] = [(mzdata::curie!(IMS:1000046), "pixel size (x)"), (mzdata::curie!(IMS:1000047), "pixel size y")];
+const MAX_DIMENSION_TERMS: [(CURIE, &str); 2] = [(mzdata::curie!(IMS:1000044), "max dimension x"), (mzdata::curie!(IMS:1000045), "max dimension y")];
+
+/// Where a grid entry's stated pixel size (`None`: not stated on either axis) differs from the
+/// supplied one: one line per axis, naming the stated value. A stated axis whose value is no length
+/// in micrometres (zero, a unit that is no length) differs too: the source settled something the
+/// supplied size would overwrite.
+pub fn user_pixel_size_differences(grid: Option<&ScanSettings>, user: &UserPixelSize) -> Vec<String> {
+    let Some(grid) = grid else { return Vec::new() };
+    PIXEL_SIZE_TERMS
+        .iter()
+        .zip([user.x, user.y])
+        .filter_map(|((curie, name), want)| {
+            let p = grid.params.iter().find(|p| p.curie() == Some(*curie))?;
+            match um_of(p) {
+                Some(v) if approx(v, want) => None,
+                Some(v) => Some(format!("{name} ({curie}) = {v} µm")),
+                None => Some(format!("{name} ({curie}) = {} {}", p.value, p.unit.to_curie().map(|c| c.to_string()).unwrap_or_else(|| "(no unit)".into()))),
+            }
+        })
+        .collect()
+}
+
+/// Refuse a `--pixel-size` that contradicts a size `grid` states, unless `--force` (owner principle
+/// P3: the supplied size could be the wrong data). `what` names the source for the message.
+pub fn check_user_pixel_size(grid: Option<&ScanSettings>, user: &UserPixelSize, what: &str) -> Result<()> {
+    let differing = user_pixel_size_differences(grid, user);
+    if differing.is_empty() || user.force {
+        return Ok(());
+    }
+    bail!(
+        "--pixel-size {}: {what} states a pixel size that differs ({}); the supplied size is written \
+         only where the source settles none. Check which is right; --force writes the supplied size \
+         over the stated one, declared as {USER_SUPPLIED} and recorded in imaging_pixel_size",
+        user.text(),
+        differing.join(", ")
+    );
+}
+
+/// The `--pixel-size` rule on a grid entry, the same on every lane (the imzML/mzML lane after its
+/// own rule and the pixel counts, the Bruker and Waters lanes on the grid they build, the archive
+/// rewrite on the archive's list). `IMS:1000046/47` are written in µm where the entry states
+/// neither — a stated axis that agrees with the supplied value stays as it is and the other is
+/// filled (a Waters single row states the x step alone) — and `IMS:1000044/45` from the pixel counts
+/// where the entry states those and no max dimension. A stated size that differs is refused
+/// ([`check_user_pixel_size`]) unless `--force`: then the supplied size is written over it, the
+/// stated values are recorded, and a stated max dimension is recomputed from the counts. `None`
+/// when the entry already states the supplied size on both axes; else the `imaging_pixel_size` row
+/// to list, whose transformation is [`USER_SUPPLIED`].
+pub fn apply_user_pixel_size(grid: &mut ScanSettings, user: &UserPixelSize, what: &str) -> Result<Option<serde_json::Value>> {
+    check_user_pixel_size(Some(grid), user, what)?;
+    let at = |grid: &ScanSettings, curie: CURIE| grid.params.iter().position(|p| p.curie() == Some(curie));
+    let stated: Vec<serde_json::Value> = PIXEL_SIZE_TERMS
+        .iter()
+        .filter_map(|(curie, _)| {
+            let p = &grid.params[at(grid, *curie)?];
+            Some(serde_json::json!({"accession": curie.to_string(), "value": p.value.to_string(), "unit": p.unit.to_curie().map(|c| c.to_string())}))
+        })
+        .collect();
+    let overridden = !user_pixel_size_differences(Some(grid), user).is_empty();
+    if stated.len() == 2 && !overridden {
+        log::info!("--pixel-size {}: {what} states the same size; nothing to write", user.text());
+        return Ok(None);
+    }
+    let want = [user.x, user.y];
+    let mut written = Vec::new();
+    for ((curie, name), v) in PIXEL_SIZE_TERMS.iter().zip(want) {
+        match at(grid, *curie) {
+            Some(_) if !overridden => continue, // stated and agreeing: as it is
+            Some(i) => {
+                let p = &mut grid.params[i];
+                p.name = (*name).into();
+                p.value = v.into();
+                p.unit = Unit::Micrometer;
+            }
+            None => grid.params.push(Param::builder().name(*name).curie(*curie).value(v).unit(Unit::Micrometer).build()),
+        }
+        written.push(serde_json::json!({"accession": curie.to_string(), "value": v, "unit": "UO:0000017", "unit_assumed": false}));
+    }
+    // The max dimension: count × size on each axis whose count the entry states, where it states
+    // none — or where the stated one belonged to the size written over.
+    let mut max_dimension = Vec::new();
+    for ((count, (curie, name)), v) in COUNTS.iter().zip(MAX_DIMENSION_TERMS).zip(want) {
+        let Some(n) = at(grid, *count).and_then(|i| grid.params[i].value.to_f64().ok()).filter(|n| *n > 0.0) else { continue };
+        match at(grid, curie) {
+            Some(i) if overridden => {
+                grid.params[i].value = (n * v).into();
+                grid.params[i].unit = Unit::Micrometer;
+                max_dimension.push(format!("{curie} recomputed as {n} × {v} µm"));
+            }
+            Some(_) => {}
+            None => {
+                grid.params.push(Param::builder().name(name).curie(curie).value(n * v).unit(Unit::Micrometer).build());
+                max_dimension.push(format!("{curie} written as {n} × {v} µm"));
+            }
+        }
+    }
+    let detail = match (stated.is_empty(), overridden) {
+        (true, _) => format!("{what} states no pixel size; {} written as supplied", user.text()),
+        (false, true) => format!("{what} states a different pixel size; {} written over it (--force)", user.text()),
+        (false, false) => format!("{what} states one axis, which agrees; the other written as supplied ({})", user.text()),
+    };
+    log::warn!("--pixel-size: {detail}{}", if max_dimension.is_empty() { String::new() } else { format!("; {}", max_dimension.join(", ")) });
+    Ok(Some(serde_json::json!({
+        "scan_settings": grid.id,
+        "case": "user supplied (--pixel-size)",
+        "transformation": USER_SUPPLIED,
+        "transformations": [USER_SUPPLIED],
+        "written_um": written,
+        "stated": stated,
+        "overridden": overridden,
+        "max_dimension": max_dimension,
+        "detail": detail,
+    })))
 }
 
 /// `provenance.time` of an imaging marker whose source states no `scan start time` on any spectrum:
@@ -825,19 +1031,54 @@ fn written_unit(q: &RawParam) -> Option<String> {
     by_name.map(|c| c.to_string()).or_else(|| q.unit_accession.clone())
 }
 
+/// One way of reading a param's unit as a length: the unit's canonical name, its size in µm,
+/// whether it is the unit ACCESSION's reading where the name says otherwise, and whether it is
+/// micrometre assumed for a param with no known length unit.
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    unit: &'static str,
+    size: f64,
+    by_accession: bool,
+    assumed: bool,
+}
+
+/// The length readings of a param's unit, in the order the rule tries them: the unit it is written
+/// in ([`written_unit`]) — micrometre, noted as assumed, when that is no known length — and then,
+/// where the unit accession names a known length the name contradicts, the accession's (owner
+/// decision D4: 31 of 479 public imzML files state `UO:0000015`, centimetre, named "micrometer").
+fn readings(q: &RawParam) -> Vec<Reading> {
+    let written = written_unit(q).as_deref().and_then(length_unit);
+    let mut out = vec![match written {
+        Some((unit, size)) => Reading { unit, size, by_accession: false, assumed: false },
+        None => Reading { unit: "micrometer", size: 1.0, by_accession: false, assumed: true },
+    }];
+    if let Some((unit, size)) = q.unit_accession.as_deref().and_then(length_unit) {
+        if written.is_none_or(|(_, s)| s != size) {
+            out.push(Reading { unit, size, by_accession: true, assumed: false });
+        }
+    }
+    out
+}
+
 /// What the pixel-size rule did to one `<scanSettings>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PixelSizeFix {
     pub settings_id: String,
     /// Which case of the rule applied.
     pub case: &'static str,
-    /// The `transformations` entry it declares, when the values changed.
-    pub transformation: Option<&'static str>,
+    /// The `transformations` entries it declares, when a value or a unit changed (empty: nothing
+    /// changed). More than one where an area's root was also read by its unit accession, or x took
+    /// micrometre as assumed while y was read by its accession.
+    pub transformations: Vec<&'static str>,
     /// Pixel sizes to write: accession (`IMS:1000046`/`47`), value, and whether its unit is set to
-    /// micrometre. An accession absent here is removed. A lone `IMS:1000046` the single-value rule
-    /// keeps is here twice, as itself and as `IMS:1000047` — the vocabulary's default made
+    /// micrometre (assumed for a param without one, or converted from the unit accession's reading,
+    /// `by_accession`). An accession absent here is removed. A lone `IMS:1000046` the single-value
+    /// rule keeps is here twice, as itself and as `IMS:1000047` — the vocabulary's default made
     /// explicit, which declares nothing.
     pub write: Vec<(&'static str, f64, bool)>,
+    /// The `write` accessions whose value is the unit ACCESSION's reading, converted to micrometres
+    /// ([`UNIT_FROM_ACCESSION`]); a lone x read that way lists its y copy too.
+    pub by_accession: Vec<&'static str>,
     /// The single-value rule kept the value: it is written under the vocabulary's names (the old
     /// "pixel size" named the AREA term), and a lone x also as y ([`apply`]).
     pub single: bool,
@@ -894,16 +1135,17 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
         })
         .collect();
     let (x, y) = (get(PIXEL_X), get(PIXEL_Y));
-    let fix = |case, transformation, write: Vec<(&'static str, f64, bool)>, detail: String| PixelSizeFix {
+    let fix = |case, transformations: Vec<&'static str>, write: Vec<(&'static str, f64, bool)>, detail: String| PixelSizeFix {
         settings_id: s.id.clone(),
         case,
-        transformation,
+        transformations,
         // A y written from a lone x (`get` finds none) carries the x param's unit.
         write_units: write
             .iter()
             .map(|&(a, _, um)| if um { Some("UO:0000017".into()) } else { get(a).or(x).and_then(written_unit) })
             .collect(),
         write,
+        by_accession: Vec::new(),
         single: false,
         unit_mismatches: unit_mismatches.clone(),
         mismatched: mismatched.clone(),
@@ -911,63 +1153,98 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
         extent_mismatches: Vec::new(),
         detail,
     };
+    // The axis to test a value against: its count and max dimension where the file states both.
+    let testable = |(c, e): (&str, &str)| {
+        let (count, extent) = (num(c)?, num(e)?);
+        (count > 0.0 && extent > 0.0).then_some((count, extent, get(e)?))
+    };
     match (x, y) {
         (None, None) => (!unit_mismatches.is_empty())
-            .then(|| fix("no pixel size stated", None, vec![], String::new())),
+            .then(|| fix("no pixel size stated", vec![], vec![], String::new())),
         (Some(px), Some(py)) => {
             let (Some(vx), Some(vy)) = (num(PIXEL_X), num(PIXEL_Y)) else {
-                return Some(fix("x and y not numeric", Some(DROPPED), vec![], format!("x={:?} y={:?}", px.value, py.value)));
+                return Some(fix("x and y not numeric", vec![DROPPED], vec![], format!("x={:?} y={:?}", px.value, py.value)));
             };
             // A pixel has a size: zero or a negative number is none (a lone value was always held to
             // this; x = 0, y = −100 µm were written as stated, into the marker too).
             if vx <= 0.0 || vy <= 0.0 {
-                return Some(fix("x and y not both positive", Some(DROPPED), vec![], format!("x={vx} y={vy}")));
+                return Some(fix("x and y not both positive", vec![DROPPED], vec![], format!("x={vx} y={vy}")));
             }
-            let (ux, uy) = (written_unit(px), written_unit(py));
             // Each axis against its own count and max dimension, where the file states both
             // (HUPO-PSI/mzPeak-specification#23: 50 and 2500 over 150 × 100 µm were written as
-            // stated with no word). A unit that is no length is not compared.
-            let extent_mismatches: Vec<String> = [(px, vx), (py, vy)]
-                .into_iter()
-                .zip(AXES)
-                .filter_map(|((p, v), (c, e))| {
-                    let (count, extent, e) = (num(c)?, num(e)?, get(e)?);
-                    let size = |q: &RawParam| match written_unit(q) {
-                        Some(u) => length_unit(&u),
-                        None => Some(("micrometer", 1.0)),
-                    };
-                    let ((vu, v_size), (eu, e_size)) = (size(p)?, size(e)?);
-                    (count > 0.0 && extent > 0.0 && !approx(v * v_size * count, extent * e_size)).then(|| {
-                        format!("{}={v} {vu} × {count} pixels is not the max dimension {}={extent} {eu}", p.accession, e.accession)
-                    })
-                })
-                .collect();
-            let f = if ux.is_some() && uy.is_some() {
-                fix("x and y with a unit", None, vec![(PIXEL_X, vx, false), (PIXEL_Y, vy, false)], String::new())
-            } else {
-                fix(
-                    "x and y without a unit: micrometre assumed",
-                    Some(UNIT_ASSUMED),
-                    vec![(PIXEL_X, vx, ux.is_none()), (PIXEL_Y, vy, uy.is_none())],
-                    format!("x={vx} y={vy}"),
-                )
+            // stated with no word), in the unit it is written in; a stated unit that is no length
+            // is not compared. An axis whose unit accession contradicts its unit name (D4) is read
+            // both ways: the name's reading first, then the accession's, and the one that passes is
+            // written — converted to micrometres when it is the accession's; neither passing, or
+            // nothing to test against, drops both sizes (the value could be the wrong data).
+            let mut write = Vec::new();
+            let mut by_accession = Vec::new();
+            let mut extent_mismatches = Vec::new();
+            let mut details = Vec::new();
+            let mut dropped: Option<(&'static str, String)> = None;
+            for ((p, v, acc), axis) in [(px, vx, PIXEL_X), (py, vy, PIXEL_Y)].into_iter().zip(AXES) {
+                let tries = readings(p);
+                let as_stated = (acc, v, written_unit(p).is_none());
+                let Some((count, extent, e)) = testable(axis) else {
+                    if tries.len() > 1 {
+                        dropped = Some(("x and y: a unit contradiction nothing tests", format!("{acc}={v}: unit {} named {:?}, and no pixel count and max dimension on the axis to tell which; both sizes dropped", tries[1].unit, p.unit_name.as_deref().unwrap_or(""))));
+                    }
+                    write.push(as_stated);
+                    continue;
+                };
+                let (eu, e_size) = readings(e)[0].unit_size();
+                let extent_um = extent * e_size;
+                let passes = |r: &Reading| approx(v * r.size * count, extent_um);
+                // A stated unit that is no length is not compared (the name's reading is then
+                // micrometre assumed, which the two-value case does not write over a stated unit).
+                let comparable = written_unit(p).is_none_or(|u| length_unit(&u).is_some());
+                if !comparable || passes(&tries[0]) {
+                    write.push(as_stated);
+                } else if let Some(r) = tries.get(1).filter(|r| passes(r)) {
+                    write.push((acc, v * r.size, true));
+                    by_accession.push(acc);
+                    details.push(format!("{acc}={v} {} by its unit accession (named {:?}): {v} {} × {count} = {extent} {eu}; written as {} micrometer", r.unit, p.unit_name.as_deref().unwrap_or(""), r.unit, v * r.size));
+                } else if tries.len() > 1 {
+                    dropped = Some(("x and y: a unit contradiction that passes under neither reading", format!("{acc}={v}: neither {v} {} (the unit name) nor {v} {} (the unit accession) × {count} is the max dimension {extent} {eu}; both sizes dropped", tries[0].unit, tries[1].unit)));
+                    write.push(as_stated);
+                } else {
+                    extent_mismatches.push(format!("{acc}={v} {} × {count} pixels is not the max dimension {}={extent} {eu}", tries[0].unit, e.accession));
+                    write.push(as_stated);
+                }
+            }
+            if let Some((case, detail)) = dropped {
+                return Some(fix(case, vec![DROPPED], vec![], detail));
+            }
+            // Micrometre set on an axis that states no unit (an axis read by its accession has one).
+            let assumed = write.iter().any(|w| w.2 && !by_accession.contains(&w.0));
+            let mut transformations = Vec::new();
+            if assumed {
+                transformations.push(UNIT_ASSUMED);
+            }
+            if !by_accession.is_empty() {
+                transformations.push(UNIT_FROM_ACCESSION);
+            }
+            let case = match (assumed, by_accession.is_empty()) {
+                (false, true) => "x and y with a unit",
+                (true, true) => "x and y without a unit: micrometre assumed",
+                (false, false) => "x and y with a unit; one read by its unit accession",
+                (true, false) => "x and y without a unit: micrometre assumed; one read by its unit accession",
             };
-            let f = PixelSizeFix { extent_mismatches, ..f };
-            Some(f).filter(|f| f.transformation.is_some() || !f.unit_mismatches.is_empty() || !f.extent_mismatches.is_empty())
+            let detail = if transformations.is_empty() { String::new() } else { std::iter::once(format!("x={vx} y={vy}")).chain(details).collect::<Vec<_>>().join("; ") };
+            let f = fix(case, transformations, write, detail);
+            let f = PixelSizeFix { extent_mismatches, by_accession, ..f };
+            Some(f).filter(|f| !f.transformations.is_empty() || !f.unit_mismatches.is_empty() || !f.extent_mismatches.is_empty())
         }
         (Some(p), None) | (None, Some(p)) => {
             let acc: &'static str = if p.accession == PIXEL_X { PIXEL_X } else { PIXEL_Y };
             let Some(v) = num(acc).filter(|v| *v > 0.0) else {
-                return Some(fix("one value, not numeric", Some(DROPPED), vec![], format!("{acc}={:?}", p.value)));
+                return Some(fix("one value, not numeric", vec![DROPPED], vec![], format!("{acc}={:?}", p.value)));
             };
             // Tested against its own axis's count and extent; the other axis's only when its own
             // states none — pixels are square in every surveyed file that states both (review
             // 2026-09-30 B17: x was tried first whatever the axis).
             let axes = if acc == PIXEL_X { AXES } else { [AXES[1], AXES[0]] };
-            let tested = axes.iter().find_map(|&(c, e)| {
-                let (count, extent) = (num(c)?, num(e)?);
-                (count > 0.0 && extent > 0.0).then_some((count, extent, get(e)?))
-            });
+            let tested = axes.into_iter().find_map(testable);
             let Some((count, extent, e)) = tested else {
                 // Nothing was tested: its own case, and the detail names what the header lacks (it
                 // said "no pixel count and max dimension" of a header stating both counts).
@@ -979,54 +1256,102 @@ pub fn pixel_size_fix(s: &RawSettings) -> Option<PixelSizeFix> {
                     (false, false) => "no pixel count (IMS:1000042/43) and no max dimension (IMS:1000044/45)",
                     (true, true) => "no axis with both a pixel count and a max dimension",
                 };
-                return Some(fix("one value, untestable", Some(DROPPED), vec![], format!("{acc}={v}; {missing} to test it against")));
+                return Some(fix("one value, untestable", vec![DROPPED], vec![], format!("{acc}={v}; {missing} to test it against")));
             };
             // Value and extent compared in µm, each in the unit it is written in (B17: the units were
             // ignored); a param without a known length unit is tested as µm, and the detail says so.
-            let mut assumed = Vec::new();
-            let mut unit = |q: &RawParam| {
-                written_unit(q).as_deref().and_then(length_unit).unwrap_or_else(|| {
-                    assumed.push(q.accession.clone());
-                    ("micrometer", 1.0)
-                })
-            };
-            let ((vu, v_size), (eu, e_size)) = (unit(p), unit(e));
+            // A value whose unit accession contradicts its unit name is read both ways (D4): the
+            // name's reading first, then the accession's.
+            let tries = readings(p);
+            let er = readings(e)[0];
+            let (eu, e_size) = er.unit_size();
             let extent_um = extent * e_size;
+            let assumed: Vec<&str> = [(p, tries[0].assumed), (e, er.assumed)].into_iter().filter(|(_, a)| *a).map(|(q, _)| q.accession.as_str()).collect();
             let note = if assumed.is_empty() { String::new() } else { format!(" ({} without a length unit: micrometre assumed)", assumed.join(", ")) };
             // What a kept value is written as: itself, and — a lone x — the same value as y. The
             // vocabulary gives `IMS:1000046` that meaning when no `IMS:1000047` is stated, so the
             // y states nothing new and declares nothing; a lone y says nothing about x.
             let kept = |v: f64, um: bool| if acc == PIXEL_X { vec![(PIXEL_X, v, um), (PIXEL_Y, v, um)] } else { vec![(PIXEL_Y, v, um)] };
             let also_y = if acc == PIXEL_X { "; also written as IMS:1000047, which the vocabulary's IMS:1000046 gives when none is stated" } else { "" };
-            let f = if approx(v.sqrt() * v_size * count, extent_um) {
+            // `(reading, as an area)` of the first reading that passes.
+            let passed = tries.iter().find_map(|r| {
+                if approx(v.sqrt() * r.size * count, extent_um) {
+                    Some((*r, true))
+                } else if approx(v * r.size * count, extent_um) {
+                    Some((*r, false))
+                } else {
+                    None
+                }
+            });
+            let Some((r, area)) = passed else {
+                let both = if tries.len() > 1 { format!("; neither as {} (the unit name) nor as {} (the unit accession)", tries[0].unit, tries[1].unit) } else { String::new() };
+                return Some(fix(
+                    "one value that tests as neither area nor length",
+                    vec![DROPPED],
+                    vec![],
+                    format!("{acc}={v} {}; count {count}, max dimension {extent} {eu}{note}{both}", tries[0].unit),
+                ));
+            };
+            let vu = r.unit;
+            let f = if r.by_accession {
+                // The accession's reading passed where the name's did not: written in micrometres,
+                // the unit the test was made in, as a length (an area's root).
+                let length = if area { v.sqrt() } else { v } * r.size;
+                let transformations = if area { vec![AREA_TO_LENGTH, UNIT_FROM_ACCESSION] } else { vec![UNIT_FROM_ACCESSION] };
+                let case = if area { "one value: an area (√value × count = extent), by its unit accession" } else { "one value: a length (value × count = extent), by its unit accession" };
+                let equation = if area { format!("√({v} {vu}²) × {count} = {extent} {eu}") } else { format!("{v} {vu} × {count} = {extent} {eu}") };
+                let f = fix(
+                    case,
+                    transformations,
+                    kept(length, true),
+                    format!("{acc}={v} read by its unit accession, {vu} (named {:?}, which does not fit the extent): {equation}; written as {length} micrometer{note}{also_y}", p.unit_name.as_deref().unwrap_or("")),
+                );
+                PixelSizeFix { by_accession: f.write.iter().map(|w| w.0).collect(), ..f }
+            } else if area {
                 fix(
                     "one value: an area (√value × count = extent)",
-                    Some(AREA_TO_LENGTH),
+                    vec![AREA_TO_LENGTH],
                     // The square root of an area is a length in the unit the area is the square
                     // of (µm² → µm, mm² → mm): a stated length unit stays, anything else was
                     // tested as µm² and becomes µm.
-                    kept(v.sqrt(), assumed.contains(&p.accession)),
+                    kept(v.sqrt(), r.assumed),
                     format!("{acc}={v} as area; √({v} {vu}²) × {count} = {extent} {eu}{note}{also_y}"),
                 )
-            } else if approx(v * v_size * count, extent_um) {
+            } else {
                 // A stated unit stays even when it is no length, as in the two-value case:
                 // micrometre is written only where none is stated.
                 let unit_assumed = written_unit(p).is_none();
                 fix(
                     "one value: a length (value × count = extent)",
-                    unit_assumed.then_some(UNIT_ASSUMED),
+                    if unit_assumed { vec![UNIT_ASSUMED] } else { vec![] },
                     kept(v, unit_assumed),
                     format!("{acc}={v}; {v} {vu} × {count} = {extent} {eu}{note}{also_y}"),
                 )
-            } else {
-                return Some(fix(
-                    "one value that tests as neither area nor length",
-                    Some(DROPPED),
-                    vec![],
-                    format!("{acc}={v} {vu}; count {count}, max dimension {extent} {eu}{note}"),
-                ));
             };
             Some(PixelSizeFix { single: true, ..f })
+        }
+    }
+}
+
+impl Reading {
+    /// `(unit name, size in µm)`.
+    fn unit_size(&self) -> (&'static str, f64) {
+        (self.unit, self.size)
+    }
+}
+
+impl PixelSizeFix {
+    /// `metadata.imaging.pixel_size_source` for the grid this fix describes: how the size it keeps
+    /// was settled, or [`SOURCE_UNKNOWN`] when it keeps none.
+    pub fn source(&self) -> &'static str {
+        if self.write.is_empty() {
+            SOURCE_UNKNOWN
+        } else if self.transformations.contains(&AREA_TO_LENGTH) {
+            SOURCE_FROM_AREA
+        } else if self.transformations.contains(&UNIT_ASSUMED) {
+            SOURCE_UNIT_ASSUMED
+        } else {
+            SOURCE_DECLARED
         }
     }
 }
@@ -1042,7 +1367,7 @@ pub fn pixel_size_fixes(settings: &[RawSettings]) -> Vec<PixelSizeFix> {
 /// value and unit — also where the value itself is kept as stated (a length with its unit).
 pub fn apply(fix: &PixelSizeFix, settings: &mut ScanSettings) {
     let at = |settings: &ScanSettings, acc: &str| settings.params.iter().position(|p| p.curie().is_some_and(|c| c.to_string() == acc));
-    if fix.transformation.is_some() {
+    if !fix.transformations.is_empty() {
         for acc in [PIXEL_X, PIXEL_Y] {
             let wanted = fix.write.iter().find(|(a, _, _)| *a == acc);
             match (at(settings, acc), wanted) {
@@ -1114,13 +1439,18 @@ pub fn fix_json(f: &PixelSizeFix) -> serde_json::Value {
     serde_json::json!({
         "scan_settings": f.settings_id,
         "case": f.case,
-        "transformation": f.transformation,
+        // The first entry under the key readers of 0.17.0-rc archives know; all of them under the next.
+        "transformation": f.transformations.first(),
+        "transformations": f.transformations,
         // The key predates `unit` (review 2026-09-30: an mm² area's root is written in mm).
         "written_um": f
             .write
             .iter()
             .zip(&f.write_units)
-            .map(|((a, v, assumed), unit)| serde_json::json!({"accession": a, "value": v, "unit": unit, "unit_assumed": assumed}))
+            .map(|((a, v, um), unit)| {
+                let by_accession = f.by_accession.contains(a);
+                serde_json::json!({"accession": a, "value": v, "unit": unit, "unit_assumed": *um && !by_accession, "unit_from_accession": by_accession})
+            })
             .collect::<Vec<_>>(),
         "unit_mismatches": f.unit_mismatches,
         "written_units": f.written_units,
@@ -1911,7 +2241,7 @@ mod tests {
     #[test]
     fn x_and_y_without_a_unit_become_micrometre() {
         let f = pixel_size_fix(&settings(&[("IMS:1000046", "20", None), ("IMS:1000047", "25", None)])).unwrap();
-        assert_eq!(f.transformation, Some(UNIT_ASSUMED));
+        assert_eq!(f.transformations.clone(), vec![UNIT_ASSUMED]);
         assert_eq!(f.write, vec![(PIXEL_X, 20.0, true), (PIXEL_Y, 25.0, true)]);
     }
 
@@ -1920,22 +2250,22 @@ mod tests {
         // 100 px × 10 µm = 1000 µm: 100 (µm²) is an area, 10 a length.
         // A lone x that is kept is also the y size (the vocabulary's default): written as both.
         let area = pixel_size_fix(&settings(&[("IMS:1000046", "100", None), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 10.0, true), (PIXEL_Y, 10.0, true)]));
+        assert_eq!((area.transformations.clone(), area.write.clone()), (vec![AREA_TO_LENGTH], vec![(PIXEL_X, 10.0, true), (PIXEL_Y, 10.0, true)]));
         let length = pixel_size_fix(&settings(&[("IMS:1000046", "10", UM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((length.transformation, length.write.clone()), (None, vec![(PIXEL_X, 10.0, false), (PIXEL_Y, 10.0, false)]));
+        assert_eq!((length.transformations.clone(), length.write.clone()), (Vec::<&str>::new(), vec![(PIXEL_X, 10.0, false), (PIXEL_Y, 10.0, false)]));
         assert_eq!(length.write_units, vec![Some("UO:0000017".to_string()); 2], "the y carries the x's unit");
         assert!(area.single && length.single && length.detail.contains("also written as IMS:1000047"), "{}", length.detail);
         // Only the y axis states count and extent: it is used.
         let y_axis = pixel_size_fix(&settings(&[("IMS:1000046", "400", UM), ("IMS:1000043", "50", None), ("IMS:1000045", "1000", UM)])).unwrap();
-        assert_eq!(y_axis.transformation, Some(AREA_TO_LENGTH));
+        assert_eq!(y_axis.transformations.clone(), vec![AREA_TO_LENGTH]);
         let neither = pixel_size_fix(&settings(&[("IMS:1000046", "7", UM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((neither.case, neither.transformation, neither.write.is_empty()), ("one value that tests as neither area nor length", Some(DROPPED), true));
+        assert_eq!((neither.case, neither.transformations.clone(), neither.write.is_empty()), ("one value that tests as neither area nor length", vec![DROPPED], true));
         // Nothing to test against is its own case, and the detail names what the header lacks: it
         // said "no pixel count and max dimension" of a header stating both counts
         // (HUPO-PSI/mzPeak-specification#23, pixel_size_area_old_name_no_extent).
         let untestable = |rest: &[(&str, &str, Option<(&str, &str)>)]| {
             let f = pixel_size_fix(&settings(&[&[("IMS:1000046", "7", UM)], rest].concat())).unwrap();
-            assert_eq!((f.case, f.transformation, f.write.is_empty(), f.single), ("one value, untestable", Some(DROPPED), true, false));
+            assert_eq!((f.case, f.transformations.clone(), f.write.is_empty(), f.single), ("one value, untestable", vec![DROPPED], true, false));
             f.detail
         };
         assert_eq!(untestable(&[]), "IMS:1000046=7; no pixel count (IMS:1000042/43) and no max dimension (IMS:1000044/45) to test it against");
@@ -1955,12 +2285,12 @@ mod tests {
         };
         assert_eq!(with(("50", UM), ("50", UM)), None, "consistent: nothing to report");
         let f = with(("50", UM), ("2500", UM)).unwrap();
-        assert_eq!((f.case, f.transformation, f.write.clone()), ("x and y with a unit", None, vec![(PIXEL_X, 50.0, false), (PIXEL_Y, 2500.0, false)]));
+        assert_eq!((f.case, f.transformations.clone(), f.write.clone()), ("x and y with a unit", Vec::<&str>::new(), vec![(PIXEL_X, 50.0, false), (PIXEL_Y, 2500.0, false)]));
         assert_eq!(f.extent_mismatches, ["IMS:1000047=2500 micrometer × 2 pixels is not the max dimension IMS:1000045=100 micrometer"]);
         assert_eq!(fix_json(&f)["extent_mismatches"].as_array().unwrap().len(), 1);
         // Without a unit: micrometre assumed, as before, and the same comparison.
         let f = with(("50", None), ("2500", None)).unwrap();
-        assert_eq!((f.transformation, f.extent_mismatches.len()), (Some(UNIT_ASSUMED), 1));
+        assert_eq!((f.transformations.clone(), f.extent_mismatches.len()), (vec![UNIT_ASSUMED], 1));
         assert!(with(("50", None), ("50", None)).unwrap().extent_mismatches.is_empty());
         // Compared in one length unit: 0.05 mm × 3 = 150 µm.
         const MM: Option<(&str, &str)> = Some(("UO:0000016", "millimeter"));
@@ -1989,21 +2319,21 @@ mod tests {
             ("IMS:1000043", "5", None), ("IMS:1000045", "500", UM),
         ]))
         .unwrap();
-        assert_eq!((y.case, y.transformation, y.write), ("one value: a length (value × count = extent)", None, vec![(PIXEL_Y, 100.0, false)]));
+        assert_eq!((y.case, y.transformations.clone(), y.write), ("one value: a length (value × count = extent)", Vec::<&str>::new(), vec![(PIXEL_Y, 100.0, false)]));
         // 0.01 mm × 100 = 1000 µm: a length, once both are in µm.
         let mm = pixel_size_fix(&settings(&[("IMS:1000046", "0.01", MM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000", UM)])).unwrap();
-        assert_eq!((mm.transformation, mm.write), (None, vec![(PIXEL_X, 0.01, false), (PIXEL_Y, 0.01, false)]));
+        assert_eq!((mm.transformations.clone(), mm.write), (Vec::<&str>::new(), vec![(PIXEL_X, 0.01, false), (PIXEL_Y, 0.01, false)]));
         let nm = pixel_size_fix(&settings(&[("IMS:1000046", "10", UM), ("IMS:1000042", "100", None), ("IMS:1000044", "1000000", Some(("UO:0000018", "nanometer")))])).unwrap();
-        assert_eq!(nm.transformation, None, "10 µm × 100 = 10⁶ nm");
+        assert_eq!(nm.transformations.clone(), Vec::<&str>::new(), "10 µm × 100 = 10⁶ nm");
         // An area in mm²: its square root in mm (√0.0001 mm² = 0.01 mm; × 100 = 1 mm), the unit kept.
         let area = pixel_size_fix(&settings(&[("IMS:1000046", "0.0001", MM), ("IMS:1000042", "100", None), ("IMS:1000044", "1", MM)])).unwrap();
-        assert_eq!((area.transformation, area.write.clone()), (Some(AREA_TO_LENGTH), vec![(PIXEL_X, 0.01, false), (PIXEL_Y, 0.01, false)]));
+        assert_eq!((area.transformations.clone(), area.write.clone()), (vec![AREA_TO_LENGTH], vec![(PIXEL_X, 0.01, false), (PIXEL_Y, 0.01, false)]));
         // The index row says which unit that is (its key, `written_um`, predates the mm case).
         assert_eq!(fix_json(&area)["written_um"][0]["unit"], "UO:0000016");
-        assert_eq!(fix_json(&area)["written_um"][1], serde_json::json!({"accession": "IMS:1000047", "value": 0.01, "unit": "UO:0000016", "unit_assumed": false}));
+        assert_eq!(fix_json(&area)["written_um"][1], serde_json::json!({"accession": "IMS:1000047", "value": 0.01, "unit": "UO:0000016", "unit_assumed": false, "unit_from_accession": false}));
         // No unit anywhere: micrometre, and the detail says so.
         let bare = pixel_size_fix(&settings(&[("IMS:1000046", "20", None), ("IMS:1000042", "100", None), ("IMS:1000044", "2000", None)])).unwrap();
-        assert_eq!((bare.transformation, bare.write.clone()), (Some(UNIT_ASSUMED), vec![(PIXEL_X, 20.0, true), (PIXEL_Y, 20.0, true)]));
+        assert_eq!((bare.transformations.clone(), bare.write.clone()), (vec![UNIT_ASSUMED], vec![(PIXEL_X, 20.0, true), (PIXEL_Y, 20.0, true)]));
         assert_eq!(fix_json(&bare)["written_um"][0]["unit"], "UO:0000017");
         assert!(bare.detail.contains("(IMS:1000046, IMS:1000044 without a length unit: micrometre assumed)"), "{}", bare.detail);
         assert!(!mm.detail.contains("assumed"), "{}", mm.detail);
@@ -2013,7 +2343,7 @@ mod tests {
         // A stated unit that is no length (UO:0000186, dimensionless) is tested as µm but kept, as
         // the two-value case keeps it: nothing is declared.
         let odd = pixel_size_fix(&settings(&[("IMS:1000046", "100", Some(("UO:0000186", "dimensionless unit"))), ("IMS:1000042", "3", None), ("IMS:1000044", "300", UM)])).unwrap();
-        assert_eq!((odd.transformation, odd.write.clone()), (None, vec![(PIXEL_X, 100.0, false), (PIXEL_Y, 100.0, false)]));
+        assert_eq!((odd.transformations.clone(), odd.write.clone()), (Vec::<&str>::new(), vec![(PIXEL_X, 100.0, false), (PIXEL_Y, 100.0, false)]));
         assert_eq!(fix_json(&odd)["written_um"][0]["unit"], "UO:0000186");
         assert!(odd.detail.contains("(IMS:1000046 without a length unit: micrometre assumed)"), "{}", odd.detail);
     }
@@ -2021,9 +2351,14 @@ mod tests {
     #[test]
     fn a_unit_accession_that_disagrees_with_its_name_is_reported() {
         let cm = Some(("UO:0000015", "micrometer"));
-        let f = pixel_size_fix(&settings(&[("IMS:1000046", "50", cm), ("IMS:1000047", "50", cm)])).unwrap();
-        assert_eq!(f.transformation, None, "reported, not rewritten");
+        // With an extent the name's reading fits (50 µm × 3 = 150 µm): reported, not rewritten.
+        let extent = [("IMS:1000042", "3", None), ("IMS:1000044", "150", UM), ("IMS:1000043", "2", None), ("IMS:1000045", "100", UM)];
+        let f = pixel_size_fix(&settings(&[&[("IMS:1000046", "50", cm), ("IMS:1000047", "50", cm)], &extent[..]].concat())).unwrap();
+        assert_eq!(f.transformations.clone(), Vec::<&str>::new(), "reported, not rewritten");
         assert_eq!(f.unit_mismatches.len(), 2, "{f:?}");
+        // Without one, nothing tells 50 µm from 50 cm: dropped (owner decision D4).
+        let untested = pixel_size_fix(&settings(&[("IMS:1000046", "50", cm), ("IMS:1000047", "50", cm)])).unwrap();
+        assert_eq!((untested.case, untested.transformations.clone(), untested.write.len()), ("x and y: a unit contradiction nothing tests", vec![DROPPED], 0));
         // Written as micrometre (mzdata took the name): the index row gives that unit, not the
         // stated centimetre accession.
         let mut ss = ScanSettings { id: "s1".into(), ..Default::default() };
@@ -2050,17 +2385,19 @@ mod tests {
         let cm_named_um = Some(("UO:0000015", "micrometer"));
         // Written as 100 µm: a length. By accession (100 cm) it was dropped.
         let kept = one_y("100", cm_named_um);
-        assert_eq!((kept.transformation, kept.write.clone(), kept.write_units.clone()), (None, vec![(PIXEL_Y, 100.0, false)], vec![Some("UO:0000017".into())]));
-        // Written as 0.01 µm: dropped. By accession (0.01 cm × 3 = 300 µm) it passed and was
-        // written as 0.01 µm.
-        assert_eq!(one_y("0.01", cm_named_um).transformation, Some(DROPPED));
-        // The micrometre accession named "millimeter" is written as mm: 100 mm is no 100 µm pixel.
-        assert_eq!(one_y("100", Some(("UO:0000017", "millimeter"))).transformation, Some(DROPPED));
+        assert_eq!((kept.transformations.clone(), kept.write.clone(), kept.write_units.clone()), (Vec::<&str>::new(), vec![(PIXEL_Y, 100.0, false)], vec![Some("UO:0000017".into())]));
+        // 0.01 µm (the name) is no 100 µm pixel; 0.01 cm (the accession) × 3 = 300 µm is: written
+        // as 100 µm from the accession's reading (D4; dropped through 0.17.0-rc.2, when it passed
+        // by accession and was written as 0.01 µm before review B17, then dropped).
+        let by_acc = one_y("0.01", cm_named_um);
+        assert_eq!((by_acc.transformations.clone(), by_acc.write.clone(), by_acc.write_units.clone()), (vec![UNIT_FROM_ACCESSION], vec![(PIXEL_Y, 100.0, true)], vec![Some("UO:0000017".into())]));
+        // The micrometre accession named "millimeter": 100 mm is no 100 µm pixel, 100 µm is.
+        assert_eq!(one_y("100", Some(("UO:0000017", "millimeter"))).write, vec![(PIXEL_Y, 100.0, true)]);
         // A unit stated by its name alone is a unit: 0.1 mm, kept in mm, nothing assumed.
         let mut s = settings(&[("IMS:1000047", "0.1", Some(("", "millimeter"))), ("IMS:1000043", "3", None), ("IMS:1000045", "300", UM)]);
         s.params[0].unit_accession = None;
         let by_name = pixel_size_fix(&s).unwrap();
-        assert_eq!((by_name.transformation, by_name.write.clone(), by_name.write_units), (None, vec![(PIXEL_Y, 0.1, false)], vec![Some("UO:0000016".into())]));
+        assert_eq!((by_name.transformations.clone(), by_name.write.clone(), by_name.write_units), (Vec::<&str>::new(), vec![(PIXEL_Y, 0.1, false)], vec![Some("UO:0000016".into())]));
         // So is it for x and y: kept as stated, no micrometre over it.
         let mut xy = settings(&[("IMS:1000046", "0.1", Some(("", "millimeter"))), ("IMS:1000047", "0.1", Some(("", "millimeter")))]);
         xy.params.iter_mut().for_each(|p| p.unit_accession = None);
@@ -2094,8 +2431,9 @@ mod tests {
         let fix = PixelSizeFix {
             settings_id: "s1".into(),
             case: "area",
-            transformation: Some(AREA_TO_LENGTH),
+            transformations: vec![AREA_TO_LENGTH],
             write: vec![(PIXEL_X, 10.0, true)],
+            by_accession: vec![],
             single: false,
             write_units: vec![],
             unit_mismatches: vec![],
@@ -2114,7 +2452,7 @@ mod tests {
         in_mm.params.push(Param::builder().name("pixel size x").curie(mzdata::curie!(IMS:1000046)).value(0.0001).unit(Unit::Millimeter).build());
         apply(&PixelSizeFix { write: vec![(PIXEL_X, 0.01, false)], ..fix.clone() }, &mut in_mm);
         assert_eq!((in_mm.params[0].value.to_f64().unwrap(), in_mm.params[0].unit), (0.01, Unit::Millimeter));
-        let drop = PixelSizeFix { write: vec![], transformation: Some(DROPPED), ..fix };
+        let drop = PixelSizeFix { write: vec![], transformations: vec![DROPPED], ..fix };
         apply(&drop, &mut ss);
         assert!(ss.params.iter().all(|p| p.curie().unwrap().to_string() != "IMS:1000046"));
     }
@@ -2149,12 +2487,12 @@ mod tests {
         // 50 µm, a length with its unit: nothing declared, the value untouched (still the integer
         // the source wrote), renamed, and given as y too.
         let length = pixel_size_fix(&settings(&[&[("IMS:1000046", "50", UM)], &grid[..]].concat())).unwrap();
-        assert_eq!(length.transformation, None);
+        assert_eq!(length.transformations.clone(), Vec::<&str>::new());
         let mut ss = source("50", Unit::Micrometer);
         apply(&length, &mut ss);
         assert_eq!(named(&ss)[1..3], named(&{ let mut a = source("2500", Unit::Unknown); apply(&area, &mut a); a })[1..3]);
         assert_eq!((ss.params[1].value.clone(), ss.params[2].value.clone()), (50i64.into(), 50i64.into()));
-        let marker = |s: &ScanSettings, lone_x| marker_block(Some(s), COUNTS_DECLARED, lone_x, serde_json::json!({}));
+        let marker = |s: &ScanSettings, lone_x| marker_block(Some(s), COUNTS_DECLARED, lone_x, SOURCE_DECLARED, serde_json::json!({}));
         assert_eq!(marker(&ss, LoneX::XOnly)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 50.0}), "both are written");
         // A lone y says nothing about x: kept alone, renamed.
         let lone_y = pixel_size_fix(&settings(&[("IMS:1000047", "50", UM), ("IMS:1000043", "2", None), ("IMS:1000045", "100", UM)])).unwrap();
@@ -2183,6 +2521,141 @@ mod tests {
         assert_eq!(marker(&lone, LoneX::AlsoY)["pixel_size_um"], serde_json::json!({"x": 50.0, "y": 50.0}));
         lone.params[0].unit = Unit::Unknown;
         assert!(marker(&lone, LoneX::AlsoY).get("pixel_size_um").is_none(), "no unit, no micrometres");
+    }
+
+    /// Owner decision D4 (2026-10-01): a pixel-size param whose unit accession and unit name
+    /// disagree is read both ways against count × max dimension. The name's reading is tried first
+    /// (kept as it was); when only the accession's passes, the value is written in micrometres from
+    /// the accession's unit and declared; neither passing, or nothing to test against (the issue
+    /// author's `pixel_size_unit_contradiction` fixture), drops it.
+    #[test]
+    fn a_unit_contradiction_is_read_both_ways_against_the_extent() {
+        let cm_named_um = Some(("UO:0000015", "micrometer"));
+        let grid = [("IMS:1000042", "3", None), ("IMS:1000044", "150", UM)];
+        let one = |v: &str| pixel_size_fix(&settings(&[&[("IMS:1000046", v, cm_named_um)], &grid[..]].concat())).unwrap();
+        // 50 "micrometer" × 3 = 150 µm: the name's reading passes, as before.
+        let by_name = one("50");
+        assert_eq!((by_name.case, by_name.transformations.clone(), by_name.write.clone()), ("one value: a length (value × count = extent)", vec![], vec![(PIXEL_X, 50.0, false), (PIXEL_Y, 50.0, false)]));
+        assert_eq!(by_name.source(), SOURCE_DECLARED);
+        // 0.005 cm × 3 = 150 µm: the checker's variant v9, dropped through rc.2; now the accession's
+        // reading, written as 50 µm and declared.
+        let by_acc = one("0.005");
+        assert_eq!(by_acc.case, "one value: a length (value × count = extent), by its unit accession");
+        assert_eq!(by_acc.transformations.clone(), vec![UNIT_FROM_ACCESSION]);
+        assert_eq!(by_acc.write, vec![(PIXEL_X, 50.0, true), (PIXEL_Y, 50.0, true)]);
+        assert_eq!(by_acc.by_accession, vec![PIXEL_X, PIXEL_Y]);
+        assert_eq!(by_acc.source(), SOURCE_DECLARED);
+        let row = fix_json(&by_acc);
+        assert_eq!(row["transformations"], serde_json::json!([UNIT_FROM_ACCESSION]));
+        assert_eq!(row["transformation"], UNIT_FROM_ACCESSION);
+        assert_eq!(row["written_um"][0], serde_json::json!({"accession": PIXEL_X, "value": 50.0, "unit": "UO:0000017", "unit_assumed": false, "unit_from_accession": true}));
+        assert!(by_acc.detail.contains("0.005 centimeter × 3 = 150 micrometer") && by_acc.detail.contains("written as 50 micrometer"), "{}", by_acc.detail);
+        // An area by accession: √(0.000025 cm²) = 0.005 cm; × 3 = 150 µm.
+        let area = one("0.000025");
+        assert_eq!(area.transformations.clone(), vec![AREA_TO_LENGTH, UNIT_FROM_ACCESSION]);
+        assert!((area.write[0].1 - 50.0).abs() < 1e-9 && area.write[0].2, "{:?}", area.write);
+        assert_eq!(area.source(), SOURCE_FROM_AREA);
+        // Neither reading: dropped, the detail naming both.
+        let neither = one("7");
+        assert_eq!((neither.transformations.clone(), neither.write.len(), neither.source()), (vec![DROPPED], 0, SOURCE_UNKNOWN));
+        assert!(neither.detail.contains("neither as micrometer (the unit name) nor as centimeter (the unit accession)"), "{}", neither.detail);
+        // Nothing to test against: dropped (Theodoros's pixel_size_unit_contradiction).
+        let untestable = pixel_size_fix(&settings(&[("IMS:1000046", "50", cm_named_um)])).unwrap();
+        assert_eq!((untestable.case, untestable.transformations.clone()), ("one value, untestable", vec![DROPPED]));
+        // x and y both stated: each axis read both ways on its own extent.
+        let xy = [("IMS:1000042", "3", None), ("IMS:1000043", "2", None), ("IMS:1000044", "150", UM), ("IMS:1000045", "100", UM)];
+        let both = |x: &str, y: &str| pixel_size_fix(&settings(&[&[("IMS:1000046", x, cm_named_um), ("IMS:1000047", y, cm_named_um)], &xy[..]].concat()));
+        let f = both("50", "50").unwrap();
+        assert!(f.transformations.is_empty() && f.extent_mismatches.is_empty() && !f.unit_mismatches.is_empty(), "{f:?}");
+        let f = both("0.005", "0.005").unwrap();
+        assert_eq!((f.case, f.transformations.clone()), ("x and y with a unit; one read by its unit accession", vec![UNIT_FROM_ACCESSION]));
+        assert_eq!(f.write, vec![(PIXEL_X, 50.0, true), (PIXEL_Y, 50.0, true)]);
+        assert_eq!(f.source(), SOURCE_DECLARED);
+        let mixed = both("50", "0.005").unwrap();
+        assert_eq!((mixed.write.clone(), mixed.by_accession.clone()), (vec![(PIXEL_X, 50.0, false), (PIXEL_Y, 50.0, true)], vec![PIXEL_Y]));
+        assert_eq!(fix_json(&mixed)["written_um"][1]["unit_from_accession"], true);
+        let f = both("7", "50").unwrap();
+        assert_eq!((f.case, f.transformations.clone(), f.write.len()), ("x and y: a unit contradiction that passes under neither reading", vec![DROPPED], 0));
+        // A plain unit without a contradiction keeps today's report: written as stated, the axis listed.
+        let plain = pixel_size_fix(&settings(&[&[("IMS:1000046", "7", UM), ("IMS:1000047", "50", UM)], &xy[..]].concat())).unwrap();
+        assert_eq!((plain.transformations.len(), plain.extent_mismatches.len(), plain.write.len()), (0, 1, 2));
+        // Applying the accession's reading writes 50 µm over the stated 0.005 (held as µm, by the name).
+        let mut ss = ScanSettings { id: "s1".into(), ..Default::default() };
+        ss.params.push(Param::builder().name("pixel size").curie(mzdata::curie!(IMS:1000046)).value(0.005).unit(Unit::Micrometer).build());
+        apply(&by_acc, &mut ss);
+        let written: Vec<(String, f64, Unit)> = ss.params.iter().map(|p| (p.curie().unwrap().to_string(), p.value.to_f64().unwrap(), p.unit)).collect();
+        assert_eq!(written, [("IMS:1000046".to_string(), 50.0, Unit::Micrometer), ("IMS:1000047".to_string(), 50.0, Unit::Micrometer)]);
+    }
+
+    /// `--pixel-size`, the lanes' one rule on a grid entry: fills an unsized grid (max dimension
+    /// from the counts), leaves an agreeing size alone, fills the axis a lone x leaves open, refuses
+    /// a differing size naming both, and writes over it under --force with the max dimension
+    /// recomputed; the marker says `user_supplied`, and `unknown` of any grid without a size.
+    #[test]
+    fn a_user_pixel_size_fills_only_what_the_source_leaves_unsettled() {
+        let user = |x: f64, y: f64, force: bool| UserPixelSize { x, y, force };
+        let count = |acc, name: &str, n: i64| Param::builder().name(name).curie(acc).value(n).build();
+        let size = |acc, name: &str, v: f64, unit| Param::builder().name(name).curie(acc).value(v).unit(unit).build();
+        let values = |s: &ScanSettings| s.params.iter().map(|p| (p.curie().unwrap().to_string(), p.value.to_f64().unwrap(), p.unit)).collect::<Vec<_>>();
+        let mut counted = ScanSettings { id: "g".into(), ..Default::default() };
+        counted.params.push(count(mzdata::curie!(IMS:1000042), "max count of pixels x", 260));
+        counted.params.push(count(mzdata::curie!(IMS:1000043), "max count of pixels y", 134));
+        let marker = |g: &ScanSettings, source: &str| marker_block(Some(g), COUNTS_DECLARED, LoneX::XOnly, source, serde_json::json!({}));
+        assert_eq!(marker(&counted, SOURCE_DECLARED)["pixel_size_source"], "unknown", "no size, whatever the lane says");
+        // Unsized: both sizes and both max dimensions written.
+        let mut g = counted.clone();
+        let row = apply_user_pixel_size(&mut g, &user(10.0, 10.0, false), "the test").unwrap().unwrap();
+        assert_eq!(values(&g)[2..], [("IMS:1000046".into(), 10.0, Unit::Micrometer), ("IMS:1000047".into(), 10.0, Unit::Micrometer), ("IMS:1000044".into(), 2600.0, Unit::Micrometer), ("IMS:1000045".into(), 1340.0, Unit::Micrometer)]);
+        assert_eq!((&row["transformation"], &row["overridden"], row["stated"].as_array().unwrap().len()), (&serde_json::json!(USER_SUPPLIED), &serde_json::json!(false), 0));
+        assert_eq!(row["max_dimension"].as_array().unwrap().len(), 2, "{row:#}");
+        assert_eq!(pixel_size_um(&g), Some((10.0, 10.0)));
+        let m = marker(&g, SOURCE_USER_SUPPLIED);
+        assert_eq!((&m["pixel_size_um"], &m["pixel_size_source"]), (&serde_json::json!({"x": 10.0, "y": 10.0}), &serde_json::json!("user_supplied")));
+        // Without counts: the sizes alone.
+        let mut bare = ScanSettings { id: "g".into(), ..Default::default() };
+        apply_user_pixel_size(&mut bare, &user(10.0, 20.0, false), "the test").unwrap().unwrap();
+        assert_eq!(values(&bare), [("IMS:1000046".into(), 10.0, Unit::Micrometer), ("IMS:1000047".into(), 20.0, Unit::Micrometer)]);
+        // A stated size that agrees (in mm, to 1e-6): nothing written, no row.
+        let mut stated = counted.clone();
+        stated.params.push(size(mzdata::curie!(IMS:1000046), "pixel size (x)", 0.01, Unit::Millimeter));
+        stated.params.push(size(mzdata::curie!(IMS:1000047), "pixel size y", 0.01, Unit::Millimeter));
+        let before = stated.clone();
+        assert!(apply_user_pixel_size(&mut stated, &user(10.0, 10.0, false), "the test").unwrap().is_none());
+        assert_eq!(stated.params, before.params);
+        // A differing one: refused naming both; --force writes over it and recomputes the max
+        // dimension it states.
+        let e = apply_user_pixel_size(&mut stated, &user(20.0, 20.0, false), "the test").unwrap_err().to_string();
+        assert!(e.contains("--pixel-size 20 µm") && e.contains("the test states a pixel size that differs") && e.contains("pixel size (x) (IMS:1000046) = 10 µm") && e.contains("--force"), "{e}");
+        assert_eq!(stated.params, before.params, "refused: untouched");
+        stated.params.push(size(mzdata::curie!(IMS:1000044), "max dimension x", 2.6, Unit::Millimeter));
+        let row = apply_user_pixel_size(&mut stated, &user(20.0, 20.0, true), "the test").unwrap().unwrap();
+        assert_eq!(values(&stated)[2..], [("IMS:1000046".into(), 20.0, Unit::Micrometer), ("IMS:1000047".into(), 20.0, Unit::Micrometer), ("IMS:1000044".into(), 5200.0, Unit::Micrometer), ("IMS:1000045".into(), 2680.0, Unit::Micrometer)]);
+        assert_eq!((&row["overridden"], row["stated"].as_array().unwrap().len()), (&serde_json::json!(true), 2));
+        assert!(row["stated"][0]["value"].as_str().unwrap().contains("0.01"), "{row:#}");
+        // A lone x that agrees: the y is filled, the x untouched.
+        let mut lone = counted.clone();
+        lone.params.push(size(mzdata::curie!(IMS:1000046), "pixel size (x)", 50.0, Unit::Micrometer));
+        let row = apply_user_pixel_size(&mut lone, &user(50.0, 100.0, false), "the test").unwrap().unwrap();
+        assert_eq!(values(&lone)[2..4], [("IMS:1000046".into(), 50.0, Unit::Micrometer), ("IMS:1000047".into(), 100.0, Unit::Micrometer)]);
+        assert_eq!(row["written_um"].as_array().unwrap().len(), 1);
+        assert!(row["detail"].as_str().unwrap().contains("states one axis, which agrees"), "{}", row["detail"]);
+        // A lone x that disagrees is a contradiction like any other.
+        let mut lone = counted.clone();
+        lone.params.push(size(mzdata::curie!(IMS:1000046), "pixel size (x)", 50.0, Unit::Micrometer));
+        assert!(apply_user_pixel_size(&mut lone, &user(20.0, 20.0, false), "the test").is_err());
+        // A stated size that is no length in µm (zero) is a contradiction too, named as stated.
+        let mut zero = counted.clone();
+        zero.params.push(size(mzdata::curie!(IMS:1000046), "pixel size (x)", 0.0, Unit::Micrometer));
+        let e = apply_user_pixel_size(&mut zero, &user(20.0, 20.0, false), "the test").unwrap_err().to_string();
+        assert!(e.contains("= 0 UO:0000017"), "{e}");
+        // Parsing.
+        assert_eq!(UserPixelSize::parse("10", false).unwrap(), user(10.0, 10.0, false));
+        assert_eq!(UserPixelSize::parse(" 10 , 20.5 ", true).unwrap(), user(10.0, 20.5, true));
+        for bad in ["", "0", "-5", "abc", "1,2,3", "10,", "inf", "nan"] {
+            assert!(UserPixelSize::parse(bad, false).is_err(), "{bad:?}");
+        }
+        assert_eq!(user(10.0, 10.0, false).text(), "10 µm");
+        assert_eq!(user(10.0, 20.0, false).text(), "10 × 20 µm");
     }
 
     /// The obsolete integer type terms become the PSI-MS ones, `cvRef` with them, in place: the
@@ -2301,7 +2774,7 @@ mod tests {
             s.add_param(size("pixel size y", mzdata::curie!(IMS:1000047), y));
             s
         };
-        let marker = |s: &ScanSettings| marker_block(Some(s), COUNTS_DECLARED, LoneX::AlsoY, serde_json::json!({}));
+        let marker = |s: &ScanSettings| marker_block(Some(s), COUNTS_DECLARED, LoneX::AlsoY, SOURCE_DECLARED, serde_json::json!({}));
         let um = serde_json::json!({"x": 100.0, "y": 50.0});
         for (x, y, unit) in [(100.0, 50.0, Unit::Micrometer), (0.1, 0.05, Unit::Millimeter), (100000.0, 50000.0, Unit::Nanometer), (0.01, 0.005, Unit::Centimeter)] {
             assert_eq!(marker(&grid(x, y, unit))["pixel_size_um"], um, "{x} {unit:?}");
@@ -2317,7 +2790,7 @@ mod tests {
     fn x_and_y_that_are_not_both_positive_are_dropped() {
         for (x, y) in [("0", "-100"), ("100", "0"), ("-5", "5")] {
             let f = pixel_size_fix(&settings(&[("IMS:1000046", x, UM), ("IMS:1000047", y, UM)])).unwrap();
-            assert_eq!((f.case, f.transformation, f.write.len()), ("x and y not both positive", Some(DROPPED), 0), "{x} {y}");
+            assert_eq!((f.case, f.transformations.clone(), f.write.len()), ("x and y not both positive", vec![DROPPED], 0), "{x} {y}");
         }
     }
 }

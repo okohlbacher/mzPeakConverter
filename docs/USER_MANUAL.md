@@ -134,7 +134,8 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `--no-mz-lattice` | off | Keep exact f64 m/z for centroid lists that sit on a fixed-point **lattice** (Shimadzu `MassHigh`, the LabSolutions mzML export) instead of the reference implementation's fitted linear grid — on every lane, the native Shimadzu `.lcd` one included (`MZPC_NO_MZ_LATTICE=1` does the same from the environment). Use it when the centroid m/z must survive to the last bit rather than to 1e-6 Da (§9). Data that is not on a lattice is unaffected either way |
 | `--chunk-size <CHUNK_SIZE>` | `50` | m/z chunk width (Th) for the chunked layout |
 | `--zstd-level <ZSTD_LEVEL>` | `3` (timsTOF ims-compact lanes: `22`) | Zstd compression level (1–22). The ims-compact lanes default to 22: their archives are written once and read many times, and 22 is 1.4 % smaller than 5 on PXD059079's 2485.d. An explicit value applies to every lane (§9) |
-| `-f, --force` | off | Overwrite the output if it already exists |
+| `-f, --force` | off | Overwrite the output if it already exists; with `--pixel-size`, also write the supplied size over one the source states |
+| `--pixel-size <X[,Y]>` | — | **Imaging runs only:** the pixel size in micrometres, `X` for square pixels or `X,Y`, written into the grid (`IMS:1000046/47`, with `IMS:1000044/45` from the pixel counts) when the source settles none — an imzML or mzML whose header states no size or one the pixel-size rule drops (§8), a Bruker MALDI `.d` without a FlexImaging `.mis` raster step or a beam scan size, the missing axis of a Waters single row, or an existing `.mzpeak` archive (§4.2: the archive gains the size). A size the source does state is kept when it agrees (to 1e-6) and is an **error naming both values** when it differs; with `--force` the supplied size is written over it and a stated max dimension is recomputed from the counts. Declared `imaging:pixel-size-user-supplied`, recorded as a row of `imaging_pixel_size` (the stated values, whether written over, the max dimensions written) and in `metadata.imaging` as `pixel_size_source: user_supplied` and `provenance.pixel_size: user supplied (--pixel-size)`. Refused (exit 1) on an mzML output, on a run or archive that is not imaging, and when malformed (zero, negative, not a number, more than two values). Config key `pixel_size` (§5) |
 | `--no-ims-compact` | off | Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and write standard f64 m/z instead |
 | `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum (Shimadzu `.lcd` does). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written. Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) |
 | `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: 50-Th chunks (`--chunk-size` overrides the width) on the reference implementation's chunk grid — every chunk row keeps its real m/z bounds (page-prunable: m/z window queries read only the chunks they need) and its points as integer TOF bins and TIMS scan numbers under the frame's own vendor calibration models (§9). Passing the flag explicitly is inert and says so |
@@ -172,9 +173,9 @@ are `dropped_flags_for` and `inert_flags_for` in `src/main.rs`:
 | Lane (how it is selected) | Refused (exit 1) | Warned; the run goes on |
 |---|---|---|
 | `.mzpeak` → `.mzpeak` filter (§4.2) | — | `--layout --no-numpress --keep-zero-runs --no-mz-lattice --chunk-size --no-ims-compact --representation --ims-chunked --no-ims-grid --bruker-sdk --no-tims-recalibration --no-chromatograms --aux --tof-grid --agilent-grid --via-msconvert --msconvert-path` (the filter re-packs Parquet members verbatim, so `--zstd-level 12` cannot change the output). `--ims-grid` is NOT a filter: it rewrites the timsTOF peaks facet into the grid layout (`--zstd-level` and `--grid-encoding` apply to that facet) and copies everything else |
-| `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux` | the filter lane's list without `--aux` |
-| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --keep-zero-runs --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --ims-grid --grid-encoding --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
-| `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert --keep-zero-runs` (the reader leaves the zero samples out itself, `agilent:drop-zero-samples`) | `--layout --no-numpress --chunk-size` |
+| `.mzpeak` → mzML export (§4.1) | `--image --sdrf --aux --pixel-size` (an mzML has no transformations list to declare a supplied size in) | the filter lane's list without `--aux` |
+| `--to mzml` / `-o x.mzML` from a raw or exchange format (§4.1) | `--image --sdrf --aux --bruker-sdk --pixel-size` (the export runs before the SDK backend is chosen, so it never uses it) | `--layout --no-numpress --keep-zero-runs --no-mz-lattice --chunk-size --zstd-level --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --ims-grid --grid-encoding --no-tims-recalibration --no-chromatograms --tof-grid --agilent-grid` |
+| `--agilent-grid` on a profile `.d` | `--image --sdrf --via-msconvert --keep-zero-runs --pixel-size` (the reader leaves the zero samples out itself, `agilent:drop-zero-samples`; a profile `.d` is no imaging run) | `--layout --no-numpress --chunk-size` |
 | `--via-msconvert` | `--aux` (the intermediate mzML is the source, so no vendor side-file of the original input can be embedded) and `--bruker-sdk --no-ims-compact --ims-chunked --no-ims-chunked --no-ims-grid --grid-encoding --no-tims-recalibration` (msconvert is chosen before any native backend); `--image` / `--sdrf` ARE embedded since 0.9.13 | — |
 | `--bruker-sdk` on a TDF (ims-compact) | `--image --sdrf --no-tims-recalibration` (the SDK lane's 1/K0 comes from the vendor's own scan→1/K0 model) | `--layout --no-numpress --keep-zero-runs` |
 | `--bruker-sdk` on a TSF, or a TDF with `--no-ims-compact` | `--image --sdrf --ims-chunked --no-ims-chunked --no-tims-recalibration` | — |
@@ -567,6 +568,7 @@ drop_aux:                  # .mzpeak input only                     (0.9.13)
 verbose: 0                 # 1 = -v, 2 = -vv                        (0.9.13)
 quiet: false               #                                        (0.9.13)
 sample: 2                  # SciEX .wiff with several samples, §4
+pixel_size: 10             # imaging runs: µm, X or "X,Y" or [X, Y]; --force on the command line still folds in (§4)
 ```
 
 ```sh
@@ -796,9 +798,17 @@ declared `imaging:pixel-count-from-positions` when the input states none, raised
 on the Bruker and Waters lanes), `pixel_size_um` (when both axes have a positive size in a length
 unit: always in micrometres, converted where the grid states nanometres, millimetres or centimetres,
 which stay as stated in `scan_settings_list`; a lone `IMS:1000046` the source
-states gives both, as the vocabulary defines it) and a `provenance` record of what was detected and
-where each value came from: `pixel_size` (`as stated`, `none stated`, or `checked, see
-imaging_pixel_size`), and on the imzML and mzML lanes `time` — `as stated` when every spectrum
+states gives both, as the vocabulary defines it), `pixel_size_source` — how that size was settled,
+one of `declared` (the source states it, with a unit: an imzML's two terms, a `.mis` raster step, a
+Waters method's step on both axes), `unit_assumed` (stated without a unit, taken as micrometre),
+`derived_from_area` (a single old-style "pixel size" area, written as its square root),
+`user_supplied` (`--pixel-size`, §4), `derived_from_positions` (a Waters step fitted to the laser
+positions), `derived_from_beam_size` (a Bruker run's beam scan size), or `unknown` whenever the marker
+states no `pixel_size_um` (nothing stated, dropped, a Waters single row, an mzML's untested lone
+`IMS:1000046`); the issue author's four values are his, the other three are this converter's,
+proposed for spec PR #25 — and a `provenance` record of what was detected and
+where each value came from: `pixel_size` (`as stated`, `none stated`, `checked, see
+imaging_pixel_size`, or `user supplied (--pixel-size)`), and on the imzML and mzML lanes `time` — `as stated` when every spectrum
 states `MS:1000016`, `stated on N of M spectra; the others are stored as 0` when only some do
 (counted in the source: a stated 0 and no time read alike once stored), or `not stated by the
 source; index is the source list order` when none does (every time is then stored as 0, no
@@ -825,8 +835,15 @@ name, which then overrides the accession, else its unit accession), micrometre w
 unit: it is an area when `√value × count = extent` and written as its square root, in the unit the
 area is the square of, a length when `value × count = extent`, and otherwise dropped — `one value,
 untestable` when the header lacks the count or the max dimension to test it against, which the row's
-detail names), each action
-declared and listed in the `imaging_pixel_size` index block together with any unit accession that
+detail names; a value whose unit accession and unit name disagree — `UO:0000015`, centimetre, named
+"micrometer" in 31 of 479 public headers — is read both ways, the name's reading first and then the
+accession's, each against the extent: the reading that passes is written, in micrometres and declared
+`imzml:pixel-size-unit-from-accession` when it is the accession's (0.005 cm × 3 = 150 µm is a 50 µm
+pixel; through 0.17.0-rc.2 only the name's reading was tested and that value was dropped), and a
+value neither reading fits, or that no extent tests — the issue author's `unit_contradiction` fixture
+— is dropped, whether stated alone or with the other axis), each action
+declared and listed in the `imaging_pixel_size` index block (each row's `transformations` lists all
+it declares, `transformation` the first) together with any unit accession that
 disagrees with its unit name; and the obsolete "one way" is written as flyback. A single
 `IMS:1000046` the rule keeps is written under the vocabulary's names as both `IMS:1000046` ("pixel
 size (x)") and `IMS:1000047` ("pixel size y"), same value and unit: the vocabulary defines
@@ -888,7 +905,14 @@ A **Waters imaging** `.raw` (MALDI or DESI; Windows, MassLynx) states each scan'
 in mm (MassLynx scan items "Laser Aim X/Y Position"), not a pixel: the converter fits a grid to them
 and writes the grid index, declared (`waters:laser-position-fitted-to-grid`), with the fit (origin,
 step and its source, count, largest residual) in the `waters_imaging` block and each axis's step as
-its pixel size. The step is the one the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`,
+its pixel size (`pixel_size_source: declared` when both steps are the method's, `derived_from_positions`
+when either was fitted), with `IMS:1000053/54` (absolute position offset, µm) on each axis with a
+step: the image's top-left corner on the stage, `(origin − step / 2) × 1000` — the edge of pixel 1,
+half a step before its centre (a Bruker run's stage offset is unknown and written nowhere). A single
+row has an x step and no y step of its own: the grid states `IMS:1000046` alone, which the IMS
+vocabulary reads as the y size too; the marker writes no `pixel_size_um` (`pixel_size_source:
+unknown`), and `waters_imaging.y.step_source` records `vocabulary default of x: a single row, not
+measured` (`--pixel-size` fills the y where its x agrees, §4). The step is the one the method declares (`methodfile.xml` `DesiXStep`/`DesiYStep`,
 any `…XStep`/`…YStep`) when the positions lie within a quarter step of it. Otherwise the positions
 must lie on an exact lattice, as the stage's set points do: positions within 1 µm are one, and the
 step is the largest gap between neighbouring distinct positions (3 µm or more) whose lattice, laid
@@ -1205,6 +1229,8 @@ The vocabulary:
 | `imzml:pixel-size-area-to-length` | a single imzML pixel size tested as an area (`√value × count = extent`) and was written as its square root, in the unit the area is the square of (micrometre when no length unit is stated) | imzML |
 | `imzml:pixel-size-dropped` | an imzML pixel size tested as neither area nor length, was not numeric, or (x and y both stated) was zero or negative on an axis, and was not written | imzML |
 | `imzml:unit-accession-replaced-by-name` | a pixel-size or extent param's unit accession and unit name disagreed and the unit written is not the stated accession (mzdata takes the unit name when it names a unit mzdata knows, whatever the attribute order) | imzML |
+| `imzml:pixel-size-unit-from-accession` | a pixel-size param's unit accession and unit name disagreed (`UO:0000015`, centimetre, named "micrometer") and only the accession's reading passed the extent test (`value × count = max dimension`, or `√value × count` for an area): the value was written in micrometres from the accession's unit. The name's reading is tried first and kept as it was when it passes; neither passing, or no extent to test against, drops the size (`imzml:pixel-size-dropped`) (§8, imaging) | imzML |
+| `imaging:pixel-size-user-supplied` | the pixel size is the one `--pixel-size` supplied (§4): written where the source settled none (the max dimension from the pixel counts), or — under `--force` — over a stated size that differed, which the `imaging_pixel_size` row records (`stated`, `overridden`) | imzML, mzML with `IMS:1000050/51`, Bruker MALDI, native Waters `.raw` with laser positions, `.mzpeak` rewrite (§4.2) |
 | `imzml:one-way-as-flyback` | the obsolete scan term "one way" (`IMS:1000411`) was written as its stated replacement, flyback (`IMS:1000413`) | imzML |
 | `imzml:obsolete-integer-type-as-psi-ms` | a binary array's data type was declared with the imaging vocabulary's obsolete `IMS:1000141` ("32-bit integer") or `IMS:1000142` ("64-bit integer") and was read as `MS:1000519` / `MS:1000522`, the PSI-MS terms that replaced them; the values are the ones the `.ibd` holds | imzML |
 | `imzml:ibd-checksum-mismatch` | the `.ibd` does not hash to a checksum the header states (`IMS:1000090/91/92`). The stated value is kept in `file_description`; `metadata.imaging.provenance.ibd_checksum_found` holds the hash found, and the `.ibd`'s `source_files` entry its SHA-1 (§8, imaging) | imzML |
