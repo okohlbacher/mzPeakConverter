@@ -274,8 +274,8 @@ fn the_direct_mzml_lane_writes_the_sources_arrays() {
 /// centroid spectrum's own arrays — exports them as stored. The reader's peak list holds a 32-bit
 /// float, so the export of an archive holding 15.1 wrote 15.100000381 (0.17.0-rc.1, and each wave-4
 /// unit on its own). A default archive stores such a spectrum's float32 peak-set values and says so
-/// when it is converted (`intensity-f32-rounding`); its export writes what it stores, at the type
-/// of the column, which the sampled spectra decide together.
+/// when it is converted (`intensity-f32-rounding`); its export writes what it stores, as the
+/// 32-bit floats of the peak column.
 #[test]
 fn a_lossless_archive_exports_its_64_bit_intensities() {
     // The fixture's first intensity array (15.0, 14.0, … as 64-bit floats), and the same plus 0.1.
@@ -305,12 +305,10 @@ fn a_lossless_archive_exports_its_64_bit_intensities() {
     assert!(log.contains("15 intensities are stored as the nearest float32") && log.contains("intensity-f32-rounding"), "{log}");
     convert(&archive, &export, &[], &[]);
     let got = arrays_of(&export);
-    // The peak facet's column is sampled from every spectrum, the fixture's profile scan=20 (64-bit
-    // intensities, routed to the data facet) included, so it is a float64 that holds the centroid
-    // spectra's float32 peak-set values, as a profile-first file's always was; through 0.17.0-rc.2
-    // the first sampled type won, here the float32 of scan=19's peak set. The export writes what
-    // the archive stores: the rounded values, as 64-bit floats.
-    assert_eq!(got[0]["IntensityArray"], (BinaryDataArrayType::Float64, want[0]["IntensityArray"].1.iter().map(|v| *v as f32 as f64).collect()));
+    // The peak facet's column is typed from the centroid spectra alone (scan=19's float32 peak
+    // set), not from the fixture's profile scan=20 with 64-bit intensities, which is stored in the
+    // data facet: a float32, holding the rounded values, which the export writes as 32-bit floats.
+    assert_eq!(got[0]["IntensityArray"], (BinaryDataArrayType::Float32, want[0]["IntensityArray"].1.iter().map(|v| *v as f32 as f64).collect()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

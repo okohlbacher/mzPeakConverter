@@ -716,8 +716,9 @@ fn stored_intensities(archive: &Path, name: &str) -> (DataType, Vec<f64>) {
 /// is another number: the conversion says so (`intensity-f32-rounding`, mirrored into the
 /// processing method), the facet's `intensity_values_rounded` counts the values, and a warning
 /// gives the count. Through 0.17.0-rc.1 `transformations` was empty for it, and where the peak
-/// facet's column is a float64 (profile spectra first in the file: the schema is sampled from
-/// them) the block showed nothing either — float64 in, float64 out, every value rounded.
+/// facet's column was a float64 (profile spectra first in the file: through rc.2 the peak facet's
+/// schema was sampled from their arrays) the block showed nothing either — float64 in, float64
+/// out, every value rounded.
 #[test]
 fn centroid_intensities_no_float32_holds_are_declared_and_counted() {
     let dir = scratch("f32-rounding");
@@ -796,8 +797,9 @@ fn centroid_intensities_no_float32_holds_are_declared_and_counted() {
     }
 
     // Profile spectra first, centroid ones after, all with 64-bit intensities, as an mzML: the
-    // peak facet's intensity column is a float64 (sampled from the profile arrays) and holds the
-    // float32-rounded values of the centroid spectra. The block alone reads float64 → float64.
+    // peak facet's intensity column is a float32 all the same — typed from the centroid spectra it
+    // stores, not from the profile arrays, which typed it float64 through rc.2 — and holds the
+    // float32-rounded values of the centroid spectra, counted and declared.
     let mixed = dir.join("mixed.mzML");
     let profile: Vec<(Vec<f64>, Vec<f64>)> = (0..3).map(|_| ((0..300).map(|i| 200.0 + 0.01 * f64::from(i)).collect(), intensities(&mut rng, 300, false))).collect();
     let centroid: Vec<(Vec<f64>, Vec<f64>)> = (0..3).map(|_| (mz(&mut rng, 50), intensities(&mut rng, 50, false))).collect();
@@ -807,11 +809,11 @@ fn centroid_intensities_no_float32_holds_are_declared_and_counted() {
     let facet = metadata(&out)["fidelity"]["spectra_peaks"].clone();
     let rounded = centroid.iter().flat_map(|(_, it)| it).filter(|x| f64::from(**x as f32) != **x).count() as u64;
     assert_eq!(rounded, 150);
-    assert_eq!((&facet["source_types"]["intensity"], &facet["stored_types"]["intensity"]), (&serde_json::json!(["float64"]), &"float64".into()), "{facet}");
+    assert_eq!((&facet["source_types"]["intensity"], &facet["stored_types"]["intensity"]), (&serde_json::json!(["float64"]), &"float32".into()), "{facet}");
     assert_eq!(facet["intensity_values_rounded"].as_u64(), Some(rounded), "{facet}");
     assert!(transformations(&out).contains(&"intensity-f32-rounding".to_string()), "{:?}", transformations(&out));
     let (dtype, stored) = stored_intensities(&out, "spectra_peaks.parquet");
-    assert_eq!(dtype, DataType::Float64);
+    assert_eq!(dtype, DataType::Float32);
     assert_eq!(stored, centroid.iter().flat_map(|(_, it)| it.iter().map(|x| f64::from(*x as f32))).collect::<Vec<_>>());
     // The profile arrays keep their 64-bit values, and are not counted.
     assert!(metadata(&out)["fidelity"]["spectra_data"].get("intensity_values_rounded").is_none());
@@ -1194,6 +1196,64 @@ fn an_integer_array_of_another_type_after_the_sampled_spectra_is_cast_and_declar
             assert!(declared.contains(&entry.to_string()), "{name}, {layout}: {declared:?}");
             assert_eq!(mirrored_transformations(&out), declared, "{name}, {layout}");
             assert!(err.contains(&format!("{} intensities are stored", later * points)) && err.contains(entry), "{name}, {layout}: {err}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The peak facet's column is typed from the spectra that reach it. A centroid spectrum reaches it
+/// through mzdata's peak set, a float32 intensity whatever the file declares (or through its own
+/// arrays when it carries a third per-peak array); a profile spectrum is stored in the data facet.
+/// Through 0.17.0-rc.2 the peak facet's schema was sampled from every sampled spectrum, a profile
+/// one's 64-bit intensity array included, so a run with 64-bit profile MS1 and centroid MS2 got a
+/// float64 peak column holding float32 values — larger and no more exact — whenever a profile
+/// spectrum came first among the sampled ones (every DDA run with profile survey scans), and with
+/// the sampled types merging (the test above) whenever one was sampled at all. The column is a
+/// float32 now whichever spectrum comes first, and when the sampled spectra (five spread over a
+/// file of more than 50) are all profile ones the facet takes the default columns a peak set fills,
+/// a float64 m/z and a float32 intensity. The data facet is as it was.
+#[test]
+fn the_peak_facets_column_is_typed_from_the_spectra_it_stores() {
+    let dir = scratch("peak-column");
+    let mut rng = Lcg(31);
+    let profile_mz: Vec<f64> = (0..300).map(|i| 200.0 + 0.01 * i as f64).collect();
+    // 64-bit profile intensities no float32 holds; 64-bit centroid intensities that are float32
+    // values, so the peak set loses nothing and the facet has nothing to declare.
+    let profile = |rng: &mut Lcg| MzmlSpectrum { profile: true, mz: profile_mz.clone(), intensity: Intensity::F64(intensities(rng, 300, false)), charge: false };
+    let centroid = |rng: &mut Lcg| {
+        let mut mz: Vec<f64> = (0..40).map(|_| 100.0 + 900.0 * rng.next()).collect();
+        mz.sort_by(f64::total_cmp);
+        let intensity = Intensity::F64(f32s(&intensities(rng, mz.len(), false)).iter().map(|x| f64::from(*x)).collect());
+        MzmlSpectrum { profile: false, mz, intensity, charge: false }
+    };
+    let mut run = |order: &[bool]| -> Vec<MzmlSpectrum> { order.iter().map(|p| if *p { profile(&mut rng) } else { centroid(&mut rng) }).collect() };
+    // The control points of a 60-spectrum file are 0, 59, 15, 30 and 45: all profile here.
+    let mut sixty = vec![true; 60];
+    sixty[50..59].fill(false);
+    let cases = [
+        ("profile-first", run(&[vec![true; 10], vec![false; 10]].concat())),
+        ("centroid-first", run(&[vec![false; 10], vec![true; 10]].concat())),
+        ("centroid-unsampled", run(&sixty)),
+    ];
+    for (name, spectra) in &cases {
+        let input = dir.join(format!("{name}.mzML"));
+        write_mzml(&input, spectra);
+        let source = |profile: bool| -> Vec<f64> { spectra.iter().filter(|s| s.profile == profile).flat_map(|s| s.intensity.as_f64()).collect() };
+        let (profile_source, centroid_source) = (source(true), source(false));
+        for layout in ["chunked", "point"] {
+            let out = dir.join(format!("{name}-{layout}.mzpeak"));
+            convert(&input, &out, &["--layout", layout]);
+            let (dtype, stored) = stored_intensities(&out, "spectra_peaks.parquet");
+            let differ = stored.iter().zip(&centroid_source).filter(|(a, b)| a != b).count();
+            assert_eq!((&dtype, stored.len(), differ), (&DataType::Float32, centroid_source.len(), 0), "{name}, {layout}: the peak column");
+            let (dtype, stored) = stored_intensities(&out, "spectra_data.parquet");
+            let differ = stored.iter().zip(&profile_source).filter(|(a, b)| a != b).count();
+            assert_eq!((&dtype, stored.len(), differ), (&DataType::Float64, profile_source.len(), 0), "{name}, {layout}: the data column");
+            let block = metadata(&out)["fidelity"].clone();
+            assert_eq!(block["spectra_peaks"]["stored_types"]["intensity"], "float32", "{name}, {layout}: {}", block["spectra_peaks"]);
+            assert!(block["spectra_peaks"].get("intensity_values_rounded").is_none(), "{name}, {layout}: {}", block["spectra_peaks"]);
+            let declared = transformations(&out);
+            assert!(!declared.iter().any(|t| t == "intensity-f32-rounding"), "{name}, {layout}: {declared:?}");
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
