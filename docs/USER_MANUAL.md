@@ -233,8 +233,8 @@ with the precursor and scan 1/K0, on the vendor's ModelType-2 model that its mob
 evaluated as mzdata evaluates the array, so each window's limits bracket its own peaks exactly;
 and the window's band as `userParam`s on the selected ion. `--no-tims-recalibration` is inert here.
 An archive's export (`a.mzpeak -o a.mzML`) carries each peak's ion mobility where the archive holds
-it (every timsTOF archive), and its 32-bit integer intensities as 64-bit floats, exactly (below:
-no export writes an integer-encoded intensity array). A `--no-ims-compact` archive holds one spectrum per diaPASEF window, and
+it (every timsTOF archive), and its 32-bit integer intensities, a chromatogram's too, as 64-bit
+floats, exactly (below: an archive's export writes no integer-encoded intensity array). A `--no-ims-compact` archive holds one spectrum per diaPASEF window, and
 exports like the `.d`. Neither holds the points of an MS2 frame that lie in a TIMS scan outside
 every isolation window of the frame: mzdata's TDF reader, which both go through, hands a PASEF frame
 over as one spectrum per window and nothing for the scans between and around them, as ProteoWizard
@@ -361,10 +361,13 @@ archive's — is exported with them, as stored, and one whose intensities are 32
 floats: mzML allows an integer-encoded array, but OpenMS 3.5 refuses a file whose intensity array
 is one (`Encoding intensity array as integer is not allowed`, an integer-intensity source mzML and
 its direct export, which writes the source's arrays as held, included), and 64-bit floats hold
-every 32-bit integer and every 64-bit one below 2^53 (the run warns and counts any beyond); a
-spectrum without a point gets arrays of length 0 in its facet's types; through 0.17.0-rc.2 an
-integer peak column went through the reader's 32-bit float peak list, which changes every value
-above 2^24, and an integer profile column was written as the integers it holds); a scan window's
+every 32-bit integer and every 64-bit one below 2^53 (the run warns and counts any beyond), and
+an archive's integer chromatogram intensities — an mzML source's integer chromatogram keeps its
+type in a default archive too — likewise, since OpenMS decodes an integer-encoded chromatogram
+intensity array as empty and refuses the file; a spectrum without a point gets arrays of length 0
+in the types a spectrum of its kind with points is written in; through 0.17.0-rc.2 an integer
+peak column went through the reader's 32-bit float peak list, which changes every value above
+2^24, and an integer profile or chromatogram column was written as the integers it holds); a scan window's
 limits, an isolation window's target and offsets, a collision
 energy and a selected ion's intensity are held by mzdata's model as 32-bit floats, so both routes
 write them within about 1e-7 relative of the source's text (a lower limit of `102.966518275071`
@@ -394,14 +397,15 @@ none in the direct export; and an imaging archive whose marker says that its sou
 which spectra and chromatograms state which of these four, in a `cvParam` of their own or of a
 `referenceableParamGroup` they refer to, in one extra pass over the source's text (the same pass
 reads each spectrum's `sourceFileRef` and looks for an imaging term; through 0.17.0-rc.2 these were
-three passes). Performance: the direct export of an mzML takes 35–45 % longer than 0.16.0 did on
-the same file (a 38 MB Shimadzu export 0.95 s where 0.16.0 took 0.65 s, a 182 MB LTQ-XL one 5.3 s
-for 3.7 s; min of 3 runs each, 2026-10-01), almost all of it per spectrum: the lane writes the
+three passes). Performance: the direct export of an mzML takes 35–50 % longer than 0.16.0 did on
+the same file (a 38 MB Shimadzu export 0.80 s where 0.16.0 took 0.60 s, a 182 MB LTQ-XL one 5.3 s
+for 3.6 s; min of 3 runs each on a quiet machine, 2026-10-02), almost all of it per spectrum: the lane writes the
 source's arrays as held (decoded and encoded again, a 64-bit intensity array deflated as such where
 0.16.0 wrote a 32-bit one from the peak list), runs the byte sinks that put the writer's output
 right, and digests the file for `<fileChecksum>` (a profile of the LTQ-XL export: zlib's deflate
-55 % of the samples, the sinks 7 %, the SHA-1 4 %); the one text pass is 0.13–0.32 s of it on those
-files, where 0.16.0 read the text once for 0.08–0.19 s. Through
+55 % of the samples, the sinks 7 %, the SHA-1 4 %); a run's fixed cost (`MZPC_MAX_SPECTRA=1`:
+opening the file, the text pass, the header and the close) is 0.13–0.31 s on those files, where
+0.16.0's was 0.07–0.12 s. Through
 0.17.0-rc.1 every export stated `positive scan`, the three zeros and a start time regardless: a
 negative-mode imaging run was exported as positive, every pixel of an imaging run without times as
 acquired at 0 min, and a reader could not tell a 0 from a measurement. Still written whatever the

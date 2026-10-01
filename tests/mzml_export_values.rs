@@ -320,9 +320,16 @@ fn raw_arrays_of(mzml: &Path) -> Vec<BTreeMap<String, (BinaryDataArrayType, Vec<
         .collect()
 }
 
-/// An mzML of centroid spectra written by mzdata's writer: 64-bit m/z, and each spectrum's intensity
-/// array as given (the writer keeps an array's own type). A spectrum may have no point.
-fn write_typed_mzml(path: &Path, spectra: &[(Vec<f64>, mzdata::spectrum::DataArray)]) {
+/// An mzML of centroid spectra written by mzdata's writer: each spectrum's m/z values in `mz_type`
+/// and its intensity array as given (the writer keeps an array's own type). A spectrum may have no
+/// point. With `tic`, a total ion current chromatogram with that intensity array over a 64-bit time
+/// array in minutes, in place of the writer's own summary pair.
+fn write_typed_mzml(
+    path: &Path,
+    spectra: &[(Vec<f64>, mzdata::spectrum::DataArray)],
+    mz_type: BinaryDataArrayType,
+    tic: Option<&mzdata::spectrum::DataArray>,
+) {
     use mzdata::io::mzml::MzMLWriter;
     use mzdata::mzpeaks::{CentroidPeak, DeconvolutedPeak};
     use mzdata::spectrum::bindata::{ArrayType, DataArray};
@@ -333,6 +340,7 @@ fn write_typed_mzml(path: &Path, spectra: &[(Vec<f64>, mzdata::spectrum::DataArr
         let mut arrays = BinaryArrayMap::new();
         let mut mz_array = DataArray::wrap(&ArrayType::MZArray, BinaryDataArrayType::Float64, Vec::new());
         mz_array.update_buffer(mz).unwrap();
+        mz_array.store_as(mz_type).unwrap();
         arrays.add(mz_array);
         arrays.add(intensity.clone());
         let mut description = SpectrumDescription {
@@ -349,22 +357,57 @@ fn write_typed_mzml(path: &Path, spectra: &[(Vec<f64>, mzdata::spectrum::DataArr
         let spectrum: MultiLayerSpectrum<CentroidPeak, DeconvolutedPeak> = MultiLayerSpectrum::new(description, Some(arrays), None, None);
         w.write(&spectrum).unwrap();
     }
+    if let Some(intensity) = tic {
+        use mzdata::params::{Param, Unit};
+        use mzdata::spectrum::{ChromatogramDescription, ChromatogramType};
+        let n = intensity.data_len().unwrap();
+        let mut arrays = BinaryArrayMap::new();
+        let mut time = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, Vec::new());
+        time.update_buffer(&(0..n).map(|k| 0.5 + k as f64).collect::<Vec<_>>()).unwrap();
+        time.unit = Unit::Minute;
+        arrays.add(time);
+        arrays.add(intensity.clone());
+        let mut description = ChromatogramDescription {
+            id: "TIC".to_string(),
+            chromatogram_type: ChromatogramType::TotalIonCurrentChromatogram,
+            ..Default::default()
+        };
+        // The writer states a chromatogram's type from a parameter alone, and would add a TIC of
+        // its own at close.
+        description.add_param(Param::builder().name("total ion current chromatogram").curie(mzdata::curie!(MS:1000235)).build());
+        w.chromatogram_count = 1;
+        w.wrote_summaries = true;
+        w.write_chromatogram(&Chromatogram::new(description, arrays)).unwrap();
+    }
     w.close().unwrap();
 }
 
 /// A `--lossless` archive of a source whose intensities are 32- or 64-bit integers (or 64-bit floats)
-/// stores them as they are, and its export writes them as stored, in their type — bit for bit, with
-/// the array's own type term, and a spectrum without a point with arrays of length 0 in that type.
-/// Through 0.17.0-rc.2 the export took a facet's arrays only when its intensity column was a 64-bit
-/// float: an integer column went through the reader's peak list, whose intensity is a 32-bit float,
-/// so every value above 2^24 came back changed (80,299,922 → 80,299,920) and the array was declared
-/// `32-bit float`, with no warning (the audit of 2026-10-01, finding 6).
+/// stores them as they are, and its export writes every value: a 64-bit float array where the
+/// archive holds one, 64-bit floats where it holds integers — a spectrum's and a chromatogram's
+/// alike — with the array's type term, a spectrum without a point with arrays of length 0 in that
+/// type, and a count of the 64-bit integers beyond 2^53 in the run's warning. Through 0.17.0-rc.2
+/// the export took a facet's arrays only when its intensity column was a 64-bit float: an integer
+/// column went through the reader's peak list, whose intensity is a 32-bit float, so every value
+/// above 2^24 came back changed (80,299,922 → 80,299,920) and the array was declared `32-bit
+/// float`, with no warning (the audit of 2026-10-01, finding 6); and a chromatogram's integer
+/// intensities were written as the integers they are, which OpenMS 3.5 decodes as an empty array
+/// and refuses the file over (`The length of RT and intensity values of chromatogram ... differ`).
 #[test]
 fn a_lossless_archive_exports_its_integer_intensities() {
     use mzdata::spectrum::bindata::{ArrayType, DataArray};
     let dir = scratch("integer-intensity");
     let mz = |n: usize| -> Vec<f64> { (0..n).map(|k| 100.0 + 1.5 * k as f64).collect() };
-    let cases: [(&str, BinaryDataArrayType, &str, Box<dyn Fn(&[f64]) -> DataArray>); 3] = [
+    let int64 = |scale: i64| -> Box<dyn Fn(&[f64]) -> DataArray> {
+        Box::new(move |v: &[f64]| {
+            let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int64, Vec::new());
+            a.update_buffer(&v.iter().map(|x| *x as i64 * scale + 1).collect::<Vec<_>>()).unwrap();
+            a
+        })
+    };
+    // Each case: the intensity type, its mzML term, the array built from the values, and how many
+    // values of the three spectra and the TIC together no 64-bit float holds exactly.
+    let cases: [(&str, BinaryDataArrayType, &str, Box<dyn Fn(&[f64]) -> DataArray>, usize); 4] = [
         (
             "int32",
             BinaryDataArrayType::Int32,
@@ -374,18 +417,15 @@ fn a_lossless_archive_exports_its_integer_intensities() {
                 a.update_buffer(&v.iter().map(|x| *x as i32).collect::<Vec<_>>()).unwrap();
                 a
             }),
+            0,
         ),
-        (
-            "int64",
-            BinaryDataArrayType::Int64,
-            "MS:1000522",
-            Box::new(|v: &[f64]| {
-                let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Int64, Vec::new());
-                // Beyond 2^53 as well, which no float holds.
-                a.update_buffer(&v.iter().map(|x| *x as i64 * 1_000_003 + 1).collect::<Vec<_>>()).unwrap();
-                a
-            }),
-        ),
+        // Scaled, but every value below 2^53 (the largest, 2,147,483,647 × 1,000,003 + 1, is near
+        // 2.1e15): each one a 64-bit float holds.
+        ("int64", BinaryDataArrayType::Int64, "MS:1000522", int64(1_000_003), 0),
+        // Scaled past 2^53 (about 9.0e15): six of the eight big values, in the spectrum and in the
+        // TIC (7 × 2^31 + 1 and 1 stay below), none of the small ones, and the first spectrum's
+        // base peak in the base-peak chromatogram the archive sums into the same column.
+        ("int64-wide", BinaryDataArrayType::Int64, "MS:1000522", int64(1 << 31), 6 + 6 + 1),
         (
             "float64",
             BinaryDataArrayType::Float64,
@@ -395,20 +435,35 @@ fn a_lossless_archive_exports_its_integer_intensities() {
                 a.update_buffer(&v.iter().map(|x| x + 0.1).collect::<Vec<_>>()).unwrap();
                 a
             }),
+            0,
         ),
     ];
     // Above 2^24 (16,777,216), where a 32-bit float no longer holds every integer, and below.
     let big = [16_777_217.0, 80_299_922.0, 33_554_433.0, 2_147_483_647.0, 7.0, 0.0, 100_000_001.0, 16_777_216.0];
     let small = [1.0, 2.0, 3.0];
-    for (tag, dtype, source_term, array) in &cases {
+    // The TIC of an mzML: its intensity array's type and values.
+    let tic_of = |mzml: &Path| {
+        let text = std::fs::read_to_string(mzml).unwrap();
+        let tic = chromatograms(&text).into_iter().find(|c| c.id() == "TIC").expect("the source's TIC is carried");
+        let intensity = tic.arrays.get(&ArrayType::IntensityArray).unwrap();
+        (intensity.dtype, intensity.to_f64().unwrap().to_vec())
+    };
+    for (tag, dtype, source_term, array, inexact) in &cases {
         let source = dir.join(format!("{tag}.mzML"));
-        write_typed_mzml(&source, &[(mz(8), array(&big)), (mz(0), array(&[])), (mz(3), array(&small))]);
+        write_typed_mzml(
+            &source,
+            &[(mz(8), array(&big)), (mz(0), array(&[])), (mz(3), array(&small))],
+            BinaryDataArrayType::Float64,
+            Some(&array(&big)),
+        );
         let want = raw_arrays_of(&source);
         assert_eq!(want[0]["IntensityArray"].0, *dtype, "{tag}: the writer kept the type");
         assert_eq!(want[1]["IntensityArray"].1.len(), 0, "{tag}: an empty spectrum");
         let source_text = std::fs::read_to_string(&source).unwrap();
         let stated: usize = elements(&source_text, "spectrum").iter().map(|s| count(s, source_term)).sum();
         assert_eq!(stated, if *dtype == BinaryDataArrayType::Float64 { 6 } else { 3 }, "{tag}: the source's type terms on its spectra");
+        let source_tic = tic_of(&source);
+        assert_eq!((source_tic.0, source_tic.1.len()), (*dtype, 8), "{tag}: the source's TIC");
         let (archive, export) = (dir.join(format!("{tag}.mzpeak")), dir.join(format!("{tag}-export.mzML")));
         convert(&source, &archive, &["--lossless"], &[]);
         let log = convert(&archive, &export, &[], &[]);
@@ -425,6 +480,14 @@ fn a_lossless_archive_exports_its_integer_intensities() {
                 assert!(got[at]["IntensityArray"] == want[at]["IntensityArray"], "{tag}: spectrum {at}: intensities, bit for bit");
             }
             assert!(got[at]["MZArray"] == want[at]["MZArray"], "{tag}: spectrum {at}: m/z");
+        }
+        // The TIC the same way: a chromatogram's integer intensity array OpenMS decodes as empty.
+        let export_tic = tic_of(&export);
+        assert_eq!(export_tic.0, BinaryDataArrayType::Float64, "{tag}: the exported TIC's intensity type");
+        assert!(export_tic.1 == source_tic.1, "{tag}: the TIC's intensities, value for value");
+        for c in chromatograms(&std::fs::read_to_string(&export).unwrap()) {
+            let dtype = c.arrays.get(&ArrayType::IntensityArray).map(|a| a.dtype);
+            assert!(!matches!(dtype, Some(BinaryDataArrayType::Int32 | BinaryDataArrayType::Int64)), "{tag}: chromatogram {:?}: {dtype:?}", c.id());
         }
         let text = std::fs::read_to_string(&export).unwrap();
         let spectra = elements(&text, "spectrum");
@@ -443,8 +506,58 @@ fn a_lossless_archive_exports_its_integer_intensities() {
         }
         assert_eq!(count(spectra[1], "encodedLength=\"0\""), 2, "{tag}: the empty spectrum's two arrays\n{}", spectra[1]);
         assert_well_formed(tag, &text, &log);
-        assert!(!log.contains("2^53"), "{tag}: {log}");
+        match *inexact {
+            0 => assert!(!log.contains("2^53"), "{tag}: {log}"),
+            n => assert!(log.contains(&format!("{n} 64-bit integer intensities exceed 2^53")), "{tag}: the warning counts them: {log}"),
+        }
+        if let Some(loads) = openms_loads(&export) {
+            assert!(loads, "{tag}: OpenMS FileInfo does not load {}", export.display());
+        }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A spectrum without a point of a `--lossless` archive whose peak facet holds 32-bit m/z and
+/// intensity is exported in the types its siblings with peaks get — the reader's peak list's 64-bit
+/// m/z and 32-bit intensity, since nothing of that facet is what the export takes — not the facet's
+/// 32-bit m/z. (A profile spectrum, and a centroid spectrum of a facet with a mobility or a wide
+/// intensity column, is exported from the facet's arrays in their types, empty or not.)
+#[test]
+fn an_empty_centroid_spectrum_is_typed_like_its_siblings() {
+    use mzdata::spectrum::bindata::{ArrayType, DataArray};
+    let dir = scratch("empty-32-bit");
+    let intensity = |v: &[f64]| {
+        let mut a = DataArray::wrap(&ArrayType::IntensityArray, BinaryDataArrayType::Float32, Vec::new());
+        a.update_buffer(&v.iter().map(|x| *x as f32).collect::<Vec<_>>()).unwrap();
+        a
+    };
+    let source = dir.join("f32.mzML");
+    write_typed_mzml(
+        &source,
+        &[(vec![100.0, 101.5], intensity(&[1.0, 2.0])), (vec![], intensity(&[])), (vec![200.0], intensity(&[3.0]))],
+        BinaryDataArrayType::Float32,
+        None,
+    );
+    let written = raw_arrays_of(&source);
+    assert_eq!((written[0]["MZArray"].0, written[0]["IntensityArray"].0), (BinaryDataArrayType::Float32, BinaryDataArrayType::Float32));
+    let (archive, export) = (dir.join("f32.mzpeak"), dir.join("f32-export.mzML"));
+    convert(&source, &archive, &["--lossless"], &[]);
+    let log = convert(&archive, &export, &[], &[]);
+    let text = std::fs::read_to_string(&export).unwrap();
+    let spectra = elements(&text, "spectrum");
+    assert_eq!(spectra.len(), 3);
+    for (at, spectrum) in spectra.iter().enumerate() {
+        let arrays = elements(spectrum, "binaryDataArray");
+        assert_eq!(arrays.len(), 2, "spectrum {at}\n{spectrum}");
+        for array in arrays {
+            let (mz, intensity) = (array.contains("MS:1000514"), array.contains("MS:1000515"));
+            assert!(mz != intensity, "spectrum {at}: an m/z or an intensity array\n{array}");
+            let want = if mz { "MS:1000523" } else { "MS:1000521" };
+            assert_eq!(count(array, want), 1, "spectrum {at}: {} as its siblings'\n{array}", if mz { "64-bit m/z" } else { "32-bit intensity" });
+        }
+    }
+    assert_eq!(count(spectra[1], "encodedLength=\"0\""), 2, "{}", spectra[1]);
+    assert_well_formed("archive", &text, &log);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

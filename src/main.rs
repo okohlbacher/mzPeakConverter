@@ -2955,12 +2955,16 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     let peak_wide = reader.metadata.peak_array_indices().is_some_and(|a| {
         a.iter().any(|e| e.array_type == ArrayType::IntensityArray && matches!(e.data_type, DataType::Float64 | DataType::Int32 | DataType::Int64))
     });
-    // A spectrum without a peak gets arrays of length 0 in the types of the facet its kind is stored
-    // in (profile: the data facet; centroid: the peak facet), as a spectrum with peaks is exported
-    // in its facet's types; through 0.17.0-rc.2 every empty spectrum got a 64-bit m/z and a 32-bit
-    // float intensity array whatever its facet holds.
-    let empty_types =
-        (facet_array_types(Some(reader.metadata.spectrum_array_indices())), facet_array_types(reader.metadata.peak_array_indices()));
+    // A spectrum without a peak gets arrays of length 0 in the types a spectrum of its kind with
+    // peaks is exported in: a profile spectrum's are its data facet's columns; a centroid spectrum's
+    // are its peak facet's where the export takes the facet's arrays (`peak_mobility`, `peak_wide`)
+    // and the reader's peak list's (64-bit m/z, 32-bit intensity) otherwise; through 0.17.0-rc.2
+    // every empty spectrum got a 64-bit m/z and a 32-bit float intensity array whatever its facet
+    // holds.
+    let empty_types = (
+        facet_array_types(Some(reader.metadata.spectrum_array_indices()), true),
+        facet_array_types(reader.metadata.peak_array_indices(), peak_mobility || peak_wide),
+    );
     // MS2 spectra that are whole frames (an ims-compact archive): precursors, but no window limits
     // of their own. Counted, and named once the export is done. Only such an archive is counted —
     // the ims-compact lanes are the one writer of the `ims_calibration` block: an MS2 spectrum of
@@ -3051,13 +3055,6 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     }
     index_refs.warn_mzml(input, "archive");
     configurations.report();
-    if inexact_intensities > 0 {
-        log::warn!(
-            "{inexact_intensities} 64-bit integer intensities exceed 2^53 and are rounded to the nearest 64-bit float: \
-             mzML consumers (OpenMS 3.5) refuse an integer-encoded intensity array, so an archive's integer intensities \
-             are exported as 64-bit floats"
-        );
-    }
     if whole_frames > 0 {
         log::warn!(
             "{whole_frames} MS2 spectra are whole timsTOF frames (an ims-compact archive): each is \
@@ -3075,19 +3072,32 @@ fn filter_mzpeak_to_mzml(input: &Path, output: &Path, opts: &filter::FilterOpts)
     // The archive's own TIC/base-peak go across too; the writer's summary is added only for the
     // kind the archive lacks.
     let n_chrom = mzdata::prelude::ChromatogramSource::count_chromatograms(&reader);
-    let chroms: Vec<Chromatogram> = (0..n_chrom)
-        .filter_map(|i| mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i))
-        .map(|mut c| {
-            c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
-            mzml_unstated::mark_precursors(c.description_mut().precursor.iter_mut(), mzml_unstated::Zeros::NONE);
-            demote_mzp_params_chrom(c.description_mut());
-            unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
-            if let Some(window) = opts.rt {
-                cut_chromatogram_to_window(&mut c, window);
-            }
-            c
-        })
-        .collect();
+    let mut chroms: Vec<Chromatogram> = Vec::with_capacity(n_chrom);
+    for i in 0..n_chrom {
+        let Some(mut c) = mzdata::prelude::ChromatogramSource::get_chromatogram_by_index(&mut reader, i) else { continue };
+        c.description_mut().precursor.iter_mut().for_each(correct_reader_ion_terms);
+        mzml_unstated::mark_precursors(c.description_mut().precursor.iter_mut(), mzml_unstated::Zeros::NONE);
+        demote_mzp_params_chrom(c.description_mut());
+        unreferenced += drop_precursor_references(&mut c.description_mut().precursor, &left_out);
+        if let Some(window) = opts.rt {
+            cut_chromatogram_to_window(&mut c, window);
+        }
+        // The chromatogram facet's integer intensity column (an mzML source's integer chromatograms
+        // keep their type in a default archive as in a `--lossless` one) leaves as 64-bit floats like
+        // a spectrum's: OpenMS 3.5 decodes an integer-encoded chromatogram intensity array as empty
+        // and refuses the file (`The length of RT and intensity values of chromatogram ... differ`);
+        // through 0.17.0-rc.2 the export wrote the integers.
+        inexact_intensities +=
+            widen_integer_intensities(&mut c.arrays).map_err(|e| anyhow!("chromatogram {:?}: intensity array: {e}", c.id()))?;
+        chroms.push(c);
+    }
+    if inexact_intensities > 0 {
+        log::warn!(
+            "{inexact_intensities} 64-bit integer intensities exceed 2^53 and are rounded to the nearest 64-bit float: \
+             mzML consumers (OpenMS 3.5) refuse an integer-encoded intensity array, so an archive's integer intensities \
+             are exported as 64-bit floats"
+        );
+    }
     if unreferenced > 0 {
         log::warn!(
             "{unreferenced} precursor or scan references named a spectrum this export leaves out; their \
@@ -3313,14 +3323,23 @@ fn empty_signal_arrays(mz: BinaryDataArrayType, intensity: BinaryDataArrayType) 
     arrays
 }
 
-/// The binary types an archive facet's m/z and intensity columns are exported in — the column's own
-/// where it is a 32- or 64-bit float, 64-bit float where it is a 32- or 64-bit integer
-/// ([`widen_integer_intensities`]), and the types the reader's peak list has (64-bit m/z, 32-bit
-/// intensity) for any other column (a grid facet's integer `tof` axis, which the reader decodes to
-/// 64-bit m/z) or no facet at all.
-fn facet_array_types(index: Option<&mzpeak_prototyping::buffer_descriptors::ArrayIndex>) -> (BinaryDataArrayType, BinaryDataArrayType) {
+/// The binary types a spectrum of an archive facet is exported in. Where the facet's arrays are what
+/// is exported (`from_arrays`: every profile spectrum; a centroid spectrum of a peak facet that holds
+/// a mobility column or an intensity column that is no 32-bit float, [`with_peak_facet_arrays`]) —
+/// the m/z and intensity column's own type where it is a 32- or 64-bit float, 64-bit float where it
+/// is a 32- or 64-bit integer ([`widen_integer_intensities`]), and the types the reader's peak list
+/// has (64-bit m/z, 32-bit intensity) for any other column (a grid facet's integer `tof` axis, which
+/// the reader decodes to 64-bit m/z) or no facet at all. Otherwise the peak list's types, which every
+/// centroid spectrum of the archive with a peak is written in (a `--lossless` archive of a 32-bit
+/// source: its empty centroid spectrum gets the 64-bit m/z its siblings with peaks get, not the
+/// facet's 32-bit).
+fn facet_array_types(
+    index: Option<&mzpeak_prototyping::buffer_descriptors::ArrayIndex>,
+    from_arrays: bool,
+) -> (BinaryDataArrayType, BinaryDataArrayType) {
     let typed = |kind: ArrayType, fallback: BinaryDataArrayType| {
         index
+            .filter(|_| from_arrays)
             .and_then(|a| a.iter().find(|e| e.array_type == kind && e.transform.is_none()))
             .and_then(|e| match e.data_type {
                 DataType::Float32 => Some(BinaryDataArrayType::Float32),
@@ -3332,13 +3351,14 @@ fn facet_array_types(index: Option<&mzpeak_prototyping::buffer_descriptors::Arra
     (typed(ArrayType::MZArray, BinaryDataArrayType::Float64), typed(ArrayType::IntensityArray, BinaryDataArrayType::Float32))
 }
 
-/// Write an archive's 32- or 64-bit integer intensity array as 64-bit floats — exact for every
-/// 32-bit integer and every 64-bit one below 2^53; returns how many values are beyond that. mzML
-/// allows an integer-encoded array, but OpenMS 3.5 refuses the file (`Encoding intensity array as
-/// integer is not allowed`, the source mzML with such arrays included), and an archive's export
-/// has to load there. Through 0.17.0-rc.2 a peak facet's integers became 32-bit floats through the
-/// reader's peak list (every value above 2^24 changed) and a profile facet's were written as the
-/// integers they are.
+/// Write an archive's 32- or 64-bit integer intensity array, a spectrum's or a chromatogram's, as
+/// 64-bit floats — exact for every 32-bit integer and every 64-bit one below 2^53; returns how many
+/// values are beyond that. mzML allows an integer-encoded array, but OpenMS 3.5 refuses the file
+/// (`Encoding intensity array as integer is not allowed` for a spectrum's, the source mzML with such
+/// arrays included; a chromatogram's it decodes as empty and refuses over the length), and an
+/// archive's export has to load there. Through 0.17.0-rc.2 a peak facet's integers became 32-bit
+/// floats through the reader's peak list (every value above 2^24 changed) and a profile or
+/// chromatogram facet's were written as the integers they are.
 fn widen_integer_intensities(arrays: &mut BinaryArrayMap) -> Result<usize> {
     let Some(intensity) = arrays.get_mut(&ArrayType::IntensityArray) else { return Ok(0) };
     let inexact = match intensity.dtype {
