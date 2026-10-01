@@ -1089,8 +1089,11 @@ fn an_image_joins_the_marker_of_an_imaging_archive() {
     assert_eq!(images[1]["archive_path"], "images/image_0001.png");
     assert_eq!(images[1]["source_name"], "slide.png");
     let matrix: Vec<f64> = images[1]["affine"]["matrix"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
-    let want = [2.0 / 15.0, 0.0, 1.0, 0.0, 2.0 / 11.0, 1.0];
+    // The image's extent on the grid's, pixel centre to pixel centre: a = Nx/W, c = 0.5 + 0.5·Nx/W
+    // (it was the corner-centre mapping, [2/15, 0, 1, 0, 2/11, 1]).
+    let want = [3.0 / 16.0, 0.0, 0.5 + 1.5 / 16.0, 0.0, 3.0 / 12.0, 0.5 + 1.5 / 12.0];
     assert!(matrix.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-12), "16×12 onto 3×3: {matrix:?}");
+    assert_eq!(images[1]["affine"]["registration_quality"], "assumed_full_extent");
     assert_eq!(member(&out, "images/image_0000.png"), png(8, 4));
     assert_eq!(member(&out, "images/image_0001.png"), png(16, 12));
     assert!(checksums_match(&out, "image") >= 6);

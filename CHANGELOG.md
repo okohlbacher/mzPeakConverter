@@ -40,6 +40,14 @@ archive numbers the spectra it keeps 0..n-1, which reverses 0.5.0's "index-stabl
 renumbered". Its rewritten facets keep the source's column encodings and Parquet layout, and `--rt`
 cuts chromatograms stored with float32 times.
 
+**Imaging follow-ups** (HUPO-PSI/mzPeak-specification#23, the issue author's five pixel-size test
+files, the Open Questions doc). A confirmed single pixel size is written for both axes, the `.ibd` is
+hashed against its stated checksum, the obsolete integer type terms no longer crash the converter,
+Bruker's beam-size fallback reads the table that holds it, and the `--image` affine maps extents.
+**New, opt-in:** `--keep-zero-runs`, and `--lossless` — a bit-exact archive or none. **Every archive
+gains a `fidelity` index block** stating source and stored point counts, numeric types, and the
+measured m/z error of each lossy transform. Default signal output is unchanged.
+
 ### Added
 
 - `metadata.imaging.pixel_count_source` (imaging profile, review B18): `declared` when the source
@@ -49,6 +57,76 @@ cuts chromatograms stored with float32 times.
   (default 48, three quarters of the validator's 64 MiB `data_row_group_not_monolithic` threshold),
   read by the vendored writer and the filter lane. `MZPC_TIMING` also reports, at the end, the row
   groups and how many encode jobs ran at once, on average by wall clock and at most.
+- **imzML: the `.ibd` is hashed against the checksum the header states.** Nothing checked it
+  through 0.16.0: the stated value was copied into the archive whether or not the `.ibd` had it
+  (HUPO-PSI/mzPeak-specification#23). The `.ibd` is now hashed in one streamed pass with the
+  algorithm of each stated checksum (`IMS:1000090` MD5, `IMS:1000091` SHA-1, `IMS:1000092`
+  SHA-256). `metadata.imaging.provenance.ibd_checksum` is `verified`, `mismatch`, `not stated`
+  or `not checked`. On a mismatch the conversion goes on: the stated value stays in
+  `file_description`, one warning names both hashes, `imzml:ibd-checksum-mismatch` is declared
+  and `provenance.ibd_checksum_found` holds the hash found. The `.ibd` is listed in
+  `source_files` with the SHA-1 it hashes to. The public chilli set is a real mismatch (states
+  173bdf17…, hashes to 0cba4527…); the mouse bladder set and both imzML example files verify.
+  One new dependency, `md-5`.
+- **imzML/mzML imaging: `provenance.time` says whether the source states scan start times.**
+  A source without `MS:1000016` is stored with time 0 on every spectrum, as before; the marker
+  now says `not stated by the source; index is the source list order`, and `as stated`
+  otherwise (a stated 0 included).
+- **Test fixtures: Theodoros Visvikis's five pixel-size imzML files** (Thyra, MIT, M4i Maastricht
+  University) under `tests/fixtures/imaging/thyra/`, with a test that converts each and compares
+  `metadata.imaging.pixel_size_um` with his `pixel_size_expected.json`: 5 of 5 match (the area
+  file had no `pixel_size_um` before).
+- **Bruker MALDI: the acquisition region of each spectrum.** Every positioned frame's scan carries
+  `MaldiFrameInfo.RegionNumber` as the scan parameter `acquisition region` (integer, no accession,
+  no new column), on the TSF, TDF ims-compact and `--no-ims-compact` lanes;
+  `bruker_maldi.regions` maps number to name. About 570 bytes per archive.
+- **`--keep-zero-runs` stores every profile point** (config `keep_zero_runs`,
+  `MZPC_KEEP_ZERO_RUNS=1`).
+  - What was wrong: the writer's zero-run mask was hard-coded on for the mzML/imzML, `--tof-grid`,
+    native vendor-reader and SCIEX grid lanes. Each spectrum kept a different subset of its m/z
+    axis under its own numpress fixed points, so the pixels of a continuous-mode imzML decoded to
+    different axes (`Example_Continuous`: 36,856 of 75,591 points stored, 9 decoded axes for 9
+    pixels, m/z 171.33333 decoding to 8 values).
+  - Now: with the flag no profile point is dropped and `zero-run-mask` is not declared
+    (`Example_Continuous`: 75,591 of 75,591 points, one decoded axis). The default is unchanged.
+  - Refused on `--agilent-grid`, whose reader drops the zero samples itself; inert with a warning
+    on the timsTOF ims-compact lanes, the `.mzpeak` filter and the mzML export.
+  - Cost on the HR2MSI bladder imzML (67,916,471 points): 193.6 MB against 173.8 MB (+11 %).
+- **`--lossless`: a bit-exact archive, or no archive.** mzML and imzML inputs only.
+  - Selects the point layout with zero runs kept and no numpress, m/z lattice or TOF grid, and
+    writes a centroid spectrum's own arrays (the default lanes store 64-bit centroid intensities
+    as float32, undeclared).
+  - After writing, the two signal facets are read back. The conversion fails and writes nothing
+    unless no signal transformation is declared (`fidelity::SIGNAL_TRANSFORMATIONS` plus the
+    `grid-fit:` and `tof-grid:` prefixes), every point read is stored, both facets are in the
+    point layout, `mz_error` is empty and no column is narrower than its source type.
+  - Refused on every other lane (a Thermo `.raw` or TDF on the standard lane included), from the
+    config file too, with `--layout chunked`, `--tof-grid auto|on`, `--agilent-grid` or an mzML
+    output, and while `MZPC_MAX_SPECTRA` is set.
+  - Measured: bladder 67,916,471 of 67,916,471 m/z and intensities equal to the `.ibd`, 409.8 MB
+    (2.4× the default); `Example_Continuous` 230 kB against 263 kB by default, m/z kept as
+    float32; a corpus Orbitrap mzML 456,131 of 456,131 points bit-equal.
+- **`metadata.fidelity` says by how much a conversion changed the signal.** `transformations`
+  names what changed; the new index block gives the numbers, read back from the two signal facets
+  at close.
+  - Per facet: `layout`, `source_points` against `stored_points` (what the zero-run mask left
+    out), `source_types` (the binary types an mzML or imzML declares) against `stored_types` (the
+    column type, or `grid:<index type>` where the m/z are grid indices, as on every default
+    timsTOF archive).
+  - `mz_error`, one entry per m/z encoding that can move a value, each with `max_abs_error`,
+    `max_rel_error_ppm` and a `basis`:
+    - numpress-linear, a bound: per chunk 0.5/fixed point plus 4 ulp of its largest m/z, the fixed
+      point read from the chunk's first 8 bytes. The bare 0.5/fixed point is exceeded by about
+      1e-14 Da through f64 rounding; the recorded bound held on every archive decoded and is
+      reached to 99.99 % on `Example_Continuous`.
+    - delta, a bound: one unit in the last place of the largest m/z at risk, 2^-52 relative, with
+      the count of chunks not exact by construction.
+    - grid fits: their acceptance tolerance and the figure derived from it over the stored m/z
+      range.
+  - The `.mzpeak` filter carries the block unchanged, and drops it (listed under
+    `filter.dropped_index_blocks`) when `--rt` or `--ms-level` removes spectra.
+  - Cost: 0.03 s of a 4.4 s conversion on the bladder imzML. Default archives are otherwise
+    unchanged.
 
 ### Changed
 
@@ -124,6 +202,28 @@ cuts chromatograms stored with float32 times.
     byte-capped row group pays for again: the corpus Lumos peak facet grows by 1.2 % (0.9 % with
     0.16.0), MFA381's by 2.3 % (6.7 %). Rebuilt from the raw file, both are 1.1 % smaller than in the
     corpus.
+- **imzML: a single pixel size the rule keeps is written on both axes.** The IMS vocabulary
+  defines `IMS:1000046` as the y size too when no `IMS:1000047` is stated, but a reader that
+  does not know that default saw no pixel size at all, and `metadata.imaging.pixel_size_um` was
+  absent. An area root or a single length is now written as `IMS:1000046` ("pixel size (x)") and
+  `IMS:1000047` ("pixel size y"), same value and unit, and `pixel_size_um` is `{x, x}`. A single
+  `IMS:1000047` stays alone. A Waters single-row run keeps its lone `IMS:1000046` and no
+  `pixel_size_um`. An mzML with positions is not run through the rule: its scan settings stay as
+  stated and a lone `IMS:1000046` there gives no `pixel_size_um`.
+- **imzML: x and y pixel sizes are compared with the stated extent.** Where an axis states its
+  pixel count and max dimension and `value × count` is not that dimension, the conversion warns
+  and lists it in the `imaging_pixel_size` row's `extent_mismatches`. The values are written as
+  stated.
+- **`--no-numpress` is no longer described as lossless.**
+  - What was wrong: the help, manual and README called delta chunks lossless. Delta stores
+    `fl(a − b)`, and `b + fl(a − b) == a` is guaranteed only for `a ≤ 2b`. A sparse list is cut
+    into chunks far wider than `--chunk-size`, so a 64-bit m/z more than twice its predecessor
+    comes back one unit in the last place off at any mass, and the error carries into the values
+    after it in the chunk.
+  - Measured: 6 of 360 points of a ToF-SIMS-like file (1.8e-15 Da); 7 of 6,281 in 200 generated
+    centroid spectra over m/z 50–5000, 3 of them above m/z 1000 (2.3e-13 Da).
+  - Now: the wording says so, the `fidelity` block counts the chunks and bounds the error, and
+    `--lossless` is the flag for a bit-exact archive. 32-bit m/z values stay exact under delta.
 
 ### Fixed
 
@@ -463,6 +563,67 @@ cuts chromatograms stored with float32 times.
   through 0.16.0 they were copied whole with "no recognizable time axis". The column keeps its type
   and `number_of_data_points` follows: the corpus Waters PDA archive under `--rt 0.5-1.0` keeps 1,449
   of 4,344 points, the Agilent DAD archive under `--rt 1-2` 272 of 950.
+- **imzML: the obsolete integer type terms `IMS:1000141` / `IMS:1000142` no longer panic.** An
+  imzML typing a binary array with the imaging vocabulary's "32-bit integer" / "64-bit integer"
+  panicked the writer ("not implemented: intensity_unknown_dc", no archive). They are read as
+  `MS:1000519` / `MS:1000522`, the terms that replaced them, declared
+  `imzml:obsolete-integer-type-as-psi-ms`; the archive equals the one the PSI-MS terms give. The
+  mzML export reads them the same way, with a warning.
+- **imzML/mzML: an m/z or intensity array without a known data type is an error, not a panic.**
+  A centroid spectrum whose array states none of `MS:1000519/521/522/523` panicked the writer
+  (exit 134, "A column was not visited: intensity_unknown_dc", a temp copy left behind), and the
+  mzML export panicked in mzdata's writer. The conversion now stops with an error naming the
+  spectrum and the array, on both lanes, and leaves no output. An empty array may still leave
+  its type out.
+- **imzML: `provenance.pixel_size` said `as stated` of a header that states no pixel size.** It
+  now says `none stated`. A single value that cannot be tested has its own case, `one value,
+  untestable`, and the detail names what the header lacks (it said "no pixel count and max
+  dimension" of a header stating both counts).
+- **imzML: a checksum or UUID made of decimal digits only was written as a number.** An MD5 of
+  `000…0` became the integer 0 in `file_description`. The provenance values are written as the
+  strings the header states.
+- **Bruker MALDI: the beam-size fallback reads the table that holds it.** `BeamScanSizeX/Y` were
+  selected from `MaldiFrameInfo`, but real files (schema 3.3 TSF, 3.5 TDF) keep them in
+  `MaldiFrameLaserInfo`, referenced by `MaldiFrameInfo.LaserInfo`, so the fallback never fired. The
+  lane now joins through `LaserInfo` (columns on `MaldiFrameInfo` still win where a schema has
+  them); `BeamScan = 0` counts as unstated, and the rule is unchanged: every positioned frame, the
+  same finite positive size. `bruker_maldi.beam_scan_size_source` names the table read. Both
+  MSV000088438 runs state `BeamScan = 0` and keep their `.mis` pixel size (1000 µm); a copy
+  without its `.mis` and with `BeamScan = 1` gets 20 × 20 µm.
+- **Bruker MALDI: frames without a position are counted.** A frame with no `MaldiFrameInfo` row, or
+  with a NULL `XIndexPos`/`YIndexPos`, got a null position silently. They are counted against
+  `Frames`, written as `bruker_maldi.frames_without_position`, and warned about once. An empty
+  frame (`NumPeaks = 0`) with a row keeps its pixel.
+- **`--image`: the affine maps extents, not corner pixel centres.** The matrix was
+  `a = (Nx−1)/(W−1), c = 1`; the profile defines image-pixel-centre (0-based) to MS-pixel-centre
+  (1-based) with the image extent equal to the grid extent: `a = Nx/W`, `c = 0.5 + 0.5·Nx/W`, the
+  same on y (28 × 24 pixels under an 8064 × 6048 image: `[0.0034722, 0, 0.501736, 0, 0.0039683,
+  0.501984]`). Archives written earlier keep their matrix.
+- **`--image` on a FlexImaging run writes no affine.** The grid of such a run is the bounding box
+  of its regions and the photo covers the slide, so `assumed_full_extent` was off by up to 11 MS
+  pixels on MSV000088438. When the archive's `bruker_maldi` block names a `.mis`, the image is
+  embedded without `affine` and a warning points at the planned teach-point registration.
+- **An output whose extension names no format is refused.** `-o x.imzML`, or any other unknown
+  extension, silently wrote a ZIP archive. Without `--to`, the output must end in `.mzpeak`,
+  `.mzML` or `.mzML.gz` (any case); anything else exits 1 naming the two formats and writes
+  nothing.
+- **mzML export declares the imaging vocabulary and carries the header's lists.** An imaging
+  export wrote its pixel positions as `cvRef="IMS"` (18 params on a 6-pixel imzML) under a
+  `cvList` of MS and UO, had no `scanSettingsList`, and an archive's export had an empty
+  `fileContent`. The export now declares `IMS`, pinned as the archive's `cv_list` has it, writes
+  the scan settings (an imaging grid, an inclusion list), and states the archive's
+  `file_description.contents`. The index offsets follow the longer header (175 MB bladder archive:
+  header +932 bytes, 34,842 offsets valid, body byte-identical). An export with nothing to add is
+  byte-identical to before.
+- **mzML export of an imzML states the grid its archive states.** The direct lane applies the
+  archive lane's scan-settings rules (pixel-size rule, unit accession against unit name, "one way"
+  as flyback); each change is a warning, since an mzML has no `transformations` list. Without
+  them mzdata resolved a unit by its name, and a pixel size in `UO:0000015` named "micrometer"
+  would have been exported as a clean 50 µm. Both routes state the same scan settings on the five
+  Thyra pixel-size files and the two imzML reference examples.
+- **mzML export of a Waters imaging `.raw` declares `IMS` and states its fitted grid.** The native
+  lane wrote the positions under a `cvList` of MS and UO and no grid (Windows lane; box check
+  pending).
 
 ### Documentation
 
