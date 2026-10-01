@@ -32,26 +32,26 @@ them.
 
 **Output change (signal facets).** A signal facet's row groups end at 48 MiB of Arrow buffers as
 well as at their row cap (`MZPC_ROW_GROUP_MB`), and a chunk's m/z bounds are byte-stream-split with
-the dictionary off. The values are unchanged; the row-group boundaries and the bytes are not. Against
-0.16.0, content identical: a Lumos centroid peak facet −1.1 % (1 → 4 row groups), MFA381's −1.8 %,
-PXD059079 2485's grid facet −0.6 %, a Thermo profile facet −0.4 %, QC01's centroid facet +0.06 %;
-point-layout facets are byte-identical. **Output change (`.mzpeak` → `.mzpeak` filter).** A filtered
-archive numbers the spectra it keeps 0..n-1, which reverses 0.5.0's "index-stable — spectra are never
-renumbered". Its rewritten facets keep the source's column encodings and Parquet layout — but for
-the chunk bounds (`*_chunk_start`/`_end`) of a source written by 0.16.0 or earlier, which are
-re-encoded the converter's way (byte-stream split, dictionary off; the corpus Lumos peak facet
+the dictionary off. The values are unchanged; the row-group boundaries and the bytes are not.
+Against 0.16.0, content identical: a Lumos centroid peak facet −1.1 % (1 → 4 row groups), MFA381's
+−1.8 %, PXD059079 2485's grid facet −0.6 %, a Thermo profile facet −0.4 %, QC01's centroid facet
++0.06 %; point-layout facets are byte-identical. **Output change (`.mzpeak` → `.mzpeak` filter).** A
+filtered archive numbers the spectra it keeps 0..n-1, which reverses 0.5.0's "index-stable — spectra
+are never renumbered". Its rewritten facets keep the source's column encodings and Parquet layout —
+but for the chunk bounds (`*_chunk_start`/`_end`) of a source written by 0.16.0 or earlier, which
+are re-encoded the converter's way (byte-stream split, dictionary off; the corpus Lumos peak facet
 −0.98 % against its source, where followed it grew 1.19 %; a 0.16.0 QC01 archive, whose bounds
 repeat, +0.07 %, both below the source; owner decision D16) — and `--rt` cuts chromatograms stored
 with float32 times.
 
 **Imaging follow-ups** (HUPO-PSI/mzPeak-specification#23, the issue author's five pixel-size test
-files, the Open Questions doc). A confirmed single pixel size is written for both axes, the `.ibd` is
-hashed against its stated checksum, the obsolete integer type terms no longer crash the converter,
-Bruker's beam-size fallback reads the table that holds it, and the `--image` affine maps extents.
-**New, opt-in:** `--keep-zero-runs`, and `--lossless` — a bit-exact archive or none. **Every archive
-gains a `fidelity` index block** stating source and stored point counts, numeric types, and the
-measured m/z error of each lossy transform. Default signal output was unchanged by these; the
-decisions of 2026-10-01 below change it.
+files, the Open Questions doc). A confirmed single pixel size is written for both axes, the `.ibd`
+is hashed against its stated checksum, the obsolete integer type terms no longer crash the
+converter, Bruker's beam-size fallback reads the table that holds it, and the `--image` affine maps
+extents. **New, opt-in:** `--keep-zero-runs`, and `--lossless` — a bit-exact archive or none.
+**Every archive gains a `fidelity` index block** stating source and stored point counts, numeric
+types, and the measured m/z error of each lossy transform. Default signal output was unchanged by
+these; the decisions of 2026-10-01 below change it.
 
 **Found by rebuilding and auditing the corpus with a release candidate** (200 units, every finding
 reproduced independently). **Output change (mzML export).** An export states the run — its id,
@@ -74,14 +74,13 @@ the output changes those decisions make; the entries under Added, Changed and Fi
 
 **Output change (the default m/z encoding).** Through 0.16.0 every chunked facet stored m/z with the
 lossy numpress-linear codec, exact delta chunks only under `--no-numpress`. The converter now
-decides from a sample of the run (exact where it costs nothing, D1/D13): delta without a trial
-when every sampled m/z is a 32-bit float value — such values come back exactly whatever their
-spacing, and delta was smaller than numpress on every such file measured — else the sample is
-written both ways and the smaller arm kept, exact on a tie. With defaults against rc.2: QC01
-−21.9 % (50.9 → 39.8 MB), SZB8102938 −16.9 %, PXD009465 t04176 −11.9 %, Example_Continuous
-−9.3 % (its zero runs now kept, below), ltpmsi-chilli −38.1 %, the decoded m/z bit-equal to the
-source; numpress-linear stays on
-the Bruker microTOF neg_01_Fistax run (delta would be 2.1× its size) and on the PXD001283 bladder
+decides from a sample of the run (exact where it costs nothing, D1/D13): delta without a trial when
+every sampled m/z is a 32-bit float value — such values come back exactly whatever their spacing,
+and delta was smaller than numpress on every such file measured — else the sample is written both
+ways and the smaller arm kept, exact on a tie. With defaults against rc.2: QC01 −21.9 % (50.9 → 39.8
+MB), SZB8102938 −16.9 %, PXD009465 t04176 −11.9 %, Example_Continuous −9.3 % (its zero runs now
+kept, below), ltpmsi-chilli −38.1 %, the decoded m/z bit-equal to the source; numpress-linear stays
+on the Bruker microTOF neg_01_Fistax run (delta would be 2.1× its size) and on the PXD001283 bladder
 imzML (3.6×), both unchanged. The `encoding_prescan` index block states the sample, the bytes per
 arm and the basis; `transformations` and `fidelity` name only what was written — `numpress-linear`
 with its bound where the codec was kept, `delta-ulp` where delta chunks are at risk on 64-bit

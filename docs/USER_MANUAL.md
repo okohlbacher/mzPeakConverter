@@ -1618,32 +1618,31 @@ into dedicated `vendor_scan_trailers` (tall + wide) and `vendor_status_log` face
   writes numpress-linear and may answer `chunked` with the point layout, the smaller exact one).
   `point` writes one row per (m/z, intensity), each at the numeric type of its column, with no
   encoding that can move a value.
-- **Zero runs and bit-exact archives** — three levels, from smallest to exact:
-  the default masks profile zero runs and stores m/z as the sample's choice (exact delta, or
-  numpress-linear bounded, the bound in `fidelity`, §8); `--keep-zero-runs` stores every point and
-  keeps that choice, which is what gives continuous-mode imaging data (one m/z axis for all
-  pixels) one decoded axis — and what a continuous-mode imzML gets without the flag since 0.17.0
-  (§8, imaging); `--lossless` is
+- **Zero runs and bit-exact archives** — three levels, from smallest to exact: the default masks
+  profile zero runs and stores m/z as the sample's choice (exact delta, or numpress-linear bounded,
+  the bound in `fidelity`, §8); `--keep-zero-runs` stores every point and keeps that choice, which
+  is what gives continuous-mode imaging data (one m/z axis for all pixels) one decoded axis — and
+  what a continuous-mode imzML gets without the flag since 0.17.0 (§8, imaging); `--lossless` is
   bit-exact or fails. It selects the point layout with zero runs kept and no numpress, lattice or
-  TOF grid, writes a centroid spectrum's arrays at the binary types the file declares (the
-  default lanes store its intensities as float32), and after writing checks the archive: no
-  signal transformation declared (the set is `SIGNAL_TRANSFORMATIONS` in `src/fidelity.rs`;
-  entries about metadata, chromatograms or precursor windows, such as
-  `mzml:dangling-reference-dropped` or `chromatogram-time-to-minutes`, do not count), both signal
-  facets in the point layout with as many points as were read, no m/z encoding with an error, and
-  no column narrower than its source type (a 32-bit value in a 64-bit column passes and shows in
-  `fidelity`). When the check fails, so does the conversion, and nothing is written; a spectrum
-  whose m/z are out of order fails it, since storing it means sorting it. mzML and imzML only.
-  The check covers the mass spectra's m/z and intensity; chromatograms (whose times are still
-  written in minutes) and wavelength spectra are stored as on the default lanes. Measured on the
-  HR2MSI mouse urinary bladder imzML (34,840 profile spectra, 67,916,471 points, 64-bit m/z;
-  815 MB `.ibd`): default 173.8 MB with 40,559,444 points stored, `--keep-zero-runs` 193.6 MB
-  (+11 %), `--lossless` 409.8 MB (2.4×, every m/z and intensity equal to the `.ibd`); these are
-  sizes without an optical image, and the 1.6 MB TIFF the corpus keeps beside this imzML is
-  embedded on top when it is there. Where m/z are 32-bit values the exact archive is the smaller
-  one: `Example_Continuous` was 263 kB masked under numpress (0.17.0-rc.2), is 238 kB by default
-  since its zero runs are kept and its 32-bit axis takes exact delta (continuous mode and *The
-  default m/z encoding*, §8; `--no-numpress` changes nothing there) and 233 kB with `--lossless`.
+  TOF grid, writes a centroid spectrum's arrays at the binary types the file declares (the default
+  lanes store its intensities as float32), and after writing checks the archive: no signal
+  transformation declared (the set is `SIGNAL_TRANSFORMATIONS` in `src/fidelity.rs`; entries about
+  metadata, chromatograms or precursor windows, such as `mzml:dangling-reference-dropped` or
+  `chromatogram-time-to-minutes`, do not count), both signal facets in the point layout with as many
+  points as were read, no m/z encoding with an error, and no column narrower than its source type (a
+  32-bit value in a 64-bit column passes and shows in `fidelity`). When the check fails, so does the
+  conversion, and nothing is written; a spectrum whose m/z are out of order fails it, since storing
+  it means sorting it. mzML and imzML only. The check covers the mass spectra's m/z and intensity;
+  chromatograms (whose times are still written in minutes) and wavelength spectra are stored as on
+  the default lanes. Measured on the HR2MSI mouse urinary bladder imzML (34,840 profile spectra,
+  67,916,471 points, 64-bit m/z; 815 MB `.ibd`): default 173.8 MB with 40,559,444 points stored,
+  `--keep-zero-runs` 193.6 MB (+11 %), `--lossless` 409.8 MB (2.4×, every m/z and intensity equal to
+  the `.ibd`); these are sizes without an optical image, and the 1.6 MB TIFF the corpus keeps beside
+  this imzML is embedded on top when it is there. Where m/z are 32-bit values the exact archive is
+  the smaller one: `Example_Continuous` was 263 kB masked under numpress (0.17.0-rc.2), is 238 kB by
+  default since its zero runs are kept and its 32-bit axis takes exact delta (continuous mode and
+  *The default m/z encoding*, §8; `--no-numpress` changes nothing there) and 233 kB with
+  `--lossless`.
 - **zstd** — applied inside Parquet, `--zstd-level` 1–22 (default 3; the timsTOF **ims-compact**
   lanes default to **5**, the measured byte-plane plateau — an explicit `--zstd-level` applies to
   both).
