@@ -570,7 +570,9 @@ fn an_empty_centroid_spectrum_is_typed_like_its_siblings() {
 /// spectrum of ms level 1 or more: through 0.17.0-rc.2 an SRM spectrum came out as `SRM spectrum`
 /// twice from its mzML and three times from its archive (ProteoWizard's Enolase `srmSpectra`: 202
 /// and 303 for 101 spectra), and every pixel of an imzML that states `ms level` 0 as `MS1 spectrum`
-/// twice (`Example_Continuous`).
+/// twice (`Example_Continuous`). Such a pixel is written at `ms level` 1 on both routes (owner
+/// decision D6; the archive declares `imzml:ms-level-0-as-1`, the direct export warns), and its
+/// type term once.
 #[test]
 fn a_spectrum_type_term_is_written_once_on_both_routes() {
     let dir = scratch("spectrum-type");
@@ -602,7 +604,8 @@ fn a_spectrum_type_term_is_written_once_on_both_routes() {
         assert_eq!(spectra.len(), 9, "{route}");
         let ms1: Vec<usize> = spectra.iter().map(|s| count(s, "MS:1000579")).collect();
         assert_eq!(ms1, [1; 9], "{route}: MS1 spectrum once per pixel");
-        assert_eq!(zeros(&mzml, "MS:1000511"), 9, "{route}: ms level 0 stays");
+        assert_eq!(zeros(&mzml, "MS:1000511"), 0, "{route}: ms level 0 is written as 1 (D6)");
+        assert_eq!(count(&mzml, r#"name="ms level" value="1""#), 9, "{route}: ms level 1 on each pixel");
         assert_well_formed(route, &mzml, &log);
     }
     let _ = std::fs::remove_dir_all(&dir);

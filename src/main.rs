@@ -15827,7 +15827,8 @@ mod tests {
         let points = |m: &serde_json::Value| (m["fidelity"]["spectra_data"]["source_points"].as_u64(), m["fidelity"]["spectra_data"]["stored_points"].as_u64());
 
         // Continuous: kept, said so, the mode and the verified shared axis in the marker, and the
-        // four pixels decode to one axis — the source's, within the numpress bound that stays.
+        // four pixels decode to one axis — the source's, exactly: the axis is 32-bit values, so the
+        // default m/z encoding is delta (P2, the sample-based rule), and nothing lossy is declared.
         let (src, axis) = profile_imzml(&dir, "cont", "continuous", false);
         let (out, m, log) = convert("cont", &src, &[]);
         assert!(!masked(&m), "{:#}", m["transformations"]);
@@ -15838,8 +15839,11 @@ mod tests {
         let decoded = stored_mz(&out, 4);
         assert!(decoded.iter().all(|d| d == &decoded[0]), "one axis for every pixel: {decoded:?}");
         assert_eq!(decoded[0].len(), 12);
-        assert!(decoded[0].iter().zip(&axis).all(|(d, a)| (d - a).abs() < 1e-6), "{:?}", decoded[0]);
-        assert!(m["transformations"].to_string().contains("numpress-linear"), "numpress stays the encoding: {:#}", m["transformations"]);
+        assert_eq!(decoded[0], axis, "the one axis, exactly");
+        let applied = m["transformations"].to_string();
+        assert!(!applied.contains("numpress-linear") && !applied.contains("delta-ulp"), "an exact encoding, nothing lossy declared: {:#}", m["transformations"]);
+        assert_eq!(m["fidelity"]["mz_error"], serde_json::json!([]), "{:#}", m["fidelity"]);
+        assert_eq!(m["encoding_prescan"]["chosen"]["mz"], "delta", "{:#}", m["encoding_prescan"]);
 
         // Continuous by its header, but one spectrum holds another array: kept all the same (the
         // header's claim decided the mask), `shared_mz_axis` false, one warning with the count.
