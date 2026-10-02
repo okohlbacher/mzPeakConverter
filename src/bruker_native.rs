@@ -669,9 +669,9 @@ pub(crate) fn add_frame_calibration_params(
 /// vendor library's `sqlite3_column_double` semantics — but see [`Self::quadratic_terms_stored`]),
 /// with the exact ModelType-1 TOF→m/z evaluation.
 ///
-/// The model — derived numerically against Bruker's timsdata library and verified to 2.5e-5 ppm on
-/// 60 golden points (speXtract `src/TdfMzCalibration.h`, `tests/calibration_golden.json`, mirrored
-/// in `tests/fixtures/tdf_calibration_golden.json`):
+/// The model — derived numerically against Bruker's timsdata library (speXtract
+/// `src/TdfMzCalibration.h`) and verified against its SDK on public files
+/// (`tests/fixtures/tdf_diapasef_sdk_golden.json`, `tests/fixtures/tdf_2485_sdk_golden.json`):
 ///
 /// ```text
 ///   t_ns   = tof * DigitizerTimebase + DigitizerDelay
@@ -1018,9 +1018,9 @@ pub(crate) fn sdk_golden_sample_plan(n_frames: usize, num_samples: i64) -> (Vec<
 /// per-frame inputs (`Frames.T1/T2/MzCalibration`) ride in `spectra_metadata` via
 /// [`add_frame_calibration_params`].
 ///
-/// The expression readers are expected to evaluate for `ModelType = 1` — derived and verified in
-/// speXtract v0.2.0 to 2.5e-5 ppm against Bruker's timsdata SDK (three diaPASEF runs, 60 golden
-/// points); `dC2 = 0` on every file seen, so `T2`'s role is unverified and it is carried as-is:
+/// The expression readers are expected to evaluate for `ModelType = 1` — derived in speXtract
+/// v0.2.0 and verified against Bruker's timsdata SDK (`model_type_1_verified` below names the
+/// files); `dC2 = 0` on every file seen, so `T2`'s role is unverified and it is carried as-is:
 ///
 /// ```text
 ///   t_ns   = tof * DigitizerTimebase + DigitizerDelay
@@ -1028,10 +1028,10 @@ pub(crate) fn sdk_golden_sample_plan(n_frames: usize, num_samples: i64) -> (Vec<
 ///   t_ns   = C0 + (1e6 / sqrt(C1_eff)) * sqrt(mz) + C2 * mz   // solve for sqrt(mz); C2 = 0 → pure sqrt
 /// ```
 ///
-/// Dropping `C2·mz` costs −11…−40 ppm, dropping the temperature term ~0.7 ppm over speXtract's ~30 mK
-/// runs (0.06 ppm over 2485.d's 3 mK); the two-point chord in `ims_calibration` is −5…−11 ppm
-/// biased there and +3.2…−4.2 ppm on 2485.d (m/z dependent). `ims_calibration.a/b` stay the reader
-/// contract; this block is the exact model beside it.
+/// Dropping `C2·mz` costs tens of ppm on a file whose `C2` is not zero; the temperature term is
+/// 0.06 ppm over 2485.d's 3 mK; the two-point chord in `ims_calibration` is +3.2…−4.2 ppm off on
+/// 2485.d (m/z dependent). `ims_calibration.a/b` stay the reader contract; this block is the exact
+/// model beside it.
 pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
     let conn = crate::vendor_sqlite::open(tdf)
         .with_context(|| format!("opening {}", tdf.display()))?;
@@ -1053,7 +1053,7 @@ pub fn vendor_mz_calibration(tdf: &Path) -> Result<serde_json::Value> {
         "per_frame_columns": per_frame_columns,
         "per_frame_columns_note": "spectra_metadata columns holding Frames.T1, Frames.T2, Frames.MzCalibration per spectrum (in this order); the id selects the mz_calibration row by Id",
         "model_type_1": "t_ns = tof*DigitizerTimebase + DigitizerDelay; cf = 1 + dC1*(T1 - tdf_t1)/1e6 (+ dC2*(T2 - tdf_t2)/1e6, dC2 = 0 on every file seen); u = sqrt(mz + C4); t_ns = C0 + (1e6/sqrt(C1*cf))*u + (C2/cf)*u^2, solve for u; mz = u^2 - C4 (C2 = 0: mz = ((t_ns - C0)*sqrt(C1*cf)/1e6)^2 - C4)",
-        "model_type_1_verified": "1e-9 ppm vs Bruker timsdata SDK on a C2 != 0, C4 != 0 file (mzdata diaPASEF.d, 2026-09-22); 2.5e-5 ppm on speXtract IH2/IH1/IH3 (C4 = 0); 1e-7 ppm on PXD059079 2485 (C2 = C4 = 0)",
+        "model_type_1_verified": "1e-9 ppm vs Bruker timsdata SDK on a C2 != 0, C4 != 0 file (mzdata diaPASEF.d, 2026-09-22); 1e-7 ppm on PXD059079 2485 (C2 = C4 = 0)",
         "model_type_2": "m = the model_type_1 quadratic on C0, C1, C2 with no C4 shift (C3/C4 repeat C0/C2 in these rows); mz = m - sum_{i<C7} C[8+i]*m^i if C5 <= m <= C6, else mz = m",
         "model_type_2_verified": "1e-9 ppm vs Bruker timsdata SDK values on OpenTIMS's test.d (10 points, 8 inside [C5, C6], 2 below; 2026-09-26)",
     }))
@@ -2620,56 +2620,6 @@ mod grid_model_tests {
         // Sanity: tof 0 near the file's MzAcqRangeLower (~100 Th), the last sample near 1700 Th.
         assert!((99.0..101.0).contains(&grid.from_index(0)), "tof 0 → {}", grid.from_index(0));
         assert!((1690.0..1710.0).contains(&grid.from_index(636_030)), "tof max → {}", grid.from_index(636_030));
-    }
-
-    /// The general (quadratic) branch of the formula reproduces all 60 speXtract golden points
-    /// (Bruker timsdata SDK `tims_index_to_mz` on three diaPASEF runs) to < 1e-4 ppm — and those
-    /// rows (C2 ≠ 0) are correctly refused as sqrt-linear.
-    #[test]
-    fn quadratic_branch_matches_the_sdk_goldens() {
-        let text = include_str!("../tests/fixtures/tdf_calibration_golden.json");
-        let files: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
-        assert_eq!(files.len(), 3);
-        let mut n = 0usize;
-        let mut worst = 0.0f64;
-        for f in &files {
-            let row = TdfMzCalibrationRow {
-                id: 1,
-                model_type: f["model_type"].as_i64().unwrap(),
-                digitizer_timebase: f["timebase"].as_f64().unwrap(),
-                digitizer_delay: f["delay"].as_f64().unwrap(),
-                t1: f["T1_ref"].as_f64().unwrap(),
-                t2: f64::NAN,
-                dc1: f["dC1"].as_f64().unwrap(),
-                dc2: 0.0,
-                c0: f["C0"].as_f64().unwrap(),
-                c1: f["C1"].as_f64().unwrap(),
-                c2: f["C2"].as_f64().unwrap(),
-                c3: 0.0,
-                c4: 0.0,
-                quadratic_terms_stored: true,
-                calibrant: None,
-            };
-            assert!(row.c2 != 0.0, "{}: a C2 ≠ 0 row", f["file"]);
-            for c in f["cases"].as_array().unwrap() {
-                let (t1, tof, mz_sdk) =
-                    (c["t1"].as_f64().unwrap(), c["tof"].as_f64().unwrap(), c["mz"].as_f64().unwrap());
-                let mz = row.tof_to_mz(tof, t1);
-                let ppm = (mz - mz_sdk).abs() / mz_sdk * 1e6;
-                worst = worst.max(ppm);
-                assert!(ppm < 1e-4, "{} frame {} tof {tof}: {mz} vs SDK {mz_sdk} ({ppm:e} ppm)", f["file"], c["frame"]);
-                // … and the reference implementation's quadratic branch agrees with the formula at
-                // the nearest integer bin (the goldens sample fractional bins), inverted exactly.
-                let grid = GridEncoding::from_parameters(TimsTofMzGrid2::ACCESSION, &row.grid_parameters(Some(t1), None)).unwrap();
-                let k = tof.round() as u32;
-                let (via_grid, model) = (grid.from_index(k), row.tof_to_mz(k as f64, t1));
-                assert!((via_grid - model).abs() / model < 1e-12, "{} frame {} bin {k}: grid {via_grid} vs model {model}", f["file"], c["frame"]);
-                assert_eq!(grid.to_index(via_grid), k);
-                n += 1;
-            }
-        }
-        assert_eq!(n, 60, "all 60 golden points exercised");
-        eprintln!("worst golden deviation: {worst:e} ppm");
     }
 
     /// Out-of-model inputs give NaN, never a plausible m/z.

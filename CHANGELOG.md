@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.17.2] — 2026-10-02
+
+**Output change (timsTOF archives).** The sentence `vendor_mz_calibration.model_type_1_verified` in
+the index of a native timsTOF archive names the two public files the ModelType-1 m/z model is
+verified on: `1e-9 ppm vs Bruker timsdata SDK on a C2 != 0, C4 != 0 file (mzdata diaPASEF.d,
+2026-09-22); 1e-7 ppm on PXD059079 2485 (C2 = C4 = 0)`. Releases 0.13.0 to 0.17.1 wrote a longer
+sentence; an archive written by one of them keeps it until it is converted again. Nothing else in an
+archive changes but the converter's version string.
+
+**Repository.** The history of this repository was rewritten and the repository republished on
+2026-10-02. The tags v0.9.5 and later and the commits under them have new ids (v0.9.4 and earlier
+are unchanged), so commit ids quoted in older entries of this file predate the rewrite; pull-request
+and issue numbers start again; the binaries of 0.13.0 to 0.17.1 are no longer offered. At the tags
+v0.9.7 to v0.17.1 `cargo test` does not compile, because one unit test includes a fixture that is no
+longer part of the history; `cargo build` is unaffected. A clone or a Homebrew tap of the earlier
+repository cannot be updated: clone again, or `brew untap okohlbacher/mzpeak` and tap again as the
+README describes.
+
+### Removed
+
+- The unit test `quadratic_branch_matches_the_sdk_goldens` and its fixture. The quadratic branch of
+  the ModelType-1 model stays covered by the SDK goldens of the public mzdata `diaPASEF.d` (`C2 !=
+  0`, `C4 != 0`), the linear case by those of PXD059079 2485, ModelType 2 by the OpenTIMS `test.d`
+  goldens.
+
 ## [0.17.1] — 2026-10-02
 
 **Output change (imaging marker).** `metadata.imaging.mz_range` is the object
