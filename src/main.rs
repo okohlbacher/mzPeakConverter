@@ -766,11 +766,13 @@ fn contacts_block(contacts: &[mzml_contact::Contact]) -> Option<(String, serde_j
 }
 
 /// The signal a spectrum hands the writer, for the imaging marker: its m/z array against the run's
-/// one axis (`shared`, a continuous-mode imzML) and the range the writer stores (`range`; `masked`:
-/// the zero-run mask is on, which applies to a profile spectrum). The writer takes a centroid
-/// spectrum's peak set, which mzdata built from the same arrays, so the arrays are the values
-/// either way; a spectrum without arrays gives the peak set's m/z, and without either an empty one.
-fn observe_stored_signal(entry: &MultiLayerSpectrum, shared: Option<&mut imaging::SharedAxis>, range: &mut imaging::StoredRange, masked: bool) {
+/// one axis (`shared`, a continuous-mode imzML) and, of a positioned spectrum written at `ms_level`
+/// 1, the range the writer stores (`range`, `None` for any other spectrum: `mz_range` is over the
+/// positioned MS1 spectra; `masked`: the zero-run mask is on, which applies to a profile spectrum).
+/// The writer takes a centroid spectrum's peak set, which mzdata built from the same arrays, so the
+/// arrays are the values either way; a spectrum without arrays gives the peak set's m/z, and without
+/// either an empty one.
+fn observe_stored_signal(entry: &MultiLayerSpectrum, shared: Option<&mut imaging::SharedAxis>, range: Option<&mut imaging::StoredRange>, masked: bool) {
     let profile = entry.signal_continuity() == mzdata::spectrum::SignalContinuity::Profile;
     if let Some(arrays) = entry.arrays.as_ref() {
         let mzs = arrays.mzs().ok();
@@ -778,14 +780,18 @@ fn observe_stored_signal(entry: &MultiLayerSpectrum, shared: Option<&mut imaging
         if let Some(s) = shared {
             s.observe(mzs);
         }
-        let intensities = arrays.get(&ArrayType::IntensityArray).and_then(|a| a.to_f64().ok());
-        range.observe(mzs, intensities.as_deref(), masked && profile);
+        if let Some(range) = range {
+            let intensities = arrays.get(&ArrayType::IntensityArray).and_then(|a| a.to_f64().ok());
+            range.observe(mzs, intensities.as_deref(), masked && profile);
+        }
     } else {
         let mzs: Vec<f64> = entry.peaks.as_ref().map(|p| p.iter().map(|peak| peak.mz).collect()).unwrap_or_default();
         if let Some(s) = shared {
             s.observe(&mzs);
         }
-        range.observe(&mzs, None, false);
+        if let Some(range) = range {
+            range.observe(&mzs, None, false);
+        }
     }
 }
 
@@ -5844,9 +5850,13 @@ fn convert_file(
     // imzML spectra typed MS1 at `ms level` 0, written at level 1 (owner decision D6).
     let mut ms_level_raised = 0usize;
     // The imaging marker's account of the stored signal: whether a continuous-mode imzML's spectra
-    // all hold one m/z array (`shared_mz_axis`), and the range the writer stores (`mz_range`).
+    // all hold one m/z array (`shared_mz_axis`), and the range the writer stores over the MS1
+    // spectra (`mz_range`).
     let mut shared_axis = continuous.then(imaging::SharedAxis::default);
     let mut stored_range = imaging::StoredRange::default();
+    // Positioned spectra written at `ms_level` 0: not MS1 for `mz_range`, named when the key is
+    // not written.
+    let mut positioned_level_0 = 0usize;
     let mut ran_out = true;
     for mut entry in reader.iter() {
         if cap.is_some_and(|m| n >= m) {
@@ -5905,8 +5915,11 @@ fn convert_file(
         if let Some(m) = &maldi {
             m.attach(&mut entry);
         }
+        // Whether the spectrum is written with a pixel position (one scan of it at least).
+        let mut has_position = false;
         if scan_positions.is_some() {
             let (kept, dropped, z) = imaging::drop_invalid_positions(entry.description_mut());
+            has_position = kept > 0;
             if dropped > 0 && unpositioned == 0 {
                 log::warn!("spectrum {}: a scan position is not a pixel index (x and y must both be integers from 1 to 2^32 − 1); removed", entry.id());
             }
@@ -5915,12 +5928,19 @@ fn convert_file(
             }
             (positioned, unpositioned, z_removed) = (positioned + kept, unpositioned + dropped, z_removed + z);
             extent.observe(entry.description());
-            // After the sort above: the arrays as the writer gets them.
-            observe_stored_signal(&entry, shared_axis.as_mut(), &mut stored_range, !mask_off);
         }
         // Before the TIC/BPC collector and the source tally see the spectrum.
         if is_imzml && imaging::ms_level_zero_as_one(entry.description_mut()) {
             ms_level_raised += 1;
+        }
+        if scan_positions.is_some() {
+            // After the sort above: the arrays as the writer gets them. After the level rule above:
+            // `mz_range` is over the positioned spectra the archive holds at `ms_level` 1, and an
+            // imzML's level-0 MS1 spectra are among them. A spectrum written without a position
+            // (it states none, or an invalid one that was removed) is no pixel and does not count.
+            let ms1_range = (has_position && entry.ms_level() == 1).then_some(&mut stored_range);
+            observe_stored_signal(&entry, shared_axis.as_mut(), ms1_range, !mask_off);
+            positioned_level_0 += usize::from(has_position && entry.ms_level() == 0);
         }
         timed += usize::from(entry.description().acquisition.scans.iter().any(|sc| sc.start_time != 0.0));
         if let Some(g) = thermo_windows.as_mut() {
@@ -6126,10 +6146,20 @@ fn convert_file(
                     );
                 }
             }
-            // The stored arrays' range (owner decision D10): what a reader can ask for, not the
-            // source's observed-m/z terms (the mask leaves edge zero runs out).
+            // `{"min": …, "max": …}` over the positioned MS1 spectra (`ms_level` 1 as written),
+            // absent when none holds an m/z: the imaging profile's key
+            // (HUPO-PSI/mzPeak-specification#25). The stored arrays' range (owner decision D10):
+            // what a reader can ask for, not the source's observed-m/z terms (the mask leaves edge
+            // zero runs out). Absent, the log says so: the level-0 rule is the imzML lane's, and an
+            // mzML whose MS1 spectra state level 0 (or none) is written at level 0.
             if let Some(range) = stored_range.json() {
                 block["mz_range"] = range;
+            } else {
+                log::warn!(
+                    "{}: no positioned spectrum written at ms_level 1 holds an m/z; metadata.imaging.mz_range is not written \
+                     ({positioned_level_0} positioned spectra are written at ms_level 0, which the key does not count)",
+                    input.display()
+                );
             }
             imaging_blocks.push(("imaging".into(), block));
         }
@@ -15835,7 +15865,7 @@ mod tests {
         assert!(log.contains("continuous-mode imzML (IMS:1000030): zero runs kept"), "{log}");
         assert_eq!((m["imaging"]["storage_mode"].as_str(), m["imaging"]["shared_mz_axis"].as_bool()), (Some("continuous"), Some(true)), "{:#}", m["imaging"]);
         assert_eq!(points(&m), (Some(48), Some(48)), "{:#}", m["fidelity"]);
-        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.0]));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 100.0, "max": 111.0}));
         let decoded = stored_mz(&out, 4);
         assert!(decoded.iter().all(|d| d == &decoded[0]), "one axis for every pixel: {decoded:?}");
         assert_eq!(decoded[0].len(), 12);
@@ -15852,7 +15882,7 @@ mod tests {
         assert!(!masked(&m));
         assert_eq!(m["imaging"]["shared_mz_axis"], false, "{:#}", m["imaging"]);
         assert!(log.contains("1 of 4 differ from the first; metadata.imaging.shared_mz_axis is false"), "{log}");
-        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.5]));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 100.0, "max": 111.5}));
 
         // Processed: masked as before, the mode stated, no shared-axis claim; the stored range is
         // what the mask left (the edge runs go, index 2 to 9); `--keep-zero-runs` is the override.
@@ -15863,12 +15893,27 @@ mod tests {
         assert_eq!(m["imaging"]["storage_mode"], "processed");
         assert!(m["imaging"].get("shared_mz_axis").is_none(), "{:#}", m["imaging"]);
         assert_eq!(points(&m), (Some(48), Some(28)), "7 of 12 points per spectrum: {:#}", m["fidelity"]);
-        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([102.0, 109.0]), "{:#}", m["imaging"]);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 102.0, "max": 109.0}), "{:#}", m["imaging"]);
         let (_, m, _) = convert("proc_keep", &src, &["--keep-zero-runs"]);
         assert!(!masked(&m));
         assert_eq!(points(&m), (Some(48), Some(48)));
-        assert_eq!(m["imaging"]["mz_range"], serde_json::json!([100.0, 111.0]));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 100.0, "max": 111.0}));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `ms_level` column of an archive's `spectra_metadata.parquet`, in row order (the member is
+    /// extracted into `dir`).
+    fn stored_ms_levels(archive: &std::path::Path, dir: &std::path::Path) -> Vec<i64> {
+        let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+        let meta = extract_zip_entry(&mut zip, "spectra_metadata.parquet", dir);
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&meta).unwrap()).unwrap().build().unwrap();
+        let mut levels = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let level = arrow::compute::cast(batch.column_by_name("ms_level").unwrap(), &arrow::datatypes::DataType::Int64).unwrap();
+            levels.extend(level.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().iter().map(|v| v.unwrap()));
+        }
+        levels
     }
 
     /// Owner decision D6 (2026-10-01): a spectrum typed `MS1 spectrum` (MS:1000579) that states
@@ -15883,18 +15928,7 @@ mod tests {
         let one = r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>"#;
         assert!(base.contains(one));
         let dir = scratch("imzml-ms-level-0");
-        let levels = |archive: &std::path::Path| -> Vec<i64> {
-            let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
-            let meta = extract_zip_entry(&mut zip, "spectra_metadata.parquet", &dir);
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&meta).unwrap()).unwrap().build().unwrap();
-            let mut levels = Vec::new();
-            for batch in reader {
-                let batch = batch.unwrap();
-                let level = arrow::compute::cast(batch.column_by_name("ms_level").unwrap(), &arrow::datatypes::DataType::Int64).unwrap();
-                levels.extend(level.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().iter().map(|v| v.unwrap()));
-            }
-            levels
-        };
+        let levels = |archive: &std::path::Path| stored_ms_levels(archive, &dir);
         for (name, level, raised) in [("zero", r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="0"/>"#, true), ("one", one, false)] {
             std::fs::write(dir.join(format!("{name}.imzML")), base.replace(one, level)).unwrap();
             std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
@@ -15917,6 +15951,226 @@ mod tests {
             assert_eq!(text.matches(r#"name="ms level" value="1""#).count(), 9, "{name}");
             assert!(!text.contains(r#"name="ms level" value="0""#), "{name}");
             assert_eq!(err.contains("state ms level 0; written with ms level 1"), raised, "{name}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.17.1: `metadata.imaging.mz_range` is over the MS1 spectra — `ms_level` 1 as the archive
+    /// holds it — as the imaging profile defines the key (HUPO-PSI/mzPeak-specification#25); 0.17.0
+    /// took every spectrum of the run. Two MS2 pixels holding the run's smallest and largest m/z do
+    /// not widen it, on the imzML lane and on the lane of an mzML stating positions; a run of MS2
+    /// spectra alone is an imaging archive all the same and has no `mz_range`.
+    #[test]
+    fn the_imaging_mz_range_is_over_the_ms1_spectra() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        let ms1 = [r#"<cvParam cvRef="MS" accession="MS:1000579" name="MS1 spectrum"/>"#, r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>"#];
+        let ms2 = [r#"<cvParam cvRef="MS" accession="MS:1000580" name="MSn spectrum"/>"#, r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>"#];
+        let group = r#"<referenceableParamGroup id="spectrum1">"#;
+        assert!(base.matches(ms1[0]).count() == 2 && base.matches(ms1[1]).count() == 1 && base.contains(group));
+        let dir = scratch("imzml-mz-range-ms1");
+        let convert = |name: &str, src: &std::path::Path| -> serde_json::Value {
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            index_metadata(&out)
+        };
+        let imzml = |name: &str, text: String| -> std::path::PathBuf {
+            std::fs::write(dir.join(format!("{name}.imzML")), text).unwrap();
+            std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
+            dir.join(format!("{name}.imzML"))
+        };
+
+        // As the fixture is, nine MS1 pixels: the whole run, 201.1 (pixel 1) to 208.3 (pixel 9).
+        let m = convert("ms1", &imzml("ms1", base.clone()));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.1, "max": 208.3}), "{:#}", m["imaging"]);
+
+        // Pixels 1 and 9 as MS2 spectra (a second param group): the range is the seven MS1 pixels',
+        // 201.2 (pixel 4) to 206.8 (pixels 6 and 8). 0.17.0 wrote [201.1, 208.3].
+        let mut spectra: Vec<String> = base.split("<spectrum ").map(str::to_string).collect();
+        assert_eq!(spectra.len(), 10);
+        for k in [1, 9] {
+            spectra[k] = spectra[k].replacen(r#"ref="spectrum1""#, r#"ref="spectrum2""#, 1);
+        }
+        let ms2_group = format!(r#"<referenceableParamGroup id="spectrum2">{}{}<cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum"/></referenceableParamGroup>"#, ms2[0], ms2[1]);
+        let mixed = spectra.join("<spectrum ").replace(group, &format!("{ms2_group}\n    {group}")).replace(r#"<referenceableParamGroupList count="3">"#, r#"<referenceableParamGroupList count="4">"#);
+        let m = convert("mixed", &imzml("mixed", mixed));
+        assert_eq!(stored_ms_levels(&dir.join("mixed.mzpeak"), &dir), vec![2, 1, 1, 1, 1, 1, 1, 1, 2]);
+        assert_eq!(m["imaging"]["pixel_count"], serde_json::json!({"x": 3, "y": 3}), "the MS2 pixels are pixels: {:#}", m["imaging"]);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.2, "max": 206.8}), "{:#}", m["imaging"]);
+
+        // The same run as an mzML stating positions (the archive's own export): the other lane.
+        let mzml = dir.join("mixed.mzML");
+        let (ok, _, err) = run_bin(&[dir.join("mixed.mzpeak").as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+        assert!(ok, "{err}");
+        let m = convert("mixed_mzml", &mzml);
+        assert_eq!(m["imaging"]["provenance"]["detected_from"], "IMS:1000050/51 on the input's scans");
+        assert_eq!(stored_ms_levels(&dir.join("mixed_mzml.mzpeak"), &dir), vec![2, 1, 1, 1, 1, 1, 1, 1, 2]);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.2, "max": 206.8}), "{:#}", m["imaging"]);
+
+        // Every pixel an MS2 spectrum: an imaging archive with its grid, and no `mz_range` (the
+        // profile: "absent when there are none"). 0.17.0 wrote [201.1, 208.3].
+        let m = convert("ms2", &imzml("ms2", base.replace(ms1[0], ms2[0]).replace(ms1[1], ms2[1])));
+        assert_eq!(stored_ms_levels(&dir.join("ms2.mzpeak"), &dir), vec![2; 9]);
+        assert_eq!((&m["imaging"]["is_imaging"], &m["imaging"]["pixel_count"]), (&serde_json::json!(true), &serde_json::json!({"x": 3, "y": 3})), "{:#}", m["imaging"]);
+        assert!(m["imaging"].get("mz_range").is_none(), "{:#}", m["imaging"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "MS1" is the level the archive holds, not the one the source states: the Thyra fixtures type
+    /// their spectra `MS1 spectrum` at `ms level` 0, the converter writes them at level 1 (owner
+    /// decision D6), and they are the spectra `mz_range` is over. The range is observed after that
+    /// rule; taken by the stated level, these files — and the ms-imaging.org examples, the DESI set
+    /// and the GBM set of the corpus — would have lost the key.
+    #[test]
+    fn imzml_ms_level_zero_spectra_are_the_ms1_spectra_of_the_mz_range() {
+        let dir = scratch("imzml-mz-range-level-0");
+        for name in ["unit_declared", "area_old_name"] {
+            let src = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/thyra")).join(format!("pixel_size_{name}.imzML"));
+            assert!(std::fs::read_to_string(&src).unwrap().contains(r#"name="ms level" value="0""#), "{name}");
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            let m = index_metadata(&out);
+            assert!(m["transformations"].to_string().contains(super::imaging::MS_LEVEL_0_AS_1), "{name}: {:#}", m["transformations"]);
+            assert_eq!(stored_ms_levels(&out, &dir), vec![1; 6], "{name}");
+            // The one axis of the six pixels (continuous mode, zero runs kept): the 60 doubles after
+            // the `.ibd`'s UUID, 183.8 to 184.39 (to the last bit, 184.38999999999947).
+            let ibd = std::fs::read(src.with_extension("ibd")).unwrap();
+            let axis = |i: usize| f64::from_le_bytes(ibd[16 + 8 * i..24 + 8 * i].try_into().unwrap());
+            assert_eq!((axis(0), (axis(59) * 100.0).round()), (183.8, 18439.0), "{name}");
+            assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": axis(0), "max": axis(59)}), "{name}: {:#}", m["imaging"]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mz_range` is over the *positioned* MS1 spectra: a spectrum written without a position is no
+    /// pixel. Pixel 1 of the fixture holds the run's smallest m/z (201.1); at `position x` 0 its
+    /// position is removed, the spectrum stays (at `ms_level` 1), and the range is the eight
+    /// pixels' — on the imzML lane and on the lane of an mzML stating positions, where that
+    /// spectrum states none. Where it is the run's one MS1 spectrum the key is absent, and the log
+    /// says so. The log also says so of an mzML whose MS1 spectra state `ms level` 0: the rule that
+    /// writes those at level 1 is the imzML lane's, the archive holds them at level 0, and with no
+    /// line the key was dropped in silence (0.17.0 wrote it).
+    #[test]
+    fn the_imaging_mz_range_is_over_the_positioned_spectra() {
+        let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.imzML")).unwrap();
+        let ibd = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid.ibd");
+        let dir = scratch("imzml-mz-range-positioned");
+        let convert = |name: &str, src: &std::path::Path| -> (serde_json::Value, String) {
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            (index_metadata(&out), err)
+        };
+        let imzml = |name: &str, text: &str| -> std::path::PathBuf {
+            std::fs::write(dir.join(format!("{name}.imzML")), text).unwrap();
+            std::fs::copy(ibd, dir.join(format!("{name}.ibd"))).unwrap();
+            dir.join(format!("{name}.imzML"))
+        };
+        let export = |name: &str| -> std::path::PathBuf {
+            let mzml = dir.join(format!("{name}.mzML"));
+            let (ok, _, err) = run_bin(&[dir.join(format!("{name}.mzpeak")).as_os_str(), "-o".as_ref(), mzml.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            mzml
+        };
+        const NOT_WRITTEN: &str = "no positioned spectrum written at ms_level 1 holds an m/z; metadata.imaging.mz_range is not written";
+
+        // Pixel 1 (the first spectrum, the run's 201.1) at x = 0. 0.17.0 wrote [201.1, 208.3].
+        let x1 = r#"<cvParam cvRef="IMS" accession="IMS:1000050" name="position x" value="1"/>"#;
+        let x0 = x1.replace(r#"value="1""#, r#"value="0""#);
+        assert!(base.find(x1).is_some_and(|at| base[..at].matches("<spectrum ").count() == 1));
+        let off_grid = base.replacen(x1, &x0, 1);
+        let (m, log) = convert("off_grid", &imzml("off_grid", &off_grid));
+        assert!(log.contains("a scan position is not a pixel index"), "{log}");
+        assert_eq!(stored_ms_levels(&dir.join("off_grid.mzpeak"), &dir), vec![1; 9]);
+        let rows = scan_positions(&dir.join("off_grid.mzpeak")).unwrap();
+        assert_eq!((rows[0], rows.iter().filter(|r| r.0.is_some() && r.1.is_some()).count()), ((None, None), 8), "{rows:?}");
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.2, "max": 208.3}), "{:#}", m["imaging"]);
+        assert!(!log.contains(NOT_WRITTEN), "{log}");
+
+        // Pixel 1 with a valid x and y and `position z` 0: z is removed, the pixel stays and counts.
+        let z0 = r#"<cvParam cvRef="IMS" accession="IMS:1000052" name="position z" value="0"/>"#;
+        let (m, log) = convert("bad_z", &imzml("bad_z", &base.replacen(x1, &format!("{x1}{z0}"), 1)));
+        assert!(log.contains("position z is not a pixel index"), "{log}");
+        assert_eq!(scan_positions(&dir.join("bad_z.mzpeak")).unwrap().iter().filter(|r| r.0.is_some() && r.1.is_some()).count(), 9);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.1, "max": 208.3}), "{:#}", m["imaging"]);
+
+        // The archive's own export: an mzML whose first spectrum states no position.
+        let mzml = export("off_grid");
+        let (m, _) = convert("off_grid_mzml", &mzml);
+        assert_eq!(m["imaging"]["provenance"]["detected_from"], "IMS:1000050/51 on the input's scans");
+        assert_eq!(scan_positions(&dir.join("off_grid_mzml.mzpeak")).unwrap()[0], (None, None));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.2, "max": 208.3}), "{:#}", m["imaging"]);
+
+        // The eight pixels as MS2 spectra (a second param group): the run's one MS1 spectrum has no
+        // position, so there is no MS1 pixel and no `mz_range`.
+        let group = r#"<referenceableParamGroup id="spectrum1">"#;
+        let ms2_group = concat!(
+            r#"<referenceableParamGroup id="spectrum2"><cvParam cvRef="MS" accession="MS:1000580" name="MSn spectrum"/>"#,
+            r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>"#,
+            r#"<cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum"/></referenceableParamGroup>"#
+        );
+        let mut spectra: Vec<String> = off_grid.split("<spectrum ").map(str::to_string).collect();
+        assert_eq!(spectra.len(), 10);
+        for s in &mut spectra[2..] {
+            *s = s.replacen(r#"ref="spectrum1""#, r#"ref="spectrum2""#, 1);
+        }
+        let lone = spectra.join("<spectrum ").replace(group, &format!("{ms2_group}\n    {group}")).replace(r#"<referenceableParamGroupList count="3">"#, r#"<referenceableParamGroupList count="4">"#);
+        let (m, log) = convert("lone", &imzml("lone", &lone));
+        assert_eq!(stored_ms_levels(&dir.join("lone.mzpeak"), &dir), vec![1, 2, 2, 2, 2, 2, 2, 2, 2]);
+        assert_eq!(m["imaging"]["is_imaging"], true, "{:#}", m["imaging"]);
+        assert!(m["imaging"].get("mz_range").is_none(), "{:#}", m["imaging"]);
+        assert!(log.contains(&format!("{NOT_WRITTEN} (0 positioned spectra are written at ms_level 0")), "{log}");
+
+        // The fixture as an mzML stating positions, its nine MS1 spectra at `ms level` 0: the archive
+        // holds them at level 0 (no level rule on this lane), the key is absent, and the log says why.
+        let (m, _) = convert("ms1", &imzml("ms1", &base));
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.1, "max": 208.3}), "{:#}", m["imaging"]);
+        let text = std::fs::read_to_string(export("ms1")).unwrap();
+        let (one, zero) = (r#"name="ms level" value="1""#, r#"name="ms level" value="0""#);
+        assert_eq!(text.matches(one).count(), 9);
+        let level_0 = dir.join("level_0.mzML");
+        std::fs::write(&level_0, text.replace(one, zero)).unwrap();
+        let (m, log) = convert("level_0", &level_0);
+        assert_eq!(stored_ms_levels(&dir.join("level_0.mzpeak"), &dir), vec![0; 9]);
+        assert_eq!(m["imaging"]["is_imaging"], true, "{:#}", m["imaging"]);
+        assert!(m["imaging"].get("mz_range").is_none(), "{:#}", m["imaging"]);
+        assert!(log.contains(&format!("{NOT_WRITTEN} (9 positioned spectra are written at ms_level 0")), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `metadata.imaging.mz_range` of a converted imzML against the imaging profile's schema for the
+    /// key (HUPO-PSI/mzPeak-specification#25, `schema/mzpeak_index.json`, the fragment below): an
+    /// object, `min` and `max` both required, both numbers. 0.17.0 wrote the array `[min, max]`,
+    /// which that schema rejected on all eight imaging archives of the example corpus. The fragment
+    /// is checked by hand (no JSON-schema crate): type, required, the type of each property.
+    #[test]
+    fn the_imaging_mz_range_validates_against_the_profile_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "description": "The m/z range over the MS1 spectra; absent when there are none.",
+            "required": ["min", "max"],
+            "properties": {"min": {"type": "number"}, "max": {"type": "number"}}
+        });
+        let dir = scratch("imzml-mz-range-schema");
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging");
+        for (name, src) in [("declared_grid", format!("{fixtures}/Synthetic_DeclaredGrid.imzML")), ("thyra", format!("{fixtures}/thyra/pixel_size_unit_declared.imzML"))] {
+            let out = dir.join(format!("{name}.mzpeak"));
+            let (ok, _, err) = run_bin(&[src.as_ref(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()], &[]);
+            assert!(ok, "{name}: {err}");
+            let m = index_metadata(&out);
+            let range = &m["imaging"]["mz_range"];
+            assert_eq!(schema["type"], "object");
+            let object = range.as_object().unwrap_or_else(|| panic!("{name}: mz_range is not an object: {range:#}"));
+            for key in schema["required"].as_array().unwrap() {
+                assert!(object.contains_key(key.as_str().unwrap()), "{name}: mz_range lacks the required {key}: {range:#}");
+            }
+            for (key, property) in schema["properties"].as_object().unwrap() {
+                assert_eq!(property["type"], "number");
+                assert!(object.get(key).is_none_or(|v| v.is_number()), "{name}: mz_range.{key} is not a number: {range:#}");
+            }
+            assert!(range["min"].as_f64() <= range["max"].as_f64(), "{name}: {range:#}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -26,9 +26,17 @@ the handful of items the ledger does not track. Decided by the owner in the 2026
     A7 the timsTOF grid terms `MS:9999001/2`.
   - **For spec PR #25, with the issue author:** `pixel_size_um` + `pixel_size_source`; that
     `spectrum.index` follows acquisition order; a shared-axis statement; zero-run stripping and L1,
-    the form of the L2 bound, f32 → f64 widening; whether `mz_range` describes the source or the
-    stored arrays; a region column; a second `registration_quality` value; the physical-position
-    rule; null time (Core).
+    the form of the L2 bound, f32 → f64 widening; a region column; a second `registration_quality`
+    value; the physical-position rule; null time (Core). **Settled 2026-10-02 (0.17.1):**
+    `mz_range` is the PR's object `{"min": …, "max": …}` over the MS1 spectra (`ms_level` 1 as
+    written) among the positioned spectra, absent when there are none, and it describes the
+    **stored** arrays (D10), not the source's observed-m/z terms — the PR text gains the word
+    "stored". 0.17.0 wrote the array `[min, max]` over every spectrum of the run, which the PR's
+    schema rejected on all eight imaging archives of the corpus. **Open on the PR's wording:** its
+    "over the MS1 spectra" does not say whether an MS1 spectrum without a position counts (the
+    converter leaves it out), nor whether MS1 is the `ms_level` or the spectrum type (the
+    converter takes `ms_level`). **Open here:** the `.mzpeak` → `.mzpeak` rewrite leaves the key
+    out when it filtered spectra, where it could recompute the range from the rows it kept.
   - **Still to test:** a Waters MALDI run with several functions or mobility (MSV000092638, 7 GB;
     order across functions is by retention time, unverified); the issue author's 33,800-frame TSF.
   - **Owed on the thread (owner):** see plan section 6.

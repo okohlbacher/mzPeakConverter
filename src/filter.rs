@@ -1693,8 +1693,13 @@ fn apply_layout(
     }
 }
 
+/// How the `filter` block's `dropped_index_blocks` names the imaging marker's `mz_range`, a key of a
+/// carried block, when the rewrite leaves it out ([`carry_index_metadata`]).
+const IMAGING_MZ_RANGE: &str = "imaging.mz_range";
+
 /// Carry the original index `metadata` blocks into `w`, add a `data_processing` entry, and add the
-/// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members, and
+/// `filter` provenance block. `imaging` loses the `images[]` entries of dropped members, and its
+/// `mz_range` when spectra were filtered out or it is not the profile's object (0.17.0's array);
 /// `encoding_prescan` names its spectrum by the new index ([`renumber_prescan_block`]); `fidelity`
 /// is left out when spectra were filtered out, since its point counts and error bounds describe
 /// the source archive's facets (the provenance block's `dropped_index_blocks` says so), and is
@@ -1742,6 +1747,24 @@ fn carry_index_metadata(
             let mut block = v.clone();
             if let Some(images) = block.get_mut("images").and_then(|i| i.as_array_mut()) {
                 images.retain(|i| !dropped.iter().any(|d| i["archive_path"] == d.as_str()));
+            }
+            // `mz_range` is the stored m/z range over the source's positioned MS1 spectra, as the
+            // object `{"min": …, "max": …}`. It is left out, and listed, where it would not describe
+            // this archive: spectra were filtered out (an `--ms-level 2` output kept the MS1 range
+            // of spectra it no longer holds), or it is 0.17.0's array `[min, max]`, which was taken
+            // over every spectrum of the run and cannot be reshaped into the MS1 range.
+            let stale = match block.get("mz_range") {
+                Some(_) if signal_rewritten => Some("spectra were filtered out, and it is the range of the archive read; the rewrite does not recompute it"),
+                Some(r) if !r.is_object() => Some(
+                    "it is not the object {min, max} over the MS1 spectra (mzpeak-convert 0.17.0 wrote an array over every spectrum); \
+                     converting the run's source writes it",
+                ),
+                _ => None,
+            };
+            if let (Some(why), Some(marker)) = (stale, block.as_object_mut()) {
+                marker.remove("mz_range");
+                log::warn!("metadata.imaging.mz_range is not carried: {why}");
+                dropped_blocks.push(IMAGING_MZ_RANGE);
             }
             w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;
         } else if k == "encoding_prescan" {

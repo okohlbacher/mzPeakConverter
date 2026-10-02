@@ -294,6 +294,99 @@ fn with_index(archive: &Path, dst: &Path, edit: impl FnOnce(&mut serde_json::Val
     zout.finish().unwrap();
 }
 
+/// `metadata.imaging.mz_range` is the stored m/z range over the positioned MS1 spectra of the
+/// archive it is in, as the object `{"min": …, "max": …}`. The rewrite copied the marker as found,
+/// so an `--ms-level 2` output kept the MS1 range of spectra it no longer held (the profile: absent
+/// when there are none), and a 0.17.0 archive kept its array `[min, max]` under a 0.17.1 software
+/// entry (the profile's schema rejects it, and its numbers are over every spectrum). Neither is
+/// carried now: the key is left out, listed in `filter.dropped_index_blocks` and warned about. A
+/// rewrite that keeps every spectrum of an archive holding the object carries it unchanged.
+#[test]
+fn the_rewrite_does_not_carry_an_mz_range_that_is_not_its_archives() {
+    const IMZML: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/imaging/Synthetic_DeclaredGrid");
+    let dir = scratch("mz-range");
+    // The fixture's nine MS1 pixels, pixels 1 and 9 (the run's 201.1 and 208.3) as MS2 spectra.
+    let base = std::fs::read_to_string(format!("{IMZML}.imzML")).unwrap();
+    let group = r#"<referenceableParamGroup id="spectrum1">"#;
+    let ms2_group = concat!(
+        r#"<referenceableParamGroup id="spectrum2"><cvParam cvRef="MS" accession="MS:1000580" name="MSn spectrum"/>"#,
+        r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>"#,
+        r#"<cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum"/></referenceableParamGroup>"#
+    );
+    let mut spectra: Vec<String> = base.split("<spectrum ").map(str::to_string).collect();
+    assert_eq!(spectra.len(), 10);
+    for k in [1, 9] {
+        spectra[k] = spectra[k].replacen(r#"ref="spectrum1""#, r#"ref="spectrum2""#, 1);
+    }
+    let mixed = spectra.join("<spectrum ").replace(group, &format!("{ms2_group}\n    {group}")).replace(r#"<referenceableParamGroupList count="3">"#, r#"<referenceableParamGroupList count="4">"#);
+    std::fs::write(dir.join("mixed.imzML"), mixed).unwrap();
+    std::fs::copy(format!("{IMZML}.ibd"), dir.join("mixed.ibd")).unwrap();
+    let src = dir.join("mixed.mzpeak");
+    ok(&mzpc(&dir.join("mixed.imzML"), &src, &[]));
+    let metadata = |a: &Path| serde_json::from_slice::<serde_json::Value>(&member(a, "mzpeak_index.json")).unwrap()["metadata"].clone();
+    let range = serde_json::json!({"min": 201.2, "max": 206.8});
+    assert_eq!(metadata(&src)["imaging"]["mz_range"], range);
+    const NOT_CARRIED: &str = "metadata.imaging.mz_range is not carried";
+
+    // Every spectrum kept: the object as it is, nothing listed, no warning.
+    let all = dir.join("all.mzpeak");
+    let r = mzpc(&src, &all, &[]);
+    ok(&r);
+    let m = metadata(&all);
+    assert_eq!(m["imaging"]["mz_range"], range, "{:#}", m["imaging"]);
+    assert!(m["filter"].get("dropped_index_blocks").is_none(), "{}", m["filter"]);
+    assert!(!String::from_utf8_lossy(&r.stderr).contains(NOT_CARRIED), "{}", String::from_utf8_lossy(&r.stderr));
+
+    // A filter that removes no spectrum keeps it too.
+    let both = dir.join("both.mzpeak");
+    ok(&mzpc(&src, &both, &["--ms-level", "1,2"]));
+    let m = metadata(&both);
+    assert_eq!(m["imaging"]["mz_range"], range, "{:#}", m["imaging"]);
+    assert!(m["filter"].get("dropped_index_blocks").is_none(), "{}", m["filter"]);
+
+    // Carried exactly: the rewrite parses the index and writes it again, and without exact float
+    // parsing (serde_json's `float_roundtrip`) the bladder archive's max 999.9986769379625 came
+    // out as 999.9986769379624, below its largest stored m/z.
+    let precise = dir.join("precise.mzpeak");
+    with_index(&src, &precise, |index| index["metadata"]["imaging"]["mz_range"] = serde_json::json!({"min": 400.0000275735195, "max": 999.9986769379625}));
+    let carried = dir.join("carried.mzpeak");
+    ok(&mzpc(&precise, &carried, &[]));
+    let index = member(&carried, "mzpeak_index.json");
+    assert_eq!(String::from_utf8_lossy(&index).matches("999.9986769379625").count(), 1);
+
+    // The MS1 pixels alone: spectra were removed, so the key goes although every MS1 pixel stayed
+    // (the range is not recomputed).
+    let ms1 = dir.join("ms1.mzpeak");
+    ok(&mzpc(&src, &ms1, &["--ms-level", "1"]));
+    let m = metadata(&ms1);
+    assert!(m["imaging"].get("mz_range").is_none(), "{:#}", m["imaging"]);
+
+    // The two MS2 pixels alone: no MS1 spectrum, no `mz_range`; the rest of the marker stays.
+    let ms2 = dir.join("ms2.mzpeak");
+    let r = mzpc(&src, &ms2, &["--ms-level", "2"]);
+    ok(&r);
+    let m = metadata(&ms2);
+    assert_eq!(table(&ms2, "spectra_metadata.parquet").num_rows(), 2);
+    assert!(m["imaging"].get("mz_range").is_none(), "{:#}", m["imaging"]);
+    assert_eq!((&m["imaging"]["is_imaging"], &m["imaging"]["pixel_count"]), (&serde_json::json!(true), &serde_json::json!({"x": 3, "y": 3})), "{:#}", m["imaging"]);
+    assert!(m["filter"]["dropped_index_blocks"].as_array().unwrap().contains(&serde_json::json!("imaging.mz_range")), "{}", m["filter"]);
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(stderr.contains(&format!("{NOT_CARRIED}: spectra were filtered out")), "{stderr}");
+
+    // A 0.17.0 archive: the array over every spectrum of the run. It is not reshaped.
+    let legacy = dir.join("legacy.mzpeak");
+    with_index(&src, &legacy, |index| index["metadata"]["imaging"]["mz_range"] = serde_json::json!([201.1, 208.3]));
+    let rewritten = dir.join("rewritten.mzpeak");
+    let r = mzpc(&legacy, &rewritten, &[]);
+    ok(&r);
+    let m = metadata(&rewritten);
+    assert!(m["imaging"].get("mz_range").is_none(), "{:#}", m["imaging"]);
+    assert_eq!(m["filter"]["dropped_index_blocks"], serde_json::json!(["imaging.mz_range"]));
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(stderr.contains(&format!("{NOT_CARRIED}: it is not the object")), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An archive written with the removed per-scan TOF delta encoding is refused by the rewrite and by
 /// the mzML export, each reading the index it has parsed for itself.
 #[test]
