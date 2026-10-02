@@ -71,6 +71,19 @@ converter's version string.
 - USER_MANUAL §8 and BACKLOG.md state the object and its scope; the backlog's open question for
   the profile ("source or stored arrays") is settled: stored.
 
+### Fixed
+
+- **The `.mzpeak` → `.mzpeak` rewrite carries the index's numbers exactly.** The lane parses the
+  index and writes it again, and `serde_json`'s default parser can return the double one unit in the
+  last place beside the one a decimal names. A rewrite that kept every spectrum of the bladder
+  archive turned `mz_range.max` 999.9986769379625 into 999.9986769379624, below the archive's
+  largest stored m/z; of 20,000 random doubles put into an index block, a rewrite by 0.17.0 changed
+  3,000, and changes none now. `serde_json` is built with `float_roundtrip`, which applies to every
+  index the converter parses. Since the lane exists. Tests: the rewrite carries 999.9986769379625 as
+  written (fails with the feature off); a filter that removes no spectrum keeps `mz_range`,
+  `--ms-level 1` on a run with MS2 pixels drops it; a pixel whose `position z` alone was removed
+  still counts.
+
 ## [0.17.0] — 2026-10-02
 
 **Fixes from the adversarial review of 2026-09-30.** Imaging input keeps its imaging on every lane,

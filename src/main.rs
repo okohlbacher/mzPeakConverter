@@ -16089,6 +16089,13 @@ mod tests {
         assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.2, "max": 208.3}), "{:#}", m["imaging"]);
         assert!(!log.contains(NOT_WRITTEN), "{log}");
 
+        // Pixel 1 with a valid x and y and `position z` 0: z is removed, the pixel stays and counts.
+        let z0 = r#"<cvParam cvRef="IMS" accession="IMS:1000052" name="position z" value="0"/>"#;
+        let (m, log) = convert("bad_z", &imzml("bad_z", &base.replacen(x1, &format!("{x1}{z0}"), 1)));
+        assert!(log.contains("position z is not a pixel index"), "{log}");
+        assert_eq!(scan_positions(&dir.join("bad_z.mzpeak")).unwrap().iter().filter(|r| r.0.is_some() && r.1.is_some()).count(), 9);
+        assert_eq!(m["imaging"]["mz_range"], serde_json::json!({"min": 201.1, "max": 208.3}), "{:#}", m["imaging"]);
+
         // The archive's own export: an mzML whose first spectrum states no position.
         let mzml = export("off_grid");
         let (m, _) = convert("off_grid_mzml", &mzml);

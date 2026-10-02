@@ -1754,15 +1754,16 @@ fn carry_index_metadata(
             // of spectra it no longer holds), or it is 0.17.0's array `[min, max]`, which was taken
             // over every spectrum of the run and cannot be reshaped into the MS1 range.
             let stale = match block.get("mz_range") {
-                Some(_) if signal_rewritten => Some("spectra were filtered out, and it is the range of the archive read"),
-                Some(r) if !r.is_object() => {
-                    Some("it is not the object {min, max} over the MS1 spectra (mzpeak-convert 0.17.0 wrote an array over every spectrum)")
-                }
+                Some(_) if signal_rewritten => Some("spectra were filtered out, and it is the range of the archive read; the rewrite does not recompute it"),
+                Some(r) if !r.is_object() => Some(
+                    "it is not the object {min, max} over the MS1 spectra (mzpeak-convert 0.17.0 wrote an array over every spectrum); \
+                     converting the run's source writes it",
+                ),
                 _ => None,
             };
             if let (Some(why), Some(marker)) = (stale, block.as_object_mut()) {
                 marker.remove("mz_range");
-                log::warn!("metadata.imaging.mz_range is not carried: {why}; converting the run's source writes it");
+                log::warn!("metadata.imaging.mz_range is not carried: {why}");
                 dropped_blocks.push(IMAGING_MZ_RANGE);
             }
             w.add_index_metadata(k, &block).map_err(|e| anyhow!("index metadata {k}: {e}"))?;

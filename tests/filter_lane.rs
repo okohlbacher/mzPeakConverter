@@ -337,6 +337,30 @@ fn the_rewrite_does_not_carry_an_mz_range_that_is_not_its_archives() {
     assert!(m["filter"].get("dropped_index_blocks").is_none(), "{}", m["filter"]);
     assert!(!String::from_utf8_lossy(&r.stderr).contains(NOT_CARRIED), "{}", String::from_utf8_lossy(&r.stderr));
 
+    // A filter that removes no spectrum keeps it too.
+    let both = dir.join("both.mzpeak");
+    ok(&mzpc(&src, &both, &["--ms-level", "1,2"]));
+    let m = metadata(&both);
+    assert_eq!(m["imaging"]["mz_range"], range, "{:#}", m["imaging"]);
+    assert!(m["filter"].get("dropped_index_blocks").is_none(), "{}", m["filter"]);
+
+    // Carried exactly: the rewrite parses the index and writes it again, and without exact float
+    // parsing (serde_json's `float_roundtrip`) the bladder archive's max 999.9986769379625 came
+    // out as 999.9986769379624, below its largest stored m/z.
+    let precise = dir.join("precise.mzpeak");
+    with_index(&src, &precise, |index| index["metadata"]["imaging"]["mz_range"] = serde_json::json!({"min": 400.0000275735195, "max": 999.9986769379625}));
+    let carried = dir.join("carried.mzpeak");
+    ok(&mzpc(&precise, &carried, &[]));
+    let index = member(&carried, "mzpeak_index.json");
+    assert_eq!(String::from_utf8_lossy(&index).matches("999.9986769379625").count(), 1);
+
+    // The MS1 pixels alone: spectra were removed, so the key goes although every MS1 pixel stayed
+    // (the range is not recomputed).
+    let ms1 = dir.join("ms1.mzpeak");
+    ok(&mzpc(&src, &ms1, &["--ms-level", "1"]));
+    let m = metadata(&ms1);
+    assert!(m["imaging"].get("mz_range").is_none(), "{:#}", m["imaging"]);
+
     // The two MS2 pixels alone: no MS1 spectrum, no `mz_range`; the rest of the marker stays.
     let ms2 = dir.join("ms2.mzpeak");
     let r = mzpc(&src, &ms2, &["--ms-level", "2"]);
