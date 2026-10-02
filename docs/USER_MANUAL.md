@@ -930,13 +930,24 @@ their shared `spectrum1` param group — is written with `ms_level` 1, declared
 the level, and readers' MS1 filters and the summed TIC/BPC pair (MS1 spectra that state a time)
 then apply to it; a spectrum that states no `ms level` at all reads the same way to mzdata and is
 treated alike. The marker's **`mz_range`** is the object `{"min": …, "max": …}` of the **stored**
-m/z arrays over the run's **MS1 spectra** — the spectra the archive holds at `ms_level` 1, so an
-imzML's MS1 spectra stating level 0 are among them and an MSn pixel is not — and is absent when no
-MS1 spectrum holds an m/z. This is the key as the draft imaging profile defines it
+m/z arrays over the run's **positioned MS1 spectra**: the spectra written with a pixel position
+that the archive holds at `ms_level` 1. "MS1" is the `ms_level` column, not `spectrum_type`. An
+imzML's MS1 spectra stating level 0 are among them (the rule above) and an MSn pixel is not; nor
+is a spectrum the archive holds at level 0 — one the source gives neither a type nor a level
+(the writer still defaults its `spectrum_type` to `MS:1000579`), and, on the lane of an mzML
+stating positions, any spectrum stating level 0 or none: the level-0 rule is the imzML lane's
+alone. A spectrum written without a position — it states none, or one that is not a pixel index
+and was removed — is no pixel and does not count. The key is absent when no positioned MS1
+spectrum holds an m/z, and the conversion then warns, with the number of positioned spectra it
+wrote at level 0. This is the key as the draft imaging profile defines it
 (HUPO-PSI/mzPeak-specification#25: an object over the MS1 spectra, absent when there are none);
 "stored" is owner decision D10. (0.17.0 wrote the array `[min, max]` over every spectrum of the
 run, which the profile's schema rejects; rebuild such an archive from its source to get the
-object.) Of each spectrum it takes the m/z the writer keeps — every point of a centroid
+object. The `.mzpeak` → `.mzpeak` rewrite, §4.2, carries the object while it keeps every
+spectrum. It leaves the key out, lists it as `imaging.mz_range` under the `filter` block's
+`dropped_index_blocks` and warns, when `--rt` or `--ms-level` removed spectra — the range is the
+source archive's — and when it finds 0.17.0's array, whose numbers are over every spectrum and
+are not reshaped.) Of each spectrum it takes the m/z the writer keeps — every point of a centroid
 spectrum, of a profile spectrum with the zero runs kept, and with the mask on the points the mask
 keeps, by the writer's own rule (an all-zero stretch at either end goes entirely, so the stored
 range is narrower than the source array's on such a spectrum: on 34,839 of the 34,840 bladder
@@ -947,7 +958,7 @@ moves a stored value within that bound. Written on the imzML and mzML-with-posit
 image** needs no structure of its own: it is a join of `spectra_metadata.total_ion_current` (and
 `base_peak_intensity`) with the pixel positions in `spectra_metadata_scans`, on `spectrum.index`
 — 0.16 s and 0.9 % of the archive's bytes for the bladder's 260 × 134 pixels; an ion image at one
-m/z is a range query over the signal facets (`mz_range` says what the archive's MS1 spectra hold).
+m/z is a range query over the signal facets (`mz_range` says what the archive's MS1 pixels hold).
 The header's **`<contact>`** is dropped unless `--keep-contact` (§4.1). The pixel size follows the
 issue author's rule (x and y with a unit are kept; without one, micrometre is assumed; x and y of
 which one is zero or negative are no pixel size and are dropped; a single value

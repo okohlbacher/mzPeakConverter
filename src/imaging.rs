@@ -1790,18 +1790,19 @@ impl SharedAxis {
     }
 }
 
-/// The smallest and largest m/z the archive stores over a run's MS1 spectra
+/// The smallest and largest m/z the archive stores over a run's positioned MS1 spectra
 /// (`metadata.imaging.mz_range`, the object `{"min": …, "max": …}` of the imaging profile,
 /// HUPO-PSI/mzPeak-specification#25; owner decision D10 for "stored"). The caller hands it the
-/// spectra the archive holds at `ms_level` 1 and no others (0.17.0 took every spectrum of the run
-/// and wrote the array `[min, max]`, which the profile's schema rejects). Of each spectrum it takes
-/// the m/z of the points the writer keeps — every point of a centroid spectrum, and of a profile
-/// spectrum with the zero-run mask off; with the mask on, the points the mask keeps, by the
-/// writer's own rule ([`mzpeak_prototyping::filter::find_where_not_zeros`]: an all-zero stretch at
-/// either end goes entirely, so the stored range is narrower than the source's `lowest`/`highest
-/// observed m/z` on such a spectrum — 34,775 of the 34,840 bladder spectra). The range of the
-/// values handed to the writer; an m/z encoding with a bound (`fidelity.mz_error`) moves a stored
-/// value within that bound.
+/// spectra written with a pixel position that the archive holds at `ms_level` 1, and no others
+/// (0.17.0 took every spectrum of the run, positioned or not, and wrote the array `[min, max]`,
+/// which the profile's schema rejects). Of each spectrum it takes the m/z of the points the writer
+/// keeps — every point of a centroid spectrum, and of a profile spectrum with the zero-run mask
+/// off; with the mask on, the points the mask keeps, by the writer's own rule
+/// ([`mzpeak_prototyping::filter::find_where_not_zeros`]: an all-zero stretch at either end goes
+/// entirely, so the stored range is narrower than the source's `lowest`/`highest observed m/z` on
+/// such a spectrum — 34,775 of the 34,840 bladder spectra). The range of the values handed to the
+/// writer; an m/z encoding with a bound (`fidelity.mz_error`) moves a stored value within that
+/// bound.
 #[derive(Debug)]
 pub struct StoredRange {
     min: f64,
