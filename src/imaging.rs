@@ -1790,14 +1790,18 @@ impl SharedAxis {
     }
 }
 
-/// The smallest and largest m/z the archive stores for a run (`metadata.imaging.mz_range`, owner
-/// decision D10): of each spectrum, the m/z of the points the writer keeps — every point of a
-/// centroid spectrum, and of a profile spectrum with the zero-run mask off; with the mask on, the
-/// points the mask keeps, by the writer's own rule ([`mzpeak_prototyping::filter::find_where_not_zeros`]:
-/// an all-zero stretch at either end goes entirely, so the stored range is narrower than the
-/// source's `lowest`/`highest observed m/z` on such a spectrum — 34,775 of the 34,840 bladder
-/// spectra). The range of the values handed to the writer; an m/z encoding with a bound
-/// (`fidelity.mz_error`) moves a stored value within that bound.
+/// The smallest and largest m/z the archive stores over a run's MS1 spectra
+/// (`metadata.imaging.mz_range`, the object `{"min": …, "max": …}` of the imaging profile,
+/// HUPO-PSI/mzPeak-specification#25; owner decision D10 for "stored"). The caller hands it the
+/// spectra the archive holds at `ms_level` 1 and no others (0.17.0 took every spectrum of the run
+/// and wrote the array `[min, max]`, which the profile's schema rejects). Of each spectrum it takes
+/// the m/z of the points the writer keeps — every point of a centroid spectrum, and of a profile
+/// spectrum with the zero-run mask off; with the mask on, the points the mask keeps, by the
+/// writer's own rule ([`mzpeak_prototyping::filter::find_where_not_zeros`]: an all-zero stretch at
+/// either end goes entirely, so the stored range is narrower than the source's `lowest`/`highest
+/// observed m/z` on such a spectrum — 34,775 of the 34,840 bladder spectra). The range of the
+/// values handed to the writer; an m/z encoding with a bound (`fidelity.mz_error`) moves a stored
+/// value within that bound.
 #[derive(Debug)]
 pub struct StoredRange {
     min: f64,
@@ -1833,9 +1837,9 @@ impl StoredRange {
         }
     }
 
-    /// `[min, max]`, or `None` when no point was stored.
+    /// `{"min": …, "max": …}`, or `None` when no point was observed (the key is then absent).
     pub fn json(&self) -> Option<serde_json::Value> {
-        (self.min <= self.max).then(|| serde_json::json!([self.min, self.max]))
+        (self.min <= self.max).then(|| serde_json::json!({"min": self.min, "max": self.max}))
     }
 }
 
@@ -3106,7 +3110,7 @@ mod tests {
     fn the_stored_range_is_what_the_mask_keeps() {
         let mz: Vec<f64> = (0..12).map(|i| 100.0 + i as f64).collect();
         let intensity = [0.0, 0.0, 0.0, 5.0, 7.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0];
-        let json = |r: &StoredRange| r.json().map(|v| (v[0].as_f64().unwrap(), v[1].as_f64().unwrap()));
+        let json = |r: &StoredRange| r.json().map(|v| (v["min"].as_f64().unwrap(), v["max"].as_f64().unwrap()));
         let mut masked = StoredRange::default();
         masked.observe(&mz, Some(&intensity), true);
         assert_eq!(json(&masked), Some((102.0, 109.0)), "{masked:?}");
