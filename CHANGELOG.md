@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.17.1] — 2026-10-02
+
+**Output change (imaging marker).** `metadata.imaging.mz_range` is the object
+`{"min": …, "max": …}` over the run's MS1 spectra — the spectra the archive holds at `ms_level` 1 —
+and is absent when there are none. 0.17.0 wrote the array `[min, max]` over every spectrum of the
+run. The owner's draft imaging profile (HUPO-PSI/mzPeak-specification#25) defines the key as that
+object over the MS1 spectra, and its JSON schema rejected 0.17.0's array on all eight imaging
+archives of the example corpus, on this key alone; no reader used the key. The numbers are still
+the range of the **stored** m/z arrays (owner decision D10; the profile's text gains the word).
+Affected: archives of the imzML and mzML-with-positions lanes written by 0.17.0. Rebuild them from
+the source to get the object — the `.mzpeak` → `.mzpeak` rewrite copies the marker as it finds it,
+array included. Nothing else in an archive changes but the converter's version string.
+
+### Changed
+
+- **`metadata.imaging.mz_range`: an object, over the MS1 spectra.** `{"min": …, "max": …}`
+  (`imaging::StoredRange::json`) in place of `[min, max]`. The range takes a spectrum when the
+  archive holds it at `ms_level` 1, and is read after the imzML rule that writes an `MS1 spectrum`
+  stating `ms level` 0 at level 1 (`imzml:ms-level-0-as-1`, D6): those spectra are MS1 as written
+  and count. Four of the corpus's eight imzML units state level 0 on every spectrum (the two
+  ms-imaging.org examples, the DESI section, the GBM section); taken by the stated level they
+  would have lost the key. An MSn pixel, and a spectrum the archive holds at level 0 (one nothing
+  types MS1; any on the mzML lane, which has no such rule), do not count; the key is absent when
+  no MS1 spectrum holds a finite m/z (a run of MS2 pixels is an imaging archive without
+  `mz_range`). Per spectrum the rule is 0.17.0's: the m/z the writer keeps, the zero-run mask's
+  own choice where it applies. `shared_mz_axis` is still every spectrum against the first.
+- **Measured on the corpus's eight imzML units** (0.17.1 against the 0.17.0 archives, same
+  command lines): every spectrum of all eight is MS1 as written, so the two numbers of each
+  `mz_range` are the ones 0.17.0 wrote (bladder `{"min": 400.00003, "max": 999.99868}`). The index
+  differs in `mz_range` (14 bytes), the converter's version string and the checksums of the five
+  Parquet members whose footer carries that string, each of which differs in that one byte; the
+  spectrum signal facets (`spectra_data`, `spectra_peaks`) and the embedded images are
+  byte-identical, and every Parquet member has its row count. Each new `metadata.imaging` block
+  validates against the profile's schema (`jsonschema`, draft 7): 0 errors, where each 0.17.0
+  block had the one on `mz_range`.
+- Tests: an MS2 pixel holding the run's smallest or largest m/z does not widen the range, on the
+  imzML lane and on an mzML stating positions; a run of MS2 pixels writes no `mz_range`; the Thyra
+  fixtures (level 0, typed MS1) keep theirs; the key against the profile's schema fragment (object,
+  `min` and `max` required, numbers), checked by hand. Each fails on 0.17.0.
+- USER_MANUAL §8 and BACKLOG.md state the object and its scope; the backlog's open question for
+  the profile ("source or stored arrays") is settled: stored.
+
 ## [0.17.0] — 2026-10-02
 
 **Fixes from the adversarial review of 2026-09-30.** Imaging input keeps its imaging on every lane,
