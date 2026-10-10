@@ -66,7 +66,7 @@ pub use base::AbstractMzPeakWriter;
 pub use builder::{ArrayConversionHelper, ColumnEncoding, DataColumnEncodings, MzPeakWriterBuilder, WriteBatchConfig};
 pub use row_group::{
     DEFAULT_ROW_GROUP_BYTES, RowGroupCut, RowGroupCutter, batch_bytes, row_group_max_bytes,
-    write_row_groups,
+    unbounded_rows, write_row_groups,
 };
 pub use split::UnpackedMzPeakWriterType;
 
@@ -581,7 +581,7 @@ fn prune_all_null_dup_point_columns(
     let mut w = ArrowWriter::try_new_with_options(
         out.try_clone()?,
         out_schema.clone(),
-        ArrowWriterOptions::new().with_properties(props.clone()),
+        ArrowWriterOptions::new().with_properties(unbounded_rows(props.clone())),
     )?;
     let mut row_groups = RowGroupCutter::new(props.max_row_group_row_count(), max_row_group_bytes);
     let dropped: Vec<String> = drop.iter().map(|&i| format!("{}.{}", point_field.name(), children[i].name())).collect();
@@ -1108,7 +1108,7 @@ impl<
                 ArrowWriter::try_new_with_options(
                     SHA512HashingStream::new(writer),
                     spectrum_buffers.schema().clone(),
-                    ArrowWriterOptions::new().with_properties(data_props),
+                    ArrowWriterOptions::new().with_properties(unbounded_rows(data_props)),
                 )
                 .unwrap(),
             ),
@@ -1600,7 +1600,7 @@ impl<
                     self.archive_writer = Some(ArrowWriter::try_new_with_options(
                         SHA512HashingStream::new(writer),
                         schema,
-                        ArrowWriterOptions::new().with_properties(props),
+                        ArrowWriterOptions::new().with_properties(unbounded_rows(props)),
                     )?);
                     // Same per-facet definition as `spectra_data` / `chromatograms_data`.
                     self.append_key_value_metadata(
@@ -1748,7 +1748,7 @@ impl<
                 self.archive_writer = Some(ArrowWriter::try_new_with_options(
                     SHA512HashingStream::new(writer),
                     self.chromatogram_data_buffers.schema().clone(),
-                    ArrowWriterOptions::new().with_properties(props),
+                    ArrowWriterOptions::new().with_properties(unbounded_rows(props)),
                 )?);
                 self.flush_chromatogram_data_records(&mut row_groups)?;
                 self.add_chromatogram_array_metadata();

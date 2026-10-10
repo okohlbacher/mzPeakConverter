@@ -52,7 +52,7 @@ use parquet::file::reader::ChunkReader;
 use mzpeak_prototyping::MzPeakReader;
 use mzpeak_prototyping::archive::{DataKind, EntityType, FileEntry, ZipArchiveWriter};
 use mzpeak_prototyping::reader::visitor::AnyCURIEArray;
-use mzpeak_prototyping::writer::{RowGroupCutter, row_group_max_bytes, write_row_groups};
+use mzpeak_prototyping::writer::{RowGroupCutter, row_group_max_bytes, unbounded_rows, write_row_groups};
 
 /// Effective filter settings for one `.mzpeak → .mzpeak` run. Built by `main.rs` from the CLI/config.
 #[derive(Debug, Default, Clone)]
@@ -1026,7 +1026,7 @@ where
     let mut points: u64 = 0;
     let mut keys: BTreeSet<u64> = BTreeSet::new();
     {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))?;
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(unbounded_rows(props)))?;
         for batch in reader {
             let batch = batch?;
             let Some(out) = map(&batch)? else { continue };

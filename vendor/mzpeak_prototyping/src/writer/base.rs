@@ -1255,7 +1255,7 @@ pub trait AbstractMzPeakWriter {
         let peak_writer = ArrowWriter::try_new_with_options(
             stream,
             peak_buffer.schema().clone(),
-            ArrowWriterOptions::new().with_properties(peak_data_props.clone()),
+            ArrowWriterOptions::new().with_properties(crate::writer::unbounded_rows(peak_data_props.clone())),
         )?;
 
         // The peak facet is ~95% of the output bytes; its Arrow-encode + zstd is single-threaded and,
@@ -1523,6 +1523,11 @@ pub trait AbstractMzPeakWriter {
             // parquet 59 renamed DEFAULT_MAX_ROW_GROUP_SIZE → DEFAULT_MAX_ROW_GROUP_ROW_COUNT
             // (same value, 1024*1024). The parallel peak encoder cuts row groups at exactly this
             // count, so the value must stay 1,048,576 for its byte-identity guarantee to hold.
+            // DELIBERATE DEVIATION (mzPeakConverter): `$MZPC_ROW_GROUP_ROWS` (`--row-group-rows`)
+            // sets the row cap of every spectrum signal facet when the caller configured none.
+            .or_else(|| {
+                std::env::var("MZPC_ROW_GROUP_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0)
+            })
             .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT);
         let data_page_size = write_batch_config
             .page_size

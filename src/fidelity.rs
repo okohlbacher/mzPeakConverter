@@ -95,7 +95,7 @@ const FACETS: [(&str, &str); 2] = [("spectra_data.parquet", "spectra_data"), ("s
 /// other entry describes metadata (a dropped reference, a pixel size, a position), a chromatogram
 /// or device trace, or a precursor window, and does not count. A NEW entry that touches spectrum
 /// signal belongs here, or in [`SIGNAL_TRANSFORMATION_PREFIXES`] when it carries a parameter.
-pub const SIGNAL_TRANSFORMATIONS: [&str; 21] = [
+pub const SIGNAL_TRANSFORMATIONS: [&str; 22] = [
     "zero-run-mask",
     "numpress-linear",
     DELTA_ULP,
@@ -117,6 +117,7 @@ pub const SIGNAL_TRANSFORMATIONS: [&str; 21] = [
     "bruker:mz-calibration-chord",
     "bruker:mz-calibrant-omitted",
     "bruker:out-of-window-points-dropped",
+    crate::thermo_centroids::VENDOR_CENTROIDS_ONLY,
 ];
 
 /// `transformations` entry: a 64-bit m/z facet holds delta chunks that are not exact by
@@ -931,6 +932,55 @@ fn stored(tmp: &Path) -> Result<Vec<(&'static str, StoredFacet)>> {
         }
     }
     Ok(out)
+}
+
+/// The `row_groups` index block's key.
+pub const ROW_GROUPS_BLOCK: &str = "row_groups";
+
+/// The `row_groups` index block: each signal facet whose row groups hold whole entries, as
+/// `"<entity>-aligned"` (`"spectrum-aligned"`, `"chromatogram-aligned"`). Checked here on the
+/// written facets, from the row-group statistics of the entry column (`*_index`): every group states
+/// a min and a max, and each group's max is below the next group's min. The writer cuts that way
+/// (`RowGroupCutter`); a facet that fails the check is left out with a warning rather than declared.
+/// `None` when no facet qualifies.
+pub fn row_group_alignment(tmp: &Path) -> Result<Option<Value>> {
+    let members = unfinished_zip_members(&mut File::open(tmp)?)?;
+    let mut block = serde_json::Map::new();
+    for m in members.iter().filter(|m| m.size > 0 && (m.name.ends_with("_data.parquet") || m.name.ends_with("_peaks.parquet"))) {
+        let reader = ArchiveFacetReader::new(File::open(tmp)?, m.offset, m.size, 0);
+        let metadata = ArrowReaderMetadata::load(&reader, Default::default()).with_context(|| format!("reading {} back", m.name))?;
+        let Some(top) = metadata.schema().fields().first() else { continue };
+        let DataType::Struct(children) = top.data_type() else { continue };
+        let Some(key) = children.iter().find(|f| f.name().ends_with("_index") && f.data_type().is_integer()) else { continue };
+        let path = format!("{}.{}", top.name(), key.name());
+        let pq = metadata.metadata();
+        let Some(col) = pq.file_metadata().schema_descr().columns().iter().position(|c| c.path().string() == path) else { continue };
+        let bounds: Option<Vec<(i128, i128)>> = pq
+            .row_groups()
+            .iter()
+            .map(|rg| {
+                use parquet::file::statistics::Statistics as S;
+                match rg.column(col).statistics()? {
+                    S::Int32(v) => Some((*v.min_opt()? as i128, *v.max_opt()? as i128)),
+                    S::Int64(v) => Some((*v.min_opt()? as i128, *v.max_opt()? as i128)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let aligned = bounds.as_ref().is_some_and(|b| b.windows(2).all(|w| w[0].1 < w[1].0));
+        if aligned {
+            let entity = key.name().trim_end_matches("_index");
+            block.insert(m.name.clone(), json!(format!("{entity}-aligned")));
+        } else {
+            log::warn!(
+                "{}: {} row groups that do not each hold whole entries by their `{path}` statistics; \
+                 not declared in the row_groups index block",
+                m.name,
+                pq.num_row_groups()
+            );
+        }
+    }
+    Ok((!block.is_empty()).then(|| Value::Object(block)))
 }
 
 /// `x` rounded UP to six significant digits: a bound stays a bound, and a figure this short comes
