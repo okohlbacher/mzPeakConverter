@@ -387,6 +387,9 @@ pub struct ShimadzuReader {
     count: usize,
     lcd_path: PathBuf,
     representation: Representation,
+    /// What the levels `--representation-levels` leaves out read: `Both` (the archive lanes);
+    /// the mzML export, which holds one representation per spectrum, sets `Profile`.
+    other_levels: Representation,
     /// One-shot latch so the "you asked for X, the file has Y" warning is emitted once per file
     /// rather than once per spectrum.
     fallback_warned: AtomicBool,
@@ -454,6 +457,7 @@ impl ShimadzuReader {
             count,
             lcd_path: path.to_path_buf(),
             representation,
+            other_levels: Representation::Both,
             fallback_warned: AtomicBool::new(false),
             stores_profile: std::cell::Cell::new(None),
             rotation_warned: AtomicBool::new(false),
@@ -616,6 +620,12 @@ impl ShimadzuReader {
         }
     }
 
+    /// What the levels `--representation-levels` does not name read (default `Both`).
+    pub fn with_other_levels(mut self, representation: Representation) -> Self {
+        self.other_levels = representation;
+        self
+    }
+
     /// Fetch one representation of spectrum `i`. `which`: 0 = profile, 1 = centroid.
     fn peaks(&self, i: usize, which: i32) -> Result<(Vec<f64>, Vec<f32>)> {
         if which == 1 {
@@ -744,12 +754,19 @@ impl ShimadzuReader {
             bail!("Shimadzu spectrum index {i} out of range (len {})", self.count);
         }
         let meta = self.meta(i)?;
+        // `--representation` holds on the levels `--representation-levels` names; every other
+        // level reads both.
+        let representation = if crate::representation_applies_to(u8::try_from(meta.ms_level.max(1)).unwrap_or(1)) {
+            self.representation
+        } else {
+            self.other_levels
+        };
         // Shimadzu exposes profile AND centroid for the same scan. Fetch what was asked for and
         // report which one actually carried data, so the spectrum can be LABELLED correctly --
         // previously the continuity flag was dropped at the ABI boundary and every spectrum was
         // written as "profile" whatever it held.
-        let want_profile = self.representation != Representation::Centroid;
-        let want_centroid = self.representation != Representation::Profile;
+        let want_profile = representation != Representation::Centroid;
+        let want_centroid = representation != Representation::Profile;
         let mut profile = if want_profile { self.peaks(i, 0)? } else { (Vec::new(), Vec::new()) };
         let mut centroid = if want_centroid { self.peaks(i, 1)? } else { (Vec::new(), Vec::new()) };
         // An explicit `--representation profile` on a file that stores only centroids would otherwise
@@ -760,7 +777,7 @@ impl ShimadzuReader {
         // `warn_if_rotated_centroids` (which WARNS — this converter stores what the vendor
         // returns and never refuses the conversion; see that function's docs).
         if profile.0.is_empty() && centroid.0.is_empty() {
-            match self.representation {
+            match representation {
                 Representation::Profile => centroid = self.peaks(i, 1)?,
                 Representation::Centroid => profile = self.peaks(i, 0)?,
                 Representation::Both => {}
@@ -774,7 +791,7 @@ impl ShimadzuReader {
                 log::warn!(
                     "this file does not store the requested representation ({:?}); writing the one \
                      it does contain, correctly labelled",
-                    self.representation
+                    representation
                 );
             }
         }

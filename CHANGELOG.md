@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.18.0] — 2026-10-10
+
+**Output change (Thermo `.raw`).** A Thermo profile scan that stores the instrument's centroid list
+(FT and Astral scans: RawFileReader's centroid stream) is written with it by default: the profile
+in `spectra_data`, the centroids in `spectra_peaks`, `number_of_data_points` and `number_of_peaks`
+both filled — the Shimadzu `.lcd` precedent for `--representation both`. Through 0.17.2 a Thermo
+archive held the profile only. `--representation centroid` stores the centroids alone,
+`--representation profile` restores the old output. Requested by the ODIA-V3 trace extractor.
+
+**Output change (every archive).** Signal row groups hold whole spectra (chromatograms), and the
+index says so per facet in a new `row_groups` block (`"spectrum-aligned"`), checked on the written
+facets from their row-group statistics. Through 0.17.2 a row group could end inside a spectrum (at
+the row cap, at the byte cap for a spectrum larger than a group, and anywhere in the filter lane's
+rewrites); readers had to look for a carried-over spectrum.
+
+### Added
+
+- `--representation` on Thermo `.raw` (mzPeak output): the vendor's centroid list beside the
+  profile (`both`, default), instead of it (`centroid`), or not at all (`profile`). Declared as
+  `vendor-centroids` / `vendor-centroids:profile-dropped` in `transformations` and as MS:1000035
+  `peak picking` in the conversion's processing method. A profile scan with no centroid list (an
+  ion-trap scan) keeps its profile, with a warning.
+- `--representation-levels LEVELS` (config `representation_levels`): the MS levels
+  `--representation` applies to, every other level reading `both`. Per spectrum on the Thermo and
+  Shimadzu readers; the BAF reader ignores it with a warning.
+- `--row-group-rows N` and `--row-group-mb MIB`, the CLI spelling of `MZPC_ROW_GROUP_ROWS` /
+  `MZPC_ROW_GROUP_MB`. `MZPC_ROW_GROUP_ROWS` now sets the row cap of every spectrum signal facet,
+  not only on the timsTOF ims-compact lane.
+- The `row_groups` index block (USER_MANUAL §7, *Row groups*).
+
+### Measured (Orbitrap Astral, 15 min DIA, ProteoBench `LFQ_Astral_DIA_15min_50ng_Human_01.raw`)
+
+- Default (`both`): 1.344 GB, against 1.294 GB from 0.17.2; the 2,928 MS1 spectra now carry their
+  vendor centroids in `spectra_peaks` beside the profile.
+- `--representation centroid --representation-levels 1`: 1.090 GB; MS1 as centroids only, MS2
+  unchanged. 4 min 05 s on ibminode06, as the default conversion.
+- Size cost of smaller row groups: `--row-group-mb 2` cuts `spectra_peaks` into 694 row groups
+  instead of 29 for +0.37 % (+3.9 MB) on that facet.
+
+### Changed
+
+- The row-group cutter (vendored writer, `row_group.rs`) closes a group only between two entries;
+  an entry larger than a group gets a group of its own. The writers it feeds no longer cut by rows
+  themselves (`unbounded_rows`).
+
 ## [0.17.2] — 2026-10-02
 
 **Output change (timsTOF archives).** The sentence `vendor_mz_calibration.model_type_1_verified` in

@@ -138,7 +138,10 @@ shortened; `tests/docs_drift.rs` fails when an option has no row here). `--help`
 | `-f, --force` | off | Overwrite the output if it already exists; also converts an imzML whose `.ibd` begins with another UUID than the header states — refused otherwise, since the two files may not be the pair the imzML describes (§8, imaging; forced, the mismatch is warned about, declared as `imzml:ibd-uuid-mismatch` and recorded); with `--pixel-size`, also writes the supplied size over one the source states (the command-line flag alone: a config file's `force: true` overwrites outputs and does not write over a stated size) |
 | `--pixel-size <X[,Y]>` | — | **Imaging runs only:** the pixel size in micrometres, `X` for square pixels or `X,Y`, written into the grid (`IMS:1000046/47`, with `IMS:1000044/45` from the pixel counts) when the source settles none — an imzML or mzML whose header states no size or one the pixel-size rule drops (§8), a Bruker MALDI `.d` without a FlexImaging `.mis` raster step or a beam scan size, the missing axis of a Waters single row, or an existing `.mzpeak` archive (§4.2: the archive gains the size). A size the source does state is kept when it agrees (to 1e-6) and is an **error naming both values** when it differs — as is, on an axis that states no size, a stated max dimension (`IMS:1000044/45`) that is not pixel count × supplied size (the test the pixel-size rule settles a size by, §8); with `--force` (on the command line) the supplied size is written over it and a stated max dimension is recomputed from the counts, its stated value kept in the row. Declared `imaging:pixel-size-user-supplied`, recorded as a row of `imaging_pixel_size` (the stated values, whether written over, the max dimensions written) and in `metadata.imaging` as `pixel_size_source: user_supplied` and `provenance.pixel_size: user supplied (--pixel-size)`. Refused (exit 1) on an mzML output, on the two `--bruker-sdk` lanes and `--agilent-grid` (they write no pixel grid), on a run or archive that is not imaging, and when malformed (zero, negative, not a number, more than two values). Config key `pixel_size` (§5) |
 | `--no-ims-compact` | off | Bruker timsTOF (TDF) only: disable the default lossless ims-compact integer-TOF storage and write standard f64 m/z instead |
-| `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum (Shimadzu `.lcd` does). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written. Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) |
+| `--representation <both\|profile\|centroid>` | `both` | Which signal representation to read when a vendor supplies BOTH profile and centroid for the same spectrum: Shimadzu `.lcd` does, and so does a Thermo `.raw` for its FT and Astral profile scans (the instrument's centroid list, RawFileReader's centroid stream). `both` is faithful to the raw data: profile goes to `spectra_data`, centroid to `spectra_peaks`, and the metadata row carries both `number_of_data_points` and `number_of_peaks`. `profile` / `centroid` force one view; a representation the file does not contain is a warning, not an error — the other one is written (a Thermo ion-trap profile scan has no centroid list and keeps its profile). Honoured by the Thermo `.raw`, Shimadzu `.lcd` and Bruker BAF readers (Thermo and BAF: mzPeak output only). The Thermo lane declares the centroids it stored as `vendor-centroids` or `vendor-centroids:profile-dropped` (§8) and adds MS:1000035 `peak picking` to the conversion's processing method |
+| `--representation-levels <LEVELS>` | every level | The MS levels `--representation` applies to (repeatable or comma-list, as `--ms-level`); every other level reads `both`. `--representation centroid --representation-levels 1` stores MS1 as the vendor's centroids only and leaves MS2 as the file has it. Per spectrum on the Thermo and Shimadzu readers; the BAF reader chooses for the whole run and ignores it, with a warning |
+| `--row-group-rows <N>` | 1,048,576 rows; 8,192 chunks on the timsTOF ims-compact lane | Row cap of a signal facet's row group (sets `MZPC_ROW_GROUP_ROWS`, §10). A row is a point in the point layout, a chunk in the chunked one. A row group always holds whole spectra (§7, *Row groups*) |
+| `--row-group-mb <MIB>` | 48 | Byte cap of a signal facet's row group, in MiB of uncompressed Arrow buffers, fractions allowed (sets `MZPC_ROW_GROUP_MB`, §10). A group closes at the first spectrum boundary that would exceed this or `--row-group-rows`, whichever comes first |
 | `--ims-chunked` | **on** | Bruker timsTOF (TDF) ims-compact only: 50-Th chunks (`--chunk-size` overrides the width) on the reference implementation's chunk grid — every chunk row keeps its real m/z bounds (page-prunable: m/z window queries read only the chunks they need) and its points as integer TOF bins and TIMS scan numbers under the frame's own vendor calibration models (§9). Passing the flag explicitly is inert and says so |
 | `--no-ims-chunked` | off | Bruker timsTOF (TDF) ims-compact only: one chunk per frame instead of 50-Th chunks — the same grid rows, whole-frame access in one row, no m/z pruning within a frame. (Through 0.13 this selected a flat point table of absolute TOF bins; that layout is gone) |
 | `--bruker-sdk` | off | Read Bruker TDF/TSF `.d` via the official Bruker timsdata SDK (parallel path to the default pure-Rust readers; Windows/Linux only, needs `timsdata.dll` / `libtimsdata.so`, found through `TIMSDATA_LIB_DIR` (§10) or the loader's search path). On a TDF still writes the lossless ims-compact layout; add `--no-ims-compact` for f64 m/z |
@@ -637,6 +640,7 @@ agilent_grid: false
 via_msconvert: false
 msconvert_path: /opt/pwiz/msconvert
 representation: both       # both | profile | centroid            (0.9.13)
+representation_levels: [1] # --representation-levels               (0.18.0)
 rt: "10-20"                # .mzpeak input only, §4.2               (0.9.13)
 ms_level: [1, 2]           # .mzpeak input only                     (0.9.13)
 drop_aux:                  # .mzpeak input only                     (0.9.13)
@@ -691,7 +695,8 @@ Contents:
 - `mzpeak_index.json` — manifest: facets, schema versions, run metadata,
   `ims_calibration` (for ims-compact), `transformations` (what was done to the signal, §8),
   `fidelity` (by how much: points stored against points read, numeric types, m/z error, §8),
-  `partial` (only when `MZPC_MAX_SPECTRA` truncated the run, §10), declared file entries.
+  `partial` (only when `MZPC_MAX_SPECTRA` truncated the run, §10), `row_groups` (which signal
+  facets hold whole spectra per row group, below), declared file entries.
   Since 0.9.13 `source_files[].location` never carries the converting machine's path (it is
   reduced to the bare `file://` authority; non-`file` URL schemes are kept), `run.id` is never a
   path, and `default_instrument_id` always resolves: a run without an instrument record gets one
@@ -787,6 +792,37 @@ vocabulary — is documented at:
 - 🔬 **[mzpeak.org/view](https://mzpeak.org/view)** — open and analyze any `.mzpeak`
   produced by this tool directly in your browser (streamed over HTTP, no upload,
   no backend).
+
+### Row groups
+
+Every signal facet (`spectra_data`, `spectra_peaks`, `chromatograms_data`, wavelength data) is cut
+into row groups only **between two entries**: a spectrum's (chromatogram's) rows, points or chunks,
+are always in one row group, in every layout and on every lane, the `.mzpeak` filter and its
+rewrites included. A group closes at the first entry boundary past `--row-group-rows` or
+`--row-group-mb`; an entry larger than a whole group gets a group of its own instead of being
+split. Every group carries the min/max statistics of its entry column (`spectrum_index`, …).
+
+The index states it, checked on the facets as written from those statistics (each group's maximum
+below the next group's minimum):
+
+```json
+"row_groups": {
+  "spectra_data.parquet": "spectrum-aligned",
+  "spectra_peaks.parquet": "spectrum-aligned",
+  "chromatograms_data.parquet": "chromatogram-aligned"
+}
+```
+
+A reader can decode the row groups of a facet listed there in parallel, one group per thread,
+without looking for an entry carried over from the previous group. A facet missing from the block
+failed the check (the conversion warns) and makes no such promise; archives written before 0.18.0
+have no block.
+
+**Size cost of smaller row groups.** Each row group restarts its column pages, page statistics and
+zstd frames, so more groups cost bytes: little while a group still holds many pages, more once
+groups shrink to a few pages per column. Measure it on the run that matters with
+`--row-group-mb` / `--row-group-rows`; for a 15 min Astral DIA run see the CHANGELOG entry of
+0.18.0.
 
 ## 8. Vendor-specific metadata handling
 
@@ -1443,6 +1479,8 @@ The vocabulary:
 | `imaging:pixel-count-raised-to-positions` | a pixel count the input states does not bound the written positions (a position lies beyond it, it is not a whole number, or only the other axis states one); that `IMS:1000042/43` was set to the largest position on its axis (`pixel_count_source: observed_max`) | imzML, mzML with `IMS:1000050/51` |
 | `imaging:invalid-position-dropped` | at least one scan stated a position that is not a pixel index (x or y missing, not an integer, below 1 or above 2³² − 1); its position params (z included) were removed and every position column is null for it. The run's warning gives the count | imzML, mzML with `IMS:1000050/51` |
 | `imaging:invalid-position-z-dropped` | at least one scan stated pixel-index x and y but a z that is not one (not an integer, below 1 or above 2³² − 1); only its z param was removed, so `position_z` is null for it and x and y are kept. The run's warning gives the count | imzML, mzML with `IMS:1000052` |
+| `vendor-centroids` | profile spectra carry the vendor's centroid list beside the profile (`--representation both`, the default): the profile in `spectra_data`, the centroids in `spectra_peaks`, both counts in the metadata row. The run's log gives the count | Thermo `.raw` |
+| `vendor-centroids:profile-dropped` | profile spectra are stored as the vendor's centroid list only (`--representation centroid`, on the levels `--representation-levels` names), labelled centroid; their profile is not in the archive. A signal transformation | Thermo `.raw` |
 | `thermo:target-only-isolation-window` | at least one precursor isolation window had no width its scan states (no positive `MS<n> Isolation Width` trailer, or an empty or inverted window) and was written target-only; thermorawfilereader computes a quarter-width or inverted window for them. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `thermo:invalid-precursor-reference-dropped` | at least one precursor named, as the spectrum it was selected from, the spectrum itself or a spectrum whose MS level is not below its own, and the reference was cleared (`precursor_id` and `precursor_index` null). mzdata names the reader library's parent index on every scan, and the library reports index 0 where a scan has no parent: on a run without MS1 (SRM) every spectrum named scan 1, scan 1 included. The run's warning gives the count | Thermo `.raw` (`--to mzml` applies the same rule, with no list to declare it in) |
 | `bruker:trace-unit-rescale` | a HyStar device trace recorded in a unit mzdata cannot state (bar, mbar, kPa, MPa, mL/min, nL/min, mAU, kV, mV, µs, h, Å) was multiplied by the exact factor into one it can, as 64-bit floats | Bruker `.d` with `chromatography-data.sqlite` |
@@ -1857,8 +1895,8 @@ when unset.
 |---|---|
 | `MZPC_BUFFER_SPECTRA=<n>` | Spectra buffered in RAM before the writer flushes a row group (default 256) on the standard f64 paths |
 | `MZPC_DECODE_WINDOW=<n>` | Bounded reorder window for the parallel timsTOF decoder (default 8× rayon threads, capped at 128). Output order — and therefore the bytes — is unchanged |
-| `MZPC_ROW_GROUP_ROWS=<n>` | Peak-facet parquet row-group size in rows (default 8192 chunks/group on chunked facets, parquet's 2^20 otherwise). Trades size against per-frame random access; a group also ends at `MZPC_ROW_GROUP_MB` |
-| `MZPC_ROW_GROUP_MB=<MiB>` | Vendored writer (and the filter lane's rewrites): byte cap of a signal-facet row group — `spectra_data`, `spectra_peaks`, `chromatograms_data`, wavelength data — in MiB of Arrow buffers, fractions allowed (default 48, three quarters of the validator's 64 MiB `data_row_group_not_monolithic` threshold). A group ends at this or at its row cap, whichever comes first. A conversion writes a spectrum's rows as one batch, and the byte rule starts a new group rather than split a spectrum that fits one; the filter lane and the point-column prune rewrite pass on reader batches of 1024 rows, so their byte cuts can fall inside a spectrum, as the row cap's always could. Changes row-group boundaries, so the bytes — not the values — differ |
+| `MZPC_ROW_GROUP_ROWS=<n>` | Row cap of a spectrum signal facet's row group (default 8192 chunks/group on the timsTOF ims-compact lane, parquet's 2^20 otherwise; `--row-group-rows` sets it). Trades size against per-frame random access; a group also ends at `MZPC_ROW_GROUP_MB`, and only between two spectra |
+| `MZPC_ROW_GROUP_MB=<MiB>` | Vendored writer (and the filter lane's rewrites): byte cap of a signal-facet row group — `spectra_data`, `spectra_peaks`, `chromatograms_data`, wavelength data — in MiB of Arrow buffers, fractions allowed (default 48, three quarters of the validator's 64 MiB `data_row_group_not_monolithic` threshold). A group ends at this or at its row cap, whichever comes first. `--row-group-mb` sets it. Since 0.18.0 every cut, by bytes or by rows, falls between two spectra (chromatograms), on the conversion, the filter lane and the point-column prune rewrite alike; a spectrum larger than a whole group is a group of its own (§7, *Row groups*). Changes row-group boundaries, so the bytes — not the values — differ |
 | `MZPC_ENCODE_THREADS=<n>` | Vendored writer: worker threads for the parallel peak-facet encode (default `available_parallelism()`; `RAYON_NUM_THREADS` is honoured as a fallback; `0` or a non-number is ignored). Output is byte-identical at any thread count |
 | `MZPC_ENCODE_INFLIGHT_BYTES=<bytes>` | Vendored writer: byte budget for row groups in flight in that parallel encode (default `max(256 MB, threads × 48 MB)`); never changes the bytes written. A group is charged at most the budget's per-thread share, so groups larger than that share still encode one per worker instead of one at a time. Memory in flight is therefore at most `max(budget, threads × largest row group)` plus Arrow's spare capacity, and the largest group is bounded by `MZPC_ROW_GROUP_MB` (a single chunk larger than that is a group of its own): a budget below `threads × MZPC_ROW_GROUP_MB` no longer lowers memory (2485 at 8 MB: 1.76 GB peak RSS, as at the default budget; through 0.16, which encoded such groups one at a time, 784 MB in seven times the wall time). To bound memory on a small host, lower `MZPC_ENCODE_THREADS` or `MZPC_ROW_GROUP_MB` |
 | `MZPC_PARALLEL_ENCODE=0` | Vendored writer: serial peak-facet encode instead of the parallel default (on for every unencrypted archive; encrypted facets are always serial). Output is byte-identical either way. Its own rule: empty or `0` = off, any other value (including `false`) = on |

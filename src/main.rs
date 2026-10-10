@@ -65,6 +65,7 @@ mod tims_mobility;
 mod thermo_status;
 mod thermo_trailers;
 mod thermo_isolation;
+mod thermo_centroids;
 mod run_metadata;
 mod agilent_meta;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -211,6 +212,28 @@ static REPRESENTATION: std::sync::OnceLock<RepresentationArg> = std::sync::OnceL
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 fn representation() -> RepresentationArg {
     *REPRESENTATION.get().unwrap_or(&RepresentationArg::Both)
+}
+
+/// `--representation-levels`, published with [`REPRESENTATION`]: empty = every level.
+static REPRESENTATION_LEVELS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// The representation to read for a spectrum at `ms_level`: `--representation` on the levels
+/// `--representation-levels` names (every level when it names none), the faithful `both` elsewhere.
+fn representation_for(ms_level: u8) -> RepresentationArg {
+    if representation_applies_to(ms_level) { representation() } else { RepresentationArg::Both }
+}
+
+/// Does `--representation` apply to a spectrum at `ms_level` (`--representation-levels`)?
+fn representation_applies_to(ms_level: u8) -> bool {
+    let levels = REPRESENTATION_LEVELS.get().map_or(&[][..], Vec::as_slice);
+    levels.is_empty() || levels.contains(&ms_level)
+}
+
+/// Whether any level is read as centroids only or with its centroids (`both`): false only for
+/// `--representation profile` on every level.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+fn representation_may_centroid() -> bool {
+    representation() != RepresentationArg::Profile || REPRESENTATION_LEVELS.get().is_some_and(|l| !l.is_empty())
 }
 
 /// The `--no-mz-lattice` opt-out, published the same way and for the same reason as
@@ -432,15 +455,40 @@ struct Cli {
 
 
     /// Which signal representation to read when a vendor supplies BOTH profile and centroid for the
-    /// same spectrum (Shimadzu `.lcd` does). `both` (the DEFAULT) is faithful to the raw data: profile
+    /// same spectrum (Shimadzu `.lcd` does, and a Thermo `.raw` for its FT and Astral profile scans:
+    /// the instrument's centroid list). `both` (the DEFAULT) is faithful to the raw data: profile
     /// goes to the `spectra_data` facet, centroid to `spectra_peaks`, and the metadata row carries
     /// both `number_of_data_points` and `number_of_peaks` so a reader knows which to read. `profile`
     /// / `centroid` force one view. A requested representation the file does not contain is a
     /// warning, not an error — the other one is written instead of producing an empty archive.
-    /// Honoured by the Shimadzu `.lcd` and Bruker BAF readers (BAF: mzPeak output only) [default:
-    /// both].
+    /// Honoured by the Thermo `.raw`, Shimadzu `.lcd` and Bruker BAF readers (Thermo and BAF: mzPeak
+    /// output only). The vendor's centroids are declared as `vendor-centroids` (beside the profile)
+    /// or `vendor-centroids:profile-dropped` in `transformations`, and as MS:1000035 `peak picking`
+    /// in the conversion's processing method [default: both].
     #[arg(long, value_enum)]
     representation: Option<RepresentationArg>,
+
+    /// The MS levels `--representation` applies to (repeatable or comma-list, as `--ms-level`);
+    /// every other level keeps the default `both`. `--representation centroid --representation-levels 1`
+    /// writes MS1 as the vendor's centroids only and leaves MS2 as the file has it. Honoured
+    /// wherever `--representation` is, on a per-spectrum basis (Thermo `.raw`, Shimadzu `.lcd`);
+    /// the Bruker BAF reader chooses for the whole run and ignores it, with a warning.
+    #[arg(long, value_name = "LEVELS", value_delimiter = ',')]
+    representation_levels: Vec<u8>,
+
+    /// Row cap of a signal facet's row group (`$MZPC_ROW_GROUP_ROWS`). A row is a point in the
+    /// point layout and a chunk in the chunked one. Smaller groups give a parallel or random-access
+    /// reader more, smaller units, at a size cost: each group restarts its column pages and
+    /// statistics. A row group always holds whole spectra, so a spectrum larger than the cap gets a
+    /// group of its own. [default: 1,048,576; 8,192 on the timsTOF ims-compact lane]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    row_group_rows: Option<u64>,
+
+    /// Byte cap of a signal facet's row group, in MiB of uncompressed Arrow buffers
+    /// (`$MZPC_ROW_GROUP_MB`; fractions allowed). The group closes at the first spectrum boundary
+    /// that would exceed it or `--row-group-rows`, whichever comes first. [default: 48]
+    #[arg(long, value_name = "MIB")]
+    row_group_mb: Option<f64>,
 
     /// Bruker timsTOF (TDF) ims-compact only — 50-Th chunks, **ON BY DEFAULT**. Each frame's peaks
     /// are split into true m/z bins (override the width with `--chunk-size`, in Th) on the reference
@@ -847,6 +895,7 @@ struct FileConfig {
     // The six below were missing until 0.9.13 although `--config` promised "any option": a file
     // with `representation: profile` was rejected as an unknown field.
     representation: Option<RepresentationArg>,
+    representation_levels: Option<Vec<u8>>,
     rt: Option<String>,
     ms_level: Option<Vec<u8>>,
     drop_aux: Option<Vec<String>>,
@@ -916,6 +965,8 @@ struct Settings {
     via_msconvert: bool,
     msconvert_path: Option<PathBuf>,
     representation: RepresentationArg,
+    /// `--representation-levels`: empty = every level.
+    representation_levels: Vec<u8>,
     rt: Option<String>,
     ms_level: Vec<u8>,
     drop_aux: Vec<String>,
@@ -1066,6 +1117,11 @@ impl Settings {
             via_msconvert: cli.via_msconvert || fc.via_msconvert.unwrap_or(false),
             msconvert_path: cli.msconvert_path.clone().or(fc.msconvert_path),
             representation: cli.representation.or(fc.representation).unwrap_or(RepresentationArg::Both),
+            representation_levels: if cli.representation_levels.is_empty() {
+                fc.representation_levels.unwrap_or_default()
+            } else {
+                cli.representation_levels.clone()
+            },
             rt: cli.rt.clone().or(fc.rt),
             ms_level: if cli.ms_level.is_empty() { fc.ms_level.unwrap_or_default() } else { cli.ms_level.clone() },
             drop_aux: if cli.drop_aux.is_empty() { fc.drop_aux.unwrap_or_default() } else { cli.drop_aux.clone() },
@@ -1245,6 +1301,14 @@ fn main() {
 
     install_tmp_panic_hook();
     let cli = Cli::parse();
+    // `--row-group-rows` / `--row-group-mb` are the CLI spelling of the writer's environment knobs,
+    // which every lane already reads; set before any writer is built.
+    if let Some(n) = cli.row_group_rows {
+        unsafe { std::env::set_var("MZPC_ROW_GROUP_ROWS", n.to_string()) };
+    }
+    if let Some(mb) = cli.row_group_mb {
+        unsafe { std::env::set_var("MZPC_ROW_GROUP_MB", mb.to_string()) };
+    }
     // Thermo .raw reading self-hosts a .NET runtime (RawFileReader targets net8.0). Allow
     // roll-forward to a newer installed major (9/10) unless the user pinned it — for THERMO input
     // only. It was set for every input until 0.9.12, which overrode the Shimadzu glue's own
@@ -1265,6 +1329,7 @@ fn main() {
         }
     };
     let _ = REPRESENTATION.set(cfg.representation);
+    let _ = REPRESENTATION_LEVELS.set(cfg.representation_levels.clone());
     let _ = SCIEX_SAMPLE.set(cfg.sample);
     init_logging(cfg.verbose, cfg.quiet);
     // Inert-flag warnings MUST come after init_logging: log::warn! against the uninitialized
@@ -1283,9 +1348,14 @@ fn main() {
     {
         log::warn!(
             "--representation is only honored for Shimadzu .lcd input and (mzPeak output only) \
-             Bruker BAF .d; ignoring it for {}",
+             Thermo .raw and Bruker BAF .d; ignoring it for {}",
             cli.input.display()
         );
+    }
+    // The BAF reader picks one representation for the whole run, so it cannot honour a per-level one.
+    #[cfg(any(windows, target_os = "linux"))]
+    if !cfg.representation_levels.is_empty() && is_baf_dir(&cli.input) {
+        log::warn!("--representation-levels is not honored for Bruker BAF .d: --representation applies to every level");
     }
     // Partial-flag honesty for the TDF mobility knob: the ims-compact reader (`bruker_native`)
     // honours it for arrays and params alike, and the lossy `--no-ims-compact` path honours it for
@@ -1324,6 +1394,9 @@ fn main() {
 fn representation_is_honoured(input: &Path, output_format: OutputFormat) -> bool {
     if is_lcd(input) {
         return true;
+    }
+    if mzdata_reads_thermo_raw(input) {
+        return output_format == OutputFormat::Mzpeak;
     }
     #[cfg(any(windows, target_os = "linux"))]
     if is_baf_dir(input) {
@@ -2653,7 +2726,7 @@ fn convert_to_mzml(
             RepresentationArg::Profile => shimadzu::Representation::Profile,
             RepresentationArg::Centroid => shimadzu::Representation::Centroid,
         };
-        let r = shimadzu::ShimadzuReader::open_with(input, rep)?;
+        let r = shimadzu::ShimadzuReader::open_with(input, rep)?.with_other_levels(shimadzu::Representation::Profile);
         return write_native_mzml(input, output, r.len(), |i| r.spectrum(i));
     }
     // Agilent profile `.d` off Windows: the pure-Rust MSProfile.bin reader gives native mzML without
@@ -5826,6 +5899,10 @@ fn convert_file(
     // target-only (`thermo_isolation`); the count is declared in `transformations` below.
     let mut thermo_windows = matches!(reader, MZReaderType::ThermoRaw(_))
         .then(|| thermo_isolation::UnstatedWidthGuard::open(read_path));
+    // The vendor's centroid lists beside (or instead of) Thermo profile spectra (`--representation`).
+    let mut thermo_centroids = matches!(reader, MZReaderType::ThermoRaw(_))
+        .then(|| thermo_centroids::VendorCentroids::open(read_path))
+        .flatten();
 
     let mut n = 0usize;
     let cap = max_spectra();
@@ -5872,6 +5949,9 @@ fn convert_file(
         }
         if lossless() {
             entry = without_peak_sets(entry);
+        }
+        if let Some(c) = thermo_centroids.as_mut() {
+            c.apply(&mut entry);
         }
         // The mzPeak peaks facet requires non-decreasing m/z within a spectrum.
         if entry.has_ion_mobility_dimension() {
@@ -5979,6 +6059,9 @@ fn convert_file(
     }
     if let Some(g) = &thermo_windows {
         g.report();
+    }
+    if let Some(c) = &thermo_centroids {
+        c.report();
     }
     // Cross-check against the source's own declared count. A reader that stops early — a truncated
     // imzML `.ibd`, a half-downloaded mzML — otherwise yields a structurally valid archive that is
@@ -6200,6 +6283,7 @@ fn convert_file(
                 declare(&mut applied, bruker_native::OUT_OF_WINDOW_DROPPED);
             }
             applied.extend(thermo_window_transformation(thermo_windows.as_ref()));
+            applied.extend(thermo_centroids.as_ref().map(thermo_centroids::VendorCentroids::transformations).unwrap_or_default());
             applied.extend(source_refs.as_ref().and_then(mzml_refs::DanglingRefs::transformation).map(str::to_string));
             applied.extend(chromatogram_transforms);
             applied
@@ -7922,6 +8006,12 @@ fn finish_archive(
     if let (true, Some(block)) = (lossless(), &fidelity_block) {
         fidelity::check_lossless(block, &applied)?;
     }
+    // Which signal facets hold whole spectra (chromatograms) per row group, checked on the facets
+    // as written: the promise a reader needs to decode row groups in parallel.
+    let row_groups_block = fidelity::row_group_alignment(tmp_guard.path()).unwrap_or_else(|e| {
+        log::warn!("row_groups index block not written: {e:#}");
+        None
+    });
     // A lane's additions to `file_description` (the contacts, `--keep-contact`): merged into the
     // block the writer copied to the index at close — its own model has no slot for them, so the
     // block is completed here rather than in vendored code — key by key, nothing of the writer's
@@ -7941,6 +8031,9 @@ fn finish_archive(
     }
     if let Some(block) = &fidelity_block {
         zip.add_index_metadata(fidelity::BLOCK, block).context("writing fidelity index block")?;
+    }
+    if let Some(block) = &row_groups_block {
+        zip.add_index_metadata(fidelity::ROW_GROUPS_BLOCK, block).context("writing row_groups index block")?;
     }
     embed_vendor_members(&mut zip, input, vendor)?;
     // The FlexImaging sequence's image with its teach-point registration, on every lane that read
@@ -8225,7 +8318,7 @@ fn convert_shimadzu(
     // implementation's fitted linear grid (`lattice_fit_grid_policy`; the same treatment the mzML
     // lane gives the LabSolutions export of these files). `--no-mz-lattice` (config `no_mz_lattice`,
     // `$MZPC_NO_MZ_LATTICE`) keeps f64 m/z here too, so the flag means the same thing on every lane.
-    let lattice = chunk.is_some() && rep != shimadzu::Representation::Profile && mz_lattice_enabled();
+    let lattice = chunk.is_some() && representation_may_centroid() && mz_lattice_enabled();
     if lattice {
         hints.peak_grid = Some(lattice_fit_grid_policy());
     }
@@ -10836,6 +10929,10 @@ fn mirror_transformations(target: &mut impl MSDataFileMetadata, applied: &[&str]
     };
     if applied.iter().any(|t| ZERO_INTENSITY_TRIMMING.contains(t)) {
         method.params.insert(0, Param::builder().name("zero intensity point trimming").curie(curie!(MS:1003901)).build());
+    }
+    // The vendor's centroid lists are its peak picking, stored by this conversion.
+    if applied.iter().any(|t| [thermo_centroids::VENDOR_CENTROIDS, thermo_centroids::VENDOR_CENTROIDS_ONLY].contains(t)) {
+        method.params.insert(0, Param::builder().name("peak picking").curie(curie!(MS:1000035)).build());
     }
     // Before the method's `file format conversion`, which stays last (the order every release wrote).
     let at = method.params.iter().position(|p| p.curie() == Some(FILE_FORMAT_CONVERSION)).unwrap_or(method.params.len());
